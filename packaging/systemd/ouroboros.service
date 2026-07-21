@@ -1,0 +1,34 @@
+# Ouroboros headless server — systemd USER unit template.
+#
+# Install (documented in docs/DEPLOYMENT.md → "Headless Linux server"):
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/systemd/ouroboros.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ouroboros
+#   loginctl enable-linger "$USER"   # keep it running after logout / before login
+#
+# The template assumes the documented layout:
+#   ~/ouroboros-server/repo    — git checkout
+#   ~/ouroboros-server/.venv   — python -m venv with requirements.txt installed
+# Adjust ExecStart/WorkingDirectory if you installed elsewhere. A systemd user
+# manager has no shell PATH and no activated venv — absolute paths are required.
+
+[Unit]
+Description=Ouroboros headless server (loopback-only; access via SSH tunnel)
+# Exit codes that must NOT be restarted:
+#   99 — panic stop (BIBLE Emergency Stop Invariant: only a human may resume)
+#   43 — another server already holds this data dir's lock (permanent conflict)
+# Exit 42 (self-restart fallback) is an ordinary unclean exit and restarts.
+StartLimitIntervalSec=600
+StartLimitBurst=6
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ouroboros-server/repo
+ExecStart=%h/ouroboros-server/.venv/bin/python -m ouroboros.cli server --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=99 43
+
+[Install]
+WantedBy=default.target

@@ -301,9 +301,15 @@ def _hidden_run(command: list[str], **kwargs):
 _lock_fd: Any = None
 
 
-def pid_lock_acquire(path: str) -> bool:
-    """Acquire an exclusive PID lock, closing the fd on lock failure."""
-    global _lock_fd
+def pid_flock_open(path: str) -> Any:
+    """Open ``path`` and take an exclusive OS lock; return the handle or None.
+
+    Handle-based variant of :func:`pid_lock_acquire` for callers that need a
+    second, independent lock in the same process. The lock is OS-released on
+    process death; the Python-created fd is close-on-exec, so an
+    ``os.execvpe`` self-restart releases it exactly when the replacement
+    image starts (which then re-acquires it on its own startup path).
+    """
     fd_obj = None
     try:
         fd_obj = open(path, "w")
@@ -314,42 +320,55 @@ def pid_lock_acquire(path: str) -> bool:
             fcntl.flock(fd_obj, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fd_obj.write(str(os.getpid()))
         fd_obj.flush()
-        # Promote to global only after lock and PID write both succeed.
-        _lock_fd = fd_obj
-        return True
+        return fd_obj
     except (IOError, OSError):
         if fd_obj is not None:
             try:
                 fd_obj.close()
             except Exception:
                 pass
-        return False
+        return None
 
 
-def pid_lock_release(path: str) -> None:
-    """Release the PID lock."""
-    global _lock_fd
-    if _lock_fd is not None:
+def pid_flock_close(path: str, fd_obj: Any) -> None:
+    """Release a lock handle returned by :func:`pid_flock_open`."""
+    if fd_obj is not None:
         if IS_WINDOWS:
             try:
-                _win32_unlock(_lock_fd.fileno())
+                _win32_unlock(fd_obj.fileno())
             except Exception:
                 pass
         else:
             import fcntl
             try:
-                fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+                fcntl.flock(fd_obj, fcntl.LOCK_UN)
             except Exception:
                 pass
         try:
-            _lock_fd.close()
+            fd_obj.close()
         except Exception:
             pass
-        _lock_fd = None
     try:
         os.unlink(path)
     except Exception:
         pass
+
+
+def pid_lock_acquire(path: str) -> bool:
+    """Acquire the process-global exclusive PID lock."""
+    global _lock_fd
+    fd_obj = pid_flock_open(path)
+    if fd_obj is None:
+        return False
+    _lock_fd = fd_obj
+    return True
+
+
+def pid_lock_release(path: str) -> None:
+    """Release the process-global PID lock."""
+    global _lock_fd
+    pid_flock_close(path, _lock_fd)
+    _lock_fd = None
 
 
 # File locking.

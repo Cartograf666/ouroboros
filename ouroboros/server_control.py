@@ -38,6 +38,14 @@ def restart_current_process(host: str, port: int, *, repo_dir: pathlib.Path, log
     except Exception:
         log.exception("Direct re-exec failed; attempting spawned restart fallback.")
         try:
+            # Release the headless server lock (no-op when not held) so the
+            # spawned replacement can acquire it before this process exits.
+            from ouroboros.config import release_server_pid_lock
+
+            release_server_pid_lock()
+        except Exception:
+            log.debug("server pid lock release failed", exc_info=True)
+        try:
             from ouroboros.config import DATA_DIR
             from ouroboros.process_custody import spawn_supervised
 

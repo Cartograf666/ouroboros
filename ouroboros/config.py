@@ -28,9 +28,18 @@ DATA_DIR = pathlib.Path(os.environ.get("OUROBOROS_DATA_DIR", APP_ROOT / "data"))
 SETTINGS_PATH = pathlib.Path(os.environ.get("OUROBOROS_SETTINGS_PATH", DATA_DIR / "settings.json"))
 PID_FILE = pathlib.Path(os.environ.get("OUROBOROS_PID_FILE", APP_ROOT / "ouroboros.pid"))
 PORT_FILE = pathlib.Path(os.environ.get("OUROBOROS_PORT_FILE", DATA_DIR / "state" / "server_port"))
+# Data-scoped headless server lock ("one `ouroboros server` per data dir").
+# Distinct from PID_FILE, which is the launcher's app-root desktop lock.
+SERVER_PID_FILE = pathlib.Path(
+    os.environ.get("OUROBOROS_SERVER_PID_FILE", DATA_DIR / "state" / "server.pid")
+)
 
 RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
+# Headless `ouroboros server` exits with this when another instance already
+# holds SERVER_PID_FILE. Listed in RestartPreventExitStatus of the shipped
+# systemd unit (with PANIC_EXIT_CODE) so a permanent conflict never restart-loops.
+SERVER_ALREADY_RUNNING_EXIT_CODE = 43
 AGENT_SERVER_PORT = 8765
 FINALIZATION_GRACE_DEFAULT_SEC = 120
 # Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at
@@ -1587,3 +1596,42 @@ def acquire_pid_lock() -> bool:
 
 def release_pid_lock() -> None:
     _compat_pid_lock_release(str(PID_FILE))
+
+
+# Headless server lock (SERVER_PID_FILE): held by `ouroboros server` for the
+# lifetime of the process so two source-mode servers cannot share one data dir.
+# Handle-based (not the platform_layer process-global slot) so it coexists with
+# the launcher lock inside one test process. OS-released on death; the fd is
+# close-on-exec, so an execvpe self-restart hands the lock to the replacement
+# image, which re-acquires it on its own `_server_command` startup path.
+_server_pid_lock_handle: Any = None
+
+
+def acquire_server_pid_lock() -> bool:
+    global _server_pid_lock_handle
+    if _server_pid_lock_handle is not None:
+        return True
+    from ouroboros.platform_layer import pid_flock_open
+
+    SERVER_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handle = pid_flock_open(str(SERVER_PID_FILE))
+    if handle is None:
+        return False
+    _server_pid_lock_handle = handle
+    return True
+
+
+def release_server_pid_lock() -> None:
+    """Release the headless server lock; safe no-op when not held.
+
+    Also called by the restart spawn-fallback (`server_control.py`) so the
+    replacement process it spawns can acquire the lock before this dying
+    process exits.
+    """
+    global _server_pid_lock_handle
+    if _server_pid_lock_handle is None:
+        return
+    from ouroboros.platform_layer import pid_flock_close
+
+    pid_flock_close(str(SERVER_PID_FILE), _server_pid_lock_handle)
+    _server_pid_lock_handle = None
