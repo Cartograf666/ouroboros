@@ -701,6 +701,10 @@ export function renderSettingsPage() {
                         <div id="local-model-test-result" class="settings-test-result"></div>
                     </div>
 
+                    <!-- Remote connection (desktop only): filled by web/modules/remote.js
+                         via the launcher bridge; stays empty in a plain browser. -->
+                    <div id="remote-connections-section"></div>
+
                     <div class="form-section">
                         <h3>Runtime Limits</h3>
                         <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the absolute ceiling, and the reaper. Budget limits control runtime cost thresholds.</div>

@@ -280,6 +280,7 @@ export function createChatInstance({
                         <div class="chat-budget-bar-fill" id="chat-budget-bar-fill"></div>
                     </div>
                 </button>
+                <span id="remote-pill-slot" class="remote-pill-slot"></span>
                 <span id="chat-status" class="status-badge offline">Connecting...</span>
             `,
         });

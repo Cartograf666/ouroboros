@@ -639,6 +639,26 @@ initUpdateStatus(ctx);
 
 initOnboardingOverlay();
 
+// Desktop Remote connection (owner-only): fill the Settings section and mount
+// the header connection pill once the launcher bridge is ready. pywebview
+// exposes the bridge only after `pywebviewready`; on a plain browser both are
+// inert. An immediate attempt covers the already-ready case.
+(function initRemoteConnectionUI() {
+    let done = false;
+    const wire = () => {
+        if (done) return;
+        done = true;
+        import('./modules/remote.js').then((remote) => {
+            const section = document.getElementById('remote-connections-section');
+            if (section) remote.initRemoteSection(section);
+            const slot = document.getElementById('remote-pill-slot');
+            if (slot) remote.mountConnectionPill(slot);
+        }).catch(() => { /* remote UI is optional */ });
+    };
+    if (window.pywebview && window.pywebview.api) wire();
+    else window.addEventListener('pywebviewready', wire, { once: true });
+})();
+
 initMatrixRain();
 loadVersion();
 syncNavigationState();

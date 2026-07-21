@@ -5730,3 +5730,44 @@ textarea.chat-input {
         transition: none;
     }
 }
+
+/* Remote connection (desktop) — header pill + Settings section.
+   Uses the shared glass/accent tokens; no hardcoded palette. */
+.remote-pill-slot { display: inline-flex; align-items: center; }
+.remote-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 6px 4px 12px;
+    border-radius: var(--pill-radius);
+    background: rgba(26, 21, 32, 0.72);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    font-size: 12px;
+    color: var(--text, #e8e4ee);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+.remote-pill-label { white-space: nowrap; }
+.remote-pill-reconnecting .remote-pill-label,
+.remote-pill-connecting .remote-pill-label { color: rgba(248, 130, 140, 1); }
+.remote-pill-gave_up .remote-pill-label,
+.remote-pill-error .remote-pill-label { color: rgba(232, 93, 111, 1); }
+.remote-pill-connected { border-color: rgba(201, 53, 69, 0.45); }
+
+.remote-profile-list { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
+.remote-profile-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    border-radius: var(--radius, 12px);
+    background: rgba(26, 21, 32, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.remote-profile-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.remote-profile-name { font-weight: 600; }
+.remote-profile-target { font-size: 12px; color: var(--text-dim, #94a3b8); font-family: var(--mono, monospace); }
+.remote-profile-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.remote-profile-active { font-size: 12px; color: rgba(201, 53, 69, 1); }
+.remote-profile-form { margin-top: 10px; }

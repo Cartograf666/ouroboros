@@ -680,18 +680,37 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         return body;
     }
 
+    // Remote v1: the launcher's native bridge is bound to the LOCAL launcher
+    // process. While the window shows a REMOTE server's page, the launcher
+    // origin-gates these owner methods and returns {origin_refused:true} — that
+    // means "this control belongs to the server whose page you are on", so we
+    // must route through the page's OWN HTTP owner endpoint instead.
+    function bridgeRefusedOrigin(result) {
+        return Boolean(result && result.ok !== true && result.origin_refused === true);
+    }
+
     async function saveRuntimeModeViaNativeBridgeIfNeeded() {
         const nextMode = byId('s-runtime-mode').value || 'advanced';
         const currentMode = currentSettings?.OUROBOROS_RUNTIME_MODE || 'advanced';
         const bridge = window.pywebview?.api?.request_runtime_mode_change;
         if (nextMode === currentMode) {
-            return bridge ? await bridge(nextMode) : await apiClient.ownerRuntimeMode(nextMode);
+            if (!bridge) return await apiClient.ownerRuntimeMode(nextMode);
+            const r = await bridge(nextMode);
+            return bridgeRefusedOrigin(r) ? await apiClient.ownerRuntimeMode(nextMode) : r;
         }
-        const result = bridge
-            ? await bridge(nextMode)
-            : (confirm(`Change Ouroboros runtime mode from ${currentMode} to ${nextMode}? The change takes effect after restart.`)
+        let result;
+        if (bridge) {
+            result = await bridge(nextMode);
+            if (bridgeRefusedOrigin(result)) {
+                result = confirm(`Change Ouroboros runtime mode from ${currentMode} to ${nextMode}? The change takes effect after restart.`)
+                    ? await apiClient.ownerRuntimeMode(nextMode)
+                    : { ok: false, error: 'Runtime mode change cancelled.' };
+            }
+        } else {
+            result = confirm(`Change Ouroboros runtime mode from ${currentMode} to ${nextMode}? The change takes effect after restart.`)
                 ? await apiClient.ownerRuntimeMode(nextMode)
-                : { ok: false, error: 'Runtime mode change cancelled.' });
+                : { ok: false, error: 'Runtime mode change cancelled.' };
+        }
         if (!result || result.ok !== true) {
             throw new Error(result?.error || 'Runtime mode change was cancelled.');
         }
@@ -705,11 +724,18 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         const currentEnabled = isTruthySetting(currentSettings?.OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS);
         if (nextEnabled === currentEnabled) return null;
         const bridge = window.pywebview?.api?.request_auto_grant_reviewed_skills_change;
-        const result = bridge
-            ? await bridge(nextEnabled)
-            : (confirm(`${nextEnabled ? 'Enable' : 'Disable'} reviewed-skill auto-grant? It only applies after a fresh executable review for the current content hash.`)
+        const confirmHttp = async () => (
+            confirm(`${nextEnabled ? 'Enable' : 'Disable'} reviewed-skill auto-grant? It only applies after a fresh executable review for the current content hash.`)
                 ? await apiClient.ownerAutoGrant(nextEnabled)
-                : { ok: false, error: 'Reviewed-skill auto-grant change cancelled.' });
+                : { ok: false, error: 'Reviewed-skill auto-grant change cancelled.' }
+        );
+        let result;
+        if (bridge) {
+            result = await bridge(nextEnabled);
+            if (bridgeRefusedOrigin(result)) result = await confirmHttp();
+        } else {
+            result = await confirmHttp();
+        }
         if (!result || result.ok !== true) {
             throw new Error(result?.error || 'Reviewed-skill auto-grant change was cancelled.');
         }
