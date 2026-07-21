@@ -63,7 +63,11 @@ def test_files_pdf_preview_and_download_bridge_are_safe():
     assert "encodeURI(data.content_url)" not in source
     assert 'parsed.path != "/api/files/download"' in launcher
     assert 'parsed.path.startswith("/api/extensions/")' in launcher
-    assert "parsed.port != actual_port" in launcher
+    # Remote v1: the file bridge validates against the ACTIVE view port (local
+    # server OR the current tunnel), so remote downloads target the remote
+    # server rather than a same-shaped local path (was pinned to actual_port).
+    assert "parsed.port != active_port" in launcher
+    assert 'active_port = int(view_state["port"])' in launcher
 
 
 def test_chat_document_bubble_opens_externally_and_downloads_separately():

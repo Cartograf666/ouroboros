@@ -6,14 +6,16 @@ import argparse
 
 import pytest
 
-from ouroboros import config
+from ouroboros import config, remote_support
 from ouroboros.platform_layer import pid_flock_close, pid_flock_open
 
 
 @pytest.fixture()
 def _isolated_server_lock(tmp_path, monkeypatch):
+    # SERVER_PID_FILE is read via config.SERVER_PID_FILE inside remote_support,
+    # so patching config is what the acquire/release helpers observe.
     monkeypatch.setattr(config, "SERVER_PID_FILE", tmp_path / "state" / "server.pid")
-    monkeypatch.setattr(config, "_server_pid_lock_handle", None)
+    monkeypatch.setattr(remote_support, "_server_pid_lock_handle", None)
     yield
     config.release_server_pid_lock()
 

@@ -28,18 +28,12 @@ DATA_DIR = pathlib.Path(os.environ.get("OUROBOROS_DATA_DIR", APP_ROOT / "data"))
 SETTINGS_PATH = pathlib.Path(os.environ.get("OUROBOROS_SETTINGS_PATH", DATA_DIR / "settings.json"))
 PID_FILE = pathlib.Path(os.environ.get("OUROBOROS_PID_FILE", APP_ROOT / "ouroboros.pid"))
 PORT_FILE = pathlib.Path(os.environ.get("OUROBOROS_PORT_FILE", DATA_DIR / "state" / "server_port"))
-# Data-scoped headless server lock ("one `ouroboros server` per data dir").
-# Distinct from PID_FILE, which is the launcher's app-root desktop lock.
-SERVER_PID_FILE = pathlib.Path(
-    os.environ.get("OUROBOROS_SERVER_PID_FILE", DATA_DIR / "state" / "server.pid")
-)
+# Data-scoped headless server lock (one `ouroboros server` per data dir; distinct from the launcher app-root PID_FILE). See ouroboros/remote_support.
+SERVER_PID_FILE = pathlib.Path(os.environ.get("OUROBOROS_SERVER_PID_FILE", DATA_DIR / "state" / "server.pid"))
 
 RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
-# Headless `ouroboros server` exits with this when another instance already
-# holds SERVER_PID_FILE. Listed in RestartPreventExitStatus of the shipped
-# systemd unit (with PANIC_EXIT_CODE) so a permanent conflict never restart-loops.
-SERVER_ALREADY_RUNNING_EXIT_CODE = 43
+SERVER_ALREADY_RUNNING_EXIT_CODE = 43  # `ouroboros server` lock conflict; in systemd RestartPreventExitStatus
 AGENT_SERVER_PORT = 8765
 FINALIZATION_GRACE_DEFAULT_SEC = 120
 # Cadence for intrinsic self-pacing checkpoints when a task has NO deadline_at
@@ -240,9 +234,7 @@ SETTINGS_DEFAULTS = {
     "MCP_ENABLED": False,
     "MCP_SERVERS": [],
     "MCP_TOOL_TIMEOUT_SEC": 60,
-    # Desktop remote-connection profiles (launcher-owned owner state). Never
-    # exposed through GET /api/settings and merge-skipped on generic POST; the
-    # only writer is the launcher bridge via update_remote_connections().
+    # Launcher-owned desktop remote-connection profiles; see ouroboros/remote_support.
     "OUROBOROS_REMOTE_CONNECTIONS": [],
     # Scope review: one or more reviewer slots; enforcement follows OUROBOROS_REVIEW_ENFORCEMENT.
     "OUROBOROS_SCOPE_REVIEW_MODELS": "anthropic/claude-fable-5",
@@ -1273,11 +1265,9 @@ def _coerce_setting_value(key: str, value):
                 return []
         if isinstance(value, list):
             items = [dict(item) for item in value if isinstance(item, dict)]
-            if key == "OUROBOROS_REMOTE_CONNECTIONS":
-                # Shape-level bound only; semantic profile validation is the
-                # launcher's job (ouroboros/remote_tunnel.py) before writing.
-                return items[:REMOTE_CONNECTIONS_MAX]
-            return items
+            # Shape/count bound only; profile semantics are validated by the
+            # launcher (ouroboros/remote_tunnel.py) before any write.
+            return items[:REMOTE_CONNECTIONS_MAX] if key == "OUROBOROS_REMOTE_CONNECTIONS" else items
         return []
     if isinstance(default, bool):
         if isinstance(value, bool):
@@ -1605,88 +1595,5 @@ def release_pid_lock() -> None:
     _compat_pid_lock_release(str(PID_FILE))
 
 
-# Desktop remote-connection profiles (owner-only launcher state).
-REMOTE_CONNECTIONS_MAX = 32
-
-
-def get_remote_connections() -> list:
-    return list(
-        _coerce_setting_value(
-            "OUROBOROS_REMOTE_CONNECTIONS",
-            load_settings().get("OUROBOROS_REMOTE_CONNECTIONS"),
-        )
-    )
-
-
-def update_remote_connections(profiles: list) -> list:
-    """Owner-only replacement write of OUROBOROS_REMOTE_CONNECTIONS.
-
-    Holds the settings lock across the whole read-modify-write (a separate
-    load()+save() pair would race the server's own saves and clobber them).
-    Writes exactly this one key and preserves every other on-disk key verbatim,
-    so the save_settings mode ratchets are structurally out of reach. Callers
-    (the launcher bridge) validate profile semantics via
-    ouroboros/remote_tunnel.py before calling; this layer enforces shape only.
-    """
-    normalized = _coerce_setting_value("OUROBOROS_REMOTE_CONNECTIONS", profiles)
-    _guard_live_settings_write()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    fd = _acquire_settings_lock()
-    try:
-        raw: dict = {}
-        if SETTINGS_PATH.exists():
-            try:
-                parsed = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-                if isinstance(parsed, dict):
-                    raw = parsed
-            except Exception:
-                pass
-        raw["OUROBOROS_REMOTE_CONNECTIONS"] = normalized
-        try:
-            tmp = SETTINGS_PATH.with_suffix(".tmp")
-            tmp.write_text(json.dumps(raw, indent=2), encoding="utf-8")
-            os.replace(str(tmp), str(SETTINGS_PATH))
-        except OSError:
-            SETTINGS_PATH.write_text(json.dumps(raw, indent=2), encoding="utf-8")
-        return list(normalized)
-    finally:
-        _release_settings_lock(fd)
-
-
-# Headless server lock (SERVER_PID_FILE): held by `ouroboros server` for the
-# lifetime of the process so two source-mode servers cannot share one data dir.
-# Handle-based (not the platform_layer process-global slot) so it coexists with
-# the launcher lock inside one test process. OS-released on death; the fd is
-# close-on-exec, so an execvpe self-restart hands the lock to the replacement
-# image, which re-acquires it on its own `_server_command` startup path.
-_server_pid_lock_handle: Any = None
-
-
-def acquire_server_pid_lock() -> bool:
-    global _server_pid_lock_handle
-    if _server_pid_lock_handle is not None:
-        return True
-    from ouroboros.platform_layer import pid_flock_open
-
-    SERVER_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    handle = pid_flock_open(str(SERVER_PID_FILE))
-    if handle is None:
-        return False
-    _server_pid_lock_handle = handle
-    return True
-
-
-def release_server_pid_lock() -> None:
-    """Release the headless server lock; safe no-op when not held.
-
-    Also called by the restart spawn-fallback (`server_control.py`) so the
-    replacement process it spawns can acquire the lock before this dying
-    process exits.
-    """
-    global _server_pid_lock_handle
-    if _server_pid_lock_handle is None:
-        return
-    from ouroboros.platform_layer import pid_flock_close
-
-    pid_flock_close(str(SERVER_PID_FILE), _server_pid_lock_handle)
-    _server_pid_lock_handle = None
+# Remote/headless support state lives in ouroboros/remote_support.py (P7 split); re-exported so `config.X` stays the stable API.
+from ouroboros.remote_support import REMOTE_CONNECTIONS_MAX, acquire_server_pid_lock, get_remote_connections, release_server_pid_lock, update_remote_connections  # noqa: E402,F401
