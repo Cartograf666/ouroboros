@@ -110,6 +110,10 @@ async def api_state(request: Request) -> JSONResponse:
             "context_mode": get_context_mode(),
             "safety_mode": get_safety_mode(),
             "skills_repo_configured": bool(get_skills_repo_path()),
+            # Desktop Remote connection capability handshake: the launcher
+            # refuses to switch its window to a remote server whose bundled
+            # SPA predates the connection-aware UI (additive, remote v1).
+            "remote_ui": True,
             "github_token_configured": bool(github_token_from_env_or_settings()),
             "accounting": {
                 "available": accounting_available,

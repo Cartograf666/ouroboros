@@ -412,6 +412,10 @@ class StateResponse(TypedDict):
     context_mode: str
     safety_mode: str
     skills_repo_configured: bool
+    # Additive (remote v1): capability flag for the desktop launcher's
+    # Remote-connection compatibility handshake — this server (and its
+    # bundled SPA) understand the connection-aware desktop UI.
+    remote_ui: bool
     github_token_configured: bool
     accounting: Dict[str, Any]
     # Multi-project sidebar feed (additive, v6.32.0): compact registered

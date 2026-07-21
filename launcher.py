@@ -36,13 +36,16 @@ from ouroboros.config import (
     SETTINGS_DEFAULTS,
     acquire_pid_lock,
     apply_settings_to_env as _apply_settings_to_env,
+    get_remote_connections,
     load_settings,
     get_runtime_mode,
     normalize_runtime_mode,
     read_version,
     release_pid_lock,
     save_settings,
+    update_remote_connections,
 )
+from ouroboros import remote_tunnel as _remote_tunnel
 from ouroboros.launcher_bootstrap import (
     BootstrapContext,
     bootstrap_repo as _bootstrap_repo,
@@ -303,6 +306,20 @@ _agent_job: Optional[object] = None
 _agent_lock = threading.Lock()
 _shutdown_event = threading.Event()
 _webview_window = None
+# Remote-connection tunnel manager (owner-only desktop surface). Module-global
+# so shutdown and the panic path can tear the ssh child down synchronously.
+_tunnel_manager: Optional["_remote_tunnel.RemoteTunnelManager"] = None
+
+
+def _disconnect_tunnel_quietly() -> None:
+    global _tunnel_manager
+    manager = _tunnel_manager
+    if manager is None:
+        return
+    try:
+        manager.disconnect()
+    except Exception:
+        log.debug("tunnel disconnect failed", exc_info=True)
 
 
 def _server_process_identity_matches(record: dict) -> bool:
@@ -698,6 +715,9 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
         if exit_code == PANIC_EXIT_CODE:
             log.info("Panic stop (exit code %d) — shutting down completely.", PANIC_EXIT_CODE)
             _shutdown_event.set()
+            # Panic must leave zero children: the ssh tunnel is launcher-owned,
+            # so it is torn down here, synchronously, before the hard exit.
+            _disconnect_tunnel_quietly()
             # The agent (server child) already exited; tear down any orphans and
             # force-exit the whole process. _webview_window.destroy() from this
             # supervisor thread cannot end the main-thread Cocoa webview loop on
@@ -1158,22 +1178,51 @@ def main():
         webview.start()
         return
 
+    # The webview's currently trusted loopback port: the local server by
+    # default, the active tunnel's local port while a remote connection is up.
+    # Mutated only by the remote_* bridge methods below.
+    view_state = {"port": actual_port}
+
+    def _current_page_is_local_origin() -> bool:
+        """True when the window currently shows the LOCAL Ouroboros page.
+
+        This is the launcher-side authority gate (owner decision D20): while a
+        REMOTE server's SPA is loaded, its page JS gets the same pywebview
+        bridge object, and that SPA is another self-modifying being's code —
+        privileged owner methods must refuse it in Python, not via JS hiding.
+        """
+        try:
+            current = str(_webview_window.get_current_url() or "") if _webview_window else ""
+        except Exception:
+            current = ""
+        return _remote_tunnel.is_local_origin(current, actual_port)
+
+    _ORIGIN_REFUSED = {
+        "ok": False,
+        "origin_refused": True,
+        "error": "owner action refused: available only from the local Ouroboros page",
+    }
+
     def _resolve_bridge_file_url(raw_url: str) -> str:
         """Validate a loopback file-bridge URL, returning the resolved full URL.
 
         Shared SSOT for both the download-to-Downloads and open-in-default-app
         bridge methods so the loopback guard cannot drift between them.
+        Validates against the ACTIVE view port — the local server, or the
+        current tunnel's local port while connected remotely — so remote file
+        downloads target the remote server and never the same-shaped local path.
         """
         import urllib.parse
 
-        full_url = urllib.parse.urljoin(f"http://127.0.0.1:{actual_port}", str(raw_url or ""))
+        active_port = int(view_state["port"])
+        full_url = urllib.parse.urljoin(f"http://127.0.0.1:{active_port}", str(raw_url or ""))
         parsed = urllib.parse.urlparse(full_url)
         if parsed.scheme != "http":
             raise ValueError("file URL must be http://")
         if parsed.hostname not in {"127.0.0.1", "localhost"}:
-            raise ValueError("desktop file access is limited to the local Ouroboros server")
-        if parsed.port != actual_port:
-            raise ValueError("file URL port must match the local Ouroboros server")
+            raise ValueError("desktop file access is limited to loopback Ouroboros servers")
+        if parsed.port != active_port:
+            raise ValueError("file URL port must match the active Ouroboros page")
         if parsed.path != "/api/files/download" and not parsed.path.startswith("/api/extensions/"):
             raise ValueError("file URL path must be /api/files/download or /api/extensions/<skill>/...")
         return full_url
@@ -1197,8 +1246,41 @@ def main():
             with target.open("wb") as fh:
                 shutil.copyfileobj(resp, fh)
 
+    local_url = f"http://127.0.0.1:{actual_port}"
+
+    def _on_tunnel_state(status: dict) -> None:
+        """Monitor-thread callback: keep the window on a live page.
+
+        - gave_up: reconnect window exhausted — return the owner to the local
+          page (the launcher-owned recovery path that never depends on the
+          remote SPA's code).
+        - reconnected on a NEW local port (stable-port bind was stolen):
+          navigate to the new tunnel origin.
+        """
+        state = status.get("state")
+        try:
+            if state == "gave_up":
+                view_state["port"] = actual_port
+                if _webview_window:
+                    _webview_window.load_url(local_url)
+            elif state == "connected" and status.get("reconnected"):
+                new_port = int(status.get("local_port") or 0)
+                if new_port and new_port != int(view_state["port"]):
+                    view_state["port"] = new_port
+                    if _webview_window:
+                        _webview_window.load_url(f"http://127.0.0.1:{new_port}")
+        except Exception:
+            log.warning("tunnel state transition handling failed", exc_info=True)
+
+    global _tunnel_manager
+    _tunnel_manager = _remote_tunnel.RemoteTunnelManager(
+        pathlib.Path(DATA_DIR), on_state_change=_on_tunnel_state
+    )
+
     class MainApi:
         def request_runtime_mode_change(self, mode: str) -> dict:
+            if not _current_page_is_local_origin():
+                return dict(_ORIGIN_REFUSED)
             try:
                 return _request_runtime_mode_change(
                     mode,
@@ -1211,6 +1293,8 @@ def main():
                 return {"ok": False, "error": f"Native confirmation failed: {exc}"}
 
         def request_auto_grant_reviewed_skills_change(self, enabled: bool) -> dict:
+            if not _current_page_is_local_origin():
+                return dict(_ORIGIN_REFUSED)
             try:
                 return _request_auto_grant_reviewed_skills_change(
                     bool(enabled),
@@ -1223,6 +1307,8 @@ def main():
                 return {"ok": False, "error": f"Native confirmation failed: {exc}"}
 
         def request_skill_key_grant(self, skill: str, keys: list) -> dict:
+            if not _current_page_is_local_origin():
+                return dict(_ORIGIN_REFUSED)
             try:
                 return _request_skill_key_grant(
                     skill,
@@ -1234,6 +1320,127 @@ def main():
             except Exception as exc:
                 log.warning("Skill grant native confirmation failed: %s", exc, exc_info=True)
                 return {"ok": False, "error": f"Native confirmation failed: {exc}"}
+
+        # --- Remote connection (owner decisions D20-D23) -------------------
+        # remote_status/remote_disconnect are callable from ANY page (the
+        # remote SPA renders the connection pill with them); everything else
+        # is origin-gated to the local page.
+
+        def remote_status(self) -> dict:
+            status = _tunnel_manager.status() if _tunnel_manager else {"state": "disconnected"}
+            status["ssh_available"] = bool(_remote_tunnel.ssh_available())
+            status["local_origin"] = _current_page_is_local_origin()
+            return {"ok": True, **status}
+
+        def remote_disconnect(self) -> dict:
+            _disconnect_tunnel_quietly()
+            view_state["port"] = actual_port
+            try:
+                if _webview_window:
+                    _webview_window.load_url(local_url)
+            except Exception:
+                log.warning("navigation back to local failed", exc_info=True)
+            return {"ok": True, "state": "disconnected"}
+
+        def remote_list(self) -> dict:
+            if not _current_page_is_local_origin():
+                return dict(_ORIGIN_REFUSED)
+            return {"ok": True, "profiles": get_remote_connections()}
+
+        def remote_save(self, profile: dict) -> dict:
+            if not _current_page_is_local_origin():
+                return dict(_ORIGIN_REFUSED)
+            try:
+                normalized = _remote_tunnel.validate_profile(profile)
+                merged = [
+                    p for p in get_remote_connections() if p.get("id") != normalized["id"]
+                ]
+                merged.append(normalized)
+                validated = _remote_tunnel.validate_profiles(merged)
+            except _remote_tunnel.ProfileError as exc:
+                return {"ok": False, "error": str(exc)}
+            update_remote_connections(validated)
+            return {"ok": True, "profiles": validated}
+
+        def remote_delete(self, profile_id: str) -> dict:
+            if not _current_page_is_local_origin():
+                return dict(_ORIGIN_REFUSED)
+            wanted = str(profile_id or "").strip()
+            status = _tunnel_manager.status() if _tunnel_manager else {}
+            if status.get("profile_id") == wanted and status.get("state") not in {
+                "disconnected",
+                "error",
+                "gave_up",
+            }:
+                _disconnect_tunnel_quietly()
+                view_state["port"] = actual_port
+            remaining = [
+                p for p in get_remote_connections() if p.get("id") != wanted
+            ]
+            update_remote_connections(remaining)
+            return {"ok": True, "profiles": remaining}
+
+        def remote_connect(self, profile_id: str) -> dict:
+            if not _current_page_is_local_origin():
+                return dict(_ORIGIN_REFUSED)
+            if not _remote_tunnel.ssh_available():
+                return {
+                    "ok": False,
+                    "error_state": "ssh_unavailable",
+                    "error": "system ssh was not found — install an OpenSSH client to use Remote connection",
+                }
+            wanted = str(profile_id or "").strip()
+            stored = next(
+                (p for p in get_remote_connections() if p.get("id") == wanted), None
+            )
+            if stored is None:
+                return {"ok": False, "error": f"unknown connection profile: {wanted}"}
+            try:
+                profile = _remote_tunnel.validate_profile(stored)
+            except _remote_tunnel.ProfileError as exc:
+                return {"ok": False, "error": f"stored profile is invalid: {exc}"}
+            confirmed = bool(
+                _webview_window
+                and _webview_window.create_confirmation_dialog(
+                    "Connect to remote Ouroboros?",
+                    (
+                        f"{profile['name']} — ssh {profile['ssh_target']}\n\n"
+                        "The window will switch to the remote server's interface. "
+                        "The remote server is a separate Ouroboros with its own "
+                        "identity, memory, and keys."
+                    ),
+                )
+            )
+            if not confirmed:
+                return {"ok": False, "error": "cancelled"}
+            try:
+                status = _tunnel_manager.connect(profile)
+            except _remote_tunnel.TunnelError as exc:
+                return {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_state": exc.state,
+                    "hint": exc.hint,
+                }
+            local_port = int(status.get("local_port") or 0)
+            remote_state = _remote_tunnel.fetch_remote_state(local_port)
+            if remote_state.get("remote_ui") is not True:
+                _disconnect_tunnel_quietly()
+                return {
+                    "ok": False,
+                    "error_state": "remote_incompatible",
+                    "error": (
+                        "the remote server is too old for desktop Remote "
+                        "connection — update Ouroboros on the server first"
+                    ),
+                }
+            view_state["port"] = local_port
+            try:
+                if _webview_window:
+                    _webview_window.load_url(f"http://127.0.0.1:{local_port}")
+            except Exception:
+                log.warning("navigation to tunnel failed", exc_info=True)
+            return {"ok": True, **status}
 
         def download_file_to_downloads(self, url: str, filename: str, open_external: bool = False) -> dict:
             try:
@@ -1272,10 +1479,9 @@ def main():
     for _stale_open in pathlib.Path(tempfile.gettempdir()).glob("ouroboros-open-*"):
         shutil.rmtree(_stale_open, ignore_errors=True)
 
-    url = f"http://127.0.0.1:{actual_port}"
     window = webview.create_window(
         f"Ouroboros v{APP_VERSION}",
-        url=url,
+        url=local_url,
         js_api=MainApi(),
         width=1100,
         height=750,
@@ -1287,6 +1493,7 @@ def main():
     def _on_closing() -> None:
         log.info("Window closing — graceful shutdown.")
         _shutdown_event.set()
+        _disconnect_tunnel_quietly()
         stop_agent()
         _kill_orphaned_children(port)
         release_pid_lock()

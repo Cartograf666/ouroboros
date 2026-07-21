@@ -24,6 +24,7 @@
  * @property {string} context_mode
  * @property {string} safety_mode
  * @property {boolean} skills_repo_configured
+ * @property {boolean} remote_ui
  * @property {boolean} github_token_configured
  * @property {Object} accounting  // physical-attempt ledger projection
  * @property {Array<Object>} projects  // active/deleting ProjectEntry sidebar projection

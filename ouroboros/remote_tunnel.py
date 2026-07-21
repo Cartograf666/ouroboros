@@ -82,6 +82,24 @@ def ssh_available() -> Optional[str]:
     return shutil.which("ssh")
 
 
+def is_local_origin(current_url: str, local_port: int) -> bool:
+    """True when ``current_url`` is the LOCAL Ouroboros server page.
+
+    The launcher's bridge authority gate (D20): privileged owner methods are
+    honored only while the window shows the local page — a remote server's SPA
+    (another self-modifying being's code) receives the same bridge object and
+    must be refused in Python, never merely hidden in JS.
+    """
+    import urllib.parse
+
+    parsed = urllib.parse.urlparse(str(current_url or ""))
+    return (
+        parsed.scheme == "http"
+        and parsed.hostname in {"127.0.0.1", "localhost"}
+        and parsed.port == int(local_port)
+    )
+
+
 def validate_profile(raw: Any) -> Dict[str, Any]:
     """Normalize one profile dict; raise ProfileError with a readable reason."""
     if not isinstance(raw, dict):
