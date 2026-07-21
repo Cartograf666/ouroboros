@@ -25,3 +25,83 @@ With the flag enabled, Ouroboros still warns when saving a non-localhost bind
 without `OUROBOROS_NETWORK_PASSWORD`, but the Settings UI no longer blocks
 ordinary settings saves such as API-key updates. Do not use this flag on an
 open LAN or public port.
+
+## Headless Linux server + desktop Remote connection
+
+Run Ouroboros headless on your own Linux server and connect the desktop app to
+it over an SSH tunnel. The remote server is a full, independent Ouroboros — its
+own identity, memory, budget, and provider keys; the desktop is a thin client.
+
+### Trust posture (read first)
+
+- The server binds **loopback only** (`127.0.0.1`). The SSH tunnel is the sole
+  entry point, and SSH is the authentication layer — so no
+  `OUROBOROS_NETWORK_PASSWORD` is involved on this path.
+- **Single-tenant assumption**: the loopback auth gate trusts every loopback
+  client, so any local process on the server (and any local process on your
+  desktop while a tunnel is up) can reach the full API. Use a server account
+  and a desktop you trust; do not run this on a shared multi-user host.
+
+### Install from source (systemd user unit)
+
+```bash
+# on the server, as an ordinary (non-root) user:
+git clone https://github.com/razzant/ouroboros.git ~/ouroboros-server/repo
+python3 -m venv ~/ouroboros-server/.venv
+~/ouroboros-server/.venv/bin/pip install -r ~/ouroboros-server/repo/requirements.txt
+# browser tools (optional): ~/ouroboros-server/.venv/bin/python -m playwright install-deps chromium
+
+cp ~/ouroboros-server/repo/packaging/systemd/ouroboros.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ouroboros
+loginctl enable-linger "$USER"     # keep it running across logout / before login
+```
+
+The unit runs `python -m ouroboros.cli server --host 127.0.0.1 --port 8765`.
+Adjust `ExecStart`/`WorkingDirectory` in the unit if you installed elsewhere —
+a systemd user manager has no shell `PATH` or activated venv, so both must be
+absolute. `Restart=on-failure` covers crashes and the self-restart exit code
+42; `RestartPreventExitStatus=99 43` guarantees a panic stop stays stopped
+(BIBLE Emergency Stop Invariant) and a lock conflict (exit 43, "another server
+already owns this data dir") never becomes a restart loop.
+
+### First-run setup through the tunnel
+
+The setup wizard is served by the gateway, so complete it in a browser over a
+temporary tunnel:
+
+```bash
+# on your desktop:
+ssh -L 8765:127.0.0.1:8765 user@your-server
+# then open http://127.0.0.1:8765 in a browser and finish the wizard
+```
+
+### Connect the desktop app
+
+1. Set up key/agent SSH auth to the server and verify it once interactively —
+   `ssh user@your-server true` — so host-key acceptance and key unlock are done
+   (the app uses `BatchMode` and never prompts for passwords or host keys).
+2. In the desktop app: **Settings → Advanced → Remote connection → Save
+   connection** (name + SSH target; the target may be a `user@host` or an
+   `~/.ssh/config` alias, which is also where a non-default port, identity file,
+   or `ProxyJump` belong).
+3. Click **Connect**. The app opens the tunnel, verifies the server is
+   reachable and recent enough, and switches the window to it. The header shows
+   a **Remote: …** pill with **Back to local**. If the tunnel drops it
+   reconnects automatically for ~2 minutes before returning you to local.
+
+If the server is not running, Connect fails with a clear message; start it with
+`systemctl --user start ouroboros`.
+
+### Terminal users (CLI over a manual tunnel)
+
+There is no built-in `ouroboros remote` command in v1. Open the tunnel yourself
+and point the CLI at it:
+
+```bash
+ssh -fN -L 8765:127.0.0.1:8765 user@your-server
+OUROBOROS_URL=http://127.0.0.1:8765 ouroboros run "your task"
+```
+
+`--attach` uploads file content to the server, so attachments work across the
+tunnel like any local run.

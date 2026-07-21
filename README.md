@@ -67,6 +67,7 @@ Most AI agents execute tasks. Ouroboros **creates itself.**
 - **Identity Persistence** — One continuous being across restarts. Remembers who it is, what it has done, and what it is becoming.
 - **Embedded Version Control** — Contains its own local Git repo. Version controls its own evolution. Optional GitHub sync for remote backup.
 - **Local Model Support** — Run with a local GGUF model via llama-cpp-python (Metal acceleration on Apple Silicon, CPU on Linux/Windows).
+- **Remote Connection** — Run Ouroboros headless on your own Linux server (systemd) and hot-switch the desktop app to it over an SSH tunnel — the remote is a full, independent Ouroboros; the desktop is a thin client. Owner-only connection profiles, loopback-only server bind, key/agent SSH auth. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 - **Transport Skills** — Optional bridges such as A2A and Telegram live as reviewed OuroborosHub skills instead of base-runtime code; reviewed chat transports can carry the same raw owner text as the local UI, including slash commands, through the Host Service grant/token boundary.
 - **MCP Client** — Optional base-runtime Model Context Protocol client for trusted HTTP/SSE tool servers. MCP tools are disabled by default, hot-reloadable from Settings → Advanced, included in the selected initial capability envelope when enabled, surfaced as `mcp_<server>__<tool>` names, and still pass through the normal per-call safety check; discovery failures are reported through an explicit omission manifest.
 

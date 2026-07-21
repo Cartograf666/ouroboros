@@ -131,6 +131,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── skill_lifecycle_queue.py ← single FIFO lane for mutating skill lifecycle actions (install/update/review/deps/enable/disable/uninstall) with recent event snapshot for Skills UI, chat live-card progress, dedupe keys, and sync tool wrapper
       ├── skill_review_runner.py ← shared lifecycle-backed skill review runner for API + agent tool paths; writes review_job.json + skill_review_* events and routes all executable skills (including self-authored provenance) through tri-model review
       ├── server_auth.py       ← Non-localhost auth gate (OUROBOROS_NETWORK_PASSWORD)
+      ├── remote_tunnel.py     ← (remote v1) LAUNCHER-SUPPORT module (not agent core): the desktop Remote-connection ssh tunnel manager (profile validation, port discovery over ssh, `ssh -N -L` tunnel, health-based monitoring + bounded reconnect, typed error taxonomy). Imported ONLY by launcher.py; an import-boundary test asserts server/agent code never imports it, and it shares launcher.py's frozen-shell review boundary
       ├── server_control.py    ← Process-control helpers: restart, panic stop
       ├── server_entrypoint.py ← CLI argument parsing, port-binding helpers
       ├── server_runtime.py    ← Server startup/onboarding and WebSocket liveness helpers
@@ -1699,6 +1700,8 @@ Runtime floors:
 | OUROBOROS_NETWORK_PASSWORD | "" | Optional. Enables the non-loopback auth gate when set; empty still allows open bind, but startup logs a warning |
 | OUROBOROS_SERVER_HOST | 127.0.0.1 | Server bind host. Use `0.0.0.0` for LAN/Docker access; restart required. |
 | OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD | unset | Env-only Docker/Kubernetes escape hatch. When set to `1`, Settings may save ordinary changes while a wildcard/non-localhost bind has no `OUROBOROS_NETWORK_PASSWORD`; use only behind ingress auth, VPN, private networking, or an auth proxy. |
+| OUROBOROS_REMOTE_CONNECTIONS | [] | (remote v1) Launcher-owned desktop Remote-connection profiles (list of `{id,name,ssh_target,remote_data_dir?,remote_agent_port?}`). OMITTED from `GET /api/settings` and merge-skipped on generic POST; written only by the launcher bridge via `config.update_remote_connections`. The self-modifying agent cannot read or set it. |
+| OUROBOROS_SERVER_PID_FILE | (empty) | Env override for the data-scoped headless server lock (`DATA_DIR/state/server.pid`); one `ouroboros server` per data dir. |
 | OUROBOROS_MODEL | google/gemini-3.5-flash | Main reasoning model (the one real default; every other worker slot below is empty→Main) |
 | OUROBOROS_MODEL_HEAVY | "" | Strong acting/coding lane for mutative first-level subagents (`auto` routes a writing child here). Empty means use `OUROBOROS_MODEL`. (Renamed from `OUROBOROS_MODEL_CODE`; stored/legacy values migrate.) |
 | OUROBOROS_MODEL_LIGHT | "" | Fast/cheap model for safety, compact routing, lightweight helper calls, and deep subagents. Empty means use `OUROBOROS_MODEL` |
@@ -1857,6 +1860,84 @@ Packaged Python bytecode policy (v6.36.0): platform build scripts PRECOMPILE the
 ### Docker
 
 Docker runs the web/server runtime without PyWebView. Non-loopback binding is allowed only by explicit network-gate policy (`OUROBOROS_NETWORK_PASSWORD` or trusted ingress override).
+
+### Remote connection (headless server + desktop ssh tunnel, remote v1)
+
+**Structure.** Three processes: (1) a headless Ouroboros `server.py` on a Linux
+server, bound loopback-only under a systemd **user** unit; (2) the desktop
+`launcher.py`, which keeps running its OWN local server; (3) an `ssh -N -L`
+tunnel the launcher spawns between them. Architecture "B": the remote server is
+a SEPARATE Ouroboros being (its own identity/memory/keys); the desktop is a thin
+client that switches its webview between the local page and the tunnelled remote
+page. (Architecture "A" — the local agent executing remote *projects* over an
+ssh tool-executor — is deliberately NOT built here; if ever needed it is a
+separate design on top of `workspace_executor.py`, not this feature.)
+
+**Operational surface.**
+- Module: `ouroboros/remote_tunnel.py` (launcher-support; see the module list).
+- Owner state: `OUROBOROS_REMOTE_CONNECTIONS` in the LOCAL `settings.json` — a
+  list of `{id, name, ssh_target, remote_data_dir?, remote_agent_port?}`
+  profiles. It is OMITTED from `GET /api/settings` and merge-skipped on the
+  generic POST; the ONLY writer is `config.update_remote_connections()` (a
+  single-lock read-modify-write) called from the launcher bridge. There is no
+  HTTP mutation endpoint. Rationale: the self-modifying agent must never be able
+  to repoint the owner's window at a foreign host (BIBLE P3 owner control).
+- Server lock: `DATA_DIR/state/server.pid` (`config.SERVER_PID_FILE`), distinct
+  from the launcher's app-root `ouroboros.pid`, so `ouroboros server` enforces
+  one instance per data dir. Conflict exits `SERVER_ALREADY_RUNNING_EXIT_CODE`
+  (43); the fd is close-on-exec so an `execvpe` self-restart hands the lock to
+  the replacement image, and the restart spawn-fallback releases it first.
+- systemd unit (`packaging/systemd/ouroboros.service`): `Restart=on-failure`
+  restarts crashes and exit 42; `RestartPreventExitStatus=99 43` keeps a panic
+  (99, Emergency Stop Invariant) and a lock conflict (43) from restart-looping.
+- Capability handshake: `GET /api/state` carries `remote_ui: true` (frozen
+  `StateResponse`); the launcher refuses to switch to a remote whose page
+  predates the connection-aware SPA.
+
+**Bridge trust boundary (why it is Python-side, not JS).** pywebview injects the
+`MainApi` bridge into WHATEVER page the window loads — including the remote
+server's SPA, which is another self-modifying being's code. So every privileged
+bridge method (`remote_save/delete/connect`, `request_runtime_mode_change`,
+`request_auto_grant_reviewed_skills_change`, `request_skill_key_grant`, file
+download) first checks that the current main-frame URL is the LOCAL origin and
+refuses otherwise (`launcher.py::_current_page_is_local_origin`, pure predicate
+`remote_tunnel.is_local_origin`). Only `remote_status`/`remote_disconnect` are
+callable from the remote page (the connection pill + "Back to local"). The file
+bridge validates against the ACTIVE view port (local or tunnel) so a remote
+download targets the remote server, never a same-shaped local path. Connect
+additionally requires a native confirmation dialog. Frontend hiding is
+presentation; the Python refusal is the authority.
+
+**Connection state machine.** `RemoteTunnelManager` (a generation token guards
+against disconnect/retry races): `connect` → discover the remote port by reading
+`<remote_data_dir>/state/server_port` over ssh (explicit `remote_agent_port`
+skips it) → pick a stable local port → spawn the tunnel → health-poll
+`/api/health` → `connected`. A monitor watches BOTH the ssh process AND periodic
+health — because `ExitOnForwardFailure` only covers listener setup, ssh stays
+alive when the destination later dies (server restart/port drift, remote panic).
+Sustained health failure → `reconnecting` (bounded ~2 min, re-discovering the
+port, reusing the stable local port; a stolen port is re-picked once) → on
+success `connected`, else `gave_up` and the launcher returns the window to
+local. The tunnel child is process-custody-recorded (daemon scope) and is torn
+down synchronously on window close AND on the panic (exit-99) path — the
+server-side custody reaper cannot reap a launcher-owned child.
+
+**SSH auth.** System `ssh` with `BatchMode=yes` — key/agent only, never an
+interactive prompt; host-key and key setup are the owner's one-time
+`ssh <target> true`. We store no ssh secrets. The profile `ssh_target` is opaque
+(a `user@host` or `~/.ssh/config` alias), validated against option-injection and
+control characters; `remote_data_dir` is charset-whitelisted so it never needs
+remote-shell quoting.
+
+**Attachments across the tunnel.** The CLI uploads `--attach` content via
+`POST /api/chat/upload` and references the returned server path, so attachments
+work identically local and remote; a path-based source missing on the server is
+disclosed as a typed `skipped_missing` manifest entry instead of a silent drop.
+
+**Deferred (not in v1):** direct URL+password CLI transport, `ouroboros remote`
+CLI sugar, ssh auto-start of the server, multiple simultaneous connections
+(Connect replaces the active one), and Docker-image bind hardening.
+Deployment/operator steps live in `docs/DEPLOYMENT.md`.
 
 ## 9. Shutdown & Process Cleanup
 
