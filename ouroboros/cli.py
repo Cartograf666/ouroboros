@@ -81,6 +81,64 @@ class OuroborosHTTPClient:
         except json.JSONDecodeError:
             return raw
 
+    def post_multipart_file(
+        self,
+        path: str,
+        file_path: "pathlib.Path",
+        *,
+        field: str = "file",
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """POST one file as multipart/form-data (stdlib-only encoder).
+
+        Body size is bounded by the caller's pre-upload size check, so the
+        in-memory encode stays within the server's 50 MB per-file cap.
+        """
+        import mimetypes
+        import uuid
+
+        source = pathlib.Path(file_path)
+        boundary = uuid.uuid4().hex
+        # Header-safe filename: strip CR/LF and quotes from the disposition.
+        safe_name = source.name.replace("\r", "").replace("\n", "").replace('"', "'")
+        mime = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+        head = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{field}"; filename="{safe_name}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n"
+        ).encode("utf-8")
+        body = head + source.read_bytes() + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        req = urllib.request.Request(
+            self.base_url + path,
+            data=body,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                req, timeout=self.timeout if timeout is None else timeout
+            ) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(raw)
+                message = payload.get("error") or raw
+            except Exception:
+                message = raw or str(exc)
+            raise CLIError(f"HTTP {exc.code}: {message}") from exc
+        except urllib.error.URLError as exc:
+            raise ConnectionCLIError(f"cannot reach Ouroboros server at {self.base_url}: {exc}") from exc
+        except TimeoutError as exc:
+            raise ConnectionCLIError(f"upload to Ouroboros server timed out at {self.base_url}") from exc
+        try:
+            return json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            return raw
+
     def get_bytes(self, path: str) -> bytes:
         req = urllib.request.Request(self.base_url + path, headers={"Accept": "application/octet-stream"})
         try:
@@ -172,6 +230,59 @@ def _status_command(args: argparse.Namespace) -> int:
     return 0
 
 
+# CLI attachments are uploaded as CONTENT (POST /api/chat/upload) and the task
+# references the returned server-side path. Passing the raw client path used to
+# lose files silently whenever the CLI and the server are different machines.
+_ATTACH_MAX_BYTES = 50 * 1024 * 1024  # mirrors the server's per-file upload cap
+
+
+def _validate_attach_paths(raw_paths: List[str]) -> List[pathlib.Path]:
+    """Loudly validate every --attach path BEFORE contacting the server."""
+    paths: List[pathlib.Path] = []
+    for raw in raw_paths or []:
+        path = pathlib.Path(raw).expanduser()
+        if not path.is_file():
+            raise CLIError(f"--attach file not found (or not a regular file): {path}")
+        if path.stat().st_size > _ATTACH_MAX_BYTES:
+            raise CLIError(f"--attach file exceeds the 50 MB upload limit: {path}")
+        paths.append(path)
+    return paths
+
+
+def _upload_attachments(
+    client: "OuroborosHTTPClient", paths: List[pathlib.Path]
+) -> "tuple[List[Dict[str, Any]], List[str]]":
+    """Upload attachment content; return (task attachments, uploaded names).
+
+    On a mid-batch failure every already-uploaded temp file is best-effort
+    deleted so partial batches never orphan files in the server's uploads dir.
+    """
+    attachments: List[Dict[str, Any]] = []
+    uploaded_names: List[str] = []
+    for path in paths:
+        try:
+            result = client.post_multipart_file("/api/chat/upload", path)
+        except CLIError:
+            _cleanup_uploads(client, uploaded_names)
+            raise
+        server_path = str((result or {}).get("path") or "")
+        server_name = str((result or {}).get("filename") or "")
+        if not server_path or not server_name:
+            _cleanup_uploads(client, uploaded_names)
+            raise CLIError(f"attachment upload failed for {path}: {result}")
+        uploaded_names.append(server_name)
+        attachments.append({"path": server_path, "label": path.name})
+    return attachments, uploaded_names
+
+
+def _cleanup_uploads(client: "OuroborosHTTPClient", uploaded_names: List[str]) -> None:
+    for name in uploaded_names:
+        try:
+            client.request("DELETE", "/api/chat/upload", {"filename": name})
+        except CLIError:
+            pass  # best-effort cleanup; the server prunes uploads eventually
+
+
 def _run_command(args: argparse.Namespace) -> int:
     prompt = " ".join(args.prompt).strip()
     if not prompt:
@@ -188,8 +299,9 @@ def _run_command(args: argparse.Namespace) -> int:
         if not isinstance(parsed_metadata, dict):
             raise CLIError("--task-metadata-json must be a JSON object")
         user_metadata = parsed_metadata
+    attach_paths = _validate_attach_paths(args.attach)
     client = _client(args, start=args.start)
-    attachments = [{"path": str(pathlib.Path(p).expanduser())} for p in args.attach]
+    attachments, uploaded_names = _upload_attachments(client, attach_paths)
     disabled_tools = []
     for raw in args.disable_tools or []:
         disabled_tools.extend(part.strip() for part in str(raw or "").split(",") if part.strip())
@@ -210,10 +322,14 @@ def _run_command(args: argparse.Namespace) -> int:
         body["disabled_tools"] = list(dict.fromkeys(disabled_tools))
     if float(args.timeout or 0) > 0:
         body["timeout_sec"] = float(args.timeout or 0)
-    created = client.request("POST", "/api/tasks", body)
-    task_id = str(created.get("task_id") or "")
-    if not task_id:
-        raise CLIError(f"task creation did not return task_id: {created}")
+    try:
+        created = client.request("POST", "/api/tasks", body)
+        task_id = str(created.get("task_id") or "")
+        if not task_id:
+            raise CLIError(f"task creation did not return task_id: {created}")
+    except CLIError:
+        _cleanup_uploads(client, uploaded_names)
+        raise
     if args.detach:
         if args.jsonl:
             print(json.dumps({"type": "task_created", "task_id": task_id, "data": created}, ensure_ascii=False))

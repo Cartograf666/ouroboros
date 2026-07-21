@@ -135,6 +135,16 @@ def stage_task_attachments(
         try:
             source = pathlib.Path(item["path"]).expanduser().resolve(strict=False)
             if not source.is_file():
+                # Typed disclosure instead of a silent drop (remote v1): a
+                # path-based attachment whose source does not exist on THIS
+                # machine must surface in the manifest so the task prompt can
+                # say so honestly. Secret/oversize skips keep their existing
+                # policy (deliberate confidentiality/bound behavior).
+                _raw_label = str(item.get("label") or "").strip() or source.name
+                label = " ".join(
+                    "".join(c for c in _raw_label if c.isprintable()).split()
+                )[:120] or "attachment"
+                manifest.append({"label": label, "status": "skipped_missing"})
                 continue
             if _is_secret_source(source):
                 log.info("stage_task_attachments: skipped secret source %s", source.name)

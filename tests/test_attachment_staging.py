@@ -137,7 +137,10 @@ class TestStageTaskAttachments:
         manifest = stage_task_attachments(
             drive, "task06", [{"path": str(tmp_path / "nope.txt")}, {"path": str(adir)}]
         )
-        assert manifest == []
+        # Remote v1: a missing/non-file source is DISCLOSED as a typed entry
+        # (skipped_missing) instead of a silent drop; nothing is staged.
+        assert [m.get("status") for m in manifest] == ["skipped_missing", "skipped_missing"]
+        assert all("relpath" not in m for m in manifest)
 
     def test_large_file_skipped(self, tmp_path, monkeypatch):
         import ouroboros.artifacts as art
