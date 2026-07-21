@@ -240,6 +240,10 @@ SETTINGS_DEFAULTS = {
     "MCP_ENABLED": False,
     "MCP_SERVERS": [],
     "MCP_TOOL_TIMEOUT_SEC": 60,
+    # Desktop remote-connection profiles (launcher-owned owner state). Never
+    # exposed through GET /api/settings and merge-skipped on generic POST; the
+    # only writer is the launcher bridge via update_remote_connections().
+    "OUROBOROS_REMOTE_CONNECTIONS": [],
     # Scope review: one or more reviewer slots; enforcement follows OUROBOROS_REVIEW_ENFORCEMENT.
     "OUROBOROS_SCOPE_REVIEW_MODELS": "anthropic/claude-fable-5",
     "OUROBOROS_SCOPE_REVIEW_MODEL": "anthropic/claude-fable-5",
@@ -1258,19 +1262,22 @@ def _coerce_setting_value(key: str, value):
     # Trim so whitespace-only config is not treated as a configured skills repo.
     if key == "OUROBOROS_SKILLS_REPO_PATH":
         return str(value or "").strip()
-    if key == "MCP_SERVERS":
-        if isinstance(value, list):
-            return [dict(item) for item in value if isinstance(item, dict)]
+    if key in ("MCP_SERVERS", "OUROBOROS_REMOTE_CONNECTIONS"):
         if isinstance(value, str):
             text = value.strip()
             if not text:
                 return []
             try:
-                parsed = json.loads(text)
+                value = json.loads(text)
             except (TypeError, ValueError):
                 return []
-            if isinstance(parsed, list):
-                return [dict(item) for item in parsed if isinstance(item, dict)]
+        if isinstance(value, list):
+            items = [dict(item) for item in value if isinstance(item, dict)]
+            if key == "OUROBOROS_REMOTE_CONNECTIONS":
+                # Shape-level bound only; semantic profile validation is the
+                # launcher's job (ouroboros/remote_tunnel.py) before writing.
+                return items[:REMOTE_CONNECTIONS_MAX]
+            return items
         return []
     if isinstance(default, bool):
         if isinstance(value, bool):
@@ -1596,6 +1603,54 @@ def acquire_pid_lock() -> bool:
 
 def release_pid_lock() -> None:
     _compat_pid_lock_release(str(PID_FILE))
+
+
+# Desktop remote-connection profiles (owner-only launcher state).
+REMOTE_CONNECTIONS_MAX = 32
+
+
+def get_remote_connections() -> list:
+    return list(
+        _coerce_setting_value(
+            "OUROBOROS_REMOTE_CONNECTIONS",
+            load_settings().get("OUROBOROS_REMOTE_CONNECTIONS"),
+        )
+    )
+
+
+def update_remote_connections(profiles: list) -> list:
+    """Owner-only replacement write of OUROBOROS_REMOTE_CONNECTIONS.
+
+    Holds the settings lock across the whole read-modify-write (a separate
+    load()+save() pair would race the server's own saves and clobber them).
+    Writes exactly this one key and preserves every other on-disk key verbatim,
+    so the save_settings mode ratchets are structurally out of reach. Callers
+    (the launcher bridge) validate profile semantics via
+    ouroboros/remote_tunnel.py before calling; this layer enforces shape only.
+    """
+    normalized = _coerce_setting_value("OUROBOROS_REMOTE_CONNECTIONS", profiles)
+    _guard_live_settings_write()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fd = _acquire_settings_lock()
+    try:
+        raw: dict = {}
+        if SETTINGS_PATH.exists():
+            try:
+                parsed = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    raw = parsed
+            except Exception:
+                pass
+        raw["OUROBOROS_REMOTE_CONNECTIONS"] = normalized
+        try:
+            tmp = SETTINGS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+            os.replace(str(tmp), str(SETTINGS_PATH))
+        except OSError:
+            SETTINGS_PATH.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        return list(normalized)
+    finally:
+        _release_settings_lock(fd)
 
 
 # Headless server lock (SERVER_PID_FILE): held by `ouroboros server` for the

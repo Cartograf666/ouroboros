@@ -287,6 +287,11 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
             # flows ONLY through the dedicated audited owner endpoint
             # (api_owner_safety_mode); save_settings additionally ratchets lowering.
             "OUROBOROS_SAFETY_MODE",
+            # Remote-connection profiles are launcher-owned owner state: the
+            # self-modifying agent must never be able to repoint the owner's
+            # desktop window at a foreign host. Only the launcher bridge writes
+            # them (config.update_remote_connections); no HTTP mutation path.
+            "OUROBOROS_REMOTE_CONNECTIONS",
         }:
             continue
         if key not in body:
@@ -775,6 +780,9 @@ def _claude_code_status_payload() -> Dict[str, Any]:
 async def api_settings_get(request: Request) -> JSONResponse:
     settings, _, _ = apply_runtime_provider_defaults(load_settings())
     safe = {k: v for k, v in settings.items()}
+    # Launcher-owned remote-connection profiles are omitted entirely (not
+    # merely masked): they are desktop owner state, not agent-facing config.
+    safe.pop("OUROBOROS_REMOTE_CONNECTIONS", None)
     for key in _SECRET_SETTING_KEYS:
         if safe.get(key):
             safe[key] = (
