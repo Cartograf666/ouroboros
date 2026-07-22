@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 import pytest
 
@@ -73,6 +74,61 @@ def test_acquire_server_pid_lock_refuses_a_held_lock(_isolated_server_lock):
         assert config.acquire_server_pid_lock() is False
     finally:
         pid_flock_close(str(config.SERVER_PID_FILE), foreign)
+
+
+@pytest.mark.serial
+@pytest.mark.skipif(os.name == "nt", reason="POSIX fork semantics")
+@pytest.mark.parametrize("drop_in_child,expect_free_after_child_dies", [(False, True), (True, True)])
+def test_forked_child_inherited_lock_fd_semantics(tmp_path, monkeypatch, drop_in_child, expect_free_after_child_dies):
+    """C3: a Linux fork inherits the flock's open file description, so a child
+    that KEEPS its inherited fd holds the lock even after the parent's fd is
+    gone; a child that calls close_inherited_server_pid_lock() does not. Proven
+    by holding the lock, forking, releasing the PARENT's fd, and checking
+    acquirability while the child is alive vs after it exits.
+    """
+    import time
+
+    monkeypatch.setattr(config, "SERVER_PID_FILE", tmp_path / "state" / "server.pid")
+    monkeypatch.setattr(remote_support, "_server_pid_lock_handle", None)
+    assert config.acquire_server_pid_lock() is True
+
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        try:
+            os.close(r)
+            if drop_in_child:
+                remote_support.close_inherited_server_pid_lock()
+            os.write(w, b"x")  # signal ready
+            time.sleep(2.0)
+        finally:
+            os._exit(0)
+    # parent
+    os.close(w)
+    os.read(r, 1)  # wait until child has (optionally) dropped its fd
+    # Simulate parent DEATH: close the parent's fd WITHOUT flock LOCK_UN (a crash
+    # closes fds but never unlocks). An explicit release_server_pid_lock() would
+    # LOCK_UN the shared open file description and free it regardless of the
+    # child — the opposite of what a crash does.
+    _handle = remote_support._server_pid_lock_handle
+    os.close(_handle.fileno())
+    remote_support._server_pid_lock_handle = None
+    # While the child is still alive: free only if the child dropped its copy.
+    h1 = pid_flock_open(str(config.SERVER_PID_FILE))
+    free_while_child_alive = h1 is not None
+    if h1 is not None:
+        pid_flock_close(str(config.SERVER_PID_FILE), h1)
+    os.waitpid(pid, 0)  # child exits → its fd closes too
+    h2 = pid_flock_open(str(config.SERVER_PID_FILE))
+    free_after_child_dies = h2 is not None
+    if h2 is not None:
+        pid_flock_close(str(config.SERVER_PID_FILE), h2)
+    os.close(r)
+    # A child that dropped its fd frees the lock immediately; one that kept it
+    # blocks until it dies — the property that keeps a crashed server from
+    # trapping its replacement on exit 43.
+    assert free_while_child_alive == drop_in_child
+    assert free_after_child_dies == expect_free_after_child_dies
 
 
 def test_server_command_exits_already_running_when_lock_held(monkeypatch, capsys):

@@ -34,6 +34,16 @@ export function pillVisible(status) {
     return state !== 'disconnected';
 }
 
+// Genuinely-live states: a profile is "the connected one" ONLY here. gave_up /
+// error are visible on the pill but NOT active — the Settings list must keep
+// their Connect button and never label them "connected".
+const _ACTIVE_STATES = new Set(['connecting', 'connected', 'reconnecting']);
+
+/** Pure: the profile id of the genuinely-active connection, else ''. */
+export function activeProfileId(status) {
+    return status && _ACTIVE_STATES.has(status.state) ? (status.profile_id || '') : '';
+}
+
 function esc(text) {
     return String(text == null ? '' : text).replace(/[&<>"']/g, (ch) => (
         { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
@@ -101,7 +111,7 @@ export async function initRemoteSection(container) {
         profiles = (listed && listed.profiles) || [];
     } catch (_e) { profiles = []; }
 
-    const activeId = pillVisible(status) ? status.profile_id : '';
+    const activeId = activeProfileId(status);
     const rows = profiles.map((p) => `
         <div class="remote-profile-row" data-remote-id="${esc(p.id)}">
             <div class="remote-profile-meta">

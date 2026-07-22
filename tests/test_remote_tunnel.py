@@ -359,6 +359,48 @@ def test_watch_exits_on_generation_change(tmp_path, monkeypatch):
     assert time.time() - started < 1.0
 
 
+@pytest.mark.serial
+@_POSIX_ONLY
+def test_reap_orphaned_tunnels_kills_ledgered_leak(tmp_path):
+    # C2: a tunnel left ledgered by a crashed launcher (daemon custody, kept by
+    # the generation reaper) must be reaped at the next launcher startup by
+    # strict fingerprint.
+    import subprocess as sp
+
+    from ouroboros import process_custody
+    from ouroboros.platform_layer import subprocess_new_group_kwargs
+
+    proc = sp.Popen(
+        ["python3", "-c", "import time; time.sleep(30)"],
+        stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+        **subprocess_new_group_kwargs(),
+    )
+    try:
+        process_custody.record_process(
+            tmp_path, pid=proc.pid, cmd=["python3", "-c", "sleep"],
+            purpose="remote_ssh_tunnel:leaked", scope="daemon",
+        )
+        # An unrelated daemon entry must survive the purpose-scoped reap.
+        process_custody.record_process(
+            tmp_path, pid=os.getpid(), cmd=["x"], purpose="companion:x:y", scope="daemon",
+        )
+        reaped = rt.reap_orphaned_tunnels(tmp_path)
+        assert reaped == 1
+        # The child is killed via its process group; reap the zombie so the
+        # returncode is observable (pid_is_alive alone sees an unreaped zombie).
+        proc.wait(timeout=5)
+        assert proc.returncode is not None and proc.returncode != 0
+        # ledger keeps the unrelated entry, drops the tunnel entry.
+        purposes = [e.get("purpose") for e in process_custody._read_ledger(tmp_path)]
+        assert "companion:x:y" in purposes
+        assert not any(str(p).startswith("remote_ssh_tunnel:") for p in purposes)
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 # --- import boundary -------------------------------------------------------------
 
 def test_remote_tunnel_is_never_imported_by_server_or_agent_code():

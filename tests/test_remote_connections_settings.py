@@ -88,6 +88,25 @@ def test_update_remote_connections_locked_rmw_preserves_other_keys(tmp_path, mon
     assert not (tmp_path / "settings.json.lock").exists()
 
 
+def test_update_remote_connections_preserves_0600_permissions(tmp_path, monkeypatch):
+    import os
+    import stat
+
+    monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.setattr(config, "_SETTINGS_LOCK", tmp_path / "settings.json.lock")
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    p = tmp_path / "settings.json"
+    p.write_text(json.dumps({"OPENROUTER_API_KEY": "sk-secret"}), encoding="utf-8")
+    os.chmod(p, 0o600)
+    update_remote_connections([{"id": "a", "ssh_target": "u@h"}])
+    mode = stat.S_IMODE(os.stat(p).st_mode)
+    # The secret-bearing settings file must stay 0600 (not relaxed to 0644).
+    assert mode == 0o600, oct(mode)
+    on_disk = json.loads(p.read_text(encoding="utf-8"))
+    assert on_disk["OPENROUTER_API_KEY"] == "sk-secret"
+    assert on_disk[_KEY] == [{"id": "a", "ssh_target": "u@h"}]
+
+
 def test_update_remote_connections_refuses_to_clobber_corrupt_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")
     monkeypatch.setattr(config, "_SETTINGS_LOCK", tmp_path / "settings.json.lock")

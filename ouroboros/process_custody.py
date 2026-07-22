@@ -455,3 +455,52 @@ def reap_orphaned_processes(
             survivors.append(entry)
     _rewrite_ledger(drive_root, survivors)
     return reaped
+
+
+def reap_purpose_prefix(drive_root: pathlib.Path, purpose_prefix: str) -> List[int]:
+    """Kill every ledgered process whose ``purpose`` starts with ``purpose_prefix``
+    and STILL matches its strict fingerprint (pid alive + same start_time +
+    cmd_sha256), then prune those entries. Scope-agnostic on purpose — used for
+    launcher-owned daemon children the ordinary generation reaper deliberately
+    keeps (e.g. the desktop remote ssh tunnel), reaped at the next launcher
+    startup so an abrupt launcher death cannot leave the child running forever.
+    Never matches by command-line class; a recycled pid fails the fingerprint
+    and is pruned without a kill.
+    """
+    drive_root = pathlib.Path(drive_root)
+    entries = _read_ledger(drive_root)
+    if not entries:
+        return []
+    reaped: List[int] = []
+    survivors: List[Dict[str, Any]] = []
+    for entry in entries:
+        purpose = str(entry.get("purpose") or "")
+        if not purpose.startswith(purpose_prefix):
+            survivors.append(entry)
+            continue
+        if not _fingerprint_matches(entry):
+            continue  # dead or recycled pid: prune silently, never kill
+        pid = int(entry.get("pid") or 0)
+        try:
+            pgid = int(entry.get("pgid") or 0)
+            if pgid > 0:
+                kill_process_group_id(pgid)
+            else:
+                from ouroboros.platform_layer import kill_pid_tree
+
+                kill_pid_tree(pid)
+            reaped.append(pid)
+            append_jsonl(drive_root / "logs" / "supervisor.jsonl", {
+                "ts": utc_now_iso(),
+                "type": "process_reaped",
+                "pid": pid,
+                "pgid": int(entry.get("pgid") or 0),
+                "purpose": purpose,
+                "scope": str(entry.get("scope") or ""),
+                "reason": "purpose_prefix_reap",
+            })
+        except Exception:
+            log.warning("Failed to reap ledgered process %s", pid, exc_info=True)
+            survivors.append(entry)
+    _rewrite_ledger(drive_root, survivors)
+    return reaped

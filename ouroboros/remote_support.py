@@ -10,7 +10,6 @@ cycle (config re-imports these at module load).
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
 # Desktop remote-connection profiles (owner-only launcher state).
@@ -61,12 +60,13 @@ def update_remote_connections(profiles: list) -> list:
             if isinstance(parsed, dict):
                 raw = parsed
         raw["OUROBOROS_REMOTE_CONNECTIONS"] = normalized
-        try:
-            tmp = config.SETTINGS_PATH.with_suffix(".tmp")
-            tmp.write_text(json.dumps(raw, indent=2), encoding="utf-8")
-            os.replace(str(tmp), str(config.SETTINGS_PATH))
-        except OSError:
-            config.SETTINGS_PATH.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        # settings.json is 0600 and holds API keys — use the shared atomic
+        # writer, which PRESERVES the existing permission bits (a bare
+        # write_text on a fresh temp file would create it 0644 and os.replace
+        # would relax the secret file to world-readable).
+        from ouroboros.utils import write_text_atomic
+
+        write_text_atomic(config.SETTINGS_PATH, json.dumps(raw, indent=2))
         return list(normalized)
     finally:
         config._release_settings_lock(fd)
@@ -111,3 +111,26 @@ def release_server_pid_lock() -> None:
 
     pid_flock_close(str(config.SERVER_PID_FILE), _server_pid_lock_handle)
     _server_pid_lock_handle = None
+
+
+def close_inherited_server_pid_lock() -> None:
+    """Close (WITHOUT unlocking) a server-lock fd inherited across fork().
+
+    On Linux, multiprocessing workers are FORKED (not exec'd), so the CLOEXEC
+    fd does not auto-close and the worker inherits a duplicate referring to the
+    SAME open file description. An flock is held while ANY fd to that description
+    is open, so a surviving worker would keep the lock alive after the server
+    parent dies — the replacement server then hits exit 43 and
+    RestartPreventExitStatus=43 blocks recovery. Each worker calls this at
+    startup to drop its inherited copy (a bare close, never LOCK_UN: the parent
+    keeps the lock while alive; the worker's copy simply must not outlive it).
+    Only touches this (forked) process's module global; the parent is unaffected.
+    """
+    global _server_pid_lock_handle
+    fd_obj = _server_pid_lock_handle
+    _server_pid_lock_handle = None
+    if fd_obj is not None:
+        try:
+            fd_obj.close()
+        except Exception:
+            pass

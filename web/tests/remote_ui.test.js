@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { pillLabel, pillVisible, remoteBridge } from '../modules/remote.js';
+import { activeProfileId, pillLabel, pillVisible, remoteBridge } from '../modules/remote.js';
 
 test('pillVisible hides the pill only when local/disconnected', () => {
     assert.equal(pillVisible({ state: 'disconnected' }), false);
@@ -16,6 +16,18 @@ test('pillLabel names the profile and reflects the connection state', () => {
     assert.equal(pillLabel({ state: 'reconnecting', profile_name: 'prod' }), 'Reconnecting: prod…');
     assert.equal(pillLabel({ state: 'gave_up', profile_id: 'p1' }), 'Remote lost: p1');
     assert.equal(pillLabel({ state: 'disconnected' }), '');
+});
+
+test('activeProfileId is empty for gave_up/error so Settings keeps Connect', () => {
+    // C4: pillVisible is true for gave_up/error (pill still shown), but the
+    // Settings list must NOT treat those as the connected profile.
+    for (const state of ['connecting', 'connected', 'reconnecting']) {
+        assert.equal(activeProfileId({ state, profile_id: 'p1' }), 'p1', state);
+    }
+    for (const state of ['gave_up', 'error', 'disconnected']) {
+        assert.equal(activeProfileId({ state, profile_id: 'p1' }), '', state);
+        assert.equal(pillVisible({ state }), state !== 'disconnected', state); // still visible (except disconnected)
+    }
 });
 
 test('remoteBridge is null without a pywebview bridge', () => {

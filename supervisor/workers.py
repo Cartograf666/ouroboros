@@ -883,6 +883,16 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     # fork-safety guard (no _scproxy/SCDynamicStoreCopyProxies on the child side
     # of fork) and a clean default for spawned workers too.
     _os.environ["OUROBOROS_IN_WORKER"] = "1"
+    # Drop any inherited headless server-lock fd (Linux fork inherits the open
+    # file description; a surviving worker holding it would keep the flock alive
+    # after the server parent dies and trap the replacement on exit 43). A bare
+    # close, never an unlock — the parent keeps the lock while alive.
+    try:
+        from ouroboros.remote_support import close_inherited_server_pid_lock
+
+        close_inherited_server_pid_lock()
+    except Exception:
+        pass
     # Adopt the server's custody session id. Under the 'spawn' start method this
     # process re-imported process_custody and minted a fresh _SESSION_ID; without
     # adopting the server's id, every service/process this worker records looks

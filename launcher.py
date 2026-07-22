@@ -1275,6 +1275,15 @@ def main():
             log.warning("tunnel state transition handling failed", exc_info=True)
 
     global _tunnel_manager
+    # Reap any ssh tunnel a previously-crashed launcher left behind (daemon
+    # custody is kept by the generation reaper, so an abrupt SIGKILL could
+    # otherwise leave the loopback→remote forward alive forever).
+    try:
+        reaped = _remote_tunnel.reap_orphaned_tunnels(pathlib.Path(DATA_DIR))
+        if reaped:
+            log.info("Reaped %d orphaned remote ssh tunnel(s) at startup", reaped)
+    except Exception:
+        log.debug("orphaned-tunnel reap failed", exc_info=True)
     _tunnel_manager = _remote_tunnel.RemoteTunnelManager(
         pathlib.Path(DATA_DIR), on_state_change=_on_tunnel_state
     )

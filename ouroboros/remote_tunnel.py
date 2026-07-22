@@ -95,6 +95,26 @@ def ssh_available() -> Optional[str]:
     return shutil.which("ssh")
 
 
+CUSTODY_PURPOSE_PREFIX = "remote_ssh_tunnel:"
+
+
+def reap_orphaned_tunnels(data_dir: pathlib.Path) -> int:
+    """Reap any ssh tunnel left ledgered by a previously-crashed launcher.
+
+    The tunnel is recorded daemon-scope (launcher-owned), which the ordinary
+    generation reaper keeps — so an abrupt launcher SIGKILL would otherwise
+    leave the loopback→remote forward alive indefinitely. The launcher calls
+    this at startup; strict-fingerprint matching means a recycled pid is pruned,
+    never killed. Returns the number of tunnels reaped.
+    """
+    try:
+        from ouroboros.process_custody import reap_purpose_prefix
+
+        return len(reap_purpose_prefix(pathlib.Path(data_dir), CUSTODY_PURPOSE_PREFIX))
+    except Exception:
+        return 0
+
+
 def is_local_origin(current_url: str, local_port: int) -> bool:
     """True when ``current_url`` is the LOCAL Ouroboros server page.
 
@@ -458,7 +478,7 @@ class RemoteTunnelManager:
                 self._data_dir,
                 pid=proc.pid,
                 cmd=argv,
-                purpose=f"remote_ssh_tunnel:{profile['id']}",
+                purpose=f"{CUSTODY_PURPOSE_PREFIX}{profile['id']}",
                 scope="daemon",
             )
         except Exception:
