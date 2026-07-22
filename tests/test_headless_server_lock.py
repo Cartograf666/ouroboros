@@ -173,6 +173,9 @@ def test_launcher_lifecycle_loop_stops_on_already_running_exit():
     # The branch runs up to the restart section's `time.sleep(2)`.
     body = loop[branch : loop.index("time.sleep(2)", branch)]
     assert "break" in body and "Not restarting" in body
+    # CR1: exit 43 means another LIVE server legitimately owns this data dir —
+    # the branch must NOT sweep the port (that would kill the valid owner).
+    assert "_kill_stale_runtime_ports" not in body
 
 
 def test_systemd_unit_prevents_panic_and_conflict_restarts():

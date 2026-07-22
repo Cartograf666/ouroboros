@@ -230,9 +230,23 @@ def _read_ledger(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
     return list(by_pid.values())
 
 
-def _rewrite_ledger(drive_root: pathlib.Path, entries: List[Dict[str, Any]]) -> None:
+def _write_ledger_file(path: pathlib.Path, entries: List[Dict[str, Any]]) -> None:
+    """Atomically replace the ledger file — caller MUST hold the ledger lock.
+
+    No locking here: the O_EXCL append lock is NOT reentrant, so a caller that
+    already holds it (reap_purpose_prefix) would deadlock if this re-acquired.
+    """
     import json
 
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    tmp.write_text(
+        "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def _rewrite_ledger(drive_root: pathlib.Path, entries: List[Dict[str, Any]]) -> None:
     path = ledger_path(drive_root)
     try:
         from ouroboros.utils import jsonl_append_lock_path
@@ -241,12 +255,7 @@ def _rewrite_ledger(drive_root: pathlib.Path, entries: List[Dict[str, Any]]) -> 
         lock_path = jsonl_append_lock_path(path)
         lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=2.0, stale_sec=10.0)
         try:
-            tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
-            tmp.write_text(
-                "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries),
-                encoding="utf-8",
-            )
-            os.replace(tmp, path)
+            _write_ledger_file(path, entries)
         finally:
             release_exclusive_file_lock(lock_path, lock_fd)
     except Exception:
@@ -468,39 +477,58 @@ def reap_purpose_prefix(drive_root: pathlib.Path, purpose_prefix: str) -> List[i
     and is pruned without a kill.
     """
     drive_root = pathlib.Path(drive_root)
-    entries = _read_ledger(drive_root)
-    if not entries:
-        return []
-    reaped: List[int] = []
-    survivors: List[Dict[str, Any]] = []
-    for entry in entries:
-        purpose = str(entry.get("purpose") or "")
-        if not purpose.startswith(purpose_prefix):
-            survivors.append(entry)
-            continue
-        if not _fingerprint_matches(entry):
-            continue  # dead or recycled pid: prune silently, never kill
-        pid = int(entry.get("pid") or 0)
-        try:
-            pgid = int(entry.get("pgid") or 0)
-            if pgid > 0:
-                kill_process_group_id(pgid)
-            else:
-                from ouroboros.platform_layer import kill_pid_tree
+    path = ledger_path(drive_root)
+    from ouroboros.utils import jsonl_append_lock_path
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 
-                kill_pid_tree(pid)
-            reaped.append(pid)
-            append_jsonl(drive_root / "logs" / "supervisor.jsonl", {
-                "ts": utc_now_iso(),
-                "type": "process_reaped",
-                "pid": pid,
-                "pgid": int(entry.get("pgid") or 0),
-                "purpose": purpose,
-                "scope": str(entry.get("scope") or ""),
-                "reason": "purpose_prefix_reap",
-            })
-        except Exception:
-            log.warning("Failed to reap ledgered process %s", pid, exc_info=True)
-            survivors.append(entry)
-    _rewrite_ledger(drive_root, survivors)
-    return reaped
+    # CR4: hold the ledger's append lock across the WHOLE read→match→kill→rewrite
+    # so a concurrent record_process append cannot slip in between the read and
+    # the rewrite and be erased (custody evidence for a live process would be
+    # lost). The kills are signals (fast), so the lock hold stays short. The
+    # write MUST use the non-locking _write_ledger_file (the O_EXCL lock is not
+    # reentrant). If the lock is unavailable, skip this cycle — the next launcher
+    # startup retries; a leaked tunnel is never silently un-reaped forever.
+    lock_path = jsonl_append_lock_path(path)
+    lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=5.0, stale_sec=10.0)
+    if lock_fd is None:
+        log.warning("reap_purpose_prefix: could not lock the process ledger; skipping this cycle")
+        return []
+    try:
+        entries = _read_ledger(drive_root)
+        if not entries:
+            return []
+        reaped: List[int] = []
+        survivors: List[Dict[str, Any]] = []
+        for entry in entries:
+            purpose = str(entry.get("purpose") or "")
+            if not purpose.startswith(purpose_prefix):
+                survivors.append(entry)
+                continue
+            if not _fingerprint_matches(entry):
+                continue  # dead or recycled pid: prune silently, never kill
+            pid = int(entry.get("pid") or 0)
+            try:
+                pgid = int(entry.get("pgid") or 0)
+                if pgid > 0:
+                    kill_process_group_id(pgid)
+                else:
+                    from ouroboros.platform_layer import kill_pid_tree
+
+                    kill_pid_tree(pid)
+                reaped.append(pid)
+                append_jsonl(drive_root / "logs" / "supervisor.jsonl", {
+                    "ts": utc_now_iso(),
+                    "type": "process_reaped",
+                    "pid": pid,
+                    "pgid": int(entry.get("pgid") or 0),
+                    "purpose": purpose,
+                    "scope": str(entry.get("scope") or ""),
+                    "reason": "purpose_prefix_reap",
+                })
+            except Exception:
+                log.warning("Failed to reap ledgered process %s", pid, exc_info=True)
+                survivors.append(entry)
+        _write_ledger_file(path, survivors)
+        return reaped
+    finally:
+        release_exclusive_file_lock(lock_path, lock_fd)

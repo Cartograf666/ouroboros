@@ -388,6 +388,14 @@ class RemoteTunnelManager:
         # leave an orphan ssh (Emergency Stop Invariant). Ownership transfers to
         # self._live atomically under self._lock (see connect/_reconnect_once).
         self._inflight: "set[subprocess.Popen[Any]]" = set()
+        # Terminal panic latch: set ONCE by force_disconnect (never cleared —
+        # panic is followed by os._exit). Every spawn publishes its Popen to
+        # _inflight UNDER self._lock and refuses if the latch is set, so a spawn
+        # racing a panic either (a) publishes first and is then group-killed by
+        # force_disconnect, or (b) sees the latch and kills nothing because it
+        # never spawned. There is no window where a live ssh is invisible to
+        # force_disconnect (Emergency Stop Invariant).
+        self._shutdown = False
         self._status: Dict[str, Any] = {"state": "disconnected"}
         # State-change callbacks run on a dedicated single-consumer thread,
         # NEVER under self._lock: the launcher callback calls webview.load_url,
@@ -429,15 +437,20 @@ class RemoteTunnelManager:
         TimeoutExpired on overrun) but via Popen so the child is registered
         before it runs and force_disconnect can group-kill it mid-flight.
         """
-        proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            **subprocess_new_group_kwargs(),
-        )
-        self._register_inflight(proc)
+        # Spawn and publish to _inflight atomically under the force_disconnect
+        # lock (CR2): a panic cannot land between Popen and registration.
+        with self._lock:
+            if self._shutdown:
+                raise TunnelError("ssh_failed", "tunnel manager shut down")
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                **subprocess_new_group_kwargs(),
+            )
+            self._inflight.add(proc)
         try:
             try:
                 out, err = proc.communicate(timeout=timeout)
@@ -537,6 +550,7 @@ class RemoteTunnelManager:
         branch before os._exit.
         """
         with self._lock:
+            self._shutdown = True  # terminal: no further spawn may proceed
             self._generation += 1
             live, self._live = self._live, None
             inflight = list(self._inflight)
@@ -562,47 +576,53 @@ class RemoteTunnelManager:
         remote_port: int,
     ) -> _Live:
         argv = tunnel_argv(profile, local_port, remote_port, ssh_path=self._ssh_path)
+        # Spawn and publish to _inflight ATOMICALLY under the force_disconnect
+        # lock (CR2): the ssh child is visible to a concurrent panic the instant
+        # it exists — there is no Popen→register gap in which force_disconnect
+        # could observe neither _live nor _inflight and os._exit past a live ssh.
         try:
-            proc = subprocess.Popen(
-                argv,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                **subprocess_new_group_kwargs(),
-            )
+            with self._lock:
+                if self._shutdown:
+                    raise TunnelError("ssh_failed", "tunnel manager shut down")
+                if generation != self._generation:
+                    raise TunnelError("ssh_failed", "connection superseded")
+                proc = subprocess.Popen(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    **subprocess_new_group_kwargs(),
+                )
+                self._inflight.add(proc)
         except OSError as exc:
             raise TunnelError("ssh_unavailable", f"could not start ssh: {exc}") from exc
-        # Custody registration is part of a SUCCESSFUL spawn (Process Custody
-        # Rule): an unledgered long-lived ssh child is invisible to the startup
-        # reaper, so a launcher crash would leak it. If recording fails, tear the
-        # child down and fail the connect rather than run it unledgered.
-        try:
-            from ouroboros.process_custody import record_process
-
-            record_process(
-                self._data_dir,
-                pid=proc.pid,
-                cmd=argv,
-                purpose=f"{CUSTODY_PURPOSE_PREFIX}{profile['id']}",
-                scope="daemon",
-            )
-        except Exception as exc:
-            _kill_tree_now(proc)
-            raise TunnelError(
-                "custody_failed",
-                f"could not record the ssh tunnel in the process ledger: {exc}",
-            ) from exc
-        # Under manager custody from here: force_disconnect can now group-kill
-        # this proc during the health-wait, before it becomes self._live. On any
+        # From here proc is under manager custody in _inflight, so a panic during
+        # the (slower) ledger write or the health-wait group-kills it. On any
         # failure below we terminate AND drop it from _inflight; on success we
         # keep it registered so the caller transfers ownership to _live under a
         # single lock hold (no window where a panic could miss it).
-        self._register_inflight(proc)
         try:
-            with self._lock:
-                if generation != self._generation:
-                    _terminate_quietly(proc)
-                    raise TunnelError("ssh_failed", "connection superseded")
+            # Custody registration is part of a SUCCESSFUL spawn (Process Custody
+            # Rule): an unledgered long-lived ssh child is invisible to the
+            # startup reaper, so a launcher crash would leak it. If recording
+            # fails, tear the child down and fail the connect rather than run it
+            # unledgered.
+            try:
+                from ouroboros.process_custody import record_process
+
+                record_process(
+                    self._data_dir,
+                    pid=proc.pid,
+                    cmd=argv,
+                    purpose=f"{CUSTODY_PURPOSE_PREFIX}{profile['id']}",
+                    scope="daemon",
+                )
+            except Exception as exc:
+                _kill_tree_now(proc)
+                raise TunnelError(
+                    "custody_failed",
+                    f"could not record the ssh tunnel in the process ledger: {exc}",
+                ) from exc
             deadline = time.time() + HEALTH_CONNECT_TIMEOUT_SEC
             while time.time() < deadline:
                 if proc.poll() is not None:
@@ -625,7 +645,7 @@ class RemoteTunnelManager:
                 if check_health(local_port):
                     return _Live(generation, profile, local_port, remote_port, proc)
                 with self._lock:
-                    if generation != self._generation:
+                    if self._shutdown or generation != self._generation:
                         _terminate_quietly(proc)
                         raise TunnelError("ssh_failed", "connection superseded")
                 time.sleep(0.5)

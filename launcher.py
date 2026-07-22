@@ -753,7 +753,9 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
                 "`systemctl --user stop ouroboros`), then relaunch.",
                 SERVER_ALREADY_RUNNING_EXIT_CODE,
             )
-            _kill_stale_runtime_ports(port)
+            # Do NOT sweep the port here: exit 43 means a DIFFERENT live server
+            # legitimately owns this data dir, and the stale-port sweep would
+            # kill that valid owner (CR1). Just stop restarting.
             break
 
         time.sleep(2)

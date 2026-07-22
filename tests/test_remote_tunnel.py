@@ -375,6 +375,23 @@ def test_force_disconnect_kills_inflight_tunnel_before_live_assigned(tmp_path, m
     assert mgr.status()["state"] == "disconnected"
 
 
+def test_shutdown_latch_refuses_spawn_after_force_disconnect(tmp_path):
+    # CR2 (round 6 / Emergency Stop): once force_disconnect fires (panic), the
+    # terminal latch must make any spawn racing it refuse BEFORE Popen — so a
+    # thread that was about to start ssh never leaves an orphan the just-run
+    # force_disconnect could not see. Proven without a real ssh: the latch check
+    # precedes Popen in both spawn paths.
+    mgr = _manager(tmp_path)
+    mgr.force_disconnect()
+    assert mgr._shutdown is True
+    prof = rt.validate_profile({"id": "a", "name": "prod", "ssh_target": "u@h"})
+    with pytest.raises(rt.TunnelError):
+        mgr._spawn_and_wait(mgr._generation, prof, 50000, 8765)
+    with pytest.raises(rt.TunnelError):
+        mgr._run_ssh_tracked(["/usr/bin/true"], timeout=5)
+    assert mgr._inflight == set()  # nothing spawned → nothing leaked
+
+
 def test_spawn_and_wait_registers_then_transfers_custody(tmp_path, monkeypatch):
     # C1: the connect() success path must leave the proc owned by _live and NOT
     # lingering in _inflight (else force_disconnect would kill it twice / a
@@ -467,6 +484,59 @@ def test_reap_orphaned_tunnels_kills_ledgered_leak(tmp_path):
         purposes = [e.get("purpose") for e in process_custody._read_ledger(tmp_path)]
         assert "companion:x:y" in purposes
         assert not any(str(p).startswith("remote_ssh_tunnel:") for p in purposes)
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+@pytest.mark.serial
+@_POSIX_ONLY
+def test_reap_purpose_prefix_holds_ledger_lock_during_transaction(tmp_path, monkeypatch):
+    # CR4 (round 6): the reap must hold the ledger's append lock across the whole
+    # read→match→kill→rewrite, so a concurrent record_process append cannot slip
+    # in and be erased. Probe: while the reap is mid-kill, an outside attempt to
+    # take the same lock must FAIL (None) — proving appenders are serialized
+    # behind the reap and their records survive the rewrite.
+    import subprocess as sp
+
+    from ouroboros import process_custody as pc
+    from ouroboros.platform_layer import (
+        acquire_exclusive_file_lock,
+        release_exclusive_file_lock,
+        subprocess_new_group_kwargs,
+    )
+    from ouroboros.utils import jsonl_append_lock_path
+
+    leak_cmd = ["python3", "-c", "import time; time.sleep(30)"]
+    proc = sp.Popen(
+        leak_cmd, stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+        **subprocess_new_group_kwargs(),
+    )
+    try:
+        pc.record_process(
+            tmp_path, pid=proc.pid, cmd=leak_cmd,
+            purpose="remote_ssh_tunnel:leaked", scope="daemon",
+        )
+        lock_path = jsonl_append_lock_path(pc.ledger_path(tmp_path))
+        held = {}
+        real_kill = pc.kill_process_group_id
+
+        def _probe_kill(pgid):
+            # Non-blocking attempt from "another appender": must fail because the
+            # reap holds the ledger lock for the full transaction.
+            fd = acquire_exclusive_file_lock(lock_path, timeout_sec=0.1)
+            held["locked_during_kill"] = fd is None
+            if fd is not None:
+                release_exclusive_file_lock(lock_path, fd)
+            return real_kill(pgid)
+
+        monkeypatch.setattr(pc, "kill_process_group_id", _probe_kill)
+        reaped = pc.reap_purpose_prefix(tmp_path, "remote_ssh_tunnel:")
+        proc.wait(timeout=5)
+        assert reaped == [proc.pid]
+        assert held.get("locked_during_kill") is True
     finally:
         try:
             proc.kill()
