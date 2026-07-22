@@ -53,6 +53,7 @@ _POPEN_ALLOWLIST = {
     "ouroboros/local_model.py",           # custody record added at spawn
     "ouroboros/extension_companion.py",   # custody write-through added at spawn
     "ouroboros/tools/services.py",        # routed through spawn_supervised
+    "ouroboros/remote_tunnel.py",         # custody record_process write-through at spawn; launcher-owned teardown
 }
 
 
