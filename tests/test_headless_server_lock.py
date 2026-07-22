@@ -155,6 +155,26 @@ def test_already_running_exit_code_is_distinct():
     }
 
 
+def test_launcher_lifecycle_loop_stops_on_already_running_exit():
+    # A2 (R3 round-5): server.main() now acquires the one-server lock at the
+    # universal boundary, so a launcher-managed server can return exit 43 when a
+    # headless server already owns the data dir. The launcher must stop cleanly
+    # on 43 (break) rather than burn the crash budget (5 respawns) on a race it
+    # cannot win — pinned by source so a refactor can't silently drop the branch.
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parents[1] / "launcher.py").read_text(encoding="utf-8")
+    loop_start = src.index("def agent_lifecycle_loop")
+    loop = src[loop_start:]
+    branch = loop.index("if exit_code == SERVER_ALREADY_RUNNING_EXIT_CODE:")
+    # The 43 branch must appear BEFORE the crash-counter give-up, and break.
+    crash_giveup = loop.index('log.error("Agent crashed %d times')
+    assert branch < crash_giveup, "exit-43 branch must precede the crash-count give-up"
+    # The branch runs up to the restart section's `time.sleep(2)`.
+    body = loop[branch : loop.index("time.sleep(2)", branch)]
+    assert "break" in body and "Not restarting" in body
+
+
 def test_systemd_unit_prevents_panic_and_conflict_restarts():
     import pathlib
 

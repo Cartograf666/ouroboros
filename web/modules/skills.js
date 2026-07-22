@@ -267,9 +267,17 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
         });
         if (!ok) throw new Error('Skill grant cancelled.');
         const bridge = window.pywebview?.api?.request_skill_key_grant;
-        const result = bridge
+        let result = bridge
             ? await bridge(name, cleanItems)
             : await apiClient.skillGrants(name, cleanItems);
+        // On a REMOTE page the launcher bridge exists but origin-gates this
+        // owner method and returns {origin_refused:true}. Fall back to the
+        // page's own server HTTP endpoint (the remote being owns the grant),
+        // mirroring settings.js/ui_helpers.js — otherwise the remote window
+        // would surface a raw "available only from the local page" refusal.
+        if (bridge && result && result.ok !== true && result.origin_refused === true) {
+            result = await apiClient.skillGrants(name, cleanItems);
+        }
         if (!result?.ok) {
             throw new Error(result?.error || 'Skill grant was cancelled.');
         }

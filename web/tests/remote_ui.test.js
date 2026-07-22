@@ -1,7 +1,30 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { activeProfileId, pillLabel, pillVisible, remoteBridge } from '../modules/remote.js';
+
+test('A1: skill key-grant falls back to HTTP when the bridge origin-refuses', () => {
+    // On a REMOTE page the launcher bridge exists but origin-gates owner
+    // methods and returns {origin_refused:true}. The skill-grant caller must
+    // fall back to the page's own server endpoint like settings.js/ui_helpers.js
+    // — otherwise the remote window shows a raw refusal. Pinned by source so a
+    // refactor cannot silently drop the fallback (the caller lives in a module
+    // closure, not an exported symbol).
+    const src = readFileSync(
+        fileURLToPath(new URL('../modules/skills.js', import.meta.url)),
+        'utf8',
+    );
+    const fn = src.slice(src.indexOf('async function requestMissingKeyGrants'));
+    const body = fn.slice(0, fn.indexOf('\n    }\n'));
+    assert.match(body, /origin_refused === true/, 'must detect the origin refusal');
+    assert.match(body, /apiClient\.skillGrants\(name, cleanItems\)/, 'must fall back to HTTP');
+    assert.ok(
+        body.indexOf('origin_refused === true') < body.lastIndexOf('apiClient.skillGrants'),
+        'fallback must follow the origin_refused check',
+    );
+});
 
 test('pillVisible hides the pill only when local/disconnected', () => {
     assert.equal(pillVisible({ state: 'disconnected' }), false);

@@ -32,6 +32,7 @@ from ouroboros.config import (
     PORT_FILE,
     REPO_DIR,
     RESTART_EXIT_CODE,
+    SERVER_ALREADY_RUNNING_EXIT_CODE,
     SETTINGS_PATH,
     SETTINGS_DEFAULTS,
     acquire_pid_lock,
@@ -739,6 +740,21 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
             _kill_orphaned_children(port)
             release_pid_lock()
             os._exit(0)
+
+        if exit_code == SERVER_ALREADY_RUNNING_EXIT_CODE:
+            # server.main() now acquires the data-scoped one-server lock at the
+            # universal boundary, so a launcher-managed server can lose it to a
+            # headless `ouroboros server` already owning this data dir. Respawn-
+            # ing cannot win that race — stop cleanly with a clear message
+            # instead of burning the crash budget (5×) on a guaranteed failure.
+            log.error(
+                "Another Ouroboros server already owns this data dir (exit %d). "
+                "Not restarting — stop the other server (e.g. "
+                "`systemctl --user stop ouroboros`), then relaunch.",
+                SERVER_ALREADY_RUNNING_EXIT_CODE,
+            )
+            _kill_stale_runtime_ports(port)
+            break
 
         time.sleep(2)
 
