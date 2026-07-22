@@ -182,6 +182,12 @@ def _manager(tmp_path, **kwargs) -> rt.RemoteTunnelManager:
     return rt.RemoteTunnelManager(tmp_path, ssh_path="/usr/bin/ssh", **kwargs)
 
 
+def _drain_events(mgr):
+    """Block until the off-lock notifier thread has delivered every emitted
+    state (the callback runs on a dedicated thread, never under the lock)."""
+    mgr._emit_q.join()
+
+
 def test_connect_success_and_replace_on_connect(tmp_path, monkeypatch):
     events = []
     mgr = _manager(tmp_path, on_state_change=lambda s: events.append(s["state"]))
@@ -192,6 +198,8 @@ def test_connect_success_and_replace_on_connect(tmp_path, monkeypatch):
         "_spawn_and_wait",
         lambda self, gen, prof, lp, rp: rt._Live(gen, prof, lp, rp, fake),
     )
+    # Neutralize the SUPERVISOR thread only (the notifier thread was already
+    # started in __init__, before this patch, so events still flow).
     monkeypatch.setattr(rt.threading.Thread, "start", lambda self: None)
     status = mgr.connect({"id": "a", "name": "prod", "ssh_target": "u@h"})
     assert status["state"] == "connected"
@@ -209,6 +217,7 @@ def test_connect_success_and_replace_on_connect(tmp_path, monkeypatch):
     mgr.disconnect()
     assert fake2._dead is True
     assert mgr.status()["state"] == "disconnected"
+    _drain_events(mgr)
     assert "connecting" in events and "connected" in events
 
 
@@ -227,37 +236,103 @@ def test_connect_failure_sets_typed_error_status(tmp_path, monkeypatch):
     assert status["hint"] == "start it"
 
 
-def test_reconnect_gives_up_and_reports(tmp_path, monkeypatch):
+def _install_live(mgr, *, generation=0, local_port=50000, remote_port=8765, proc=None):
+    live = rt._Live(
+        generation,
+        rt.validate_profile({"id": "a", "name": "prod", "ssh_target": "h"}),
+        local_port,
+        remote_port,
+        proc or _FakeProc(),
+    )
+    with mgr._lock:
+        mgr._generation = generation
+        mgr._live = live
+    return live
+
+
+def test_reconnect_once_gives_up_and_reports(tmp_path, monkeypatch):
     events = []
     mgr = _manager(tmp_path, on_state_change=lambda s: events.append(dict(s)))
     fake = _FakeProc()
     monkeypatch.setattr(rt, "RECONNECT_TOTAL_SEC", 0.05)
     monkeypatch.setattr(rt, "RECONNECT_BACKOFF_SEC", (0.01,))
-
-    def _still_down(profile, ssh_path):
-        raise rt.TunnelError("ssh_failed", "unreachable")
-
-    monkeypatch.setattr(rt, "discover_remote_port", _still_down)
-    live = rt._Live(0, rt.validate_profile({"id": "a", "ssh_target": "h"}), 50000, 8765, fake)
-    with mgr._lock:
-        mgr._generation = 0
-        mgr._live = live
-    mgr._reconnect(0, live)
+    monkeypatch.setattr(
+        rt, "discover_remote_port",
+        lambda profile, ssh_path: (_ for _ in ()).throw(rt.TunnelError("ssh_failed", "unreachable")),
+    )
+    _install_live(mgr, proc=fake)
+    assert mgr._reconnect_once(0) is False  # give-up returns False → supervisor stops
     status = mgr.status()
     assert status["state"] == "gave_up"
     assert status["error_state"] == "ssh_failed"
     assert fake._dead is True
+    _drain_events(mgr)
     assert any(e["state"] == "reconnecting" for e in events)
 
 
-def test_monitor_exits_on_generation_change(tmp_path, monkeypatch):
+def test_reconnect_once_succeeds_and_reuses_stable_local_port(tmp_path, monkeypatch):
+    """The whole point of D21: a drop reconnects on the SAME local port so the
+    browser origin / sessionStorage survives, and returns True to keep watching."""
+    events = []
+    mgr = _manager(tmp_path, on_state_change=lambda s: events.append(dict(s)))
+    monkeypatch.setattr(rt, "discover_remote_port", lambda profile, ssh_path: 8765)
+    new_proc = _FakeProc()
+    monkeypatch.setattr(
+        rt.RemoteTunnelManager, "_spawn_and_wait",
+        lambda self, gen, prof, lp, rp: rt._Live(gen, prof, lp, rp, new_proc),
+    )
+    # pick_local_port must NOT be called on the happy path (stable port reused).
+    monkeypatch.setattr(rt, "pick_local_port", lambda: (_ for _ in ()).throw(AssertionError("re-picked")))
+    _install_live(mgr, local_port=50123)
+    assert mgr._reconnect_once(0) is True  # success → supervisor keeps watching
+    status = mgr.status()
+    assert status["state"] == "connected"
+    assert status["reconnected"] is True
+    assert status["local_port"] == 50123
+    assert mgr._live.proc is new_proc
+
+
+def test_reconnect_once_repicks_local_port_once_on_bind_conflict(tmp_path, monkeypatch):
+    mgr = _manager(tmp_path)
+    monkeypatch.setattr(rt, "discover_remote_port", lambda profile, ssh_path: 8765)
+    picks = iter([50999])
+    monkeypatch.setattr(rt, "pick_local_port", lambda: next(picks))
+    calls = {"n": 0}
+
+    def _spawn(self, gen, prof, lp, rp):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            assert lp == 50000  # first tries the stable port
+            raise rt.TunnelError("bind_conflict", "listener busy")
+        assert lp == 50999  # second uses the re-picked port
+        return rt._Live(gen, prof, lp, rp, _FakeProc())
+
+    monkeypatch.setattr(rt.RemoteTunnelManager, "_spawn_and_wait", _spawn)
+    _install_live(mgr, local_port=50000)
+    assert mgr._reconnect_once(0) is True
+    assert calls["n"] == 2
+    assert mgr.status()["local_port"] == 50999
+
+
+def test_watch_returns_true_on_sustained_health_failure(tmp_path, monkeypatch):
+    """ssh-alive != destination-alive: a live ssh proc whose /api/health fails
+    past the threshold must trigger reconnect (the ExitOnForwardFailure gap)."""
+    mgr = _manager(tmp_path)
+    monkeypatch.setattr(rt, "HEALTH_POLL_INTERVAL_SEC", 0.001)
+    monkeypatch.setattr(rt, "HEALTH_FAIL_THRESHOLD", 3)
+    monkeypatch.setattr(rt, "check_health", lambda port, **k: False)
+    _install_live(mgr, proc=_FakeProc())  # proc.poll() is None (alive)
+    assert mgr._watch_until_unhealthy(0) is True  # unhealthy → reconnect
+
+
+def test_watch_exits_on_generation_change(tmp_path, monkeypatch):
     mgr = _manager(tmp_path)
     monkeypatch.setattr(rt, "HEALTH_POLL_INTERVAL_SEC", 0.01)
     with mgr._lock:
-        mgr._generation = 7  # monitor was started for an older generation
+        mgr._generation = 7  # supervisor was started for an older generation
     started = time.time()
-    mgr._monitor(3)
-    assert time.time() - started < 1.0  # returned immediately, no reconnect attempt
+    assert mgr._watch_until_unhealthy(3) is False  # stale → stop, no reconnect
+    assert time.time() - started < 1.0
 
 
 # --- import boundary -------------------------------------------------------------

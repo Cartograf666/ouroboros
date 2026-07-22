@@ -1443,6 +1443,12 @@ def main():
             return {"ok": True, **status}
 
         def download_file_to_downloads(self, url: str, filename: str, open_external: bool = False) -> dict:
+            # Host-privileged action (writes ~/Downloads, may auto-open via the
+            # OS handler): origin-gated like the other privileged methods (D20).
+            # A remote page must not be able to drop+auto-open files on the
+            # desktop; the SPA falls back to an in-browser download there.
+            if not _current_page_is_local_origin():
+                return dict(_ORIGIN_REFUSED)
             try:
                 full_url = _resolve_bridge_file_url(url)
                 target = _unique_bridge_target(pathlib.Path.home() / "Downloads", filename)
@@ -1460,7 +1466,11 @@ def main():
             Fetches the loopback file into a private temp dir (NOT ~/Downloads)
             and hands it to the platform default handler. This never navigates
             the in-app WKWebView, which was the original fullscreen-lockup bug.
+            Origin-gated (D20): the untrusted remote page must not trigger a
+            host-side OS open — that is a webview→host escalation.
             """
+            if not _current_page_is_local_origin():
+                return dict(_ORIGIN_REFUSED)
             try:
                 full_url = _resolve_bridge_file_url(url)
                 # Per-open private dir: mkdtemp atomically creates a fresh 0700

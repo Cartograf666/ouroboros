@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import pathlib
+import queue
 import re
 import shutil
 import socket
@@ -330,6 +331,26 @@ class RemoteTunnelManager:
         self._generation = 0
         self._live: Optional[_Live] = None
         self._status: Dict[str, Any] = {"state": "disconnected"}
+        # State-change callbacks run on a dedicated single-consumer thread,
+        # NEVER under self._lock: the launcher callback calls webview.load_url,
+        # and status() (polled by the connection pill every few seconds) also
+        # takes the lock — invoking load_url while holding it risks a UI-thread
+        # stall / deadlock. The queue serializes callbacks in transition order.
+        self._emit_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        if on_state_change is not None:
+            threading.Thread(
+                target=self._notify_loop, daemon=True, name="remote-tunnel-notify",
+            ).start()
+
+    def _notify_loop(self) -> None:
+        while True:
+            payload = self._emit_q.get()
+            try:
+                self._on_state_change(payload)  # type: ignore[misc]
+            except Exception:
+                pass
+            finally:
+                self._emit_q.task_done()
 
     # -- public API -----------------------------------------------------------
 
@@ -378,8 +399,8 @@ class RemoteTunnelManager:
                 remote_port=live.remote_port,
             )
         threading.Thread(
-            target=self._monitor, args=(generation,), daemon=True,
-            name=f"remote-tunnel-monitor-{generation}",
+            target=self._supervise, args=(generation,), daemon=True,
+            name=f"remote-tunnel-supervisor-{generation}",
         ).start()
         return self.status()
 
@@ -394,13 +415,11 @@ class RemoteTunnelManager:
     # -- internals -------------------------------------------------------------
 
     def _set_status(self, **status: Any) -> None:
+        # Callers hold self._lock; only the assignment happens here. The
+        # callback is dispatched off-lock via the notifier thread (see __init__).
         self._status = status
-        callback = self._on_state_change
-        if callback is not None:
-            try:
-                callback(dict(status))
-            except Exception:
-                pass
+        if self._on_state_change is not None:
+            self._emit_q.put(dict(status))
 
     def _spawn_and_wait(
         self,
@@ -465,13 +484,29 @@ class RemoteTunnelManager:
             f"/api/health response within {int(HEALTH_CONNECT_TIMEOUT_SEC)}s",
         )
 
-    def _monitor(self, generation: int) -> None:
+    def _supervise(self, generation: int) -> None:
+        """Iterative watch→reconnect driver (one daemon thread per connection).
+
+        A loop, NOT mutual recursion: watch until the tunnel goes unhealthy,
+        attempt a bounded reconnect, and on success loop back to watching. Any
+        stale generation (disconnect / a newer connect) or an exhausted
+        reconnect window ends the thread. Reconnect cycles therefore never nest
+        stack frames (a long session with intermittent flaps stays flat)."""
+        while self._watch_until_unhealthy(generation):
+            if not self._reconnect_once(generation):
+                return
+
+    def _watch_until_unhealthy(self, generation: int) -> bool:
+        """Poll health until the tunnel needs reconnecting.
+
+        Returns True if the current live tunnel became unhealthy (caller should
+        reconnect); False if this generation is stale/disconnected (stop)."""
         failures = 0
         while True:
             time.sleep(HEALTH_POLL_INTERVAL_SEC)
             with self._lock:
                 if generation != self._generation or self._live is None:
-                    return
+                    return False
                 live = self._live
             if live.proc.poll() is None and check_health(live.local_port):
                 failures = 0
@@ -479,14 +514,19 @@ class RemoteTunnelManager:
             failures += 1
             if live.proc.poll() is None and failures < HEALTH_FAIL_THRESHOLD:
                 continue
-            self._reconnect(generation, live)
-            return
+            return True
 
-    def _reconnect(self, generation: int, live: _Live) -> None:
-        profile = live.profile
+    def _reconnect_once(self, generation: int) -> bool:
+        """One bounded reconnect cycle for the current live tunnel.
+
+        Returns True on a successful reconnect (caller resumes watching), False
+        when the generation went stale or the reconnect window was exhausted
+        (`gave_up`) — in both cases the supervisor thread should stop."""
         with self._lock:
-            if generation != self._generation:
-                return
+            if generation != self._generation or self._live is None:
+                return False
+            live = self._live
+            profile = live.profile
             self._set_status(
                 state="reconnecting",
                 profile_id=profile["id"],
@@ -496,11 +536,12 @@ class RemoteTunnelManager:
         _terminate_quietly(live.proc)
         deadline = time.time() + RECONNECT_TOTAL_SEC
         attempt = 0
+        repicked = False
         last_error: Optional[TunnelError] = None
         while time.time() < deadline:
             with self._lock:
                 if generation != self._generation:
-                    return
+                    return False
             try:
                 remote_port = discover_remote_port(profile, ssh_path=self._ssh_path)
                 new_live = self._spawn_and_wait(
@@ -508,11 +549,14 @@ class RemoteTunnelManager:
                 )
             except TunnelError as exc:
                 last_error = exc
-                if exc.state == "bind_conflict":
+                if exc.state == "bind_conflict" and not repicked:
                     # The stable local port was stolen while we were down —
-                    # pick a fresh one exactly once per reconnect cycle.
+                    # pick a fresh one ONCE per reconnect cycle, then fall
+                    # through to normal backoff so a pathological repeated
+                    # steal cannot become an un-backed-off respawn loop.
                     try:
                         live = dataclasses.replace(live, local_port=pick_local_port())
+                        repicked = True
                         continue
                     except OSError:
                         pass
@@ -523,7 +567,7 @@ class RemoteTunnelManager:
             with self._lock:
                 if generation != self._generation:
                     _terminate_quietly(new_live.proc)
-                    return
+                    return False
                 self._live = new_live
                 self._set_status(
                     state="connected",
@@ -533,11 +577,10 @@ class RemoteTunnelManager:
                     remote_port=new_live.remote_port,
                     reconnected=True,
                 )
-            self._monitor(generation)
-            return
+            return True
         with self._lock:
             if generation != self._generation:
-                return
+                return False
             self._live = None
             self._set_status(
                 state="gave_up",
@@ -547,6 +590,7 @@ class RemoteTunnelManager:
                 error_state=getattr(last_error, "state", "health_timeout"),
                 hint=getattr(last_error, "hint", ""),
             )
+        return False
 
 
 def _terminate_quietly(proc: "subprocess.Popen[Any]") -> None:

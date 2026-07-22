@@ -91,8 +91,9 @@ class OuroborosHTTPClient:
     ) -> Any:
         """POST one file as multipart/form-data (stdlib-only encoder).
 
-        Body size is bounded by the caller's pre-upload size check, so the
-        in-memory encode stays within the server's 50 MB per-file cap.
+        The file is read fully into memory (bounded by the caller's 50 MB
+        pre-upload size check, so the transient stays within the server's
+        per-file cap); this is a desktop CLI client, not a streaming service.
         """
         import mimetypes
         import uuid

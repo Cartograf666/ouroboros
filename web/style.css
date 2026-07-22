@@ -5732,7 +5732,8 @@ textarea.chat-input {
 }
 
 /* Remote connection (desktop) — header pill + Settings section.
-   Uses the shared glass/accent tokens; no hardcoded palette. */
+   Uses the shared glass/accent tokens plus the crimson accent literals the
+   codebase already uses for working/active states (matches existing norm). */
 .remote-pill-slot { display: inline-flex; align-items: center; }
 .remote-pill {
     display: inline-flex;

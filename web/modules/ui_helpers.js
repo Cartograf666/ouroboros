@@ -111,11 +111,28 @@ export function setInlineStatus(el, text, tone = 'muted') {
     if (el) { el.textContent = text || ''; el.dataset.tone = normalizeTone(tone); }
 }
 
+// D20: the launcher origin-gates the host file bridge and returns
+// {origin_refused:true} while the window shows a REMOTE server's page, so a
+// remote page can never drop+auto-open files on the desktop. Both helpers then
+// degrade to the plain browser path instead of surfacing an error.
+function _bridgeRefusedOrigin(result) {
+    return Boolean(result && result.ok !== true && result.origin_refused === true);
+}
+
 export async function openViaHostBridge(url, filename = 'file') {
     const api = window.pywebview?.api;
+    // True web / non-desktop OR a remote-origin refusal: open in a new tab. This
+    // never navigates the app itself; the browser previews or downloads per its
+    // own handling. (In the desktop WKWebView on the LOCAL page the bridge below
+    // is used instead; window.open is only the last-resort/web path.)
+    const browserFallback = () => {
+        window.open(url, '_blank', 'noopener');
+        return { ok: true, native: false };
+    };
     const openBridge = api?.open_file_with_default_app;
     if (openBridge) {
         const result = await openBridge(url, filename);
+        if (_bridgeRefusedOrigin(result)) return browserFallback();
         if (!result?.ok) throw new Error(result?.error || 'open failed');
         return { ...result, native: true };
     }
@@ -129,21 +146,23 @@ export async function openViaHostBridge(url, filename = 'file') {
     const downloadBridge = api?.download_file_to_downloads;
     if (downloadBridge) {
         const result = await downloadBridge(url, filename, true);
+        if (_bridgeRefusedOrigin(result)) return browserFallback();
         if (!result?.ok) throw new Error(result?.error || 'open failed');
         return { ...result, native: true };
     }
-    // True web / non-desktop: open in a new tab. This never navigates the app
-    // itself; the browser previews (e.g. PDF) or downloads per its own handling.
-    window.open(url, '_blank', 'noopener');
-    return { ok: true, native: false };
+    return browserFallback();
 }
 
 export async function downloadViaHostBridge(url, filename = 'download', { openExternal = false, fetchOptions = {} } = {}) {
     const bridge = window.pywebview?.api?.download_file_to_downloads;
     if (bridge) {
         const result = await bridge(url, filename, Boolean(openExternal));
-        if (!result?.ok) throw new Error(result?.error || 'desktop download failed');
-        return { ...result, native: true };
+        // Remote-origin refusal (D20): fall through to the in-browser blob
+        // download below rather than erroring.
+        if (!_bridgeRefusedOrigin(result)) {
+            if (!result?.ok) throw new Error(result?.error || 'desktop download failed');
+            return { ...result, native: true };
+        }
     }
     const resp = await apiFetch(url, fetchOptions);
     if (!resp.ok) throw new Error(`download failed: HTTP ${resp.status}`);
