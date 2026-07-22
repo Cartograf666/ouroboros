@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import urllib.request
 
 import pytest
@@ -155,19 +156,18 @@ def test_run_command_validates_attachments_before_contacting_server(tmp_path, mo
     assert called == []
 
 
-def test_post_multipart_file_encodes_wellformed_body(tmp_path, monkeypatch):
-    f = tmp_path / "тест file\".txt"
-    f.write_bytes(b"BYTES")
+class _Resp(io.BytesIO):
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _capture_multipart(monkeypatch, path):
     captured = {}
-
-    class _Resp(io.BytesIO):
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
 
     def fake_urlopen(req, timeout=None):
         captured["url"] = req.full_url
@@ -176,8 +176,16 @@ def test_post_multipart_file_encodes_wellformed_body(tmp_path, monkeypatch):
         return _Resp(json.dumps({"ok": True, "filename": "n", "path": "/p"}).encode())
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    client = cli.OuroborosHTTPClient("http://127.0.0.1:1")
-    result = client.post_multipart_file("/api/chat/upload", f)
+    result = cli.OuroborosHTTPClient("http://127.0.0.1:1").post_multipart_file("/api/chat/upload", path)
+    return result, captured
+
+
+def test_post_multipart_file_encodes_wellformed_body(tmp_path, monkeypatch):
+    # A space + non-ascii name is valid on every OS (no '"', which is illegal on
+    # NTFS); still exercises disposition encoding cross-platform.
+    f = tmp_path / "тест file.txt"
+    f.write_bytes(b"BYTES")
+    result, captured = _capture_multipart(monkeypatch, f)
     assert result["ok"] is True
     assert captured["url"].endswith("/api/chat/upload")
     assert "multipart/form-data; boundary=" in captured["content_type"]
@@ -187,9 +195,18 @@ def test_post_multipart_file_encodes_wellformed_body(tmp_path, monkeypatch):
     assert body.rstrip().endswith(f"--{boundary}--".encode())
     assert b"BYTES" in body
     assert b'name="file"' in body
-    # The disposition filename is header-safe: no quotes/CR/LF survive.
-    disposition = body.split(b"\r\n\r\n", 1)[0]
-    assert b'"' not in disposition.split(b'filename="', 1)[1].split(b"\r\n", 1)[0][:-1]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="'\"' is an illegal NTFS filename char")
+def test_post_multipart_file_strips_quote_from_disposition(tmp_path, monkeypatch):
+    # A '"' in the on-disk name is only creatable on POSIX; verify the encoder
+    # strips it from the Content-Disposition filename (header-injection guard).
+    f = tmp_path / 'a"b.txt'
+    f.write_bytes(b"X")
+    _result, captured = _capture_multipart(monkeypatch, f)
+    disposition = captured["body"].split(b"\r\n\r\n", 1)[0]
+    filename_field = disposition.split(b'filename="', 1)[1].split(b"\r\n", 1)[0][:-1]
+    assert b'"' not in filename_field
 
 
 def test_stage_task_attachments_discloses_missing_sources(tmp_path):

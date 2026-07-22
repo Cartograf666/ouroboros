@@ -322,6 +322,18 @@ def _disconnect_tunnel_quietly() -> None:
         log.debug("tunnel disconnect failed", exc_info=True)
 
 
+def _force_disconnect_tunnel() -> None:
+    """Panic-path teardown: immediate SIGKILL of the ssh tree, no graceful wait
+    (Emergency Stop Invariant — panic must not be delayed)."""
+    manager = _tunnel_manager
+    if manager is None:
+        return
+    try:
+        manager.force_disconnect()
+    except Exception:
+        log.debug("tunnel force-disconnect failed", exc_info=True)
+
+
 def _server_process_identity_matches(record: dict) -> bool:
     try:
         pid = int(record.get("pid") or 0)
@@ -715,9 +727,10 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
         if exit_code == PANIC_EXIT_CODE:
             log.info("Panic stop (exit code %d) — shutting down completely.", PANIC_EXIT_CODE)
             _shutdown_event.set()
-            # Panic must leave zero children: the ssh tunnel is launcher-owned,
-            # so it is torn down here, synchronously, before the hard exit.
-            _disconnect_tunnel_quietly()
+            # Panic must leave zero children with NO delay: force-kill the ssh
+            # tunnel tree immediately (not the graceful bounded-wait path) before
+            # the hard exit — Emergency Stop Invariant.
+            _force_disconnect_tunnel()
             # The agent (server child) already exited; tear down any orphans and
             # force-exit the whole process. _webview_window.destroy() from this
             # supervisor thread cannot end the main-thread Cocoa webview loop on

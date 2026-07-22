@@ -20,6 +20,13 @@ SAFETY_CRITICAL_PATHS = frozenset({
     "ouroboros/tools/extension_dispatch.py",
     "ouroboros/tools/registry.py",
     "prompts/SAFETY.md",
+    # Remote v1: launcher/owner-authority modules. remote_tunnel.py holds the
+    # origin-gate predicate (is_local_origin, the desktop trust boundary) and
+    # remote_support.py owns the ONLY writer of the owner-only connection
+    # profiles — an advanced-mode self-edit could weaken either before a
+    # launcher restart, so both are protected (pro + reviewed self-mod only).
+    "ouroboros/remote_tunnel.py",
+    "ouroboros/remote_support.py",
 })
 
 FROZEN_CONTRACT_PATH_PREFIXES = (

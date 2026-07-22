@@ -107,6 +107,16 @@ def test_file_bridge_validates_active_view_port():
     )
 
 
+def test_privileged_remote_modules_are_protected_paths():
+    """C3: the launcher/owner-authority modules must be protected from
+    advanced-mode self-modification (origin gate + owner-only profile writer)."""
+    from ouroboros.runtime_mode_policy import is_protected_runtime_path, protected_path_category
+
+    for path in ("ouroboros/remote_tunnel.py", "ouroboros/remote_support.py"):
+        assert is_protected_runtime_path(path), path
+        assert protected_path_category(path) == "safety-critical", path
+
+
 def test_remote_connections_self_change_detector():
     """W1: the shell self-change guard for OUROBOROS_REMOTE_CONNECTIONS mirrors
     the other owner-only-key detectors (safety-mode/context-mode)."""
@@ -148,7 +158,10 @@ def test_disconnect_tunnel_quietly_handles_absent_and_failing_manager(monkeypatc
 def test_shutdown_paths_tear_down_the_tunnel():
     source = (REPO_ROOT / "launcher.py").read_text(encoding="utf-8")
     closing = source[source.index("def _on_closing") : source.index("window.events.closing")]
-    assert "_disconnect_tunnel_quietly()" in closing
+    assert "_disconnect_tunnel_quietly()" in closing  # window close: graceful
     panic = source[source.index("if exit_code == PANIC_EXIT_CODE") :]
     panic = panic[: panic.index("time.sleep(2)")]
-    assert "_disconnect_tunnel_quietly()" in panic
+    # Panic must use the FORCE teardown (immediate SIGKILL, no graceful wait) —
+    # Emergency Stop Invariant forbids delay.
+    assert "_force_disconnect_tunnel()" in panic
+    assert "_disconnect_tunnel_quietly()" not in panic

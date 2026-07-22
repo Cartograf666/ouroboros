@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import os
 
 import pytest
@@ -131,15 +130,21 @@ def test_forked_child_inherited_lock_fd_semantics(tmp_path, monkeypatch, drop_in
     assert free_after_child_dies == expect_free_after_child_dies
 
 
-def test_server_command_exits_already_running_when_lock_held(monkeypatch, capsys):
-    from ouroboros import cli
+def test_server_main_exits_already_running_when_lock_held(monkeypatch):
+    # The one-server lock now lives at the universal boundary server.main(), so a
+    # held lock returns exit 43 there (before binding a port), covering every
+    # entry path (headless CLI, launcher-managed server.py, direct run).
+    import server
+    from types import SimpleNamespace
 
-    monkeypatch.setattr(config, "acquire_server_pid_lock", lambda: False)
-    args = argparse.Namespace(host="", port=0)
-    code = cli._server_command(args)
-    assert code == config.SERVER_ALREADY_RUNNING_EXIT_CODE
-    err = capsys.readouterr().err
-    assert "another instance already holds" in err
+    monkeypatch.setattr(server, "load_settings", lambda: {"OUROBOROS_SERVER_HOST": "127.0.0.1"})
+    monkeypatch.setattr(server, "parse_server_args", lambda *_a, **_k: SimpleNamespace(host="127.0.0.1", port=8765))
+    monkeypatch.setattr(server, "get_network_auth_startup_warning", lambda _host: "")
+    monkeypatch.setattr(server, "validate_network_auth_configuration", lambda _host: "")
+    monkeypatch.setattr(server, "acquire_server_pid_lock", lambda: False)  # lock held
+    # find_free_port must NOT be reached; make it loud if it is.
+    monkeypatch.setattr(server, "find_free_port", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("reached bind")))
+    assert server.main() == server.SERVER_ALREADY_RUNNING_EXIT_CODE
 
 
 def test_already_running_exit_code_is_distinct():

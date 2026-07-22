@@ -31,7 +31,13 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional
 
-from ouroboros.platform_layer import subprocess_new_group_kwargs, terminate_process_tree
+from ouroboros.platform_layer import (
+    kill_pid_tree,
+    kill_process_group_id,
+    process_group_id,
+    subprocess_new_group_kwargs,
+    terminate_process_tree,
+)
 
 # --- profile contract -------------------------------------------------------
 
@@ -444,6 +450,22 @@ class RemoteTunnelManager:
         if live is not None:
             _terminate_quietly(live.proc)
 
+    def force_disconnect(self) -> None:
+        """Panic path: kill the ssh process TREE immediately, no graceful wait.
+
+        The Emergency Stop Invariant forbids any delay in panic teardown, so
+        this must NOT use the graceful bounded-wait path (`_terminate_quietly`).
+        It group-SIGKILLs the whole ssh tree (catching ProxyJump/ProxyCommand
+        descendants) and returns at once. Safe to call from the launcher's
+        exit-99 branch before os._exit.
+        """
+        with self._lock:
+            self._generation += 1
+            live, self._live = self._live, None
+            self._status = {"state": "disconnected"}
+        if live is not None:
+            _kill_tree_now(live.proc)
+
     # -- internals -------------------------------------------------------------
 
     def _set_status(self, **status: Any) -> None:
@@ -471,6 +493,10 @@ class RemoteTunnelManager:
             )
         except OSError as exc:
             raise TunnelError("ssh_unavailable", f"could not start ssh: {exc}") from exc
+        # Custody registration is part of a SUCCESSFUL spawn (Process Custody
+        # Rule): an unledgered long-lived ssh child is invisible to the startup
+        # reaper, so a launcher crash would leak it. If recording fails, tear the
+        # child down and fail the connect rather than run it unledgered.
         try:
             from ouroboros.process_custody import record_process
 
@@ -481,8 +507,12 @@ class RemoteTunnelManager:
                 purpose=f"{CUSTODY_PURPOSE_PREFIX}{profile['id']}",
                 scope="daemon",
             )
-        except Exception:
-            pass  # custody is best-effort forensics; teardown is launcher-owned
+        except Exception as exc:
+            _kill_tree_now(proc)
+            raise TunnelError(
+                "custody_failed",
+                f"could not record the ssh tunnel in the process ledger: {exc}",
+            ) from exc
         deadline = time.time() + HEALTH_CONNECT_TIMEOUT_SEC
         while time.time() < deadline:
             if proc.poll() is not None:
@@ -623,6 +653,25 @@ class RemoteTunnelManager:
                 hint=getattr(last_error, "hint", ""),
             )
         return False
+
+
+def _kill_tree_now(proc: "subprocess.Popen[Any]") -> None:
+    """Immediate SIGKILL of the ssh process tree — no graceful wait (panic)."""
+    try:
+        pgid = process_group_id(proc.pid) if proc.pid and proc.pid > 0 else 0
+    except Exception:
+        pgid = 0
+    try:
+        if pgid and pgid > 0:
+            kill_process_group_id(pgid)  # whole group incl ProxyJump/Command kids
+        elif proc.pid and proc.pid > 0:
+            kill_pid_tree(proc.pid)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
 
 
 def _terminate_quietly(proc: "subprocess.Popen[Any]") -> None:

@@ -137,6 +137,7 @@ def _restart_current_process(host: str, port: int) -> None:
 
 from ouroboros.config import (
     load_settings, save_settings, apply_settings_to_env as _apply_settings_to_env,
+    acquire_server_pid_lock, SERVER_ALREADY_RUNNING_EXIT_CODE, SERVER_PID_FILE,
 )
 from ouroboros.server_runtime import (
     apply_runtime_provider_defaults,
@@ -2321,6 +2322,23 @@ def main() -> int:
     if auth_error:
         log.error(auth_error)
         return 2
+    # One server per data dir — acquired at the UNIVERSAL startup boundary (not
+    # just the CLI wrapper) so every entry path (headless CLI, launcher-managed
+    # server.py, direct source run) is covered, and a self-reexec that drops the
+    # CLOEXEC lock reacquires it here. Held for the process lifetime (OS-released
+    # on death). A genuine conflict returns exit 43 (systemd RestartPreventExit-
+    # Status keeps it from restart-looping); an unexpected lock error fails OPEN
+    # so a lock-file glitch never bricks startup.
+    try:
+        if not acquire_server_pid_lock():
+            log.error(
+                "Another Ouroboros server already holds %s for this data dir; "
+                "stop it first (systemd: systemctl --user stop ouroboros).",
+                SERVER_PID_FILE,
+            )
+            return SERVER_ALREADY_RUNNING_EXIT_CODE
+    except Exception:
+        log.warning("server pid-lock acquire errored; continuing", exc_info=True)
     actual_port = find_free_port(args.host, args.port)
     if actual_port != args.port:
         log.info("Port %d busy on %s, using %d instead", args.port, args.host, actual_port)

@@ -194,20 +194,9 @@ def _server_command(args: argparse.Namespace) -> int:
         os.environ["OUROBOROS_SERVER_HOST"] = args.host
     if args.port:
         os.environ["OUROBOROS_SERVER_PORT"] = str(args.port)
-    from ouroboros.config import (
-        SERVER_ALREADY_RUNNING_EXIT_CODE,
-        SERVER_PID_FILE,
-        acquire_server_pid_lock,
-        release_server_pid_lock,
-    )
-
-    if not acquire_server_pid_lock():
-        print(
-            f"ouroboros server: another instance already holds {SERVER_PID_FILE} "
-            "for this data dir; stop it first (systemd: systemctl --user stop ouroboros)",
-            file=sys.stderr,
-        )
-        return SERVER_ALREADY_RUNNING_EXIT_CODE
+    # The one-server-per-data-dir lock is acquired inside server.main() (the
+    # universal startup boundary), so every entry path — not just this CLI
+    # wrapper — enforces it and a self-reexec reacquires it there.
     import server
 
     try:
@@ -215,7 +204,6 @@ def _server_command(args: argparse.Namespace) -> int:
         return int(server.main())
     finally:
         sys.argv = old_argv
-        release_server_pid_lock()
 
 
 def _status_command(args: argparse.Namespace) -> int:

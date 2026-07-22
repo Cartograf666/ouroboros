@@ -341,6 +341,21 @@ def test_watch_returns_true_on_sustained_health_failure(tmp_path, monkeypatch):
     assert mgr._watch_until_unhealthy(0) is True  # unhealthy → reconnect
 
 
+def test_force_disconnect_does_not_graceful_wait(tmp_path, monkeypatch):
+    # C2 / Emergency Stop: the panic teardown must kill immediately, never take
+    # the graceful bounded-wait path (_terminate_quietly).
+    mgr = _manager(tmp_path)
+    fake = _FakeProc()
+    _install_live(mgr, proc=fake)
+    calls = {"graceful": 0, "now": 0}
+    monkeypatch.setattr(rt, "_terminate_quietly", lambda p: calls.__setitem__("graceful", calls["graceful"] + 1))
+    monkeypatch.setattr(rt, "_kill_tree_now", lambda p: (calls.__setitem__("now", calls["now"] + 1), p.kill()))
+    mgr.force_disconnect()
+    assert calls["now"] == 1 and calls["graceful"] == 0
+    assert fake._dead is True
+    assert mgr.status()["state"] == "disconnected"
+
+
 def test_terminate_quietly_reaps_child_before_returning(monkeypatch):
     # C5: teardown must not return until the ssh child is terminal, else a
     # zombie lingers and the stable forwarded port can be reused mid-exit.
