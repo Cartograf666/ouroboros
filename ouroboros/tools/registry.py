@@ -324,6 +324,27 @@ def _detect_safety_mode_self_lowering(text_lower: str) -> bool:
     )
 
 
+def _detect_remote_connections_self_change(text_lower: str) -> bool:
+    """Detect shell/script attempts to write the owner-only remote-connection
+    profiles (remote v1). OUROBOROS_REMOTE_CONNECTIONS is launcher-owned — the
+    ONLY legitimate writer is the desktop launcher bridge (with a native connect
+    confirmation). The self-modifying agent must not repoint the owner's window
+    at a foreign host via a shell `config.update_remote_connections(...)` or a
+    direct settings.json edit. Mirrors the safety-mode/context-mode guards."""
+    import urllib.parse
+
+    decoded = urllib.parse.unquote(urllib.parse.unquote(text_lower)).lower()
+    text_lower = f"{text_lower} {decoded}"
+    mentions_key = "ouroboros_remote_connections" in text_lower
+    mentions_writer = "update_remote_connections" in text_lower
+    mentions_save = (
+        "save_settings" in text_lower
+        or "settings.json" in text_lower
+        or "/api/settings" in text_lower
+    )
+    return mentions_writer or (mentions_key and mentions_save)
+
+
 def _detect_owner_skill_attest_self_call(text_lower: str) -> bool:
     """Detect agent attempts to loopback-call the OWNER-ONLY skill owner-attestation endpoint
     (C1, v6.39). Owner-attestation skips the expensive LLM skill review; it MUST be
@@ -1922,6 +1943,8 @@ class ToolRegistry:
             return "⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to weaken OUROBOROS_SCOPE_REVIEW_FLOOR (e.g. to ``advisory``) through settings.json, /api/settings, or /api/owner/scope-review-floor. The scope-review floor gates the BIBLE P3 blocking review — it is owner-controlled, and the agent must not lower it to slip its own changes past the gate. Ask the owner to change it, or stop the agent and edit settings.json directly."
         if _detect_safety_mode_self_lowering(cmd_lower):
             return "⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to change OUROBOROS_SAFETY_MODE (e.g. to ``light``/``off``) through settings.json, /api/settings, or /api/owner/safety-mode. LLM-safety coverage is owner-controlled (BIBLE P3) — the agent must not reduce its own supervision. Ask the owner to change it via the dedicated /api/owner/safety-mode endpoint, or stop the agent and edit settings.json directly."
+        if _detect_remote_connections_self_change(cmd_lower):
+            return "⚠️ REMOTE_CONNECTIONS_SELF_CHANGE_BLOCKED: shell command pattern looks like an attempt to write OUROBOROS_REMOTE_CONNECTIONS (via config.update_remote_connections or a settings.json edit). Desktop remote-connection profiles are owner-controlled — the only writer is the launcher bridge (with a native connect confirmation). The agent must not add or repoint a remote host; the owner manages profiles in Settings → Remote."
         if _detect_owner_skill_attest_self_call(cmd_lower):
             return "⚠️ OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED: shell command pattern looks like an attempt to loopback-POST /api/owner/skills/<skill>/attest-review. Owner-attestation skips the expensive LLM skill review and is OWNER-ONLY — the agent must not self-attest its own skill to bypass the immune system's review. Ask the owner to attest it from the Skills UI."
         if _detect_mutative_toggle_self_change(cmd_lower):

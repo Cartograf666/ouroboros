@@ -27,11 +27,28 @@ def test_pid_flock_open_is_exclusive_per_open_description(tmp_path):
     try:
         assert pid_flock_open(str(path)) is None
     finally:
-        pid_flock_close(str(path), first)
-    # Released — a fresh handle acquires again.
+        pid_flock_close(str(path), first)  # default remove=False → file persists
+    # The lock FILE persists after release (race-free discipline); a fresh
+    # handle re-opens and re-flocks the same inode.
+    assert path.exists()
     again = pid_flock_open(str(path))
     assert again is not None
     pid_flock_close(str(path), again)
+    assert path.exists()
+
+
+def test_pid_flock_close_no_unlink_race_release_reacquire(tmp_path):
+    # C4: release must NOT unlink — an unlink after unlock lets a second holder
+    # take the same inode, then the first's unlink would delete the live lock.
+    # With persistent file, release→reacquire keeps the SAME path exclusive.
+    path = tmp_path / "server.pid"
+    a = pid_flock_open(str(path))
+    assert a is not None
+    pid_flock_close(str(path), a)  # persistent
+    b = pid_flock_open(str(path))
+    assert b is not None
+    assert pid_flock_open(str(path)) is None  # still exclusive on the same file
+    pid_flock_close(str(path), b)
 
 
 def test_acquire_server_pid_lock_creates_state_dir_and_is_idempotent(_isolated_server_lock):
@@ -40,7 +57,10 @@ def test_acquire_server_pid_lock_creates_state_dir_and_is_idempotent(_isolated_s
     # Same process re-acquire is a no-op success (held handle kept).
     assert config.acquire_server_pid_lock() is True
     config.release_server_pid_lock()
-    assert not config.SERVER_PID_FILE.exists()
+    # File persists after release (race-free discipline); the lock is free.
+    assert config.SERVER_PID_FILE.exists()
+    assert config.acquire_server_pid_lock() is True  # re-acquirable
+    config.release_server_pid_lock()
     # Release when not held stays a safe no-op.
     config.release_server_pid_lock()
 

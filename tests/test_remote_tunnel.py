@@ -15,6 +15,11 @@ from ouroboros import remote_tunnel as rt
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
+# The stub-ssh tests write a `#!/bin/sh` script and execute it directly; Windows
+# CreateProcess cannot run a shebang script (WinError 193). These tests exercise
+# POSIX transport mechanics only — the runtime code is portable (platform_layer).
+_POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX stub-ssh (shebang script)")
+
 
 # --- profile validation -------------------------------------------------------
 
@@ -130,6 +135,7 @@ def _write_stub_ssh(tmp_path: pathlib.Path, body: str) -> str:
 
 
 @pytest.mark.serial
+@_POSIX_ONLY
 def test_discover_remote_port_reads_stub_output(tmp_path):
     ssh = _write_stub_ssh(tmp_path, 'echo 8123\n')
     prof = rt.validate_profile({"id": "a", "ssh_target": "h"})
@@ -137,6 +143,7 @@ def test_discover_remote_port_reads_stub_output(tmp_path):
 
 
 @pytest.mark.serial
+@_POSIX_ONLY
 def test_discover_remote_port_classifies_ssh_transport_failure(tmp_path):
     ssh = _write_stub_ssh(tmp_path, 'echo "Permission denied (publickey)." >&2\nexit 255\n')
     prof = rt.validate_profile({"id": "a", "ssh_target": "h"})
@@ -147,6 +154,7 @@ def test_discover_remote_port_classifies_ssh_transport_failure(tmp_path):
 
 
 @pytest.mark.serial
+@_POSIX_ONLY
 def test_discover_remote_port_detects_inactive_unit(tmp_path):
     ssh = _write_stub_ssh(
         tmp_path,
@@ -164,7 +172,7 @@ def test_discover_remote_port_detects_inactive_unit(tmp_path):
 class _FakeProc:
     def __init__(self):
         # Invalid pid so platform group-kill helpers can never touch a real
-        # process; _terminate_quietly then falls through to .kill().
+        # process; _terminate_quietly then falls through to .kill()+.wait().
         self.pid = -1
         self.stderr = None
         self._dead = False
@@ -175,7 +183,15 @@ class _FakeProc:
     def kill(self):
         self._dead = True
 
-    terminate = kill
+    # terminate() (group TERM) does NOT kill this fake — it models an ssh child
+    # that outlives TERM, so _terminate_quietly must escalate to kill()+wait().
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        if self._dead:
+            return 1
+        raise subprocess.TimeoutExpired(cmd="ssh", timeout=timeout)
 
 
 def _manager(tmp_path, **kwargs) -> rt.RemoteTunnelManager:
@@ -325,6 +341,14 @@ def test_watch_returns_true_on_sustained_health_failure(tmp_path, monkeypatch):
     assert mgr._watch_until_unhealthy(0) is True  # unhealthy → reconnect
 
 
+def test_terminate_quietly_reaps_child_before_returning(monkeypatch):
+    # C5: teardown must not return until the ssh child is terminal, else a
+    # zombie lingers and the stable forwarded port can be reused mid-exit.
+    proc = _FakeProc()  # terminate() does NOT kill; only kill()+wait() reaps
+    rt._terminate_quietly(proc)
+    assert proc.poll() is not None  # provably reaped (kill escalated + waited)
+
+
 def test_watch_exits_on_generation_change(tmp_path, monkeypatch):
     mgr = _manager(tmp_path)
     monkeypatch.setattr(rt, "HEALTH_POLL_INTERVAL_SEC", 0.01)
@@ -369,6 +393,8 @@ def test_ssh_available_returns_path_or_none():
     assert result is None or os.path.isabs(result)
 
 
+@pytest.mark.serial
+@_POSIX_ONLY
 def test_stub_subprocess_helpers_do_not_leak(tmp_path):
     # _run_ssh must not hang on a stub that ignores stdin and exits.
     ssh = _write_stub_ssh(tmp_path, "exit 0\n")

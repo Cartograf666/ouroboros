@@ -805,13 +805,21 @@ def _render_attachment_lines(attachments: Any) -> str:
         relpath = str(item.get("relpath") or "").strip()
         root = str(item.get("root") or "artifact_store").strip() or "artifact_store"
         label = str(item.get("label") or pathlib.Path(relpath).name).strip()
-        if str(item.get("status") or "") == "skipped_missing":
+        status = str(item.get("status") or "")
+        if status == "skipped_missing":
             # Honest disclosure (remote v1): the declared source path did not
             # exist on this server, so there is nothing to read — never render
             # a fake read_file() line for it.
             lines.append(
                 f"- {label or 'attachment'}: NOT STAGED - the declared source "
                 "file was not found on the server"
+            )
+            continue
+        if status == "skipped_over_limit":
+            # P1 disclosure: the input set exceeded the per-task staging cap.
+            lines.append(
+                f"- {label or 'additional attachments'}: NOT STAGED - the "
+                f"per-task attachment limit ({item.get('limit')}) was reached"
             )
             continue
         if not relpath:

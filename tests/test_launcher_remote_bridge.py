@@ -107,6 +107,20 @@ def test_file_bridge_validates_active_view_port():
     )
 
 
+def test_remote_connections_self_change_detector():
+    """W1: the shell self-change guard for OUROBOROS_REMOTE_CONNECTIONS mirrors
+    the other owner-only-key detectors (safety-mode/context-mode)."""
+    from ouroboros.tools.registry import _detect_remote_connections_self_change as det
+
+    # Blocked: the writer, or the key together with a settings-write channel.
+    assert det("python -c 'from ouroboros.config import update_remote_connections; update_remote_connections([])'")
+    assert det('echo \'{"ouroboros_remote_connections": []}\' > ~/ouroboros/data/settings.json')
+    assert det("curl -x post /api/settings -d ouroboros_remote_connections=...")
+    # Not blocked: unrelated commands, or a bare mention without a write channel.
+    assert not det("ls -la ~/ouroboros/data")
+    assert not det("grep ouroboros_remote_connections docs/architecture.md")
+
+
 def test_disconnect_tunnel_quietly_handles_absent_and_failing_manager(monkeypatch):
     import launcher
 

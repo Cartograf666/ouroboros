@@ -59,6 +59,20 @@ def test_validate_attach_paths_is_loud_on_missing_file(tmp_path):
         _validate_attach_paths([str(tmp_path)])
 
 
+def test_validate_attach_paths_rejects_over_limit_batch(tmp_path):
+    # P1 no-silent-loss: reject an over-cap batch up front (shared server cap)
+    # rather than uploading files the server would silently drop.
+    from ouroboros.artifacts import _MAX_STAGED_ATTACHMENTS as cap
+
+    files = []
+    for i in range(cap + 1):
+        f = tmp_path / f"f{i}.txt"
+        f.write_text("x")
+        files.append(str(f))
+    with pytest.raises(CLIError, match="at most"):
+        _validate_attach_paths(files)
+
+
 def test_validate_attach_paths_rejects_oversized(tmp_path):
     big = tmp_path / "big.bin"
     with big.open("wb") as fh:
@@ -198,6 +212,31 @@ def test_stage_task_attachments_discloses_missing_sources(tmp_path):
     skipped = next(m for m in manifest if m.get("status") == "skipped_missing")
     assert skipped["label"] == "gone-from-this-machine.txt"
     assert "relpath" not in skipped
+
+
+def test_stage_task_attachments_discloses_over_limit_omission(tmp_path):
+    from ouroboros.artifacts import _MAX_STAGED_ATTACHMENTS, stage_task_attachments
+
+    srcs = []
+    for i in range(_MAX_STAGED_ATTACHMENTS + 3):
+        f = tmp_path / f"f{i}.txt"
+        f.write_text("x")
+        srcs.append({"path": str(f)})
+    manifest = stage_task_attachments(tmp_path / "drive", "task-lim", srcs)
+    over = [m for m in manifest if m.get("status") == "skipped_over_limit"]
+    assert len(over) == 1  # exactly one typed omission entry, not a silent break
+    assert over[0]["limit"] == _MAX_STAGED_ATTACHMENTS
+    staged = [m for m in manifest if m.get("relpath")]
+    assert len(staged) == _MAX_STAGED_ATTACHMENTS
+
+
+def test_render_attachment_lines_discloses_over_limit(tmp_path):
+    from ouroboros.gateway.tasks import _render_attachment_lines
+
+    rendered = _render_attachment_lines(
+        [{"label": "5 more attachment(s)", "status": "skipped_over_limit", "limit": 25}]
+    )
+    assert "NOT STAGED" in rendered and "limit" in rendered and "read_file" not in rendered
 
 
 def test_render_attachment_lines_discloses_skipped_without_fake_read(tmp_path):

@@ -238,9 +238,22 @@ _ATTACH_MAX_BYTES = 50 * 1024 * 1024  # mirrors the server's per-file upload cap
 
 
 def _validate_attach_paths(raw_paths: List[str]) -> List[pathlib.Path]:
-    """Loudly validate every --attach path BEFORE contacting the server."""
+    """Loudly validate every --attach path BEFORE contacting the server.
+
+    Enforces the SAME per-task cap the server stages against, so an over-limit
+    batch is rejected up front rather than uploading files the server would drop
+    (P1 no-silent-loss: no orphaned uploads, no undisclosed incomplete input).
+    """
+    from ouroboros.artifacts import _MAX_STAGED_ATTACHMENTS as _CAP
+
+    raw_paths = list(raw_paths or [])
+    if len(raw_paths) > _CAP:
+        raise CLIError(
+            f"--attach accepts at most {_CAP} files per task; got {len(raw_paths)}. "
+            "Bundle the rest (e.g. a zip) or split the task."
+        )
     paths: List[pathlib.Path] = []
-    for raw in raw_paths or []:
+    for raw in raw_paths:
         path = pathlib.Path(raw).expanduser()
         if not path.is_file():
             raise CLIError(f"--attach file not found (or not a regular file): {path}")

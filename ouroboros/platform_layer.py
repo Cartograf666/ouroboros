@@ -330,8 +330,18 @@ def pid_flock_open(path: str) -> Any:
         return None
 
 
-def pid_flock_close(path: str, fd_obj: Any) -> None:
-    """Release a lock handle returned by :func:`pid_flock_open`."""
+def pid_flock_close(path: str, fd_obj: Any, *, remove: bool = False) -> None:
+    """Release a lock handle returned by :func:`pid_flock_open`.
+
+    ``remove=False`` (default) leaves the lock FILE persistent and releases the
+    lock only by closing the owning handle — the race-free discipline for a
+    single-instance lock: unlinking after unlock lets a second acquirer take the
+    same inode between unlock and unlink, whereupon this close would delete the
+    LIVE second lock's pathname and a third acquirer could create+lock a new
+    inode (two live holders). A leftover empty lock file is harmless — the next
+    acquirer just re-opens and re-flocks it. ``remove=True`` preserves the
+    historical unlink behavior of the process-global launcher PID lock.
+    """
     if fd_obj is not None:
         if IS_WINDOWS:
             try:
@@ -348,10 +358,11 @@ def pid_flock_close(path: str, fd_obj: Any) -> None:
             fd_obj.close()
         except Exception:
             pass
-    try:
-        os.unlink(path)
-    except Exception:
-        pass
+    if remove:
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
 
 
 def pid_lock_acquire(path: str) -> bool:
@@ -365,9 +376,9 @@ def pid_lock_acquire(path: str) -> bool:
 
 
 def pid_lock_release(path: str) -> None:
-    """Release the process-global PID lock."""
+    """Release the process-global PID lock (historical: unlink on release)."""
     global _lock_fd
-    pid_flock_close(path, _lock_fd)
+    pid_flock_close(path, _lock_fd, remove=True)
     _lock_fd = None
 
 

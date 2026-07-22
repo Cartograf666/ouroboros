@@ -128,9 +128,21 @@ def stage_task_attachments(
 
     manifest: List[Dict[str, Any]] = []
     staged = 0
-    for item in items:
+    for idx, item in enumerate(items):
         if staged >= _MAX_STAGED_ATTACHMENTS:
-            log.info("stage_task_attachments: hit max staged attachments (%d); skipping rest", _MAX_STAGED_ATTACHMENTS)
+            # P1 no-silent-loss: instead of a bare break that hides the dropped
+            # inputs, emit one typed omission entry naming the remaining count so
+            # the task prompt discloses that the input set is incomplete.
+            remaining = len(items) - idx
+            log.info(
+                "stage_task_attachments: hit max staged attachments (%d); %d not staged",
+                _MAX_STAGED_ATTACHMENTS, remaining,
+            )
+            manifest.append({
+                "label": f"{remaining} more attachment(s)",
+                "status": "skipped_over_limit",
+                "limit": _MAX_STAGED_ATTACHMENTS,
+            })
             break
         try:
             source = pathlib.Path(item["path"]).expanduser().resolve(strict=False)

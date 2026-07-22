@@ -132,6 +132,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── skill_review_runner.py ← shared lifecycle-backed skill review runner for API + agent tool paths; writes review_job.json + skill_review_* events and routes all executable skills (including self-authored provenance) through tri-model review
       ├── server_auth.py       ← Non-localhost auth gate (OUROBOROS_NETWORK_PASSWORD)
       ├── remote_tunnel.py     ← (remote v1) LAUNCHER-SUPPORT module (not agent core): the desktop Remote-connection ssh tunnel manager (profile validation, port discovery over ssh, `ssh -N -L` tunnel, health-based monitoring + bounded reconnect, typed error taxonomy). Imported ONLY by launcher.py; an import-boundary test asserts server/agent code never imports it, and it shares launcher.py's frozen-shell review boundary
+      ├── remote_support.py    ← (remote v1) Owner-only remote/headless support state extracted from config.py (P7 split): the OUROBOROS_REMOTE_CONNECTIONS locked read-modify-write writer + the headless SERVER_PID_FILE lock helpers. Re-exported through `config.*` as the stable API; imports config lazily to avoid a cycle
       ├── server_control.py    ← Process-control helpers: restart, panic stop
       ├── server_entrypoint.py ← CLI argument parsing, port-binding helpers
       ├── server_runtime.py    ← Server startup/onboarding and WebSocket liveness helpers
@@ -913,6 +914,7 @@ A left `#primary-sidebar` of ROWS (`.nav-row`, not an icon rail): Chat (Main), a
 - `web/modules/api_types.js` mirrors browser-facing envelopes with JSDoc.
 - `web/modules/ui_helpers.js` centralizes tone badges, age labels, inline status, host-bridge downloads, and the safe field renderer/value collector shared by Widgets and Settings (Settings retains its narrow route/component contract).
 - `web/modules/skill_card_renderer.js` renders installed Skills cards from shared lifecycle/review/grant state.
+- `web/modules/remote.js` (remote v1) renders the desktop Settings→Remote connection UI and the header connection pill; talks ONLY to the launcher pywebview bridge (never `/api/settings`), inert in a plain browser.
 - `web/modules/update_status.js` (v6.41.0) renders the main-screen Update pill + the staged auto/assisted/manual dialog; `web/modules/activity.js` (v6.41.0) renders the Dashboard Activity subtab (cron schedules, running/queued tasks, background consciousness) with direct mechanical controls. Both use the shared `.btn` button system.
 - `web/modules/toast.js`, `masonry.js`, and CSS tokens in `style.css` keep cards/notifications/layout consistent without a build system.
 
@@ -1700,7 +1702,7 @@ Runtime floors:
 | OUROBOROS_NETWORK_PASSWORD | "" | Optional. Enables the non-loopback auth gate when set; empty still allows open bind, but startup logs a warning |
 | OUROBOROS_SERVER_HOST | 127.0.0.1 | Server bind host. Use `0.0.0.0` for LAN/Docker access; restart required. |
 | OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD | unset | Env-only Docker/Kubernetes escape hatch. When set to `1`, Settings may save ordinary changes while a wildcard/non-localhost bind has no `OUROBOROS_NETWORK_PASSWORD`; use only behind ingress auth, VPN, private networking, or an auth proxy. |
-| OUROBOROS_REMOTE_CONNECTIONS | [] | (remote v1) Launcher-owned desktop Remote-connection profiles (list of `{id,name,ssh_target,remote_data_dir?,remote_agent_port?}`). OMITTED from `GET /api/settings` and merge-skipped on generic POST; written only by the launcher bridge via `config.update_remote_connections`. The self-modifying agent cannot read or set it. |
+| OUROBOROS_REMOTE_CONNECTIONS | [] | (remote v1) Launcher-owned desktop Remote-connection profiles (list of `{id,name,ssh_target,remote_data_dir?,remote_agent_port?}`). No HTTP read/mutation surface: OMITTED from `GET /api/settings` and merge-skipped on generic POST; the only writer is the launcher bridge via `config.update_remote_connections`. A shell/script self-write (`config.update_remote_connections(...)` or a settings.json edit) is blocked by a deterministic detector (`registry._detect_remote_connections_self_change`) mirroring the other owner-only keys, and SAFETY.md classifies it dangerous. Profiles store no secrets (key/agent SSH only). |
 | OUROBOROS_SERVER_PID_FILE | (empty) | Env override for the data-scoped headless server lock (`DATA_DIR/state/server.pid`); one `ouroboros server` per data dir. |
 | OUROBOROS_MODEL | google/gemini-3.5-flash | Main reasoning model (the one real default; every other worker slot below is empty→Main) |
 | OUROBOROS_MODEL_HEAVY | "" | Strong acting/coding lane for mutative first-level subagents (`auto` routes a writing child here). Empty means use `OUROBOROS_MODEL`. (Renamed from `OUROBOROS_MODEL_CODE`; stored/legacy values migrate.) |

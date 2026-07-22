@@ -163,7 +163,12 @@ class TestStageTaskAttachments:
             f.write_text(str(i), encoding="utf-8")
             items.append({"path": str(f)})
         manifest = art.stage_task_attachments(drive, "task08", items)
-        assert len(manifest) == 2
+        # Cap = 2 staged entries + one typed over-limit omission (P1 disclosure,
+        # not a silent break).
+        staged = [m for m in manifest if m.get("relpath")]
+        assert len(staged) == 2
+        over = [m for m in manifest if m.get("status") == "skipped_over_limit"]
+        assert len(over) == 1 and over[0]["limit"] == 2
 
     def test_distinct_sources_no_clobber(self, tmp_path):
         from ouroboros.artifacts import stage_task_attachments

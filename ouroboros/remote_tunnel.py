@@ -55,6 +55,7 @@ HEALTH_POLL_INTERVAL_SEC = 5.0
 HEALTH_FAIL_THRESHOLD = 3
 RECONNECT_TOTAL_SEC = 120.0
 RECONNECT_BACKOFF_SEC = (2.0, 5.0, 10.0, 15.0)
+TERMINATE_WAIT_SEC = 5.0  # bounded wait for the ssh child to actually exit
 
 _BASE_SSH_OPTS = [
     "-o", "BatchMode=yes",
@@ -594,14 +595,29 @@ class RemoteTunnelManager:
 
 
 def _terminate_quietly(proc: "subprocess.Popen[Any]") -> None:
+    """Terminate the ssh child and WAIT until it is actually reaped.
+
+    Returning before the child exits would leave a zombie and race the reuse of
+    the (stable) forwarded local port on the next connect/reconnect. So: group
+    TERM, bounded wait, then kill the process tree and wait again.
+    """
     try:
-        terminate_process_tree(proc)
+        terminate_process_tree(proc)  # group SIGTERM (best-effort)
     except Exception:
         pass
-    # Group SIGTERM is best-effort (a reparented/foreign-group child may miss
-    # it); make sure the direct child itself is down before we return.
     try:
-        if proc.poll() is None:
-            proc.kill()
+        proc.wait(timeout=TERMINATE_WAIT_SEC)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        return
+    # Still alive after TERM — force-kill the direct child and reap it.
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=TERMINATE_WAIT_SEC)
     except Exception:
         pass
