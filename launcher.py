@@ -1207,10 +1207,12 @@ def main():
         """Validate a loopback file-bridge URL, returning the resolved full URL.
 
         Shared SSOT for both the download-to-Downloads and open-in-default-app
-        bridge methods so the loopback guard cannot drift between them.
-        Validates against the ACTIVE view port — the local server, or the
-        current tunnel's local port while connected remotely — so remote file
-        downloads target the remote server and never the same-shaped local path.
+        bridge methods so the loopback guard cannot drift between them. Both
+        callers are origin-gated to the LOCAL page, so in practice `active_port`
+        is the local server; validating against the ACTIVE view port is
+        defense-in-depth — if either method were ever reached mid-navigation it
+        still scopes the fetch to the currently-shown loopback server rather
+        than a same-shaped path on a different one.
         """
         import urllib.parse
 

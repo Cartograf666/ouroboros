@@ -47,12 +47,19 @@ def update_remote_connections(profiles: list) -> list:
     try:
         raw: dict = {}
         if config.SETTINGS_PATH.exists():
+            # Refuse rather than clobber: if the file exists but is unreadable/
+            # unparseable, writing only this one key would DESTROY every other
+            # on-disk key (the RMW promises to preserve them). A hand-fixable
+            # partial corruption must survive for the owner to repair.
             try:
                 parsed = json.loads(config.SETTINGS_PATH.read_text(encoding="utf-8"))
-                if isinstance(parsed, dict):
-                    raw = parsed
-            except Exception:
-                pass
+            except Exception as exc:
+                raise RuntimeError(
+                    f"refusing to write remote connections: {config.SETTINGS_PATH} "
+                    f"exists but is not readable/parseable ({exc}); fix it first"
+                ) from exc
+            if isinstance(parsed, dict):
+                raw = parsed
         raw["OUROBOROS_REMOTE_CONNECTIONS"] = normalized
         try:
             tmp = config.SETTINGS_PATH.with_suffix(".tmp")

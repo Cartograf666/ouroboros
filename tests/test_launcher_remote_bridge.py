@@ -18,11 +18,10 @@ from ouroboros.remote_tunnel import is_local_origin
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 # Bridge methods deliberately callable from a REMOTE page: the connection pill
-# needs status + a way home. Everything else in MainApi is origin-gated.
+# needs status + a way home. EVERY other MainApi method — including the host
+# file bridge (download_file_to_downloads/open_file_with_default_app) — is
+# origin-gated, so the untrusted remote page cannot reach a privileged action.
 REMOTE_SAFE_METHODS = {"remote_status", "remote_disconnect"}
-# File-bridge methods use the active-view-port URL validator instead of the
-# origin gate (they must work on the remote page against the remote server).
-ACTIVE_PORT_VALIDATED = {"download_file_to_downloads", "open_file_with_default_app"}
 
 
 @pytest.mark.parametrize(
@@ -70,11 +69,13 @@ def _starts_with_origin_gate(fn: ast.FunctionDef) -> bool:
 def test_every_privileged_main_api_method_is_origin_gated():
     methods = _main_api_methods()
     assert "remote_connect" in methods and "remote_save" in methods  # surface exists
+    # The host file bridge is included here (not exempt): its R1 security gate
+    # must stay pinned so a future refactor cannot silently drop it.
+    assert "download_file_to_downloads" in methods and "open_file_with_default_app" in methods
     ungated = [
         name
         for name, fn in methods.items()
         if name not in REMOTE_SAFE_METHODS
-        and name not in ACTIVE_PORT_VALIDATED
         and not _starts_with_origin_gate(fn)
     ]
     assert ungated == [], (
@@ -93,6 +94,10 @@ def test_remote_safe_methods_are_not_origin_gated():
 
 
 def test_file_bridge_validates_active_view_port():
+    # Defense-in-depth beneath the origin gate: even though the file bridge is
+    # origin-gated to the local page, the URL resolver still scopes the fetch to
+    # the active view port so it can never target a same-shaped path on a
+    # different server if it were ever reached mid-navigation.
     source = (REPO_ROOT / "launcher.py").read_text(encoding="utf-8")
     fn_start = source.index("def _resolve_bridge_file_url")
     fn_body = source[fn_start : source.index("def _unique_bridge_target")]

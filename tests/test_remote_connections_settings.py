@@ -88,6 +88,22 @@ def test_update_remote_connections_locked_rmw_preserves_other_keys(tmp_path, mon
     assert not (tmp_path / "settings.json.lock").exists()
 
 
+def test_update_remote_connections_refuses_to_clobber_corrupt_settings(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.setattr(config, "_SETTINGS_LOCK", tmp_path / "settings.json.lock")
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    # An existing but unparseable file must NOT be silently overwritten with a
+    # single-key doc — that would destroy every other key the owner could fix.
+    (tmp_path / "settings.json").write_text("{ this is not json", encoding="utf-8")
+    import pytest
+
+    with pytest.raises(RuntimeError, match="not readable/parseable"):
+        update_remote_connections([{"id": "x", "ssh_target": "u@h"}])
+    # The corrupt file is left intact for the owner to repair.
+    assert (tmp_path / "settings.json").read_text(encoding="utf-8") == "{ this is not json"
+    assert not (tmp_path / "settings.json.lock").exists()
+
+
 def test_update_remote_connections_creates_settings_file(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")
     monkeypatch.setattr(config, "_SETTINGS_LOCK", tmp_path / "settings.json.lock")
