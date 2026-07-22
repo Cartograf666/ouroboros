@@ -108,6 +108,14 @@ def ensure_state_defaults(st: Dict[str, Any]) -> Dict[str, Any]:
     st.setdefault("evolution_cycle", 0)
     st.setdefault("session_total_snapshot", None)
     st.setdefault("session_spent_snapshot", None)
+    # Drift compares like with like: the OpenRouter-only settled ledger total vs
+    # the queried OpenRouter key's usage. The all-provider spent_usd delta is NOT
+    # comparable once direct-provider lanes (e.g. Anthropic advisory) carry real
+    # spend — that shape kept budget_drift_alert latched at ~88% while nothing
+    # was wrong with the ledger.
+    st.setdefault("session_openrouter_settled_snapshot", None)
+    st.setdefault("session_openrouter_key_fp", "")
+    st.setdefault("openrouter_ledger_settled_usd", None)
     st.setdefault("budget_drift_pct", None)
     st.setdefault("budget_drift_alert", False)
     st.setdefault("evolution_consecutive_failures", 0)
@@ -209,6 +217,10 @@ def init_state() -> Dict[str, Any]:
         st = _load_state_unlocked()
 
         st["session_spent_snapshot"] = float(st.get("spent_usd") or 0.0)
+        or_settled = _openrouter_ledger_settled()
+        st["session_openrouter_settled_snapshot"] = or_settled
+        st["openrouter_ledger_settled_usd"] = or_settled
+        st["session_openrouter_key_fp"] = _openrouter_key_fingerprint()
 
         ground_truth = check_openrouter_ground_truth()
         if ground_truth is not None:
@@ -355,6 +367,38 @@ def reset_per_task_budget(data_root: Any, *, confirm_isolated: bool = False) -> 
     return True
 
 
+def _openrouter_key_fingerprint() -> str:
+    """Non-secret identity of the currently configured OpenRouter key.
+
+    Drift comparison is only meaningful while the ledger baseline and the
+    ``/auth/key`` ground truth describe the SAME key; a settings hot-reload can
+    swap the key mid-session. Returns a short sha256 prefix (never the key)."""
+    import hashlib
+
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return ""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+
+
+def _openrouter_ledger_settled(breakdown: Optional[Dict[str, Any]] = None) -> Optional[float]:
+    """Cumulative settled USD attributed to provider=openrouter in the attempt
+    ledger, or None when the ledger is unavailable. Settled-only on purpose:
+    reservations/unresolved bounds are conservative estimates and would inflate
+    the tracked side of the drift comparison."""
+    try:
+        if breakdown is None:
+            from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown
+
+            ensure_legacy_imported(DRIVE_ROOT)
+            breakdown = usage_breakdown(DRIVE_ROOT)
+        bucket = dict(breakdown.get("by_provider") or {}).get("openrouter") or {}
+        return float(bucket.get("settled_usd") or 0.0)
+    except Exception:
+        log.debug("OpenRouter ledger settled total unavailable", exc_info=True)
+        return None
+
+
 def check_openrouter_ground_truth() -> Optional[Dict[str, float]]:
     """Return OpenRouter total/daily usage, or None on error."""
     try:
@@ -444,6 +488,7 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
         st["spent_tokens_completion"] = _to_int(breakdown.get("completion_tokens"))
         st["spent_tokens_cached"] = _to_int(breakdown.get("cached_tokens"))
         st["usage_accounting"] = projection
+        st["openrouter_ledger_settled_usd"] = _openrouter_ledger_settled(breakdown)
         previous_check_call = _to_int(st.get("openrouter_last_check_call"), -1)
         should_check_ground_truth = bool(
             st["spent_calls"] > 0
@@ -466,14 +511,41 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
                 st["openrouter_daily_usd"] = ground_truth["daily_usd"]
                 st["openrouter_last_check_at"] = utc_now_iso()
 
+                # Drift compares the OpenRouter-only settled ledger delta with the
+                # queried OpenRouter key's usage delta — the only like-for-like
+                # pair. Direct-provider spend (Anthropic/OpenAI/local) is invisible
+                # to /auth/key by construction and must not count as "drift".
                 session_total_snap = st.get("session_total_snapshot")
-                session_spent_snap = st.get("session_spent_snapshot")
+                session_or_settled_snap = st.get("session_openrouter_settled_snapshot")
+                or_ledger_settled = st.get("openrouter_ledger_settled_usd")
+                current_fp = _openrouter_key_fingerprint()
+                baseline_fp = str(st.get("session_openrouter_key_fp") or "")
+                integrity_degraded = bool(breakdown.get("integrity_degraded"))
+                key_changed = bool(current_fp) and bool(baseline_fp) and current_fp != baseline_fp
 
-                if session_total_snap is not None and session_spent_snap is not None:
-                    current_total_usd = ground_truth["total_usd"]
-                    current_spent_usd = _to_float(st.get("spent_usd") or 0.0)
-                    or_delta = current_total_usd - _to_float(session_total_snap)
-                    our_delta = current_spent_usd - _to_float(session_spent_snap)
+                if integrity_degraded:
+                    # A quarantined ledger tail makes the tracked side non-final;
+                    # a confident percentage would be dishonest. Comparison is
+                    # suppressed, not zeroed.
+                    st["budget_drift_pct"] = None
+                    st["budget_drift_alert"] = False
+                elif (
+                    key_changed
+                    or session_total_snap is None
+                    or session_or_settled_snap is None
+                    or or_ledger_settled is None
+                ):
+                    # Rebaseline (key swapped mid-session, or pre-upgrade state
+                    # lacks the OpenRouter-only snapshot) and skip this cycle:
+                    # the old baseline describes a different key/metric.
+                    st["session_total_snapshot"] = ground_truth["total_usd"]
+                    st["session_openrouter_settled_snapshot"] = or_ledger_settled
+                    st["session_openrouter_key_fp"] = current_fp
+                    st["budget_drift_pct"] = None
+                    st["budget_drift_alert"] = False
+                else:
+                    or_delta = ground_truth["total_usd"] - _to_float(session_total_snap)
+                    our_delta = _to_float(or_ledger_settled) - _to_float(session_or_settled_snap)
 
                     if or_delta > 0.001:
                         drift_pct = abs(or_delta - our_delta) / max(abs(or_delta), 0.01) * 100.0
@@ -481,6 +553,9 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
                         abs_diff = abs(or_delta - our_delta)
                         if drift_pct > 50.0 and abs_diff > 5.0:
                             st["budget_drift_alert"] = True
+                            all_provider_delta = _to_float(st.get("spent_usd") or 0.0) - _to_float(
+                                st.get("session_spent_snapshot") or 0.0
+                            )
                             append_jsonl(
                                 DRIVE_ROOT / "logs" / "events.jsonl",
                                 {
@@ -493,8 +568,12 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
                                     "our_delta": round(our_delta, 4),
                                     "or_delta": round(or_delta, 4),
                                     "abs_diff": round(abs_diff, 4),
+                                    "all_provider_delta": round(all_provider_delta, 4),
                                     "spent_calls": st["spent_calls"],
-                                    "note": "High drift expected if OR key is shared or tracking had early bugs",
+                                    "note": (
+                                        "OpenRouter-only ledger delta vs /auth/key usage delta. "
+                                        "High drift usually means a shared OR key or missing ledger rows."
+                                    ),
                                 }
                             )
                         else:
@@ -730,18 +809,27 @@ def status_text(workers_dict: Dict[int, Any], pending_list: list, running_dict: 
 
     drift_pct = st.get("budget_drift_pct")
     if accounting_available and drift_pct is not None:
+        # Same fields as the update_budget computation: OpenRouter-only settled
+        # ledger delta vs the key's usage delta. Rendering the all-provider
+        # spent delta here used to contradict the percentage next to it.
         session_total_snap = st.get("session_total_snapshot")
-        session_spent_snap = st.get("session_spent_snapshot")
+        session_or_settled_snap = st.get("session_openrouter_settled_snapshot")
+        or_ledger_settled = st.get("openrouter_ledger_settled_usd")
         or_total = st.get("openrouter_total_usd")
 
-        if session_total_snap is not None and session_spent_snap is not None and or_total is not None:
+        if (
+            session_total_snap is not None
+            and session_or_settled_snap is not None
+            and or_ledger_settled is not None
+            and or_total is not None
+        ):
             or_delta = or_total - session_total_snap
-            our_delta = spent - session_spent_snap
+            our_delta = float(or_ledger_settled) - float(session_or_settled_snap)
 
             drift_icon = " ⚠️" if st.get("budget_drift_alert") else ""
             lines.append(
                 f"budget_drift: {drift_pct:.1f}%{drift_icon} "
-                f"(tracked: ${our_delta:.2f} vs OpenRouter: ${or_delta:.2f})"
+                f"(openrouter tracked: ${our_delta:.2f} vs OpenRouter key: ${or_delta:.2f})"
             )
 
     models = model_breakdown(st)

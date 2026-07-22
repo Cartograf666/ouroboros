@@ -1066,6 +1066,29 @@ def resolve_shell_cwd(ctx: Any, cwd: str = "", *, operation: Operation = "shell"
     raise ValueError("cwd is outside allowed roots")
 
 
+def canonical_data_root(ctx: Any) -> pathlib.Path:
+    """Canonical (parent/budget) data root for resources that exist only on the
+    real drive — installed skill payloads under ``data/skills/``.
+
+    Live subagents run on an isolated child drive
+    (``data/state/headless_tasks/<tid>/data``) that physically has no
+    ``skills/`` tree, so resolving ``root=skill_payload`` against
+    ``ctx.drive_root`` blinded every read-only scout with a bare
+    "Directory not found" (v6.70.0 granted the read/list/search verbs; this
+    supplies the matching path base). Precedence mirrors the existing
+    canonical-root consumers (``task_pacing``): task_metadata
+    ``budget_drive_root`` → ctx ``budget_drive_root`` → ``drive_root``.
+    For root tasks all three are the same directory, so behavior there is
+    unchanged; isolated benchmark roots keep their own canonical root."""
+    metadata = getattr(ctx, "task_metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    for candidate in (metadata.get("budget_drive_root"), getattr(ctx, "budget_drive_root", "")):
+        text = str(candidate or "").strip()
+        if text:
+            return pathlib.Path(text).resolve(strict=False)
+    return pathlib.Path(getattr(ctx, "drive_root")).resolve(strict=False)
+
+
 def resource_root_path(
     ctx: Any,
     root: ResourceRoot,
@@ -1105,8 +1128,13 @@ def resource_root_path(
         s = str(skill_name or "").strip()
         if not b or not s:
             raise ValueError("root=skill_payload requires bucket and skill_name")
+        # Installed payloads live only on the canonical data root; a subagent's
+        # isolated child drive has no skills/ tree (see canonical_data_root).
+        # Write authority is unaffected: the skill_payload verb matrix already
+        # confines write/edit/review to parent profiles (skill_repair /
+        # self_modification), which run on the canonical drive.
         target = resolve_skill_payload_target(
-            pathlib.Path(getattr(ctx, "drive_root")),
+            canonical_data_root(ctx),
             f"skills/{b}/{s}",
         )
         return target.payload_root

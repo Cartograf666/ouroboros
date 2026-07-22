@@ -1,4 +1,4 @@
-# Ouroboros v6.74.4 — Architecture & Reference
+# Ouroboros v6.74.5 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -436,6 +436,12 @@ from the active `ToolContext` and persisted as `parent_task_id`, `root_task_id`,
 `subagent_envelope`. For workspace/forked children,
 `budget_drive_root` is also the canonical status/result root, so parent tools
 read the same child lifecycle records that the supervisor writes.
+Installed skill payloads exist only on the canonical data root, so the
+`skill_payload` resource root resolves through `canonical_data_root()`
+(`tool_access.py`: task_metadata `budget_drive_root` → ctx `budget_drive_root`
+→ `drive_root`) rather than the child drive — a read-only scout on an isolated
+child drive reads the real payload it was asked to audit, while the verb
+matrix keeps skill-payload writes parent-only (v6.74.5).
 `task_status.py` is the effective-status SSOT for gateway and tool reads: a
 child terminal result overrides a stale parent `requested`/`scheduled`/`running`
 result, while authoritative parent terminal failures/cancellations stay
