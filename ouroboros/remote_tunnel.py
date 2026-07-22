@@ -288,13 +288,26 @@ def _run_ssh(argv: List[str], *, timeout: float) -> "subprocess.CompletedProcess
     )
 
 
-def discover_remote_port(profile: Dict[str, Any], *, ssh_path: str = "ssh") -> int:
-    """Read the remote server_port file over ssh; raise typed TunnelError."""
+def discover_remote_port(
+    profile: Dict[str, Any],
+    *,
+    ssh_path: str = "ssh",
+    runner: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None,
+) -> int:
+    """Read the remote server_port file over ssh; raise typed TunnelError.
+
+    ``runner`` runs one ssh command and returns its CompletedProcess; it
+    defaults to the module ``_run_ssh``. The manager passes its OWN tracked
+    runner so the short-lived discovery ssh is registered under manager custody
+    and can be group-killed by ``force_disconnect`` mid-flight (Emergency Stop:
+    no ssh subprocess may outlive a panic, even one spawned before ``_live``).
+    """
+    run = runner or _run_ssh
     explicit = profile.get("remote_agent_port")
     if explicit:
         return int(explicit)
     try:
-        proc = _run_ssh(
+        proc = run(
             discovery_argv(profile, ssh_path=ssh_path),
             timeout=DISCOVERY_SUBPROCESS_TIMEOUT_SEC,
         )
@@ -320,7 +333,7 @@ def discover_remote_port(profile: Dict[str, Any], *, ssh_path: str = "ssh") -> i
     # Remote command ran but cat failed: the port file is absent.
     state, hint = "port_file_missing", "start it: systemctl --user start ouroboros"
     try:
-        active = _run_ssh(
+        active = run(
             unit_active_argv(profile, ssh_path=ssh_path),
             timeout=DISCOVERY_SUBPROCESS_TIMEOUT_SEC,
         )
@@ -368,6 +381,13 @@ class RemoteTunnelManager:
         self._lock = threading.RLock()
         self._generation = 0
         self._live: Optional[_Live] = None
+        # Every ssh subprocess that is live but NOT yet owned by self._live:
+        # the in-flight discovery `cat` and the tunnel `ssh -N` during its
+        # connect/reconnect health-wait window. force_disconnect() group-kills
+        # this set together with self._live so a panic in that window can never
+        # leave an orphan ssh (Emergency Stop Invariant). Ownership transfers to
+        # self._live atomically under self._lock (see connect/_reconnect_once).
+        self._inflight: "set[subprocess.Popen[Any]]" = set()
         self._status: Dict[str, Any] = {"state": "disconnected"}
         # State-change callbacks run on a dedicated single-consumer thread,
         # NEVER under self._lock: the launcher callback calls webview.load_url,
@@ -390,6 +410,48 @@ class RemoteTunnelManager:
             finally:
                 self._emit_q.task_done()
 
+    # -- in-flight subprocess custody -----------------------------------------
+
+    def _register_inflight(self, proc: "subprocess.Popen[Any]") -> None:
+        with self._lock:
+            self._inflight.add(proc)
+
+    def _unregister_inflight(self, proc: "subprocess.Popen[Any]") -> None:
+        with self._lock:
+            self._inflight.discard(proc)
+
+    def _run_ssh_tracked(
+        self, argv: List[str], *, timeout: float
+    ) -> "subprocess.CompletedProcess[str]":
+        """Run one ssh command under manager custody (see self._inflight).
+
+        Mirrors ``_run_ssh`` semantics (DEVNULL stdin, captured text output,
+        TimeoutExpired on overrun) but via Popen so the child is registered
+        before it runs and force_disconnect can group-kill it mid-flight.
+        """
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **subprocess_new_group_kwargs(),
+        )
+        self._register_inflight(proc)
+        try:
+            try:
+                out, err = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_tree_now(proc)
+                try:
+                    proc.communicate(timeout=2)
+                except Exception:
+                    pass
+                raise
+            return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+        finally:
+            self._unregister_inflight(proc)
+
     # -- public API -----------------------------------------------------------
 
     def status(self) -> Dict[str, Any]:
@@ -409,7 +471,9 @@ class RemoteTunnelManager:
                 profile_name=profile["name"],
             )
         try:
-            remote_port = discover_remote_port(profile, ssh_path=self._ssh_path)
+            remote_port = discover_remote_port(
+                profile, ssh_path=self._ssh_path, runner=self._run_ssh_tracked
+            )
             local_port = pick_local_port()
             live = self._spawn_and_wait(generation, profile, local_port, remote_port)
         except TunnelError as exc:
@@ -426,9 +490,14 @@ class RemoteTunnelManager:
             raise
         with self._lock:
             if generation != self._generation:
+                self._inflight.discard(live.proc)
                 _terminate_quietly(live.proc)
                 raise TunnelError("ssh_failed", "connection superseded")
+            # Ownership transfer under the SAME lock that would satisfy a
+            # force_disconnect: the tunnel proc moves from _inflight to _live
+            # with no gap in which a panic could miss it.
             self._live = live
+            self._inflight.discard(live.proc)
             self._set_status(
                 state="connected",
                 profile_id=profile["id"],
@@ -446,9 +515,14 @@ class RemoteTunnelManager:
         with self._lock:
             self._generation += 1
             live, self._live = self._live, None
+            inflight = list(self._inflight)
+            self._inflight.clear()
             self._set_status(state="disconnected")
-        if live is not None:
-            _terminate_quietly(live.proc)
+        # Bumping the generation makes any in-flight connect abandon its result,
+        # but an ssh already spawned would linger until its own timeout — tear
+        # the current live tunnel AND every in-flight ssh down now (graceful).
+        for proc in _dedupe_procs(live, inflight):
+            _terminate_quietly(proc)
 
     def force_disconnect(self) -> None:
         """Panic path: kill the ssh process TREE immediately, no graceful wait.
@@ -456,15 +530,20 @@ class RemoteTunnelManager:
         The Emergency Stop Invariant forbids any delay in panic teardown, so
         this must NOT use the graceful bounded-wait path (`_terminate_quietly`).
         It group-SIGKILLs the whole ssh tree (catching ProxyJump/ProxyCommand
-        descendants) and returns at once. Safe to call from the launcher's
-        exit-99 branch before os._exit.
+        descendants) and returns at once. Kills BOTH the live tunnel and every
+        in-flight ssh (discovery + a tunnel still in its connect/reconnect
+        health-wait, before _live is assigned) — otherwise a panic mid-connect
+        would leave an orphan ssh. Safe to call from the launcher's exit-99
+        branch before os._exit.
         """
         with self._lock:
             self._generation += 1
             live, self._live = self._live, None
+            inflight = list(self._inflight)
+            self._inflight.clear()
             self._status = {"state": "disconnected"}
-        if live is not None:
-            _kill_tree_now(live.proc)
+        for proc in _dedupe_procs(live, inflight):
+            _kill_tree_now(proc)
 
     # -- internals -------------------------------------------------------------
 
@@ -513,38 +592,55 @@ class RemoteTunnelManager:
                 "custody_failed",
                 f"could not record the ssh tunnel in the process ledger: {exc}",
             ) from exc
-        deadline = time.time() + HEALTH_CONNECT_TIMEOUT_SEC
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                stderr_tail = ""
-                try:
-                    stderr_tail = (proc.stderr.read() or b"").decode(
-                        "utf-8", errors="replace"
-                    ).strip().splitlines()[-1:][0] if proc.stderr else ""
-                except Exception:
-                    pass
-                state = "bind_conflict" if "forwarding" in stderr_tail.lower() else "ssh_failed"
-                raise TunnelError(
-                    state,
-                    f"ssh tunnel exited (code {proc.returncode}): {stderr_tail[:200]}",
-                    hint=(
-                        "run `ssh %s true` once interactively if keys/host "
-                        "verification are not set up yet" % profile["ssh_target"]
-                    ),
-                )
-            if check_health(local_port):
-                return _Live(generation, profile, local_port, remote_port, proc)
+        # Under manager custody from here: force_disconnect can now group-kill
+        # this proc during the health-wait, before it becomes self._live. On any
+        # failure below we terminate AND drop it from _inflight; on success we
+        # keep it registered so the caller transfers ownership to _live under a
+        # single lock hold (no window where a panic could miss it).
+        self._register_inflight(proc)
+        try:
             with self._lock:
                 if generation != self._generation:
                     _terminate_quietly(proc)
                     raise TunnelError("ssh_failed", "connection superseded")
-            time.sleep(0.5)
-        _terminate_quietly(proc)
-        raise TunnelError(
-            "health_timeout",
-            f"tunnel to {profile['ssh_target']} established no healthy "
-            f"/api/health response within {int(HEALTH_CONNECT_TIMEOUT_SEC)}s",
-        )
+            deadline = time.time() + HEALTH_CONNECT_TIMEOUT_SEC
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    stderr_tail = ""
+                    try:
+                        stderr_tail = (proc.stderr.read() or b"").decode(
+                            "utf-8", errors="replace"
+                        ).strip().splitlines()[-1:][0] if proc.stderr else ""
+                    except Exception:
+                        pass
+                    state = "bind_conflict" if "forwarding" in stderr_tail.lower() else "ssh_failed"
+                    raise TunnelError(
+                        state,
+                        f"ssh tunnel exited (code {proc.returncode}): {stderr_tail[:200]}",
+                        hint=(
+                            "run `ssh %s true` once interactively if keys/host "
+                            "verification are not set up yet" % profile["ssh_target"]
+                        ),
+                    )
+                if check_health(local_port):
+                    return _Live(generation, profile, local_port, remote_port, proc)
+                with self._lock:
+                    if generation != self._generation:
+                        _terminate_quietly(proc)
+                        raise TunnelError("ssh_failed", "connection superseded")
+                time.sleep(0.5)
+            _terminate_quietly(proc)
+            raise TunnelError(
+                "health_timeout",
+                f"tunnel to {profile['ssh_target']} established no healthy "
+                f"/api/health response within {int(HEALTH_CONNECT_TIMEOUT_SEC)}s",
+            )
+        except BaseException:
+            # Failure (or supersede): the proc has been terminated above; drop
+            # it from custody. Success returns without entering this handler, so
+            # the proc stays registered for the ownership transfer.
+            self._unregister_inflight(proc)
+            raise
 
     def _supervise(self, generation: int) -> None:
         """Iterative watch→reconnect driver (one daemon thread per connection).
@@ -605,7 +701,9 @@ class RemoteTunnelManager:
                 if generation != self._generation:
                     return False
             try:
-                remote_port = discover_remote_port(profile, ssh_path=self._ssh_path)
+                remote_port = discover_remote_port(
+                    profile, ssh_path=self._ssh_path, runner=self._run_ssh_tracked
+                )
                 new_live = self._spawn_and_wait(
                     generation, profile, live.local_port, remote_port
                 )
@@ -628,9 +726,11 @@ class RemoteTunnelManager:
                 continue
             with self._lock:
                 if generation != self._generation:
+                    self._inflight.discard(new_live.proc)
                     _terminate_quietly(new_live.proc)
                     return False
                 self._live = new_live
+                self._inflight.discard(new_live.proc)
                 self._set_status(
                     state="connected",
                     profile_id=profile["id"],
@@ -653,6 +753,25 @@ class RemoteTunnelManager:
                 hint=getattr(last_error, "hint", ""),
             )
         return False
+
+
+def _dedupe_procs(
+    live: "Optional[_Live]", inflight: "List[subprocess.Popen[Any]]"
+) -> "List[subprocess.Popen[Any]]":
+    """Live tunnel proc + in-flight procs, de-duplicated by identity.
+
+    Ownership transfer removes a proc from _inflight as it becomes _live, so
+    overlap is not expected — but a teardown must never kill the same proc
+    twice, so dedupe defensively (identity, since Popen is unhashable-safe as a
+    set member but we keep it explicit)."""
+    procs: List["subprocess.Popen[Any]"] = []
+    seen: set = set()
+    for proc in ([live.proc] if live is not None else []) + list(inflight):
+        if id(proc) in seen:
+            continue
+        seen.add(id(proc))
+        procs.append(proc)
+    return procs
 
 
 def _kill_tree_now(proc: "subprocess.Popen[Any]") -> None:

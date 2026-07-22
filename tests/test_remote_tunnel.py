@@ -208,7 +208,7 @@ def test_connect_success_and_replace_on_connect(tmp_path, monkeypatch):
     events = []
     mgr = _manager(tmp_path, on_state_change=lambda s: events.append(s["state"]))
     fake = _FakeProc()
-    monkeypatch.setattr(rt, "discover_remote_port", lambda p, ssh_path: 8765)
+    monkeypatch.setattr(rt, "discover_remote_port", lambda p, ssh_path, **_k: 8765)
     monkeypatch.setattr(
         rt.RemoteTunnelManager,
         "_spawn_and_wait",
@@ -240,7 +240,7 @@ def test_connect_success_and_replace_on_connect(tmp_path, monkeypatch):
 def test_connect_failure_sets_typed_error_status(tmp_path, monkeypatch):
     mgr = _manager(tmp_path)
 
-    def _boom(profile, ssh_path):
+    def _boom(profile, ssh_path, **_k):
         raise rt.TunnelError("server_inactive", "down", hint="start it")
 
     monkeypatch.setattr(rt, "discover_remote_port", _boom)
@@ -274,7 +274,7 @@ def test_reconnect_once_gives_up_and_reports(tmp_path, monkeypatch):
     monkeypatch.setattr(rt, "RECONNECT_BACKOFF_SEC", (0.01,))
     monkeypatch.setattr(
         rt, "discover_remote_port",
-        lambda profile, ssh_path: (_ for _ in ()).throw(rt.TunnelError("ssh_failed", "unreachable")),
+        lambda profile, ssh_path, **_k: (_ for _ in ()).throw(rt.TunnelError("ssh_failed", "unreachable")),
     )
     _install_live(mgr, proc=fake)
     assert mgr._reconnect_once(0) is False  # give-up returns False → supervisor stops
@@ -291,7 +291,7 @@ def test_reconnect_once_succeeds_and_reuses_stable_local_port(tmp_path, monkeypa
     browser origin / sessionStorage survives, and returns True to keep watching."""
     events = []
     mgr = _manager(tmp_path, on_state_change=lambda s: events.append(dict(s)))
-    monkeypatch.setattr(rt, "discover_remote_port", lambda profile, ssh_path: 8765)
+    monkeypatch.setattr(rt, "discover_remote_port", lambda profile, ssh_path, **_k: 8765)
     new_proc = _FakeProc()
     monkeypatch.setattr(
         rt.RemoteTunnelManager, "_spawn_and_wait",
@@ -310,7 +310,7 @@ def test_reconnect_once_succeeds_and_reuses_stable_local_port(tmp_path, monkeypa
 
 def test_reconnect_once_repicks_local_port_once_on_bind_conflict(tmp_path, monkeypatch):
     mgr = _manager(tmp_path)
-    monkeypatch.setattr(rt, "discover_remote_port", lambda profile, ssh_path: 8765)
+    monkeypatch.setattr(rt, "discover_remote_port", lambda profile, ssh_path, **_k: 8765)
     picks = iter([50999])
     monkeypatch.setattr(rt, "pick_local_port", lambda: next(picks))
     calls = {"n": 0}
@@ -356,6 +356,57 @@ def test_force_disconnect_does_not_graceful_wait(tmp_path, monkeypatch):
     assert mgr.status()["state"] == "disconnected"
 
 
+def test_force_disconnect_kills_inflight_tunnel_before_live_assigned(tmp_path, monkeypatch):
+    # C1 (round 4 / Emergency Stop): during connect() the tunnel ssh is spawned
+    # and health-waited BEFORE self._live is assigned. A panic in that window
+    # must still group-kill it — an untracked ssh -N would outlive os._exit.
+    mgr = _manager(tmp_path)
+    fake = _FakeProc()
+    killed = []
+    monkeypatch.setattr(rt, "_kill_tree_now", lambda p: (killed.append(p), p.kill()))
+    # Simulate _spawn_and_wait mid-flight: proc registered in custody, _live
+    # still None (exactly the connect() health-wait window).
+    with mgr._lock:
+        mgr._inflight.add(fake)
+    assert mgr._live is None
+    mgr.force_disconnect()
+    assert fake in killed and fake._dead is True
+    assert mgr._inflight == set()  # custody cleared
+    assert mgr.status()["state"] == "disconnected"
+
+
+def test_spawn_and_wait_registers_then_transfers_custody(tmp_path, monkeypatch):
+    # C1: the connect() success path must leave the proc owned by _live and NOT
+    # lingering in _inflight (else force_disconnect would kill it twice / a
+    # stale handle would be group-killed on a later panic).
+    mgr = _manager(tmp_path)
+    fake = _FakeProc()
+    monkeypatch.setattr(rt, "discover_remote_port", lambda p, ssh_path, **_k: 8765)
+
+    def _spawn(self, gen, prof, lp, rp):
+        # Model the real method's custody registration without a real ssh.
+        self._register_inflight(fake)
+        return rt._Live(gen, prof, lp, rp, fake)
+
+    monkeypatch.setattr(rt.RemoteTunnelManager, "_spawn_and_wait", _spawn)
+    monkeypatch.setattr(rt.threading.Thread, "start", lambda self: None)
+    mgr.connect({"id": "a", "name": "prod", "ssh_target": "u@h"})
+    assert mgr._live is not None and mgr._live.proc is fake
+    assert mgr._inflight == set()  # ownership transferred out of _inflight
+
+
+def test_run_ssh_tracked_registers_and_clears_inflight(tmp_path):
+    # C1: the discovery runner registers its short-lived ssh under custody for
+    # the duration of the call, then clears it. A `true` stand-in proves the
+    # set is empty after a normal completion.
+    import shutil
+    true_bin = shutil.which("true") or "/usr/bin/true"
+    mgr = _manager(tmp_path)
+    result = mgr._run_ssh_tracked([true_bin], timeout=10)
+    assert result.returncode == 0
+    assert mgr._inflight == set()
+
+
 def test_terminate_quietly_reaps_child_before_returning(monkeypatch):
     # C5: teardown must not return until the ssh child is terminal, else a
     # zombie lingers and the stable forwarded port can be reused mid-exit.
@@ -385,14 +436,21 @@ def test_reap_orphaned_tunnels_kills_ledgered_leak(tmp_path):
     from ouroboros import process_custody
     from ouroboros.platform_layer import subprocess_new_group_kwargs
 
+    # C4 (round 4): one command list for BOTH the spawn and the custody record,
+    # so the recorded fingerprint is the argv actually launched. record_process
+    # anchors on the LIVE cmdline when available (so this test passed before on
+    # POSIX), but on a platform where the live cmdline is unreadable the fallback
+    # hashes the passed argv — a divergent list there would record a mismatched
+    # fingerprint and skip the kill. Keep them identical.
+    leak_cmd = ["python3", "-c", "import time; time.sleep(30)"]
     proc = sp.Popen(
-        ["python3", "-c", "import time; time.sleep(30)"],
+        leak_cmd,
         stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL,
         **subprocess_new_group_kwargs(),
     )
     try:
         process_custody.record_process(
-            tmp_path, pid=proc.pid, cmd=["python3", "-c", "sleep"],
+            tmp_path, pid=proc.pid, cmd=leak_cmd,
             purpose="remote_ssh_tunnel:leaked", scope="daemon",
         )
         # An unrelated daemon entry must survive the purpose-scoped reap.
