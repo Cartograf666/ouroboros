@@ -46,7 +46,18 @@ _NAME_MAX = 80
 
 DEFAULT_REMOTE_DATA_DIR = "~/Ouroboros/data"
 
-# --- timing/policy constants (module-local; launcher-only surface) ----------
+# --- timing/policy constants -------------------------------------------------
+# DELIBERATE EXCEPTION to the DEVELOPMENT.md "numeric timeouts live in config.py
+# SETTINGS_DEFAULTS with a getter + env registration" rule (owner-approved).
+# That rule governs AGENT-facing / cognitive waits the owner may tune via the
+# settings surface. These are LAUNCHER-ONLY ssh-transport constants: this module
+# is imported solely by launcher.py (an import-boundary test asserts the
+# server/agent runtime never imports it), so they never belong in the
+# agent-readable settings table. They are already CENTRALIZED here as named
+# constants (the rule's actual target is *scattered* magic numbers at call
+# sites, which this is not), and config.py sits at the P7 module-size gate —
+# relocating them would breach that gate. If a deployment ever needs to tune
+# these, promote them to config then.
 
 SSH_CONNECT_TIMEOUT_SEC = 10
 DISCOVERY_SUBPROCESS_TIMEOUT_SEC = 25
