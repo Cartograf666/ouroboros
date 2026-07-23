@@ -137,7 +137,13 @@ def test_server_main_exits_already_running_when_lock_held(monkeypatch):
     import server
     from types import SimpleNamespace
 
-    monkeypatch.setattr(server, "load_settings", lambda: {"OUROBOROS_SERVER_HOST": "127.0.0.1"})
+    # R17C1: load_settings is a MUTATING migration surface — it must NOT be
+    # reached when the lock is already held, or a second server could rewrite
+    # the legitimate owner's settings before discovering the conflict.
+    monkeypatch.setattr(
+        server, "load_settings",
+        lambda: (_ for _ in ()).throw(AssertionError("load_settings reached before lock")),
+    )
     monkeypatch.setattr(server, "parse_server_args", lambda *_a, **_k: SimpleNamespace(host="127.0.0.1", port=8765))
     monkeypatch.setattr(server, "get_network_auth_startup_warning", lambda _host: "")
     monkeypatch.setattr(server, "validate_network_auth_configuration", lambda _host: "")

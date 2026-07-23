@@ -2306,6 +2306,26 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
         pass
 
 def main() -> int:
+    # One server per data dir — acquired FIRST, before load_settings() or any
+    # other data-root access (R17C1). load_settings is a mutating MIGRATION
+    # surface, so a second server sharing the data root must discover the lock
+    # conflict BEFORE it can rewrite settings the legitimate owner controls.
+    # Acquired at the UNIVERSAL startup boundary so every entry path (headless
+    # CLI, launcher-managed server.py, direct source run) is covered, and a
+    # self-reexec that drops the CLOEXEC lock reacquires it here. Held for the
+    # process lifetime (OS-released on death). FAIL CLOSED: acquire_server_pid_
+    # lock returns False on an IO/OS lock error (→ exit 43), and any OTHER
+    # exception propagates rather than being swallowed — the one-server
+    # exclusion must never be silently disabled when its state-integrity
+    # guarantee is unavailable (that would let two servers mutate one data root).
+    if not acquire_server_pid_lock():
+        log.error(
+            "Could not acquire the one-server lock at %s (another server holds it, "
+            "or the lock is unavailable); refusing to start. systemd: "
+            "systemctl --user stop ouroboros.",
+            SERVER_PID_FILE,
+        )
+        return SERVER_ALREADY_RUNNING_EXIT_CODE
     try:
         saved_host = str(load_settings().get("OUROBOROS_SERVER_HOST") or "").strip()
     except Exception:
@@ -2322,23 +2342,6 @@ def main() -> int:
     if auth_error:
         log.error(auth_error)
         return 2
-    # One server per data dir — acquired at the UNIVERSAL startup boundary (not
-    # just the CLI wrapper) so every entry path (headless CLI, launcher-managed
-    # server.py, direct source run) is covered, and a self-reexec that drops the
-    # CLOEXEC lock reacquires it here. Held for the process lifetime (OS-released
-    # on death). FAIL CLOSED: acquire_server_pid_lock already returns False on an
-    # IO/OS lock error (→ exit 43), and any OTHER exception propagates rather
-    # than being swallowed — the one-server exclusion must never be silently
-    # disabled exactly when its state-integrity guarantee is unavailable (that
-    # would let two servers mutate the same data root).
-    if not acquire_server_pid_lock():
-        log.error(
-            "Could not acquire the one-server lock at %s (another server holds it, "
-            "or the lock is unavailable); refusing to start. systemd: "
-            "systemctl --user stop ouroboros.",
-            SERVER_PID_FILE,
-        )
-        return SERVER_ALREADY_RUNNING_EXIT_CODE
     actual_port = find_free_port(args.host, args.port)
     if actual_port != args.port:
         log.info("Port %d busy on %s, using %d instead", args.port, args.host, actual_port)
