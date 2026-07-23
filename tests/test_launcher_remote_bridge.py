@@ -155,6 +155,20 @@ def test_disconnect_tunnel_quietly_handles_absent_and_failing_manager(monkeypatc
     assert calls == [True]
 
 
+def test_on_tunnel_state_guards_navigation_by_generation():
+    # R11C1(b): _on_tunnel_state must reject a navigation whose generation is
+    # stale (a delayed gave_up/reconnected from a superseded connection must not
+    # move the window). Pinned by source: the generation guard precedes any
+    # load_url in the handler.
+    source = (REPO_ROOT / "launcher.py").read_text(encoding="utf-8")
+    start = source.index("def _on_tunnel_state")
+    body = source[start : source.index("global _tunnel_manager", start)]
+    assert "current_generation" in body, "handler must consult the manager generation"
+    assert body.index("current_generation") < body.index("load_url"), (
+        "the stale-generation guard must precede any navigation"
+    )
+
+
 def test_shutdown_paths_tear_down_the_tunnel():
     source = (REPO_ROOT / "launcher.py").read_text(encoding="utf-8")
     closing = source[source.index("def _on_closing") : source.index("window.events.closing")]

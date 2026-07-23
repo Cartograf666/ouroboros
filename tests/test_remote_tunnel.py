@@ -412,6 +412,41 @@ def test_spawn_and_wait_registers_then_transfers_custody(tmp_path, monkeypatch):
     assert mgr._inflight == set()  # ownership transferred out of _inflight
 
 
+def test_run_ssh_tracked_rejects_stale_generation(tmp_path):
+    # R11C1(a): a discovery sub-spawn bound to a stale generation must refuse
+    # BEFORE Popen — so a multi-step discovery (port cat → unit_active fallback)
+    # cannot launch its 2nd ssh after a disconnect bumped the generation and
+    # cleared _inflight, which would leak past a graceful window close.
+    import shutil
+    true_bin = shutil.which("true") or "/usr/bin/true"
+    mgr = _manager(tmp_path)
+    with mgr._lock:
+        mgr._generation = 5
+    with pytest.raises(rt.TunnelError):
+        mgr._run_ssh_tracked([true_bin], timeout=5, generation=4)  # stale → refuse
+    assert mgr._inflight == set()  # nothing spawned, nothing to leak
+    # The current generation still runs (and the generation-bound runner factory
+    # produces a runner that carries it).
+    runner = mgr._generation_runner(5)
+    result = runner([true_bin], timeout=5)
+    assert result.returncode == 0
+    assert mgr._inflight == set()
+
+
+def test_status_payloads_carry_generation_for_navigation_guard(tmp_path, monkeypatch):
+    # R11C1(b): every emitted status carries its generation so the launcher can
+    # reject a superseded navigation; current_generation tracks connect/disconnect.
+    seen = []
+    mgr = _manager(tmp_path, on_state_change=lambda s: seen.append(s.get("_generation")))
+    g0 = mgr.current_generation
+    mgr.disconnect()
+    _drain_events(mgr)
+    assert mgr.current_generation == g0 + 1
+    assert seen and seen[-1] == mgr.current_generation  # payload stamped current
+    # status() itself never leaks the internal token.
+    assert "_generation" not in mgr.status()
+
+
 def test_run_ssh_tracked_registers_and_clears_inflight(tmp_path):
     # C1: the discovery runner registers its short-lived ssh under custody for
     # the duration of the call, then clears it. A `true` stand-in proves the

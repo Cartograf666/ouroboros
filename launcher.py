@@ -324,8 +324,7 @@ def _disconnect_tunnel_quietly() -> None:
 
 
 def _force_disconnect_tunnel() -> None:
-    """Panic-path teardown: immediate SIGKILL of the ssh tree, no graceful wait
-    (Emergency Stop Invariant — panic must not be delayed)."""
+    """Panic teardown: immediate SIGKILL of the ssh tree (Emergency Stop)."""
     manager = _tunnel_manager
     if manager is None:
         return
@@ -336,8 +335,7 @@ def _force_disconnect_tunnel() -> None:
 
 
 def _present_server_conflict_page() -> bool:
-    """Exit-43 owner-visible page: replace the stranded 'Connecting…' view with
-    the recovery commands. Returns True when shown (False → nothing to do)."""
+    """Exit-43 owner-visible page with recovery commands. True when shown."""
     window = _webview_window
     if window is None:
         return False
@@ -348,7 +346,7 @@ def _present_server_conflict_page() -> bool:
         "<p>The desktop server exited (code 43) because a different live server — usually a headless "
         "<code>ouroboros server</code> under systemd — already holds this data dir's lock. Restarting cannot "
         "win that race, so the launcher stopped instead of fighting it.</p>"
-        "<p style='text-align:left'>To use the desktop app on this machine:<br>1. Stop the other server: "
+        "<p style='text-align:left'>To use the desktop app here:<br>1. Stop the other server: "
         "<code>systemctl --user stop ouroboros</code><br>2. Relaunch Ouroboros.</p>"
         "<p>To keep the headless server, connect to it via Settings&nbsp;→&nbsp;Remote from a desktop on "
         "another data dir.</p></div></body></html>"
@@ -1306,14 +1304,18 @@ def main():
     def _on_tunnel_state(status: dict) -> None:
         """Monitor-thread callback: keep the window on a live page.
 
-        - gave_up: reconnect window exhausted — return the owner to the local
-          page (the launcher-owned recovery path that never depends on the
-          remote SPA's code).
-        - reconnected on a NEW local port (stable-port bind was stolen):
-          navigate to the new tunnel origin.
+        gave_up → return to the local page (launcher-owned recovery, never
+        depends on the remote SPA); reconnected on a NEW local port (stable-port
+        bind was stolen) → navigate to the new tunnel origin.
         """
         state = status.get("state")
         try:
+            # R11C1: ignore a NAVIGATION from a superseded generation (a delayed
+            # gave_up/reconnected must not move the window). The pill polls status().
+            mgr = _tunnel_manager
+            gen = status.get("_generation")
+            if mgr is not None and gen is not None and gen != mgr.current_generation:
+                return
             if state == "gave_up":
                 view_state["port"] = actual_port
                 if _webview_window:

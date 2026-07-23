@@ -416,11 +416,21 @@ class RemoteTunnelManager:
         while True:
             payload = self._emit_q.get()
             try:
+                # Every transition is delivered (the pill shows them all); the
+                # payload carries its `_generation` so a NAVIGATION-causing
+                # callback (gave_up → local, reconnected → new port) can be
+                # ignored by the launcher when a newer connect/disconnect has
+                # superseded it (R11C1 — a stale callback must never navigate).
                 self._on_state_change(payload)  # type: ignore[misc]
             except Exception:
                 pass
             finally:
                 self._emit_q.task_done()
+
+    @property
+    def current_generation(self) -> int:
+        with self._lock:
+            return self._generation
 
     # -- in-flight subprocess custody -----------------------------------------
 
@@ -432,20 +442,35 @@ class RemoteTunnelManager:
         with self._lock:
             self._inflight.discard(proc)
 
+    def _generation_runner(self, generation: int) -> Callable[..., "subprocess.CompletedProcess[str]"]:
+        """A discovery runner bound to ``generation`` (every ssh it spawns is
+        generation-checked before Popen)."""
+        def _run(argv: List[str], *, timeout: float) -> "subprocess.CompletedProcess[str]":
+            return self._run_ssh_tracked(argv, timeout=timeout, generation=generation)
+        return _run
+
     def _run_ssh_tracked(
-        self, argv: List[str], *, timeout: float
+        self, argv: List[str], *, timeout: float, generation: Optional[int] = None
     ) -> "subprocess.CompletedProcess[str]":
         """Run one ssh command under manager custody (see self._inflight).
 
         Mirrors ``_run_ssh`` semantics (DEVNULL stdin, captured text output,
         TimeoutExpired on overrun) but via Popen so the child is registered
         before it runs and force_disconnect can group-kill it mid-flight.
+
+        ``generation`` binds the spawn to a connection generation: a stale
+        generation (a disconnect/newer connect happened) refuses BEFORE Popen,
+        so a multi-step discovery (port cat → unit_active fallback) cannot spawn
+        its 2nd ssh after disconnect() already returned and cleared _inflight —
+        which would otherwise leak past a graceful window close (R11C1).
         """
         # Spawn and publish to _inflight atomically under the force_disconnect
         # lock (CR2): a panic cannot land between Popen and registration.
         with self._lock:
             if self._shutdown:
                 raise TunnelError("ssh_failed", "tunnel manager shut down")
+            if generation is not None and generation != self._generation:
+                raise TunnelError("ssh_failed", "connection superseded")
             proc = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,
@@ -473,7 +498,9 @@ class RemoteTunnelManager:
 
     def status(self) -> Dict[str, Any]:
         with self._lock:
-            return dict(self._status)
+            out = dict(self._status)
+        out.pop("_generation", None)  # internal ordering token, not public state
+        return out
 
     def connect(self, profile: Dict[str, Any]) -> Dict[str, Any]:
         """Open a tunnel to ``profile`` (replacing any current connection)."""
@@ -489,7 +516,8 @@ class RemoteTunnelManager:
             )
         try:
             remote_port = discover_remote_port(
-                profile, ssh_path=self._ssh_path, runner=self._run_ssh_tracked
+                profile, ssh_path=self._ssh_path,
+                runner=self._generation_runner(generation),
             )
             local_port = pick_local_port()
             live = self._spawn_and_wait(generation, profile, local_port, remote_port)
@@ -568,6 +596,9 @@ class RemoteTunnelManager:
     def _set_status(self, **status: Any) -> None:
         # Callers hold self._lock; only the assignment happens here. The
         # callback is dispatched off-lock via the notifier thread (see __init__).
+        # Stamp the current generation so the notifier can drop a payload that a
+        # newer disconnect/connect has superseded before it reaches the launcher.
+        status["_generation"] = self._generation
         self._status = status
         if self._on_state_change is not None:
             self._emit_q.put(dict(status))
@@ -726,7 +757,8 @@ class RemoteTunnelManager:
                     return False
             try:
                 remote_port = discover_remote_port(
-                    profile, ssh_path=self._ssh_path, runner=self._run_ssh_tracked
+                    profile, ssh_path=self._ssh_path,
+                    runner=self._generation_runner(generation),
                 )
                 new_live = self._spawn_and_wait(
                     generation, profile, live.local_port, remote_port
