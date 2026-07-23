@@ -19,6 +19,7 @@ Transport contract (owner decisions D5/D9/D10/D21/D22):
 from __future__ import annotations
 
 import dataclasses
+import os
 import pathlib
 import queue
 import re
@@ -411,6 +412,30 @@ class RemoteTunnelManager:
             threading.Thread(
                 target=self._notify_loop, daemon=True, name="remote-tunnel-notify",
             ).start()
+        # No tunnel is live at construction (launcher start): clear any stale
+        # active-tunnel-port registry a crashed predecessor may have left, so the
+        # subagent control-plane deny boundary never over-blocks a random port.
+        self._publish_active_tunnel_port(None)
+
+    def _active_tunnel_port_file(self) -> pathlib.Path:
+        return self._data_dir / "state" / "active_tunnel_port"
+
+    def _publish_active_tunnel_port(self, port: Optional[int]) -> None:
+        """Publish (or clear) the live tunnel's local port for the subagent
+        control-plane deny boundary (R18C1). Best-effort; written atomically and
+        removed on disconnect so a subagent can never reach the remote control
+        plane through the forward, and a stale file can't over-block."""
+        path = self._active_tunnel_port_file()
+        try:
+            if port is None:
+                path.unlink(missing_ok=True)
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+            tmp.write_text(str(int(port)), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass  # best-effort registry; the deny boundary degrades safe
 
     def _notify_loop(self) -> None:
         while True:
@@ -481,16 +506,18 @@ class RemoteTunnelManager:
             )
             self._inflight.add(proc)
         try:
-            try:
-                out, err = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                _kill_tree_now(proc)
-                try:
-                    proc.communicate(timeout=2)
-                except Exception:
-                    pass
-                raise
+            out, err = proc.communicate(timeout=timeout)
             return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+        except BaseException:
+            # ANY failure (TimeoutExpired or an unexpected communicate error):
+            # group-kill and reap before dropping custody, so no live ssh escapes
+            # force_disconnect and no zombie lingers (R18C2).
+            _kill_tree_now(proc)
+            try:
+                proc.communicate(timeout=2)
+            except Exception:
+                pass
+            raise
         finally:
             self._unregister_inflight(proc)
 
@@ -588,6 +615,9 @@ class RemoteTunnelManager:
             inflight = list(self._inflight)
             self._inflight.clear()
             self._status = {"state": "disconnected"}
+        # force_disconnect bypasses _set_status, so clear the port registry here
+        # too — the forward is being killed (R18C1).
+        self._publish_active_tunnel_port(None)
         for proc in _dedupe_procs(live, inflight):
             _kill_tree_now(proc)
 
@@ -600,6 +630,14 @@ class RemoteTunnelManager:
         # newer disconnect/connect has superseded before it reaches the launcher.
         status["_generation"] = self._generation
         self._status = status
+        # Keep the subagent control-plane deny registry in step with the forward
+        # (R18C1): publish the local port only while genuinely connected; clear
+        # it the moment the forward is down (connecting/reconnecting/terminal).
+        state = status.get("state")
+        if state == "connected":
+            self._publish_active_tunnel_port(status.get("local_port"))
+        else:
+            self._publish_active_tunnel_port(None)
         if self._on_state_change is not None:
             self._emit_q.put(dict(status))
 
@@ -653,7 +691,8 @@ class RemoteTunnelManager:
                     scope="daemon",
                 )
             except Exception as exc:
-                _kill_tree_now(proc)
+                # Teardown+reap is centralized in the except BaseException below
+                # (R18C2), so a custody-record failure no longer leaves a zombie.
                 raise TunnelError(
                     "custody_failed",
                     f"could not record the ssh tunnel in the process ledger: {exc}",
@@ -691,9 +730,15 @@ class RemoteTunnelManager:
                 f"/api/health response within {int(HEALTH_CONNECT_TIMEOUT_SEC)}s",
             )
         except BaseException:
-            # Failure (or supersede): the proc has been terminated above; drop
-            # it from custody. Success returns without entering this handler, so
-            # the proc stays registered for the ownership transfer.
+            # ANY failure path (expected supersede/timeout, an UNEXPECTED
+            # health/HTTP exception, or custody-record failure): guarantee the
+            # child is terminal AND reaped before dropping custody, so no live
+            # ssh escapes force_disconnect and no zombie lingers (R18C2). Success
+            # returns above without entering here, keeping the proc registered
+            # for the ownership transfer. _terminate_quietly is idempotent on an
+            # already-dead child (fast no-op wait), so paths that already
+            # terminated pay nothing.
+            _terminate_quietly(proc)
             self._unregister_inflight(proc)
             raise
 

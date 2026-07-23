@@ -375,6 +375,72 @@ def test_force_disconnect_kills_inflight_tunnel_before_live_assigned(tmp_path, m
     assert mgr.status()["state"] == "disconnected"
 
 
+def test_active_tunnel_port_registry_publish_and_clear(tmp_path, monkeypatch):
+    # R18C1: the live tunnel's local port must be published for the subagent
+    # control-plane deny boundary while connected, and cleared when down.
+    mgr = _manager(tmp_path)
+    port_file = tmp_path / "state" / "active_tunnel_port"
+    # Construction clears any stale registry.
+    assert not port_file.exists()
+    # A connected transition publishes the local port...
+    with mgr._lock:
+        mgr._set_status(state="connected", profile_id="a", local_port=51234, remote_port=8765)
+    assert port_file.read_text().strip() == "51234"
+    # ...and a non-connected transition clears it.
+    with mgr._lock:
+        mgr._set_status(state="reconnecting", profile_id="a", local_port=51234)
+    assert not port_file.exists()
+
+
+def test_browser_control_plane_denies_active_tunnel_port(tmp_path, monkeypatch):
+    # R18C1: the browser subagent guard must treat the published tunnel port as a
+    # control-plane port (blocked), exactly like the local server ports.
+    from ouroboros import config
+    import ouroboros.tools.browser as browser
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "active_tunnel_port").write_text("51234", encoding="utf-8")
+    assert 51234 in browser._control_plane_loopback_ports()
+    # Cleared → no longer blocked.
+    (tmp_path / "state" / "active_tunnel_port").unlink()
+    assert 51234 not in browser._control_plane_loopback_ports()
+
+
+def test_run_ssh_tracked_kills_and_unregisters_on_communicate_failure(tmp_path, monkeypatch):
+    # R18C2: a non-timeout communicate() failure must still group-kill + reap the
+    # child and drop it from _inflight — never leave a live ssh invisible to
+    # force_disconnect.
+    mgr = _manager(tmp_path)
+    fake = _FakeProc()
+    fake.communicate = lambda timeout=None: (_ for _ in ()).throw(RuntimeError("comm boom"))
+    monkeypatch.setattr(rt.subprocess, "Popen", lambda *a, **k: fake)
+    killed = []
+    monkeypatch.setattr(rt, "_kill_tree_now", lambda p: (killed.append(p), p.kill()))
+    with pytest.raises(RuntimeError):
+        mgr._run_ssh_tracked(["ssh", "x"], timeout=5)
+    assert fake in killed
+    assert mgr._inflight == set()
+
+
+def test_spawn_and_wait_kills_and_unregisters_on_unexpected_exception(tmp_path, monkeypatch):
+    # R18C2: an UNEXPECTED exception after custody registration (e.g. check_health
+    # raising) must terminate+reap the live child and drop it from _inflight, or
+    # it escapes force_disconnect.
+    mgr = _manager(tmp_path)
+    fake = _FakeProc()
+    monkeypatch.setattr(rt.subprocess, "Popen", lambda *a, **k: fake)
+    monkeypatch.setattr("ouroboros.process_custody.record_process", lambda *a, **k: {})
+    monkeypatch.setattr(rt, "check_health", lambda port, **k: (_ for _ in ()).throw(RuntimeError("health boom")))
+    killed = []
+    monkeypatch.setattr(rt, "_terminate_quietly", lambda p: (killed.append(p), p.kill()))
+    with pytest.raises(RuntimeError):
+        mgr._spawn_and_wait(mgr._generation, {"id": "a", "name": "p", "ssh_target": "u@h"}, 50000, 8765)
+    assert fake in killed
+    assert fake.poll() is not None
+    assert mgr._inflight == set()
+
+
 def test_shutdown_latch_refuses_spawn_after_force_disconnect(tmp_path):
     # CR2 (round 6 / Emergency Stop): once force_disconnect fires (panic), the
     # terminal latch must make any spawn racing it refuse BEFORE Popen — so a

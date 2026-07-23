@@ -48,9 +48,11 @@ own identity, memory, budget, and provider keys; the desktop is a thin client.
   one Ouroboros server per port.
   "Any local process" explicitly includes the desktop's own resident Ouroboros
   agent: while a tunnel is up, the local agent's shell can reach the remote
-  being's API through the forwarded loopback port (the port is ephemeral and
-  not in the subagent browser control-plane blocklist in v1 — a known,
-  disclosed residual; a follow-up may register the active tunnel port there).
+  being's API through the forwarded loopback port. Its SUBAGENTS cannot: the
+  active tunnel port is published to `state/active_tunnel_port` on connect and
+  joins the subagent browser control-plane deny boundary (removed on
+  disconnect), so an acting child is refused the forward exactly as it is
+  refused the local control-plane ports.
 
 ### Install from source (systemd user unit)
 

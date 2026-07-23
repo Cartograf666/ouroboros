@@ -99,6 +99,18 @@ def _control_plane_loopback_ports() -> set[int]:
             ports.add(int(port_text))
     except (OSError, ValueError):
         pass
+    # Remote v1 (R18C1): while a desktop tunnel is up, its loopback forward proxies
+    # the REMOTE Ouroboros control plane — a subagent reaching it would drive
+    # another being's API. The launcher publishes the active tunnel port here on
+    # connect and removes it on disconnect, so this deny boundary covers it too.
+    try:
+        from ouroboros.config import DATA_DIR
+
+        tport = (DATA_DIR / "state" / "active_tunnel_port").read_text(encoding="utf-8").strip()
+        if tport.isdigit():
+            ports.add(int(tport))
+    except (OSError, ValueError):
+        pass
     return ports
 
 
