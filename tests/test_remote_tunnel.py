@@ -87,7 +87,7 @@ def test_discovery_argv_shape():
     assert "BatchMode=yes" in argv and "ControlMaster=no" in argv
     assert "--" in argv  # option/operand separator before the target
     assert argv[argv.index("--") + 1] == "user@host"
-    assert argv[-1] == "cat ~/Ouroboros/data/state/server_port"
+    assert argv[-1] == "cat ~/ouroboros-server/data/state/server_port"
 
 
 def test_tunnel_argv_binds_loopback_explicitly():

@@ -50,7 +50,11 @@ _TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:\[\]%-]{0,255}$")
 _REMOTE_DIR_RE = re.compile(r"^(~/|/)[A-Za-z0-9_./-]{0,511}$")
 _NAME_MAX = 80
 
-DEFAULT_REMOTE_DATA_DIR = "~/Ouroboros/data"
+# Matches the documented headless install layout (docs/DEPLOYMENT.md and the
+# systemd unit's Environment=OUROBOROS_APP_ROOT=%h/ouroboros-server) — NOT the
+# desktop app root (~/Ouroboros). A non-standard install sets the profile's
+# remote_data_dir explicitly.
+DEFAULT_REMOTE_DATA_DIR = "~/ouroboros-server/data"
 
 # --- timing/policy constants -------------------------------------------------
 # DELIBERATE EXCEPTION to the DEVELOPMENT.md "numeric timeouts live in config.py

@@ -141,7 +141,7 @@ export async function initRemoteSection(container) {
             <div class="remote-profile-form form-grid two">
                 <div class="form-field"><label>Name</label><input id="remote-new-name" placeholder="prod box"></div>
                 <div class="form-field"><label>SSH target</label><input id="remote-new-target" placeholder="user@host or ~/.ssh/config alias"></div>
-                <div class="form-field"><label>Remote data dir (optional)</label><input id="remote-new-datadir" placeholder="~/Ouroboros/data"></div>
+                <div class="form-field"><label>Remote data dir (optional)</label><input id="remote-new-datadir" placeholder="~/ouroboros-server/data"></div>
                 <div class="form-field"><label>Remote agent port (optional)</label><input id="remote-new-port" type="number" placeholder="auto-discovered"></div>
             </div>
             <div class="settings-toolbar">

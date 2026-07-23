@@ -176,6 +176,40 @@ def test_launcher_lifecycle_loop_stops_on_already_running_exit():
     # CR1: exit 43 means another LIVE server legitimately owns this data dir —
     # the branch must NOT sweep the port (that would kill the valid owner).
     assert "_kill_stale_runtime_ports" not in body
+    # R7C2: the branch must show the owner an actionable page, not strand the
+    # window on a dead 'Connecting…' view.
+    assert "_present_server_conflict_page()" in body
+
+
+def test_server_conflict_page_is_shown_and_actionable(monkeypatch):
+    # R7C2 behavioral: the conflict presenter replaces the window content with
+    # recovery instructions (load_html), and degrades safely with no window.
+    import launcher
+
+    shown = []
+
+    class _FakeWindow:
+        def load_html(self, html):
+            shown.append(html)
+
+    monkeypatch.setattr(launcher, "_webview_window", _FakeWindow())
+    assert launcher._present_server_conflict_page() is True
+    assert len(shown) == 1
+    page = shown[0]
+    # Actionable content: names the conflict, the stop command, and the remote path.
+    assert "owns this data" in page
+    assert "systemctl --user stop ouroboros" in page
+    assert "Remote" in page
+    # No window (headless/early startup): a safe no-op, not a crash.
+    monkeypatch.setattr(launcher, "_webview_window", None)
+    assert launcher._present_server_conflict_page() is False
+
+    class _Boom:
+        def load_html(self, html):
+            raise RuntimeError("nope")
+
+    monkeypatch.setattr(launcher, "_webview_window", _Boom())
+    assert launcher._present_server_conflict_page() is False  # swallowed, logged
 
 
 def test_systemd_unit_prevents_panic_and_conflict_restarts():
@@ -192,3 +226,9 @@ def test_systemd_unit_prevents_panic_and_conflict_restarts():
     assert str(config.SERVER_ALREADY_RUNNING_EXIT_CODE) in codes
     assert "Restart=on-failure" in text
     assert "--host 127.0.0.1" in text
+    # R7C1: without an explicit app root the server would import code from
+    # ~/ouroboros-server/repo while config paths (data, self-repo git and
+    # self-modification flows) defaulted to ~/Ouroboros/* — a different,
+    # possibly desktop, checkout. The unit must pin the app root to the
+    # documented layout.
+    assert "Environment=OUROBOROS_APP_ROOT=%h/ouroboros-server" in text

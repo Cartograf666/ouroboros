@@ -177,6 +177,37 @@ def test_update_remote_connections_refuses_outside_launcher_process(tmp_path, mo
     assert not (tmp_path / "settings.json").exists()
 
 
+def test_generic_saves_never_clobber_concurrent_profile_write(tmp_path, monkeypatch):
+    """R7 scope advisory: a generic settings save carries a profile list loaded
+    BEFORE the settings lock; if the launcher writes profiles in between, the
+    save must carry the DISK value (re-read under the lock), not the stale one.
+    Covers both writers: gateway._owner_write_settings and config.save_settings."""
+    from ouroboros.gateway.settings import _owner_write_settings
+
+    monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.setattr(config, "_SETTINGS_LOCK", tmp_path / "settings.json.lock")
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    fresh = [{"id": "fresh", "ssh_target": "owner@new"}]
+    stale = [{"id": "stale", "ssh_target": "old@old"}]
+    # Disk state = the launcher's just-landed write.
+    (tmp_path / "settings.json").write_text(
+        json.dumps({_KEY: fresh, "TOTAL_BUDGET": 1.0}), encoding="utf-8"
+    )
+    # A generic save arrives carrying the pre-lock (stale) list.
+    _owner_write_settings({_KEY: stale, "TOTAL_BUDGET": 2.0})
+    on_disk = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
+    assert on_disk[_KEY] == fresh  # launcher write preserved
+    assert on_disk["TOTAL_BUDGET"] == 2.0  # the generic save itself landed
+    # Same guarantee through config.save_settings.
+    (tmp_path / "settings.json").write_text(
+        json.dumps({_KEY: fresh, "TOTAL_BUDGET": 3.0}), encoding="utf-8"
+    )
+    config.save_settings({_KEY: stale, "TOTAL_BUDGET": 4.0})
+    on_disk = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
+    assert on_disk[_KEY] == fresh
+    assert on_disk["TOTAL_BUDGET"] == 4.0
+
+
 def test_env_allowlist_never_propagates_remote_connections(monkeypatch):
     monkeypatch.delenv(_KEY, raising=False)
     config.apply_settings_to_env({_KEY: [{"id": "a"}], "OUROBOROS_MODEL": "m"})

@@ -39,6 +39,29 @@ def _launcher_process_holds_authority() -> bool:
     return platform_layer.pid_lock_held()
 
 
+def preserve_disk_remote_connections(settings: dict) -> dict:
+    """Carry the CURRENT on-disk profile list into a generic settings write.
+
+    Caller MUST hold the settings lock. Every generic save writes a full dict
+    loaded BEFORE the lock, so a launcher profile write landing in between
+    would be clobbered by the stale list riding along. The server never
+    legitimately changes OUROBOROS_REMOTE_CONNECTIONS (merge-skipped, no HTTP
+    surface), so at write time the disk value is authoritative. Unreadable
+    file → leave the dict as-is (the generic save overwrites wholesale anyway,
+    matching its pre-existing corrupt-file behavior).
+    """
+    from ouroboros import config
+
+    key = "OUROBOROS_REMOTE_CONNECTIONS"
+    try:
+        parsed = json.loads(config.SETTINGS_PATH.read_text(encoding="utf-8"))
+        if isinstance(parsed, dict) and key in parsed:
+            settings[key] = parsed[key]
+    except (OSError, ValueError):
+        pass
+    return settings
+
+
 def get_remote_connections() -> list:
     from ouroboros import config
 

@@ -25,6 +25,12 @@ StartLimitBurst=6
 [Service]
 Type=simple
 WorkingDirectory=%h/ouroboros-server/repo
+# App root MUST match the documented layout: without it config.py defaults to
+# ~/Ouroboros (the desktop install location), so the server would import code
+# from ~/ouroboros-server/repo while its data dir, self-repo git/governance and
+# self-modification flows all address a DIFFERENT (possibly desktop) checkout.
+# With this line: REPO_DIR=%h/ouroboros-server/repo, DATA_DIR=%h/ouroboros-server/data.
+Environment=OUROBOROS_APP_ROOT=%h/ouroboros-server
 ExecStart=%h/ouroboros-server/.venv/bin/python -m ouroboros.cli server --host 127.0.0.1 --port 8765
 Restart=on-failure
 RestartSec=5

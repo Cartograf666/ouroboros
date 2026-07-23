@@ -876,7 +876,15 @@ Before every commit, verify the following:
   progress-aware waiting tunes the *passive* wait, it does not remove the watchdog.
 - [ ] New numeric timeout constants are an SSOT in `config.py` `SETTINGS_DEFAULTS`
   with a getter and env registration; do not scatter magic wait numbers across
-  call sites.
+  call sites. Narrow recorded exception (2026-07-24, owner decision, Remote
+  Connection v1): the launcher-only ssh-tunnel supervision timings live
+  module-local in `ouroboros/remote_tunnel.py` (grouped at the top, one place —
+  not scattered across call sites). Rationale: they are process-internal
+  frozen-shell launcher mechanics, deliberately NOT owner-tunable settings (no
+  env/setting should let a self-change soften panic teardown or reconnect
+  bounds), and the module is import-isolated from server/agent code, whereas
+  `config.py` sits at its P7 size gate. Any future owner-tunable timeout still
+  follows the SSOT rule above.
 
 #### Loop / State-Machine Changes
 - [ ] Changes to `loop.py` or other task state-machine logic include adversarial tests for malformed output, false-completion prevention, replay/log durability, and failure modes — not just the happy path.

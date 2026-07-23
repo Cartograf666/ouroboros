@@ -1392,6 +1392,13 @@ def save_settings(
                 f"OUROBOROS_RUNTIME_MODE elevation refused: "
                 f"{baseline_mode!r} -> {new_mode!r}.{hint}"
             )
+        # Under the lock: the profile list riding in ``settings`` was loaded
+        # BEFORE the lock — carry the on-disk value instead, so a concurrent
+        # launcher profile write is never clobbered (generic saves never
+        # legitimately change OUROBOROS_REMOTE_CONNECTIONS).
+        from ouroboros.remote_support import preserve_disk_remote_connections
+
+        settings = preserve_disk_remote_connections(dict(settings))
         try:
             tmp = SETTINGS_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")

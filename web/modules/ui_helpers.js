@@ -121,18 +121,26 @@ function _bridgeRefusedOrigin(result) {
 
 export async function openViaHostBridge(url, filename = 'file') {
     const api = window.pywebview?.api;
-    // True web / non-desktop OR a remote-origin refusal: open in a new tab. This
-    // never navigates the app itself; the browser previews or downloads per its
-    // own handling. (In the desktop WKWebView on the LOCAL page the bridge below
-    // is used instead; window.open is only the last-resort/web path.)
+    // True web / non-desktop (no bridge at all): open in a new tab. This never
+    // navigates the app itself; the browser previews or downloads per its own
+    // handling.
     const browserFallback = () => {
         window.open(url, '_blank', 'noopener');
         return { ok: true, native: false };
     };
+    // Remote-origin refusal WITH a live bridge = the desktop WKWebView showing
+    // a REMOTE page. There window.open is a silent no-op that would report
+    // {ok:true} while doing nothing — degrade to the blob download instead
+    // (downloadViaHostBridge handles its own origin refusal by downloading
+    // in-page), so "Open" visibly delivers the file.
+    const refusedFallback = async () => {
+        const result = await downloadViaHostBridge(url, filename);
+        return { ...result, opened: false, downloaded: true };
+    };
     const openBridge = api?.open_file_with_default_app;
     if (openBridge) {
         const result = await openBridge(url, filename);
-        if (_bridgeRefusedOrigin(result)) return browserFallback();
+        if (_bridgeRefusedOrigin(result)) return refusedFallback();
         if (!result?.ok) throw new Error(result?.error || 'open failed');
         return { ...result, native: true };
     }
@@ -146,7 +154,7 @@ export async function openViaHostBridge(url, filename = 'file') {
     const downloadBridge = api?.download_file_to_downloads;
     if (downloadBridge) {
         const result = await downloadBridge(url, filename, true);
-        if (_bridgeRefusedOrigin(result)) return browserFallback();
+        if (_bridgeRefusedOrigin(result)) return refusedFallback();
         if (!result?.ok) throw new Error(result?.error || 'open failed');
         return { ...result, native: true };
     }

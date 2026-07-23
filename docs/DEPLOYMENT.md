@@ -41,6 +41,11 @@ own identity, memory, budget, and provider keys; the desktop is a thin client.
   client, so any local process on the server (and any local process on your
   desktop while a tunnel is up) can reach the full API. Use a server account
   and a desktop you trust; do not run this on a shared multi-user host.
+  "Any local process" explicitly includes the desktop's own resident Ouroboros
+  agent: while a tunnel is up, the local agent's shell can reach the remote
+  being's API through the forwarded loopback port (the port is ephemeral and
+  not in the subagent browser control-plane blocklist in v1 — a known,
+  disclosed residual; a follow-up may register the active tunnel port there).
 
 ### Install from source (systemd user unit)
 
@@ -57,8 +62,13 @@ systemctl --user enable --now ouroboros
 loginctl enable-linger "$USER"     # keep it running across logout / before login
 ```
 
-The unit runs `python -m ouroboros.cli server --host 127.0.0.1 --port 8765`.
-Adjust `ExecStart`/`WorkingDirectory` in the unit if you installed elsewhere —
+The unit runs `python -m ouroboros.cli server --host 127.0.0.1 --port 8765`
+with `Environment=OUROBOROS_APP_ROOT=%h/ouroboros-server`, so the server's
+repo AND data live together under `~/ouroboros-server/` (`repo/`, `data/`) —
+without that line the code would run from `~/ouroboros-server/repo` while
+data/self-repo paths defaulted to `~/Ouroboros/*` (the desktop location).
+Adjust `ExecStart`/`WorkingDirectory`/`Environment` together if you installed
+elsewhere (and set the profile's *Remote data dir* on the desktop to match) —
 a systemd user manager has no shell `PATH` or activated venv, so both must be
 absolute. `Restart=on-failure` covers crashes and the self-restart exit code
 42; `RestartPreventExitStatus=99 43` guarantees a panic stop stays stopped

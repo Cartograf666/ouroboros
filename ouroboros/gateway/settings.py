@@ -371,7 +371,17 @@ def _owner_write_settings(
     _config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     fd = _config._acquire_settings_lock()
     try:
-        atomic_write_json(_config.SETTINGS_PATH, dict(settings), trailing_newline=False)
+        # Under the lock: re-read the on-disk remote-connection profiles so a
+        # launcher profile write landing between this handler's load and this
+        # write is never clobbered by the stale list riding in ``settings``
+        # (generic saves never legitimately change that key).
+        from ouroboros.remote_support import preserve_disk_remote_connections
+
+        atomic_write_json(
+            _config.SETTINGS_PATH,
+            preserve_disk_remote_connections(dict(settings)),
+            trailing_newline=False,
+        )
     finally:
         _config._release_settings_lock(fd)
 

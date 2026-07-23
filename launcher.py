@@ -335,6 +335,39 @@ def _force_disconnect_tunnel() -> None:
         log.debug("tunnel force-disconnect failed", exc_info=True)
 
 
+def _present_server_conflict_page() -> bool:
+    """Owner-visible terminal state for exit 43 (another server owns the data
+    dir): replace the stranded 'Connecting…' page with a plain explanation and
+    the exact recovery commands, instead of leaving a dead window. Returns True
+    when the page was actually shown (False → caller logs; nothing else to do).
+    """
+    window = _webview_window
+    if window is None:
+        return False
+    html = (
+        "<html><body style='background:#1a1a2e;color:white;font-family:system-ui;"
+        "display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>"
+        "<div style='max-width:560px;text-align:center'>"
+        "<h2>Another Ouroboros server owns this data directory</h2>"
+        "<p>The desktop server exited (code 43) because a different live server "
+        "— usually a headless <code>ouroboros server</code> under systemd — "
+        "already holds this data dir's lock. Restarting cannot win that race, "
+        "so the launcher stopped instead of fighting it.</p>"
+        "<p style='text-align:left'>To use the desktop app on this machine:<br>"
+        "1. Stop the other server: <code>systemctl --user stop ouroboros</code><br>"
+        "2. Relaunch Ouroboros.</p>"
+        "<p>To keep the headless server, connect to it via "
+        "Settings&nbsp;→&nbsp;Remote from a desktop on another data dir.</p>"
+        "</div></body></html>"
+    )
+    try:
+        window.load_html(html)
+        return True
+    except Exception:
+        log.warning("could not present the server-conflict page", exc_info=True)
+        return False
+
+
 def _server_process_identity_matches(record: dict) -> bool:
     try:
         pid = int(record.get("pid") or 0)
@@ -755,7 +788,9 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
             )
             # Do NOT sweep the port here: exit 43 means a DIFFERENT live server
             # legitimately owns this data dir, and the stale-port sweep would
-            # kill that valid owner (CR1). Just stop restarting.
+            # kill that valid owner (CR1). Show the owner an actionable page in
+            # the window (R7C2 — no stranded 'Connecting…'), then stop.
+            _present_server_conflict_page()
             break
 
         time.sleep(2)
