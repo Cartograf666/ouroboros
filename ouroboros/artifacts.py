@@ -149,29 +149,38 @@ def stage_task_attachments(
                 "limit": _MAX_STAGED_ATTACHMENTS,
             })
             break
+        # Sanitized display label, available to EVERY disclosure branch (drop
+        # control chars + collapse whitespace + bound, so a crafted filename
+        # cannot inject prompt lines). P1/P2 (R12C3): NO rejection branch drops
+        # an input silently — each emits a typed, non-sensitive omission entry.
+        _raw_path = str(item.get("path") or "")
+        _raw_label = str(item.get("label") or "").strip() or pathlib.Path(_raw_path).name
+        label = " ".join("".join(c for c in _raw_label if c.isprintable()).split())[:120] or "attachment"
         try:
             source = pathlib.Path(item["path"]).expanduser().resolve(strict=False)
             if not source.is_file():
-                # Typed disclosure instead of a silent drop (remote v1): a
-                # path-based attachment whose source does not exist on THIS
-                # machine must surface in the manifest so the task prompt can
-                # say so honestly. Secret/oversize skips keep their existing
-                # policy (deliberate confidentiality/bound behavior).
-                _raw_label = str(item.get("label") or "").strip() or source.name
-                label = " ".join(
-                    "".join(c for c in _raw_label if c.isprintable()).split()
-                )[:120] or "attachment"
+                # Path-based attachment whose source does not exist on THIS
+                # machine (remote v1) — disclose, never a fake read_file line.
                 manifest.append({"label": label, "status": "skipped_missing"})
                 continue
             if _is_secret_source(source):
+                # Confidentiality: never stage a secret-looking source, but DO
+                # disclose that one was withheld (the label only, no content).
                 log.info("stage_task_attachments: skipped secret source %s", source.name)
+                manifest.append({"label": label, "status": "skipped_secret"})
                 continue
             try:
                 src_size = source.stat().st_size
-                if src_size > _MAX_STAGED_ATTACHMENT_BYTES:
-                    log.info("stage_task_attachments: skipped oversized source %s", source.name)
-                    continue
             except OSError:
+                manifest.append({"label": label, "status": "skipped_unreadable"})
+                continue
+            if src_size > _MAX_STAGED_ATTACHMENT_BYTES:
+                log.info("stage_task_attachments: skipped oversized source %s", source.name)
+                manifest.append({
+                    "label": label,
+                    "status": "skipped_oversize",
+                    "limit_bytes": _MAX_STAGED_ATTACHMENT_BYTES,
+                })
                 continue
             # Aggregate bound (P1 disclosure, not a silent drop): if this file
             # would push the task's total staged bytes over the shared cap, skip
@@ -202,11 +211,6 @@ def stage_task_attachments(
             if dest.resolve(strict=False) != source.resolve(strict=False):
                 shutil.copy2(source, dest)
             mime = mimetypes.guess_type(str(dest))[0] or "application/octet-stream"
-            # Sanitize the label rendered verbatim into the [ATTACHMENTS] manifest line / image
-            # caption: drop control chars + collapse whitespace (incl. newlines) + bound, so a
-            # crafted filename cannot inject extra prompt lines or break the rendered read_file line.
-            _raw_label = str(item.get("label") or "").strip() or source.name
-            label = " ".join("".join(c for c in _raw_label if c.isprintable()).split())[:120] or "attachment"
             manifest.append({
                 "label": label,
                 "root": "artifact_store",
@@ -224,7 +228,10 @@ def stage_task_attachments(
             staged += 1
             total_bytes += src_size
         except Exception:
+            # P1 (R12C3): even an unexpected stat/copy failure is disclosed, not
+            # silently dropped — the task must know an input did not make it.
             log.debug("stage_task_attachments: skipped a file on error", exc_info=True)
+            manifest.append({"label": label, "status": "skipped_error"})
             continue
     return manifest
 

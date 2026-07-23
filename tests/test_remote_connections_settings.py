@@ -24,23 +24,24 @@ _KEY = "OUROBOROS_REMOTE_CONNECTIONS"
 
 
 @pytest.fixture()
-def _launcher_identity(tmp_path):
+def _launcher_identity(tmp_path, monkeypatch):
     """Grant this test process the launcher's OS-anchored write authority.
 
     update_remote_connections refuses outside the desktop launcher process
-    (CR3: authority = holding the launcher's exclusive PID lock,
-    platform_layer.pid_lock_held). Tests that exercise the writer simulate the
-    launcher the REAL way — acquiring the global pid lock on an isolated path —
-    and release it afterwards so other tests see a non-launcher process.
+    (CR3/R12C1: authority = holding the exclusive PID lock ON THE CANONICAL
+    config.PID_FILE, platform_layer.pid_lock_held(PID_FILE)). Tests simulate the
+    launcher the REAL way — point PID_FILE at an isolated path and acquire the
+    global lock on THAT exact path — then release it afterwards.
     """
-    from ouroboros import platform_layer
+    from ouroboros import config, platform_layer
 
-    lock_path = str(tmp_path / "ouroboros.pid")
-    assert platform_layer.pid_lock_acquire(lock_path)
+    pid_file = tmp_path / "ouroboros.pid"
+    monkeypatch.setattr(config, "PID_FILE", pid_file)
+    assert platform_layer.pid_lock_acquire(str(pid_file))
     try:
         yield
     finally:
-        platform_layer.pid_lock_release(lock_path)
+        platform_layer.pid_lock_release(str(pid_file))
 
 
 def test_coercion_accepts_list_of_dicts_and_json_string():
@@ -164,15 +165,27 @@ def test_update_remote_connections_refuses_outside_launcher_process(tmp_path, mo
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     # This test process does not hold the global pid lock (agent topology).
     monkeypatch.setattr(platform_layer, "_lock_fd", None)
+    monkeypatch.setattr(platform_layer, "_lock_path", "")
+    pid_file = tmp_path / "ouroboros.pid"
+    monkeypatch.setattr(config, "PID_FILE", pid_file)
     with pytest.raises(RuntimeError, match="owner-only"):
         update_remote_connections([{"id": "x", "ssh_target": "u@h"}])
     # Forged pid-file content must NOT grant authority (the lock, not the file
     # content, is the identity).
-    pid_file = tmp_path / "ouroboros.pid"
     pid_file.write_text(str(os.getpid()), encoding="utf-8")
-    monkeypatch.setattr(config, "PID_FILE", pid_file)
     with pytest.raises(RuntimeError, match="owner-only"):
         update_remote_connections([{"id": "x", "ssh_target": "u@h"}])
+    # R12C1: holding the lock on an ARBITRARY OTHER path must NOT grant authority
+    # — a worker could pid_lock_acquire('/tmp/x') otherwise. Authority requires
+    # the lock be held on the CANONICAL PID_FILE (which the launcher holds
+    # exclusively, so a child can never acquire it).
+    other = tmp_path / "not-the-pid-file.lock"
+    assert platform_layer.pid_lock_acquire(str(other))
+    try:
+        with pytest.raises(RuntimeError, match="owner-only"):
+            update_remote_connections([{"id": "x", "ssh_target": "u@h"}])
+    finally:
+        platform_layer.pid_lock_release(str(other))
     # Nothing was written in any refusal path.
     assert not (tmp_path / "settings.json").exists()
 
@@ -206,6 +219,29 @@ def test_generic_saves_never_clobber_concurrent_profile_write(tmp_path, monkeypa
     on_disk = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
     assert on_disk[_KEY] == fresh
     assert on_disk["TOTAL_BUDGET"] == 4.0
+
+
+def test_generic_save_cannot_seed_profiles_when_disk_lacks_key(tmp_path, monkeypatch):
+    """R12C2: on a fresh/upgraded install whose settings lack the profile key, a
+    non-launcher generic save must NOT be able to seed profiles — the caller's
+    value is discarded and the empty default written, so update_remote_connections
+    (launcher-gated) stays the ONLY writer that can set profiles."""
+    from ouroboros.gateway.settings import _owner_write_settings
+
+    monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.setattr(config, "_SETTINGS_LOCK", tmp_path / "settings.json.lock")
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    # Disk has NO remote-connections key (fresh install); NOT the launcher.
+    (tmp_path / "settings.json").write_text(json.dumps({"TOTAL_BUDGET": 1.0}), encoding="utf-8")
+    evil = [{"id": "evil", "ssh_target": "attacker@evil"}]
+    _owner_write_settings({_KEY: evil, "TOTAL_BUDGET": 2.0})
+    on_disk = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
+    assert on_disk[_KEY] == []  # seeded value discarded → empty default
+    assert on_disk["TOTAL_BUDGET"] == 2.0
+    # Same guarantee through config.save_settings.
+    config.save_settings({_KEY: evil, "TOTAL_BUDGET": 3.0})
+    on_disk = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
+    assert on_disk[_KEY] == []
 
 
 def test_env_allowlist_never_propagates_remote_connections(monkeypatch):

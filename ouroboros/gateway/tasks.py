@@ -830,6 +830,24 @@ def _render_attachment_lines(attachments: Any) -> str:
                 f"per-task total attachment size limit (~{_mb} MB) was reached"
             )
             continue
+        if status == "skipped_oversize":
+            _mb = int(item.get("limit_bytes") or 0) // (1024 * 1024)
+            lines.append(
+                f"- {label or 'attachment'}: NOT STAGED - exceeds the "
+                f"{_mb} MB per-file limit"
+            )
+            continue
+        if status == "skipped_secret":
+            lines.append(
+                f"- {label or 'attachment'}: NOT STAGED - withheld by secret-file policy"
+            )
+            continue
+        if status == "skipped_unreadable":
+            lines.append(f"- {label or 'attachment'}: NOT STAGED - could not be read")
+            continue
+        if status == "skipped_error":
+            lines.append(f"- {label or 'attachment'}: NOT STAGED - staging failed")
+            continue
         if not relpath:
             continue
         kind = "image" if item.get("is_image") else (str(item.get("mime") or "").strip() or "file")

@@ -34,31 +34,39 @@ def _launcher_process_holds_authority() -> bool:
     still bypass Python and write settings.json raw; closing that class needs
     OS-level user separation, out of v1 scope.
     """
-    from ouroboros import platform_layer
+    from ouroboros import config, platform_layer
 
-    return platform_layer.pid_lock_held()
+    # Require the lock be held on the CANONICAL PID_FILE — not any writable path
+    # a worker could lock to forge the identity (R12C1).
+    return platform_layer.pid_lock_held(str(config.PID_FILE))
 
 
 def preserve_disk_remote_connections(settings: dict) -> dict:
-    """Carry the CURRENT on-disk profile list into a generic settings write.
+    """Force the profile key in a generic settings write to the on-disk value
+    (or the empty default when absent) — NEVER the caller's value.
 
-    Caller MUST hold the settings lock. Every generic save writes a full dict
-    loaded BEFORE the lock, so a launcher profile write landing in between
-    would be clobbered by the stale list riding along. The server never
-    legitimately changes OUROBOROS_REMOTE_CONNECTIONS (merge-skipped, no HTTP
-    surface), so at write time the disk value is authoritative. Unreadable
-    file → leave the dict as-is (the generic save overwrites wholesale anyway,
-    matching its pre-existing corrupt-file behavior).
+    Caller MUST hold the settings lock. Two guarantees:
+      * a launcher profile write landing between a generic caller's load and its
+        write is never clobbered by the stale list riding along; and
+      * a generic writer can never SEED profiles — R12C1/R12C2: if the caller
+        supplied a value and the disk lacks the key (fresh/upgraded install),
+        keeping the caller's value would let any save_settings/_owner_write
+        caller bypass update_remote_connections's launcher-only gate. So the
+        caller's value is ALWAYS discarded; only update_remote_connections (the
+        launcher-gated writer, which does not pass through here) sets profiles.
+    Unreadable/corrupt disk → empty default (fail toward no-injection).
     """
     from ouroboros import config
 
     key = "OUROBOROS_REMOTE_CONNECTIONS"
+    on_disk: list = []
     try:
         parsed = json.loads(config.SETTINGS_PATH.read_text(encoding="utf-8"))
         if isinstance(parsed, dict) and key in parsed:
-            settings[key] = parsed[key]
+            on_disk = config._coerce_setting_value(key, parsed[key])
     except (OSError, ValueError):
         pass
+    settings[key] = on_disk
     return settings
 
 

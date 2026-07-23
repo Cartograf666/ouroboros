@@ -299,6 +299,10 @@ def _hidden_run(command: list[str], **kwargs):
 
 # PID file locking.
 _lock_fd: Any = None
+# Canonical filesystem path of the currently-held process-global PID lock, so
+# authority checks can require the lock be held on a SPECIFIC path (not any
+# writable file). Set on acquire, cleared on release.
+_lock_path: str = ""
 
 
 def pid_flock_open(path: str) -> Any:
@@ -365,31 +369,48 @@ def pid_flock_close(path: str, fd_obj: Any, *, remove: bool = False) -> None:
             pass
 
 
+def _resolve_lock_path(path: str) -> str:
+    try:
+        return str(pathlib.Path(path).expanduser().resolve(strict=False))
+    except Exception:
+        return str(path)
+
+
 def pid_lock_acquire(path: str) -> bool:
     """Acquire the process-global exclusive PID lock."""
-    global _lock_fd
+    global _lock_fd, _lock_path
     fd_obj = pid_flock_open(path)
     if fd_obj is None:
         return False
     _lock_fd = fd_obj
+    _lock_path = _resolve_lock_path(path)
     return True
 
 
-def pid_lock_held() -> bool:
+def pid_lock_held(expected_path: str = "") -> bool:
     """True while THIS process holds the process-global exclusive PID lock.
 
-    Only the desktop launcher acquires that lock (launcher.py::main), so this
-    doubles as an OS-anchored "am I the launcher process?" predicate: the flock
-    is exclusive while the launcher lives, so no agent/server/worker child can
-    acquire it to mint the identity, and child processes start with a fresh
-    module state (subprocess, not fork) so they never inherit a truthy slot.
+    ``expected_path`` (when given) REQUIRES the held lock to be on that exact
+    canonical path — not merely any writable file. This is the load-bearing
+    check for launcher authority (remote v1): without it a worker/tool could
+    ``pid_lock_acquire('/tmp/anything')`` to flip ``_lock_fd`` truthy and mint
+    the launcher identity (R12C1). Requiring the canonical PID_FILE closes that:
+    the launcher holds it EXCLUSIVELY (advisory flock), so a child that tries to
+    acquire the SAME path fails and cannot forge the identity. Children also
+    start with fresh module state (subprocess, not fork), never inheriting a
+    truthy slot.
     """
-    return _lock_fd is not None
+    if _lock_fd is None:
+        return False
+    if expected_path and _lock_path != _resolve_lock_path(expected_path):
+        return False
+    return True
 
 
 def pid_lock_release(path: str) -> None:
     """Release the process-global PID lock (historical: unlink on release)."""
-    global _lock_fd
+    global _lock_fd, _lock_path
+    _lock_path = ""
     pid_flock_close(path, _lock_fd, remove=True)
     _lock_fd = None
 
