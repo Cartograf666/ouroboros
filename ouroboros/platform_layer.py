@@ -408,10 +408,20 @@ def pid_lock_held(expected_path: str = "") -> bool:
 
 
 def pid_lock_release(path: str) -> None:
-    """Release the process-global PID lock (historical: unlink on release)."""
+    """Release the process-global PID lock — PERSISTENT lock file (remove=False).
+
+    Do NOT unlink on release (R14C1): unlink-after-unlock is a race — a second
+    launcher can acquire the existing inode between our unlock and unlink, then
+    our unlink drops the live path and a third launcher locks a fresh inode, so
+    two live launchers both satisfy pid_lock_held(PID_FILE). Since remote v1
+    makes that lock load-bearing authorization (remote_support._launcher_process
+    _holds_authority), two authorities could both mutate owner-only profiles.
+    The persistent-file discipline (same as SERVER_PID_FILE) keeps exactly one
+    inode: a successor reacquires the flock on the SAME path.
+    """
     global _lock_fd, _lock_path
     _lock_path = ""
-    pid_flock_close(path, _lock_fd, remove=True)
+    pid_flock_close(path, _lock_fd, remove=False)
     _lock_fd = None
 
 

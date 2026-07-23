@@ -155,6 +155,31 @@ def test_already_running_exit_code_is_distinct():
     }
 
 
+def test_launcher_pid_lock_release_is_persistent_no_unlink_race(tmp_path):
+    # R14C1: the launcher PID lock is now load-bearing authorization (remote v1),
+    # so pid_lock_release must NOT unlink (unlink-after-unlock lets a successor
+    # take the same inode, then our unlink drops the live path and a third holder
+    # locks a FRESH inode → two live "authorities"). Persistent-file discipline:
+    # release keeps the SAME inode, a successor reacquires the flock on it.
+    import os as _os
+
+    from ouroboros import platform_layer
+
+    path = str(tmp_path / "ouroboros.pid")
+    assert platform_layer.pid_lock_acquire(path) is True
+    inode_held = _os.stat(path).st_ino
+    platform_layer.pid_lock_release(path)
+    # File PERSISTS after release (not unlinked) with the SAME inode.
+    assert _os.path.exists(path), "release must not unlink the load-bearing lock file"
+    assert _os.stat(path).st_ino == inode_held, "a new inode would allow a second authority"
+    # A successor reacquires the flock on that same inode; while held it is
+    # exclusive (a second handle cannot lock it).
+    assert platform_layer.pid_lock_acquire(path) is True
+    assert _os.stat(path).st_ino == inode_held
+    assert pid_flock_open(path) is None  # still exclusive on the SAME file
+    platform_layer.pid_lock_release(path)
+
+
 def test_launcher_lifecycle_loop_stops_on_already_running_exit():
     # A2 (R3 round-5): server.main() now acquires the one-server lock at the
     # universal boundary, so a launcher-managed server can return exit 43 when a
