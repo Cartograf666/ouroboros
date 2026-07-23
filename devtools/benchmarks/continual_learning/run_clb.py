@@ -215,6 +215,11 @@ def _sanitized_child_env(run_dir: pathlib.Path, settings: dict, args: argparse.N
         # forward-channel for a patched adapter on the docker path.
         "OUROBOROS_SAFETY_MODE": str(settings.get("OUROBOROS_SAFETY_MODE") or "light"),
         "OUROBOROS_REVIEW_ENFORCEMENT": str(settings.get("OUROBOROS_REVIEW_ENFORCEMENT") or "blocking"),
+        # Operator patch 2026-07-23: forward review MODE (not just enforcement) and
+        # subagent depth so a submittable "review required" / no-swarm run is achievable
+        # from the launcher instead of silently living on defaults (auto / depth 2).
+        "OUROBOROS_TASK_REVIEW_MODE": str(settings.get("OUROBOROS_TASK_REVIEW_MODE") or "auto"),
+        "OUROBOROS_MAX_SUBAGENT_DEPTH": str(settings.get("OUROBOROS_MAX_SUBAGENT_DEPTH") or 2),
         "CLBENCH_SOLVE_DISABLED_TOOLS": ",".join(settings.get("CLBENCH_SOLVE_DISABLED_TOOLS") or []),
     })
     if args.or_provider:

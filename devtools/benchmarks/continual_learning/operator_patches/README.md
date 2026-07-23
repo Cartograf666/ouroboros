@@ -59,3 +59,15 @@ itself) is the supported path for v6.56.0 bridge runs.
    `completed`/`degraded` outcomes before reading cost fields
    (`task_cost_finalized` is never emitted for failed/cancelled — those read
    immediately). Apply with `patch -p0` from the external checkout root.
+
+## Addendum (v6.74.5, 2026-07-23)
+
+7. `clb_disabled_tools_env.v6745.patch` — make `DISABLED_TOOLS` read from the
+   `CLBENCH_SOLVE_DISABLED_TOOLS` env var (forwarded by `run_clb.py`) instead of
+   a hardcoded `[]`. Lets a submittable no-swarm run disable `schedule_subagent`
+   from the launcher. Apply with `patch -p0` from the external checkout root
+   (after `clb_acceptance_claims.v674.patch`; different hunk, no conflict).
+8. Launcher change (no patch file — `run_clb.py` is our own code): `_sanitized_child_env`
+   now also forwards `OUROBOROS_TASK_REVIEW_MODE` and `OUROBOROS_MAX_SUBAGENT_DEPTH`
+   so a "review required" / bounded-depth submittable run is configurable from the
+   launcher instead of silently defaulting to auto / depth 2.
