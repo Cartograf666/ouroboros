@@ -393,6 +393,11 @@ class RemoteTunnelManager:
         # leave an orphan ssh (Emergency Stop Invariant). Ownership transfers to
         # self._live atomically under self._lock (see connect/_reconnect_once).
         self._inflight: "set[subprocess.Popen[Any]]" = set()
+        # Procs currently in GRACEFUL teardown (_terminate_quietly can wait
+        # seconds). They are removed from _live/_inflight before that wait, so a
+        # concurrent panic would otherwise miss them — force_disconnect also
+        # group-kills this set so no terminating ssh survives os._exit (R19C1).
+        self._terminating: "set[subprocess.Popen[Any]]" = set()
         # Terminal panic latch: set ONCE by force_disconnect (never cleared —
         # panic is followed by os._exit). Every spawn publishes its Popen to
         # _inflight UNDER self._lock and refuses if the latch is set, so a spawn
@@ -589,12 +594,19 @@ class RemoteTunnelManager:
             live, self._live = self._live, None
             inflight = list(self._inflight)
             self._inflight.clear()
+            # Move to _terminating UNDER the same lock, before releasing it, so
+            # there is no window where these procs are in no tracked set.
+            self._terminating.update(p for p in _dedupe_procs(live, inflight))
             self._set_status(state="disconnected")
         # Bumping the generation makes any in-flight connect abandon its result,
         # but an ssh already spawned would linger until its own timeout — tear
         # the current live tunnel AND every in-flight ssh down now (graceful).
         for proc in _dedupe_procs(live, inflight):
-            _terminate_quietly(proc)
+            try:
+                _terminate_quietly(proc)
+            finally:
+                with self._lock:
+                    self._terminating.discard(proc)
 
     def force_disconnect(self) -> None:
         """Panic path: kill the ssh process TREE immediately, no graceful wait.
@@ -602,11 +614,13 @@ class RemoteTunnelManager:
         The Emergency Stop Invariant forbids any delay in panic teardown, so
         this must NOT use the graceful bounded-wait path (`_terminate_quietly`).
         It group-SIGKILLs the whole ssh tree (catching ProxyJump/ProxyCommand
-        descendants) and returns at once. Kills BOTH the live tunnel and every
-        in-flight ssh (discovery + a tunnel still in its connect/reconnect
-        health-wait, before _live is assigned) — otherwise a panic mid-connect
-        would leave an orphan ssh. Safe to call from the launcher's exit-99
-        branch before os._exit.
+        descendants) and returns at once. Kills the live tunnel, every in-flight
+        ssh (discovery + a tunnel in its connect/reconnect health-wait, before
+        _live is assigned), AND every proc mid graceful teardown (_terminating —
+        a concurrent disconnect that already removed them from _live/_inflight
+        but is still waiting on TERM, R19C1) — otherwise a panic could leave an
+        orphan ssh. Safe to call from the launcher's exit-99 branch before
+        os._exit.
         """
         with self._lock:
             self._shutdown = True  # terminal: no further spawn may proceed
@@ -614,11 +628,13 @@ class RemoteTunnelManager:
             live, self._live = self._live, None
             inflight = list(self._inflight)
             self._inflight.clear()
+            terminating = list(self._terminating)
+            self._terminating.clear()
             self._status = {"state": "disconnected"}
         # force_disconnect bypasses _set_status, so clear the port registry here
         # too — the forward is being killed (R18C1).
         self._publish_active_tunnel_port(None)
-        for proc in _dedupe_procs(live, inflight):
+        for proc in _dedupe_procs(live, inflight + terminating):
             _kill_tree_now(proc)
 
     # -- internals -------------------------------------------------------------

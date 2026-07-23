@@ -47,12 +47,18 @@ own identity, memory, budget, and provider keys; the desktop is a thin client.
   port at startup and would kill a headless server squatting it. One machine =
   one Ouroboros server per port.
   "Any local process" explicitly includes the desktop's own resident Ouroboros
-  agent: while a tunnel is up, the local agent's shell can reach the remote
-  being's API through the forwarded loopback port. Its SUBAGENTS cannot: the
+  agent: while a tunnel is up, the local agent — and, like for the LOCAL
+  control-plane ports (8765/8766/8767), any shell-capable child it spawns
+  (`run_command`) — can reach the remote being's API through the forwarded
+  loopback port. That is the same single-tenant trust posture as the rest of
+  this section (the workspace is not a network sandbox). The ONE deterministic
+  boundary that IS extended to the tunnel: subagent BROWSER navigation. The
   active tunnel port is published to `state/active_tunnel_port` on connect and
-  joins the subagent browser control-plane deny boundary (removed on
-  disconnect), so an acting child is refused the forward exactly as it is
-  refused the local control-plane ports.
+  joins `browser._control_plane_loopback_ports` (removed on disconnect), so a
+  subagent's browser tool is refused the forward exactly as it is refused the
+  local control-plane ports — no more, no less. Shell isolation for children is
+  out of scope (and would need OS-level sandboxing, not a command-text
+  heuristic).
 
 ### Install from source (systemd user unit)
 

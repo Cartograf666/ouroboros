@@ -356,6 +356,42 @@ def test_force_disconnect_does_not_graceful_wait(tmp_path, monkeypatch):
     assert mgr.status()["state"] == "disconnected"
 
 
+def test_force_disconnect_kills_procs_mid_graceful_teardown(tmp_path, monkeypatch):
+    # R19C1 (Emergency Stop): a proc that disconnect() has removed from _live/
+    # _inflight but is still in its graceful TERM wait must remain killable by a
+    # concurrent panic. Model it directly: a proc sitting in _terminating must be
+    # group-killed by force_disconnect.
+    mgr = _manager(tmp_path)
+    fake = _FakeProc()
+    killed = []
+    monkeypatch.setattr(rt, "_kill_tree_now", lambda p: (killed.append(p), p.kill()))
+    with mgr._lock:
+        mgr._terminating.add(fake)  # disconnect() moved it here, still waiting on TERM
+    assert mgr._live is None and mgr._inflight == set()
+    mgr.force_disconnect()
+    assert fake in killed and fake._dead is True
+    assert mgr._terminating == set()
+
+
+def test_disconnect_holds_procs_in_terminating_during_teardown(tmp_path, monkeypatch):
+    # R19C1: while disconnect() is inside _terminate_quietly, the proc must be
+    # visible in _terminating (so a concurrent force_disconnect can still see it).
+    mgr = _manager(tmp_path)
+    fake = _FakeProc()
+    _install_live(mgr, proc=fake)
+    seen = {}
+    real = rt._terminate_quietly
+
+    def _probe(p):
+        seen["in_terminating_during_wait"] = p in mgr._terminating
+        return real(p)
+
+    monkeypatch.setattr(rt, "_terminate_quietly", _probe)
+    mgr.disconnect()
+    assert seen.get("in_terminating_during_wait") is True
+    assert mgr._terminating == set()  # cleared after teardown
+
+
 def test_force_disconnect_kills_inflight_tunnel_before_live_assigned(tmp_path, monkeypatch):
     # C1 (round 4 / Emergency Stop): during connect() the tunnel ssh is spawned
     # and health-waited BEFORE self._live is assigned. A panic in that window

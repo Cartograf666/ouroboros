@@ -655,6 +655,8 @@ finalization states.
 │   │   ├── usage_attempts.quarantine.jsonl ← Loud quarantine evidence for a proven corrupt final ledger row; the validated prefix remains readable
 │   │   ├── usage_import_watermark.json ← Resumable/idempotent legacy-import watermark plus source hashes and archive reference
 │   │   ├── server_port ← Active HTTP port used by the launcher/browser handoff
+│   │   ├── server.pid ← (remote v1, `config.SERVER_PID_FILE`) Data-scoped one-server flock: exactly one `ouroboros server` per data dir; conflict → exit 43. Persistent lock file (never unlinked on release — race-free reacquire)
+│   │   ├── active_tunnel_port ← (remote v1) The desktop tunnel's live loopback forward port, written by the launcher tunnel manager on connect and removed on disconnect. Consumed by `browser._control_plane_loopback_ports` so a subagent's browser tool cannot navigate the forward to the REMOTE control plane (parity with the local control-plane ports). SAFETY-RELEVANT: create-on-connect / remove-on-disconnect / cleared at launcher start
 │   │   ├── server_process.json ← Launcher-owned server PID/process-group identity record for relaunch cleanup
 │   │   ├── advisory_review.json ← Durable advisory/review ledger (runs, attempts, obligations, commit-readiness debts)
 │   │   ├── deep_self_review_context.json ← Last deep self-review Generated Deep Self-Review Atlas manifest and model metadata
