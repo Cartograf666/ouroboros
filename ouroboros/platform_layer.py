@@ -375,6 +375,18 @@ def pid_lock_acquire(path: str) -> bool:
     return True
 
 
+def pid_lock_held() -> bool:
+    """True while THIS process holds the process-global exclusive PID lock.
+
+    Only the desktop launcher acquires that lock (launcher.py::main), so this
+    doubles as an OS-anchored "am I the launcher process?" predicate: the flock
+    is exclusive while the launcher lives, so no agent/server/worker child can
+    acquire it to mint the identity, and child processes start with a fresh
+    module state (subprocess, not fork) so they never inherit a truthy slot.
+    """
+    return _lock_fd is not None
+
+
 def pid_lock_release(path: str) -> None:
     """Release the process-global PID lock (historical: unlink on release)."""
     global _lock_fd

@@ -1884,6 +1884,21 @@ separate design on top of `workspace_executor.py`, not this feature.)
   single-lock read-modify-write) called from the launcher bridge. There is no
   HTTP mutation endpoint. Rationale: the self-modifying agent must never be able
   to repoint the owner's window at a foreign host (BIBLE P3 owner control).
+  The writer itself is STRUCTURALLY launcher-only
+  (`remote_support._launcher_process_holds_authority`): it refuses unless THIS
+  process holds the launcher's exclusive `PID_FILE` lock
+  (`platform_layer.pid_lock_held`; only launcher.py::main acquires that lock).
+  The identity cannot be minted from agent code: while the launcher lives the
+  OS lock is exclusive, and `run_command`/`run_script` interpreters are fresh
+  child subprocesses (no inherited lock state) — so a direct in-process call
+  to the writer refuses no matter how the function name was reached. It is
+  deliberately NOT a pid-file CONTENT check (an advisory lock does not prevent
+  writes, so content is forgeable; and Windows `LockFileEx` blocks re-reading
+  the held file). The shell-text detector
+  (`registry._detect_remote_connections_self_change`) is defense-in-depth, not
+  the wall. Residual limit, stated honestly: same-user arbitrary code can
+  still bypass Python and write `settings.json` raw; closing that class needs
+  OS-level user separation, out of v1 scope.
 - Server lock: `DATA_DIR/state/server.pid` (`config.SERVER_PID_FILE`), distinct
   from the launcher's app-root `ouroboros.pid`, so `ouroboros server` enforces
   one instance per data dir. Conflict exits `SERVER_ALREADY_RUNNING_EXIT_CODE`

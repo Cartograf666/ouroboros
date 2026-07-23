@@ -8,8 +8,10 @@ written only through the locked read-modify-write helper.
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import patch
 
+import pytest
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
@@ -19,6 +21,26 @@ from ouroboros.config import _coerce_setting_value, update_remote_connections
 from ouroboros.gateway.settings import _merge_settings_payload
 
 _KEY = "OUROBOROS_REMOTE_CONNECTIONS"
+
+
+@pytest.fixture()
+def _launcher_identity(tmp_path):
+    """Grant this test process the launcher's OS-anchored write authority.
+
+    update_remote_connections refuses outside the desktop launcher process
+    (CR3: authority = holding the launcher's exclusive PID lock,
+    platform_layer.pid_lock_held). Tests that exercise the writer simulate the
+    launcher the REAL way — acquiring the global pid lock on an isolated path —
+    and release it afterwards so other tests see a non-launcher process.
+    """
+    from ouroboros import platform_layer
+
+    lock_path = str(tmp_path / "ouroboros.pid")
+    assert platform_layer.pid_lock_acquire(lock_path)
+    try:
+        yield
+    finally:
+        platform_layer.pid_lock_release(lock_path)
 
 
 def test_coercion_accepts_list_of_dicts_and_json_string():
@@ -67,7 +89,7 @@ def test_settings_get_omits_remote_connections(tmp_path, monkeypatch):
     assert _KEY not in payload
 
 
-def test_update_remote_connections_locked_rmw_preserves_other_keys(tmp_path, monkeypatch):
+def test_update_remote_connections_locked_rmw_preserves_other_keys(tmp_path, monkeypatch, _launcher_identity):
     monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")
     monkeypatch.setattr(config, "_SETTINGS_LOCK", tmp_path / "settings.json.lock")
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
@@ -88,8 +110,7 @@ def test_update_remote_connections_locked_rmw_preserves_other_keys(tmp_path, mon
     assert not (tmp_path / "settings.json.lock").exists()
 
 
-def test_update_remote_connections_preserves_0600_permissions(tmp_path, monkeypatch):
-    import os
+def test_update_remote_connections_preserves_0600_permissions(tmp_path, monkeypatch, _launcher_identity):
     import stat
 
     monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")
@@ -107,15 +128,13 @@ def test_update_remote_connections_preserves_0600_permissions(tmp_path, monkeypa
     assert on_disk[_KEY] == [{"id": "a", "ssh_target": "u@h"}]
 
 
-def test_update_remote_connections_refuses_to_clobber_corrupt_settings(tmp_path, monkeypatch):
+def test_update_remote_connections_refuses_to_clobber_corrupt_settings(tmp_path, monkeypatch, _launcher_identity):
     monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")
     monkeypatch.setattr(config, "_SETTINGS_LOCK", tmp_path / "settings.json.lock")
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     # An existing but unparseable file must NOT be silently overwritten with a
     # single-key doc — that would destroy every other key the owner could fix.
     (tmp_path / "settings.json").write_text("{ this is not json", encoding="utf-8")
-    import pytest
-
     with pytest.raises(RuntimeError, match="not readable/parseable"):
         update_remote_connections([{"id": "x", "ssh_target": "u@h"}])
     # The corrupt file is left intact for the owner to repair.
@@ -123,7 +142,7 @@ def test_update_remote_connections_refuses_to_clobber_corrupt_settings(tmp_path,
     assert not (tmp_path / "settings.json.lock").exists()
 
 
-def test_update_remote_connections_creates_settings_file(tmp_path, monkeypatch):
+def test_update_remote_connections_creates_settings_file(tmp_path, monkeypatch, _launcher_identity):
     monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")
     monkeypatch.setattr(config, "_SETTINGS_LOCK", tmp_path / "settings.json.lock")
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
@@ -131,9 +150,34 @@ def test_update_remote_connections_creates_settings_file(tmp_path, monkeypatch):
     assert json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))[_KEY] == written
 
 
-def test_env_allowlist_never_propagates_remote_connections(monkeypatch):
-    import os
+def test_update_remote_connections_refuses_outside_launcher_process(tmp_path, monkeypatch):
+    """CR3 (D13 structural): the writer must refuse in any process that does NOT
+    hold the launcher's exclusive PID lock — an agent run_command/run_script
+    interpreter calling it directly (however the function name was reached)
+    hits this wall, not just the shell-text detector. Forging is out of reach:
+    while the launcher lives its flock is exclusive, and pid-file CONTENT is
+    deliberately not consulted (an advisory lock does not stop writes)."""
+    from ouroboros import platform_layer
 
+    monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.setattr(config, "_SETTINGS_LOCK", tmp_path / "settings.json.lock")
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    # This test process does not hold the global pid lock (agent topology).
+    monkeypatch.setattr(platform_layer, "_lock_fd", None)
+    with pytest.raises(RuntimeError, match="owner-only"):
+        update_remote_connections([{"id": "x", "ssh_target": "u@h"}])
+    # Forged pid-file content must NOT grant authority (the lock, not the file
+    # content, is the identity).
+    pid_file = tmp_path / "ouroboros.pid"
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    monkeypatch.setattr(config, "PID_FILE", pid_file)
+    with pytest.raises(RuntimeError, match="owner-only"):
+        update_remote_connections([{"id": "x", "ssh_target": "u@h"}])
+    # Nothing was written in any refusal path.
+    assert not (tmp_path / "settings.json").exists()
+
+
+def test_env_allowlist_never_propagates_remote_connections(monkeypatch):
     monkeypatch.delenv(_KEY, raising=False)
     config.apply_settings_to_env({_KEY: [{"id": "a"}], "OUROBOROS_MODEL": "m"})
     assert _KEY not in os.environ

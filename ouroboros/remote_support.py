@@ -16,6 +16,29 @@ from typing import Any
 REMOTE_CONNECTIONS_MAX = 32
 
 
+def _launcher_process_holds_authority() -> bool:
+    """True only inside the desktop launcher process (OS-anchored identity).
+
+    Authority = THIS process holds the launcher's exclusive ``PID_FILE`` flock
+    (``platform_layer.pid_lock_held``; only launcher.py::main acquires it).
+    That identity cannot be minted from agent code: while the launcher lives
+    the OS lock is exclusive, so a ``run_command``/``run_script`` interpreter
+    (a separate child process) can neither acquire it nor inherit it (children
+    are fresh subprocesses, not forks of the launcher). This makes D13
+    structural — a direct in-process call to the writer refuses regardless of
+    how the function name was reached; the string detector in tools/registry
+    stays as defense-in-depth. Deliberately NOT a pid-file CONTENT check: the
+    advisory lock does not prevent writes, so file content is forgeable — and
+    on Windows re-reading a LockFileEx-held file from a second handle fails.
+    Residual limit (documented in ARCHITECTURE): same-user arbitrary code can
+    still bypass Python and write settings.json raw; closing that class needs
+    OS-level user separation, out of v1 scope.
+    """
+    from ouroboros import platform_layer
+
+    return platform_layer.pid_lock_held()
+
+
 def get_remote_connections() -> list:
     from ouroboros import config
 
@@ -39,6 +62,14 @@ def update_remote_connections(profiles: list) -> list:
     """
     from ouroboros import config
 
+    if not _launcher_process_holds_authority():
+        raise RuntimeError(
+            "OUROBOROS_REMOTE_CONNECTIONS is owner-only: update_remote_connections "
+            "runs only inside the desktop launcher process (whose pid holds "
+            f"{config.PID_FILE}). Agent, server and worker processes must not "
+            "modify remote connection profiles — the owner manages them in "
+            "Settings → Remote."
+        )
     normalized = config._coerce_setting_value("OUROBOROS_REMOTE_CONNECTIONS", profiles)
     config._guard_live_settings_write()
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
