@@ -4,6 +4,16 @@ How Ouroboros runs Terminal-Bench 2.1 (harbor) and what a published number means
 Companion to `README.md` (mechanics) — this file is the disclosure/validity SSOT
 for TB runs, in the same spirit as `../swe_bench_pro/METHODOLOGY.md`.
 
+## CLEAN SEED PRECONDITION (MANDATORY)
+
+**A SUBMITTABLE TB RUN MUST START FROM A CLEAN SEED WORKTREE:
+`git status --porcelain` EMPTY, `git describe --dirty` WITHOUT A `-dirty`
+SUFFIX. A DIRTY SEED POISONS THE RUN MANIFEST (`...-dirty`), MAKES PROVENANCE
+NON-REPRODUCIBLE, AND DISQUALIFIES THE RUN FROM LEADERBOARD SUBMISSION.
+COMMIT ADAPTER EDITS (WIP COMMIT RECORDED IN RUN NOTES IS FINE) AND REMOVE
+STRAY FILES BEFORE LAUNCH; IF DIRT IS FOUND AFTER LAUNCH, ESCALATE TO THE
+OWNER IMMEDIATELY.**
+
 ## Protocol
 
 - Official harbor harness and task images; `run_tb.py` launches the installed

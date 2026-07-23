@@ -1095,6 +1095,14 @@ PY
                 self.task_timeout_sec = probed
         if self.task_timeout_sec is None:
             self.task_timeout_sec = self._resolve_task_timeout_from_dataset(context)
+        instruction = (
+            instruction
+            + "\n\nIMPORTANT - integrity: do not fetch this benchmark's task "
+            "definitions, solutions, tests, or reference materials from source "
+            "repositories or mirrors on the internet. Solve the task using the "
+            "environment you are given; downloading general-purpose software or "
+            "data that the task itself requires is fine."
+        )
         (self.logs_dir / "instruction.txt").write_text(instruction, encoding="utf-8")
         await environment.upload_file(self.logs_dir / "instruction.txt", "/logs/agent/instruction.txt")
 
