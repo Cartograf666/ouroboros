@@ -312,6 +312,28 @@ def test_render_attachment_lines_discloses_over_limit(tmp_path):
     assert "NOT STAGED" in rendered and "limit" in rendered and "read_file" not in rendered
 
 
+def test_missing_secret_shaped_source_disclosed_generically(tmp_path):
+    # R16C1: a MISSING secret-shaped path (e.g. ~/.ssh/id_rsa, credentials.json)
+    # must disclose generically — echoing the basename would leak the secret
+    # filename into the prompt, breaking the secret-silence contract.
+    from ouroboros.artifacts import stage_task_attachments
+    from ouroboros.gateway.tasks import _render_attachment_lines
+
+    for secret_path in (str(tmp_path / ".ssh" / "id_rsa"), str(tmp_path / "credentials.json")):
+        manifest = stage_task_attachments(
+            tmp_path / "drive", "task-secret-missing", [{"path": secret_path}]
+        )
+        assert [m.get("status") for m in manifest] == ["skipped_missing"]
+        label = manifest[0]["label"]
+        assert "id_rsa" not in label and "credentials" not in label
+        assert label == "a withheld attachment"
+        rendered = _render_attachment_lines(manifest)
+        assert "id_rsa" not in rendered and "credentials" not in rendered
+    # A missing NON-secret path still discloses its name (unchanged).
+    m2 = stage_task_attachments(tmp_path / "drive2", "t", [{"path": str(tmp_path / "report.pdf")}])
+    assert m2[0]["label"] == "report.pdf"
+
+
 def test_stage_task_attachments_skips_malformed_entries(tmp_path):
     # R15C2: a malformed attachment entry (string/None) must be skipped, not
     # abort the whole batch — a valid entry after it still stages.

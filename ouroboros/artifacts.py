@@ -170,7 +170,14 @@ def stage_task_attachments(
             if not source.is_file():
                 # Path-based attachment whose source does not exist on THIS
                 # machine (remote v1) — disclose, never a fake read_file line.
-                manifest.append({"label": label, "status": "skipped_missing"})
+                # BUT if the (missing) path is secret-SHAPED (~/.ssh/id_rsa,
+                # credentials.json), surface a GENERIC omission — echoing the
+                # basename would leak the secret filename into the prompt,
+                # contradicting the secret-silence contract (R16C1).
+                if _is_secret_source(source):
+                    manifest.append({"label": "a withheld attachment", "status": "skipped_missing"})
+                else:
+                    manifest.append({"label": label, "status": "skipped_missing"})
                 continue
             if _is_secret_source(source):
                 log.info("stage_task_attachments: skipped secret source %s", source.name)
