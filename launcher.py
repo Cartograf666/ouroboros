@@ -307,6 +307,9 @@ _agent_job: Optional[object] = None
 _agent_lock = threading.Lock()
 _shutdown_event = threading.Event()
 _webview_window = None
+# Exit-43 conflict page shown → window-close must skip the port sweep that would
+# kill the DIFFERENT live server legitimately owning this data dir/port (R15C1).
+_server_conflict_active = False
 # Remote-connection tunnel manager (owner-only desktop surface). Module-global
 # so shutdown and the panic path can tear the ssh child down synchronously.
 _tunnel_manager: Optional["_remote_tunnel.RemoteTunnelManager"] = None
@@ -336,6 +339,8 @@ def _force_disconnect_tunnel() -> None:
 
 def _present_server_conflict_page() -> bool:
     """Exit-43 owner-visible page with recovery commands. True when shown."""
+    global _server_conflict_active
+    _server_conflict_active = True  # window-close must skip the port sweep (R15C1)
     window = _webview_window
     if window is None:
         return False
@@ -763,10 +768,8 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
             os._exit(0)
 
         if exit_code == SERVER_ALREADY_RUNNING_EXIT_CODE:
-            # server.main() acquires the one-server lock at the universal
-            # boundary, so a launcher-managed server can lose it to a headless
-            # server already owning this data dir. Respawning cannot win that
-            # race — stop cleanly instead of burning the crash budget.
+            # A headless server already owns this data dir's one-server lock;
+            # respawning cannot win that race — stop cleanly, don't crash-loop.
             log.error(
                 "Another Ouroboros server already owns this data dir (exit %d). "
                 "Not restarting — stop the other server (e.g. "
@@ -1230,8 +1233,7 @@ def main():
         webview.start()
         return
 
-    # The webview's currently trusted loopback port (local server, or the active
-    # tunnel port while connected). Mutated only by the remote_* bridge methods.
+    # Webview's trusted loopback port (local server, or active tunnel port).
     view_state = {"port": actual_port}
 
     def _current_page_is_local_origin() -> bool:
@@ -1386,11 +1388,8 @@ def main():
                 log.warning("Skill grant native confirmation failed: %s", exc, exc_info=True)
                 return {"ok": False, "error": f"Native confirmation failed: {exc}"}
 
-        # --- Remote connection (owner decisions D20-D23) -------------------
-        # remote_status/remote_disconnect are callable from ANY page (the
-        # remote SPA renders the connection pill with them); everything else
-        # is origin-gated to the local page.
-
+        # Remote connection (D20-D23): remote_status/remote_disconnect are
+        # callable from ANY page (the pill needs them); the rest is origin-gated.
         def remote_status(self) -> dict:
             status = _tunnel_manager.status() if _tunnel_manager else {"state": "disconnected"}
             status["ssh_available"] = bool(_remote_tunnel.ssh_available())
@@ -1508,10 +1507,8 @@ def main():
             return {"ok": True, **status}
 
         def download_file_to_downloads(self, url: str, filename: str, open_external: bool = False) -> dict:
-            # Host-privileged action (writes ~/Downloads, may auto-open via the
-            # OS handler): origin-gated like the other privileged methods (D20).
-            # A remote page must not be able to drop+auto-open files on the
-            # desktop; the SPA falls back to an in-browser download there.
+            # Host-privileged (writes ~/Downloads, may auto-open): origin-gated
+            # like the other privileged methods (D20); remote page → browser DL.
             if not _current_page_is_local_origin():
                 return dict(_ORIGIN_REFUSED)
             try:
@@ -1570,7 +1567,10 @@ def main():
         _shutdown_event.set()
         _disconnect_tunnel_quietly()
         stop_agent()
-        _kill_orphaned_children(port)
+        # R15C1: skip the broad port sweep on the conflict page — it would kill
+        # the valid foreign server that owns this data dir/port.
+        if not _server_conflict_active:
+            _kill_orphaned_children(port)
         release_pid_lock()
         os._exit(0)
 

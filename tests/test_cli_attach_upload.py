@@ -312,6 +312,21 @@ def test_render_attachment_lines_discloses_over_limit(tmp_path):
     assert "NOT STAGED" in rendered and "limit" in rendered and "read_file" not in rendered
 
 
+def test_stage_task_attachments_skips_malformed_entries(tmp_path):
+    # R15C2: a malformed attachment entry (string/None) must be skipped, not
+    # abort the whole batch — a valid entry after it still stages.
+    from ouroboros.artifacts import stage_task_attachments
+
+    ok = tmp_path / "ok.txt"
+    ok.write_text("hi")
+    manifest = stage_task_attachments(
+        tmp_path / "drive", "task-malformed",
+        ["not-a-dict", None, 42, {"path": str(ok)}],
+    )
+    staged = [m for m in manifest if m.get("relpath")]
+    assert len(staged) == 1 and staged[0]["label"] == "ok.txt"
+
+
 def test_stage_task_attachments_discloses_over_total_omission(tmp_path):
     # R9C2: files that individually pass the per-file cap but together exceed the
     # per-task TOTAL must stop with one typed omission entry (no silent break).

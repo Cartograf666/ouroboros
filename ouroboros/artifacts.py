@@ -134,6 +134,11 @@ def stage_task_attachments(
     staged = 0
     total_bytes = 0
     for idx, item in enumerate(items):
+        # A malformed entry (string/None) must be skipped, not abort the whole
+        # batch (R15C2): the label derivation below reads item.get(...) OUTSIDE
+        # the per-item try, so a non-dict here would otherwise raise.
+        if not isinstance(item, dict):
+            continue
         if staged >= _MAX_STAGED_ATTACHMENTS:
             # P1 no-silent-loss: instead of a bare break that hides the dropped
             # inputs, emit one typed omission entry naming the remaining count so

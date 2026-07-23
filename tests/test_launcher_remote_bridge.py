@@ -155,6 +155,23 @@ def test_disconnect_tunnel_quietly_handles_absent_and_failing_manager(monkeypatc
     assert calls == [True]
 
 
+def test_window_close_skips_port_sweep_on_server_conflict():
+    # R15C1: on the exit-43 conflict page a different live server legitimately
+    # owns this data dir/port; window close must NOT run the broad port sweep
+    # (_kill_orphaned_children) that would kill it. Pinned by source: the sweep
+    # is guarded by the conflict flag, which the conflict page sets.
+    source = (REPO_ROOT / "launcher.py").read_text(encoding="utf-8")
+    closing = source[source.index("def _on_closing") : source.index("window.events.closing")]
+    assert "_kill_orphaned_children(port)" in closing
+    assert "if not _server_conflict_active:" in closing
+    guard = closing.index("_server_conflict_active")
+    sweep = closing.index("_kill_orphaned_children(port)")
+    assert guard < sweep, "the conflict-state guard must gate the port sweep"
+    # The conflict page sets the flag that suppresses the sweep.
+    page = source[source.index("def _present_server_conflict_page") : source.index("def _server_process_identity_matches")]
+    assert "_server_conflict_active = True" in page
+
+
 def test_on_tunnel_state_guards_navigation_by_generation():
     # R11C1(b): _on_tunnel_state must reject a navigation whose generation is
     # stale (a delayed gave_up/reconnected from a superseded connection must not
