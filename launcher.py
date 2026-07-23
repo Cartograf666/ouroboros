@@ -336,29 +336,22 @@ def _force_disconnect_tunnel() -> None:
 
 
 def _present_server_conflict_page() -> bool:
-    """Owner-visible terminal state for exit 43 (another server owns the data
-    dir): replace the stranded 'Connecting…' page with a plain explanation and
-    the exact recovery commands, instead of leaving a dead window. Returns True
-    when the page was actually shown (False → caller logs; nothing else to do).
-    """
+    """Exit-43 owner-visible page: replace the stranded 'Connecting…' view with
+    the recovery commands. Returns True when shown (False → nothing to do)."""
     window = _webview_window
     if window is None:
         return False
     html = (
-        "<html><body style='background:#1a1a2e;color:white;font-family:system-ui;"
-        "display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>"
-        "<div style='max-width:560px;text-align:center'>"
+        "<html><body style='background:#1a1a2e;color:white;font-family:system-ui;display:flex;"
+        "align-items:center;justify-content:center;height:100vh;margin:0'><div style='max-width:560px;text-align:center'>"
         "<h2>Another Ouroboros server owns this data directory</h2>"
-        "<p>The desktop server exited (code 43) because a different live server "
-        "— usually a headless <code>ouroboros server</code> under systemd — "
-        "already holds this data dir's lock. Restarting cannot win that race, "
-        "so the launcher stopped instead of fighting it.</p>"
-        "<p style='text-align:left'>To use the desktop app on this machine:<br>"
-        "1. Stop the other server: <code>systemctl --user stop ouroboros</code><br>"
-        "2. Relaunch Ouroboros.</p>"
-        "<p>To keep the headless server, connect to it via "
-        "Settings&nbsp;→&nbsp;Remote from a desktop on another data dir.</p>"
-        "</div></body></html>"
+        "<p>The desktop server exited (code 43) because a different live server — usually a headless "
+        "<code>ouroboros server</code> under systemd — already holds this data dir's lock. Restarting cannot "
+        "win that race, so the launcher stopped instead of fighting it.</p>"
+        "<p style='text-align:left'>To use the desktop app on this machine:<br>1. Stop the other server: "
+        "<code>systemctl --user stop ouroboros</code><br>2. Relaunch Ouroboros.</p>"
+        "<p>To keep the headless server, connect to it via Settings&nbsp;→&nbsp;Remote from a desktop on "
+        "another data dir.</p></div></body></html>"
     )
     try:
         window.load_html(html)
@@ -761,35 +754,30 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
         if exit_code == PANIC_EXIT_CODE:
             log.info("Panic stop (exit code %d) — shutting down completely.", PANIC_EXIT_CODE)
             _shutdown_event.set()
-            # Panic must leave zero children with NO delay: force-kill the ssh
-            # tunnel tree immediately (not the graceful bounded-wait path) before
-            # the hard exit — Emergency Stop Invariant.
+            # Emergency Stop Invariant: force-kill the ssh tunnel tree with NO
+            # delay (not the graceful path) before the hard exit.
             _force_disconnect_tunnel()
-            # The agent (server child) already exited; tear down any orphans and
-            # force-exit the whole process. _webview_window.destroy() from this
-            # supervisor thread cannot end the main-thread Cocoa webview loop on
-            # macOS (it leaves a black frozen window), so exit with parity to the
-            # window-close path: kill orphans, release the pid lock, os._exit(0).
+            # destroy() from this supervisor thread can't end the main-thread
+            # Cocoa webview loop on macOS (black frozen window), so exit with
+            # window-close parity: kill orphans, release the lock, os._exit(0).
             _kill_orphaned_children(port)
             release_pid_lock()
             os._exit(0)
 
         if exit_code == SERVER_ALREADY_RUNNING_EXIT_CODE:
-            # server.main() now acquires the data-scoped one-server lock at the
-            # universal boundary, so a launcher-managed server can lose it to a
-            # headless `ouroboros server` already owning this data dir. Respawn-
-            # ing cannot win that race — stop cleanly with a clear message
-            # instead of burning the crash budget (5×) on a guaranteed failure.
+            # server.main() acquires the one-server lock at the universal
+            # boundary, so a launcher-managed server can lose it to a headless
+            # server already owning this data dir. Respawning cannot win that
+            # race — stop cleanly instead of burning the crash budget.
             log.error(
                 "Another Ouroboros server already owns this data dir (exit %d). "
                 "Not restarting — stop the other server (e.g. "
                 "`systemctl --user stop ouroboros`), then relaunch.",
                 SERVER_ALREADY_RUNNING_EXIT_CODE,
             )
-            # Do NOT sweep the port here: exit 43 means a DIFFERENT live server
+            # Do NOT sweep the port: exit 43 means a DIFFERENT live server
             # legitimately owns this data dir, and the stale-port sweep would
-            # kill that valid owner (CR1). Show the owner an actionable page in
-            # the window (R7C2 — no stranded 'Connecting…'), then stop.
+            # kill that valid owner (CR1). Show an actionable page (R7C2), stop.
             _present_server_conflict_page()
             break
 
@@ -1244,9 +1232,8 @@ def main():
         webview.start()
         return
 
-    # The webview's currently trusted loopback port: the local server by
-    # default, the active tunnel's local port while a remote connection is up.
-    # Mutated only by the remote_* bridge methods below.
+    # The webview's currently trusted loopback port (local server, or the active
+    # tunnel port while connected). Mutated only by the remote_* bridge methods.
     view_state = {"port": actual_port}
 
     def _current_page_is_local_origin() -> bool:
@@ -1342,8 +1329,7 @@ def main():
 
     global _tunnel_manager
     # Reap any ssh tunnel a previously-crashed launcher left behind (daemon
-    # custody is kept by the generation reaper, so an abrupt SIGKILL could
-    # otherwise leave the loopback→remote forward alive forever).
+    # custody survives the generation reaper, so a SIGKILL could otherwise leak).
     try:
         reaped = _remote_tunnel.reap_orphaned_tunnels(pathlib.Path(DATA_DIR))
         if reaped:

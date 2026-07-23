@@ -28,7 +28,7 @@ DATA_DIR = pathlib.Path(os.environ.get("OUROBOROS_DATA_DIR", APP_ROOT / "data"))
 SETTINGS_PATH = pathlib.Path(os.environ.get("OUROBOROS_SETTINGS_PATH", DATA_DIR / "settings.json"))
 PID_FILE = pathlib.Path(os.environ.get("OUROBOROS_PID_FILE", APP_ROOT / "ouroboros.pid"))
 PORT_FILE = pathlib.Path(os.environ.get("OUROBOROS_PORT_FILE", DATA_DIR / "state" / "server_port"))
-# Data-scoped headless server lock (one `ouroboros server` per data dir; distinct from the launcher app-root PID_FILE). See ouroboros/remote_support.
+# Data-scoped headless server lock (one `ouroboros server` per data dir). See ouroboros/remote_support.
 SERVER_PID_FILE = pathlib.Path(os.environ.get("OUROBOROS_SERVER_PID_FILE", DATA_DIR / "state" / "server.pid"))
 
 RESTART_EXIT_CODE = 42
@@ -234,8 +234,7 @@ SETTINGS_DEFAULTS = {
     "MCP_ENABLED": False,
     "MCP_SERVERS": [],
     "MCP_TOOL_TIMEOUT_SEC": 60,
-    # Launcher-owned desktop remote-connection profiles; see ouroboros/remote_support.
-    "OUROBOROS_REMOTE_CONNECTIONS": [],
+    "OUROBOROS_REMOTE_CONNECTIONS": [],  # launcher-owned; see ouroboros/remote_support
     # Scope review: one or more reviewer slots; enforcement follows OUROBOROS_REVIEW_ENFORCEMENT.
     "OUROBOROS_SCOPE_REVIEW_MODELS": "anthropic/claude-fable-5",
     "OUROBOROS_SCOPE_REVIEW_MODEL": "anthropic/claude-fable-5",
@@ -1264,9 +1263,7 @@ def _coerce_setting_value(key: str, value):
             except (TypeError, ValueError):
                 return []
         if isinstance(value, list):
-            items = [dict(item) for item in value if isinstance(item, dict)]
-            # Shape/count bound only; profile semantics are validated by the
-            # launcher (ouroboros/remote_tunnel.py) before any write.
+            items = [dict(item) for item in value if isinstance(item, dict)]  # shape/count only; launcher validates
             return items[:REMOTE_CONNECTIONS_MAX] if key == "OUROBOROS_REMOTE_CONNECTIONS" else items
         return []
     if isinstance(default, bool):
@@ -1392,10 +1389,8 @@ def save_settings(
                 f"OUROBOROS_RUNTIME_MODE elevation refused: "
                 f"{baseline_mode!r} -> {new_mode!r}.{hint}"
             )
-        # Under the lock: the profile list riding in ``settings`` was loaded
-        # BEFORE the lock — carry the on-disk value instead, so a concurrent
-        # launcher profile write is never clobbered (generic saves never
-        # legitimately change OUROBOROS_REMOTE_CONNECTIONS).
+        # Under the lock: carry the on-disk profiles so a concurrent launcher
+        # write is never clobbered by the pre-lock copy (CR4/R7).
         from ouroboros.remote_support import preserve_disk_remote_connections
 
         settings = preserve_disk_remote_connections(dict(settings))
@@ -1601,6 +1596,5 @@ def acquire_pid_lock() -> bool:
 def release_pid_lock() -> None:
     _compat_pid_lock_release(str(PID_FILE))
 
-
-# Remote/headless support state lives in ouroboros/remote_support.py (P7 split); re-exported so `config.X` stays the stable API.
+# Remote/headless support (ouroboros/remote_support.py, P7 split); re-exported so `config.X` stays the stable API.
 from ouroboros.remote_support import REMOTE_CONNECTIONS_MAX, acquire_server_pid_lock, get_remote_connections, release_server_pid_lock, update_remote_connections  # noqa: E402,F401
