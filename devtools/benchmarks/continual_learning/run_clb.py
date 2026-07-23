@@ -220,8 +220,20 @@ def _sanitized_child_env(run_dir: pathlib.Path, settings: dict, args: argparse.N
         # from the launcher instead of silently living on defaults (auto / depth 2).
         "OUROBOROS_TASK_REVIEW_MODE": str(settings.get("OUROBOROS_TASK_REVIEW_MODE") or "auto"),
         "OUROBOROS_MAX_SUBAGENT_DEPTH": str(settings.get("OUROBOROS_MAX_SUBAGENT_DEPTH") or 2),
-        "CLBENCH_SOLVE_DISABLED_TOOLS": ",".join(settings.get("CLBENCH_SOLVE_DISABLED_TOOLS") or []),
+        "CLBENCH_SOLVE_DISABLED_TOOLS": (
+            _dt if isinstance((_dt := settings.get("CLBENCH_SOLVE_DISABLED_TOOLS") or []), str)
+            else ",".join(_dt)
+        ),
     })
+    # Operator patch 2026-07-23 (round 2): forward the remaining campaign knobs a patched
+    # adapter observes via env (see _docker_launcher._overrides operator-env block) —
+    # runtime mode, reviewer list, split review efforts, context mode, workers. Only set
+    # when the template declares them, so unpatched adapters keep parity defaults.
+    for _knob in ("OUROBOROS_RUNTIME_MODE", "OUROBOROS_REVIEW_MODELS", "OUROBOROS_EFFORT_REVIEW",
+                  "OUROBOROS_EFFORT_SCOPE_REVIEW", "OUROBOROS_CONTEXT_MODE", "OUROBOROS_MAX_WORKERS"):
+        _val = settings.get(_knob)
+        if _val:
+            env[_knob] = str(_val)
     if args.or_provider:
         env["OUROBOROS_OR_PROVIDER"] = args.or_provider
     return env

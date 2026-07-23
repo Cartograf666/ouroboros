@@ -71,3 +71,18 @@ itself) is the supported path for v6.56.0 bridge runs.
    now also forwards `OUROBOROS_TASK_REVIEW_MODE` and `OUROBOROS_MAX_SUBAGENT_DEPTH`
    so a "review required" / bounded-depth submittable run is configurable from the
    launcher instead of silently defaulting to auto / depth 2.
+
+## Addendum (v6.74.5, campaign luna 2026-07-23)
+
+7. `clb_env_campaign_overrides.v6745.patch` — `_docker_launcher._overrides()`
+   gains an operator-env override block: `OUROBOROS_RUNTIME_MODE`,
+   `OUROBOROS_TASK_REVIEW_MODE`, `OUROBOROS_REVIEW_MODELS`,
+   `OUROBOROS_EFFORT_REVIEW`, `OUROBOROS_EFFORT_SCOPE_REVIEW`,
+   `OUROBOROS_REVIEW_ENFORCEMENT`, `OUROBOROS_SAFETY_MODE`,
+   `OUROBOROS_MAX_SUBAGENT_DEPTH`, `OUROBOROS_MAX_WORKERS`,
+   `OUROBOROS_CONTEXT_MODE` — explicit host exports win over the hardcoded
+   CC-parity defaults (runtime=advanced, 3× reviewer list, uniform effort).
+   Launcher side: `run_clb.py` forwards these knobs from the settings template
+   (and fixes CLBENCH_SOLVE_DISABLED_TOOLS string-vs-list join). Without the
+   patch pair a campaign asking runtime=pro / single low-effort reviewer /
+   review=required silently ran on parity defaults.
