@@ -41,6 +41,11 @@ own identity, memory, budget, and provider keys; the desktop is a thin client.
   client, so any local process on the server (and any local process on your
   desktop while a tunnel is up) can reach the full API. Use a server account
   and a desktop you trust; do not run this on a shared multi-user host.
+- **Do not co-host on one machine+port**: the headless server is meant to run on
+  a DIFFERENT machine from the desktop app. Do not run both on the same host
+  bound to the same port (8765) — the desktop launcher clears its own runtime
+  port at startup and would kill a headless server squatting it. One machine =
+  one Ouroboros server per port.
   "Any local process" explicitly includes the desktop's own resident Ouroboros
   agent: while a tunnel is up, the local agent's shell can reach the remote
   being's API through the forwarded loopback port (the port is ephemeral and

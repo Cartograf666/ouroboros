@@ -835,11 +835,11 @@ def _terminate_quietly(proc: "subprocess.Popen[Any]") -> None:
         pass
     except Exception:
         return
-    # Still alive after TERM — force-kill the direct child and reap it.
-    try:
-        proc.kill()
-    except Exception:
-        pass
+    # Still alive after group TERM — escalate to a group/tree SIGKILL, NOT just
+    # proc.kill() on the direct ssh child: a ProxyCommand/ProxyJump descendant
+    # that ignores TERM would otherwise survive disconnect/reconnect/window-close
+    # and orphan the forward (R10C2 — zero-orphans shutdown invariant).
+    _kill_tree_now(proc)
     try:
         proc.wait(timeout=TERMINATE_WAIT_SEC)
     except Exception:

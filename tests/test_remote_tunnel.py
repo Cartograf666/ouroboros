@@ -432,6 +432,22 @@ def test_terminate_quietly_reaps_child_before_returning(monkeypatch):
     assert proc.poll() is not None  # provably reaped (kill escalated + waited)
 
 
+def test_terminate_quietly_escalates_to_group_kill_not_direct_child(tmp_path, monkeypatch):
+    # R10C2: a TERM-resistant ProxyCommand/ProxyJump descendant must be reaped by
+    # a group/tree SIGKILL, NOT a bare proc.kill() on the direct ssh child. Pin
+    # that the graceful teardown escalates through _kill_tree_now after the TERM
+    # timeout (the same tree-kill the panic path uses).
+    calls = {"tree": 0, "direct": 0}
+    proc = _FakeProc()
+    monkeypatch.setattr(rt, "TERMINATE_WAIT_SEC", 0.01)
+    monkeypatch.setattr(rt, "_kill_tree_now", lambda p: (calls.__setitem__("tree", calls["tree"] + 1), p.kill()))
+    orig_kill = proc.kill
+    proc.kill = lambda: (calls.__setitem__("direct", calls["direct"] + 1), orig_kill())
+    rt._terminate_quietly(proc)
+    assert calls["tree"] == 1, "must escalate via the group/tree SIGKILL"
+    assert proc.poll() is not None
+
+
 def test_watch_exits_on_generation_change(tmp_path, monkeypatch):
     mgr = _manager(tmp_path)
     monkeypatch.setattr(rt, "HEALTH_POLL_INTERVAL_SEC", 0.01)
