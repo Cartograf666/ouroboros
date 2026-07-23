@@ -112,7 +112,14 @@ def render_run_settings(base_path: pathlib.Path, run_dir: pathlib.Path, *, solve
     bare = _bare_model(solve_model)
     for key in _PINNED_MODEL_KEYS:
         settings[key] = bare
-    settings["OUROBOROS_REVIEW_MODELS"] = ",".join([bare] * 3)
+    # Reviewer roster: honor an explicit template declaration (e.g. a single
+    # low-effort reviewer for a campaign); default to the triple-slot parity
+    # roster only when the template does not declare one.
+    if not str(settings.get("OUROBOROS_REVIEW_MODELS") or "").strip():
+        settings["OUROBOROS_REVIEW_MODELS"] = ",".join([bare] * 3)
+    else:
+        settings["OUROBOROS_REVIEW_MODELS"] = ",".join(
+            _bare_model(x.strip()) for x in str(settings["OUROBOROS_REVIEW_MODELS"]).split(",") if x.strip())
     settings["OUROBOROS_POST_TASK_EVOLUTION"] = "true" if evolution else "false"
     if total_budget is not None:
         settings["TOTAL_BUDGET"] = float(total_budget)
