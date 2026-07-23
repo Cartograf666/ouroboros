@@ -56,6 +56,7 @@ python3 -m venv ~/ouroboros-server/.venv
 ~/ouroboros-server/.venv/bin/pip install -r ~/ouroboros-server/repo/requirements.txt
 # browser tools (optional): ~/ouroboros-server/.venv/bin/python -m playwright install-deps chromium
 
+mkdir -p ~/.config/systemd/user
 cp ~/ouroboros-server/repo/packaging/systemd/ouroboros.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now ouroboros

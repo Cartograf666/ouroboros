@@ -822,6 +822,14 @@ def _render_attachment_lines(attachments: Any) -> str:
                 f"per-task attachment limit ({item.get('limit')}) was reached"
             )
             continue
+        if status == "skipped_over_total":
+            # P1 disclosure: the input set exceeded the per-task TOTAL-bytes cap.
+            _mb = int(item.get("limit_bytes") or 0) // (1024 * 1024)
+            lines.append(
+                f"- {label or 'additional attachments'}: NOT STAGED - the "
+                f"per-task total attachment size limit (~{_mb} MB) was reached"
+            )
+            continue
         if not relpath:
             continue
         kind = "image" if item.get("is_image") else (str(item.get("mime") or "").strip() or "file")

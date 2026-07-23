@@ -40,6 +40,17 @@ class OuroborosHTTPClient:
         self.base_url = (base_url or _default_base_url()).rstrip("/")
         self.timeout = timeout
 
+    def _base_headers(self) -> Dict[str, str]:
+        """Shared header authority for EVERY request this client makes.
+
+        request() and post_multipart_file() both start from here so they can
+        never diverge on transport-level headers — a single place to add auth
+        (e.g. an OUROBOROS_NETWORK_PASSWORD header) if the CLI ever gains
+        non-loopback support (deferred, plan D9: v1 is ssh-tunnel-only, where
+        loopback needs no password). Today: Accept only.
+        """
+        return {"Accept": "application/json"}
+
     def request(
         self,
         method: str,
@@ -49,7 +60,7 @@ class OuroborosHTTPClient:
         timeout: Optional[float] = None,
     ) -> Any:
         data = None
-        headers = {"Accept": "application/json"}
+        headers = self._base_headers()
         if body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -109,13 +120,12 @@ class OuroborosHTTPClient:
             f"Content-Type: {mime}\r\n\r\n"
         ).encode("utf-8")
         body = head + source.read_bytes() + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        headers = self._base_headers()
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
         req = urllib.request.Request(
             self.base_url + path,
             data=body,
-            headers={
-                "Accept": "application/json",
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-            },
+            headers=headers,
             method="POST",
         )
         try:
@@ -222,7 +232,9 @@ def _status_command(args: argparse.Namespace) -> int:
 # CLI attachments are uploaded as CONTENT (POST /api/chat/upload) and the task
 # references the returned server-side path. Passing the raw client path used to
 # lose files silently whenever the CLI and the server are different machines.
-_ATTACH_MAX_BYTES = 50 * 1024 * 1024  # mirrors the server's per-file upload cap
+# Attachment limits are NOT redefined here — the single authority is the server
+# staging layer (ouroboros/artifacts.py); the CLI imports it so the up-front
+# check and the server-side stage can never diverge.
 
 
 def _validate_attach_paths(raw_paths: List[str]) -> List[pathlib.Path]:
@@ -232,7 +244,11 @@ def _validate_attach_paths(raw_paths: List[str]) -> List[pathlib.Path]:
     batch is rejected up front rather than uploading files the server would drop
     (P1 no-silent-loss: no orphaned uploads, no undisclosed incomplete input).
     """
-    from ouroboros.artifacts import _MAX_STAGED_ATTACHMENTS as _CAP
+    from ouroboros.artifacts import (
+        _MAX_STAGED_ATTACHMENTS as _CAP,
+        _MAX_STAGED_ATTACHMENT_BYTES as _PER_FILE,
+        _MAX_STAGED_TOTAL_BYTES as _TOTAL,
+    )
 
     raw_paths = list(raw_paths or [])
     if len(raw_paths) > _CAP:
@@ -241,12 +257,26 @@ def _validate_attach_paths(raw_paths: List[str]) -> List[pathlib.Path]:
             "Bundle the rest (e.g. a zip) or split the task."
         )
     paths: List[pathlib.Path] = []
+    total = 0
     for raw in raw_paths:
         path = pathlib.Path(raw).expanduser()
         if not path.is_file():
             raise CLIError(f"--attach file not found (or not a regular file): {path}")
-        if path.stat().st_size > _ATTACH_MAX_BYTES:
-            raise CLIError(f"--attach file exceeds the 50 MB upload limit: {path}")
+        size = path.stat().st_size
+        if size > _PER_FILE:
+            raise CLIError(
+                f"--attach file exceeds the {_PER_FILE // (1024 * 1024)} MB per-file "
+                f"upload limit: {path}"
+            )
+        total += size
+        # Aggregate bound: reject the whole batch BEFORE uploading anything, so a
+        # set of individually-valid files can't stream ~1.25 GB only to be
+        # partly dropped at staging (same authority the server enforces).
+        if total > _TOTAL:
+            raise CLIError(
+                f"--attach total size exceeds the {_TOTAL // (1024 * 1024)} MB "
+                "per-task limit; bundle or split the inputs."
+            )
         paths.append(path)
     return paths
 

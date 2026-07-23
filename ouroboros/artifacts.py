@@ -37,6 +37,10 @@ _MAX_SCRATCH_PATHS = 1000
 _ATTACHMENTS_SUBDIR = "attachments"
 _MAX_STAGED_ATTACHMENTS = 25
 _MAX_STAGED_ATTACHMENT_BYTES = 50 * 1024 * 1024  # ~50 MB per file
+# Aggregate bound across ALL attachments of one task — the single authority the
+# CLI enforces before uploading and staging enforces on write, so N individually
+# valid files can't sum to an unbounded transfer (25 × 50 MB ≈ 1.25 GB otherwise).
+_MAX_STAGED_TOTAL_BYTES = 200 * 1024 * 1024  # ~200 MB total
 
 
 def _safe_attachment_name(raw_name: str) -> str:
@@ -128,6 +132,7 @@ def stage_task_attachments(
 
     manifest: List[Dict[str, Any]] = []
     staged = 0
+    total_bytes = 0
     for idx, item in enumerate(items):
         if staged >= _MAX_STAGED_ATTACHMENTS:
             # P1 no-silent-loss: instead of a bare break that hides the dropped
@@ -162,11 +167,27 @@ def stage_task_attachments(
                 log.info("stage_task_attachments: skipped secret source %s", source.name)
                 continue
             try:
-                if source.stat().st_size > _MAX_STAGED_ATTACHMENT_BYTES:
+                src_size = source.stat().st_size
+                if src_size > _MAX_STAGED_ATTACHMENT_BYTES:
                     log.info("stage_task_attachments: skipped oversized source %s", source.name)
                     continue
             except OSError:
                 continue
+            # Aggregate bound (P1 disclosure, not a silent drop): if this file
+            # would push the task's total staged bytes over the shared cap, skip
+            # it with a typed omission entry so the prompt discloses the loss.
+            if total_bytes + src_size > _MAX_STAGED_TOTAL_BYTES:
+                remaining = len(items) - idx
+                log.info(
+                    "stage_task_attachments: hit total-bytes cap (%d B); %d not staged",
+                    _MAX_STAGED_TOTAL_BYTES, remaining,
+                )
+                manifest.append({
+                    "label": f"{remaining} more attachment(s)",
+                    "status": "skipped_over_total",
+                    "limit_bytes": _MAX_STAGED_TOTAL_BYTES,
+                })
+                break
             attach_dir.mkdir(parents=True, exist_ok=True)
             # The stored filename derives from the SOURCE basename (it carries the
             # real extension, which mime detection needs); the human label is for
@@ -201,6 +222,7 @@ def stage_task_attachments(
                 "is_image": mime.startswith("image/"),
             })
             staged += 1
+            total_bytes += src_size
         except Exception:
             log.debug("stage_task_attachments: skipped a file on error", exc_info=True)
             continue

@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import pathlib
 import urllib.request
 
 import pytest
@@ -75,11 +76,66 @@ def test_validate_attach_paths_rejects_over_limit_batch(tmp_path):
 
 
 def test_validate_attach_paths_rejects_oversized(tmp_path):
+    # R9C2: the per-file bound is the SHARED server authority, not a CLI-local
+    # literal — sparse-truncate one byte over it.
+    from ouroboros.artifacts import _MAX_STAGED_ATTACHMENT_BYTES as per_file
+
     big = tmp_path / "big.bin"
     with big.open("wb") as fh:
-        fh.truncate(cli._ATTACH_MAX_BYTES + 1)
-    with pytest.raises(CLIError, match="50 MB"):
+        fh.truncate(per_file + 1)
+    with pytest.raises(CLIError, match="per-file"):
         _validate_attach_paths([str(big)])
+
+
+def test_validate_attach_paths_rejects_over_total_batch(tmp_path):
+    # R9C2: individually-valid files whose COMBINED size exceeds the shared
+    # per-task total must be rejected up front (no ~1.25 GB upload-then-drop).
+    from ouroboros.artifacts import (
+        _MAX_STAGED_ATTACHMENT_BYTES as per_file,
+        _MAX_STAGED_TOTAL_BYTES as total,
+    )
+
+    # Each file is just under the per-file cap; enough of them to cross the total.
+    each = per_file - 1
+    n = (total // each) + 1
+    files = []
+    for i in range(int(n)):
+        f = tmp_path / f"f{i}.bin"
+        with f.open("wb") as fh:
+            fh.truncate(each)
+        files.append(str(f))
+    # Stay within the count cap so it's the TOTAL bound that trips (not count).
+    from ouroboros.artifacts import _MAX_STAGED_ATTACHMENTS as cap
+    assert len(files) <= cap, "test wants the total bound to trip, not the count cap"
+    with pytest.raises(CLIError, match="total size"):
+        _validate_attach_paths(files)
+
+
+def test_multipart_and_request_share_base_headers(monkeypatch):
+    # R9C1: post_multipart_file must build its headers from the SAME authority as
+    # request() (a single place to add auth later — deferred D9), so the two can
+    # never diverge. Capture every urllib Request and assert both carry the full
+    # base-header set (title-cased by urllib).
+    client = cli.OuroborosHTTPClient("http://127.0.0.1:1")
+    captured = []
+
+    class _FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"{}"
+
+    def _fake_urlopen(req, timeout=None):
+        captured.append(dict(req.headers))
+        return _FakeResp()
+
+    monkeypatch.setattr(cli.urllib.request, "urlopen", _fake_urlopen)
+    client.request("POST", "/api/x", body={"a": 1})
+    client.post_multipart_file("/api/chat/upload", pathlib.Path(__file__))
+    assert len(captured) == 2
+    expected = {k.title() for k in client._base_headers()}  # {"Accept"} today
+    for headers in captured:
+        present = {k.title() for k in headers}
+        assert expected.issubset(present), (expected, present)
 
 
 def test_upload_attachments_returns_server_paths(tmp_path):
@@ -254,6 +310,42 @@ def test_render_attachment_lines_discloses_over_limit(tmp_path):
         [{"label": "5 more attachment(s)", "status": "skipped_over_limit", "limit": 25}]
     )
     assert "NOT STAGED" in rendered and "limit" in rendered and "read_file" not in rendered
+
+
+def test_stage_task_attachments_discloses_over_total_omission(tmp_path):
+    # R9C2: files that individually pass the per-file cap but together exceed the
+    # per-task TOTAL must stop with one typed omission entry (no silent break).
+    from ouroboros.artifacts import (
+        _MAX_STAGED_ATTACHMENT_BYTES,
+        _MAX_STAGED_TOTAL_BYTES,
+        stage_task_attachments,
+    )
+
+    each = _MAX_STAGED_ATTACHMENT_BYTES  # exactly the per-file cap (allowed)
+    n = (_MAX_STAGED_TOTAL_BYTES // each) + 2
+    srcs = []
+    for i in range(int(n)):
+        f = tmp_path / f"big{i}.bin"
+        with f.open("wb") as fh:
+            fh.truncate(each)
+        srcs.append({"path": str(f)})
+    manifest = stage_task_attachments(tmp_path / "drive", "task-total", srcs)
+    over = [m for m in manifest if m.get("status") == "skipped_over_total"]
+    assert len(over) == 1
+    assert over[0]["limit_bytes"] == _MAX_STAGED_TOTAL_BYTES
+    staged = [m for m in manifest if m.get("relpath")]
+    # Total bound stops staging before the byte ceiling is crossed.
+    assert sum(pathlib.Path(m["abs_path"]).stat().st_size for m in staged) <= _MAX_STAGED_TOTAL_BYTES
+
+
+def test_render_attachment_lines_discloses_over_total(tmp_path):
+    from ouroboros.gateway.tasks import _render_attachment_lines
+
+    rendered = _render_attachment_lines(
+        [{"label": "3 more attachment(s)", "status": "skipped_over_total",
+          "limit_bytes": 200 * 1024 * 1024}]
+    )
+    assert "NOT STAGED" in rendered and "MB" in rendered and "read_file" not in rendered
 
 
 def test_render_attachment_lines_discloses_skipped_without_fake_read(tmp_path):
