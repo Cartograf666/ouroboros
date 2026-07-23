@@ -82,7 +82,7 @@ def task_body(
         "executor_ref": executor_ref,
         # House rule: benches measure the single-model Ouroboros harness, so the
         # external coding-agent gateway is withheld from the solve task.
-        "disabled_tools": ["claude_code_edit"],
+        "disabled_tools": ["claude_code_edit", "schedule_subagent"],  # operator 2026-07-23: subagents=0
         "actor_id": "programbench",
         "source": "programbench",
         # Advisory Observable Acceptance Claims (task-general vocabulary; the

@@ -727,7 +727,9 @@ PY
         # v6.55.0: claude_code_edit is disabled in EVERY bench run regardless of the
         # web gate — benches measure Ouroboros as a single-model harness; the embedded
         # Claude-Code delegate is a separate future experiment.
-        disabled = ["claude_code_edit"]
+        # Operator 2026-07-23: schedule_subagent disabled for the no-swarm submittable
+        # campaign (subagents=0). With delegation off, max_workers is moot (no pool to fill).
+        disabled = ["claude_code_edit", "schedule_subagent"]
         if getattr(self, "disable_agent_web", True):
             disabled = list(self._WEB_TOOLS_MIRROR) + list(self._DELEGATED_VISION_TOOLS) + disabled
         return disabled

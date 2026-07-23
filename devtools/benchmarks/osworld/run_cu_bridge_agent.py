@@ -120,6 +120,7 @@ def _effective_disabled_tools(allow_a11y: bool) -> list[str]:
     disabled += [extension_surface_name(SKILL_NAME, t) for t in _DENIED_SKILL_EXT_TOOLS]
     if not allow_a11y:
         disabled.append(extension_surface_name(SKILL_NAME, "ax_tree"))
+    disabled.append("schedule_subagent")  # operator 2026-07-23: subagents=0 no-swarm campaign
     return disabled
 
 
