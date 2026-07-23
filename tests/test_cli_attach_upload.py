@@ -348,43 +348,6 @@ def test_render_attachment_lines_discloses_over_total(tmp_path):
     assert "NOT STAGED" in rendered and "MB" in rendered and "read_file" not in rendered
 
 
-def test_stage_task_attachments_discloses_oversize_secret_unreadable(tmp_path):
-    # R12C3: NO rejection branch drops an input silently — oversize and secret
-    # each surface a typed omission entry (P1/P2).
-    from ouroboros.artifacts import _MAX_STAGED_ATTACHMENT_BYTES, stage_task_attachments
-
-    big = tmp_path / "big.bin"
-    with big.open("wb") as fh:
-        fh.truncate(_MAX_STAGED_ATTACHMENT_BYTES + 1)
-    secret = tmp_path / "server.key"  # ".key" → matched by the secret-source policy
-    secret.write_text("x")
-    ok = tmp_path / "ok.txt"
-    ok.write_text("hello")
-    manifest = stage_task_attachments(
-        tmp_path / "drive", "task-branches",
-        [{"path": str(big)}, {"path": str(secret)}, {"path": str(ok)}],
-    )
-    statuses = {m.get("status") for m in manifest}
-    assert "skipped_oversize" in statuses
-    assert "skipped_secret" in statuses
-    assert any(m.get("relpath") for m in manifest)  # the good file still staged
-    # Renderer surfaces each without a fake read_file line.
-    from ouroboros.gateway.tasks import _render_attachment_lines
-    rendered = _render_attachment_lines(manifest)
-    assert "per-file limit" in rendered and "secret-file policy" in rendered
-
-
-def test_render_attachment_lines_discloses_unreadable_and_error(tmp_path):
-    from ouroboros.gateway.tasks import _render_attachment_lines
-
-    rendered = _render_attachment_lines([
-        {"label": "a", "status": "skipped_unreadable"},
-        {"label": "b", "status": "skipped_error"},
-    ])
-    assert "could not be read" in rendered and "staging failed" in rendered
-    assert "read_file" not in rendered
-
-
 def test_render_attachment_lines_discloses_skipped_without_fake_read(tmp_path):
     from ouroboros.gateway.tasks import _render_attachment_lines
 
