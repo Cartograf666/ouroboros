@@ -323,37 +323,41 @@ def test_post_multipart_file_strips_quote_from_disposition(tmp_path, monkeypatch
     assert b'"' not in filename_field
 
 
-def test_validate_attach_paths_drops_secret_sources_with_zero_uploads(tmp_path):
-    # R32C1: a secret SOURCE (~/.ssh/id_rsa, credentials.json, *.pem, a secret-
-    # DIRECTORY component) must be refused BEFORE any upload. Staging drops it,
-    # but for a REMOTE server the CLI would otherwise already have transmitted
-    # and persisted the secret bytes on another machine. Zero multipart requests.
-    normal = tmp_path / "doc.txt"
-    normal.write_text("data")
-    ssh_dir = tmp_path / ".ssh"
-    ssh_dir.mkdir()
-    key = ssh_dir / "id_rsa"  # secret DIRECTORY component (.ssh) + secret name
-    key.write_text("PRIVATE")
-    creds = tmp_path / "credentials.json"  # secret NAME
-    creds.write_text("{}")
-    pem = tmp_path / "server.pem"  # secret EXTENSION
-    pem.write_text("cert")
+def test_validate_attach_paths_refuses_secret_sources_loudly_and_generically(tmp_path):
+    # R32C1 + R34C1: a secret SOURCE (~/.ssh/id_rsa, credentials.json, *.pem, a
+    # secret-DIRECTORY component) must be refused BEFORE any upload — for a REMOTE
+    # server the CLI would otherwise transmit and persist the bytes on another
+    # machine. R34C1 (P1 no-silent-loss): the refusal is LOUD, not a silent drop
+    # that would narrow the task without disclosure — but the message is GENERIC
+    # (never the filename) so confidentiality holds. And it happens before the
+    # server is ever contacted, so ZERO multipart requests.
+    for name, make in [
+        (".ssh/id_rsa", lambda: (tmp_path / ".ssh").mkdir(exist_ok=True) or (tmp_path / ".ssh" / "id_rsa")),
+        ("credentials.json", lambda: tmp_path / "credentials.json"),
+        ("server.pem", lambda: tmp_path / "server.pem"),
+    ]:
+        p = make()
+        p.write_text("SECRET")
+        with pytest.raises(CLIError, match="secret-source policy"):
+            _validate_attach_paths([str(p)])
+    # The message must NOT name the file (confidentiality).
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir(exist_ok=True)
+    key = ssh / "id_rsa"
+    key.write_text("x")
+    try:
+        _validate_attach_paths([str(key)])
+    except CLIError as exc:
+        assert "id_rsa" not in str(exc) and str(key) not in str(exc)
 
-    kept = _validate_attach_paths([str(key), str(normal), str(creds), str(pem)])
-    assert [p.name for p in kept] == ["doc.txt"]
 
-    client = FakeClient()
-    attachments, names = _upload_attachments(client, kept)
-    assert client.uploads and all("doc.txt" in u[1] for u in client.uploads)
-    assert len(client.uploads) == 1  # exactly the non-secret file — ZERO secret uploads
-
-
-def test_validate_attach_paths_drops_missing_secret_without_confirming_existence(tmp_path):
-    # A secret-SHAPED path that does not exist must be dropped SILENTLY — never a
-    # loud "not found", which would confirm the secret file's (non-)existence and
-    # leak its name. The secret check runs before the is_file() branch.
-    kept = _validate_attach_paths([str(tmp_path / ".ssh" / "id_ed25519")])
-    assert kept == []
+def test_validate_attach_paths_refuses_missing_secret_without_confirming_existence(tmp_path):
+    # A secret-SHAPED path that does NOT exist must still be refused generically —
+    # never a loud "not found", which would confirm the file's (non-)existence.
+    # The secret check runs before the is_file() branch, and its message names no
+    # file, so it discloses neither existence nor identity.
+    with pytest.raises(CLIError, match="secret-source policy"):
+        _validate_attach_paths([str(tmp_path / ".ssh" / "id_ed25519")])
 
 
 def test_upload_attachments_enforces_aggregate_budget_at_read_time(tmp_path, monkeypatch):

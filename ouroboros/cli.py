@@ -327,11 +327,18 @@ def _validate_attach_paths(raw_paths: List[str]) -> List[pathlib.Path]:
         # Secret-source refusal BEFORE any network contact (R32C1): staging drops
         # a credential source (~/.ssh/id_rsa, *.pem, credentials.json), but for a
         # REMOTE server the CLI would already have uploaded the bytes — they'd
-        # land and persist on another machine. Mirror the server's SAME predicate
-        # here and skip silently (never confirm the file's existence, preserving
-        # the tested secret-silence contract) so a secret produces ZERO uploads.
+        # land and persist on another machine. So refuse using the server's SAME
+        # predicate. R34C1 (P1 no-silent-loss): fail LOUDLY, not silently — a
+        # silent drop narrows an owner-requested task without disclosure (e.g. a
+        # benign file with a secret-shaped name). The message is GENERIC (never
+        # the filename) so confidentiality holds and existence is not confirmed,
+        # yet the owner sees the omission before any task is created. Zero uploads.
         if is_secret_attachment_source(path.resolve()) or is_secret_attachment_source(path):
-            continue
+            raise CLIError(
+                "one or more --attach files were withheld by secret-source policy "
+                "(a path resolving under a credential location or with a "
+                "credential-shaped name); remove them from --attach to proceed."
+            )
         if not path.is_file():
             raise CLIError(f"--attach file not found (or not a regular file): {path}")
         size = path.stat().st_size
