@@ -111,6 +111,10 @@ def test_update_remote_connections_locked_rmw_preserves_other_keys(tmp_path, mon
     assert not (tmp_path / "settings.json.lock").exists()
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX file-permission semantics; Windows has no 0600 mode bit (reports 0o666)",
+)
 def test_update_remote_connections_preserves_0600_permissions(tmp_path, monkeypatch, _launcher_identity):
     import stat
 
