@@ -131,21 +131,19 @@ def stage_task_attachments(
         return []
 
     manifest: List[Dict[str, Any]] = []
-    staged = 0
     total_bytes = 0
     for idx, item in enumerate(items):
-        # A malformed entry (string/None) must be skipped, not abort the whole
-        # batch (R15C2): the label derivation below reads item.get(...) OUTSIDE
-        # the per-item try, so a non-dict here would otherwise raise.
-        if not isinstance(item, dict):
-            continue
-        if staged >= _MAX_STAGED_ATTACHMENTS:
-            # P1 no-silent-loss: instead of a bare break that hides the dropped
-            # inputs, emit one typed omission entry naming the remaining count so
-            # the task prompt discloses that the input set is incomplete.
+        # Cap on items PROCESSED, not on successful stages (R28C1): a disclosure
+        # row (skipped_missing/oversize/secret/…) does not stage a file, so a
+        # cap keyed on successful copies let an arbitrarily long list of
+        # nonexistent paths produce an UNBOUNDED manifest that _render_attachment_
+        # lines then expanded into the prompt (memory/context blowup). Bounding
+        # the loop by index caps the manifest at ~_MAX_STAGED_ATTACHMENTS rows +
+        # one summarized remainder, regardless of how many inputs actually stage.
+        if idx >= _MAX_STAGED_ATTACHMENTS:
             remaining = len(items) - idx
             log.info(
-                "stage_task_attachments: hit max staged attachments (%d); %d not staged",
+                "stage_task_attachments: hit max attachments (%d); %d not processed",
                 _MAX_STAGED_ATTACHMENTS, remaining,
             )
             manifest.append({
@@ -154,6 +152,11 @@ def stage_task_attachments(
                 "limit": _MAX_STAGED_ATTACHMENTS,
             })
             break
+        # A malformed entry (string/None) must be skipped, not abort the whole
+        # batch (R15C2): the label derivation below reads item.get(...) OUTSIDE
+        # the per-item try, so a non-dict here would otherwise raise.
+        if not isinstance(item, dict):
+            continue
         # Sanitized display label, used by the disclosure branches (drop control
         # chars + collapse whitespace + bound, so a crafted filename cannot
         # inject prompt lines). Disclosure policy (established, tested contract):
@@ -232,7 +235,6 @@ def stage_task_attachments(
                 "mime": mime,
                 "is_image": mime.startswith("image/"),
             })
-            staged += 1
             total_bytes += src_size
         except Exception:
             log.debug("stage_task_attachments: skipped a file on error", exc_info=True)

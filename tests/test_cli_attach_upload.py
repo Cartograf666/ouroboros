@@ -396,6 +396,22 @@ def test_stage_task_attachments_skips_malformed_entries(tmp_path):
     assert len(staged) == 1 and staged[0]["label"] == "ok.txt"
 
 
+def test_stage_task_attachments_bounds_manifest_for_all_missing(tmp_path):
+    # R28C1: a POST with an arbitrarily long list of NONEXISTENT paths must not
+    # produce an unbounded manifest (each would be a skipped_missing row expanded
+    # into the prompt). The cap is on items PROCESSED, so the manifest is bounded
+    # at ~_MAX_STAGED_ATTACHMENTS rows + one summarized remainder.
+    from ouroboros.artifacts import _MAX_STAGED_ATTACHMENTS, stage_task_attachments
+
+    srcs = [{"path": str(tmp_path / f"nope{i}.txt")} for i in range(_MAX_STAGED_ATTACHMENTS + 500)]
+    manifest = stage_task_attachments(tmp_path / "drive", "task-flood", srcs)
+    assert len(manifest) <= _MAX_STAGED_ATTACHMENTS + 1  # bounded, not 525 rows
+    over = [m for m in manifest if m.get("status") == "skipped_over_limit"]
+    assert len(over) == 1  # the summarized remainder
+    missing = [m for m in manifest if m.get("status") == "skipped_missing"]
+    assert len(missing) == _MAX_STAGED_ATTACHMENTS  # capped, each disclosed once
+
+
 def test_stage_task_attachments_discloses_over_total_omission(tmp_path):
     # R9C2: files that individually pass the per-file cap but together exceed the
     # per-task TOTAL must stop with one typed omission entry (no silent break).
