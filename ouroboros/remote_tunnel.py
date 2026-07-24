@@ -232,10 +232,13 @@ def remote_port_file_path(profile: Dict[str, Any]) -> str:
 
 
 def discovery_argv(profile: Dict[str, Any], *, ssh_path: str = "ssh") -> List[str]:
+    # `head -c` bounds the output on a COOPERATIVE remote (the port file is a few
+    # bytes); the client _bounded_communicate cap is the boundary for a hostile
+    # one that ignores it (audit-F1).
     return [
         ssh_path, "-n", "-T", *_BASE_SSH_OPTS,
         "--", profile["ssh_target"],
-        f"cat {remote_port_file_path(profile)}",
+        f"head -c 4096 {remote_port_file_path(profile)}",
     ]
 
 
@@ -243,7 +246,7 @@ def unit_active_argv(profile: Dict[str, Any], *, ssh_path: str = "ssh") -> List[
     return [
         ssh_path, "-n", "-T", *_BASE_SSH_OPTS,
         "--", profile["ssh_target"],
-        "systemctl --user is-active ouroboros",
+        "systemctl --user is-active ouroboros 2>/dev/null | head -c 4096",
     ]
 
 
@@ -385,15 +388,68 @@ def remote_ui_compatible(local_port: int) -> bool:
         return False
 
 
+# The discovery ssh command returns a tiny value (a port number, or "active").
+# Cap the read HARD (audit-F1): the remote is untrusted, so its `cat`/`head`/
+# `systemctl` output must not be read unbounded into launcher memory (OOM) —
+# parity with _tunnel_get's body cap. The remote command also self-limits with
+# `head -c` (cooperative case); this is the client-side security boundary.
+_DISCOVERY_MAX_OUTPUT_BYTES = 64 * 1024
+
+
+def _bounded_communicate(
+    proc: "subprocess.Popen[Any]", *, timeout: float, max_bytes: int
+) -> "tuple[str, str]":
+    """Read proc stdout/stderr with a HARD byte cap AND total-time deadline.
+
+    A watchdog thread reads at most max_bytes+1 per stream; on overrun or on the
+    deadline the whole tree is group-killed and TimeoutExpired is raised (which
+    discover_remote_port maps to a typed ssh_failed). Cross-platform (thread +
+    read, no select). Raising TimeoutExpired keeps the runner contract."""
+    box: Dict[str, Any] = {}
+
+    def _read() -> None:
+        try:
+            box["out"] = proc.stdout.read(max_bytes + 1) if proc.stdout else ""
+            box["err"] = proc.stderr.read(max_bytes + 1) if proc.stderr else ""
+        except Exception as exc:  # noqa: BLE001 — surfaced to the joining thread
+            box["exc"] = exc
+
+    worker = threading.Thread(target=_read, daemon=True, name="ssh-bounded-read")
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        _kill_tree_now(proc)
+        raise subprocess.TimeoutExpired(cmd=proc.args, timeout=timeout)
+    if "exc" in box:
+        raise box["exc"]
+    out, err = box.get("out") or "", box.get("err") or ""
+    if len(out) > max_bytes or len(err) > max_bytes:
+        _kill_tree_now(proc)
+        raise subprocess.TimeoutExpired(cmd=proc.args, timeout=timeout)
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+    return out, err
+
+
 def _run_ssh(argv: List[str], *, timeout: float) -> "subprocess.CompletedProcess[str]":
-    return subprocess.run(
+    proc = subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
         **subprocess_new_group_kwargs(),
     )
+    try:
+        out, err = _bounded_communicate(
+            proc, timeout=timeout, max_bytes=_DISCOVERY_MAX_OUTPUT_BYTES
+        )
+    finally:
+        if proc.poll() is None:
+            _kill_tree_now(proc)
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def discover_remote_port(
@@ -623,11 +679,15 @@ class RemoteTunnelManager:
             )
             self._inflight.add(proc)
         try:
-            out, err = proc.communicate(timeout=timeout)
+            # Byte-capped read (audit-F1): the untrusted remote's discovery
+            # output must not be read unbounded into launcher memory.
+            out, err = _bounded_communicate(
+                proc, timeout=timeout, max_bytes=_DISCOVERY_MAX_OUTPUT_BYTES
+            )
             return subprocess.CompletedProcess(argv, proc.returncode, out, err)
         except BaseException:
-            # ANY failure (TimeoutExpired or an unexpected communicate error):
-            # group-kill and reap before dropping custody, so no live ssh escapes
+            # ANY failure (timeout / oversize / unexpected read error): group-kill
+            # and reap before dropping custody, so no live ssh escapes
             # force_disconnect and no zombie lingers (R18C2).
             _kill_tree_now(proc)
             try:

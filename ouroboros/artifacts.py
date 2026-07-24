@@ -43,6 +43,43 @@ _MAX_STAGED_ATTACHMENT_BYTES = 50 * 1024 * 1024  # ~50 MB per file
 _MAX_STAGED_TOTAL_BYTES = 200 * 1024 * 1024  # ~200 MB total
 
 
+def is_secret_attachment_source(src: pathlib.Path) -> bool:
+    """True when an attachment SOURCE path is credential-bearing.
+
+    SSOT secret detection for attachments: reuses the user_files secret blocklist
+    so a secret SOURCE (e.g. ``~/.ssh/id_rsa``, ``credentials.json``, ``*.pem``)
+    is never staged into a task. The CLI (`ouroboros run --attach`) imports this
+    to refuse a secret BEFORE uploading its bytes — critical for the remote v1
+    path, where an unchecked upload would transmit and persist the secret on a
+    remote server even though staging later drops it (R32C1).
+    """
+    from ouroboros.tool_access import (
+        _USER_FILES_ALLOWED_DOTNAMES,
+        _USER_FILES_SECRET_COMPONENTS,
+        _USER_FILES_SECRET_NAMES,
+        _USER_FILES_SECRET_RE,
+    )
+
+    src = pathlib.Path(src)
+    for part in src.parts:
+        part_lower = part.lower()
+        if part_lower in _USER_FILES_SECRET_COMPONENTS:
+            return True
+        # Parity with user_files_path_block_reason (DEFAULT-DENY dotted): a non-allowlisted
+        # dotted SOURCE component is potentially credential-bearing, so an enumerated-blocklist
+        # gap (e.g. ~/.terraform.d/credentials.tfrc.json) can't auto-stage a secret. Owner-
+        # supplied attachments only — defense-in-depth parity, not a live agent-exfil path.
+        if part.startswith(".") and part_lower not in _USER_FILES_ALLOWED_DOTNAMES:
+            return True
+    name = src.name
+    name_lower = name.lower()
+    return bool(
+        name_lower in _USER_FILES_SECRET_NAMES
+        or _USER_FILES_SECRET_RE.search(name)
+        or name_lower.endswith((".key", ".pem", ".p12", ".pfx"))
+    )
+
+
 def _safe_attachment_name(raw_name: str) -> str:
     """Sanitize an attachment basename (mirrors gateway/files._sanitize_upload_filename)."""
 
@@ -96,33 +133,10 @@ def stage_task_attachments(
     if not items:
         return []
 
-    # SSOT secret detection: reuse the user_files secret blocklist so a credential
-    # SOURCE (e.g. ~/.ssh/id_rsa, credentials.json, *.pem) is never copied in.
-    from ouroboros.tool_access import (
-        _USER_FILES_ALLOWED_DOTNAMES,
-        _USER_FILES_SECRET_COMPONENTS,
-        _USER_FILES_SECRET_NAMES,
-        _USER_FILES_SECRET_RE,
-    )
-
-    def _is_secret_source(src: pathlib.Path) -> bool:
-        for part in src.parts:
-            part_lower = part.lower()
-            if part_lower in _USER_FILES_SECRET_COMPONENTS:
-                return True
-            # Parity with user_files_path_block_reason (DEFAULT-DENY dotted): a non-allowlisted
-            # dotted SOURCE component is potentially credential-bearing, so an enumerated-blocklist
-            # gap (e.g. ~/.terraform.d/credentials.tfrc.json) can't auto-stage a secret. Owner-
-            # supplied attachments only — defense-in-depth parity, not a live agent-exfil path.
-            if part.startswith(".") and part_lower not in _USER_FILES_ALLOWED_DOTNAMES:
-                return True
-        name = src.name
-        name_lower = name.lower()
-        return bool(
-            name_lower in _USER_FILES_SECRET_NAMES
-            or _USER_FILES_SECRET_RE.search(name)
-            or name_lower.endswith((".key", ".pem", ".p12", ".pfx"))
-        )
+    # SSOT secret detection: is_secret_attachment_source (module level) is the
+    # single authority — the CLI imports the SAME predicate to refuse a secret
+    # before uploading (R32C1), so the client and server can never diverge.
+    _is_secret_source = is_secret_attachment_source
 
     try:
         attach_dir = task_artifact_dir_path(drive_root, task_id, create=True) / _ATTACHMENTS_SUBDIR

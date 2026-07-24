@@ -96,7 +96,7 @@ def test_discovery_argv_shape():
     assert "BatchMode=yes" in argv and "ControlMaster=no" in argv
     assert "--" in argv  # option/operand separator before the target
     assert argv[argv.index("--") + 1] == "user@host"
-    assert argv[-1] == "cat ~/ouroboros-server/data/state/server_port"
+    assert argv[-1] == "head -c 4096 ~/ouroboros-server/data/state/server_port"
 
 
 def test_tunnel_argv_binds_loopback_explicitly():
@@ -546,13 +546,18 @@ def test_browser_control_plane_denies_active_tunnel_port(tmp_path, monkeypatch):
     assert 51234 not in browser._control_plane_loopback_ports()
 
 
-def test_run_ssh_tracked_kills_and_unregisters_on_communicate_failure(tmp_path, monkeypatch):
-    # R18C2: a non-timeout communicate() failure must still group-kill + reap the
-    # child and drop it from _inflight — never leave a live ssh invisible to
-    # force_disconnect.
+def test_run_ssh_tracked_kills_and_unregisters_on_read_failure(tmp_path, monkeypatch):
+    # R18C2: a non-timeout read failure must still group-kill + reap the child
+    # and drop it from _inflight — never leave a live ssh invisible to
+    # force_disconnect. (Read now goes through _bounded_communicate, audit-F1.)
+    class _BoomIO:
+        def read(self, _n): raise RuntimeError("read boom")
+
     mgr = _manager(tmp_path)
     fake = _FakeProc()
-    fake.communicate = lambda timeout=None: (_ for _ in ()).throw(RuntimeError("comm boom"))
+    fake.stdout = _BoomIO()
+    fake.stderr = _BoomIO()
+    fake.communicate = lambda timeout=None: ("", "")
     monkeypatch.setattr(rt.subprocess, "Popen", lambda *a, **k: fake)
     killed = []
     monkeypatch.setattr(rt, "_kill_tree_now", lambda p: (killed.append(p), p.kill()))
@@ -765,6 +770,18 @@ def test_reap_orphaned_tunnels_returns_none_when_unconfirmed(tmp_path, monkeypat
 
 @pytest.mark.serial
 @_POSIX_ONLY
+def test_discovery_read_is_byte_capped_against_flood(tmp_path):
+    # audit-F1: an untrusted remote flooding the discovery ssh output must not be
+    # read unbounded. A stub 'ssh' that emits far more than the cap → discovery
+    # fails closed (bounded read → TimeoutExpired → TunnelError), never OOMs.
+    ssh = _write_stub_ssh(tmp_path, "yes X | head -c 5000000\n")  # ~5 MB > 64 KB cap
+    prof = rt.validate_profile({"id": "a", "ssh_target": "h"})
+    with pytest.raises(rt.TunnelError):
+        rt.discover_remote_port(prof, ssh_path=ssh)
+
+
+@pytest.mark.serial
+@_POSIX_ONLY
 def test_reap_purpose_prefix_no_wnohang_does_not_crash(tmp_path, monkeypatch):
     # R30C1: os.WNOHANG is Unix-only; on Windows the zombie-reap must be GUARDED,
     # not AttributeError into the swallowing except (which would silently defeat
@@ -784,8 +801,51 @@ def test_reap_purpose_prefix_no_wnohang_does_not_crash(tmp_path, monkeypatch):
     try:
         pc.record_process(tmp_path, pid=proc.pid, cmd=["python3", "-c", "import time; time.sleep(30)"],
                           purpose="remote_ssh_tunnel:x", scope="daemon")
+        # Must COMPLETE (no AttributeError from the missing os.WNOHANG). Return
+        # value: on POSIX WITHOUT WNOHANG our own killed child lingers as an
+        # unreaped zombie, so pid_is_alive stays True → the match reads as a
+        # survivor → None (unconfirmed, R32C2). On real Windows there are no
+        # zombies, so the same path would confirm death and return a list. Either
+        # way the call returns normally — that's the R30C1 guarantee under test.
         result = pc.reap_purpose_prefix(tmp_path, "remote_ssh_tunnel:")
-        assert isinstance(result, list)  # completed, no AttributeError crash
+        assert result is None or isinstance(result, list)  # completed, no crash
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+@pytest.mark.serial
+@_POSIX_ONLY
+def test_reap_purpose_prefix_returns_none_when_a_match_survives_kill(tmp_path, monkeypatch):
+    # R32C2: when a MATCHING process survives the kill, reap must return None
+    # (unconfirmed) — never an ordinary reaped list that reap_orphaned_tunnels
+    # reads as "all clear" and uses to clear the tunnel deny marker over a still-
+    # live forward. The entry is KEPT as a survivor so a later startup retries.
+    import subprocess as sp
+
+    from ouroboros import process_custody as pc
+    from ouroboros.platform_layer import subprocess_new_group_kwargs
+
+    leak_cmd = ["python3", "-c", "import time; time.sleep(30)"]
+    proc = sp.Popen(leak_cmd, stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+                    **subprocess_new_group_kwargs())
+    try:
+        pc.record_process(tmp_path, pid=proc.pid, cmd=leak_cmd,
+                          purpose="remote_ssh_tunnel:stubborn", scope="daemon")
+        # Neuter the kill so the matching process cannot die within the grace.
+        monkeypatch.setattr(pc, "kill_process_group_id", lambda pgid: None)
+        monkeypatch.setattr(pc, "kill_pid_tree", lambda pid: None, raising=False)
+        import ouroboros.platform_layer as pl
+        monkeypatch.setattr(pl, "kill_pid_tree", lambda pid: None, raising=False)
+
+        assert pc.reap_purpose_prefix(tmp_path, "remote_ssh_tunnel:") is None
+        # The launcher-facing wrapper propagates None → keep the deny marker.
+        assert rt.reap_orphaned_tunnels(tmp_path) is None
+        # The still-live entry is retained for a later retry, not pruned.
+        entries = pc._read_ledger(tmp_path)
+        assert any(str(e.get("purpose")) == "remote_ssh_tunnel:stubborn" for e in entries)
     finally:
         try:
             proc.kill()

@@ -104,11 +104,15 @@ class OuroborosHTTPClient:
         """POST one file as multipart/form-data (stdlib-only encoder).
 
         The file is read fully into memory (desktop CLI client, not a streaming
-        service). ``max_bytes`` re-enforces the per-file cap AT READ TIME
-        (R31C1): _validate_attach_paths checks size earlier, but a file that
-        grows or is swapped between validation and upload would otherwise be
-        read unbounded and bypass the validated cap — so read at most limit+1
-        and refuse if it grew.
+        service). ``max_bytes`` re-enforces a byte cap AT READ TIME (R31C1/R32C3):
+        _validate_attach_paths checks sizes earlier, but a file that grows or is
+        swapped between validation and upload would otherwise be read unbounded
+        and bypass the validated cap — so read at most limit+1 and refuse if it
+        grew. The caller passes ``min(per-file cap, remaining aggregate budget)``
+        so a batch of individually-valid-but-grown files can't exceed the task's
+        total-bytes limit either. The actual bytes read are recorded on
+        ``self._last_upload_bytes`` so the caller can decrement its running
+        aggregate budget by the TRUE transfer size (not the pre-stat estimate).
         """
         import mimetypes
         import uuid
@@ -128,11 +132,15 @@ class OuroborosHTTPClient:
                 content = _fh.read(max_bytes + 1)
             if len(content) > max_bytes:
                 raise CLIError(
-                    f"attachment {source.name} exceeds the {max_bytes // (1024 * 1024)} MB "
-                    "per-file limit at upload time (did it grow after validation?)"
+                    f"attachment {source.name} exceeds the remaining "
+                    f"{max_bytes // (1024 * 1024)} MB upload budget at read time "
+                    "(file grew after validation, or the task's total attachment "
+                    "size is exhausted)"
                 )
         else:
             content = source.read_bytes()
+        # TRUE transferred size, for the caller's running aggregate budget (R32C3).
+        self._last_upload_bytes = len(content)
         body = head + content + f"\r\n--{boundary}--\r\n".encode("utf-8")
         headers = self._base_headers()
         headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
@@ -262,6 +270,7 @@ def _validate_attach_paths(raw_paths: List[str]) -> List[pathlib.Path]:
         _MAX_STAGED_ATTACHMENTS as _CAP,
         _MAX_STAGED_ATTACHMENT_BYTES as _PER_FILE,
         _MAX_STAGED_TOTAL_BYTES as _TOTAL,
+        is_secret_attachment_source,
     )
 
     raw_paths = list(raw_paths or [])
@@ -274,6 +283,14 @@ def _validate_attach_paths(raw_paths: List[str]) -> List[pathlib.Path]:
     total = 0
     for raw in raw_paths:
         path = pathlib.Path(raw).expanduser()
+        # Secret-source refusal BEFORE any network contact (R32C1): staging drops
+        # a credential source (~/.ssh/id_rsa, *.pem, credentials.json), but for a
+        # REMOTE server the CLI would already have uploaded the bytes — they'd
+        # land and persist on another machine. Mirror the server's SAME predicate
+        # here and skip silently (never confirm the file's existence, preserving
+        # the tested secret-silence contract) so a secret produces ZERO uploads.
+        if is_secret_attachment_source(path.resolve()) or is_secret_attachment_source(path):
+            continue
         if not path.is_file():
             raise CLIError(f"--attach file not found (or not a regular file): {path}")
         size = path.stat().st_size
@@ -303,24 +320,35 @@ def _upload_attachments(
     On a mid-batch failure every already-uploaded temp file is best-effort
     deleted so partial batches never orphan files in the server's uploads dir.
     """
-    from ouroboros.artifacts import _MAX_STAGED_ATTACHMENT_BYTES as _PER_FILE
+    from ouroboros.artifacts import (
+        _MAX_STAGED_ATTACHMENT_BYTES as _PER_FILE,
+        _MAX_STAGED_TOTAL_BYTES as _TOTAL,
+    )
 
     attachments: List[Dict[str, Any]] = []
     uploaded_names: List[str] = []
+    # Running aggregate budget re-enforced at READ TIME (R32C3): _validate_attach_
+    # paths checks the 200 MB total from pre-upload stat values, but each file can
+    # grow (staying under 50 MB) between validation and upload, so N files could
+    # otherwise stream far past _TOTAL. Cap each read at the SMALLER of the per-
+    # file limit and the budget still remaining, then decrement by the TRUE bytes
+    # sent — the batch can never transmit more than _TOTAL.
+    remaining = _TOTAL
     for path in paths:
         # Exception-SAFE (R23C2): ANY failure — a CLIError, an OSError from a file
         # that vanished after validation, or a non-dict HTTP-200 body making
         # .get() raise — must release every already-uploaded file, never orphan
         # them in the server's uploads dir. Non-CLIErrors normalize to CLIError.
         try:
-            # max_bytes re-enforces the per-file cap at read time (R31C1) against
-            # a file that grew/was swapped between validation and upload.
-            result = client.post_multipart_file("/api/chat/upload", path, max_bytes=_PER_FILE)
+            limit = min(_PER_FILE, remaining)
+            result = client.post_multipart_file("/api/chat/upload", path, max_bytes=limit)
             data = result if isinstance(result, dict) else {}
             server_path = str(data.get("path") or "")
             server_name = str(data.get("filename") or "")
             if not server_path or not server_name:
                 raise CLIError(f"attachment upload failed for {path}: {result}")
+            sent = int(getattr(client, "_last_upload_bytes", 0) or 0)
+            remaining = max(0, remaining - sent)
         except Exception as exc:
             _cleanup_uploads(client, uploaded_names)
             if isinstance(exc, CLIError):

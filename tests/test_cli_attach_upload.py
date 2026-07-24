@@ -145,7 +145,7 @@ def test_post_multipart_file_bounds_read_against_grown_file(tmp_path):
     with big.open("wb") as fh:
         fh.truncate(2048)
     client = cli.OuroborosHTTPClient("http://127.0.0.1:1")
-    with pytest.raises(CLIError, match="per-file limit at upload time"):
+    with pytest.raises(CLIError, match="upload budget at read time"):
         client.post_multipart_file("/api/chat/upload", big, max_bytes=1024)
 
 
@@ -321,6 +321,101 @@ def test_post_multipart_file_strips_quote_from_disposition(tmp_path, monkeypatch
     disposition = captured["body"].split(b"\r\n\r\n", 1)[0]
     filename_field = disposition.split(b'filename="', 1)[1].split(b"\r\n", 1)[0][:-1]
     assert b'"' not in filename_field
+
+
+def test_validate_attach_paths_drops_secret_sources_with_zero_uploads(tmp_path):
+    # R32C1: a secret SOURCE (~/.ssh/id_rsa, credentials.json, *.pem, a secret-
+    # DIRECTORY component) must be refused BEFORE any upload. Staging drops it,
+    # but for a REMOTE server the CLI would otherwise already have transmitted
+    # and persisted the secret bytes on another machine. Zero multipart requests.
+    normal = tmp_path / "doc.txt"
+    normal.write_text("data")
+    ssh_dir = tmp_path / ".ssh"
+    ssh_dir.mkdir()
+    key = ssh_dir / "id_rsa"  # secret DIRECTORY component (.ssh) + secret name
+    key.write_text("PRIVATE")
+    creds = tmp_path / "credentials.json"  # secret NAME
+    creds.write_text("{}")
+    pem = tmp_path / "server.pem"  # secret EXTENSION
+    pem.write_text("cert")
+
+    kept = _validate_attach_paths([str(key), str(normal), str(creds), str(pem)])
+    assert [p.name for p in kept] == ["doc.txt"]
+
+    client = FakeClient()
+    attachments, names = _upload_attachments(client, kept)
+    assert client.uploads and all("doc.txt" in u[1] for u in client.uploads)
+    assert len(client.uploads) == 1  # exactly the non-secret file — ZERO secret uploads
+
+
+def test_validate_attach_paths_drops_missing_secret_without_confirming_existence(tmp_path):
+    # A secret-SHAPED path that does not exist must be dropped SILENTLY — never a
+    # loud "not found", which would confirm the secret file's (non-)existence and
+    # leak its name. The secret check runs before the is_file() branch.
+    kept = _validate_attach_paths([str(tmp_path / ".ssh" / "id_ed25519")])
+    assert kept == []
+
+
+def test_upload_attachments_enforces_aggregate_budget_at_read_time(tmp_path, monkeypatch):
+    # R32C3: validation checks the 200 MB aggregate from pre-upload stat values,
+    # but files can GROW (each staying under the per-file cap) between validation
+    # and the read. The read-time budget must still bound the TOTAL transferred —
+    # not just each file. Model it with tiny caps and files that grew after
+    # validation; the batch must abort with a budget error and clean up.
+    import ouroboros.artifacts as art
+
+    monkeypatch.setattr(art, "_MAX_STAGED_ATTACHMENT_BYTES", 100, raising=True)
+    monkeypatch.setattr(art, "_MAX_STAGED_TOTAL_BYTES", 150, raising=True)
+
+    f0 = tmp_path / "f0.bin"
+    f1 = tmp_path / "f1.bin"
+    f0.write_bytes(b"a" * 10)
+    f1.write_bytes(b"b" * 10)
+    validated = _validate_attach_paths([str(f0), str(f1)])  # 20 B total, passes
+    # Both grow to 80 B: each still < 100 B per-file, but 160 B > 150 B aggregate.
+    f0.write_bytes(b"a" * 80)
+    f1.write_bytes(b"b" * 80)
+
+    uploaded = []
+
+    class _RealBytesClient(FakeClient):
+        # Exercise the REAL post_multipart_file read path so the budget is
+        # enforced against actual bytes, not the fake's canned response.
+        def post_multipart_file(self, path, file_path, *, field="file", timeout=None, max_bytes=None):
+            content = pathlib.Path(file_path).read_bytes()
+            if max_bytes is not None and len(content) > max_bytes:
+                from ouroboros.cli import CLIError as _E
+                self._last_upload_bytes = 0
+                raise _E("exceeds the remaining upload budget at read time")
+            self._last_upload_bytes = len(content)
+            index = len(self.uploads)
+            self.uploads.append((path, str(file_path)))
+            uploaded.append(file_path.name)
+            name = f"srv-{index}_{file_path.name}"
+            return {"ok": True, "filename": name, "path": f"/srv/uploads/{name}"}
+
+    client = _RealBytesClient()
+    with pytest.raises(CLIError, match="budget"):
+        _upload_attachments(client, validated)
+    # f0 (80 B) fit; f1 (80 B) crossed the 150 B budget → aborted + f0 released.
+    assert uploaded == ["f0.bin"]
+    deletes = [r for r in client.requests if r[0] == "DELETE"]
+    assert deletes == [("DELETE", "/api/chat/upload", {"filename": "srv-0_f0.bin"})]
+
+
+def test_post_multipart_file_records_true_bytes_sent(tmp_path, monkeypatch):
+    # R32C3: the running aggregate budget decrements by _last_upload_bytes, so the
+    # real encoder must record the TRUE number of content bytes it transmitted.
+    f = tmp_path / "payload.bin"
+    f.write_bytes(b"z" * 37)
+    client = cli.OuroborosHTTPClient("http://127.0.0.1:1")
+
+    def fake_urlopen(req, timeout=None):
+        return _Resp(json.dumps({"ok": True, "filename": "n", "path": "/p"}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    client.post_multipart_file("/api/chat/upload", f, max_bytes=1000)
+    assert client._last_upload_bytes == 37
 
 
 def test_stage_task_attachments_discloses_missing_sources(tmp_path):

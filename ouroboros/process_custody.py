@@ -503,6 +503,13 @@ def reap_purpose_prefix(drive_root: pathlib.Path, purpose_prefix: str) -> Option
             return []
         reaped: List[int] = []
         survivors: List[Dict[str, Any]] = []
+        # R32C2: a MATCHING entry whose process survived the kill (or whose kill
+        # raised) means an orphan of this purpose may still be live. The reaped
+        # list alone can't express that — an empty/short list reads as "all
+        # clear" to reap_orphaned_tunnels, which then clears the tunnel deny
+        # marker over a still-live forward. Track it and return None (unconfirmed)
+        # so the caller keeps the safety marker, exactly like the lock-busy case.
+        matching_survivor = False
         for entry in entries:
             purpose = str(entry.get("purpose") or "")
             if not purpose.startswith(purpose_prefix):
@@ -546,6 +553,7 @@ def reap_purpose_prefix(drive_root: pathlib.Path, purpose_prefix: str) -> Option
                 if not dead:
                     log.warning("reap_purpose_prefix: pid %s still alive after kill; keeping", pid)
                     survivors.append(entry)
+                    matching_survivor = True
                     continue
                 reaped.append(pid)
                 append_jsonl(drive_root / "logs" / "supervisor.jsonl", {
@@ -560,7 +568,10 @@ def reap_purpose_prefix(drive_root: pathlib.Path, purpose_prefix: str) -> Option
             except Exception:
                 log.warning("Failed to reap ledgered process %s", pid, exc_info=True)
                 survivors.append(entry)
+                matching_survivor = True
         _write_ledger_file(path, survivors)
-        return reaped
+        # A live matching survivor makes cleanup UNCONFIRMED (None), never a
+        # short reaped list the caller would read as "all clear" (R32C2).
+        return None if matching_survivor else reaped
     finally:
         release_exclusive_file_lock(lock_path, lock_fd)
