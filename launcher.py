@@ -1304,16 +1304,12 @@ def main():
     local_url = f"http://127.0.0.1:{actual_port}"
 
     def _on_tunnel_state(status: dict) -> None:
-        """Monitor-thread callback: keep the window on a live page.
-
-        gave_up → return to the local page (launcher-owned recovery, never
-        depends on the remote SPA); reconnected on a NEW local port (stable-port
-        bind was stolen) → navigate to the new tunnel origin.
-        """
+        """Monitor-thread callback: gave_up → return to local; reconnected on a
+        NEW local port → navigate to the new tunnel origin (after admission)."""
         state = status.get("state")
         try:
-            # R11C1: ignore a NAVIGATION from a superseded generation (a delayed
-            # gave_up/reconnected must not move the window). The pill polls status().
+            # R11C1: ignore navigation from a superseded generation (delayed
+            # gave_up/reconnected must not move the window; the pill polls status).
             mgr = _tunnel_manager
             gen = status.get("_generation")
             if mgr is not None and gen is not None and gen != mgr.current_generation:
@@ -1325,6 +1321,13 @@ def main():
             elif state == "connected" and status.get("reconnected"):
                 new_port = int(status.get("local_port") or 0)
                 if new_port and new_port != int(view_state["port"]):
+                    # R21C1: re-run the admission handshake before navigating (a
+                    # remote restarted onto an incompatible version must not slip in).
+                    if not _remote_tunnel.remote_ui_compatible(new_port):
+                        view_state["port"] = actual_port
+                        if _webview_window:
+                            _webview_window.load_url(local_url)
+                        return
                     view_state["port"] = new_port
                     if _webview_window:
                         _webview_window.load_url(f"http://127.0.0.1:{new_port}")
@@ -1487,8 +1490,7 @@ def main():
                     "hint": exc.hint,
                 }
             local_port = int(status.get("local_port") or 0)
-            remote_state = _remote_tunnel.fetch_remote_state(local_port)
-            if remote_state.get("remote_ui") is not True:
+            if not _remote_tunnel.remote_ui_compatible(local_port):  # shared admission (R21C1)
                 _disconnect_tunnel_quietly()
                 return {
                     "ok": False,
@@ -1507,8 +1509,7 @@ def main():
             return {"ok": True, **status}
 
         def download_file_to_downloads(self, url: str, filename: str, open_external: bool = False) -> dict:
-            # Host-privileged (writes ~/Downloads, may auto-open): origin-gated
-            # like the other privileged methods (D20); remote page → browser DL.
+            # Host-privileged (writes ~/Downloads, may auto-open): origin-gated (D20); remote → browser DL.
             if not _current_page_is_local_origin():
                 return dict(_ORIGIN_REFUSED)
             try:
@@ -1567,8 +1568,7 @@ def main():
         _shutdown_event.set()
         _disconnect_tunnel_quietly()
         stop_agent()
-        # R15C1: skip the broad port sweep on the conflict page — it would kill
-        # the valid foreign server that owns this data dir/port.
+        # R15C1: skip the port sweep on the conflict page — it would kill the valid foreign server.
         if not _server_conflict_active:
             _kill_orphaned_children(port)
         release_pid_lock()

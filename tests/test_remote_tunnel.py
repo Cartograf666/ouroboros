@@ -437,6 +437,43 @@ def test_active_tunnel_port_registry_publish_and_clear(tmp_path, monkeypatch):
     assert not port_file.exists()  # cleared after teardown
 
 
+def test_remote_ui_compatible_is_failclosed(monkeypatch):
+    # R21C1: the shared admission predicate — True only when the remote advertises
+    # remote_ui; anything else (missing key, error) is False (fail closed).
+    monkeypatch.setattr(rt, "fetch_remote_state", lambda p: {"remote_ui": True})
+    assert rt.remote_ui_compatible(51234) is True
+    monkeypatch.setattr(rt, "fetch_remote_state", lambda p: {"remote_ui": False})
+    assert rt.remote_ui_compatible(51234) is False
+    monkeypatch.setattr(rt, "fetch_remote_state", lambda p: {})
+    assert rt.remote_ui_compatible(51234) is False
+    monkeypatch.setattr(rt, "fetch_remote_state", lambda p: (_ for _ in ()).throw(RuntimeError("x")))
+    assert rt.remote_ui_compatible(51234) is False
+
+
+def test_reconnect_fails_closed_when_marker_cannot_be_published(tmp_path, monkeypatch):
+    # R21C1: reconnect must apply the SAME fail-closed admission as initial
+    # connect — if the deny-boundary marker can't be persisted for the (possibly
+    # re-picked) port, it must NOT go connected; it retries and finally gives up.
+    events = []
+    mgr = _manager(tmp_path, on_state_change=lambda s: events.append(s["state"]))
+    fake = _FakeProc()
+    monkeypatch.setattr(rt, "RECONNECT_TOTAL_SEC", 0.05)
+    monkeypatch.setattr(rt, "RECONNECT_BACKOFF_SEC", (0.01,))
+    monkeypatch.setattr(rt, "discover_remote_port", lambda profile, ssh_path, **_k: 8765)
+    monkeypatch.setattr(
+        rt.RemoteTunnelManager, "_spawn_and_wait",
+        lambda self, gen, prof, lp, rp: rt._Live(gen, prof, lp, rp, _FakeProc()),
+    )
+    # Marker publish always fails → connect must NOT be announced.
+    monkeypatch.setattr(mgr, "_publish_active_tunnel_port", lambda port: False)
+    _install_live(mgr, proc=fake)
+    assert mgr._reconnect_once(0) is False   # gave up, never went connected
+    _drain_events(mgr)
+    assert "connected" not in events
+    assert mgr._live is None
+    assert mgr._inflight == set() and mgr._terminating == set()
+
+
 def test_connect_fails_closed_when_marker_cannot_be_published(tmp_path, monkeypatch):
     # R20C3: if the deny-boundary marker cannot be persisted, a live forward must
     # NOT be presented as connected — connect fails closed and tears down.

@@ -282,6 +282,18 @@ def fetch_remote_state(local_port: int, *, timeout: float = 5.0) -> Dict[str, An
         return {}
 
 
+def remote_ui_compatible(local_port: int) -> bool:
+    """Shared post-connect admission (R21C1): the remote must advertise
+    ``remote_ui`` via /api/state through the tunnel before the launcher navigates
+    the window to it. Enforced IDENTICALLY on initial connect AND on reconnect —
+    a remote that restarts/downgrades to an incompatible version must not slip
+    through the reconnect navigation. Fail closed on any error."""
+    try:
+        return fetch_remote_state(int(local_port)).get("remote_ui") is True
+    except Exception:
+        return False
+
+
 def _run_ssh(argv: List[str], *, timeout: float) -> "subprocess.CompletedProcess[str]":
     return subprocess.run(
         argv,
@@ -886,6 +898,7 @@ class RemoteTunnelManager:
                 time.sleep(min(delay, max(0.0, deadline - time.time())))
                 continue
             reconnect_superseded = False
+            marker_failed = False
             with self._lock:
                 if generation != self._generation:
                     # Hand to _terminating under the lock; graceful wait OUTSIDE
@@ -893,11 +906,18 @@ class RemoteTunnelManager:
                     self._inflight.discard(new_live.proc)
                     self._terminating.add(new_live.proc)
                     reconnect_superseded = True
+                elif not self._publish_active_tunnel_port(new_live.local_port):
+                    # Fail CLOSED, same admission invariant as initial connect
+                    # (R21C1): if the deny-boundary marker can't be persisted for
+                    # the (possibly re-picked) port, do NOT go connected — tear
+                    # this attempt down and keep retrying/backing off.
+                    self._inflight.discard(new_live.proc)
+                    self._terminating.add(new_live.proc)
+                    marker_failed = True
                 else:
-                    # Republish the marker (the reconnect may have re-picked the
-                    # local port after a bind steal) atomically with going live —
-                    # a fast write, not a graceful wait (R20C3).
-                    self._publish_active_tunnel_port(new_live.local_port)
+                    # Marker republished (reconnect may have re-picked the local
+                    # port after a bind steal) atomically with going live — a
+                    # fast write, not a graceful wait (R20C3).
                     self._live = new_live
                     self._inflight.discard(new_live.proc)
                     self._set_status(
@@ -911,6 +931,17 @@ class RemoteTunnelManager:
             if reconnect_superseded:
                 self._finish_terminating(new_live.proc)
                 return False
+            if marker_failed:
+                self._finish_terminating(new_live.proc)
+                last_error = TunnelError(
+                    "custody_failed",
+                    "could not record the active tunnel port for the subagent "
+                    "control-plane deny boundary",
+                )
+                delay = RECONNECT_BACKOFF_SEC[min(attempt, len(RECONNECT_BACKOFF_SEC) - 1)]
+                attempt += 1
+                time.sleep(min(delay, max(0.0, deadline - time.time())))
+                continue
             return True
         with self._lock:
             if generation != self._generation:

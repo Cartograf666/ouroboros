@@ -172,6 +172,24 @@ def test_window_close_skips_port_sweep_on_server_conflict():
     assert "_server_conflict_active = True" in page
 
 
+def test_reconnect_navigation_repeats_admission_handshake():
+    # R21C1: navigating to a RECONNECTED endpoint must re-run the same remote_ui
+    # admission as initial connect — a restarted/downgraded remote must not slip
+    # through. Pinned by source: both the initial-connect nav and the reconnect
+    # nav gate load_url on remote_tunnel.remote_ui_compatible.
+    source = (REPO_ROOT / "launcher.py").read_text(encoding="utf-8")
+    # Initial connect (remote_connect) gates on the shared admission.
+    rc = source[source.index("def remote_connect") : source.index("def remote_connect") + 2500]
+    assert "remote_ui_compatible(local_port)" in rc
+    # Reconnect nav (in _on_tunnel_state) gates on the SAME predicate before load_url.
+    ots_start = source.index("def _on_tunnel_state")
+    ots = source[ots_start : source.index("global _tunnel_manager", ots_start)]
+    assert "remote_ui_compatible(new_port)" in ots
+    guard = ots.index("remote_ui_compatible(new_port)")
+    nav = ots.index('load_url(f"http://127.0.0.1:{new_port}")')
+    assert guard < nav, "reconnect must run the admission handshake before navigating"
+
+
 def test_on_tunnel_state_guards_navigation_by_generation():
     # R11C1(b): _on_tunnel_state must reject a navigation whose generation is
     # stale (a delayed gave_up/reconnected from a superseded connection must not
