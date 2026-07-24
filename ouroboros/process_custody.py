@@ -512,13 +512,38 @@ def reap_purpose_prefix(drive_root: pathlib.Path, purpose_prefix: str) -> Option
                 continue  # dead or recycled pid: prune silently, never kill
             pid = int(entry.get("pid") or 0)
             try:
+                import time as _time
+
+                from ouroboros.platform_layer import kill_pid_tree, pid_is_alive
+
                 pgid = int(entry.get("pgid") or 0)
                 if pgid > 0:
                     kill_process_group_id(pgid)
                 else:
-                    from ouroboros.platform_layer import kill_pid_tree
-
                     kill_pid_tree(pid)
+                # Verify DEATH, not just that a signal was sent (R29C1): only a
+                # confirmed-dead pid counts as reaped and is pruned. A pid still
+                # alive after the grace is KEPT as a survivor so a later reap
+                # retries — a caller must never treat "signal sent" as "gone" and
+                # clear a safety marker over a still-live forward.
+                dead = False
+                for _ in range(10):
+                    # If the killed pid is OUR child it lingers as a zombie until
+                    # reaped; a reparented orphan (the production case) is reaped
+                    # by init. WNOHANG-reap the zombie when it IS our child so a
+                    # terminated-but-unwaited process reads as dead, not "alive".
+                    try:
+                        os.waitpid(pid, os.WNOHANG)
+                    except (ChildProcessError, OSError):
+                        pass
+                    if not pid_is_alive(pid):
+                        dead = True
+                        break
+                    _time.sleep(0.05)
+                if not dead:
+                    log.warning("reap_purpose_prefix: pid %s still alive after kill; keeping", pid)
+                    survivors.append(entry)
+                    continue
                 reaped.append(pid)
                 append_jsonl(drive_root / "logs" / "supervisor.jsonl", {
                     "ts": utc_now_iso(),

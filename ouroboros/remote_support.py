@@ -123,34 +123,66 @@ def update_remote_connections(profiles: list) -> list:
     normalized = config._coerce_setting_value("OUROBOROS_REMOTE_CONNECTIONS", profiles)
     config._guard_live_settings_write()
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    fd = config._acquire_settings_lock()
-    try:
-        raw: dict = {}
-        if config.SETTINGS_PATH.exists():
-            # Refuse rather than clobber: if the file exists but is unreadable/
-            # unparseable, writing only this one key would DESTROY every other
-            # on-disk key (the RMW promises to preserve them). A hand-fixable
-            # partial corruption must survive for the owner to repair.
-            try:
-                parsed = json.loads(config.SETTINGS_PATH.read_text(encoding="utf-8"))
-            except Exception as exc:
-                raise RuntimeError(
-                    f"refusing to write remote connections: {config.SETTINGS_PATH} "
-                    f"exists but is not readable/parseable ({exc}); fix it first"
-                ) from exc
-            if isinstance(parsed, dict):
-                raw = parsed
-        raw["OUROBOROS_REMOTE_CONNECTIONS"] = normalized
-        # settings.json is 0600 and holds API keys — use the shared atomic
-        # writer, which PRESERVES the existing permission bits (a bare
-        # write_text on a fresh temp file would create it 0644 and os.replace
-        # would relax the secret file to world-readable).
-        from ouroboros.utils import write_text_atomic
 
-        write_text_atomic(config.SETTINGS_PATH, json.dumps(raw, indent=2))
-        return list(normalized)
-    finally:
-        config._release_settings_lock(fd)
+    def _write_once() -> None:
+        fd = config._acquire_settings_lock()
+        try:
+            raw: dict = {}
+            if config.SETTINGS_PATH.exists():
+                # Refuse rather than clobber: if the file exists but is unreadable/
+                # unparseable, writing only this one key would DESTROY every other
+                # on-disk key (the RMW promises to preserve them). A hand-fixable
+                # partial corruption must survive for the owner to repair.
+                try:
+                    parsed = json.loads(config.SETTINGS_PATH.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"refusing to write remote connections: {config.SETTINGS_PATH} "
+                        f"exists but is not readable/parseable ({exc}); fix it first"
+                    ) from exc
+                if isinstance(parsed, dict):
+                    raw = parsed
+            raw["OUROBOROS_REMOTE_CONNECTIONS"] = normalized
+            # settings.json is 0600 and holds API keys — use the shared atomic
+            # writer, which PRESERVES the existing permission bits (a bare
+            # write_text on a fresh temp file would create it 0644 and os.replace
+            # would relax the secret file to world-readable).
+            from ouroboros.utils import write_text_atomic
+
+            write_text_atomic(config.SETTINGS_PATH, json.dumps(raw, indent=2))
+        finally:
+            config._release_settings_lock(fd)
+
+    def _persisted() -> bool:
+        fd = config._acquire_settings_lock()
+        try:
+            parsed = json.loads(config.SETTINGS_PATH.read_text(encoding="utf-8"))
+            return isinstance(parsed, dict) and config._coerce_setting_value(
+                "OUROBOROS_REMOTE_CONNECTIONS", parsed.get("OUROBOROS_REMOTE_CONNECTIONS"),
+            ) == list(normalized)
+        except Exception:
+            return False
+        finally:
+            config._release_settings_lock(fd)
+
+    # R29C2: the server's process-tool owner-state restore snapshots the WHOLE
+    # settings.json before a run_command/run_script and rewrites that snapshot
+    # after — which would silently revert a legitimate launcher profile write
+    # landing in that window. Write, then VERIFY it persisted; if a concurrent
+    # restore reverted it, retry a few times, and fail LOUDLY if it will not
+    # stick so the UI asks the owner to retry instead of falsely reporting
+    # success. (Full cross-process interval locking is deferred, D-followup.)
+    import time as _time
+
+    for _attempt in range(6):
+        _write_once()
+        if _persisted():
+            return list(normalized)
+        _time.sleep(0.25)
+    raise RuntimeError(
+        "could not persist remote connection profiles: a background agent task "
+        "is reverting owner settings right now; try again in a moment"
+    )
 
 
 # Headless server lock (SERVER_PID_FILE): held by `ouroboros server` for the

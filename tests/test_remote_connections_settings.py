@@ -221,6 +221,23 @@ def test_generic_saves_never_clobber_concurrent_profile_write(tmp_path, monkeypa
     assert on_disk["TOTAL_BUDGET"] == 4.0
 
 
+def test_update_remote_connections_fails_loudly_when_write_keeps_reverting(tmp_path, monkeypatch, _launcher_identity):
+    # R29C2: if a concurrent process-tool owner-state restore keeps reverting the
+    # profile write, update_remote_connections must FAIL loudly (so the UI asks
+    # the owner to retry) rather than falsely report success. Simulate a
+    # persistent revert by making the atomic write a no-op → the key never
+    # persists → the verify-retry exhausts and raises.
+    import ouroboros.utils as _utils
+
+    monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.setattr(config, "_SETTINGS_LOCK", tmp_path / "settings.json.lock")
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    (tmp_path / "settings.json").write_text(json.dumps({"TOTAL_BUDGET": 1.0}), encoding="utf-8")
+    monkeypatch.setattr(_utils, "write_text_atomic", lambda *a, **k: None)  # write silently lost
+    with pytest.raises(RuntimeError, match="reverting owner settings|try again"):
+        update_remote_connections([{"id": "a", "ssh_target": "u@h"}])
+
+
 def test_generic_save_cannot_seed_profiles_when_disk_lacks_key(tmp_path, monkeypatch):
     """R12C2: on a fresh/upgraded install whose settings lack the profile key, a
     non-launcher generic save must NOT be able to seed profiles — the caller's

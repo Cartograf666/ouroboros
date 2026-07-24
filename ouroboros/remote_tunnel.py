@@ -649,6 +649,20 @@ class RemoteTunnelManager:
     def connect(self, profile: Dict[str, Any]) -> Dict[str, Any]:
         """Open a tunnel to ``profile`` (replacing any current connection)."""
         profile = validate_profile(profile)
+        # R29C1: a deny-boundary marker surviving from a PRIOR session (we are not
+        # currently connected) may still guard a LIVE orphan forward. The marker
+        # is a single port, so a new connection would overwrite it and drop the
+        # orphan's port from the subagent deny set. Confirm the orphan is reaped
+        # (dead) BEFORE reusing the marker; if cleanup is unconfirmed (ledger lock
+        # busy → reap returns None), refuse and let the owner retry.
+        if self._live is None and self._active_tunnel_port_file().exists():
+            if reap_orphaned_tunnels(self._data_dir) is None:
+                raise TunnelError(
+                    "cleanup_pending",
+                    "a previous remote connection is still being cleaned up "
+                    "(process ledger busy); try again in a moment",
+                )
+            self._publish_active_tunnel_port(None)  # confirmed dead → clear stale marker
         self.disconnect()
         with self._lock:
             self._generation += 1

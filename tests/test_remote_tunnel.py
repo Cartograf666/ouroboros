@@ -732,12 +732,14 @@ def test_reap_orphaned_tunnels_kills_ledgered_leak(tmp_path):
         process_custody.record_process(
             tmp_path, pid=os.getpid(), cmd=["x"], purpose="companion:x:y", scope="daemon",
         )
+        from ouroboros.platform_layer import pid_is_alive
+
         reaped = rt.reap_orphaned_tunnels(tmp_path)
         assert reaped == 1
-        # The child is killed via its process group; reap the zombie so the
-        # returncode is observable (pid_is_alive alone sees an unreaped zombie).
-        proc.wait(timeout=5)
-        assert proc.returncode is not None and proc.returncode != 0
+        # R29C1: reap now VERIFIES death (and WNOHANG-reaps the zombie itself), so
+        # the pid is gone by the time reap returned 1. (Popen.wait can no longer
+        # observe the code — reap already consumed the child's exit status.)
+        assert not pid_is_alive(proc.pid)
         # ledger keeps the unrelated entry, drops the tunnel entry.
         purposes = [e.get("purpose") for e in process_custody._read_ledger(tmp_path)]
         assert "companion:x:y" in purposes
