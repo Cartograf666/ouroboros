@@ -278,24 +278,56 @@ def pick_local_port() -> int:
         return int(sock.getsockname()[1])
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Block ALL HTTP redirects (R25C1): the remote server reached through the
+    tunnel is another (untrusted) being's HTTP service — following a 3xx would
+    let it steer the launcher process to an arbitrary loopback/private target
+    (SSRF). Turn any redirect into an error instead of following it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        raise urllib.error.HTTPError(req.full_url, code, f"redirect blocked: {newurl}", headers, fp)
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+_REMOTE_STATE_MAX_BYTES = 1 * 1024 * 1024  # /api/state is small; cap before read/parse
+
+
+def _tunnel_get(url: str, *, timeout: float, max_bytes: int) -> "tuple[int, bytes]":
+    """GET a loopback URL through the tunnel with NO redirects, the final URL
+    pinned to the exact expected one, and the body hard-capped (R25C1). Raises on
+    any redirect / URL mismatch / oversize so callers can fail closed."""
+    req = urllib.request.Request(url, method="GET")
+    with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as resp:
+        if resp.geturl() != url:  # defensive: no silent redirect slipped through
+            raise urllib.error.URLError(f"unexpected response URL: {resp.geturl()}")
+        data = resp.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise urllib.error.URLError("response body exceeds cap")
+        return int(resp.status), data
+
+
 def check_health(local_port: int, *, timeout: float = 3.0) -> bool:
     url = f"http://127.0.0.1:{int(local_port)}/api/health"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return 200 <= resp.status < 300
+        status, _ = _tunnel_get(url, timeout=timeout, max_bytes=64 * 1024)
+        return 200 <= status < 300
     except (urllib.error.URLError, OSError, ValueError):
         return False
 
 
 def fetch_remote_state(local_port: int, *, timeout: float = 5.0) -> Dict[str, Any]:
-    """GET /api/state through the tunnel (launcher compatibility handshake)."""
+    """GET /api/state through the tunnel (launcher compatibility handshake).
+
+    No-redirect + size-capped (R25C1): the remote is untrusted, so it cannot
+    redirect this launcher-side GET to another loopback service or flood it with
+    an unbounded body."""
     import json
 
     url = f"http://127.0.0.1:{int(local_port)}/api/state"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
-            return payload if isinstance(payload, dict) else {}
+        _status, data = _tunnel_get(url, timeout=timeout, max_bytes=_REMOTE_STATE_MAX_BYTES)
+        payload = json.loads(data.decode("utf-8", errors="replace") or "{}")
+        return payload if isinstance(payload, dict) else {}
     except (urllib.error.URLError, OSError, ValueError):
         return {}
 

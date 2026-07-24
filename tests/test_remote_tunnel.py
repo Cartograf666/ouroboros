@@ -827,6 +827,46 @@ def test_reap_purpose_prefix_holds_ledger_lock_during_transaction(tmp_path, monk
             pass
 
 
+@pytest.mark.serial
+@_POSIX_ONLY
+def test_tunnel_get_blocks_redirects_and_caps_body(tmp_path):
+    # R25C1: the remote (untrusted) HTTP service must not be able to (a) redirect
+    # the launcher-side GET to another target (SSRF) or (b) flood it with an
+    # unbounded body. Stand up a tiny HTTP server that does each and assert
+    # fetch_remote_state/check_health fail closed.
+    import http.server
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):  # silence
+            pass
+
+        def do_GET(self):
+            if self.path == "/api/state":  # redirect elsewhere (SSRF attempt)
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:1/evil")
+                self.end_headers()
+            elif self.path == "/api/health":  # oversized body
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"x" * (200 * 1024))
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        # Redirect on /api/state → fetch_remote_state returns {} (redirect blocked).
+        assert rt.fetch_remote_state(port) == {}
+        # Oversized /api/health body → check_health fails closed (cap 64 KB).
+        assert rt.check_health(port) is False
+    finally:
+        srv.shutdown()
+
+
 # --- import boundary -------------------------------------------------------------
 
 def test_remote_tunnel_is_never_imported_by_server_or_agent_code():
