@@ -466,7 +466,7 @@ def reap_orphaned_processes(
     return reaped
 
 
-def reap_purpose_prefix(drive_root: pathlib.Path, purpose_prefix: str) -> List[int]:
+def reap_purpose_prefix(drive_root: pathlib.Path, purpose_prefix: str) -> Optional[List[int]]:
     """Kill every ledgered process whose ``purpose`` starts with ``purpose_prefix``
     and STILL matches its strict fingerprint (pid alive + same start_time +
     cmd_sha256), then prune those entries. Scope-agnostic on purpose — used for
@@ -491,8 +491,12 @@ def reap_purpose_prefix(drive_root: pathlib.Path, purpose_prefix: str) -> List[i
     lock_path = jsonl_append_lock_path(path)
     lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=5.0, stale_sec=10.0)
     if lock_fd is None:
+        # Return None (NOT []) to distinguish "could not confirm — lock busy"
+        # from "reaped nothing". A caller relying on this for a safety decision
+        # (e.g. clearing a deny-boundary marker) must NOT treat unconfirmed
+        # cleanup as "all clear" (R22C1).
         log.warning("reap_purpose_prefix: could not lock the process ledger; skipping this cycle")
-        return []
+        return None
     try:
         entries = _read_ledger(drive_root)
         if not entries:

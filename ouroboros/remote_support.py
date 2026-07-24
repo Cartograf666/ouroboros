@@ -16,6 +16,25 @@ from typing import Any
 REMOTE_CONNECTIONS_MAX = 32
 
 
+def build_server_conflict_html() -> str:
+    """Owner-visible exit-43 page (another live server owns this data dir/port).
+    Rendered by the desktop launcher when its server child exits 43; the copy
+    names the exact recovery commands. Lives here (the headless-server-lock
+    domain) so the launcher stays within its size budget."""
+    return (
+        "<html><body style='background:#1a1a2e;color:white;font-family:system-ui;display:flex;"
+        "align-items:center;justify-content:center;height:100vh;margin:0'><div style='max-width:560px;text-align:center'>"
+        "<h2>Another Ouroboros server owns this data directory</h2>"
+        "<p>The desktop server exited (code 43) because a different live server — usually a headless "
+        "<code>ouroboros server</code> under systemd — already holds this data dir's lock. Restarting cannot "
+        "win that race, so the launcher stopped instead of fighting it.</p>"
+        "<p style='text-align:left'>To use the desktop app here:<br>1. Stop the other server: "
+        "<code>systemctl --user stop ouroboros</code><br>2. Relaunch Ouroboros.</p>"
+        "<p>To keep the headless server, connect to it via Settings&nbsp;→&nbsp;Remote from a desktop on "
+        "another data dir.</p></div></body></html>"
+    )
+
+
 def _launcher_process_holds_authority() -> bool:
     """True only inside the desktop launcher process (OS-anchored identity).
 

@@ -344,20 +344,10 @@ def _present_server_conflict_page() -> bool:
     window = _webview_window
     if window is None:
         return False
-    html = (
-        "<html><body style='background:#1a1a2e;color:white;font-family:system-ui;display:flex;"
-        "align-items:center;justify-content:center;height:100vh;margin:0'><div style='max-width:560px;text-align:center'>"
-        "<h2>Another Ouroboros server owns this data directory</h2>"
-        "<p>The desktop server exited (code 43) because a different live server — usually a headless "
-        "<code>ouroboros server</code> under systemd — already holds this data dir's lock. Restarting cannot "
-        "win that race, so the launcher stopped instead of fighting it.</p>"
-        "<p style='text-align:left'>To use the desktop app here:<br>1. Stop the other server: "
-        "<code>systemctl --user stop ouroboros</code><br>2. Relaunch Ouroboros.</p>"
-        "<p>To keep the headless server, connect to it via Settings&nbsp;→&nbsp;Remote from a desktop on "
-        "another data dir.</p></div></body></html>"
-    )
     try:
-        window.load_html(html)
+        from ouroboros.remote_support import build_server_conflict_html
+
+        window.load_html(build_server_conflict_html())
         return True
     except Exception:
         log.warning("could not present the server-conflict page", exc_info=True)
@@ -1324,6 +1314,9 @@ def main():
                     # R21C1: re-run the admission handshake before navigating (a
                     # remote restarted onto an incompatible version must not slip in).
                     if not _remote_tunnel.remote_ui_compatible(new_port):
+                        # R22C2: tear the manager OUT of connected too, else the
+                        # ssh/_live/marker/pill stay "connected" for a rejected remote.
+                        _disconnect_tunnel_quietly()
                         view_state["port"] = actual_port
                         if _webview_window:
                             _webview_window.load_url(local_url)
@@ -1335,17 +1328,22 @@ def main():
             log.warning("tunnel state transition handling failed", exc_info=True)
 
     global _tunnel_manager
-    # Reap any ssh tunnel a previously-crashed launcher left behind (daemon
-    # custody survives the generation reaper, so a SIGKILL could otherwise leak).
-    try:
-        reaped = _remote_tunnel.reap_orphaned_tunnels(pathlib.Path(DATA_DIR))
-        if reaped:
-            log.info("Reaped %d orphaned remote ssh tunnel(s) at startup", reaped)
-    except Exception:
-        log.debug("orphaned-tunnel reap failed", exc_info=True)
     _tunnel_manager = _remote_tunnel.RemoteTunnelManager(
         pathlib.Path(DATA_DIR), on_state_change=_on_tunnel_state
     )
+    # Reap an ssh tunnel a crashed launcher left ledgered. Clear the stale
+    # deny-boundary marker ONLY on a CONFIRMED reap (R22C1) — an unconfirmed
+    # reap (ledger lock busy) may mean a leaked forward is still live, so keep it.
+    try:
+        reaped = _remote_tunnel.reap_orphaned_tunnels(pathlib.Path(DATA_DIR))
+        if reaped is None:
+            log.warning("startup orphan-tunnel reap unconfirmed; keeping the deny marker")
+        else:
+            if reaped:
+                log.info("Reaped %d orphaned remote ssh tunnel(s) at startup", reaped)
+            _tunnel_manager.clear_active_tunnel_marker()
+    except Exception:
+        log.debug("orphaned-tunnel reap failed", exc_info=True)
 
     class MainApi:
         def request_runtime_mode_change(self, mode: str) -> dict:

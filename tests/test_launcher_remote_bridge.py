@@ -172,6 +172,33 @@ def test_window_close_skips_port_sweep_on_server_conflict():
     assert "_server_conflict_active = True" in page
 
 
+def test_reconnect_downgrade_disconnects_manager_before_local():
+    # R22C2: when a reconnected remote fails the admission handshake, the launcher
+    # must tear the manager OUT of connected (not just navigate local) — else the
+    # ssh/_live/marker/pill stay "connected" for a rejected remote and block a
+    # normal reconnect. Pinned by source: the incompatible branch disconnects
+    # before returning to local.
+    source = (REPO_ROOT / "launcher.py").read_text(encoding="utf-8")
+    ots_start = source.index("def _on_tunnel_state")
+    ots = source[ots_start : source.index("global _tunnel_manager", ots_start)]
+    guard = ots.index("remote_ui_compatible(new_port)")
+    disc = ots.index("_disconnect_tunnel_quietly()", guard)
+    nav = ots.index("load_url(local_url)", guard)
+    assert guard < disc < nav, "must disconnect the manager before navigating to local"
+
+
+def test_startup_reap_clears_marker_only_when_confirmed():
+    # R22C1: the launcher clears the deny-boundary marker ONLY on a confirmed
+    # reap (reaped is not None); an unconfirmed reap keeps it. Pinned by source.
+    source = (REPO_ROOT / "launcher.py").read_text(encoding="utf-8")
+    seg = source[source.index("reap_orphaned_tunnels(pathlib.Path(DATA_DIR))") - 200:]
+    seg = seg[: seg.index("class MainApi")]
+    assert "if reaped is None:" in seg
+    assert "clear_active_tunnel_marker()" in seg
+    # The clear is in the else (confirmed) branch, after the None check.
+    assert seg.index("if reaped is None:") < seg.index("clear_active_tunnel_marker()")
+
+
 def test_reconnect_navigation_repeats_admission_handshake():
     # R21C1: navigating to a RECONNECTED endpoint must re-run the same remote_ui
     # admission as initial connect — a restarted/downgraded remote must not slip

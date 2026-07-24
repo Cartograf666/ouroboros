@@ -109,21 +109,27 @@ def ssh_available() -> Optional[str]:
 CUSTODY_PURPOSE_PREFIX = "remote_ssh_tunnel:"
 
 
-def reap_orphaned_tunnels(data_dir: pathlib.Path) -> int:
+def reap_orphaned_tunnels(data_dir: pathlib.Path) -> Optional[int]:
     """Reap any ssh tunnel left ledgered by a previously-crashed launcher.
 
     The tunnel is recorded daemon-scope (launcher-owned), which the ordinary
     generation reaper keeps — so an abrupt launcher SIGKILL would otherwise
     leave the loopback→remote forward alive indefinitely. The launcher calls
     this at startup; strict-fingerprint matching means a recycled pid is pruned,
-    never killed. Returns the number of tunnels reaped.
+    never killed.
+
+    Returns the number of tunnels reaped (0 = none live), or None when cleanup
+    could NOT be confirmed (ledger lock busy / error) — the caller must treat
+    None as "an orphan forward may still be live" and keep the deny-boundary
+    marker rather than clearing it (R22C1).
     """
     try:
         from ouroboros.process_custody import reap_purpose_prefix
 
-        return len(reap_purpose_prefix(pathlib.Path(data_dir), CUSTODY_PURPOSE_PREFIX))
+        reaped = reap_purpose_prefix(pathlib.Path(data_dir), CUSTODY_PURPOSE_PREFIX)
+        return None if reaped is None else len(reaped)
     except Exception:
-        return 0
+        return None
 
 
 def is_local_origin(current_url: str, local_port: int) -> bool:
@@ -429,9 +435,14 @@ class RemoteTunnelManager:
             threading.Thread(
                 target=self._notify_loop, daemon=True, name="remote-tunnel-notify",
             ).start()
-        # No tunnel is live at construction (launcher start): clear any stale
-        # active-tunnel-port registry a crashed predecessor may have left, so the
-        # subagent control-plane deny boundary never over-blocks a random port.
+        # NOTE: the stale active-tunnel-port marker is NOT cleared here. Clearing
+        # it is only safe once startup reap has CONFIRMED no orphan forward is
+        # live (R22C1) — the launcher clears it via clear_active_tunnel_marker()
+        # after a confirmed reap, and keeps it when the reap is unconfirmed.
+
+    def clear_active_tunnel_marker(self) -> None:
+        """Public: drop the deny-boundary marker (launcher startup, only after a
+        CONFIRMED orphan-tunnel reap)."""
         self._publish_active_tunnel_port(None)
 
     def _active_tunnel_port_file(self) -> pathlib.Path:

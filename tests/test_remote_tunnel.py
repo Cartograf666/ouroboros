@@ -710,6 +710,37 @@ def test_reap_orphaned_tunnels_kills_ledgered_leak(tmp_path):
             pass
 
 
+def test_reap_orphaned_tunnels_returns_none_when_unconfirmed(tmp_path, monkeypatch):
+    # R22C1: reap must return None (NOT 0) when cleanup can't be confirmed, so the
+    # launcher keeps the deny-boundary marker instead of clearing it over a
+    # possibly-live orphan forward.
+    import ouroboros.process_custody as pc
+
+    monkeypatch.setattr(pc, "reap_purpose_prefix", lambda root, prefix: None)
+    assert rt.reap_orphaned_tunnels(tmp_path) is None
+    monkeypatch.setattr(pc, "reap_purpose_prefix", lambda root, prefix: [])
+    assert rt.reap_orphaned_tunnels(tmp_path) == 0  # confirmed, nothing live
+
+
+@pytest.mark.serial
+@_POSIX_ONLY
+def test_reap_purpose_prefix_returns_none_when_ledger_lock_busy(tmp_path):
+    # R22C1: a held ledger lock → reap can't confirm → None (distinct from []).
+    from ouroboros import process_custody as pc
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+    from ouroboros.utils import jsonl_append_lock_path
+
+    # Seed a ledger so ledger_path exists, then hold its append lock.
+    pc.record_process(tmp_path, pid=os.getpid(), cmd=["x"], purpose="remote_ssh_tunnel:x", scope="daemon")
+    lock_path = jsonl_append_lock_path(pc.ledger_path(tmp_path))
+    fd = acquire_exclusive_file_lock(lock_path, timeout_sec=2.0)
+    assert fd is not None
+    try:
+        assert pc.reap_purpose_prefix(tmp_path, "remote_ssh_tunnel:") is None
+    finally:
+        release_exclusive_file_lock(lock_path, fd)
+
+
 @pytest.mark.serial
 @_POSIX_ONLY
 def test_reap_purpose_prefix_holds_ledger_lock_during_transaction(tmp_path, monkeypatch):
