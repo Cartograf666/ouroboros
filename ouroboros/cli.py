@@ -92,6 +92,41 @@ class OuroborosHTTPClient:
         except json.JSONDecodeError:
             return raw
 
+    @staticmethod
+    def _reject_swapped_or_secret_source(source: "pathlib.Path", fh: Any) -> None:
+        """Bind an already-opened attachment handle to a non-secret identity.
+
+        TOCTOU hardening (R33C2): _validate_attach_paths applied the secret-source
+        policy to the resolved path, but this method later REOPENS the original
+        path — a symlink or path swapped in between could feed credential bytes to
+        a remote server despite that pre-check. So, on the SAME handle we read
+        from: (1) re-resolve and re-apply the secret policy (catches a swap BEFORE
+        open), and (2) verify the opened fd's (st_dev, st_ino) still matches the
+        re-resolved path (catches a swap in the open→check window, where the
+        handle holds the old inode while the path now names a different file).
+        """
+        import os as _os
+
+        fd_stat = _os.fstat(fh.fileno())
+        real = pathlib.Path(_os.path.realpath(source))
+        from ouroboros.artifacts import is_secret_attachment_source
+
+        if is_secret_attachment_source(real) or is_secret_attachment_source(source):
+            raise CLIError(
+                f"refusing to upload a secret-shaped attachment source: {source.name}"
+            )
+        try:
+            real_stat = real.stat()
+        except OSError as exc:
+            raise CLIError(
+                f"attachment source vanished before upload: {source.name}"
+            ) from exc
+        if (fd_stat.st_dev, fd_stat.st_ino) != (real_stat.st_dev, real_stat.st_ino):
+            raise CLIError(
+                f"attachment source changed identity between validation and "
+                f"upload: {source.name}"
+            )
+
     def post_multipart_file(
         self,
         path: str,
@@ -100,6 +135,7 @@ class OuroborosHTTPClient:
         field: str = "file",
         timeout: Optional[float] = None,
         max_bytes: Optional[int] = None,
+        revalidate_secret: bool = False,
     ) -> Any:
         """POST one file as multipart/form-data (stdlib-only encoder).
 
@@ -129,6 +165,11 @@ class OuroborosHTTPClient:
         ).encode("utf-8")
         if max_bytes is not None and max_bytes >= 0:
             with source.open("rb") as _fh:
+                # Re-check secret policy + inode identity on the SAME handle we
+                # read from (R33C2), so a post-validation path/symlink swap can't
+                # transmit credential bytes to the remote server.
+                if revalidate_secret:
+                    self._reject_swapped_or_secret_source(source, _fh)
                 content = _fh.read(max_bytes + 1)
             if len(content) > max_bytes:
                 raise CLIError(
@@ -341,7 +382,9 @@ def _upload_attachments(
         # them in the server's uploads dir. Non-CLIErrors normalize to CLIError.
         try:
             limit = min(_PER_FILE, remaining)
-            result = client.post_multipart_file("/api/chat/upload", path, max_bytes=limit)
+            result = client.post_multipart_file(
+                "/api/chat/upload", path, max_bytes=limit, revalidate_secret=True
+            )
             data = result if isinstance(result, dict) else {}
             server_path = str(data.get("path") or "")
             server_name = str(data.get("filename") or "")

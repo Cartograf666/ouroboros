@@ -34,7 +34,7 @@ class FakeClient:
         self.fail_task_create = fail_task_create
         self.base_url = "http://127.0.0.1:9999"
 
-    def post_multipart_file(self, path, file_path, *, field="file", timeout=None, max_bytes=None):
+    def post_multipart_file(self, path, file_path, *, field="file", timeout=None, max_bytes=None, revalidate_secret=False):
         index = len(self.uploads)
         self.uploads.append((path, str(file_path)))
         if index == self.fail_upload_at:
@@ -189,7 +189,7 @@ def test_upload_attachments_cleans_up_on_non_clierror(tmp_path):
         files.append(f)
 
     class _RaceClient(FakeClient):
-        def post_multipart_file(self, path, file_path, *, field="file", timeout=None, max_bytes=None):
+        def post_multipart_file(self, path, file_path, *, field="file", timeout=None, max_bytes=None, revalidate_secret=False):
             if len(self.uploads) == 1:  # 2nd file
                 raise OSError("file vanished after validation")
             return super().post_multipart_file(path, file_path)
@@ -211,7 +211,7 @@ def test_upload_attachments_cleans_up_on_non_dict_response(tmp_path):
         files.append(f)
 
     class _BadBodyClient(FakeClient):
-        def post_multipart_file(self, path, file_path, *, field="file", timeout=None, max_bytes=None):
+        def post_multipart_file(self, path, file_path, *, field="file", timeout=None, max_bytes=None, revalidate_secret=False):
             if len(self.uploads) == 1:  # 2nd file: server returns a bare string
                 self.uploads.append((path, str(file_path)))
                 return "OK (not json)"
@@ -381,7 +381,7 @@ def test_upload_attachments_enforces_aggregate_budget_at_read_time(tmp_path, mon
     class _RealBytesClient(FakeClient):
         # Exercise the REAL post_multipart_file read path so the budget is
         # enforced against actual bytes, not the fake's canned response.
-        def post_multipart_file(self, path, file_path, *, field="file", timeout=None, max_bytes=None):
+        def post_multipart_file(self, path, file_path, *, field="file", timeout=None, max_bytes=None, revalidate_secret=False):
             content = pathlib.Path(file_path).read_bytes()
             if max_bytes is not None and len(content) > max_bytes:
                 from ouroboros.cli import CLIError as _E
@@ -416,6 +416,68 @@ def test_post_multipart_file_records_true_bytes_sent(tmp_path, monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     client.post_multipart_file("/api/chat/upload", f, max_bytes=1000)
     assert client._last_upload_bytes == 37
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink swap needs POSIX symlinks")
+def test_upload_refuses_path_swapped_to_secret_before_open(tmp_path, monkeypatch):
+    # R33C2: _validate_attach_paths cleared a NORMAL path, but the upload reopens
+    # the original path. A symlink swapped in between (now pointing at a secret)
+    # must be refused at open time — ZERO network requests, no credential bytes
+    # ever leave the machine for the remote server.
+    normal = tmp_path / "doc.txt"
+    normal.write_text("data")
+    validated = _validate_attach_paths([str(normal)])  # passes: not secret
+    assert [p.name for p in validated] == ["doc.txt"]
+    # Swap the validated path to a symlink at a secret-shaped target.
+    normal.unlink()
+    secret_target = tmp_path / "credentials.json"
+    secret_target.write_text("SECRET")
+    normal.symlink_to(secret_target)
+
+    net = []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: net.append(1))
+    client = cli.OuroborosHTTPClient("http://127.0.0.1:1")
+    with pytest.raises(CLIError, match="secret-shaped"):
+        _upload_attachments(client, validated)
+    assert net == []  # ZERO multipart requests — the secret never left the machine
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink identity test needs POSIX symlinks")
+def test_reject_swapped_source_detects_inode_mismatch(tmp_path):
+    # R33C2: the opened handle is bound to the checked identity by (dev, ino). If
+    # the re-resolved path names a DIFFERENT file than the open handle (a swap in
+    # the open->check window), refuse even when the new target is not itself secret.
+    a = tmp_path / "a.txt"
+    a.write_text("A")
+    b = tmp_path / "b.txt"  # non-secret, but a DIFFERENT inode than the handle
+    b.write_text("B")
+    link = tmp_path / "link"
+    link.symlink_to(b)
+    client = cli.OuroborosHTTPClient("http://127.0.0.1:1")
+    fh = a.open("rb")  # handle bound to a.txt's inode
+    try:
+        with pytest.raises(CLIError, match="changed identity"):
+            client._reject_swapped_or_secret_source(link, fh)  # re-resolves to b.txt
+    finally:
+        fh.close()
+
+
+def test_upload_normal_file_passes_revalidation(tmp_path, monkeypatch):
+    # R33C2 (happy path): an ordinary, unchanged attachment must pass the open-time
+    # secret + inode revalidation and upload normally — the guard must not break
+    # the common case.
+    f = tmp_path / "doc.txt"
+    f.write_bytes(b"hello")
+    validated = _validate_attach_paths([str(f)])
+
+    def fake_urlopen(req, timeout=None):
+        return _Resp(json.dumps({"ok": True, "filename": "n", "path": "/p"}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    client = cli.OuroborosHTTPClient("http://127.0.0.1:1")
+    attachments, names = _upload_attachments(client, validated)
+    assert attachments == [{"path": "/p", "label": "doc.txt"}]
+    assert names == ["n"]
 
 
 def test_stage_task_attachments_discloses_missing_sources(tmp_path):

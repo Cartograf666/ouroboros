@@ -446,6 +446,58 @@ def test_active_tunnel_port_registry_publish_and_clear(tmp_path, monkeypatch):
     assert not port_file.exists()  # cleared after teardown
 
 
+def test_disconnect_retains_marker_when_death_unconfirmed(tmp_path, monkeypatch):
+    # R33C1: graceful teardown (_terminate_quietly) can return after a final wait
+    # that still TIMED OUT — the forward may have outlived the kill. Clearing the
+    # deny marker then would drop a possibly-live forward from the subagent
+    # browser boundary. So an UNCONFIRMED teardown must RETAIN the marker; the
+    # next startup/connect strict-fingerprint reap reconciles it.
+    port_file = tmp_path / "state" / "active_tunnel_port"
+    mgr = _manager(tmp_path)
+    _install_live(mgr, proc=_FakeProc(), local_port=51234)
+    mgr._publish_active_tunnel_port(51234)
+    assert port_file.exists()
+    monkeypatch.setattr(rt, "_terminate_quietly", lambda p: False)  # death NOT confirmed
+    mgr.disconnect()
+    assert port_file.exists(), "unconfirmed teardown must keep the deny marker (fail-closed)"
+
+
+def test_disconnect_clears_marker_only_on_confirmed_death(tmp_path, monkeypatch):
+    # R33C1 (complement): when teardown CONFIRMS death, the marker IS cleared —
+    # the fail-closed retention must not become a permanent leak on the happy path.
+    port_file = tmp_path / "state" / "active_tunnel_port"
+    mgr = _manager(tmp_path)
+    _install_live(mgr, proc=_FakeProc(), local_port=51234)
+    mgr._publish_active_tunnel_port(51234)
+    monkeypatch.setattr(rt, "_terminate_quietly", lambda p: True)  # confirmed dead
+    mgr.disconnect()
+    assert not port_file.exists()
+
+
+def test_force_disconnect_retains_marker_for_startup_reap(tmp_path, monkeypatch):
+    # R33C1: panic teardown cannot afford the bounded wait that CONFIRMS ssh death
+    # (Emergency Stop) and _kill_tree_now swallows kill failures — so it must NOT
+    # clear the deny marker. force_disconnect only ever runs just before os._exit,
+    # so the marker is retained and the NEXT launcher startup's confirmed reap
+    # reconciles it (a group-SIGKILL that silently failed keeps its boundary).
+    port_file = tmp_path / "state" / "active_tunnel_port"
+    mgr = _manager(tmp_path)
+    _install_live(mgr, proc=_FakeProc(), local_port=51234)
+    mgr._publish_active_tunnel_port(51234)
+    assert port_file.exists()
+    monkeypatch.setattr(rt, "_kill_tree_now", lambda p: p.kill())
+    mgr.force_disconnect()
+    assert port_file.exists(), "panic must RETAIN the marker; startup reap reconciles it"
+
+
+def test_terminate_quietly_reports_confirmed_death(tmp_path):
+    # R33C1: the marker gate relies on _terminate_quietly's return contract — True
+    # only when the child was reaped within the bounded wait, False otherwise.
+    dead = _FakeProc()
+    dead.kill()  # _FakeProc.wait() now returns 1 (reaped) → confirmed
+    assert rt._terminate_quietly(dead) is True
+
+
 def test_remote_ui_compatible_is_failclosed(monkeypatch):
     # R21C1: the shared admission predicate — True only when the remote advertises
     # remote_ui; anything else (missing key, error) is False (fail closed).

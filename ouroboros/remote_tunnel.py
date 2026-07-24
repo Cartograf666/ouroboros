@@ -19,6 +19,7 @@ Transport contract (owner decisions D5/D9/D10/D21/D22):
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 import pathlib
 import queue
@@ -39,6 +40,8 @@ from ouroboros.platform_layer import (
     subprocess_new_group_kwargs,
     terminate_process_tree,
 )
+
+log = logging.getLogger(__name__)
 
 # --- profile contract -------------------------------------------------------
 
@@ -826,9 +829,11 @@ class RemoteTunnelManager:
         # Bumping the generation makes any in-flight connect abandon its result,
         # but an ssh already spawned would linger until its own timeout — tear
         # the current live tunnel AND every in-flight ssh down now (graceful).
+        confirmed_dead = True
         for proc in _dedupe_procs(live, inflight):
             try:
-                _terminate_quietly(proc)
+                if not _terminate_quietly(proc):
+                    confirmed_dead = False
             finally:
                 with self._lock:
                     self._terminating.discard(proc)
@@ -838,9 +843,21 @@ class RemoteTunnelManager:
         # bumping the generation again) may already have published its own live
         # marker while we were waiting in teardown; unlinking it would leave that
         # newer forward uncovered by the subagent deny boundary.
+        # AND only when teardown CONFIRMED death (R33C1): _terminate_quietly can
+        # return after a final wait that still timed out, so a forward that
+        # outlived the kill must KEEP its marker (fail-closed) — the next
+        # startup's strict-fingerprint reap (or the next connect's) reconciles it,
+        # never this unconfirmed teardown dropping it from the deny boundary.
         with self._lock:
             if self._generation == gen and self._live is None:
-                self._publish_active_tunnel_port(None)
+                if confirmed_dead:
+                    self._publish_active_tunnel_port(None)
+                else:
+                    log.warning(
+                        "remote tunnel teardown did not confirm ssh death; "
+                        "retaining the active_tunnel_port deny marker for the "
+                        "next startup reap"
+                    )
 
     def force_disconnect(self) -> None:
         """Panic path: kill the ssh process TREE immediately, no graceful wait.
@@ -865,9 +882,16 @@ class RemoteTunnelManager:
             terminating = list(self._terminating)
             self._terminating.clear()
             self._status = {"state": "disconnected"}
-        # force_disconnect bypasses _set_status, so clear the port registry here
-        # too — the forward is being killed (R18C1).
-        self._publish_active_tunnel_port(None)
+        # The marker is deliberately NOT cleared here (R33C1). Panic forbids the
+        # bounded wait that would CONFIRM the ssh tree died (Emergency Stop), and
+        # _kill_tree_now swallows kill failures — so a group-SIGKILL that did not
+        # actually land would leave a live forward with its deny marker dropped.
+        # force_disconnect is only ever called from the launcher's panic branch
+        # immediately before os._exit, so the process is dying anyway: retain the
+        # marker and let the NEXT launcher startup's strict-fingerprint reap
+        # (reap_orphaned_tunnels — clears the marker only on a CONFIRMED reap,
+        # keeps it on an unconfirmed one, R32C2) reconcile it. No live subagent
+        # exists between panic and that startup, so a retained marker is free.
         for proc in _dedupe_procs(live, inflight + terminating):
             _kill_tree_now(proc)
 
@@ -1189,12 +1213,19 @@ def _kill_tree_now(proc: "subprocess.Popen[Any]") -> None:
         pass
 
 
-def _terminate_quietly(proc: "subprocess.Popen[Any]") -> None:
+def _terminate_quietly(proc: "subprocess.Popen[Any]") -> bool:
     """Terminate the ssh child and WAIT until it is actually reaped.
 
     Returning before the child exits would leave a zombie and race the reuse of
     the (stable) forwarded local port on the next connect/reconnect. So: group
     TERM, bounded wait, then kill the process tree and wait again.
+
+    Returns True only when death was CONFIRMED (the child was reaped within the
+    bounded wait); False when the final wait still timed out or could not be
+    performed. The caller uses this to gate clearing the active_tunnel_port deny
+    marker — an unconfirmed teardown must RETAIN the marker (fail-closed, R33C1),
+    exactly like an unconfirmed startup reap, so a forward that outlived the kill
+    is never dropped from the subagent browser deny boundary.
     """
     try:
         terminate_process_tree(proc)  # group SIGTERM (best-effort)
@@ -1202,11 +1233,13 @@ def _terminate_quietly(proc: "subprocess.Popen[Any]") -> None:
         pass
     try:
         proc.wait(timeout=TERMINATE_WAIT_SEC)
-        return
+        return True  # reaped → confirmed dead
     except subprocess.TimeoutExpired:
         pass
     except Exception:
-        return
+        # Could not wait (already reaped elsewhere / no such child): can't
+        # PROVE death here → report unconfirmed and let the marker be retained.
+        return False
     # Still alive after group TERM — escalate to a group/tree SIGKILL, NOT just
     # proc.kill() on the direct ssh child: a ProxyCommand/ProxyJump descendant
     # that ignores TERM would otherwise survive disconnect/reconnect/window-close
@@ -1214,5 +1247,6 @@ def _terminate_quietly(proc: "subprocess.Popen[Any]") -> None:
     _kill_tree_now(proc)
     try:
         proc.wait(timeout=TERMINATE_WAIT_SEC)
+        return True
     except Exception:
-        pass
+        return False
