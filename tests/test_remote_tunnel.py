@@ -134,6 +134,30 @@ def test_explicit_remote_agent_port_skips_ssh():
     assert rt.discover_remote_port(prof, ssh_path="/nonexistent/ssh") == 9000
 
 
+def test_resolve_loopback_file_url_pins_to_passed_port():
+    # R37C1: the resolver pins the fetch to the caller's LOCAL port regardless of
+    # any port encoded in the raw url — so the origin-gated file bridge (which
+    # passes actual_port) can never be tricked into fetching from a stale/remote
+    # tunnel port after a back-navigation.
+    assert (
+        rt.resolve_loopback_file_url("/api/files/download?path=x", 8765)
+        == "http://127.0.0.1:8765/api/files/download?path=x"
+    )
+    assert rt.resolve_loopback_file_url(
+        "/api/extensions/skill/a.bin", 8765
+    ) == "http://127.0.0.1:8765/api/extensions/skill/a.bin"
+    # A raw url naming a DIFFERENT (e.g. remote tunnel) port is rejected — the
+    # relative-join keeps the pinned host:port, so an absolute other-port url
+    # mismatches and raises rather than fetching from that port.
+    with pytest.raises(ValueError):
+        rt.resolve_loopback_file_url("http://127.0.0.1:59999/api/files/download", 8765)
+    # Non-loopback host, wrong scheme, and disallowed paths all rejected.
+    with pytest.raises(ValueError):
+        rt.resolve_loopback_file_url("http://evil.example/api/files/download", 8765)
+    with pytest.raises(ValueError):
+        rt.resolve_loopback_file_url("/api/secret/dump", 8765)
+
+
 # --- discovery via stub ssh (real subprocess → serial) --------------------------
 
 def _write_stub_ssh(tmp_path: pathlib.Path, body: str) -> str:

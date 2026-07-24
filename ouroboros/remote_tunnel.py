@@ -153,6 +153,35 @@ def is_local_origin(current_url: str, local_port: int) -> bool:
     )
 
 
+def resolve_loopback_file_url(raw_url: str, port: int) -> str:
+    """Validate a file-bridge URL and pin it to the LOCAL loopback ``port``.
+
+    Used by the launcher's download-to-Downloads / open-in-default-app bridge
+    methods, which are origin-gated to the LOCAL page. R37C1: the fetch MUST be
+    bound to the local server port, NOT to the mutable "active view" port — a
+    remote SPA can navigate the webview back to the local URL without calling
+    remote_disconnect, so the current page passes the local-origin gate while the
+    view-port state still names the remote tunnel; resolving the download against
+    that stale port would fetch remote-server content and hand it to the host OS.
+    Pinning to the caller's local ``port`` closes that. Path allowlist unchanged
+    (/api/files/download or /api/extensions/<skill>/...).
+    """
+    import urllib.parse
+
+    port = int(port)
+    full_url = urllib.parse.urljoin(f"http://127.0.0.1:{port}", str(raw_url or ""))
+    parsed = urllib.parse.urlparse(full_url)
+    if parsed.scheme != "http":
+        raise ValueError("file URL must be http://")
+    if parsed.hostname not in {"127.0.0.1", "localhost"}:
+        raise ValueError("desktop file access is limited to loopback Ouroboros servers")
+    if parsed.port != port:
+        raise ValueError("file URL port must match the local Ouroboros page")
+    if parsed.path != "/api/files/download" and not parsed.path.startswith("/api/extensions/"):
+        raise ValueError("file URL path must be /api/files/download or /api/extensions/<skill>/...")
+    return full_url
+
+
 def validate_profile(raw: Any) -> Dict[str, Any]:
     """Normalize one profile dict; raise ProfileError with a readable reason."""
     if not isinstance(raw, dict):
@@ -726,7 +755,28 @@ class RemoteTunnelManager:
                     "(process ledger busy); try again in a moment",
                 )
             self._publish_active_tunnel_port(None)  # confirmed dead → clear stale marker
-        self.disconnect()
+        # R37C1: replace-on-connect tears the CURRENT tunnel down first. If that
+        # death can't be confirmed, disconnect() retained the OLD marker (R33C1) —
+        # publishing a NEW port marker below would overwrite it and drop a
+        # possibly-live old forward from the deny boundary. Fail CLOSED: spawn
+        # nothing, keep the old marker, let the owner retry (the old forward is
+        # reconciled by the next startup reap or a later confirmed disconnect).
+        if not self.disconnect():
+            with self._lock:
+                self._set_status(
+                    state="error",
+                    profile_id=profile["id"],
+                    profile_name=profile["name"],
+                    error="the previous remote connection could not be confirmed "
+                          "closed; try again in a moment",
+                    error_state="teardown_unconfirmed",
+                    hint="",
+                )
+            raise TunnelError(
+                "teardown_unconfirmed",
+                "the previous remote connection could not be confirmed closed; "
+                "try again in a moment",
+            )
         with self._lock:
             self._generation += 1
             generation = self._generation
@@ -815,7 +865,14 @@ class RemoteTunnelManager:
         ).start()
         return self.status()
 
-    def disconnect(self) -> None:
+    def disconnect(self) -> bool:
+        """Graceful teardown of the current tunnel + any in-flight ssh.
+
+        Returns whether the old forward's death was CONFIRMED (R37C1): a caller
+        that will publish a REPLACEMENT marker (connect's replace-on-connect) must
+        fail closed on False — overwriting the retained old marker would drop a
+        possibly-live forward from the subagent deny boundary.
+        """
         with self._lock:
             self._generation += 1
             gen = self._generation
@@ -858,6 +915,7 @@ class RemoteTunnelManager:
                         "retaining the active_tunnel_port deny marker for the "
                         "next startup reap"
                     )
+        return confirmed_dead
 
     def force_disconnect(self) -> None:
         """Panic path: kill the ssh process TREE immediately, no graceful wait.

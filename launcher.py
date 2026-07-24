@@ -1240,30 +1240,17 @@ def main():
     }
 
     def _resolve_bridge_file_url(raw_url: str) -> str:
-        """Validate a loopback file-bridge URL, returning the resolved full URL.
+        """Validate a loopback file-bridge URL for the LOCAL-origin-gated file
+        methods, pinned to the LOCAL server port (actual_port).
 
-        Shared SSOT for both the download-to-Downloads and open-in-default-app
-        bridge methods so the loopback guard cannot drift between them. Both
-        callers are origin-gated to the LOCAL page, so in practice `active_port`
-        is the local server; validating against the ACTIVE view port is
-        defense-in-depth — if either method were ever reached mid-navigation it
-        still scopes the fetch to the currently-shown loopback server rather
-        than a same-shaped path on a different one.
+        R37C1: both callers (download-to-Downloads, open-in-default-app) are
+        origin-gated to the LOCAL page, so the fetch must target the LOCAL server
+        (actual_port) — NOT the mutable active-view port, which can still name the
+        remote tunnel after a remote SPA navigates the webview back to the local
+        URL without calling remote_disconnect. Delegates to the shared SSOT
+        resolver so the guard cannot drift between the two callers.
         """
-        import urllib.parse
-
-        active_port = int(view_state["port"])
-        full_url = urllib.parse.urljoin(f"http://127.0.0.1:{active_port}", str(raw_url or ""))
-        parsed = urllib.parse.urlparse(full_url)
-        if parsed.scheme != "http":
-            raise ValueError("file URL must be http://")
-        if parsed.hostname not in {"127.0.0.1", "localhost"}:
-            raise ValueError("desktop file access is limited to loopback Ouroboros servers")
-        if parsed.port != active_port:
-            raise ValueError("file URL port must match the active Ouroboros page")
-        if parsed.path != "/api/files/download" and not parsed.path.startswith("/api/extensions/"):
-            raise ValueError("file URL path must be /api/files/download or /api/extensions/<skill>/...")
-        return full_url
+        return _remote_tunnel.resolve_loopback_file_url(raw_url, actual_port)
 
     def _unique_bridge_target(directory: pathlib.Path, filename: str) -> pathlib.Path:
         safe_name = pathlib.Path(str(filename or "download")).name or "download"

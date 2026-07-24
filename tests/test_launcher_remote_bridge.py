@@ -93,17 +93,21 @@ def test_remote_safe_methods_are_not_origin_gated():
         )
 
 
-def test_file_bridge_validates_active_view_port():
-    # Defense-in-depth beneath the origin gate: even though the file bridge is
-    # origin-gated to the local page, the URL resolver still scopes the fetch to
-    # the active view port so it can never target a same-shaped path on a
-    # different server if it were ever reached mid-navigation.
+def test_file_bridge_pins_to_local_actual_port_not_view_state():
+    # R37C1: the file bridge methods are origin-gated to the LOCAL page, so their
+    # fetch MUST bind to the local server port (actual_port). It must NOT use
+    # view_state["port"] — a remote SPA can navigate the webview back to the local
+    # URL without calling remote_disconnect, so the page passes the local-origin
+    # gate while view_state still names the remote tunnel; resolving a download
+    # against that stale port would pull remote content onto the host OS.
     source = (REPO_ROOT / "launcher.py").read_text(encoding="utf-8")
     fn_start = source.index("def _resolve_bridge_file_url")
     fn_body = source[fn_start : source.index("def _unique_bridge_target")]
-    assert 'view_state["port"]' in fn_body, (
-        "_resolve_bridge_file_url must validate against the ACTIVE view port "
-        "(local or tunnel), not the pinned local server port"
+    assert 'view_state["port"]' not in fn_body, (
+        "_resolve_bridge_file_url must NOT resolve against the mutable view port"
+    )
+    assert "resolve_loopback_file_url(raw_url, actual_port)" in fn_body, (
+        "the file bridge must pin its fetch to the LOCAL actual_port"
     )
 
 
