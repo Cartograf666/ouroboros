@@ -109,8 +109,18 @@ def record_process(
     purpose: str,
     scope: str,
     owner_task_id: str = "",
+    require_durable: bool = False,
 ) -> Dict[str, Any]:
-    """Append a custody record for an already-spawned process."""
+    """Append a custody record for an already-spawned process.
+
+    ``append_jsonl`` RETURNS False (never raises) when every write retry fails,
+    so this used to report success even when the ledger write did not land —
+    leaving the process invisible to the startup reaper (R39C2). Callers whose
+    process MUST be durably reapable (the launcher's ssh tunnel — an unledgered
+    forward is an orphan the reaper can't find) pass ``require_durable=True`` to
+    turn a failed append into a raised error they can fail closed on. The default
+    stays best-effort (log-and-continue) for the many callers whose contract is
+    unchanged (spawn_supervised, companions, local model, executor)."""
     if scope not in _VALID_SCOPES:
         raise ValueError(f"process custody scope must be one of {_VALID_SCOPES}, got {scope!r}")
     try:
@@ -132,7 +142,12 @@ def record_process(
         "owner_task": str(owner_task_id or ""),
         "session_id": _SESSION_ID,
     }
-    append_jsonl(ledger_path(drive_root), entry)
+    ok = append_jsonl(ledger_path(drive_root), entry)
+    if require_durable and not ok:
+        raise RuntimeError(
+            f"process custody ledger append failed for pid {pid} ({purpose}); "
+            "refusing to run this process unledgered"
+        )
     return entry
 
 

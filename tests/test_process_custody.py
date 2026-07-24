@@ -440,3 +440,29 @@ def test_installed_skill_names_is_disk_derived_and_none_on_failure(monkeypatch):
     monkeypatch.setattr(skl, "discover_skills",
                         lambda *a, **k: [SimpleNamespace(name="alpha"), SimpleNamespace(name="beta")])
     assert server._installed_skill_names() == {"alpha", "beta"}
+
+
+def test_record_process_require_durable_raises_on_append_failure(tmp_path, monkeypatch):
+    # R39C2: append_jsonl RETURNS False (never raises) when all write retries fail,
+    # so record_process used to report success over a ledger entry that never
+    # landed — leaving the process unreapable. require_durable=True turns that into
+    # a raised error so a caller that needs durable custody (the ssh tunnel) fails
+    # closed; the default stays best-effort for every other caller.
+    monkeypatch.setattr(process_custody, "append_jsonl", lambda *a, **k: False)
+    # Default (best-effort): a failed append must NOT raise.
+    process_custody.record_process(
+        tmp_path, pid=os.getpid(), cmd=["x"], purpose="p", scope="daemon"
+    )
+    # Durable: a failed append MUST raise so the caller can fail closed.
+    with pytest.raises(RuntimeError, match="unledgered"):
+        process_custody.record_process(
+            tmp_path, pid=os.getpid(), cmd=["x"],
+            purpose="remote_ssh_tunnel:x", scope="daemon", require_durable=True,
+        )
+    # A SUCCESSFUL append with require_durable=True returns normally.
+    monkeypatch.setattr(process_custody, "append_jsonl", lambda *a, **k: True)
+    entry = process_custody.record_process(
+        tmp_path, pid=os.getpid(), cmd=["x"],
+        purpose="remote_ssh_tunnel:x", scope="daemon", require_durable=True,
+    )
+    assert entry["purpose"] == "remote_ssh_tunnel:x"

@@ -1030,6 +1030,17 @@ class RemoteTunnelManager:
             # ledger. Keeping the ledger write first makes that window minimal (no
             # fallible op precedes it). If recording fails, tear the child down and
             # fail the connect rather than run it unledgered.
+            # NB (R39, deny-marker vs bind ordering): custody MUST precede the
+            # marker (record needs the pid, so it can only run post-Popen), which
+            # means the marker is published a few statements AFTER ssh's Popen — it
+            # is NOT possible to also publish it before the forward could bind
+            # without reintroducing the unledgered-orphan window above (the two
+            # invariants are in tension; zero-orphan custody wins). In practice the
+            # forwarded listener is not bound until ssh has completed its session
+            # setup to the remote (a network round-trip), which is far longer than
+            # the microseconds to record + publish here, so the marker is present
+            # before the port is reachable; the local port is also OS-ephemeral and
+            # unpredictable. Residual window accepted deliberately.
             try:
                 from ouroboros.process_custody import record_process
 
@@ -1039,6 +1050,10 @@ class RemoteTunnelManager:
                     cmd=argv,
                     purpose=f"{CUSTODY_PURPOSE_PREFIX}{profile['id']}",
                     scope="daemon",
+                    # R39C2: a silently-failed ledger append (append_jsonl returns
+                    # False, never raises) would leave this forward unledgered and
+                    # unreapable — fail the connect instead of running an orphan.
+                    require_durable=True,
                 )
             except Exception as exc:
                 # Teardown+reap is centralized in the except BaseException below
