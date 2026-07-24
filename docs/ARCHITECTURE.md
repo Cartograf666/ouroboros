@@ -1898,9 +1898,21 @@ separate design on top of `workspace_executor.py`, not this feature.)
   writes, so content is forgeable; and Windows `LockFileEx` blocks re-reading
   the held file). The shell-text detector
   (`registry._detect_remote_connections_self_change`) is defense-in-depth, not
-  the wall. Residual limit, stated honestly: same-user arbitrary code can
-  still bypass Python and write `settings.json` raw; closing that class needs
-  OS-level user separation, out of v1 scope.
+  the wall. A DIRECT raw write to `settings.json` by an agent process tool
+  (dynamic key, dodging the detector) is reverted by the whole-file owner-state
+  snapshot/restore around `run_command`/`run_script` (`registry._snapshot_owner_
+  files`/`_restore_owner_files`), which covers OUROBOROS_REMOTE_CONNECTIONS by
+  snapshotting the entire settings.json — the structural backstop behind the
+  write gate.
+  KNOWN v1 LIMITATION (owner decision 2026-07-24, R30C2 — pragmatic mitigation
+  chosen over a full cross-process protocol): a LEGITIMATE launcher profile save
+  landing INSIDE an active process-tool's snapshot→restore window can be reverted
+  by that restore AFTER the save returned. `update_remote_connections` writes,
+  verifies persistence, retries briefly, and FAILS LOUDLY if it cannot confirm
+  (the UI asks the owner to retry) — but a restore firing after that window is
+  not covered. Fail-safe (the save is lost, never corrupted) and self-evident
+  (the profile does not appear). Full coverage (a shared durable launcher↔restore
+  revision/lock protocol) is a deferred follow-up.
 - Server lock: `DATA_DIR/state/server.pid` (`config.SERVER_PID_FILE`), distinct
   from the launcher's app-root `ouroboros.pid`, so `ouroboros server` enforces
   one instance per data dir. Conflict exits `SERVER_ALREADY_RUNNING_EXIT_CODE`

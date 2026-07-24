@@ -765,6 +765,36 @@ def test_reap_orphaned_tunnels_returns_none_when_unconfirmed(tmp_path, monkeypat
 
 @pytest.mark.serial
 @_POSIX_ONLY
+def test_reap_purpose_prefix_no_wnohang_does_not_crash(tmp_path, monkeypatch):
+    # R30C1: os.WNOHANG is Unix-only; on Windows the zombie-reap must be GUARDED,
+    # not AttributeError into the swallowing except (which would silently defeat
+    # the death-verify). Simulate the no-WNOHANG platform and exercise the kill+
+    # verify branch with a LIVE matching entry — reap must complete (return a
+    # list), never raise.
+    import os as _os
+    import subprocess as sp
+
+    from ouroboros import process_custody as pc
+    from ouroboros.platform_layer import subprocess_new_group_kwargs
+
+    monkeypatch.delattr(_os, "WNOHANG", raising=False)
+    proc = sp.Popen(["python3", "-c", "import time; time.sleep(30)"],
+                    stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+                    **subprocess_new_group_kwargs())
+    try:
+        pc.record_process(tmp_path, pid=proc.pid, cmd=["python3", "-c", "import time; time.sleep(30)"],
+                          purpose="remote_ssh_tunnel:x", scope="daemon")
+        result = pc.reap_purpose_prefix(tmp_path, "remote_ssh_tunnel:")
+        assert isinstance(result, list)  # completed, no AttributeError crash
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+@pytest.mark.serial
+@_POSIX_ONLY
 def test_reap_purpose_prefix_returns_none_when_ledger_lock_busy(tmp_path):
     # R22C1: a held ledger lock → reap can't confirm → None (distinct from []).
     from ouroboros import process_custody as pc

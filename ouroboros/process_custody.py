@@ -528,14 +528,17 @@ def reap_purpose_prefix(drive_root: pathlib.Path, purpose_prefix: str) -> Option
                 # clear a safety marker over a still-live forward.
                 dead = False
                 for _ in range(10):
-                    # If the killed pid is OUR child it lingers as a zombie until
+                    # POSIX only (R30C1): os.WNOHANG doesn't exist on Windows. If
+                    # the killed pid is OUR child it lingers as a zombie until
                     # reaped; a reparented orphan (the production case) is reaped
                     # by init. WNOHANG-reap the zombie when it IS our child so a
-                    # terminated-but-unwaited process reads as dead, not "alive".
-                    try:
-                        os.waitpid(pid, os.WNOHANG)
-                    except (ChildProcessError, OSError):
-                        pass
+                    # terminated-but-unwaited process reads as dead. On Windows
+                    # there are no zombies — pid_is_alive alone reflects death.
+                    if hasattr(os, "WNOHANG"):
+                        try:
+                            os.waitpid(pid, os.WNOHANG)
+                        except (ChildProcessError, OSError):
+                            pass
                     if not pid_is_alive(pid):
                         dead = True
                         break
