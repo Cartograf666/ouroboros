@@ -180,10 +180,22 @@ def validate_profile(raw: Any) -> Dict[str, Any]:
         normalized["remote_data_dir"] = remote_dir
     port = raw.get("remote_agent_port")
     if port not in (None, "", 0):
-        try:
+        # Reject bool and NON-INTEGRAL values BEFORE int() (R24C2): int(8765.9)
+        # would silently truncate to 8765 and connect to an unintended port, and
+        # bool is an int subclass (True→1). Accept only a true integer, an
+        # integer-valued float, or an all-digits string.
+        if isinstance(port, bool):
+            raise ProfileError("remote_agent_port must be an integer")
+        if isinstance(port, int):
+            port_int = port
+        elif isinstance(port, float):
+            if not port.is_integer():
+                raise ProfileError("remote_agent_port must be an integer")
             port_int = int(port)
-        except (TypeError, ValueError):
-            raise ProfileError("remote_agent_port must be an integer") from None
+        elif isinstance(port, str) and port.strip().isdigit():
+            port_int = int(port.strip())
+        else:
+            raise ProfileError("remote_agent_port must be an integer")
         if not 1 <= port_int <= 65535:
             raise ProfileError("remote_agent_port must be in 1..65535")
         normalized["remote_agent_port"] = port_int

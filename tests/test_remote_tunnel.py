@@ -46,9 +46,16 @@ def test_validate_profile_rejects_hostile_targets(target):
 def test_validate_profile_rejects_unknown_fields_and_bad_port():
     with pytest.raises(rt.ProfileError):
         rt.validate_profile({"id": "a", "ssh_target": "h", "identity_file": "x"})
-    for bad_port in ("nope", -1, 0.5, 70000):
+    # R24C2: a positive FRACTIONAL value (8765.9) must be rejected, not silently
+    # int()-truncated to 8765; bool (int subclass) must be rejected too.
+    for bad_port in ("nope", -1, 0.5, 70000, 8765.9, True, "87.6"):
         with pytest.raises(rt.ProfileError):
             rt.validate_profile({"id": "a", "ssh_target": "h", "remote_agent_port": bad_port})
+    # Integer-valued forms are accepted (int, integer-valued float, digit string).
+    for good_port in (8765, 8765.0, "9000"):
+        assert rt.validate_profile(
+            {"id": "a", "ssh_target": "h", "remote_agent_port": good_port}
+        )["remote_agent_port"] == int(good_port if not isinstance(good_port, str) else int(good_port))
 
 
 @pytest.mark.parametrize("path", ["~/Ouroboros/data", "/srv/obo/data"])
