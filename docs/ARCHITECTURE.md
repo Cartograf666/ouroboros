@@ -724,7 +724,7 @@ finalization states.
 │   ├── archive/            ← Rotated logs, rescue snapshots
 │   └── uploads/            ← Chat file attachments (uploaded via paperclip button)
 ├── Deliverables/      ← (v6.38.0) Visible user-deliverables container: a BARE user_files filename (no directory) lands here instead of the home root (OUROBOROS_DELIVERABLES_ROOT; sibling of projects/, outside repo/ and data/, never GC-pruned)
-└── ouroboros.pid           ← PID lock file (platform lock — auto-released on crash)
+└── ouroboros.pid           ← Launcher PID lock file (persistent; OS flock auto-released on crash/close, file never unlinked — remote v1 launcher-authority invariant)
 ```
 
 ---
@@ -1984,7 +1984,13 @@ processes. No zombies, no workers lingering in background.**
    b. _kill_stale_on_port(active port + Host Service port)
    c. read data/state/extension_companions.json and kill listed companions/ports
    d. multiprocessing.active_children() → SIGKILL each
-4. release_pid_lock()               ← delete ~/Ouroboros/ouroboros.pid
+4. release_pid_lock()               ← close the handle to release the OS flock; the
+                                       lock FILE (~/Ouroboros/ouroboros.pid) is left
+                                       PERSISTENT, never unlinked (remote v1 R14C1:
+                                       unlink-after-unlock would let a second launcher
+                                       take a new inode and defeat the launcher-authority
+                                       invariant; a successor reacquires the flock on the
+                                       same path)
 ```
 
 Inside `server.py` ordinary lifespan shutdown relies on graceful uvicorn

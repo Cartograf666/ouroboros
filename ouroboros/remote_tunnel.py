@@ -425,22 +425,26 @@ class RemoteTunnelManager:
     def _active_tunnel_port_file(self) -> pathlib.Path:
         return self._data_dir / "state" / "active_tunnel_port"
 
-    def _publish_active_tunnel_port(self, port: Optional[int]) -> None:
+    def _publish_active_tunnel_port(self, port: Optional[int]) -> bool:
         """Publish (or clear) the live tunnel's local port for the subagent
-        control-plane deny boundary (R18C1). Best-effort; written atomically and
-        removed on disconnect so a subagent can never reach the remote control
-        plane through the forward, and a stale file can't over-block."""
+        control-plane deny boundary (R18C1). Returns True on success. A PUBLISH
+        (port set) that fails must be treated as fail-CLOSED by the caller — a
+        live forward whose port the deny set cannot cover must not be presented
+        as connected (R20C3). A CLEAR is best-effort (removing a deny entry never
+        creates exposure). Written atomically; the marker is cleared only after
+        the forward is confirmed dead (see connect/disconnect)."""
         path = self._active_tunnel_port_file()
         try:
             if port is None:
                 path.unlink(missing_ok=True)
-                return
+                return True
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
             tmp.write_text(str(int(port)), encoding="utf-8")
             os.replace(tmp, path)
+            return True
         except OSError:
-            pass  # best-effort registry; the deny boundary degrades safe
+            return False
 
     def _notify_loop(self) -> None:
         while True:
@@ -565,22 +569,46 @@ class RemoteTunnelManager:
                         hint=exc.hint,
                     )
             raise
+        superseded = False
+        marker_ok = True
         with self._lock:
             if generation != self._generation:
+                # Superseded: hand the proc to _terminating under the lock (stays
+                # visible to a concurrent panic); the graceful wait runs OUTSIDE
+                # the lock (R20C1 — never hold force_disconnect's lock for ~10s).
                 self._inflight.discard(live.proc)
-                _terminate_quietly(live.proc)
-                raise TunnelError("ssh_failed", "connection superseded")
-            # Ownership transfer under the SAME lock that would satisfy a
-            # force_disconnect: the tunnel proc moves from _inflight to _live
-            # with no gap in which a panic could miss it.
-            self._live = live
-            self._inflight.discard(live.proc)
-            self._set_status(
-                state="connected",
-                profile_id=profile["id"],
-                profile_name=profile["name"],
-                local_port=live.local_port,
-                remote_port=live.remote_port,
+                self._terminating.add(live.proc)
+                superseded = True
+            else:
+                # Ownership transfer + deny-boundary marker + connected status,
+                # ALL under one lock: a fast atomic marker write (NOT a graceful
+                # wait) so the marker-present ⟺ forward-live invariant has no gap
+                # (R20C3), while a panic waits only microseconds here.
+                marker_ok = self._publish_active_tunnel_port(live.local_port)
+                if marker_ok:
+                    self._live = live
+                    self._inflight.discard(live.proc)
+                    self._set_status(
+                        state="connected",
+                        profile_id=profile["id"],
+                        profile_name=profile["name"],
+                        local_port=live.local_port,
+                        remote_port=live.remote_port,
+                    )
+                else:
+                    self._inflight.discard(live.proc)
+                    self._terminating.add(live.proc)
+        if superseded:
+            self._finish_terminating(live.proc)
+            raise TunnelError("ssh_failed", "connection superseded")
+        if not marker_ok:
+            # Fail CLOSED (R20C3): a live forward whose port the subagent deny set
+            # cannot cover must never be presented as connected.
+            self._finish_terminating(live.proc)
+            raise TunnelError(
+                "custody_failed",
+                "could not record the active tunnel port for the subagent "
+                "control-plane deny boundary; refusing to connect",
             )
         threading.Thread(
             target=self._supervise, args=(generation,), daemon=True,
@@ -607,6 +635,10 @@ class RemoteTunnelManager:
             finally:
                 with self._lock:
                     self._terminating.discard(proc)
+        # Clear the deny-boundary marker ONLY NOW, after the forward is confirmed
+        # dead (R20C3): clearing earlier would drop the deny entry while the old
+        # forward was still live for the graceful-wait window.
+        self._publish_active_tunnel_port(None)
 
     def force_disconnect(self) -> None:
         """Panic path: kill the ssh process TREE immediately, no graceful wait.
@@ -646,16 +678,26 @@ class RemoteTunnelManager:
         # newer disconnect/connect has superseded before it reaches the launcher.
         status["_generation"] = self._generation
         self._status = status
-        # Keep the subagent control-plane deny registry in step with the forward
-        # (R18C1): publish the local port only while genuinely connected; clear
-        # it the moment the forward is down (connecting/reconnecting/terminal).
-        state = status.get("state")
-        if state == "connected":
-            self._publish_active_tunnel_port(status.get("local_port"))
-        else:
-            self._publish_active_tunnel_port(None)
+        # NOTE: the active_tunnel_port marker is NOT driven from here — it is a
+        # forward-liveness invariant (marker present ⟺ a forward is live on that
+        # port), published on a CONFIRMED connect and cleared only after the
+        # forward is CONFIRMED dead (R20C3). Driving it off status transitions
+        # would clear it before the old forward actually terminated.
         if self._on_state_change is not None:
             self._emit_q.put(dict(status))
+
+    def _finish_terminating(self, proc: "subprocess.Popen[Any]") -> None:
+        """Graceful kill+reap OUTSIDE self._lock, then drop from _terminating.
+
+        Callers first move proc into _terminating UNDER the lock (so a concurrent
+        panic still sees it), then release the lock and call this — the multi-
+        second graceful wait must NEVER run while holding the lock force_disconnect
+        needs (R20C1 Emergency Stop)."""
+        try:
+            _terminate_quietly(proc)
+        finally:
+            with self._lock:
+                self._terminating.discard(proc)
 
     def _spawn_and_wait(
         self,
@@ -736,7 +778,9 @@ class RemoteTunnelManager:
                     return _Live(generation, profile, local_port, remote_port, proc)
                 with self._lock:
                     if self._shutdown or generation != self._generation:
-                        _terminate_quietly(proc)
+                        # Raise UNDER the lock (fast) — the graceful wait runs in
+                        # the except BaseException below, OUTSIDE the lock, so a
+                        # concurrent panic is never delayed (R20C1).
                         raise TunnelError("ssh_failed", "connection superseded")
                 time.sleep(0.5)
             _terminate_quietly(proc)
@@ -841,26 +885,40 @@ class RemoteTunnelManager:
                 attempt += 1
                 time.sleep(min(delay, max(0.0, deadline - time.time())))
                 continue
+            reconnect_superseded = False
             with self._lock:
                 if generation != self._generation:
+                    # Hand to _terminating under the lock; graceful wait OUTSIDE
+                    # (R20C1).
                     self._inflight.discard(new_live.proc)
-                    _terminate_quietly(new_live.proc)
-                    return False
-                self._live = new_live
-                self._inflight.discard(new_live.proc)
-                self._set_status(
-                    state="connected",
-                    profile_id=profile["id"],
-                    profile_name=profile["name"],
-                    local_port=new_live.local_port,
-                    remote_port=new_live.remote_port,
-                    reconnected=True,
-                )
+                    self._terminating.add(new_live.proc)
+                    reconnect_superseded = True
+                else:
+                    # Republish the marker (the reconnect may have re-picked the
+                    # local port after a bind steal) atomically with going live —
+                    # a fast write, not a graceful wait (R20C3).
+                    self._publish_active_tunnel_port(new_live.local_port)
+                    self._live = new_live
+                    self._inflight.discard(new_live.proc)
+                    self._set_status(
+                        state="connected",
+                        profile_id=profile["id"],
+                        profile_name=profile["name"],
+                        local_port=new_live.local_port,
+                        remote_port=new_live.remote_port,
+                        reconnected=True,
+                    )
+            if reconnect_superseded:
+                self._finish_terminating(new_live.proc)
+                return False
             return True
         with self._lock:
             if generation != self._generation:
                 return False
             self._live = None
+            # The old forward was terminated at the top of this cycle and no new
+            # one came up — clear the deny-boundary marker (forward is dead).
+            self._publish_active_tunnel_port(None)
             self._set_status(
                 state="gave_up",
                 profile_id=profile["id"],

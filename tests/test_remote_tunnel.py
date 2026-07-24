@@ -412,20 +412,49 @@ def test_force_disconnect_kills_inflight_tunnel_before_live_assigned(tmp_path, m
 
 
 def test_active_tunnel_port_registry_publish_and_clear(tmp_path, monkeypatch):
-    # R18C1: the live tunnel's local port must be published for the subagent
-    # control-plane deny boundary while connected, and cleared when down.
-    mgr = _manager(tmp_path)
+    # R18C1/R20C3: a full connect publishes the local port for the subagent
+    # deny boundary; disconnect clears it AFTER the forward is torn down. The
+    # marker is a forward-liveness invariant, NOT driven off status transitions
+    # (a status transition must not clear it before the forward is dead).
     port_file = tmp_path / "state" / "active_tunnel_port"
-    # Construction clears any stale registry.
-    assert not port_file.exists()
-    # A connected transition publishes the local port...
-    with mgr._lock:
-        mgr._set_status(state="connected", profile_id="a", local_port=51234, remote_port=8765)
-    assert port_file.read_text().strip() == "51234"
-    # ...and a non-connected transition clears it.
+    fake = _FakeProc()
+    mgr = _manager(tmp_path)
+    assert not port_file.exists()  # construction clears any stale marker
+    monkeypatch.setattr(rt, "discover_remote_port", lambda p, ssh_path, **_k: 8765)
+    monkeypatch.setattr(rt, "pick_local_port", lambda: 51234)
+    monkeypatch.setattr(
+        rt.RemoteTunnelManager, "_spawn_and_wait",
+        lambda self, gen, prof, lp, rp: rt._Live(gen, prof, lp, rp, fake),
+    )
+    monkeypatch.setattr(rt.threading.Thread, "start", lambda self: None)
+    mgr.connect({"id": "a", "name": "prod", "ssh_target": "u@h"})
+    assert port_file.read_text().strip() == "51234"  # published on connect
+    # A mere status transition does NOT clear it (only confirmed teardown does).
     with mgr._lock:
         mgr._set_status(state="reconnecting", profile_id="a", local_port=51234)
-    assert not port_file.exists()
+    assert port_file.exists(), "marker must survive a status transition (forward still live)"
+    mgr.disconnect()
+    assert not port_file.exists()  # cleared after teardown
+
+
+def test_connect_fails_closed_when_marker_cannot_be_published(tmp_path, monkeypatch):
+    # R20C3: if the deny-boundary marker cannot be persisted, a live forward must
+    # NOT be presented as connected — connect fails closed and tears down.
+    fake = _FakeProc()
+    mgr = _manager(tmp_path)
+    monkeypatch.setattr(rt, "discover_remote_port", lambda p, ssh_path, **_k: 8765)
+    monkeypatch.setattr(rt, "pick_local_port", lambda: 51234)
+    monkeypatch.setattr(
+        rt.RemoteTunnelManager, "_spawn_and_wait",
+        lambda self, gen, prof, lp, rp: rt._Live(gen, prof, lp, rp, fake),
+    )
+    monkeypatch.setattr(mgr, "_publish_active_tunnel_port", lambda port: port is None)  # publish fails, clear ok
+    monkeypatch.setattr(rt.threading.Thread, "start", lambda self: None)
+    with pytest.raises(rt.TunnelError):
+        mgr.connect({"id": "a", "name": "prod", "ssh_target": "u@h"})
+    assert mgr._live is None
+    assert fake._dead is True  # torn down
+    assert mgr._inflight == set() and mgr._terminating == set()
 
 
 def test_browser_control_plane_denies_active_tunnel_port(tmp_path, monkeypatch):
