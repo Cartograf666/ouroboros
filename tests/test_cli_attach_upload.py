@@ -34,7 +34,7 @@ class FakeClient:
         self.fail_task_create = fail_task_create
         self.base_url = "http://127.0.0.1:9999"
 
-    def post_multipart_file(self, path, file_path, *, field="file", timeout=None):
+    def post_multipart_file(self, path, file_path, *, field="file", timeout=None, max_bytes=None):
         index = len(self.uploads)
         self.uploads.append((path, str(file_path)))
         if index == self.fail_upload_at:
@@ -138,6 +138,17 @@ def test_multipart_and_request_share_base_headers(monkeypatch):
         assert expected.issubset(present), (expected, present)
 
 
+def test_post_multipart_file_bounds_read_against_grown_file(tmp_path):
+    # R31C1: a file larger than max_bytes AT READ TIME (grown/swapped after
+    # validation) must be refused, not read unbounded into memory.
+    big = tmp_path / "grew.bin"
+    with big.open("wb") as fh:
+        fh.truncate(2048)
+    client = cli.OuroborosHTTPClient("http://127.0.0.1:1")
+    with pytest.raises(CLIError, match="per-file limit at upload time"):
+        client.post_multipart_file("/api/chat/upload", big, max_bytes=1024)
+
+
 def test_upload_attachments_returns_server_paths(tmp_path):
     files = []
     for name in ("a.txt", "b.txt"):
@@ -178,7 +189,7 @@ def test_upload_attachments_cleans_up_on_non_clierror(tmp_path):
         files.append(f)
 
     class _RaceClient(FakeClient):
-        def post_multipart_file(self, path, file_path, *, field="file", timeout=None):
+        def post_multipart_file(self, path, file_path, *, field="file", timeout=None, max_bytes=None):
             if len(self.uploads) == 1:  # 2nd file
                 raise OSError("file vanished after validation")
             return super().post_multipart_file(path, file_path)
@@ -200,7 +211,7 @@ def test_upload_attachments_cleans_up_on_non_dict_response(tmp_path):
         files.append(f)
 
     class _BadBodyClient(FakeClient):
-        def post_multipart_file(self, path, file_path, *, field="file", timeout=None):
+        def post_multipart_file(self, path, file_path, *, field="file", timeout=None, max_bytes=None):
             if len(self.uploads) == 1:  # 2nd file: server returns a bare string
                 self.uploads.append((path, str(file_path)))
                 return "OK (not json)"

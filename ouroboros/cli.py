@@ -99,12 +99,16 @@ class OuroborosHTTPClient:
         *,
         field: str = "file",
         timeout: Optional[float] = None,
+        max_bytes: Optional[int] = None,
     ) -> Any:
         """POST one file as multipart/form-data (stdlib-only encoder).
 
-        The file is read fully into memory (bounded by the caller's 50 MB
-        pre-upload size check, so the transient stays within the server's
-        per-file cap); this is a desktop CLI client, not a streaming service.
+        The file is read fully into memory (desktop CLI client, not a streaming
+        service). ``max_bytes`` re-enforces the per-file cap AT READ TIME
+        (R31C1): _validate_attach_paths checks size earlier, but a file that
+        grows or is swapped between validation and upload would otherwise be
+        read unbounded and bypass the validated cap — so read at most limit+1
+        and refuse if it grew.
         """
         import mimetypes
         import uuid
@@ -119,7 +123,17 @@ class OuroborosHTTPClient:
             f'Content-Disposition: form-data; name="{field}"; filename="{safe_name}"\r\n'
             f"Content-Type: {mime}\r\n\r\n"
         ).encode("utf-8")
-        body = head + source.read_bytes() + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        if max_bytes is not None and max_bytes >= 0:
+            with source.open("rb") as _fh:
+                content = _fh.read(max_bytes + 1)
+            if len(content) > max_bytes:
+                raise CLIError(
+                    f"attachment {source.name} exceeds the {max_bytes // (1024 * 1024)} MB "
+                    "per-file limit at upload time (did it grow after validation?)"
+                )
+        else:
+            content = source.read_bytes()
+        body = head + content + f"\r\n--{boundary}--\r\n".encode("utf-8")
         headers = self._base_headers()
         headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
         req = urllib.request.Request(
@@ -289,6 +303,8 @@ def _upload_attachments(
     On a mid-batch failure every already-uploaded temp file is best-effort
     deleted so partial batches never orphan files in the server's uploads dir.
     """
+    from ouroboros.artifacts import _MAX_STAGED_ATTACHMENT_BYTES as _PER_FILE
+
     attachments: List[Dict[str, Any]] = []
     uploaded_names: List[str] = []
     for path in paths:
@@ -297,7 +313,9 @@ def _upload_attachments(
         # .get() raise — must release every already-uploaded file, never orphan
         # them in the server's uploads dir. Non-CLIErrors normalize to CLIError.
         try:
-            result = client.post_multipart_file("/api/chat/upload", path)
+            # max_bytes re-enforces the per-file cap at read time (R31C1) against
+            # a file that grew/was swapped between validation and upload.
+            result = client.post_multipart_file("/api/chat/upload", path, max_bytes=_PER_FILE)
             data = result if isinstance(result, dict) else {}
             server_path = str(data.get("path") or "")
             server_name = str(data.get("filename") or "")
