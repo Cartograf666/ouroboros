@@ -215,6 +215,11 @@ def test_reconnect_navigation_repeats_admission_handshake():
     guard = ots.index("remote_ui_compatible(new_port)")
     nav = ots.index('load_url(f"http://127.0.0.1:{new_port}")')
     assert guard < nav, "reconnect must run the admission handshake before navigating"
+    # F1: the admission must NOT be gated on a port change — it runs on every
+    # reconnect (the port is stable across reconnects). The port-change check
+    # must appear AFTER the admission handshake, guarding only the navigation.
+    portcheck = ots.index('new_port != int(view_state["port"])')
+    assert guard < portcheck, "admission must precede (not be nested in) the port-change check"
 
 
 def test_on_tunnel_state_guards_navigation_by_generation():

@@ -1310,17 +1310,19 @@ def main():
                     _webview_window.load_url(local_url)
             elif state == "connected" and status.get("reconnected"):
                 new_port = int(status.get("local_port") or 0)
-                if new_port and new_port != int(view_state["port"]):
-                    # R21C1: re-run the admission handshake before navigating (a
-                    # remote restarted onto an incompatible version must not slip in).
-                    if not _remote_tunnel.remote_ui_compatible(new_port):
-                        # R22C2: tear the manager OUT of connected too, else the
-                        # ssh/_live/marker/pill stay "connected" for a rejected remote.
-                        _disconnect_tunnel_quietly()
-                        view_state["port"] = actual_port
-                        if _webview_window:
-                            _webview_window.load_url(local_url)
-                        return
+                if not new_port:
+                    return
+                # R21C1/F1: re-admit on EVERY reconnect, not only a port change —
+                # the tunnel port is stable, so an incompatible restart would else
+                # never be re-checked. Navigation stays port-conditional below.
+                if not _remote_tunnel.remote_ui_compatible(new_port):
+                    # R22C2: tear the manager out of connected (not just navigate).
+                    _disconnect_tunnel_quietly()
+                    view_state["port"] = actual_port
+                    if _webview_window:
+                        _webview_window.load_url(local_url)
+                    return
+                if new_port != int(view_state["port"]):
                     view_state["port"] = new_port
                     if _webview_window:
                         _webview_window.load_url(f"http://127.0.0.1:{new_port}")
