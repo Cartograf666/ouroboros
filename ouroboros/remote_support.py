@@ -35,6 +35,50 @@ def build_server_conflict_html() -> str:
     )
 
 
+def _generic_startup_failed_html() -> str:
+    """Fallback page when the local server did not become ready for a reason
+    OTHER than a data-dir conflict (crash, port bind failure, dependency error)."""
+    return (
+        "<html><body style='background:#1a1a2e;color:white;font-family:system-ui;"
+        "display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>"
+        "<div style='text-align:center;max-width:460px;padding:24px'>"
+        "<h2>Ouroboros failed to start</h2>"
+        "<p>The local agent server did not become ready.</p>"
+        "<p style='color:#94a3b8;font-size:13px;margin-top:10px'>"
+        "Check launcher.log and agent_stdout.log in the Ouroboros data directory "
+        "for details.</p>"
+        "</div></body></html>"
+    )
+
+
+def startup_failed_window_spec(conflict_active: bool) -> dict:
+    """Choose the startup-failure window (title/html/size) the launcher shows.
+
+    R35C1: on the PRIMARY conflict path a headless server already owns the data
+    dir, so the desktop server child exits 43 and the lifecycle loop latches
+    ``_server_conflict_active`` BEFORE any window exists — the live
+    ``_present_server_conflict_page`` call then no-op'd (window is None). The
+    launcher's ``not server_ready`` branch consults that persisted flag through
+    this helper so a data-dir conflict shows the ACTIONABLE recovery page
+    (``build_server_conflict_html`` — names the exact ``systemctl`` command)
+    rather than the generic ``failed to start`` surface. Pure + here (not the
+    at-budget launcher) so it is unit-testable without a webview.
+    """
+    if conflict_active:
+        return {
+            "title": "Ouroboros — Server Already Running",
+            "html": build_server_conflict_html(),
+            "width": 560,
+            "height": 380,
+        }
+    return {
+        "title": "Ouroboros — Startup Failed",
+        "html": _generic_startup_failed_html(),
+        "width": 520,
+        "height": 260,
+    }
+
+
 def _launcher_process_holds_authority() -> bool:
     """True only inside the desktop launcher process (OS-anchored identity).
 

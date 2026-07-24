@@ -1204,21 +1204,14 @@ def main():
         _shutdown_event.set()
         stop_agent()
         lifecycle_thread.join(timeout=5)
+        # R35C1: an exit-43 data-dir conflict latches _server_conflict_active in
+        # the lifecycle loop before any window exists, so route to the ACTIONABLE
+        # recovery page (not the generic failure surface) via the shared spec.
+        from ouroboros.remote_support import startup_failed_window_spec
+        _spec = startup_failed_window_spec(_server_conflict_active)
         webview.create_window(
-            "Ouroboros — Startup Failed",
-            html=(
-                "<html><body style='background:#1a1a2e;color:white;font-family:system-ui;"
-                "display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>"
-                "<div style='text-align:center;max-width:460px;padding:24px'>"
-                "<h2>Ouroboros failed to start</h2>"
-                "<p>The local agent server did not become ready.</p>"
-                "<p style='color:#94a3b8;font-size:13px;margin-top:10px'>"
-                "Check launcher.log and agent_stdout.log in the Ouroboros data directory "
-                "for details.</p>"
-                "</div></body></html>"
-            ),
-            width=520,
-            height=260,
+            _spec["title"], html=_spec["html"],
+            width=_spec["width"], height=_spec["height"],
         )
         webview.start()
         return

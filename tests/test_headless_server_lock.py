@@ -243,6 +243,24 @@ def test_server_conflict_page_is_shown_and_actionable(monkeypatch):
     assert launcher._present_server_conflict_page() is False  # swallowed, logged
 
 
+def test_startup_failed_window_spec_routes_exit43_to_conflict_page():
+    # R35C1: on the PRIMARY conflict path the server exits 43 BEFORE any window
+    # exists, so the live _present_server_conflict_page() no-op'd and the launcher
+    # fell back to the generic "failed to start" surface. main()'s not-ready
+    # branch now consults the latched conflict flag through this spec — a conflict
+    # must select the ACTIONABLE recovery page naming the exact systemctl command;
+    # a plain startup failure must NOT.
+    conflict = remote_support.startup_failed_window_spec(True)
+    assert conflict["html"] == remote_support.build_server_conflict_html()
+    assert "systemctl --user stop ouroboros" in conflict["html"]
+    assert "Already Running" in conflict["title"]
+
+    generic = remote_support.startup_failed_window_spec(False)
+    assert "systemctl" not in generic["html"]
+    assert "failed to start" in generic["html"].lower()
+    assert generic["title"] != conflict["title"]
+
+
 def test_systemd_unit_prevents_panic_and_conflict_restarts():
     import pathlib
 
