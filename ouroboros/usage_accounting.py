@@ -236,7 +236,11 @@ def _named_lock(
 
 @contextlib.contextmanager
 def _locked(root: pathlib.Path) -> Iterator[None]:
-    with _named_lock(root, "usage_attempts.lock", timeout_sec=4.0, stale_sec=30.0):
+    # Operator fix 2026-07-23: 4.0s starves under a grown ledger (reserve_attempt
+    # re-reads the whole usage_attempts.jsonl under this lock — ~0.5s hold at 20MB),
+    # failing healthy tasks with UsageAccountingError at >=10 concurrent workers.
+    # Waiting longer is always correct here; the transaction itself stays atomic.
+    with _named_lock(root, "usage_attempts.lock", timeout_sec=45.0, stale_sec=90.0):
         yield
 
 
