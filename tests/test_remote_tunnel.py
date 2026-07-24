@@ -584,6 +584,59 @@ def test_marker_published_before_health_check_passes(tmp_path, monkeypatch):
     assert seen["marker"] == "51999"  # marker present BEFORE health passed
 
 
+def test_custody_ledger_recorded_before_marker_published(tmp_path, monkeypatch):
+    # R38C2 (Process Custody Rule): the durable ledger write (record_process) must
+    # run BEFORE _publish_active_tunnel_port — a crash in that window must never be
+    # able to leave a live ssh child the startup reaper can't find while the marker
+    # is already (or about to be) written.
+    mgr = _manager(tmp_path)
+    order = []
+    monkeypatch.setattr(rt, "discover_remote_port", lambda p, ssh_path, **k: 8765)
+    monkeypatch.setattr(rt, "pick_local_port", lambda: 51888)
+    monkeypatch.setattr(rt.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(
+        "ouroboros.process_custody.record_process", lambda *a, **k: order.append("record")
+    )
+    monkeypatch.setattr(
+        mgr, "_publish_active_tunnel_port",
+        lambda port: (order.append(f"publish:{port}"), True)[1],
+    )
+    monkeypatch.setattr(rt, "check_health", lambda *a, **k: True)
+    monkeypatch.setattr(rt.threading.Thread, "start", lambda self: None)
+    mgr.connect({"id": "a", "name": "prod", "ssh_target": "u@h"})
+    # (a leading publish:None from connect's pre-connect disconnect is noise.)
+    assert "record" in order and "publish:51888" in order
+    assert order.index("record") < order.index("publish:51888")
+
+
+def test_custody_record_failure_leaves_no_marker_and_no_live_child(tmp_path, monkeypatch):
+    # R38C2 fault injection: if the ledger write fails, the marker must NOT be
+    # published and the ssh child must be terminated + dropped from _inflight —
+    # never an unledgered live forward, and never a marker without a ledger entry.
+    port_file = tmp_path / "state" / "active_tunnel_port"
+    mgr = _manager(tmp_path)
+    fake = _FakeProc()
+    published = []
+    monkeypatch.setattr(rt, "discover_remote_port", lambda p, ssh_path, **k: 8765)
+    monkeypatch.setattr(rt, "pick_local_port", lambda: 51888)
+    monkeypatch.setattr(rt.subprocess, "Popen", lambda *a, **k: fake)
+    monkeypatch.setattr(
+        "ouroboros.process_custody.record_process",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ledger down")),
+    )
+    real_pub = mgr._publish_active_tunnel_port
+    monkeypatch.setattr(
+        mgr, "_publish_active_tunnel_port",
+        lambda port: (published.append(port), real_pub(port))[1],
+    )
+    monkeypatch.setattr(rt.threading.Thread, "start", lambda self: None)
+    with pytest.raises(rt.TunnelError):
+        mgr.connect({"id": "a", "name": "prod", "ssh_target": "u@h"})
+    assert 51888 not in published  # the port marker was never published
+    assert not port_file.exists()  # no marker persisted without a ledger entry
+    assert fake._dead is True and mgr._inflight == set()  # child killed, not leaked
+
+
 def test_reconnect_aborts_and_retains_marker_when_old_death_unconfirmed(tmp_path, monkeypatch):
     # R36C1: reconnect tears the OLD forward down at the top of the cycle. If that
     # death can't be CONFIRMED, the old ssh may still be live on live.local_port —

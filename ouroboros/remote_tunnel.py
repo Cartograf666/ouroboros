@@ -1021,26 +1021,15 @@ class RemoteTunnelManager:
         # keep it registered so the caller transfers ownership to _live under a
         # single lock hold (no window where a panic could miss it).
         try:
-            # R38C1: publish the deny marker BEFORE the health-wait (and before the
-            # ledger write). ssh bound 127.0.0.1:local_port at the Popen above —
-            # the forward reaches the remote control plane from that instant, but
-            # the marker used to be published only AFTER our health poll passed,
-            # leaving a multi-second window (up to HEALTH_CONNECT_TIMEOUT_SEC) where
-            # the port forwarded to the remote yet was ABSENT from the subagent
-            # deny set. Publishing here makes marker-present a SUPERSET of
-            # forward-reachable (fail-closed). Any failure below runs the except
-            # BaseException cleanup, which clears this marker on CONFIRMED death.
-            if not self._publish_active_tunnel_port(local_port):
-                raise TunnelError(
-                    "custody_failed",
-                    "could not record the active tunnel port for the subagent "
-                    "control-plane deny boundary",
-                )
-            # Custody registration is part of a SUCCESSFUL spawn (Process Custody
-            # Rule): an unledgered long-lived ssh child is invisible to the
-            # startup reaper, so a launcher crash would leak it. If recording
-            # fails, tear the child down and fail the connect rather than run it
-            # unledgered.
+            # DURABLE CUSTODY FIRST (Process Custody Rule, R38C2): record the ssh
+            # child in the process ledger as the VERY FIRST fallible op after the
+            # Popen — before the marker write or any other work. An unledgered
+            # long-lived ssh child is invisible to the startup reaper, so a
+            # launcher crash between Popen and the ledger write would leak it and
+            # reap_orphaned_tunnels could then clear the marker over an empty
+            # ledger. Keeping the ledger write first makes that window minimal (no
+            # fallible op precedes it). If recording fails, tear the child down and
+            # fail the connect rather than run it unledgered.
             try:
                 from ouroboros.process_custody import record_process
 
@@ -1058,6 +1047,22 @@ class RemoteTunnelManager:
                     "custody_failed",
                     f"could not record the ssh tunnel in the process ledger: {exc}",
                 ) from exc
+            # THEN publish the deny marker — still BEFORE the health-wait (R38C1),
+            # but AFTER the durable ledger entry (R38C2). ssh bound
+            # 127.0.0.1:local_port at the Popen above, so the forward reaches the
+            # remote control plane from that instant; publishing only after our
+            # health poll passed left a multi-second window (up to
+            # HEALTH_CONNECT_TIMEOUT_SEC) where the port forwarded to the remote yet
+            # was ABSENT from the subagent deny set. Publishing here makes
+            # marker-present a SUPERSET of forward-reachable (fail-closed). Any
+            # failure below runs the except BaseException cleanup, which clears
+            # this marker on CONFIRMED death.
+            if not self._publish_active_tunnel_port(local_port):
+                raise TunnelError(
+                    "custody_failed",
+                    "could not record the active tunnel port for the subagent "
+                    "control-plane deny boundary",
+                )
             deadline = time.time() + HEALTH_CONNECT_TIMEOUT_SEC
             while time.time() < deadline:
                 if proc.poll() is not None:
