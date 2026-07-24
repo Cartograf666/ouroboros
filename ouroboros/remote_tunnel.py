@@ -642,6 +642,7 @@ class RemoteTunnelManager:
     def disconnect(self) -> None:
         with self._lock:
             self._generation += 1
+            gen = self._generation
             live, self._live = self._live, None
             inflight = list(self._inflight)
             self._inflight.clear()
@@ -658,10 +659,15 @@ class RemoteTunnelManager:
             finally:
                 with self._lock:
                     self._terminating.discard(proc)
-        # Clear the deny-boundary marker ONLY NOW, after the forward is confirmed
-        # dead (R20C3): clearing earlier would drop the deny entry while the old
-        # forward was still live for the graceful-wait window.
-        self._publish_active_tunnel_port(None)
+        # Clear the deny-boundary marker after the forward is confirmed dead
+        # (R20C3) — but ONLY if THIS disconnect is still the latest operation
+        # (R23C1): a newer connect (which itself began by calling disconnect,
+        # bumping the generation again) may already have published its own live
+        # marker while we were waiting in teardown; unlinking it would leave that
+        # newer forward uncovered by the subagent deny boundary.
+        with self._lock:
+            if self._generation == gen and self._live is None:
+                self._publish_active_tunnel_port(None)
 
     def force_disconnect(self) -> None:
         """Panic path: kill the ssh process TREE immediately, no graceful wait.

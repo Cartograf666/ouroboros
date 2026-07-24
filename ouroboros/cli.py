@@ -292,16 +292,22 @@ def _upload_attachments(
     attachments: List[Dict[str, Any]] = []
     uploaded_names: List[str] = []
     for path in paths:
+        # Exception-SAFE (R23C2): ANY failure — a CLIError, an OSError from a file
+        # that vanished after validation, or a non-dict HTTP-200 body making
+        # .get() raise — must release every already-uploaded file, never orphan
+        # them in the server's uploads dir. Non-CLIErrors normalize to CLIError.
         try:
             result = client.post_multipart_file("/api/chat/upload", path)
-        except CLIError:
+            data = result if isinstance(result, dict) else {}
+            server_path = str(data.get("path") or "")
+            server_name = str(data.get("filename") or "")
+            if not server_path or not server_name:
+                raise CLIError(f"attachment upload failed for {path}: {result}")
+        except Exception as exc:
             _cleanup_uploads(client, uploaded_names)
-            raise
-        server_path = str((result or {}).get("path") or "")
-        server_name = str((result or {}).get("filename") or "")
-        if not server_path or not server_name:
-            _cleanup_uploads(client, uploaded_names)
-            raise CLIError(f"attachment upload failed for {path}: {result}")
+            if isinstance(exc, CLIError):
+                raise
+            raise CLIError(f"attachment upload failed for {path}: {exc}") from exc
         uploaded_names.append(server_name)
         attachments.append({"path": server_path, "label": path.name})
     return attachments, uploaded_names
@@ -356,12 +362,17 @@ def _run_command(args: argparse.Namespace) -> int:
         body["timeout_sec"] = float(args.timeout or 0)
     try:
         created = client.request("POST", "/api/tasks", body)
-        task_id = str(created.get("task_id") or "")
+        task_id = str(created.get("task_id") or "") if isinstance(created, dict) else ""
         if not task_id:
             raise CLIError(f"task creation did not return task_id: {created}")
-    except CLIError:
+    except Exception as exc:
+        # Exception-SAFE (R23C2): release the uploaded files on ANY failure —
+        # incl. a non-dict HTTP-200 body (created.get would raise) — until a
+        # valid task_id takes ownership of them.
         _cleanup_uploads(client, uploaded_names)
-        raise
+        if isinstance(exc, CLIError):
+            raise
+        raise CLIError(f"task creation failed: {exc}") from exc
     if args.detach:
         if args.jsonl:
             print(json.dumps({"type": "task_created", "task_id": task_id, "data": created}, ensure_ascii=False))

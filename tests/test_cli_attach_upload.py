@@ -166,6 +166,53 @@ def test_upload_attachments_cleans_up_partial_batch(tmp_path):
     assert deletes == [("DELETE", "/api/chat/upload", {"filename": "srv-0_a.txt"})]
 
 
+def test_upload_attachments_cleans_up_on_non_clierror(tmp_path):
+    # R23C2: a NON-CLIError mid-batch (e.g. the 2nd file's read raising OSError,
+    # or a non-dict HTTP-200 making .get() raise) must still release earlier
+    # uploads — not just a CLIError. Model it via a client whose 2nd upload
+    # raises OSError; the 1st upload must be deleted and the error normalized.
+    files = []
+    for name in ("a.txt", "b.txt"):
+        f = tmp_path / name
+        f.write_text(name)
+        files.append(f)
+
+    class _RaceClient(FakeClient):
+        def post_multipart_file(self, path, file_path, *, field="file", timeout=None):
+            if len(self.uploads) == 1:  # 2nd file
+                raise OSError("file vanished after validation")
+            return super().post_multipart_file(path, file_path)
+
+    client = _RaceClient()
+    with pytest.raises(CLIError):  # OSError normalized to CLIError
+        _upload_attachments(client, files)
+    deletes = [r for r in client.requests if r[0] == "DELETE"]
+    assert deletes == [("DELETE", "/api/chat/upload", {"filename": "srv-0_a.txt"})]
+
+
+def test_upload_attachments_cleans_up_on_non_dict_response(tmp_path):
+    # R23C2: a non-dict HTTP-200 body (post_multipart_file returns a str) must not
+    # raise AttributeError uncaught — it releases prior uploads and normalizes.
+    files = []
+    for name in ("a.txt", "b.txt"):
+        f = tmp_path / name
+        f.write_text(name)
+        files.append(f)
+
+    class _BadBodyClient(FakeClient):
+        def post_multipart_file(self, path, file_path, *, field="file", timeout=None):
+            if len(self.uploads) == 1:  # 2nd file: server returns a bare string
+                self.uploads.append((path, str(file_path)))
+                return "OK (not json)"
+            return super().post_multipart_file(path, file_path)
+
+    client = _BadBodyClient()
+    with pytest.raises(CLIError):
+        _upload_attachments(client, files)
+    deletes = [r for r in client.requests if r[0] == "DELETE"]
+    assert deletes == [("DELETE", "/api/chat/upload", {"filename": "srv-0_a.txt"})]
+
+
 def test_cleanup_uploads_swallows_delete_failures():
     class _Angry(FakeClient):
         def request(self, method, path, body=None, **_kwargs):

@@ -474,6 +474,30 @@ def test_reconnect_fails_closed_when_marker_cannot_be_published(tmp_path, monkey
     assert mgr._inflight == set() and mgr._terminating == set()
 
 
+def test_disconnect_does_not_clear_marker_owned_by_newer_connect(tmp_path, monkeypatch):
+    # R23C1: a stale disconnect finishing its graceful teardown must NOT unlink a
+    # marker that a NEWER connect published meanwhile — that would leave the newer
+    # live forward uncovered by the subagent deny boundary. Deterministically race
+    # it: the teardown hook simulates a newer connect (bumps generation + publishes
+    # its own marker); the stale disconnect's final clear must then be skipped.
+    port_file = tmp_path / "state" / "active_tunnel_port"
+    mgr = _manager(tmp_path)
+    fake = _FakeProc()
+    _install_live(mgr, proc=fake)
+    mgr._publish_active_tunnel_port(50001)  # the disconnecting connection's marker
+
+    def _newer_connect_during_teardown(p):
+        with mgr._lock:
+            mgr._generation += 1  # a newer operation takes over
+            mgr._live = rt._Live(mgr._generation, {"id": "n", "name": "n", "ssh_target": "h"}, 50002, 8765, _FakeProc())
+        mgr._publish_active_tunnel_port(50002)  # newer live marker
+        p.kill()
+
+    monkeypatch.setattr(rt, "_terminate_quietly", _newer_connect_during_teardown)
+    mgr.disconnect()
+    assert port_file.read_text().strip() == "50002", "stale disconnect must not erase the newer marker"
+
+
 def test_connect_fails_closed_when_marker_cannot_be_published(tmp_path, monkeypatch):
     # R20C3: if the deny-boundary marker cannot be persisted, a live forward must
     # NOT be presented as connected — connect fails closed and tears down.
@@ -580,6 +604,7 @@ def test_spawn_and_wait_registers_then_transfers_custody(tmp_path, monkeypatch):
     assert mgr._inflight == set()  # ownership transferred out of _inflight
 
 
+@pytest.mark.serial
 def test_run_ssh_tracked_rejects_stale_generation(tmp_path):
     # R11C1(a): a discovery sub-spawn bound to a stale generation must refuse
     # BEFORE Popen — so a multi-step discovery (port cat → unit_active fallback)
@@ -615,6 +640,7 @@ def test_status_payloads_carry_generation_for_navigation_guard(tmp_path, monkeyp
     assert "_generation" not in mgr.status()
 
 
+@pytest.mark.serial
 def test_run_ssh_tracked_registers_and_clears_inflight(tmp_path):
     # C1: the discovery runner registers its short-lived ssh under custody for
     # the duration of the call, then clears it. A `true` stand-in proves the
