@@ -535,6 +535,49 @@ def test_reconnect_fails_closed_when_marker_cannot_be_published(tmp_path, monkey
     assert mgr._inflight == set() and mgr._terminating == set()
 
 
+def test_reconnect_aborts_and_retains_marker_when_old_death_unconfirmed(tmp_path, monkeypatch):
+    # R36C1: reconnect tears the OLD forward down at the top of the cycle. If that
+    # death can't be CONFIRMED, the old ssh may still be live on live.local_port —
+    # re-picking a fresh port or clearing the marker on give-up would drop a live
+    # forward from the subagent deny boundary. So reconnect must ABORT before any
+    # reconnect attempt and RETAIN the marker (fail-closed, same as disconnect()).
+    port_file = tmp_path / "state" / "active_tunnel_port"
+    mgr = _manager(tmp_path)
+    _install_live(mgr, generation=1, local_port=50123, proc=_FakeProc())
+    mgr._publish_active_tunnel_port(50123)
+    assert port_file.exists()
+    monkeypatch.setattr(rt, "_terminate_quietly", lambda p: False)  # death NOT confirmed
+    discovered = {"n": 0}
+    monkeypatch.setattr(
+        rt, "discover_remote_port",
+        lambda *a, **k: discovered.__setitem__("n", discovered["n"] + 1) or 8765,
+    )
+    assert mgr._reconnect_once(1) is False
+    assert discovered["n"] == 0  # aborted BEFORE any reconnect attempt (no repick)
+    assert port_file.read_text().strip() == "50123"  # marker RETAINED, unchanged
+    assert mgr.status()["state"] == "gave_up"
+
+
+def test_reconnect_giveup_clears_marker_on_confirmed_death(tmp_path, monkeypatch):
+    # R36C1 complement: when the old forward IS confirmed dead and the reconnect
+    # window is exhausted, the marker MUST still be cleared — the fail-closed
+    # retention above must not become a permanent leak on the normal give-up path.
+    port_file = tmp_path / "state" / "active_tunnel_port"
+    mgr = _manager(tmp_path)
+    _install_live(mgr, generation=1, local_port=50123, proc=_FakeProc())
+    mgr._publish_active_tunnel_port(50123)
+    monkeypatch.setattr(rt, "_terminate_quietly", lambda p: True)  # confirmed dead
+    monkeypatch.setattr(rt, "RECONNECT_TOTAL_SEC", 0.05)
+    monkeypatch.setattr(rt, "RECONNECT_BACKOFF_SEC", (0.01,))
+    monkeypatch.setattr(
+        rt, "discover_remote_port",
+        lambda *a, **k: (_ for _ in ()).throw(rt.TunnelError("health_timeout", "down")),
+    )
+    assert mgr._reconnect_once(1) is False
+    assert not port_file.exists()  # confirmed dead + gave up → marker cleared
+    assert mgr.status()["state"] == "gave_up"
+
+
 def test_disconnect_does_not_clear_marker_owned_by_newer_connect(tmp_path, monkeypatch):
     # R23C1: a stale disconnect finishing its graceful teardown must NOT unlink a
     # marker that a NEWER connect published meanwhile — that would leave the newer

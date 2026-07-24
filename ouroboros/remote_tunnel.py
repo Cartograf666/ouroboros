@@ -1077,7 +1077,28 @@ class RemoteTunnelManager:
                 profile_name=profile["name"],
                 local_port=live.local_port,
             )
-        _terminate_quietly(live.proc)
+        # R36C1: gate the reconnect on CONFIRMED death of the OLD forward — the
+        # same fail-closed marker contract disconnect() enforces (R33C1). If the
+        # old ssh's death can't be confirmed it may still be LIVE on
+        # live.local_port; re-picking a fresh port (publishing a new marker) or
+        # clearing the marker in the gave_up branch would then drop a live remote
+        # control-plane forward from the subagent deny boundary. So ABORT the
+        # reconnect WITHOUT touching the marker and leave _live in place — the
+        # eventual disconnect()/connect() (both gate marker-clear on confirmed
+        # death) or the next startup reap reconciles it.
+        if not _terminate_quietly(live.proc):
+            with self._lock:
+                if generation != self._generation:
+                    return False
+                self._set_status(
+                    state="gave_up",
+                    profile_id=profile["id"],
+                    profile_name=profile["name"],
+                    error="tunnel teardown could not be confirmed during reconnect",
+                    error_state="health_timeout",
+                    hint="",
+                )
+            return False
         deadline = time.time() + RECONNECT_TOTAL_SEC
         attempt = 0
         repicked = False
