@@ -192,7 +192,10 @@ def validate_profile(raw: Any) -> Dict[str, Any]:
             if not port.is_integer():
                 raise ProfileError("remote_agent_port must be an integer")
             port_int = int(port)
-        elif isinstance(port, str) and port.strip().isdigit():
+        elif isinstance(port, str) and port.strip().isascii() and port.strip().isdigit():
+            # ASCII-only: str.isdigit() is True for superscripts ('²') that int()
+            # then rejects with a bare ValueError, escaping the ProfileError
+            # handler (audit F1). isascii() pins it to plain 0-9.
             port_int = int(port.strip())
         else:
             raise ProfileError("remote_agent_port must be an integer")
@@ -294,16 +297,54 @@ _REMOTE_STATE_MAX_BYTES = 1 * 1024 * 1024  # /api/state is small; cap before rea
 
 def _tunnel_get(url: str, *, timeout: float, max_bytes: int) -> "tuple[int, bytes]":
     """GET a loopback URL through the tunnel with NO redirects, the final URL
-    pinned to the exact expected one, and the body hard-capped (R25C1). Raises on
-    any redirect / URL mismatch / oversize so callers can fail closed."""
-    req = urllib.request.Request(url, method="GET")
-    with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as resp:
-        if resp.geturl() != url:  # defensive: no silent redirect slipped through
-            raise urllib.error.URLError(f"unexpected response URL: {resp.geturl()}")
-        data = resp.read(max_bytes + 1)
-        if len(data) > max_bytes:
-            raise urllib.error.URLError("response body exceeds cap")
-        return int(resp.status), data
+    pinned to the exact expected one, the body hard-capped (R25C1), AND a hard
+    TOTAL wall-clock deadline (F2/audit): urllib's ``timeout`` is per socket op,
+    so an untrusted remote could drip-feed one byte just under each window and
+    stall the read forever under the byte cap. Run the whole open+read in a
+    watchdog thread joined for ``timeout``; on overrun, close the response to
+    unblock it and fail closed. Raises on redirect / URL mismatch / oversize /
+    deadline so callers fail closed."""
+    box: Dict[str, Any] = {}
+
+    def _do() -> None:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            resp = _NO_REDIRECT_OPENER.open(req, timeout=timeout)
+            box["resp"] = resp
+            if resp.geturl() != url:  # no silent redirect slipped through
+                raise urllib.error.URLError(f"unexpected response URL: {resp.geturl()}")
+            data = resp.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                raise urllib.error.URLError("response body exceeds cap")
+            box["ok"] = (int(resp.status), data)
+        except BaseException as exc:  # noqa: BLE001 — surfaced to the joining thread
+            box["err"] = exc
+        finally:
+            resp = box.get("resp")
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+    worker = threading.Thread(target=_do, daemon=True, name="remote-tunnel-get")
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        # Overran the total deadline — close the socket to unblock the worker
+        # (which then exits), and fail closed.
+        resp = box.get("resp")
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        raise urllib.error.URLError("tunnel GET exceeded its total deadline")
+    if "err" in box:
+        raise box["err"]
+    if "ok" not in box:
+        raise urllib.error.URLError("tunnel GET produced no result")
+    return box["ok"]
 
 
 def check_health(local_port: int, *, timeout: float = 3.0) -> bool:
@@ -671,12 +712,26 @@ class RemoteTunnelManager:
         if not marker_ok:
             # Fail CLOSED (R20C3): a live forward whose port the subagent deny set
             # cannot cover must never be presented as connected.
-            self._finish_terminating(live.proc)
-            raise TunnelError(
-                "custody_failed",
+            msg = (
                 "could not record the active tunnel port for the subagent "
-                "control-plane deny boundary; refusing to connect",
+                "control-plane deny boundary; refusing to connect"
             )
+            # R26C1: set a TERMINAL error status (generation-safe) — otherwise
+            # _status stays "connecting" and the header pill keeps showing a
+            # misleading "Connecting…" after remote_connect already reported
+            # failure.
+            with self._lock:
+                if generation == self._generation:
+                    self._set_status(
+                        state="error",
+                        profile_id=profile["id"],
+                        profile_name=profile["name"],
+                        error=msg,
+                        error_state="custody_failed",
+                        hint="",
+                    )
+            self._finish_terminating(live.proc)
+            raise TunnelError("custody_failed", msg)
         threading.Thread(
             target=self._supervise, args=(generation,), daemon=True,
             name=f"remote-tunnel-supervisor-{generation}",

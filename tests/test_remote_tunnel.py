@@ -48,7 +48,9 @@ def test_validate_profile_rejects_unknown_fields_and_bad_port():
         rt.validate_profile({"id": "a", "ssh_target": "h", "identity_file": "x"})
     # R24C2: a positive FRACTIONAL value (8765.9) must be rejected, not silently
     # int()-truncated to 8765; bool (int subclass) must be rejected too.
-    for bad_port in ("nope", -1, 0.5, 70000, 8765.9, True, "87.6"):
+    # Audit F1: a non-ASCII "digit" (superscript ²) is str.isdigit()==True but
+    # int()-invalid — must raise ProfileError, not a bare ValueError.
+    for bad_port in ("nope", -1, 0.5, 70000, 8765.9, True, "87.6", "²", "٣"):
         with pytest.raises(rt.ProfileError):
             rt.validate_profile({"id": "a", "ssh_target": "h", "remote_agent_port": bad_port})
     # Integer-valued forms are accepted (int, integer-valued float, digit string).
@@ -523,6 +525,10 @@ def test_connect_fails_closed_when_marker_cannot_be_published(tmp_path, monkeypa
     assert mgr._live is None
     assert fake._dead is True  # torn down
     assert mgr._inflight == set() and mgr._terminating == set()
+    # R26C1: status must be a TERMINAL error, NOT left at "connecting" (else the
+    # header pill keeps showing a misleading "Connecting…" after failure).
+    st = mgr.status()
+    assert st["state"] == "error" and st.get("error_state") == "custody_failed"
 
 
 def test_browser_control_plane_denies_active_tunnel_port(tmp_path, monkeypatch):
