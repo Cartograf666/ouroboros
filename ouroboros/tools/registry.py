@@ -2093,6 +2093,12 @@ class ToolRegistry:
         return None
 
     def _snapshot_owner_files(self) -> Dict[pathlib.Path, Optional[str]]:
+        # The ENTIRE settings.json is snapshotted (and restored wholesale by
+        # _restore_owner_files), so EVERY owner-only key — safety/context/runtime
+        # mode AND OUROBOROS_REMOTE_CONNECTIONS (remote v1) — is reverted after a
+        # process tool, even a direct/dynamically-keyed write that dodges the
+        # string detector. This whole-file snapshot is the structural backstop
+        # behind those keys' write gates; keep it whole-file, never per-key (R27C1).
         from ouroboros import config as _cfg
         out: Dict[pathlib.Path, Optional[str]] = {}
         settings_path = pathlib.Path(_cfg.SETTINGS_PATH)

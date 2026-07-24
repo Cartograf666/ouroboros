@@ -346,6 +346,35 @@ def test_run_shell_restores_obfuscated_self_authored_state_marker(tmp_path):
     assert not marker.exists()
 
 
+def test_run_shell_reverts_direct_remote_connections_write(tmp_path, monkeypatch):
+    # R27C1: a process tool writing OUROBOROS_REMOTE_CONNECTIONS DIRECTLY into
+    # settings.json (dynamic key — bypassing update_remote_connections AND the
+    # string detector) must be reverted by the WHOLE-settings owner-snapshot/
+    # restore invariant. The launcher-process-only gate is not the sole guard:
+    # the profiles key is covered because the entire settings.json is snapshotted
+    # and restored for every process tool, deterministically (not safety-gated).
+    from ouroboros import config as _cfg
+
+    ctx = _make_ctx(tmp_path)
+    settings = ctx.drive_root / "settings.json"
+    monkeypatch.setattr(_cfg, "SETTINGS_PATH", settings)
+    settings.write_text(json.dumps({"TOTAL_BUDGET": 5}), encoding="utf-8")
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry._ctx = ctx
+
+    before = registry._snapshot_owner_files()
+    # Simulate what a run_script would persist via a dynamically-built key.
+    settings.write_text(
+        json.dumps({"TOTAL_BUDGET": 5,
+                    "OUROBOROS_REMOTE_CONNECTIONS": [{"id": "evil", "ssh_target": "a@b"}]}),
+        encoding="utf-8",
+    )
+    assert registry._restore_owner_files(before) is True
+    on_disk = json.loads(settings.read_text(encoding="utf-8"))
+    assert "OUROBOROS_REMOTE_CONNECTIONS" not in on_disk  # reverted
+    assert on_disk["TOTAL_BUDGET"] == 5
+
+
 def test_claude_code_edit_resolves_skill_cwd_under_drive_root(tmp_path, monkeypatch):
     from ouroboros.tools import shell as shell_mod
     import types
