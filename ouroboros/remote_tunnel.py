@@ -1057,12 +1057,22 @@ class RemoteTunnelManager:
             # marker-present a SUPERSET of forward-reachable (fail-closed). Any
             # failure below runs the except BaseException cleanup, which clears
             # this marker on CONFIRMED death.
-            if not self._publish_active_tunnel_port(local_port):
-                raise TunnelError(
-                    "custody_failed",
-                    "could not record the active tunnel port for the subagent "
-                    "control-plane deny boundary",
-                )
+            # R39C1: the publish MUST be generation-gated UNDER the lock. A stale
+            # (superseded) attempt whose ssh is about to be killed must NEVER write
+            # its now-dead port over a newer connection's live marker — check
+            # _shutdown/_generation atomically with the write, exactly like the
+            # Popen registration above. A superseded attempt raises here and its
+            # except-cleanup won't clear the marker (generation guard), leaving the
+            # newer connection's marker intact.
+            with self._lock:
+                if self._shutdown or generation != self._generation:
+                    raise TunnelError("ssh_failed", "connection superseded")
+                if not self._publish_active_tunnel_port(local_port):
+                    raise TunnelError(
+                        "custody_failed",
+                        "could not record the active tunnel port for the subagent "
+                        "control-plane deny boundary",
+                    )
             deadline = time.time() + HEALTH_CONNECT_TIMEOUT_SEC
             while time.time() < deadline:
                 if proc.poll() is not None:

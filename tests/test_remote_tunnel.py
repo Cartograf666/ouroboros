@@ -584,6 +584,31 @@ def test_marker_published_before_health_check_passes(tmp_path, monkeypatch):
     assert seen["marker"] == "51999"  # marker present BEFORE health passed
 
 
+def test_spawn_publish_is_generation_gated_against_supersession(tmp_path, monkeypatch):
+    # R39C1: if a connection is superseded AFTER its ssh spawned but BEFORE the
+    # deny-marker write, the stale attempt must NOT publish its (about-to-die) port
+    # — that would overwrite a newer live connection's marker with a dead port,
+    # dropping the newer forward from the deny set. Model the supersession landing
+    # in that exact window by having record_process bump the generation.
+    port_file = tmp_path / "state" / "active_tunnel_port"
+    mgr = _manager(tmp_path)
+    fake = _FakeProc()
+    monkeypatch.setattr(rt, "discover_remote_port", lambda p, ssh_path, **k: 8765)
+    monkeypatch.setattr(rt, "pick_local_port", lambda: 51777)
+    monkeypatch.setattr(rt.subprocess, "Popen", lambda *a, **k: fake)
+
+    def _bump(*a, **k):  # a concurrent disconnect/connect superseded us mid-spawn
+        with mgr._lock:
+            mgr._generation += 1
+
+    monkeypatch.setattr("ouroboros.process_custody.record_process", _bump)
+    monkeypatch.setattr(rt.threading.Thread, "start", lambda self: None)
+    with pytest.raises(rt.TunnelError):
+        mgr.connect({"id": "a", "name": "prod", "ssh_target": "u@h"})
+    assert not port_file.exists()  # stale attempt never published its dead port
+    assert fake._dead is True and mgr._inflight == set()
+
+
 def test_custody_ledger_recorded_before_marker_published(tmp_path, monkeypatch):
     # R38C2 (Process Custody Rule): the durable ledger write (record_process) must
     # run BEFORE _publish_active_tunnel_port — a crash in that window must never be
