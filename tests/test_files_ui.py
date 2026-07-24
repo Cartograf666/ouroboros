@@ -61,13 +61,16 @@ def test_files_pdf_preview_and_download_bridge_are_safe():
     assert "download_file_to_downloads" in download_helper
     assert "URL.createObjectURL" in download_helper
     assert "encodeURI(data.content_url)" not in source
-    assert 'parsed.path != "/api/files/download"' in launcher
-    assert 'parsed.path.startswith("/api/extensions/")' in launcher
-    # Remote v1: the file bridge validates against the ACTIVE view port (local
-    # server OR the current tunnel), so remote downloads target the remote
-    # server rather than a same-shaped local path (was pinned to actual_port).
-    assert "parsed.port != active_port" in launcher
-    assert 'active_port = int(view_state["port"])' in launcher
+    # R37C2: the file-bridge URL validation moved to the shared SSOT resolver
+    # remote_tunnel.resolve_loopback_file_url, and the launcher delegates to it
+    # PINNED to the LOCAL actual_port — NOT the mutable active-view port, which a
+    # remote SPA could leave naming the tunnel after navigating back to local.
+    assert "resolve_loopback_file_url(raw_url, actual_port)" in launcher
+    assert 'active_port = int(view_state["port"])' not in launcher
+    resolver = _read("ouroboros/remote_tunnel.py")
+    assert 'parsed.path != "/api/files/download"' in resolver
+    assert 'parsed.path.startswith("/api/extensions/")' in resolver
+    assert "parsed.port != port" in resolver  # pinned to the passed LOCAL port
 
 
 def test_chat_document_bubble_opens_externally_and_downloads_separately():
