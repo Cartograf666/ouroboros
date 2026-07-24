@@ -970,18 +970,22 @@ class RemoteTunnelManager:
         if self._on_state_change is not None:
             self._emit_q.put(dict(status))
 
-    def _finish_terminating(self, proc: "subprocess.Popen[Any]") -> None:
+    def _finish_terminating(self, proc: "subprocess.Popen[Any]") -> bool:
         """Graceful kill+reap OUTSIDE self._lock, then drop from _terminating.
 
         Callers first move proc into _terminating UNDER the lock (so a concurrent
         panic still sees it), then release the lock and call this — the multi-
         second graceful wait must NEVER run while holding the lock force_disconnect
-        needs (R20C1 Emergency Stop)."""
+        needs (R20C1 Emergency Stop). Returns whether death was CONFIRMED (R38C1)
+        so a caller that will then clear the deny marker can fail closed on an
+        unconfirmed teardown of an already-reachable (marker-published) forward."""
+        confirmed_dead = False
         try:
-            _terminate_quietly(proc)
+            confirmed_dead = _terminate_quietly(proc)
         finally:
             with self._lock:
                 self._terminating.discard(proc)
+        return confirmed_dead
 
     def _spawn_and_wait(
         self,
@@ -1017,6 +1021,21 @@ class RemoteTunnelManager:
         # keep it registered so the caller transfers ownership to _live under a
         # single lock hold (no window where a panic could miss it).
         try:
+            # R38C1: publish the deny marker BEFORE the health-wait (and before the
+            # ledger write). ssh bound 127.0.0.1:local_port at the Popen above —
+            # the forward reaches the remote control plane from that instant, but
+            # the marker used to be published only AFTER our health poll passed,
+            # leaving a multi-second window (up to HEALTH_CONNECT_TIMEOUT_SEC) where
+            # the port forwarded to the remote yet was ABSENT from the subagent
+            # deny set. Publishing here makes marker-present a SUPERSET of
+            # forward-reachable (fail-closed). Any failure below runs the except
+            # BaseException cleanup, which clears this marker on CONFIRMED death.
+            if not self._publish_active_tunnel_port(local_port):
+                raise TunnelError(
+                    "custody_failed",
+                    "could not record the active tunnel port for the subagent "
+                    "control-plane deny boundary",
+                )
             # Custody registration is part of a SUCCESSFUL spawn (Process Custody
             # Rule): an unledgered long-lived ssh child is invisible to the
             # startup reaper, so a launcher crash would leak it. If recording
@@ -1082,8 +1101,17 @@ class RemoteTunnelManager:
             # for the ownership transfer. _terminate_quietly is idempotent on an
             # already-dead child (fast no-op wait), so paths that already
             # terminated pay nothing.
-            _terminate_quietly(proc)
+            confirmed_dead = _terminate_quietly(proc)
             self._unregister_inflight(proc)
+            # R38C1: this attempt published local_port's deny marker before the
+            # health-wait; the attempt failed, so clear it — but ONLY after
+            # CONFIRMED death and ONLY while this generation still owns the marker
+            # and no _live was assigned (a newer connect may already have published
+            # its own port). Unconfirmed death → RETAIN (fail-closed), reconciled
+            # by the next startup reap — identical to the disconnect() contract.
+            with self._lock:
+                if confirmed_dead and generation == self._generation and self._live is None:
+                    self._publish_active_tunnel_port(None)
             raise
 
     def _supervise(self, generation: int) -> None:
@@ -1160,6 +1188,12 @@ class RemoteTunnelManager:
         deadline = time.time() + RECONNECT_TOTAL_SEC
         attempt = 0
         repicked = False
+        # R38C1: track whether every in-flight forward torn down mid-cycle was
+        # CONFIRMED dead. _spawn_and_wait publishes a forward's deny marker before
+        # the health-wait, so a reconnect attempt that came up but was then
+        # rejected (marker-write failed) had a REACHABLE forward — if its teardown
+        # can't be confirmed, the gave_up branch must RETAIN the marker (fail-closed).
+        teardowns_confirmed = True
         last_error: Optional[TunnelError] = None
         while time.time() < deadline:
             with self._lock:
@@ -1225,7 +1259,16 @@ class RemoteTunnelManager:
                 self._finish_terminating(new_live.proc)
                 return False
             if marker_failed:
-                self._finish_terminating(new_live.proc)
+                # This attempt's forward came up (so _spawn_and_wait published its
+                # deny marker) but the ownership-transfer republish failed. Tear it
+                # down; clear its marker only on CONFIRMED death (generation-gated),
+                # else retain and remember so the gave_up branch does too (R38C1).
+                confirmed = self._finish_terminating(new_live.proc)
+                with self._lock:
+                    if confirmed and generation == self._generation and self._live is None:
+                        self._publish_active_tunnel_port(None)
+                    elif not confirmed:
+                        teardowns_confirmed = False
                 last_error = TunnelError(
                     "custody_failed",
                     "could not record the active tunnel port for the subagent "
@@ -1240,9 +1283,18 @@ class RemoteTunnelManager:
             if generation != self._generation:
                 return False
             self._live = None
-            # The old forward was terminated at the top of this cycle and no new
-            # one came up — clear the deny-boundary marker (forward is dead).
-            self._publish_active_tunnel_port(None)
+            # The old forward was CONFIRMED dead at the top of this cycle (R36C1)
+            # and no new one came up — clear the deny-boundary marker UNLESS an
+            # in-flight teardown this cycle could not confirm death, in which case
+            # retain it (fail-closed) for the next startup reap (R38C1).
+            if teardowns_confirmed:
+                self._publish_active_tunnel_port(None)
+            else:
+                log.warning(
+                    "remote reconnect gave up but an in-flight tunnel teardown was "
+                    "unconfirmed; retaining the active_tunnel_port deny marker for "
+                    "the next startup reap"
+                )
             self._set_status(
                 state="gave_up",
                 profile_id=profile["id"],

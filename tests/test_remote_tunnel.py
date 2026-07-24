@@ -559,6 +559,31 @@ def test_reconnect_fails_closed_when_marker_cannot_be_published(tmp_path, monkey
     assert mgr._inflight == set() and mgr._terminating == set()
 
 
+def test_marker_published_before_health_check_passes(tmp_path, monkeypatch):
+    # R38C1: `ssh -N -L` binds the local forward at session setup, so
+    # 127.0.0.1:local_port already proxies to the remote control plane while
+    # _spawn_and_wait is still polling /api/health. The deny marker must therefore
+    # be present the FIRST time check_health runs — publishing only after health
+    # passed left a multi-second window where the port was reachable but not in the
+    # subagent deny set. Drive the REAL _spawn_and_wait with a stub Popen.
+    port_file = tmp_path / "state" / "active_tunnel_port"
+    mgr = _manager(tmp_path)
+    monkeypatch.setattr(rt, "discover_remote_port", lambda p, ssh_path, **k: 8765)
+    monkeypatch.setattr(rt, "pick_local_port", lambda: 51999)
+    monkeypatch.setattr(rt.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr("ouroboros.process_custody.record_process", lambda *a, **k: None)
+    monkeypatch.setattr(rt.threading.Thread, "start", lambda self: None)
+    seen = {}
+
+    def _health(port, **_k):
+        seen["marker"] = port_file.read_text().strip() if port_file.exists() else None
+        return True
+
+    monkeypatch.setattr(rt, "check_health", _health)
+    mgr.connect({"id": "a", "name": "prod", "ssh_target": "u@h"})
+    assert seen["marker"] == "51999"  # marker present BEFORE health passed
+
+
 def test_reconnect_aborts_and_retains_marker_when_old_death_unconfirmed(tmp_path, monkeypatch):
     # R36C1: reconnect tears the OLD forward down at the top of the cycle. If that
     # death can't be CONFIRMED, the old ssh may still be live on live.local_port —
