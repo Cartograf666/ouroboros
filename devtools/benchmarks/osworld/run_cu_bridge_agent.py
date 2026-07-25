@@ -472,6 +472,9 @@ def main() -> int:
         write_json(run_dir / "task_run_manifest.json", benchmark_run_manifest(
             benchmark="osworld", run_root=result_root, repo_dir=repo_dir,
             requested_task_ids=[example_id], dataset=dataset_name, settings_path=settings_path,
+            # v6.75.0: the shared seed gate now defaults to require_clean=True. This launcher
+            # keeps its pre-v6.75.0 behaviour until its own phase adds --allow-dirty-seed.
+            require_clean=False,
             output_paths={"task_outcome": str(run_dir / "task_outcome.json")},
             harness={
                 # HONEST contract: reset()/evaluate() are official, but GUI actions

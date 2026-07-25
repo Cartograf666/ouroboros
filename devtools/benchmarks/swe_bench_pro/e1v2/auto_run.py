@@ -31,6 +31,12 @@ from datetime import datetime, timezone
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[4]))
 
+from devtools.benchmarks.common.manifests import (
+    CAMPAIGN_FATAL_PROVENANCE_REASONS,
+    SeedShapeRefused,
+    admit_benchmark_run,
+    finalize_run_manifest,
+)
 from devtools.benchmarks.common.run_roots import ensure_outside_repo
 from ouroboros.platform_layer import kill_process_tree, subprocess_new_group_kwargs
 
@@ -38,9 +44,14 @@ HARN = pathlib.Path(__file__).resolve().parent
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]
 RUN_PRO = HARN / "run_pro.py"
 
+# Deterministic PER-TASK failures: retrying them only burns wall clock, but the next task can
+# still run (an image/env problem is specific to that instance).
 PERMANENT_INFRA = {"pyexpat_abi_mismatch", "server_import_failed", "pip_bootstrap_failed", "libc_skip"}
 
-
+# CAMPAIGN-fatal refusals (owner Q8 = hard stop). These are properties of the VOLUME plus the
+# mounted seed, identical for every task in the shard: recording them per task would restore the
+# same broken volume N times, burn the whole wall clock and still exit 0 with a zero headline.
+# The named escape is OBO_ALLOW_EVOLVED_VOLUME=1 (honoured inside the container).
 def log(msg: str) -> None:
     t = time.strftime("%m-%d %H:%M:%S")
     print(f"[auto {t}] {msg}", file=sys.stderr, flush=True)
@@ -87,6 +98,19 @@ def restore(src: pathlib.Path, vsuf: str) -> bool:
             log(f"restore FAILED {name} rc={r.returncode}: {vol} may be empty — retry state is unreliable")
             ok = False
     return ok
+
+
+def seed_stamp(vsuf: str) -> str:
+    """Read the immutable seed stamp `<VERSION> <HEAD>` written into the obo-repo volume.
+
+    Read BEFORE the baseline last-good snapshot: the stamp is what the campaign's provenance is
+    anchored to, and a volume carried over from an earlier campaign would otherwise be
+    snapshotted as this campaign's baseline with no record of whose code it holds. Empty string
+    when the volume is fresh (the container writes the stamp while seeding)."""
+    r = subprocess.run(["docker", "run", "--rm", "--pull=never", "-v", f"obo-repo{vsuf}:/d:ro",
+                        "--entrypoint", "cat", "alpine:3", "/d/.git/ouroboros_seed"],
+                       capture_output=True, text=True)
+    return (r.stdout or "").strip() if r.returncode == 0 else ""
 
 
 def reflections(vsuf: str) -> int:
@@ -172,6 +196,8 @@ def run_one(i: int, out_dir: pathlib.Path, args, attempt: int) -> dict:
         cmd += ["--memory-mode", args.memory_mode]
     if args.baseline:
         cmd += ["--baseline"]
+    if getattr(args, "allow_dirty_seed", False):
+        cmd += ["--allow-dirty-seed"]
     env = dict(os.environ)
     for p in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         env.pop(p, None)
@@ -215,10 +241,16 @@ def run_one(i: int, out_dir: pathlib.Path, args, attempt: int) -> dict:
                 "degraded": bool(last.get("evolution_degraded", False)), "row": last}
         if last.get("infra_suspect"):
             reason = str(last.get("infra_reason") or "")
+            if reason in CAMPAIGN_FATAL_PROVENANCE_REASONS:
+                # Provenance refusal: the same volume + seed would refuse every remaining task.
+                log(f"FATAL: provenance refusal reason={reason}; stopping the shard "
+                    f"(fix the volume/seed, or set OBO_ALLOW_EVOLVED_VOLUME=1 to run against a "
+                    f"deliberately evolved volume and record it).")
+                raise SystemExit(2)
             if reason in PERMANENT_INFRA:
                 log(f"idx{i} permanent infra_suspect reason={reason}; recording non-run and continuing without retry")
                 return {**base, "pb": 0, "ae": 0, "permanent_skip": True}
-            # Task did not actually execute (e.g. musl-image env-volume skip, image
+            # Task did not actually execute (e.g. a missing env volume, image
             # eviction). Never snapshot a non-run task as a LEGIT last-good: surface
             # as pb=None so the caller treats it as a failure (retry/stop).
             return {**base, "pb": None, "ae": None, "permanent_skip": False}
@@ -295,6 +327,8 @@ def main() -> int:
     ap.add_argument("--solve-timeout", type=int, default=None, help="forward to run_pro")
     ap.add_argument("--memory-mode", default="", help="forward to run_pro")
     ap.add_argument("--baseline", action="store_true", help="forward to run_pro (evolution off)")
+    ap.add_argument("--allow-dirty-seed", action="store_true",
+                    help="forward to run_pro: record and proceed with an unclean seed checkout")
     args = ap.parse_args()
 
     # v6.74.0 (C4): the shard budget is DERIVED from the schedule by default.
@@ -328,127 +362,207 @@ def main() -> int:
     if not os.environ.get("OPENROUTER_API_KEY", "").strip():
         log("error: OPENROUTER_API_KEY is not set"); return 2
 
-    # The utility image backs every snapshot/restore (below) and run_pro's state
-    # reads, all with --pull=never. Guarantee it up front — the first snapshot()
-    # runs before any run_pro call, so run_pro's own preflight is too late here.
-    from devtools.benchmarks.swe_bench_pro.e1v2.run_pro import ensure_util_image
-    ensure_util_image()
-
     vsuf = args.volume_suffix
     out_dir = ensure_outside_repo(pathlib.Path(args.out_dir).expanduser(), REPO_ROOT)
     lastgood = out_dir / "_lastgood"
     done_dir = out_dir / "done_idx"
-    done_dir.mkdir(parents=True, exist_ok=True)
 
-    log(f"START autonomous run idx{args.start}..{args.end} vsuf='{vsuf}'; current volume reflections={reflections(vsuf)}")
-    log("capturing baseline last-good (= state before first task)...")
-    if not snapshot(lastgood, vsuf):
-        log("FATAL: baseline last-good snapshot incomplete — refusing to start without a "
-            "valid rollback point (a transient would roll back to blank state). Check docker/volumes.")
-        return 3
+    # Campaign-level provenance gate + record, BEFORE anything that costs money or touches the
+    # SHARED docker daemon: the util-image pull, the volume reads (`reflections`, `seed_stamp`)
+    # and the baseline snapshot all now run AFTER admission. `--reset-state` stays a deliberate
+    # ONE-OFF campaign action the operator passes to run_pro directly: forwarding it per
+    # run_one() would wipe the carried volumes on every task and turn an evolution campaign
+    # into a sequence of cold starts.
+    manifest_path = out_dir / "auto_run_manifest.json"
+    manifest = admit_benchmark_run(
+        manifest_path,
+        benchmark="swe_bench_pro",
+        run_root=out_dir,
+        repo_dir=REPO_ROOT,
+        requested_task_ids=[str(i) for i in range(args.start, args.end + 1)],
+        require_clean=not args.allow_dirty_seed,
+        argv=sys.argv,
+        dataset="ScaleAI/SWE-bench_Pro",
+        output_paths={"run_root": str(out_dir), "manifest": str(manifest_path),
+                      "summary": str(out_dir / "auto_summary.json"),
+                      "timeline_all": str(out_dir / "timeline_all.jsonl")},
+        harness={"driver": "e1v2/auto_run.py", "volume_suffix": vsuf,
+                 "solve_model": args.solve_model,
+                 "per_task_cost": args.per_task_cost, "total_budget": args.total_budget},
+        extra={"volume_seed_stamp": "", "start": args.start, "end": args.end,
+               "outcome": "started"},
+    )
+    # On disk ALREADY (`admit_benchmark_run` writes before the gate can raise): a refusal must
+    # leave a durable record of WHAT was refused, not just a line on a stderr a shard launcher
+    # discards. The shared finalization seam then guarantees the FINAL typed outcome on every
+    # exit path, including an unhandled one.
 
-    results = []
-    own_images: list[str] = []   # image refs of completed own tasks, oldest first
-    cleaned: set[str] = set()
-    consecutive_exhausted = 0
-    for i in range(args.start, args.end + 1):
-        marker = done_dir / f"{i}.json"
-        if marker.exists():
-            try:
-                rec = json.loads(marker.read_text(encoding="utf-8"))
-            except Exception:
-                rec = {"idx": i, "instance_id": "?", "patch_bytes": -1}
-            results.append(rec)
-            log(f"idx{i} SKIP-DONE (sentinel exists; not re-solving) :: {str(rec.get('instance_id'))[:46]}")
-            continue
-        tries = 0
-        exhausted = False
-        while True:
-            r = run_one(i, out_dir, args, attempt=tries)
-            pb, ae, row = r["pb"], r["ae"], (r.get("row") or {})
-            # Genuine 0-byte failure = the agent demonstrably ran (>=2 solve events),
-            # the provider channel was healthy enough (<3 network transients), and the
-            # run was not cut short by infra (OOM kill / host timeout leave an empty
-            # patch that says nothing about the agent). Anything weaker is a non-run
-            # and gets retried; anything recorded here is final (k=1).
-            infra_cut = bool(row.get("oom")) or ("TIMEOUT" in (row.get("flags") or []))
-            genuine_0b = (pb == 0 and not r["permanent_skip"]
-                          and (ae is not None and ae < 3)
-                          and int(row.get("n_events", 0)) >= 2
-                          and not infra_cut)
-            ok = (pb is not None) and (pb > 0 or genuine_0b or r["permanent_skip"])
-            if not ok:
-                kind = "run_pro-failure" if pb is None else \
-                    f"TRANSIENT(0B,api_err={ae},n_events={row.get('n_events', '?')},infra_cut={infra_cut})"
-                # Archive under the attempt number that just ran (matches the
-                # `attempt` field written to timeline_all.jsonl), THEN bump.
-                _archive_attempt(out_dir, r["iid"], tries)
-                if not restore(lastgood, vsuf):
-                    # Baseline tgz is guaranteed present (start-of-run gate), so a
-                    # False here is a failed extract (docker transient). Retry once;
-                    # if it still fails, the volume state is unreliable and any
-                    # further attempt would corrupt k=1 provenance — stop the shard
-                    # (append-only + done_idx make it resumable) rather than proceed.
-                    time.sleep(30)
+    results: list = []
+
+    with finalize_run_manifest(manifest_path, manifest, outcome="completed") as final:
+        def _finish(code: int, *, outcome: str, stopped_at=None, refusal=None) -> int:
+            """Name the FINAL outcome; the shared seam writes the retained manifest."""
+            manifest["extra"].update({
+                "stopped_at": stopped_at,
+                "task_count": len(results),
+                "n_with_patch": sum(1 for r in results if int(r.get("patch_bytes") or 0) > 0),
+            })
+            final.update({"outcome": outcome, "exit_code": int(code)})
+            if refusal:
+                final["refusal"] = refusal
+            return code
+
+        # Seed SHAPE, then the run's own scratch dir — both AFTER the manifest is persisted. A
+        # worktree-pointer seed makes the provenance record describe a checkout the container
+        # cannot use at all (`cp -a` copies the pointer verbatim); it is a filesystem assertion,
+        # so running it before admission left that refusal with no durable record and made the
+        # admission seam stop being the outer boundary.
+        from devtools.benchmarks.swe_bench_pro.e1v2.run_pro import (
+            assert_seed_is_git_directory,
+            ensure_util_image,
+        )
+        try:
+            assert_seed_is_git_directory(REPO_ROOT)
+        except SeedShapeRefused as refused:
+            log(f"FATAL: {refused}")
+            return _finish(2, outcome="refused",
+                           refusal={"stage": "seed_shape", "exit_code": 2,
+                                    "reason": refused.reason})
+        done_dir.mkdir(parents=True, exist_ok=True)
+
+        # The utility image backs every snapshot/restore (below) and run_pro's state
+        # reads, all with --pull=never. Guarantee it here — the first snapshot() runs
+        # before any run_pro call, so run_pro's own preflight is too late — but AFTER
+        # admission, because the pull mutates the SHARED docker daemon.
+        ensure_util_image()
+        log(f"START autonomous run idx{args.start}..{args.end} vsuf='{vsuf}'; current volume reflections={reflections(vsuf)}")
+        stamp = seed_stamp(vsuf)
+        log(f"seed stamp (obo-repo{vsuf}): {stamp or '<absent: fresh volume>'}")
+        manifest["extra"]["volume_seed_stamp"] = stamp
+
+        log("capturing baseline last-good (= state before first task)...")
+        if not snapshot(lastgood, vsuf):
+            log("FATAL: baseline last-good snapshot incomplete — refusing to start without a "
+                "valid rollback point (a transient would roll back to blank state). Check docker/volumes.")
+            return _finish(3, outcome="refused",
+                           refusal={"stage": "baseline_snapshot", "exit_code": 3,
+                                    "reason": "lastgood_snapshot_incomplete"})
+
+        own_images: list[str] = []   # image refs of completed own tasks, oldest first
+        cleaned: set[str] = set()
+        consecutive_exhausted = 0
+        for i in range(args.start, args.end + 1):
+            marker = done_dir / f"{i}.json"
+            if marker.exists():
+                try:
+                    rec = json.loads(marker.read_text(encoding="utf-8"))
+                except Exception:
+                    rec = {"idx": i, "instance_id": "?", "patch_bytes": -1}
+                results.append(rec)
+                log(f"idx{i} SKIP-DONE (sentinel exists; not re-solving) :: {str(rec.get('instance_id'))[:46]}")
+                continue
+            tries = 0
+            exhausted = False
+            while True:
+                try:
+                    r = run_one(i, out_dir, args, attempt=tries)
+                except SystemExit as exc:
+                    # run_one raises SystemExit on a CAMPAIGN-fatal stop (volume-wide provenance
+                    # refusal, missing container secret opt-in). That is a deliberate refusal, not
+                    # a crash, and it carries the shard's real exit status — record both, then let
+                    # it propagate exactly as before.
+                    _finish(int(exc.code) if isinstance(exc.code, int) else 2,
+                            outcome="refused", stopped_at=i,
+                            refusal={"stage": "campaign_fatal_infra",
+                                     "exit_code": int(exc.code) if isinstance(exc.code, int) else 2,
+                                     "reason": "run_one_campaign_fatal"})
+                    raise
+                pb, ae, row = r["pb"], r["ae"], (r.get("row") or {})
+                # Genuine 0-byte failure = the agent demonstrably ran (>=2 solve events),
+                # the provider channel was healthy enough (<3 network transients), and the
+                # run was not cut short by infra (OOM kill / host timeout leave an empty
+                # patch that says nothing about the agent). Anything weaker is a non-run
+                # and gets retried; anything recorded here is final (k=1).
+                infra_cut = bool(row.get("oom")) or ("TIMEOUT" in (row.get("flags") or []))
+                genuine_0b = (pb == 0 and not r["permanent_skip"]
+                              and (ae is not None and ae < 3)
+                              and int(row.get("n_events", 0)) >= 2
+                              and not infra_cut)
+                ok = (pb is not None) and (pb > 0 or genuine_0b or r["permanent_skip"])
+                if not ok:
+                    kind = "run_pro-failure" if pb is None else \
+                        f"TRANSIENT(0B,api_err={ae},n_events={row.get('n_events', '?')},infra_cut={infra_cut})"
+                    # Archive under the attempt number that just ran (matches the
+                    # `attempt` field written to timeline_all.jsonl), THEN bump.
+                    _archive_attempt(out_dir, r["iid"], tries)
                     if not restore(lastgood, vsuf):
-                        log(f"FATAL: restore of last-good failed twice at idx{i} — volume state "
-                            f"unreliable; stopping shard to preserve provenance (resume via done_idx).")
-                        return 4
-                tries += 1
-                if tries > args.max_retries:
-                    # Retries exhausted on a task that keeps failing to execute
-                    # (e.g. deterministic OOM). Record THIS failed attempt as the
-                    # final result with full disclosure and move on — one
-                    # pathological instance must not stop the whole shard.
-                    exhausted = True
-                    log(f"idx{i} EXHAUSTED_RETRIES ({args.max_retries}): recording final "
-                        f"failure (patch=0B) and continuing :: {str(r['iid'])[:46]}")
-                else:
-                    log(f"idx{i} {kind} - retry {tries}/{args.max_retries} after "
-                        f"{args.retry_wait}s; attempt archived + restore last-good")
-                    time.sleep(args.retry_wait)
-                    continue
-            if ok and r["permanent_skip"]:
-                if not restore(lastgood, vsuf):
-                    log(f"!! restore of last-good failed after permanent-skip idx{i}; next task starts "
-                        f"from current (un-rolled-back) volume state — treat downstream results with care.")
-                log(f"idx{i} SKIP_PERMANENT_INFRA: patch={pb}B api_err={ae} degraded={r['degraded']} :: {str(r['iid'])[:46]}")
-            elif ok:
-                snapshot(lastgood, vsuf)  # new last-good = post-idx_i
-                tag = "LEGIT" if pb > 0 else "LEGIT-0B(genuine)"
-                log(f"idx{i} {tag}: patch={pb}B api_err={ae} n_events={row.get('n_events', '?')} "
-                    f"refl={reflections(vsuf)} degraded={r['degraded']} :: {str(r['iid'])[:46]}")
-            # exhausted path: volumes already restored above
-            rec = {"idx": i, "instance_id": r["iid"], "patch_bytes": pb if pb is not None else 0,
-                   "api_err": ae, "retries": min(tries, args.max_retries),
-                   "evolution_degraded": r["degraded"],
-                   "permanent_skip": r["permanent_skip"], "genuine_0b": genuine_0b,
-                   "exhausted_retries": exhausted, "infra_cut": infra_cut}
-            results.append(rec)
-            try:
-                marker.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
-            except Exception as e:
-                log(f"!! done-sentinel write failed for idx{i}: {e}")
-            ref = str(row.get("image_ref") or "")
-            if ref and ref not in own_images:
-                own_images.append(ref)
-            keep = max(1, args.keep_images)
-            for old in own_images[:-keep]:
-                if old not in cleaned:
-                    _rmi(old)
-                    cleaned.add(old)
-            if r["degraded"]:
-                log(f"idx{i}: evolution degraded (benign telemetry); run continues")
-            consecutive_exhausted = consecutive_exhausted + 1 if exhausted else 0
-            if consecutive_exhausted >= 2:
-                log("two consecutive tasks exhausted retries — provider/infra is likely down; stopping shard.")
-                _write_summary(out_dir, results, stopped_at=i)
-                return 1
-            break
+                        # Baseline tgz is guaranteed present (start-of-run gate), so a
+                        # False here is a failed extract (docker transient). Retry once;
+                        # if it still fails, the volume state is unreliable and any
+                        # further attempt would corrupt k=1 provenance — stop the shard
+                        # (append-only + done_idx make it resumable) rather than proceed.
+                        time.sleep(30)
+                        if not restore(lastgood, vsuf):
+                            log(f"FATAL: restore of last-good failed twice at idx{i} — volume state "
+                                f"unreliable; stopping shard to preserve provenance (resume via done_idx).")
+                            return _finish(4, outcome="stopped_restore_failed", stopped_at=i,
+                                           refusal={"stage": "restore_lastgood", "exit_code": 4,
+                                                    "reason": "lastgood_restore_failed_twice"})
+                    tries += 1
+                    if tries > args.max_retries:
+                        # Retries exhausted on a task that keeps failing to execute
+                        # (e.g. deterministic OOM). Record THIS failed attempt as the
+                        # final result with full disclosure and move on — one
+                        # pathological instance must not stop the whole shard.
+                        exhausted = True
+                        log(f"idx{i} EXHAUSTED_RETRIES ({args.max_retries}): recording final "
+                            f"failure (patch=0B) and continuing :: {str(r['iid'])[:46]}")
+                    else:
+                        log(f"idx{i} {kind} - retry {tries}/{args.max_retries} after "
+                            f"{args.retry_wait}s; attempt archived + restore last-good")
+                        time.sleep(args.retry_wait)
+                        continue
+                if ok and r["permanent_skip"]:
+                    if not restore(lastgood, vsuf):
+                        log(f"!! restore of last-good failed after permanent-skip idx{i}; next task starts "
+                            f"from current (un-rolled-back) volume state — treat downstream results with care.")
+                    log(f"idx{i} SKIP_PERMANENT_INFRA: patch={pb}B api_err={ae} degraded={r['degraded']} :: {str(r['iid'])[:46]}")
+                elif ok:
+                    snapshot(lastgood, vsuf)  # new last-good = post-idx_i
+                    tag = "LEGIT" if pb > 0 else "LEGIT-0B(genuine)"
+                    log(f"idx{i} {tag}: patch={pb}B api_err={ae} n_events={row.get('n_events', '?')} "
+                        f"refl={reflections(vsuf)} degraded={r['degraded']} :: {str(r['iid'])[:46]}")
+                # exhausted path: volumes already restored above
+                rec = {"idx": i, "instance_id": r["iid"], "patch_bytes": pb if pb is not None else 0,
+                       "api_err": ae, "retries": min(tries, args.max_retries),
+                       "evolution_degraded": r["degraded"],
+                       "permanent_skip": r["permanent_skip"], "genuine_0b": genuine_0b,
+                       "exhausted_retries": exhausted, "infra_cut": infra_cut}
+                results.append(rec)
+                try:
+                    marker.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+                except Exception as e:
+                    log(f"!! done-sentinel write failed for idx{i}: {e}")
+                ref = str(row.get("image_ref") or "")
+                if ref and ref not in own_images:
+                    own_images.append(ref)
+                keep = max(1, args.keep_images)
+                for old in own_images[:-keep]:
+                    if old not in cleaned:
+                        _rmi(old)
+                        cleaned.add(old)
+                if r["degraded"]:
+                    log(f"idx{i}: evolution degraded (benign telemetry); run continues")
+                consecutive_exhausted = consecutive_exhausted + 1 if exhausted else 0
+                if consecutive_exhausted >= 2:
+                    log("two consecutive tasks exhausted retries — provider/infra is likely down; stopping shard.")
+                    _write_summary(out_dir, results, stopped_at=i)
+                    return _finish(1, outcome="stopped_provider_down", stopped_at=i)
+                break
 
-    _write_summary(out_dir, results, stopped_at=None)
-    log(f"DONE idx{args.start}..{args.end}: {len(results)} tasks, volume reflections={reflections(vsuf)}")
-    return 0
+        _write_summary(out_dir, results, stopped_at=None)
+        log(f"DONE idx{args.start}..{args.end}: {len(results)} tasks, volume reflections={reflections(vsuf)}")
+        return _finish(0, outcome="completed")
 
 
 def _write_summary(out_dir: pathlib.Path, results: list, stopped_at) -> None:

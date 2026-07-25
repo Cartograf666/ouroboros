@@ -102,6 +102,24 @@ The task body carries `metadata.budget_profile` (see `schemas.programbench_budge
   execute is allowed; byte reads, copy/hash/static introspection/tracing/debugging are denied.
 - Submission artifact is `<run>/<instance_id>/submission.tar.gz`.
 - Sidecars (`run_manifest.json`, `result_index.jsonl`) are audit artifacts only.
+- **`result_index.jsonl` is APPEND-ONLY (v6.75.0).** EVERY row — processed and skipped
+  alike — is appended the moment it exists, at the run root AND in the instance dir, so a
+  resumed instance's own history contains the skip event that explains the gap. Before this the run root ledger was one
+  whole-file rewrite at the very end, so a crash discarded every completed instance and a
+  resume silently replaced the previous run's history. Consequences for readers: a resumed or
+  re-done instance appears MORE THAN ONCE, so **dedup by `instance_id` and take the LAST
+  row**; the file is run history, not a set. The denominator still comes from the requested
+  selection (`run_manifest.json` → `requested_task_ids`), never from the line count.
+- **`run_manifest.json` is written FIRST (v6.75.0)**, right after selection and before the
+  first instance — it carries the shared seed-provenance gate
+  (`benchmark_run_manifest(require_clean=True)`, escape `--allow-dirty-seed`) plus the
+  runtime attestation of the server named by `--ouroboros-url` (the HTTP `runtime_version`
+  and the local HEAD of `--repo-dir`; a skew hard-stops unless `OBO_ALLOW_EVOLVED_VOLUME=1`).
+  It is written to disk as soon as it is built, so a refusal after admission still leaves a
+  durable record of what was refused, and it is rewritten at the end with the eval status and
+  the completed/failed counts. Previously
+  it was written only after every instance AND the official eval, i.e. after all the spend,
+  so the gate could not stop an unreproducible run.
 
 ## Mac notes
 

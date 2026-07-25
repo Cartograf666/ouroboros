@@ -617,6 +617,9 @@ def main(argv: list[str] | None = None) -> int:
             run_root=run_root,
             repo_dir=repo,
             requested_task_ids=list(args.task or []),
+            # v6.75.0: the shared seed gate now defaults to require_clean=True. This launcher
+            # keeps its pre-v6.75.0 behaviour until its own phase adds --allow-dirty-seed.
+            require_clean=False,
             metadata={
                 # dataset + official_command are promoted to top-level by benchmark_run_manifest;
                 # everything else must go through `extra` (the helper drops unknown top-level keys).

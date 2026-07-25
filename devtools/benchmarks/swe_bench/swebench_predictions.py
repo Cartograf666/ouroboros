@@ -19,7 +19,7 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from devtools.benchmarks.common.manifests import benchmark_run_manifest, write_json
+from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_run_manifest
 from devtools.benchmarks.common.result_index import task_result_row, write_result_index
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
@@ -391,6 +391,11 @@ def main() -> int:
     parser.add_argument("--settings-path", default="")
     parser.add_argument("--isolated-data-root", default="", help="isolated Ouroboros data root used for this run")
     parser.add_argument("--print-eval-command", default="", help="optional preset/dataset for official eval command")
+    parser.add_argument(
+        "--allow-dirty-seed",
+        action="store_true",
+        help="record and proceed with an unclean/unidentifiable seed checkout instead of refusing",
+    )
     args = parser.parse_args()
     settings_path = Path(args.settings_path).expanduser() if args.settings_path else default_settings_path()
 
@@ -414,61 +419,64 @@ def main() -> int:
     logs_dir = str(ensure_outside_repo(Path(args.logs_dir), REPO_ROOT)) if args.logs_dir else ""
 
     input_rows = _records(input_path)
-    predictions, errors, ledger_rows, first_error = _run_prediction_rows(
-        args,
-        input_rows,
-        output_path=output_path,
-        logs_dir=logs_dir,
-    )
-
-    if first_error is not None and not args.continue_on_error:
-        _append_not_attempted_rows(ledger_rows, input_rows, benchmark="swe_bench")
-
-    output_path.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False) for row in predictions) + ("\n" if predictions else ""),
-        encoding="utf-8",
-    )
-    write_result_index(ledger_output_path, ledger_rows)
-    if errors:
-        errors_output_path.write_text(
-            "\n".join(json.dumps(row, ensure_ascii=False) for row in errors) + "\n",
-            encoding="utf-8",
-        )
     eval_command = (
         swebench_eval_cmd(resolve_preset(args.print_eval_command), output_path, "ouroboros", 1)
         if args.print_eval_command
         else []
     )
-    write_json(
+    # Manifest FIRST (seed-provenance gate before any paid agent run): `admit_benchmark_run`
+    # persists the complete gate/refusal payload BEFORE enforcement raises, and the retained dict
+    # is augmented with the outcome counts and finalized with a typed outcome on every exit path.
+    manifest = admit_benchmark_run(
         manifest_output_path,
-        benchmark_run_manifest(
-            benchmark="swe_bench",
-            run_root=output_path.parent,
-            repo_dir=REPO_ROOT,
-            requested_task_ids=[str(item.get("instance_id") or "") for item in input_rows],
-            output_paths={
-                "predictions": str(output_path),
-                "errors": str(errors_output_path),
-                "ledger": str(ledger_output_path),
-            },
-            dataset=resolve_preset(args.print_eval_command) if args.print_eval_command else "",
-            official_command=eval_command,
-            timeout_sec=int(args.timeout),
-            isolated_data_root=str(args.isolated_data_root or ""),
-            settings_path=settings_path,
-            extra={
-                "model_name_or_path": args.model_name,
-                "prediction_count": len(predictions),
-                "error_count": len(errors),
-                "input": str(input_path),
-            },
-        ),
+        benchmark="swe_bench",
+        run_root=output_path.parent,
+        repo_dir=REPO_ROOT,
+        requested_task_ids=[str(item.get("instance_id") or "") for item in input_rows],
+        require_clean=not args.allow_dirty_seed,
+        output_paths={
+            "predictions": str(output_path),
+            "errors": str(errors_output_path),
+            "ledger": str(ledger_output_path),
+        },
+        dataset=resolve_preset(args.print_eval_command) if args.print_eval_command else "",
+        official_command=eval_command,
+        timeout_sec=int(args.timeout),
+        isolated_data_root=str(args.isolated_data_root or ""),
+        settings_path=settings_path,
+        extra={"model_name_or_path": args.model_name, "input": str(input_path)},
     )
-    if args.print_eval_command:
-        print(" ".join(shlex.quote(part) for part in eval_command))
-    if first_error is not None:
-        raise first_error
-    return 0
+
+    with finalize_run_manifest(manifest_output_path, manifest, outcome="completed") as final:
+        predictions, errors, ledger_rows, first_error = _run_prediction_rows(
+            args,
+            input_rows,
+            output_path=output_path,
+            logs_dir=logs_dir,
+        )
+
+        if first_error is not None and not args.continue_on_error:
+            _append_not_attempted_rows(ledger_rows, input_rows, benchmark="swe_bench")
+
+        output_path.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in predictions) + ("\n" if predictions else ""),
+            encoding="utf-8",
+        )
+        write_result_index(ledger_output_path, ledger_rows)
+        if errors:
+            errors_output_path.write_text(
+                "\n".join(json.dumps(row, ensure_ascii=False) for row in errors) + "\n",
+                encoding="utf-8",
+            )
+        manifest["extra"].update({"prediction_count": len(predictions), "error_count": len(errors)})
+        if args.print_eval_command:
+            print(" ".join(shlex.quote(part) for part in eval_command))
+        if first_error is not None:
+            # A named terminal outcome BEFORE the re-raise: the run stopped on an instance
+            # error, which the shared seam then annotates with the typed exception.
+            final.update({"outcome": "stopped_instance_error", "exit_code": 1})
+            raise first_error
+        return 0
 
 
 if __name__ == "__main__":

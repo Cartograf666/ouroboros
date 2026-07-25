@@ -67,6 +67,40 @@ def as_set(v) -> set:
     return set(v or [])
 
 
+def instance_verdict(
+    output_path: pathlib.Path,
+    raw_row: dict | None,
+) -> tuple[str, str, str]:
+    """Classify one instance as ``pass`` / ``fail`` / ``ungraded`` plus a typed reason.
+
+    Third state, not a third opinion: an instance the official evaluator never scored is NOT
+    a model failure, and folding it into the FAIL bucket is what made earlier headlines
+    unfalsifiable. The returned verdict feeds the reported denominator; it never re-scores
+    anything (the official per-instance output stays the authority).
+    Returns ``(verdict, reason, tests_column)``.
+    """
+    if raw_row is None:
+        return "ungraded", "instance_not_in_dataset", "-"
+    if not output_path.is_file():
+        return "ungraded", "no_official_output", "-"
+    try:
+        out = json.loads(output_path.read_text())
+        # The SHAPE of the parsed output is part of parsing: an unexpected-but-valid JSON body
+        # (tests as a dict, rows without `name`) must land in the same `ungraded` bucket, never
+        # produce a headline through a raised KeyError/TypeError.
+        tests = out.get("tests") or []
+        passed = {t["name"] for t in tests if t.get("status") == "PASSED"}
+    except Exception as exc:  # noqa: BLE001 - an unparseable output is ungraded, never a FAIL
+        return "ungraded", f"output_unparseable:{type(exc).__name__}", "-"
+    need = as_set(raw_row.get("FAIL_TO_PASS") or raw_row.get("fail_to_pass")) | as_set(
+        raw_row.get("PASS_TO_PASS") or raw_row.get("pass_to_pass")
+    )
+    column = f"{len(passed)}/{len(need - passed)}/{len(need)}"
+    if not need:
+        return "ungraded", "no_required_tests", column
+    return ("pass" if need <= passed else "fail"), "", column
+
+
 def main() -> int:
     default_run_root = _default_run_root()
     ap = argparse.ArgumentParser()
@@ -119,40 +153,58 @@ def main() -> int:
         hint = " (pass --csv <path> to enable baseline comparison)" if args.csv else ""
         print(f"[swe-pro] note: baseline CSV not found at {csv_path}; baseline column blank{hint}", file=sys.stderr)
     print("\n[diagnostic] Non-leaderboard summary derived from official per-instance outputs.")
-    print(f"{'instance':52} {'diagnostic':18} {'baseline':10} {'tests P/missing/total'}")
+    print(f"{'instance':52} {'verdict':10} {'reason':26} {'baseline':10} {'tests P/missing/total'}")
     n_res = 0
+    n_ungraded = 0
+    verdict_rows: list[dict] = []
     for p in patches:
         iid = p["instance_id"]
         od = out_dir / iid / f"{args.prefix}_output.json"
         if not od.is_file():
             od2 = list((out_dir).glob(f"**/{args.prefix}_output.json"))
             od = next((x for x in od2 if iid in str(x)), od)
-        status = "NO_OUTPUT"; ntp = "-"
-        if od.is_file():
-            try:
-                out = json.loads(od.read_text())
-                tests = out.get("tests") or []
-                passed = {t["name"] for t in tests if t.get("status") == "PASSED"}
-                rsd = rs.get(iid, {})
-                f2p = as_set(rsd.get("FAIL_TO_PASS") or rsd.get("fail_to_pass"))
-                p2p = as_set(rsd.get("PASS_TO_PASS") or rsd.get("pass_to_pass"))
-                need = f2p | p2p
-                resolved = bool(need) and need <= passed
-                n_res += int(resolved)
-                status = "DIAGNOSTIC_PASS" if resolved else "DIAGNOSTIC_FAIL"
-                ntp = f"{len(passed)}/{len(need - passed)}/{len(need)}"
-            except Exception as e:
-                status = f"PARSE_ERR:{e}"[:18]
-        print(f"{iid[:52]:52} {status:18} {verd.get(iid,'?'):10} {ntp}")
-    # B1: the RAW, unadjusted headline is the SOLE reported metric. Any contamination /
-    # benchmark-defect analysis (e.g. the `interface`-field false-negatives on some
-    # instances) lives ONLY in the separate diagnostic CONTAMINATION_AUDIT.md and never
-    # adjusts this number — gold is never shown to the solver and nothing is re-scored.
+        verdict, reason, ntp = instance_verdict(od, rs.get(iid))
+        n_res += int(verdict == "pass")
+        n_ungraded += int(verdict == "ungraded")
+        verdict_rows.append({"instance_id": iid, "verdict": verdict, "reason": reason,
+                             "tests": ntp, "official_output": str(od)})
+        print(f"{iid[:52]:52} {verdict:10} {reason[:26]:26} {verd.get(iid,'?'):10} {ntp}")
+    # B1: the RAW, unadjusted headline is the SOLE reported metric, and its FORMULA IS
+    # UNCHANGED (resolved over submitted instances). Any contamination / benchmark-defect
+    # analysis (e.g. the `interface`-field false-negatives on some instances) lives ONLY in
+    # the separate diagnostic CONTAMINATION_AUDIT.md and never adjusts this number — gold is
+    # never shown to the solver and nothing is re-scored.
     total = len(patches)
     pct = (100.0 * n_res / total) if total else 0.0
+    graded = total - n_ungraded
     print(f"\n[headline] RAW Pass@1: {n_res}/{total} = {pct:.1f}%  (official Pro eval output remains source of truth)")
+    print(f"[headline] ungraded={n_ungraded}/{total} (instances the official evaluator never scored; "
+          "they stay in the headline denominator above)")
+    if n_ungraded:
+        graded_pct = (100.0 * n_res / graded) if graded else 0.0
+        print(f"[diagnostic] pass/(total-ungraded) = {n_res}/{graded} = {graded_pct:.1f}% "
+              "— DIAGNOSTIC ONLY, NOT leaderboard-valid (it shrinks the denominator).")
     print("[headline] Contamination/benchmark-defect notes are diagnostic only — see "
           "devtools/benchmarks/swe_bench_pro/CONTAMINATION_AUDIT.md (the raw headline above is NOT adjusted by them).")
+    (out_dir / "grade_summary.json").write_text(
+        json.dumps(
+            {
+                "schema": "ouroboros.swe_bench_pro.grade_summary.v1",
+                "submitted": total,
+                "pass": n_res,
+                "fail": total - n_res - n_ungraded,
+                "ungraded": n_ungraded,
+                "headline_raw_pass_at_1_pct": round(pct, 2),
+                "diagnostic_pass_over_graded_pct": round((100.0 * n_res / graded), 2) if graded else 0.0,
+                "diagnostic_not_leaderboard_valid": True,
+                "verdicts": verdict_rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return 0
 
 

@@ -15,7 +15,7 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
-from devtools.benchmarks.common.manifests import benchmark_run_manifest, write_json
+from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_run_manifest
 from devtools.benchmarks.common.result_index import task_result_row, write_result_index
 from devtools.benchmarks.common.run_roots import default_settings_path, ensure_outside_repo, repo_root_from_devtools, run_root
 
@@ -211,6 +211,11 @@ def main() -> int:
     parser.add_argument("--run-root", default="")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-allow-task-failures", action="store_true")
+    parser.add_argument(
+        "--allow-dirty-seed",
+        action="store_true",
+        help="record and proceed with an unclean/unidentifiable seed checkout instead of refusing",
+    )
     args = parser.parse_args()
 
     repo_dir = pathlib.Path(args.repo_dir).expanduser().resolve(strict=False)
@@ -221,7 +226,8 @@ def main() -> int:
         pathlib.Path(args.run_root).expanduser() if args.run_root else run_root("harness_bench_fast", args.run_id),
         repo_dir,
     )
-    out_root.mkdir(parents=True, exist_ok=True)
+    # No pre-admission mkdir: the atomic manifest write creates the run root, and the console
+    # log is opened only after admission.
     results_json = out_root / "results.json"
     ledger_output = out_root / "result_index.jsonl"
     manifest_output = out_root / "run_manifest.json"
@@ -247,50 +253,59 @@ def main() -> int:
         json_output=results_json,
         allow_task_failures=not args.no_allow_task_failures,
     )
-    write_json(
+    # Built ONCE (the seed gate runs inside it) and PERSISTED BEFORE enforcement can raise, so
+    # a refusal leaves a durable record of what was refused; then RETAINED and rewritten with the
+    # final typed outcome on every exit path by the shared finalization seam below.
+    manifest = admit_benchmark_run(
         manifest_output,
-        benchmark_run_manifest(
-            benchmark="harness_bench_fast",
-            run_root=out_root,
-            repo_dir=repo_dir,
-            requested_task_ids=task_ids,
-            argv=sys.argv,
-            dataset=f"harness-bench-fast:{bench_root}",
-            settings_path=settings_path,
-            timeout_sec=args.timeout,
-            output_paths={
-                "results_json": str(results_json),
-                "ledger": str(ledger_output),
-                "manifest": str(manifest_output),
-                "console_log": str(console_log),
-                "per_task_logs": str(wrapper_log_root),
-            },
-            harness={
-                "mode": "run-cli",
-                "bench_root": str(bench_root),
-                "cli_command": cli_command,
-                "concurrency": args.concurrency,
-                "attempts": args.attempts,
-                "memory_mode": "empty",
-            },
-            official_command=cmd,
-        ),
+        benchmark="harness_bench_fast",
+        run_root=out_root,
+        repo_dir=repo_dir,
+        requested_task_ids=task_ids,
+        require_clean=not args.allow_dirty_seed,
+        argv=sys.argv,
+        dataset=f"harness-bench-fast:{bench_root}",
+        settings_path=settings_path,
+        timeout_sec=args.timeout,
+        output_paths={
+            "results_json": str(results_json),
+            "ledger": str(ledger_output),
+            "manifest": str(manifest_output),
+            "console_log": str(console_log),
+            "per_task_logs": str(wrapper_log_root),
+        },
+        harness={
+            "mode": "run-cli",
+            "bench_root": str(bench_root),
+            "cli_command": cli_command,
+            "concurrency": args.concurrency,
+            "attempts": args.attempts,
+            "memory_mode": "empty",
+        },
+        official_command=cmd,
+        extra={"outcome": "started"},
     )
-    print(shlex.join(cmd))
-    if args.dry_run:
-        _write_ledger_from_results(result_json=results_json, ledger_output=ledger_output, requested_task_ids=task_ids)
-        return 0
 
-    with console_log.open("w", encoding="utf-8") as fh:
-        proc = subprocess.run(
-            cmd,
-            cwd=bench_root,
-            text=True,
-            stdout=fh,
-            stderr=subprocess.STDOUT,
-        )
-    _write_ledger_from_results(result_json=results_json, ledger_output=ledger_output, requested_task_ids=task_ids)
-    return int(proc.returncode)
+    with finalize_run_manifest(manifest_output, manifest) as final:
+        print(shlex.join(cmd))
+        if args.dry_run:
+            _write_ledger_from_results(result_json=results_json, ledger_output=ledger_output, requested_task_ids=task_ids)
+            final["outcome"] = "dry_run"
+            return 0
+
+        with console_log.open("w", encoding="utf-8") as fh:
+            proc = subprocess.run(
+                cmd,
+                cwd=bench_root,
+                text=True,
+                stdout=fh,
+                stderr=subprocess.STDOUT,
+            )
+        _write_ledger_from_results(result_json=results_json, ledger_output=ledger_output, requested_task_ids=task_ids)
+        code = int(proc.returncode)
+        final.update({"outcome": "completed" if code == 0 else "harness_nonzero_exit",
+                      "exit_code": code})
+        return code
 
 
 if __name__ == "__main__":

@@ -201,6 +201,9 @@ def main() -> int:
         run_root=run_root,
         repo_dir=repo_root,
         requested_task_ids=list(actual_include_filters),
+        # v6.75.0: the shared seed gate now defaults to require_clean=True. This launcher
+        # keeps its pre-v6.75.0 behaviour until its own phase adds --allow-dirty-seed.
+        require_clean=False,
         metadata={
             "argv": sys.argv,
             "output_paths": {"harbor_output_dir": str(run_root)},

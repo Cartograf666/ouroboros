@@ -214,6 +214,9 @@ def main() -> int:
             run_root=output_root,
             repo_dir=repo_root,
             requested_task_ids=requested,
+            # v6.75.0: the shared seed gate now defaults to require_clean=True. This launcher
+            # keeps its pre-v6.75.0 behaviour until its own phase adds --allow-dirty-seed.
+            require_clean=False,
             argv=sys.argv,
             output_paths={"ledger": str(ledger_path), "manifest": str(manifest_path)},
             dataset="OSWorld",

@@ -30,6 +30,7 @@ import urllib.request
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
+from devtools.benchmarks.common.manifests import runtime_attestation
 from ouroboros.platform_layer import (
     kill_pid_tree,
     subprocess_new_group_kwargs,
@@ -173,6 +174,9 @@ class IsolatedServer:
         self.host_service_port = free_port()
         self.base_url = f"http://{host}:{self.port}"
         self.proc: subprocess.Popen | None = None
+        # Filled by _wait_ready: the HTTP runtime_version + the clone's HEAD/VERSION that
+        # produced it, so a driver can record WHICH agent identity its numbers came from.
+        self.attestation: dict = {}
 
     def _env(self) -> dict:
         env = dict(os.environ)
@@ -245,6 +249,11 @@ class IsolatedServer:
             try:
                 st = self._state()
                 if st.get("supervisor_ready") and int(st.get("workers_total") or 0) > 0:
+                    # Owner Q9=A+B: the identity attestation rides inside the readiness path
+                    # every IsolatedServer driver must run, so no driver can skip it. It is a
+                    # ONE-SHOT step here (not part of the polled probe): a raise inside the
+                    # poll would be swallowed as "not ready yet" and burn the whole timeout.
+                    self.attestation = runtime_attestation(self.base_url, self.clone)
                     return
                 last = f"supervisor_ready={st.get('supervisor_ready')} workers={st.get('workers_total')}"
             except (urllib.error.URLError, OSError, ValueError) as exc:

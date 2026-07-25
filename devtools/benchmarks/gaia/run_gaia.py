@@ -255,6 +255,9 @@ def _write_manifest(root: pathlib.Path, args: argparse.Namespace, planned_argv: 
         run_root=root,
         repo_dir=REPO,
         requested_task_ids=requested,
+        # v6.75.0: the shared seed gate now defaults to require_clean=True. This launcher
+        # keeps its pre-v6.75.0 behaviour until its own phase adds --allow-dirty-seed.
+        require_clean=False,
         metadata={
             "argv": planned_argv,
             "dataset": "inspect_evals/gaia",

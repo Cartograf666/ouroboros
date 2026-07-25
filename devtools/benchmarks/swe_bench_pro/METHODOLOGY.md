@@ -60,12 +60,75 @@ data are private (commercial *results* are published). Our 70-task subset
 **Integrity rules we enforce locally (not official defaults).** (a) Public Pro Docker
 images have leaked future git history (official **issue #93**); we strip it before
 solve (`strip_gold_history.sh`) — a *local* defense, not an official guarantee.
-(b) We run with `web_search` OFF so the solver cannot reach the upstream fix; the
-official repo exposes a `--block_network` eval flag but does not mandate network-off
-for all solve runs, so treat network-off as *our* legitimacy choice.
+(b) We run with `web_search` (and the browser/vision tools) OFF via the adapter's
+`--disable-tools` policy — that tool policy, not the network, is what actually keeps the
+solver off the upstream fix. Treat it as *our* legitimacy choice: nothing official
+requires it.
+(c) **The solve container's network is OPEN, and egress isolation is NOT part of this
+release.**
+*What the official contract says about the solve network: nothing.* The official
+SWE-bench Pro harness does not regulate the solve container's network at all — it
+neither provides nor requires any solve-time network control. The `--block_network`
+flag that does exist in the official evaluator applies to the **EVAL** container: in
+`swe_bench_pro_eval.py` it is consumed only by `eval_with_docker`/`eval_with_modal`,
+where it becomes `run_kwargs["network_mode"] = "none"` for the container that applies
+the patch and runs the tests — verified in the official clone, not ours:
+`SWE-bench_Pro-os/swe_bench_pro_eval.py:405`, flag defined `:464`.
+*What we ship.* Solve containers get the **open, unisolated network** they had before
+v6.75.0 — no network flags at all in the docker argv, no relay, no in-container reachability
+probe, and no `--network-mode` flag on either driver. **Do not read anything in this
+release as a network-level containment claim.** What actually keeps the solver off the
+upstream fix is the tool policy in (b) (`--disable-tools`: `web_search`, browser and vision
+tools off), plus the gold-history strip in (a) — both *our* legitimacy choices, neither
+official.
+*Why, and what was deferred.* A structural egress-isolation subsystem (an `--internal`
+docker network plus one dual-homed fixed-upstream TLS pass-through relay per configured
+provider host, with positive+negative in-container probes and a fail-closed refusal) was
+built during v6.75.0 and then **extracted before release**; it is deferred to a later one,
+so nothing in this tree implements it. The owner's decision (2026-07-25) that it would be
+**off by default** is what made the extraction cheap: the comparison baseline we measure
+against (codex) also runs with network access, so cheating is looked for **in the traces**
+rather than prevented by the sandbox; and isolation would have cost us the musl/Alpine
+instances outright, because their install-in-image transport needs general network during
+setup.
+*How many instances that would have been (measured 2026-07-25, not an estimate of
+convenience).* The dataset itself cannot answer: the HF `ScaleAI/SWE-bench_Pro`
+test split has 731 rows and 16 columns (`repo`, `instance_id`, `base_commit`,
+`patch`, `test_patch`, `problem_statement`, `requirements`, `interface`,
+`repo_language`, `fail_to_pass`, `pass_to_pass`, `issue_specificity`,
+`issue_categories`, `before_repo_set_cmd`, `selected_test_files_to_run`,
+`dockerhub_tag`) — there is **no libc, base-image or Dockerfile field**, and the tag
+is an opaque `<repo>-<commit>` slug. libc is a property of the built image only, which
+is why `run_pro.image_libc()` probes `/lib/libc.musl*` inside it.
+Measured over every SWE-Pro instance ever solved on this host (287 distinct instances
+across the local run archive; an install-in-image solve is identified by its
+`/out/install.log`, which only that transport writes): **31 distinct instances are
+Alpine/musl = 10.8% of the 287 attempted**, and **26 of those 31 (83.9%) produced a
+non-empty patch** — i.e. isolating egress would not have been free, it would have removed
+instances the agent was solving. musl is per-INSTANCE, not per-repo: the 31 span four repos
+(`protonmail/webclients` 20, `gravitational/teleport` 9, `navidrome/navidrome` 1,
+`future-architect/vuls` 1) with different Alpine bases per instance (v3.18, v3.21 seen
+in the install logs), so a repo-level extrapolation (141 instances live in the two
+biggest of those repos, 19.3% of 731) is an upper-bound guess, NOT the count.
+Getting the exact 731-wide number is one pass of the existing probe over the dataset's
+`dockerhub_tag`s — `docker pull jefzda/sweap-images:<tag>` then
+`ls /lib/libc.musl*` (`image_libc`) for each row — which needs the network and roughly
+a terabyte of image pulls; it is deliberately NOT run here. **These numbers are the
+evidence the owner ruled on** (2026-07-25). Note precisely what they do and do not
+license: they justify *not* imposing isolation (a change that can only ever restore
+instances), and they are explicitly NOT a 731-wide count — no claim about the full set is
+made on the strength of a 287-instance sample.
 
 **Reporting rule.** Headline = **raw Pass@1 over submitted instances** (one patch per
-task, first final answer; no manual patch repair, no audit-based re-weighting). Any
+task, first final answer; no manual patch repair, no audit-based re-weighting). The
+formula is unchanged by v6.75.0. What is added is honesty about the denominator:
+`grade_pro.py` classifies every instance as `pass` / `fail` / **`ungraded`** with a
+typed reason (`no_official_output`, `output_unparseable`, `no_required_tests`,
+`instance_not_in_dataset`), prints `ungraded=N/total` beside the unchanged headline,
+and writes `grade_summary.json`. An instance the official evaluator never scored is not
+a model failure. The `pass/(total−ungraded)` percentage is printed only when there ARE
+ungraded instances and is explicitly labelled **diagnostic, not leaderboard-valid** —
+it shrinks the denominator and must never be reported as the headline. Any
 retry-on-transient resampling (§3.1) is disclosed with conditions + counts
 (conditional best-of-N, not pure pass@1). `CONTAMINATION_AUDIT.md` is diagnostic-only
 and never re-weights scores.
@@ -281,6 +344,62 @@ The agent under test is seeded from the mounted source (`/opt/ouroboros-ro` →
 `cp -a` into `/obo-repo`). Mount a clean checkout at a known tag: a dirty working
 tree would leak uncommitted local edits into the measured agent and make the run
 non-reproducible. Record the exact seed commit/tag with the results.
+
+**v6.75.0 makes all of that enforced rather than advisory. Three DIFFERENT identities are
+attested, never conflated:**
+
+1. **the seed stamp** — `<VERSION> <HEAD>` of the mounted source, written into
+   `/obo-repo/.git/ouroboros_seed` *while the volume is being seeded* (inside `.git`, so it
+   is not untracked working-tree dirt). The seeding condition `[ -e /obo-repo/.git ] ||` is
+   unchanged: an existing `.git` is an EVOLVED volume and is never re-seeded. The mounted
+   HEAD is read ONCE and reused by both the stamp write and the verification, and an
+   unreadable HEAD is refused as `seed_head_unreadable` rather than persisted as a
+   sentinel: a stamped `unknown` would later read as `seed_mismatch`/`lineage_broken` and
+   poison every subsequent task on that volume.
+2. **the live HEAD of the evolving volume** — compared to the stamp by
+   `git merge-base --is-ancestor`, not by equality: an evolution run legitimately moves HEAD
+   forward, and an equality check would kill every task after the first.
+3. **the version the running server reports over HTTP** (`GET /api/health`, frozen contract,
+   read-only here) — compared to the live `/obo-repo/VERSION`.
+
+Any mismatch refuses the task before the paid solve with a typed reason
+(`stamp_absent` | `seed_mismatch` | `lineage_broken` | `runtime_skew` |
+`runtime_unreachable` | `seed_head_unreadable`), `exit 88`, and a
+recorded `/out/seed_attestation.json` that `run_pro.py` folds into the timeline row. All
+five are properties of the VOLUME plus the mounted seed, identical for every task in the
+shard, so BOTH drivers treat them as CAMPAIGN-fatal instead of per-task skips — recording
+them per task would restore the same broken volume N times, burn the whole wall clock and
+still exit 0 with a zero headline. The reason set is ONE shared authority,
+`common/manifests.py::CAMPAIGN_FATAL_PROVENANCE_REASONS`: `auto_run.py` stops the shard (one
+`FATAL: provenance refusal` line, exit 2) and `run_pro.py` stops its own schedule the same
+way (exit 2, typed `volume_provenance` refusal in the run manifest), so a direct `run_pro`
+invocation — or `orchestrate_probe.py`, which shells out to it — can no longer refuse every
+task and report success.
+Per-task refusals (`libc_skip`) stay per-task skips. The named override `OBO_ALLOW_EVOLVED_VOLUME=1` authorises EXACTLY ONE of
+those reasons — `runtime_skew`, the deliberately evolved/version-skewed runtime it exists for
+— and records `overridden: true` next to `override_set: true`: an audited exception, never a
+silent one. It does NOT waive the others. A volume with no stamp, a foreign seed, a broken
+lineage, an unreadable seed HEAD, or a `/api/health` that is unreachable or does not answer
+with the contract (`runtime_unreachable`) means the provenance was never established at all,
+so those stay fail-closed with the override exported; waiving them would let a paid solve
+proceed while attesting nothing. The shell allowlist is a single token
+(`OBO_OVERRIDABLE_SEED_REASON`) asserted equal to `manifests.OVERRIDABLE_ATTESTATION_REASONS`,
+so the in-container and host-side gates cannot drift. The check is a ONE-SHOT step, deliberately not
+inside `ready_probe()`: the readiness loop reads any non-zero probe rc as "not ready yet",
+so a refusal there would be swallowed and burn the whole 900s window.
+
+The host side is gated too: `run_pro.py` / `auto_run.py` build the run manifest immediately
+after argument parsing, which is where the shared clean-seed gate runs
+(`benchmark_run_manifest(require_clean=True)`), so a dirty or unidentifiable seed stops the
+run before the first task instead of being discovered in a `-dirty` manifest afterwards;
+`--allow-dirty-seed` records the exception. Unknown cleanliness is not cleanliness: when the
+`git status` probe itself fails (corrupt `.git/index`, or its 10s timeout on a huge untracked
+tree / CephFS) the record says `status_available: false` and the gate refuses with
+`seed_status_unavailable` — the earlier coercion to `dirty: false` would have let a genuinely
+dirty seed through with `seed_gate.ok: true`. Both drivers also assert the mounted seed has a
+real `.git` **directory** — a `git worktree add --detach` seed has a pointer *file*, which
+`cp -a` copies verbatim and which leaves the container with no git identity at all (no
+stamp, no lineage, no self-edit accounting).
 
 ## 4. Container And Environment Pitfalls
 

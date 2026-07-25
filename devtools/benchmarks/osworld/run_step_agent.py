@@ -950,6 +950,9 @@ def _write_task_records(config: TaskRecordConfig) -> dict[str, Any]:
             run_root=config.result_root,
             repo_dir=config.repo_dir,
             requested_task_ids=[config.example_id],
+            # v6.75.0: the shared seed gate now defaults to require_clean=True. This launcher
+            # keeps its pre-v6.75.0 behaviour until its own phase adds --allow-dirty-seed.
+            require_clean=False,
             dataset="OSWorld",
             settings_path=config.settings_path,
             output_paths={

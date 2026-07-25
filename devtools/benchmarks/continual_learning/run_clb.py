@@ -571,6 +571,9 @@ def main(argv: list[str] | None = None) -> int:
         run_root=out,
         repo_dir=REPO,
         requested_task_ids=requested,
+        # v6.75.0: the shared seed gate now defaults to require_clean=True. This launcher
+        # keeps its pre-v6.75.0 behaviour until its own phase adds --allow-dirty-seed.
+        require_clean=False,
         metadata={
             "argv": sys.argv if argv is None else [sys.argv[0], *argv],
             "dataset": "continual-learning-bench (external)",

@@ -30,6 +30,14 @@ from datetime import datetime, timezone
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[4]))
 
+from devtools.benchmarks.common.manifests import (
+    ALLOW_EVOLVED_VOLUME_ENV,
+    CAMPAIGN_FATAL_PROVENANCE_REASONS,
+    SeedShapeRefused,
+    admit_benchmark_run,
+    finalize_run_manifest,
+    write_json,
+)
 from devtools.benchmarks.common.run_roots import ensure_outside_repo
 from devtools.benchmarks.common.model_slots import pin_single_model
 
@@ -417,6 +425,33 @@ def docker_pull_if_missing(img: str) -> bool:
     return True
 
 
+def assert_seed_is_git_directory(src: pathlib.Path) -> None:
+    """The mounted seed must have a real ``.git`` DIRECTORY, not a worktree pointer file.
+
+    `cp -a` copies the pointer file verbatim, and inside the container the path it names does
+    not exist — so the seeded /obo-repo has no usable git identity: the seed stamp, the
+    `merge-base` lineage rail (entrypoint_pro.sh), and the self-edit accounting all silently
+    degrade. Our own habit of pinning seeds with `git worktree add --detach` produces exactly
+    that shape, so this long-implicit invariant is now checked out loud.
+
+    Raises ``SeedShapeRefused`` — a ``RuntimeError``, deliberately NOT the ``SystemExit`` this
+    used to raise: ``SystemExit`` derives from ``BaseException``, so the callers' typed-refusal
+    handlers never ran and the run recorded a generic crash instead of the ``seed_shape`` refusal.
+    Both callers turn it into a recorded refusal and a nonzero return, so the process still exits
+    nonzero and the manifest's ``exit_code`` matches what the process actually returns.
+    """
+    git_path = pathlib.Path(src) / ".git"
+    if git_path.is_dir():
+        return
+    raise SeedShapeRefused(
+        "seed_is_not_a_git_directory",
+        f"error: the mounted seed {src} has no real .git directory ({git_path} is "
+        f"{'a file (git worktree pointer)' if git_path.exists() else 'missing'}). The container "
+        "seeds /obo-repo with `cp -a`, so a worktree pointer leaves the agent without git "
+        "identity (no seed stamp, no merge-base lineage). Use a full clone at the pinned commit."
+    )
+
+
 def run_instance(cid: str, row: dict, args, api_key: str, seed_settings: pathlib.Path,
                  task_total: float) -> dict:
     out = (ensure_outside_repo(pathlib.Path(args.out_dir).expanduser(), SRC) / cid.replace("/", "_")).resolve()
@@ -477,8 +512,15 @@ def run_instance(cid: str, row: dict, args, api_key: str, seed_settings: pathlib
         # capped at the RAM limit (clean OOM, exit 137) rather than swapping the
         # host to death. See README "Diagnosing SIGKILL / OOM".
         mem_flags = ["--memory", args.mem_limit, "--memory-swap", args.mem_limit]
+    # The named provenance override (owner Q8) is forwarded ONLY when the operator set it, so a
+    # normal run cannot accidentally inherit a permissive attestation posture.
+    override_env = (
+        ["-e", "OBO_ALLOW_EVOLVED_VOLUME=1"]
+        if str(os.environ.get("OBO_ALLOW_EVOLVED_VOLUME", "")).strip().lower() in {"1", "true", "yes"}
+        else []
+    )
     cmd = ["docker", "run", "--rm", "--pull=never", "--name", cname,
-        *mem_flags,
+        *mem_flags, *override_env,
         # Name-only env form: docker forwards the value from our process environment
         # (set below) so the live key never appears in the host argv / `ps` output.
         "-e", "OPENROUTER_API_KEY",
@@ -614,6 +656,13 @@ def run_instance(cid: str, row: dict, args, api_key: str, seed_settings: pathlib
             absorb = json.loads(abp.read_text(encoding="utf-8"))
         except Exception:
             absorb = {}
+    attestation = {}
+    atp = out / "seed_attestation.json"
+    if atp.exists():
+        try:
+            attestation = json.loads(atp.read_text(encoding="utf-8"))
+        except Exception:
+            attestation = {}
     image_id = ""
     try:
         image_id = subprocess.run(["docker", "image", "inspect", "-f", "{{.Id}}", img],
@@ -627,6 +676,7 @@ def run_instance(cid: str, row: dict, args, api_key: str, seed_settings: pathlib
            "infra_reason": infra_reason,
            "health_rollback": ("HEALTH_GATE_ROLLBACK" in clog) or ("PRETASK HEALTH-GATE FAILED" in clog),
            "selfedit": selfedit,
+           "seed_attestation": attestation,
            "evolution_degraded": bool(absorb.get("degraded")),
            "absorb_reason": str(absorb.get("reason", "")),
            "refl_line": grep1("knowledge files:"),
@@ -663,6 +713,7 @@ def normalize_result(row: dict, cid: str, args) -> dict:
         "solve_line": "",
         "quiet_line": "",
         "selfedit": {},
+        "seed_attestation": {},
         "evolution_degraded": False,
         "absorb_reason": "",
     }
@@ -708,6 +759,9 @@ def build_timeline_row(order: int, cid: str, res: dict, spent_after: float, flag
             "oom": bool(res.get("oom")), "n_events": int(res.get("n_events", 0)),
             "image_ref": str(res.get("image_ref", "")), "image_id": str(res.get("image_id", "")),
             "refl": res["refl_line"], "quiet": res["quiet_line"],
+            # Provenance of THIS attempt: which agent identity produced the patch (seed stamp /
+            # lineage verdict from inside the container), needed to attribute a result.
+            "seed_attestation": res.get("seed_attestation") or {},
             "commits_added": se.get("commits_added", 0),
             "loc_added": se.get("loc_added", 0), "loc_removed": se.get("loc_removed", 0),
             "tools_added": se.get("tools_added", []), "verdicts": se.get("verdicts", {}),
@@ -784,6 +838,9 @@ def main() -> int:
     ap.add_argument("--volume-suffix", default="",
                     help="suffix for obo-repo/obo-data volumes AND container names, e.g. -w1, so parallel "
                          "workers stay isolated (obo-repo-w1/obo-data-w1). Empty = shared default volumes.")
+    ap.add_argument("--allow-dirty-seed", action="store_true",
+                    help="record and proceed with an unclean/unidentifiable seed checkout instead "
+                         "of refusing (a dirty seed writes a '-dirty' manifest: not submittable)")
     ap.add_argument("--pause-on-api-err", type=int, default=0,
                     help="pause after a task whose api_errors count exceeds N (manual check: transient interruption vs legitimate recovery). -1 disables pausing")
     args = ap.parse_args()
@@ -793,110 +850,208 @@ def main() -> int:
     if not api_key and not os.environ.get("OPENAI_API_KEY", "").strip():
         print("error: neither OPENROUTER_API_KEY nor OPENAI_API_KEY is set", file=sys.stderr); return 2
 
-    ensure_util_image()  # pull the --pull=never utility image once, up front
-
     out_dir = ensure_outside_repo(pathlib.Path(args.out_dir).expanduser(), SRC)
     order = read_full_order() if args.full_set else read_csv_order(pathlib.Path(args.csv).expanduser())
     ids = order[args.start - 1: args.start - 1 + args.limit]
     print(f"[pro] sequence ({len(ids)}): " + " -> ".join(norm(i)[:40] for i in ids), file=sys.stderr)
     rows = load_pro_rows(ids)
+
+    vsuf = (getattr(args, "volume_suffix", "") or "")
+    settings_snapshot = {}
+    try:
+        settings_snapshot = json.loads(pathlib.Path(args.settings).expanduser().read_text(encoding="utf-8"))
+    except Exception:
+        settings_snapshot = {}
+    return _run_schedule(args, out_dir, ids, rows, vsuf, settings_snapshot, api_key)
+
+
+def _run_schedule(args, out_dir: pathlib.Path, ids: list, rows: dict, vsuf: str,
+                  settings_snapshot: dict, api_key: str) -> int:
+    """The run itself, split out of ``main()`` so the schedule keeps one scope of its own.
+
+    ``missing`` is DERIVED here rather than passed: it is a pure function of ``ids`` and
+    ``rows``, and this signature has to stay inside the 8-parameter cap the review checklist
+    asserts (``docs/DEVELOPMENT.md``).
+    """
     missing = [i for i in ids if i not in rows]
     if missing:
         print(f"[pro] !! missing from dataset (skip): {missing}", file=sys.stderr)
-
-    vsuf = (getattr(args, "volume_suffix", "") or "")
-    VREPO, VDATA = "obo-repo" + vsuf, "obo-data" + vsuf
-    if args.reset_state:
+    # Provenance + admission, BEFORE the first paid task: until v6.75.0 this driver wrote no
+    # manifest at all, so the universal seed gate could not protect the one benchmark where a
+    # dirty seed actually happened. The manifest is built once here (the gate runs inside it),
+    # augmented as the run progresses, and rewritten at the end. A run the seed gate refuses must
+    # not pull the utility image either (a mutation of the SHARED docker daemon) — that moved
+    # behind the gate too.
+    manifest_path = out_dir / "run_manifest.json"
+    manifest = admit_benchmark_run(
+        manifest_path,
+        benchmark="swe_bench_pro",
+        run_root=out_dir,
+        repo_dir=SRC,
+        requested_task_ids=list(ids),
+        require_clean=not args.allow_dirty_seed,
+        argv=sys.argv,
+        dataset="ScaleAI/SWE-bench_Pro",
+        settings_path=pathlib.Path(args.settings).expanduser(),
+        timeout_sec=args.solve_timeout,
+        output_paths={
+            "run_root": str(out_dir),
+            "predictions": str(out_dir / "predictions.jsonl"),
+            "timeline": str(out_dir / "timeline.jsonl"),
+            "manifest": str(manifest_path),
+        },
+        harness={
+            "driver": "e1v2/run_pro.py",
+            "solve_model": args.solve_model,
+            "evolution": bool(args.self_improve),
+            "cadence": args.cadence,
+            "volume_suffix": vsuf,
+        },
+        extra={"missing_from_dataset": missing, "outcome": "started"},
+    )
+    # `admit_benchmark_run` persisted it ALREADY, before anything could refuse — including the
+    # seed gate itself, whose refusal payload reaches disk before it raises. A manifest that only
+    # reached disk once setup succeeded left a refused run with no durable record of what was
+    # refused or why; the operator then had nothing but stderr, which a shard launcher discards.
+    # The shared finalization seam below rewrites it with the FINAL typed outcome on every exit
+    # path, so an unhandled failure can no longer leave the record saying `started`.
+    with finalize_run_manifest(manifest_path, manifest, outcome="completed") as final:
+        # Seed SHAPE is asserted here, after the manifest is on disk — not before admission. A
+        # worktree-pointer `.git` is precisely the refusal whose durable record matters (the
+        # container `cp -a`s the pointer and the agent ends up with no git identity), and checking
+        # it earlier made the admission seam stop being the outer boundary it claims to be.
+        try:
+            assert_seed_is_git_directory(SRC)
+        except SeedShapeRefused as refused:
+            print(f"[pro] FATAL: {refused}", file=sys.stderr)
+            final.update({"outcome": "refused", "exit_code": 2,
+                          "refusal": {"stage": "seed_shape", "exit_code": 2,
+                                      "reason": refused.reason}})
+            return 2
+        write_json(manifest_path, manifest)
+        ensure_util_image()  # pull the --pull=never utility image once, AFTER admission
+        VREPO, VDATA = "obo-repo" + vsuf, "obo-data" + vsuf
+        if args.reset_state:
+            for v in (VREPO, VDATA):
+                subprocess.run(["docker", "volume", "rm", "-f", v], capture_output=True)
         for v in (VREPO, VDATA):
-            subprocess.run(["docker", "volume", "rm", "-f", v], capture_output=True)
-    for v in (VREPO, VDATA):
-        subprocess.run(["docker", "volume", "create", v], capture_output=True)
+            subprocess.run(["docker", "volume", "create", v], capture_output=True)
 
-    def atomic_write(p: pathlib.Path, text: str) -> None:
-        tmp = p.with_suffix(p.suffix + ".tmp"); tmp.write_text(text, encoding="utf-8"); os.replace(tmp, p)
+        def atomic_write(p: pathlib.Path, text: str) -> None:
+            tmp = p.with_suffix(p.suffix + ".tmp"); tmp.write_text(text, encoding="utf-8"); os.replace(tmp, p)
 
-    preds, timeline = [], []
+        preds, timeline = [], []
 
-    def persist() -> None:
-        atomic_write(out_dir / "timeline.jsonl", "\n".join(json.dumps(t, ensure_ascii=False) for t in timeline) + "\n")
-        atomic_write(out_dir / "predictions.jsonl", "\n".join(json.dumps(p, ensure_ascii=False) for p in preds) + ("\n" if preds else ""))
+        def persist() -> None:
+            atomic_write(out_dir / "timeline.jsonl", "\n".join(json.dumps(t, ensure_ascii=False) for t in timeline) + "\n")
+            atomic_write(out_dir / "predictions.jsonl", "\n".join(json.dumps(p, ensure_ascii=False) for p in preds) + ("\n" if preds else ""))
 
-    for i, cid in enumerate([c for c in ids if c in rows], 1):
-        row = rows[cid]
-        img = f"{IMG_REPO}:{row['dockerhub_tag']}"
-        cid_dir = out_dir / cid.replace("/", "_")
-        # Resume: a prior (possibly teardown-killed) invocation already captured a
-        # patch for this task. Reconstruct the record from disk with NO Docker calls
-        # (no image pull, no state read) and continue. Skipped under --reset-state,
-        # which wants a clean fresh solve.
-        rr = None if args.reset_state else resume_result(cid, cid_dir, args.model_name)
-        if rr is not None:
-            res = normalize_result(rr, cid, args)
+        for i, cid in enumerate([c for c in ids if c in rows], 1):
+            row = rows[cid]
+            img = f"{IMG_REPO}:{row['dockerhub_tag']}"
+            cid_dir = out_dir / cid.replace("/", "_")
+            # Resume: a prior (possibly teardown-killed) invocation already captured a
+            # patch for this task. Reconstruct the record from disk with NO Docker calls
+            # (no image pull, no state read) and continue. Skipped under --reset-state,
+            # which wants a clean fresh solve.
+            rr = None if args.reset_state else resume_result(cid, cid_dir, args.model_name)
+            if rr is not None:
+                res = normalize_result(rr, cid, args)
+                if res["model_patch"].strip():
+                    preds.append({k: res[k] for k in ("instance_id", "model_name_or_path", "model_patch")})
+                # spent_after is unknown on resume; recording 0.0 avoids a docker state read.
+                timeline.append(build_timeline_row(i, cid, res, 0.0, ["RESUME"]))
+                persist()
+                print(f"[pro] RESUME task {i}/{len(ids)}: {norm(cid)[:50]} patch.diff exists "
+                      f"({len(res['model_patch'])}B), skipped re-solve (no docker)", file=sys.stderr)
+                continue
+            docker_pull_if_missing(img)
+            # v6.74.0 (C4): read the CUMULATIVE ledger spend on the FIRST task of the
+            # invocation too. auto_run drives run_pro per-task (--limit 1, i always 1),
+            # so the old `if i > 1 else 0.0` fast-path seeded every task with
+            # task_total = per_task_cost while the runtime compared the volume's
+            # cumulative ledger against it — the shard-starvation root cause
+            # (shard_07: task 1 spent $47.38 of a $50 "total"). ensure_util_image()
+            # already guarantees the utility image this read needs.
+            spent = read_spent_usd(VDATA)
+            if spent >= args.total_budget:
+                print(f"[pro] STOP: budget ${args.total_budget} exhausted (spent ${spent:.2f})", file=sys.stderr); break
+            task_total = min(args.total_budget, spent + args.per_task_cost)
+            seed = derive_run_settings(args.settings, out_dir, args.solve_model, task_total, args.per_task_cost,
+                                       post_task_evolution=args.self_improve, cadence=args.cadence,
+                                       review_slots=args.review_slots, review_effort=args.review_effort,
+                                       runtime_mode=args.runtime_mode, image_input_mode=args.image_input_mode)
+            print(f"\n[pro] === task {i}/{len(ids)}: {norm(cid)[:50]} === spent=${spent:.2f} cap=${task_total:.2f} lang={row.get('repo_language')}", file=sys.stderr)
+            res = normalize_result(run_instance(cid, row, args, api_key, seed, task_total), cid, args)
             if res["model_patch"].strip():
                 preds.append({k: res[k] for k in ("instance_id", "model_name_or_path", "model_patch")})
-            # spent_after is unknown on resume; recording 0.0 avoids a docker state read.
-            timeline.append(build_timeline_row(i, cid, res, 0.0, ["RESUME"]))
+            flags = [f for f, on in (("TIMEOUT", res["timed_out"]), ("INFRA", res["infra_suspect"]),
+                                     ("ROLLBACK", res["health_rollback"])) if on]
+            # EARLY persist BEFORE the teardown. The patch is already captured inside
+            # run_instance (read from /out/patch.diff before the container exits). The
+            # teardown below — dump_state, then the NEXT task's image pull — can hang for
+            # hours on a loaded docker daemon (colima). If the orchestrator kills a
+            # teardown-hung run, this record is already on disk, so auto_run sees a LEGIT
+            # task (timeline row exists) instead of a phantom failure it re-pulls and
+            # re-solves. The post-teardown write below corrects spent_after.
+            timeline.append(build_timeline_row(i, cid, res, spent, flags))   # provisional spend
             persist()
-            print(f"[pro] RESUME task {i}/{len(ids)}: {norm(cid)[:50]} patch.diff exists "
-                  f"({len(res['model_patch'])}B), skipped re-solve (no docker)", file=sys.stderr)
-            continue
-        docker_pull_if_missing(img)
-        # v6.74.0 (C4): read the CUMULATIVE ledger spend on the FIRST task of the
-        # invocation too. auto_run drives run_pro per-task (--limit 1, i always 1),
-        # so the old `if i > 1 else 0.0` fast-path seeded every task with
-        # task_total = per_task_cost while the runtime compared the volume's
-        # cumulative ledger against it — the shard-starvation root cause
-        # (shard_07: task 1 spent $47.38 of a $50 "total"). ensure_util_image()
-        # already guarantees the utility image this read needs.
-        spent = read_spent_usd(VDATA)
-        if spent >= args.total_budget:
-            print(f"[pro] STOP: budget ${args.total_budget} exhausted (spent ${spent:.2f})", file=sys.stderr); break
-        task_total = min(args.total_budget, spent + args.per_task_cost)
-        seed = derive_run_settings(args.settings, out_dir, args.solve_model, task_total, args.per_task_cost,
-                                   post_task_evolution=args.self_improve, cadence=args.cadence,
-                                   review_slots=args.review_slots, review_effort=args.review_effort,
-                                   runtime_mode=args.runtime_mode, image_input_mode=args.image_input_mode)
-        print(f"\n[pro] === task {i}/{len(ids)}: {norm(cid)[:50]} === spent=${spent:.2f} cap=${task_total:.2f} lang={row.get('repo_language')}", file=sys.stderr)
-        res = normalize_result(run_instance(cid, row, args, api_key, seed, task_total), cid, args)
-        if res["model_patch"].strip():
-            preds.append({k: res[k] for k in ("instance_id", "model_name_or_path", "model_patch")})
-        flags = [f for f, on in (("TIMEOUT", res["timed_out"]), ("INFRA", res["infra_suspect"]),
-                                 ("ROLLBACK", res["health_rollback"])) if on]
-        # EARLY persist BEFORE the teardown. The patch is already captured inside
-        # run_instance (read from /out/patch.diff before the container exits). The
-        # teardown below — dump_state, then the NEXT task's image pull — can hang for
-        # hours on a loaded docker daemon (colima). If the orchestrator kills a
-        # teardown-hung run, this record is already on disk, so auto_run sees a LEGIT
-        # task (timeline row exists) instead of a phantom failure it re-pulls and
-        # re-solves. The post-teardown write below corrects spent_after.
-        timeline.append(build_timeline_row(i, cid, res, spent, flags))   # provisional spend
-        persist()
-        dump_state(cid_dir, VREPO, VDATA, vsuf)
-        spent_after = read_spent_usd(VDATA)
-        timeline[-1] = build_timeline_row(i, cid, res, spent_after, flags)   # accurate spend
-        se = res.get("selfedit") or {}
-        print(f"[pro] {norm(cid)[:50]}: patch={len(res['model_patch'])}B spent=${spent_after:.2f} api_err={res['api_errors']} ctx_err={res['api_ctx']} {' '.join(flags) or 'ok'}", file=sys.stderr)
-        if args.pretask_evolution:
-            pe = res.get("pretask_evolution") or {}
-            print(f"[pro]    pretask-evolution: absorbed={pe.get('absorbed', False)} cycles={pe.get('cycles_after', 0)} "
-                  f"reason={pe.get('reason', '')} degraded={pe.get('degraded', False)} elapsed={pe.get('elapsed_sec', '?')}", file=sys.stderr)
-        if args.self_improve:
-            print(f"[pro]    self-edit: commits={se.get('commits_added',0)} loc=+{se.get('loc_added',0)}/-{se.get('loc_removed',0)} "
-                  f"tools={len(se.get('tools_added',[]))} verdicts={se.get('verdicts',{})} rollback={se.get('health_rollback',False)}", file=sys.stderr)
-        for key in ("solve_line", "refl_line", "quiet_line"):
-            if res[key]:
-                print(f"[pro]    {res[key]}", file=sys.stderr)
-        print(f"[pro]    dump: data={'OK' if (cid_dir/'obo-data.tgz').exists() else 'NO'} repo={'OK' if (cid_dir/'obo-repo.tgz').exists() else 'NO'}", file=sys.stderr)
-        persist()
-        if args.pause_on_api_err >= 0 and res["api_errors"] > args.pause_on_api_err:
-            print(f"\n[pro] ⏸ PAUSED_API_ERR: task {i} ({norm(cid)[:46]}) api_errors={res['api_errors']} > {args.pause_on_api_err}, "
-                  f"patch={len(res['model_patch'])}B", file=sys.stderr)
-            print("[pro]    MANUAL CHECK: legitimate recovery (real patch, events appended) or transient interruption (0B/few edits).", file=sys.stderr)
-            print(f"[pro]    post-task dump saved in {cid.replace('/','_')}/. Rerun this task by restoring volumes to the previous dump and using --start {args.start + i - 1}.", file=sys.stderr)
-            break
+            # CAMPAIGN-fatal provenance refusal, decided by the SHARED authority both drivers
+            # consume. These reasons are properties of the volume plus the mounted seed, so every
+            # remaining task would refuse identically: continuing appended one INFRA row per task
+            # and still returned 0 with `outcome: completed`, i.e. a zero headline reported as
+            # success. `auto_run` already stopped its shard on exactly this set; a DIRECT run_pro
+            # invocation (and `orchestrate_probe`, which shells out to it) had no such stop.
+            # Tested immediately after the row is persisted (auto_run parses that row) and BEFORE
+            # dump_state / read_spent_usd: the volume archival below can hang for hours on a loaded
+            # daemon, which would strand the promised refusal and exit code instead of recording it.
+            fatal_reason = str(res.get("infra_reason") or "")
+            if fatal_reason in CAMPAIGN_FATAL_PROVENANCE_REASONS:
+                print(f"[pro] FATAL: provenance refusal reason={fatal_reason} on task {i} "
+                      f"({norm(cid)[:46]}); stopping the schedule instead of refusing every "
+                      f"remaining task. Fix the volume/seed, or set {ALLOW_EVOLVED_VOLUME_ENV}=1 "
+                      "to run against a deliberately evolved volume and record it.",
+                      file=sys.stderr)
+                final.update({
+                    "outcome": "refused",
+                    "exit_code": 2,
+                    "refusal": {"stage": "volume_provenance", "exit_code": 2,
+                                "reason": fatal_reason, "task_index": i, "instance_id": cid},
+                })
+                break
+            dump_state(cid_dir, VREPO, VDATA, vsuf)
+            spent_after = read_spent_usd(VDATA)
+            timeline[-1] = build_timeline_row(i, cid, res, spent_after, flags)   # accurate spend
+            se = res.get("selfedit") or {}
+            print(f"[pro] {norm(cid)[:50]}: patch={len(res['model_patch'])}B spent=${spent_after:.2f} api_err={res['api_errors']} ctx_err={res['api_ctx']} {' '.join(flags) or 'ok'}", file=sys.stderr)
+            if args.pretask_evolution:
+                pe = res.get("pretask_evolution") or {}
+                print(f"[pro]    pretask-evolution: absorbed={pe.get('absorbed', False)} cycles={pe.get('cycles_after', 0)} "
+                      f"reason={pe.get('reason', '')} degraded={pe.get('degraded', False)} elapsed={pe.get('elapsed_sec', '?')}", file=sys.stderr)
+            if args.self_improve:
+                print(f"[pro]    self-edit: commits={se.get('commits_added',0)} loc=+{se.get('loc_added',0)}/-{se.get('loc_removed',0)} "
+                      f"tools={len(se.get('tools_added',[]))} verdicts={se.get('verdicts',{})} rollback={se.get('health_rollback',False)}", file=sys.stderr)
+            for key in ("solve_line", "refl_line", "quiet_line"):
+                if res[key]:
+                    print(f"[pro]    {res[key]}", file=sys.stderr)
+            print(f"[pro]    dump: data={'OK' if (cid_dir/'obo-data.tgz').exists() else 'NO'} repo={'OK' if (cid_dir/'obo-repo.tgz').exists() else 'NO'}", file=sys.stderr)
+            persist()
+            if args.pause_on_api_err >= 0 and res["api_errors"] > args.pause_on_api_err:
+                print(f"\n[pro] ⏸ PAUSED_API_ERR: task {i} ({norm(cid)[:46]}) api_errors={res['api_errors']} > {args.pause_on_api_err}, "
+                      f"patch={len(res['model_patch'])}B", file=sys.stderr)
+                print("[pro]    MANUAL CHECK: legitimate recovery (real patch, events appended) or transient interruption (0B/few edits).", file=sys.stderr)
+                print(f"[pro]    post-task dump saved in {cid.replace('/','_')}/. Rerun this task by restoring volumes to the previous dump and using --start {args.start + i - 1}.", file=sys.stderr)
+                break
 
-    print(f"\n[pro] done. tasks={len(timeline)} predictions={len(preds)} -> {out_dir/'predictions.jsonl'}", file=sys.stderr)
-    return 0
+        manifest["extra"].update({
+            "task_count": len(timeline),
+            "prediction_count": len(preds),
+        })
+        print(f"\n[pro] done. tasks={len(timeline)} predictions={len(preds)} -> {out_dir/'predictions.jsonl'}", file=sys.stderr)
+        # The seam's mapping carries the exit status through loop exit: a `break` that stopped the
+        # schedule (a campaign-fatal provenance refusal) must not be reported as success. Normal
+        # completion leaves the default 0.
+        return int(final.get("exit_code") or 0)
 
 
 if __name__ == "__main__":

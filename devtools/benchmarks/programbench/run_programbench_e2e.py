@@ -20,9 +20,15 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
-from devtools.benchmarks.common.manifests import MODEL_SLOT_KEYS, benchmark_run_manifest, write_json
+from devtools.benchmarks.common.manifests import (
+    MODEL_SLOT_KEYS,
+    admit_benchmark_run,
+    finalize_run_manifest,
+    runtime_attestation,
+    write_json,
+)
 from devtools.benchmarks.common.official_commands import programbench_command_for_manifest
-from devtools.benchmarks.common.result_index import task_result_row, write_result_index
+from devtools.benchmarks.common.result_index import append_result_index, task_result_row
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
     ensure_outside_repo,
@@ -413,6 +419,11 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="docker setup + task body only")
     parser.add_argument("--eval", action="store_true", help="run official programbench eval/info after all instances")
     parser.add_argument("--no-eval", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--allow-dirty-seed",
+        action="store_true",
+        help="record and proceed with an unclean/unidentifiable seed checkout instead of refusing",
+    )
     args = parser.parse_args()
     if args.no_eval:
         args.eval = False
@@ -434,119 +445,184 @@ def main() -> int:
     if not instances:
         raise SystemExit("no ProgramBench instances matched the selection")
 
-    write_json(
-        out_root / "instance_order.json",
-        {
-            "count": len(instances),
+    selected_ids = [str(item["instance_id"]) for item in instances]
+    manifest_path = out_root / "run_manifest.json"
+    ledger_path = out_root / "result_index.jsonl"
+    # ADMISSION, before the first instance burns anything: the seed-provenance gate (built into
+    # the manifest) plus the runtime identity of the server we are about to submit to. Until
+    # v6.75.0 this manifest was written at the very END of the run — after every instance and
+    # the official eval — so the gate physically could not stop an unreproducible run.
+    # `admit_benchmark_run` persists the complete gate/refusal payload BEFORE enforcement raises.
+    manifest = admit_benchmark_run(
+        manifest_path,
+        benchmark="programbench",
+        run_root=out_root,
+        repo_dir=repo_dir,
+        requested_task_ids=selected_ids,
+        require_clean=not args.allow_dirty_seed,
+        argv=sys.argv,
+        output_paths={
+            "run_root": str(out_root),
+            "ledger": str(ledger_path),
+            "manifest": str(manifest_path),
+        },
+        dataset="programbench",
+        harness={
+            "ouroboros_url": str(args.ouroboros_url),
+            "difficulty": str(args.difficulty or ""),
+            "dry_run": bool(args.dry_run),
+            "solve_model": str(args.solve_model or ""),
+            "model_slots_normalized": model_slots,
+        },
+        official_command=programbench_command_for_manifest(out_root, eval_requested=bool(args.eval)),
+        isolated_data_root="",
+        settings_path=settings_path,
+        extra={
+            "eval_requested": bool(args.eval),
+            "official_eval_status": "not_run",
+            "protected_paths": protected_paths,
             "shuffle": bool(args.shuffle),
             "shuffle_seed": 42 if args.shuffle else None,
-            "instance_ids": [str(item["instance_id"]) for item in instances],
+            "instance_order": str(out_root / "instance_order.json"),
+            "runtime_attestation": {"pending": "not_attested_yet"},
         },
     )
 
-    selected_ids = [str(item["instance_id"]) for item in instances]
-    skipped_rows: list[dict[str, Any]] = []
-    if not args.redo_existing:
-        # Resume narrows the WORK, never the ledger denominator: instances with a
-        # prior submission are recorded as explicit skipped rows, not dropped.
-        pending = []
-        for instance in instances:
-            submission = safe_join_under(out_root, str(instance["instance_id"])) / "submission.tar.gz"
-            if submission.is_file() and submission.stat().st_size > 0:
-                skipped_rows.append(task_result_row(
-                    benchmark="programbench",
-                    instance_id=str(instance["instance_id"]),
-                    status="skipped",
-                    reason_code="skipped_existing_submission",
-                    prediction_written=True,
-                    official_eval_status="not_run",
-                    output_paths={"submission": str(submission)},
-                ))
-                continue
-            pending.append(instance)
-        instances = pending
-
-    rows: list[dict[str, Any]] = list(skipped_rows)
-    cfg = InstanceRunConfig(
-        out_root=out_root,
-        ouroboros_url=str(args.ouroboros_url),
-        timeout_sec=float(args.timeout_sec),
-        cpus=str(args.cpus),
-        memory=str(args.memory),
-        protected_paths=protected_paths,
-        dry_run=bool(args.dry_run),
-        skip_pull=bool(args.skip_pull),
-        redo_existing=bool(args.redo_existing),
-    )
-    for instance in instances:
-        row = _process_instance(instance, cfg)
-        rows.append(row)
-        write_result_index(safe_join_under(out_root, str(instance["instance_id"])) / "result_index.jsonl", [row])
-
-    ledger_path = out_root / "result_index.jsonl"
-    write_result_index(ledger_path, rows)
-
-    eval_result = None
-    official_eval_status = "not_run"
-    if args.eval and not args.dry_run:
-        try:
-            eval_result = run_official_eval(out_root)
-            # returncode != 0 = the eval RAN and reported test failures (a valid
-            # partial-pass benchmark result, not a run error).
-            official_eval_status = "completed" if eval_result.get("eval", {}).get("returncode") == 0 else "failed"
-        except Exception as exc:
-            # The eval could not RUN at all (harness/infra error) — distinct from a
-            # ran-but-some-tests-failed result; this is a run error (r2 fable #3).
-            official_eval_status = "error"
-            write_json(
-                out_root / "programbench_eval_result.json",
-                {"error": str(exc), "traceback": traceback.format_exc()},
-            )
-
-    write_json(
-        out_root / "run_manifest.json",
-        benchmark_run_manifest(
-            benchmark="programbench",
-            run_root=out_root,
-            repo_dir=repo_dir,
-            requested_task_ids=selected_ids,
-            argv=sys.argv,
-            output_paths={
-                "run_root": str(out_root),
-                "ledger": str(ledger_path),
-                "manifest": str(out_root / "run_manifest.json"),
-            },
-            dataset="programbench",
-            harness={
-                "ouroboros_url": str(args.ouroboros_url),
-                "difficulty": str(args.difficulty or ""),
-                "dry_run": bool(args.dry_run),
-                "solve_model": str(args.solve_model or ""),
-                "model_slots_normalized": model_slots,
-            },
-            official_command=programbench_command_for_manifest(out_root, eval_requested=bool(args.eval)),
-            isolated_data_root="",
-            settings_path=settings_path,
-            extra={
-                "eval_requested": bool(args.eval),
-                "official_eval_status": official_eval_status,
-                "protected_paths": protected_paths,
+    with finalize_run_manifest(manifest_path, manifest, outcome="completed") as final:
+        # Written AFTER persisted admission: a refused run must not leave run artefacts behind, and
+        # nothing before the admission call may touch the filesystem.
+        write_json(
+            out_root / "instance_order.json",
+            {
+                "count": len(instances),
                 "shuffle": bool(args.shuffle),
                 "shuffle_seed": 42 if args.shuffle else None,
-                "instance_order": str(out_root / "instance_order.json"),
+                "instance_ids": [str(item["instance_id"]) for item in instances],
+            },
+        )
+        # Attestation runs INSIDE the finalization block, never in the admission call's argument
+        # list: Python evaluates arguments BEFORE entering the callee, so an attestation refusal
+        # there meant `admit_benchmark_run` never ran and no manifest ever reached disk — the
+        # durable-refusal contract defeated by evaluation order. The refusal still propagates
+        # (unchanged behaviour); it is now recorded as a typed refusal first.
+        if args.dry_run:
+            manifest["extra"]["runtime_attestation"] = {"skipped": "dry_run"}
+        else:
+            try:
+                attested = runtime_attestation(str(args.ouroboros_url), repo_dir)
+            except Exception as exc:
+                # A refusal CARRIES the record it built (`RuntimeAttestationRefused.attestation`),
+                # so the durable manifest keeps the exact typed reason plus the runtime_version /
+                # repo_head / repo_version facts instead of a generic message. The fallback reason
+                # covers a failure that carries no record at all.
+                refused = getattr(exc, "attestation", None)
+                if isinstance(refused, dict):
+                    manifest["extra"]["runtime_attestation"] = refused
+                final.update({
+                    "outcome": "refused",
+                    "exit_code": 3,
+                    "refusal": {
+                        "stage": "runtime_attestation",
+                        "exit_code": 3,
+                        "reason": str((refused or {}).get("reason") or "")
+                                  or "runtime_attestation_failed",
+                    },
+                })
+                # RETURN the recorded code, never re-raise it. An escaping RuntimeError exits the
+                # process with status 1 (`raise SystemExit(main())` is never reached), so a bare
+                # re-raise made the durable record say 3 while the process said 1 — the record and
+                # reality disagreeing is the one thing this manifest exists to prevent. The message
+                # the exception used to surface is logged here instead.
+                print(f"[pb-e2e] FATAL: {exc}", file=sys.stderr)
+                return 3
+            manifest["extra"]["runtime_attestation"] = attested
+        skipped_rows: list[dict[str, Any]] = []
+        if not args.redo_existing:
+            # Resume narrows the WORK, never the ledger denominator: instances with a
+            # prior submission are recorded as explicit skipped rows, not dropped.
+            pending = []
+            for instance in instances:
+                submission = safe_join_under(out_root, str(instance["instance_id"])) / "submission.tar.gz"
+                if submission.is_file() and submission.stat().st_size > 0:
+                    skipped_rows.append(task_result_row(
+                        benchmark="programbench",
+                        instance_id=str(instance["instance_id"]),
+                        status="skipped",
+                        reason_code="skipped_existing_submission",
+                        prediction_written=True,
+                        official_eval_status="not_run",
+                        output_paths={"submission": str(submission)},
+                    ))
+                    continue
+                pending.append(instance)
+            instances = pending
+
+        rows: list[dict[str, Any]] = list(skipped_rows)
+        cfg = InstanceRunConfig(
+            out_root=out_root,
+            ouroboros_url=str(args.ouroboros_url),
+            timeout_sec=float(args.timeout_sec),
+            cpus=str(args.cpus),
+            memory=str(args.memory),
+            protected_paths=protected_paths,
+            dry_run=bool(args.dry_run),
+            skip_pull=bool(args.skip_pull),
+            redo_existing=bool(args.redo_existing),
+        )
+        # APPEND-ONLY run ledger: one line per row, written the moment the row exists. The old
+        # whole-file rewrite at the end of the run discarded every completed instance if the
+        # process died mid-run, and a resumed run silently replaced the previous run's history.
+        # Readers dedup by instance_id, LAST row wins (documented in programbench/README.md).
+        # BOTH locations for EVERY row, skips included: a resumed instance whose skip event only
+        # reached the run root has an instance-level history that silently omits the resume, and the
+        # README states the two-location contract without qualification.
+        for row in skipped_rows:
+            append_result_index(safe_join_under(out_root, str(row["instance_id"])), row)
+            append_result_index(out_root, row)
+        for instance in instances:
+            row = _process_instance(instance, cfg)
+            rows.append(row)
+            append_result_index(safe_join_under(out_root, str(instance["instance_id"])), row)
+            append_result_index(out_root, row)
+
+        eval_result = None
+        official_eval_status = "not_run"
+        if args.eval and not args.dry_run:
+            try:
+                eval_result = run_official_eval(out_root)
+                # returncode != 0 = the eval RAN and reported test failures (a valid
+                # partial-pass benchmark result, not a run error).
+                official_eval_status = "completed" if eval_result.get("eval", {}).get("returncode") == 0 else "failed"
+            except Exception as exc:
+                # The eval could not RUN at all (harness/infra error) — distinct from a
+                # ran-but-some-tests-failed result; this is a run error (r2 fable #3).
+                official_eval_status = "error"
+                write_json(
+                    out_root / "programbench_eval_result.json",
+                    {"error": str(exc), "traceback": traceback.format_exc()},
+                )
+
+        manifest["extra"].update(
+            {
+                "official_eval_status": official_eval_status,
                 "completed_count": sum(1 for row in rows if row.get("status") == "completed"),
                 "failed_count": sum(1 for row in rows if not _row_successful(row)),
-            },
-        ),
-    )
-    print(out_root)
-    rows_ok = all(_row_successful(row) for row in rows)
-    # A REQUESTED official eval that could NOT run (harness error) is a run failure
-    # even when every solve completed — otherwise `run_...e2e --eval && ...` reads a
-    # broken eval as success. A "failed" eval that merely reported test failures is
-    # a valid partial-pass result and does NOT fail the run (r2 fable #3).
-    eval_errored = bool(args.eval) and not args.dry_run and official_eval_status == "error"
-    return 0 if (rows_ok and not eval_errored) else 1
+            }
+        )
+        print(out_root)
+        rows_ok = all(_row_successful(row) for row in rows)
+        # A REQUESTED official eval that could NOT run (harness error) is a run failure
+        # even when every solve completed — otherwise `run_...e2e --eval && ...` reads a
+        # broken eval as success. A "failed" eval that merely reported test failures is
+        # a valid partial-pass result and does NOT fail the run (r2 fable #3).
+        eval_errored = bool(args.eval) and not args.dry_run and official_eval_status == "error"
+        code = 0 if (rows_ok and not eval_errored) else 1
+        if code:
+            # A typed terminal outcome, not a bare exit code: the two reasons a completed run
+            # still fails are distinguishable in its own record.
+            final["outcome"] = "official_eval_error" if eval_errored else "instances_failed"
+        final["exit_code"] = code
+        return code
 
 
 if __name__ == "__main__":

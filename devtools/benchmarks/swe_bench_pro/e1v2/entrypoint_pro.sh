@@ -15,7 +15,38 @@ mkdir -p /obo-data /out
 IID="${OBO_INSTANCE_ID:-task}"
 WORK="${OBO_WORKDIR:-/app}"
 
-[ -e /obo-repo/.git ] || { echo "[pro] seed /obo-repo" >&2; cp -a /opt/ouroboros-ro/. /obo-repo/; }
+# The mounted seed's identity is computed ONCE here and reused by BOTH the stamp write and the
+# verification below — two independent `rev-parse` invocations could disagree, and a persisted
+# `unknown` sentinel HEAD later reads as `seed_mismatch`/`lineage_broken` instead of
+# saying what actually happened. An unreadable HEAD is its own typed reason and NEVER becomes a
+# stamp: a sentinel stamp would poison every later task on this volume.
+MOUNTED_VERSION="$(tr -d '[:space:]' < /opt/ouroboros-ro/VERSION 2>/dev/null)"
+MOUNTED_HEAD="$(git -C /opt/ouroboros-ro -c safe.directory='*' rev-parse HEAD 2>/dev/null)"
+SEED_REASON=""
+# The ONLY reason OBO_ALLOW_EVOLVED_VOLUME=1 may ever waive, mirroring
+# OVERRIDABLE_ATTESTATION_REASONS in devtools/benchmarks/common/manifests.py. It authorises a
+# deliberately evolved / version-skewed runtime and NOTHING else: stamp_absent, seed_mismatch,
+# lineage_broken, seed_head_unreadable and runtime_unreachable all mean the volume's provenance
+# or the live runtime identity was never established at all, so waiving them would let a paid
+# solve continue while attesting NOTHING - the fail-open this gate exists to remove.
+OBO_OVERRIDABLE_SEED_REASON="runtime_skew"
+[ -n "$MOUNTED_HEAD" ] || SEED_REASON="seed_head_unreadable"
+
+# The seeding CONDITION STAYS: an existing /obo-repo/.git is an EVOLVED volume carried from a
+# previous task and re-seeding it would erase the agent's own reviewed commits. Seeding also
+# writes the immutable SEED STAMP `<VERSION> <HEAD>` of the mounted source; the stamp lives
+# inside .git so it never shows up as untracked working-tree dirt. Verification of the stamp
+# happens once, below, after the server starts.
+[ -e /obo-repo/.git ] || {
+  echo "[pro] seed /obo-repo" >&2
+  cp -a /opt/ouroboros-ro/. /obo-repo/
+  if [ -n "$MOUNTED_HEAD" ]; then
+    printf '%s %s\n' "$MOUNTED_VERSION" "$MOUNTED_HEAD" \
+      > /obo-repo/.git/ouroboros_seed 2>/dev/null || true
+  else
+    echo "[pro] seed HEAD unreadable — refusing to persist a sentinel stamp" >&2
+  fi
+}
 git -C /obo-repo config user.name  "Ouroboros"          2>/dev/null || true
 git -C /obo-repo config user.email "ouroboros@local.mac" 2>/dev/null || true
 cp /opt/oboros-settings-ro.json /obo-data/settings.json
@@ -149,6 +180,25 @@ git -C "$WORK" ls-files --others --exclude-standard -z > /out/base_untracked.sna
 
 REPO_HEAD0="$(git -C /obo-repo rev-parse HEAD 2>/dev/null)"
 
+# --- SEED INVARIANT (one-shot, before the paid solve). Three DIFFERENT identities, never
+# conflated: the immutable seed STAMP, the live HEAD of the evolving volume, and the version the
+# running server reports over HTTP. Equality is only correct for the stamp; the live HEAD must
+# be the stamp or a DESCENDANT of it, because an evolution run legitimately moves HEAD forward.
+# This is a single step, NOT part of ready_probe(): the readiness loop treats every non-zero rc
+# as "not ready yet", so a refusal inside the probe would be swallowed and burn the full 900s.
+# MOUNTED_VERSION / MOUNTED_HEAD / SEED_REASON come from the single computation at the top of
+# this script (one `rev-parse`, no `unknown` sentinel).
+SEED_STAMP="$(cat /obo-repo/.git/ouroboros_seed 2>/dev/null | head -1)"
+if [ -n "$SEED_REASON" ]; then
+  : # seed_head_unreadable already decided: the mounted source has no readable identity
+elif [ -z "$SEED_STAMP" ]; then
+  SEED_REASON="stamp_absent"                       # .git exists but no stamp: pre-v6.75.0 volume
+elif [ "$SEED_STAMP" != "$MOUNTED_VERSION $MOUNTED_HEAD" ]; then
+  SEED_REASON="seed_mismatch"                      # this volume was seeded from OTHER source
+elif ! git -C /obo-repo merge-base --is-ancestor "${SEED_STAMP##* }" "$REPO_HEAD0" 2>/dev/null; then
+  SEED_REASON="lineage_broken"                     # live HEAD is not a descendant of the seed
+fi
+
 export OUROBOROS_SERVER_HOST=127.0.0.1
 export OUROBOROS_SERVER_PORT=8765
 "$OBO_PY" /obo-repo/server.py >>/out/server.log 2>&1 &
@@ -172,6 +222,74 @@ while [ $(( $(date +%s) - T0 )) -lt "$READY_MAX" ]; do
 done
 [ "$R" = 1 ] || { echo "[pro] not ready after ${READY_MAX}s" >&2; tail -30 /out/server.log >&2; kill "$SRV" 2>/dev/null; exit 1; }
 echo "[pro] server ready in $(( $(date +%s) - T0 ))s" >&2
+
+# --- RUNTIME ATTESTATION (one-shot, still before the paid solve): the version the RUNNING
+# server reports over the frozen /api/health contract must match the live /obo-repo it was
+# started from. Deliberately AFTER the readiness loop (the endpoint has to be up) and before
+# anything is spent; the seed invariant computed above is decided together with it here, so a
+# refusal produces exactly one typed reason for auto_run's retry classifier.
+RUNTIME_VERSION="$("$OBO_PY" - <<'PYEOF' 2>/dev/null
+import json, urllib.request
+try:
+    with urllib.request.urlopen("http://127.0.0.1:8765/api/health", timeout=10) as r:
+        print(str(json.loads(r.read().decode()).get("runtime_version") or ""))
+except Exception:
+    print("")
+PYEOF
+)"
+LIVE_VERSION="$(tr -d '[:space:]' < /obo-repo/VERSION 2>/dev/null)"
+# An EMPTY RUNTIME_VERSION is not a skew, it is the ABSENCE of a live identity: the heredoc above
+# prints "" for any transport failure, a non-200, or a body that is not the /api/health contract.
+# Collapsing that into runtime_skew made it OVERRIDABLE, so with OBO_ALLOW_EVOLVED_VOLUME=1
+# exported the container solved on against a server it had never identified. Its own
+# non-overridable reason keeps it fail-closed. A genuine skew (both versions known and different,
+# or an unreadable /obo-repo/VERSION) stays the deliberately waivable case.
+if [ -z "$SEED_REASON" ]; then
+  if [ -z "$RUNTIME_VERSION" ]; then
+    SEED_REASON="runtime_unreachable"
+  elif [ "$RUNTIME_VERSION" != "$LIVE_VERSION" ]; then
+    SEED_REASON="runtime_skew"
+  fi
+fi
+SEED_STAMP="$SEED_STAMP" MOUNTED_VERSION="$MOUNTED_VERSION" MOUNTED_HEAD="$MOUNTED_HEAD" \
+REPO_HEAD0="$REPO_HEAD0" LIVE_VERSION="$LIVE_VERSION" RUNTIME_VERSION="$RUNTIME_VERSION" \
+SEED_REASON="$SEED_REASON" OBO_OVERRIDABLE_SEED_REASON="$OBO_OVERRIDABLE_SEED_REASON" \
+"$OBO_PY" - >/out/seed_attestation.json 2>/dev/null <<'PYEOF' || true
+import json, os
+reason = os.environ.get("SEED_REASON", "")
+waives = [r for r in os.environ.get("OBO_OVERRIDABLE_SEED_REASON", "").split(",") if r]
+override_set = os.environ.get("OBO_ALLOW_EVOLVED_VOLUME", "") == "1"
+print(json.dumps({
+    "schema": "ouroboros.benchmark.seed_attestation.v1",
+    "seed": os.environ.get("SEED_STAMP", ""),
+    "mounted_version": os.environ.get("MOUNTED_VERSION", ""),
+    "mounted_head": os.environ.get("MOUNTED_HEAD", ""),
+    "live_head": os.environ.get("REPO_HEAD0", ""),
+    "live_version": os.environ.get("LIVE_VERSION", ""),
+    "runtime_version": os.environ.get("RUNTIME_VERSION", ""),
+    "reason": reason,
+    "ok": not reason,
+    # override_set (was it exported) is a DIFFERENT fact from overridden (did it waive THIS
+    # reason), exactly as in common/manifests.py::runtime_attestation. The old record conflated
+    # them, so an audit of a refused run read as if the override had applied.
+    "override_set": override_set,
+    "override_waives": waives,
+    "overridden": bool(reason) and override_set and reason in waives,
+}))
+PYEOF
+if [ -n "$SEED_REASON" ]; then
+  if [ "${OBO_ALLOW_EVOLVED_VOLUME:-0}" = "1" ] && [ "$SEED_REASON" = "$OBO_OVERRIDABLE_SEED_REASON" ]; then
+    echo "[pro] provenance $SEED_REASON OVERRIDDEN by OBO_ALLOW_EVOLVED_VOLUME=1 (recorded in /out/seed_attestation.json)" >&2
+  else
+    if [ "${OBO_ALLOW_EVOLVED_VOLUME:-0}" = "1" ]; then
+      echo "[pro] OBO_ALLOW_EVOLVED_VOLUME=1 does NOT waive reason=$SEED_REASON (it waives only $OBO_OVERRIDABLE_SEED_REASON): the volume provenance or the live runtime identity was never established, so there is nothing to attest" >&2
+    fi
+    echo "SOLVE_INFRA_SUSPECT reason=$SEED_REASON" >&2
+    echo "[pro] refusing to solve: stamp='$SEED_STAMP' mounted='$MOUNTED_VERSION $MOUNTED_HEAD' live_head=$REPO_HEAD0 runtime=$RUNTIME_VERSION live=$LIVE_VERSION" >&2
+    kill "$SRV" 2>/dev/null || true
+    exit 88
+  fi
+fi
 
 "$OBO_PY" -m ouroboros.cli --url http://127.0.0.1:8765 evolve stop >/dev/null 2>&1 || true
 

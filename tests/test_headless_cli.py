@@ -2414,6 +2414,9 @@ def test_swebench_helper_records_cli_timeout_with_continue(tmp_path, monkeypatch
         "argv",
         [
             "swebench_predictions.py",
+            # --allow-dirty-seed: this test exercises the CLI-timeout ledger path, not the
+            # v6.75.0 seed-provenance gate, so it must not depend on the developer's tree state.
+            "--allow-dirty-seed",
             "--input",
             str(rows_path),
             "--output",

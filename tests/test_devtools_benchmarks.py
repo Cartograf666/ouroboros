@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import io
@@ -114,11 +115,14 @@ def test_benchmark_manifest_records_provenance_without_diff_text(tmp_path):
     (repo / "app.py").write_text("print('changed')\n", encoding="utf-8")
 
     provenance = repo_provenance(repo)
+    # require_clean=False: this test asserts the provenance RECORD on a deliberately dirty
+    # checkout. The gate itself (default require_clean=True) is asserted separately below.
     manifest = benchmark_run_manifest(
         benchmark="unit",
         run_root=tmp_path / "run",
         repo_dir=repo,
         requested_task_ids=["task-1"],
+        require_clean=False,
         metadata={"argv": ["bench", "--task", "task-1"]},
     )
 
@@ -127,6 +131,17 @@ def test_benchmark_manifest_records_provenance_without_diff_text(tmp_path):
     assert "print('changed')" not in json.dumps(provenance)
     assert manifest["requested_count"] == 1
     assert manifest["source"]["tracked_diff_sha256"]
+    assert manifest["seed_gate"] == {
+        "require_clean": False,
+        "allow_dirty_seed": True,
+        "expect": "",
+        "git_available": True,
+        "status_available": True,
+        "dirty": True,
+        "describe": manifest["source"]["describe"],
+        "reason": "seed_dirty",
+        "ok": False,
+    }
 
 
 def test_benchmark_common_helpers_keep_compact_api_surface():
@@ -857,7 +872,7 @@ def test_programbench_task_body_sets_executor_and_protected_policy(tmp_path):
     assert protected["allow"] == ["execute"]
     assert {"read_bytes", "hash", "static_introspection", "dynamic_trace", "debug"} <= set(protected["deny"])
     # House rule: benches measure the single-model Ouroboros harness.
-    assert body["disabled_tools"] == ["claude_code_edit"]
+    assert body["disabled_tools"] == ["claude_code_edit", "schedule_subagent"]
     # POST /api/tasks accepts no top-level task_contract field; the pacing block
     # rides in metadata.budget_profile and must already be in the normalized
     # contract shape so build_task_contract() adopts it verbatim.
@@ -1014,6 +1029,7 @@ def test_programbench_preflight_failure_writes_blocker_sidecars(tmp_path, monkey
         "argv",
         [
             "run_programbench.py",
+            "--allow-dirty-seed",
             "--workspace",
             str(workspace),
             "--instruction-file",
@@ -1073,7 +1089,7 @@ def test_programbench_prepare_only_normalizes_raw_workspace(tmp_path, monkeypatc
     monkeypatch.setattr(run_programbench, "preflight_cleanroom_container",
                         lambda _: {"image": "task_cleanroom", "network": "none"})
     monkeypatch.setattr(sys, "argv", [
-        "run_programbench.py", "--workspace", str(workspace),
+        "run_programbench.py", "--allow-dirty-seed", "--workspace", str(workspace),
         "--instruction-file", str(instruction), "--container-name", "pb",
         "--instance-id", "case-prep", "--ledger-output", str(output),
         "--manifest-output", str(manifest),
@@ -1110,6 +1126,7 @@ def test_programbench_submission_failure_writes_sidecars(tmp_path, monkeypatch):
         "argv",
         [
             "run_programbench.py",
+            "--allow-dirty-seed",
             "--workspace",
             str(workspace),
             "--instruction-file",
@@ -1159,6 +1176,7 @@ def test_programbench_official_eval_failure_writes_sidecars(tmp_path, monkeypatc
         "argv",
         [
             "run_programbench.py",
+            "--allow-dirty-seed",
             "--workspace",
             str(workspace),
             "--instruction-file",
@@ -2247,6 +2265,7 @@ def test_swe_pro_predictions_continue_on_error_writes_denominator_ledger(tmp_pat
         "argv",
         [
             "pro_predictions.py",
+            "--allow-dirty-seed",
             "--input",
             str(input_jsonl),
             "--output",
@@ -2288,6 +2307,7 @@ def test_swe_pro_predictions_fail_fast_marks_remaining_requested_tasks(tmp_path,
         "argv",
         [
             "pro_predictions.py",
+            "--allow-dirty-seed",
             "--input",
             str(input_jsonl),
             "--output",
@@ -2319,6 +2339,7 @@ def test_swe_predictions_rejects_unsafe_instance_id_before_logs_escape(tmp_path,
         "argv",
         [
             "swebench_predictions.py",
+            "--allow-dirty-seed",
             "--input",
             str(input_jsonl),
             "--output",
@@ -2355,6 +2376,7 @@ def test_swe_predictions_fail_fast_still_writes_sidecars(tmp_path, monkeypatch):
         "argv",
         [
             "swebench_predictions.py",
+            "--allow-dirty-seed",
             "--input",
             str(input_jsonl),
             "--output",
@@ -2398,6 +2420,7 @@ def test_swe_pro_predictions_rejects_unsafe_instance_id_before_patch_path(tmp_pa
         "argv",
         [
             "pro_predictions.py",
+            "--allow-dirty-seed",
             "--input",
             str(input_jsonl),
             "--output",
@@ -2420,7 +2443,7 @@ def test_benchmark_output_helpers_reject_repo_internal_outputs(tmp_path, monkeyp
     input_jsonl = tmp_path / "instances.jsonl"
     input_jsonl.write_text("", encoding="utf-8")
 
-    monkeypatch.setattr(sys, "argv", ["swebench_predictions.py", "--input", str(input_jsonl), "--output", str(REPO_ROOT / "devtools" / "bad.jsonl")])
+    monkeypatch.setattr(sys, "argv", ["swebench_predictions.py", "--allow-dirty-seed", "--input", str(input_jsonl), "--output", str(REPO_ROOT / "devtools" / "bad.jsonl")])
     with pytest.raises(ValueError, match="benchmark run output must not be under repo"):
         swe_predictions.main()
 
@@ -2434,7 +2457,7 @@ def test_benchmark_output_helpers_reject_repo_internal_outputs(tmp_path, monkeyp
     with pytest.raises(ValueError, match="live runtime data"):
         ensure_file_output_outside_repo(live_data / "bench" / "result_index.jsonl", REPO_ROOT)
 
-    monkeypatch.setattr(sys, "argv", ["swebench_predictions.py", "--input", str(input_jsonl), "--output", str(live_data / "predictions.jsonl")])
+    monkeypatch.setattr(sys, "argv", ["swebench_predictions.py", "--allow-dirty-seed", "--input", str(input_jsonl), "--output", str(live_data / "predictions.jsonl")])
     with pytest.raises(ValueError, match="live runtime data"):
         swe_predictions.main()
 
@@ -3216,12 +3239,12 @@ def test_bench_template_scaffold_defaults_v655(tmp_path):
 
     assert set(OuroborosTerminalBenchAgent._WEB_TOOLS_MIRROR) == set(_WEB_TOOLS)
     web_off = agent._disabled_tools()
-    assert web_off[-1] == "claude_code_edit"
+    assert web_off[-2:] == ["claude_code_edit", "schedule_subagent"]
     assert set(_WEB_TOOLS) <= set(web_off)
     assert {"analyze_screenshot", "vlm_query"} <= set(web_off)
     assert "view_image" not in web_off
     agent.disable_agent_web = False
-    assert agent._disabled_tools() == ["claude_code_edit"]
+    assert agent._disabled_tools() == ["claude_code_edit", "schedule_subagent"]
     assert OuroborosTerminalBenchAgent._DEADLINE_SAFETY_SEC == 105
 
     bench_root = _pathlib.Path(__file__).resolve().parents[1] / "devtools" / "benchmarks"
@@ -3602,3 +3625,1297 @@ def test_programbench_submission_tarball_contract(tmp_path):
     assert not any(n.startswith(".git") or n.startswith("build") for n in names)
     assert not any(n.startswith(".ouroboros") for n in names)
     assert "probe.log" not in names
+
+
+# --------------------------------------------------------------------------------------
+# v6.75.0 (P1) — run provenance: clean seed, runtime attestation, tri-state grading,
+# append-only ledger, atomic sidecars, authoritative key headroom.
+# --------------------------------------------------------------------------------------
+
+
+def _git_commit_all(repo: Path) -> None:
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@t.t", "-c", "user.name=t", "commit", "-qm", "seed"],
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_benchmark_manifest_seed_gate_fails_closed_by_default(tmp_path):
+    """Owner Q19=B: an unreproducible seed refuses the run BY DEFAULT, with a recorded escape.
+
+    Three refusal classes, all before any paid task: a dirty working tree (the manifest would
+    say `-dirty` and the run would not be submittable), a checkout with no git identity at all
+    (the source cannot be named), and a seed that does not match an explicit `expect` pin. The
+    `expect` mismatch is NOT waivable by --allow-dirty-seed: 'dirty' and 'wrong commit' are
+    different facts.
+    """
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    clean = benchmark_run_manifest(
+        benchmark="unit", run_root=tmp_path / "run", repo_dir=repo, requested_task_ids=["t"],
+    )
+    assert clean["seed_gate"]["ok"] is True
+    assert clean["seed_gate"]["require_clean"] is True
+    assert clean["seed_gate"]["allow_dirty_seed"] is False
+
+    head = clean["source"]["head"]
+    pinned = benchmark_run_manifest(
+        benchmark="unit", run_root=tmp_path / "run", repo_dir=repo, requested_task_ids=["t"],
+        expect=head[:12],
+    )
+    assert pinned["seed_gate"]["expect"] == head[:12]
+
+    (repo / "app.py").write_text("print('dirty')\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="reason=seed_dirty"):
+        benchmark_run_manifest(
+            benchmark="unit", run_root=tmp_path / "run", repo_dir=repo, requested_task_ids=["t"],
+        )
+    waived = benchmark_run_manifest(
+        benchmark="unit", run_root=tmp_path / "run", repo_dir=repo, requested_task_ids=["t"],
+        require_clean=False,
+    )
+    assert waived["seed_gate"]["reason"] == "seed_dirty"
+    assert waived["seed_gate"]["allow_dirty_seed"] is True
+
+    with pytest.raises(RuntimeError, match="reason=seed_mismatch"):
+        benchmark_run_manifest(
+            benchmark="unit", run_root=tmp_path / "run", repo_dir=repo, requested_task_ids=["t"],
+            require_clean=False, expect="0" * 40,
+        )
+
+    not_git = tmp_path / "plain"
+    not_git.mkdir()
+    with pytest.raises(RuntimeError, match="reason=seed_identity_unavailable"):
+        benchmark_run_manifest(
+            benchmark="unit", run_root=tmp_path / "run", repo_dir=not_git, requested_task_ids=["t"],
+        )
+
+
+def test_benchmark_seed_gate_refuses_when_cleanliness_cannot_be_determined(tmp_path):
+    """The fourth refusal class: the cleanliness probe itself did not answer.
+
+    `git status` can fail for real (a corrupt `.git/index`, or the 10s timeout on a huge
+    untracked tree / CephFS). Coercing that into `dirty: False` let a genuinely dirty seed pass
+    the gate with `seed_gate.ok: true`, which is exactly the `-dirty`-provenance run owner
+    Q19=B exists to prevent. Reproduced with a REAL corrupted index, not a mock: `rev-parse
+    HEAD` still works (so the seed has an identity) while `status` fails.
+    """
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    (repo / "app.py").write_text("print('dirty and unreportable')\n", encoding="utf-8")
+    (repo / ".git" / "index").write_bytes(b"DIRC\x00\x00\x00\xffnot-an-index")
+
+    provenance = repo_provenance(repo)
+    assert provenance["git_available"] is True          # the commit is still readable
+    assert provenance["status_available"] is False      # the cleanliness probe is not
+    assert provenance["dirty"] is False                 # ... and its value carries no information
+
+    with pytest.raises(RuntimeError, match="reason=seed_status_unavailable"):
+        benchmark_run_manifest(
+            benchmark="unit", run_root=tmp_path / "run", repo_dir=repo, requested_task_ids=["t"],
+        )
+    # The recorded escape keeps working and keeps saying WHY it was needed.
+    waived = benchmark_run_manifest(
+        benchmark="unit", run_root=tmp_path / "run", repo_dir=repo, requested_task_ids=["t"],
+        require_clean=False,
+    )
+    assert waived["seed_gate"]["reason"] == "seed_status_unavailable"
+    assert waived["seed_gate"]["ok"] is False
+    assert waived["seed_gate"]["status_available"] is False
+
+
+def test_benchmark_write_json_is_atomic_and_byte_identical(tmp_path):
+    """write_json became atomic without changing a single byte of any existing sidecar.
+
+    The atomic helper defaults to NO trailing newline, so the call must pass
+    trailing_newline=True — otherwise every manifest/ledger sidecar silently changes shape.
+    Also asserts no temp sibling survives a successful write.
+    """
+    from devtools.benchmarks.common.manifests import write_json
+
+    payload = {"b": 1, "a": ["x", "ю"], "nested": {"k": None}}
+    target = tmp_path / "deep" / "run_manifest.json"
+    write_json(target, payload)
+    legacy = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    assert target.read_text(encoding="utf-8") == legacy
+    assert sorted(p.name for p in target.parent.iterdir()) == ["run_manifest.json"]
+
+    write_json(target, {"replaced": True})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"replaced": True}
+
+
+def test_benchmark_manifests_module_stays_stdlib_only_at_import():
+    """`common/manifests.py` is imported by every launcher, including the container-side
+    Terminal-Bench agent, so the atomic-write dependency on the runtime package must be a LAZY
+    import inside write_json — a module-level `import ouroboros` would make the runtime a hard
+    dependency of all benchmark families."""
+    source = (REPO_ROOT / "devtools" / "benchmarks" / "common" / "manifests.py").read_text(encoding="utf-8")
+    module_level = [
+        line
+        for line in source.splitlines()
+        if line.startswith(("import ", "from ")) and "ouroboros" in line
+    ]
+    assert module_level == []
+
+    # Cross-launcher import smoke: every P1-owned launcher imports the shared module cleanly.
+    for module in (
+        "devtools.benchmarks.common.manifests",
+        "devtools.benchmarks.programbench.run_programbench",
+        "devtools.benchmarks.programbench.run_programbench_e2e",
+        "devtools.benchmarks.swe_bench.swebench_predictions",
+        "devtools.benchmarks.swe_bench_pro.pro_predictions",
+        "devtools.benchmarks.harness_bench_fast.run_harness_bench_fast",
+    ):
+        importlib.import_module(module)
+
+
+def test_openrouter_key_remaining_uses_authoritative_field(monkeypatch):
+    """`limit_remaining` is the source of truth; `limit - usage` is only a FALLBACK, and an
+    uncapped key is None (not 0.0, not 'plenty'). The credit-endpoint arithmetic this replaces
+    lied on a nearly exhausted key and burned half a run."""
+    from devtools.benchmarks.common.manifests import openrouter_key_remaining
+
+    bodies: list[bytes] = []
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def read(self):
+            return bodies.pop(0)
+
+    def fake_urlopen(req, timeout=0):
+        assert req.full_url == "https://openrouter.ai/api/v1/key"
+        assert req.headers["Authorization"] == "Bearer or-key"
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    bodies.append(b'{"data":{"limit":100,"usage":97.5,"limit_remaining":0.23}}')
+    assert openrouter_key_remaining("or-key") == 0.23
+    bodies.append(b'{"data":{"limit":100,"usage":97.5}}')
+    assert openrouter_key_remaining("or-key") == pytest.approx(2.5)
+    bodies.append(b'{"data":{"limit":null,"usage":12.0}}')
+    assert openrouter_key_remaining("or-key") is None
+
+    with pytest.raises(RuntimeError, match="requires an API key"):
+        openrouter_key_remaining("  ")
+
+
+def test_runtime_attestation_records_both_facts_and_fails_closed(tmp_path, monkeypatch):
+    """Owner Q7=B / Q8: record the HTTP runtime_version AND the local commit, and hard-stop on
+    a skew unless the named override is set (the override is itself recorded)."""
+    from devtools.benchmarks.common import manifests
+
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    (repo / "VERSION").write_text("6.75.0\n", encoding="utf-8")
+    _git_commit_all(repo)
+
+    served = {"runtime_version": "6.75.0"}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def read(self):
+            return json.dumps(served).encode("utf-8")
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
+    monkeypatch.delenv(manifests.ALLOW_EVOLVED_VOLUME_ENV, raising=False)
+
+    ok = manifests.runtime_attestation("http://127.0.0.1:9/", repo)
+    assert ok["ok"] is True and ok["reason"] == ""
+    assert ok["runtime_version"] == "6.75.0"
+    assert ok["repo_version"] == "6.75.0"
+    assert len(ok["repo_head"]) == 40
+    assert ok["overridden"] is False
+
+    served["runtime_version"] = "6.74.5"
+    with pytest.raises(RuntimeError, match="reason=runtime_skew"):
+        manifests.runtime_attestation("http://127.0.0.1:9/", repo)
+
+    monkeypatch.setenv(manifests.ALLOW_EVOLVED_VOLUME_ENV, "1")
+    overridden = manifests.runtime_attestation("http://127.0.0.1:9/", repo)
+    assert overridden["reason"] == "runtime_skew" and overridden["overridden"] is True
+    assert overridden["ok"] is False
+
+
+def test_runtime_attestation_override_waives_only_the_evolved_runtime_reason(tmp_path, monkeypatch):
+    """`OBO_ALLOW_EVOLVED_VOLUME` authorises a deliberately evolved / version-skewed runtime and
+    NOTHING else. It used to be applied to every failure reason, so with the override exported
+    ProgramBench admission continued after an unreachable `/api/health` — the attestation gate
+    fail-open the phase exists to remove. Per reason, with the override SET: `runtime_skew`
+    proceeds and is recorded; `runtime_unreachable` (no live identity at all) and
+    `commit_unavailable` (no commit to attribute the numbers to) still raise."""
+    from devtools.benchmarks.common import manifests
+
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    (repo / "VERSION").write_text("6.75.0\n", encoding="utf-8")
+    _git_commit_all(repo)
+
+    served: dict = {"runtime_version": "6.74.5"}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def read(self):
+            return json.dumps(served).encode("utf-8")
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
+    monkeypatch.setenv(manifests.ALLOW_EVOLVED_VOLUME_ENV, "1")
+
+    assert manifests.OVERRIDABLE_ATTESTATION_REASONS == ("runtime_skew",)
+
+    skewed = manifests.runtime_attestation("http://127.0.0.1:9/", repo)
+    assert skewed["reason"] == "runtime_skew"
+    assert skewed["overridden"] is True and skewed["override_set"] is True
+    assert skewed["override_waives"] == ["runtime_skew"]
+    assert skewed["ok"] is False
+
+    # (a) transport/parse failure -> no live runtime identity was established AT ALL.
+    def _boom(*_a, **_k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    with pytest.raises(RuntimeError, match="reason=runtime_unreachable") as unreachable:
+        manifests.runtime_attestation("http://127.0.0.1:9/", repo)
+    assert "does NOT waive" in str(unreachable.value)
+    assert "override_set=True" in str(unreachable.value)
+
+    # ... including a 200 whose body is not the health contract (parse failure, same class).
+    class _Garbage(_Resp):
+        def read(self):
+            return b"<html>not json</html>"
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Garbage())
+    with pytest.raises(RuntimeError, match="reason=runtime_unreachable"):
+        manifests.runtime_attestation("http://127.0.0.1:9/", repo)
+
+    # (b) no local commit -> nothing to attribute the numbers to. `repo_dir` outside git makes
+    # `repo_head` empty, and the version pin removes the skew reason so the missing commit is the
+    # one under test (no dependence on the AMBIENT checkout: this is a fresh tmp dir).
+    served["runtime_version"] = "6.75.0"
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
+    bare = tmp_path / "not-a-repo"
+    bare.mkdir()
+    (bare / "VERSION").write_text("6.75.0\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="reason=commit_unavailable") as no_commit:
+        manifests.runtime_attestation("http://127.0.0.1:9/", bare, expected_version="6.75.0")
+    assert "does NOT waive" in str(no_commit.value)
+
+
+def test_runtime_attestation_lineage_allows_descendants_only(tmp_path):
+    """Evolution legitimately moves HEAD forward, so provenance compares a LINE OF DESCENT
+    (`merge-base --is-ancestor`), never equality — and an unknown commit is False, not
+    'probably fine'."""
+    from devtools.benchmarks.common.manifests import commit_lineage_ok
+
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    seed = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    (repo / "evolved.py").write_text("print('evolved')\n", encoding="utf-8")
+    _git_commit_all(repo)
+    evolved = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                             capture_output=True, text=True).stdout.strip()
+
+    assert commit_lineage_ok(seed, seed, repo) is True
+    assert commit_lineage_ok(seed, evolved, repo) is True
+    assert commit_lineage_ok(evolved, seed, repo) is False
+    assert commit_lineage_ok(seed, "", repo) is False
+    assert commit_lineage_ok("0" * 40, evolved, repo) is False
+
+
+def test_runtime_attestation_is_wired_into_url_attaching_readiness_paths():
+    """Owner Q9=A+B: the shared helper exists AND every launcher that attaches to a live server
+    URL calls it from its own readiness/admission path. This meta-test names the CONCRETE entry
+    points landed in this phase; CLB's host-engine path is covered through IsolatedServer, and
+    the CLB-docker stand-in plus the three OSWorld launchers are their own phase's migration
+    (they are asserted here as KNOWN-PENDING so the list can never silently claim them)."""
+    bench = REPO_ROOT / "devtools" / "benchmarks"
+    wired = {
+        # shared readiness seam: every IsolatedServer driver (evolve_smoke + CLB host engine)
+        bench / "common" / "server_runner.py": "runtime_attestation(self.base_url, self.clone)",
+        bench / "programbench" / "run_programbench_e2e.py": "runtime_attestation(str(args.ouroboros_url), repo_dir)",
+    }
+    for path, call in wired.items():
+        assert call in path.read_text(encoding="utf-8"), f"{path.name} lost its attestation call"
+
+    # SWE-Pro attests inside the container (it has no host-side URL): one-shot, after readiness
+    # and before the paid solve.
+    entrypoint = (bench / "swe_bench_pro" / "e1v2" / "entrypoint_pro.sh").read_text(encoding="utf-8")
+    assert "/api/health" in entrypoint and "runtime_skew" in entrypoint
+
+    pending = [
+        bench / "osworld" / "run_step_agent.py",
+        bench / "osworld" / "run_cu_bridge_agent.py",
+        bench / "osworld" / "osworld_adapter_skeleton.py",
+    ]
+    assert all("runtime_attestation" not in path.read_text(encoding="utf-8") for path in pending)
+
+
+def test_swe_pro_grade_reports_tri_state_verdicts(tmp_path, monkeypatch):
+    """Owner Q17=B: an instance the official evaluator never scored is `ungraded`, not a FAIL.
+    The official headline FORMULA is unchanged (pass over submitted); `ungraded=N/total` is
+    printed next to it and the shrunken-denominator percentage is explicitly labelled
+    diagnostic / not leaderboard-valid."""
+    import devtools.benchmarks.swe_bench_pro.grade_pro as grade_pro
+
+    eval_repo = tmp_path / "SWE-bench_Pro-os"
+    helper = eval_repo / "helper_code"
+    helper.mkdir(parents=True)
+    (helper / "sweap_eval_full_v2.jsonl").write_text(
+        json.dumps({"instance_id": "won", "FAIL_TO_PASS": ["t1"], "PASS_TO_PASS": []}) + "\n"
+        + json.dumps({"instance_id": "lost", "FAIL_TO_PASS": ["t1"], "PASS_TO_PASS": []}) + "\n"
+        + json.dumps({"instance_id": "crashed", "FAIL_TO_PASS": ["t1"], "PASS_TO_PASS": []}) + "\n",
+        encoding="utf-8",
+    )
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(
+        "\n".join(
+            json.dumps({"instance_id": iid, "model_patch": "diff --git a/a b/a\n", "model_name_or_path": "m"})
+            for iid in ("won", "lost", "crashed", "not_in_dataset")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "out"
+    for iid, tests in (("won", [{"name": "t1", "status": "PASSED"}]), ("lost", [{"name": "t1", "status": "FAILED"}])):
+        (out_dir / iid).mkdir(parents=True)
+        (out_dir / iid / "ours_output.json").write_text(json.dumps({"tests": tests}), encoding="utf-8")
+    # "crashed" has no official output at all -> ungraded, not a model failure.
+
+    monkeypatch.setattr(
+        sys, "argv",
+        ["grade_pro.py", "--predictions", str(predictions), "--out-dir", str(out_dir),
+         "--eval-repo", str(eval_repo), "--skip-run"],
+    )
+    assert grade_pro.main() == 0
+
+    summary = json.loads((out_dir / "grade_summary.json").read_text(encoding="utf-8"))
+    assert summary["submitted"] == 4
+    assert summary["pass"] == 1
+    assert summary["fail"] == 1
+    assert summary["ungraded"] == 2
+    assert summary["headline_raw_pass_at_1_pct"] == 25.0          # UNCHANGED formula: 1/4
+    assert summary["diagnostic_pass_over_graded_pct"] == 50.0     # 1/2, labelled diagnostic
+    assert summary["diagnostic_not_leaderboard_valid"] is True
+    by_id = {row["instance_id"]: row for row in summary["verdicts"]}
+    assert by_id["won"]["verdict"] == "pass"
+    assert by_id["lost"]["verdict"] == "fail"
+    assert by_id["crashed"]["verdict"] == "ungraded"
+    assert by_id["crashed"]["reason"] == "no_official_output"
+    assert by_id["not_in_dataset"]["reason"] == "instance_not_in_dataset"
+
+
+def test_swe_pro_grade_ungraded_covers_unparseable_and_empty_requirements(tmp_path):
+    """The other two ungraded classes: an official output we cannot parse, and a dataset row
+    with no required tests (an empty `need` set used to silently read as FAIL)."""
+    from devtools.benchmarks.swe_bench_pro.grade_pro import instance_verdict
+
+    broken = tmp_path / "ours_output.json"
+    broken.write_text("{not json", encoding="utf-8")
+    verdict, reason, _ = instance_verdict(broken, {"FAIL_TO_PASS": ["t1"]})
+    assert verdict == "ungraded" and reason.startswith("output_unparseable")
+
+    empty = tmp_path / "empty.json"
+    empty.write_text(json.dumps({"tests": [{"name": "t1", "status": "PASSED"}]}), encoding="utf-8")
+    assert instance_verdict(empty, {"FAIL_TO_PASS": [], "PASS_TO_PASS": []})[:2] == ("ungraded", "no_required_tests")
+    assert instance_verdict(empty, None)[:2] == ("ungraded", "instance_not_in_dataset")
+
+    # Valid JSON with an UNEXPECTED SHAPE is also unparseable output, never a headline: the row
+    # extraction has to sit inside the same guard as json.loads (a raised TypeError/KeyError here
+    # would abort the whole grading pass).
+    for payload in ({"tests": {"t1": "PASSED"}}, {"tests": [{"status": "PASSED"}]}, {"tests": [None]}):
+        odd = tmp_path / f"odd_{abs(hash(str(payload)))}.json"
+        odd.write_text(json.dumps(payload), encoding="utf-8")
+        verdict, reason, column = instance_verdict(odd, {"FAIL_TO_PASS": ["t1"]})
+        assert verdict == "ungraded" and reason.startswith("output_unparseable") and column == "-"
+
+
+def test_programbench_e2e_ledger_is_append_only_and_manifest_is_written_first(tmp_path, monkeypatch):
+    """P1.5 + P1.2 on the biggest spender: every row is appended the moment it exists (a crash
+    used to discard the whole run's ledger, and a resume silently replaced the previous run's
+    history), and the manifest — which carries the seed gate — is written BEFORE the first
+    instance instead of after the official eval."""
+    from devtools.benchmarks.programbench import run_programbench_e2e as e2e
+
+    run_root = tmp_path / "pb-run"
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    instances = [{"instance_id": "inst-a", "image_name": "img-a"}, {"instance_id": "inst-b", "image_name": "img-b"}]
+    monkeypatch.setattr(e2e, "_load_instances", lambda **_k: list(instances))
+    monkeypatch.setattr(e2e, "runtime_attestation", lambda url, repo: {"ok": True, "runtime_version": "6.75.0"})
+    monkeypatch.setattr(e2e, "run_root", lambda *_a, **_k: run_root)
+
+    seen: list[str] = []
+
+    def _fake_process(instance, cfg):
+        seen.append(str(instance["instance_id"]))
+        # The ledger must already hold the FIRST row while the SECOND instance is still running.
+        if len(seen) == 2:
+            lines = (run_root / "result_index.jsonl").read_text(encoding="utf-8").splitlines()
+            assert [json.loads(line)["instance_id"] for line in lines] == ["inst-a"]
+            # The manifest already exists mid-run and carries the seed gate. Assert the gate's
+            # SHAPE, never its verdict: `ok` mirrors the ambient checkout, so pinning it to False
+            # passes on a developer's dirty tree and fails on a clean CI checkout.
+            gate = json.loads((run_root / "run_manifest.json").read_text(encoding="utf-8"))["seed_gate"]
+            assert set(gate) >= {"ok", "reason", "require_clean", "allow_dirty_seed", "dirty", "git_available"}
+            assert gate["require_clean"] is False and gate["allow_dirty_seed"] is True
+            assert gate["ok"] is (not gate["reason"])
+        return e2e.task_result_row(
+            benchmark="programbench", instance_id=str(instance["instance_id"]),
+            status="completed", reason_code="submission_prepared",
+        )
+
+    monkeypatch.setattr(e2e, "_process_instance", _fake_process)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_programbench_e2e.py", "--allow-dirty-seed", "--settings-path", str(settings),
+         "--ouroboros-url", "http://127.0.0.1:9"],
+    )
+
+    assert e2e.main() == 0
+    rows = [json.loads(line) for line in (run_root / "result_index.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [row["instance_id"] for row in rows] == ["inst-a", "inst-b"]
+
+    # A resume APPENDS; readers dedup by instance_id with the last row winning.
+    monkeypatch.setattr(e2e, "_load_instances", lambda **_k: [instances[1]])
+    monkeypatch.setattr(e2e, "_process_instance", lambda instance, cfg: e2e.task_result_row(
+        benchmark="programbench", instance_id="inst-b", status="failed", reason_code="task_not_completed"))
+    assert e2e.main() == 1
+    rows = [json.loads(line) for line in (run_root / "result_index.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [row["instance_id"] for row in rows] == ["inst-a", "inst-b", "inst-b"]
+    latest = {row["instance_id"]: row for row in rows}
+    assert latest["inst-b"]["status"] == "failed"
+    assert latest["inst-a"]["status"] == "completed"
+
+    # Every processed row reached BOTH ledgers, which is the contract programbench/README.md
+    # states without qualification.
+    for iid in ("inst-a", "inst-b"):
+        per_instance = (run_root / iid / "result_index.jsonl").read_text(encoding="utf-8").splitlines()
+        assert [json.loads(line)["instance_id"] for line in per_instance] == [iid] * len(per_instance)
+
+    # ... and so does a SKIP row. A resume narrows the work, never the ledger: the instance that
+    # is skipped because it already has a submission gets its skip event appended at the run root
+    # AND in its own directory. Only the run root was written, so a resumed instance's own history
+    # silently omitted the resume while the README claimed both locations.
+    submission = run_root / "inst-a" / "submission.tar.gz"
+    submission.write_bytes(b"tarball")
+    root_before = len((run_root / "result_index.jsonl").read_text(encoding="utf-8").splitlines())
+    instance_before = len((run_root / "inst-a" / "result_index.jsonl").read_text(encoding="utf-8").splitlines())
+    monkeypatch.setattr(e2e, "_load_instances", lambda **_k: list(instances))
+    monkeypatch.setattr(e2e, "_process_instance", lambda instance, cfg: e2e.task_result_row(
+        benchmark="programbench", instance_id=str(instance["instance_id"]),
+        status="completed", reason_code="submission_prepared"))
+    assert e2e.main() == 0
+
+    root_rows = [json.loads(line) for line in
+                 (run_root / "result_index.jsonl").read_text(encoding="utf-8").splitlines()]
+    instance_rows = [json.loads(line) for line in
+                     (run_root / "inst-a" / "result_index.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(root_rows) == root_before + 2          # inst-a skipped + inst-b processed
+    assert len(instance_rows) == instance_before + 1
+    assert instance_rows[-1]["status"] == "skipped"
+    assert instance_rows[-1]["reason_code"] == "skipped_existing_submission"
+    assert instance_rows[-1] == next(r for r in root_rows if r["status"] == "skipped")
+
+
+def test_harness_bench_fast_manifest_is_durable_and_records_the_final_outcome(tmp_path, monkeypatch):
+    """The third P1 launcher's half of the manifest lifecycle. It wrote its manifest inline and
+    never touched it again, so a run's own record never said how the run ENDED. It is now built
+    once, on disk before the harness subprocess starts (asserted from inside the subprocess
+    stand-in, i.e. before anything is spent), retained, and rewritten with the final outcome and
+    exit code — including the harness's own non-zero exit."""
+    from devtools.benchmarks.harness_bench_fast import run_harness_bench_fast as hbf
+
+    out_root = tmp_path / "hbf-run"
+    manifest_path = out_root / "run_manifest.json"
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(hbf, "_read_task_ids", lambda root, ids, task_file="": ["task_1"])
+
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["manifest_before_spend"] = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return subprocess.CompletedProcess(cmd, 7, stdout="", stderr="")
+
+    monkeypatch.setattr(hbf.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_harness_bench_fast.py", "--run-root", str(out_root), "--allow-dirty-seed",
+         "--settings-path", str(settings), "--bench-root", str(tmp_path / "bench")],
+    )
+
+    assert hbf.main() == 7
+    # Durable BEFORE the harness ran, and the seed gate's SHAPE is in it (never its verdict: `ok`
+    # mirrors the ambient checkout and would flip between a dirty tree and clean CI).
+    early = seen["manifest_before_spend"]
+    assert early["extra"]["outcome"] == "started"
+    assert set(early["seed_gate"]) >= {"ok", "reason", "require_clean", "allow_dirty_seed"}
+    assert early["seed_gate"]["require_clean"] is False
+
+    final = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert final["extra"]["outcome"] == "harness_nonzero_exit"
+    assert final["extra"]["exit_code"] == 7
+    assert final["requested_task_ids"] == ["task_1"]
+
+    # A dry run records that it was a dry run rather than leaving `started` behind forever.
+    monkeypatch.setattr(sys, "argv", [*sys.argv, "--dry-run"])
+    assert hbf.main() == 0
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["extra"]["outcome"] == "dry_run"
+
+
+def test_benchmark_admission_persists_the_refusal_before_enforcement_raises(tmp_path):
+    """The provenance lifecycle is now ENFORCED, not promised.
+
+    `_seed_gate` used to raise from inside `benchmark_run_manifest`, i.e. before the dict reached
+    any caller, so no launcher could persist the refusal the contract promises: a refused run left
+    nothing but a stderr line that a shard launcher discards. Admission now builds the COMPLETE
+    payload, `admit_benchmark_run` writes it, and only then does enforcement raise — and the typed
+    exception carries the same payload so any other caller can persist it too.
+    """
+    from devtools.benchmarks.common.manifests import (
+        BenchmarkAdmissionRefused,
+        admit_benchmark_run,
+    )
+
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+
+    admitted_path = tmp_path / "admitted" / "run_manifest.json"
+    admitted = admit_benchmark_run(
+        admitted_path, benchmark="unit", run_root=tmp_path / "run", repo_dir=repo,
+        requested_task_ids=["t"],
+    )
+    assert admitted["seed_gate"]["ok"] is True
+    assert json.loads(admitted_path.read_text(encoding="utf-8"))["seed_gate"]["ok"] is True
+    assert "refusal" not in admitted["extra"]
+
+    (repo / "app.py").write_text("print('dirty')\n", encoding="utf-8")
+    refused_path = tmp_path / "refused" / "run_manifest.json"
+    with pytest.raises(BenchmarkAdmissionRefused, match="reason=seed_dirty") as refused:
+        admit_benchmark_run(
+            refused_path, benchmark="unit", run_root=tmp_path / "run", repo_dir=repo,
+            requested_task_ids=["t"],
+        )
+    # Still a RuntimeError for every pre-existing caller, and the payload rode on the exception.
+    assert isinstance(refused.value, RuntimeError)
+    assert refused.value.manifest["seed_gate"]["reason"] == "seed_dirty"
+
+    persisted = json.loads(refused_path.read_text(encoding="utf-8"))
+    assert persisted["seed_gate"]["reason"] == "seed_dirty"
+    assert persisted["seed_gate"]["ok"] is False
+    assert persisted["requested_task_ids"] == ["t"]
+    # Same terminal vocabulary a completed run uses, so both read the same way in an audit.
+    assert persisted["extra"]["outcome"] == "refused"
+    assert persisted["extra"]["exit_code"] == 1
+    assert persisted["extra"]["refusal"] == {
+        "stage": "seed_gate", "reason": "seed_dirty", "exit_code": 1}
+
+    # The `expect` pin is refused even WITH the dirty-seed escape, and is just as durable.
+    pinned_path = tmp_path / "pinned" / "run_manifest.json"
+    with pytest.raises(BenchmarkAdmissionRefused, match="reason=seed_mismatch"):
+        admit_benchmark_run(
+            pinned_path, benchmark="unit", run_root=tmp_path / "run", repo_dir=repo,
+            requested_task_ids=["t"], require_clean=False, expect="0" * 40,
+        )
+    pinned = json.loads(pinned_path.read_text(encoding="utf-8"))
+    assert pinned["extra"]["refusal"]["reason"] == "seed_mismatch"
+    assert pinned["seed_gate"]["allow_dirty_seed"] is True
+
+
+def test_finalize_run_manifest_records_a_typed_outcome_on_every_exit_path(tmp_path):
+    """The ONE finalization seam. Its whole point is the paths a launcher does NOT think about:
+    an early typed return and an escaping exception. Several migrated launchers only ever updated
+    counts, so their own record still said `started` after they had finished or died."""
+    from devtools.benchmarks.common.manifests import finalize_run_manifest
+
+    target = tmp_path / "deep" / "run_manifest.json"
+
+    def _extra():
+        return json.loads(target.read_text(encoding="utf-8"))["extra"]
+
+    manifest = {"extra": {"outcome": "started"}}
+    with finalize_run_manifest(target, manifest) as final:
+        assert final["outcome"] == "completed"
+    assert _extra() == {"outcome": "completed", "exit_code": 0}
+
+    manifest = {"extra": {"outcome": "started"}}
+    with finalize_run_manifest(target, manifest) as final:
+        final.update({"outcome": "refused", "exit_code": 3,
+                      "refusal": {"stage": "seed_shape", "reason": "seed_is_not_a_git_directory"}})
+    recorded = _extra()
+    assert recorded["outcome"] == "refused" and recorded["exit_code"] == 3
+    assert recorded["refusal"]["stage"] == "seed_shape"
+
+    manifest = {"extra": {"outcome": "started"}}
+    with pytest.raises(ZeroDivisionError):
+        with finalize_run_manifest(target, manifest):
+            raise ZeroDivisionError("boom")
+    recorded = _extra()
+    assert recorded["outcome"] == "crashed" and recorded["exit_code"] == 1
+    assert recorded["error"] == {"type": "ZeroDivisionError", "message": "boom"}
+
+    # A launcher that NAMED its outcome before re-raising keeps that name; the typed error is
+    # recorded NEXT to it rather than replacing it.
+    manifest = {"extra": {}}
+    with pytest.raises(RuntimeError):
+        with finalize_run_manifest(target, manifest) as final:
+            final.update({"outcome": "stopped_instance_error", "exit_code": 1})
+            raise RuntimeError("instance blew up")
+    recorded = _extra()
+    assert recorded["outcome"] == "stopped_instance_error"
+    assert recorded["error"]["type"] == "RuntimeError"
+
+    # BaseException (SIGINT / SystemExit) must not slip past the seam either.
+    manifest = {"extra": {}}
+    with pytest.raises(KeyboardInterrupt):
+        with finalize_run_manifest(target, manifest):
+            raise KeyboardInterrupt
+    recorded = _extra()
+    assert recorded["outcome"] == "crashed" and recorded["error"]["type"] == "KeyboardInterrupt"
+
+    # ... and a SystemExit keeps its REAL status: flattening it to 1 made the record disagree
+    # with the code the process exits with (auto_run's campaign-fatal refusal exits 2).
+    manifest = {"extra": {}}
+    with pytest.raises(SystemExit):
+        with finalize_run_manifest(target, manifest):
+            raise SystemExit(2)
+    recorded = _extra()
+    assert recorded["outcome"] == "crashed" and recorded["exit_code"] == 2
+    # A non-integer status (SystemExit("message")) has no numeric meaning -> generic failure.
+    manifest = {"extra": {}}
+    with pytest.raises(SystemExit):
+        with finalize_run_manifest(target, manifest):
+            raise SystemExit("no numeric status")
+    assert _extra()["exit_code"] == 1
+
+
+# Calls that must NEVER run before `admit_benchmark_run()` in a migrated launcher. One named
+# constant so it stays extendable: separate review rounds each found a different pre-admission
+# operation (a seed-shape assertion, a volume archival, an artefact write), so the "admission is
+# the outer boundary" rule is guarded by a test instead of by review.
+_PRE_ADMISSION_DENIED_NAMES = frozenset({
+    "assert_seed_is_git_directory", "ensure_util_image", "dump_state", "runtime_attestation",
+    "snapshot", "restore", "reflections", "seed_stamp", "run_one", "run_instance",
+    "preflight_cleanroom_container", "prepare_seeded_workspace", "create_submission_tarball",
+    "run_official_eval", "write_json", "write_jsonl", "write_result_index", "append_result_index",
+    "write_text", "write_bytes", "mkdir", "unlink", "rmtree", "touch", "rename", "chmod",
+    "urlopen", "Popen", "check_output", "check_call",
+})
+# Matched as a prefix on any dotted segment, so `docker_pull_if_missing` / `subprocess.run` /
+# `shutil.rmtree` are all caught without enumerating them.
+_PRE_ADMISSION_DENIED_PREFIXES = ("subprocess", "docker", "shutil")
+
+
+def _dotted_callee(node) -> str:
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+    return ".".join(reversed(parts))
+
+
+def _denied_pre_admission_call(dotted: str) -> str:
+    segments = dotted.split(".")
+    if _PRE_ADMISSION_DENIED_NAMES.intersection(segments):
+        return sorted(_PRE_ADMISSION_DENIED_NAMES.intersection(segments))[0]
+    for segment in segments:
+        for prefix in _PRE_ADMISSION_DENIED_PREFIXES:
+            if segment.startswith(prefix):
+                return segment
+    return ""
+
+
+def _calls_before(function: ast.FunctionDef, stop_callee: str) -> list[str]:
+    """Dotted callee names in the statements of ``function`` that PRECEDE ``stop_callee``."""
+    seen: list[str] = []
+    for statement in function.body:
+        if any(isinstance(node, ast.Call) and _dotted_callee(node.func).endswith(stop_callee)
+               for node in ast.walk(statement)):
+            return seen
+        seen.extend(
+            _dotted_callee(node.func) for node in ast.walk(statement) if isinstance(node, ast.Call)
+        )
+    raise AssertionError(f"{function.name}() never calls {stop_callee}")
+
+
+def test_every_migrated_launcher_routes_through_both_manifest_seams():
+    """Fix the CLASS, not the cases: the seams are pointless if a launcher can pair
+    `benchmark_run_manifest()` with its own `write_json()` again (no durable refusal) or skip the
+    finalization block (no final outcome). Named files, so a new launcher cannot join silently and
+    the launchers whose migration belongs to a LATER phase cannot be silently claimed."""
+    bench = REPO_ROOT / "devtools" / "benchmarks"
+    migrated = [
+        bench / "programbench" / "run_programbench.py",
+        bench / "programbench" / "run_programbench_e2e.py",
+        bench / "swe_bench" / "swebench_predictions.py",
+        bench / "swe_bench_pro" / "pro_predictions.py",
+        bench / "harness_bench_fast" / "run_harness_bench_fast.py",
+        bench / "swe_bench_pro" / "e1v2" / "run_pro.py",
+        bench / "swe_bench_pro" / "e1v2" / "auto_run.py",
+    ]
+    for path in migrated:
+        source = path.read_text(encoding="utf-8")
+        assert "admit_benchmark_run(" in source, f"{path.name} bypasses the admission seam"
+        assert "finalize_run_manifest(" in source, f"{path.name} records no final outcome"
+        assert "benchmark_run_manifest(" not in source, (
+            f"{path.name} calls the builder directly again: its refusal would never be persisted"
+        )
+        # Python evaluates ARGUMENTS before entering the callee, so a gate called inside the
+        # admission call's argument list refuses BEFORE the manifest can be written — the durable
+        # refusal defeated by evaluation order. Attestation belongs after admission.
+        call = source.split("admit_benchmark_run(", 1)[1].split("\n    )\n", 1)[0]
+        assert "runtime_attestation(" not in call, (
+            f"{path.name} evaluates runtime_attestation inside the admission argument list"
+        )
+        # ADMISSION IS THE OUTER BOUNDARY. Everything a launcher does before it must be argument
+        # parsing and pure local derivation: no filesystem assertion, no docker, no subprocess, no
+        # network, no state mutation. Walked with `ast` over the function that performs admission
+        # AND, when that is not `main()`, over the statements of `main()` that precede it.
+        tree = ast.parse(source)
+        functions = {node.name: node for node in ast.walk(tree)
+                     if isinstance(node, ast.FunctionDef)}
+        owner = next(
+            node.name for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and any(isinstance(inner, ast.Call)
+                    and _dotted_callee(inner.func).endswith("admit_benchmark_run")
+                    for inner in ast.walk(node))
+        )
+        prefix = _calls_before(functions[owner], "admit_benchmark_run")
+        if owner != "main":
+            prefix += _calls_before(functions["main"], owner)
+        for dotted in prefix:
+            denied = _denied_pre_admission_call(dotted)
+            assert not denied, (
+                f"{path.name}: {dotted}() runs BEFORE admit_benchmark_run() in {owner}() -- a "
+                f"refusal there leaves no durable manifest (denied token: {denied})"
+            )
+    pending = [
+        bench / "gaia" / "run_gaia.py",
+        bench / "continual_learning" / "run_clb.py",
+        bench / "terminal_bench" / "run_tb.py",
+        bench / "terminal_bench" / "run_harbor_smoke.py",
+        bench / "osworld" / "run_step_agent.py",
+        bench / "osworld" / "run_cu_bridge_agent.py",
+        bench / "osworld" / "osworld_adapter_skeleton.py",
+    ]
+    for path in pending:
+        assert "benchmark_run_manifest(" in path.read_text(encoding="utf-8")
+
+
+def test_runtime_attestation_decides_commit_availability_before_skew(tmp_path, monkeypatch):
+    """Reason ORDER is part of the fail-closed contract. A checkout with no readable commit that
+    ALSO disagrees on the version was labelled `runtime_skew` — an OVERRIDABLE reason — so
+    `OBO_ALLOW_EVOLVED_VOLUME=1` waived a run with no commit to attribute its numbers to."""
+    from devtools.benchmarks.common import manifests
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def read(self):
+            return b'{"runtime_version": "6.75.0"}'
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
+    monkeypatch.setenv(manifests.ALLOW_EVOLVED_VOLUME_ENV, "1")
+
+    bare = tmp_path / "not-a-repo"
+    bare.mkdir()
+    (bare / "VERSION").write_text("6.74.5\n", encoding="utf-8")   # skew AND no commit
+    with pytest.raises(RuntimeError, match="reason=commit_unavailable") as refused:
+        manifests.runtime_attestation("http://127.0.0.1:9/", bare)
+    assert "does NOT waive" in str(refused.value)
+
+    # With a real commit the same version disagreement IS the waivable skew.
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    (repo / "VERSION").write_text("6.74.5\n", encoding="utf-8")
+    _git_commit_all(repo)
+    skewed = manifests.runtime_attestation("http://127.0.0.1:9/", repo)
+    assert skewed["reason"] == "runtime_skew" and skewed["overridden"] is True
+
+
+def test_programbench_launcher_records_a_typed_outcome_on_its_failure_path(tmp_path, monkeypatch):
+    """Failure path of the per-instance ProgramBench launcher: it only ever wrote
+    `failure_reason_code`, so its manifest still claimed the run was `started` after it died."""
+    from devtools.benchmarks.programbench import run_programbench as pb
+
+    out_root = tmp_path / "pb"
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    instruction = tmp_path / "task.txt"
+    instruction.write_text("do it", encoding="utf-8")
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(pb, "run_root", lambda *_a, **_k: out_root)
+
+    def _boom(container_name):
+        raise RuntimeError("cleanroom container is not running")
+
+    monkeypatch.setattr(pb, "preflight_cleanroom_container", _boom)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_programbench.py", "--workspace", str(workspace), "--instruction-file",
+         str(instruction), "--container-name", "c", "--instance-id", "inst-a",
+         "--settings-path", str(settings), "--allow-dirty-seed"],
+    )
+    with pytest.raises(RuntimeError, match="cleanroom container is not running"):
+        pb.main()
+
+    extra = json.loads((out_root / "inst-a" / "run_manifest.json").read_text(encoding="utf-8"))["extra"]
+    assert extra["outcome"] == "blocked"
+    assert extra["exit_code"] == 1
+    assert extra["refusal"]["stage"] == "cleanroom_preflight_failed"
+    assert extra["error"]["type"] == "RuntimeError"
+    assert extra["failure_reason_code"] == "cleanroom_preflight_failed"
+
+
+def test_programbench_e2e_records_a_typed_outcome_on_its_failure_paths(tmp_path, monkeypatch):
+    """Failure paths of the biggest spender: a completed run whose instances failed gets a NAMED
+    outcome (not just exit 1), and an instance that RAISES leaves `crashed`, never `started`."""
+    from devtools.benchmarks.programbench import run_programbench_e2e as e2e
+
+    out_root = tmp_path / "pb-e2e"
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(e2e, "_load_instances",
+                        lambda **_k: [{"instance_id": "inst-a", "image_name": "img-a"}])
+    monkeypatch.setattr(e2e, "runtime_attestation", lambda url, repo: {"ok": True})
+    monkeypatch.setattr(e2e, "run_root", lambda *_a, **_k: out_root)
+    monkeypatch.setattr(e2e, "_process_instance", lambda instance, cfg: e2e.task_result_row(
+        benchmark="programbench", instance_id="inst-a", status="failed",
+        reason_code="task_not_completed"))
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_programbench_e2e.py", "--allow-dirty-seed", "--settings-path", str(settings),
+         "--ouroboros-url", "http://127.0.0.1:9"],
+    )
+    assert e2e.main() == 1
+    extra = json.loads((out_root / "run_manifest.json").read_text(encoding="utf-8"))["extra"]
+    assert extra["outcome"] == "instances_failed" and extra["exit_code"] == 1
+
+    def _boom(instance, cfg):
+        raise RuntimeError("docker exec died")
+
+    monkeypatch.setattr(e2e, "_process_instance", _boom)
+    with pytest.raises(RuntimeError, match="docker exec died"):
+        e2e.main()
+    extra = json.loads((out_root / "run_manifest.json").read_text(encoding="utf-8"))["extra"]
+    assert extra["outcome"] == "crashed" and extra["error"]["type"] == "RuntimeError"
+
+
+def test_swebench_predictions_records_a_typed_outcome_when_it_stops_on_an_error(tmp_path, monkeypatch):
+    """Failure path of the SWE-bench predictions launcher: it re-raises the first instance error,
+    which used to escape with the manifest's `outcome` never written at all."""
+    from devtools.benchmarks.swe_bench import swebench_predictions as sp
+
+    input_path = tmp_path / "instances.jsonl"
+    input_path.write_text(json.dumps({"instance_id": "a"}) + "\n", encoding="utf-8")
+    output = tmp_path / "preds.jsonl"
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(sp, "_run_prediction_rows",
+                        lambda args, rows, **_k: ([], [], [], RuntimeError("agent never started")))
+    monkeypatch.setattr(
+        sys, "argv",
+        ["swebench_predictions.py", "--input", str(input_path), "--output", str(output),
+         "--settings-path", str(settings), "--allow-dirty-seed"],
+    )
+    with pytest.raises(RuntimeError, match="agent never started"):
+        sp.main()
+
+    extra = json.loads(Path(str(output) + ".run_manifest.json").read_text(encoding="utf-8"))["extra"]
+    assert extra["outcome"] == "stopped_instance_error"
+    assert extra["exit_code"] == 1
+    assert extra["error"]["type"] == "RuntimeError"
+    assert extra["prediction_count"] == 0
+
+
+def test_pro_predictions_records_a_typed_outcome_when_it_stops_on_an_error(tmp_path, monkeypatch):
+    """Failure path of the SWE-Pro prediction packer, driven by a REAL malformed input row."""
+    from devtools.benchmarks.swe_bench_pro import pro_predictions as pp
+
+    input_path = tmp_path / "rows.jsonl"
+    input_path.write_text(json.dumps({"instance_id": "a"}) + "\n", encoding="utf-8")
+    output = tmp_path / "preds.jsonl"
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        sys, "argv",
+        ["pro_predictions.py", "--input", str(input_path), "--output", str(output),
+         "--patch-dir", str(tmp_path / "patches"), "--settings-path", str(settings),
+         "--allow-dirty-seed"],
+    )
+    with pytest.raises(RuntimeError, match="each row must include"):
+        pp.main()
+
+    extra = json.loads(Path(str(output) + ".run_manifest.json").read_text(encoding="utf-8"))["extra"]
+    assert extra["outcome"] == "stopped_instance_error"
+    assert extra["exit_code"] == 1
+    assert extra["error"]["type"] == "RuntimeError"
+
+
+def test_harness_bench_fast_records_a_crash_instead_of_leaving_started(tmp_path, monkeypatch):
+    """The exceptional path of `harness_bench_fast`: its `_finish` helper covered every INTENDED
+    exit, so an unhandled failure (missing harness runner) left `outcome: started` forever."""
+    from devtools.benchmarks.harness_bench_fast import run_harness_bench_fast as hbf
+
+    out_root = tmp_path / "hbf-run"
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(hbf, "_read_task_ids", lambda root, ids, task_file="": ["task_1"])
+
+    def _boom(cmd, **kwargs):
+        raise FileNotFoundError("harness runner is not installed")
+
+    monkeypatch.setattr(hbf.subprocess, "run", _boom)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_harness_bench_fast.py", "--run-root", str(out_root), "--allow-dirty-seed",
+         "--settings-path", str(settings), "--bench-root", str(tmp_path / "bench")],
+    )
+    with pytest.raises(FileNotFoundError):
+        hbf.main()
+
+    extra = json.loads((out_root / "run_manifest.json").read_text(encoding="utf-8"))["extra"]
+    assert extra["outcome"] == "crashed"
+    assert extra["exit_code"] == 1
+    assert extra["error"]["type"] == "FileNotFoundError"
+
+
+def test_programbench_e2e_persists_the_manifest_when_attestation_refuses(tmp_path, monkeypatch, capsys):
+    """A runtime-attestation refusal must leave the seed-admission manifest ON DISK.
+
+    Attestation used to be evaluated inside `admit_benchmark_run(...)`'s argument list, and Python
+    evaluates arguments before entering the callee — so `runtime_unreachable` /
+    `commit_unavailable` / `runtime_skew` raised with no `run_manifest.json` written at all,
+    defeating the durable-refusal contract by evaluation order alone.
+    """
+    from devtools.benchmarks.programbench import run_programbench_e2e as e2e
+
+    out_root = tmp_path / "pb-attest"
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(e2e, "_load_instances",
+                        lambda **_k: [{"instance_id": "inst-a", "image_name": "img-a"}])
+    monkeypatch.setattr(e2e, "run_root", lambda *_a, **_k: out_root)
+
+    from devtools.benchmarks.common.manifests import RuntimeAttestationRefused
+
+    record = {"schema": "ouroboros.benchmark.runtime_attestation.v1",
+              "reason": "runtime_unreachable", "ok": False, "runtime_version": "",
+              "repo_head": "a" * 40, "repo_version": "6.75.0", "override_set": False,
+              "http_error": "OSError: connection refused"}
+
+    def _refuse(url, repo):
+        raise RuntimeAttestationRefused(
+            "runtime attestation failed reason=runtime_unreachable", record)
+
+    monkeypatch.setattr(e2e, "runtime_attestation", _refuse)
+    # An instance stand-in that must NEVER be reached: the refusal precedes all spend.
+    monkeypatch.setattr(e2e, "_process_instance",
+                        lambda instance, cfg: pytest.fail("an instance ran after the refusal"))
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_programbench_e2e.py", "--allow-dirty-seed", "--settings-path", str(settings),
+         "--ouroboros-url", "http://127.0.0.1:9"],
+    )
+    # RETURNS the recorded code. It used to re-raise, which exits the process with status 1 while
+    # the manifest said 3 — the record and reality disagreeing (see
+    # test_migrated_launcher_exit_status_matches_the_recorded_exit_code).
+    assert e2e.main() == 3
+    assert "reason=runtime_unreachable" in capsys.readouterr().err
+
+    manifest = json.loads((out_root / "run_manifest.json").read_text(encoding="utf-8"))
+    # The seed gate's SHAPE is on disk (never its verdict: `ok` mirrors the ambient checkout).
+    assert set(manifest["seed_gate"]) >= {"ok", "reason", "require_clean", "allow_dirty_seed"}
+    assert manifest["seed_gate"]["require_clean"] is False
+    assert manifest["seed_gate"]["ok"] is (not manifest["seed_gate"]["reason"])
+    extra = manifest["extra"]
+    assert extra["outcome"] == "refused"
+    assert extra["exit_code"] == 3
+    # The EXACT typed reason, not a generic message: the helper builds the record and the launcher
+    # persists it, so the manifest keeps the facts the provenance contract exists to preserve.
+    assert extra["refusal"] == {"stage": "runtime_attestation", "exit_code": 3,
+                                "reason": "runtime_unreachable"}
+    assert extra["runtime_attestation"]["reason"] == "runtime_unreachable"
+    assert extra["runtime_attestation"]["runtime_version"] == ""
+    assert extra["runtime_attestation"]["repo_head"] == "a" * 40
+    assert extra["runtime_attestation"]["repo_version"] == "6.75.0"
+    # No `error` key: nothing escaped, because the refusal is RETURNED. The record is the report.
+    assert "error" not in extra
+
+    # A refusal that carries NO record still refuses and still records a durable manifest, with the
+    # generic reason as the documented fallback.
+    def _bare(url, repo):
+        raise RuntimeError("attestation blew up with no record")
+
+    monkeypatch.setattr(e2e, "runtime_attestation", _bare)
+    assert e2e.main() == 3
+    assert "no record" in capsys.readouterr().err
+    extra = json.loads((out_root / "run_manifest.json").read_text(encoding="utf-8"))["extra"]
+    assert extra["refusal"]["reason"] == "runtime_attestation_failed"
+    assert extra["runtime_attestation"] == {"pending": "not_attested_yet"}
+
+
+# --------------------------------------------------------------------------------------
+# The recorded exit status must BE the process's exit status. Three review rounds found a
+# fresh instance of "recorded != real" (a SystemExit flattened to 1, a re-raise after
+# recording 2, a re-raise after recording 3), so the invariant is asserted behaviourally,
+# once per migrated launcher, by driving main() into a refusal path.
+# --------------------------------------------------------------------------------------
+
+
+def _process_status_of(main) -> int:
+    """The status a process would exit with, exactly as ``raise SystemExit(main())`` computes it."""
+    try:
+        return int(main() or 0)
+    except SystemExit as exc:
+        return int(exc.code) if isinstance(exc.code, int) else 1
+    except BaseException:
+        return 1                      # any other escaping exception: CPython exits 1
+
+
+def _refusal_case_programbench(tmp_path, monkeypatch):
+    from devtools.benchmarks.programbench import run_programbench as pb
+
+    out_root = tmp_path / "pb"
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    instruction = tmp_path / "task.txt"
+    instruction.write_text("do it", encoding="utf-8")
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+
+    def _boom(container_name):
+        raise RuntimeError("cleanroom container is not running")
+
+    monkeypatch.setattr(pb, "run_root", lambda *_a, **_k: out_root)
+    monkeypatch.setattr(pb, "preflight_cleanroom_container", _boom)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_programbench.py", "--workspace", str(workspace), "--instruction-file",
+         str(instruction), "--container-name", "c", "--instance-id", "inst-a",
+         "--settings-path", str(settings), "--allow-dirty-seed"],
+    )
+    return pb.main, out_root / "inst-a" / "run_manifest.json"
+
+
+def _refusal_case_programbench_e2e(tmp_path, monkeypatch):
+    from devtools.benchmarks.common.manifests import RuntimeAttestationRefused
+    from devtools.benchmarks.programbench import run_programbench_e2e as e2e
+
+    out_root = tmp_path / "pb-e2e"
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+
+    def _refuse(url, repo):
+        raise RuntimeAttestationRefused("runtime attestation failed reason=runtime_unreachable",
+                                        {"reason": "runtime_unreachable", "ok": False})
+
+    monkeypatch.setattr(e2e, "_load_instances",
+                        lambda **_k: [{"instance_id": "inst-a", "image_name": "img-a"}])
+    monkeypatch.setattr(e2e, "run_root", lambda *_a, **_k: out_root)
+    monkeypatch.setattr(e2e, "runtime_attestation", _refuse)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_programbench_e2e.py", "--allow-dirty-seed", "--settings-path", str(settings),
+         "--ouroboros-url", "http://127.0.0.1:9"],
+    )
+    return e2e.main, out_root / "run_manifest.json"
+
+
+def _refusal_case_swebench_predictions(tmp_path, monkeypatch):
+    from devtools.benchmarks.swe_bench import swebench_predictions as sp
+
+    input_path = tmp_path / "instances.jsonl"
+    input_path.write_text(json.dumps({"instance_id": "a"}) + "\n", encoding="utf-8")
+    output = tmp_path / "preds.jsonl"
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(sp, "_run_prediction_rows",
+                        lambda args, rows, **_k: ([], [], [], RuntimeError("agent never started")))
+    monkeypatch.setattr(
+        sys, "argv",
+        ["swebench_predictions.py", "--input", str(input_path), "--output", str(output),
+         "--settings-path", str(settings), "--allow-dirty-seed"],
+    )
+    return sp.main, Path(str(output) + ".run_manifest.json")
+
+
+def _refusal_case_pro_predictions(tmp_path, monkeypatch):
+    from devtools.benchmarks.swe_bench_pro import pro_predictions as pp
+
+    input_path = tmp_path / "rows.jsonl"
+    input_path.write_text(json.dumps({"instance_id": "a"}) + "\n", encoding="utf-8")
+    output = tmp_path / "preds.jsonl"
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        sys, "argv",
+        ["pro_predictions.py", "--input", str(input_path), "--output", str(output),
+         "--patch-dir", str(tmp_path / "patches"), "--settings-path", str(settings),
+         "--allow-dirty-seed"],
+    )
+    return pp.main, Path(str(output) + ".run_manifest.json")
+
+
+def _refusal_case_harness_bench_fast(tmp_path, monkeypatch):
+    from devtools.benchmarks.harness_bench_fast import run_harness_bench_fast as hbf
+
+    out_root = tmp_path / "hbf-run"
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(hbf, "_read_task_ids", lambda root, ids, task_file="": ["task_1"])
+    monkeypatch.setattr(hbf.subprocess, "run",
+                        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 7, stdout="", stderr=""))
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_harness_bench_fast.py", "--run-root", str(out_root), "--allow-dirty-seed",
+         "--settings-path", str(settings), "--bench-root", str(tmp_path / "bench")],
+    )
+    return hbf.main, out_root / "run_manifest.json"
+
+
+def _refusal_case_run_pro(tmp_path, monkeypatch):
+    from devtools.benchmarks.swe_bench_pro.e1v2 import run_pro
+
+    out_dir = tmp_path / "out"
+    seed = tmp_path / "worktree-seed"
+    seed.mkdir()
+    (seed / ".git").write_text("gitdir: /elsewhere/.git/worktrees/wt\n", encoding="utf-8")
+    monkeypatch.setattr(run_pro, "SRC", seed)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    monkeypatch.setattr(run_pro, "read_full_order", lambda: ["inst__a"])
+    monkeypatch.setattr(run_pro, "load_pro_rows", lambda ids: {})
+    monkeypatch.setattr(sys, "argv", ["run_pro.py", "--full-set", "--out-dir", str(out_dir),
+                                      "--allow-dirty-seed"])
+    return run_pro.main, out_dir / "run_manifest.json"
+
+
+def _refusal_case_auto_run(tmp_path, monkeypatch):
+    from devtools.benchmarks.common.manifests import SeedShapeRefused
+    from devtools.benchmarks.swe_bench_pro.e1v2 import auto_run
+
+    out_dir = tmp_path / "auto"
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    fake_run_pro = SimpleNamespace()
+
+    def _refuse(path):
+        raise SeedShapeRefused("seed_is_not_a_git_directory", "no real .git directory")
+
+    fake_run_pro.assert_seed_is_git_directory = _refuse
+    fake_run_pro.ensure_util_image = lambda: None
+    monkeypatch.setitem(sys.modules, "devtools.benchmarks.swe_bench_pro.e1v2.run_pro", fake_run_pro)
+    monkeypatch.setattr(sys, "argv", ["auto_run.py", "--start", "1", "--end", "1",
+                                      "--out-dir", str(out_dir), "--allow-dirty-seed"])
+    return auto_run.main, out_dir / "auto_run_manifest.json"
+
+
+_REFUSAL_CASES = (
+    _refusal_case_programbench,
+    _refusal_case_programbench_e2e,
+    _refusal_case_swebench_predictions,
+    _refusal_case_pro_predictions,
+    _refusal_case_harness_bench_fast,
+    _refusal_case_run_pro,
+    _refusal_case_auto_run,
+)
+
+
+@pytest.mark.parametrize(
+    "build_case", _REFUSAL_CASES,
+    ids=[case.__name__[len("_refusal_case_"):] for case in _REFUSAL_CASES],
+)
+def test_migrated_launcher_exit_status_matches_the_recorded_exit_code(build_case, tmp_path, monkeypatch):
+    """The manifest's `exit_code` must BE the status the process exits with, per launcher.
+
+    Asserted as a PROPERTY rather than as syntax: each case drives the launcher into a failing
+    path and compares the status `raise SystemExit(main())` would produce against the
+    `extra.exit_code` the run's own record claims. Recording a code and then letting a plain
+    exception escape silently reports 1 instead — which is how three separate review rounds each
+    found a fresh instance of the record disagreeing with reality.
+    """
+    main, manifest_path = build_case(tmp_path, monkeypatch)
+    status = _process_status_of(main)
+    extra = json.loads(manifest_path.read_text(encoding="utf-8"))["extra"]
+    assert status == extra["exit_code"], (
+        f"process would exit {status} but the manifest records exit_code={extra['exit_code']} "
+        f"(outcome={extra.get('outcome')!r})"
+    )
+    assert status != 0                      # every case here is a failure path
+    assert extra["outcome"] not in ("started", "completed")
+
+
+def test_runtime_attestation_requires_the_contracted_runtime_version_field(tmp_path, monkeypatch):
+    """Only the CONTRACTED field counts as a runtime identity.
+
+    `runtime_version` is part of the frozen `HealthResponse` (`ouroboros/gateway/contracts.py`).
+    The helper used to fall back to a generic `version` key, so ANY unrelated HTTP server that
+    answered `{"version": "6.75.0"}` attested successfully and ProgramBench's default admission
+    path would bless a server that is not Ouroboros at all. Its absence is now the distinct,
+    NON-overridable reason `runtime_version_absent` — the endpoint answered, but not with the
+    health contract, so no live runtime identity was established.
+    """
+    from devtools.benchmarks.common import manifests
+
+    repo = tmp_path / "repo"
+    _git_repo(repo)
+    (repo / "VERSION").write_text("6.75.0\n", encoding="utf-8")
+    _git_commit_all(repo)
+
+    served: dict = {"version": "6.75.0"}          # a stranger's field, not the contract's
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def read(self):
+            return json.dumps(served).encode("utf-8")
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
+    monkeypatch.delenv(manifests.ALLOW_EVOLVED_VOLUME_ENV, raising=False)
+
+    with pytest.raises(RuntimeError, match="reason=runtime_version_absent"):
+        manifests.runtime_attestation("http://127.0.0.1:9/", repo)
+
+    # ... and the override does NOT rescue it: it waives a deliberate skew only.
+    monkeypatch.setenv(manifests.ALLOW_EVOLVED_VOLUME_ENV, "1")
+    with pytest.raises(RuntimeError, match="reason=runtime_version_absent") as refused:
+        manifests.runtime_attestation("http://127.0.0.1:9/", repo)
+    assert "does NOT waive" in str(refused.value)
+    assert "runtime_version_absent" not in manifests.OVERRIDABLE_ATTESTATION_REASONS
+
+    # The contracted field attests, with the same payload otherwise unchanged.
+    served.clear()
+    served["runtime_version"] = "6.75.0"
+    attested = manifests.runtime_attestation("http://127.0.0.1:9/", repo)
+    assert attested["ok"] is True and attested["reason"] == ""
+    assert attested["runtime_version"] == "6.75.0"

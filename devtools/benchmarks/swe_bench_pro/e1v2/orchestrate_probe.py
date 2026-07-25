@@ -23,7 +23,7 @@ new-vs-v25 verdicts.
     --settings .../settings_sonnet46_probe.json --eval-repo .../SWE-bench_Pro-os
 """
 from __future__ import annotations
-import argparse, csv, hashlib, json, os, re, subprocess, sys, threading, time, pathlib
+import argparse, csv, hashlib, json, os, subprocess, sys, threading, time, pathlib
 
 PRO = pathlib.Path(__file__).resolve().parent
 SRC = pathlib.Path(__file__).resolve().parents[4]
@@ -56,6 +56,81 @@ def reap_timed_out_runpro(proc, worker: int, env: dict) -> None:
             subprocess.run(["docker", "rm", "-f", cid], capture_output=True, env=env, timeout=60)
     except Exception:
         pass
+
+
+def read_graded_verdict(eval_dir: pathlib.Path, instance_id: str) -> tuple[str, str]:
+    """Read one instance's verdict from ``grade_pro.py``'s TYPED artefact.
+
+    ``grade_pro`` writes ``grade_summary.json`` (``verdicts[]`` with ``verdict`` in
+    ``pass|fail|ungraded`` plus ``reason``/``tests``); this reads that structure instead of
+    scraping the grader's console output. The previous log string-matching (``DIAGNOSTIC_PASS``
+    and friends) silently returned ``ERR`` for EVERY task once the grader's printing changed,
+    which reports a healthy run as a broken harness.
+    Returns ``(verdict_in_probe_vocabulary, tests_column)``.
+    """
+    summary_path = pathlib.Path(eval_dir) / "grade_summary.json"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return "ERR", ""
+    rows = [r for r in (summary.get("verdicts") or []) if isinstance(r, dict)]
+    row = next((r for r in rows if str(r.get("instance_id")) == str(instance_id)), None)
+    if row is None and len(rows) == 1:
+        row = rows[0]          # single-instance grading: accept the only row (prefixed vs bare id)
+    if row is None:
+        return "ERR", ""
+    verdict = str(row.get("verdict") or "")
+    reason = str(row.get("reason") or "")
+    tests = str(row.get("tests") or "")
+    if verdict == "pass":
+        return "PASS", tests
+    if verdict == "fail":
+        return "FAIL", tests
+    if verdict == "ungraded":
+        return ("NO_OUTPUT" if reason == "no_official_output" else f"UNGRADED:{reason}" if reason else "UNGRADED"), tests
+    return "ERR", tests
+
+
+def grade_one(tdir: pathlib.Path, pred: pathlib.Path, iid: str, *,
+              host_python: str, eval_repo: str, run_csv: pathlib.Path) -> tuple[str, str]:
+    """Grade ONE task and return its verdict, or ``("ERR", "")`` — never a stale one.
+
+    A task directory can already hold ``pro_eval/grade_summary.json`` from an earlier
+    attempt (this orchestrator is rerun over partial runs, and ``--out-dir`` is reused).
+    The summary is therefore REMOVED before the grader runs, and the verdict is accepted
+    only when the grader both exited 0 AND produced that artefact in THIS attempt.
+    Without those two conditions a grader that timed out or crashed left the previous
+    PASS/FAIL in place and it was silently attributed to the new attempt — a wrong
+    headline number with no error anywhere.
+    """
+    ev = tdir / "pro_eval"
+    summary = ev / "grade_summary.json"
+    try:
+        summary.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        # Cannot guarantee freshness => refuse to read the file at all.
+        (tdir / "grade.log").write_text(f"GRADE_STALE_SUMMARY_UNREMOVABLE {exc!r}\n", encoding="utf-8")
+        return "ERR", ""
+    cmd = [host_python, str(GRADE_PRO), "--predictions", str(pred),
+           "--out-dir", str(ev), "--eval-repo", eval_repo,
+           "--workers", "1", "--csv", str(run_csv)]
+    rc = None
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=2400, env=dict(os.environ))
+        rc = r.returncode
+        out = (r.stdout or "") + "\n" + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        out = "GRADE_TIMEOUT"
+    except Exception as exc:
+        out = f"GRADE_INVOCATION_FAILED {exc!r}"
+    (tdir / "grade.log").write_text(out, encoding="utf-8")
+    # The log stays for humans; the VERDICT comes from the typed artefact only, and only
+    # when this invocation succeeded and actually wrote it.
+    if rc != 0 or not summary.is_file():
+        return "ERR", ""
+    return read_graded_verdict(ev, iid)
 
 
 def sha256(p: pathlib.Path) -> str:
@@ -143,23 +218,6 @@ def main() -> int:
     stop = threading.Event()
     state = {"cum_spent": 0.0, "results": []}
 
-    def grade_one(tdir: pathlib.Path, pred: pathlib.Path) -> tuple:
-        ev = tdir / "pro_eval"
-        cmd = [args.host_python, str(GRADE_PRO), "--predictions", str(pred),
-               "--out-dir", str(ev), "--eval-repo", args.eval_repo,
-               "--workers", "1", "--csv", str(run_csv)]
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=2400, env=dict(os.environ))
-            out = (r.stdout or "") + "\n" + (r.stderr or "")
-        except subprocess.TimeoutExpired:
-            out = "GRADE_TIMEOUT"
-        (tdir / "grade.log").write_text(out, encoding="utf-8")
-        verdict = ("PASS" if "DIAGNOSTIC_PASS" in out else
-                   "FAIL" if "DIAGNOSTIC_FAIL" in out else
-                   "NO_OUTPUT" if "NO_OUTPUT" in out else "ERR")
-        m = re.search(r"DIAGNOSTIC_\w+\s+\S+\s+(\d+/\d+/\d+)", out)
-        return verdict, (m.group(1) if m else "")
-
     def run_task(w: int, r: dict) -> None:
         idx = int(r["idx"]); iid = r["instance_id"]
         tag = tags.get(iid) or tags.get(iid[len("instance_"):] if iid.startswith("instance_") else "instance_" + iid)
@@ -204,7 +262,8 @@ def main() -> int:
                 pred = None
         verdict_new, tests = "", ""
         if pred and not args.no_grade:
-            verdict_new, tests = grade_one(tdir, pf)
+            verdict_new, tests = grade_one(tdir, pf, iid, host_python=args.host_python,
+                                           eval_repo=args.eval_repo, run_csv=run_csv)
         if tag and not args.keep_images:
             subprocess.run(["docker", "rmi", "-f", f"{IMG_REPO}:{tag}"], capture_output=True, env=dict(os.environ))
         with lock:
