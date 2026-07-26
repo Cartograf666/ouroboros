@@ -1048,3 +1048,79 @@ def test_body_error_storm_does_not_phantom_exhaust_budget(data_root):
         _request(data_root, task_id="after", model="openai/gpt-5.5", global_limit_usd=25.0)
     )
     assert reservation is not None
+
+
+def test_cache_bearing_sends_are_measured_on_every_cache_inclusive_route(tmp_path):
+    """A cached send must still teach density on routes whose prompt_tokens is a TOTAL.
+
+    The skip exists for routes that report cache tokens OUTSIDE prompt_tokens, where a
+    partially cached call would look falsely cheap and LOOSEN the review-pack cap. It must
+    not fire on routes that already fold cache reads and writes in — every review surface
+    marks a stable prefix, so skipping those would make the measurement path vacuous and
+    freeze every pack at the cold-start density forever.
+
+    Pinned as a CONTRACT, not as the current membership list: direct-Anthropic became
+    cache-inclusive in v6.77.0 (`llm.py` folds cache_read/cache_creation into
+    prompt_tokens) but was left out of the set until v6.81.0, which silently killed
+    measurement on the main and heavy slots. Nothing failed, because nothing tested it."""
+    from ouroboros.capability_evidence import _DENSITY_MEMO, get_token_density
+    from ouroboros.provider_models import normalize_model_identity
+
+    cached_usage = {
+        "prompt_tokens": 1_500_000,   # already INCLUDES the cache reads below
+        "cached_tokens": 900_000,
+        "cache_write_tokens": 100_000,
+    }
+
+    for provider, model in (
+        ("anthropic", "anthropic/claude-sonnet-5"),
+        ("openrouter", "openrouter/some-model"),
+        ("openai", "openai/gpt-5.5"),
+        ("openai-compatible", "compat/some-model"),
+        ("cloudru", "cloudru/some-model"),
+        ("local", "local/some-model"),
+    ):
+        _DENSITY_MEMO.clear()
+        root = tmp_path / provider
+        ua._observe_token_density(
+            ua.AttemptRequest(
+                model=model,
+                provider=provider,
+                prompt_tokens_estimate=1_000_000,
+                drive_root=root,
+            ),
+            dict(cached_usage),
+        )
+        measured = get_token_density(root, normalize_model_identity(model))
+        assert abs(measured - 1.5) < 1e-6, f"{provider} must be measured, got {measured}"
+
+    # The other direction: a route whose cache-token semantics are undocumented is still
+    # skipped, because there an under-measured density loosens the cap.
+    _DENSITY_MEMO.clear()
+    root = tmp_path / "gigachat"
+    ua._observe_token_density(
+        ua.AttemptRequest(
+            model="gigachat/some-model",
+            provider="gigachat",
+            prompt_tokens_estimate=1_000_000,
+            drive_root=root,
+        ),
+        dict(cached_usage),
+    )
+    assert get_token_density(root, normalize_model_identity("gigachat/some-model")) == 0.0
+
+    # And an UNCACHED send on that same route is measured normally — the skip is about
+    # cache accounting, not about distrusting the provider.
+    _DENSITY_MEMO.clear()
+    root = tmp_path / "gigachat_uncached"
+    ua._observe_token_density(
+        ua.AttemptRequest(
+            model="gigachat/some-model",
+            provider="gigachat",
+            prompt_tokens_estimate=1_000_000,
+            drive_root=root,
+        ),
+        {"prompt_tokens": 1_500_000},
+    )
+    measured = get_token_density(root, normalize_model_identity("gigachat/some-model"))
+    assert abs(measured - 1.5) < 1e-6

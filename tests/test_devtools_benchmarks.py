@@ -6824,3 +6824,62 @@ def test_gaia_and_tb_launchers_add_no_runtime_attestation(tmp_path):
         assert "runtime_attestation" not in src, f"{path.name} must not attest a live runtime"
     for path in (tb_dir / "run_tb.py", tb_dir / "run_harbor_smoke.py", gaia_dir / "run_gaia.py"):
         assert "require_clean=not " in path.read_text(encoding="utf-8"), f"{path.name} lost its seed gate"
+
+
+def test_architecture_launcher_count_is_pinned_to_the_registry():
+    """ARCHITECTURE must state the real migrated-launcher count, derived not restated.
+
+    Two phases edited the same 33 KB single-physical-line paragraph independently. Git
+    merged both survivors with no conflict marker, leaving the document asserting ELEVEN
+    in one sentence and ten in another while the registry held fourteen. Every gate was
+    green: no test pinned the prose to the code, so the only reader who could have caught
+    it was a human diffing a 33 KB line by eye.
+
+    Pinned as a CONTRACT: the number in the document must equal len(MIGRATED_LAUNCHERS),
+    whatever that becomes. A phase that migrates a launcher and forgets the prose fails
+    here instead of shipping a document that misdescribes its own gate."""
+    import pathlib
+    import re
+
+    from devtools.benchmarks.common.launcher_audit import (
+        MIGRATED_LAUNCHERS,
+        PENDING_LAUNCHERS,
+    )
+
+    words = {
+        7: "SEVEN", 8: "EIGHT", 9: "NINE", 10: "TEN", 11: "ELEVEN", 12: "TWELVE",
+        13: "THIRTEEN", 14: "FOURTEEN", 15: "FIFTEEN", 16: "SIXTEEN",
+    }
+    total = len(MIGRATED_LAUNCHERS)
+    expected = words.get(total)
+    assert expected is not None, f"extend the word table for {total} launchers"
+
+    arch = pathlib.Path(__file__).resolve().parents[1] / "docs" / "ARCHITECTURE.md"
+    text = arch.read_text(encoding="utf-8")
+
+    # Only NUMBER words are claims about a count; "the migrated launchers" is not.
+    # Historical, explicitly version-qualified counts ("ELEVEN as of v6.76.0") are
+    # legitimate and exempt — the paragraph is partly a per-version narrative.
+    numerals = "|".join(sorted(words.values(), key=len, reverse=True))
+    pattern = re.compile(rf"\b({numerals})\b(?=[^.]{{0,80}}?migrated launchers)", re.I)
+    found = 0
+    for match in pattern.finditer(text):
+        word = match.group(1)
+        following = text[match.end():match.end() + 40]
+        if re.match(r"\s+as of v\d+\.\d+\.\d+", following):
+            continue
+        found += 1
+        assert word.upper() == expected, (
+            f"ARCHITECTURE says {word!r} migrated launchers but the registry holds "
+            f"{total} ({expected}); an unqualified count must be the current one"
+        )
+
+    assert found, (
+        "no unqualified migrated-launcher count found in ARCHITECTURE — the check went "
+        "vacuous; a count must be stated so it can be pinned"
+    )
+
+    if not PENDING_LAUNCHERS:
+        assert "`PENDING_LAUNCHERS` is the empty tuple" in text or (
+            "PENDING_LAUNCHERS` now the empty tuple" in text
+        ), "the empty residual must stay disclosed while it is empty"

@@ -1096,8 +1096,15 @@ def settle_attempt(
 # the main loop and every review surface mark a stable prefix, so a
 # skip-on-any-cache-token rule would silently make the measurement path VACUOUS and
 # freeze every pack at the conservative cold-start density forever.
+# `anthropic` belongs here as of v6.81.0: the direct-Anthropic path now reports
+# `prompt_tokens = input_tokens + cache_read_input_tokens + cache_creation_input_tokens`
+# (`llm.py`, v6.77.0), i.e. the same OpenAI-semantics total the rest of this set has.
+# It was correctly ABSENT while that path still reported bare `input_tokens`; leaving it
+# out afterwards made the measurement vacuous on the main and heavy slots, which are the
+# direct-Anthropic routes. GigaChat stays out: its `precached_prompt_tokens` semantics
+# are still undocumented.
 _CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS = frozenset({
-    "openrouter", "openai", "openai-compatible", "cloudru", "local",
+    "openrouter", "openai", "openai-compatible", "cloudru", "local", "anthropic",
 })
 
 
@@ -1110,13 +1117,12 @@ def _observe_token_density(request: AttemptRequest, usage: Optional[Dict[str, An
     packs keep using the conservative cold-start density).
 
     A cache-bearing send is skipped ONLY on a route whose ``prompt_tokens`` semantics
-    are not known to be cache-inclusive (today the direct-Anthropic path, which reports
-    bare ``input_tokens``, plus GigaChat, whose `precached_prompt_tokens` semantics are
-    undocumented). There a partially cached call would report a falsely LOW density, and
-    an under-measured density LOOSENS the review-pack cap — the one direction that
-    reintroduces provider 400s. No arithmetic reconstruction is attempted here on
-    purpose: the direct-Anthropic accounting fix is owned elsewhere, and adding cache
-    tokens back would double-count once it lands."""
+    are not known to be cache-inclusive — today GigaChat, whose `precached_prompt_tokens`
+    semantics are undocumented. There a partially cached call would report a falsely LOW
+    density, and an under-measured density LOOSENS the review-pack cap — the one direction
+    that reintroduces provider 400s. No arithmetic reconstruction is attempted here on
+    purpose; the direct-Anthropic path needs none, because as of v6.77.0 it already folds
+    cache reads and writes into ``prompt_tokens`` itself."""
     try:
         normalized = dict(usage or {})
         cache_bearing = bool(

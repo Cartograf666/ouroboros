@@ -547,7 +547,28 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
 
     # A route whose prompt_tokens semantics are NOT known cache-inclusive stays
     # skipped while cache tokens are present (a falsely low density would LOOSEN the
-    # review-pack cap — the only dangerous direction).
+    # review-pack cap — the only dangerous direction). GigaChat is that route: its
+    # `precached_prompt_tokens` semantics are undocumented.
+    #
+    # This example used to be direct-Anthropic, and that was correct when this test was
+    # written: the path reported bare `input_tokens` then. v6.77.0 made it fold cache
+    # reads and writes into `prompt_tokens`, so the premise expired inside this very
+    # release and the assertion became a pin on a stale world rather than on a contract.
+    _DENSITY_MEMO.clear()
+    execute_physical_attempt(
+        AttemptRequest(
+            model="gigachat-model", provider="gigachat",
+            prompt_tokens_estimate=50_000, max_completion_tokens=1024,
+            drive_root=tmp_path,
+        ),
+        lambda: response,
+        extractor=lambda resp: (dict(resp.usage), 0.0, True),
+    )
+    assert get_token_density(tmp_path, "gigachat-model") == 0.0
+
+    # ...and the direct-Anthropic route, now cache-inclusive, IS measured. Leaving it
+    # out made the measurement vacuous on the main and heavy slots, which are exactly
+    # the routes this machinery exists to calibrate.
     _DENSITY_MEMO.clear()
     execute_physical_attempt(
         AttemptRequest(
@@ -558,4 +579,4 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
         lambda: response,
         extractor=lambda resp: (dict(resp.usage), 0.0, True),
     )
-    assert get_token_density(tmp_path, "direct-anthropic-model") == 0.0
+    assert abs(get_token_density(tmp_path, "direct-anthropic-model") - 1.6) < 1e-6
