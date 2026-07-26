@@ -48,8 +48,14 @@ import sys
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
-from devtools.benchmarks.common.manifests import benchmark_run_manifest, write_json
-from devtools.benchmarks.common.run_roots import ensure_outside_repo, run_root
+from devtools.benchmarks.common.manifests import (
+    admit_benchmark_run,
+    finalize_run_manifest,
+    model_slot_snapshot,
+    repo_provenance,
+    write_json,
+)
+from devtools.benchmarks.common.run_roots import assert_outside_repo, live_repo_roots, run_root
 from devtools.benchmarks.common.secrets import load_secret_env, redacted_env_summary
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
@@ -64,6 +70,11 @@ DOMAINS = (
     "sales_prediction",
 )
 BRIDGE_PHASES = ("stateless", "stateful_noevo", "stateful_evo")
+# Honest label for an instance the bridge recovered from the shim's full
+# ``instance_outcomes`` list: officially scored, but closed as a side effect of another
+# question's step, so the agent never had its own turn on it. Written by the tracked
+# operator patch ``clb_multi_instance_outcomes.v6746.patch``; read here for disclosure.
+AUTO_RESOLVED_STATUS = "auto_resolved_no_agent_turn"
 BRIDGE_MODULE = "src.systems.ouroboros.run_clbench_bridge_agent"
 # In-runner Ouroboros adapter subtree + the commit the reference run pinned it at
 # (MANIFEST.json of the v6.52.2_full40_db handoff bundle).
@@ -144,12 +155,32 @@ def check_runner(runner: pathlib.Path) -> dict:
     }
 
 
-def check_clone(clone: pathlib.Path) -> None:
-    """The Ouroboros clone handed to the external adapter must never be the live repo."""
+def refuse_live_repo_clone(clone: pathlib.Path) -> pathlib.Path:
+    """PURE argument validation: the clone must never be the LIVE repo. Returns it resolved.
+
+    The authority is ``live_repo_roots()`` — the runtime's configured checkout — NOT this
+    launcher's own ``REPO``. Comparing against ``REPO`` asked "is this the tree I am executing
+    from?", which is the same question only in the development workspace: ship the launcher
+    inside a pinned seed and passing that seed as ``--ouroboros-clone``, which is exactly the
+    recipe METHODOLOGY prescribes, was refused. The gate's intent is unchanged — a run must
+    never be pointed at the live working repo, where it could disturb a running server.
+
+    Deliberately free of any filesystem probe so it can run BEFORE `admit_benchmark_run` —
+    "you passed the wrong path" is an argument error with nothing to record, unlike the
+    shape probe below, which is a preflight and belongs inside the admitted run.
+    """
     resolved = pathlib.Path(clone).expanduser().resolve(strict=False)
-    if resolved == REPO.resolve(strict=False):
-        raise SystemExit("--ouroboros-clone must be a dedicated CLONE, never the live repo "
-                         f"({REPO}); the adapter's engines boot throwaway sub-clones from it.")
+    for live in live_repo_roots():
+        if resolved == live.expanduser().resolve(strict=False):
+            raise SystemExit("--ouroboros-clone must be a dedicated CLONE, never the LIVE repo "
+                             f"({live}); the adapter's engines boot throwaway sub-clones from it "
+                             "and a benchmark must not touch the tree a running server serves.")
+    return resolved
+
+
+def check_clone(clone: pathlib.Path) -> None:
+    """The Ouroboros clone handed to the external adapter must be a real checkout."""
+    resolved = refuse_live_repo_clone(clone)
     if not (resolved / "devtools" / "benchmarks" / "common" / "server_runner.py").exists():
         raise SystemExit(f"--ouroboros-clone does not look like an Ouroboros checkout "
                          f"(missing devtools/benchmarks/common/server_runner.py): {resolved}")
@@ -237,7 +268,8 @@ def _sanitized_child_env(run_dir: pathlib.Path, settings: dict, args: argparse.N
     # runtime mode, reviewer list, split review efforts, context mode, workers. Only set
     # when the template declares them, so unpatched adapters keep parity defaults.
     for _knob in ("OUROBOROS_RUNTIME_MODE", "OUROBOROS_REVIEW_MODELS", "OUROBOROS_EFFORT_REVIEW",
-                  "OUROBOROS_EFFORT_SCOPE_REVIEW", "OUROBOROS_CONTEXT_MODE", "OUROBOROS_MAX_WORKERS"):
+                  "OUROBOROS_EFFORT_SCOPE_REVIEW", "OUROBOROS_CONTEXT_MODE",
+                  "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_MAX_WORKERS"):
         _val = settings.get(_knob)
         if _val:
             env[_knob] = str(_val)
@@ -362,6 +394,7 @@ def collect_results(run_dir: pathlib.Path) -> dict:
         rewards: dict[int, float | None] = {}
         costs: list[float] = []
         found_keys: set[tuple[str, str]] = set()
+        auto_resolved: list[int | None] = []
         if cond_dir.is_dir():
             for outcome_path in sorted(cond_dir.glob("*/q*/task_outcome.json")):
                 try:
@@ -378,6 +411,8 @@ def collect_results(run_dir: pathlib.Path) -> dict:
                 domain = str(row.get("domain") or outcome_path.parent.parent.name)
                 qid = outcome_path.parent.name
                 found_keys.add((domain, qid))
+                if str(row.get("ouroboros_status") or "") == AUTO_RESOLVED_STATUS:
+                    auto_resolved.append(idx)
                 ledger_rows.append({
                     "benchmark": "continual_learning",
                     "condition": cond_name,
@@ -410,6 +445,13 @@ def collect_results(run_dir: pathlib.Path) -> dict:
             "missing_reward_indices": sorted(i for i, r in rewards.items() if r is None),
             "mean_reward": _mean(list(rewards.values())),
             "cost_usd": round(sum(costs), 2) if costs else None,
+            # Instances the bridge recovered from the shim's full instance_outcomes list
+            # because ONE task.step() closed several at once — officially scored, but the
+            # agent never had its own turn on them (see METHODOLOGY §4a). Disclose this
+            # count next to any mean; it is also why n_outcomes can exceed the requested
+            # --num-instances window.
+            "n_auto_resolved_no_agent_turn": len(auto_resolved),
+            "auto_resolved_no_agent_turn_indices": sorted(i for i in auto_resolved if i is not None),
         }
     def _cond_mean(name: str) -> float | None:
         return (conditions.get(name) or {}).get("mean_reward")
@@ -494,6 +536,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task-timeout-sec", type=int, default=900)
     parser.add_argument("--total-budget", type=float, default=None,
                         help="isolated-server TOTAL_BUDGET (default: settings TOTAL_BUDGET)")
+    parser.add_argument("--allow-dirty-seed", action="store_true",
+                        help="run even when the EXECUTION seed — the --ouroboros-clone the adapter boots "
+                             "its agent servers from — is dirty or its git identity is unreadable (default: "
+                             "fail closed). The escape is recorded in the manifest; a dirty seed makes the "
+                             "run's provenance irreproducible and NOT submittable.")
     parser.add_argument("--dry-run", action="store_true", help="write manifest + rendered settings + planned argv, spend nothing")
     parser.add_argument("--collect-only", default="",
                         help="skip launching; (re)normalize results in an EXISTING run dir")
@@ -504,13 +551,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(results, indent=2))
         return 0
 
-    settings_template = json.loads(pathlib.Path(args.settings).expanduser().read_text(encoding="utf-8"))
-    args.model = args.model or str(settings_template.get("OUROBOROS_MODEL") or "")
-    args.effort = args.effort or str(settings_template.get("OUROBOROS_EFFORT_TASK") or "low")
-    args.or_provider = args.or_provider or str(settings_template.get("OUROBOROS_OR_PROVIDER") or "")
-    if not args.model:
-        raise SystemExit("no solve model: pass --model or set OUROBOROS_MODEL in the settings template")
-
+    # --- PURE argument validation / local derivation (everything before admission) ------
     # Strict-sequential guard: the bench design forbids cross-task parallelism. Only the
     # per-instance-independent stateless baseline may fan out, and only on explicit opt-in.
     if args.instance_workers > 1:
@@ -525,69 +566,56 @@ def main(argv: list[str] | None = None) -> int:
         if non_stateless:
             raise SystemExit(f"--instance-workers>1 allows ONLY stateless phases; drop {non_stateless} "
                              "or run them in a separate sequential invocation.")
-    if args.evolution and args.path == "bridge" and "stateful_evo" not in args.phases:
-        print("[clb] note: --evolution on the bridge path only takes effect in the stateful_evo phase",
-              file=sys.stderr)
-
-    runner_report = check_runner(pathlib.Path(args.runner_path or "."))
-    if not args.runner_path or not runner_report["present"] or not (
-            runner_report["run_benchmark_present"] if args.path == "standard" else runner_report["bridge_present"]):
-        message = (
-            "external runner not found/incomplete at "
-            f"{runner_report['path'] or '(unset)'} — the continual-learning-bench repo is REQUIRED and is "
-            "NOT vendored in this repository. Obtain it separately; its Ouroboros adapter "
-            f"(src/systems/ouroboros/, pinned commit {ADAPTER_PINNED_COMMIT[:7]}) ships in the run handoff "
-            "bundle under bench-config/external-adapters/ouroboros/. See README.md."
-        )
-        if not args.dry_run:
-            raise SystemExit(message)
-        print(f"[clb] WARNING (dry-run): {message}", file=sys.stderr)
     if args.ouroboros_clone:
-        check_clone(pathlib.Path(args.ouroboros_clone))
+        # Pure path comparison only; the checkout-shape probe is a preflight and runs after
+        # admission, so its refusal leaves a durable record.
+        execution_clone = refuse_live_repo_clone(pathlib.Path(args.ouroboros_clone))
     elif not args.dry_run:
         raise SystemExit("--ouroboros-clone (or $OUROBOROS_BENCH_CLONE) is required for a real run")
     else:
         args.ouroboros_clone = "(unset)"
+        execution_clone = None
 
     out = pathlib.Path(args.out_dir).expanduser() if args.out_dir else run_root("continual_learning")
-    out = ensure_outside_repo(out, REPO)
-    rendered = render_run_settings(pathlib.Path(args.settings), out, solve_model=args.model,
-                                   evolution=args.evolution, total_budget=args.total_budget)
-    runner_python = args.runner_python
-    if not runner_python:
-        venv_python = pathlib.Path(runner_report["path"]) / ".venv" / "bin" / "python"
-        runner_python = str(venv_python) if venv_python.exists() else sys.executable
-    plans = build_planned_argv(args, rendered, out, runner_python)
-    fidelity = _fidelity_report(rendered, args)
-    _print_fidelity_warnings(fidelity)
-
+    # Confine against EVERY checkout this run touches, not just the launcher's own. Validating
+    # only against REPO let admission artefacts land inside the execution clone — the very seed
+    # whose cleanliness the gate is about to attest — which both pollutes it and can make the
+    # seed dirty. ASSERT, not ensure: the directory must not exist before the manifest does.
+    for authority in (REPO, execution_clone):
+        if authority is not None:
+            out = assert_outside_repo(out, authority)
+    manifest_path = out / "run_manifest.json"
     if args.path == "bridge":
         requested = [f"{args.domain}:q{i:03d}" for i in range(args.num_instances)]
     else:
         requested = [f"{args.domain}:{args.schedule}:run{r}" for r in range(args.runs)]
-    child_env = _sanitized_child_env(out, rendered, args) if args.ouroboros_clone != "(unset)" else dict(os.environ)
-    manifest = benchmark_run_manifest(
+
+    # --- ADMISSION -----------------------------------------------------------------------
+    # The seed gate is bound to the EXECUTION clone — the checkout the adapter actually boots
+    # its agent servers from (`--ouroboros-clone`) — not to this launcher's own checkout. The
+    # two are different trees by construction (the clone may never be the live repo), so
+    # gating REPO let a DIRTY execution seed pass whenever the launcher happened to be clean:
+    # the run's numbers came from code the manifest never described. The launcher's own
+    # provenance is recorded ALONGSIDE it, never instead of it.
+    manifest = admit_benchmark_run(
+        manifest_path,
         benchmark="continual_learning",
         run_root=out,
-        repo_dir=REPO,
+        # dry-run without a clone has no execution seed; the launcher checkout stands in and
+        # `seed_gate_target` records which tree the verdict is about.
+        repo_dir=execution_clone if execution_clone is not None else REPO,
         requested_task_ids=requested,
-        # v6.75.0: the shared seed gate now defaults to require_clean=True. This launcher
-        # keeps its pre-v6.75.0 behaviour until its own phase adds --allow-dirty-seed.
-        require_clean=False,
+        require_clean=not args.allow_dirty_seed,
         metadata={
             "argv": sys.argv if argv is None else [sys.argv[0], *argv],
             "dataset": "continual-learning-bench (external)",
-            "official_command": plans[0],
             "settings_path": str(out / "_run_settings.json"),
             "output_paths": {"traces": str(out / "traces"), "runner_state": str(out / "runner_state"),
                              "results": str(out / "results.json")},
-            "harness": {"external_runner": runner_report, "entrypoint": args.path,
-                        "planned_invocations": plans},
             "timeout_sec": args.task_timeout_sec,
             "extra": {
                 "domain": args.domain,
                 "path": args.path,
-                "solve_model": _litellm_model(args.model),
                 "phases": args.phases if args.path == "bridge" else "",
                 "schedule": args.schedule if args.path == "standard" else "default",
                 "runs": args.runs if args.path == "standard" else 1,
@@ -601,29 +629,108 @@ def main(argv: list[str] | None = None) -> int:
                     "note": "cross-task order is strictly sequential by bench design; "
                             "OUROBOROS_MAX_WORKERS is a WITHIN-task subagent pool, not cross-task parallelism",
                 },
-                "fidelity": fidelity,
-                "provider_env_present": redacted_env_summary(child_env),
+                "allow_dirty_seed": bool(args.allow_dirty_seed),
+                "seed_gate_target": ("execution_clone" if execution_clone is not None
+                                     else "launcher_checkout_dry_run"),
+                "execution_clone": str(execution_clone) if execution_clone is not None else "",
+                # Where the runtime attestation for THIS run comes from. The host engine
+                # path is attested inside IsolatedServer._wait_ready(); the docker engine
+                # is a thin stand-in that never calls it, so its attestation arrives via
+                # the tracked operator patch (see operator_patches/README.md item 10).
+                "runtime_attestation_path": (
+                    "docker engine: operator_patch clb_docker_runtime_attestation.v6746 "
+                    "(DockerOuroborosEngine._attest_runtime, post-health, pre-solve)"
+                    if args.docker else
+                    "host engine: IsolatedServer._wait_ready()"
+                ),
                 "report_grade": "local_low_seed" if (args.runs < 5 or args.path == "bridge") else "leaderboard_shape",
             },
         },
     )
-    write_json(out / "run_manifest.json", manifest)
 
-    if args.dry_run:
-        print(json.dumps({"run_root": str(out), "planned_invocations": plans, "fidelity": fidelity}, indent=2))
-        return 0
-
-    rc = 0
-    for plan in plans:
-        proc = subprocess.run(plan, cwd=runner_report["path"], env=child_env)
-        rc = proc.returncode or rc
-        if proc.returncode != 0:
-            print(f"[clb] runner invocation failed rc={proc.returncode}: {' '.join(plan[:4])} ...",
+    # --- POST-ADMISSION: preflight, settings rendering, the external runner ---------------
+    with finalize_run_manifest(manifest_path, manifest) as final:
+        # The launcher's own provenance is a GIT SUBPROCESS probe. Evaluated in the admission
+        # call's argument list it would have run before the seam was even entered (Python
+        # evaluates arguments first) — the same shape phase P1 was blocked on. It is attached
+        # to the RETAINED manifest here instead, which `finalize_run_manifest` writes.
+        manifest["extra"]["launcher_provenance"] = repo_provenance(REPO)
+        settings_template = json.loads(pathlib.Path(args.settings).expanduser().read_text(encoding="utf-8"))
+        args.model = args.model or str(settings_template.get("OUROBOROS_MODEL") or "")
+        args.effort = args.effort or str(settings_template.get("OUROBOROS_EFFORT_TASK") or "low")
+        args.or_provider = args.or_provider or str(settings_template.get("OUROBOROS_OR_PROVIDER") or "")
+        if not args.model:
+            raise SystemExit("no solve model: pass --model or set OUROBOROS_MODEL in the settings template")
+        if args.evolution and args.path == "bridge" and "stateful_evo" not in args.phases:
+            print("[clb] note: --evolution on the bridge path only takes effect in the stateful_evo phase",
                   file=sys.stderr)
-            break
-    collect_results(out)
-    print(f"[clb] run root: {out}")
-    return rc
+
+        runner_report = check_runner(pathlib.Path(args.runner_path or "."))
+        if not args.runner_path or not runner_report["present"] or not (
+                runner_report["run_benchmark_present"] if args.path == "standard" else runner_report["bridge_present"]):
+            message = (
+                "external runner not found/incomplete at "
+                f"{runner_report['path'] or '(unset)'} — the continual-learning-bench repo is REQUIRED and is "
+                "NOT vendored in this repository. Obtain it separately; its Ouroboros adapter "
+                f"(src/systems/ouroboros/, pinned commit {ADAPTER_PINNED_COMMIT[:7]}) ships in the run handoff "
+                "bundle under bench-config/external-adapters/ouroboros/. See README.md."
+            )
+            if not args.dry_run:
+                final.update({"outcome": "refused", "exit_code": 1,
+                              "refusal": {"stage": "external_runner", "reason": "runner_missing",
+                                          "exit_code": 1}})
+                raise SystemExit(message)
+            print(f"[clb] WARNING (dry-run): {message}", file=sys.stderr)
+        if execution_clone is not None:
+            check_clone(execution_clone)
+
+        rendered = render_run_settings(pathlib.Path(args.settings), out, solve_model=args.model,
+                                       evolution=args.evolution, total_budget=args.total_budget)
+        # RE-SNAPSHOT the slots from the settings the engines are actually handed. Admission
+        # declared this path, but the file did not exist yet at that moment, so `model_slots`
+        # described only the launcher's environment — for the docker engine, which gets a fresh
+        # container environment, that is a description of nobody. The SWE-Pro smoke found the
+        # same class one file over (a manifest naming the template's model, not the run's).
+        rendered_path = out / "_run_settings.json"
+        manifest["model_slots"] = model_slot_snapshot(rendered_path, env_overrides=not args.docker)
+        runner_python = args.runner_python
+        if not runner_python:
+            venv_python = pathlib.Path(runner_report["path"]) / ".venv" / "bin" / "python"
+            runner_python = str(venv_python) if venv_python.exists() else sys.executable
+        plans = build_planned_argv(args, rendered, out, runner_python)
+        fidelity = _fidelity_report(rendered, args)
+        _print_fidelity_warnings(fidelity)
+        child_env = _sanitized_child_env(out, rendered, args) if args.ouroboros_clone != "(unset)" else dict(os.environ)
+
+        # Late facts on the RETAINED manifest: the finalization seam writes this same dict.
+        manifest["official_command"] = plans[0]
+        manifest["harness"] = {"external_runner": runner_report, "entrypoint": args.path,
+                               "planned_invocations": plans,
+                               "settings_template": str(pathlib.Path(args.settings).expanduser()),
+                               "settings_derived": str(rendered_path)}
+        manifest["extra"].update({
+            "solve_model": _litellm_model(args.model),
+            "fidelity": fidelity,
+            "provider_env_present": redacted_env_summary(child_env),
+        })
+
+        if args.dry_run:
+            final.update({"outcome": "dry_run", "exit_code": 0})
+            print(json.dumps({"run_root": str(out), "planned_invocations": plans, "fidelity": fidelity}, indent=2))
+            return 0
+
+        rc = 0
+        for plan in plans:
+            proc = subprocess.run(plan, cwd=runner_report["path"], env=child_env)
+            rc = proc.returncode or rc
+            if proc.returncode != 0:
+                print(f"[clb] runner invocation failed rc={proc.returncode}: {' '.join(plan[:4])} ...",
+                      file=sys.stderr)
+                break
+        collect_results(out)
+        final.update({"outcome": "completed" if rc == 0 else "runner_failed", "exit_code": int(rc)})
+        print(f"[clb] run root: {out}")
+        return rc
 
 
 if __name__ == "__main__":

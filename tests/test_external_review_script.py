@@ -103,7 +103,9 @@ def test_external_review_script_resolves_models_and_efforts(monkeypatch):
     assert config["scope_models"] == ["openai/gpt-5.5"]
     assert config["scope_effort"] == "high"
     assert config["review_enforcement"] == "blocking"
-    assert config["scope_review_floor"] == "blocking_1m"
+    # v6.80.0: the scope-review floor key is gone; the operator line pins the context
+    # mode instead, because that is now what decides scope-review applicability.
+    assert config["context_mode"] == "max"
 
 
 def _write_target_config(repo: Path) -> None:
@@ -115,7 +117,6 @@ def _write_target_config(repo: Path) -> None:
         "    'OUROBOROS_SCOPE_REVIEW_MODELS': 'anthropic/fable',\n"
         "    'OUROBOROS_EFFORT_REVIEW': 'high',\n"
         "    'OUROBOROS_EFFORT_SCOPE_REVIEW': 'high',\n"
-        "    'OUROBOROS_SCOPE_REVIEW_FLOOR': 'blocking_1m',\n"
         "}\n",
         encoding="utf-8",
     )
@@ -173,7 +174,7 @@ def test_target_base_defaults_override_local_review_settings(tmp_path, monkeypat
     for _key in (
         *defaults.keys(),
         "OUROBOROS_REVIEW_ENFORCEMENT",
-        "OUROBOROS_SCOPE_REVIEW_DEGRADED",
+        "OUROBOROS_CONTEXT_MODE",
         "OUROBOROS_OBSERVABILITY_KEEP_RAW",
         "OUROBOROS_PRE_PUSH_TESTS",
         "OUROBOROS_PREFLIGHT_DIFF_AWARE",
@@ -203,7 +204,6 @@ def test_contributor_defaults_reject_explicit_direct_provider_route(monkeypatch)
         "OUROBOROS_SCOPE_REVIEW_MODELS": "anthropic/claude-fable-5",
         "OUROBOROS_EFFORT_REVIEW": "high",
         "OUROBOROS_EFFORT_SCOPE_REVIEW": "high",
-        "OUROBOROS_SCOPE_REVIEW_FLOOR": "blocking_1m",
     }
     with pytest.raises(RuntimeError, match="non-OpenRouter"):
         _apply_contributor_review_env(defaults)
@@ -471,14 +471,12 @@ def test_contributor_resolved_config_rejects_direct_provider_actors():
         "OUROBOROS_SCOPE_REVIEW_MODELS": "anthropic/claude-fable-5",
         "OUROBOROS_EFFORT_REVIEW": "high",
         "OUROBOROS_EFFORT_SCOPE_REVIEW": "high",
-        "OUROBOROS_SCOPE_REVIEW_FLOOR": "blocking_1m",
     }
     _assert_contributor_openrouter_config({
         "triad_models": ["anthropic/claude-fable-5", "openai/gpt-5.6-sol"],
         "scope_models": ["anthropic/claude-fable-5"],
         "triad_effort": "high",
         "scope_effort": "high",
-        "scope_review_floor": "blocking_1m",
     }, defaults)
     with pytest.raises(RuntimeError, match="exclusively through OpenRouter"):
         _assert_contributor_openrouter_config({
@@ -486,7 +484,6 @@ def test_contributor_resolved_config_rejects_direct_provider_actors():
             "scope_models": ["anthropic/claude-fable-5"],
             "triad_effort": "high",
             "scope_effort": "high",
-            "scope_review_floor": "blocking_1m",
         }, defaults)
     with pytest.raises(RuntimeError, match="drifted from target-base defaults"):
         _assert_contributor_openrouter_config({
@@ -494,7 +491,6 @@ def test_contributor_resolved_config_rejects_direct_provider_actors():
             "scope_models": ["anthropic/claude-fable-5"],
             "triad_effort": "high",
             "scope_effort": "high",
-            "scope_review_floor": "blocking_1m",
         }, defaults)
 
 

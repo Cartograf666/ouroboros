@@ -37,7 +37,7 @@ from devtools.benchmarks.common.manifests import (
     admit_benchmark_run,
     finalize_run_manifest,
 )
-from devtools.benchmarks.common.run_roots import ensure_outside_repo
+from devtools.benchmarks.common.run_roots import assert_outside_repo
 from ouroboros.platform_layer import kill_process_tree, subprocess_new_group_kwargs
 
 HARN = pathlib.Path(__file__).resolve().parent
@@ -363,7 +363,7 @@ def main() -> int:
         log("error: OPENROUTER_API_KEY is not set"); return 2
 
     vsuf = args.volume_suffix
-    out_dir = ensure_outside_repo(pathlib.Path(args.out_dir).expanduser(), REPO_ROOT)
+    out_dir = assert_outside_repo(pathlib.Path(args.out_dir).expanduser(), REPO_ROOT)
     lastgood = out_dir / "_lastgood"
     done_dir = out_dir / "done_idx"
 

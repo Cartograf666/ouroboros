@@ -74,7 +74,7 @@ itself) is the supported path for v6.56.0 bridge runs.
 
 ## Addendum (v6.74.5, campaign luna 2026-07-23)
 
-7. `clb_env_campaign_overrides.v6745.patch` — `_docker_launcher._overrides()`
+8. `clb_env_campaign_overrides.v6745.patch` — `_docker_launcher._overrides()`
    gains an operator-env override block: `OUROBOROS_RUNTIME_MODE`,
    `OUROBOROS_TASK_REVIEW_MODE`, `OUROBOROS_REVIEW_MODELS`,
    `OUROBOROS_EFFORT_REVIEW`, `OUROBOROS_EFFORT_SCOPE_REVIEW`,
@@ -86,3 +86,72 @@ itself) is the supported path for v6.56.0 bridge runs.
    (and fixes CLBENCH_SOLVE_DISABLED_TOOLS string-vs-list join). Without the
    patch pair a campaign asking runtime=pro / single low-effort reviewer /
    review=required silently ran on parity defaults.
+
+## Addendum (v6.76.0, 2026-07-25)
+
+### Apply order (unambiguous)
+
+Both patches below were generated against a clone that ALREADY carries every
+patch above, so they are applied LAST. In particular, on
+`run_clbench_bridge_agent.py` they must come **after these three, in this
+order**: `run_clbench_bridge_agent.v6560.patch` →
+`clb_acceptance_claims.v674.patch` → `clb_disabled_tools_env.v6745.patch`.
+On `_docker_launcher.py` they come after `_docker_launcher.v6560.patch` →
+`clb_env_campaign_overrides.v6745.patch`. Apply with `patch -p0 < <file>` from
+the external checkout root (a clean clone at `549998d` plus the patches above).
+
+9. `clb_multi_instance_outcomes.v6746.patch` — the stateful bridge loop takes
+   the **whole** `instance_outcomes` list from `GET /_outcome` instead of only
+   the row whose `instance_index` matches the question the agent was handed.
+   The shim already collects outcomes correctly and non-destructively with the
+   official runner's own helpers (`_collect_step_outcomes` /
+   `_upsert_instance_outcomes` over `task.get_instance_outcomes()`), and ONE
+   `task.step()` can close SEVERAL instances; the old single-row read dropped
+   every co-resolved instance, because `advance_question()` then walked past
+   them and no `q###/task_outcome.json` was ever written for them. Recovered
+   rows are labelled `ouroboros_status="auto_resolved_no_agent_turn"` and carry
+   NO agent-turn artefacts (no `prompt.txt`, no `ouroboros_task_final.json`, no
+   `absorb.json`) and `cost_usd: null` — honest labelling, never a silent
+   backfill. An ALREADY recorded row is never rewritten except to fill a still-null
+   reward that only materialised at `evaluate()` time (marked
+   `reward_source: "late_instance_outcomes_fill"`; status and cost are preserved).
+   Consequence, ACCEPTED and disclosed (owner decision): the loop's
+   `steps` counter counts agent turns, so the recorded instance count can
+   overshoot `--num-instances` by the size of the last co-resolved group. That
+   is deliberate — dropping already-scored official rewards to hit the window
+   exactly would be worse. Report the scored count from `result_index.jsonl`,
+   not the requested window. `run_clb.collect_results` needs no change: it
+   reads the same per-question `task_outcome.json` schema.
+   BOTH writers of that file go through `_atomic_write_json` (temp file in the
+   same directory, flush+fsync, close, then one `os.replace`), which the patch
+   adds. `task_outcome.json` is the ONLY record that an instance existed, so a
+   truncating `write_text` interrupted mid-flight does not lose an update, it
+   loses the ROW: `collect_results` would parse `{}` and the instance would
+   disappear from the denominator this patch exists to preserve. The
+   late-reward fill rewrites rows that are already VALID, which is when that
+   costs the most. A LOCAL seam, not `devtools...manifests.write_json`: this
+   module lives in the external checkout and only reaches the Ouroboros clone
+   through `_launcher`'s call-time `sys.path` insert, and that helper also
+   imports `ouroboros.utils`, which the CL-Bench runner venv does not install.
+10. `clb_docker_runtime_attestation.v6746.patch` — runtime attestation for the
+   **docker** engine path. The host-engine path is attested through
+   `IsolatedServer._wait_ready()`, but `_docker_launcher.DockerOuroborosEngine`
+   is only a "thin stand-in for IsolatedServer" (own `_DockerServer`, own health
+   gate) and never calls `_wait_ready`, so the supported docker path would
+   otherwise run unattested. The patch adds `_attest_runtime()`, called right
+   after the health+settle gate and BEFORE any paid task, which calls the shared
+   helper `devtools.benchmarks.common.manifests.runtime_attestation(base_url,
+   repo_dir, *, expected_version="", timeout=10)` (both the HTTP
+   `runtime_version` and the local repo head). `repo_dir` is a REQUIRED
+   POSITIONAL — it is how the commit half of the attestation is reported — and
+   the patch passes the mounted clone, whose `VERSION` is also handed over as
+   `expected_version`. The HELPER owns the policy: skew, an unreachable runtime,
+   or an unreadable commit aborts the run, and the named escape
+   `OBO_ALLOW_EVOLVED_VOLUME` (`1`/`true`/`yes`) downgrades it to a record with
+   `overridden: true` for a deliberately evolved `/obo/repo` volume. The patch
+   keeps no second copy of that decision; it stores the record on the engine as
+   `runtime_attestation` and prints it.
+   **Requires an Ouroboros bench clone at v6.75.0 or newer** — that is where
+   `runtime_attestation` lands. On an older clone the patch fails closed with an
+   explicit ImportError message naming the requirement, so do not apply it to a
+   pre-v6.75.0 bench clone.

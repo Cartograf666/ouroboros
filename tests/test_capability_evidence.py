@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-
+import json
 
 import ouroboros.capability_evidence as ce
 
@@ -263,3 +263,299 @@ def test_active_main_route_sets_cloudru_base_url():
     assert route["provider"] == "cloudru"
     # The bug was base_url='' for cloudru (only openai/openai-compatible/gigachat set it).
     assert route["base_url"] == "https://foundation-models.api.cloud.ru/v1"
+
+
+# --- v6.80.0: measured tokenizer density (token_density namespace) --------------
+
+def test_token_density_is_measured_throttled_and_bounded(tmp_path, monkeypatch):
+    """RS4: observations are measured, conservative (MAX of fresh pairs), bounded in
+    retention, and throttled — the store is one file behind one lock shared with the
+    scope-review path, and a lock-starvation incident under bench load is on record."""
+    from ouroboros.capability_evidence import (
+        COLD_START_TOKEN_DENSITY,
+        MEASURED_DENSITY_SAFETY_FACTOR,
+        _DENSITY_MEMO,
+        _TOKEN_DENSITY_MAX_PAIRS,
+        get_token_density,
+        record_token_density,
+        resolve_token_density,
+    )
+
+    _DENSITY_MEMO.clear()
+    # No observation anywhere -> the documented conservative cold-start density.
+    assert get_token_density(tmp_path, "some/model") == 0.0
+    density, source = resolve_token_density(tmp_path, "some/model")
+    assert source == "cold_conservative"
+    assert density == COLD_START_TOKEN_DENSITY
+
+    chars = 4_000_000  # 1,000,000 estimated tokens
+    record_token_density(tmp_path, "m/one", prompt_chars=chars, prompt_tokens=1_500_000)
+    assert abs(get_token_density(tmp_path, "m/one") - 1.5) < 1e-6
+    density, source = resolve_token_density(tmp_path, "m/one")
+    assert source == "measured"
+    # A model's OWN measured density applies (with the safety factor); the cold-start
+    # constant bounds the COLD path only, so a lighter tokenizer is not permanently
+    # charged a Claude-derived 1.65. calibrated_input_token_limit still bounds the
+    # resulting cap by the historical absolute-margin form.
+    assert abs(density - 1.5 * MEASURED_DENSITY_SAFETY_FACTOR) < 1e-6
+
+    # Above the floor, the measured value (with the safety factor) is what applies.
+    _DENSITY_MEMO.clear()
+    record_token_density(tmp_path, "m/dense", prompt_chars=chars, prompt_tokens=2_000_000)
+    density, source = resolve_token_density(tmp_path, "m/dense")
+    assert source == "measured"
+    assert abs(density - 2.0 * MEASURED_DENSITY_SAFETY_FACTOR) < 1e-6
+
+    # A DENSER observation always wins (conservative); a lighter one never lowers it
+    # inside the window.
+    _DENSITY_MEMO.clear()
+    record_token_density(tmp_path, "m/one", prompt_chars=chars, prompt_tokens=1_800_000)
+    assert abs(get_token_density(tmp_path, "m/one") - 1.8) < 1e-6
+    _DENSITY_MEMO.clear()
+    record_token_density(tmp_path, "m/one", prompt_chars=chars, prompt_tokens=1_100_000)
+    assert abs(get_token_density(tmp_path, "m/one") - 1.8) < 1e-6
+
+    # Raw-pair retention is bounded.
+    for extra in range(12):
+        _DENSITY_MEMO.clear()
+        record_token_density(
+            tmp_path, "m/one", prompt_chars=chars, prompt_tokens=1_200_000 + extra * 40_000,
+        )
+    entry = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    assert len(entry["token_density"]["m/one"]["pairs"]) <= _TOKEN_DENSITY_MAX_PAIRS
+
+    # Throttle: a repeat observation within tolerance must not touch the shared store
+    # AT ALL (it is one file behind one lock shared with the scope-review hot path).
+    current = get_token_density(tmp_path, "m/one")
+    saves: list = []
+    monkeypatch.setattr(ce, "_save", lambda root, data: saves.append(1))
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=chars, prompt_tokens=int(current * chars / 4),
+    )
+    assert saves == [], "a within-tolerance repeat must not write the shared store"
+    # ...and a real drift IS persisted.
+    _DENSITY_MEMO.clear()
+    record_token_density(tmp_path, "m/one", prompt_chars=chars, prompt_tokens=int(3.0 * chars / 4))
+    assert len(saves) == 1
+    monkeypatch.undo()
+
+    # Junk and too-small observations are ignored (fixed scaffolding dominates them).
+    _DENSITY_MEMO.clear()
+    record_token_density(tmp_path, "m/two", prompt_chars=100, prompt_tokens=90)
+    record_token_density(tmp_path, "m/two", prompt_chars=chars, prompt_tokens=0)
+    record_token_density(tmp_path, "m/two", prompt_chars=chars, prompt_tokens=99_000_000)
+    assert get_token_density(tmp_path, "m/two") == 0.0
+
+    # The cold-conservative fallback is the MAX of the constant and every fresh
+    # observation, so a light GPT measurement can never make an unknown model optimistic.
+    density, source = resolve_token_density(tmp_path, "never/seen")
+    assert source == "cold_conservative"
+    assert density >= COLD_START_TOKEN_DENSITY
+
+
+def test_token_density_is_concurrency_safe_under_bench_like_parallelism(tmp_path):
+    """The density writer must not corrupt or lose the shared store under the kind of
+    parallelism a benchmark server produces."""
+    import threading
+
+    from ouroboros.capability_evidence import (
+        _DENSITY_MEMO, get_token_density, record_token_density,
+    )
+
+    _DENSITY_MEMO.clear()
+    errors: list = []
+
+    def worker(index: int) -> None:
+        try:
+            for _ in range(15):
+                _DENSITY_MEMO.clear()
+                record_token_density(
+                    tmp_path, f"m/{index}",
+                    prompt_chars=4_000_000, prompt_tokens=1_400_000 + index * 10_000,
+                )
+        except Exception as exc:  # pragma: no cover - the assertion below reports it
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    data = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    assert len(data["token_density"]) == 8
+    for index in range(8):
+        assert get_token_density(tmp_path, f"m/{index}") > 0
+
+
+def test_cold_density_never_demotes_the_main_loop_context_fit(tmp_path, monkeypatch):
+    """Д7 CRITICAL decoupling: the conservative cold-start density is for review-pack
+    sizing ONLY. Every fresh install and EVERY isolated benchmark server starts with an
+    empty observation store, so applying it to the main loop would silently demote
+    `initial_mode` from Max to Low and lose information (BIBLE P1)."""
+    from ouroboros import context_fit
+    from ouroboros.capability_evidence import _DENSITY_MEMO, record_token_density
+
+    _DENSITY_MEMO.clear()
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+
+    # Empty store: a no-observation route keeps the neutral 1.0 baseline.
+    assert context_fit._route_calibration_ratio(tmp_path, "fp", "openai/gpt-5.5") == 1.0
+    assert context_fit._route_calibration_ratio(tmp_path, "fp", "anthropic/claude-fable-5") == 1.0
+
+    # Only a MEASURED density for that exact model may raise it.
+    record_token_density(
+        tmp_path, "anthropic/claude-fable-5", prompt_chars=4_000_000, prompt_tokens=1_580_000,
+    )
+    assert context_fit._route_calibration_ratio(tmp_path, "fp", "openai/gpt-5.5") == 1.0
+    assert context_fit._route_calibration_ratio(
+        tmp_path, "fp", "anthropic/claude-fable-5"
+    ) > 1.5
+
+
+def test_no_observation_non_claude_main_route_keeps_todays_initial_mode(tmp_path, monkeypatch):
+    """Named anti-regression test: empty store + KNOWN window + non-Claude main route
+    ⇒ `initial_mode` identical to today's (Max)."""
+    from types import SimpleNamespace
+
+    from ouroboros import context_fit
+    from ouroboros.capability_evidence import _DENSITY_MEMO
+
+    _DENSITY_MEMO.clear()
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    core = context_fit.ContextCore(
+        base_prompt="p", bible_md="b", architecture_md="a", development_md="d",
+        semi_stable_text="s", dynamic_text="y", user_content_json='"u"',
+        docs_need_development=False, force_low_docs=False,
+    )
+    env = SimpleNamespace(drive_root=str(tmp_path))
+    monkeypatch.setattr(context_fit, "reference_doc_sections", lambda *a, **k: [])
+
+    def resolver(task, *, allow_fetch):
+        return (
+            {"provider": "openai", "model": "openai/gpt-5.5", "base_url": "", "use_local": False},
+            SimpleNamespace(route_fp="fp", status="confirmed", stale=False, window_tokens=400_000),
+        )
+
+    plan = context_fit.build_context_fit_plan(
+        env, core, {}, preferred_mode="max", route_resolver=resolver,
+    )
+    assert plan.initial_mode == "max"
+    assert plan.max_projection.calibration_ratio == 1.0
+
+
+def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
+    tmp_path, monkeypatch,
+):
+    """Bounds the cold-baseline exposure to a SINGLE round (v6.80.0, Д7).
+
+    The main-loop baseline for an unmeasured route is the neutral 1.0, so a cold
+    Claude-family route is no longer proactively demoted max->low. This test verifies
+    the protection comes back by MEASUREMENT rather than by guess: round 1 dispatches
+    at baseline 1.0, the first settled send records this model's density through the
+    real ``execute_physical_attempt`` boundary, and the very next
+    ``build_context_fit_plan`` for the same model already carries a measured baseline.
+
+    Critically, the recorded send carries CACHE tokens — the main loop always marks a
+    stable prefix — on a cache-INCLUSIVE provider (OpenRouter, whose prompt_tokens
+    semantics `pricing.py` already assumes). An over-broad skip-on-any-cache-token
+    rule would make the whole measurement path vacuous and freeze every projection and
+    review pack at the cold density forever, which would be a much wider exposure than
+    one round.
+
+    RESIDUAL EXPOSURE (accepted, disclosed): the only window left open is a FIRST
+    round whose prompt ALREADY exceeds the calibrated window on a fresh evidence
+    store. That round fails ``infra_failed`` with ``context_overflow``; ``loop.py``
+    then reprojects the transcript into task-local Low exactly once and retries. From
+    the next projection onward the density is measured, so the exposure does not
+    recur for that model.
+    """
+    from types import SimpleNamespace
+
+    from ouroboros import context_fit
+    from ouroboros.capability_evidence import _DENSITY_MEMO, get_token_density
+    from ouroboros.usage_accounting import AttemptRequest, execute_physical_attempt
+
+    _DENSITY_MEMO.clear()
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("TOTAL_BUDGET", "500")  # the reservation rail is not under test
+    model = "anthropic/claude-fable-5"  # Claude-family, routed through OpenRouter
+    core = context_fit.ContextCore(
+        base_prompt="p", bible_md="b", architecture_md="a", development_md="d",
+        semi_stable_text="s", dynamic_text="y", user_content_json='"u"',
+        docs_need_development=False, force_low_docs=False,
+    )
+    env = SimpleNamespace(drive_root=str(tmp_path))
+    monkeypatch.setattr(context_fit, "reference_doc_sections", lambda *a, **k: [])
+
+    def resolver(task, *, allow_fetch):
+        return (
+            {"provider": "openrouter", "model": model, "base_url": "", "use_local": False},
+            SimpleNamespace(
+                route_fp="fp-cold", status="confirmed", stale=False, window_tokens=1_000_000,
+            ),
+        )
+
+    def _plan():
+        return context_fit.build_context_fit_plan(
+            env, core, {}, preferred_mode="max", route_resolver=resolver,
+        )
+
+    # --- Round 1: no observation anywhere -> neutral baseline, NO demotion.
+    assert get_token_density(tmp_path, model) == 0.0
+    first = _plan()
+    assert first.max_projection.calibration_ratio == 1.0
+    assert first.initial_mode == "max"
+
+    # --- The first settled send records the density through the REAL boundary,
+    # cache tokens and all.
+    request = AttemptRequest(
+        model=model,
+        provider="openrouter",
+        prompt_tokens_estimate=50_000,     # == 200,000 prompt chars
+        max_completion_tokens=1024,
+        drive_root=tmp_path,
+    )
+    response = SimpleNamespace(usage={
+        "prompt_tokens": 80_000,           # cache-INCLUSIVE (pricing.py's assumption)
+        "completion_tokens": 10,
+        "cached_tokens": 45_000,           # the stable governance prefix was cached
+        "cache_write_tokens": 600,         # ...and part of it was written this call
+    })
+    execute_physical_attempt(
+        request,
+        lambda: response,
+        extractor=lambda resp: (dict(resp.usage), 0.0, True),
+    )
+
+    measured = get_token_density(tmp_path, model)
+    assert measured > 1.0, (
+        "a cache-bearing send on a cache-inclusive provider must still be measurable; "
+        f"got {measured}"
+    )
+    assert abs(measured - 1.6) < 1e-6
+
+    # --- Round 2 for the SAME model: the projection is now measured, not guessed.
+    second = _plan()
+    assert second.max_projection.calibration_ratio > 1.0
+    assert abs(second.max_projection.calibration_ratio - 1.6) < 1e-6
+    assert second.max_projection.calibrated_tokens == int(
+        second.max_projection.estimated_tokens * second.max_projection.calibration_ratio
+    )
+
+    # A route whose prompt_tokens semantics are NOT known cache-inclusive stays
+    # skipped while cache tokens are present (a falsely low density would LOOSEN the
+    # review-pack cap — the only dangerous direction).
+    _DENSITY_MEMO.clear()
+    execute_physical_attempt(
+        AttemptRequest(
+            model="direct-anthropic-model", provider="anthropic",
+            prompt_tokens_estimate=50_000, max_completion_tokens=1024,
+            drive_root=tmp_path,
+        ),
+        lambda: response,
+        extractor=lambda resp: (dict(resp.usage), 0.0, True),
+    )
+    assert get_token_density(tmp_path, "direct-anthropic-model") == 0.0

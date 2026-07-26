@@ -131,7 +131,9 @@ def test_sanitize_chat_completion_tools_drops_overlong_names():
     assert [tool["function"]["name"] for tool in sanitized] == ["a" * 64]
 
 
-def test_build_remote_kwargs_marks_last_sorted_tool_for_cache():
+def test_finalized_payload_marks_last_sorted_tool_for_cache():
+    """v6.77.0: the marker is placed once, by the send-time payload finalizer (the two
+    per-builder copies are gone), still on the LAST tool of the deterministic sort."""
     from ouroboros.llm import LLMClient
 
     client = LLMClient()
@@ -148,6 +150,9 @@ def test_build_remote_kwargs_marks_last_sorted_tool_for_cache():
             {"type": "function", "function": {"name": "alpha_tool", "description": "a", "parameters": {"type": "object", "properties": {}}}},
         ],
     )
+    assert all("cache_control" not in tool for tool in kwargs["tools"])
+
+    assert client._normalize_payload_cache_ttl(target, kwargs) == "default"
 
     assert [tool["function"]["name"] for tool in kwargs["tools"]] == ["alpha_tool", "zeta_tool"]
     assert "cache_control" not in kwargs["tools"][0]

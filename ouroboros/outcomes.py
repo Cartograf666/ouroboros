@@ -81,8 +81,6 @@ _OUTCOME_TIERS = (OUTCOME_TIER_SOLVED, OUTCOME_TIER_BEST_EFFORT, OUTCOME_TIER_BL
 REASON_FINAL_MESSAGE = "final_message"
 REASON_EMPTY_FINAL_TEXT = "empty_final_text"
 REASON_PROVIDER_FAILURE = "provider_failure"
-REASON_ARTIFACT_FAILED = "artifact_failed"
-REASON_ARTIFACT_PENDING = "artifact_pending"
 REASON_TASK_EXCEPTION = "task_exception"
 REASON_DEEP_SELF_REVIEW_UNAVAILABLE = "deep_self_review_unavailable"
 REASON_DEEP_SELF_REVIEW_ERROR = "deep_self_review_error"
@@ -90,6 +88,18 @@ REASON_TOOL_FAILURE = "tool_failure"
 REASON_DELIVERY_CONTROL_DEGRADED = "delivery_control_degraded"
 REASON_CHILD_RESULTS_DEFERRED = "child_results_deferred"
 REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE = "review_skipped_deadline_reserve"
+
+# v6.78.0 (owner Q23=B): the HOST acceptance decision has exactly three owner-facing
+# states, each carrying a typed `reason` drawn from facts the host already computed
+# (dialogue_status, pass_reason, panel/degraded reasons, the pacing launch reason).
+# This is the HOST decision vocabulary only — the reviewer's own PASS|FAIL|DEGRADED
+# verdict vocabulary is a different layer and is deliberately unchanged.
+ACCEPTANCE_ACCEPTED = "accepted"
+ACCEPTANCE_REVISION_REQUESTED = "revision_requested"
+ACCEPTANCE_FINALIZED_UNACCEPTED = "finalized_unaccepted"
+ACCEPTANCE_DECISION_STATUSES = (
+    ACCEPTANCE_ACCEPTED, ACCEPTANCE_REVISION_REQUESTED, ACCEPTANCE_FINALIZED_UNACCEPTED,
+)
 
 _BLOCKING_TOOL_STATUSES = frozenset({
     "artifact_output_error",
@@ -209,12 +219,9 @@ WARN_EXPECTED_OUTPUT_UNGROUNDED = "expected_output_ungrounded"
 # the trace, not a receipt), so it needs no receipt status here.
 _RECEIPT_GROUNDING_STATUSES = frozenset({"pass", "observed", "declared"})
 
-# A failed verification receipt (``status=="fail"``) is "reconciled" ONLY by a LATER
-# genuine grounding receipt — a passing run-kind check (``pass``) or an observed artifact
-# (``observed``). A later ``declared`` (the no_visible_machine_contract escape hatch) does
-# NOT reconcile a red: that would let an agent see red, then declare-away the finalization
-# nudge. So this is deliberately NARROWER than _RECEIPT_GROUNDING_STATUSES (no ``declared``).
-_RECEIPT_RED_RECONCILING_STATUSES = frozenset({"pass", "observed"})
+# Historical name of the RED-reconciling statuses; the SSOT now lives next to the
+# reconciliation core it parameterizes (see `_outcome_receipts.RED_RECONCILING_STATUSES`).
+_RECEIPT_RED_RECONCILING_STATUSES = _outcome_receipts.RED_RECONCILING_STATUSES
 
 # Ledger entry statuses that do NOT count as a failure for ``summary.has_failures``.
 # SSOT: the receipt grounding statuses (pass/observed/declared) are folded in so a turn
@@ -240,13 +247,6 @@ def _is_ignored_readonly_block(tool: str, status: str) -> bool:
     from ouroboros.tool_capabilities import READ_ONLY_PARALLEL_TOOLS
 
     return status in _NON_BLOCKING_READONLY_BLOCK_STATUSES and tool in READ_ONLY_PARALLEL_TOOLS
-
-
-def _clip(text: Any, cap: int) -> str:
-    """Bound a string for a ledger INDEX projection with a DISCLOSED marker (BIBLE P1 —
-    never silent). The full content stays durable elsewhere (the receipt store / blobs)."""
-    t = str(text or "")
-    return t if len(t) <= cap else t[:cap] + f"…[+{len(t) - cap} chars]"
 
 
 def _merge_objective_warning(objective: Dict[str, Any], code: str) -> None:
@@ -338,11 +338,18 @@ def should_nudge_verification(llm_trace: Dict[str, Any], drive_root: Any, task_i
 
 def latest_unreconciled_failed_receipt(receipts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Pure core: the most recent RED receipt (``status=="fail"``) with NO later genuine
-    grounding receipt (a passing run-kind check or an observed artifact — see
-    ``_RECEIPT_RED_RECONCILING_STATUSES``; a later ``declared`` does NOT reconcile). Returns
-    the failing receipt, or ``None``. Structural — typed receipt status only, NO content
-    matching (Bible P5). Shared SSOT by the finalize nudge and the acceptance
-    verification_summary so the reconciliation rule lives in one place."""
+    grounding receipt for the SAME verification (a passing run-kind check or an observed
+    artifact — see ``_RECEIPT_RED_RECONCILING_STATUSES``; a later ``declared`` does NOT
+    reconcile). Returns the failing receipt, or ``None``. Structural: the typed receipt
+    status decides pass/fail, and identity is ONE typed key: the ``criterion_id`` when
+    present, else the canonical ``check`` text, else the observed ``paths`` set (owner
+    Q28=B, content-ADDRESSING — never a semantic keyword gate). Kind AND value must match,
+    so a green of another check — or one that omits the id — no longer clears a red; a red
+    with NO key at all keeps the older any-later-green rule. Advisory, never a gate.
+    The NEWEST element of the OUTSTANDING SET (``_outcome_receipts.unreconciled_failed``)
+    — never a single latest-pointer, which a newer red would let erase an older still-red
+    one. Shared SSOT by the finalize nudge and the acceptance verification_summary so the
+    reconciliation rule lives in one place."""
     return _outcome_receipts.latest_unreconciled_failed(
         receipts,
         _RECEIPT_RED_RECONCILING_STATUSES,
@@ -361,9 +368,14 @@ def latest_unreconciled_masked_pass(receipts: List[Dict[str, Any]]) -> Optional[
     """Pure core (v6.52.2): the most recent PASS receipt whose check can MASK the real exit code
     (``check_exit_masking`` flag from the verify sensor — e.g. ``... | tail``, ``|| true``), with
     NO later CLEAN (non-masked) grounding receipt (a pass/observed whose check is not masked).
-    Returns the masked passing receipt, or ``None``. A masked PASS is 'reconciled' by a later
-    genuine clean grounding. FLAG-driven (typed receipt field), never content matching (Bible P5);
-    advisory only. Shared SSOT by the finalize nudge and the acceptance verification_summary."""
+    Returns the masked passing receipt, or ``None``. Identity is the ``criterion_id`` key when
+    the masked receipt carries one, else ANY clean grounding reconciles: its own text
+    identity is the MASKED command, which the remediation necessarily changes, so the red
+    path's check-text rule would be unclearable (``_outcome_receipts._reconciles_masked``).
+    The NEWEST element of the OUTSTANDING SET (``_outcome_receipts.unreconciled_masked``),
+    so a cleanly reconciled newer masked check no longer takes an older one with it.
+    FLAG-driven (typed receipt field); advisory only. Shared SSOT by the finalize nudge and
+    the acceptance verification_summary."""
     return _outcome_receipts.latest_unreconciled_masked(
         receipts,
         _RECEIPT_RED_RECONCILING_STATUSES,
@@ -732,6 +744,10 @@ def _aggregate_outcome_tier(tiers: List[str]) -> str:
 def _acceptance_decision_projection(acceptance_decision: Dict[str, Any]) -> Dict[str, Any]:
     out = {
         "status": str(acceptance_decision.get("status") or ""),
+        # v6.78.0: the typed reason carries the distinction the collapsed status no
+        # longer spells out (no-quorum vs FAIL-without-capsule vs obligations open
+        # vs capsule spent vs deadline skip). Historical records have no reason.
+        "reason": str(acceptance_decision.get("reason") or ""),
         "source": str(acceptance_decision.get("source") or ""),
         "rationale": str(acceptance_decision.get("rationale") or "")[:500],
         "agent_disposition": str(acceptance_decision.get("agent_disposition") or ""),
@@ -1023,8 +1039,12 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     acceptance_decision = _trace_mapping(llm_trace, "acceptance_decision")
     review_decision = _trace_mapping(llm_trace, "review_decision")
     mutation_attribution = _trace_mapping(llm_trace, "mutation_attribution")
+    # v6.78.0: keyed on the CANONICAL status plus the typed reason (before the
+    # three-state collapse the reason literal WAS the status). Missing this pairing
+    # would silently stop degrading an eligible-but-skipped panel — a false green.
     acceptance_review_skipped_deadline_reserve = (
-        str(acceptance_decision.get("status") or "")
+        str(acceptance_decision.get("status") or "") == ACCEPTANCE_FINALIZED_UNACCEPTED
+        and str(acceptance_decision.get("reason") or "")
         == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
         and str(review_decision.get("eligibility") or "") == "eligible"
     )
@@ -1473,34 +1493,11 @@ def build_verification_ledger(
 
     # FR3: host-attested verify_and_record receipts (injected into the trace by
     # _store_task_result before this build) become first-class ledger entries.
+    # The row shape is the FIXED projection in `_outcome_receipts` (a new receipt key
+    # is silently dropped unless added there).
     for receipt in llm_trace.get("verification_receipts") or []:
         if isinstance(receipt, dict):
-            entries.append({
-                "kind": "verification_receipt",
-                "status": str(receipt.get("status") or "unknown"),
-                "contract_kind": str(receipt.get("contract_kind") or ""),
-                "criterion_id": str(receipt.get("criterion_id") or ""),
-                "check": _clip(receipt.get("check"), 300),
-                "expected": _clip(receipt.get("expected"), 200),
-                # Verification SEMANTICS so a reviewer sees how `expected` was matched
-                # (substring-only is weak evidence for a metric-graded task).
-                "expected_match": str(receipt.get("expected_match") or "substring"),
-                "matched": receipt.get("matched"),
-                "returncode": receipt.get("returncode"),
-                "summary": _clip(receipt.get("summary"), 300),
-                # C: after-only artifact-lifecycle flag (a check that built then deleted a
-                # declared deliverable). The receipt entry is a FIXED projection — a new
-                # receipt key is silently dropped unless added here. Bounded for ledger size.
-                "artifact_lifecycle": (receipt.get("artifact_lifecycle") or [])[:50],
-                "artifacts_missing_after": (receipt.get("artifacts_missing_after") or [])[:50],
-                # v6.52.2: exit-masking sensor flag — the check's shell pipeline can launder the
-                # real exit code (e.g. `... | tail`, `|| true`). FLAG-ONLY (status unchanged).
-                "check_exit_masking": bool(receipt.get("check_exit_masking")),
-                "check_exit_masking_reasons": (receipt.get("check_exit_masking_reasons") or [])[:10],
-                # v6.54.4 criterion provenance (flag-only): task_stated | agent_defined.
-                "criterion_source": str(receipt.get("criterion_source") or ""),
-                "criterion_basis": _clip(receipt.get("criterion_basis"), 500),
-            })
+            entries.append(_outcome_receipts.verification_receipt_ledger_row(receipt))
 
     # Agent-invoked child/self review remains in the raw trace for forensics but
     # is advisory evidence, never an objective or verification authority.

@@ -367,19 +367,27 @@ def openrouter_key_remaining(api_key: str, *, timeout: int = 10) -> float | None
     return float(data.get("limit") or 0.0) - float(data.get("usage") or 0.0)
 
 
-def model_slot_snapshot(settings_path: pathlib.Path | None = None) -> dict[str, str]:
-    """Return configured model/review slots without exposing provider secrets."""
+def model_slot_snapshot(settings_path: pathlib.Path | None = None, *,
+                        env_overrides: bool = True) -> dict[str, str]:
+    """Return configured model/review slots without exposing provider secrets.
+
+    ``env_overrides`` models how the server being described gets its configuration. A server
+    started in THIS process's environment reads settings.json but lets the environment win, so
+    the launcher's env belongs in the snapshot (the default). A server started in a CONTAINER
+    is handed the settings FILE and a fresh environment, so the launcher's own env is not part
+    of its configuration at all and must not be reported as if it were: pass ``False`` there.
+    """
     settings: dict[str, Any] = {}
-    if settings_path and settings_path.exists():
+    if settings_path and pathlib.Path(settings_path).exists():
         try:
-            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+            loaded = json.loads(pathlib.Path(settings_path).read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 settings = loaded
         except Exception:
             settings = {}
     slots: dict[str, str] = {}
     for key in MODEL_SLOT_KEYS:
-        value = os.environ.get(key)
+        value = os.environ.get(key) if env_overrides else None
         if value is None:
             value = settings.get(key)
         if value not in (None, ""):

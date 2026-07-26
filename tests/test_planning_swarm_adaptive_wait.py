@@ -537,7 +537,7 @@ def test_cutoff_omission_surfaces_precise_stop_reason(monkeypatch, tmp_path):
     ctx.event_queue = _queue.Queue()
     ctx.task_metadata = {"root_task_id": "parent1", "session_id": "s"}
 
-    def fake_schedule(ctx_arg, **kwargs):
+    def fake_schedule(ctx_arg, _internal=None, **kwargs):
         records = list(getattr(ctx_arg, "_last_scheduled_subagents", []) or [])
         records.append({"task_ids": ["scout-1"]})
         ctx_arg._last_scheduled_subagents = records
@@ -557,10 +557,17 @@ def test_cutoff_omission_surfaces_precise_stop_reason(monkeypatch, tmp_path):
         }],
         "artifact": {"path": "x"},
     })
+    request = pr._PlanReviewRequest(
+        plan="p", goal="g", files_to_touch=[], context_level="minimal",
+    )
     out = pr._start_planning_swarm(
         ctx,
-        pr._PlanReviewRequest(
-            plan="p", goal="g", files_to_touch=[], context_level="minimal",
+        request,
+        pr._plan_request_fingerprint(
+            plan=request.plan, goal=request.goal, files_to_touch=request.files_to_touch,
+            context_level=request.context_level, context_notes=request.context_notes,
+            plan_class=request.plan_class, scope=request.scope,
+            include_tests=request.include_tests,
         ),
     )
     assert out["started"] is True
@@ -611,3 +618,188 @@ def test_collect_not_running_still_gets_shared_cutoff(monkeypatch, tmp_path):
         ctx, task_ids=["s1"], schedule_outputs=[],
         fingerprint="fp", wait_timeout=0.25, max_wait=0.3)
     assert out["wait_stop_reason"] == "ceiling"
+
+
+# --- v6.79.0: scout-wave admission (owner Q26/Q27) --------------------------------
+
+def test_scout_wave_plan_binds_child_deadline_inside_the_consumable_window():
+    """The child deadline must sit strictly INSIDE the wave's shared cutoff, leaving room for
+    the finalization grace, so a handoff exists while the parent is still reading.
+
+    The dispatch margin is DERIVED from the finalization grace rather than being its own wait
+    constant (timeout-SSOT rule): raising the one configured authority must move the whole
+    reserve, so the second leg below doubles the grace and pins the doubled reserve. A hardcoded
+    30s margin passes the first leg and fails the second."""
+    from ouroboros.tools.review_synthesis import (
+        PLANNING_SCOUT_DEADLINE_MARGIN_FRACTION,
+        planning_scout_wave_plan,
+    )
+
+    now = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
+    cutoff = now + timedelta(seconds=900)
+    deadline, refusal = planning_scout_wave_plan(
+        cutoff.isoformat(), max_workers=4, grace_sec=120, now=now,
+    )
+    assert refusal == ""
+    parsed = pr.parse_deadline_ts(deadline)
+    assert now < parsed < cutoff
+    # Historical value at the default 120s grace, now expressed as a fraction of it.
+    assert (cutoff - parsed).total_seconds() == 150
+    assert int(120 * PLANNING_SCOUT_DEADLINE_MARGIN_FRACTION) == 30
+
+    # Same window, DOUBLE the configured grace -> the reserve tracks it, margin included.
+    wide = now + timedelta(seconds=3000)
+    deadline, refusal = planning_scout_wave_plan(
+        wide.isoformat(), max_workers=4, grace_sec=240, now=now,
+    )
+    assert refusal == ""
+    assert (wide - pr.parse_deadline_ts(deadline)).total_seconds() == 300
+
+
+def test_scout_wave_plan_shrinks_the_reserve_instead_of_swallowing_a_short_window():
+    """A window shorter than grace+margin still yields a (short) deadline inside it — the
+    reserve is capped at a fraction of the window rather than refusing every short wave."""
+    from ouroboros.tools.review_synthesis import planning_scout_wave_plan
+
+    now = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
+    cutoff = now + timedelta(seconds=60)
+    deadline, refusal = planning_scout_wave_plan(
+        cutoff.isoformat(), max_workers=4, grace_sec=120, now=now,
+    )
+    assert refusal == ""
+    parsed = pr.parse_deadline_ts(deadline)
+    assert now < parsed < cutoff
+
+
+def test_scout_wave_plan_refuses_a_closed_window_and_a_starved_pool():
+    from ouroboros.tools.review_synthesis import planning_scout_wave_plan
+
+    now = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
+    closed, refusal = planning_scout_wave_plan(
+        (now - timedelta(seconds=1)).isoformat(), max_workers=4, grace_sec=120, now=now,
+    )
+    assert closed == "" and "already closed" in refusal
+
+    starved, starved_reason = planning_scout_wave_plan(
+        (now + timedelta(seconds=900)).isoformat(), max_workers=1, grace_sec=120, now=now,
+    )
+    assert starved == "" and "worker capacity" in starved_reason
+
+    malformed, malformed_reason = planning_scout_wave_plan(
+        "not-a-timestamp", max_workers=4, grace_sec=120, now=now,
+    )
+    assert malformed == "" and "malformed" in malformed_reason
+
+
+def test_scheduled_scout_receives_the_wave_bound_deadline(monkeypatch, tmp_path):
+    """The deadline computed for the wave reaches ``_schedule_task`` verbatim (children used to
+    inherit the parent deadline unchanged, so a scout could outlive its own consumption window).
+
+    It must arrive through the POSITIONAL-ONLY internal-options mapping, never as a public
+    schedule_subagent parameter: the strict schema is a contract and the handler sits under the
+    <8-parameter gate."""
+    import ouroboros.tools.control as control
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setenv("OUROBOROS_MAX_WORKERS", "3")
+    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC", "0")
+    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "900")
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "parent-deadline-bound"
+    ctx.task_depth = 0
+    ctx.current_chat_id = 1
+    ctx.event_queue = __import__("queue").Queue()
+    ctx.task_metadata = {"root_task_id": ctx.task_id}
+    seen = {}
+    seen_public = {}
+
+    def fake_schedule(ctx_arg, internal=None, **kwargs):
+        seen.update(internal or {})
+        seen_public.update(kwargs)
+        ctx_arg._last_scheduled_subagents = [{"task_ids": ["scout-dl"]}]
+        return "scheduled"
+
+    monkeypatch.setattr(control, "_schedule_task", fake_schedule)
+    monkeypatch.setattr(pr, "wait_for_effective_tasks", lambda *a, **k: {
+        "tasks": {"scout-dl": {"status": "completed", "result": "handoff"}}, "all_terminal": True,
+    })
+    request = pr._PlanReviewRequest(plan="p", goal="g", files_to_touch=[], context_level="minimal")
+    out = pr._start_planning_swarm(
+        ctx, request, pr._plan_request_fingerprint(
+            plan=request.plan, goal=request.goal, files_to_touch=request.files_to_touch,
+            context_level=request.context_level, context_notes=request.context_notes,
+            plan_class=request.plan_class, scope=request.scope,
+            include_tests=request.include_tests,
+        ),
+    )
+
+    assert out["started"] is True
+    # Internal seam only: the public schema never carries it.
+    assert "deadline_at" not in seen_public
+    child_deadline = pr.parse_deadline_ts(str(seen.get("deadline_at") or ""))
+    cutoff = pr.parse_deadline_ts(
+        pr.plan_review_wave(
+            pr.load_plan_review_state(tmp_path, ctx.task_id), out["handoffs"]["request_fingerprint"],
+        )["scout_cutoff_at"]
+    )
+    assert child_deadline is not None and child_deadline < cutoff
+
+
+def test_scout_wave_budget_gate_declines_new_wave_but_never_the_recovery_path(monkeypatch, tmp_path):
+    """The budget gate lives INSIDE the new-wave branch: a resumed wave collects handoffs that
+    are already PAID, and gating those would abandon spend instead of saving it (MUST-FIX 8)."""
+    import ouroboros.tools.control as control
+    from ouroboros.task_results import load_plan_review_state, write_task_result
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setenv("OUROBOROS_MAX_WORKERS", "3")
+    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC", "0")
+    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "900")
+    gate_calls = {"n": 0}
+
+    def fake_gate(_ctx, **kwargs):
+        gate_calls["n"] += 1
+        gate_calls["surface"] = kwargs.get("surface")
+        gate_calls["models"] = list(kwargs.get("models") or [])
+        return {"estimated_wave_usd": 9.0, "remaining_usd": 0.5, "limit_usd": 10.0}
+
+    monkeypatch.setattr(pr, "review_wave_budget_gate", fake_gate)
+    monkeypatch.setattr(control, "_schedule_task", lambda *_a, **_k: (
+        (_ for _ in ()).throw(AssertionError("a declined wave must not schedule a scout"))
+    ))
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "parent-budget-declined"
+    ctx.task_depth = 0
+    ctx.current_chat_id = 1
+    ctx.event_queue = __import__("queue").Queue()
+    ctx.task_metadata = {"root_task_id": ctx.task_id}
+    request = pr._PlanReviewRequest(plan="p", goal="g", files_to_touch=[], context_level="minimal")
+
+    out = pr._start_planning_swarm(ctx, request, pr._plan_request_fingerprint(
+        plan=request.plan, goal=request.goal, files_to_touch=request.files_to_touch,
+        context_level=request.context_level, context_notes=request.context_notes,
+        plan_class=request.plan_class, scope=request.scope,
+        include_tests=request.include_tests,
+    ))
+
+    assert out["started"] is True and out["degraded_evidence"] is True
+    assert gate_calls["n"] == 1 and gate_calls["surface"] == "plan_task_scouts"
+    assert gate_calls["models"], "the wave must be priced per intended scout"
+    attempt = load_plan_review_state(tmp_path, ctx.task_id)["waves"][0]["intended_scouts"][0]
+    assert attempt["schedule_status"] == "failed"
+    assert "declined before dispatch" in attempt["schedule_reason"]
+    assert out["handoffs"]["omissions"][0]["reason"] == "schedule_failed"
+
+    # Resume of the SAME fingerprint: no second gate call, and a paid handoff is still collected.
+    write_task_result(
+        tmp_path, "paid-scout", "completed", parent_task_id=ctx.task_id, root_task_id=ctx.task_id,
+        delegation_role="subagent", role="planning-scout-1", result="already paid handoff",
+    )
+    resumed = pr._start_planning_swarm(ctx, request, pr._plan_request_fingerprint(
+        plan=request.plan, goal=request.goal, files_to_touch=request.files_to_touch,
+        context_level=request.context_level, context_notes=request.context_notes,
+        plan_class=request.plan_class, scope=request.scope,
+        include_tests=request.include_tests,
+    ))
+    assert resumed["resumed"] is True
+    assert gate_calls["n"] == 1, "the recovery/collection path must never consult the gate"

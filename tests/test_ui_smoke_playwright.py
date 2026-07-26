@@ -2076,3 +2076,122 @@ def test_ui_smoke_v639_skip_review_button(direct_server_with_data):
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             pytest.skip(str(exc))
         raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_v679_subagent_depth_zero_round_trips_through_settings(direct_server_with_data):
+    """v6.79.0: the owner can actually reach, save, and re-read a Subagent Depth of 0.
+
+    The structural fix (``_bounded_positive_int_setting`` honouring a configured 0) is
+    unreachable if the visible control refuses the value or the load path rewrites it back to
+    the fallback. This drives the real consumer flow — Settings -> Advanced -> type -> save ->
+    full page reload — and pins the three neighbouring states so the fix cannot silently break
+    them: 0 (no delegation), a normal positive value, and empty (falls back, does not persist
+    an invalid value). Screenshots are written for vision inspection; a saved screenshot is
+    not verification on its own (docs/DEVELOPMENT.md "Browser/mobile verification").
+    """
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    data_dir = direct_server_with_data["data_dir"]
+    settings_path = data_dir / "settings.json"
+    evidence_dir = pathlib.Path(
+        os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", str(data_dir.parent))
+    )
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+
+    def saved_depth():
+        return json.loads(settings_path.read_text(encoding="utf-8")).get(
+            "OUROBOROS_MAX_SUBAGENT_DEPTH", "<absent>"
+        )
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1400, "height": 1000})
+            try:
+                def open_settings_advanced():
+                    """Reload the whole app the way an owner would, then reopen the field."""
+                    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                    page.wait_for_selector('[data-nav-page="settings"]', timeout=30_000)
+                    page.click('[data-nav-page="settings"]')
+                    page.wait_for_selector("#s-subagent-depth", state="attached", timeout=30_000)
+                    page.click('[data-settings-tab="advanced"]')
+                    depth = page.locator("#s-subagent-depth")
+                    depth.wait_for(state="visible", timeout=30_000)
+                    # Saving is blocked until the settings load succeeds; waiting on the real
+                    # enablement avoids racing the first fetch.
+                    page.wait_for_function(
+                        "() => document.querySelector('#btn-save-settings')?.disabled === false",
+                        timeout=30_000,
+                    )
+                    depth.scroll_into_view_if_needed()
+                    return depth
+
+                def type_depth(value):
+                    page.fill("#s-subagent-depth", value)
+                    page.dispatch_event("#s-subagent-depth", "input")
+                    page.dispatch_event("#s-subagent-depth", "change")
+
+                def save_and_wait():
+                    page.click("#btn-save-settings")
+                    page.wait_for_function(
+                        "() => (document.querySelector('#settings-status')?.textContent || '')"
+                        ".includes('Settings saved')",
+                        timeout=30_000,
+                    )
+
+                depth = open_settings_advanced()
+                # The control must admit 0 at all: a min of 1 would make it unreachable.
+                assert depth.get_attribute("min") == "0"
+                assert depth.get_attribute("max") == "10"
+                assert depth.is_enabled()
+                assert depth.input_value() == "2"  # unset -> visible fallback
+                page.screenshot(path=str(evidence_dir / "v679-depth-01-initial-unset.png"))
+
+                # 0 is a valid value for the control, not a validation error.
+                type_depth("0")
+                assert page.evaluate(
+                    "() => document.querySelector('#s-subagent-depth').validity.valid"
+                ) is True
+                assert page.evaluate(
+                    "() => document.querySelector('#s-subagent-depth').validationMessage"
+                ) == ""
+                page.screenshot(path=str(evidence_dir / "v679-depth-02-typed-zero.png"))
+
+                save_and_wait()
+                assert page.locator("#s-subagent-depth").input_value() == "0"
+                assert saved_depth() == 0
+                page.screenshot(path=str(evidence_dir / "v679-depth-03-saved-zero.png"))
+
+                # The round trip is the point: a reload must not rewrite 0 back to 2.
+                open_settings_advanced()
+                assert page.locator("#s-subagent-depth").input_value() == "0"
+                assert saved_depth() == 0
+                page.screenshot(path=str(evidence_dir / "v679-depth-04-reload-zero.png"))
+
+                # Neighbouring state: an ordinary positive value still round-trips.
+                type_depth("3")
+                save_and_wait()
+                assert saved_depth() == 3
+                open_settings_advanced()
+                assert page.locator("#s-subagent-depth").input_value() == "3"
+                page.screenshot(path=str(evidence_dir / "v679-depth-05-reload-three.png"))
+
+                # Neighbouring state: empty is not a value — it falls back to 2 rather than
+                # persisting an unparsable setting.
+                type_depth("")
+                page.screenshot(path=str(evidence_dir / "v679-depth-06-empty-typed.png"))
+                save_and_wait()
+                assert saved_depth() == 2
+                open_settings_advanced()
+                assert page.locator("#s-subagent-depth").input_value() == "2"
+                page.screenshot(path=str(evidence_dir / "v679-depth-07-reload-after-empty.png"))
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise

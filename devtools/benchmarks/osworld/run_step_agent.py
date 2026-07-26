@@ -49,9 +49,20 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from devtools.benchmarks.common.manifests import benchmark_run_manifest, write_json
+from devtools.benchmarks.common.manifests import (
+    BenchmarkAdmissionRefused,
+    RuntimeAttestationRefused,
+    admit_benchmark_run,
+    finalize_run_manifest,
+    runtime_attestation,
+    write_json,
+)
 from devtools.benchmarks.common.result_index import append_result_index, task_result_row
-from devtools.benchmarks.common.run_roots import ensure_outside_repo
+from devtools.benchmarks.common.run_roots import (
+    assert_outside_repo,
+    ensure_outside_repo,
+    repo_root_from_devtools,
+)
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -228,6 +239,11 @@ class TaskRecordConfig:
     steps: int
     status: str
     reason_code: str
+    # The ADMITTED manifest (persisted by `admit_benchmark_run` before anything could
+    # refuse). Required, and deliberately without a default: the records used to fall back
+    # to REBUILDING it with `require_clean=False`, which wrote a manifest whose `seed_gate`
+    # said the run was admissible on exactly the path where the gate had REFUSED it.
+    base_manifest: dict[str, Any]
     error: str = ""
     extra: dict[str, Any] | None = None
 
@@ -311,6 +327,394 @@ def _is_default_desktop_server(url: str) -> bool:
     port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
     is_loopback = host in _LOOPBACK_HOSTS or host.startswith("127.")
     return is_loopback and port == _DEFAULT_DESKTOP_PORT
+
+
+# --------------------------------------------------------------------------- #
+# Shared OSWorld launcher helpers (imported by run_cu_bridge_agent.py, which
+# already reuses this module for the live-server guard and checkout probe).
+# --------------------------------------------------------------------------- #
+
+def amend_task_manifest(base_manifest: dict[str, Any], *, output_paths: dict[str, Any],
+                        extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return the per-task manifest: the ONE early-built manifest plus late facts.
+
+    The clean-seed/provenance gate lives in ``benchmark_run_manifest`` itself, so the
+    manifest has to be built BEFORE the first paid step; the outcome-time facts
+    (output paths, counters, evaluator status) are merged in here instead of building
+    a second manifest after the money is spent.
+    """
+    manifest = dict(base_manifest)
+    manifest["output_paths"] = {**(manifest.get("output_paths") or {}), **output_paths}
+    manifest["extra"] = {**(manifest.get("extra") or {}), **(extra or {})}
+    return manifest
+
+
+def admit_step_loop_run(manifest_path: Path, *, result_root: Path, repo_dir: Path,
+                        settings_path: Path, example_id: str,
+                        require_clean: bool) -> dict[str, Any]:
+    """ADMISSION seam for the step loop: build the manifest, PERSIST it, then enforce.
+
+    Routes through the shared `admit_benchmark_run` (v6.75.0) rather than pairing the bare
+    manifest builder with a later `write_json()`: the complete gate/refusal
+    payload reaches disk BEFORE a refusal propagates, so a refused run is exactly as
+    auditable as an admitted one. A refusal raises `BenchmarkAdmissionRefused` carrying
+    that same manifest, which the caller records and finalizes.
+    """
+    return admit_benchmark_run(
+        manifest_path,
+        benchmark="osworld",
+        run_root=result_root,
+        repo_dir=repo_dir,
+        requested_task_ids=[example_id],
+        dataset="OSWorld",
+        settings_path=settings_path,
+        require_clean=require_clean,
+        harness={
+            "adapter": "external_step_loop",
+            "official_actions": True,
+            "memory_mode": "empty_per_ouroboros_step",
+            "action_space": "pyautogui",
+            "aligned_upstream": dict(ALIGNED_UPSTREAM),
+        },
+    )
+
+
+def _teardown_partial_desktop_env(env: Any) -> None:
+    """Best-effort teardown of a DesktopEnv whose ``__init__`` raised.
+
+    ``env.close()`` is the official path (it calls
+    ``provider.stop_emulator(path_to_vm)``); a construction that died before
+    ``provider``/``path_to_vm`` were assigned cannot use it, so fall back to the
+    provider directly. Never raises: cleanup must not mask the original failure.
+    """
+    try:
+        env.close()
+        return
+    except Exception:
+        pass
+    provider = getattr(env, "provider", None)
+    if provider is None:
+        return
+    try:
+        provider.stop_emulator(getattr(env, "path_to_vm", None))
+    except Exception:
+        pass
+
+
+def construct_desktop_env(desktop_env_cls: Any, *, attempts: int, deadline: float,
+                          retry_sleep_sec: float = 5.0, **kwargs: Any) -> Any:
+    """Construct ``DesktopEnv``, retrying a failed boot and tearing down each attempt.
+
+    THE AUTHORISED BENEFIT IS THE RETRY (owner decision Q15=A). ``DesktopEnv.__init__``
+    boots the VM/container inside ``_start_emulator()``, and the launchers used to retry
+    only ``env.reset`` — so one transient boot failure (a lost
+    ``/tmp/docker_port_allocation.lck`` race, a slow image load) burned the whole task.
+    The constructor is now retried inside the startup window instead.
+
+    Teardown of failed attempts is BELT-AND-BRACES, not a fix for measured debris: no run
+    here has been shown to accumulate leaked containers. It is done because a raise inside
+    ``__init__`` discards the half-built object, so whatever ``_start_emulator()`` had
+    already started would be unreachable and therefore unstoppable. Constructing through
+    ``__new__`` + explicit ``__init__`` keeps that partially-initialised instance
+    reachable, which is the only way to close it at all.
+
+    ``deadline`` is an absolute ``time.time()`` bound on STARTING a new attempt (an
+    in-flight attempt is never cut short), so a run cannot spend its whole startup window
+    respawning VMs.
+    """
+    last_err = ""
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        if attempt > 1 and time.time() >= deadline:
+            last_err = f"{last_err}; startup deadline reached, no further attempts"
+            break
+        env = desktop_env_cls.__new__(desktop_env_cls)
+        try:
+            env.__init__(**kwargs)
+            return env
+        except Exception as exc:  # noqa: BLE001 - every failed boot must be cleaned up
+            last_err = f"attempt {attempt}: {type(exc).__name__}: {exc}"
+            print(f"[osworld] DesktopEnv construction failed ({last_err}); tearing down", flush=True)
+            _teardown_partial_desktop_env(env)
+            time.sleep(max(0.0, float(retry_sleep_sec)))
+    raise RuntimeError(f"DesktopEnv construction failed: {last_err}")
+
+
+class ClaimDirNotConfined(ValueError):
+    """The claim directory would put lock/marker files inside repo/ or the live data root."""
+
+
+def confined_claims_dir(claims_dir: Path, *, repo_dir: Path) -> Path:
+    """Resolve a claim directory, REFUSING one inside ANY checkout this run touches.
+
+    The claim dir is operator-supplied (`--claim-dir`) and the helpers below create it and
+    write `.lock`, `.scored` and `.scored_unconfirmed` into it, so an unchecked path mutates a
+    repository or the live runtime data. Routed through the SAME boundary every benchmark
+    output root uses (`assert_outside_repo`, which also covers `live_data_roots()`), in its
+    PURE form so the refusal happens before anything is created.
+
+    ``repo_dir`` is REQUIRED and is the checkout actually being executed (`--repo-dir`, the one
+    the run manifest attests). Deriving the authority from this module's own location instead —
+    which is all this helper used to do — confined the claim dir against the LAUNCHER's
+    checkout, so `--repo-dir /other/bench-clone --claim-dir /other/bench-clone/.claims` wrote
+    lock and marker state straight into the execution checkout: the very tree whose cleanliness
+    the seed gate is about to attest. Both roots are checked, active checkout first; the static
+    one is belt-and-braces, never the sole authority.
+    """
+    resolved = Path(claims_dir)
+    for authority in (Path(repo_dir).expanduser(), repo_root_from_devtools()):
+        try:
+            resolved = assert_outside_repo(resolved, authority)
+        except ValueError as exc:
+            raise ClaimDirNotConfined(f"--claim-dir is not confined: {exc}") from exc
+    return resolved
+
+
+def task_claim_key(domain: str, example_id: str) -> str:
+    """Filesystem-safe claim identity for one OSWorld task."""
+    return f"{_safe_slug(str(domain))}__{_safe_slug(str(example_id))}"
+
+
+def claim_stale_sec(task_timeout_sec: float, startup_timeout_sec: float, margin_sec: float) -> float:
+    """Lock staleness bound: longer than every rail the legitimate holder can be inside.
+
+    A holder spends TWO startup windows, not one: ``construct_desktop_env`` gets its
+    own ``startup_timeout`` deadline and the reset-to-usable-screenshot loop then gets
+    a fresh one (sharing a single window would let a slow boot eat the reset budget).
+    Adding the task timeout, the bound is ``task_timeout + 2 * startup_timeout +
+    margin``. A one-window bound could expire while a lane was still legitimately
+    working, which is exactly how two lanes end up on one task.
+
+    ``env.evaluate()`` runs after all of those and is UNBOUNDED — upstream getters may
+    fetch over the network — so no formula can cover it. That residual is what
+    ``margin`` is for: raise ``--claim-margin-sec`` for domains with slow evaluators
+    instead of widening the formula with a term nothing enforces.
+    """
+    return (float(task_timeout_sec) + 2.0 * float(startup_timeout_sec)
+            + max(0.0, float(margin_sec)))
+
+
+def acquire_task_claim(claims_dir: Path, claim_key: str, *, stale_sec: float,
+                       repo_dir: Path, metadata: str = "") -> tuple[int | None, str]:
+    """Claim one task for this lane. Returns ``(lock_fd, reason)``.
+
+    ``lock_fd is None`` means DO NOT run this task; ``reason`` is one of
+    ``already_scored`` (another attempt produced an official score — the "first scored attempt
+    wins" rule, enforced rather than merely documented), ``scored_unconfirmed`` (a score exists
+    but its canonical marker could not be persisted; see ``mark_task_scored``) or ``in_flight``
+    (another attempt holds the lock). Reuses the portable O_EXCL lockfile from
+    ``ouroboros.platform_layer``; no daemon, no registry, no lease.
+
+    The scored STATE is read from markers, never from the lock, so a refusal on it is
+    STALENESS-INDEPENDENT: the lock is deliberately expirable (`stale_sec` reclaims a crashed
+    holder's task) and a protection built on it would fail open the moment somebody waited long
+    enough. `scored_unconfirmed` therefore refuses forever, until an operator clears it.
+
+    The state is checked TWICE, and the second check is the load-bearing one. Checking it only
+    BEFORE waiting for the lock is a live TOCTOU hole: two attempts both see no marker, the
+    first wins the lock, scores, marks and releases, and the second then acquires the lock with
+    the marker already on disk and would still be told ``claimed`` — rerunning a task that
+    already has an official score, which is the exact corruption the rule forbids. So the state
+    is re-read once the lock is HELD (nobody can be mid-transition then) and the lock we just
+    took is released again if the answer changed.
+    """
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+
+    claims_dir = confined_claims_dir(claims_dir, repo_dir=repo_dir)
+    claims_dir.mkdir(parents=True, exist_ok=True)
+    state = scored_claim_state(claims_dir, claim_key)
+    if state:
+        return None, state
+    lock_path = claims_dir / f"{claim_key}.lock"
+    fd = acquire_exclusive_file_lock(
+        lock_path, timeout_sec=1.0, stale_sec=stale_sec,
+        metadata=metadata or f"pid={os.getpid()} ts={time.time()}\n",
+    )
+    if fd is None:
+        return None, "in_flight"
+    state = scored_claim_state(claims_dir, claim_key)
+    if state:
+        # Scored by the previous holder while we were blocking on the lock. Give back the lock
+        # we just took — keeping it would park a task nobody may run for the whole staleness
+        # window — and step aside.
+        release_exclusive_file_lock(lock_path, fd)
+        return None, state
+    return fd, "claimed"
+
+
+UNCONFIRMED_SCORE_SUFFIX = ".scored_unconfirmed"
+
+
+class ClaimMarkerNotDurable(RuntimeError):
+    """The permanent ``<key>.scored`` marker could not be persisted.
+
+    "First SCORED attempt wins" (owner Q14=A) is an AUTHORITY fixed before any numbers were
+    read, not an optimisation: with no marker another attempt reruns a task that already has an
+    official score, and the pre-registered dedup rule is violated in the direction that
+    CORRUPTS results. So a marker-persistence failure is raised rather than swallowed.
+
+    ``unconfirmed_marker`` is the durable record of the "scored but unmarked" state — the
+    ``<key>.scored_unconfirmed`` path — or ``None`` when even THAT could not be written. The
+    distinction is the whole recovery story: with the marker, the refusal is permanent and
+    visible; without it, nothing on disk remembers that a score exists, so retaining the
+    in-flight lock is all that is left and that lock EXPIRES. The caller must then refuse
+    loudly rather than pretend the task is protected.
+    """
+
+    def __init__(self, message: str, *, unconfirmed_marker: Path | None = None) -> None:
+        super().__init__(message)
+        self.unconfirmed_marker = unconfirmed_marker
+
+
+def record_unconfirmed_score(claims_dir: Path, claim_key: str, *, repo_dir: Path, reason: str,
+                             payload: dict[str, Any] | None = None) -> Path | None:
+    """Durably record "this task HAS an official score that no canonical marker names".
+
+    Returns the marker path, or ``None`` when even THIS could not be written. Never raises: it
+    is called on paths whose job is to decide WHICH refusal to make, including one that is
+    already unwinding a ``KeyboardInterrupt``, and a second failure there must not replace the
+    operator's interrupt with a disk error.
+
+    ``<key>.scored_unconfirmed`` is the only STALENESS-INDEPENDENT protection available once the
+    canonical marker is missing: `stale_sec` reclaims the in-flight lock BY DESIGN, so a
+    lock-only protection fails open the moment somebody waits long enough. This marker never
+    expires, so ``scored_claim_state`` refuses the task until an operator clears it.
+
+    Idempotent in the direction that matters: an existing canonical ``.scored`` marker means the
+    score IS properly recorded, so it is returned untouched and no unconfirmed state is created.
+    """
+    from ouroboros.utils import atomic_write_json
+
+    try:
+        claims_dir = confined_claims_dir(claims_dir, repo_dir=repo_dir)
+        marker = claims_dir / f"{claim_key}.scored"
+        if marker.is_file():
+            return marker
+        unconfirmed = claims_dir / f"{claim_key}{UNCONFIRMED_SCORE_SUFFIX}"
+        claims_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(
+            unconfirmed,
+            {"claim_key": claim_key, "ts_unix": time.time(), "reason": reason,
+             "canonical_marker": str(marker), **(payload or {})},
+            trailing_newline=True,
+            fsync=True,
+        )
+        return unconfirmed if unconfirmed.is_file() else None
+    except BaseException:  # noqa: BLE001 - the caller ESCALATES a None, never a new exception
+        return None
+
+
+def mark_task_scored(claims_dir: Path, claim_key: str, *, repo_dir: Path,
+                     payload: dict[str, Any] | None = None) -> Path:
+    """Fail-CLOSED durable claim transition: this task HAS an official score.
+
+    Called immediately after ``env.evaluate()`` and BEFORE the score is projected into any
+    result artefact, which is what makes the rule survive a crash. The only orderings a
+    process death can then produce are "marker, no result" (a later lane steps aside; the
+    denominator shows the missing row) and "no marker, no result" (a later lane legitimately
+    retries). "Result without marker" — the one ordering that makes a lane rerun an
+    already-scored task — is unreachable.
+
+    Written with ``fsync=True``: "durable" has to mean survived-the-power-cut, not
+    reached-the-page-cache. Idempotent — an existing marker IS the first scored attempt and
+    is never overwritten.
+
+    If the canonical marker cannot be written, the "scored but unmarked" state is recorded
+    DURABLY at ``<key>.scored_unconfirmed`` instead, and the refusal carries that path. Leaving
+    only the in-flight lock behind was a protection with an expiry date: `stale_sec` makes that
+    lock reclaimable BY DESIGN, so once enough time passed another attempt claimed a task that
+    already had an official score — the same corruption, merely delayed. The marker never
+    expires, so the refusal is permanent and an operator can see it.
+    """
+    from ouroboros.utils import atomic_write_json
+
+    claims_dir = confined_claims_dir(claims_dir, repo_dir=repo_dir)
+    marker = claims_dir / f"{claim_key}.scored"
+    unconfirmed = claims_dir / f"{claim_key}{UNCONFIRMED_SCORE_SUFFIX}"
+    try:
+        claims_dir.mkdir(parents=True, exist_ok=True)
+        if not marker.exists():
+            atomic_write_json(
+                marker,
+                {"claim_key": claim_key, "ts_unix": time.time(), **(payload or {})},
+                trailing_newline=True,
+                fsync=True,
+            )
+        if not marker.is_file():
+            raise OSError(f"scored marker is absent after a successful write: {marker}")
+    except Exception as exc:  # noqa: BLE001 - re-raised as the typed fail-closed refusal
+        # SECOND and LAST attempt, at a different path. Not a further layer of best-effort: it
+        # decides WHICH refusal the caller must make. If it succeeds the task is permanently
+        # refused by `scored_claim_state`; if it fails, nothing on disk remembers the score and
+        # the caller has to say so loudly instead of promising a protection that expires.
+        recorded = record_unconfirmed_score(
+            claims_dir, claim_key, repo_dir=repo_dir, reason="scored_marker_write_failed",
+            payload={"error": f"{type(exc).__name__}: {exc}", **(payload or {})},
+        )
+        if recorded is not None:
+            raise ClaimMarkerNotDurable(
+                f"could not persist the scored-claim marker {marker}: {type(exc).__name__}: "
+                f"{exc}; recorded the scored-but-unmarked state at {recorded} instead, which "
+                "refuses this task permanently (staleness cannot reclaim it)",
+                unconfirmed_marker=recorded,
+            ) from exc
+        raise ClaimMarkerNotDurable(
+            f"could not persist the scored-claim marker {marker} NOR the fallback "
+            f"{unconfirmed}: {type(exc).__name__}: {exc}; the claim directory is unusable, so "
+            "NOTHING on disk records that this task has an official score and the in-flight "
+            "lock will expire — refuse loudly and do not continue against this claim dir",
+            unconfirmed_marker=None,
+        ) from exc
+    return marker
+
+
+def scored_claim_state(claims_dir: Path | None, claim_key: str) -> str:
+    """READ-ONLY ownership question. ``""``, ``"already_scored"`` or ``"scored_unconfirmed"``.
+
+    Deliberately pure (``exists()`` only — no mkdir, no lock, no write) so a launcher can ask it
+    BEFORE admission and step aside leaving ZERO footprint. "First SCORED attempt wins" means a
+    later attempt must not even write its own admission record into the winner's per-task run
+    directory: the manifest path is shared between attempts, so a footprint there is a clobber.
+
+    Neither answer involves the lock, so neither expires. ``scored_unconfirmed`` means a score
+    exists but its canonical marker could not be persisted (``mark_task_scored``); it needs an
+    operator, and until then the task stays refused rather than silently becoming claimable.
+    """
+    if claims_dir is None:
+        return ""
+    claims_dir = Path(claims_dir)
+    if (claims_dir / f"{claim_key}.scored").exists():
+        return "already_scored"
+    if (claims_dir / f"{claim_key}{UNCONFIRMED_SCORE_SUFFIX}").exists():
+        return "scored_unconfirmed"
+    return ""
+
+
+def task_already_scored(claims_dir: Path | None, claim_key: str) -> bool:
+    """True when this task must not be run again — either scored state counts."""
+    return bool(scored_claim_state(claims_dir, claim_key))
+
+
+def release_task_claim(claims_dir: Path, claim_key: str, lock_fd: int | None, *,
+                       scored: bool, repo_dir: Path,
+                       payload: dict[str, Any] | None = None) -> None:
+    """Release the in-flight lock; a SCORED attempt keeps its permanent marker.
+
+    Only a scored attempt owns ``<key>.scored``. An unscored attempt (adapter error,
+    preflight block, crashed lane) deliberately leaves the task claimable again so a later
+    lane may retry it — "first SCORED attempt wins", not "first attempt wins".
+
+    A scored claim is released ONLY once its marker is confirmed on disk. The marker is the
+    entire mechanism that stops a rerun, so releasing the lock without it hands the task
+    straight back to the next attempt; ``mark_task_scored`` raises ``ClaimMarkerNotDurable``
+    instead (the write used to be wrapped in a bare ``except: pass``) and the release below
+    never runs.
+    """
+    from ouroboros.platform_layer import release_exclusive_file_lock
+
+    claims_dir = Path(claims_dir)
+    if scored:
+        mark_task_scored(claims_dir, claim_key, repo_dir=repo_dir, payload=payload)
+    release_exclusive_file_lock(claims_dir / f"{claim_key}.lock", lock_fd)
 
 
 def _preflight(config: PreflightConfig) -> dict[str, Any]:
@@ -421,6 +825,26 @@ def _preflight(config: PreflightConfig) -> dict[str, Any]:
                 failures.append(message)
     except Exception as exc:
         failures.append(f"Ouroboros server not reachable: {type(exc).__name__}: {exc}")
+    # Owner Q9=A+B / Q10: this launcher attaches to a live server URL, so its own admission
+    # path attests WHAT is running (the HTTP `runtime_version`) against the checkout it was
+    # started from (local HEAD + VERSION) before a single paid step. The shared helper fails
+    # CLOSED by raising; translate that into a typed preflight failure so the caller still
+    # gets `blocked/preflight_failed` records instead of a bare traceback.
+    #
+    # A refusal CARRIES the record it built (`RuntimeAttestationRefused.attestation`): the exact
+    # typed reason plus `runtime_version`, `repo_head` and `repo_version`. Keeping only the
+    # message threw those away at the moment they matter most — the manifest then said
+    # `runtime_attestation_failed` and nothing about WHICH runtime disagreed with WHICH commit.
+    try:
+        details["runtime_attestation"] = runtime_attestation(config.ouroboros_url, config.repo_dir)
+    except RuntimeAttestationRefused as exc:
+        details["runtime_attestation"] = dict(exc.attestation)
+        failures.append(f"runtime attestation failed reason={exc.attestation.get('reason') or ''}: {exc}")
+    except RuntimeError as exc:
+        # No record to keep (the helper raised before building one).
+        details["runtime_attestation"] = {"ok": False, "reason": "runtime_attestation_failed",
+                                          "error": f"{type(exc).__name__}: {exc}"}
+        failures.append(f"runtime attestation failed: {exc}")
     try:
         ensure_outside_repo(config.result_root, config.repo_dir)
     except Exception as exc:
@@ -943,33 +1367,27 @@ def _write_task_records(config: TaskRecordConfig) -> dict[str, Any]:
         **details,
     }
     write_json(config.run_dir / "task_outcome.json", outcome)
-    write_json(
-        config.run_dir / "task_run_manifest.json",
-        benchmark_run_manifest(
-            benchmark="osworld",
-            run_root=config.result_root,
-            repo_dir=config.repo_dir,
-            requested_task_ids=[config.example_id],
-            # v6.75.0: the shared seed gate now defaults to require_clean=True. This launcher
-            # keeps its pre-v6.75.0 behaviour until its own phase adds --allow-dirty-seed.
-            require_clean=False,
-            dataset="OSWorld",
-            settings_path=config.settings_path,
-            output_paths={
-                "task_outcome": str(config.run_dir / "task_outcome.json"),
-                "traj": str(config.run_dir / "traj.jsonl"),
-                "task_run_manifest": str(config.run_dir / "task_run_manifest.json"),
-            },
-            harness={
-                "adapter": "external_step_loop",
-                "official_actions": True,
-                "memory_mode": "empty_per_ouroboros_step",
-                "action_space": "pyautogui",
-                "aligned_upstream": dict(ALIGNED_UPSTREAM),
-            },
-            extra=details,
-        ),
-    )
+    # Amend the ADMITTED manifest IN PLACE so the finalization seam writes one dict that
+    # carries both these late facts and the run's terminal outcome. Rebuilding a manifest
+    # here (the old fallback, with `require_clean=False`) recorded a WAIVED gate on the very
+    # path where the real gate had refused the run.
+    config.base_manifest.update(amend_task_manifest(
+        config.base_manifest,
+        output_paths={
+            "task_outcome": str(config.run_dir / "task_outcome.json"),
+            "traj": str(config.run_dir / "traj.jsonl"),
+            "task_run_manifest": str(config.run_dir / "task_run_manifest.json"),
+        },
+        extra=details,
+    ))
+    # The manifest itself is NOT published here. Every caller runs INSIDE an active
+    # `finalize_run_manifest` over this very path, and the seam merges the terminal
+    # outcome/exit_code/refusal into this same retained dict only when its context EXITS —
+    # so a write here publishes a pre-merge record (for a refusal, the admission seam's
+    # generic payload saying exit_code 1 while the process will exit 2) that a concurrent
+    # reader can observe and an interruption makes durable. The seam writes this path on
+    # every exit path already, so the write was pure duplication with a window attached.
+    # Enforced for the whole family by launcher_audit Invariant C.
     append_result_index(
         config.result_root,
         task_result_row(
@@ -1038,16 +1456,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_obs_chars", type=int, default=12000)
     parser.add_argument("--screenshot-check-only", action="store_true")
     parser.add_argument("--show-vm", action="store_true")
+    parser.add_argument("--allow-dirty-seed", action="store_true",
+                        help="run even when this Ouroboros checkout is dirty or its git identity is "
+                             "unreadable (default: fail closed before the VM boots). Recorded in the "
+                             "manifest; a dirty seed makes the run's provenance irreproducible.")
     return parser
 
 
 def main() -> int:
-    _ensure_vmrun_on_path()
-    _install_optional_dependency_stubs()
+    # NOTHING but argument parsing and pure local derivation until `admit_step_loop_run`
+    # below. `_ensure_vmrun_on_path()` probes the filesystem for `vmrun` and mutates $PATH,
+    # `_install_optional_dependency_stubs()` mutates `sys.modules`, and the `sys.path` insert
+    # is process state: all three moved into `_run_step_loop`, i.e. after the run is on disk.
     args = build_arg_parser().parse_args()
 
     osworld_root = Path(args.osworld_root).expanduser().resolve(strict=False)
-    sys.path.insert(0, str(osworld_root))
     if _is_default_desktop_server(args.ouroboros_url) and not args.allow_live_server:
         raise SystemExit(
             "refusing the default desktop server port (8765 on a loopback host): bench steps would "
@@ -1063,7 +1486,8 @@ def main() -> int:
     result_root = Path(args.result_dir).expanduser()
     if not result_root.is_absolute():
         result_root = osworld_root / result_root
-    result_root = ensure_outside_repo(result_root, Path(args.repo_dir).expanduser().resolve(strict=False))
+    # ASSERT, not ensure (see run_cu_bridge_agent): no directory before the manifest.
+    result_root = assert_outside_repo(result_root, Path(args.repo_dir).expanduser().resolve(strict=False))
     # Official example dir layout consumed by upstream show_result.py:
     # <result_dir>/<action_space>/<observation_type>/<model>/<domain>/<example_id>
     run_dir = (
@@ -1074,11 +1498,98 @@ def main() -> int:
         / domain
         / example_id
     )
-    run_dir.mkdir(parents=True, exist_ok=True)
+    # NO mkdir here: ADMISSION IS THE OUTER BOUNDARY (v6.75.0), so nothing touches the
+    # filesystem before the manifest is persisted. The atomic manifest write creates the tree.
+    manifest_path = run_dir / "task_run_manifest.json"
 
     repo_dir = Path(args.repo_dir).expanduser().resolve(strict=False)
     data_dir = Path(args.data_dir).expanduser().resolve(strict=False)
     settings_path = Path(args.settings_path).expanduser().resolve(strict=False)
+    # ADMISSION: build the manifest, WRITE it, then let the seed gate enforce — before the
+    # preflight, the VM boot and every paid step. `_write_task_records` amends this same dict
+    # and `finalize_run_manifest` records how the run ended on EVERY exit path.
+    #
+    # The gate fails CLOSED (owner Q19). Nothing has been spent at this point, so report it as
+    # this launcher's own typed refusal — `blocked/seed_gate_failed` with a ledger row —
+    # instead of a bare traceback, over the manifest `admit_benchmark_run` already persisted.
+    try:
+        base_manifest = admit_step_loop_run(
+            manifest_path,
+            result_root=result_root, repo_dir=repo_dir, settings_path=settings_path,
+            example_id=example_id, require_clean=not args.allow_dirty_seed,
+        )
+    except BenchmarkAdmissionRefused as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        refused = exc.manifest
+        # exit_code 2 is what this launcher REALLY exits with for a blocked run; the seam's
+        # generic refusal payload says 1, and a record that disagrees with the process status
+        # is the exact class of bug the parity test exists to catch.
+        with finalize_run_manifest(manifest_path, refused, outcome="refused", exit_code=2) as final:
+            final["refusal"] = {**((refused.get("extra") or {}).get("refusal") or {}),
+                                "exit_code": 2}
+            outcome = _write_task_records(TaskRecordConfig(
+                run_dir=run_dir,
+                result_root=result_root,
+                repo_dir=repo_dir,
+                settings_path=settings_path,
+                example_id=example_id,
+                domain=domain,
+                reward=None,
+                steps=0,
+                status="blocked",
+                reason_code="seed_gate_failed",
+                base_manifest=refused,
+                error=error,
+                extra={"allow_dirty_seed": bool(args.allow_dirty_seed),
+                       "seed_gate_error": error},
+            ))
+        print(json.dumps(outcome, ensure_ascii=False, indent=2))
+        return 2
+    base_manifest["extra"] = {**(base_manifest.get("extra") or {}),
+                              "allow_dirty_seed": bool(args.allow_dirty_seed)}
+    with finalize_run_manifest(manifest_path, base_manifest) as final:
+        return _run_step_loop(args, final, StepLoopPaths(
+            run_dir=run_dir, result_root=result_root, repo_dir=repo_dir, data_dir=data_dir,
+            settings_path=settings_path, osworld_root=osworld_root, task_path=task_path,
+            domain=domain, example_id=example_id, base_manifest=base_manifest,
+        ))
+
+
+@dataclass
+class StepLoopPaths:
+    """Resolved paths + the ADMITTED manifest handed to the post-admission body."""
+
+    run_dir: Path
+    result_root: Path
+    repo_dir: Path
+    data_dir: Path
+    settings_path: Path
+    osworld_root: Path
+    task_path: Path
+    domain: str
+    example_id: str
+    base_manifest: dict[str, Any]
+
+
+def _run_step_loop(args: argparse.Namespace, final: dict[str, Any],
+                   paths: StepLoopPaths) -> int:
+    """Everything AFTER admission: preflight, VM boot, the step loop, official evaluate.
+
+    Split out of `main()` so the admission function's pre-admission statements stay trivially
+    auditable (the seam meta-test walks them with `ast` and denies every filesystem/docker/
+    subprocess/network call there). `final` is the finalization seam's mutable record.
+    """
+    run_dir, result_root = paths.run_dir, paths.result_root
+    repo_dir, data_dir, settings_path = paths.repo_dir, paths.data_dir, paths.settings_path
+    domain, example_id = paths.domain, paths.example_id
+    base_manifest = paths.base_manifest
+    osworld_root, task_path = paths.osworld_root, paths.task_path
+    # Process/environment preparation belongs HERE, after the persisted admission boundary:
+    # each of these probes the filesystem or mutates process state, so a refusal in any of
+    # them must land on a run that already has a durable record.
+    _ensure_vmrun_on_path()
+    _install_optional_dependency_stubs()
+    sys.path.insert(0, str(osworld_root))
     preflight = _preflight(PreflightConfig(
         osworld_root=osworld_root,
         task_path=task_path,
@@ -1093,7 +1604,23 @@ def main() -> int:
         allow_scaffold_mismatch=bool(args.allow_scaffold_mismatch),
     ))
     write_json(run_dir / "preflight.json", preflight)
+    # The attestation record travels with the manifest, not just the preflight file, so a
+    # scored row can always be attributed to a runtime version + commit.
+    base_manifest["extra"]["runtime_attestation"] = (
+        (preflight.get("details") or {}).get("runtime_attestation") or {})
     if not preflight["ok"]:
+        # The documented contract is that a launcher NAMES the exact attestation reason in its
+        # typed refusal, not just that a preflight failed: `runtime_skew` and "the task JSON is
+        # missing" are different operator actions. When the attestation is what refused, its
+        # reason and stage are the refusal; otherwise the generic preflight one stands.
+        attestation = base_manifest["extra"]["runtime_attestation"]
+        attestation_reason = (str(attestation.get("reason") or "")
+                              if isinstance(attestation, dict) and not attestation.get("ok", True)
+                              else "")
+        refusal = ({"stage": "runtime_attestation", "reason": attestation_reason, "exit_code": 2}
+                   if attestation_reason
+                   else {"stage": "preflight", "reason": "preflight_failed", "exit_code": 2})
+        final.update({"outcome": "blocked", "exit_code": 2, "refusal": refusal})
         outcome = _write_task_records(TaskRecordConfig(
             run_dir=run_dir,
             result_root=result_root,
@@ -1105,6 +1632,7 @@ def main() -> int:
             steps=0,
             status="blocked",
             reason_code="preflight_failed",
+            base_manifest=base_manifest,
             error="; ".join(preflight["failures"]),
             extra={"preflight": preflight},
         ))
@@ -1132,7 +1660,13 @@ def main() -> int:
     ))
 
     try:
-        env = DesktopEnv(
+        # The constructor boots the VM, so a failed boot needs the SAME retry+cleanup
+        # discipline the reset loop already has (see construct_desktop_env).
+        env = construct_desktop_env(
+            DesktopEnv,
+            attempts=max(1, int(args.reset_retries)),
+            deadline=time.time() + max(1, int(args.startup_timeout_sec)),
+            retry_sleep_sec=max(0.1, float(args.startup_retry_sleep_sec)),
             provider_name=args.provider_name,
             path_to_vm=args.path_to_vm,
             action_space="pyautogui",
@@ -1211,6 +1745,7 @@ def main() -> int:
             steps=step_idx,
             status="completed",
             reason_code="official_evaluate",
+            base_manifest=base_manifest,
             extra={
                 "screenshot_check_only": bool(args.screenshot_check_only),
                 "final_answer": agent.final_answer or agent.last_response,
@@ -1225,6 +1760,8 @@ def main() -> int:
         return 0
     except Exception as exc:  # noqa: BLE001 - denominator-preserving adapter failure
         error = f"{type(exc).__name__}: {exc}"
+        final.update({"outcome": "adapter_error", "exit_code": 1,
+                      "error": {"type": type(exc).__name__, "message": str(exc)[:4000]}})
         outcome = _write_task_records(TaskRecordConfig(
             run_dir=run_dir,
             result_root=result_root,
@@ -1236,6 +1773,7 @@ def main() -> int:
             steps=locals().get("step_idx", 0),
             status="adapter_error",
             reason_code=type(exc).__name__,
+            base_manifest=base_manifest,
             error=error,
             extra={
                 "final_answer": agent.final_answer or agent.last_response,

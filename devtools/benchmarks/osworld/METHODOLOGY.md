@@ -161,6 +161,29 @@ final-state-only numbers; say so. Preflight-blocked and adapter-error tasks
 stay in the denominator via `result_index.jsonl` (`status=blocked` /
 `adapter_error`).
 
+A refused runtime attestation keeps its EVIDENCE: all three launchers catch
+`RuntimeAttestationRefused` and persist the record it carries (the exact typed
+reason plus `runtime_version`, `repo_head`, `repo_version`) under
+`extra.runtime_attestation`, rather than only the string
+`runtime_attestation_failed` — so a blocked row says WHICH runtime disagreed with
+WHICH commit.
+
+All three launchers ADMIT their run through the shared seams in
+`common/manifests.py`: `admit_benchmark_run()` builds the manifest from pure
+argument derivation, WRITES it, and only then does the provenance/clean-seed gate
+enforce, so a dirty or git-identity-less checkout stops the run BEFORE the
+preflight and the VM boot AND leaves a durable record of what was refused;
+`finalize_run_manifest()` records the terminal `outcome` plus the process's real
+`exit_code` on every exit path. Nothing touches the filesystem before admission.
+The `--allow-dirty-seed` escape is recorded in the manifest
+(`extra.allow_dirty_seed` and the `seed_gate` block); a run that used it is not
+submittable.
+
+When several run directories cover the same task (resumes, retries, or a future
+laned run — the lane generator is NOT part of this release, see §7.9),
+merge them with the pre-registered dedup rule in §7.9 — **first scored attempt
+wins** — never by picking the best score.
+
 ## 7. cu_bridge runner: protocol deltas and disclosures
 
 `run_cu_bridge_agent.py` is a SECOND runner with a different shape from the
@@ -217,7 +240,176 @@ leaderboard run without the disclosures below.
    and may fail on bot-detection. For a clean campaign, either provide a valid
    proxy config or publish the "proxy unavailable" subset separately rather than
    counting those as model failures.
-9. **Dataset pin + self-reported vs verified.** The manifest records the
+9. **Overlapping runs and the dedup rule (v6.76.0). PRE-REGISTERED — this
+   rule is fixed here BEFORE any numbers are looked at.**
+   - **MULTIPLE LANES ARE SUPPORTED; THERE IS NO MULTI-LANE LAUNCHER GENERATOR IN
+     THIS RELEASE.** Overlapping runs are a supported configuration and the
+     v6.76.0 smoke exercises it: several lanes run concurrently, each an
+     operator-written script invoking `run_cu_bridge_agent.py --claim-dir <shared>`
+     against its own isolated bench server, over a SHARED results tree. What was
+     built during this phase and then EXTRACTED is the CONVENIENCE GENERATOR for
+     those scripts (`gen_lanes.py`, `bind_lane_ports`, `lanes.json`); it is
+     deferred to a later release. So nothing in this tree generates lane scripts,
+     allocates lane ports or starts more than one bench server — the operator
+     does that — and no claim is made about an automated lane topology.
+   - The claim mechanism below is what makes overlapping runs safe, and it is NOT
+     lane-specific: append-only reruns, resumes and retry passes over a SHARED
+     results tree need the same "who owns this task" answer that two concurrent
+     lanes do, and the dedup rule is what makes an overlay of several run
+     directories reproducible.
+   - **PER-ATTEMPT RECORDS, ONE CANONICAL RESULT.** The per-task run directory
+     `<result_dir>/<domain>/<example_id>/` is keyed by the TASK, so overlapping
+     attempts share it. Every ADMITTED attempt therefore writes its OWN
+     admission and finalization record to
+     `attempts/<attempt_id>/task_run_manifest.json`, and only the attempt
+     HOLDING the claim writes the canonical artefacts in the run directory
+     itself (`task.json`, `result.txt`, `task_outcome.json`,
+     `task_run_manifest.json`). Without that split, two lanes overwrote each
+     other's admission record before either had claimed the task, and the loser
+     then finalized `skipped_in_flight` on top of the holder's still-running
+     record — defeating both the claim's ownership contract and the append-only
+     evidence contract. The shared `result_index.jsonl` ledger stays
+     append-only, but it is NOT a per-attempt log: an attempt enters it only
+     when it produces an OUTCOME (`task_outcome.json` + one ledger row, written
+     together). An attempt that steps aside on a held or already-scored claim
+     produces no outcome and therefore no row (see **Claims** below); an attempt
+     blocked before the claim — a failed seed gate or runtime attestation — does
+     produce an outcome, so its row exists and carries `claim_owner: false`.
+     Each row names its `attempt_dir` and whether that attempt was the
+     `claim_owner`, so a reader deduping by `instance_id` can tell the holder's
+     row from a bystander's. **So an auditor reconstructing a run reads the
+     `attempts/` subtree for everything that was TRIED and `result_index.jsonl`
+     for everything that produced an outcome and therefore counts in the
+     denominator** — the split is what keeps a losing lane out of the canonical
+     record, not an omission in it.
+   - **Claims.** Two attempts can never both take the same task. Before seeding the
+     skill or booting a VM, `run_cu_bridge_agent.py --claim-dir` takes an exclusive
+     O_EXCL lock (`ouroboros.platform_layer.acquire_exclusive_file_lock`) whose
+     staleness bound is `task_timeout + 2 × startup_timeout + margin`. TWO
+     startup windows, because a holder gets one for the `DesktopEnv` constructor
+     and a fresh one for the reset-to-usable-screenshot loop; a one-window bound
+     could expire while a lane was still legitimately working. `env.evaluate()`
+     runs after all of those and is UNBOUNDED (upstream getters may fetch over
+     the network), so the formula cannot cover it — that residual is what
+     `--claim-margin-sec` (default 900s) is for; raise it for domains with slow
+     evaluators. An attempt that finds the task claimed or
+     already scored exits with code 4 without producing an outcome, and therefore
+     writes NO ledger row: the owning attempt owns the denominator row. Its own
+     admission record under `attempts/<attempt_id>/` is where that attempt is
+     visible. The scored STATE is answered with a READ-ONLY probe
+     BEFORE admission (`scored_claim_state`), so a late attempt leaves no footprint
+     at all in the winner's shared per-task run directory, and again UNDER THE HELD
+     LOCK inside `acquire_task_claim`: reading it only before waiting for
+     the lock is a live TOCTOU hole, because a contender that started before the
+     winner scored would acquire the lock afterwards and still be told `claimed`.
+     The lock taken purely to look is handed straight back. That state is read from
+     MARKERS and never from the lock, so a refusal on it never expires — the lock is
+     deliberately reclaimable (`stale_sec` recovers a crashed holder's task) and a
+     protection built on it would fail open once somebody waited long enough. No
+     daemon, no registry, no lease.
+   - **DEDUP RULE: FIRST SCORED ATTEMPT WINS.** Runs are append-only, so a task
+     may legitimately appear in several run dirs (a crashed lane, a resume, a
+     later retry pass). When merging/overlaying results, the authoritative row
+     for a task is the EARLIEST attempt that produced an official
+     `env.evaluate()` score — regardless of its value. Later attempts of an
+     already-scored task are recorded but never counted, and a higher reward from
+     a later attempt is NEVER preferred (that would be best-of-N under another
+     name). Unscored attempts (adapter error, blocked preflight, crashed lane)
+     do not consume the task: only a scored attempt leaves the permanent
+     `<claim>/<key>.scored` marker, so a retry lane may take an unscored task
+     again. That marker is the RULE'S AUTHORITY, not an optimisation, so it is
+     fail-closed and durable: `mark_task_scored()` fsyncs it immediately after
+     `env.evaluate()` and BEFORE the reward is written to `result.txt` or any
+     outcome/ledger artefact, a write failure raises instead of being swallowed,
+     and a scored claim is never released while its marker is unconfirmed. The
+     only crash orderings reachable are therefore "marker, no result" (a later
+     lane steps aside; the missing row is visible in the denominator) and
+     "no marker, no result" (a later lane legitimately retries) — never
+     "result without marker", which is what made a lane rerun a task that already
+     had an official score. If the canonical marker cannot be persisted, the task is
+     SCORED BUT UNMARKED, and that state is itself recorded DURABLY:
+     `mark_task_scored()` fsyncs `<claim>/<key>.scored_unconfirmed` (one further
+     path, NOT a further layer of best-effort) and `scored_claim_state` refuses the
+     task on it with its own typed reason `scored_unconfirmed`, REGARDLESS of
+     staleness — so the refusal is permanent and visible to an operator instead of
+     the task silently becoming claimable again. The runner also retains its
+     in-flight lock as interim cover, reports the official reward with
+     `reason_code=claim_marker_not_durable` and `claim_lock_retained`, and exits 2.
+     Retaining the lock alone was NOT enough: `stale_sec` reclaims it by design, so a
+     lock-only protection merely delayed the rerun of an already-scored task.
+     If even the fallback marker cannot be written, NOTHING on disk records the
+     score and there is no protection left to promise: the runner refuses loudly
+     with `reason_code=claim_state_unrecoverable` and exit 3, stating that the claim
+     directory is unusable and further tasks must not be run against it. Such a task
+     must be reconciled by hand before the claim dir is reused; a
+     `.scored_unconfirmed` marker is cleared deliberately, never by expiry.
+     The claim directory itself is confined: `--claim-dir` is resolved through the
+     same `assert_outside_repo`/`live_data_roots()` boundary as every benchmark
+     output root before anything is created, so lock and marker files can never
+     land in a repository checkout or the owner's live runtime data. The authority
+     is the EXECUTION checkout (`--repo-dir`, the tree the manifest attests) and
+     the launcher's own checkout — both, not either. Confining against the
+     launcher's location alone let `--repo-dir /other/bench-clone --claim-dir
+     /other/bench-clone/.claims` write lock and marker state into the very seed
+     whose cleanliness the gate was about to attest.
+   - **THE INTERRUPT WINDOW IS CLOSED; THE `SIGKILL` WINDOW IS NOT — say so when
+     reporting a hard-killed run.**
+     An interrupt (`KeyboardInterrupt`/`SystemExit`, which are `BaseException` and
+     bypass an `except Exception`) between `env.evaluate()` and the marker is
+     handled DURABLY: `<claim>/<key>.scored_unconfirmed` is fsync'd before the
+     interrupt is re-raised, so the task is refused permanently and the operator
+     sees why. Retaining the in-flight lock — which is all this path used to do —
+     was a protection with a countdown on it, because `stale_sec` reclaims that
+     lock BY DESIGN: once the staleness bound passed, the next attempt was handed
+     an ALREADY-EVALUATED task and the score was counted twice. The lock is still
+     retained as interim cover, but the refusal now comes from a marker that
+     cannot expire.
+     A `SIGKILL` in that window is NOT handled and cannot be — no handler runs by
+     definition. That window is exactly: `env.evaluate()` has returned a score and
+     neither `mark_task_scored()` nor the interrupt path has completed its one
+     fsync'd atomic write.
+     What the `SIGKILL` window costs is bounded, and it is NOT a wrong number. The
+     marker is written BEFORE `result.txt`, `task_outcome.json` and the ledger row,
+     so a kill in that window leaves NO record of the score anywhere: there is no
+     row for an overlay to select, and a later attempt retrying the task is correct
+     rather than a rerun of a counted score. The cost is one lost evaluation. (This
+     is exactly why the INTERRUPT case is different and had to be closed: there the
+     process does get to run code, and leaving only the expirable lock behind meant
+     a score that WAS durably recorded could be counted a second time.)
+     We deliberately did NOT close the `SIGKILL` window with an intent marker before
+     `env.evaluate()`. That would block staleness reclaim for the whole evaluation
+     — which is UNBOUNDED (upstream getters fetch over the network) — so every hard
+     kill during evaluation (OOM killer, host reboot, an operator killing a hung
+     evaluator) would leave a NEVER-SCORED task permanently refused and needing
+     manual clearing. That trades a narrow benign window for a broad harmful one.
+     **After a hard kill, check the claim dir against the results tree:** a task
+     with a `.scored`/`.scored_unconfirmed` marker but no `result.txt` or ledger row
+     was scored and lost its projection — reconcile it or report the missing row in
+     the denominator; a task with neither marker and no result is safely retryable.
+   - **VM boot failures are retried; the teardown is belt-and-braces.** The
+     benefit claimed here is the RETRY: previously only `env.reset` was retried,
+     so a single transient `DesktopEnv.__init__` failure (a lost port-allocation
+     lock race, a slow image load) burned the whole task.
+     `run_step_agent.construct_desktop_env()` now retries the constructor within
+     the startup window. It also tears down every failed attempt (`env.close()` →
+     `provider.stop_emulator()`) because a raise inside `__init__` discards the
+     half-built object, leaving whatever `_start_emulator()` had already started
+     unreachable. That teardown is a PRECAUTION, not a fix for measured debris —
+     no run here has been shown to accumulate leaked containers.
+   - **Provider lock.** Upstream holds a single GLOBAL
+     `/tmp/docker_port_allocation.lck` across port allocation AND
+     `containers.run` with a 10-second `LOCK_TIMEOUT`, so any concurrent docker
+     container start loses the race and raises `filelock.Timeout` before its agent
+     starts. The lockfile is host-wide, not run-wide: on this SHARED daemon the
+     contender can be a resume pass, another of our runs, or another user's
+     container entirely — the lane generator is deferred out of this release, but
+     the contention is not lane-specific and does not go away with it. Both halves
+     of the fix are applied: the tracked operator patch
+     `operator_patches/osworld_docker_lock_timeout.v6760.patch` raises it to 60s,
+     and our constructor retry above absorbs the residual races. Report runs made
+     without the patch as such — the retry alone means more lost boots, not wrong
+     scores.
+10. **Dataset pin + self-reported vs verified.** The manifest records the
    checkout `variant` (V1-Verified: 369 tasks, 361 without the 8 Google-Drive
    tasks; OSWorld-V2: 108 long-horizon tasks) and git commit under
    `osworld_checkout`. Locally produced numbers are self-reported by definition;

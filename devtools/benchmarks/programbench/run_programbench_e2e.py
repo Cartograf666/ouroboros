@@ -31,7 +31,7 @@ from devtools.benchmarks.common.official_commands import programbench_command_fo
 from devtools.benchmarks.common.result_index import append_result_index, task_result_row
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
-    ensure_outside_repo,
+    assert_outside_repo,
     run_root,
     safe_join_under,
 )
@@ -431,21 +431,23 @@ def main() -> int:
     _ensure_docker_host()
     repo_dir = pathlib.Path(args.repo_dir).expanduser().resolve(strict=False)
     settings_path = pathlib.Path(args.settings_path).expanduser() if args.settings_path else default_settings_path()
-    model_slots = preflight_model_slots(settings_path, solve_model=str(args.solve_model or ""))
-    out_root = ensure_outside_repo(run_root("programbench", args.run_id), repo_dir)
+    out_root = assert_outside_repo(run_root("programbench", args.run_id), repo_dir)
     protected_paths = args.protected_path or default_protected_backend_paths()
 
-    instances = _load_instances(
-        difficulty=str(args.difficulty or ""),
-        filter_spec=str(args.filter_spec or ""),
-        slice_spec=str(args.slice_spec or ""),
-        instance_id=str(args.instance_id or ""),
-        shuffle=bool(args.shuffle),
-    )
-    if not instances:
-        raise SystemExit("no ProgramBench instances matched the selection")
-
-    selected_ids = [str(item["instance_id"]) for item in instances]
+    # The DECLARED selector, which is pure argv, is what admission can honestly record: the
+    # RESOLVED ids require loading the ProgramBench dataset, and that load (plus the model-slot
+    # preflight's settings read) can fail on the state of the world — a failure that used to
+    # take the process down before any manifest existed, leaving the run invisible rather than
+    # merely footprint-free. Both moved behind admission; `requested_task_ids` is amended with
+    # the resolved ids there, and the selector below records what was ASKED FOR either way.
+    selector = {
+        "difficulty": str(args.difficulty or ""),
+        "filter_spec": str(args.filter_spec or ""),
+        "slice_spec": str(args.slice_spec or ""),
+        "instance_id": str(args.instance_id or ""),
+        "shuffle": bool(args.shuffle),
+    }
+    declared_ids = [str(args.instance_id)] if args.instance_id else []
     manifest_path = out_root / "run_manifest.json"
     ledger_path = out_root / "result_index.jsonl"
     # ADMISSION, before the first instance burns anything: the seed-provenance gate (built into
@@ -458,7 +460,7 @@ def main() -> int:
         benchmark="programbench",
         run_root=out_root,
         repo_dir=repo_dir,
-        requested_task_ids=selected_ids,
+        requested_task_ids=declared_ids,
         require_clean=not args.allow_dirty_seed,
         argv=sys.argv,
         output_paths={
@@ -472,7 +474,8 @@ def main() -> int:
             "difficulty": str(args.difficulty or ""),
             "dry_run": bool(args.dry_run),
             "solve_model": str(args.solve_model or ""),
-            "model_slots_normalized": model_slots,
+            "selector": selector,
+            "model_slots_normalized": {"pending": "preflight_runs_after_admission"},
         },
         official_command=programbench_command_for_manifest(out_root, eval_requested=bool(args.eval)),
         isolated_data_root="",
@@ -489,6 +492,22 @@ def main() -> int:
     )
 
     with finalize_run_manifest(manifest_path, manifest, outcome="completed") as final:
+        # PREFLIGHT + DISCOVERY, now inside the admitted run: every refusal below is recorded by
+        # the finalization seam instead of vanishing with the process.
+        model_slots = preflight_model_slots(settings_path, solve_model=str(args.solve_model or ""))
+        manifest["harness"]["model_slots_normalized"] = model_slots
+        instances = _load_instances(**selector)
+        if not instances:
+            final.update({"outcome": "refused", "exit_code": 1,
+                          "refusal": {"stage": "instance_selection", "exit_code": 1,
+                                      "reason": "no_instances_matched"}})
+            raise SystemExit("no ProgramBench instances matched the selection")
+        selected_ids = [str(item["instance_id"]) for item in instances]
+        # AMEND the retained manifest with the ids the selector actually resolved to. The
+        # declared selector stays in `harness`, so the record says both what was asked for and
+        # what it meant.
+        manifest["requested_task_ids"] = selected_ids
+        manifest["requested_count"] = len(selected_ids)
         # Written AFTER persisted admission: a refused run must not leave run artefacts behind, and
         # nothing before the admission call may touch the filesystem.
         write_json(

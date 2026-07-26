@@ -5,6 +5,7 @@ git tree / user_files root."""
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -195,8 +196,10 @@ def test_nudge_gate_and_auto_equals_required():
 
 
 def test_latest_unreconciled_failed_verification_predicate():
-    """v6.51.0 idea-3: the red-verification predicate. Structural (typed receipt status
-    only), no content matching; `declared` does NOT reconcile a red (escape-hatch bypass)."""
+    """v6.51.0 idea-3 + v6.78.0 (owner Q28=B): the red-verification predicate. The
+    typed receipt status decides pass/fail (never prose), and a green reconciles a red
+    ONLY when it grounds the SAME verification — same `criterion_id`, else the same
+    whitespace-normalized `check` text. `declared` never reconciles a red."""
     from ouroboros import outcomes as O
 
     def dr_with(receipts):
@@ -213,19 +216,308 @@ def test_latest_unreconciled_failed_verification_predicate():
     # a lone fail -> returns it
     got = O.latest_unreconciled_failed_verification(dr_with([{"status": "fail", "check": "go test", "returncode": 1}]), "rt")
     assert got is not None and got.get("check") == "go test"
-    # fail then later pass / observed -> reconciled -> None
+    # fail then later pass / observed OF THE SAME CHECK -> reconciled -> None
+    assert O.latest_unreconciled_failed_verification(
+        dr_with([{"status": "fail", "check": "go test"}, {"status": "pass", "check": "go test"}]), "rt") is None
+    assert O.latest_unreconciled_failed_verification(
+        dr_with([{"status": "fail", "check": "go test"}, {"status": "observed", "check": "go test"}]), "rt") is None
+    # spacing BETWEEN tokens still reconciles (the canonical text is the same command)
+    assert O.latest_unreconciled_failed_verification(
+        dr_with([{"status": "fail", "check": "go  test"}, {"status": "pass", "check": "go test"}]), "rt") is None
+    # same criterion_id reconciles even when the command text differs (id wins)
+    assert O.latest_unreconciled_failed_verification(dr_with([
+        {"status": "fail", "criterion_id": "c1", "check": "pytest tests/x.py"},
+        {"status": "pass", "criterion_id": "c1", "check": "pytest tests/x.py -v"},
+    ]), "rt") is None
+    # v6.78.0: a green re-run of a DIFFERENT check no longer clears an unrelated red
+    still_red = O.latest_unreconciled_failed_verification(dr_with([
+        {"status": "fail", "check": "pytest tests/x.py"},
+        {"status": "pass", "check": "pytest tests/y.py"},
+    ]), "rt")
+    assert still_red is not None and still_red.get("check") == "pytest tests/x.py"
+    # ...including the cosmetic-reflag case (`-v`) with no criterion_id to bind them
+    assert O.latest_unreconciled_failed_verification(dr_with([
+        {"status": "fail", "check": "pytest tests/x.py"},
+        {"status": "pass", "check": "pytest tests/x.py -v"},
+    ]), "rt") is not None
+    # an identity-LESS red (no criterion_id, no check, no paths) has no identity to
+    # protect, so it keeps the pre-v6.78.0 rule: any later green clears it. The narrowing
+    # would only mint an UNCLEARABLE flag — verify.py writes exactly such a red for a
+    # malformed `artifact_observation` with no artifact_paths.
     assert O.latest_unreconciled_failed_verification(dr_with([{"status": "fail"}, {"status": "pass"}]), "rt") is None
-    assert O.latest_unreconciled_failed_verification(dr_with([{"status": "fail"}, {"status": "observed"}]), "rt") is None
     # fail then later DECLARED (escape hatch) -> NOT reconciled (codex #8) -> returns the fail
-    assert O.latest_unreconciled_failed_verification(dr_with([{"status": "fail"}, {"status": "declared"}]), "rt") is not None
+    assert O.latest_unreconciled_failed_verification(
+        dr_with([{"status": "fail", "check": "c"}, {"status": "declared", "check": "c"}]), "rt") is not None
     # pass then fail -> latest red unreconciled -> returns the fail
     assert O.latest_unreconciled_failed_verification(dr_with([{"status": "pass"}, {"status": "fail"}]), "rt") is not None
-    # content-independence: a PASS whose summary contains "FAIL" must NOT count as red...
+    # content-independence of the STATUS: a PASS whose summary contains "FAIL" must NOT count as red...
     assert O.latest_unreconciled_failed_verification(dr_with([{"status": "pass", "summary": "1 FAIL earlier, now PASS"}]), "rt") is None
     # ...and a fail with a bland summary MUST count
     assert O.latest_unreconciled_failed_verification(dr_with([{"status": "fail", "summary": "all good"}]), "rt") is not None
     # malformed entries tolerated (non-dict / missing status)
     assert O.latest_unreconciled_failed_verification(dr_with([{"nostatus": 1}]), "rt") is None
+
+
+def test_masked_pass_reconciliation_cannot_use_the_check_text_identity():
+    """The masked path must NOT inherit the red path's check-text identity. A masked
+    receipt's only text identity is its own MASKED command, and the sensor is a pure
+    function of argv, so the byte-identical re-run is re-flagged masked and could never
+    be the clean reconciler — text equality would make the flag unclearable by the very
+    remediation the host prescribes ("drop the masking pipe"). Rule: equal criterion_id
+    when the MASKED receipt carries one — a later clean receipt that omits its id does
+    not clear it — else ANY later clean grounding."""
+    from ouroboros import outcomes as O
+    from ouroboros.tools.verify import _check_has_exit_masking
+
+    # WHY text identity cannot bind here: remediation necessarily changes the text.
+    assert _check_has_exit_masking(["sh", "-c", "make test | tail"])[0] is True
+    assert _check_has_exit_masking(["sh", "-c", "make test"])[0] is False
+
+    masked = {"status": "pass", "check": "sh -c make test | tail", "check_exit_masking": True}
+    assert O.latest_unreconciled_masked_pass([masked]) is not None
+    # the PRESCRIBED remediation (same run, masking pipe dropped) clears it
+    assert O.latest_unreconciled_masked_pass(
+        [masked, {"status": "pass", "check": "sh -c make test"}]) is None
+    # so does any other later clean grounding, as before v6.78.0
+    assert O.latest_unreconciled_masked_pass(
+        [masked, {"status": "pass", "check": "make lint"}]) is None
+    # a later receipt that is ITSELF masked never reconciles
+    assert O.latest_unreconciled_masked_pass(
+        [masked, {"status": "pass", "check": "make lint | tail", "check_exit_masking": True}]) is not None
+    # criterion_id still binds when BOTH receipts carry one
+    assert O.latest_unreconciled_masked_pass([
+        dict(masked, criterion_id="c1"),
+        {"status": "pass", "criterion_id": "c1", "check": "sh -c make test"},
+    ]) is None
+    assert O.latest_unreconciled_masked_pass([
+        dict(masked, criterion_id="c1"),
+        {"status": "pass", "criterion_id": "c2", "check": "sh -c make test"},
+    ]) is not None
+
+
+def test_artifact_observation_class_reconciles_on_its_observed_path_set():
+    """Adversarial review (minor, accepted): the artifact-observation class runs NO
+    command, so it has neither `check` nor (usually) `criterion_id` — under strict
+    single-identity equality a red "report.md missing" could never be cleared by the
+    byte-identical green observation after the file was written, leaving a permanent
+    unreconciled red and a nudge on a task that DID verify itself. The observed path
+    SET is that class's real identity."""
+    from ouroboros import _outcome_receipts as R
+    from ouroboros import outcomes as O
+
+    red = {"status": "fail", "contract_kind": "artifact_observation", "paths": ["report.md"]}
+    green = {"status": "observed", "contract_kind": "artifact_observation", "paths": ["report.md"]}
+    other = {"status": "observed", "contract_kind": "artifact_observation", "paths": ["other.md"]}
+
+    # The key VALUE is the injective serialization of the set, not a line-join: a path
+    # may legally contain a newline, so `["a\nb"]` and `["a", "b"]` must not share a key.
+    assert R.receipt_identity(red) == ("artifact_paths", '["report.md"]')
+    assert R.receipt_identity({"paths": ["a\nb"]}) != R.receipt_identity({"paths": ["a", "b"]})
+    # same path set -> reconciled (order-insensitive; the SET is the identity)
+    assert O.latest_unreconciled_failed_receipt([red, green]) is None
+    assert O.latest_unreconciled_failed_receipt([
+        {"status": "fail", "paths": ["b.md", "a.md"]},
+        {"status": "observed", "paths": ["a.md", "b.md"]},
+    ]) is None
+    # a DIFFERENT path does not reconcile it
+    assert O.latest_unreconciled_failed_receipt([red, other]) is not None
+    # a green COMMAND check does not reconcile an observation (different identity)
+    assert O.latest_unreconciled_failed_receipt(
+        [red, {"status": "pass", "check": "ls report.md"}]) is not None
+    # criterion_id still wins when present
+    assert O.latest_unreconciled_failed_receipt([
+        {"status": "fail", "criterion_id": "c1", "paths": ["report.md"]},
+        {"status": "observed", "criterion_id": "c1", "paths": ["elsewhere.md"]},
+    ]) is None
+    # an identity-LESS red keeps the pre-v6.78.0 rule (any later green clears it): it has
+    # no identity to protect, and verify.py writes exactly this shape for a malformed
+    # `artifact_observation` call with no artifact_paths — under the narrowing that one
+    # mistake poisoned `unreconciled_red` for the rest of the task.
+    assert R.receipt_identity({}) == ("none", "")
+    assert R.receipt_identity({"paths": []}) == ("none", "")
+    assert O.latest_unreconciled_failed_receipt([{"status": "fail"}, {"status": "observed"}]) is None
+    malformed = {"status": "fail", "contract_kind": "artifact_observation",
+                 "paths": [], "summary": "no artifact_paths given"}
+    assert O.latest_unreconciled_failed_receipt(
+        [malformed, {"status": "pass", "check": "pytest -q"}]) is None
+    assert O.latest_unreconciled_failed_receipt([malformed]) is not None
+    # a `declared` escape hatch still does not reconcile it
+    assert O.latest_unreconciled_failed_receipt(
+        [malformed, {"status": "declared", "check": "c"}]) is not None
+
+
+def test_artifact_observation_reconciliation_clears_the_red_nudge(tmp_path, monkeypatch):
+    """Loop-level consequence of the fix: the concrete flow (declare -> observe FAIL ->
+    write the file -> observe again) must leave NO red nudge, while an observation of a
+    different path must still nudge."""
+    from types import SimpleNamespace
+
+    import ouroboros.loop as loop_mod
+    from ouroboros.outcomes import append_verification_receipt
+
+    monkeypatch.setattr(loop_mod, "_skill_finalization_message", lambda *_a, **_k: "")
+
+    def _fires(drive, receipts):
+        for receipt in receipts:
+            append_verification_receipt(drive, "t", receipt)
+        return loop_mod._maybe_inject_finalization_nudges(
+            SimpleNamespace(_ctx=SimpleNamespace()), drive, "t",
+            {"reasoning_notes": [], "tool_calls": []}, "answer", [], lambda *_: None,
+        )
+
+    same = tmp_path / "same"
+    same.mkdir()
+    assert _fires(same, [
+        {"status": "fail", "contract_kind": "artifact_observation", "paths": ["report.md"],
+         "summary": "missing: report.md"},
+        {"status": "observed", "contract_kind": "artifact_observation", "paths": ["report.md"],
+         "summary": "observed 1 artifact(s): report.md"},
+    ]) is False
+
+    other = tmp_path / "other"
+    other.mkdir()
+    assert _fires(other, [
+        {"status": "fail", "contract_kind": "artifact_observation", "paths": ["report.md"]},
+        {"status": "observed", "contract_kind": "artifact_observation", "paths": ["notes.md"]},
+    ]) is True
+
+
+def test_receipt_identity_and_disclosed_whitespace_flag():
+    """The identity rule and its DISCLOSED flag (Q28=B): criterion_id wins; without
+    one the whitespace-normalized check text IS the verification's identity, and both
+    reviewer-facing consumers say so."""
+    from ouroboros import _outcome_receipts as R
+    from ouroboros.outcomes import build_verification_ledger
+    from ouroboros.review_evidence import _accept_verification_summary
+
+    # The check key pairs the canonical text with the RENDERING that produced the stored
+    # string (round 8) — `receipt_identity_parts` below still exposes the plain text.
+    go_test = ("check", json.dumps(["unversioned", "go test"]))
+    assert R.receipt_identity({"criterion_id": " c1 ", "check": "x"}) == ("criterion_id", "c1")
+    assert R.receipt_identity({"check": "go   test"}) == go_test
+    assert R.receipt_identity({"paths": ["a.md"], "check": "go test"}) == go_test
+    # The three components are independent; `receipt_identity` selects the ONE typed key
+    # sameness is decided by, and `receipt_identity_parts` discloses all three.
+    assert R.receipt_identity_parts(
+        {"criterion_id": " c1 ", "check": "go   test", "paths": ["b.md", "a.md"]}
+    ) == ("c1", "go test", "a.md\nb.md")
+    assert R.receipt_identity_parts({}) == ("", "", "")
+    assert R.receipt_identity_parts({"paths": "not-a-list"}) == ("", "", "")
+    # The flag is TRUE for the `check` kind and false for every other kind — see
+    # test_the_whitespace_flag_is_derived_once_for_every_identity_kind.
+    assert R.receipt_expected_whitespace_normalized({"check": "go test"}) is True
+    assert R.receipt_expected_whitespace_normalized({"paths": ["a.md"]}) is False
+    assert R.receipt_expected_whitespace_normalized({"criterion_id": "c1", "check": "go test"}) is False
+    assert R.receipt_expected_whitespace_normalized({}) is False
+
+    # Consumer 1: the acceptance reviewer's verification_summary.
+    summary = _accept_verification_summary([{"status": "fail", "check": "pytest tests/x.py"}])
+    assert summary["expected_whitespace_normalized"] is True
+    assert summary["reconciliation_identity_kinds"] == ["check"]
+    assert summary["latest_identity"]["paths"] == []  # a command check observes no path set
+    id_summary = _accept_verification_summary([
+        {"status": "pass", "criterion_id": "c1", "check": "pytest"},
+        {"status": "observed", "paths": ["report.md"]},
+    ])
+    # Neither row is governed by command text: the `criterion_id` row is named, and the
+    # observation row's path SET normalizes nothing (round 7).
+    assert id_summary["expected_whitespace_normalized"] is False
+    assert id_summary["reconciliation_identity_kinds"] == ["artifact_paths", "criterion_id"]
+    # the observation class runs no command, so its identity reaches the reviewer as the
+    # observed path set (latest_check is empty for it) — never silently dropped
+    assert id_summary["latest_check"] == ""
+    assert id_summary["latest_identity"]["paths"] == ["report.md"]
+    assert _accept_verification_summary(
+        [{"status": "pass", "criterion_id": "c1", "check": "pytest"}]
+    )["expected_whitespace_normalized"] is False
+
+    # Consumer 2: the FIXED verification-ledger receipt projection.
+    ledger = build_verification_ledger(
+        task={"id": "t1"},
+        loop_outcome={"outcome_axes": {"execution": {"status": "ok"}}},
+        llm_trace={"verification_receipts": [
+            {"status": "fail", "check": "pytest tests/x.py"},
+            {"status": "observed", "contract_kind": "artifact_observation", "paths": ["report.md"]},
+        ]},
+        artifact_bundle={"status": "not_applicable", "artifacts": [], "errors": []},
+    )
+    rows = [r for r in ledger["entries"] if r.get("kind") == "verification_receipt"]
+    assert rows[0]["expected_whitespace_normalized"] is True
+    assert rows[0]["reconciliation_identity"] == "check"
+    assert rows[0]["paths"] == []
+    assert rows[1]["reconciliation_identity"] == "artifact_paths"
+    assert rows[1]["expected_whitespace_normalized"] is False
+    # the FIXED projection carries the identity the reconciliation actually used
+    assert rows[1]["paths"] == ["report.md"]
+
+
+def test_receipt_reconciliation_matches_one_typed_identity_key():
+    """Sameness is ONE typed key (kind AND value), never a fallback chain over the three
+    components: an existing `criterion_id` is authoritative, so a green that carries only
+    the check text cannot clear a criterion-keyed red — in either direction — and a
+    command check never reconciles a bare observation."""
+    from ouroboros import outcomes as O
+
+    # Round-5 CRITICAL, stated as behaviour: the earlier red is keyed by `c1`, the later
+    # green only by its check text. Different KINDS never match, so the red stays open.
+    # This is the narrowing that made the relation transitive; it fails SAFE (a red that
+    # the chain used to clear may now stay open — never the reverse).
+    assert O.latest_unreconciled_failed_receipt([
+        {"status": "fail", "criterion_id": "c1", "check": "pytest tests/x.py"},
+        {"status": "pass", "check": "pytest  tests/x.py"},
+    ]) is not None
+    # ...and the reverse direction (the red lacked the id, the green added one)
+    assert O.latest_unreconciled_failed_receipt([
+        {"status": "fail", "check": "pytest tests/x.py"},
+        {"status": "pass", "criterion_id": "c1", "check": "pytest tests/x.py"},
+    ]) is not None
+    # The same key on both sides still reconciles, by id or by check text alone.
+    assert O.latest_unreconciled_failed_receipt([
+        {"status": "fail", "criterion_id": "c1", "check": "pytest tests/x.py"},
+        {"status": "pass", "criterion_id": "c1", "check": "pytest tests/x.py -v"},
+    ]) is None
+    assert O.latest_unreconciled_failed_receipt([
+        {"status": "fail", "check": "pytest tests/x.py"},
+        {"status": "pass", "check": "pytest  tests/x.py"},
+    ]) is None
+    # two DIFFERENT ids are two different criteria — identical command text does NOT
+    # collapse them
+    assert O.latest_unreconciled_failed_receipt([
+        {"status": "fail", "criterion_id": "c1", "check": "pytest tests/x.py"},
+        {"status": "pass", "criterion_id": "c2", "check": "pytest tests/x.py"},
+    ]) is not None
+    # a command check and a bare observation are different verifications, both ways
+    assert O.latest_unreconciled_failed_receipt([
+        {"status": "fail", "check": "ls report.md"},
+        {"status": "observed", "paths": ["report.md"]},
+    ]) is not None
+    assert O.latest_unreconciled_failed_receipt([
+        {"status": "fail", "paths": ["report.md"]},
+        {"status": "pass", "check": "ls report.md", "paths": ["report.md"]},
+    ]) is not None
+    # the masked-green path keys on the criterion_id ALONE (its own text identity is the
+    # masked command, which the remediation changes — see
+    # test_masked_pass_reconciliation_cannot_use_the_check_text_identity), and it is the
+    # same typed key: a later clean receipt that OMITS its id no longer clears an
+    # identified masked criterion (round 5, the masked half of the same ambiguity).
+    assert O.latest_unreconciled_masked_pass([
+        {"status": "pass", "criterion_id": "c1", "check": "make test | tail", "check_exit_masking": True},
+        {"status": "pass", "check": "make test | tail"},
+    ]) is not None
+    assert O.latest_unreconciled_masked_pass([
+        {"status": "pass", "criterion_id": "c1", "check": "make test | tail", "check_exit_masking": True},
+        {"status": "pass", "criterion_id": "c1", "check": "make test"},
+    ]) is None
+    # ...while a masked receipt with NO id keeps the any-later-clean fallback: it names
+    # no criterion, so narrowing would only mint an unclearable flag.
+    assert O.latest_unreconciled_masked_pass([
+        {"status": "pass", "check": "make test | tail", "check_exit_masking": True},
+        {"status": "pass", "check": "make test"},
+    ]) is None
+    assert O.latest_unreconciled_masked_pass([
+        {"status": "pass", "criterion_id": "c1", "check": "make test | tail", "check_exit_masking": True},
+        {"status": "pass", "criterion_id": "c2", "check": "make test | tail"},
+    ]) is not None
 
 
 def test_red_verification_nudge_one_shot_and_before_receipt_absent(monkeypatch):

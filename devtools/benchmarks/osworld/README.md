@@ -25,7 +25,23 @@ Files:
   `OUROBOROS_RUNTIME_MODE=pro`; see the benchmarks index "Bench-Template
   Scaffold Defaults").
 - `METHODOLOGY.md` — official 2.0 protocol, scaffold disclosures, honest
-  runnable-vs-skeleton status, and the cu_bridge final_answer lesson.
+  runnable-vs-skeleton status, the cu_bridge final_answer lesson, and (§7.9) the
+  pre-registered multi-lane/dedup rules.
+- **Multiple lanes are supported; the lane-script GENERATOR is not in this
+  release.** Overlapping runs are a supported configuration and the smoke uses
+  them: several operator-written lane scripts, each invoking
+  `run_cu_bridge_agent.py --claim-dir <shared>` against its own isolated bench
+  server, over a shared results tree. What was built during this phase and
+  EXTRACTED before release is the convenience generator for those scripts
+  (`gen_lanes.py`, lane port binding, `lanes.json`); nothing here generates lane
+  scripts, allocates lane ports or starts more than one bench server. The
+  `--claim-dir` mechanism is what makes overlapping attempts safe and is not
+  lane-specific — append-only resumes and retry passes over a shared results tree
+  need the same ownership answer. See METHODOLOGY.md §7.9.
+- `operator_patches/` — unified diffs for the THIRD-PARTY OSWorld checkout (never
+  a fork, never a commit into it; never tasks/evaluators/scoring). Currently the
+  docker provider's `LOCK_TIMEOUT` 10s→60s, which together with our constructor
+  retry keeps concurrent lanes from dying on `/tmp/docker_port_allocation.lck`.
 - `osworld_adapter_skeleton.py` refuses to run unless the official environment,
   live Ouroboros server, computer-use payload, and output-root isolation are all
   present. It also requires `unix_computer_use` to have a fresh executable review

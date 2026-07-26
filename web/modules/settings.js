@@ -33,7 +33,7 @@ const VALUE_FIELDS = [
 ];
 const _SAFETY_MODE_RANK = { full: 2, light: 1, off: 0 };
 const NUMBER_FIELDS = [
-    ['s-workers', 'OUROBOROS_MAX_WORKERS', 10], ['s-active-subagents', 'OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT', 3], ['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 2],
+    ['s-workers', 'OUROBOROS_MAX_WORKERS', 10], ['s-active-subagents', 'OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT', 3], ['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 2, true],
     ['s-tool-timeout', 'OUROBOROS_TOOL_TIMEOUT_SEC', 600], ['s-local-port', 'LOCAL_MODEL_PORT', 8766], ['s-local-gpu-layers', 'LOCAL_MODEL_N_GPU_LAYERS', -1, true],
     ['s-local-ctx', 'LOCAL_MODEL_CONTEXT_LENGTH', 16384], ['s-gc-retention-days', 'OUROBOROS_GC_RETENTION_DAYS', 7],
     ['s-bg-wakeup-min', 'OUROBOROS_BG_WAKEUP_MIN', 30], ['s-bg-wakeup-max', 'OUROBOROS_BG_WAKEUP_MAX', 7200], ['s-bg-max-rounds', 'OUROBOROS_BG_MAX_ROUNDS', 10],
@@ -763,12 +763,49 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         }
     }
 
+    // A pinned scope reviewer's route has no other reachable path to Capability
+    // Evidence: the settings save probes it and returns the SAME needs_ack contract the
+    // Max gate uses, so reuse that flow verbatim. Without rendering it the owner only
+    // ever sees commits blocked by SCOPE_REVIEW_SUB_FLOOR telling them to owner-ack a
+    // route the UI never offered. Declining leaves the slot fail-closed, as before.
+    async function ackReviewCapabilityNotices(notices) {
+        const pending = (Array.isArray(notices) ? notices : [])
+            .filter((notice) => notice?.needs_ack?.model);
+        let acked = 0;
+        for (const notice of pending) {
+            const ack = notice.needs_ack;
+            const seen = Number(notice.window_tokens || 0);
+            const confirmed = window.confirm(
+                'Scope review is fail-closed unless its reviewer\'s 1,000,000-token context '
+                + `window is known, and this route reports ${seen > 0 ? `${seen} tokens` : 'no window metadata'}.\n\n`
+                + 'Confirm that this model supports a 1,000,000-token context window?\n'
+                + `  provider: ${ack.provider || '(default)'}\n  model: ${ack.model}\n`
+                + `  base_url: ${ack.base_url || '(default)'}\n\n`
+                + 'This applies only to this exact model/provider. Answering No leaves scope '
+                + 'review blocking commits on this route.'
+            );
+            if (!confirmed) continue;
+            await apiClient.ownerCapabilityAck({
+                provider: ack.provider, model: ack.model, base_url: ack.base_url,
+                window_tokens: 1000000, note: 'owner-confirmed scope reviewer window',
+            });
+            acked += 1;
+        }
+        return acked;
+    }
+
     async function saveContextModeViaOwnerEndpointIfNeeded() {
         const input = byId('s-context-mode');
         if (!input) return null;
         const next = input.value || 'max';
         const current = currentSettings?.OUROBOROS_CONTEXT_MODE || 'max';
-        if (next === current) return null;
+        // A displayed `low` that is a system AUTO-DOWNGRADE is not an owner selection
+        // (see the chat toggle): re-picking Low must still POST so the idempotent
+        // endpoint clears the derived flag, otherwise an install whose route cannot be
+        // confirmed >=1M has no reachable way to declare Low and every commit blocks.
+        const derivedLow = String(currentSettings?.OUROBOROS_CONTEXT_MODE_AUTO_LOW || '')
+            .trim().toLowerCase() === 'true';
+        if (next === current && !(next === 'low' && derivedLow)) return null;
         // Owner-only + hot-apply (saves immediately, no restart). Max needs the active model's
         // 1M-token window confirmed; on a 409 needs_ack, share the chat-toggle's ack flow
         // (CW8) — confirm, POST the route-scoped capability-ack, retry — instead of a
@@ -1055,6 +1092,13 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             } catch (error) {
                 safetyModeError = error.message || String(error);
             }
+            let reviewAcks = 0;
+            let reviewAckError = '';
+            try {
+                reviewAcks = await ackReviewCapabilityNotices(data.review_capability_notices);
+            } catch (error) {
+                reviewAckError = error.message || String(error);
+            }
             await loadSettings();
             syncAutoGrantBridgeState();
             let statusMsg;
@@ -1107,6 +1151,13 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             }
             if (autoGrantError) {
                 statusMsg = `${statusMsg} Reviewed-skill auto-grant was not changed: ${autoGrantError}`;
+                statusType = 'warn';
+            }
+            if (reviewAcks > 0) {
+                statusMsg = `${statusMsg} Confirmed a 1M-token window for ${reviewAcks} scope-review route(s).`;
+            }
+            if (reviewAckError) {
+                statusMsg = `${statusMsg} The scope-reviewer window confirmation was not saved: ${reviewAckError}`;
                 statusType = 'warn';
             }
             setStatus(statusMsg, statusType);

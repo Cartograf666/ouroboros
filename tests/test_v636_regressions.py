@@ -235,22 +235,105 @@ def test_agent_advisory_review_is_never_objective_or_verification_authority():
 
 
 def test_review_axis_preserves_agent_acceptance_disposition():
+    """v6.78.0 (P4.1, owner Q23=A): the agent's stance is projected as
+    `agent_disposition`/`agent_rationale`, and the host verdict it used to
+    overwrite (`status`/`source`/`rationale`) survives untouched. The agent
+    vocabulary (`rejected`/`partial`/`deferred`) can no longer reach `status`."""
     from ouroboros.outcomes import _review_axis
 
     axis = _review_axis({
         "acceptance_decision": {
-            "status": "rejected",
-            "source": "agent_task_acceptance_review_tool",
-            "rationale": "Scope drift.",
+            "status": "finalized_unaccepted",
+            "reason": "open_obligations",
+            "source": "task_acceptance_review",
+            "rationale": "Host verdict.",
             "agent_disposition": "rejected",
             "agent_rationale": "Scope drift.",
         }
     })
 
     decision = axis["acceptance_decision"]
-    assert decision["status"] == "rejected"
+    assert decision["status"] == "finalized_unaccepted"
+    assert decision["reason"] == "open_obligations"
+    assert decision["rationale"] == "Host verdict."
     assert decision["agent_disposition"] == "rejected"
     assert decision["agent_rationale"] == "Scope drift."
+
+
+def _apply_agent_acceptance_payload(trace, payload):
+    """Drive the real agent-path acceptance merge through the tool handler."""
+    import json
+
+    from ouroboros.loop_tool_execution import process_tool_results
+
+    process_tool_results(
+        [{
+            "fn_name": "task_acceptance_review",
+            "tool_call_id": "call-agent",
+            "result": json.dumps(payload),
+            "is_error": False,
+            "args_for_log": {},
+            "tool_args": {},
+            "result_meta": {"status": "ok"},
+        }],
+        [],
+        trace,
+        emit_progress=lambda _msg: None,
+    )
+
+
+def test_agent_decision_cannot_overwrite_host_acceptance_verdict():
+    """v6.78.0 P4.1 + gap G4: the agent path MERGES its stance into the existing
+    host decision. The removed code assigned a WHOLE NEW dict, so merely dropping
+    three keys would still have clobbered the host verdict."""
+    trace = {
+        "tool_calls": [],
+        "acceptance_decision": {
+            "status": "accepted",
+            "reason": "clean_pass",
+            "source": "task_acceptance_review",
+            "rationale": "Quorum PASS.",
+        },
+    }
+    _apply_agent_acceptance_payload(trace, {
+        "request": {"surface": "task_acceptance"},
+        "actors": [],
+        "parsed_findings": [],
+        "aggregate_signal": "PASS",
+        "dissent_noted": True,
+        "agent_decision": {
+            "disposition": "rejected",
+            "source": "agent_task_acceptance_review_tool",
+            "rationale": "Scope drift.",
+        },
+    })
+
+    decision = trace["acceptance_decision"]
+    assert decision["status"] == "accepted"          # host verdict preserved
+    assert decision["reason"] == "clean_pass"
+    assert decision["source"] == "task_acceptance_review"
+    assert decision["rationale"] == "Quorum PASS."
+    assert decision["agent_disposition"] == "rejected"
+    assert decision["agent_rationale"] == "Scope drift."
+    assert decision["dissent_noted"] is True
+
+
+def test_agent_decision_without_host_verdict_stays_status_less():
+    """Gap G5: with no host decision yet the agent path records its stance only —
+    it must NOT fabricate a host status it has no authority to write."""
+    trace = {"tool_calls": []}
+    _apply_agent_acceptance_payload(trace, {
+        "request": {"surface": "task_acceptance"},
+        "actors": [],
+        "parsed_findings": [],
+        "aggregate_signal": "PASS",
+        "agent_decision": {"disposition": "partial", "rationale": "Half done."},
+    })
+
+    decision = trace["acceptance_decision"]
+    assert decision.get("status", "") == ""
+    assert decision["agent_disposition"] == "partial"
+    assert decision["source"] == "agent_task_acceptance_review_tool"
 
 
 def test_provider_unavailable_no_salvage_path_does_not_raise(monkeypatch):

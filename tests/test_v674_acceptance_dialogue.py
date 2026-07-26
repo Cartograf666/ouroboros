@@ -438,7 +438,10 @@ def test_dialogue_terminal_finalizes_honestly_with_both_positions(monkeypatch, t
     another, trace, tool_ctx, fences = _apply_harness(monkeypatch, result, tmp_path=tmp_path)
     assert another is False  # NOT re-driven: the reviewers ended the dialogue
     decision = trace["acceptance_decision"]
-    assert decision["status"] == "best_effort_open_obligations"  # never a clean accept
+    # v6.78.0: one canonical terminal status; the with/without-obligations
+    # distinction lives on the `open_obligations` list asserted below.
+    assert decision["status"] == "finalized_unaccepted"  # never a clean accept
+    assert decision["reason"] == "dialogue_terminal"
     assert decision["dialogue_status"] == DIALOGUE_STABLE_DISAGREEMENT
     assert decision["dialogue_votes"][DIALOGUE_STABLE_DISAGREEMENT] == ["s1", "s2"]
     assert decision["open_obligations"]  # the obligations stay recorded, not wiped

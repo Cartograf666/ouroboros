@@ -201,13 +201,39 @@ def _route_calibration_ratio(
     route_fp: str,
     model: str,
 ) -> float:
-    """Conservative family baseline plus successful exact-route observations."""
-    from ouroboros.tools.review_helpers import (
-        CLAUDE_REAL_TOKENS_PER_ESTIMATED,
-        is_claude_family_model,
-    )
+    """Measured model baseline plus successful exact-route observations.
 
-    baseline = CLAUDE_REAL_TOKENS_PER_ESTIMATED if is_claude_family_model(model) else 1.0
+    DELIBERATELY NOT the cold-conservative review-pack density (v6.80.0): with an
+    empty observation store — every fresh install and EVERY isolated benchmark server
+    — a cold cross-model density would silently demote ``initial_mode`` from Max to
+    Low for the main loop. Unknown routes deliberately try Max (BIBLE P1: the horizon
+    is not narrowed by a guess). Only MEASURED knowledge about this exact model, plus
+    exact-route observations, may raise the baseline above 1.0.
+
+    What actually happens on a genuine overflow (verified, not assumed): the round
+    FAILS. ``loop_llm_call`` classifies it as ``context_overflow`` with
+    ``retry_same_request=False``, marks the usage ``execution_status="infra_failed" /
+    reason_code="llm_api_error"``, and emits the one-time
+    ``context_overflow_suggest_low`` owner hint — it does NOT rebuild anything. The
+    ONE-SHOT recovery lives one level up in ``loop.py``: after that failed round, a
+    confirmed ``context_overflow`` on a ``preferred_mode="max"`` plan for the same
+    model persists a forensic pre-retry checkpoint and reprojects the transcript into
+    task-local Low exactly once (guarded by ``_context_fit_low_retry_used``), then
+    retries. So the residual cost of the neutral cold baseline is bounded to ONE failed
+    round per task, and only when the very first prompt already exceeds the window on a
+    fresh evidence store; the first successful send records this model's density, after
+    which the projection is measured rather than guessed.
+    """
+    baseline = 1.0
+    try:
+        from ouroboros.capability_evidence import get_token_density
+        from ouroboros.provider_models import normalize_model_identity
+
+        measured = get_token_density(drive_root, normalize_model_identity(str(model or "")))
+        if measured > 0:
+            baseline = measured
+    except Exception:
+        log.debug("Measured token density unavailable for context fit", exc_info=True)
     ratios = [float(baseline)]
     try:
         events_path = pathlib.Path(drive_root) / "logs" / "events.jsonl"

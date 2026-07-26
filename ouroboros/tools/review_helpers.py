@@ -33,25 +33,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # non-blocking skip gate leaves headroom for default 1M-context reviewer models.
 REVIEW_PROMPT_TOKEN_BUDGET = 920_000
 
-# Tokenizer-density calibration shared by the review surfaces (scope review,
-# deep self-review). estimate_tokens (chars/4) tracks GPT-style tokenizers
-# within each surface's fixed headroom margin, but Claude-family tokenizers cut
-# code-heavy packs at ~2.5 chars/token: a real scope pack estimated at 739,508
-# tokens measured 1,166,914 REAL tokens (1.58x) and drew a deterministic 400
-# "prompt is too long: > 1,000,000 maximum" from every Anthropic upstream.
-# The calibration sizes the PROMPT for the configured reviewer's real
-# tokenizer — it never changes the reviewer model or a surface's window floor.
-CLAUDE_REAL_TOKENS_PER_ESTIMATED = 1.65  # measured 1.58 on code + margin
-
-
-def is_claude_family_model(model_id: str) -> bool:
-    """Whether a configured model id resolves to a Claude-family tokenizer.
-
-    "fable"/"mythos" cover bare Anthropic 5th-gen aliases configured without a
-    provider prefix (e.g. a Claude Code-style "fable" slot value).
-    """
-    low = str(model_id or "").strip().lower().lstrip("~")
-    return any(marker in low for marker in ("anthropic", "claude", "fable", "mythos"))
+# Tokenizer-density calibration shared by every review surface (triad, scope, plan,
+# deep self-review). estimate_tokens (chars/4) tracks GPT-style tokenizers, but a
+# real Claude scope pack estimated at 739,508 tokens measured 1,166,914 REAL tokens
+# (1.58x) and drew a deterministic 400 "prompt is too long". The density is no longer
+# a hand-set family constant: it is MEASURED per model at the physical send boundary
+# and stored in the capability_evidence ``token_density`` namespace (provenance and
+# cold-start rules live there). It sizes the PROMPT — never the reviewer model or a
+# window floor (BIBLE P3).
 
 
 def calibrated_input_token_limit(
@@ -61,17 +50,28 @@ def calibrated_input_token_limit(
     output_reserve: int,
     tokenizer_margin: int,
     budget_cap: int = REVIEW_PROMPT_TOKEN_BUDGET,
+    drive_root: Any = None,
 ) -> int:
-    """Model-family-aware estimated-token INPUT cap inside ``context_window``.
+    """Density-calibrated estimated-token INPUT cap inside ``context_window``.
 
-    GPT-family: window − output_reserve − tokenizer_margin (historical shape).
-    Claude-family: (window − output_reserve) / CLAUDE_REAL_TOKENS_PER_ESTIMATED,
-    so the assembled prompt fits the model's denser real tokenizer. Both forms
-    are clamped to the shared prompt-size SSOT (``budget_cap``).
-    """
-    if is_claude_family_model(model_id):
-        return min(budget_cap, int((context_window - output_reserve) / CLAUDE_REAL_TOKENS_PER_ESTIMATED))
-    return min(budget_cap, context_window - output_reserve - tokenizer_margin)
+    The STRICTEST of three bounds, so it never exceeds what the historical shape
+    allowed: the prompt-size SSOT (``budget_cap``), the density form
+    ``(window − output_reserve) / density``, and the historical absolute-margin form
+    ``window − output_reserve − tokenizer_margin``. A model with no observation
+    sizes DOWN from the cold-conservative density, not up from a chars/4 estimate; a
+    MEASURED model uses its own density (stored per model identity as a running
+    maximum, so measurement never loosens that model's cap), and the absolute-margin
+    form keeps every result at or below the pre-measurement cap."""
+    from ouroboros.capability_evidence import resolve_token_density
+
+    density, _ = resolve_token_density(
+        drive_root if drive_root is not None else review_drive_root(None), model_id
+    )
+    return min(
+        budget_cap,
+        int((context_window - output_reserve) / max(1.0, density)),
+        context_window - output_reserve - tokenizer_margin,
+    )
 
 SKILL_HOST_CONTEXT_FILES = (
     ("docs/CREATING_SKILLS.md", "markdown"),
@@ -879,6 +879,9 @@ def build_scope_actor_record(scope_result: object, *, fallback_model_id: str = "
         "error": error_text,
         "raw_text": getattr(scope_result, "raw_text", ""),
         "prompt_chars": getattr(scope_result, "prompt_chars", 0),
+        # measured | estimated_from_tokens | not_assembled — a back-computed count
+        # must not read as a measurement (RS5).
+        "prompt_chars_source": getattr(scope_result, "prompt_chars_source", "measured"),
         "tokens_in": getattr(scope_result, "tokens_in", 0),
         "tokens_out": getattr(scope_result, "tokens_out", 0),
         "cost_usd": getattr(scope_result, "cost_usd", 0.0),

@@ -73,6 +73,9 @@ export const apiClient = {
     ownerAutoGrant: (enabled) => jsonPost('/api/owner/auto-grant', { enabled: Boolean(enabled) }),
     ownerContextMode: (mode) => jsonPost('/api/owner/context-mode', { mode }),
     /** @returns {Promise<import('./api_types.js').OwnerScopeReviewFloorResponse>} */
+    // DEPRECATED (v6.80.0): the value is stored but nothing consults it — BIBLE P3
+    // scope-review applicability follows the owner context mode. Kept as a frozen
+    // contract surface; the response carries an explicit deprecation notice.
     ownerScopeReviewFloor: (floor) => jsonPost('/api/owner/scope-review-floor', { floor }),
     /** @returns {Promise<import('./api_types.js').OwnerSafetyModeResponse>} */
     ownerSafetyMode: (mode) => jsonPost('/api/owner/safety-mode', { mode }),

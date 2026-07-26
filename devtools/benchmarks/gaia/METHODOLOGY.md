@@ -135,6 +135,26 @@ so echoes of it in traces do not self-trip the audit regex) and does NOT contain
 the literal "FINAL ANSWER" marker. **Disclosure:** the pre-2026-07-04 runs did not
 carry this instruction, so pre/post-fix rows are not directly comparable.
 
+**Epistemic-grounding instruction (SSOT, all harnesses, v6.79.0).** Every solver also
+appends `GAIA_EPISTEMIC_INSTRUCTION` (same file, same identical-across-harnesses
+discipline). It is a DISCLOSURE obligation, not a retrieval obligation: when the answer
+depends on an external fact the model cannot verify from its own knowledge, check it
+against a primary source and say which one; if it could not be verified, say plainly that
+the value is unverified instead of presenting a guess as established fact. It explicitly
+does NOT ask the agent to look up things it already knows reliably — the owner's stated
+constraint when approving it (Q20/Q22, 2026-07-25) was that Ouroboros must not start
+searching the web for trivia — and it is NOT a gate: nothing refuses a final answer for
+missing a citation. It carries the same wording locks as the anti-lookup text (no
+benchmark name, no `FINAL ANSWER` literal, no leak-regex match) and is stripped from
+traces before the leakage scan like the other two SSOT instructions.
+
+Scope, stated for the record: this rule lives ONLY in this adapter. It is deliberately
+absent from `prompts/SYSTEM.md` and from the typed task contract, and a test asserts that
+(`tests/test_devtools_benchmarks.py::test_epistemic_rule_stays_out_of_the_global_system_prompt`).
+**Disclosure:** rows produced before v6.79.0 did not carry this instruction, so they are
+not strictly comparable with later rows; the effect direction is unknown and unmeasured
+(no campaign was run for it — owner Q4).
+
 `audit_leakage.py` implements the audit (diagnostic only — it never changes an
 inspect score):
 

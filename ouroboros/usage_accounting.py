@@ -1089,6 +1089,61 @@ def settle_attempt(
     )
 
 
+# Providers whose reported ``prompt_tokens`` INCLUDES cache reads and cache writes —
+# the assumption `pricing.py` already encodes when it derives
+# `regular_input = prompt_tokens - cached - cache_write`. On these routes a cached call
+# still measures density correctly, so cache markers must NOT suppress the observation:
+# the main loop and every review surface mark a stable prefix, so a
+# skip-on-any-cache-token rule would silently make the measurement path VACUOUS and
+# freeze every pack at the conservative cold-start density forever.
+_CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS = frozenset({
+    "openrouter", "openai", "openai-compatible", "cloudru", "local",
+})
+
+
+def _observe_token_density(request: AttemptRequest, usage: Optional[Dict[str, Any]]) -> None:
+    """Learn the model's real tokenizer density from one settled physical send.
+
+    Called AFTER settlement and therefore OUTSIDE the ledger lock, so a
+    capability-evidence write can never delay or starve monetary accounting; every
+    failure is swallowed (fail-soft — an unlearned observation only means review
+    packs keep using the conservative cold-start density).
+
+    A cache-bearing send is skipped ONLY on a route whose ``prompt_tokens`` semantics
+    are not known to be cache-inclusive (today the direct-Anthropic path, which reports
+    bare ``input_tokens``, plus GigaChat, whose `precached_prompt_tokens` semantics are
+    undocumented). There a partially cached call would report a falsely LOW density, and
+    an under-measured density LOOSENS the review-pack cap — the one direction that
+    reintroduces provider 400s. No arithmetic reconstruction is attempted here on
+    purpose: the direct-Anthropic accounting fix is owned elsewhere, and adding cache
+    tokens back would double-count once it lands."""
+    try:
+        normalized = dict(usage or {})
+        cache_bearing = bool(
+            int(normalized.get("cached_tokens") or 0)
+            or int(normalized.get("cache_write_tokens") or 0)
+        )
+        provider = str(request.provider or "").strip().lower()
+        if cache_bearing and provider not in _CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS:
+            return
+        real = int(normalized.get("prompt_tokens") or normalized.get("input_tokens") or 0)
+        estimate = int(request.prompt_tokens_estimate or 0)
+        if real <= 0 or estimate <= 0:
+            return
+        from ouroboros.capability_evidence import record_token_density
+        from ouroboros.provider_models import normalize_model_identity
+
+        record_token_density(
+            _drive_root(request.drive_root),
+            normalize_model_identity(str(request.model or "")),
+            prompt_chars=estimate * 4,
+            prompt_tokens=real,
+            source="dispatch_usage",
+        )
+    except Exception:
+        log.debug("token-density observation skipped", exc_info=True)
+
+
 def _is_pre_routing_rejection(exc: BaseException) -> bool:
     """True for an OpenRouter router-side 404 that never reached an upstream.
 
@@ -1182,6 +1237,7 @@ def execute_physical_attempt(
     try:
         usage, cost, final = extractor(response)
         settle_attempt(reservation, usage, cost_usd=cost, cost_final=final)
+        _observe_token_density(request, usage)
     except Exception as exc:
         # The provider response may already be paid and useful.  Preserve it;
         # extractor and persistence failures both leave an unresolved upper bound.
@@ -1212,6 +1268,7 @@ async def execute_physical_attempt_async(
     try:
         usage, cost, final = extractor(response)
         settle_attempt(reservation, usage, cost_usd=cost, cost_final=final)
+        _observe_token_density(request, usage)
     except Exception as exc:
         log.exception("Failed to account paid provider response: %s", reservation.attempt_id)
         try:

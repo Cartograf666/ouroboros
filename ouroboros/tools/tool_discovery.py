@@ -10,7 +10,11 @@ import logging
 from typing import List, Optional, TYPE_CHECKING
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tool_policy import list_non_core_tools as _policy_list_non_core
+from ouroboros.tool_policy import (
+    CAPABILITY_OMISSION_HEADER,
+    format_capability_omissions as _format_omissions,
+    list_non_core_tools as _policy_list_non_core,
+)
 
 if TYPE_CHECKING:
     from ouroboros.tools.registry import ToolRegistry
@@ -41,23 +45,14 @@ def _list_available_tools(ctx: ToolContext, **kwargs) -> str:
     if not non_core:
         if not omissions:
             return "All tools are already in your active set."
-        lines = ["All currently discovered tools are already in your active set.", "", "[CAPABILITY_OMISSION_MANIFEST]"]
-        for item in omissions:
-            lines.append(
-                f"- {item.get('surface', 'unknown')}: {item.get('reason', 'unknown')} "
-                f"({item.get('error', 'no detail')})"
-            )
+        lines = ["All currently discovered tools are already in your active set.", ""]
+        lines.extend(_format_omissions(omissions))
         return "\n".join(lines)
     lines = [f"**{len(non_core)} additional tools available** (use `enable_tools` to activate):\n"]
     for t in non_core:
         lines.append(f"- **{t['name']}**: {t['description'][:120]}")
     if omissions:
-        lines.append("\n[CAPABILITY_OMISSION_MANIFEST]")
-        for item in omissions:
-            lines.append(
-                f"- {item.get('surface', 'unknown')}: {item.get('reason', 'unknown')} "
-                f"({item.get('error', 'no detail')})"
-            )
+        lines.extend(_format_omissions(omissions, header="\n" + CAPABILITY_OMISSION_HEADER))
     return "\n".join(lines)
 
 

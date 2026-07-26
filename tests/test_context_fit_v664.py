@@ -105,7 +105,11 @@ def test_known_window_uses_family_and_exact_route_calibration(tmp_path, monkeypa
     assert plan.max_projection.calibration_ratio == 1.8
     assert plan.max_projection.calibrated_tokens == int(plan.max_projection.estimated_tokens * 1.8)
 
-    # Without a route sample, the existing Claude-family 1.65 calibration is the floor.
+    # v6.80.0 (Д7 decoupling): WITHOUT a route sample and WITHOUT a measured density
+    # for that model, the main-loop baseline stays the neutral 1.0 — "unknown routes
+    # deliberately try Max". The conservative cold-start density used for REVIEW packs
+    # is never applied here, because an empty observation store (every fresh install and
+    # every isolated benchmark server) would otherwise demote Max to Low silently.
     monkeypatch.setattr(
         context,
         "_context_fit_route",
@@ -117,7 +121,21 @@ def test_known_window_uses_family_and_exact_route_calibration(tmp_path, monkeypa
     claude = context.build_context_fit_plan(
         env, memory, {"id": "fit-3", "type": "task", "text": "solve"}, preferred_mode="max",
     )
-    assert claude.max_projection.calibration_ratio >= 1.65
+    assert claude.max_projection.calibration_ratio == 1.0
+    assert claude.initial_mode == "max"
+
+    # A MEASURED density for that exact model DOES raise the baseline.
+    from ouroboros.capability_evidence import _DENSITY_MEMO, record_token_density
+
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        env.drive_root, "anthropic/claude-fable-5",
+        prompt_chars=4_000_000, prompt_tokens=1_650_000,
+    )
+    measured = context.build_context_fit_plan(
+        env, memory, {"id": "fit-4", "type": "task", "text": "solve"}, preferred_mode="max",
+    )
+    assert measured.max_projection.calibration_ratio >= 1.65
 
 
 def test_positive_no_fit_evidence_selects_low_before_dispatch(tmp_path, monkeypatch):

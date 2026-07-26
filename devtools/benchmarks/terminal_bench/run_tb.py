@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import shlex
 import subprocess
 import sys
@@ -20,12 +21,36 @@ from dataclasses import dataclass
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
-from devtools.benchmarks.common.manifests import benchmark_run_manifest, write_json
-from devtools.benchmarks.common.run_roots import default_settings_path, ensure_outside_repo, repo_root_from_devtools
+from devtools.benchmarks.common.manifests import (
+    MODEL_SLOT_KEYS,
+    admit_benchmark_run,
+    finalize_run_manifest,
+    model_slot_snapshot,
+    write_json,
+)
+from devtools.benchmarks.common.run_roots import (
+    default_settings_path,
+    ensure_outside_repo,
+    repo_root_from_devtools,
+    safe_benchmark_id,
+    safe_join_under,
+)
 from devtools.benchmarks.terminal_bench.run_harbor_smoke import AGENT_IMPORT
 
 
 DEFAULT_DATASET = "terminal-bench/terminal-bench-2-1"
+
+# Frontier-Bench (Terminal-Bench's successor, harbor + Laude Institute). It is a HARBOR DATASET
+# with the same task shape as TB2.x (`task.toml` + `instruction.md` + `environment/Dockerfile` +
+# `tests/test.sh` + `solution/solve.sh`), so it needs NO new launcher and NO new package — only
+# this identity. Harbor resolves it as `<org>/<name>` and defaults the ref to `latest`, which is a
+# MUTABLE tag row: a reproducible run must pin an immutable ref via `--dataset
+# frontier-bench/frontier-bench@v0.1.0` (or `@<revision>` / `@sha256:<digest>`). Verified on the
+# installed harbor 0.18.0 with a negative control: `@v0.1.0` resolves 74 tasks while a bogus
+# `@v9.9.9` exits non-zero. `harbor dataset download frontier-bench/frontier-bench --cache` populates
+# `~/.cache/harbor/tasks/packages/frontier-bench/<task>/<digest>/task.toml`, which is exactly the
+# subtree the adapter's dataset-parametric wall-clock lookup already globs.
+FRONTIER_BENCH_DATASET = "frontier-bench/frontier-bench"
 
 # Every model slot the in-container adapter forwards (plus the review triad, handled specially).
 # Used by --all-model for a single-model run: review STAYS ON but lightened to ONE reviewer at low
@@ -84,6 +109,10 @@ class HarborCommandConfig:
     setup_timeout_multiplier: float = 1.0
     build_timeout_multiplier: float = 1.0
     disable_agent_web: bool = True
+    base_job_config: pathlib.Path | None = None
+    agent_env: tuple[str, ...] = ()
+    verifier_env: tuple[str, ...] = ()
+    harbor_env: str = ""
 
 
 def _effective_helper_models(measured_model: str, light_model: str, *, disable_agent_web: bool = False) -> list[tuple[str, str]]:
@@ -215,6 +244,175 @@ def report_grade(*, k: int, leaderboard_valid: bool, low_k_floor: int = 5) -> tu
     )
 
 
+_ENV_PASSTHROUGH_FLAGS = ("--ae", "--ve", "--agent-env", "--verifier-env")
+
+# A POSIX-shaped environment variable name. Deliberately stricter than "anything before the
+# first `=`": a name is the only part of an `--ae`/`--ve` pair this launcher ever writes down,
+# so it must be a NAME, not whatever the shell happened to hand us.
+_ENV_NAME_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def env_assignment(token: str) -> str:
+    """argparse ``type=`` for ``--agent-env`` / ``--verifier-env``: require ``NAME=VALUE``.
+
+    SECURITY, and the reason it is validated HERE rather than downstream: every consumer of these
+    tokens splits on the first `=` and treats the left half as a non-secret NAME it may persist
+    (`agent_env_keys` / `verifier_env_keys` in `run_manifest.json`), print (the passthrough
+    warning) or emit (`redacted_command`'s `NAME=<redacted>`). `"x".split("=", 1)[0]` is `"x"`,
+    so a token with NO `=` — exactly what a fat-fingered `--ve $OPENAI_API_KEY` produces — made
+    the WHOLE token, credential included, the "name" and put it in the clear in all three places.
+    Phase v6.75.0 exists partly to harden secret scrubbing; the scrubber's own input path was
+    writing the secret out. A malformed name could also inject control characters into those
+    artifacts or produce an unmatchable scrub marker.
+
+    Refusing at the point of parse means the process dies before `ensure_outside_repo`, before
+    admission and before any artifact exists. The token is NEVER echoed — it may BE the secret,
+    which is also why this raises `ArgumentTypeError` (argparse quotes only our message) rather
+    than `ValueError` (argparse would render `invalid env_assignment value: '<token>'`)."""
+    name, sep, _value = str(token).partition("=")
+    if not sep or not _ENV_NAME_RE.match(name):
+        raise argparse.ArgumentTypeError(
+            "expected NAME=VALUE with a POSIX environment variable name "
+            "([A-Za-z_][A-Za-z0-9_]*) and an explicit '='. The offending token is not echoed: "
+            "a token without '=' is usually an expanded credential."
+        )
+    return str(token)
+
+
+def redacted_command(cmd: list[str]) -> list[str]:
+    """The harbor command with agent-/verifier-env VALUES removed.
+
+    Everything THIS LAUNCHER writes to the run root or prints (manifest `official_command`,
+    `harbor_command.txt`, stdout) goes through here: `--ve OPENAI_API_KEY=sk-…` names a real
+    credential, and a published Harbor artifact tree must not carry it. Only the argv handed
+    to the subprocess keeps the values.
+
+    Scope limit, stated because it was previously overstated: this covers our own writes only.
+    Harbor persists the values itself into the job directory (see `harbor_command()`), so the
+    submission copy still needs the value sweep in `scrub_submission_secrets.py`.
+
+    Defence in depth against a malformed pair: `main()` refuses one at parse time
+    (`env_assignment`), but this helper is also callable on an argv assembled elsewhere, and its
+    old `token.split("=", 1)[0]` published the WHOLE token as a "name" when there was no `=`.
+    Anything that is not a well-formed `NAME=…` is now replaced wholesale, name included."""
+    out: list[str] = []
+    redact_next = False
+    for token in cmd:
+        if redact_next:
+            name, sep, _value = str(token).partition("=")
+            out.append(f"{name}=<redacted>" if sep and _ENV_NAME_RE.match(name) else "<redacted>")
+            redact_next = False
+            continue
+        out.append(token)
+        redact_next = token in _ENV_PASSTHROUGH_FLAGS
+    return out
+
+
+def _load_job_config(path: pathlib.Path) -> dict:
+    """Load a base Harbor JobConfig (JSON, or YAML when PyYAML is available)."""
+    text = pathlib.Path(path).read_text(encoding="utf-8")
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        import yaml  # optional: only a YAML base config needs it
+
+        loaded = yaml.safe_load(text)
+    else:
+        loaded = json.loads(text)
+    if not isinstance(loaded, dict):
+        raise ValueError(f"base job config {path} must be a mapping, got {type(loaded).__name__}")
+    return loaded
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge ``override`` into ``base`` (override wins; lists are replaced)."""
+    merged = dict(base)
+    for key, value in override.items():
+        current = merged.get(key)
+        merged[key] = _deep_merge(current, value) if isinstance(current, dict) and isinstance(value, dict) else value
+    return merged
+
+
+# Harbor's own default for `-e/--env` when the flag is absent. Recorded (not guessed) so a run that
+# leaves the flag off still discloses which backend produced its numbers.
+HARBOR_DEFAULT_ENV = "docker"
+
+
+def harbor_version(harbor_bin: str) -> str:
+    """Best-effort version of the harbor binary this run will actually invoke.
+
+    Provenance, not control flow: a number produced by harbor 0.18.0 and one produced by 0.20.0 are
+    not interchangeable, and this host deliberately keeps several harbor venvs side by side (TB2.1
+    stays pinned at 0.18.0 so published rows keep their harness, while a newer dataset may need a
+    newer harbor via --harbor-bin). Any failure — missing binary, non-zero exit, timeout — yields
+    "" rather than raising: unknown provenance must not abort a run, it must be visibly unknown."""
+    try:
+        proc = subprocess.run(
+            [str(harbor_bin), "--version"], capture_output=True, text=True, timeout=30, check=False,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or proc.stderr or "").strip().splitlines()[0].strip() if (proc.stdout or proc.stderr).strip() else ""
+
+
+def submission_subtree(dataset: str) -> tuple[str, str]:
+    """Derive ``(family, version)`` for the leaderboard submission tree from the DATASET.
+
+    TB2.1's leaderboard repo files submissions under `submissions/terminal-bench/2.1/…`, which
+    was hardcoded here: a run on any other dataset (Harbor-Index) would have been filed under
+    the TB2.1 tree — a wrong, silently misleading path. The dataset name carries the identity
+    (`<org>/<family>-<major>-<minor>`), so derive it and keep the TB2.1 output byte-identical.
+    A name with no trailing version segment yields `(<name>, "")`, and the caller drops the
+    empty component. The exact upstream layout for a NON-TB2.1 leaderboard must still be read
+    from that leaderboard's own SUBMIT.md before a real submission (see METHODOLOGY.md);
+    `--submission-subtree` overrides this derivation when it differs.
+
+    A harbor `@ref` pin is stripped first: the version a run is PINNED to (`@v0.1.0`, `@3`,
+    `@sha256:…`) is harbor registry addressing, not part of the leaderboard tree, and leaving it in
+    would put a literal `@` in a submission directory name."""
+    name = str(dataset or "").split("/")[-1].split("@", 1)[0]
+    parts = name.rsplit("-", 2)
+    if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+        return parts[0], f"{parts[1]}.{parts[2]}"
+    return name, ""
+
+
+def confined_submission_subtree(raw_subtree: str, *, dataset: str) -> list[str]:
+    """Validate the leaderboard subtree into CONFINED single path components.
+
+    `submission_root` is checked by `ensure_outside_repo`, but the job directory is DERIVED from
+    it — and validating an ancestor does not confine its descendant. `--submission-subtree ../../..`
+    (or a family derived from a `--dataset` such as `org/..-2-1`, since `submission_subtree` splits
+    the name and does not judge it) walks straight back out of the checked root and writes
+    `metadata.yaml` / `agent_job_config.json` wherever it lands — including inside the Ouroboros
+    repository that guard exists to keep out of benchmark output. So the components that are about
+    to BE created are what get validated here, before anything is created.
+
+    Each component must be a single safe path component (`safe_benchmark_id` — the same closed rule
+    the other launchers already apply to untrusted ids, not a second one): `.`, `..`, empty, and any
+    embedded separator are refused rather than normalised away. Absolute and drive-qualified forms
+    are refused up front instead of being silently reinterpreted as relative. Backslash and `C:` are
+    named explicitly and not left to POSIX intuition: this repository runs a three-OS CI matrix, and
+    on Windows `\\` IS a separator and `C:` IS a drive qualifier, so a value that is an inert
+    directory name here is a live escape there.
+    """
+    if raw_subtree:
+        field, text = "--submission-subtree", str(raw_subtree)
+    else:
+        field = "submission subtree derived from --dataset"
+        text = "/".join(part for part in submission_subtree(dataset) if part)
+    if (
+        pathlib.PurePosixPath(text).is_absolute()
+        or pathlib.PureWindowsPath(text).drive
+        or text.startswith("\\")
+    ):
+        raise ValueError(f"{field} must be a relative path under the submission root, got: {text!r}")
+    parts = [part for part in text.split("/") if part]
+    if not parts:
+        raise ValueError(f"{field} must name at least one path component, got: {text!r}")
+    return [safe_benchmark_id(part, field=field) for part in parts]
+
+
 def _write_agent_job_config(config: HarborCommandConfig) -> pathlib.Path:
     """Write the agents[] section of the Harbor JobConfig for `harbor run -c`.
 
@@ -236,6 +434,9 @@ def _write_agent_job_config(config: HarborCommandConfig) -> pathlib.Path:
         "install_timeout_sec": 1200,
         "server_start_timeout_sec": 240,
         "disable_agent_web": bool(config.disable_agent_web),
+        # The dataset identity the adapter needs to resolve the right per-task cache subtree
+        # (`~/.cache/harbor/tasks/packages/<org>/<name>/<digest>`): one org is not a constant.
+        "dataset": config.dataset,
     }
     effort = os.environ.get("OUROBOROS_EFFORT_TASK", "").strip().lower()
     if effort:
@@ -243,7 +444,7 @@ def _write_agent_job_config(config: HarborCommandConfig) -> pathlib.Path:
         # the adapter forwards the kwarg back into the container env, so the
         # declared effort always equals the effective one.
         kwargs["reasoning_effort"] = effort
-    job_config = {
+    job_config: dict[str, object] = {
         "agents": [
             {
                 "name": "Ouroboros Installed",
@@ -253,10 +454,67 @@ def _write_agent_job_config(config: HarborCommandConfig) -> pathlib.Path:
             }
         ]
     }
+    if config.base_job_config is not None:
+        # A leaderboard/dataset may publish its own JobConfig (env allowlists, verifier
+        # settings, resource shape). Deep-merge OURS on top so every upstream key we do not
+        # set survives verbatim, while the agents[] block — including agents[0].name, whose
+        # absence permanently invalidates a submission — always stays ours.
+        job_config = _deep_merge(_load_job_config(config.base_job_config), job_config)
     config.jobs_dir.mkdir(parents=True, exist_ok=True)
     path = config.jobs_dir / "agent_job_config.json"
     path.write_text(json.dumps(job_config, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+# Model slots this launcher must NOT copy out of the host settings file: the in-container adapter
+# (`harbor_installed_agent._container_env`) does not forward them, so a container never sees them.
+# Recording them would put a model in the manifest that provably did not assist the run — the same
+# class of lie as recording the wrong one, just in the other direction.
+_UNFORWARDED_MODEL_SLOT_KEYS = ("OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS")
+
+
+def resolved_model_slots(config: HarborCommandConfig) -> dict[str, str]:
+    """The model slots this run ACTUALLY uses, resolved the way the container resolves them.
+
+    Derived from the assembled ``HarborCommandConfig`` — the very object ``harbor_command()``
+    turns into the job config the adapter reads — and never from a settings TEMPLATE or from
+    ``--model`` before the ``--all-model`` override has rewritten it. SWE-Pro's manifest once
+    named a model that did not run because it snapshotted the template instead of the derived
+    settings; a manifest that is merely SILENT about the model (TB's previous state: the model
+    existed only in ``argv`` and the disclosure ledger) is the same failure one step quieter,
+    because an auditor still cannot reconstruct which model produced the numbers.
+
+    Resolution order mirrors ``harbor_installed_agent._container_env`` exactly: the forwarded
+    host env / settings snapshot first, then the job-config kwargs, which are the last word —
+    so the recorded main model is the one the adapter pins, not whatever ``OUROBOROS_MODEL``
+    happened to sit in the operator's shell. ``ouroboros_model`` also drives HEAVY and both
+    fallback keys in the container, so they are recorded as the same model rather than left to
+    imply a second one.
+    """
+    slots = {
+        key: value
+        for key, value in model_slot_snapshot(config.settings_path).items()
+        if key not in _UNFORWARDED_MODEL_SLOT_KEYS
+    }
+    if config.model:
+        slots["OUROBOROS_MODEL"] = config.model
+        slots["OUROBOROS_MODEL_HEAVY"] = config.model
+        slots["OUROBOROS_MODEL_FALLBACKS"] = config.model
+    if config.light_model:
+        slots["OUROBOROS_MODEL_LIGHT"] = config.light_model
+    return {key: value for key, value in slots.items() if key in MODEL_SLOT_KEYS}
+
+
+def augment_manifest(manifest: dict, config: HarborCommandConfig) -> None:
+    """Mirror the run's resolved models into the manifest, once the job config exists.
+
+    Same shape and same seam as GAIA's ``_augment_manifest`` (``gaia/run_gaia.py``): the
+    settings-derived facts are added AFTER admission and persisted by the finalization seam, and
+    they land under ``model_slots`` filtered to ``MODEL_SLOT_KEYS``. Keeping the field name and
+    filter identical across families is the point — an auditor reading any benchmark's
+    ``run_manifest.json`` finds the model in the same place.
+    """
+    manifest["model_slots"] = resolved_model_slots(config)
 
 
 def harbor_command(config: HarborCommandConfig) -> list[str]:
@@ -287,6 +545,15 @@ def harbor_command(config: HarborCommandConfig) -> list[str]:
         cache_dir = ensure_outside_repo(pathlib.Path(pip_cache), repo_root_from_devtools())
         mounts = [{"type": "bind", "source": str(cache_dir), "target": "/opt/ouro-pip-cache"}]
         cmd.extend(["--mounts", json.dumps(mounts)])
+    # Execution backend (harbor's own `-e/--env`). Harbor's default is `docker`, i.e. the LOCAL
+    # docker daemon, and Frontier-Bench was verified to run there end-to-end on harbor 0.18.0 (the
+    # oracle solution of a real FB task scored reward 1.0 through the separate-environment
+    # verifier), so a cloud sandbox provider is NOT required despite upstream's CI/leaderboard runs
+    # using `--env modal`. Emit the flag ONLY when explicitly chosen so the default path stays
+    # byte-identical to every published TB2.1 command; when omitted, the effective backend is
+    # harbor's own default, which is what the manifest/ledger record.
+    if str(config.harbor_env or "").strip():
+        cmd.extend(["--env", str(config.harbor_env).strip()])
     # Setup/build timeout multipliers default to 1.0 (Harbor static_validation rejects non-1.0
     # agent_setup / environment_build multipliers). Emit the flags ONLY when an explicit
     # local-only override is set; a leaderboard-valid run leaves them absent (== Harbor default).
@@ -294,6 +561,38 @@ def harbor_command(config: HarborCommandConfig) -> list[str]:
         cmd.extend(["--agent-setup-timeout-multiplier", str(float(config.setup_timeout_multiplier))])
     if float(config.build_timeout_multiplier) != 1.0:
         cmd.extend(["--environment-build-timeout-multiplier", str(float(config.build_timeout_multiplier))])
+    # Agent-/verifier-phase env passthrough (harbor's own `--ae` / `--ve`, present in 0.18 and
+    # 0.20). Some datasets require a verifier-side base URL or an agent-side region; these are
+    # deploy knobs like --n-concurrent, not leaderboard-config fields, so they do not affect
+    # static_validation.
+    #
+    # HONESTY FIX (v6.79.0): the previous comment here claimed "VALUES ARE NEVER WRITTEN TO THE
+    # RUN ROOT". That was FALSE, and false on the path where it matters most (Harbor-Index, where
+    # the judge key goes through `--ve` and the submission upload is PUBLIC). What is true:
+    #   * THIS launcher's own artifacts carry NAMES only — `official_command` in the manifest,
+    #     `harbor_command.txt` and stdout all go through `redacted_command()`, and the manifest
+    #     records `agent_env_keys` / `verifier_env_keys`;
+    #   * but HARBOR persists its own JobConfig into the job directory, which sits INSIDE the
+    #     submission tree: `harbor/job.py` does
+    #     `self._job_config_path.write_text(self.config.model_dump_json(indent=4,
+    #     exclude_defaults=True))` → `<jobs-dir>/<job_name>/config.json` (one timestamp level
+    #     below the `--jobs-dir` we pass), and the same values are re-serialized into the job
+    #     `lock.json` and every trial's `config.json` / `lock.json` / `result.json`.
+    #     `--ae` lands in `agents[].env`, `--ve` in `verifier.env`.
+    #   * harbor filters those values through `templatize_sensitive_env`
+    #     (`harbor/utils/env.py`), which is keyed on the variable NAME only. Measured on the
+    #     installed 0.18.0: a value equal to `os.environ[NAME]` becomes `${NAME}` (no leak); a
+    #     NAME matching `KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|AUTH` is written as
+    #     `value[:4] + "****" + value[-3:]` (a PARTIAL disclosure — 7 characters of a live
+    #     credential); any other NAME (e.g. `MY_BEARER`) is written VERBATIM in cleartext.
+    # So the submission copy has to be scrubbed by VALUE, not just by name: pass every
+    # `--ae`/`--ve` pair to `scrub_submission_secrets.py --env-passthrough NAME=VALUE`, which
+    # sweeps the whole tree (harbor's config/lock/result files included), also sweeps harbor's
+    # own partial form, and refuses to finish if any needle survives.
+    for value in config.agent_env:
+        cmd.extend(["--ae", value])
+    for value in config.verifier_env:
+        cmd.extend(["--ve", value])
     for task in config.task_filters:
         cmd.extend(["--include-task-name", task])
     if config.execute:
@@ -469,7 +768,44 @@ def write_disclosure_ledger(*, jobs_dir: pathlib.Path, out_path: pathlib.Path, r
     return ledger
 
 
-def main(argv: list[str] | None = None) -> int:
+def classify_harbor_outcome(ledger: dict | None, returncode: int) -> tuple[str, int]:
+    """The typed outcome AND real exit status for a harbor job — from the job's own trials.
+
+    Same class as GAIA's swallowed inspect failure: `harbor run` has no non-zero exit path for a
+    job whose trials all ERRORED, so its return code cannot tell a dead job from a scored one
+    (2026-07-04: a job wrote 444 trial `result.json` files and zero rewards, and looked healthy).
+    Three facts kept apart, only the last being a result:
+
+    ``no_scored_trials``   no trial reached the verifier — an INFRA zero (also covers zero trials).
+    ``trials_unverified``  the ledger could not be built, so there is no evidence of a result;
+                           fail closed, because unknown success is not success.
+    ``completed``          at least one trial carries a numeric reward. An all-zero reward
+                           distribution over scored trials is a GENUINE zero and stays `completed`.
+    """
+    code = int(returncode)
+    if code:
+        return "harness_nonzero_exit", code
+    if not isinstance(ledger, dict):
+        return "trials_unverified", 1
+    n_trials = int(ledger.get("n_trials") or 0)
+    distribution = ledger.get("reward_distribution")
+    # `null` is the disclosure ledger's bucket for a trial with no numeric reward, i.e. one the
+    # verifier never scored (errored, cancelled before verification, unparseable result).
+    unscored = int((distribution or {}).get("null") or 0) if isinstance(distribution, dict) else n_trials
+    if n_trials - unscored <= 0:
+        return "no_scored_trials", 1
+    return "completed", 0
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Every CLI flag this launcher accepts, in one place.
+
+    Extracted from ``main`` purely to keep it under the per-function limit in
+    docs/DEVELOPMENT.md. It BUILDS the parser and does nothing else — no parsing, no
+    filesystem, no network, nothing that can fail — so it cannot move a failure ahead of the
+    admission gate (ADMISSION IS THE OUTER BOUNDARY). ``main`` keeps ``parse_args`` and every
+    ``parser.error`` path, because those depend on the PARSED values.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--model", default="", help="measured/declared model; or use --all-model to set every slot")
@@ -533,6 +869,57 @@ def main(argv: list[str] | None = None) -> int:
         choices=["none", "low", "medium", "high"],
         help="reasoning effort for the in-task review under --all-model (default low; cuts the review-latency tax)",
     )
+    parser.add_argument(
+        "--base-job-config",
+        default="",
+        help="upstream Harbor JobConfig (json/yaml) to deep-merge UNDER our agents[] block; "
+             "every key we do not set is preserved verbatim",
+    )
+    parser.add_argument(
+        "--agent-env",
+        action="append",
+        default=[],
+        type=env_assignment,
+        help="KEY=VALUE forwarded to harbor --ae (agent phase); repeatable. THE VALUE IS "
+             "PERSISTED: this launcher redacts only the command artifacts it owns, while harbor "
+             "writes the pair into its own job config/lock/result files. Before publishing a "
+             "submission copy, sweep it with scrub_submission_secrets.py --env-passthrough "
+             "KEY=VALUE (see terminal_bench/METHODOLOGY.md)",
+    )
+    parser.add_argument(
+        "--verifier-env",
+        action="append",
+        default=[],
+        type=env_assignment,
+        help="KEY=VALUE forwarded to harbor --ve (verifier phase); repeatable. THE VALUE IS "
+             "PERSISTED: this launcher redacts only the command artifacts it owns, while harbor "
+             "writes the pair into its own job config/lock/result files. Before publishing a "
+             "submission copy, sweep it with scrub_submission_secrets.py --env-passthrough "
+             "KEY=VALUE (see terminal_bench/METHODOLOGY.md)",
+    )
+    parser.add_argument(
+        "--harbor-env",
+        default="",
+        help="harbor execution backend passed to its own -e/--env (e.g. docker, modal, daytona). "
+             f"Default: unset, i.e. harbor's own default ({HARBOR_DEFAULT_ENV}, the local daemon)",
+    )
+    parser.add_argument(
+        "--submission-subtree",
+        default="",
+        help="override the derived submissions/<family>/<version> path (default: derived from "
+             "--dataset). Must be a relative path of plain components: absolute, drive-qualified "
+             "and '..' forms are refused, not normalised",
+    )
+    parser.add_argument(
+        "--allow-dirty-seed",
+        action="store_true",
+        help="record and proceed with an unclean/unidentifiable seed checkout instead of refusing",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_arg_parser()
     args = parser.parse_args(argv)
 
     if args.all_model:
@@ -557,6 +944,9 @@ def main(argv: list[str] | None = None) -> int:
             "leaderboard-faithful (reward-hacking guard off).",
             file=sys.stderr,
         )
+    # Resolved BEFORE the first mkdir below: an escaping subtree must refuse while nothing exists
+    # yet, not after `ensure_outside_repo` has already created the run and submission roots.
+    subtree = confined_submission_subtree(args.submission_subtree, dataset=args.dataset)
 
     repo = repo_root_from_devtools()
     run_root = ensure_outside_repo(
@@ -570,31 +960,19 @@ def main(argv: list[str] | None = None) -> int:
         else run_root / "submission",
         repo,
     )
-    job_dir = submission_root / "submissions" / "terminal-bench" / "2.1" / f"ouroboros__{args.model.replace('/', '-')}" / "job"
-    job_dir.mkdir(parents=True, exist_ok=True)
-    metadata_path = job_dir.parent / "metadata.yaml"
-    metadata_path.write_text(
-        leaderboard_metadata(agent_name=args.agent_name, org_name=args.org_name, model=args.model, light_model=args.light_model, disable_agent_web=bool(args.disable_agent_web)),
-        encoding="utf-8",
+    # Second belt on the SAME object: the components are already validated, and the assembled path
+    # is re-confined under the validated root. `--model` is only slash-flattened, not id-checked
+    # (real slots carry `.` and provider suffixes like `:free`, which a strict id rule would reject),
+    # so this join is what keeps a hostile model string inside the tree on every OS.
+    job_dir = safe_join_under(
+        submission_root, "submissions", *subtree, f"ouroboros__{args.model.replace('/', '-')}", "job",
     )
-
-    cmd = harbor_command(HarborCommandConfig(
-        dataset=args.dataset,
-        model=args.model,
-        k=args.k,
-        jobs_dir=job_dir,
-        harbor_bin=args.harbor_bin,
-        n_concurrent=args.n_concurrent,
-        task_filters=list(args.task or []),
-        settings_path=settings_path,
-        execute=bool(args.execute),
-        light_model=args.light_model,
-        review_enforcement=args.review_enforcement,
-        safety_mode=args.safety_mode,
-        setup_timeout_multiplier=args.setup_timeout_multiplier,
-        build_timeout_multiplier=args.build_timeout_multiplier,
-        disable_agent_web=bool(args.disable_agent_web),
-    ))
+    metadata_path = job_dir.parent / "metadata.yaml"
+    # Backend + harness provenance, resolved ONCE and shared by the manifest and the ledger so the
+    # two can never disagree. `harbor_env_effective` names the backend that actually ran even when
+    # the flag was left off (harbor's default), because "which sandbox produced this number" is a
+    # disclosure obligation, not an inference for a later reader to make.
+    harbor_env_effective = str(args.harbor_env or "").strip() or HARBOR_DEFAULT_ENV
     leaderboard_valid = bool(
         int(args.k) >= 5
         and float(args.timeout_multiplier) == 1.0
@@ -610,67 +988,160 @@ def main(argv: list[str] | None = None) -> int:
     )
     if report_grade_warning:
         print(report_grade_warning, file=sys.stderr)
-    write_json(
-        run_root / "run_manifest.json",
-        benchmark_run_manifest(
-            benchmark="terminal_bench",
-            run_root=run_root,
-            repo_dir=repo,
-            requested_task_ids=list(args.task or []),
-            # v6.75.0: the shared seed gate now defaults to require_clean=True. This launcher
-            # keeps its pre-v6.75.0 behaviour until its own phase adds --allow-dirty-seed.
-            require_clean=False,
-            metadata={
-                # dataset + official_command are promoted to top-level by benchmark_run_manifest;
-                # everything else must go through `extra` (the helper drops unknown top-level keys).
-                "dataset": args.dataset,
-                "official_command": cmd,
-                "extra": {
+    manifest_path = run_root / "run_manifest.json"
+    # Admission is the outermost REFUSAL point, not the outermost side effect: `ensure_outside_repo`
+    # above already created `run_root` and `submission_root` (both mkdir). What still happens INSIDE
+    # the block below is everything that costs or publishes — the submission skeleton's CONTENTS,
+    # harbor's job config and the `harbor --version` probe — so a refused run leaves two empty
+    # directories and the persisted refusal, never a half-built submission tree.
+    manifest = admit_benchmark_run(
+        manifest_path,
+        benchmark="terminal_bench",
+        run_root=run_root,
+        repo_dir=repo,
+        requested_task_ids=list(args.task or []),
+        require_clean=not args.allow_dirty_seed,
+        # dataset + official_command are promoted to top-level by benchmark_run_manifest;
+        # everything else must go through `extra` (the helper drops unknown top-level keys).
+        dataset=args.dataset,
+        extra={
+            "outcome": "started",
+            "k": int(args.k),
+            "n_concurrent": int(args.n_concurrent),
+            "timeout_multiplier": float(args.timeout_multiplier),
+            "setup_timeout_multiplier": float(args.setup_timeout_multiplier),
+            "build_timeout_multiplier": float(args.build_timeout_multiplier),
+            "resource_overrides": list(args.resource_override or []),
+            "disable_agent_web": bool(args.disable_agent_web),
+            "all_model": args.all_model or "",
+            # The measured models, recorded at ADMISSION so even a refused or crashed run names
+            # what it was about to measure. These are post-`--all-model` values (the override
+            # above rewrites both), i.e. what actually reaches the harbor job config — the same
+            # numbers `model_slots` carries once `augment_manifest` runs.
+            "model": args.model,
+            "light_model": args.light_model,
+            "leaderboard_valid": leaderboard_valid,
+            "report_grade": report_grade_value,
+            "report_grade_warning": report_grade_warning,
+            "leaderboard_submission_root": str(submission_root),
+            "submission_subtree": "/".join(subtree),
+            "metadata_yaml": str(metadata_path),
+            "base_job_config": str(args.base_job_config or ""),
+            # Harness/backend provenance. `harbor_env` is what was REQUESTED (empty = flag
+            # omitted); `harbor_env_effective` is what ran. `harbor_version` is resolved
+            # after admission (it shells out) and is "" when the binary could not be
+            # interrogated -- visibly unknown, never assumed.
+            "harbor_bin": str(args.harbor_bin),
+            "harbor_env": str(args.harbor_env or ""),
+            "harbor_env_effective": harbor_env_effective,
+            # NAMES only -- no value ever enters an artifact THIS launcher writes. Splitting on
+            # the first `=` is safe ONLY because `type=env_assignment` already refused any token
+            # without one: without that guard a `--ve <expanded-secret>` typo made the whole
+            # credential the "name" and persisted it here in the clear.
+            "agent_env_keys": [str(item).split("=", 1)[0] for item in (args.agent_env or [])],
+            "verifier_env_keys": [str(item).split("=", 1)[0] for item in (args.verifier_env or [])],
+            # Typed audit fact, not a string to grep: harbor writes these values into
+            # its own job/trial config+lock+result files under the job dir (partially
+            # redacted at best, verbatim when the NAME looks non-sensitive), so a
+            # submission built from this run MUST be value-scrubbed. See harbor_command().
+            "env_passthrough_persisted_by_harbor": bool(
+                list(args.agent_env or []) or list(args.verifier_env or [])
+            ),
+        },
+    )
+    with finalize_run_manifest(manifest_path, manifest) as final:
+        job_dir.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(
+            leaderboard_metadata(agent_name=args.agent_name, org_name=args.org_name, model=args.model, light_model=args.light_model, disable_agent_web=bool(args.disable_agent_web)),
+            encoding="utf-8",
+        )
+        harbor_config = HarborCommandConfig(
+            dataset=args.dataset,
+            model=args.model,
+            k=args.k,
+            jobs_dir=job_dir,
+            harbor_bin=args.harbor_bin,
+            n_concurrent=args.n_concurrent,
+            task_filters=list(args.task or []),
+            settings_path=settings_path,
+            execute=bool(args.execute),
+            light_model=args.light_model,
+            review_enforcement=args.review_enforcement,
+            safety_mode=args.safety_mode,
+            setup_timeout_multiplier=args.setup_timeout_multiplier,
+            build_timeout_multiplier=args.build_timeout_multiplier,
+            disable_agent_web=bool(args.disable_agent_web),
+            base_job_config=pathlib.Path(args.base_job_config).expanduser() if args.base_job_config else None,
+            agent_env=tuple(args.agent_env or []),
+            verifier_env=tuple(args.verifier_env or []),
+            harbor_env=args.harbor_env,
+        )
+        # Recorded from the ASSEMBLED config, not from `args`: the job config below is what the
+        # adapter reads, so binding the manifest to the same object is what keeps the recorded
+        # model and the executed model from ever drifting apart.
+        augment_manifest(manifest, harbor_config)
+        cmd = harbor_command(harbor_config)
+        harbor_version_value = harbor_version(args.harbor_bin)
+        manifest["official_command"] = redacted_command(cmd)
+        manifest["extra"]["harbor_version"] = harbor_version_value
+        safe_cmd = shlex.join(redacted_command(cmd))
+        (run_root / "harbor_command.txt").write_text(safe_cmd + "\n", encoding="utf-8")
+        print(safe_cmd)
+        passthrough_keys = [str(item).split("=", 1)[0]
+                            for item in [*(args.agent_env or []), *(args.verifier_env or [])]]
+        if passthrough_keys:
+            # Names only. Harbor writes these VALUES into its own job/trial config+lock+result
+            # files inside the submission tree, so the scrub is not optional on the upload path.
+            print(f"[run_tb] WARNING: {len(passthrough_keys)} --ae/--ve value(s) "
+                  f"({','.join(sorted(set(passthrough_keys)))}) will be persisted by harbor into the "
+                  "job dir. Before ANY upload, scrub a COPY with: scrub_submission_secrets.py --root "
+                  "<job_copy> --secrets-from … --env-passthrough NAME=VALUE (one per value above).",
+                  file=sys.stderr)
+        if not args.execute:
+            final.update({"outcome": "command_generated", "exit_code": 0})
+            return 0
+        completed = subprocess.run(cmd, cwd=repo, env={**os.environ, "PYTHONPATH": str(repo)})
+        ledger: dict | None = None
+        try:
+            ledger = write_disclosure_ledger(
+                jobs_dir=job_dir,
+                out_path=run_root / "disclosure_ledger.json",
+                run_meta={
+                    "dataset": args.dataset,
                     "k": int(args.k),
                     "n_concurrent": int(args.n_concurrent),
-                    "timeout_multiplier": float(args.timeout_multiplier),
+                    "disable_agent_web": bool(args.disable_agent_web),
                     "setup_timeout_multiplier": float(args.setup_timeout_multiplier),
                     "build_timeout_multiplier": float(args.build_timeout_multiplier),
-                    "resource_overrides": list(args.resource_override or []),
-                    "disable_agent_web": bool(args.disable_agent_web),
-                    "all_model": args.all_model or "",
                     "leaderboard_valid": leaderboard_valid,
                     "report_grade": report_grade_value,
                     "report_grade_warning": report_grade_warning,
-                    "leaderboard_submission_root": str(submission_root),
-                    "metadata_yaml": str(metadata_path),
+                    "model": args.model,
+                    "model_provider_prefix": (args.model.split("/", 1)[0] if "/" in args.model else ""),
+                    "all_model": args.all_model or "",
+                    "harbor_bin": str(args.harbor_bin),
+                    "harbor_version": harbor_version_value,
+                    "harbor_env_effective": harbor_env_effective,
+                    "harbor_returncode": int(completed.returncode),
                 },
-            },
-        ),
-    )
-    (run_root / "harbor_command.txt").write_text(shlex.join(cmd) + "\n", encoding="utf-8")
-    print(shlex.join(cmd))
-    if not args.execute:
-        return 0
-    completed = subprocess.run(cmd, cwd=repo, env={**os.environ, "PYTHONPATH": str(repo)})
-    try:
-        write_disclosure_ledger(
-            jobs_dir=job_dir,
-            out_path=run_root / "disclosure_ledger.json",
-            run_meta={
-                "dataset": args.dataset,
-                "k": int(args.k),
-                "n_concurrent": int(args.n_concurrent),
-                "disable_agent_web": bool(args.disable_agent_web),
-                "setup_timeout_multiplier": float(args.setup_timeout_multiplier),
-                "build_timeout_multiplier": float(args.build_timeout_multiplier),
-                "leaderboard_valid": leaderboard_valid,
-                "report_grade": report_grade_value,
-                "report_grade_warning": report_grade_warning,
-                "model": args.model,
-                "model_provider_prefix": (args.model.split("/", 1)[0] if "/" in args.model else ""),
-                "all_model": args.all_model or "",
-                "harbor_returncode": int(completed.returncode),
-            },
-        )
-    except Exception as exc:  # disclosure is best-effort; never mask the harbor result
-        print(f"[run_tb] disclosure ledger skipped: {exc!r}", file=sys.stderr)
-    return int(completed.returncode)
+            )
+        except Exception as exc:  # disclosure is best-effort; never mask the harbor result
+            print(f"[run_tb] disclosure ledger skipped: {exc!r}", file=sys.stderr)
+        code = int(completed.returncode)
+        # THE STATUS COMES FROM THE TRIALS, NOT FROM HARBOR'S EXIT CODE (see
+        # `classify_harbor_outcome`). The raw harness code is kept next to the verdict so an
+        # audit never confuses "harbor exited 0" with "the job produced a result".
+        outcome, exit_code = classify_harbor_outcome(ledger, code)
+        trials = {
+            "n_trials": int((ledger or {}).get("n_trials") or 0),
+            "reward_distribution": dict((ledger or {}).get("reward_distribution") or {}),
+        } if isinstance(ledger, dict) else {"n_trials": 0, "reward_distribution": {}}
+        final.update({"outcome": outcome, "exit_code": exit_code,
+                      "harness_exit_code": code, "harbor_trials": trials})
+        if outcome != "completed":
+            print(f"[run_tb] harbor job did not produce a result: outcome={outcome} "
+                  f"harness_exit_code={code} trials={json.dumps(trials)}", file=sys.stderr)
+        return exit_code
 
 
 if __name__ == "__main__":

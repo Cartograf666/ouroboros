@@ -331,6 +331,29 @@ def test_schedule_task_rejects_legacy_description_schema(tmp_path):
     assert ctx.pending_events == []
     assert not (tmp_path / "task_results").exists()
 
+    # Runtime-INTERNAL scheduling options are not part of the public schema and are not
+    # bindable by keyword (they ride the positional-only mapping), so a model emitting one is
+    # refused exactly like any other unsupported argument.
+    internal_as_kwarg = _schedule_task(ctx, objective="o", expected_output="e", deadline_at="2026-01-01T00:00:00Z")
+    assert "TOOL_ARG_ERROR" in internal_as_kwarg and "deadline_at" in internal_as_kwarg
+    assert ctx.pending_events == []
+
+
+def test_schedule_task_internal_options_mapping_is_closed(tmp_path):
+    """The private seam is closed: a typo in an internal option must fail loudly rather than be
+    silently ignored (the failure mode a free-form mapping invites)."""
+    import pytest
+
+    from ouroboros.tools.control import _schedule_task
+
+    ctx = SimpleNamespace(
+        task_depth=0, pending_events=[], event_queue=None, drive_root=tmp_path,
+        task_id="parent123", task_metadata={}, is_direct_chat=False,
+        is_workspace_mode=lambda: False,
+    )
+    with pytest.raises(TypeError, match="deadline_ats"):
+        _schedule_task(ctx, {"deadline_ats": "typo"}, objective="o", expected_output="e")
+
 
 def test_schedule_task_workspace_mode_inherits_context_and_enqueues(tmp_path):
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
@@ -1480,6 +1503,106 @@ def test_handle_schedule_task_depth_rejection_writes_failed_status(tmp_path, mon
     assert sent[0][2]["is_progress"] is True
     assert sent[0][2]["progress_meta"]["delegation_role"] == "subagent"
     assert sent[0][2]["progress_meta"]["status"] == STATUS_FAILED
+
+
+def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monkeypatch):
+    """v6.79.0 (owner Q26): a configured depth of 0 means NO delegation.
+
+    Before this, ``_bounded_positive_int_setting`` rewrote a configured 0 to the default 2,
+    so every run that asked for "no swarm" silently delegated two levels deep. All three
+    facts are pinned together: the resolved setting, the tool-side gate, and the supervisor
+    gate — plus the invariant that a ROOT task (depth 0 itself) still runs at depth 0."""
+    from supervisor import events as ev_module
+    from ouroboros.config import get_max_subagent_depth
+    from ouroboros.task_results import STATUS_FAILED
+
+    monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "0")
+    assert get_max_subagent_depth() == 0
+
+    # Tool-side gate: the first child of a root task is already too deep.
+    import ouroboros.tools.control as control
+    from ouroboros.tools.registry import ToolContext
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "root-no-swarm"
+    ctx.task_depth = 0
+    out = control._schedule_task(ctx, objective="Delegate", expected_output="Something")
+    assert "depth limit (0) exceeded" in out
+
+    # Supervisor gate: a depth-1 child event is refused; a depth-0 ROOT task is NOT.
+    monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
+    enqueued = []
+
+    class FakeCtx:
+        DRIVE_ROOT = tmp_path
+        PENDING = []
+        RUNNING = {}
+        WORKERS = {0: SimpleNamespace(busy_task_id=None)}
+
+        def load_state(self):
+            return {"owner_chat_id": 1}
+
+        def send_with_budget(self, chat_id, text, **kwargs):
+            pass
+
+        def enqueue_task(self, task):
+            enqueued.append(task)
+
+        def persist_queue_snapshot(self, reason=""):
+            pass
+
+    def _event(task_id: str, depth: int) -> dict:
+        return {
+            "type": "schedule_subagent",
+            "task_id": task_id,
+            "objective": "work",
+            "expected_output": "result",
+            "depth": depth,
+            "delegation_role": "subagent" if depth else "",
+            "memory_mode": "forked",
+            "chat_id": 1,
+            "drive_root": str(tmp_path / "state" / "headless_tasks" / task_id / "data"),
+            "child_drive_root": str(tmp_path / "state" / "headless_tasks" / task_id / "data"),
+        }
+
+    ev_module._handle_schedule_task(_event("child-at-1", 1), FakeCtx())
+    child = json.loads((tmp_path / "task_results" / "child-at-1.json").read_text(encoding="utf-8"))
+    assert child["status"] == STATUS_FAILED and "depth limit (0)" in child["result"]
+    assert not enqueued
+
+    ev_module._handle_schedule_task(_event("root-at-0", 0), FakeCtx())
+    root = json.loads((tmp_path / "task_results" / "root-at-0.json").read_text(encoding="utf-8"))
+    assert root["status"] != STATUS_FAILED
+    assert enqueued and enqueued[0]["id"] == "root-at-0"
+
+
+def test_other_bounded_int_settings_keep_their_min_of_one(monkeypatch):
+    """``min_value`` defaults to 1, so the depth fix does not leak into sibling settings."""
+    from ouroboros.config import get_max_active_subagents_per_root, SETTINGS_DEFAULTS
+
+    monkeypatch.setenv("OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", "0")
+    assert get_max_active_subagents_per_root() == int(
+        SETTINGS_DEFAULTS["OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT"]
+    )
+
+
+def test_settings_ui_carries_a_configured_zero_subagent_depth():
+    """The runtime honouring 0 is worthless if the Settings page silently reverts it: 0 is FALSY
+    in JS, so a stored 0 read through the plain `if (value)` branch displayed the fallback 2, and
+    the next Save (which posts every number field unconditionally) wrote 2 back — re-enabling two
+    levels of delegation through the UI. All three carriers of the owner's 0 are pinned: the input
+    can reach it, the depth entry is falsy-tolerant, and the load path still honours that flag
+    (without which the flag is inert)."""
+    root = pathlib.Path(__file__).resolve().parents[1]
+    settings_js = (root / "web" / "modules" / "settings.js").read_text(encoding="utf-8")
+    settings_ui = (root / "web" / "modules" / "settings_ui.js").read_text(encoding="utf-8")
+    assert 'id="s-subagent-depth" type="number" min="0"' in settings_ui
+    # The 4th tuple element is the falsy-tolerant flag consumed by the load path below.
+    assert "['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 2, true]" in settings_js
+    assert (
+        "if (allowFalsy ? value !== null && value !== undefined : value) byId(id).value = value;"
+        in settings_js
+    ), "the load path no longer honours the falsy-tolerant flag, so the entry is inert"
 
 
 def test_handle_schedule_task_rejects_legacy_subagent_event_schema(tmp_path, monkeypatch):

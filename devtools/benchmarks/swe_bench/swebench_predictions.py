@@ -23,8 +23,8 @@ from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_r
 from devtools.benchmarks.common.result_index import task_result_row, write_result_index
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
-    ensure_file_output_outside_repo,
-    ensure_outside_repo,
+    assert_file_output_outside_repo,
+    assert_outside_repo,
     repo_root_from_devtools,
     safe_benchmark_id,
 )
@@ -400,25 +400,24 @@ def main() -> int:
     settings_path = Path(args.settings_path).expanduser() if args.settings_path else default_settings_path()
 
     input_path = Path(args.input).expanduser()
-    output_path = ensure_file_output_outside_repo(Path(args.output), REPO_ROOT)
+    output_path = assert_file_output_outside_repo(Path(args.output), REPO_ROOT)
     errors_output_path = (
-        ensure_file_output_outside_repo(Path(args.errors_output), REPO_ROOT)
+        assert_file_output_outside_repo(Path(args.errors_output), REPO_ROOT)
         if args.errors_output
         else Path(str(output_path) + ".errors.jsonl")
     )
     ledger_output_path = (
-        ensure_file_output_outside_repo(Path(args.ledger_output), REPO_ROOT)
+        assert_file_output_outside_repo(Path(args.ledger_output), REPO_ROOT)
         if args.ledger_output
         else Path(str(output_path) + ".ledger.jsonl")
     )
     manifest_output_path = (
-        ensure_file_output_outside_repo(Path(args.manifest_output), REPO_ROOT)
+        assert_file_output_outside_repo(Path(args.manifest_output), REPO_ROOT)
         if args.manifest_output
         else Path(str(output_path) + ".run_manifest.json")
     )
-    logs_dir = str(ensure_outside_repo(Path(args.logs_dir), REPO_ROOT)) if args.logs_dir else ""
+    logs_dir = str(assert_outside_repo(Path(args.logs_dir), REPO_ROOT)) if args.logs_dir else ""
 
-    input_rows = _records(input_path)
     eval_command = (
         swebench_eval_cmd(resolve_preset(args.print_eval_command), output_path, "ouroboros", 1)
         if args.print_eval_command
@@ -432,7 +431,11 @@ def main() -> int:
         benchmark="swe_bench",
         run_root=output_path.parent,
         repo_dir=REPO_ROOT,
-        requested_task_ids=[str(item.get("instance_id") or "") for item in input_rows],
+        # The DECLARED input path, not the ids inside it: `_records` reads and JSON-parses
+        # `--input`, and a missing or malformed instance file used to kill the process before
+        # any manifest existed. Reading it is now the first thing the ADMITTED run does, and
+        # `requested_task_ids` is amended below with what it actually contained.
+        requested_task_ids=[],
         require_clean=not args.allow_dirty_seed,
         output_paths={
             "predictions": str(output_path),
@@ -448,6 +451,9 @@ def main() -> int:
     )
 
     with finalize_run_manifest(manifest_output_path, manifest, outcome="completed") as final:
+        input_rows = _records(input_path)
+        manifest["requested_task_ids"] = [str(item.get("instance_id") or "") for item in input_rows]
+        manifest["requested_count"] = len(input_rows)
         predictions, errors, ledger_rows, first_error = _run_prediction_rows(
             args,
             input_rows,

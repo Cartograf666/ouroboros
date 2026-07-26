@@ -37,10 +37,9 @@ FINALIZATION_GRACE_DEFAULT_SEC = 120
 # (e.g. headless benchmark runs). Advisory only — surfaces elapsed/rounds/cost so
 # the model can self-pace; it is not a stop gate. 0 disables.
 PACING_INTERVAL_DEFAULT_SEC = 600
-# Supervisor-loop liveness deadline (WS3, v6.34.0): a dedicated watchdog thread
-# flags the main supervisor loop as STALLED if it has not ticked within this many
-# seconds (it normally ticks every ~0.5s). Far above any healthy tick so it only
-# fires on a real wedge (a blocking step starving new-message intake). 0 disables.
+# Supervisor-loop liveness deadline (WS3, v6.34.0): a watchdog thread flags the main
+# supervisor loop STALLED if it has not ticked within this many seconds (healthy tick
+# ~0.5s), so it only fires on a real wedge. 0 disables.
 SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC = 90
 
 
@@ -224,6 +223,12 @@ SETTINGS_DEFAULTS = {
     # Cognitive-horizon knob (BIBLE P1): the agent cannot lower it (owner-only),
     # and it never changes model / reasoning-effort / output-token budgets.
     "OUROBOROS_CONTEXT_MODE": "max",
+    # Derived system state, never an owner choice (see get_owner_context_mode).
+    # TRI-STATE, fail-CLOSED: "" is UNKNOWN, not "the owner chose low". Only an explicit
+    # "false" (written by api_owner_context_mode alone) makes a stored `low` an owner
+    # declaration, so a pre-v6.80.0 settings.json and an env allowlist forwarding the
+    # mode without this key both leave the BIBLE P3 scope gate ON.
+    "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "",
     # Optional extra user-managed skills checkout; Ouroboros never clones/pulls it.
     "OUROBOROS_SKILLS_REPO_PATH": "",
     "OUROBOROS_CLAWHUB_REGISTRY_URL": "https://clawhub.ai/api/v1",
@@ -234,15 +239,9 @@ SETTINGS_DEFAULTS = {
     # Scope review: one or more reviewer slots; enforcement follows OUROBOROS_REVIEW_ENFORCEMENT.
     "OUROBOROS_SCOPE_REVIEW_MODELS": "anthropic/claude-fable-5",
     "OUROBOROS_SCOPE_REVIEW_MODEL": "anthropic/claude-fable-5",
-    # Opt-in (default off): in low context mode, after the normal scope-review
-    # prompt cannot fit, optionally run a supplemental
-    # window-fitting ADVISORY degraded scope review (top-scored touched +
-    # import-seam + contracts full; the rest manifest-only). Does NOT claim full
-    # coverage and does NOT replace the >=1M blocking scope floor.
-    "OUROBOROS_SCOPE_REVIEW_DEGRADED": "false",
-    # P3 scope-reviewer capability floor: blocking_1m (default; the reviewer is the
-    # >=1M blocking gate) | advisory (sub-1M reviewer, supplementary only — can
-    # never satisfy a required blocking scope gate). See get_scope_review_floor.
+    # DEPRECATED, enforcement-inert (v6.80.0): stored, owner-only (dedicated audited
+    # endpoint), but NOTHING consults it — whether the BIBLE P3 blocking scope review
+    # applies follows owner-only OUROBOROS_CONTEXT_MODE. Degraded opt-in key: removed.
     "OUROBOROS_SCOPE_REVIEW_FLOOR": "blocking_1m",
     "OUROBOROS_TASK_REVIEW_MODE": "auto",
     # LLM safety-supervisor coverage (owner-only, like runtime/context mode):
@@ -261,20 +260,15 @@ SETTINGS_DEFAULTS = {
     # then fail-closed blocks a benign command. Registered numeric SSOT (no inline literals).
     "OUROBOROS_SAFETY_MAX_TOKENS": 2000,
     "OUROBOROS_SAFETY_CALL_TIMEOUT_SEC": 60,
-    # v6.54.3 transport-timeout SSOT (deadline package D). web_search: the OpenAI
-    # streaming SDK call ran with NO client timeout, so the ToolEntry 540s outer cap
-    # was the only (thread-kill) bound; 480 keeps the transport failure cleanly
-    # messaged below that cap. LLM no_proxy read/write floor: was a hardcoded 3600s —
-    # 2700 still leaves generous headroom for long silent reasoning (scope review /
-    # deep self-review can think 20-40 min before the first byte) while a dead
-    # socket no longer pins a worker for a full hour.
+    # v6.54.3 transport-timeout SSOT (deadline package D). web_search: 480 keeps the
+    # transport failure messaged below the ToolEntry 540s outer thread-kill cap. LLM
+    # no_proxy read/write floor: 2700 leaves headroom for long silent reasoning without
+    # pinning a worker on a dead socket.
     "OUROBOROS_WEBSEARCH_TIMEOUT_SEC": 480,
     "OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC": 2700,
-    # v6.54.3 (1.5): plan_task deadline scaling. With a task deadline, the planning
-    # swarm's wait ceiling is min(configured ceiling, remaining/4); below this floor
-    # planning cannot return anything useful in time, so plan_task SKIPS with a typed
-    # reason + telemetry instead of eating the tail of the budget (TB2.1: plan_task
-    # was structurally irrational under a 900s deadline — ceiling 900s + wrapper 1520s).
+    # v6.54.3 (1.5): plan_task deadline scaling. With a task deadline the planning swarm's
+    # wait ceiling is min(configured ceiling, remaining/4); below this floor plan_task SKIPS
+    # with a typed reason + telemetry rather than eat the tail of the budget.
     "OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC": 300,
     # Acceptance-review budget layer (task_pacing SSOT). The first final review
     # reserves at least 200s; later passes use max(this floor, 1.5×timing EWMA).
@@ -354,10 +348,8 @@ def parse_fallback_chain() -> list[str]:
 
     Reads OUROBOROS_MODEL_FALLBACKS, then the legacy singular OUROBOROS_MODEL_FALLBACK
     (env-only back-compat). No dedup, no active-model drop, and NO SETTINGS_DEFAULTS
-    injection: an EXPLICITLY empty Fallbacks slot means "no cross-model fallback" (so an
-    OpenAI-compatible / local owner who clears it is not silently routed to the default
-    Anthropic chain into an unconfigured provider). The shipped default reaches a default
-    install through apply_settings_to_env, which writes the non-empty default into env."""
+    injection: an EXPLICITLY empty Fallbacks slot means "no cross-model fallback". The
+    shipped default reaches a default install through apply_settings_to_env."""
     raw = (
         str(os.environ.get("OUROBOROS_MODEL_FALLBACKS", "") or "").strip()
         or str(os.environ.get("OUROBOROS_MODEL_FALLBACK", "") or "").strip()
@@ -390,14 +382,19 @@ _LEGACY_SLOT_RENAMES = (
 
 
 def migrate_legacy_slot_keys(settings: dict) -> dict:
-    """In-place v6.39 slot rename-alias migration. Preserves a stored value (never orphans
-    an owner customization), then drops the legacy key so it does not linger. Shared SSOT
-    for every settings entry point (load_settings AND the Colab settings builder) so a
-    Drive/legacy settings file is migrated the same way regardless of how it is loaded."""
+    """In-place settings migration, applied BEFORE defaults are merged.
+
+    Preserves a stored value (never orphans an owner customization), then drops the legacy
+    key. Shared SSOT for every settings entry point (load_settings AND the Colab builder).
+    Order matters: the singular scope-review pin is promoted HERE, before ``SETTINGS_DEFAULTS``
+    supplies the plural that WINS in get_scope_review_models."""
     for _old, _new in _LEGACY_SLOT_RENAMES:
         if _new not in settings and _old in settings:
             settings[_new] = settings[_old]
         settings.pop(_old, None)
+    _pin = str(settings.get("OUROBOROS_SCOPE_REVIEW_MODEL") or "").strip()
+    if _pin and not str(settings.get("OUROBOROS_SCOPE_REVIEW_MODELS") or "").strip():
+        settings["OUROBOROS_SCOPE_REVIEW_MODELS"] = _pin
     return settings
 
 
@@ -468,12 +465,8 @@ def _resolve_baseline_from_env() -> Optional[str]:
 
 
 def initialize_runtime_mode_baseline(mode: Optional[str] = None) -> None:
-    """Pin the immutable runtime-mode baseline before any agent code runs.
-
-    Call after ``load_settings``/``apply_settings_to_env`` and before worker or
-    supervisor startup. The pin is exported as ``OUROBOROS_BOOT_RUNTIME_MODE``
-    so subprocesses enforce the same owner-selected baseline.
-    """
+    """Pin the immutable runtime-mode baseline before any agent code runs: call it after
+    ``load_settings``/``apply_settings_to_env``, before worker or supervisor startup."""
     global _BOOT_RUNTIME_MODE
     if _BOOT_RUNTIME_MODE is not None:
         return
@@ -575,11 +568,10 @@ def direct_provider_review_models_fallback(provider: str) -> list[str]:
 
 def adaptive_quorum(n_slots: int) -> int:
     """Reviewer-quorum SSOT for an ARBITRARY configured slot count, reused by
-    triad/scope/plan/skill/acceptance review. A single configured reviewer needs
-    1 (a loud single_reviewer_no_diversity degraded mode), 2 need both, 3+ keep
-    the classic 2-of-N majority. This honors an explicit small reviewer config
-    (Bible P3 stays loud); it is DISTINCT from "configured >= quorum but fewer
-    responded", which remains a loud infra quorum FAILURE at the call site."""
+    triad/scope/plan/skill/acceptance review. One configured reviewer needs 1 (a loud
+    single_reviewer_no_diversity degraded mode), 2 need both, 3+ keep the classic 2-of-N
+    majority. DISTINCT from "configured >= quorum but fewer responded", which stays a loud
+    infra quorum FAILURE at the call site."""
     return 2 if n_slots >= 3 else max(1, n_slots)
 
 
@@ -600,11 +592,9 @@ def get_review_models() -> list[str]:
 
     migrated = [migrate_model_value(provider, model) for model in models]
     if not migrated or any(not model.startswith(provider_prefix) for model in migrated):
-        # Auto-expand to the [main]*N stochastic fallback ONLY when nothing
-        # usable is configured (empty, or foreign models in an exclusive
-        # direct-provider setup). An explicit provider-matching list — including
-        # a single model — is honored exactly (duplicates are valid stochastic
-        # slots, at the owner's discretion).
+        # Auto-expand to the [main]*N stochastic fallback ONLY when nothing usable is
+        # configured (empty, or foreign models in an exclusive direct-provider setup). An
+        # explicit provider-matching list is honored exactly, duplicates included.
         return direct_provider_review_models_fallback(provider)
     return migrated
 
@@ -789,15 +779,17 @@ def get_post_task_evolution_budget_usd() -> float:
         return 0.0
 
 
-def _bounded_positive_int_setting(key: str, *, default: int, hard_max: int) -> int:
+def _bounded_positive_int_setting(key: str, *, default: int, hard_max: int, min_value: int = 1) -> int:
+    """Bounded int setting; below ``min_value`` it is a typo and falls back to ``default``. Only
+    subagent depth passes 0 — there an explicit 0 is a real owner choice, not unset (owner Q26)."""
     raw = os.environ.get(key, SETTINGS_DEFAULTS.get(key, default))
     try:
         parsed = int(raw)
     except (TypeError, ValueError):
         parsed = default
-    if parsed < 1:
+    if parsed < min_value:
         parsed = default
-    return max(1, min(parsed, hard_max))
+    return max(min_value, min(parsed, hard_max))
 
 
 def get_max_active_subagents_per_root() -> int:
@@ -809,21 +801,22 @@ def get_max_active_subagents_per_root() -> int:
 
 
 def get_max_subagent_depth() -> int:
+    """Structural nesting cap; 0 = NO delegation at all (every child refused, root tasks still
+    run). Before v6.79.0 a configured 0 was silently rewritten to 2, so "no-swarm" delegated."""
     return _bounded_positive_int_setting(
         "OUROBOROS_MAX_SUBAGENT_DEPTH",
         default=int(SETTINGS_DEFAULTS["OUROBOROS_MAX_SUBAGENT_DEPTH"]),
         hard_max=10,
+        min_value=0,
     )
 
 
 def get_allow_mutative_subagents() -> bool:
     """Whether the parent may spawn mutative (acting) subagents.
 
-    Owner-controlled. Empty/unset => follow runtime mode (ON in advanced/pro,
-    OFF in light). Explicit truthy/falsey overrides. This only gates whether
-    acting subagents may be SCHEDULED; light-mode self-repo writes still stay
-    blocked by the runtime sandbox regardless of this toggle.
-    """
+    Owner-controlled. Empty/unset => follow runtime mode (ON in advanced/pro, OFF in
+    light); explicit truthy/falsey overrides. Gates only SCHEDULING: light-mode self-repo
+    writes stay blocked by the runtime sandbox regardless."""
     key = "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS"
     raw = os.environ.get(key, SETTINGS_DEFAULTS.get(key, ""))
     text = str(raw or "").strip().lower()
@@ -885,9 +878,9 @@ def get_task_review_mode() -> str:
     return raw if raw in {"off", "auto", "required"} else default_val
 
 
-def get_auto_grant_enabled() -> bool:
-    """Return whether reviewed skills should receive requested grants."""
-    key = "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"
+def _settings_flag_enabled(key: str) -> bool:
+    """Disk-then-env-then-default boolean: an explicitly STORED value wins, so a UI toggle
+    applies without a restart, while env still seeds a key the file never mentions."""
     raw = None
     try:
         if SETTINGS_PATH.exists():
@@ -898,25 +891,17 @@ def get_auto_grant_enabled() -> bool:
         raw = None
     if raw is None:
         raw = os.environ.get(key, SETTINGS_DEFAULTS[key])
-    raw = str(raw or "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_auto_grant_enabled() -> bool:
+    """Return whether reviewed skills should receive requested grants."""
+    return _settings_flag_enabled("OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS")
 
 
 def get_trust_native_seeded_skills() -> bool:
     """Whether launcher-seeded native skills get the hash-pinned trust verdict."""
-    key = "OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS"
-    raw = None
-    try:
-        if SETTINGS_PATH.exists():
-            disk = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-            if isinstance(disk, dict) and key in disk:
-                raw = disk.get(key)
-    except Exception:
-        raw = None
-    if raw is None:
-        raw = os.environ.get(key, SETTINGS_DEFAULTS[key])
-    raw = str(raw or "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    return _settings_flag_enabled("OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS")
 
 
 def normalize_runtime_mode(value: Any) -> str:
@@ -950,11 +935,10 @@ def normalize_safety_mode(value: Any) -> str:
 def get_safety_mode() -> str:
     """Return the owner-selected LLM-safety-supervisor coverage (full | light | off).
 
-    Owner-only at the write surface (dropped from the agent-reachable /api/settings
-    POST; flows only through the dedicated audited owner endpoint), so the agent
-    cannot lower its own safety coverage. Deterministic registry sandbox, protected
-    paths, and light-mode guards run regardless of this mode (BIBLE P3: the LLM
-    supervisor is a layer, not the floor)."""
+    Owner-only at the write surface (dropped from the agent-reachable /api/settings POST),
+    so the agent cannot lower its own safety coverage. Deterministic registry sandbox,
+    protected paths and light-mode guards run regardless (BIBLE P3: the LLM supervisor is a
+    layer, not the floor)."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MODE"])
     return normalize_safety_mode(os.environ.get("OUROBOROS_SAFETY_MODE", default_val) or default_val)
 
@@ -989,9 +973,7 @@ def get_websearch_timeout_sec() -> float:
 def get_llm_transport_read_timeout_sec() -> float:
     """Default httpx read/write timeout for no_proxy LLM clients (v6.54.3, D).
 
-    Generous by design: long silent reasoning (scope review, deep self-review)
-    can take 20-40 min before the first byte. This is the DEAD-SOCKET bound,
-    not a latency target; explicit per-call timeouts always win."""
+    The DEAD-SOCKET bound, not a latency target; explicit per-call timeouts win."""
     try:
         val = float(os.environ.get("OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC"])
     except (TypeError, ValueError):
@@ -1043,64 +1025,100 @@ def normalize_context_mode(value: Any) -> str:
 
 
 def get_context_mode() -> str:
-    """Return the owner-selected working-context mode (low | max).
+    """The EFFECTIVE working-context mode (low | max) used by context sizing.
 
-    Unlike runtime mode there is NO boot-pin: context mode is not a privilege
-    boundary, so it hot-applies on the next task. It stays owner-only at the
-    write surface (dropped from the agent-reachable /api/settings POST), so the
-    agent cannot lower its own cognitive horizon (BIBLE P1 cognitive-horizon).
-    """
+    Owner selection, possibly narrowed by the /api/settings model auto-downgrade; the
+    P3 scope gate reads get_owner_context_mode instead. No boot-pin: hot-applies on the
+    next task. The key is dropped from the agent-reachable /api/settings POST (P1)."""
     default_val = str(SETTINGS_DEFAULTS["OUROBOROS_CONTEXT_MODE"])
     return normalize_context_mode(
         os.environ.get("OUROBOROS_CONTEXT_MODE", default_val) or default_val
     )
 
 
-def _settings_file_context_mode(default: str = "max") -> str:
-    """Read the persisted/current context mode without normalizing whole settings."""
+def get_owner_context_mode() -> str:
+    """The OWNER-SELECTED context mode, ignoring any system auto-downgrade.
+
+    The P3 scope gate reads THIS, not the effective mode: the agent-reachable
+    /api/settings model auto-downgrade narrows the effective mode without the owner
+    choosing it, and honouring that would let the agent switch an immune gate off.
+
+    The derived flag is TRI-STATE and resolved FAIL-CLOSED: absent or unrecognised is
+    UNKNOWN, never an owner declaration, so it reports `max` and the gate stays ON. Only
+    an explicit stored `false` counts, written by api_owner_context_mode alone (an owner
+    write always clears the flag) — otherwise a pre-v6.80.0 settings.json or an isolated
+    server forwarding the mode alone would read as "the owner switched scope review off"."""
+    if get_context_mode() != "low":
+        return "max"
+    return "low" if _owner_declared_low(os.environ.get("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "")) else "max"
+
+
+def _settings_file_value(key: str, default: str) -> str:
+    """Read ONE persisted setting off disk, without normalizing the whole file. DISK ONLY, for EVERY caller: env
+    is inherited and freely rewritten by any subprocess, so it can never be a ratchet's PREVIOUS value — reading it
+    there turns ``max -> low`` into ``low -> low`` and the gate opens. Absent/corrupt = the fail-closed default."""
     if SETTINGS_PATH.exists():
         try:
             disk_settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
             if isinstance(disk_settings, dict):
-                return normalize_context_mode(disk_settings.get("OUROBOROS_CONTEXT_MODE", default))
+                return str(disk_settings.get(key, default) or default)
         except (OSError, json.JSONDecodeError):
             pass
-    return normalize_context_mode(os.environ.get("OUROBOROS_CONTEXT_MODE", default) or default)
+    return default
+
+
+# The same keys from the other side: load_settings overlays env onto disk-ABSENT keys, so without this an
+# ordinary load->save round-trip in a process whose env says low/off would launder that value onto disk
+# unauthorised — or, once the guard reads disk, raise a PermissionError nobody authored. Owner endpoints
+# write BOTH disk and env, so the owner path is unaffected.
+_DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SAFETY_MODE")
+
+
+def _owner_declared_low(value: Any) -> bool:
+    """True when the derived auto-downgrade flag reads as an OWNER-authored ``low``
+    (get_owner_context_mode's own tri-state: absent/unrecognised is UNKNOWN, not owner)."""
+    return str(value or "").strip().lower() in ("0", "false", "no", "off")
 
 
 def _guard_context_mode_lowering(settings: dict, *, allow_context_lowering: bool = False) -> None:
-    """Refuse agent-reachable settings writes that lower the cognitive horizon."""
-    previous_mode = _settings_file_context_mode()
+    """Refuse agent-reachable settings writes that lower the cognitive horizon.
+
+    TWO ratchets on the SAME owner authorisation (``allow_context_lowering``, held only by
+    the dedicated owner endpoint): the mode may not step ``max -> low``, AND the derived
+    auto-downgrade flag may not be CLEARED. Since v6.80.0 that flag is an AUTHORITY BIT —
+    clearing it makes get_owner_context_mode report ``low``, switching the BIBLE P3 scope
+    gate off: the same horizon-lowering spelled through another key. So ``unknown/true ->
+    false`` needs the owner path, while SETTING it true (the system auto-downgrade on the
+    model route) stays free. It belongs HERE because save_settings is the seam every writer
+    funnels through, and a second lexical shell check would not do — a key can always be
+    constructed dynamically (BIBLE P5)."""
+    previous_mode = normalize_context_mode(_settings_file_value("OUROBOROS_CONTEXT_MODE", "max"))
     next_mode = normalize_context_mode(settings.get("OUROBOROS_CONTEXT_MODE", previous_mode))
     if previous_mode == "max" and next_mode == "low" and not allow_context_lowering:
         raise PermissionError(
             "OUROBOROS_CONTEXT_MODE lowering refused: 'max' -> 'low'. "
             "Context mode is owner-controlled — use the dedicated owner endpoint/UI/CLI."
         )
+    if allow_context_lowering or "OUROBOROS_CONTEXT_MODE_AUTO_LOW" not in settings:
+        return
+    previous_flag = _settings_file_value("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "")
+    if _owner_declared_low(settings["OUROBOROS_CONTEXT_MODE_AUTO_LOW"]) and not _owner_declared_low(previous_flag):
+        raise PermissionError(
+            f"OUROBOROS_CONTEXT_MODE_AUTO_LOW clearing refused: {previous_flag or 'unknown'!r} -> 'false'. "
+            "Clearing the derived flag turns a system auto-downgrade into an owner-declared scope-review "
+            "skip — it is owner-controlled, use the dedicated owner endpoint/UI/CLI."
+        )
 
 
 _SAFETY_MODE_RANK = {"full": 2, "light": 1, "off": 0}
 
 
-def _settings_file_safety_mode(default: str = "full") -> str:
-    """Read the persisted/current safety mode without normalizing whole settings."""
-    if SETTINGS_PATH.exists():
-        try:
-            disk_settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-            if isinstance(disk_settings, dict):
-                return normalize_safety_mode(disk_settings.get("OUROBOROS_SAFETY_MODE", default))
-        except (OSError, json.JSONDecodeError):
-            pass
-    return normalize_safety_mode(os.environ.get("OUROBOROS_SAFETY_MODE", default) or default)
-
-
 def _guard_safety_mode_lowering(settings: dict, *, allow_safety_lowering: bool = False) -> None:
     """Refuse agent-reachable settings writes that lower LLM-safety coverage.
 
-    ``full -> light -> off`` is a strictly decreasing coverage ladder; any downward
-    step is owner-only (mirrors the context-mode ratchet — the agent must not reduce
-    its own supervision to remove friction, BIBLE P3)."""
-    previous_mode = _settings_file_safety_mode()
+    ``full -> light -> off`` is a strictly decreasing coverage ladder; any downward step is
+    owner-only (mirrors the context-mode ratchet, BIBLE P3)."""
+    previous_mode = normalize_safety_mode(_settings_file_value("OUROBOROS_SAFETY_MODE", "full"))
     next_mode = normalize_safety_mode(settings.get("OUROBOROS_SAFETY_MODE", previous_mode))
     if _SAFETY_MODE_RANK[next_mode] < _SAFETY_MODE_RANK[previous_mode] and not allow_safety_lowering:
         raise PermissionError(
@@ -1122,10 +1140,8 @@ def get_skills_repo_path() -> str:
         return raw
 
 
-# Skills data layout
-#
-# Runtime skill packages live under ``data/skills/<source>/<slug>/``. The
-# git-tracked ``repo/skills/`` tree is only a launcher seed; the optional
+# Skills data layout: runtime skill packages live under ``data/skills/<source>/<slug>/``.
+# The git-tracked ``repo/skills/`` tree is only a launcher seed; the optional
 # ``OUROBOROS_SKILLS_REPO_PATH`` adds a user-managed checkout.
 
 SKILL_SOURCE_NATIVE = "native"
@@ -1295,11 +1311,10 @@ def load_settings() -> dict:
                     }
             except Exception:
                 pass
-        # Rename-alias migration: fold deprecated per-subsystem retention keys into
-        # the unified OUROBOROS_GC_RETENTION_DAYS, then drop the legacy keys so they
-        # do not linger. Prefer a CUSTOMIZED legacy value (one that differs from its
-        # former default) so a user's customization is never orphaned by the rename;
-        # an all-defaults file collapses to the unified default (e.g. service 14->7).
+        # Rename-alias migration: fold deprecated per-subsystem retention keys into the
+        # unified OUROBOROS_GC_RETENTION_DAYS, then drop the legacy keys. Prefer a CUSTOMIZED
+        # legacy value so a rename never orphans it; an all-defaults file collapses to the
+        # unified default (e.g. service 14->7).
         from ouroboros.retention import LEGACY_RETENTION_KEYS, pick_legacy_retention_seed
         if "OUROBOROS_GC_RETENTION_DAYS" not in loaded:
             seed = pick_legacy_retention_seed(loaded.get)
@@ -1312,7 +1327,7 @@ def load_settings() -> dict:
         settings.update(loaded)
         for key in SETTINGS_DEFAULTS:
             raw_env = os.environ.get(key)
-            if raw_env is None:
+            if raw_env is None or key in _DISK_AUTHORED_SETTINGS:  # owner ratchets: DISK-authored, never env
                 continue
             if key == "OUROBOROS_RETURN_REASONING" and raw_env == "":
                 settings[key] = ""
@@ -1334,34 +1349,33 @@ def save_settings(
 ) -> None:
     """Persist settings and enforce owner-only mode ratchets.
 
-    Elevation above the boot baseline is refused after initialization; then
-    ``allow_elevation=True`` is inert to agent-reachable subprocesses. Production
-    entry points must call ``initialize_runtime_mode_baseline`` before agent code.
-    Context-mode lowering (max -> low) likewise requires an explicit owner path.
-    """
+    Elevation above the boot baseline is refused after initialization (``allow_elevation``
+    is then inert to agent-reachable subprocesses; production entry points must call
+    ``initialize_runtime_mode_baseline`` before agent code). Context-mode lowering and
+    clearing the derived auto-low flag likewise require the explicit owner path."""
     _guard_live_settings_write()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     fd = _acquire_settings_lock()
     try:
+        # Silence stays silence on the WRITE path too (the other half of the apply_settings_to_env rule):
+        # a disk-authored key the file does not carry, arriving as the shipped default, is load_settings
+        # filling a gap, not authorship. AUTHORSHIP IS THE PATH — deliberate writes go through the owner
+        # endpoints' _owner_write_settings, not this function. Dropped values are defaults.
+        settings = {k: v for k, v in settings.items() if not (
+            k in _DISK_AUTHORED_SETTINGS and str(v) == str(SETTINGS_DEFAULTS.get(k, ""))
+            and not _settings_file_value(k, ""))}
         _guard_context_mode_lowering(settings)
         _guard_safety_mode_lowering(settings)
-        # Baseline order: in-process pin, inherited env pin, on-disk fallback.
+        # Baseline: the in-process pin, else the STRICTEST of the inherited env pin and disk. The env pin only
+        # exists so a subprocess inherits the parent's ratchet, so it may only TIGHTEN — letting it RAISE the
+        # baseline is the caller-controlled "previous value" hole of _settings_file_value on a fourth key (a
+        # subprocess exporting BOOT_RUNTIME_MODE=pro could otherwise persist its own elevation).
         baseline_pinned_in_process = _BOOT_RUNTIME_MODE is not None
-        baseline_inherited_from_env = (
-            not baseline_pinned_in_process and _resolve_baseline_from_env() is not None
-        )
-        if baseline_pinned_in_process:
-            baseline_mode = _BOOT_RUNTIME_MODE
-        elif baseline_inherited_from_env:
-            baseline_mode = _resolve_baseline_from_env()
-        else:
-            baseline_mode = "advanced"
-            if SETTINGS_PATH.exists():
-                try:
-                    disk_settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-                    baseline_mode = normalize_runtime_mode(disk_settings.get("OUROBOROS_RUNTIME_MODE"))
-                except (OSError, json.JSONDecodeError):
-                    pass
+        inherited_baseline = None if baseline_pinned_in_process else _resolve_baseline_from_env()
+        baseline_inherited_from_env = inherited_baseline is not None
+        disk_baseline = normalize_runtime_mode(_settings_file_value("OUROBOROS_RUNTIME_MODE", "advanced"))
+        baseline_mode = _BOOT_RUNTIME_MODE or min(
+            [m for m in (inherited_baseline, disk_baseline) if m], key=_RUNTIME_MODE_RANK.__getitem__)
         new_mode = normalize_runtime_mode(settings.get("OUROBOROS_RUNTIME_MODE"))
         # Once a boot baseline is pinned, allow_elevation is inert.
         baseline_pinned = baseline_pinned_in_process or baseline_inherited_from_env
@@ -1440,25 +1454,6 @@ def get_finalization_grace_sec(settings: Optional[dict] = None) -> int:
     return max(0, min(parsed, 300))
 
 
-def get_scope_review_floor(settings: Optional[dict] = None) -> str:
-    """P3 scope-reviewer capability floor: 'blocking_1m' (default) or 'advisory'.
-
-    blocking_1m: the scope reviewer is treated as the >=1M blocking gate (the
-    default gpt-5.5 reviewer IS 1M). advisory: a sub-1M reviewer may run, but its
-    scope output is SUPPLEMENTARY ONLY and can NEVER satisfy a required blocking
-    constitutional/release scope gate. Binary by design — no chunked tier."""
-    raw = os.environ.get("OUROBOROS_SCOPE_REVIEW_FLOOR")
-    if raw is None and isinstance(settings, dict):
-        raw = settings.get("OUROBOROS_SCOPE_REVIEW_FLOOR")
-    if raw is None:
-        try:
-            raw = load_settings().get("OUROBOROS_SCOPE_REVIEW_FLOOR")
-        except Exception:
-            raw = None
-    value = str(raw or "blocking_1m").strip().lower()
-    return "advisory" if value == "advisory" else "blocking_1m"
-
-
 def get_pacing_interval_sec(settings: Optional[dict] = None) -> int:
     """Intrinsic self-pacing checkpoint cadence in seconds (0 disables)."""
     raw = os.environ.get("OUROBOROS_PACING_INTERVAL_SEC")
@@ -1495,72 +1490,63 @@ def apply_settings_to_env(settings: dict) -> None:
         "ANTHROPIC_API_KEY",
         "OUROBOROS_NETWORK_PASSWORD",
         "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_VISION",
-        "OUROBOROS_MODEL_CONSCIOUSNESS",
-        "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "CLAUDE_CODE_MODEL",
+        "OUROBOROS_MODEL_CONSCIOUSNESS", "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "CLAUDE_CODE_MODEL",
         "OUROBOROS_FALLBACK_COOLDOWN_ENABLED", "OUROBOROS_FALLBACK_COOLDOWN_SEC",
-        "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL", "OUROBOROS_MODEL_MAX_CONCURRENCY",
-        "OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC",
+        "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL", "OUROBOROS_MODEL_MAX_CONCURRENCY", "OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC",
         "OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC", "OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC",
-        "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT",
-        "OUROBOROS_MAX_WORKERS", "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT",
+        "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT", "OUROBOROS_MAX_WORKERS", "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT",
         "OUROBOROS_MAX_SUBAGENT_DEPTH", "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC",
-        "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC",
-        "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC",
+        "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC",
         "TOTAL_BUDGET", "OUROBOROS_PER_TASK_COST_USD", "GITHUB_TOKEN", "GITHUB_REPO",
         "OUROBOROS_RUB_USD_RATE", "OUROBOROS_PRICING_TTL_SEC",
         "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
         "OUROBOROS_VISION_CAPTION_TIMEOUT_SEC",
         "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", "OUROBOROS_TASK_ABS_CEILING_SEC",
         "OUROBOROS_PACING_INTERVAL_SEC", "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC",
-        "OUROBOROS_MAX_ROUNDS", "OUROBOROS_TRANSIENT_RETRY_MAX",
-        "OUROBOROS_IMAGE_INPUT_MODE",
+        "OUROBOROS_MAX_ROUNDS", "OUROBOROS_TRANSIENT_RETRY_MAX", "OUROBOROS_IMAGE_INPUT_MODE",
         "OUROBOROS_BG_MAX_ROUNDS", "OUROBOROS_BG_WAKEUP_MIN", "OUROBOROS_BG_WAKEUP_MAX",
         "OUROBOROS_WEBSEARCH_MODEL", "OUROBOROS_WEBSEARCH_BACKEND",
-        "OUROBOROS_MAIN_WEB_SEARCH", "OUROBOROS_MAIN_WEB_SEARCH_ENGINE",
-        "OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS",
-        "OUROBOROS_OR_PROVIDER",
-        "OUROBOROS_SEARCH_CODE_WALL_SEC",
+        "OUROBOROS_MAIN_WEB_SEARCH", "OUROBOROS_MAIN_WEB_SEARCH_ENGINE", "OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS",
+        "OUROBOROS_OR_PROVIDER", "OUROBOROS_SEARCH_CODE_WALL_SEC",
         "OUROBOROS_GENERATIVE_PROBE", "OUROBOROS_GENERATIVE_PROBE_CHARS",
         "OUROBOROS_POST_TASK_EVOLUTION", "OUROBOROS_POST_TASK_EVOLUTION_CADENCE",
         "OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD", "OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE",
         "OUROBOROS_REVIEW_MODELS", "OUROBOROS_REVIEW_ENFORCEMENT",
-        "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS",
-        "OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS",
-        "OUROBOROS_RESTART_DRAIN_MAX_SEC",
-        "OUROBOROS_SCOPE_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODEL",
-        "OUROBOROS_SCOPE_REVIEW_DEGRADED", "OUROBOROS_SCOPE_REVIEW_FLOOR",
-        "OUROBOROS_TASK_REVIEW_MODE",
-        "OUROBOROS_SAFETY_MODE", "OUROBOROS_SAFETY_MAX_TOKENS", "OUROBOROS_SAFETY_CALL_TIMEOUT_SEC",
+        "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS", "OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS", "OUROBOROS_RESTART_DRAIN_MAX_SEC",
+        "OUROBOROS_SCOPE_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODEL", "OUROBOROS_SCOPE_REVIEW_FLOOR",
+        "OUROBOROS_TASK_REVIEW_MODE", "OUROBOROS_SAFETY_MODE", "OUROBOROS_SAFETY_MAX_TOKENS", "OUROBOROS_SAFETY_CALL_TIMEOUT_SEC",
         "OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC",
-        "OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC",
-        "OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC", "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES",
-        "OUROBOROS_ACCEPTANCE_RESERVE_PCT",
+        "OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC", "OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC",
+        "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", "OUROBOROS_ACCEPTANCE_RESERVE_PCT",
         # Unified disposable-artifact GC retention (replaces per-subsystem keys).
         "OUROBOROS_GC_RETENTION_DAYS",
         # Runtime-mode, context-mode, and skills-repo plumbing.
-        "OUROBOROS_RUNTIME_MODE", "OUROBOROS_CONTEXT_MODE", "OUROBOROS_SKILLS_REPO_PATH",
-        "OUROBOROS_HOST_SERVICE_PORT",
+        "OUROBOROS_RUNTIME_MODE", "OUROBOROS_CONTEXT_MODE",
+        "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SKILLS_REPO_PATH", "OUROBOROS_HOST_SERVICE_PORT",
         # Acting (mutative) subagents: owner toggle + worktree/projects roots.
         "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "OUROBOROS_SUBAGENT_WORKTREE_ROOT",
-        "OUROBOROS_SUBAGENT_PROJECTS_ROOT",
-        "OUROBOROS_DELIVERABLES_ROOT",
+        "OUROBOROS_SUBAGENT_PROJECTS_ROOT", "OUROBOROS_DELIVERABLES_ROOT",
         # ClawHub marketplace registry URL.
         "OUROBOROS_CLAWHUB_REGISTRY_URL",
-        "MCP_ENABLED", "MCP_TOOL_TIMEOUT_SEC",
-        "OUROBOROS_EFFORT_TASK", "OUROBOROS_EFFORT_EVOLUTION",
+        "MCP_ENABLED", "MCP_TOOL_TIMEOUT_SEC", "OUROBOROS_EFFORT_TASK", "OUROBOROS_EFFORT_EVOLUTION",
         "OUROBOROS_EFFORT_REVIEW", "OUROBOROS_EFFORT_SCOPE_REVIEW",
-        "OUROBOROS_EFFORT_DEEP_SELF_REVIEW",
-        "OUROBOROS_EFFORT_CONSCIOUSNESS",
-        "OUROBOROS_RETURN_REASONING",
-        "OUROBOROS_REASONING_SUMMARY",
+        "OUROBOROS_EFFORT_DEEP_SELF_REVIEW", "OUROBOROS_EFFORT_CONSCIOUSNESS",
+        "OUROBOROS_RETURN_REASONING", "OUROBOROS_REASONING_SUMMARY",
         "LOCAL_MODEL_SOURCE", "LOCAL_MODEL_FILENAME",
-        "LOCAL_MODEL_PORT", "LOCAL_MODEL_N_GPU_LAYERS", "LOCAL_MODEL_CONTEXT_LENGTH",
-        "LOCAL_MODEL_CHAT_FORMAT",
-        "USE_LOCAL_MAIN", "USE_LOCAL_HEAVY", "USE_LOCAL_LIGHT", "USE_LOCAL_CONSCIOUSNESS", "USE_LOCAL_FALLBACK",
-        "OUROBOROS_FILE_BROWSER_DEFAULT",
+        "LOCAL_MODEL_PORT", "LOCAL_MODEL_N_GPU_LAYERS", "LOCAL_MODEL_CONTEXT_LENGTH", "LOCAL_MODEL_CHAT_FORMAT",
+        "USE_LOCAL_MAIN", "USE_LOCAL_HEAVY", "USE_LOCAL_LIGHT", "USE_LOCAL_CONSCIOUSNESS", "USE_LOCAL_FALLBACK", "OUROBOROS_FILE_BROWSER_DEFAULT",
     ]
+    # Disk-authored ratchets PROJECT ONLY WHAT THE FILE ACTUALLY SAYS: a default standing in for an absent
+    # key is not an owner decision, so overwriting/popping the env entry would clobber a legitimately
+    # forwarded value (harbor_installed_agent runs with NO settings.json; server_runner documents the same
+    # "settings.json over env" clobber). Silence stays silent. ONE fail-closed exception: env may not author
+    # the owner-declared-low CLAIM (auto-low `false`), which would switch the BIBLE P3 scope gate off.
+    unauthored = {k for k in _DISK_AUTHORED_SETTINGS if not _settings_file_value(k, "")}
     for k in env_keys:
         val = settings.get(k)
+        if k in unauthored and not _owner_declared_low(
+                os.environ.get(k) if k == "OUROBOROS_CONTEXT_MODE_AUTO_LOW" else ""):
+            continue
         if k == "OUROBOROS_RETURN_REASONING" and val == "":
             os.environ[k] = ""
             continue

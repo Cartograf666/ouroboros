@@ -17,8 +17,8 @@ from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_r
 from devtools.benchmarks.common.result_index import task_result_row, write_result_index
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
-    ensure_file_output_outside_repo,
-    ensure_outside_repo,
+    assert_file_output_outside_repo,
+    assert_outside_repo,
     run_root,
     safe_benchmark_id,
 )
@@ -122,28 +122,27 @@ def main() -> int:
 
     input_path = Path(args.input).expanduser()
     settings_path = Path(args.settings_path).expanduser() if args.settings_path else default_settings_path()
-    output = ensure_file_output_outside_repo(Path(args.output), REPO_ROOT)
+    output = assert_file_output_outside_repo(Path(args.output), REPO_ROOT)
     errors_output = (
-        ensure_file_output_outside_repo(Path(args.errors_output), REPO_ROOT)
+        assert_file_output_outside_repo(Path(args.errors_output), REPO_ROOT)
         if args.errors_output
         else Path(str(output) + ".errors.jsonl")
     )
     ledger_output = (
-        ensure_file_output_outside_repo(Path(args.ledger_output), REPO_ROOT)
+        assert_file_output_outside_repo(Path(args.ledger_output), REPO_ROOT)
         if args.ledger_output
         else Path(str(output) + ".ledger.jsonl")
     )
     manifest_output = (
-        ensure_file_output_outside_repo(Path(args.manifest_output), REPO_ROOT)
+        assert_file_output_outside_repo(Path(args.manifest_output), REPO_ROOT)
         if args.manifest_output
         else Path(str(output) + ".run_manifest.json")
     )
     patch_dir = Path(args.patch_dir).expanduser() if args.patch_dir else run_root("swe_bench_pro") / "patches"
-    ensure_outside_repo(patch_dir, REPO_ROOT)
+    assert_outside_repo(patch_dir, REPO_ROOT)  # `_capture_patch` creates it when it writes
     predictions: list[dict[str, str]] = []
     errors: list[dict[str, Any]] = []
     ledger_rows: list[dict[str, Any]] = []
-    input_rows = _rows(input_path)
     # Build the manifest ONCE, BEFORE any capture work: it carries the seed-provenance gate,
     # so an unreproducible seed stops the run here instead of after the artifacts exist.
     # `admit_benchmark_run` persists the complete gate/refusal payload BEFORE enforcement raises,
@@ -153,7 +152,9 @@ def main() -> int:
         benchmark="swe_bench_pro",
         run_root=output.parent,
         repo_dir=REPO_ROOT,
-        requested_task_ids=[str(item.get("instance_id") or "") for item in input_rows],
+        # DECLARED input only (see `extra.input`): `_rows` reads and parses `--input`, so the
+        # ids are not knowable until the run is admitted. Amended below with what it held.
+        requested_task_ids=[],
         require_clean=not args.allow_dirty_seed,
         output_paths={
             "predictions": str(output),
@@ -168,11 +169,20 @@ def main() -> int:
         extra={
             "model_name_or_path": args.model_name,
             "input": str(input_path),
-            "runtime_attestations": _collect_attestations(list(args.attestation or [])),
+            # DECLARED paths only. `_collect_attestations` READS each of them, and evaluating it
+            # here meant it ran inside the admission call's own argument list — Python evaluates
+            # arguments before entering the callee, so it executed while nothing was on disk yet.
+            # Same evaluation-order trap `runtime_attestation` was moved out of; the aggregate is
+            # attached to the retained manifest inside the admitted run below.
+            "runtime_attestation_paths": [str(path) for path in (args.attestation or [])],
         },
     )
 
     with finalize_run_manifest(manifest_output, manifest, outcome="completed") as final:
+        input_rows = _rows(input_path)
+        manifest["requested_task_ids"] = [str(item.get("instance_id") or "") for item in input_rows]
+        manifest["requested_count"] = len(input_rows)
+        manifest["extra"]["runtime_attestations"] = _collect_attestations(list(args.attestation or []))
         first_error: Exception | None = None
         for item in input_rows:
             instance_id = str(item.get("instance_id") or "").strip()

@@ -744,6 +744,7 @@ export function createChatInstance({
         const ctxBtn = byId('context-mode');
         if (ctxBtn && typeof data?.context_mode === 'string') {
             ctxBtn.dataset.contextMode = data.context_mode === 'low' ? 'low' : 'max';
+            ctxBtn.dataset.contextModeAutoLow = data.context_mode_auto_low ? 'true' : 'false';
         }
         const budget = headerBudgetPresentation(data);
         const budgetText = byId('budget-text');
@@ -2873,7 +2874,12 @@ export function createChatInstance({
         if (!seg || contextModeBtn.dataset.disabled === 'true') return;
         const next = seg.dataset.mode === 'low' ? 'low' : 'max';
         const current = contextModeBtn.dataset.contextMode === 'low' ? 'low' : 'max';
-        if (next === current) return;
+        // A displayed `low` that is a system AUTO-DOWNGRADE is not an owner selection:
+        // re-picking Low must still POST (the endpoint is idempotent and clears the
+        // derived flag), or an unconfirmable-window install stays wedged with scope
+        // review blocking every commit and no reachable way to declare Low.
+        const derivedLow = contextModeBtn.dataset.contextModeAutoLow === 'true';
+        if (next === current && !(next === 'low' && derivedLow)) return;
         contextModeBtn.dataset.disabled = 'true';
         const postMode = (mode) => apiFetch('/api/owner/context-mode', {
             method: 'POST',

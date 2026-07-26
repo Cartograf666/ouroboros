@@ -27,7 +27,11 @@ from typing import Any
 if str(pathlib.Path(__file__).resolve().parents[4]) not in sys.path:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[4]))
 
-from devtools.benchmarks.gaia.inspect_solver import GAIA_ANTI_LEAK_INSTRUCTION, GAIA_FORMAT_INSTRUCTION  # noqa: E402
+from devtools.benchmarks.gaia.inspect_solver import (  # noqa: E402
+    GAIA_ANTI_LEAK_INSTRUCTION,
+    GAIA_EPISTEMIC_INSTRUCTION,
+    GAIA_FORMAT_INSTRUCTION,
+)
 
 # Reuse the proven, hardened staging + prompt extraction from the Ouroboros solver
 # (it stages GAIA attachments and filters repo/data/secret paths — identical needs here).
@@ -150,6 +154,9 @@ def run_claude_code(
     # Anti-lookup rule (SSOT, identical across harnesses; see METHODOLOGY.md).
     if GAIA_ANTI_LEAK_INSTRUCTION not in full_prompt:
         full_prompt += GAIA_ANTI_LEAK_INSTRUCTION
+    # Epistemic-grounding disclosure rule (SSOT, adapter-only; see METHODOLOGY.md).
+    if GAIA_EPISTEMIC_INSTRUCTION not in full_prompt:
+        full_prompt += GAIA_EPISTEMIC_INSTRUCTION
 
     cmd = [
         "claude", "-p", full_prompt,
