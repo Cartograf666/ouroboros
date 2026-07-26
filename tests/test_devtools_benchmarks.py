@@ -6883,3 +6883,74 @@ def test_architecture_launcher_count_is_pinned_to_the_registry():
         assert "`PENDING_LAUNCHERS` is the empty tuple" in text or (
             "PENDING_LAUNCHERS` now the empty tuple" in text
         ), "the empty residual must stay disclosed while it is empty"
+
+
+def test_scrubber_refuses_symlinks_instead_of_writing_through_them(tmp_path, capsys, monkeypatch):
+    """A symlink under --root must stop the scrub dead, before anything is written.
+
+    Two independent failures, both proven against the pre-fix tool:
+
+    * `p.is_file()` and `path.write_text()` BOTH follow a file symlink, so the sweep
+      rewrites the link's TARGET outside --root. A pack linking to the live settings.json
+      had its real keys replaced with `<REDACTED:...>` by the tool meant to protect them.
+      `cp -a` preserves symlinks, so the procedural "run this on a COPY" rule does not
+      help — the copy carries the same link.
+    * `rglob` does not descend through a DIRECTORY symlink, yet the verify pass still
+      printed `verify_leftovers=0` and exited 0. The tool certified a tree it had never
+      read, for content reachable under --root and about to be uploaded publicly.
+
+    The second is the one that matters most: silent non-coverage reported as cleanliness
+    is precisely the class of false claim this release exists to remove, and here the
+    consequence is a live API key on a public leaderboard."""
+    from devtools.benchmarks.terminal_bench import scrub_submission_secrets as scrub
+
+    fake = "FAKEfake-scrub-symlink-000000000000cccc"   # obviously fake; never a credential
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    live = outside / "live_settings.json"
+    live.write_text(f'{{"OPENROUTER_API_KEY": "{fake}"}}\n', encoding="utf-8")
+
+    behind_dir_link = tmp_path / "behind"
+    behind_dir_link.mkdir()
+    (behind_dir_link / "deep.txt").write_text(f"token={fake}\n", encoding="utf-8")
+
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    (pack / "normal.txt").write_text(f"plain={fake}\n", encoding="utf-8")
+    (pack / "linked_settings.json").symlink_to(live)
+    (pack / "hidden_dir").symlink_to(behind_dir_link, target_is_directory=True)
+
+    secrets_src = tmp_path / "secrets.txt"
+    secrets_src.write_text(f"OPENROUTER_API_KEY: {fake}\n", encoding="utf-8")
+
+    argv = ["scrub_submission_secrets.py", "--root", str(pack),
+            "--secrets-from", str(secrets_src)]
+    monkeypatch.setattr(sys, "argv", argv)
+    rc = scrub.main()
+
+    assert rc == 2, "a symlink under --root must be a hard refusal, not a warning"
+
+    err = capsys.readouterr().err
+    assert "REFUSING TO SCRUB" in err
+    # BOTH kinds must be named, with their targets, so the operator can act.
+    assert "linked_settings.json" in err and str(live) in err
+    assert "hidden_dir" in err and str(behind_dir_link) in err
+
+    # Fail CLOSED: not one byte written anywhere — not through the link, not even to the
+    # ordinary file the tool could legitimately have swept.
+    assert fake in live.read_text(encoding="utf-8"), "wrote through the symlink"
+    assert fake in (behind_dir_link / "deep.txt").read_text(encoding="utf-8")
+    assert fake in (pack / "normal.txt").read_text(encoding="utf-8"), (
+        "a refusal must leave the tree untouched; a partially swept pack is worse than "
+        "an unswept one"
+    )
+    assert (pack / "linked_settings.json").is_symlink(), "must not have been replaced"
+
+    # ...and with the links gone the tool still does its job, so the guard is a refusal
+    # of an unsafe shape rather than a loss of capability.
+    (pack / "linked_settings.json").unlink()
+    (pack / "hidden_dir").unlink()
+    monkeypatch.setattr(sys, "argv", argv)
+    assert scrub.main() == 0
+    assert fake not in (pack / "normal.txt").read_text(encoding="utf-8")

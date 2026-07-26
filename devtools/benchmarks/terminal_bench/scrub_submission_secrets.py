@@ -318,6 +318,38 @@ def main() -> int:
     # certify a tree it never fully inspected.
     needles = expand_encoded_forms(secrets)
 
+    # A symlink anywhere under --root breaks BOTH halves of this tool's promise, so it is
+    # refused before a single byte is written — the same fail-closed discipline as the
+    # --env-passthrough refusal above.
+    #
+    #   * a FILE symlink is followed by both `p.is_file()` and `path.write_text()`, so the
+    #     sweep edits the TARGET, outside --root. A pack containing a link to the live
+    #     settings.json would have its real keys replaced with <REDACTED:...> by the very
+    #     tool meant to protect them. `cp -a` preserves symlinks, so the procedural "run
+    #     this on a COPY" rule does not save you.
+    #   * a DIRECTORY symlink is not traversed by rglob at all, yet the verify pass then
+    #     prints verify_leftovers=0 and exits 0 — an affirmative certification of content
+    #     the tool never read, for a tree that is about to be uploaded publicly. Silent
+    #     non-coverage reported as cleanliness is the one failure this tool must not have.
+    #
+    # Refusing is right rather than resolving-and-continuing: under --root a symlink is
+    # either an accident or an escape, and the operator must decide which.
+    symlinks = sorted(p for p in root.rglob("*") if p.is_symlink())
+    if symlinks:
+        print("REFUSING TO SCRUB: symlinks under --root cannot be swept or verified "
+              "safely:", file=sys.stderr)
+        for link in symlinks:
+            try:
+                target = str(link.readlink())
+            except OSError:
+                target = "<unreadable>"
+            kind = "dir" if link.is_dir() else "file"
+            print(f"  {link} -> {target} ({kind})", file=sys.stderr)
+        print("  (nothing was modified. Replace each link with a real copy — "
+              "`cp -aL`, or `tar --dereference` when building the pack — and re-run.)",
+              file=sys.stderr)
+        return 2
+
     files = [p for p in root.rglob("*") if p.is_file()]
 
     blanked_fields = 0
