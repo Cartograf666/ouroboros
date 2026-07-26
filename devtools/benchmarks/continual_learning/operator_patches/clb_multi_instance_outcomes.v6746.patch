@@ -8,7 +8,7 @@
  import time
  import urllib.request
  from pathlib import Path
-@@ -439,6 +440,122 @@
+@@ -439,6 +440,130 @@
      return _poll_terminal(base, task_id, args.task_timeout_sec)
  
  
@@ -76,8 +76,13 @@
 +
 +    A LOCAL seam, deliberately: this module lives in the external CL-Bench checkout and
 +    only reaches the Ouroboros clone through `_launcher`'s call-time sys.path insert, so a
-+    module-level import of the shared helper would break the standard entrypoint. Keep the
-+    two in sync — the shared helper is the SSOT for the vocabulary.
++    module-level import of the shared helper would break the standard entrypoint. The
++    shared helper is the SSOT for the vocabulary; "keep the two in sync" as a COMMENT is
++    exactly what failed here (both copies carried four invented codes and missed
++    round_limit/deadline_local), so the mirror is now pinned to the SSOT by
++    tests/test_benchmark_provenance_v6810.py::
++    test_clb_operator_patch_mirrors_the_truncation_ssot_verbatim, which reads this patch
++    file and fails on any divergence.
 +    """
 +    if not isinstance(task_result, dict) or not task_result:
 +        return {"available": False}
@@ -92,10 +97,13 @@
 +        "available": True,
 +        "status": str(task_result.get("status") or ""),
 +        "reason_code": reason_code,
++        # MIRROR of result_index.RUNTIME_TRUNCATION_REASON_CODES, sorted. Every code below
++        # is emitted by the runtime; the guard test above fails if this list and the SSOT
++        # ever diverge again.
 +        "truncated": reason_code in (
-+            "budget_exhausted", "max_rounds_exceeded", "task_timeout",
-+            "cancelled", "context_exhausted", "provider_unavailable",
-+            "llm_api_error", "rate_limited"),
++            "budget_exhausted", "children_unabsorbed", "deadline_local",
++            "finalization_grace", "llm_api_error", "provider_unavailable",
++            "round_limit"),
 +        "degraded": bool(task_result.get("degraded") or loop_outcome.get("degraded")),
 +        "resource_limit": resource_limit,
 +    }
@@ -131,7 +139,7 @@
  def run_stateful(args, out_root: Path, *, evolution: bool) -> list:
      """STATEFUL ROLLOUT (CC-comparable): ONE persistent Ouroboros server + ONE CONTINUOUS task across all
      instances (the schema_drift migration fires mid-sequence, as CC's rollout experiences it). One agent
-@@ -471,21 +588,62 @@
+@@ -471,21 +596,62 @@
                  final = _submit_and_poll(eng, prompt, args)
                  (rd / "ouroboros_task_final.json").write_text(json.dumps(final, indent=2), encoding="utf-8")
                  oc = _api(url, "GET", "/_outcome", timeout=30)

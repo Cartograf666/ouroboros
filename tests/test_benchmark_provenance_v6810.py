@@ -5,18 +5,25 @@ Two claims a benchmark artefact must never make falsely:
 * FIX A — a container carries only the provider credentials the run DECLARED, and the
   manifest discloses which ones it got (by fingerprint, never by value);
 * FIX B — a task the RUNTIME stopped for a reason other than finishing (the per-task USD
-  reservation rail, a round cap) says so in the artefact, instead of being indistinguishable
-  from an honest failure.
+  reservation rail, the round cap, the loop-local deadline) says so in the artefact, instead
+  of being indistinguishable from an honest failure. The vocabulary for that is DERIVED from
+  `ouroboros.outcomes.BEST_EFFORT_REASON_CODES`, never restated: the first cut hand-copied it
+  and got it wrong in both directions at once (see
+  `test_truncation_vocabulary_is_derived_from_the_runtime_not_restated`).
 """
 from __future__ import annotations
 
 import json
+import pathlib
+import re
 
 from devtools.benchmarks.common.manifests import provider_credential_disclosure
 from devtools.benchmarks.common.result_index import (
+    RUNTIME_TRUNCATION_REASON_CODES,
     runtime_terminal_disclosure,
     task_result_row,
 )
+from ouroboros.outcomes import BEST_EFFORT_REASON_CODES
 from devtools.benchmarks.common.secrets import (
     credential_disclosure,
     isolated_credential_grants,
@@ -235,3 +242,121 @@ def test_task_result_row_publishes_the_runtime_reason_alongside_the_adapter_stag
     # because nothing happened or because the writer forgot.
     assert task_result_row(benchmark="gaia", instance_id="x",
                            status="failed")["runtime_outcome"] == {"available": False}
+
+
+# ------------------------------------------------------- FIX B: the vocabulary is DERIVED
+
+# Every literal `reason_code` the runtime writes, and the DECISION for each: does an auditor
+# risk mistaking it for a capability result? This table is the record the drift guard below
+# enforces — a new runtime code with no row here fails the suite, which is the only thing
+# that stops the vocabulary from being hand-copied beside the check again.
+_TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
+    # -- truncating: the rail stopped the attempt, so reward 0 is not a capability fact ----
+    "budget_exhausted": (True, "loop.py:287 per-task USD reservation rail"),
+    "round_limit": (True, "loop.py:3128 _handle_round_limit, the round cap"),
+    "finalization_grace": (True, "loop.py:3146 supervisor finalize_now grace"),
+    "deadline_local": (True, "loop.py:3220 loop-local deadline"),
+    "provider_unavailable": (True, "loop.py:3185 reroute + fallback exhausted"),
+    "children_unabsorbed": (True, "loop.py:4071 forced terminal, child results unabsorbed"),
+    "llm_api_error": (True, "loop_llm_call.py:630 transport death; never a fair shot"),
+    # -- not truncating: a real terminal the agent reached, or a rejected tool call --------
+    "task_exception": (False, "agent.py:777 the attempt ran and crashed; an honest failure"),
+    "swarm_force_plan_not_called": (False, "loop.py:4109 policy terminal, agent had its shot"),
+    "capability_profile_mismatch": (False, "control_delegation.py:81 rejected delegate call"),
+    "delegation_constraint_block_surface": (False, "control_delegation.py:116 rejected call"),
+    "delegation_constraint_child_cap": (False, "control_delegation.py:149 rejected call"),
+    "delegation_constraint_halt_fanout": (False, "control_delegation.py:103 rejected call"),
+    "delegation_constraint_require_lane": (False, "control_delegation.py:126 rejected call"),
+    "deep_self_review_unavailable": (False, "agent.py:705 owner-config gap on a review task"),
+    "deep_self_review_error": (False, "agent.py:743 review-stage error on a review task"),
+}
+
+_REASON_CODE_LITERAL = re.compile(
+    r"""reason_code(?:=|["']\s*:\s*)\s*["']([a-z0-9_]+)["']"""
+)
+
+
+def _runtime_reason_code_literals() -> dict[str, str]:
+    """Every literal reason code the runtime source assigns, with its first emitting line."""
+    root = pathlib.Path(__file__).resolve().parents[1] / "ouroboros"
+    found: dict[str, str] = {}
+    for path in sorted(root.rglob("*.py")):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for match in _REASON_CODE_LITERAL.finditer(line):
+                found.setdefault(match.group(1), f"{path.relative_to(root.parent)}:{lineno}")
+    return found
+
+
+def test_truncation_vocabulary_is_derived_from_the_runtime_not_restated():
+    """The set must be COMPUTED from `ouroboros.outcomes`, and every member must be real.
+
+    INVERTED BUG-PINNING NOTE. Until v6.81.0 this set was hand-written beside the check and
+    listed `max_rounds_exceeded`, `task_timeout`, `context_exhausted` and `rate_limited` —
+    none of which the runtime has ever emitted — while omitting `round_limit` and
+    `deadline_local`, the two codes it DOES use for the round cap and the local deadline. A
+    round-capped task therefore published an affirmative `truncated: false` and was filed
+    under `genuine_failure_count`: a false capability claim made by the very field added to
+    prevent false capability claims. Nothing pinned that, so nothing caught it.
+    """
+    assert BEST_EFFORT_REASON_CODES <= RUNTIME_TRUNCATION_REASON_CODES, \
+        "every forced-finalization code must be disclosed as truncation"
+    assert {"round_limit", "deadline_local"} <= RUNTIME_TRUNCATION_REASON_CODES
+
+    emitted = _runtime_reason_code_literals()
+    for code in sorted(RUNTIME_TRUNCATION_REASON_CODES):
+        assert code in emitted, f"{code} is published but no line in ouroboros/ emits it"
+
+
+def test_every_runtime_reason_code_has_a_recorded_truncation_decision():
+    """Drift guard. A reason code added to the runtime tomorrow silently defaults to
+    `truncated: false` — an affirmative claim — unless somebody DECIDED it should. This
+    fails until the decision is written down, so the omission cannot pass as a judgement."""
+    emitted = _runtime_reason_code_literals()
+    undecided = sorted(set(emitted) - set(_TRUNCATION_DECISIONS))
+    assert not undecided, (
+        "new runtime reason code(s) with no recorded decision in _TRUNCATION_DECISIONS: "
+        + ", ".join(f"{code} ({emitted[code]})" for code in undecided)
+    )
+    stale = sorted(set(_TRUNCATION_DECISIONS) - set(emitted))
+    assert not stale, f"decision recorded for code(s) the runtime no longer emits: {stale}"
+
+    decided_truncating = {c for c, (yes, _why) in _TRUNCATION_DECISIONS.items() if yes}
+    assert decided_truncating == set(RUNTIME_TRUNCATION_REASON_CODES)
+
+
+def test_round_capped_and_deadline_stopped_runs_are_disclosed_as_truncated():
+    """The two codes the runtime really uses for the round cap and the local deadline.
+
+    Both FAILED before the derivation fix: `truncated` came back False, so `run_tb.py` filed
+    a round-capped trial as `genuine_failure_count` — "the agent got a fair shot and got it
+    wrong" — about a trial that was cut off mid-attempt.
+    """
+    for code in ("round_limit", "deadline_local", "finalization_grace", "children_unabsorbed"):
+        disclosed = runtime_terminal_disclosure({"status": "failed", "reason_code": code})
+        assert disclosed["truncated"] is True, code
+
+
+def test_the_two_out_of_tree_mirrors_stay_pinned_to_the_derived_vocabulary():
+    """Three hand-written copies of one vocabulary is how all three came to be wrong.
+
+    The Harbor runner is a source template executed inside the task container, so it now
+    INTERPOLATES the SSOT instead of restating it. The CL-Bench bridge genuinely cannot
+    import it (that module lives in an external clone reached only through a call-time
+    sys.path insert), so its mirror stays — but pinned here, because the comment that asked
+    for it to be kept in sync demonstrably did not hold.
+    """
+    repo = pathlib.Path(__file__).resolve().parents[1]
+
+    harbor = (repo / "devtools/benchmarks/terminal_bench/harbor_installed_agent.py"
+              ).read_text(encoding="utf-8")
+    assert "truncated = reason_code in {truncation_codes_literal}" in harbor
+    assert "truncation_codes_literal = repr(tuple(sorted(RUNTIME_TRUNCATION_REASON_CODES)))" in harbor
+    assert "max_rounds_exceeded" not in harbor
+
+    patch = (repo / "devtools/benchmarks/continual_learning/operator_patches"
+                    "/clb_multi_instance_outcomes.v6746.patch").read_text(encoding="utf-8")
+    mirrored = re.search(r'"truncated": reason_code in \((.*?)\),', patch, re.S)
+    assert mirrored, "the CL-Bench mirror's truncation expression is no longer parseable"
+    assert set(re.findall(r'"([a-z0-9_]+)"', mirrored.group(1))) == set(
+        RUNTIME_TRUNCATION_REASON_CODES
+    ), "the CL-Bench operator patch has drifted from RUNTIME_TRUNCATION_REASON_CODES"

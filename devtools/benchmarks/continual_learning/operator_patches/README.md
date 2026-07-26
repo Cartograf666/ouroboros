@@ -173,7 +173,13 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
     `devtools.benchmarks.common.result_index.runtime_terminal_disclosure` (the SSOT
     for the vocabulary) for the same reason `_atomic_write_json` is local: this
     module lives in the external checkout and only reaches the Ouroboros clone
-    through `_launcher`'s call-time `sys.path` insert. Keep the two in sync.
+    through `_launcher`'s call-time `sys.path` insert. The mirror is ENFORCED, not
+    merely requested: `tests/test_benchmark_provenance_v6810.py::
+    test_clb_operator_patch_mirrors_the_truncation_ssot_verbatim` parses the
+    truncation vocabulary out of THIS patch file and fails if it diverges from
+    `RUNTIME_TRUNCATION_REASON_CODES`. A "keep in sync" comment alone did not
+    hold — the first cut of both copies listed four codes the runtime never emits
+    and missed `round_limit`/`deadline_local`.
     Launcher side (`run_clb.py`, our own code, no patch file):
     `collect_results` carries `runtime_outcome` into `results.json` /
     `result_index.jsonl`, defaulting to `{"available": false}` for rows written

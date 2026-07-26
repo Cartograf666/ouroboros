@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from devtools.benchmarks.common.manifests import openrouter_key_remaining, repo_provenance, write_json
+from devtools.benchmarks.common.result_index import RUNTIME_TRUNCATION_REASON_CODES
 
 try:  # Harbor is an optional benchmark dependency.
     from harbor.agents.installed.base import BaseInstalledAgent
@@ -752,6 +753,7 @@ PY
     async def _run_ouroboros_task(self, environment: BaseEnvironment, env: dict[str, str]) -> dict[str, Any]:
         workspace_root = json.dumps(self.workspace_dir)
         disabled_tools_line = f'"disabled_tools": {json.dumps(self._disabled_tools())},'
+        truncation_codes_literal = repr(tuple(sorted(RUNTIME_TRUNCATION_REASON_CODES)))
 
         runner = textwrap.dedent(
             f"""
@@ -839,17 +841,19 @@ PY
                 or str(execution.get("reason_code") or "") == "llm_api_error"
             )
             # The runtime can stop a task for a reason that is NOT "the task is finished" --
-            # the per-task USD reservation rail (budget_exhausted), a round cap, a context
-            # cap. That is neither infra_failed nor a fair-shot wrong answer, and without it
-            # a cost-truncated trial is indistinguishable from an honest failure downstream.
+            # the per-task USD reservation rail (budget_exhausted), the round cap
+            # (round_limit), the loop-local deadline (deadline_local). That is neither
+            # infra_failed nor a fair-shot wrong answer, and without it a cost-truncated
+            # trial is indistinguishable from an honest failure downstream. The vocabulary is
+            # INTERPOLATED from result_index.RUNTIME_TRUNCATION_REASON_CODES on the host, not
+            # restated here: this runner is a source template executed inside the task
+            # container, so the literal below is generated, and a runtime code added upstream
+            # cannot go missing from it.
             loop_outcome = latest.get("loop_outcome") if isinstance(latest.get("loop_outcome"), dict) else {{}}
             resource_limit = latest.get("resource_limit")
             if not isinstance(resource_limit, dict):
                 resource_limit = loop_outcome.get("resource_limit")
-            truncated = reason_code in (
-                "budget_exhausted", "max_rounds_exceeded", "task_timeout",
-                "cancelled", "context_exhausted",
-            )
+            truncated = reason_code in {truncation_codes_literal}
             summary = {{
                 "return_code": 2 if infra_failed else 0,
                 "task_status_code": 0 if status == "completed" else 1,

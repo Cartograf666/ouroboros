@@ -654,9 +654,11 @@ def write_disclosure_ledger(*, jobs_dir: pathlib.Path, out_path: pathlib.Path, r
             "exception_type": exception_type,
             "reason_code": adapter_summary.get("reason_code"),
             "infra_failed": bool(adapter_summary.get("infra_failed")),
-            # The runtime's own cost/round/context truncation, forwarded by the adapter
-            # summary. Without it a trial the per-task USD rail stopped is counted as a
-            # fair-shot wrong answer, which is a claim about capability that never happened.
+            # The runtime's own resource-rail truncation (USD rail / round cap / loop-local
+            # deadline / forced finalization), forwarded by the adapter summary, whose
+            # vocabulary is interpolated from result_index.RUNTIME_TRUNCATION_REASON_CODES.
+            # Without it a trial the per-task USD rail stopped is counted as a fair-shot
+            # wrong answer, which is a claim about capability that never happened.
             "truncated": bool(adapter_summary.get("truncated")),
             "resource_limit": adapter_summary.get("resource_limit") or {},
             "captured_after_cancellation": captured_after_cancellation,
@@ -682,7 +684,12 @@ def write_disclosure_ledger(*, jobs_dir: pathlib.Path, out_path: pathlib.Path, r
     # as a clean reward-0 trial with exception_info=null). Without this a 429-driven failure is
     # indistinguishable from a genuine wrong answer.
     _timeout_types = {"AgentTimeoutError", "VerifierTimeoutError"}
-    _provider_reasons = {"provider_unavailable", "llm_api_error", "rate_limited", "provider_error"}
+    # Both codes are real and grepped: loop.py:3185 (reroute + fallback exhausted) and
+    # loop_llm_call.py:630 (transport death). `rate_limited`/`provider_error` used to sit
+    # here too and the runtime has never emitted either — inert, but a hand-written claim
+    # about a vocabulary that lives elsewhere, which is exactly the defect this release fixed
+    # in RUNTIME_TRUNCATION_REASON_CODES. This set is a strict subset of it by construction.
+    _provider_reasons = {"provider_unavailable", "llm_api_error"}
 
     def _failure_category(t: dict) -> str:
         """Classify each trial into exactly one honest bucket (precedence matters).
@@ -701,7 +708,8 @@ def write_disclosure_ledger(*, jobs_dir: pathlib.Path, out_path: pathlib.Path, r
                          harness cut egress at the finish line, the agent's own finalization LLM call
                          died on DNS, and the real outcome was masked.
         'cost_truncated' the RUNTIME stopped the trial on its own resource rail (per-task USD
-                         reservation / round cap / context cap) rather than on an answer. Not
+                         reservation / round cap / loop-local deadline / forced finalization
+                         with an unabsorbed child) rather than on an answer. Not
                          provider_infra (nothing was unavailable) and emphatically not 'genuine':
                          'genuine' asserts a FAIR SHOT, and a trial cut off at $0.45 of actual
                          spend by a worst-case reservation bound did not get one.

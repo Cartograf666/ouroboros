@@ -256,10 +256,15 @@ leaderboard run without the disclosures below.
    `remote_exec_calls`) and `max_rounds_effective`; report these alongside any
    score. **A task the USD rail truncated is NOT a capability failure.** Read
    `runtime_outcome` in `task_outcome.json` / `result_index.jsonl`: it carries
-   the runtime's own `reason_code` (`budget_exhausted`), a `truncated` flag and
-   the `resource_limit` block. Report truncated tasks separately from honest
-   failures; `max_rounds_effective` alone will not tell you they happened. The
-   current Verified leaderboard standard is 100 steps.
+   the runtime's own `reason_code`, a `truncated` flag and the `resource_limit`
+   block. `truncated` is true for every code in
+   `result_index.RUNTIME_TRUNCATION_REASON_CODES`, which is DERIVED from
+   `ouroboros.outcomes.BEST_EFFORT_REASON_CODES` rather than restated — so the
+   USD rail (`budget_exhausted`), the round cap (`round_limit`) and the
+   loop-local deadline (`deadline_local`) are all covered, and a code the
+   runtime never emits cannot be listed. Report truncated tasks separately from
+   honest failures; `max_rounds_effective` alone will not tell you they
+   happened. The current Verified leaderboard standard is 100 steps.
 5. **Observation modality.** Screenshot-only by DEFAULT: `ax_tree` is disabled
    per task unless `--allow-a11y`. A run with `--allow-a11y` must be reported as
    "Additional a11y tree used: Yes" (the leaderboard separates Screenshot /

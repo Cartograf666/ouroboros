@@ -7,6 +7,8 @@ import pathlib
 import time
 from typing import Any
 
+from ouroboros.outcomes import BEST_EFFORT_REASON_CODES
+
 
 def append_result_index(run_dir: pathlib.Path, row: dict[str, Any]) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -18,12 +20,36 @@ def append_result_index(run_dir: pathlib.Path, row: dict[str, Any]) -> None:
 # finished". A truncated run and an honest failure are otherwise indistinguishable in a
 # benchmark artefact, which is how an aggregator records `2/3` with no indication that a
 # third of the run was cost-truncated. NOT an exhaustive failure taxonomy — only the class
-# an auditor must never mistake for a capability result. SSOT for the vocabulary:
-# `ouroboros.outcomes.BEST_EFFORT_REASON_CODES` + `loop._handle_budget_exceeded`.
-RUNTIME_TRUNCATION_REASON_CODES = frozenset({
-    "budget_exhausted", "max_rounds_exceeded", "task_timeout", "cancelled",
-    "context_exhausted", "provider_unavailable", "llm_api_error", "rate_limited",
+# an auditor must never mistake for a capability result.
+#
+# DERIVED, never restated. The vocabulary lives in the runtime, and a hand-copied mirror
+# beside the check is how this field came to publish four codes the runtime never emits
+# (`max_rounds_exceeded`, `task_timeout`, `context_exhausted`, `rate_limited`) while missing
+# the two it actually uses for the round cap and the local deadline — i.e. the disclosure
+# field added to stop false capability claims was itself asserting `truncated: false` for
+# every round-capped task. `tests/test_benchmark_provenance_v6810.py` carries the drift
+# guard: every literal `reason_code` in `ouroboros/` must have a recorded decision here.
+#
+# Per-code decision for `BEST_EFFORT_REASON_CODES` ("forced finalization may yield a
+# best-effort outcome"). All six are also "must not be read as a capability result", because
+# forced finalization means the attempt was cut short by a rail rather than ended by the
+# agent, so the set is taken whole with no subtraction:
+#   budget_exhausted     loop.py:287   per-task USD reservation rail
+#   round_limit          loop.py:3128  round cap (_handle_round_limit)
+#   finalization_grace   loop.py:3146  supervisor finalize_now grace
+#   deadline_local       loop.py:3220  loop-local deadline
+#   provider_unavailable loop.py:3185  same-model reroute + fallback exhausted
+#   children_unabsorbed  loop.py:4071  forced terminal with child results unabsorbed
+_TRUNCATION_CODES_NOT_BEST_EFFORT = frozenset({
+    # ADDITIVE DELTA, one code. `llm_api_error` (loop_llm_call.py:630) is not a best-effort
+    # code — it terminates without an extracted answer — but it is the same class for an
+    # AUDITOR as provider_unavailable: a transport death, never a fair shot at the task.
+    # Adapters that lack a separate infra channel (the GAIA/OSWorld result rows) would
+    # otherwise publish an affirmative `truncated: false` for it.
+    "llm_api_error",
 })
+
+RUNTIME_TRUNCATION_REASON_CODES = BEST_EFFORT_REASON_CODES | _TRUNCATION_CODES_NOT_BEST_EFFORT
 
 
 def runtime_terminal_disclosure(task_result: Any) -> dict[str, Any]:

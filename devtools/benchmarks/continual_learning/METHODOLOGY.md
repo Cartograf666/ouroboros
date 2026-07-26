@@ -167,8 +167,11 @@ arrives the same way (`clb_docker_runtime_attestation.v6746.patch`): the host
 engine is attested inside `IsolatedServer._wait_ready()`, but the docker engine
 is a thin stand-in that never calls it. The manifest records which path attested
 the run under `extra.runtime_attestation_path`, derived from whether that patch is
-actually applied in the execution clone — an absent attestation is recorded as
-absent (`extra.runtime_attested: false`), never assumed from the `--docker` flag.
+actually applied in the `--runner-path` ADAPTER checkout (which is not the
+execution clone — see §6) — an absent hook is recorded as absent
+(`extra.runtime_attestation_available: false`), never assumed from the `--docker`
+flag. The field says the hook is PRESENT in the tree that will execute, not that
+attestation has already run.
 
 The run's SEED gate is bound to the EXECUTION clone — the `--ouroboros-clone`
 checkout the external adapter boots its agent servers from — not to this
