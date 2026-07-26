@@ -64,3 +64,29 @@ Both ship in the run handoff bundle (`bench-config/`).
 | VM OOM worker kill | `signal 9` in runroot task_results | max_workers 3 + reaper + VM sizing |
 | Host network outage | engine silent, DNS dead | bridge outage-hold + retry 12 |
 | Prose final (payload left in agent workspace) | task `completed`, no parseable JSON | bridge format-repair round (same-container re-emission micro-task, review passes 0) |
+
+## v6.81.0 campaign operational lessons (2026-07-26)
+
+- **Scoring:** only with `analyze_final_results.py` at/after upstream
+  `5f8c50eb` (cohort scale fix, merged 2026-07-19). The pinned checkout's
+  script mixes cohort scales and fabricates a phantom top-1 (+0.2231 vs the
+  real post-fix 0.196). See METHODOLOGY §10.
+- **Multi-seed via bridge is broken for 4/6 domains** (run_index dropped —
+  METHODOLOGY §11). Pre-flight: diff prompt MD5s across seeds before spending.
+- **OpenRouter budget truth:** spendable = min(key limit − usage from
+  `/api/v1/key`, account balance from `/api/v1/credits`). Key limits are not
+  money (precedent: $12k limit on a $2k account nearly killed the campaign).
+  Watchers must print both and alert on the min. Keys shared with parallel
+  campaigns drain between checks.
+- **Live key rotation without restart:** edit `OPENROUTER_API_KEY` in the
+  isolated server's `runner_state/*/data/settings.json`; it is re-read at the
+  next task start, rollout memory survives. After rotation, check the first
+  completed questions for nonzero cost (reward=0 at cost=0 = fail-open
+  poisoning; quarantine and re-run).
+- **Secrets hygiene:** isolated servers snapshot LIVE owner keys into
+  `runner_state/*/data/settings.json` (world-readable by default on a shared
+  host). `chmod 600` after the campaign; never ship `runner_state/` or
+  `clone/` in any bundle.
+- **Interrupted stateful rollouts are not resumable as seeds** (memory state
+  is the measured quantity): a partial domain arm is a write-off, not a
+  top-up. Kill the least-complete arms first when money runs short.

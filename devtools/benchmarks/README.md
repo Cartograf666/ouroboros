@@ -101,6 +101,36 @@ Benchmark changes must be general-purpose harness improvements first. Do not add
 task-specific answers, hidden verifier knowledge, or resource/timeout overrides
 that violate a benchmark's official submission rules.
 
+## Upstream-Drift & Protocol-Fidelity Pre-Flight (MANDATORY before any expensive run)
+
+Four checks, each of which failed at once in the CLB v6.81.0 campaign
+(continual_learning/METHODOLOGY.md §10-§12) and would have cost the whole
+budget if the run had been the submission:
+
+1. **Upstream drift.** Check the external benchmark repo's commits/PRs/issues
+   AFTER our pin (via GitHub API/web; do not fetch into the pinned clone). A
+   metric/scale change can ship as **re-scored reference artifacts with no
+   task-code commit** — when reference artifacts carry two reward copies
+   (top-level vs nested), prove which one the local scorer reads before
+   trusting any number it prints.
+2. **Empirical protocol fidelity.** Verify every protocol parameter by its
+   ARTIFACTS, not its flag. Multi-seed must mean different question orders:
+   diff prompt hashes across seeds BEFORE mass spend (CLB: `--run-index` was
+   accepted and silently dropped on 4/6 domains — five "seeds" were five
+   replicates). This generalizes the "declared vs applied" settings rule to
+   the harness itself.
+3. **Read submission requirements BEFORE the run, not after.** Which arms are
+   mandatory (stateless baseline!), how many seeds, which artifact layout,
+   whether a public implementation link is required — and run in
+   submission-shape via the official runner from the start. Money burned on a
+   non-submittable path converts to a submission only by fabricating
+   provenance, which is prohibited.
+4. **A pinned local scoring script is not ground truth.** Reconcile local
+   normalization against the PUBLIC leaderboard (top-1 value, last-updated
+   date). A mismatch means a convention divergence to be root-caused — not
+   "the other party's numbers are stale". Never compare two systems' raw
+   scores without proving they are on the same scale.
+
 ## LifelongAgentBench Status
 
 `lifelongagentbench` (arXiv 2508.19005) has NO adapter here: the external
