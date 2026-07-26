@@ -155,3 +155,26 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
    `runtime_attestation` lands. On an older clone the patch fails closed with an
    explicit ImportError message naming the requirement, so do not apply it to a
    pre-v6.75.0 bench clone.
+
+## Addendum (v6.81.0, 2026-07-26)
+
+11. `clb_multi_instance_outcomes.v6746.patch` was **regenerated in place** (no new
+    file, same apply order) to publish the RUNTIME's own terminal reason in each
+    `q###/task_outcome.json`. `_write_instance_outcome` gains a keyword-only
+    `runtime_result` and a `runtime_outcome` column projected by a new local
+    `_runtime_terminal_disclosure` helper; the agent-turn call site passes `final`,
+    the co-resolved call site passes nothing (it had no turn, so the row honestly
+    reads `{"available": false}`). WHY: `ouroboros_status` alone cannot carry it —
+    a question the per-task USD reservation rail truncated reports status
+    `failed` exactly like a genuinely wrong answer, so an aggregator could not tell
+    a cost-truncated question from a capability failure. Reward, success and
+    `cost_usd` are untouched; this ADDS disclosure.
+    The helper is a deliberate LOCAL mirror of
+    `devtools.benchmarks.common.result_index.runtime_terminal_disclosure` (the SSOT
+    for the vocabulary) for the same reason `_atomic_write_json` is local: this
+    module lives in the external checkout and only reaches the Ouroboros clone
+    through `_launcher`'s call-time `sys.path` insert. Keep the two in sync.
+    Launcher side (`run_clb.py`, our own code, no patch file):
+    `collect_results` carries `runtime_outcome` into `results.json` /
+    `result_index.jsonl`, defaulting to `{"available": false}` for rows written
+    before this patch — a stated gap, never a silent absence.

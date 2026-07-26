@@ -395,6 +395,30 @@ def model_slot_snapshot(settings_path: pathlib.Path | None = None, *,
     return slots
 
 
+def provider_credential_disclosure(settings_path: pathlib.Path | None = None) -> dict[str, Any]:
+    """Record WHICH provider credentials the described server can reach — by fingerprint.
+
+    ``model_slots`` already says which models a run declared; this says which providers it
+    could actually have spent on, which is not the same fact and is the one a routing
+    fallback can falsify. Reads the settings FILE only: an isolated benchmark server loads
+    its provider credentials from the sanitized settings.json (see
+    ``server_runner.build_isolated_settings``), not from the launcher's own environment.
+    An absent/unreadable settings path yields ``{"available": False}`` — a stated gap, never
+    a silently empty grant list."""
+    from devtools.benchmarks.common.secrets import isolated_credential_grants
+
+    path = pathlib.Path(settings_path) if settings_path else None
+    if not path or not path.exists():
+        return {"available": False, "reason": "settings_path_absent"}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"available": False, "reason": "settings_unreadable"}
+    if not isinstance(loaded, dict):
+        return {"available": False, "reason": "settings_not_an_object"}
+    return {"available": True, **isolated_credential_grants(loaded)}
+
+
 class BenchmarkAdmissionRefused(RuntimeError):
     """A refused admission gate that CARRIES the manifest describing what it refused.
 
@@ -576,6 +600,7 @@ def benchmark_run_manifest(
         "isolated_data_root": str(meta.get("isolated_data_root") or ""),
         "output_paths": meta.get("output_paths") or {},
         "model_slots": model_slot_snapshot(meta_settings_path),
+        "provider_credentials": provider_credential_disclosure(meta_settings_path),
         "source": source,
         "seed_gate": gate,
         "extra": meta.get("extra") or {},

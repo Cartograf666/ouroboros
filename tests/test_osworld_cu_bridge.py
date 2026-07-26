@@ -1451,3 +1451,15 @@ def test_cu_bridge_ledger_row_never_points_at_an_outcome_that_was_not_written(
     assert row["details"]["reward"] == 1.0
     assert any("attempt_outcome" in e for e in row["details"]["publication_errors"]), \
         "the row must carry the collected publication errors"
+    # BOTH SIDES of the same rule. The previous round fixed the ledger row and left the
+    # manifest lying: `_amend_manifest` still added `output_paths.task_outcome`
+    # unconditionally, so the finalized attempt manifest kept naming the missing file. A
+    # pointer is a pointer wherever it is written.
+    attempt_manifests = sorted(
+        (results / "chrome" / "abc" / "attempts").glob("*/task_run_manifest.json"))
+    assert attempt_manifests, "the attempt manifest must still be finalized"
+    manifest = json.loads(attempt_manifests[-1].read_text(encoding="utf-8"))
+    assert "task_outcome" not in (manifest.get("output_paths") or {}), \
+        "the manifest must not point at an artefact whose write failed either"
+    assert (manifest.get("output_paths") or {}).get("attempt_dir"), \
+        "...while the pointer that IS valid survives"

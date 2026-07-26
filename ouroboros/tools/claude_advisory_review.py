@@ -1324,6 +1324,10 @@ def _handle_advisory_pre_review(
     repo_dir = pathlib.Path(ctx.repo_dir)
     drive_root = pathlib.Path(ctx.drive_root)
 
+    # KNOWN ORDERING DEBT (v6.82 backlog, deliberately NOT restructured here): this self-repair
+    # runs ~87 lines AFTER `_release_metadata_preflight`, the gate it exists to satisfy, so with
+    # respect to that gate it is dead code — a desynced version carrier still blocks. Left in
+    # place because reordering runtime review machinery is out of scope for a provenance commit.
     auto_synced_paths = _auto_sync_release_metadata_if_needed(ctx, repo_dir, drive_root, paths)
     if paths is not None and auto_synced_paths:
         paths = sorted({str(p) for p in list(paths) + auto_synced_paths if str(p).strip()})

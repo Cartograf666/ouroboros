@@ -354,6 +354,7 @@ def _process_instance(instance: dict[str, Any], cfg: InstanceRunConfig) -> dict[
                 instance_id=instance_id,
                 status="failed",
                 reason_code=str(task_result.get("reason_code") or "") or "task_not_completed",
+                runtime_result=task_result,
                 prediction_written=False,
                 official_eval_status="not_run",
                 output_paths=output_paths,
@@ -373,6 +374,11 @@ def _process_instance(instance: dict[str, Any], cfg: InstanceRunConfig) -> dict[
             instance_id=instance_id,
             status="completed",
             reason_code="submission_prepared",
+            # The non-completed branch above already publishes the runtime `reason_code`; the
+            # success branch dropped it, so a submission prepared by a cost-truncated run read
+            # exactly like one from a run that finished. `infra_failed` collapses the runtime's
+            # terminal reason to one bool and cannot carry `budget_exhausted` at all.
+            runtime_result=task_result,
             prediction_written=True,
             official_eval_status="not_run",
             output_paths=output_paths,

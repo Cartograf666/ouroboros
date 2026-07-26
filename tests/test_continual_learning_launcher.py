@@ -370,22 +370,29 @@ def test_dry_run_records_seed_escape_and_attestation_path(tmp_path):
     # run is unattested. Naming the patch because `--docker` was passed asserted a provenance
     # check that never ran — the same defect as a manifest naming a model that never ran. The
     # previous form of this assertion pinned that bug: it demanded the false claim.
-    assert extra["runtime_attested"] is False
+    assert extra["runtime_attestation_available"] is False
     assert "UNATTESTED" in extra["runtime_attestation_path"]
     assert extra["adapter_operator_patches"]["patches"][
         "clb_docker_runtime_attestation.v6746"] is False
 
 
-def test_dry_run_claims_attestation_only_when_the_patch_is_in_the_execution_clone(tmp_path):
-    """The mirror: a clone that REALLY carries the hook is recorded as attested.
+def test_attestation_field_claims_availability_not_that_the_check_ran(tmp_path):
+    """The mirror — but it names the fact the probe actually has.
 
-    Both directions matter. Deriving the field from the tree is only correct if it still
-    reports the patched path when the patch is there — otherwise the fix would trade a false
-    claim for a false denial, and an auditor would discount an attested run.
+    Both directions matter: deriving the field from the tree is only correct if it still
+    reports the patched path when the patch is there, otherwise the fix trades a false claim
+    for a false denial. What this test no longer does is call it `runtime_attested`.
+
+    INVERTED BUG-PINNING TEST. The previous form asserted `extra["runtime_attested"] is True`
+    for a DRY RUN against a clone that merely contained an `_attest_runtime` DEFINITION — no
+    container ever started, so nothing was attested. It encoded a false positive as the
+    contract. The probe is a tree probe (owner-approved goal) and the field is now
+    `runtime_attestation_available`, which is exactly what a source scan can establish.
     """
     runner = _fake_runner(tmp_path)
     (runner / "src" / "systems" / "ouroboros" / "_docker_launcher.py").write_text(
         "class DockerOuroborosEngine:\n"
+        "    def __init__(self):\n        self.runtime_attestation: dict = {}\n"
         "    def _attest_runtime(self, clone):\n        pass\n",
         encoding="utf-8")
     clone = _fake_clone(tmp_path)
@@ -398,9 +405,85 @@ def test_dry_run_claims_attestation_only_when_the_patch_is_in_the_execution_clon
     assert rc == 0
     extra = json.loads((Path(json.loads(buf.getvalue())["run_root"]) / "run_manifest.json")
                        .read_text(encoding="utf-8"))["extra"]
-    assert extra["runtime_attested"] is True
+    assert extra["runtime_attestation_available"] is True
+    assert "runtime_attested" not in extra, \
+        "a dry run attested nothing; the manifest must not carry a field claiming it did"
+    assert extra["runtime_attestation_evidence"] == (
+        "static_source_scan of the --runner-path adapter checkout")
     assert "clb_docker_runtime_attestation" in extra["runtime_attestation_path"]
     assert "UNATTESTED" not in extra["runtime_attestation_path"]
+
+
+def test_patch_probe_ignores_bare_env_name_mentions(tmp_path):
+    """A marker must be PATCH-UNIQUE, not a bare env-var name.
+
+    The pinned adapter may legitimately name `OUROBOROS_SAFETY_MODE` or
+    `CLBENCH_SOLVE_DISABLED_TOOLS` in a comment or a docker `-e` passthrough list without the
+    patch being applied. Keying detection on the bare name made the probe false-positive, and
+    the direction is the dangerous one: the manifest would file the knob under
+    `enforced_via_operator_patch` for a run that executed unenforced.
+    """
+    runner = _fake_runner(tmp_path)
+    adapter = runner / "src" / "systems" / "ouroboros"
+    (adapter / "_docker_launcher.py").write_text(
+        "# forwards nothing; the -e list below is just a passthrough\n"
+        'PASSTHROUGH = ["OUROBOROS_SAFETY_MODE", "OUROBOROS_RUNTIME_MODE"]\n'
+        "# see also _attest_runtime in a newer adapter\n",
+        encoding="utf-8")
+    (adapter / "run_clbench_bridge_agent.py").write_text(
+        "# CLBENCH_SOLVE_DISABLED_TOOLS is honored by an operator patch we did not apply\n"
+        "DISABLED_TOOLS: list[str] = []\n",
+        encoding="utf-8")
+    probe = run_clb.adapter_patch_probe(runner)
+    assert probe["patches"] == {
+        "clb_docker_runtime_attestation.v6746": False,
+        "clb_env_campaign_overrides.v6745": False,
+        "clb_disabled_tools_env.v6745": False,
+    }
+    assert probe["evidence"] == "static_source_scan"
+
+
+def test_disabled_tools_gap_is_entrypoint_specific(tmp_path):
+    """`--path standard` never executes the patched bridge module, so the knob is a GAP there.
+
+    Verified against the live adapter: on the standard path the run goes run_benchmark.py ->
+    system.py -> `_docker_launcher.submit()`, which hardcodes `"disabled_tools": []`; only
+    `run_clbench_bridge_agent.py` (bridge) and `_live_bridge.py` pass DISABLED_TOOLS. Keying
+    the verdict purely on the marker filed the knob as ENFORCED on the DEFAULT path against a
+    patched checkout and claimed claude_code_edit was excluded from a task contract that
+    excluded nothing.
+    """
+    runner = _fake_runner(tmp_path)
+    adapter = runner / "src" / "systems" / "ouroboros"
+    clone = _fake_clone(tmp_path)
+    # A genuinely patched bridge module (patch-unique tokens, as the operator's patch writes).
+    (adapter / "run_clbench_bridge_agent.py").write_text(
+        "import os as _os\n"
+        "# Operator patch 2026-07-23: honor CLBENCH_SOLVE_DISABLED_TOOLS from env\n"
+        'DISABLED_TOOLS: list[str] = [t.strip() for t in '
+        '_os.environ.get("CLBENCH_SOLVE_DISABLED_TOOLS", "").split(",") if t.strip()]\n',
+        encoding="utf-8")
+
+    def _fidelity_for(path: str) -> dict:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run_clb.main([
+                "--runner-path", str(runner), "--ouroboros-clone", str(clone),
+                "--path", path, "--allow-dirty-seed", "--dry-run",
+            ])
+        assert rc == 0
+        return json.loads(buf.getvalue())["fidelity"]
+
+    bridge = _fidelity_for("bridge")
+    assert "CLBENCH_SOLVE_DISABLED_TOOLS" in bridge["enforced_via_operator_patch"]
+
+    standard = _fidelity_for("standard")
+    assert "CLBENCH_SOLVE_DISABLED_TOOLS" not in standard["enforced_via_operator_patch"], \
+        "the standard entrypoint never imports the patched bridge module"
+    gap = standard["declared_only_pinned_adapter_gap"]["CLBENCH_SOLVE_DISABLED_TOOLS"]
+    assert "standard" in gap["status"] and "disabled_tools=[]" in gap["status"]
+    # The patch IS present in the checkout — the probe must keep saying so, honestly.
+    assert standard["adapter_operator_patches"]["clb_disabled_tools_env.v6745"] is True
 
 
 def test_fidelity_follows_the_execution_clone_not_the_pinned_commit_constant(tmp_path):
@@ -432,11 +515,22 @@ def test_fidelity_follows_the_execution_clone_not_the_pinned_commit_constant(tmp
         assert knob in unpatched["declared_only_pinned_adapter_gap"]
         assert knob not in unpatched["enforced_via_operator_patch"]
 
-    # Now apply the two forwarding patches' markers, as the operator does before a real run.
+    # Now apply the two forwarding patches, as the operator does before a real run. The
+    # fixtures carry the patches' OWN tokens (comment tag + the exact expression they
+    # introduce), not bare env-var names — see
+    # test_patch_probe_ignores_bare_env_name_mentions for why the difference is load-bearing.
     (adapter / "_docker_launcher.py").write_text(
-        "ov['OUROBOROS_SAFETY_MODE'] = os.environ['OUROBOROS_SAFETY_MODE']\n", encoding="utf-8")
+        "        # Operator env overrides (campaign knobs). Parity defaults stay authoritative\n"
+        '        for _k in ("OUROBOROS_RUNTIME_MODE", "OUROBOROS_REVIEW_ENFORCEMENT",\n'
+        '                   "OUROBOROS_SAFETY_MODE"):\n'
+        "            _v = os.environ.get(_k)\n"
+        "            if _v:\n                ov[_k] = _v\n",
+        encoding="utf-8")
     (adapter / "run_clbench_bridge_agent.py").write_text(
-        "DISABLED_TOOLS = os.environ.get('CLBENCH_SOLVE_DISABLED_TOOLS', '').split(',')\n",
+        "import os as _os\n"
+        "# Operator patch 2026-07-23: honor CLBENCH_SOLVE_DISABLED_TOOLS from env\n"
+        'DISABLED_TOOLS: list[str] = [t.strip() for t in '
+        '_os.environ.get("CLBENCH_SOLVE_DISABLED_TOOLS", "").split(",") if t.strip()]\n',
         encoding="utf-8")
 
     patched = _fidelity_of()

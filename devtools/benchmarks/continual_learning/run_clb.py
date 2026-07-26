@@ -156,38 +156,70 @@ def check_runner(runner: pathlib.Path) -> dict:
 
 
 # Tracked operator patches whose EFFECT this launcher's provenance block describes, each keyed
-# to a marker that only the applied patch puts into the execution clone. See
-# operator_patches/README.md; a patch renamed there must be renamed here in the same commit.
-ADAPTER_PATCH_MARKERS: dict[str, tuple[str, str]] = {
-    "clb_docker_runtime_attestation.v6746": ("_docker_launcher.py", "_attest_runtime"),
-    "clb_env_campaign_overrides.v6745": ("_docker_launcher.py", "OUROBOROS_SAFETY_MODE"),
-    "clb_disabled_tools_env.v6745": ("run_clbench_bridge_agent.py", "CLBENCH_SOLVE_DISABLED_TOOLS"),
+# to markers that only the applied patch puts into the ADAPTER checkout (`--runner-path`, the
+# external continual-learning-bench tree) — NOT the `--ouroboros-clone` execution seed the
+# seed gate binds to; the two are different trees and an operator who patches the wrong one
+# gets an honest "unpatched" report. See operator_patches/README.md; a patch renamed there
+# must be renamed here in the same commit.
+#
+# MARKER-UNIQUENESS REQUIREMENT — do not weaken this. Every token below must be something ONLY
+# the applied patch writes: its own comment tag, a `def` line, the exact expression it
+# introduces. A bare env-var NAME is NOT such a token. The pinned adapter may legitimately
+# mention `OUROBOROS_SAFETY_MODE` or `CLBENCH_SOLVE_DISABLED_TOOLS` in a comment or a `-e`
+# passthrough list without the patch being applied, and the resulting false positive errs in
+# the DANGEROUS direction: the manifest reports `enforced_via_operator_patch` for a run that
+# actually executed unenforced. Every token in the tuple must match, never just one.
+ADAPTER_PATCH_MARKERS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "clb_docker_runtime_attestation.v6746": ("_docker_launcher.py", (
+        "def _attest_runtime(", "self.runtime_attestation")),
+    "clb_env_campaign_overrides.v6745": ("_docker_launcher.py", (
+        "Operator env overrides (campaign knobs)", "_v = os.environ.get(_k)")),
+    "clb_disabled_tools_env.v6745": ("run_clbench_bridge_agent.py", (
+        "Operator patch 2026-07-23: honor CLBENCH_SOLVE_DISABLED_TOOLS",
+        '_os.environ.get("CLBENCH_SOLVE_DISABLED_TOOLS"')),
 }
+
+# Which adapter module each entrypoint actually executes. The bridge entrypoint runs
+# `run_clbench_bridge_agent.py`; `--path standard` (the DEFAULT) goes through
+# `run_benchmark.py` -> `system.py` -> `_docker_launcher.submit()`, which hardcodes
+# `"disabled_tools": []`. A marker in a module the chosen entrypoint never imports says
+# nothing about the run.
+_DISABLED_TOOLS_FORWARDING_ENTRYPOINTS = ("bridge",)
 
 
 def adapter_patch_probe(runner: pathlib.Path) -> dict:
-    """Which tracked operator patches are ACTUALLY present in the execution clone.
+    """Which tracked operator patches are ACTUALLY present in the adapter checkout.
 
     The provenance and fidelity blocks used to describe the patched adapter from CONSTANTS —
-    "``--docker`` was passed, therefore the attestation hook ran; the adapter is the pinned
-    commit, therefore these three knobs are dropped". Both statements are about a tree, and
-    the tree is the thing that was never consulted: the clone is patched (or not) by an
-    operator, out of band, per run. The attestation claim was false on an unpatched clone and
-    the fidelity gap was false on a patched one — the same defect this campaign already fixed
-    where a manifest named a model that never ran.
+    "``--docker`` was passed, therefore the attestation hook is there; the adapter is the
+    pinned commit, therefore these three knobs are dropped". Both statements are about a tree,
+    and the tree is the thing that was never consulted: the adapter subtree is patched (or
+    not) by an operator, out of band, per run.
 
-    So the record is DERIVED, by looking for a marker the applied patch leaves behind. An
+    So the record is DERIVED, by looking for markers the applied patch leaves behind. An
     unreadable or absent adapter file yields ``False``: absent provenance recorded honestly is
     fine, a claimed one that did not happen is not.
+
+    NOTE THE SUBJECT. This probes the ``--runner-path`` ADAPTER subtree (the external
+    continual-learning-bench checkout, ``<runner>/src/systems/ouroboros``), NOT the
+    ``--ouroboros-clone`` execution seed the seed gate binds to. They are different trees;
+    ``adapter_path`` in the returned probe names the one that was read.
+
+    THIS PROBE IS STATIC by design (owner-approved goal: a tree probe). It answers "is the
+    patch in this tree", never "did the effect happen at runtime" — which is why the field it
+    feeds is named ``runtime_attestation_available``, not ``runtime_attested``.
     """
     adapter = pathlib.Path(runner).expanduser().resolve(strict=False) / ADAPTER_REL
-    probe: dict = {"adapter_path": str(adapter), "patches": {}}
-    for name, (filename, marker) in ADAPTER_PATCH_MARKERS.items():
-        try:
-            applied = marker in (adapter / filename).read_text(encoding="utf-8")
-        except OSError:
-            applied = False
-        probe["patches"][name] = applied
+    probe: dict = {"adapter_path": str(adapter), "evidence": "static_source_scan", "patches": {}}
+    sources: dict[str, str] = {}
+    for name, (filename, markers) in ADAPTER_PATCH_MARKERS.items():
+        if filename not in sources:
+            try:
+                sources[filename] = (adapter / filename).read_text(encoding="utf-8")
+            except OSError:
+                sources[filename] = ""
+        text = sources[filename]
+        probe["patches"][name] = bool(text) and all(marker in text for marker in markers)
     return probe
 
 
@@ -240,33 +272,39 @@ def _fidelity_report(settings: dict, args: argparse.Namespace,
     """
     disabled = list(settings.get("CLBENCH_SOLVE_DISABLED_TOOLS") or [])
     applied = dict((patch_probe or {}).get("patches") or {})
+    # ONE marker for the three env knobs is CORRECT, not a shortcut: the campaign-override
+    # patch adds OUROBOROS_RUNTIME_MODE, OUROBOROS_REVIEW_ENFORCEMENT and OUROBOROS_SAFETY_MODE
+    # in a single loop in a single hunk, so they arrive together or not at all.
     # The host engine boots a real `IsolatedServer`, which inherits the launcher's env, so the
-    # two env knobs are enforced there whether or not the docker-only patch is applied.
+    # env knobs are enforced there whether or not the docker-only patch is applied.
     env_knobs_forwarded = (not args.docker) or bool(applied.get("clb_env_campaign_overrides.v6745"))
-    tools_forwarded = bool(applied.get("clb_disabled_tools_env.v6745"))
+    # ENTRYPOINT-SPECIFIC. The patch lives in `run_clbench_bridge_agent.py`, which ONLY the
+    # bridge entrypoint executes. On the DEFAULT `--path standard` the run goes
+    # run_benchmark.py -> system.py -> `_docker_launcher.submit()`, which hardcodes
+    # `"disabled_tools": []`; `system.py` never mentions the list at all. Keying purely on the
+    # marker therefore filed the knob as ENFORCED on the default path against a patched clone
+    # and claimed every declared tool — claude_code_edit included — was excluded from the task
+    # contract, for a run whose executed path excluded nothing. Overstating enforcement is the
+    # dangerous direction, and it is exactly the class this fix exists to remove.
+    tools_forwarded = (bool(applied.get("clb_disabled_tools_env.v6745"))
+                       and args.path in _DISABLED_TOOLS_FORWARDING_ENTRYPOINTS)
     enforced: dict = {}
     gap: dict = {}
-    (enforced if env_knobs_forwarded else gap)["OUROBOROS_SAFETY_MODE"] = {
-        "declared": settings.get("OUROBOROS_SAFETY_MODE"),
-        "status": ("exported in env and applied in-container by operator patch "
+    _env_status = ("exported in env and applied in-container by operator patch "
                    "clb_env_campaign_overrides.v6745 (docker engine `_overrides`)"
                    if args.docker else
                    "exported in env — effective on the HOST engine path "
-                   "(IsolatedServer inherits env)")
-        if env_knobs_forwarded else
-        ("exported in env, but the docker engine forwards only an explicit -e list and DROPS "
-         "it: operator patch clb_env_campaign_overrides.v6745 is NOT applied in this clone"),
+                   "(IsolatedServer inherits env)") if env_knobs_forwarded else (
+        "exported in env, but the docker engine forwards only an explicit -e list and DROPS "
+        "it: operator patch clb_env_campaign_overrides.v6745 is NOT applied in this adapter "
+        "checkout")
+    (enforced if env_knobs_forwarded else gap)["OUROBOROS_SAFETY_MODE"] = {
+        "declared": settings.get("OUROBOROS_SAFETY_MODE"),
+        "status": _env_status,
     }
     (enforced if env_knobs_forwarded else gap)["OUROBOROS_REVIEW_ENFORCEMENT"] = {
         "declared": settings.get("OUROBOROS_REVIEW_ENFORCEMENT"),
-        "status": ("exported in env and applied in-container by operator patch "
-                   "clb_env_campaign_overrides.v6745 (docker engine `_overrides`)"
-                   if args.docker else
-                   "exported in env — effective on the HOST engine path "
-                   "(IsolatedServer inherits env)")
-        if env_knobs_forwarded else
-        ("exported in env, but the docker engine forwards only an explicit -e list and DROPS "
-         "it: operator patch clb_env_campaign_overrides.v6745 is NOT applied in this clone"),
+        "status": _env_status,
     }
     (enforced if tools_forwarded else gap)["CLBENCH_SOLVE_DISABLED_TOOLS"] = {
         "declared": disabled,
@@ -275,12 +313,21 @@ def _fidelity_report(settings: dict, args: argparse.Namespace,
                    "declared tool — including claude_code_edit — is excluded from the task "
                    "contract")
         if tools_forwarded else
-        ("exported in env as a comma list; operator patch clb_disabled_tools_env.v6745 is NOT "
-         "applied in this clone, so the pinned adapter submits tasks WITHOUT disabled_tools "
-         "(no claude_code_edit exclusion)"),
+        ((f"exported in env as a comma list, but this run uses --path {args.path} "
+          "(run_benchmark.py -> system.py -> _docker_launcher.submit, which hardcodes "
+          "disabled_tools=[]); operator patch clb_disabled_tools_env.v6745 patches "
+          "run_clbench_bridge_agent.py, which that entrypoint never executes")
+         if applied.get("clb_disabled_tools_env.v6745") else
+         ("exported in env as a comma list; operator patch clb_disabled_tools_env.v6745 is NOT "
+          "applied in this clone, so the pinned adapter submits tasks WITHOUT disabled_tools "
+          "(no claude_code_edit exclusion)")),
     }
     return {
+        # STATIC availability of each tracked patch in the `--runner-path` ADAPTER checkout —
+        # NOT a claim that any of them ran. The full probe (adapter_path, evidence) is recorded
+        # separately at `extra.adapter_operator_patches`; METHODOLOGY §6 names both.
         "adapter_operator_patches": applied,
+        "adapter_operator_patches_evidence": "static_source_scan",
         "enforced_via_operator_patch": enforced,
         "declared_only_pinned_adapter_gap": gap,
         "enforced_via_runner_interface": {
@@ -466,6 +513,7 @@ def collect_results(run_dir: pathlib.Path) -> dict:
                 "reward": None,
                 "success": None,
                 "ouroboros_status": "external_runner_sidecar_only",
+                "runtime_outcome": {"available": False},
                 "cost_usd": None,
             })
     for cond_name in sorted(set(found_condition_names) | set(expected_conditions)):
@@ -502,6 +550,14 @@ def collect_results(run_dir: pathlib.Path) -> dict:
                     "success": row.get("success"),
                     "ouroboros_status": str(row.get("ouroboros_status") or ""),
                     "cost_usd": row.get("cost_usd"),
+                    # The RUNTIME's own terminal reason, written by operator patch
+                    # clb_multi_instance_outcomes.v6746. `ouroboros_status` cannot carry
+                    # it: a question the per-task USD rail truncated says "failed" exactly
+                    # like a genuinely wrong answer. Rows written before that patch carry
+                    # no such key, so the gap is STATED rather than assumed absent.
+                    "runtime_outcome": (row.get("runtime_outcome")
+                                        if isinstance(row.get("runtime_outcome"), dict)
+                                        else {"available": False}),
                 })
         for expected in expected_ids:
             domain, _, qid = expected.partition(":")
@@ -516,6 +572,7 @@ def collect_results(run_dir: pathlib.Path) -> dict:
                     "success": None,
                     "ouroboros_status": "missing_outcome",
                     "cost_usd": None,
+                    "runtime_outcome": {"available": False},
                 })
         scored = [r for r in rewards.values() if r is not None]
         conditions[cond_name] = {
@@ -713,7 +770,7 @@ def main(argv: list[str] | None = None) -> int:
                                      else "launcher_checkout_dry_run"),
                 "execution_clone": str(execution_clone) if execution_clone is not None else "",
                 # `runtime_attestation_path` is NOT claimed here. On the docker path it is a
-                # fact about the execution clone (is the operator patch applied?), and a
+                # fact about the ADAPTER checkout (is the operator patch applied?), and a
                 # filesystem probe may not run before `admit_benchmark_run`. It is derived
                 # post-admission and attached to the retained manifest, next to `fidelity`.
                 "report_grade": "local_low_seed" if (args.runs < 5 or args.path == "bridge") else "leaderboard_shape",
@@ -782,30 +839,36 @@ def main(argv: list[str] | None = None) -> int:
                                "planned_invocations": plans,
                                "settings_template": str(pathlib.Path(args.settings).expanduser()),
                                "settings_derived": str(rendered_path)}
-        # Where the runtime attestation for THIS run comes from — derived, never assumed. The
-        # host engine is attested inside `IsolatedServer._wait_ready()`. The docker engine is a
-        # thin stand-in that never calls it, so its attestation exists only if the tracked
-        # operator patch is applied in the clone that will execute (README.md item 10). Naming
-        # the patch because `--docker` was passed asserted a check that had not run.
-        attested = bool(patch_probe["patches"]["clb_docker_runtime_attestation.v6746"])
+        # NAME THE FACT YOU HAVE. This is a TREE probe (owner-approved goal): it establishes
+        # that the attestation hook is PRESENT in the adapter checkout the run will execute,
+        # which is not the same claim as "attestation ran" — a dry run establishes it without a
+        # container ever starting. The field is therefore `runtime_attestation_available`, and
+        # the enforcement itself still lives where it belongs: the hook fails the run closed on
+        # skew / unreachable runtime / unknown commit, before any paid task.
+        hook_available = bool(patch_probe["patches"]["clb_docker_runtime_attestation.v6746"])
         manifest["extra"].update({
             "solve_model": _litellm_model(args.model),
             "fidelity": fidelity,
             "adapter_operator_patches": patch_probe,
             "runtime_attestation_path": (
                 ("docker engine: operator_patch clb_docker_runtime_attestation.v6746 "
-                 "(DockerOuroborosEngine._attest_runtime, post-health, pre-solve)" if attested else
+                 "(DockerOuroborosEngine._attest_runtime, post-health, pre-solve)"
+                 if hook_available else
                  "NONE: the docker engine never calls IsolatedServer._wait_ready() and operator "
-                 "patch clb_docker_runtime_attestation.v6746 is NOT applied in the execution "
-                 "clone — THIS RUN IS UNATTESTED")
+                 "patch clb_docker_runtime_attestation.v6746 is NOT applied in the "
+                 "--runner-path ADAPTER checkout (not the --ouroboros-clone seed) — "
+                 "THIS RUN IS UNATTESTED")
                 if args.docker else
                 "host engine: IsolatedServer._wait_ready()"
             ),
-            "runtime_attested": (not args.docker) or attested,
+            "runtime_attestation_available": (not args.docker) or hook_available,
+            "runtime_attestation_evidence": (
+                "static_source_scan of the --runner-path adapter checkout" if args.docker
+                else "in-tree IsolatedServer._wait_ready (no operator patch involved)"),
             "provider_env_present": redacted_env_summary(child_env),
         })
-        if args.docker and not attested:
-            print("[clb] WARNING: docker path with NO runtime attestation — operator patch "
+        if args.docker and not hook_available:
+            print("[clb] WARNING: docker path with NO runtime attestation hook — operator patch "
                   "clb_docker_runtime_attestation.v6746 is not applied in "
                   f"{patch_probe['adapter_path']}; the run's provenance records this honestly "
                   "rather than claiming a check that did not run.", file=sys.stderr)

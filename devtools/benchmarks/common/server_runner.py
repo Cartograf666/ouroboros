@@ -31,6 +31,8 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
 from devtools.benchmarks.common.manifests import runtime_attestation
+from devtools.benchmarks.common.secrets import isolated_credential_grants  # noqa: F401 (re-export)
+from ouroboros.provider_models import ALL_PROVIDER_CREDENTIAL_KEYS, provider_credential_plan
 from ouroboros.platform_layer import (
     kill_pid_tree,
     subprocess_new_group_kwargs,
@@ -63,16 +65,14 @@ STALE_INHERITED_ENV_KEYS = (
 # credentials/endpoints, model slots, effort, and budget. Owner/control secrets and knobs
 # (GITHUB_TOKEN, OUROBOROS_NETWORK_PASSWORD, transport/skill secrets, owner chat ids, etc.)
 # are NEVER copied — the isolated data root is readable by untrusted benchmark tasks.
-# Model-slot / effort / local-model / gigachat-provider key families (all are model or
-# provider config — safe to copy). GIGACHAT_* covers its credentials+endpoint+scope.
-_ISO_SETTINGS_ALLOW_PREFIX = ("OUROBOROS_MODEL", "OUROBOROS_EFFORT", "LOCAL_MODEL_", "GIGACHAT_")
-# EXPLICIT provider creds/endpoints + review/budget keys. Deliberately NOT a `*_API_KEY`
-# pattern: a custom skill secret could be named `<x>_API_KEY` and must NOT be copied.
+# Model-slot / effort / local-model key families (all are model config — safe to copy).
+# NOTE the absent `GIGACHAT_` prefix: every provider credential family, GigaChat's included,
+# is gated on the run's DECLARED slots below instead of riding an unconditional prefix.
+_ISO_SETTINGS_ALLOW_PREFIX = ("OUROBOROS_MODEL", "OUROBOROS_EFFORT", "LOCAL_MODEL_")
+# NON-credential review/budget/model keys. Provider credentials are deliberately NOT here —
+# see _grant_provider_credentials. Deliberately NOT a `*_API_KEY` pattern either: a custom
+# skill secret could be named `<x>_API_KEY` and must NOT be copied.
 _ISO_SETTINGS_ALLOW_EXACT = frozenset({
-    "OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL",
-    "OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_BASE_URL",
-    "CLOUDRU_FOUNDATION_MODELS_API_KEY", "CLOUDRU_FOUNDATION_MODELS_BASE_URL",
-    "ANTHROPIC_API_KEY",
     "OUROBOROS_WEBSEARCH_MODEL", "OUROBOROS_REVIEW_MODELS",
     "OUROBOROS_SCOPE_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODEL",
     # Review policy knobs (non-secret): must propagate so settings.json's task-acceptance
@@ -110,17 +110,38 @@ def _is_secret_env_key(key: str) -> bool:
 
 
 def build_isolated_settings(live_cfg: dict, **overrides) -> dict:
-    """Build an isolated benchmark settings.json from live settings, copying ONLY the
-    EXPLICIT provider/model/budget allowlist above (never owner/control secrets like
-    GITHUB_TOKEN / OUROBOROS_NETWORK_PASSWORD / transport / skill secrets / owner knobs),
-    then applying explicit isolated overrides. The isolated data root is reachable by
-    untrusted benchmark tasks, so this is the hermetic 'provider keys + model slots only' seed."""
+    """Build an isolated benchmark settings.json from live settings: copy the non-credential
+    model/effort/budget/review allowlist above, apply the explicit isolated overrides, and
+    then grant ONLY the provider credentials the resulting run's DECLARED model slots need.
+
+    Owner/control secrets (GITHUB_TOKEN, OUROBOROS_NETWORK_PASSWORD, transport/skill secrets,
+    owner knobs) were never copied and still are not. What changes here is narrower and was
+    the real defect: the copied provider set used to be a function of whatever happened to be
+    in the live settings file at launch, so a run pinned to OpenRouter still received direct
+    ANTHROPIC_API_KEY / OPENAI_API_KEY / Cloud.ru / GigaChat credentials. A routing fallback
+    could then spend outside the declared bucket while the manifest said otherwise, and two
+    nominally identical runs could reach different providers invisibly — a pinned seed that
+    pins the code but not the environment is not reproducible.
+
+    Credentials travel in whole GROUPS (``PROVIDER_CREDENTIAL_GROUPS``), so a key never
+    arrives without the endpoint/auth fields it is useless without (GigaChat
+    CREDENTIALS+PASSWORD+endpoint+scope, Cloud.ru key+base_url). An explicit override always
+    wins over the derived grant. Use ``isolated_credential_grants`` on the RESULT to record
+    what was granted."""
     out: dict = {}
     for key, value in (live_cfg or {}).items():
         ks = str(key)
+        if ks in ALL_PROVIDER_CREDENTIAL_KEYS:
+            continue  # gated below on the declared slots, never copied wholesale
         if ks in _ISO_SETTINGS_ALLOW_EXACT or ks.startswith(_ISO_SETTINGS_ALLOW_PREFIX):
             out[ks] = value
     out.update(overrides)
+    for key in provider_credential_plan(out)["planned_keys"]:
+        if key in (overrides or {}):
+            continue
+        value = (live_cfg or {}).get(key)
+        if value not in (None, ""):
+            out[key] = value
     return out
 
 

@@ -364,9 +364,16 @@ def _run_prediction_rows(
                     instance_id=instance_id,
                     status="completed",
                     reason_code="patch_generated",
+                    # A patch produced under `budget_exhausted` used to be indistinguishable
+                    # from a clean completion: the failure branches above already publish the
+                    # runtime `reason_code`, the SUCCESS branch dropped it for a hard-coded
+                    # adapter-stage literal. The patch is still real and still scored — this
+                    # only says how the runtime stopped producing it.
+                    runtime_result=task_result,
                     prediction_written=True,
                     official_eval_status="pending",
-                    output_paths={"prediction_jsonl": str(output_path)},
+                    output_paths={"prediction_jsonl": str(output_path),
+                                  "task_result": str(result_json_path)},
                     details={"patch_bytes": len(result.stdout.encode("utf-8", errors="replace"))},
                 )
             )

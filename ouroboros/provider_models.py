@@ -36,6 +36,48 @@ MODEL_PROVIDER_CREDENTIAL_KEYS: frozenset[str] = frozenset({
     "GIGACHAT_PASSWORD",
 })
 
+# EVERY env/settings key ``llm.LLM._resolve_remote_target`` reads for a provider, GROUPED so
+# a credential and the fields it is useless without travel together or not at all (GigaChat
+# needs CREDENTIALS *or* USER+PASSWORD plus its endpoint/scope; Cloud.ru's key is meaningless
+# against the wrong base_url; the openai-compatible lane legitimately falls back to the legacy
+# OPENAI_* pair).  Deriving a per-run credential set from anything but this table is guessing:
+# `anthropic/claude-sonnet-4.6` is an OPENROUTER model id, only `anthropic::…` is direct.
+PROVIDER_CREDENTIAL_GROUPS: dict[str, tuple[str, ...]] = {
+    "openrouter": ("OPENROUTER_API_KEY",),
+    "openai": ("OPENAI_API_KEY",),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "cloudru": ("CLOUDRU_FOUNDATION_MODELS_API_KEY", "CLOUDRU_FOUNDATION_MODELS_BASE_URL"),
+    "gigachat": (
+        "GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD", "GIGACHAT_USER",
+        "GIGACHAT_BASE_URL", "GIGACHAT_SCOPE", "GIGACHAT_VERIFY_SSL_CERTS",
+    ),
+    "openai-compatible": (
+        "OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_BASE_URL",
+        "OPENAI_API_KEY", "OPENAI_BASE_URL",
+    ),
+    "local": (),
+}
+
+# Settings keys that hold a ROUTED model identity (prefix -> provider via provider_for_model).
+# Superset of the live slots; a key absent from settings still declares whatever
+# ``config.SETTINGS_DEFAULTS`` will hand the runtime, which is why declared_model_settings()
+# fills the defaults in rather than treating "unset" as "unused".
+MODEL_SETTING_KEYS: tuple[str, ...] = (
+    "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT",
+    "OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS",
+    "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_FALLBACK",
+    "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "OUROBOROS_WEBSEARCH_MODEL",
+    "OUROBOROS_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODELS",
+    "OUROBOROS_SCOPE_REVIEW_MODEL",
+)
+
+# Settings keys whose value is a Claude Agent SDK / Claude Code model NAME (``opus[1m]``),
+# NOT a routed model identity: they carry no provider prefix, so provider_for_model would
+# mis-route them to OpenRouter.  Their transport is the Anthropic SDK subprocess, which
+# authenticates with ANTHROPIC_API_KEY (tools/shell.py claude_code_edit,
+# tools/claude_advisory_review.py), so a non-empty value DECLARES the anthropic provider.
+CLAUDE_SDK_MODEL_SETTING_KEYS: tuple[str, ...] = ("CLAUDE_CODE_MODEL", "CLAUDE_AGENT_SDK_MODEL")
+
 
 def provider_for_model(model: str) -> str:
     """Return the execution provider for a model id (``local`` for local lanes)."""
@@ -97,6 +139,85 @@ def resolve_credentialed_model(default_model: str) -> str:
         if model_has_credentials(candidate):
             return candidate
     return default_model
+
+
+def declared_model_settings(settings: dict) -> dict[str, str]:
+    """Return the model slots a settings mapping DECLARES, with runtime defaults filled in.
+
+    An absent or empty slot is not "unused": the server falls back to
+    ``config.SETTINGS_DEFAULTS`` for it, so the default's provider is genuinely reachable and
+    must be declared.  Lazy config import (config imports this module)."""
+    from ouroboros.config import SETTINGS_DEFAULTS
+
+    declared: dict[str, str] = {}
+    for key in (*MODEL_SETTING_KEYS, *CLAUDE_SDK_MODEL_SETTING_KEYS):
+        value = str((settings or {}).get(key) or "").strip()
+        if not value:
+            value = str(SETTINGS_DEFAULTS.get(key) or "").strip()
+        if value:
+            declared[key] = value
+    return declared
+
+
+def providers_for_declared_models(declared: dict) -> dict[str, list[str]]:
+    """Map ``{settings key: model string}`` to ``{provider: sorted model strings}``.
+
+    Comma chains (fallbacks, review triads) are expanded; the Claude-SDK slots resolve to
+    ``anthropic`` by transport rather than by prefix."""
+    found: dict[str, set] = {}
+    for key, raw in (declared or {}).items():
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        if str(key) in CLAUDE_SDK_MODEL_SETTING_KEYS:
+            found.setdefault("anthropic", set()).add(text)
+            continue
+        for part in text.split(","):
+            model = part.strip()
+            if model:
+                found.setdefault(provider_for_model(model), set()).add(model)
+    return {provider: sorted(models) for provider, models in sorted(found.items())}
+
+
+def credential_keys_for_providers(providers) -> tuple[str, ...]:
+    """Return the ordered, de-duplicated credential keys a provider set needs."""
+    keys: list[str] = []
+    for provider in providers:
+        group = PROVIDER_CREDENTIAL_GROUPS.get(str(provider))
+        if group is None:
+            # Unknown provider: fail OPEN with its primary key rather than silently
+            # handing a run no credential at all.
+            group = tuple(filter(None, (PROVIDER_ENV_KEYS.get(str(provider), ""),)))
+        for key in group:
+            if key not in keys:
+                keys.append(key)
+    return tuple(keys)
+
+
+ALL_PROVIDER_CREDENTIAL_KEYS: frozenset[str] = frozenset(
+    key for group in PROVIDER_CREDENTIAL_GROUPS.values() for key in group
+)
+
+
+def provider_credential_plan(settings: dict) -> dict:
+    """Derive WHICH provider credentials a settings mapping's declared models actually need.
+
+    Returns ``{declared_model_slots, providers, planned_keys, fail_open}``.  ``fail_open`` is
+    the disclosed escape hatch: when nothing resolves (a settings mapping with no model slot
+    at all) the plan is the FULL credential universe, because a benchmark that dies on a
+    missing key at hour six is worse than one that carries a spare."""
+    declared = declared_model_settings(settings)
+    providers = providers_for_declared_models(declared)
+    planned = credential_keys_for_providers(providers)
+    fail_open = not planned
+    if fail_open:
+        planned = tuple(sorted(ALL_PROVIDER_CREDENTIAL_KEYS))
+    return {
+        "declared_model_slots": declared,
+        "providers": providers,
+        "planned_keys": sorted(planned),
+        "fail_open": fail_open,
+    }
 
 
 OPENAI_DIRECT_DEFAULTS = {

@@ -172,11 +172,13 @@ def test_report_grade_k5_not_valid_is_local():
 
 # --- disclosure ledger ----------------------------------------------------------
 
-def _write_trial(d: pathlib.Path, task: str, reward, exc=None, reason=None):
+def _write_trial(d: pathlib.Path, task: str, reward, exc=None, reason=None, truncated=False):
     d.mkdir(parents=True, exist_ok=True)
     meta = {"turns": 3}
     if reason is not None:
-        meta["summary"] = {"reason_code": reason, "infra_failed": False}
+        meta["summary"] = {"reason_code": reason, "infra_failed": False, "truncated": truncated,
+                           "resource_limit": ({"status": "resource_limited", "scope": "root"}
+                                              if truncated else {})}
     (d / "result.json").write_text(json.dumps({
         "task_name": task, "trial_name": d.name,
         "verifier_result": {"rewards": {"reward": reward}},
@@ -207,6 +209,29 @@ def test_disclosure_ledger_provider_unavailable_vs_cancellation(tmp_path):
     assert led["provider_or_infra_failure_count"] == 1  # only p1 (genuine mid-run provider death)
     assert led["wall_clock_cancellation_count"] == 1  # only p2 (teardown artifact)
     assert led["genuine_failure_count"] == 0
+
+
+def test_disclosure_ledger_separates_cost_truncation_from_a_fair_shot_wrong_answer(tmp_path):
+    """A trial the RUNTIME's own resource rail stopped is not a `genuine` failure.
+
+    `genuine` asserts a FAIR SHOT — reward 0 having reached a real terminal. A trial cut off
+    by the per-task USD reservation bound (a worst-case estimate that reached the rail at
+    $0.45 of actual spend in the v6.81.0 OSWorld smoke) never got one, and counting it as a
+    wrong answer overstates the failure as a capability result. It is not provider/infra
+    either: nothing was unavailable.
+    """
+    jobs = tmp_path / "job"
+    _write_trial(jobs / "b1", "alpha", 0.0, reason="budget_exhausted", truncated=True)
+    _write_trial(jobs / "b2", "beta", 0.0)  # a real fair-shot wrong answer
+    led = run_tb.write_disclosure_ledger(jobs_dir=jobs, out_path=tmp_path / "led.json", run_meta={})
+    assert led["cost_truncated_count"] == 1
+    assert led["genuine_failure_count"] == 1  # b2 only
+    assert led["provider_or_infra_failure_count"] == 0
+    assert led["wall_clock_cancellation_count"] == 0
+    truncated_row = next(t for t in led["trials"] if t["task_name"] == "alpha")
+    assert truncated_row["truncated"] is True
+    assert truncated_row["resource_limit"]["scope"] == "root"
+    assert "cost_truncated" in led["exception_note"]
 
 
 def test_disclosure_ledger_counts(tmp_path):

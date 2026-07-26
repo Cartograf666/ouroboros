@@ -654,6 +654,11 @@ def write_disclosure_ledger(*, jobs_dir: pathlib.Path, out_path: pathlib.Path, r
             "exception_type": exception_type,
             "reason_code": adapter_summary.get("reason_code"),
             "infra_failed": bool(adapter_summary.get("infra_failed")),
+            # The runtime's own cost/round/context truncation, forwarded by the adapter
+            # summary. Without it a trial the per-task USD rail stopped is counted as a
+            # fair-shot wrong answer, which is a claim about capability that never happened.
+            "truncated": bool(adapter_summary.get("truncated")),
+            "resource_limit": adapter_summary.get("resource_limit") or {},
             "captured_after_cancellation": captured_after_cancellation,
             "cost_usd": agent_result.get("cost_usd"),
             "turns": agent_meta.get("turns"),
@@ -695,6 +700,11 @@ def write_disclosure_ledger(*, jobs_dir: pathlib.Path, out_path: pathlib.Path, r
                          post-cancellation network teardown (captured_after_cancellation) -- the
                          harness cut egress at the finish line, the agent's own finalization LLM call
                          died on DNS, and the real outcome was masked.
+        'cost_truncated' the RUNTIME stopped the trial on its own resource rail (per-task USD
+                         reservation / round cap / context cap) rather than on an answer. Not
+                         provider_infra (nothing was unavailable) and emphatically not 'genuine':
+                         'genuine' asserts a FAIR SHOT, and a trial cut off at $0.45 of actual
+                         spend by a worst-case reservation bound did not get one.
         'genuine'        reward 0 having reached a real terminal (final_message / tool_failure / ...)
                          -- a fair-shot wrong answer. NOTE: captured_after_cancellation is NOT used to
                          route here; it is set broadly on teardown, including on trials that DID emit
@@ -710,6 +720,10 @@ def write_disclosure_ledger(*, jobs_dir: pathlib.Path, out_path: pathlib.Path, r
             return "provider_infra"     # setup timeout / nonzero exit / transport: real infra fault.
         if t.get("infra_failed"):
             return "provider_infra"
+        if t.get("truncated") and t.get("reason_code") not in _provider_reasons:
+            # Runtime resource rail. Ordered AFTER the infra checks (an infra fault that also
+            # tripped a rail is still an infra fault) and BEFORE 'genuine'.
+            return "cost_truncated"
         if t.get("reason_code") in _provider_reasons:
             # Provider reason WITH the teardown flag == masked harness cancellation, not a real
             # provider fault; WITHOUT it == a genuine mid-run provider/network death.
@@ -742,10 +756,14 @@ def write_disclosure_ledger(*, jobs_dir: pathlib.Path, out_path: pathlib.Path, r
         "api_rate_limit_error_count": int(exception_histogram.get("ApiRateLimitError", 0)),
         "provider_or_infra_failure_count": int(provider_or_infra_failures),
         "wall_clock_cancellation_count": int(categories["cancelled"]),
+        "cost_truncated_count": int(categories["cost_truncated"]),
         "genuine_failure_count": int(categories["genuine"]),
         "exception_note": (
             "Honest taxonomy: every reward-0 trial is exactly one of provider_or_infra_failure / "
-            "wall_clock_cancellation / genuine_failure (reward-1 trials are 'pass'). agent_timeout_count "
+            "wall_clock_cancellation / cost_truncated / genuine_failure (reward-1 trials are 'pass'). "
+            "cost_truncated is the RUNTIME's own resource rail (per-task USD reservation, round cap, "
+            "context cap): nothing was unavailable and no answer was reached, so it is neither infra "
+            "nor a fair-shot wrong answer. agent_timeout_count "
             "is the Harbor-named subset. A provider reason_code (e.g. provider_unavailable) only counts as "
             "provider_or_infra when it was NOT a post-cancellation teardown artifact: the harness cuts "
             "container egress at the finish line, so an agent's own finalization/summary LLM calls die on "
@@ -764,6 +782,7 @@ def write_disclosure_ledger(*, jobs_dir: pathlib.Path, out_path: pathlib.Path, r
         f"{ledger['agent_timeout_count']} AgentTimeoutError, "
         f"{ledger['provider_or_infra_failure_count']} provider/infra, "
         f"{ledger['wall_clock_cancellation_count']} wall-clock-cancelled, "
+        f"{ledger['cost_truncated_count']} cost-truncated, "
         f"{ledger['genuine_failure_count']} genuine failures -> {out_path}"
     )
     return ledger

@@ -161,6 +161,29 @@ final-state-only numbers; say so. Preflight-blocked and adapter-error tasks
 stay in the denominator via `result_index.jsonl` (`status=blocked` /
 `adapter_error`).
 
+**Do NOT score by filtering `result_index.jsonl` rows on `status == "completed"`.**
+`status` is a claim about the RECORD, not about the evaluation:
+
+- `status="partially_published"` means the score was obtained and the official
+  evaluation really ran, but at least one destination (the outcome sidecar, the
+  manifest amendment, the ledger) could not be written. The status the run
+  reached is preserved verbatim in `details.outcome_status`, and
+  `details.publication_errors` lists the gap. Filtering on `status` silently
+  drops these SCORED rows.
+- `output_paths.task_outcome` MAY BE ABSENT. The pointer is emitted only when
+  that write actually succeeded — a row naming a path that does not exist is
+  worse than one naming none, because a reader cannot distinguish it from a
+  file deleted later. The finalized attempt manifest follows the same rule.
+- `runtime_outcome` (see §7.4) carries the RUNTIME's own terminal reason,
+  independently of the adapter-stage `status`/`reason_code`. A cost-truncated
+  task publishes `status="completed"`, `reason_code="official_evaluate"` and
+  `runtime_outcome.reason_code="budget_exhausted"`, `truncated=true` — all
+  three are true at once and the artefact must be read that way.
+
+Score from `details.reward` / `official_eval_status` (which are deliberately
+never demoted by a publication failure), and use `status` only to judge how
+complete the record is.
+
 A refused runtime attestation keeps its EVIDENCE: all three launchers catch
 `RuntimeAttestationRefused` and persist the record it carries (the exact typed
 reason plus `runtime_version`, `repo_head`, `repo_version`) under
@@ -210,14 +233,33 @@ leaderboard run without the disclosures below.
    iff the last recorded action is `FAIL`, so this matches the official
    semantics; a `FAIL` on a feasible task scores 0. Detection reads only the
    terminal answer (never intermediate reasoning) to avoid spurious flips.
-4. **Budget is rounds + wall-clock, NOT leaderboard steps.** There is no
-   per-task step cap; the budget is the bench server's `OUROBOROS_MAX_ROUNDS`
-   (default 200) plus `--task_timeout_sec`. A leaderboard "step" is one model
-   turn (which may batch several pyautogui actions); an Ouroboros round is not
-   step-equivalent. `task_outcome.json` records `budget_counters`
-   (`llm_rounds`, `screenshots`, `gui_action_calls`, `remote_exec_calls`) and
-   `max_rounds_effective`; report these alongside any score. The current
-   Verified leaderboard standard is 100 steps.
+4. **Budget is rounds + wall-clock + a per-task USD rail, NOT leaderboard
+   steps.** There is no per-task STEP cap. There are THREE caps, and the one
+   that binds in practice is the third:
+   - the bench server's `OUROBOROS_MAX_ROUNDS` (default 200);
+   - `--task_timeout_sec` wall clock;
+   - **the runtime's per-task USD reservation rail**
+     (`OUROBOROS_PER_TASK_COST_USD`, enforced by
+     `usage_accounting.reserve_attempt`: it refuses when
+     `root_accounted + reservation_upper_bound > root_limit_usd`). The bound is
+     a WORST-CASE estimate that grows with multimodal context, so on a
+     screenshot-heavy OSWorld task it reaches the rail far below actual spend —
+     in the v6.81.0 smoke it tripped a $6.00 rail at **$0.45 of actual spend**,
+     stopping tasks at 13 and 22 rounds while `max_rounds_effective` reported
+     200. An earlier version of this item claimed there was no other per-task
+     cap; that was false, and it is exactly the kind of claim this file exists
+     to prevent.
+
+   A leaderboard "step" is one model turn (which may batch several pyautogui
+   actions); an Ouroboros round is not step-equivalent. `task_outcome.json`
+   records `budget_counters` (`llm_rounds`, `screenshots`, `gui_action_calls`,
+   `remote_exec_calls`) and `max_rounds_effective`; report these alongside any
+   score. **A task the USD rail truncated is NOT a capability failure.** Read
+   `runtime_outcome` in `task_outcome.json` / `result_index.jsonl`: it carries
+   the runtime's own `reason_code` (`budget_exhausted`), a `truncated` flag and
+   the `resource_limit` block. Report truncated tasks separately from honest
+   failures; `max_rounds_effective` alone will not tell you they happened. The
+   current Verified leaderboard standard is 100 steps.
 5. **Observation modality.** Screenshot-only by DEFAULT: `ax_tree` is disabled
    per task unless `--allow-a11y`. A run with `--allow-a11y` must be reported as
    "Additional a11y tree used: Yes" (the leaderboard separates Screenshot /

@@ -21,6 +21,7 @@ from typing import Any
 if str(pathlib.Path(__file__).resolve().parents[4]) not in sys.path:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[4]))
 
+from devtools.benchmarks.common.result_index import runtime_terminal_disclosure
 from devtools.benchmarks.common.run_roots import ensure_outside_repo, run_root
 from devtools.benchmarks.gaia.inspect_solver import (
     GAIA_ANTI_LEAK_INSTRUCTION,
@@ -150,6 +151,10 @@ def run_ouroboros(prompt: str, sample_id: str = "sample", attachments: list[path
         "final_answer": str(answer or "").strip(),
         "returncode": proc.returncode,
         "result_json": str(result_json),
+        # The full runtime task result is already on disk here and was read for the answer
+        # alone; the terminal reason travelled no further than a path pointer, so a sample
+        # the runtime truncated scored as an ordinary wrong answer in the Inspect log.
+        "runtime_outcome": runtime_terminal_disclosure(payload),
         "stderr_tail": proc.stderr[-4000:],
     }
 
@@ -476,6 +481,7 @@ def ouroboros_solver():
         if not hasattr(state, "metadata") or getattr(state, "metadata") is None:
             state.metadata = {}
         state.metadata["ouroboros_result_json"] = result.get("result_json", "")
+        state.metadata["ouroboros_runtime_outcome"] = result.get("runtime_outcome") or {"available": False}
         if not hasattr(state, "output") or getattr(state, "output") is None:
             state.output = SimpleNamespace(completion="")
         state.output.completion = result["final_answer"]

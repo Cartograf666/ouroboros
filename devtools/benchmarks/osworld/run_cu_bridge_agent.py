@@ -34,7 +34,7 @@ import os
 import sys
 import time
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +49,11 @@ from devtools.benchmarks.common.manifests import (
     runtime_attestation,
     write_json,
 )
-from devtools.benchmarks.common.result_index import append_result_index, task_result_row
+from devtools.benchmarks.common.result_index import (
+    append_result_index,
+    runtime_terminal_disclosure,
+    task_result_row,
+)
 from devtools.benchmarks.common.run_roots import assert_outside_repo, timestamp_run_id
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -602,6 +606,14 @@ class CuBridgeRun:
     # True once THIS attempt holds the task claim (or when no claim dir is configured). Only an
     # owner writes the artefacts under `run_dir` that are shared between attempts.
     owns_task: bool = False
+    # The RUNTIME's own terminal task result (`GET /api/tasks/<id>`), stashed the moment the
+    # poll ends so EVERY outcome path below discloses why Ouroboros stopped — not just the
+    # coarse `ouroboros_status`. Two of three tasks in the v6.81.0 OSWorld smoke were
+    # terminated by the per-task USD reservation rail (`reason_code=budget_exhausted`) and the
+    # artefact published `status=completed, reason_code=official_evaluate`, so an aggregator
+    # recorded 2/3 with no way to tell a cost-truncated run from an honest failure. Lives on
+    # the run record rather than as a parameter so no outcome path can forget it.
+    runtime_result: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -638,10 +650,18 @@ def _write_cu_outcome(run: CuBridgeRun, reward: float | None, status: str, reaso
     and DISCLOSED (`publication_errors`, and a best-effort rewrite of the sidecars that carry
     it) instead of cancelling the destinations that would have succeeded.
     """
+    # `status`/`reason_code` here are the ADAPTER's stage vocabulary ("completed",
+    # "official_evaluate"). `runtime_outcome` is a SEPARATE fact: why the Ouroboros runtime
+    # itself stopped. They disagree exactly when it matters — a task the per-task USD rail
+    # truncated still evaluates, so the adapter honestly reports `completed`/`official_evaluate`
+    # while the runtime reports `budget_exhausted`. Publishing only the former made a truncated
+    # run indistinguishable from an honest failure. Reward and `official_eval_status` are
+    # untouched: this ADDS disclosure, it does not subtract fact.
     outcome = {
         "ok": status == "completed",
         "task_id": run.example_id, "domain": run.domain, "reward": reward,
         "status": status, "reason_code": reason, "error": error,
+        "runtime_outcome": runtime_terminal_disclosure(run.runtime_result),
         "result_dir": str(run.run_dir), "attempt_dir": str(run.attempt_dir),
         "claim_owner": bool(run.owns_task), **(extra or {}),
     }
@@ -658,12 +678,23 @@ def _write_cu_outcome(run: CuBridgeRun, reward: float | None, status: str, reaso
                   file=sys.stderr, flush=True)
 
     def _amend_manifest() -> None:
+        """Amend the ADMITTED manifest — WITHOUT a pointer to an outcome that was not written.
+
+        Same rule as `_ledger_row`, and it has to be applied on BOTH sides: a pointer naming a
+        path that does not exist is worse than no pointer, because a reader cannot tell it from
+        a file deleted later. Fixing only the ledger row left the finalized attempt manifest
+        still naming the missing file. `attempt_outcome` is published immediately before this,
+        so `failed_destinations` is already authoritative here.
+        """
         from devtools.benchmarks.osworld.run_step_agent import amend_task_manifest
+        output_paths: dict[str, str] = {"attempt_dir": str(run.attempt_dir)}
+        if "attempt_outcome" not in failed_destinations:
+            output_paths["task_outcome"] = str(run.attempt_dir / "task_outcome.json")
         run.base_manifest.update(amend_task_manifest(
             run.base_manifest,
-            output_paths={"task_outcome": str(run.attempt_dir / "task_outcome.json"),
-                          "attempt_dir": str(run.attempt_dir)},
+            output_paths=output_paths,
             extra={"attempt_dir": str(run.attempt_dir), "claim_owner": bool(run.owns_task),
+                   "runtime_outcome": runtime_terminal_disclosure(run.runtime_result),
                    **(extra or {})},
         ))
 
@@ -722,6 +753,7 @@ def _write_cu_outcome(run: CuBridgeRun, reward: float | None, status: str, reaso
             benchmark="osworld", instance_id=run.example_id,
             status="partially_published" if partial else status,
             reason_code=reason,
+            runtime_result=run.runtime_result,
             official_eval_status="completed" if reward is not None else "not_run",
             output_paths=output_paths,
             error=error, details={"domain": run.domain, "reward": reward,
@@ -993,6 +1025,11 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
                 break
             time.sleep(8)
         (run_dir / "ouroboros_task_final.json").write_text(json.dumps(latest, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Hand the RUNTIME's own terminal reason to every outcome path below (including the
+        # adapter_error ones). Set here, once, rather than threaded as a parameter: the poll is
+        # the only place it exists, and an outcome path that forgets it publishes an artefact in
+        # which a cost-truncated run is indistinguishable from an honest failure.
+        run.runtime_result = dict(latest)
 
         infeasible_declared = _final_answer_declares_infeasible(latest)
         fail_info: dict[str, Any] = {}

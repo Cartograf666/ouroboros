@@ -838,6 +838,18 @@ PY
                 or str(execution.get("status") or "") == "infra_failed"
                 or str(execution.get("reason_code") or "") == "llm_api_error"
             )
+            # The runtime can stop a task for a reason that is NOT "the task is finished" --
+            # the per-task USD reservation rail (budget_exhausted), a round cap, a context
+            # cap. That is neither infra_failed nor a fair-shot wrong answer, and without it
+            # a cost-truncated trial is indistinguishable from an honest failure downstream.
+            loop_outcome = latest.get("loop_outcome") if isinstance(latest.get("loop_outcome"), dict) else {{}}
+            resource_limit = latest.get("resource_limit")
+            if not isinstance(resource_limit, dict):
+                resource_limit = loop_outcome.get("resource_limit")
+            truncated = reason_code in (
+                "budget_exhausted", "max_rounds_exceeded", "task_timeout",
+                "cancelled", "context_exhausted",
+            )
             summary = {{
                 "return_code": 2 if infra_failed else 0,
                 "task_status_code": 0 if status == "completed" else 1,
@@ -846,6 +858,12 @@ PY
                 "status": status,
                 "reason_code": reason_code,
                 "infra_failed": infra_failed,
+                "truncated": truncated,
+                "resource_limit": resource_limit if isinstance(resource_limit, dict) else {{}},
+                "degraded": bool(latest.get("degraded") or loop_outcome.get("degraded")),
+                "degraded_reason": str(
+                    latest.get("degraded_reason") or loop_outcome.get("degraded_reason") or ""
+                ),
                 "cost_usd": latest.get("cost_usd"),
                 "prompt_tokens": latest.get("prompt_tokens"),
                 "completion_tokens": latest.get("completion_tokens"),

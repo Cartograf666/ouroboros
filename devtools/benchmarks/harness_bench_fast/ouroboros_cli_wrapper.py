@@ -25,6 +25,13 @@ from typing import Any
 
 
 DEFAULT_REPO = pathlib.Path(__file__).resolve().parents[3]
+# Invoked as a SCRIPT by `harness_bench run-cli`, so the repo root is not implicitly on the
+# path the way it is for the package-imported adapters.
+if str(DEFAULT_REPO) not in sys.path:
+    sys.path.insert(0, str(DEFAULT_REPO))
+
+from devtools.benchmarks.common.result_index import runtime_terminal_disclosure  # noqa: E402
+
 DEFAULT_DATA = DEFAULT_REPO.parent / "data"
 DEFAULT_SETTINGS = DEFAULT_DATA / "settings.json"
 DEFAULT_OUROBOROS_BIN = DEFAULT_REPO.parent / ".venv" / "bin" / "ouroboros"
@@ -48,6 +55,14 @@ def _task_id_from_workspace(workspace: pathlib.Path) -> str:
         if len(parts) > 1:
             return "_".join(parts[:-1]) or stem
     return name
+
+
+def _read_json(path: pathlib.Path) -> Any:
+    """Best-effort read; an absent/corrupt result file must not fail the wrapper."""
+    try:
+        return json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - disclosure is best-effort, the run's exit code is not
+        return None
 
 
 def _write_json(path: pathlib.Path, payload: Any) -> None:
@@ -218,6 +233,11 @@ def main(argv: list[str] | None = None) -> int:
             "stdout_chars": len(completed.stdout or ""),
             "stderr_chars": len(completed.stderr or ""),
             "result_json": str(result_json),
+            # The runtime task result is written to `result_json` by `--result-json-out`, but
+            # the summary only ever POINTED at it, so a task the runtime truncated (per-task
+            # USD rail, round cap) was indistinguishable from an honest verifier failure in
+            # every artefact a reader of this summary sees.
+            "runtime_outcome": runtime_terminal_disclosure(_read_json(result_json)),
         },
     )
     return int(completed.returncode)
