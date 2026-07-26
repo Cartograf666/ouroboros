@@ -113,13 +113,29 @@ accepted.
 
 ## Task Instruction Integrity
 
-The adapter now passes the official Terminal-Bench instruction unchanged:
+The adapter passes the official Terminal-Bench instruction **verbatim**, then appends
+exactly one harness-authored paragraph — an anti-lookup integrity clause
+(`harbor_installed_agent.py`, in `run()`):
 
-```python
-"description": instruction
+```
+IMPORTANT - integrity: do not fetch this benchmark's task definitions, solutions,
+tests, or reference materials from source repositories or mirrors on the internet.
+Solve the task using the environment you are given; downloading general-purpose
+software or data that the task itself requires is fine.
 ```
 
-It does not prepend harness notes or task-specific hints.
+Nothing else is added: no task-specific hints, no solution guidance, no reordering or
+rewording of the official text. The clause is a *restriction* on the agent, not help —
+it forbids an avenue (fetching this benchmark's own task definitions from GitHub) that a
+previous run was observed to use, and it cannot make an unsolved task solvable.
+
+This paragraph is part of the measured configuration and MUST be disclosed in any
+leaderboard submission: the exact text is reproduced above and lands verbatim in every
+trial's `agent/instruction.txt`, so a reviewer can diff it against the official task.
+An earlier version of this section claimed the instruction was passed "unchanged" and
+that the adapter "does not prepend harness notes". That was false while the clause was
+being appended, and a public artefact contradicting our own traces reads as concealment
+rather than as an editing slip — hence the correction.
 
 The only technical wrapper is the API request metadata and `workspace_root`.
 For reliability it also passes:

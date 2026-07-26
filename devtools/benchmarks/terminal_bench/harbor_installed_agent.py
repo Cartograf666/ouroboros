@@ -744,7 +744,13 @@ PY
         # web gate — benches measure Ouroboros as a single-model harness; the embedded
         # Claude-Code delegate is a separate future experiment.
         # Operator 2026-07-23: schedule_subagent disabled for the no-swarm submittable
-        # campaign (subagents=0). With delegation off, max_workers is moot (no pool to fill).
+        # campaign. NB (measured on the v6.81.0 runs, correcting an earlier claim here that
+        # this means "subagents=0"): withholding the TOOL stops the agent from DELEGATING the
+        # task, but `plan_task` still runs pooled planning scouts, which surface in traces as
+        # `delegation_role=subagent`. A submission must therefore disclose "no task delegation",
+        # not "no subagents" — the traces contradict the stronger claim. `max_workers` is not
+        # moot for the same reason: the scouts need the pool (1 worker forces the degraded
+        # inline fallback).
         disabled = ["claude_code_edit", "schedule_subagent"]
         if getattr(self, "disable_agent_web", True):
             disabled = list(self._WEB_TOOLS_MIRROR) + list(self._DELEGATED_VISION_TOOLS) + disabled
