@@ -24,7 +24,7 @@ from devtools.benchmarks.common.manifests import (
     finalize_run_manifest,
     write_json,
 )
-from devtools.benchmarks.common.run_roots import ensure_outside_repo, run_root
+from devtools.benchmarks.common.run_roots import assert_outside_repo, run_root
 from ouroboros.config import SETTINGS_DEFAULTS
 from ouroboros.utils import truncate_review_artifact
 
@@ -525,7 +525,7 @@ def main(argv: list[str] | None = None) -> int:
     _apply_profile_defaults(args)
 
     out = pathlib.Path(args.out_dir).expanduser() if args.out_dir else run_root("gaia")
-    out = ensure_outside_repo(out, REPO)
+    out = assert_outside_repo(out, REPO)
     planned = build_inspect_argv(args, out)
     base_settings_path = pathlib.Path(args.settings).expanduser().resolve(strict=False)
     manifest_path = out / "run_manifest.json"

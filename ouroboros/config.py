@@ -1359,6 +1359,9 @@ def save_settings(
     try:
         # Silence stays silence on the WRITE path too (the other half of the apply_settings_to_env rule):
         # a disk-authored key the file does not carry, arriving as the shipped default, is load_settings
+        # Persisting one here would end a forwarded env override MID-RUN and label a
+        # benchmark artefact with a mode it never ran under; the agent-reachable
+        # callers are set_tool_timeout and onboarding.
         # filling a gap, not authorship. AUTHORSHIP IS THE PATH — deliberate writes go through the owner
         # endpoints' _owner_write_settings, not this function. Dropped values are defaults.
         settings = {k: v for k, v in settings.items() if not (

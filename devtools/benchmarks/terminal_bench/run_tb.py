@@ -30,6 +30,7 @@ from devtools.benchmarks.common.manifests import (
 )
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
+    assert_outside_repo,
     ensure_outside_repo,
     repo_root_from_devtools,
     safe_benchmark_id,
@@ -949,12 +950,12 @@ def main(argv: list[str] | None = None) -> int:
     subtree = confined_submission_subtree(args.submission_subtree, dataset=args.dataset)
 
     repo = repo_root_from_devtools()
-    run_root = ensure_outside_repo(
+    run_root = assert_outside_repo(
         pathlib.Path(args.run_root).expanduser() if args.run_root else pathlib.Path.cwd() / "tb21_ouroboros_run",
         repo,
     )
     settings_path = pathlib.Path(args.settings_path).expanduser() if args.settings_path else default_settings_path()
-    submission_root = ensure_outside_repo(
+    submission_root = assert_outside_repo(
         pathlib.Path(args.submission_root).expanduser()
         if args.submission_root
         else run_root / "submission",

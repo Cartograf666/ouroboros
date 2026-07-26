@@ -19,8 +19,8 @@ from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_r
 from devtools.benchmarks.common.result_index import task_result_row, write_result_index
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
-    ensure_file_output_outside_repo,
-    ensure_outside_repo,
+    assert_file_output_outside_repo,
+    assert_outside_repo,
     repo_root_from_devtools,
     run_root as default_run_root,
 )
@@ -173,7 +173,7 @@ def main() -> int:
 
     repo_root = repo_root_from_devtools()
     settings_path = pathlib.Path(args.settings_path).expanduser() if args.settings_path else default_settings_path()
-    run_root = ensure_outside_repo(
+    run_root = assert_outside_repo(
         pathlib.Path(args.run_root).expanduser() if args.run_root else default_run_root("terminal_bench"),
         repo_root,
     )
@@ -198,7 +198,7 @@ def main() -> int:
         options={"execute": args.execute, "host_settings_path": str(settings_path)},
     )
     ledger_output = (
-        ensure_file_output_outside_repo(pathlib.Path(args.ledger_output), repo_root)
+        assert_file_output_outside_repo(pathlib.Path(args.ledger_output), repo_root)
         if args.ledger_output
         else run_root / "result_index.jsonl"
     )
