@@ -16,9 +16,9 @@ import logging
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
 from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
-from ouroboros.outcomes import extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
+from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_call_id, persist_call
-from ouroboros.tool_policy import initial_tool_schemas, list_non_core_tools
+from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context import build_user_content, estimate_context_prompt_tokens
 from ouroboros.context_budget import EMERGENCY_COMPACTION_CHARS, LOW_EMERGENCY_COMPACTION_CHARS
@@ -819,7 +819,8 @@ def _supersede_delivery_acceptance_binding(
     tools._ctx._task_acceptance_reviewed = False
     llm_trace.pop("root_phase_checkpoint", None)
     _set_acceptance_decision(llm_trace, {
-        "status": "revision_requested",
+        "status": ACCEPTANCE_REVISION_REQUESTED,
+        "reason": "delivery_binding_superseded",
         "source": "delivery_candidate_binding",
         "rationale": (
             "The delivery candidate or its evidence binding changed after host "
@@ -857,7 +858,8 @@ def _supersede_task_acceptance_for_owner_followup(
         "trigger": "owner_followup_after_acceptance",
     }
     _set_acceptance_decision(llm_trace, {
-        "status": "revision_requested",
+        "status": ACCEPTANCE_REVISION_REQUESTED,
+        "reason": "owner_followup",
         "source": "owner_followup",
         "rationale": "The owner added a directive after acceptance evidence was frozen; re-review is required.",
     })
@@ -914,7 +916,8 @@ def _supersede_task_acceptance_for_evidence_change(
         "trigger": reason,
     }
     _set_acceptance_decision(llm_trace, {
-        "status": "revision_requested",
+        "status": ACCEPTANCE_REVISION_REQUESTED,
+        "reason": "evidence_refresh",
         "source": "host_acceptance_evidence_refresh",
         "rationale": (
             "Task or child evidence changed after acceptance evidence was frozen; "
@@ -1098,9 +1101,51 @@ def _server_web_allowed_by_task(ctx: Any) -> bool:
     return not any(resources.get(name) is False for name in forbidden_names)
 
 
+ACCEPTANCE_REASON_UNSPECIFIED = "unspecified"
+# Closed set of typed acceptance reasons (v6.78.0). Every value is either a fact the
+# host already computed for another purpose or the name of the exit branch; nothing
+# here is derived from model prose. `unspecified` is only the fail-closed fallback of
+# `_set_acceptance_decision` for a future writer that forgets its reason.
+ACCEPTANCE_DECISION_REASONS = (
+    "clean_pass",
+    "clean_pass_obligations_closed",
+    "no_actionable_changes",
+    "delivery_binding_superseded",
+    "owner_followup",
+    "evidence_refresh",
+    "improvement_capsule",
+    "dialogue_terminal",
+    "open_obligations",
+    "capsule_spent",
+    "improvement_window_closed",
+    "reviewer_fail_no_capsule",
+    "review_degraded",
+    "fence_reopen_failed",
+    "infra_failure",
+    REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE,
+    ACCEPTANCE_REASON_UNSPECIFIED,
+)
+
+
 def _set_acceptance_decision(llm_trace: Dict[str, Any], decision: Dict[str, Any]) -> None:
+    """The ONLY merge point for the host acceptance decision (v6.78.0, owner Q23).
+
+    Every host exit funnels here and can only leave in one of the three canonical
+    owner-facing states (``ACCEPTANCE_DECISION_STATUSES``) plus a typed ``reason``
+    naming WHICH exit it was. A status outside the trio fails closed to
+    ``finalized_unaccepted`` and its raw token survives as the ``reason``, so a
+    future writer can neither invent a fourth state nor lose its own token. The
+    agent's stance (``agent_disposition``/``agent_rationale``) is carried forward,
+    never overwritten — after P4.1 the agent no longer writes a status at all.
+    """
     previous = llm_trace.get("acceptance_decision") if isinstance(llm_trace.get("acceptance_decision"), dict) else {}
     merged = dict(decision)
+    status = str(merged.get("status") or "")
+    reason = str(merged.get("reason") or "")
+    if status not in ACCEPTANCE_DECISION_STATUSES:
+        merged["status"] = ACCEPTANCE_FINALIZED_UNACCEPTED
+        reason = reason or status or ACCEPTANCE_REASON_UNSPECIFIED
+    merged["reason"] = reason
     for key in ("agent_disposition", "agent_rationale"):
         if previous.get(key) and not merged.get(key):
             merged[key] = previous.get(key)
@@ -1274,7 +1319,8 @@ def _dispose_obligations_on_clean_pass(
         ob["disposition_reason"] = "resolved by revision: the clean re-review returned no findings"
         ob["status"] = "disposed_by_re_review"
     _set_acceptance_decision(llm_trace, {
-        "status": "accepted",
+        "status": ACCEPTANCE_ACCEPTED,
+        "reason": "clean_pass_obligations_closed",
         "source": "task_acceptance_review",
         "rationale": "Clean PASS re-review; open obligations closed by the revision (dissent, if any, stays advisory).",
         "dissent_noted": dissent_noted,
@@ -1652,7 +1698,8 @@ def _apply_task_acceptance_result(
             ctx.llm_trace, result, open_obligations, bool(dissent),
         ):
             _set_acceptance_decision(ctx.llm_trace, {
-                "status": "accepted",
+                "status": ACCEPTANCE_ACCEPTED,
+                "reason": "clean_pass",
                 "source": "task_acceptance_review",
                 "rationale": "Quorum PASS classified the deliverable solved with criterion evidence.",
                 "dissent_noted": bool(dissent),
@@ -1688,11 +1735,10 @@ def _apply_task_acceptance_result(
             pass_index=ctx.passes_done,
         )
         _set_acceptance_decision(ctx.llm_trace, {
-            "status": (
-                "best_effort_open_obligations"
-                if open_obligations
-                else "finalized_after_capsule"
-            ),
+            # The with/without-obligations distinction moves from the status token to
+            # the `open_obligations` id list this branch already records.
+            "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+            "reason": "dialogue_terminal",
             "source": "task_acceptance_review",
             "rationale": (
                 f"Reviewer quorum judged the dialogue {dialogue['status']}; "
@@ -1712,7 +1758,8 @@ def _apply_task_acceptance_result(
         return False
     if capsule and pass_ok:
         _set_acceptance_decision(ctx.llm_trace, {
-            "status": "revision_requested",
+            "status": ACCEPTANCE_REVISION_REQUESTED,
+            "reason": "improvement_capsule",
             "source": "task_acceptance_review",
             "rationale": "A compact advisory improvement capsule was fed back for one bounded revision pass.",
             "dissent_noted": bool(dissent),
@@ -1721,7 +1768,8 @@ def _apply_task_acceptance_result(
         if not _end_task_acceptance_fence(ctx.tools._ctx, outcome="revision"):
             ctx.tools._ctx._task_acceptance_reviewed = True
             _set_acceptance_decision(ctx.llm_trace, {
-                "status": "review_degraded",
+                "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+                "reason": "fence_reopen_failed",
                 "source": "task_acceptance_fence",
                 "rationale": "The revision could not safely reopen queue admission at the dispatch boundary.",
             })
@@ -1754,7 +1802,8 @@ def _apply_task_acceptance_result(
     aggregate_signal = str(result.aggregate_signal or "DEGRADED").upper()
     if aggregate_signal == "DEGRADED":
         _set_acceptance_decision(ctx.llm_trace, {
-            "status": "review_degraded",
+            "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+            "reason": "review_degraded",
             "source": "task_acceptance_review",
             "rationale": "Acceptance reviewers did not reach a valid quorum.",
             "degraded_reasons": list(getattr(result, "degraded_reasons", []) or []),
@@ -1780,7 +1829,8 @@ def _apply_task_acceptance_result(
         return False
     if capsule and open_obligations:
         _set_acceptance_decision(ctx.llm_trace, {
-            "status": "best_effort_open_obligations",
+            "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+            "reason": "open_obligations",
             "source": "task_acceptance_review",
             "rationale": (
                 f"Improvement gates exhausted ({pass_reason or 'passes spent'}) with "
@@ -1795,7 +1845,12 @@ def _apply_task_acceptance_result(
         )
     elif capsule:
         _set_acceptance_decision(ctx.llm_trace, {
-            "status": "finalized_after_capsule",
+            "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+            "reason": (
+                "improvement_window_closed"
+                if (not ctx.passes_done and pass_reason)
+                else "capsule_spent"
+            ),
             "source": "task_acceptance_review",
             "rationale": (
                 f"Improvement window closed before any capsule pass ({pass_reason})."
@@ -1810,7 +1865,8 @@ def _apply_task_acceptance_result(
         )
     elif aggregate_signal == "FAIL":
         _set_acceptance_decision(ctx.llm_trace, {
-            "status": "review_failed",
+            "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+            "reason": "reviewer_fail_no_capsule",
             "source": "task_acceptance_review",
             "rationale": "A valid acceptance reviewer FAIL had no additional capsule text.",
             "dissent_noted": bool(dissent),
@@ -1818,7 +1874,8 @@ def _apply_task_acceptance_result(
         ctx.emit_progress("Task acceptance review: FAIL (finalizing with a failed review verdict).")
     elif open_obligations:
         _set_acceptance_decision(ctx.llm_trace, {
-            "status": "best_effort_open_obligations",
+            "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+            "reason": "open_obligations",
             "source": "task_acceptance_review",
             "rationale": (
                 f"Re-review was not a clean PASS ({result.aggregate_signal}); "
@@ -1830,12 +1887,30 @@ def _apply_task_acceptance_result(
         ctx.emit_progress(f"Task acceptance review: {result.aggregate_signal} (no changes suggested).")
     else:
         _set_acceptance_decision(ctx.llm_trace, {
-            "status": "accepted",
+            # Round-9 CRITICAL 1: this is the fall-through AFTER
+            # `task_acceptance_is_clean(result)` already refused the panel, so it
+            # cannot mint `accepted` — docs/ARCHITECTURE.md reserves that state for
+            # clean acceptance ("quorum PASS, `solved`, and supported evidence for
+            # every contributing criterion"). The reachable case is a reviewer
+            # claiming `solved` while supplying a MISSING criterion with the
+            # improvement-pass cap already spent: there is nothing actionable left
+            # to feed back, but "nothing left to ask for" is not "accepted". The
+            # typed reason is unchanged (`no_actionable_changes` still names WHY the
+            # loop stops here) and the tier honesty keeps riding `outcome_tier`;
+            # only the owner-facing state is now the honest one.
+            "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+            "reason": "no_actionable_changes",
             "source": "task_acceptance_review",
-            "rationale": "No actionable task-acceptance changes were suggested.",
+            "rationale": (
+                f"Re-review was not a clean acceptance ({result.aggregate_signal}) and "
+                "suggested no actionable changes; finalizing honestly without acceptance."
+            ),
             "dissent_noted": bool(dissent),
         })
-        ctx.emit_progress(f"Task acceptance review: {result.aggregate_signal} (no changes suggested).")
+        ctx.emit_progress(
+            f"Task acceptance review: {result.aggregate_signal} — not a clean acceptance "
+            "and no actionable changes were suggested; finalizing without acceptance."
+        )
     return False
 
 
@@ -1873,7 +1948,8 @@ def _record_acceptance_infra_failure(ctx: _TaskAcceptanceContext, exc: Exception
     if isinstance(seen, dict) and binding_hash:
         seen[binding_hash] = run_record
     _set_acceptance_decision(ctx.llm_trace, {
-        "status": "review_degraded",
+        "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+        "reason": "infra_failure",
         "source": "task_acceptance_review",
         "rationale": "The mandatory host acceptance panel failed before a valid quorum.",
         "degraded_reasons": [f"{type(exc).__name__}: {safe_error}"],
@@ -2057,16 +2133,14 @@ def _run_task_acceptance_review_once(
     elif agent_called:
         trigger = f"{trigger}_after_agent_tool"
     llm_trace["review_decision"] = {
-        "eligibility": "eligible" if eligible else "not_eligible",
-        "trigger": trigger,
+        "eligibility": "eligible" if eligible else "not_eligible", "trigger": trigger,
     }
     if not eligible:
         return False
     fence_ok, _fence_token = _begin_task_acceptance_fence(tools._ctx, task_id)
     if not fence_ok:
         llm_trace["review_decision"] = {
-            "eligibility": "acceptance_fence_failed",
-            "trigger": trigger,
+            "eligibility": "acceptance_fence_failed", "trigger": trigger,
         }
         _append_or_merge_user_message(
             messages,
@@ -2113,8 +2187,10 @@ def _run_task_acceptance_review_once(
             tools._ctx, llm_trace, status=launch_reason, pass_index=passes_done,
         )
         llm_trace["review_decision"].update({"skipped": launch_reason})
+        # The pacing launch reason is now the typed REASON, not the status;
+        # `outcomes.derive_loop_outcome` keys on that PAIR (see its comment).
         _set_acceptance_decision(llm_trace, {
-            "status": launch_reason,
+            "status": ACCEPTANCE_FINALIZED_UNACCEPTED, "reason": launch_reason,
             "source": "task_pacing",
             "rationale": (
                 f"Remaining {budget_snapshot.remaining_sec:.0f}s is inside the finalization "
@@ -2797,23 +2873,16 @@ def _setup_dynamic_tools(tools_registry, tool_schemas, messages):
         if not non_core:
             if not omissions:
                 return "All tools are already in your active set."
-            lines = ["All currently discovered tools are already in your active set.", "", "[CAPABILITY_OMISSION_MANIFEST]"]
-            for item in omissions:
-                lines.append(
-                    f"- {item.get('surface', 'unknown')}: {item.get('reason', 'unknown')} "
-                    f"({item.get('error', 'no detail')})"
-                )
+            lines = ["All currently discovered tools are already in your active set.", ""]
+            lines.extend(format_capability_omissions(omissions))
             return "\n".join(lines)
         lines = [f"**{len(non_core)} additional tools available** (use `enable_tools` to activate):\n"]
         for t in non_core:
             lines.append(f"- **{t['name']}**: {t['description'][:120]}")
         if omissions:
-            lines.append("\n[CAPABILITY_OMISSION_MANIFEST]")
-            for item in omissions:
-                lines.append(
-                    f"- {item.get('surface', 'unknown')}: {item.get('reason', 'unknown')} "
-                    f"({item.get('error', 'no detail')})"
-                )
+            lines.extend(format_capability_omissions(
+                omissions, header="\n" + CAPABILITY_OMISSION_HEADER,
+            ))
         return "\n".join(lines)
 
     def _handle_enable_tools(ctx=None, tools: str = "", **kwargs):
@@ -2861,13 +2930,10 @@ def _setup_dynamic_tools(tools_registry, tool_schemas, messages):
         else []
     )
     if omissions:
-        lines = ["[CAPABILITY_OMISSION_MANIFEST]"]
-        for item in omissions:
-            lines.append(
-                f"- {item.get('surface', 'unknown')}: {item.get('reason', 'unknown')} "
-                f"({item.get('error') or item.get('resource') or 'no detail'})"
-            )
-        _append_or_merge_user_message(messages, "[SYSTEM NOTICE]\n" + "\n".join(lines))
+        _append_or_merge_user_message(
+            messages,
+            "[SYSTEM NOTICE]\n" + "\n".join(format_capability_omissions(omissions)),
+        )
 
     return tool_schemas, enabled_extra
 
@@ -4157,6 +4223,13 @@ def _no_tool_final_answer(
         "max_rounds": limit_ctx.max_rounds,
         "task_cost_usd": limit_ctx.accumulated_usage.get("cost"),
     }
+    # v6.78.0 (owner Q20/Q22): mirror the host-attested native-retrieval fact into the
+    # trace so `build_task_acceptance_evidence` can show the reviewer whether the answer
+    # was grounded in fetched pages. Reviewer-side only — the agent never sees it (it
+    # receives the improvement capsule, not the evidence packet).
+    _retrieval = limit_ctx.accumulated_usage.get("retrieval")
+    if isinstance(_retrieval, dict) and _retrieval:
+        llm_trace["retrieval"] = dict(_retrieval)
     if _run_task_acceptance_review_once(
         tools=tools,
         content=content or "",

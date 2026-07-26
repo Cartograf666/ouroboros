@@ -103,6 +103,7 @@ _ACCEPT_ARTIFACT_PREVIEW_CAP = 2000    # small text-artifact preview chars
 _ACCEPT_ARTIFACT_PREVIEW_MAX_BYTES = 4096  # only preview artifacts smaller than this
 _ACCEPT_TOTAL_BUDGET = 240_000         # whole-packet char ceiling; degrade trajectory tail first
 _ACCEPT_OBLIGATIONS_MAX = 40           # obligation-catalog row cap (open-first, then most-recent)
+_ACCEPT_RETRIEVAL_URLS_MAX = 20        # native-retrieval URLs carried inline (+ disclosed omitted count)
 
 
 def obligation_is_pending(row: Any) -> bool:
@@ -227,24 +228,88 @@ def _accept_verification_summary(receipts: list) -> Dict[str, Any]:
     """Compact first-class projection of the host-attested verify_and_record receipts — the
     reviewer should see at a glance whether the agent's OWN checks were green or RED (esp. a
     finalized-over-red), without scrolling a raw receipt list."""
-    from ouroboros.outcomes import latest_unreconciled_failed_receipt, latest_unreconciled_masked_pass
+    from ouroboros._outcome_receipts import (
+        IDENTITY_PATH_LIMIT,
+        canonical_path_set,
+        disclosed_list_projection,
+        receipt_disclosed_reconciliation_key,
+        receipt_expected_whitespace_normalized,
+        receipt_identity_projection,
+        unreconciled_failed,
+        unreconciled_masked,
+    )
 
     valid = [r for r in (receipts or []) if isinstance(r, dict)]
     if not valid:
         return {"count": 0}
     statuses = [str(r.get("status") or "") for r in valid]
     latest = valid[-1]
-    _masked_pass = latest_unreconciled_masked_pass(valid)
+    # The OUTSTANDING SETS, not two latest-pointers: "is anything still unverified" is a
+    # question about identities, and the reviewer is told how MANY are open, not only
+    # that one is (round 2 — a newer red used to erase an older still-red one entirely).
+    _masked = unreconciled_masked(valid)
+    _masked_pass = _masked[-1] if _masked else None
+    # v6.78.0: the SHARED identity projection (SSOT with the fixed ledger receipt row),
+    # rendered through the redacting `_accept_redact_cap` because a receipt's `check`
+    # and observed paths are raw host command surface.
+    def _identity(receipt: Dict[str, Any]) -> Dict[str, Any]:
+        return receipt_identity_projection(receipt, bound=_accept_redact_cap, check_cap=400)
+
+    _reds = unreconciled_failed(valid)
+    _red = _reds[-1] if _reds else None
+    _latest_identity = _identity(latest)
+    # Canonicalize the RAW set first, render and bound it second — always that order.
+    # Redaction and truncation are lossy, so de-duplicating the RENDERED strings (as
+    # this did) collapsed distinct long paths sharing a rendered prefix while
+    # `artifacts_missing_after_omitted` still reported 0. Same rule, same helper, as the
+    # receipt path sets and `fold_retrieval_usage`'s raw-keyed URL dedup.
+    _missing_after = canonical_path_set([
+        p for r in valid for p in (r.get("artifacts_missing_after") or [])
+    ])
     return {
         "count": len(valid),
         "failed_count": sum(1 for s in statuses if s == "fail"),
         "passing_count": sum(1 for s in statuses if s in ("pass", "observed")),
-        "unreconciled_red": bool(latest_unreconciled_failed_receipt(valid)),
+        # v6.78.0 (owner Q28=B): a red is cleared only by a later green carrying the SAME
+        # typed identity key — `criterion_id`, else canonical `check` text, else observed
+        # `paths` set, kind AND value (a red carrying NO key at all is still cleared by
+        # any later green). Advisory, never a gate.
+        "unreconciled_red": bool(_red),
+        # How many DISTINCT verifications are still red — `unreconciled_red_identity`
+        # names only the newest, so without this a second outstanding red would be
+        # invisible behind a flag that looks like it describes exactly one.
+        "unreconciled_red_count": len(_reds),
+        # A flag whose CAUSE is missing is not reconstructible: the unreconciled red is
+        # not necessarily the latest receipt (a later green of a DIFFERENT verification
+        # leaves it standing), so projecting only `latest_*` would show the reviewer
+        # `unreconciled_red=true` with no way to see WHICH verification is still red.
+        # Same shared projection, so the red's identity is rendered exactly as the
+        # ledger renders it. Absent when there is no unreconciled red.
+        **({"unreconciled_red_identity": _identity(_red)} if _red else {}),
+        # DISCLOSED: at least one receipt is governed by canonical TEXT (the check
+        # command, or the observed path set) rather than a criterion_id, so a
+        # cosmetically different green re-run does not clear it. Judge the substance,
+        # not the command spelling. Never true of a MASKED pass, which reconciles on the
+        # criterion_id alone or on any later clean grounding. Both this flag and
+        # `reconciliation_identity_kinds` read the SHARED mode-aware key the
+        # reconciliation itself compares — the reviewer is told the authority that
+        # actually decided, never one re-derived beside it (round 6).
+        "expected_whitespace_normalized": any(
+            receipt_expected_whitespace_normalized(r) for r in valid
+        ),
+        "reconciliation_identity_kinds": sorted(
+            {receipt_disclosed_reconciliation_key(r)[0] for r in valid}
+        ),
         "latest_status": str(latest.get("status") or ""),
-        # The receipt `check`/`summary` are raw host command stdout/stderr — redact (NOT just
-        # truncate) before they reach the reviewer prompt (review #1, HIGH-1: this was the one
-        # packet block bypassing redaction). `_accept_redact_cap` redacts + DISCLOSED-truncates.
-        "latest_check": _accept_redact_cap(str(latest.get("check") or ""), 400),
+        # v6.78.0: the latest receipt's identity through the SAME shared projection —
+        # criterion_id, check text, and the observed-path SET that IS the identity of the
+        # command-less artifact-observation class (for which `latest_check` is empty), plus
+        # the disclosed omitted count / full-set hash whenever the path list is bounded.
+        # The receipt `check`/`summary`/paths are raw host command stdout/stderr — redact (NOT
+        # just truncate) before they reach the reviewer prompt (review #1, HIGH-1: this was the
+        # one packet block bypassing redaction). `_accept_redact_cap` redacts + DISCLOSED-truncates.
+        "latest_identity": _latest_identity,
+        "latest_check": _latest_identity["check"],
         "latest_returncode": latest.get("returncode"),
         "latest_expected_match": str(latest.get("expected_match") or ""),
         "latest_summary": _accept_redact_cap(str(latest.get("summary") or ""), 2000),
@@ -253,17 +318,28 @@ def _accept_verification_summary(receipts: list) -> Dict[str, Any]:
         # status stays pass; the LLM reviewer judges whether attesting a now-missing artifact
         # is acceptable (Bible P5). Paths redacted before reaching the reviewer prompt.
         "artifacts_missing_after_any": any(bool(r.get("artifacts_missing_after")) for r in valid),
-        "artifacts_missing_after": sorted({
-            _accept_redact_cap(str(p), 200)
-            for r in valid for p in (r.get("artifacts_missing_after") or [])
-        })[:20],
+        # Same P1 rule as the identity paths, through the SAME shared helper: the bound
+        # stays, the SILENCE does not. Redaction/truncation happen HERE, after the set
+        # was canonicalized, so what is counted is what is carried.
+        **disclosed_list_projection(
+            _missing_after, key="artifacts_missing_after", limit=IDENTITY_PATH_LIMIT,
+            bound=_accept_redact_cap, item_cap=200,
+        ),
         # v6.52.2: a PASS whose check can MASK the real exit code (`... | tail`, `|| true`) is
         # WEAK grounding — surface it so the reviewer does not credit a possibly-laundered green.
         # Flag-only; the LLM reviewer judges (Bible P5).
         "check_exit_masking_unreconciled": bool(_masked_pass),
-        "check_exit_masking_reasons": sorted({
-            str(reason) for r in valid for reason in (r.get("check_exit_masking_reasons") or [])
-        })[:10],
+        # As with the reds: how many masked greens are still un-re-grounded, not just
+        # whether one is.
+        "check_exit_masking_unreconciled_count": len(_masked),
+        **disclosed_list_projection(
+            sorted({
+                str(reason) for r in valid for reason in (r.get("check_exit_masking_reasons") or [])
+            }),
+            key="check_exit_masking_reasons",
+            limit=10,
+            bound=_accept_redact_cap,
+        ),
         # v6.54.4 criterion provenance: how many checks verified a criterion the
         # AGENT synthesized vs one the task states. An agent_defined-only summary
         # asks the reviewer to judge criterion equivalence, not just check results.
@@ -283,6 +359,12 @@ def _accept_claim_support_refs(contract: Dict[str, Any], receipts: list) -> list
     projection links claim ids to actual host-attested receipts so reviewers do
     not have to credit agent prose as evidence.
     """
+    from ouroboros._outcome_receipts import (
+        _lifecycle_row,
+        canonical_path_set,
+        disclosed_list_projection,
+    )
+
     claims = contract.get("acceptance_claims") if isinstance(contract, dict) else []
     if not isinstance(claims, list) or not claims:
         return []
@@ -309,21 +391,23 @@ def _accept_claim_support_refs(contract: Dict[str, Any], receipts: list) -> list
                 "contract_kind": str(receipt.get("contract_kind") or ""),
                 "matched": receipt.get("matched") if "matched" in receipt else None,
             }
+            # Both lists go through the SHARED disclosed projection, not a hand-rolled
+            # `[:5]`: this is a cognitive-review surface, so the bound stays but the
+            # SILENCE does not (BIBLE P1), and the path set is canonicalized on the RAW
+            # values BEFORE redaction/truncation so two distinct paths sharing a
+            # rendered prefix cannot collapse behind an `_omitted` count of 0.
             lifecycle = receipt.get("artifact_lifecycle")
             if isinstance(lifecycle, list) and lifecycle:
-                ref["artifact_lifecycle"] = [
-                    {
-                        **item,
-                        "path": _accept_redact_cap(str(item.get("path") or ""), 200),
-                    }
-                    if isinstance(item, dict) else item
-                    for item in lifecycle[:5]
-                ]
-            missing_after = receipt.get("artifacts_missing_after")
-            if isinstance(missing_after, list) and missing_after:
-                ref["artifacts_missing_after"] = [
-                    _accept_redact_cap(str(path), 200) for path in missing_after[:5]
-                ]
+                ref.update(disclosed_list_projection(
+                    lifecycle, key="artifact_lifecycle", limit=5,
+                    item=lambda row: _lifecycle_row(row, bound=_accept_redact_cap),
+                ))
+            missing_after = canonical_path_set(receipt.get("artifacts_missing_after"))
+            if missing_after:
+                ref.update(disclosed_list_projection(
+                    missing_after, key="artifacts_missing_after", limit=5,
+                    bound=_accept_redact_cap, item_cap=200,
+                ))
             refs.append(ref)
         supported = any(
             ref.get("status") in {"pass", "observed"}
@@ -336,6 +420,12 @@ def _accept_claim_support_refs(contract: Dict[str, Any], receipts: list) -> list
             "claim": _accept_redact_cap(str(claim.get("claim") or ""), 300),
             "support_expected": _accept_redact_cap(str(claim.get("support") or ""), 400),
             "support_refs": refs,
+            # Same P1 rule, counted inline rather than through
+            # `disclosed_list_projection`: this window keeps the MOST RECENT five
+            # receipts, and the shared helper carries the LEADING items. The bound
+            # stays; a reviewer reading "supported" now also sees how many earlier
+            # receipts for this criterion the window left out.
+            "support_refs_omitted": max(0, len(linked) - len(refs)),
             "support_status": "supported" if supported else ("declared_only" if declared_only else ("linked_failed" if refs else "missing")),
         })
     return out
@@ -713,6 +803,34 @@ def build_task_acceptance_evidence(
         if candidates:
             ev["candidate_answers"] = [str(c)[:300] for c in candidates][:8]
             prov["candidate_answers"] = "agent_supplied"
+        # v6.78.0 (owner Q20/Q22): host-attested NATIVE retrieval made inside the answering
+        # model's own request — counts plus capped URLs, no titles/snippets. Present ONLY when
+        # the provider actually searched (native main-loop search is off by default, and the
+        # `web_search`/browser TOOLS issue their own calls, which never land here), so its
+        # ABSENCE is not a deficiency and never implies a knowledge-only answer — the reviewer
+        # rules say exactly that. Never shown to the agent.
+        retrieval = llm_trace.get("retrieval") if isinstance(llm_trace.get("retrieval"), dict) else {}
+        if retrieval:
+            from ouroboros._outcome_receipts import disclosed_list_projection
+
+            # The rules call these "the URLs it fetched", so a bound here must SAY what
+            # it left out (BIBLE P1). Same shared projection as the receipt path sets;
+            # the accumulator's own omissions (`fold_retrieval_usage` caps per task) are
+            # added on, and its full-set hash carried, because the complete URL set lives
+            # only in the per-call observability payloads.
+            _urls = disclosed_list_projection(
+                retrieval.get("urls"), key="urls", limit=_ACCEPT_RETRIEVAL_URLS_MAX,
+                bound=_accept_redact_cap,
+            )
+            _urls["urls_omitted"] += int(retrieval.get("urls_omitted") or 0)
+            if str(retrieval.get("urls_identity_sha256") or ""):
+                _urls["urls_identity_sha256"] = str(retrieval.get("urls_identity_sha256"))
+            ev["retrieval"] = {
+                "web_search_requests": int(retrieval.get("web_search_requests") or 0),
+                "source_count": int(retrieval.get("source_count") or 0),
+                **_urls,
+            }
+            prov["retrieval"] = "host_attested"
         # v6.71.1: host-attested catalog of the acceptance obligations the host
         # raised (id/item/recommendation/status) so the reviewer can adjudicate the
         # agent's per-obligation dispositions/rebuttals — those arrive separately

@@ -58,6 +58,35 @@ def test_legacy_tool_names_are_not_public_schemas(tmp_path):
         assert "user_files" in set(root.get("enum") or []), tool_name
 
 
+def test_schedule_subagent_handler_validation_is_derived_from_the_published_schema(tmp_path):
+    """The handler's closed keyword set and the model-visible schema must be ONE object.
+
+    They used to be two: a hand-written frozenset whose own comment admitted it "mirrors" the
+    schema. A mirror drifts silently — add a parameter to the schema and the handler refuses it as
+    "unsupported"; drop one and the handler still accepts it. Derivation makes that
+    unrepresentable; this test asserts the derivation is still in force, and that adding a
+    parameter to the schema really does open the handler to it (a copy would fail here)."""
+    from ouroboros.tools import control
+
+    registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    schema = registry.get_schema_by_name("schedule_subagent") or {}
+    parameters = ((schema.get("function") or {}).get("parameters") or {})
+    published = set((parameters.get("properties") or {}).keys())
+
+    assert published, "schedule_subagent must publish parameters"
+    assert control.schedule_subagent_param_names() == published
+    assert parameters.get("additionalProperties") is False
+    assert set(parameters.get("required") or []) <= published
+    # Internal scheduling options ride the positional-only `internal` mapping and must stay
+    # OUT of the published surface (and therefore out of the derived allowed set).
+    assert published.isdisjoint(control._INTERNAL_SCHEDULE_OPTIONS)
+
+    # The schema each caller gets is a fresh object: mutating one must not poison the next.
+    first = control.schedule_subagent_properties()
+    first["objective"]["description"] = "mutated"
+    assert control.schedule_subagent_properties()["objective"]["description"] != "mutated"
+
+
 def test_list_files_schema_uses_path_not_dir(tmp_path):
     registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
     schema = registry.get_schema_by_name("list_files") or {}

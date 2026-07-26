@@ -17,7 +17,7 @@ if __package__ in {None, ""}:
 
 from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_run_manifest
 from devtools.benchmarks.common.result_index import task_result_row, write_result_index
-from devtools.benchmarks.common.run_roots import default_settings_path, ensure_outside_repo, repo_root_from_devtools, run_root
+from devtools.benchmarks.common.run_roots import assert_outside_repo, default_settings_path, repo_root_from_devtools, run_root
 
 
 # Parameterized: env HARNESS_BENCH_ROOT, else a repo-relative sibling fallback (never a
@@ -222,7 +222,7 @@ def main() -> int:
     bench_root = pathlib.Path(args.bench_root).expanduser().resolve(strict=False)
     data_dir = pathlib.Path(args.data_dir).expanduser().resolve(strict=False) if args.data_dir else repo_dir.parent / "data"
     settings_path = pathlib.Path(args.settings_path).expanduser().resolve(strict=False) if args.settings_path else default_settings_path()
-    out_root = ensure_outside_repo(
+    out_root = assert_outside_repo(
         pathlib.Path(args.run_root).expanduser() if args.run_root else run_root("harness_bench_fast", args.run_id),
         repo_dir,
     )
@@ -234,25 +234,12 @@ def main() -> int:
     console_log = out_root / "console.log"
     wrapper_log_root = out_root / "per_task_logs"
 
-    task_ids = _read_task_ids(bench_root, args.task, args.task_file)
-    cli_command = _wrapper_command(
-        repo_dir=repo_dir,
-        data_dir=data_dir,
-        settings_path=settings_path,
-        model=args.model,
-        log_root=wrapper_log_root,
-        timeout=args.timeout,
-    )
-    cmd = _harness_command(
-        bench_root=bench_root,
-        cli_command=cli_command,
-        task_ids=task_ids,
-        timeout=args.timeout,
-        concurrency=args.concurrency,
-        attempts=args.attempts,
-        json_output=results_json,
-        allow_task_failures=not args.no_allow_task_failures,
-    )
+    # `_read_task_ids` DISCOVERS ids by shelling out to `uv run python -m harness_bench list`
+    # with a 60s timeout, so it must not run before the run is on disk: admission records the
+    # ids the CLI actually DECLARED (pure argv), and discovery plus the derived commands are
+    # attached to the retained manifest inside the finalization block below. The widened seam
+    # meta-test caught this — the subprocess was hidden one level down inside a local helper.
+    declared_task_ids = list(args.task)
     # Built ONCE (the seed gate runs inside it) and PERSISTED BEFORE enforcement can raise, so
     # a refusal leaves a durable record of what was refused; then RETAINED and rewritten with the
     # final typed outcome on every exit path by the shared finalization seam below.
@@ -261,7 +248,7 @@ def main() -> int:
         benchmark="harness_bench_fast",
         run_root=out_root,
         repo_dir=repo_dir,
-        requested_task_ids=task_ids,
+        requested_task_ids=declared_task_ids,
         require_clean=not args.allow_dirty_seed,
         argv=sys.argv,
         dataset=f"harness-bench-fast:{bench_root}",
@@ -277,16 +264,38 @@ def main() -> int:
         harness={
             "mode": "run-cli",
             "bench_root": str(bench_root),
-            "cli_command": cli_command,
             "concurrency": args.concurrency,
             "attempts": args.attempts,
             "memory_mode": "empty",
         },
-        official_command=cmd,
         extra={"outcome": "started"},
     )
 
     with finalize_run_manifest(manifest_output, manifest) as final:
+        task_ids = _read_task_ids(bench_root, args.task, args.task_file)
+        cli_command = _wrapper_command(
+            repo_dir=repo_dir,
+            data_dir=data_dir,
+            settings_path=settings_path,
+            model=args.model,
+            log_root=wrapper_log_root,
+            timeout=args.timeout,
+        )
+        cmd = _harness_command(
+            bench_root=bench_root,
+            cli_command=cli_command,
+            task_ids=task_ids,
+            timeout=args.timeout,
+            concurrency=args.concurrency,
+            attempts=args.attempts,
+            json_output=results_json,
+            allow_task_failures=not args.no_allow_task_failures,
+        )
+        # Late facts on the RETAINED manifest, which the finalization seam writes.
+        manifest["requested_task_ids"] = [str(task_id) for task_id in task_ids]
+        manifest["requested_count"] = len(task_ids)
+        manifest["harness"] = {**(manifest.get("harness") or {}), "cli_command": cli_command}
+        manifest["official_command"] = cmd
         print(shlex.join(cmd))
         if args.dry_run:
             _write_ledger_from_results(result_json=results_json, ledger_output=ledger_output, requested_task_ids=task_ids)

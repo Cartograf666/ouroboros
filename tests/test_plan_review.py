@@ -92,8 +92,20 @@ def _contract_review_text(signal: str) -> str:
     return _review_text(signal, findings)
 
 
+def _start_swarm(ctx, request):
+    """Test seam: production computes the BINDING fingerprint (agent-passed values
+    only) before calling the swarm, so the wave is keyed by an identity the agent can
+    reproduce. Mirrors that call shape for the direct unit tests."""
+    from ouroboros.tools.plan_review import _plan_request_fingerprint, _start_planning_swarm
+
+    return _start_planning_swarm(ctx, request, _plan_request_fingerprint(
+        plan=request.plan, goal=request.goal, files_to_touch=request.files_to_touch,
+        context_level=request.context_level, context_notes=request.context_notes,
+        plan_class=request.plan_class, scope=request.scope,
+        include_tests=request.include_tests,
+    ))
+
 def test_planning_swarm_cutoff_omissions_reach_panel(monkeypatch, tmp_path):
-    from ouroboros.tools.plan_review import _start_planning_swarm
     from ouroboros.tools.registry import ToolContext
 
     monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC", "0")
@@ -105,7 +117,7 @@ def test_planning_swarm_cutoff_omissions_reach_panel(monkeypatch, tmp_path):
     ctx.event_queue = queue.Queue()
     ctx.task_metadata = {"root_task_id": "parent1", "session_id": "sess1"}
 
-    result = _start_planning_swarm(
+    result = _start_swarm(
         ctx,
         _plan_request("Do the work", "Ship a fix", context_level="focused"),
     )
@@ -135,7 +147,7 @@ def test_planning_swarm_resumes_existing_handoffs_without_rescheduling(monkeypat
     ctx.task_metadata = {"root_task_id": "parent1", "session_id": "sess1"}
     scheduled = {"count": 0}
 
-    def fake_schedule(ctx_arg, **kwargs):
+    def fake_schedule(ctx_arg, _internal=None, **kwargs):
         scheduled["count"] += 1
         ctx_arg._last_scheduled_subagents = [{"task_ids": ["scout-resume"]}]
         return "scheduled scout-resume"
@@ -156,11 +168,11 @@ def test_planning_swarm_resumes_existing_handoffs_without_rescheduling(monkeypat
 
     monkeypatch.setattr(pr, "wait_for_effective_tasks", fake_wait)
 
-    first = pr._start_planning_swarm(
+    first = _start_swarm(
         ctx,
         _plan_request("Do the work", "Ship a fix", context_level="minimal"),
     )
-    second = pr._start_planning_swarm(
+    second = _start_swarm(
         ctx,
         _plan_request("Do the work", "Ship a fix", context_level="minimal"),
     )
@@ -186,7 +198,7 @@ def test_planning_swarm_persists_wave_before_wait(monkeypatch, tmp_path):
     scheduled = {"count": 0}
     collected = {"count": 0}
 
-    def fake_schedule(ctx_arg, **_kwargs):
+    def fake_schedule(ctx_arg, _internal=None, **_kwargs):
         scheduled["count"] += 1
         ctx_arg._last_scheduled_subagents = [{"task_ids": ["scout-durable"]}]
         return "scheduled scout-durable"
@@ -219,8 +231,8 @@ def test_planning_swarm_persists_wave_before_wait(monkeypatch, tmp_path):
     monkeypatch.setattr(pr, "_collect_planning_handoffs", fake_collect)
     request = _plan_request("Do the work", "Ship a fix", context_level="minimal")
     with pytest.raises(RuntimeError, match="simulated wait crash"):
-        pr._start_planning_swarm(ctx, request)
-    resumed = pr._start_planning_swarm(ctx, request)
+        _start_swarm(ctx, request)
+    resumed = _start_swarm(ctx, request)
 
     assert resumed["started"] is True
     assert resumed["resumed"] is True
@@ -229,18 +241,19 @@ def test_planning_swarm_persists_wave_before_wait(monkeypatch, tmp_path):
 
 def test_planning_scout_recovers_durable_id_when_side_channel_is_missing(monkeypatch, tmp_path):
     import ouroboros.tools.control as control
-    import ouroboros.tools.plan_review as pr
     from ouroboros.task_results import load_plan_review_state, write_task_result
     from ouroboros.tools.registry import ToolContext
 
     monkeypatch.setenv("OUROBOROS_MAX_WORKERS", "3")
-    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "0")
+    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "0.25")
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "parent-durable-id"
     ctx.event_queue = queue.Queue()
     ctx.task_metadata = {"root_task_id": ctx.task_id}
+    # A POSITIVE consumable window: with max_wait 0 the wave now refuses to launch scouts at
+    # all (v6.79.0 scout-window admission), which is a different path from id recovery.
 
-    def fake_schedule(_ctx, **kwargs):
+    def fake_schedule(_ctx, _internal=None, **kwargs):
         write_task_result(
             tmp_path,
             "scout-issued",
@@ -254,7 +267,7 @@ def test_planning_scout_recovers_durable_id_when_side_channel_is_missing(monkeyp
         return "scheduled without side channel"
 
     monkeypatch.setattr(control, "_schedule_task", fake_schedule)
-    result = pr._start_planning_swarm(
+    result = _start_swarm(
         ctx,
         _plan_request("P", "G", context_level="minimal"),
     )
@@ -280,13 +293,15 @@ def test_resumed_pending_scout_recovers_previously_issued_durable_id(monkeypatch
     ctx.task_id = "parent-resume-issued"
     ctx.event_queue = queue.Queue()
     ctx.task_metadata = {"root_task_id": ctx.task_id}
+    # v6.80.0: the binding fingerprint uses the AGENT-passed plan_class (empty here,
+    # so it is omitted from the payload) — not the host-resolved "self_mod".
     fingerprint = pr._plan_request_fingerprint(
         plan="P",
         goal="G",
         files_to_touch=[],
         context_level="minimal",
         context_notes="",
-        plan_class="self_mod",
+        plan_class="",
         scope=None,
         include_tests=False,
     )
@@ -314,7 +329,7 @@ def test_resumed_pending_scout_recovers_previously_issued_durable_id(monkeypatch
         lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not reschedule")),
     )
 
-    result = pr._start_planning_swarm(
+    result = _start_swarm(
         ctx,
         _plan_request("P", "G", context_level="minimal"),
     )
@@ -414,7 +429,7 @@ def test_planning_swarm_persists_intents_before_launch_and_partial_failure(monke
     calls = {"count": 0, "fingerprint": ""}
     leaked = "abcdefghijklmnop-secret-value"
 
-    def fake_schedule(ctx_arg, **_kwargs):
+    def fake_schedule(ctx_arg, _internal=None, **_kwargs):
         calls["count"] += 1
         state = load_plan_review_state(tmp_path, str(ctx_arg.task_id))
         assert len(state["waves"]) == 1
@@ -452,7 +467,7 @@ def test_planning_swarm_persists_intents_before_launch_and_partial_failure(monke
 
     monkeypatch.setattr(control, "_schedule_task", fake_schedule)
     monkeypatch.setattr(pr, "wait_for_effective_tasks", fake_wait)
-    result = pr._start_planning_swarm(
+    result = _start_swarm(
         ctx,
         _plan_request(
             "Do the work", "Ship a fix",
@@ -615,7 +630,7 @@ def test_planning_swarm_does_not_duplicate_wave_after_terminal_empty_handoff(mon
     ctx.task_metadata = {"root_task_id": "parent1", "session_id": "sess1"}
     scheduled = {"count": 0}
 
-    def fake_schedule(ctx_arg, **kwargs):
+    def fake_schedule(ctx_arg, _internal=None, **kwargs):
         scheduled["count"] += 1
         tid = f"scout-{scheduled['count']}"
         records = list(getattr(ctx_arg, "_last_scheduled_subagents", []) or [])
@@ -632,11 +647,11 @@ def test_planning_swarm_does_not_duplicate_wave_after_terminal_empty_handoff(mon
     monkeypatch.setattr(control, "_schedule_task", fake_schedule)
     monkeypatch.setattr(pr, "wait_for_effective_tasks", lambda *_args, **_kwargs: wait_results.pop(0))
 
-    first = pr._start_planning_swarm(
+    first = _start_swarm(
         ctx,
         _plan_request("Do the work", "Ship a fix", context_level="minimal"),
     )
-    second = pr._start_planning_swarm(
+    second = _start_swarm(
         ctx,
         _plan_request("Do the work", "Ship a fix", context_level="minimal"),
     )
@@ -652,7 +667,6 @@ def test_planning_swarm_does_not_duplicate_wave_after_terminal_empty_handoff(mon
 
 def test_planning_swarm_capacity_becomes_panel_omission(monkeypatch, tmp_path):
     import ouroboros.tools.control as control
-    from ouroboros.tools.plan_review import _start_planning_swarm
     from ouroboros.tools.registry import ToolContext
 
     monkeypatch.setenv("OUROBOROS_MAX_WORKERS", "1")
@@ -668,7 +682,7 @@ def test_planning_swarm_capacity_becomes_panel_omission(monkeypatch, tmp_path):
     ctx.event_queue = queue.Queue()
     ctx.task_metadata = {"root_task_id": "parent1", "session_id": "sess1"}
 
-    result = _start_planning_swarm(
+    result = _start_swarm(
         ctx,
         _plan_request("Do the work", "Ship a fix", context_level="focused"),
     )
@@ -694,7 +708,7 @@ def test_capacity_cutoff_and_schedule_failure_all_become_panel_omissions(monkeyp
     ctx.current_chat_id = 1
     ctx.event_queue = queue.Queue()
     ctx.task_metadata = {"root_task_id": "parent1", "session_id": "sess1"}
-    result = pr._start_planning_swarm(
+    result = _start_swarm(
         ctx, _plan_request("P", "G", context_level="minimal"),
     )
     assert result["started"] is True
@@ -705,7 +719,7 @@ def test_capacity_cutoff_and_schedule_failure_all_become_panel_omissions(monkeyp
     monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC", "0")
     monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "0.25")
 
-    def fake_schedule(ctx_arg, **kwargs):
+    def fake_schedule(ctx_arg, _internal=None, **kwargs):
         ctx_arg._last_scheduled_subagents = [{"task_ids": ["scout-sat"]}]
         return "scheduled scout-sat"
 
@@ -721,7 +735,7 @@ def test_capacity_cutoff_and_schedule_failure_all_become_panel_omissions(monkeyp
     ctx2.current_chat_id = 1
     ctx2.event_queue = queue.Queue()
     ctx2.task_metadata = {"root_task_id": "parent2", "session_id": "sess1"}
-    saturated = pr._start_planning_swarm(
+    saturated = _start_swarm(
         ctx2, _plan_request("P", "G", context_level="minimal"),
     )
     assert saturated["started"] is True
@@ -730,7 +744,7 @@ def test_capacity_cutoff_and_schedule_failure_all_become_panel_omissions(monkeyp
     )
 
     # Scheduling failure (no scout started at all) is still explicit panel evidence.
-    monkeypatch.setattr(control, "_schedule_task", lambda ctx_arg, **kwargs: "ERROR: refused")
+    monkeypatch.setattr(control, "_schedule_task", lambda ctx_arg, _internal=None, **kwargs: "ERROR: refused")
     ctx3 = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx3.task_id = "parent3"
     ctx3.task_depth = 0
@@ -738,7 +752,7 @@ def test_capacity_cutoff_and_schedule_failure_all_become_panel_omissions(monkeyp
     ctx3.event_queue = queue.Queue()
     ctx3.task_metadata = {"root_task_id": "parent3", "session_id": "sess1"}
     ctx3._last_scheduled_subagents = []
-    infra = pr._start_planning_swarm(
+    infra = _start_swarm(
         ctx3, _plan_request("P", "G", context_level="minimal"),
     )
     assert infra["started"] is True
@@ -754,7 +768,9 @@ def test_all_schedule_failures_still_reach_reviewer_panel(monkeypatch, tmp_path)
     ctx = _make_ctx(tmp_path)
     ctx.task_id = "parent-all-schedule-failed"
     monkeypatch.setenv("OUROBOROS_MAX_WORKERS", "3")
-    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "0")
+    # 0.25s, not 0: a zero-length window is refused before launch now, and this test is about
+    # a schedule FAILURE reaching the panel, not about window admission.
+    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "0.25")
     monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "m1,m2")
     monkeypatch.setattr(control, "_schedule_task", lambda *_a, **_k: "ERROR: queue refused")
     monkeypatch.setattr(pr, "_load_plan_checklist", lambda: "checklist")
@@ -802,7 +818,7 @@ def test_cutoff_omissions_go_directly_to_reviewer_without_inline_model(monkeypat
             "reason": "terminal_without_usable_handoff:failed",
         },
     ]
-    def capacity_swarm(ctx_arg, request):
+    def capacity_swarm(ctx_arg, request, fingerprint=""):
         handoffs = _seed_mock_planning_wave(
             ctx_arg,
             request,
@@ -813,6 +829,7 @@ def test_cutoff_omissions_go_directly_to_reviewer_without_inline_model(monkeypat
             included_task_ids=[],
             omissions=omitted,
             stop_reason="ceiling",
+            fingerprint=fingerprint,
         )
         handoffs["wait"] = {
             "tasks": {"s1": {"status": "running"}, "s2": {"status": "failed"}}
@@ -897,7 +914,7 @@ def test_scout_change_after_prompt_is_audit_only_without_paid_review_replay(monk
         "result": "reviewed version",
     }
 
-    def stale_swarm(ctx_arg, request):
+    def stale_swarm(ctx_arg, request, fingerprint=""):
         handoffs = _seed_mock_planning_wave(
             ctx_arg,
             request,
@@ -908,6 +925,7 @@ def test_scout_change_after_prompt_is_audit_only_without_paid_review_replay(monk
             }],
             included_task_ids=["scout-stale"],
             omissions=[],
+            fingerprint=fingerprint,
         )
         root, parent_id = pr._planning_state_location(ctx_arg)
         write_task_result(
@@ -1057,7 +1075,7 @@ def test_terminal_zero_ready_scout_wave_still_reaches_reviewer_panel(monkeypatch
             "reason": "completed_without_nonempty_handoff",
         },
     ]
-    def terminal_empty_swarm(ctx_arg, request):
+    def terminal_empty_swarm(ctx_arg, request, fingerprint=""):
         handoffs = _seed_mock_planning_wave(
             ctx_arg,
             request,
@@ -1067,6 +1085,7 @@ def test_terminal_zero_ready_scout_wave_still_reaches_reviewer_panel(monkeypatch
             ],
             included_task_ids=[],
             omissions=omissions,
+            fingerprint=fingerprint,
         )
         handoffs["wait"] = {"tasks": {
             "s1": {"status": "failed", "result": ""},
@@ -1118,6 +1137,7 @@ def _seed_mock_planning_wave(
     included_task_ids: list[str],
     omissions: list[dict],
     stop_reason: str = "",
+    fingerprint: str = "",
 ) -> dict:
     """Create authoritative host state for tests that mock only scout execution."""
     import ouroboros.tools.plan_review as pr
@@ -1130,7 +1150,10 @@ def _seed_mock_planning_wave(
         reserve_plan_review_wave,
     )
 
-    fingerprint = pr._plan_request_fingerprint(
+    # The BINDING fingerprint is computed by the caller from the AGENT-passed
+    # envelope; recomputing it here from a host-RESOLVED request would key the wave
+    # under an identity production never uses.
+    fingerprint = fingerprint or pr._plan_request_fingerprint(
         plan=str(request.plan or ""),
         goal=str(request.goal or ""),
         files_to_touch=list(request.files_to_touch or []),
@@ -1172,7 +1195,7 @@ def _seed_mock_planning_wave(
     return plan_review_wave_handoffs(wave)
 
 
-def _completed_planning_swarm(ctx, request) -> dict:
+def _completed_planning_swarm(ctx, request, fingerprint="") -> dict:
     """Return a mocked completed swarm without bypassing host planning authority."""
     from ouroboros.task_results import write_task_result
     from ouroboros.tools.plan_review import _planning_state_location
@@ -1188,6 +1211,7 @@ def _completed_planning_swarm(ctx, request) -> dict:
         }],
         included_task_ids=["scout1"],
         omissions=[],
+        fingerprint=fingerprint,
     )
     handoffs.update({
         "wait": {
@@ -1629,7 +1653,12 @@ class TestPlanReviewFormatOutput(unittest.TestCase):
 
 class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
     async def test_budget_gate_skips_when_oversized(self):
-        """When assembled prompt exceeds token limit, returns PLAN_REVIEW_SKIPPED."""
+        """An assembled prompt no slot can fit is a loud typed preflight degradation.
+
+        v6.80.0: the shared "assembled prompt too large" gate became a PER-SLOT
+        calibrated fit check, so a prompt above every slot's cap now reports
+        PLAN_REVIEW_DEGRADED_PREFLIGHT_OVERSIZE with NO reviewer called (instead of
+        paying for slots with a guaranteed provider 400)."""
         from ouroboros.tools import plan_review as pr
 
         ctx = _make_ctx()
@@ -1660,7 +1689,7 @@ class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
                 ),
             )
 
-        self.assertIn("PLAN_REVIEW_SKIPPED", result)
+        self.assertIn("PLAN_REVIEW_DEGRADED_PREFLIGHT_OVERSIZE", result)
 
         atlas = SimpleNamespace(
             text="small atlas",
@@ -2016,7 +2045,7 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
         self.assertEqual(summary["aggregate_signal"], "REVIEW_REQUIRED")
         self.assertIn("must precede AGGREGATE", summary["projection_errors"][1])
 
-    def _write_review(self, tmp_path, *, aggregate="REVIEW_REQUIRED"):
+    def _write_review(self, tmp_path, *, aggregate="REVIEW_REQUIRED", component_hashes=None):
         from ouroboros.task_results import (
             plan_review_wave_handoffs,
             record_plan_review_collection,
@@ -2047,6 +2076,7 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
             plan_text_hash=hashlib.sha256(b"P").hexdigest(),
             scout_roles=[],
             cutoff_at="2099-01-01T00:00:00+00:00",
+            component_hashes=component_hashes,
         )
         record_plan_review_collection(
             tmp_path,
@@ -2631,11 +2661,11 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
             self.assertNotIn("PLAN_REVIEW_DISPOSITION_STALE", as_vacuous)
 
     def test_populated_disposition_without_prior_review_is_ignored_unbindable(self):
-        # An UNBINDABLE disposition (no review exists for this exact fingerprint)
-        # has no closing power by construction: proceeding launches a REAL review,
-        # which cannot fabricate a closure. Models fabricate populated placeholders
-        # ("dummy"/"none"/"x") when constrained, so ANY unbindable disposition is
-        # discarded before launch instead of wedging the first submission (v6.65.2).
+        # v6.80.0: an UNBINDABLE non-empty disposition FAILS FAST instead of being
+        # discarded before a paid wave. The v6.65.2 anti-wedge guarantee is preserved
+        # EXPLICITLY in the error text ("OMIT review_disposition entirely"), so a model
+        # that fabricated a placeholder learns the exact way out instead of silently
+        # paying for a full scout+reviewer wave it did not intend.
         import tempfile
         import ouroboros.tools.plan_review as pr
         from ouroboros.tools.registry import ToolContext
@@ -2660,11 +2690,94 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
                 out = pr._reuse_or_disposition_plan_review(
                     ctx, "c" * 64, populated, hashlib.sha256(b"P").hexdigest()
                 )
-                self.assertIsNone(out, f"unbindable={populated!r} must proceed")
-                self.assertTrue(
-                    getattr(ctx, "_plan_disposition_ignored_unbindable", False),
-                    "the discard must be disclosed via the ctx flag",
-                )
+                self.assertIsNotNone(out, f"unbindable={populated!r} must fail fast")
+                self.assertIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", out)
+                self.assertIn("OMIT review_disposition entirely", out)
+                self.assertIn("no wave was launched", out)
+
+    def test_agent_envelope_drift_is_unbindable_not_a_warning(self):
+        """The P3 plan gate: a review of `[a.py]` must NOT close a submission for
+        `[a.py, b.py, c.py]`.
+
+        `files_to_touch` is exported in the tool schema as PART OF THE REVIEW IDENTITY
+        ("a review_disposition can only close a review submitted with the SAME list"),
+        and the binding fingerprint is a pure function of the agent's envelope. Binding a
+        drifted envelope and merely PREPENDING an ENVELOPE_MISMATCH note let stale plan
+        review authorise materially expanded scope; the claimed fingerprint must equal
+        the submitted one, and a mismatch fails fast so the agent runs a real review."""
+        import tempfile
+
+        import ouroboros.tools.plan_review as pr
+        from ouroboros.tools.review_synthesis import plan_review_component_hashes
+
+        reviewed = pr._PlanReviewRequest(plan="P", goal="G", files_to_touch=["a.py"])
+        submitted = pr._PlanReviewRequest(
+            plan="P", goal="G", files_to_touch=["a.py", "b.py", "c.py"],
+        )
+        plan_hash = hashlib.sha256(b"P").hexdigest()
+        disposition = {"review_fingerprint": "a" * 64, "items": [
+            {"finding_id": "plan-slot-1:f1", "decision": "reject", "rationale": "one"},
+            {"finding_id": "plan-slot-2:f2", "decision": "reject", "rationale": "two"},
+        ]}
+
+        with tempfile.TemporaryDirectory() as raw:
+            ctx, _ = self._write_review(
+                pathlib.Path(raw),
+                component_hashes=plan_review_component_hashes(reviewed),
+            )
+            # The submitted envelope grew, so its fingerprint differs from the reviewed
+            # one: the disposition names a review of something else and cannot close it.
+            drifted = pr._reuse_or_disposition_plan_review(
+                ctx, "e" * 64, disposition, plan_hash, submitted,
+            )
+            self.assertIsNotNone(drifted)
+            self.assertIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", drifted)
+            self.assertIn("ENVELOPE_MISMATCH on: files_to_touch", drifted)
+            self.assertIn("OMIT review_disposition entirely", drifted)
+            self.assertIn("no wave was launched", drifted)
+
+        # The SAME agent envelope still closes its own review, and HOST-RESOLVED drift
+        # (resolved plan_class / context_level, deliberately outside the binding
+        # identity) is reported as a note rather than blocking the close.
+        with tempfile.TemporaryDirectory() as raw:
+            ctx, fingerprint = self._write_review(
+                pathlib.Path(raw),
+                component_hashes=plan_review_component_hashes(reviewed),
+            )
+            escalated = pr._PlanReviewRequest(
+                plan="P", goal="G", files_to_touch=["a.py"], plan_class="self_mod",
+            )
+            bound = pr._reuse_or_disposition_plan_review(
+                ctx, fingerprint,
+                {**disposition, "review_fingerprint": fingerprint},
+                plan_hash, escalated,
+            )
+            self.assertIsNotNone(bound)
+            self.assertNotIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", bound)
+            self.assertIn("ENVELOPE_MISMATCH on: plan_class", bound)
+
+        # ...and the unbindable path names the same drift instead of nothing.
+        state = {
+            "latest_review_fingerprint": "a" * 64,
+            "waves": [{
+                "request_fingerprint": "a" * 64,
+                "plan_text_hash": plan_hash,
+                "component_hashes": plan_review_component_hashes(reviewed),
+            }],
+        }
+        unbindable = pr._unbindable_disposition_error(
+            state, "e" * 64, {"review_fingerprint": "z" * 64, "items": []}, plan_hash, submitted,
+        )
+        self.assertIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", unbindable)
+        self.assertIn("ENVELOPE_MISMATCH on: files_to_touch", unbindable)
+        # An UNCHANGED envelope reports nothing, and so does a caller with no request.
+        same = pr._unbindable_disposition_error(
+            state, "e" * 64, {"review_fingerprint": "z" * 64, "items": []}, plan_hash, reviewed,
+        )
+        self.assertNotIn("ENVELOPE_MISMATCH", same)
+        self.assertNotIn("ENVELOPE_MISMATCH", pr._unbindable_disposition_error(
+            state, "e" * 64, {"review_fingerprint": "z" * 64, "items": []}, plan_hash,
+        ))
 
     def test_state_lookup_failure_is_error_not_absence(self):
         # Consultation guard: an indeterminate state store must ERROR, never be
@@ -2687,19 +2800,19 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
             )
             self.assertIsNotNone(out)
             self.assertIn("PLAN_REVIEW_STATE_INVALID", out)
-            self.assertFalse(
-                getattr(ctx, "_plan_disposition_ignored_unbindable", False)
-            )
+            self.assertNotIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", out)
 
-    def test_handle_plan_task_notes_ignored_unbindable_disposition(self):
+    def test_handle_plan_task_surfaces_unbindable_disposition_error(self):
+        """v6.80.0: the tool result is the fail-fast error itself, not a note tacked
+        onto a review that was paid for anyway."""
         import ouroboros.tools.plan_review as pr
         from unittest.mock import patch
         from ouroboros.tools.registry import ToolContext
 
         async def _stub(ctx, request):
-            # emulate the gate discarding an unbindable disposition mid-flight
-            setattr(ctx, "_plan_disposition_ignored_unbindable", True)
-            return "PLAN_REVIEW_OUTCOME: GREEN"
+            return pr._unbindable_disposition_error(
+                {"waves": []}, "c" * 64, request.review_disposition, "planhash",
+            )
 
         ctx = ToolContext(repo_dir=pathlib.Path("."), drive_root=pathlib.Path("."))
         with patch.object(pr, "_run_plan_review_async", _stub):
@@ -2711,8 +2824,8 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
                     {"finding_id": "dummy", "decision": "reject", "rationale": "x"}
                 ]},
             )
-        self.assertIn("PLAN_REVIEW_OUTCOME: GREEN", out)
-        self.assertIn("PLAN_REVIEW_DISPOSITION_IGNORED_UNBINDABLE", out)
+        self.assertIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", out)
+        self.assertIn("OMIT review_disposition entirely", out)
 
     def test_handle_plan_task_notes_ignored_vacuous_disposition(self):
         import ouroboros.tools.plan_review as pr
@@ -2866,5 +2979,100 @@ class TestClassifyReviewerError(unittest.TestCase):
         self.assertGreater(len(msg), 0)
 
 
+class TestPlanBudgetFollowsQuorum(unittest.TestCase):
+    """The shared-prompt budget is the one a review QUORUM can read, not the global minimum.
+
+    ``min(slot_limits.values())`` let one small-window slot dictate the Atlas for every reviewer:
+    with caps [545K, 745K, 745K] and quorum 2 it threw away ~200K of context the two large slots
+    could have read, and refused an irreducible 600K prompt those two would have accepted. The
+    small slot must drop OUT of the quorum instead — and be RECORDED as not participating.
+    """
+
+    def setUp(self):
+        from ouroboros.tools.review_synthesis import plan_slot_fit, quorum_input_token_limit
+
+        self.limit = quorum_input_token_limit
+        self.fit = plan_slot_fit
+        self.models = ["small/545", "big/a", "big/b"]
+        self.limits = {"small/545": 545_000, "big/a": 745_000, "big/b": 745_000}
+
+    def test_reviewer_example_keeps_the_context_two_large_slots_can_read(self):
+        self.assertEqual(self.limit(self.models, self.limits), 745_000)
+
+    def test_600k_prompt_runs_on_the_quorum_and_records_the_slot_that_cannot_fit(self):
+        callable_models, oversize, error = self.fit(self.models, self.limits, 600_000)
+        self.assertEqual(callable_models, ["big/a", "big/b"])
+        self.assertEqual(error, "")  # two of three IS the quorum — not a degradation
+        self.assertEqual([rec["model"] for rec in oversize], ["small/545"])
+        self.assertIn("preflight_oversize", oversize[0]["error"])
+        self.assertEqual(oversize[0]["tokens_in"], 0)
+
+    def test_prompt_above_the_quorum_budget_still_fails_loudly(self):
+        _callable, _oversize, error = self.fit(self.models, self.limits, 800_000)
+        self.assertIn("PLAN_REVIEW_DEGRADED_PREFLIGHT_OVERSIZE", error)
+
+    def test_unavailable_or_uncalibrated_slots_cannot_justify_a_bigger_prompt(self):
+        # Only one slot has a cap at assembly time: the other two read 0, so the quorum-th
+        # largest cap is 0 and nothing is assembled against a window nobody has.
+        self.assertEqual(self.limit(self.models, {"big/a": 745_000}), 0)
+        self.assertEqual(self.limit([], {}), 0)
+
+    def test_small_configs_need_every_slot_so_the_budget_is_the_minimum(self):
+        # adaptive_quorum: 1 slot -> 1, 2 slots -> both, 3+ -> 2 of N.
+        self.assertEqual(self.limit(["a", "b"], {"a": 545_000, "b": 745_000}), 545_000)
+        self.assertEqual(self.limit(["a"], {"a": 545_000}), 545_000)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_plan_task_at_zero_depth_finishes_on_degraded_evidence_without_a_wedge(monkeypatch, tmp_path):
+    """v6.79.0 consequence of honouring depth=0 (owner Q26): planning scouts go through the
+    SAME ``schedule_subagent`` gate, so a no-delegation run gets no scouts at all. plan_task
+    must then complete on its existing ``degraded_evidence`` path — one refused attempt per
+    intended scout, an explicit panel omission, a persisted audit artifact, and NO repeated
+    scheduling on resume (the wave is not re-reserved and no scout is retried)."""
+    import ouroboros.tools.plan_review as pr
+    from ouroboros.task_results import load_plan_review_state
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "0")
+    monkeypatch.setenv("OUROBOROS_MAX_WORKERS", "3")
+    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC", "0")
+    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "900")
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "parent-zero-depth"
+    ctx.task_depth = 0
+    ctx.current_chat_id = 1
+    ctx.event_queue = queue.Queue()
+    ctx.task_metadata = {"root_task_id": ctx.task_id}
+    request = _plan_request("P", "G", context_level="minimal")
+
+    result = pr._start_planning_swarm(ctx, request, pr._plan_request_fingerprint(
+        plan=request.plan, goal=request.goal, files_to_touch=request.files_to_touch,
+        context_level=request.context_level, context_notes=request.context_notes,
+        plan_class=request.plan_class, scope=request.scope,
+        include_tests=request.include_tests,
+    ))
+
+    assert result["started"] is True
+    assert result["degraded_evidence"] is True
+    assert result["task_ids"] == []
+    assert result["handoffs"]["omissions"]
+    assert result["handoffs"]["omissions"][0]["reason"] == "schedule_failed"
+    assert "depth limit (0) exceeded" in result["handoffs"]["omissions"][0]["detail"]
+    assert (tmp_path / "task_results" / "artifacts" / ctx.task_id / "plan_task_handoffs.json").exists()
+
+    scouts = load_plan_review_state(tmp_path, ctx.task_id)["waves"][0]["intended_scouts"]
+    assert scouts and all(item["schedule_status"] == "failed" for item in scouts)
+
+    # Resume of the same plan: still terminal, still no scheduling attempt, no extra wave.
+    resumed = pr._start_planning_swarm(ctx, request, pr._plan_request_fingerprint(
+        plan=request.plan, goal=request.goal, files_to_touch=request.files_to_touch,
+        context_level=request.context_level, context_notes=request.context_notes,
+        plan_class=request.plan_class, scope=request.scope,
+        include_tests=request.include_tests,
+    ))
+    assert resumed["resumed"] is True and resumed["degraded_evidence"] is True
+    assert len(load_plan_review_state(tmp_path, ctx.task_id)["waves"]) == 1

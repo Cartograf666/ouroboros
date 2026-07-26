@@ -36,7 +36,12 @@ test('shared task severity never paints degraded or best-effort outcomes green',
             objective: { status: 'degraded', source: 'task_acceptance_deadline_reserve' },
             review: {
                 status: 'skipped', eligibility: 'eligible', run_count: 0,
-                acceptance_decision: { status: 'review_skipped_deadline_reserve' },
+                // v6.78.0: canonical host status + typed reason (the reason literal
+                // is what execution.reason_code / objective.source key off).
+                acceptance_decision: {
+                    status: 'finalized_unaccepted',
+                    reason: 'review_skipped_deadline_reserve',
+                },
             },
         },
     }), 'warn');

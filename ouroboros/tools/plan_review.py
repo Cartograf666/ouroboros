@@ -37,13 +37,11 @@ from ouroboros.tools.review_helpers import (
     load_governance_doc,
     load_checklist_section,
     review_wave_budget_gate,
-    REVIEW_PROMPT_TOKEN_BUDGET as _REVIEW_BUDGET,
 )
 from ouroboros.tools.review_synthesis import (
     emit_plan_review_usage as _emit_plan_review_usage,  # noqa: F401 — test-compat re-export
     build_plan_review_messages,
     PLAN_REVIEW_CONTROL_PREFIX,
-    UNBINDABLE_DISPOSITION_NOTE as _UNBINDABLE_DISPOSITION_NOTE,
     VACUOUS_DISPOSITION_NOTE as _VACUOUS_DISPOSITION_NOTE,
     addressable_plan_findings,
     vacuous_review_disposition as _vacuous_review_disposition,
@@ -56,10 +54,18 @@ from ouroboros.tools.review_synthesis import (
     format_plan_review_output as _format_output,
     normalize_plan_scope as _normalize_plan_scope,
     parse_plan_review_signal,
+    bindable_claimed_wave as _bindable_claimed_wave,
+    per_slot_input_token_limits as _per_slot_input_token_limits,
+    plan_envelope_mismatch_note as _envelope_note,
+    plan_review_component_hashes as _plan_component_hashes,
     plan_review_fingerprint as _plan_request_fingerprint,
+    plan_slot_fit as _plan_slot_fit,
     plan_text_fingerprint,
+    quorum_input_token_limit as _quorum_input_token_limit,
+    unbindable_disposition_error as _unbindable_disposition_error,
     planning_handoff_selection as _planning_handoff_selection,
     planning_scout_framing as _planning_scout_framing,
+    planning_scout_wave_plan as _planning_scout_wave_plan,
     planning_swarm_context as _planning_swarm_context,
     render_plan_review_result as _render_existing_plan_review,
     summarize_plan_review_results as _summarize_plan_review_results,
@@ -75,6 +81,9 @@ _build_user_content = build_plan_review_user_content
 log = logging.getLogger(__name__)
 
 _PLAN_REVIEW_MAX_TOKENS = 65536
+# Scout-wave admission prices ONE opening round per scout (a deliberate lower bound: a wave
+# that cannot fund even that must not start; the per-attempt reservation rail covers the rest).
+_PLAN_SCOUT_MAX_TOKENS = 8192
 _PLAN_REVIEW_EFFORT = "high"
 _PLAN_REVIEW_SLOT_TIMEOUT_SEC = 560
 # Wrapper covers the shared scout cutoff plus one reviewer slot below the hard timeout.
@@ -86,14 +95,6 @@ _PLAN_TASK_TOOL_TIMEOUT_SEC = _PLAN_REVIEW_WRAPPER_TIMEOUT_SEC + 10
 def _effective_swarm_max_wait() -> float:
     from ouroboros.config import get_plan_task_swarm_max_wait_sec
     return min(get_plan_task_swarm_max_wait_sec(), float(_PLAN_SWARM_MAX_WAIT_DEFAULT_SEC))
-
-_PLAN_MODEL_CONTEXT_WINDOW = 1_000_000
-_PLAN_OUTPUT_MARGIN_TOKENS = 155_000
-_PLAN_BUDGET_TOKEN_LIMIT = min(
-    _REVIEW_BUDGET,
-    _PLAN_MODEL_CONTEXT_WINDOW - _PLAN_REVIEW_MAX_TOKENS - _PLAN_OUTPUT_MARGIN_TOKENS,
-)
-
 
 @dataclass(frozen=True)
 class _PlanReviewRequest:
@@ -164,7 +165,7 @@ def get_tools():
                                 "a navigation map) and task-fit scout framing."
                             ),
                         },
-                        "files_to_touch": {"type": "array", "description": "Optional list of repo-relative file paths you plan to modify. Their current content (HEAD snapshot) will be injected so reviewers can reason about concrete code, not just abstract plans.", "items": {"type": "string"}},
+                        "files_to_touch": {"type": "array", "description": "Optional list of repo-relative file paths you plan to modify. Their current content (HEAD snapshot) will be injected so reviewers can reason about concrete code, not just abstract plans. This list is PART OF THE REVIEW IDENTITY: changing it changes the review fingerprint, so a review_disposition can only close a review submitted with the SAME list.", "items": {"type": "string"}},
                         "context_level": {
                             "type": "string",
                             "enum": ["minimal", "localized", "broad", "constitutional"],
@@ -240,9 +241,7 @@ def get_tools():
                         },
                     },
                     # context_level is enforced HOST-SIDE by _resolve_plan_context_level:
-                    # explicit-choice for self_mod, optional (defaults minimal) for
-                    # external/creative/research — an unconditional schema `required`
-                    # contradicted that contract (triad r2, self_consistency).
+                    # explicit-choice for self_mod, optional (defaults minimal) otherwise.
                     "required": ["plan", "goal"],
                 },
             },
@@ -256,7 +255,6 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
     review_disposition = params.get("review_disposition")
     vacuous_disposition = _vacuous_review_disposition(review_disposition)
     review_disposition = None if vacuous_disposition else review_disposition
-    setattr(ctx, "_plan_disposition_ignored_unbindable", False)
     request = _PlanReviewRequest(
         plan=str(params.get("plan") or ""),
         goal=str(params.get("goal") or ""),
@@ -280,27 +278,17 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
                 result = pool.submit(
                     asyncio.run,
                     asyncio.wait_for(
-                        _run_plan_review_async(
-                            ctx,
-                            request,
-                        ),
-                        timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC,
+                        _run_plan_review_async(ctx, request), timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC,
                     ),
                 ).result(timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC + 5)
         except RuntimeError:
             result = asyncio.run(
                 asyncio.wait_for(
-                    _run_plan_review_async(
-                        ctx,
-                        request,
-                    ),
-                    timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC,
+                    _run_plan_review_async(ctx, request), timeout=_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC,
                 )
             )
         if isinstance(result, str) and vacuous_disposition:
             result += _VACUOUS_DISPOSITION_NOTE
-        elif isinstance(result, str) and getattr(ctx, "_plan_disposition_ignored_unbindable", False):
-            result += _UNBINDABLE_DISPOSITION_NOTE
         return result
     except concurrent.futures.TimeoutError:
         return f"ERROR: Plan review timed out after {_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC}s."
@@ -343,14 +331,8 @@ def _planning_state_location(ctx: ToolContext) -> tuple[pathlib.Path, str]:
 
 
 def _collect_planning_handoffs(
-    ctx: ToolContext,
-    *,
-    task_ids: list[str],
-    schedule_outputs: list[str],
-    fingerprint: str,
-    wait_timeout: float,
-    max_wait: float = 0.0,
-    intended_scouts: list[dict] | None = None,
+    ctx: ToolContext, *, task_ids: list[str], schedule_outputs: list[str], fingerprint: str,
+    wait_timeout: float, max_wait: float = 0.0, intended_scouts: list[dict] | None = None,
     cutoff_at: str = "",
 ) -> dict:
     """Wait for every started scout until terminal or the one shared cutoff."""
@@ -464,6 +446,7 @@ def _scheduled_side_channel_ids(ctx: ToolContext) -> list[str]:
 
 def _schedule_planning_scouts(
     ctx: ToolContext, wave: dict, *, fingerprint: str, objective: str, constraints: str, context: str,
+    deadline_at: str = "",
 ) -> dict:
     from ouroboros.tools.control import _schedule_task
 
@@ -475,8 +458,10 @@ def _schedule_planning_scouts(
         before_side = set(_scheduled_side_channel_ids(ctx))
         before_durable = set(_planning_direct_children(ctx))
         try:
+            # The scout deadline rides the POSITIONAL-ONLY internal-options mapping, not a new public
+            # parameter: `deadline_at` is runtime-internal and stays out of the strict schema.
             output = _schedule_task(
-                ctx, objective=objective,
+                ctx, {"deadline_at": deadline_at}, objective=objective,
                 expected_output=("A concise planning handoff with sections: summary, missed_touchpoints, "
                                  "risks, suggested_scope_adjustments, tests_to_run, blockers."),
                 role=role, context=context, constraints=constraints, memory_mode="forked", model_lane="light",
@@ -509,13 +494,7 @@ def _schedule_planning_scouts(
     return wave
 
 
-def _recover_pending_planning_scouts(
-    ctx: ToolContext,
-    state: dict,
-    wave: dict,
-    *,
-    fingerprint: str,
-) -> dict:
+def _recover_pending_planning_scouts(ctx: ToolContext, state: dict, wave: dict, *, fingerprint: str) -> dict:
     """Resolve an interrupted schedule from durable child rows before declaring omission."""
     root, parent_id = _planning_state_location(ctx)
     assigned = {
@@ -592,21 +571,18 @@ def _collect_host_planning_wave(
 def _start_planning_swarm(
     ctx: ToolContext,
     request: _PlanReviewRequest,
+    fingerprint: str,
 ) -> dict:
-    from ouroboros.config import get_max_workers
+    """Reserve/resume the scout wave for an ALREADY-COMPUTED binding fingerprint.
+
+    The caller passes it in: recomputing it here from the host-RESOLVED request would
+    key the wave under a different identity than the one the agent can name."""
+    from ouroboros.config import get_finalization_grace_sec, get_light_model, get_max_workers
 
     plan = request.plan
-    goal = request.goal
     files_to_touch = request.files_to_touch
     context_level = request.context_level
-    context_notes = request.context_notes
     plan_class = request.plan_class or "self_mod"
-    scope = request.scope
-    include_tests = request.include_tests
-    fingerprint = _plan_request_fingerprint(
-        plan=plan, goal=goal, files_to_touch=files_to_touch, context_level=context_level,
-        context_notes=context_notes, plan_class=plan_class, scope=scope, include_tests=include_tests,
-    )
     wait_timeout, max_wait = _planning_swarm_timing(ctx)
     root, parent_id = _planning_state_location(ctx)
     try:
@@ -619,31 +595,50 @@ def _start_planning_swarm(
             wave, created = reserve_plan_review_wave(
                 root, parent_id, fingerprint=fingerprint, plan_text_hash=plan_text_fingerprint(plan),
                 scout_roles=roles, cutoff_at=(_planning_now() + timedelta(seconds=max_wait)).isoformat(),
+                component_hashes=_plan_component_hashes(request),
             )
             resumed = not created
-            if created and get_max_workers() < 2:
-                message = "no spare worker capacity; increase OUROBOROS_MAX_WORKERS to at least 2"
-                for attempt in list(wave.get("intended_scouts") or []):
-                    wave = record_plan_review_scout(
-                        root, parent_id, fingerprint=fingerprint, role=str(attempt.get("role") or ""),
-                        schedule_status="failed", task_ids=[], reason=message,
-                    )
-            elif created:
+            if created:
                 objective, constraints = _planning_scout_framing(plan_class)
-                wave = _schedule_planning_scouts(
-                    ctx, wave, fingerprint=fingerprint, objective=objective, constraints=constraints,
-                    context=_planning_swarm_context(
-                        plan=plan, goal=goal, files_to_touch=files_to_touch, context_level=context_level,
-                        context_notes=context_notes, scope=scope,
-                    ),
+                context = _planning_swarm_context(
+                    plan=plan, goal=request.goal, files_to_touch=files_to_touch,
+                    context_level=context_level, context_notes=request.context_notes,
+                    scope=request.scope,
                 )
+                # Admission for a NEW wave ONLY. The recovery/collection path below gathers
+                # handoffs that are already PAID — gating those would abandon spend, not save it.
+                # The worker-capacity refusal lives inside the wave plan (max_workers < 2).
+                scout_deadline, refusal = _planning_scout_wave_plan(
+                    str(wave.get("scout_cutoff_at") or ""), max_workers=get_max_workers(),
+                    grace_sec=get_finalization_grace_sec(), now=_planning_now(),
+                )
+                admission = None if refusal else review_wave_budget_gate(
+                    ctx, surface="plan_task_scouts", max_completion_tokens=_PLAN_SCOUT_MAX_TOKENS,
+                    models=[get_light_model()] * len(wave.get("intended_scouts") or []),
+                    prompt_chars=len(objective) + len(constraints) + len(context),
+                )
+                if admission is not None:
+                    refusal = (
+                        "the scout wave was declined before dispatch — estimated ~$"
+                        f"{admission.get('estimated_wave_usd')} exceeds the remaining root budget "
+                        f"${admission.get('remaining_usd')} (limit ${admission.get('limit_usd')})"
+                    )
+                if refusal:
+                    for attempt in list(wave.get("intended_scouts") or []):
+                        wave = record_plan_review_scout(
+                            root, parent_id, fingerprint=fingerprint, role=str(attempt.get("role") or ""),
+                            schedule_status="failed", task_ids=[], reason=refusal,
+                        )
+                else:
+                    wave = _schedule_planning_scouts(
+                        ctx, wave, fingerprint=fingerprint, objective=objective, constraints=constraints,
+                        context=context, deadline_at=scout_deadline,
+                    )
         if not created and any(
             str(item.get("schedule_status") or "") == "pending"
             for item in wave.get("intended_scouts") or []
         ):
-            wave = _recover_pending_planning_scouts(
-                ctx, state, wave, fingerprint=fingerprint,
-            )
+            wave = _recover_pending_planning_scouts(ctx, state, wave, fingerprint=fingerprint)
         handoffs, wave = _collect_host_planning_wave(
             ctx, wave, fingerprint=fingerprint, wait_timeout=wait_timeout, max_wait=max_wait,
         )
@@ -788,12 +783,9 @@ def _planning_evidence_horizon(
     subject_repo: pathlib.Path,
     scope: dict | None = None,
 ) -> str:
-    """One compact planning-evidence manifest; no second context pipeline.
-
-    The plan and goal remain the canonical inline intent.  This block contributes
-    the durable task contract, lineage aliases, raw forensic refs and disclosed
-    omissions exactly once to the shared reviewer prompt.
-    """
+    """One compact planning-evidence manifest; no second context pipeline. Contributes the
+    durable task contract, lineage aliases, raw forensic refs and disclosed omissions exactly
+    once to the shared reviewer prompt; plan and goal stay the canonical inline intent."""
     from ouroboros.observability import redact_projection
 
     meta = getattr(ctx, "task_metadata", {})
@@ -921,7 +913,7 @@ def _reuse_or_disposition_plan_review(
     ctx: ToolContext,
     fingerprint: str,
     review_disposition: dict | None,
-    plan_text_hash: str = "",
+    plan_text_hash: str = "", request: _PlanReviewRequest | None = None,
 ) -> str | None:
     if _vacuous_review_disposition(review_disposition):
         review_disposition = None  # vacuous == absent (see review_synthesis)
@@ -946,11 +938,15 @@ def _reuse_or_disposition_plan_review(
             "text as well as a new request fingerprint."
         )
     if not review or expected_fp != fingerprint:
-        if review_disposition is not None:
-            # UNBINDABLE: no review for this fingerprint — can close nothing; discard
-            # pre-launch, run a real review (erroring wedged submissions, v6.65.0/1).
-            setattr(ctx, "_plan_disposition_ignored_unbindable", True)
-        return None
+        if review_disposition is None:
+            return None
+        bound = _bindable_claimed_wave(state, review_disposition, plan_text_hash, fingerprint)
+        if bound is None:
+            return _unbindable_disposition_error(
+                state, fingerprint, review_disposition, plan_text_hash, request,
+            )
+        wave, fingerprint = bound, str(bound.get("request_fingerprint") or "")
+        review = wave.get("review") if isinstance(wave.get("review"), dict) else {}
     if str((wave or {}).get("review_evidence_status") or "") == "pending":
         try:
             wave = _mark_planning_handoffs_consumed(ctx, dict(wave or {}))
@@ -989,7 +985,8 @@ def _reuse_or_disposition_plan_review(
             review, cached=True,
         )
     if review_disposition is not None:
-        return _apply_review_disposition(ctx, audit, review, fingerprint, review_disposition)
+        note = _envelope_note(wave, request)
+        return note + _apply_review_disposition(ctx, audit, review, fingerprint, review_disposition)
     if str(state.get("latest_review_fingerprint") or "") != fingerprint:
         try:
             represented = represent_plan_review(
@@ -1195,24 +1192,23 @@ async def _run_plan_review_async(
             plan_class=resolved_class,
             scope=scope,
         )
+        # BINDING identity = a pure function of the AGENT's envelope (resolved values
+        # live in the wave's component hashes, for diagnostics only).
         request_fingerprint = _plan_request_fingerprint(
-            plan=plan,
-            goal=goal,
-            files_to_touch=files_to_touch,
-            context_level=resolved_context_level,
-            context_notes=context_notes,
-            plan_class=resolved_class,
-            scope=scope,
-            include_tests=include_tests,
+            plan=plan, goal=goal, files_to_touch=files_to_touch, context_level=context_level,
+            context_notes=context_notes, plan_class=plan_class, scope=scope, include_tests=include_tests,
         )
         existing = _reuse_or_disposition_plan_review(
-            ctx, request_fingerprint, review_disposition, plan_text_fingerprint(plan)
+            ctx, request_fingerprint, review_disposition, plan_text_fingerprint(plan), resolved_request,
         )
         if existing is not None:
             return existing
         if not list(_cfg.get_review_models() or []):
             return "ERROR: No review models configured. Set OUROBOROS_REVIEW_MODELS in settings."
         models = _get_review_models()
+        slot_limits = _per_slot_input_token_limits(
+            models, context_window=1_000_000, output_reserve=_PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000)
+        plan_budget_limit = _quorum_input_token_limit(models, slot_limits)  # quorum, not the smallest window
 
     if deadline_blocked:
         return _plan_deadline_skip(ctx, emit=True) or deadline_skip
@@ -1222,7 +1218,7 @@ async def _run_plan_review_async(
     if planning_handoff_override is not None:
         planning_handoff_raw, planning_handoff_compact = planning_handoff_override
     else:
-        swarm = _start_planning_swarm(ctx, resolved_request)
+        swarm = _start_planning_swarm(ctx, resolved_request, request_fingerprint)
         if not swarm.get("started"):
             return str(swarm.get("error") or "ERROR: plan_task planning swarm failed closed.")
         planning_handoffs = dict(swarm.get("handoffs") or {})
@@ -1244,12 +1240,10 @@ async def _run_plan_review_async(
     dev_md = load_governance_doc(governance_repo, "docs/DEVELOPMENT.md", on_missing="explicit")
     arch_md = load_governance_doc(governance_repo, "docs/ARCHITECTURE.md", on_missing="explicit")
     checklists_md = load_governance_doc(governance_repo, "docs/CHECKLISTS.md", on_missing="explicit")
-    # v6.61.0 (5.2) doc tiering — a GOVERNANCE-contract change approved by owner quiz 19
-    # (DEVELOPMENT.md Core-Governance table + prose updated in the same commit): reviewers
-    # of a NON-self_mod plan keep BIBLE + DEVELOPMENT in full but get ARCHITECTURE as the
-    # LOSSLESS navigation map (every section + line range, full sections on demand) — an
-    # external/creative/research plan needs the self-body's operational map as an index,
-    # not ~45K tokens of inline detail. self_mod keeps today's full pack untouched.
+    # v6.61.0 (5.2) doc tiering (GOVERNANCE-contract change, owner quiz 19): reviewers of a
+    # NON-self_mod plan keep BIBLE + DEVELOPMENT in full but get ARCHITECTURE as the LOSSLESS
+    # navigation map (every section + line range, full sections on demand). self_mod keeps
+    # today's full pack untouched.
     if resolved_class != "self_mod" and arch_md.strip():
         from ouroboros.context_layout import generate_doc_nav_map
 
@@ -1311,7 +1305,7 @@ async def _run_plan_review_async(
                     ),
                     fixed_prompt_tokens=fixed_prompt_tokens,
                     target_total_tokens=target_tokens,
-                    hard_total_tokens=_PLAN_BUDGET_TOKEN_LIMIT,
+                    hard_total_tokens=plan_budget_limit,
                     include_tests=bool(include_tests),
                     title=f"Generated Plan Review Atlas ({resolved_context_level})",
                     drive_root=pathlib.Path(ctx.drive_root),
@@ -1328,11 +1322,9 @@ async def _run_plan_review_async(
                 + ". Split the plan into a smaller scope or choose a smaller context_level."
             )
 
-        # The Atlas slot is the LAST section of the stable evidence prefix by
-        # construction, so substitute the LAST occurrence within that boundary:
-        # a wider search would match the placeholder literal quoted by the plan
-        # text (dynamic tail) or inlined in a HEAD snapshot earlier in the
-        # stable prefix (e.g. a plan touching plan_review.py itself).
+        # The Atlas slot is the LAST section of the stable evidence prefix by construction, so
+        # substitute the LAST occurrence within that boundary: a wider search would match the
+        # placeholder literal quoted by the plan text or by a HEAD snapshot.
         slot = user_content.rfind(placeholder, 0, user_stable_len)
         if slot < 0:
             return "ERROR: Failed to build review context atlas: placeholder missing."
@@ -1340,15 +1332,12 @@ async def _run_plan_review_async(
         user_stable_len += len(atlas.text) - len(placeholder)
 
     estimated_tokens = estimate_tokens(system_prompt + user_content)
-    if estimated_tokens > _PLAN_BUDGET_TOKEN_LIMIT and planning_handoff_raw:
+    if estimated_tokens > plan_budget_limit and planning_handoff_raw:
         user_content = user_content.replace(planning_handoff_raw, planning_handoff_compact)
         estimated_tokens = estimate_tokens(system_prompt + user_content)
-    if estimated_tokens > _PLAN_BUDGET_TOKEN_LIMIT:
-        return (
-            f"⚠️ PLAN_REVIEW_SKIPPED: assembled prompt too large "
-            f"({estimated_tokens:,} estimated tokens, limit {_PLAN_BUDGET_TOKEN_LIMIT:,}). "
-            f"Consider reducing files_to_touch or splitting the plan into smaller scopes."
-        )
+    models, oversize_results, fit_error = _plan_slot_fit(models, slot_limits, estimated_tokens)
+    if fit_error:
+        return fit_error
 
     # Budget admission for the whole reviewer wave (v6.69.0): declining up front
     # beats dying mid-wave with paid partial slots. Fail-open on unknowns.
@@ -1371,7 +1360,7 @@ async def _run_plan_review_async(
         f"(context={resolved_context_level}, ~{estimated_tokens:,} tokens each)…"
     )
 
-    raw_results = await _run_plan_review_slots(
+    raw_results = oversize_results + await _run_plan_review_slots(
         ctx, models, system_prompt, user_content, user_stable_len=user_stable_len,
     )
     return _finalize_plan_review_output(ctx, _PlanReviewFinalization(
@@ -1460,11 +1449,9 @@ _PLAN_CLASSES = ("self_mod", "external", "creative", "research")
 
 
 def _resolve_plan_class(ctx: ToolContext, plan_class: str, files_to_touch: list) -> tuple[str, str]:
-    """v6.61.0 (5.1): resolve the plan's CLASS — the agent declares it LLM-first
-    (self_mod | external | creative | research), and the host STRUCTURALLY escalates
-    to self_mod when the planned files resolve under the SYSTEM repo (a path fact,
-    never keyword matching — P5). self_mod keeps today's full-pack review; the other
-    classes get the tiered doc pack (5.2) and task-fit scout framing (5.3).
+    """v6.61.0 (5.1): resolve the plan's CLASS — the agent declares it LLM-first (self_mod |
+    external | creative | research), and the host STRUCTURALLY escalates to self_mod when the
+    planned files resolve under the SYSTEM repo (a path fact, never keyword matching — P5).
     Returns (resolved_class, escalation_note)."""
     from ouroboros.tool_access import path_is_relative_to
     from ouroboros.tools.registry import active_repo_dir_for
@@ -1515,9 +1502,8 @@ def _resolve_plan_context_level(raw_level: str, *, plan_class: str = "self_mod")
     level = str(raw_level or "").strip().lower()
     valid = {"minimal", "localized", "broad", "constitutional"}
     if level not in valid:
-        # v6.61.0 (5.2): non-self_mod classes default to `minimal` — the generated
-        # Atlas is repo archaeology, which an external/creative/research plan needs
-        # only on explicit request. self_mod keeps the explicit-choice contract.
+        # v6.61.0 (5.2): non-self_mod classes default to `minimal` — the generated Atlas is repo
+        # archaeology, needed only on request. self_mod keeps the explicit-choice contract.
         if not level and plan_class in ("external", "creative", "research"):
             return "minimal"
         allowed = ", ".join(sorted(valid))

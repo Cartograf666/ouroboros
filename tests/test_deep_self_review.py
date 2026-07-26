@@ -681,8 +681,20 @@ class TestReviewPackOverflow:
             )
 
         assert "too large" in result
-        from ouroboros.deep_self_review import _DEEP_INPUT_TOKEN_LIMIT
-        assert f"{_DEEP_INPUT_TOKEN_LIMIT:,}" in result
+        # v6.80.0: the deep reviewer's cap is DENSITY-calibrated per model at call
+        # time (the module constant is only the uncalibrated window arithmetic), so
+        # the message must quote the calibrated number actually enforced.
+        from ouroboros.tools.review_helpers import calibrated_input_token_limit
+        from ouroboros.deep_self_review import (
+            _DEEP_MAX_OUTPUT_TOKENS, _DEEP_MODEL_CONTEXT_WINDOW, _DEEP_OUTPUT_MARGIN_TOKENS,
+        )
+        enforced = calibrated_input_token_limit(
+            "test-model",
+            context_window=_DEEP_MODEL_CONTEXT_WINDOW,
+            output_reserve=_DEEP_MAX_OUTPUT_TOKENS,
+            tokenizer_margin=_DEEP_OUTPUT_MARGIN_TOKENS,
+        )
+        assert f"{enforced:,}" in result
         assert usage == {}
         mock_llm.chat.assert_not_called()
 

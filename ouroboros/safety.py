@@ -286,6 +286,16 @@ def _get_safety_prompt() -> str:
         )
 
 
+# Safety-supervisor prompt-cache TTL. The SAFETY.md system prefix is byte-stable and
+# dominates this lane's input, but the gaps between checks are set by how long the
+# PRECEDING tool ran — a subagent wave, a test suite or a review round routinely puts
+# minutes between two consecutive checks, so the provider's 5-minute default would
+# re-pay the write multiplier several times per task. The 1h tier pays the higher write
+# once and reads at 0.1x for the rest of the hour; it breaks even against 5m after the
+# second expiry, which a task-length run of ~46 checks passes with room to spare.
+_SAFETY_CACHE_TTL = "1h"
+
+
 # Secret redaction.
 
 # Segment matching avoids false positives like ``override_author``.
@@ -631,6 +641,24 @@ def _run_llm_check(
     prompt = _build_check_prompt(tool_name, arguments, messages)
     client = LLMClient()
 
+    # The safety supervisor sends a TOOL-FREE payload, and the send-time cache finalizer
+    # (llm._normalize_payload_cache_ttl) is only allowed to add a marker to a tool schema
+    # — so this lane can only be cached if the CALLER declares its own stable prefix, the
+    # way every review surface does. The SAFETY.md system prompt is byte-stable across
+    # every check, so it is the whole cacheable prefix; the per-call tool proposal stays
+    # in the unmarked user turn. Transport shape only: the assembled prompt TEXT, the
+    # model slot, the verdict parsing and the fail-closed semantics are unchanged. On a
+    # route that cannot carry markers the marker is STRIPPED and the single text block is
+    # preserved (`llm._copy_messages_with_cache_policy`); the local and GigaChat lanes
+    # additionally flatten it back to the identical string. So the prompt text is
+    # byte-identical everywhere, while on the OpenAI-compatible lanes (direct OpenAI,
+    # openai-compatible, Cloud.ru, non-cache OpenRouter families) the system `content`
+    # goes over the wire as a ONE-ELEMENT block list instead of a bare string — accepted
+    # by OpenAI-compatible servers, and the disclosed residual of this change is a strict
+    # self-hosted LIGHT endpoint that rejects array system content (this lane fails
+    # CLOSED, so such a rejection would surface as SAFETY_VIOLATION, not as a bypass).
+    from ouroboros.tools.review_helpers import cached_prompt_blocks
+
     light_model = get_light_model()
     log.info(f"Running safety check on {tool_name} using {light_model} (local={_use_local_light})")
 
@@ -688,7 +716,9 @@ def _run_llm_check(
                 task_id=str(getattr(ctx, "task_id", "") or "safety"),
                 call_type="safety_supervisor",
                 messages=[
-                    {"role": "system", "content": _get_safety_prompt()},
+                    {"role": "system", "content": cached_prompt_blocks(
+                        _get_safety_prompt(), ttl=_SAFETY_CACHE_TTL,
+                    )},
                     {"role": "user", "content": prompt},
                 ],
                 model=light_model,
@@ -749,7 +779,11 @@ def _run_llm_check(
                     task_id=str(getattr(ctx, "task_id", "") or "safety"),
                     call_type="safety_supervisor_repair",
                     messages=[
-                        {"role": "system", "content": _get_safety_prompt()},
+                        # Same declared prefix as the first attempt, so the repair call
+                        # reads the cache the first one wrote instead of paying again.
+                        {"role": "system", "content": cached_prompt_blocks(
+                            _get_safety_prompt(), ttl=_SAFETY_CACHE_TTL,
+                        )},
                         {"role": "user", "content": repair_prompt},
                     ],
                     model=light_model,

@@ -1240,3 +1240,129 @@ def test_task_create_request_declares_executor_ref_contract():
                 "workspace_backend_path": "/workspace",
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# v6.80.0 frozen-ABI extensions: assert the shape that CROSSES THE WIRE.
+#
+# ARCHITECTURE.md §11.3 requires every ABI extension to update this suite. The
+# declared-vs-emitted key comparison above is static (AST over dict literals);
+# these two drive the real handlers so the browser-visible VALUE and its type
+# are covered too, not just the presence of an annotation.
+# ---------------------------------------------------------------------------
+
+
+def _api_state_payload(tmp_path, monkeypatch):
+    """Drive the real ``/api/state`` handler and return its decoded JSON body."""
+    import asyncio
+    import json
+    import types
+
+    from starlette.requests import Request
+
+    from ouroboros.gateway.state import api_state
+    from supervisor import queue, state, workers
+
+    root = tmp_path / "data"
+    (root / "state").mkdir(parents=True, exist_ok=True)
+    (root / "logs").mkdir(parents=True, exist_ok=True)
+    (root / "state" / "state.json").write_text(json.dumps({"spent_usd": 0.0}), encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(root))
+    monkeypatch.setenv("OUROBOROS_SETTINGS_PATH", str(root / "settings.json"))
+    monkeypatch.setattr(state, "load_state", lambda: {"current_branch": "ouroboros"})
+    monkeypatch.setattr(state, "TOTAL_BUDGET_LIMIT", 1.0)
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "PENDING", [])
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda: {})
+    app = types.SimpleNamespace(state=types.SimpleNamespace(drive_root=root, app_start=0.0))
+    request = Request({
+        "type": "http", "method": "GET", "path": "/api/state", "headers": [],
+        "query_string": b"", "scheme": "http", "server": ("test", 80),
+        "client": ("test", 1), "app": app,
+    })
+    response = asyncio.run(api_state(request))
+    assert response.status_code == 200
+    return json.loads(response.body)
+
+
+def test_state_response_context_mode_auto_low_crosses_the_wire(tmp_path, monkeypatch):
+    """``context_mode_auto_low`` must reach the browser as a real bool with real semantics.
+
+    The owner control needs to distinguish "the owner chose Low" from "the system auto-downgraded
+    to Low", because a no-op click on an already-selected Low short-circuited and left the derived
+    flag set. A truthy string or a missing key would break that control silently.
+    """
+    import json
+    import os
+
+    from ouroboros.gateway.contracts import StateResponse
+
+    monkeypatch.setattr(os, "environ", dict(os.environ))  # api_state reads mode state from env
+    for key in ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW"):
+        os.environ.pop(key, None)
+
+    # 1. System auto-downgrade: effective low, owner horizon still max -> True.
+    os.environ["OUROBOROS_CONTEXT_MODE"] = "low"
+    payload = _api_state_payload(tmp_path, monkeypatch)
+    assert set(payload) == set(StateResponse.__annotations__), (
+        "the emitted /api/state payload drifted from the frozen StateResponse contract"
+    )
+    assert payload["context_mode_auto_low"] is True
+    assert payload["context_mode"] == "low"
+    assert '"context_mode_auto_low": true' in json.dumps(payload), "must serialize as a JSON bool"
+
+    # 2. Owner-declared low (the stored `false` flag): not an auto-downgrade.
+    os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
+    payload = _api_state_payload(tmp_path, monkeypatch)
+    assert payload["context_mode_auto_low"] is False
+
+    # 3. Plain max: nothing was downgraded.
+    os.environ["OUROBOROS_CONTEXT_MODE"] = "max"
+    os.environ.pop("OUROBOROS_CONTEXT_MODE_AUTO_LOW", None)
+    payload = _api_state_payload(tmp_path, monkeypatch)
+    assert payload["context_mode_auto_low"] is False
+    assert payload["context_mode"] == "max"
+
+
+def test_owner_scope_review_floor_deprecation_notice_crosses_the_wire(tmp_path, monkeypatch):
+    """The deprecated floor endpoint must SAY so on the wire, and match its frozen contract.
+
+    The write is still accepted and stored (an owner customization is never destroyed), but
+    enforcement now follows the owner-only context mode, so the response carries a notice naming
+    the control that actually decides. An empty or missing notice is a silent lie to the owner.
+    """
+    import json
+
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from ouroboros import config as cfg
+    from ouroboros.gateway.contracts import OwnerScopeReviewFloorResponse
+    from ouroboros.gateway.settings import api_owner_scope_review_floor
+
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps({"TOTAL_BUDGET": "10"}), encoding="utf-8")
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "_SETTINGS_LOCK", pathlib.Path(str(settings_path) + ".lock"))
+
+    app = Starlette(routes=[
+        Route("/api/owner/scope-review-floor", endpoint=api_owner_scope_review_floor, methods=["POST"]),
+    ])
+    app.state.drive_root = tmp_path
+    response = TestClient(app).post("/api/owner/scope-review-floor", json={"floor": "advisory"})
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert set(payload) == set(OwnerScopeReviewFloorResponse.__annotations__), (
+        "the emitted scope-review-floor payload drifted from its frozen contract"
+    )
+    assert payload["ok"] is True
+    assert payload["scope_review_floor"] == "advisory"
+    notice = payload["deprecation_notice"]
+    assert isinstance(notice, str) and notice.strip(), "the notice must not cross the wire empty"
+    assert "context mode" in notice.lower(), "the notice must name the control that now decides"
+    # The owner's customization is stored even though it is enforcement-inert.
+    assert json.loads(settings_path.read_text(encoding="utf-8"))["OUROBOROS_SCOPE_REVIEW_FLOOR"] == "advisory"

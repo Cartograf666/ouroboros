@@ -715,7 +715,9 @@ export function renderSettingsPage() {
                             </div>
                             <div class="form-field">
                                 <label>Subagent Depth</label>
-                                <input id="s-subagent-depth" type="number" min="1" max="10" value="2">
+                                <!-- 0 is a real owner choice ("no delegation at all"), honoured
+                                     structurally since v6.79.0 — it must be reachable here. -->
+                                <input id="s-subagent-depth" type="number" min="0" max="10" value="2">
                             </div>
                             <div class="form-field">
                                 <label>Tool Timeout (s)</label>

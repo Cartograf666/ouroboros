@@ -130,7 +130,6 @@ def test_review_prompt_token_budget_is_ssot():
     """
     from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET
     from ouroboros.tools.scope_review import _SCOPE_BUDGET_TOKEN_LIMIT
-    from ouroboros.tools.plan_review import _PLAN_BUDGET_TOKEN_LIMIT
 
     assert REVIEW_PROMPT_TOKEN_BUDGET == 920_000, (
         f"REVIEW_PROMPT_TOKEN_BUDGET drifted to {REVIEW_PROMPT_TOKEN_BUDGET}; "
@@ -141,21 +140,22 @@ def test_review_prompt_token_budget_is_ssot():
         f"_SCOPE_BUDGET_TOKEN_LIMIT ({_SCOPE_BUDGET_TOKEN_LIMIT}) must equal "
         f"the SSOT REVIEW_PROMPT_TOKEN_BUDGET ({REVIEW_PROMPT_TOKEN_BUDGET})."
     )
-    # Plan review reserves output headroom inside the reviewer window (same
-    # class of fix as scope review): the limit is min(SSOT, window − output −
-    # margin) and must never exceed the SSOT.
-    from ouroboros.tools.plan_review import (
-        _PLAN_MODEL_CONTEXT_WINDOW,
-        _PLAN_OUTPUT_MARGIN_TOKENS,
-        _PLAN_REVIEW_MAX_TOKENS,
+    # Plan review reserves output headroom inside the reviewer window (same class of
+    # fix as scope review), but v6.80.0 replaced its module constants with PER-SLOT
+    # calibrated caps: every slot cap must still stay inside the shared SSOT.
+    from ouroboros.tools.plan_review import _PLAN_REVIEW_MAX_TOKENS
+    from ouroboros.tools.review_synthesis import per_slot_input_token_limits
+
+    limits = per_slot_input_token_limits(
+        ["anthropic/claude-fable-5", "openai/gpt-5.6-sol"],
+        context_window=1_000_000,
+        output_reserve=_PLAN_REVIEW_MAX_TOKENS,
+        tokenizer_margin=155_000,
     )
-    assert _PLAN_BUDGET_TOKEN_LIMIT == min(
-        REVIEW_PROMPT_TOKEN_BUDGET,
-        _PLAN_MODEL_CONTEXT_WINDOW - _PLAN_REVIEW_MAX_TOKENS - _PLAN_OUTPUT_MARGIN_TOKENS,
-    )
-    assert _PLAN_BUDGET_TOKEN_LIMIT <= REVIEW_PROMPT_TOKEN_BUDGET
-    assert _PLAN_BUDGET_TOKEN_LIMIT + _PLAN_REVIEW_MAX_TOKENS <= _PLAN_MODEL_CONTEXT_WINDOW, (
-        "plan input cap + reserved output exceeds the reviewer window; "
+    assert limits and all(v <= REVIEW_PROMPT_TOKEN_BUDGET for v in limits.values())
+    assert all(v > 0 for v in limits.values())
+    assert all(v + _PLAN_REVIEW_MAX_TOKENS <= 1_000_000 for v in limits.values()), (
+        "a per-slot plan input cap + reserved output exceeds the reviewer window; "
         "the provider would hard-400."
     )
 
@@ -194,22 +194,18 @@ def test_scope_input_budget_reserves_output_within_window():
     )
 
 
-def test_scope_input_limit_is_model_family_calibrated(monkeypatch):
-    """Claude-family scope reviewers get a code-density-calibrated input cap.
+def test_scope_input_limit_is_density_calibrated(monkeypatch, tmp_path):
+    """Scope reviewers get a MEASURED-density-calibrated input cap (v6.80.0).
 
-    Regression guard for the deterministic 400 where a 739,508-estimated-token
-    scope pack measured 1,166,914 REAL tokens on the Claude tokenizer (~1.58x
-    the chars/4 estimate on code) and was rejected by every fable-5 upstream as
-    "prompt is too long: > 1,000,000 maximum". The calibrated cap must keep
-    estimated*ratio + output inside the 1M window; the GPT-family cap stays at
-    the historical 745K. The model-family cap shrinks the PROMPT only — the
-    reviewer model and the >=1M window floor (BIBLE P3) are untouched.
+    Regression guard for the deterministic 400 where a 739,508-estimated-token scope
+    pack measured 1,166,914 REAL tokens on the Claude tokenizer (~1.58x the chars/4
+    estimate on code) and was rejected by every fable-5 upstream as "prompt is too
+    long: > 1,000,000 maximum". The hand-set family constant is gone; the cap must
+    still keep estimated*density + output inside the 1M window, must never exceed the
+    shared SSOT, and must never be LOOSER than the historical absolute-margin cap.
     """
-    from ouroboros.tools.review_helpers import (
-        CLAUDE_REAL_TOKENS_PER_ESTIMATED as _ANTHROPIC_REAL_TOKENS_PER_ESTIMATED,
-    )
+    from ouroboros.capability_evidence import COLD_START_TOKEN_DENSITY
     from ouroboros.tools.scope_review import (
-        _ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT,
         _SCOPE_BUDGET_TOKEN_LIMIT,
         _SCOPE_INPUT_TOKEN_LIMIT,
         _SCOPE_MAX_TOKENS,
@@ -217,57 +213,140 @@ def test_scope_input_limit_is_model_family_calibrated(monkeypatch):
         _effective_scope_input_limit,
     )
 
-    # This test verifies the model-family CALIBRATION CONSTANT applied at a 1M window,
-    # not the window-resolution policy. Treat the reviewer as >=1M so an off-default
-    # Claude model (fable-5) takes the 1M-calibrated path: since the v6.46.0 false-1M
-    # fix, an off-default model with no Capability Evidence fail-closes to the sub-floor.
+    # This test verifies the CALIBRATION at a 1M window, not the window-resolution
+    # policy: since the v6.46.0 false-1M fix an off-default model with no Capability
+    # Evidence fail-closes to the sub-floor.
     monkeypatch.setattr("ouroboros.tools.scope_review._scope_reviewer_window", lambda m: 1_000_000)
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
 
-    assert _ANTHROPIC_REAL_TOKENS_PER_ESTIMATED >= 1.58, (
-        "calibration ratio must cover the measured 1.58x Claude code density"
+    assert COLD_START_TOKEN_DENSITY >= 1.58, (
+        "the conservative cold-start density must cover the measured 1.58x Claude code density"
     )
-    real_tokens_at_cap = int(_ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT * _ANTHROPIC_REAL_TOKENS_PER_ESTIMATED)
-    assert real_tokens_at_cap + _SCOPE_MAX_TOKENS <= _SCOPE_MODEL_CONTEXT_WINDOW, (
-        "calibrated cap * real-token ratio + output reserve must fit the 1M window"
+    cap = _effective_scope_input_limit(scope_model="anthropic/claude-fable-5")
+    assert int(cap * COLD_START_TOKEN_DENSITY) + _SCOPE_MAX_TOKENS <= _SCOPE_MODEL_CONTEXT_WINDOW, (
+        "calibrated cap * real-token density + output reserve must fit the 1M window"
     )
-    assert _ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT <= _SCOPE_BUDGET_TOKEN_LIMIT
-
-    assert _effective_scope_input_limit(scope_model="anthropic/claude-fable-5") == _ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT
-    assert _effective_scope_input_limit(scope_model="anthropic::claude-fable-5") == _ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT
-    # Bare aliases without a provider prefix must still classify as Claude-family.
-    assert _effective_scope_input_limit(scope_model="fable-5") == _ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT
-    assert _effective_scope_input_limit(scope_model="~mythos-5") == _ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT
-    assert _effective_scope_input_limit(scope_model="openai/gpt-5.5") == _SCOPE_INPUT_TOKEN_LIMIT
+    assert cap <= _SCOPE_BUDGET_TOKEN_LIMIT
+    # Every spelling of the shipped reviewer resolves to the same calibrated cap, and
+    # the historical absolute-margin cap remains an upper bound for ANY model.
+    for spelling in ("anthropic::claude-fable-5", "fable-5", "~mythos-5", "openai/gpt-5.5"):
+        assert _effective_scope_input_limit(scope_model=spelling) <= _SCOPE_INPUT_TOKEN_LIMIT
 
 
-def test_calibrated_input_limit_shared_helper():
-    """The shared helper is the calibration SSOT for scope AND deep review."""
-    from ouroboros.tools.review_helpers import (
-        CLAUDE_REAL_TOKENS_PER_ESTIMATED,
-        calibrated_input_token_limit,
-        is_claude_family_model,
-    )
+def test_calibrated_input_limit_shared_helper(tmp_path, monkeypatch):
+    """The shared helper is the calibration SSOT for scope, triad, plan AND deep review.
 
-    assert is_claude_family_model("anthropic/claude-fable-5")
-    assert is_claude_family_model("fable-5")
-    assert not is_claude_family_model("openai/gpt-5.5")
-
-    gpt = calibrated_input_token_limit(
-        "openai/gpt-5.5", context_window=1_000_000, output_reserve=100_000, tokenizer_margin=155_000
-    )
-    claude = calibrated_input_token_limit(
-        "anthropic/claude-fable-5", context_window=1_000_000, output_reserve=100_000, tokenizer_margin=155_000
-    )
-    assert gpt == 745_000
-    assert claude == int(900_000 / CLAUDE_REAL_TOKENS_PER_ESTIMATED)
-    assert int(claude * CLAUDE_REAL_TOKENS_PER_ESTIMATED) + 100_000 <= 1_000_000
-
-    # Deep self-review consumes the same helper for its model-aware gate.
+    A MEASURED observation must actually reach it (the old import-time constant froze
+    the pre-measurement value for the whole process), and seeding an observation that
+    reproduces the legacy effective density must reproduce the legacy limit BYTE-FOR-BYTE.
+    """
     import inspect
 
     from ouroboros import deep_self_review
+    from ouroboros.capability_evidence import (
+        COLD_START_TOKEN_DENSITY,
+        MEASURED_DENSITY_SAFETY_FACTOR,
+        record_token_density,
+    )
+    from ouroboros.tools.review_helpers import calibrated_input_token_limit
 
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
+
+    def limit(model):
+        return calibrated_input_token_limit(
+            model, context_window=1_000_000, output_reserve=100_000,
+            tokenizer_margin=155_000, drive_root=tmp_path,
+        )
+
+    # Cold start: the conservative density applies to EVERY model, so the cap is at or
+    # below the historical GPT-family 745K and never above it.
+    assert limit("openai/gpt-5.5") == int(900_000 / COLD_START_TOKEN_DENSITY)
+    assert limit("anthropic/claude-fable-5") == int(900_000 / COLD_START_TOKEN_DENSITY)
+    assert limit("openai/gpt-5.5") <= 745_000
+
+    # Seed a measurement reproducing the LEGACY effective density (1.65) and the
+    # legacy Claude limit comes back byte-identical.
+    legacy_density = 1.65 / MEASURED_DENSITY_SAFETY_FACTOR
+    chars = 4_000_000
+    record_token_density(
+        tmp_path, "anthropic/claude-fable-5",
+        prompt_chars=chars, prompt_tokens=int(legacy_density * chars / 4),
+    )
+    assert limit("anthropic/claude-fable-5") == int(900_000 / 1.65)
+
+    # A model with a genuinely LIGHTER tokenizer keeps its OWN measured density: the
+    # cold-start constant is a Claude-derived cold-path value, not a global floor that
+    # permanently shrinks every other model's pack. The historical absolute-margin form
+    # still bounds the result, so the cap never exceeds the pre-measurement one.
+    record_token_density(
+        tmp_path, "openai/gpt-5.5", prompt_chars=chars, prompt_tokens=int(1.0 * chars / 4),
+    )
+    assert limit("openai/gpt-5.5") == 1_000_000 - 100_000 - 155_000 == 745_000
+
+    # Deep self-review consumes the same helper for its model-aware gate.
     assert "calibrated_input_token_limit" in inspect.getsource(deep_self_review.run_deep_self_review)
+    # ...as does the triad, whose pack size moves with the same formula.
+    from ouroboros.tools import review as triad
+    assert "calibrated_input_token_limit" in inspect.getsource(triad)
+
+
+def test_measured_density_never_loosens_a_models_own_review_pack_cap(tmp_path, monkeypatch):
+    """Measurement may only ever TIGHTEN a given model's cap — PER MODEL IDENTITY.
+
+    One normalized identity accumulates observations from every surface (the shipped
+    `claude-fable-5` is both the scope reviewer and a triad slot), so a run of doc-only
+    commits whose prose-dominated packs measure ~1.1 must not pull a code-heavy model's
+    stored density back down and hand the NEXT code-heavy scope pack a bigger cap — the
+    deterministic 400 this calibration prevents. The guarantee lives in the STORE (a
+    running per-model maximum), not in a global Claude-derived floor: flooring every
+    model at 1.65 permanently shrank the pack of every lighter tokenizer instead.
+    """
+    from ouroboros.capability_evidence import (
+        _DENSITY_MEMO,
+        record_token_density,
+        resolve_token_density,
+    )
+    from ouroboros.tools.review_helpers import calibrated_input_token_limit
+
+    _DENSITY_MEMO.clear()
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
+
+    def limit(model):
+        return calibrated_input_token_limit(
+            model, context_window=1_000_000, output_reserve=100_000,
+            tokenizer_margin=155_000, drive_root=tmp_path,
+        )
+
+    cold = limit("anthropic/claude-fable-5")
+    chars = 4_000_000
+
+    # A real code-heavy pack measures 1.58 on this identity: the cap TIGHTENS.
+    record_token_density(
+        tmp_path, "anthropic/claude-fable-5",
+        prompt_chars=chars, prompt_tokens=int(1.58 * chars / 4),
+    )
+    density, source = resolve_token_density(tmp_path, "anthropic/claude-fable-5")
+    assert source == "measured"
+    tightened = limit("anthropic/claude-fable-5")
+    assert tightened <= cold
+
+    # A later run of prose-dominated packs measures ~1.1 on the SAME identity: the
+    # stored density is a running maximum, so the cap does NOT loosen back.
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        tmp_path, "anthropic/claude-fable-5",
+        prompt_chars=chars, prompt_tokens=int(1.1 * chars / 4),
+    )
+    assert resolve_token_density(tmp_path, "anthropic/claude-fable-5")[0] == density
+    assert limit("anthropic/claude-fable-5") == tightened
+
+    # A measured DENSER value still tightens further (the direction that prevents 400s).
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        tmp_path, "anthropic/claude-fable-5",
+        prompt_chars=chars, prompt_tokens=int(2.0 * chars / 4),
+    )
+    assert limit("anthropic/claude-fable-5") < tightened
 
 
 def test_scope_normalize_defaults_pass_severity_only():

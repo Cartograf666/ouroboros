@@ -410,6 +410,9 @@ class StateResponse(TypedDict):
     supervisor_error: Optional[str]
     runtime_mode: str
     context_mode: str
+    # True when the EFFECTIVE `low` is a system auto-downgrade rather than an owner
+    # selection: the owner control needs it to offer "confirm Low" on a no-op click.
+    context_mode_auto_low: bool
     safety_mode: str
     skills_repo_configured: bool
     github_token_configured: bool
@@ -474,6 +477,9 @@ class OwnerContextModeResponse(TypedDict):
 class OwnerScopeReviewFloorResponse(TypedDict):
     ok: bool
     scope_review_floor: str  # blocking_1m | advisory (v6.34.0, CW1)
+    # v6.80.0: the value is STORED but enforcement-inert — scope-review applicability
+    # follows the owner-only context mode. The notice says so on every write.
+    deprecation_notice: str
 
 
 class OwnerSafetyModeResponse(TypedDict):

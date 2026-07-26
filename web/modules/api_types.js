@@ -22,6 +22,7 @@
  * @property {?string} supervisor_error
  * @property {string} runtime_mode
  * @property {string} context_mode
+ * @property {boolean} context_mode_auto_low  // effective low is a system auto-downgrade, not an owner selection
  * @property {string} safety_mode
  * @property {boolean} skills_repo_configured
  * @property {boolean} github_token_configured
@@ -335,6 +336,7 @@
  * @typedef {Object} OwnerScopeReviewFloorResponse
  * @property {boolean} ok
  * @property {string} scope_review_floor  // blocking_1m | advisory (v6.34.0, CW1)
+ * @property {string} deprecation_notice  // v6.80.0: stored, but enforcement-inert
  */
 
 /**
@@ -499,4 +501,4 @@
  * @property {boolean=} ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.75.0';
+export const GATEWAY_CONTRACT_VERSION = '6.81.0';

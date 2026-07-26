@@ -10,7 +10,7 @@ import pathlib
 import re
 import socket
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
@@ -277,10 +277,15 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
             "OUROBOROS_RUNTIME_MODE",
             "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS",
             "OUROBOROS_CONTEXT_MODE",
-            # CW1 (v6.34.0): the P3 scope-review floor is an immune-system control —
-            # a generic /api/settings write must NOT be able to weaken it to advisory.
-            # It flows ONLY through the dedicated audited owner endpoint (api_owner_
-            # scope_review_floor); the UI uses that, never the generic settings merge.
+            # Derived auto-downgrade state (v6.80.0). Merge-skipped in BOTH directions:
+            # setting it would fake an owner narrowing, and CLEARING it would turn a
+            # system auto-downgrade into an owner-declared scope-review skip.
+            "OUROBOROS_CONTEXT_MODE_AUTO_LOW",
+            # CW1 (v6.34.0): the scope-review floor is owner-only and flows ONLY through
+            # its dedicated audited endpoint (api_owner_scope_review_floor). Since v6.80.0
+            # the value is enforcement-inert — BIBLE P3 scope-review applicability follows
+            # the owner context mode — but the frozen contract surface and the owner-only
+            # write path stay, so a generic settings write still cannot author it.
             "OUROBOROS_SCOPE_REVIEW_FLOOR",
             # v6.54.3: LLM-safety-supervisor coverage (full/light/off) is likewise an
             # immune-system control — a generic settings write must not lower it. It
@@ -351,22 +356,35 @@ def _owner_audit(request: Request, action: str, payload: Dict[str, Any]) -> None
         log.debug("Failed to write owner API audit event", exc_info=True)
 
 
+# The context mode and its derived authority bit are authored together, by the owner endpoint
+# or by the system auto-downgrade — never by a generic save (see prepare_settings_for_persist).
+_CONTEXT_MODE_KEYS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW")
+
+
 def _owner_write_settings(
     settings: Dict[str, Any],
     *,
+    authored_keys: Sequence[str] = (),
     allow_context_lowering: bool = False,
     allow_safety_lowering: bool = False,
 ) -> None:
-    """Write owner-controlled settings without applying the runtime-mode ratchet."""
+    """Write owner-controlled settings without applying the runtime-mode ratchet.
+
+    Skipping that ONE ratchet is the whole reason this writer exists; everything else comes from
+    ``config.prepare_settings_for_persist``, the single point both persisting writers pass through.
+    An endpoint that genuinely authors a disk-authored key (context mode, safety mode, the derived
+    auto-low flag) must name it in ``authored_keys`` — otherwise a POST about an unrelated key would
+    author a mode decision out of the defaults merge that ``_owner_read_settings_raw`` performs."""
     from ouroboros import config as _config
 
     _config._guard_live_settings_write()
-    _config._guard_context_mode_lowering(settings, allow_context_lowering=allow_context_lowering)
-    _config._guard_safety_mode_lowering(settings, allow_safety_lowering=allow_safety_lowering)
+    to_write = _config.prepare_settings_for_persist(
+        dict(settings), authored_keys=authored_keys,
+        allow_context_lowering=allow_context_lowering, allow_safety_lowering=allow_safety_lowering)
     _config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     fd = _config._acquire_settings_lock()
     try:
-        atomic_write_json(_config.SETTINGS_PATH, dict(settings), trailing_newline=False)
+        atomic_write_json(_config.SETTINGS_PATH, to_write, trailing_newline=False)
     finally:
         _config._release_settings_lock(fd)
 
@@ -550,6 +568,125 @@ def _max_context_block(settings: Dict[str, Any], *, allow_generative: bool = Fal
         }
 
 
+# Settings keys a review slot's route can resolve its base URL through. Changing one
+# changes the ROUTE FINGERPRINT for an unchanged model, so it must retrigger the
+# capability notice exactly as a slot change does (see _review_capability_notices).
+_REVIEW_ROUTE_BASE_URL_KEYS = frozenset({
+    "OPENAI_BASE_URL",
+    "OPENAI_COMPATIBLE_BASE_URL",
+    "CLOUDRU_FOUNDATION_MODELS_BASE_URL",
+    "GIGACHAT_BASE_URL",
+})
+
+
+def _review_slot_route(settings: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """(provider, model, base_url, use_local) for a REVIEW slot's own route.
+
+    Deliberately NOT ``_active_main_route``: a review slot is pinned by its own model
+    id and must never inherit the main lane's USE_LOCAL_MAIN routing."""
+    from ouroboros.provider_models import provider_for_model
+
+    provider = provider_for_model(str(model or ""))
+    base_url = ""
+    if provider == "openai":
+        base_url = str(settings.get("OPENAI_BASE_URL") or "")
+    elif provider == "openai-compatible":
+        base_url = str(settings.get("OPENAI_COMPATIBLE_BASE_URL") or "")
+    elif provider == "cloudru":
+        base_url = str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "")
+    elif provider == "gigachat":
+        base_url = str(settings.get("GIGACHAT_BASE_URL") or "")
+    use_local = provider == "local" or str(model or "").endswith(" (local)")
+    return {
+        "provider": "local" if use_local else provider,
+        "model": str(model or ""),
+        "base_url": base_url,
+        "use_local": use_local,
+    }
+
+
+def _unrecognised_review_models(models: Any) -> list:
+    """Review-slot model ids the provider catalog does not know (evidence-based).
+
+    An OpenRouter-routed id that is ABSENT from a SUCCESSFULLY fetched OpenRouter
+    catalog is reported loudly: a truncated slot value (e.g. ``-5``) otherwise looks
+    valid on save and only surfaces later as three waves of ``400 <id> is not a valid
+    model ID``, which destroys the review quorum. Nothing is rejected or rewritten —
+    the fetch may be unavailable, so this is a WARNING, never a save gate."""
+    try:
+        from ouroboros.llm import LLMClient
+        from ouroboros.provider_models import provider_for_model
+
+        candidates = [str(m or "").strip() for m in (models or []) if str(m or "").strip()]
+        openrouter = [m for m in candidates if provider_for_model(m) == "openrouter"]
+        if not openrouter:
+            return []
+        LLMClient.openrouter_context_length(openrouter[0], allow_fetch=True)
+        if not getattr(LLMClient, "_CAPABILITIES_FETCH_OK", False):
+            return []  # no authoritative catalog -> cannot claim anything is unknown
+        known = getattr(LLMClient, "_CONTEXT_LENGTH_CACHE", {}) or {}
+        return [m for m in openrouter if m not in known]
+    except Exception:
+        return []
+
+
+def _review_capability_notices(settings: Dict[str, Any]) -> list:
+    """Owner-facing Capability Evidence notices for the configured review slots.
+
+    The Max-context gate only ever probed the MAIN route, so a PINNED scope reviewer
+    could not become "known" through any path and silently ran with the conservative
+    sub-floor window — exactly the failure the owner hit. Saving settings now probes
+    the review + scope-review slots too and returns the SAME
+    ``needs_ack:{route, route_fp, evidence}`` contract the Max gate already uses, and
+    ``settings.js`` renders it through the SAME confirm -> owner-capability-ack flow.
+    Advisory only: a slot without evidence stays fail-closed at review time (the pin is
+    routing intent, never evidence) — this just makes "known" reachable.
+
+    ONLY the scope-review surface is probed: it is the one surface whose >=1M evidence
+    gates anything, so probing the triad slots was network work whose result was
+    discarded. The caller gates this on a ROUTE-AFFECTING change (the scope slot itself
+    or any base URL that route resolves through), not every settings save: capability is
+    a property of provider+base_url+model, so a hot base-URL change produces a route with
+    no evidence exactly as a model change does.
+
+    The slot is read from the CANDIDATE settings, not from ``get_scope_review_models()``:
+    that reads process env, which is not necessarily the value being saved, so the notice
+    could describe the outgoing route instead of the incoming one."""
+    notices: list = []
+    try:
+        from ouroboros.capability_evidence import ONE_MILLION, confirms_at_least, probe
+        from ouroboros.config import DATA_DIR, get_scope_review_models
+
+        candidates = [
+            m for m in str(
+                settings.get("OUROBOROS_SCOPE_REVIEW_MODELS")
+                or settings.get("OUROBOROS_SCOPE_REVIEW_MODEL")
+                or ""
+            ).replace(",", " ").split() if m
+        ] or list(get_scope_review_models() or [])
+        seen: set = set()
+        for model in candidates:
+            if str(model) in seen:
+                continue
+            seen.add(str(model))
+            route = _review_slot_route(settings, str(model))
+            ev = probe(
+                DATA_DIR, provider=route["provider"], model=route["model"],
+                base_url=route["base_url"], use_local=route["use_local"],
+                allow_fetch=True, allow_generative=False,
+            )
+            if not confirms_at_least(ev, ONE_MILLION):
+                notices.append({
+                    "surface": "scope_review",
+                    "needs_ack": {**route, "route_fp": ev.route_fp, "evidence": ev.to_json()},
+                    "window_tokens": int(ev.window_tokens or 0),
+                    "verified": int(ev.window_tokens or 0) > 0,
+                })
+    except Exception:
+        log.debug("review capability probe skipped", exc_info=True)
+    return notices
+
+
 def _active_route_confirms_max(
     settings: Optional[Dict[str, Any]] = None,
     *,
@@ -597,6 +734,69 @@ def _active_route_confirms_max(
         return None
 
 
+def _apply_max_context_auto_downgrade(
+    current: Dict[str, Any],
+    old_effective_settings: Dict[str, Any],
+) -> tuple:
+    """Narrow Max->Low IN PLACE when a model change lands on an unverified route.
+
+    Returns ``(notice, probe_error)``: at most one is set. ``probe_error`` means the
+    provider could not be reached at all and the caller must 503 WITHOUT saving.
+
+    Max-mode is fail-closed (BIBLE P1/P3). The low->max TOGGLE is gated by
+    api_owner_context_mode, but a model/provider CHANGE while already in Max must not
+    silently keep Max on an unverified (sub-1M / unknown) route. Owner decision
+    (v6.33.0 WS11): changing models stays FRICTION-FREE — the model change ALWAYS
+    succeeds; if the new route can't be confirmed >=1M the context mode
+    AUTO-DOWNGRADES to Low with a plain notice (never a 409 that blocks the save).
+    Every uncertainty resolves CLOSED (-> Low)."""
+    from ouroboros.config import get_context_mode
+
+    try:
+        in_max = get_context_mode() == "max"
+    except Exception:
+        in_max = True  # cannot determine the mode -> assume max, re-gate
+    if not in_max:
+        return None, None
+    def _route_key(r):
+        return (r["provider"], r["model"], r["base_url"], r["use_local"])
+    try:
+        route_changed = (
+            _route_key(_active_main_route(current))
+            != _route_key(_active_main_route(old_effective_settings))
+        )
+    except Exception:
+        route_changed = True  # cannot compare routes -> assume changed, re-gate
+    if not route_changed:
+        return None, None
+    block = _max_context_block(current, allow_generative=True)  # fail-closed internally
+    if block is None:
+        return None, None
+    if block.get("probe_failed"):
+        # Owner decision P4: a genuine NO-CONNECTION during the probe is an ERROR, not
+        # a silent downgrade — and the model is NOT saved. (A sub-1M/unprobeable route
+        # still auto-downgrades.)
+        return None, str(
+            block.get("error")
+            or "Couldn't reach the provider to verify the model's context window."
+        )
+    current["OUROBOROS_CONTEXT_MODE"] = "low"
+    os.environ["OUROBOROS_CONTEXT_MODE"] = "low"
+    # This narrowing is SYSTEM-initiated on an AGENT-REACHABLE path (a plain
+    # {"OUROBOROS_MODEL": ...} POST names neither the context key nor settings.json, so
+    # the self-lowering shell guard cannot see it). Since v6.80.0 the context mode also
+    # decides whether the BIBLE P3 blocking scope review applies, so the auto-low is
+    # marked as derived: get_owner_context_mode keeps reporting the OWNER's selection,
+    # and scope review stays ON. Context sizing is unchanged.
+    current["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "true"
+    os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "true"
+    return (
+        str(block.get("error") or "")
+        + " Context mode switched to Low. To use Max with this model, confirm it "
+          "supports a 1M-token context window."
+    ), None
+
+
 async def api_owner_context_mode(request: Request) -> JSONResponse:
     """Persist the owner-selected context mode (low/max).
 
@@ -627,8 +827,13 @@ async def api_owner_context_mode(request: Request) -> JSONResponse:
         if block is not None:
             return JSONResponse({"ok": False, "context_mode": previous_mode, **block}, status_code=409)
     current["OUROBOROS_CONTEXT_MODE"] = next_mode
-    _owner_write_settings(current, allow_context_lowering=True)
+    # An explicit owner selection re-authors the value: the derived auto-downgrade flag
+    # is cleared, so `low` chosen HERE really does mean "scope review not performed".
+    current["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
+    # This endpoint IS the author of both keys, so they persist even at the shipped default.
+    _owner_write_settings(current, authored_keys=_CONTEXT_MODE_KEYS, allow_context_lowering=True)
     os.environ["OUROBOROS_CONTEXT_MODE"] = next_mode
+    os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
     _owner_audit(
         request,
         "context_mode",
@@ -637,13 +842,27 @@ async def api_owner_context_mode(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "context_mode": next_mode})
 
 
+_SCOPE_REVIEW_FLOOR_DEPRECATION_NOTICE = (
+    "OUROBOROS_SCOPE_REVIEW_FLOOR is DEPRECATED since v6.80.0 and no longer affects "
+    "anything: your value is stored, but whether the BIBLE P3 blocking scope review runs "
+    "is decided solely by the owner-only context mode (max = blocking scope gate, low = "
+    "whole-repository scope review declaredly not performed). Use POST "
+    "/api/owner/context-mode to change that."
+)
+
+
 async def api_owner_scope_review_floor(request: Request) -> JSONResponse:
     """Persist the owner-selected P3 scope-review floor (blocking_1m | advisory).
 
-    Owner-only + audited (CW1, v6.34.0): the floor is an immune-system control, so
-    it is merge-skipped from the generic /api/settings path — ONLY this dedicated,
-    audited endpoint may change it. That stops any generic settings write from
-    silently weakening the blocking >=1M scope gate to advisory (BIBLE P3)."""
+    Owner-only + audited (CW1, v6.34.0): merge-skipped from the generic /api/settings
+    path, so ONLY this dedicated endpoint may author it.
+
+    DEPRECATED and ENFORCEMENT-INERT since v6.80.0: nothing in the runtime consults the
+    stored value — scope-review applicability comes solely from
+    ``config.get_owner_context_mode()``. The endpoint is kept because the gateway contract
+    surface is frozen and because an owner customization is never destroyed: the write is
+    accepted, stored, audited, and answered with an explicit deprecation notice naming the
+    control that actually decides."""
     try:
         body = await request.json()
     except Exception:
@@ -659,9 +878,17 @@ async def api_owner_scope_review_floor(request: Request) -> JSONResponse:
     _owner_audit(
         request,
         "scope_review_floor",
-        {"scope_review_floor": raw, "previous_scope_review_floor": previous},
+        {
+            "scope_review_floor": raw,
+            "previous_scope_review_floor": previous,
+            "deprecated": True,
+        },
     )
-    return JSONResponse({"ok": True, "scope_review_floor": raw})
+    return JSONResponse({
+        "ok": True,
+        "scope_review_floor": raw,
+        "deprecation_notice": _SCOPE_REVIEW_FLOOR_DEPRECATION_NOTICE,
+    })
 
 
 async def api_owner_safety_mode(request: Request) -> JSONResponse:
@@ -684,7 +911,8 @@ async def api_owner_safety_mode(request: Request) -> JSONResponse:
     current = _owner_read_settings_raw()
     previous = _config.normalize_safety_mode(current.get("OUROBOROS_SAFETY_MODE"))
     current["OUROBOROS_SAFETY_MODE"] = raw_mode
-    _owner_write_settings(current, allow_safety_lowering=True)
+    _owner_write_settings(
+        current, authored_keys=("OUROBOROS_SAFETY_MODE",), allow_safety_lowering=True)
     os.environ["OUROBOROS_SAFETY_MODE"] = raw_mode
     _owner_audit(
         request,
@@ -971,42 +1199,14 @@ async def api_settings_post(request: Request) -> JSONResponse:
         current, provider_defaults_changed, provider_default_keys = apply_runtime_provider_defaults(current)
         if str(current.get("LOCAL_MODEL_SOURCE", "") or "").strip() and not has_startup_ready_provider(current):
             return json_error("Local-only setups must route at least one model to the local runtime.", 400)
-        # Max-mode is fail-closed (BIBLE P1/P3). The low->max TOGGLE is gated by
-        # api_owner_context_mode, but a model/provider CHANGE while already in Max
-        # must not silently keep Max on an unverified (sub-1M / unknown) route.
-        # Owner decision (v6.33.0 WS11): changing models stays FRICTION-FREE — the
-        # model change ALWAYS succeeds; if the new route can't be confirmed ≥1M, we
-        # AUTO-DOWNGRADE context mode to Low and return a plain notice (never a 409
-        # that blocks the save). Every uncertainty resolves CLOSED (-> Low).
-        _max_downgrade_notice = None
-        from ouroboros.config import get_context_mode as _get_ctx_mode
-        try:
-            _in_max = _get_ctx_mode() == "max"
-        except Exception:
-            _in_max = True  # cannot determine the mode -> assume max, re-gate
-        if _in_max:
-            _route_key = lambda r: (r["provider"], r["model"], r["base_url"], r["use_local"])
-            try:
-                _route_changed = _route_key(_active_main_route(current)) != _route_key(_active_main_route(old_effective_settings))
-            except Exception:
-                _route_changed = True  # cannot compare routes -> assume changed, re-gate
-            if _route_changed:
-                _block = _max_context_block(current, allow_generative=True)  # internally fail-closed on error
-                if _block is not None:
-                    if _block.get("probe_failed"):
-                        # Owner decision P4: a genuine NO-CONNECTION during the probe
-                        # is an ERROR, not a silent downgrade — and the model is NOT
-                        # saved. (A sub-1M/unprobeable route still auto-downgrades.)
-                        return json_error(
-                            str(_block.get("error") or "Couldn't reach the provider to verify the model's context window."),
-                            503,
-                        )
-                    current["OUROBOROS_CONTEXT_MODE"] = "low"
-                    os.environ["OUROBOROS_CONTEXT_MODE"] = "low"
-                    _max_downgrade_notice = (
-                        str(_block.get("error") or "")
-                        + " Context mode switched to Low. To use Max with this model, confirm it supports a 1M-token context window."
-                    )
+        # Fail-closed Max narrowing on a model/route change (see the helper): the save
+        # always succeeds, but an unverified route drops context sizing to Low, and an
+        # unreachable provider is a 503 that does NOT persist the model.
+        _max_downgrade_notice, _max_probe_error = _apply_max_context_auto_downgrade(
+            current, old_effective_settings
+        )
+        if _max_probe_error:
+            return json_error(_max_probe_error, 503)
         all_changed = [
             k for k in current
             if str(current.get(k, "") or "") != str(old_effective_settings.get(k, "") or "")
@@ -1018,7 +1218,12 @@ async def api_settings_post(request: Request) -> JSONResponse:
         # The Max->Low auto-downgrade above is an owner-endpoint, system-initiated
         # lowering (the new model can't sustain Max), so it is allowed past the
         # cognitive-horizon guard; an ordinary save never lowers context mode.
-        _owner_write_settings(settings_to_save, allow_context_lowering=bool(_max_downgrade_notice))
+        # The generic POST authors these keys ONLY when the auto-downgrade above actually fired;
+        # a save about a model slot must not author a context mode out of the defaults merge.
+        _owner_write_settings(
+            settings_to_save,
+            authored_keys=_CONTEXT_MODE_KEYS if _max_downgrade_notice else (),
+            allow_context_lowering=bool(_max_downgrade_notice))
         _apply_settings_to_env(current)
         _start_supervisor_if_needed_for_request(request, current)
 
@@ -1150,6 +1355,32 @@ async def api_settings_post(request: Request) -> JSONResponse:
             resp["context_mode"] = "low"
             resp["context_mode_downgraded"] = True
             resp["notice"] = _max_downgrade_notice
+        if any(k.startswith("OUROBOROS_SCOPE_REVIEW_MODEL") or k == "OUROBOROS_REVIEW_MODELS"
+               for k in all_changed):
+            _unknown = _unrecognised_review_models(
+                str(current.get("OUROBOROS_SCOPE_REVIEW_MODELS") or "").replace(",", " ").split()
+                + str(current.get("OUROBOROS_REVIEW_MODELS") or "").replace(",", " ").split()
+            )
+            if _unknown:
+                warnings.append(
+                    "Unrecognised review model id(s) the provider catalog does not list: "
+                    + ", ".join(sorted(set(_unknown)))
+                    + ". Review calls to these slots will fail with 'not a valid model ID' "
+                    "and can break the review quorum — check for a truncated value."
+                )
+                resp["warnings"] = warnings
+        # Capability is a property of the whole ROUTE (provider + base_url + model), and
+        # the lazy scope probe memoises by that fingerprint. A base-URL change therefore
+        # produces an unprobed route exactly as a model change does; gating notices on
+        # the model alone left the next scope review at the conservative sub-floor with
+        # the advertised owner-ack path unreachable.
+        if any(
+            k.startswith("OUROBOROS_SCOPE_REVIEW_MODEL") or k in _REVIEW_ROUTE_BASE_URL_KEYS
+            for k in all_changed
+        ):
+            _capability_notices = _review_capability_notices(current)
+            if _capability_notices:
+                resp["review_capability_notices"] = _capability_notices
         return JSONResponse(resp)
     except Exception as e:
         return json_exception(e, 400)

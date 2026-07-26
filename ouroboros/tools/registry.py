@@ -261,25 +261,193 @@ def _detect_context_mode_self_lowering(text_lower: str) -> bool:
     )
 
 
-def _detect_scope_review_floor_self_lowering(text_lower: str) -> bool:
-    """Detect shell/script attempts to weaken the owner-controlled scope-review floor
-    (CW1, v6.34.0). OUROBOROS_SCOPE_REVIEW_FLOOR gates the BIBLE P3 blocking scope
-    review; the agent must not lower it to ``advisory`` to slip its own changes past
-    the gate. Mirrors the context-mode self-lowering guard."""
-    mentions_floor_key = "ouroboros_scope_review_floor" in text_lower
-    mentions_owner_endpoint = "/api/owner/scope-review-floor" in text_lower
-    mentions_floor_endpoint = "scope-review-floor" in text_lower and "/api/owner" in text_lower
-    mentions_floor_cli = "scope-review-floor" in text_lower and (
-        "ouroboros settings" in text_lower
-        or "ouroboros.cli" in text_lower
+# Commands that can only READ. This is an ALLOWLIST on purpose: an unrecognised
+# command head is treated as executable access, so the enumeration fails CLOSED.
+# (A denylist of "write markers" fails OPEN — every new spelling of a POST walks
+# around it, which is exactly the keyword-gate antipattern BIBLE P5 forbids.)
+_READ_ONLY_INSPECTION_COMMANDS = frozenset({
+    "grep", "egrep", "fgrep", "zgrep", "rg", "ag", "ack", "ripgrep",
+    "cat", "bat", "head", "tail", "less", "more", "nl", "strings",
+    "ls", "find", "fd", "stat", "file", "wc", "sort", "uniq", "cut", "tr", "column",
+    "basename", "dirname", "realpath", "readlink", "diff", "cmp", "jq", "yq",
+    "echo", "printf", "true", "pwd", "date", "tree",
+})
+# Wrappers that do not themselves act: the real command head follows them.
+_COMMAND_HEAD_WRAPPERS = frozenset({
+    "sudo", "env", "command", "builtin", "exec", "nohup", "time", "nice", "ionice",
+    "stdbuf", "\\",
+})
+# ``git`` reads only through these subcommands.
+_READ_ONLY_GIT_SUBCOMMANDS = frozenset({
+    "grep", "log", "show", "diff", "blame", "cat-file", "ls-files", "ls-tree",
+    "rev-parse", "status", "describe",
+})
+# Allowlist MEMBERSHIP IS NOT ENOUGH: several read heads execute or write through their
+# own options. Per command, because short flags are not portable — ``grep -o`` prints
+# matches, ``sort -o`` writes a file. Text reaching here is lowercased, so an upper-case
+# spelling (``git grep -O``, ``fd -X``) collapses onto the same entry.
+_SEARCH_TOOL_EXEC_OPTIONS = frozenset({"--pre", "--pre-glob", "--hostname-bin", "--pager"})
+_DENIED_READ_OPTIONS: dict = {
+    # find/fd run and delete: -exec/-execdir/-ok/-okdir/-x, -delete, and the -f* writers.
+    "find": frozenset({
+        "-exec", "-execdir", "-ok", "-okdir", "-delete",
+        "-fls", "-fprint", "-fprint0", "-fprintf",
+    }),
+    "fd": frozenset({"-x", "--exec", "--exec-batch"}),
+    "rg": _SEARCH_TOOL_EXEC_OPTIONS,
+    "ripgrep": _SEARCH_TOOL_EXEC_OPTIONS,
+    "ag": _SEARCH_TOOL_EXEC_OPTIONS,
+    "ack": _SEARCH_TOOL_EXEC_OPTIONS,
+    "sort": frozenset({"-o", "--output", "--compress-program"}),
+    "less": frozenset({"-o", "--log-file", "-k", "--lesskey-file"}),
+    "more": frozenset({"-o"}),
+    "file": frozenset({"-c", "--compile"}),
+    # git: external diff/textconv helpers execute a configured program, -o/--output and
+    # git grep -O write or spawn a pager, --exec-path relocates the git binaries.
+    "git": frozenset({
+        "-c", "--config-env", "--exec-path", "--ext-diff", "--textconv",
+        "-o", "--output", "--open-files-in-pager",
+    }),
+}
+# The executable itself must be a bare name or live in a system bin: ``/tmp/evil/grep``
+# and ``./grep`` are shadowing, not inspection.
+_TRUSTED_EXECUTABLE_DIRS = frozenset({
+    "/bin", "/usr/bin", "/usr/local/bin", "/sbin", "/usr/sbin", "/opt/homebrew/bin",
+})
+
+
+def _trusted_read_head(token: str) -> str:
+    """The allowlist-comparable command name, or "" when the executable is untrusted."""
+    if "\\" in token:
+        return ""  # a windows/escaped path is not a form we can resolve — fail closed
+    directory, sep, name = token.rpartition("/")
+    if sep and directory not in _TRUSTED_EXECUTABLE_DIRS:
+        return ""
+    return name.removesuffix(".exe")
+
+
+def _denied_read_option(token: str, denied: frozenset) -> bool:
+    """True when an argument spells an execution/mutation option of its command."""
+    if not token.startswith("-") or token in {"-", "--"}:
+        return False
+    name = token.split("=", 1)[0]
+    if name in denied:
+        return True
+    if name.startswith("--"):
+        return False
+    return any(f"-{letter}" in denied for letter in name[1:])  # bundled short cluster
+
+
+# Spellings that make a shell run a command NESTED inside another one. The read exemption
+# fails closed on all of them: the head-allowlist can only vouch for heads it actually sees,
+# and a nested command's head is not one of them ("echo" vouching for the "curl -X POST" it
+# interpolates). Refusing the CONSTRUCT rather than enumerating the payloads inside it is the
+# point — no list of "what a write looks like" is ever complete (BIBLE P5).
+_NESTED_EXECUTION_MARKERS = ("$(", "`", "<(", ">(")
+# Bare tokens the lexer emits for the same constructs (and for a plain subshell). These used to
+# be STRIPPED from the token list before the head was taken, which is precisely how the nested
+# command escaped validation; they are refused instead.
+_NESTED_EXECUTION_TOKENS = frozenset({"$", "(", ")", "<(", ">(", "$("})
+
+
+def _is_pure_read_inspection(text_lower: str) -> bool:
+    """True when EVERY command in a shell line is a read-only source inspection.
+
+    Structural, not keyword-based: the line is split into per-command segments with
+    the shared lexer (``shell_parse.shell_segments``) and each segment's HEAD is
+    matched against an allowlist. An unknown head — any interpreter, HTTP client,
+    or shell — is not an inspection, whatever flags or payload spelling it carries.
+
+    Head membership is NECESSARY, NOT SUFFICIENT (review round 2): an allowed head can
+    still execute through its own options (``find -exec``, ``rg --pre``, git's external
+    diff/textconv) or through what precedes it. So the options are validated per command
+    (``_DENIED_READ_OPTIONS``), a leading environment assignment is REFUSED rather than
+    dropped (``PATH=``/``LD_PRELOAD=``/``GIT_EXTERNAL_DIFF=`` change what actually runs),
+    wrappers may not carry their own flags (``env -i``, ``sudo -e``), and the executable
+    must resolve to a bare name or a system bin. Anything unrecognised stays fail-closed.
+
+    NESTED EXECUTION IS REFUSED BEFORE ANY OF THAT (review round 3). Only the heads the lexer
+    actually surfaces get validated, so a command substitution hid its command from every check
+    above: ``echo "$(curl -X POST .../api/owner/scope-review-floor)"`` presented the allowlisted
+    ``echo``, and the write-shape detector does not recognise an HTTP POST, so the exemption was
+    granted to a line that existed to reach the owner-only endpoint. A quoted substitution is
+    one opaque argument token to the lexer, which is why this is a check on the TEXT and on the
+    tokens, not something the per-segment head walk could have caught.
+    """
+    from ouroboros.shell_parse import shell_segments
+
+    if any(marker in text_lower for marker in _NESTED_EXECUTION_MARKERS):
+        return False
+    segments = shell_segments(text_lower)
+    if not segments:
+        return False
+    for segment in segments:
+        if any(token in _NESTED_EXECUTION_TOKENS for token in segment):
+            return False
+        tokens = [token for token in segment if token]
+        while tokens and tokens[0] in _COMMAND_HEAD_WRAPPERS:
+            tokens = tokens[1:]
+            if tokens and tokens[0].startswith("-"):
+                return False  # a wrapper's own options can rebuild the environment
+        if not tokens:
+            continue  # a bare wrapper executes nothing
+        if "=" in tokens[0] and not tokens[0].startswith(("-", "=")):
+            return False  # leading env assignment: never silently discarded
+        head = _trusted_read_head(tokens[0])
+        if head == "git":
+            if len(tokens) < 2 or tokens[1] not in _READ_ONLY_GIT_SUBCOMMANDS:
+                return False
+        elif not head or head not in _READ_ONLY_INSPECTION_COMMANDS:
+            return False
+        denied = _DENIED_READ_OPTIONS.get(head)
+        if denied and any(_denied_read_option(token, denied) for token in tokens[1:]):
+            return False
+    return True
+
+
+def _detect_scope_review_floor_self_lowering(text_lower: str, *, writeish: bool = True) -> bool:
+    """Detect shell/script attempts to REACH the owner-controlled scope-review floor
+    (CW1, v6.34.0). ``OUROBOROS_SCOPE_REVIEW_FLOOR`` is deprecated and enforcement-inert
+    since v6.80.0 (scope-review applicability follows the owner context mode), but it is
+    still an owner-only stored setting behind its dedicated audited endpoint, so the agent
+    must not write it through any channel. Mirrors the context-mode guard.
+
+    POLARITY (v6.80.0): naming the owner endpoint or the floor key in a settings context
+    is blocked UNLESS the whole command line is demonstrably read-only inspection
+    (``_is_pure_read_inspection``). The earlier shape — block only on a listed HTTP write
+    marker — failed OPEN: ``python -c "httpx.request('POST', '.../api/owner/
+    scope-review-floor', ...)"`` names the endpoint, matches no marker, and mutated the
+    setting. No substring enumeration of "what a write looks like" is ever complete
+    (BIBLE P5), so the enumeration was inverted to "what a read looks like", where an
+    unrecognised entry is refused rather than admitted.
+
+    Pure source inspection stays allowed: ``grep OUROBOROS_SCOPE_REVIEW_FLOOR
+    data/settings.json`` and ``rg '/api/owner/scope-review-floor' ouroboros/gateway``
+    read and do not act. ``writeish`` is the shell guard's own already-computed
+    write-shape fact (redirects, writer commands, write-mode ``open()``); it disqualifies
+    the read exemption, and its default ``True`` keeps a caller that cannot supply the
+    fact fail-closed."""
+    import urllib.parse
+
+    decoded = urllib.parse.unquote(urllib.parse.unquote(text_lower)).lower()
+    text = f"{text_lower} {decoded}"
+    mentions_floor_key = "ouroboros_scope_review_floor" in text
+    mentions_owner_endpoint = "/api/owner/scope-review-floor" in text
+    mentions_floor_endpoint = "scope-review-floor" in text and "/api/owner" in text
+    mentions_floor_cli = "scope-review-floor" in text and (
+        "ouroboros settings" in text
+        or "ouroboros.cli" in text
     )
-    mentions_save = "save_settings" in text_lower or "settings.json" in text_lower or "/api/settings" in text_lower
-    return (
+    mentions_save = "save_settings" in text or "settings.json" in text or "/api/settings" in text
+    reaches_floor = (
         mentions_owner_endpoint
         or mentions_floor_endpoint
         or mentions_floor_cli
         or (mentions_floor_key and mentions_save)
     )
+    if not reaches_floor:
+        return False
+    return writeish or not _is_pure_read_inspection(text_lower)
 
 
 def _compose_execute_result(result: str, route_note: str, safety_msg: str) -> str:
@@ -1918,8 +2086,8 @@ class ToolRegistry:
             return "⚠️ ELEVATION_BLOCKED: shell command pattern looks like an OUROBOROS_RUNTIME_MODE elevation attempt (mentions ``save_settings`` together with ``OUROBOROS_RUNTIME_MODE``, or invokes ``ouroboros.config.save_settings`` directly). Runtime mode is owner-controlled — change it by stopping the agent and editing settings.json directly, then restart."
         if _detect_context_mode_self_lowering(cmd_lower):
             return "⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to lower OUROBOROS_CONTEXT_MODE to low through settings.json or /api/owner/context-mode. Context mode is owner-controlled — ask the owner to change the Low/Max toggle or edit settings while the agent is stopped."
-        if _detect_scope_review_floor_self_lowering(cmd_lower):
-            return "⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to weaken OUROBOROS_SCOPE_REVIEW_FLOOR (e.g. to ``advisory``) through settings.json, /api/settings, or /api/owner/scope-review-floor. The scope-review floor gates the BIBLE P3 blocking review — it is owner-controlled, and the agent must not lower it to slip its own changes past the gate. Ask the owner to change it, or stop the agent and edit settings.json directly."
+        if _detect_scope_review_floor_self_lowering(cmd_lower, writeish=writeish):
+            return "⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: shell command pattern reaches OUROBOROS_SCOPE_REVIEW_FLOOR through settings.json, /api/settings, or /api/owner/scope-review-floor from something other than a pure read. The floor is a deprecated, enforcement-inert owner setting (BIBLE P3 scope-review applicability follows the owner context mode) — it stays owner-only, and the agent must not write owner settings through any channel. Ask the owner to change it via the dedicated /api/owner/scope-review-floor endpoint, or stop the agent and edit settings.json directly. Pure source inspection (grep/rg/cat/jq/git grep) is allowed; an interpreter or HTTP client naming the endpoint is not, whatever verb it spells."
         if _detect_safety_mode_self_lowering(cmd_lower):
             return "⚠️ SAFETY_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to change OUROBOROS_SAFETY_MODE (e.g. to ``light``/``off``) through settings.json, /api/settings, or /api/owner/safety-mode. LLM-safety coverage is owner-controlled (BIBLE P3) — the agent must not reduce its own supervision. Ask the owner to change it via the dedicated /api/owner/safety-mode endpoint, or stop the agent and edit settings.json directly."
         if _detect_owner_skill_attest_self_call(cmd_lower):

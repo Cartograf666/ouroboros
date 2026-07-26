@@ -9,9 +9,11 @@ from ouroboros.gateway.contracts import (
     WS_MESSAGE_TYPES,
     ChatInbound,
     ChatOutbound,
+    OwnerScopeReviewFloorResponse,
     PhotoOutbound,
     SkillDeleteResponse,
     SkillLifecycleQueueResponse,
+    StateResponse,
     VideoOutbound,
 )
 from ouroboros.gateway.router import collect_routes
@@ -20,7 +22,23 @@ from ouroboros.gateway.router import collect_routes
 def _js_typedef_fields(text: str, name: str) -> set[str]:
     match = re.search(rf"@typedef \{{Object\}} {name}\b(?P<body>.*?)\n \*/", text, re.S)
     assert match, f"api_types.js missing {name}"
-    return set(re.findall(r"@property \{[^}]+\} ([A-Za-z_][A-Za-z0-9_]*)\b", match.group("body")))
+    # Types nest braces (``{Object<string, {project_id: string}>}``), so scan for the BALANCED
+    # closing brace instead of the first one — a non-greedy ``[^}]+`` silently mis-parses those
+    # properties and makes the field set look like it drifted when it has not.
+    fields: set[str] = set()
+    for line in match.group("body").split("\n"):
+        head, sep, rest = line.partition("@property {")
+        if not sep:
+            continue
+        depth = 1
+        for idx, char in enumerate(rest):
+            depth += (char == "{") - (char == "}")
+            if depth == 0:
+                identifier = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)", rest[idx + 1:])
+                if identifier:
+                    fields.add(identifier.group(1))
+                break
+    return fields
 
 
 def _contains_none(annotation) -> bool:
@@ -77,10 +95,20 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         encoding="utf-8"
     )
     assert "openAICompatibleModels" in api_client
-    for cls in (ChatInbound, ChatOutbound, PhotoOutbound, VideoOutbound):
+    # v6.80.0: the two contracts extended this release join the FIELD-level parity list. The name-level
+    # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
+    # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
+    for cls in (ChatInbound, ChatOutbound, PhotoOutbound, VideoOutbound,
+                StateResponse, OwnerScopeReviewFloorResponse):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+    assert re.search(r"@property \{boolean\} context_mode_auto_low\b", text), (
+        "StateResponse.context_mode_auto_low must be a JSDoc boolean — the owner control branches on it"
+    )
+    assert re.search(r"@property \{string\} deprecation_notice\b", text), (
+        "OwnerScopeReviewFloorResponse.deprecation_notice must be declared for the browser"
+    )
     assert re.search(r"@property \{boolean=\} force_plan\b", text), "ChatInbound missing force_plan"
     for field in ("model_lane", "requested_model_lane", "effective_model_lane", "model", "task_group_id"):
         assert re.search(rf"@property \{{string=\}} {field}\b", text), f"ChatOutbound missing {field}"

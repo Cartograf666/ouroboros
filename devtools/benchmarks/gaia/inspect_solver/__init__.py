@@ -29,3 +29,27 @@ GAIA_ANTI_LEAK_INSTRUCTION = (
     "that reveal the expected answer. Looking up the reference answer instead of "
     "deriving it is a protocol violation and invalidates your answer."
 )
+
+# SSOT for the epistemic-grounding rule, appended by every solver alongside the two
+# instructions above (owner decision Q20=1+4 / Q22, 2026-07-25). It is a DISCLOSURE
+# obligation, not a retrieval obligation: this task family is answered from external
+# facts the model cannot verify from its own weights, so an unverified answer must SAY
+# it is unverified instead of being presented as established. Deliberately scoped to
+# this adapter — the owner explicitly refused a global `prompts/SYSTEM.md` rule and a
+# typed contract field, because a runtime-wide "source your claims" duty would push
+# Ouroboros into searching the web for trivia it already knows (his example: "what is
+# the capital of Russia"). There is NO hard finalization gate either (option Y,
+# rejected): the reviewer-side retrieval fact is the audit channel.
+# Wording constraints (guarded by tests, same class as the anti-leak text): must NOT
+# name the benchmark, must NOT contain the literal "FINAL ANSWER" (the solvers gate the
+# format instruction on that substring), must NOT match the leak-query regex, and must
+# NOT instruct the agent to search — only to disclose when a claim rests on something
+# it did not check.
+GAIA_EPISTEMIC_INSTRUCTION = (
+    "\n\nIMPORTANT - epistemic honesty: When your answer depends on an external fact "
+    "you cannot verify from your own knowledge, check it against a primary source and "
+    "say which source you used. If you could not verify it, state plainly that the "
+    "value is unverified and why, instead of presenting a guess as established fact. "
+    "Do not look things up that you already know reliably; this asks for honesty about "
+    "the basis of your answer, not extra lookups."
+)

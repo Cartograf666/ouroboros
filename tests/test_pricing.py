@@ -96,6 +96,32 @@ def test_missing_cache_prices_are_not_invented():
         ) is None
 
 
+def test_cache_heavy_anthropic_usage_keeps_a_nonzero_fresh_input_component():
+    """v6.77.0 accounting boundary: `regular_input = prompt_tokens - cached - cache_write`
+    only yields the FRESH input when `prompt_tokens` is the OpenAI-semantics TOTAL input.
+    Direct Anthropic used to report `input_tokens` alone (cache reads/writes excluded), so
+    the subtraction clamped fresh input to 0 and the row understated the prompt."""
+    with patch(
+        "ouroboros.llm.fetch_openrouter_pricing",
+        return_value={"anthropic/claude-x": (3.0, 0.3, 3.75, 15.0)},
+    ):
+        # Provider row: input_tokens=500, cache_read=9_000, cache_creation=500.
+        pre_fix = estimate_cost_optional(
+            "anthropic/claude-x", 500, 100, cached_tokens=9_000, cache_write_tokens=500,
+            provider="openrouter",
+        )
+        post_fix = estimate_cost_optional(
+            "anthropic/claude-x", 10_000, 100, cached_tokens=9_000, cache_write_tokens=500,
+            provider="openrouter",
+        )
+
+    cached_and_write = (9_000 * 0.3 + 500 * 3.75) / 1_000_000
+    completion = 100 * 15.0 / 1_000_000
+    assert pre_fix == round(cached_and_write + completion, 6)  # regular_input clamped to 0
+    assert post_fix == round(500 * 3.0 / 1_000_000 + cached_and_write + completion, 6)
+    assert post_fix > pre_fix
+
+
 def test_exact_prompt_tier_is_applied_without_prefix_matching():
     row = PricingSchedule(
         (1.0, 0.1, None, 3.0),

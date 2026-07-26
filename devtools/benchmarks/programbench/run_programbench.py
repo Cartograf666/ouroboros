@@ -24,8 +24,8 @@ from devtools.benchmarks.common.official_commands import programbench_command_fo
 from devtools.benchmarks.common.result_index import task_result_row, write_result_index
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
-    ensure_file_output_outside_repo,
-    ensure_outside_repo,
+    assert_file_output_outside_repo,
+    assert_outside_repo,
     run_root,
     safe_join_under,
 )
@@ -118,15 +118,15 @@ def main() -> int:
 
     repo_dir = pathlib.Path(args.repo_dir).expanduser().resolve(strict=False)
     settings_path = pathlib.Path(args.settings_path).expanduser() if args.settings_path else default_settings_path()
-    out_root = ensure_outside_repo(run_root("programbench", args.run_id), repo_dir)
+    out_root = assert_outside_repo(run_root("programbench", args.run_id), repo_dir)
     instance_dir = safe_join_under(out_root, args.instance_id)
     ledger_output = (
-        ensure_file_output_outside_repo(pathlib.Path(args.ledger_output), repo_dir)
+        assert_file_output_outside_repo(pathlib.Path(args.ledger_output), repo_dir)
         if args.ledger_output
         else instance_dir / "result_index.jsonl"
     )
     manifest_output = (
-        ensure_file_output_outside_repo(pathlib.Path(args.manifest_output), repo_dir)
+        assert_file_output_outside_repo(pathlib.Path(args.manifest_output), repo_dir)
         if args.manifest_output
         else instance_dir / "run_manifest.json"
     )

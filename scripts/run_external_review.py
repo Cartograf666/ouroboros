@@ -84,7 +84,6 @@ _CONTRIBUTOR_DEFAULT_KEYS = (
     "OUROBOROS_SCOPE_REVIEW_MODELS",
     "OUROBOROS_EFFORT_REVIEW",
     "OUROBOROS_EFFORT_SCOPE_REVIEW",
-    "OUROBOROS_SCOPE_REVIEW_FLOOR",
 )
 _REVIEW_SUBSTRATE_PATHS = frozenset({
     "BIBLE.md",
@@ -296,7 +295,10 @@ def _apply_contributor_review_env(defaults: dict[str, str]) -> None:
     for key, value in defaults.items():
         os.environ[key] = value
     os.environ["OUROBOROS_REVIEW_ENFORCEMENT"] = "blocking"
-    os.environ["OUROBOROS_SCOPE_REVIEW_DEGRADED"] = "false"
+    # Scope-review applicability follows the context mode (v6.80.0): pin max so the
+    # operator review line always runs the blocking whole-repo scope reviewer, even
+    # when the host happens to sit in the owner's low mode.
+    os.environ["OUROBOROS_CONTEXT_MODE"] = "max"
     os.environ["OUROBOROS_OBSERVABILITY_KEEP_RAW"] = "0"
     os.environ["OUROBOROS_PRE_PUSH_TESTS"] = "1"
     os.environ["OUROBOROS_PREFLIGHT_DIFF_AWARE"] = "false"
@@ -638,7 +640,6 @@ def _assert_contributor_openrouter_config(
         ),
         "triad_effort": expected_defaults["OUROBOROS_EFFORT_REVIEW"],
         "scope_effort": expected_defaults["OUROBOROS_EFFORT_SCOPE_REVIEW"],
-        "scope_review_floor": expected_defaults["OUROBOROS_SCOPE_REVIEW_FLOOR"],
     }
     drift = {
         key: {"expected": value, "resolved": resolved_config.get(key)}
@@ -756,9 +757,9 @@ def _review_evidence_and_cost(ctx: object) -> tuple[list[dict], dict]:
 def _resolved_review_config(*, profile: str = "production_commit_gate") -> dict:
     """Return resolved review slots and efforts after settings/env loading."""
     from ouroboros.config import (
+        get_context_mode,
         get_review_enforcement,
         get_review_models,
-        get_scope_review_floor,
         get_scope_review_models,
         resolve_effort,
     )
@@ -771,7 +772,7 @@ def _resolved_review_config(*, profile: str = "production_commit_gate") -> dict:
         "scope_models": get_scope_review_models(),
         "scope_effort": resolve_effort("scope_review"),
         "review_enforcement": get_review_enforcement(),
-        "scope_review_floor": get_scope_review_floor(),
+        "context_mode": get_context_mode(),
         "runtime_mode": os.environ.get("OUROBOROS_RUNTIME_MODE", ""),
     }
 

@@ -364,7 +364,26 @@ def test_latest_unreconciled_masked_pass_predicate():
     from ouroboros.outcomes import latest_unreconciled_masked_pass as mp
 
     assert bool(mp([{"status": "pass", "check_exit_masking": True}])) is True
-    # a later CLEAN (non-masked) pass reconciles it
+    # ANY later CLEAN (non-masked) grounding reconciles a masked pass: the masked receipt's
+    # only text identity is its MASKED command, so requiring text equality would make the
+    # flag unclearable by the prescribed remediation (drop the masking pipe), which
+    # necessarily changes the text. The masked receipt's own criterion_id still binds.
+    assert bool(mp([
+        {"status": "pass", "check": "make test | tail", "check_exit_masking": True},
+        {"status": "pass", "check": "make test"},
+    ])) is False
+    assert bool(mp([
+        {"status": "pass", "criterion_id": "c1", "check": "make test | tail", "check_exit_masking": True},
+        {"status": "pass", "criterion_id": "c1", "check": "make test"},
+    ])) is False
+    assert bool(mp([
+        {"status": "pass", "criterion_id": "c1", "check": "make test | tail", "check_exit_masking": True},
+        {"status": "pass", "criterion_id": "c2", "check": "make test"},
+    ])) is True
+    assert bool(mp([
+        {"status": "pass", "check": "make test | tail", "check_exit_masking": True},
+        {"status": "pass", "check": "make lint"},
+    ])) is False
     assert bool(mp([{"status": "pass", "check_exit_masking": True}, {"status": "pass"}])) is False
     # a clean-only history never flags
     assert bool(mp([{"status": "pass"}])) is False
@@ -405,7 +424,7 @@ def test_masked_verification_nudge_one_shot_advisory_and_ordering(tmp_path):
     drive = tmp_path / "drive"
     drive.mkdir()
     append_verification_receipt(drive, "t", {
-        "status": "pass", "check": "sh -c 'node t | tail'",
+        "status": "pass", "criterion_id": "c1", "check": "sh -c 'node t | tail'",
         "check_exit_masking": True, "check_exit_masking_reasons": ["pipeline_tail"],
     })
 
@@ -422,8 +441,11 @@ def test_masked_verification_nudge_one_shot_advisory_and_ordering(tmp_path):
     # one-shot: the latch suppresses a second injection
     assert _run(ctx, []) is False
 
-    # a later CLEAN pass reconciles the masked pass -> no nudge on a fresh ctx
-    append_verification_receipt(drive, "t", {"status": "pass", "check": "pytest -q"})
+    # a later CLEAN pass OF THE SAME CHECK reconciles the masked pass -> no nudge on a
+    # fresh ctx (v6.78.0: a clean re-run of an unrelated check would NOT clear it)
+    append_verification_receipt(drive, "t", {
+        "status": "pass", "criterion_id": "c1", "check": "sh -c 'node t'",
+    })
     assert _run(SimpleNamespace(), []) is False
 
     # ORDERING: a RED receipt makes the red nudge win (not the masked one)

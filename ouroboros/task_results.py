@@ -642,6 +642,7 @@ def reserve_plan_review_wave(
     plan_text_hash: str,
     scout_roles: List[str],
     cutoff_at: str,
+    component_hashes: Optional[Dict[str, str]] = None,
 ) -> tuple[Dict[str, Any], bool]:
     created = False
 
@@ -655,6 +656,9 @@ def reserve_plan_review_wave(
         state["waves"].append({
             "request_fingerprint": fingerprint,
             "plan_text_hash": plan_text_hash,
+            # Per-field hashes of the envelope this wave was created from — diagnostics
+            # only (ENVELOPE_MISMATCH), never part of the binding identity.
+            "component_hashes": dict(component_hashes or {}),
             "created_at": utc_now_iso(),
             "scout_cutoff_at": cutoff_at,
             "phase": "scheduling",

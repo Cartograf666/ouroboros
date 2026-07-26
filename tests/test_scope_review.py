@@ -795,7 +795,6 @@ class TestRunScopeReviewFailClosed:
         )
         monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
         monkeypatch.setattr(mod, "_call_scope_llm", lambda *a, **k: ("", None, oversize_error))
-        monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "blocking_1m")
         monkeypatch.setattr(mod, "_scope_reviewer_window", lambda _m: 1_000_000)
 
         result = mod.run_scope_review(MockCtx(), "test commit", scope_model="anthropic/claude-fable-5")
@@ -838,7 +837,6 @@ class TestRunScopeReviewFailClosed:
                     "reason": f"Checked {item_id} against the staged review-gate fixture.",
                 })
         monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
-        monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "blocking_1m")
         monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
         monkeypatch.setattr(
             mod,
@@ -871,22 +869,6 @@ class TestRunScopeReviewFailClosed:
         assert result_giga.critical_findings == []
         assert any(f.get("item") == "scope_review_sub_floor" for f in result_giga.advisory_findings)
 
-        # The owner-selected advisory floor preserves the same useful evidence
-        # without pretending that it has >=1M blocking authority.
-        monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "advisory")
-        result_advisory = mod.run_scope_review(
-            MockCtx(), "test commit", scope_model="anthropic/claude-opus-4.8"
-        )
-        assert result_advisory.blocked is False
-        assert result_advisory.status == "responded"
-        assert result_advisory.critical_findings == []
-        assert any(
-            f.get("item") == "scope_review_sub_floor"
-            for f in result_advisory.advisory_findings
-        )
-
-        monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "blocking_1m")
-
         # The >=1M reviewer (fable-5 pin) keeps blocking authority.
         result_full = mod.run_scope_review(
             MockCtx(), "test commit", scope_model="anthropic/claude-fable-5"
@@ -915,7 +897,6 @@ class TestRunScopeReviewFailClosed:
             }
             for item_id in sorted(mod._SCOPE_REQUIRED_ITEMS)
         ]
-        monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "blocking_1m")
         monkeypatch.setattr(mod, "_scope_reviewer_window", lambda _m: 200_000)
         monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
         monkeypatch.setattr(
@@ -935,8 +916,10 @@ class TestRunScopeReviewFailClosed:
         assert result.cost_usd == 0.02
         assert any(f.get("item") == "scope_review_sub_floor" for f in result.advisory_findings)
 
-    def test_explicit_advisory_floor_keeps_oversize_nonblocking(self, tmp_path, monkeypatch):
-        """The explicit owner advisory override remains loud and non-authoritative."""
+    def test_oversize_always_fails_closed_after_floor_removal(self, tmp_path, monkeypatch):
+        """v6.80.0: the owner advisory-floor escape is GONE — a provider oversize
+        rejection has no authoritative verdict and therefore always fails CLOSED, in
+        every context mode where scope review runs at all."""
         mod = _get_module("ouroboros.tools.scope_review")
 
         class MockCtx:
@@ -948,21 +931,19 @@ class TestRunScopeReviewFailClosed:
                 return tmp_path
 
         error = "Error code: 400 - prompt is too long: 300000 tokens > 200000 maximum"
-        monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "advisory")
         monkeypatch.setattr(mod, "_scope_reviewer_window", lambda _m: 200_000)
         monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
         monkeypatch.setattr(mod, "_call_scope_llm", lambda *a, **k: ("", None, error))
 
         result = mod.run_scope_review(MockCtx(), "test commit", scope_model="small/reviewer")
 
-        assert result.blocked is False
-        assert result.status == "budget_exceeded"
+        assert result.blocked is True
+        assert result.status == "fixed_overflow"
         assert result.advisory_findings[0]["item"] == "scope_review_skipped"
 
     def test_irreducible_sub_floor_prompt_blocks_default_floor(self, monkeypatch):
         """A pre-dispatch sub-floor fit failure cannot silently satisfy P3."""
         mod = _get_module("ouroboros.tools.scope_review")
-        monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "blocking_1m")
         monkeypatch.setattr(mod, "_scope_reviewer_window", lambda _m: 200_000)
 
         result = mod._handle_prompt_signals(
@@ -1027,7 +1008,6 @@ class TestRunScopeReviewFailClosed:
         )
         monkeypatch.setattr(mod, "_effective_scope_input_limit", lambda *a, **k: 10)
 
-        monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "blocking_1m")
         monkeypatch.setattr(mod, "_scope_reviewer_window", lambda _m: 1_000_000)
         result = mod.run_scope_review(MockCtx(), "test commit", scope_model="anthropic/claude-fable-5")
 
@@ -1069,22 +1049,28 @@ class TestRunScopeReviewFailClosed:
     def test_effective_scope_limit_uses_real_window_for_small_window_reviewer(self, monkeypatch):
         """B2: a KNOWN sub-1M reviewer window (Capability Evidence) replaces the
         assumed 1M, so the pack overflows into the visible budget_exceeded skip
-        instead of a deterministic provider 400. Unknown windows keep the 1M
-        constants (the default reviewer is >=1M)."""
+        instead of a deterministic provider 400. The limit is computed PER CALL from
+        the measured/cold density (v6.80.0), never from an import-time constant."""
         mod = _get_module("ouroboros.tools.scope_review")
+        from ouroboros.tools.review_helpers import calibrated_input_token_limit
         # opus-4.8 KNOWN sub-floor (200K) via evidence; everything else >=1M.
         monkeypatch.setattr(
             mod, "_scope_reviewer_window",
             lambda m: 200_000 if "opus" in str(m) else 1_000_000,
         )
 
-        # fable-5 (1M, anthropic family): calibrated 1M-based constant.
-        assert mod._effective_scope_input_limit(scope_model="anthropic/claude-fable-5") == mod._ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT
+        full = calibrated_input_token_limit(
+            "anthropic/claude-fable-5",
+            context_window=mod._SCOPE_MODEL_CONTEXT_WINDOW,
+            output_reserve=mod._SCOPE_MAX_TOKENS,
+            tokenizer_margin=mod._SCOPE_OUTPUT_MARGIN_TOKENS,
+        )
+        assert mod._effective_scope_input_limit(scope_model="anthropic/claude-fable-5") == full
         # opus-4.8 (200K window): cap shrinks far below the 1M-based one.
         small = mod._effective_scope_input_limit(scope_model="anthropic/claude-opus-4.8")
-        assert 0 <= small < mod._ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT
-        # gpt-5.5 (1M, non-anthropic): unchanged constant.
-        assert mod._effective_scope_input_limit(scope_model="openai/gpt-5.5") == mod._SCOPE_INPUT_TOKEN_LIMIT
+        assert 0 <= small < full
+        # A cold-start non-Claude 1M reviewer is never LOOSER than the historical cap.
+        assert mod._effective_scope_input_limit(scope_model="openai/gpt-5.5") <= mod._SCOPE_INPUT_TOKEN_LIMIT
 
     def test_run_scope_review_preserves_pass_rows_in_actor_record(self, tmp_path, monkeypatch):
         """scope_raw_result.parsed_items must keep PASS rows for audit coverage."""
@@ -2138,7 +2124,7 @@ def test_scope_reviewer_window_fail_closed_on_absent_evidence(monkeypatch, tmp_p
     """claudexor B4 + v6.46.0 false-1M fix: with NO capability evidence, ONLY the
     SHIPPED designated reviewer (_SCOPE_MODEL_DEFAULT) is granted the 1M blocking
     sentinel under blocking_1m. An OFF-DEFAULT reviewer (e.g. an
-    OUROBOROS_SCOPE_REVIEW_MODEL pin) fails closed to the sub-floor under BOTH floors —
+    OUROBOROS_SCOPE_REVIEW_MODEL pin) fails closed to the conservative sub-floor —
     so the P3 authority downgrades it visibly instead of silently treating a 200K model
     as 1M and overflowing its real window into a provider 400. A non-default >=1M
     reviewer must be owner-acked to regain 1M."""
@@ -2154,14 +2140,12 @@ def test_scope_reviewer_window_fail_closed_on_absent_evidence(monkeypatch, tmp_p
         lambda *a, **k: SimpleNamespace(window_tokens=0),
     )
 
-    # An OFF-DEFAULT reviewer with no evidence fails closed under advisory...
-    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "advisory")
+    # An OFF-DEFAULT reviewer with no evidence fails closed to the sub-floor...
     w_adv = sr._scope_reviewer_window("gigachat::GigaChat-3-Ultra")
     assert 0 < w_adv < sr._SCOPE_MODEL_CONTEXT_WINDOW, w_adv  # fail-closed sub-floor
 
-    # ...AND under blocking_1m (the v6.46.0 bug: a pinned off-default 200K model that
-    # used to be wrongly trusted as 1M now fails closed instead of overflowing).
-    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "blocking_1m")
+    # ...as does a pinned off-default 200K model (the v6.46.0 bug: it used to be
+    # wrongly trusted as 1M and overflowed).
     w_offdefault = sr._scope_reviewer_window("anthropic/claude-sonnet-4.5")
     assert w_offdefault == sr._SCOPE_FAILCLOSED_WINDOW, w_offdefault
 
@@ -2246,3 +2230,147 @@ def test_parallel_commit_scope_is_one_substantive_call(monkeypatch, tmp_path):
     parallel_review.run_parallel_review(ctx, "test commit")
 
     assert calls == [("scope/model", False)]
+
+
+# --- v6.80.0: scope review follows the owner-only context mode -----------------
+
+def test_low_context_mode_skips_scope_review_with_a_typed_evidence_row(monkeypatch, tmp_path):
+    """RS2: in owner-selected `low` mode no reviewer is called, the commit is not
+    gated on scope, and the skip leaves a TYPED durable row on the same
+    review-evidence surface that carries fail-closed results — so a low-mode commit
+    is never forensically confusable with "scope review silently failed" (BIBLE P1).
+
+    The derived auto-low flag must be an EXPLICIT `false` here: an absent flag is
+    UNKNOWN, not an owner declaration, and resolves fail-closed to gate-ON."""
+    from ouroboros import config
+    from ouroboros.tools import review_helpers
+    from ouroboros.tools import scope_review as sr
+
+    class _Ctx:
+        repo_dir = str(tmp_path)
+        task_id = "low-mode-skip"
+        pending_events = []
+
+        def drive_logs(self):
+            return tmp_path
+
+    called = []
+    monkeypatch.setattr(sr, "_call_scope_llm", lambda *a, **k: called.append(1) or ("", None, ""))
+    monkeypatch.setattr(sr, "_build_scope_prompt", lambda *a, **k: called.append(1) or ("p", None))
+    monkeypatch.setattr(config, "get_context_mode", lambda: "low")
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "false")
+
+    result = sr.run_scope_review(_Ctx(), "test commit", scope_model="anthropic/claude-fable-5")
+
+    assert called == [], "low mode must not call the reviewer or even assemble a prompt"
+    assert result.blocked is False
+    assert result.status == "skipped_low_context_mode"
+    assert any(
+        f.get("item") == "scope_review_skipped_low_context_mode"
+        for f in result.advisory_findings
+    )
+    record = review_helpers.build_scope_actor_record(result, fallback_model_id="x")
+    assert record["status"] == "skipped_low_context_mode"
+    assert record["prompt_chars_source"] == "not_assembled"
+
+    # max mode (the unchanged DEFAULT) still assembles and calls.
+    monkeypatch.setattr(config, "get_context_mode", lambda: "max")
+    sr.run_scope_review(_Ctx(), "test commit", scope_model="anthropic/claude-fable-5")
+    assert called, "max mode must still run scope review"
+
+
+def test_default_context_mode_is_max_and_agent_cannot_lower_it(monkeypatch):
+    """RS2 anti-regression: the DEFAULT behaviour is unchanged (max ⇒ blocking scope
+    gate), and the agent still cannot reach the setting that now also switches scope
+    review off — on the settings merge, the shell guard, or the browser guard."""
+    from ouroboros import config
+    from ouroboros.gateway.settings import _merge_settings_payload
+    from ouroboros.tools.browser import _blocks_context_mode_self_lowering_js
+    from ouroboros.tools.registry import _detect_context_mode_self_lowering
+
+    assert config.SETTINGS_DEFAULTS["OUROBOROS_CONTEXT_MODE"] == "max"
+    monkeypatch.delenv("OUROBOROS_CONTEXT_MODE", raising=False)
+    assert config.get_context_mode() == "max"
+
+    merged = _merge_settings_payload({"OUROBOROS_CONTEXT_MODE": "max"},
+                                     {"OUROBOROS_CONTEXT_MODE": "low"})
+    assert merged["OUROBOROS_CONTEXT_MODE"] == "max"
+    assert _detect_context_mode_self_lowering(
+        "save_settings({'ouroboros_context_mode': 'low'})"
+    ) is True
+    assert _blocks_context_mode_self_lowering_js(
+        "fetch('/api/owner/context-mode', {body: JSON.stringify({mode: 'low'})})"
+    ) is True
+
+
+def test_window_provenance_wording_is_four_way(monkeypatch):
+    """RS5: the four cases must read differently — a conservative fallback must not
+    be reported with the same words as a confirmed measurement."""
+    from ouroboros.tools import scope_review as sr
+
+    phrases = {
+        sr._window_provenance_phrase(200_000, sr._WINDOW_CONFIRMED),
+        sr._window_provenance_phrase(200_000, sr._WINDOW_ASSERTED),
+        sr._window_provenance_phrase(200_000, sr._WINDOW_UNKNOWN),
+        sr._window_provenance_phrase(1_000_000, sr._WINDOW_SENTINEL),
+    }
+    assert len(phrases) == 4
+    assert "confirmed" in sr._window_provenance_phrase(200_000, sr._WINDOW_CONFIRMED)
+    assert "owner-asserted" in sr._window_provenance_phrase(200_000, sr._WINDOW_ASSERTED)
+    assert "unknown window" in sr._window_provenance_phrase(200_000, sr._WINDOW_UNKNOWN)
+    assert "designated-default" in sr._window_provenance_phrase(1_000_000, sr._WINDOW_SENTINEL)
+
+    # A substituted window seam still gets an honest (coarser) label, never "confirmed".
+    monkeypatch.setattr(sr, "_scope_reviewer_window", lambda _m: 250_000)
+    assert sr._scope_reviewer_window_evidence("x/y") == (250_000, sr._WINDOW_UNKNOWN)
+
+
+def test_ladder_steps_are_recorded_once_aggregated(tmp_path, monkeypatch):
+    """RS5: the guaranteed-fit ladder leaves ONE aggregated field in the existing
+    context manifest — not an event per step, and not silence."""
+    from ouroboros.tools import scope_review as sr
+
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(sr, "run_cmd", lambda cmd, cwd=None: (
+        "M\ta.py" if "--name-status" in cmd else "diff --git a/a.py b/a.py\n+x = 1\n"
+    ))
+    monkeypatch.setattr(sr, "_gather_scope_packs", lambda *a, **k: "ATLAS")
+    monkeypatch.setattr(sr, "_effective_scope_input_limit", lambda **_k: 900_000)
+
+    prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
+
+    assert status is None and prompt
+    manifest = sr._current_scope_context_manifest()
+    steps = manifest.get("ladder_steps")
+    assert isinstance(steps, list) and len(steps) == 1
+    assert steps[0]["step"] == "full_atlas"
+    assert set(steps[0]) >= {"tokens_before", "tokens_after", "diff_only_files", "deficit"}
+
+
+def test_cold_start_sizes_down_and_passes_instead_of_400ing(tmp_path, monkeypatch):
+    """RS4 anti-regression: with NO observation for an unknown model the cold-start
+    density must make the cap SMALLER than the historical optimistic one (pack passes),
+    never larger (pack draws a deterministic provider 400)."""
+    from ouroboros.capability_evidence import _DENSITY_MEMO, record_token_density
+    from ouroboros.tools import scope_review as sr
+
+    _DENSITY_MEMO.clear()
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sr, "_scope_reviewer_window", lambda _m: 1_000_000)
+
+    cold = sr._effective_scope_input_limit(scope_model="unknown/brand-new-model")
+    assert 0 < cold <= sr._SCOPE_INPUT_TOKEN_LIMIT, (
+        "a cold start must never be LOOSER than the historical absolute-margin cap"
+    )
+    # A pack sized at the cold cap still fits the reviewer's real window even at the
+    # conservative density, so the first call is not a guaranteed 400.
+    from ouroboros.capability_evidence import COLD_START_TOKEN_DENSITY
+    assert int(cold * COLD_START_TOKEN_DENSITY) + sr._SCOPE_MAX_TOKENS <= 1_000_000
+
+    # A later genuine measurement is what changes the number — and it is disclosed as
+    # `measured` provenance rather than silently replacing an assumption.
+    record_token_density(
+        tmp_path, "unknown/brand-new-model", prompt_chars=4_000_000, prompt_tokens=1_100_000,
+    )
+    from ouroboros.capability_evidence import resolve_token_density
+    assert resolve_token_density(tmp_path, "unknown/brand-new-model")[1] == "measured"

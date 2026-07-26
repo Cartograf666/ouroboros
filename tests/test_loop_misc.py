@@ -241,20 +241,76 @@ def test_server_web_allowed_respects_task_resource_contract():
 def test_set_acceptance_decision_preserves_agent_stance():
     trace = {
         "acceptance_decision": {
-            "status": "rejected",
             "agent_disposition": "rejected",
             "agent_rationale": "Scope drift.",
         }
     }
     _set_acceptance_decision(trace, {
         "status": "accepted",
+        "reason": "no_actionable_changes",
         "source": "task_acceptance_review",
         "rationale": "No actionable changes.",
     })
 
     assert trace["acceptance_decision"]["status"] == "accepted"
+    assert trace["acceptance_decision"]["reason"] == "no_actionable_changes"
     assert trace["acceptance_decision"]["agent_disposition"] == "rejected"
     assert trace["acceptance_decision"]["agent_rationale"] == "Scope drift."
+
+
+def test_set_acceptance_decision_collapses_unknown_status_fail_closed():
+    """v6.78.0 (P4.2): the merge point is the ONLY place a host acceptance status is
+    minted, and it can only mint the canonical trio. A future writer that invents a
+    fourth token gets `finalized_unaccepted` and its token survives as the reason —
+    never a silent fourth owner-facing state, never a lost token."""
+    from ouroboros.loop import ACCEPTANCE_DECISION_REASONS
+    from ouroboros.outcomes import ACCEPTANCE_DECISION_STATUSES
+
+    trace: dict = {}
+    _set_acceptance_decision(trace, {"status": "some_future_state", "source": "x"})
+    assert trace["acceptance_decision"]["status"] == "finalized_unaccepted"
+    assert trace["acceptance_decision"]["reason"] == "some_future_state"
+
+    _set_acceptance_decision(trace, {"status": "", "source": "x"})
+    assert trace["acceptance_decision"]["status"] == "finalized_unaccepted"
+    assert trace["acceptance_decision"]["reason"] == "unspecified"
+
+    # Canonical status + typed reason passes through untouched.
+    _set_acceptance_decision(trace, {"status": "accepted", "reason": "clean_pass"})
+    assert trace["acceptance_decision"] == {"status": "accepted", "reason": "clean_pass"}
+    assert ACCEPTANCE_DECISION_STATUSES == (
+        "accepted", "revision_requested", "finalized_unaccepted",
+    )
+    assert "unspecified" in ACCEPTANCE_DECISION_REASONS
+
+
+def test_every_host_acceptance_writer_emits_a_canonical_status_and_typed_reason():
+    """Table-driven guard over the WHOLE writer inventory (v6.78.0): every
+    `_set_acceptance_decision` call site in loop.py must pass a canonical status
+    constant and a reason from the closed set. Source-level so a new writer added
+    without a reason fails here instead of silently shipping an untyped decision."""
+    import pathlib
+    import re
+
+    from ouroboros.loop import ACCEPTANCE_DECISION_REASONS
+
+    src = pathlib.Path(loop_mod.__file__).read_text(encoding="utf-8").splitlines()
+    starts = [
+        i for i, line in enumerate(src)
+        if "_set_acceptance_decision(" in line and not line.lstrip().startswith("def ")
+    ]
+    assert len(starts) == 16, f"writer inventory changed: {len(starts)} call sites"
+    allowed_status = {
+        "ACCEPTANCE_ACCEPTED", "ACCEPTANCE_REVISION_REQUESTED",
+        "ACCEPTANCE_FINALIZED_UNACCEPTED",
+    }
+    for start in starts:
+        block = "\n".join(src[start:start + 30])
+        status = re.findall(r'"status": ([A-Z_]+)', block)
+        assert status and status[0] in allowed_status, f"line {start + 1}: {block[:120]}"
+        assert '"reason"' in block, f"line {start + 1} has no typed reason"
+        for reason in re.findall(r'"reason": "([a-z_]+)"', block):
+            assert reason in ACCEPTANCE_DECISION_REASONS, reason
 
 
 def test_task_acceptance_review_tool_result_lifts_agent_decision_into_trace():

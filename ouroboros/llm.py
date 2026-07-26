@@ -45,6 +45,25 @@ def supports_message_cache_control(model: str) -> bool:
     return m.startswith("anthropic/") or m.startswith("google/gemini-")
 
 
+def _route_normalizes_cache_breakpoints(target: Dict[str, Any]) -> bool:
+    """Routes whose assembled payload the send-time finalizer may MUTATE: exactly the
+    Anthropic ephemeral-cache family the two deleted per-builder marking sites served —
+    direct Anthropic plus OpenRouter ``anthropic/*`` (the family fact stays owned by
+    ``supports_message_cache_control``). Every other route — direct OpenAI,
+    OpenAI-compatible, Cloud.ru, GigaChat, unsupported OpenRouter families, and Gemini
+    (whose explicit cache documents no ``ttl`` field, so its markers stay bare) — is
+    observed byte-for-byte, never mutated (Provider Independence).
+    """
+    if str(target.get("provider") or "") == "anthropic":
+        return True
+    model = str(target.get("resolved_model") or "").strip().lstrip("~")
+    return bool(
+        target.get("supports_openrouter_extensions")
+        and supports_message_cache_control(model)
+        and model.startswith("anthropic/")
+    )
+
+
 def _reasoning_signature_portable_across_or_providers(model: str) -> bool:
     """Families whose replayed reasoning signatures SURVIVE an OpenRouter same-model
     cross-provider failover — so the ``allow_fallbacks=false`` continuity pin is
@@ -2016,39 +2035,110 @@ class LLMClient:
             return None
         return self._retry_without_optional_sampling(kwargs, usage_model, RuntimeError(message))
 
-    @classmethod
-    def _prompt_cache_ttl_from_payload(cls, *payload_parts: Any) -> Optional[str]:
-        """Report the strongest cache TTL present in the outgoing payload.
+    # Anthropic accepts at most four declared cache breakpoints per request.
+    _MAX_CACHE_BREAKPOINTS = 4
 
-        "1h" (extended cache write, billed at a higher write multiplier) wins over
-        "default" so usage/pricing account the actual write tier, never silently
-        underprice an extended-TTL write (accounting fidelity, not send behavior).
-        """
-        found: Optional[str] = None
+    @staticmethod
+    def _payload_cache_breakpoints(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Blocks carrying a ``cache_control`` marker, in the real wire prefix order
+        ``tools -> system -> messages`` — NOT the order arguments happen to arrive in.
 
-        def _mark(cc: Any) -> None:
-            nonlocal found
-            if not isinstance(cc, dict):
-                return
-            if str(cc.get("ttl") or "") == "1h":
-                found = "1h"
-            elif found is None:
-                found = "default"
-
-        for part in payload_parts:
-            items = part if isinstance(part, list) else [part]
-            for item in items:
+        Descends one level INTO a block's own ``content`` list: a direct-Anthropic
+        ``tool_result`` block nests its blocks (``_anthropic_messages`` builds it from a
+        ``role="tool"`` message whose content is a list), so the sealed transcript anchor
+        (``loop.seal_task_transcript``) sits at ``messages[i].content[j].content[k]``.
+        Missing it undercounts the cap and leaves that anchor out of TTL ordering exactly
+        on the lane whose provider enforces both. ``tool_result`` is the only nested-content
+        shape, and the descent is route-independent because no other payload nests."""
+        holders: List[Dict[str, Any]] = []
+        for key in ("tools", "system", "messages"):
+            part = payload.get(key)
+            for item in (part if isinstance(part, list) else [part]):
                 if not isinstance(item, dict):
                     continue
-                _mark(item.get("cache_control"))
+                if isinstance(item.get("cache_control"), dict):
+                    holders.append(item)
                 content = item.get("content")
                 if isinstance(content, list):
                     for block in content:
-                        if isinstance(block, dict):
-                            _mark(block.get("cache_control"))
-                if found == "1h":
-                    return found
-        return found
+                        if not isinstance(block, dict):
+                            continue
+                        if isinstance(block.get("cache_control"), dict):
+                            holders.append(block)
+                        nested = block.get("content")
+                        if isinstance(nested, list):
+                            holders.extend(
+                                inner for inner in nested
+                                if isinstance(inner, dict)
+                                and isinstance(inner.get("cache_control"), dict)
+                            )
+        return holders
+
+    def _normalize_payload_cache_ttl(
+        self,
+        target: Dict[str, Any],
+        payload: Dict[str, Any],
+    ) -> Optional[str]:
+        """Finalize cache policy on the FULLY ASSEMBLED payload; report its strongest TTL.
+
+        The one point where tools, system and messages coexist, hence the single home for
+        send-time cache policy (v6.77.0 — replaces two per-builder "mark the last tool"
+        copies and restores the TTL ordering guard lost in 176567b BY CONSTRUCTION): a
+        ``1h`` breakpoint promotes the earlier EXISTING breakpoints to ``1h`` (a longer TTL
+        must precede a shorter one — 5m tools before 1h system is a hard 400) and never
+        creates a marker on an earlier segment; a bare marker is the provider default and
+        ranks as 5m; the ONLY marker it ever adds is on the last tool schema, and only when
+        the tools segment carries none (unconditional on this family in both deleted sites —
+        a tool-free payload therefore stays uncached HERE, and system/messages never gain a
+        marker they did not declare; a tool-free lane is cached only by DECLARING its stable
+        prefix at the caller, as the review surfaces and the safety supervisor do via
+        ``review_helpers.cached_prompt_blocks``); above the four-breakpoint cap the four EARLIEST
+        (governance-prefix) markers are kept, the tail MARKERS — never content — are dropped
+        and the reduction is disclosed in usage (rationale and the builder-side loud layer:
+        ``docs/ARCHITECTURE.md``). Only this freshly assembled payload is normalized —
+        never caller-owned messages/tools, the canonical transcript, or a route that cannot
+        carry these markers (``_route_normalizes_cache_breakpoints``). "1h" wins over
+        "default" so pricing bills the extended-tier write multiplier.
+        """
+        breakpoints = self._payload_cache_breakpoints(payload)
+        note: Optional[Dict[str, Any]] = None
+        if _route_normalizes_cache_breakpoints(target):
+            tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
+            if not any(isinstance(t, dict) and isinstance(t.get("cache_control"), dict) for t in tools):
+                for tool in reversed(tools):
+                    # Schema entries only — skips an appended openrouter:web_search tool.
+                    if isinstance(tool, dict) and (
+                        isinstance(tool.get("function"), dict)
+                        or tool.get("input_schema") is not None
+                    ):
+                        tool["cache_control"] = {"type": "ephemeral"}
+                        breakpoints = self._payload_cache_breakpoints(payload)
+                        break
+            declared = len(breakpoints)
+            if declared > self._MAX_CACHE_BREAKPOINTS:
+                for holder in breakpoints[self._MAX_CACHE_BREAKPOINTS:]:
+                    holder.pop("cache_control", None)
+                breakpoints = breakpoints[:self._MAX_CACHE_BREAKPOINTS]
+                note = {"declared": declared, "kept": len(breakpoints),
+                        "dropped": declared - len(breakpoints)}
+            if any(str(b["cache_control"].get("ttl") or "") == "1h" for b in breakpoints):
+                for holder in breakpoints:
+                    holder["cache_control"]["ttl"] = "1h"
+        if not hasattr(self, "_cache_breakpoint_tls"):
+            self._cache_breakpoint_tls = threading.local()
+        self._cache_breakpoint_tls.pending = note
+        if any(str(b["cache_control"].get("ttl") or "") == "1h" for b in breakpoints):
+            return "1h"
+        return "default" if breakpoints else None
+
+    def _pop_cache_breakpoint_disclosure(self) -> Optional[Dict[str, Any]]:
+        """The pending ≤4-cap reduction record for THIS thread's in-flight call (the
+        finalizer writes the slot before every send, so it never mis-attributes)."""
+        tls = getattr(self, "_cache_breakpoint_tls", None)
+        pending = getattr(tls, "pending", None) if tls is not None else None
+        if tls is not None:
+            tls.pending = None
+        return pending if isinstance(pending, dict) else None
 
     def _fetch_generation_cost(
         self,
@@ -2174,10 +2264,7 @@ class LLMClient:
                     allow_server_web_search=allow_server_web_search,
                     cache_affinity=cache_affinity,
                 )
-                prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
-                    kwargs.get("messages"),
-                    kwargs.get("tools"),
-                )
+                prompt_cache_ttl = self._normalize_payload_cache_ttl(target, kwargs)
                 with capture_attempt_ids() as attempt_ids:
                     resp = await self._create_chat_completion_with_retries_async(
                         _oa_client.chat.completions.create, kwargs, target,
@@ -2205,10 +2292,7 @@ class LLMClient:
             # Cached clients are built without a timeout; honor the caller's
             # per-request timeout instead of silently using the SDK default.
             kwargs["timeout"] = float(timeout)
-        prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
-            kwargs.get("messages"),
-            kwargs.get("tools"),
-        )
+        prompt_cache_ttl = self._normalize_payload_cache_ttl(target, kwargs)
         with capture_attempt_ids() as attempt_ids:
             resp = await self._create_chat_completion_with_retries_async(
                 client.chat.completions.create, kwargs, target,
@@ -2693,8 +2777,6 @@ class LLMClient:
     @staticmethod
     def _build_anthropic_tools(
         tools: Optional[List[Dict[str, Any]]],
-        *,
-        cache_control: bool = False,
     ) -> List[Dict[str, Any]]:
         anthropic_tools: List[Dict[str, Any]] = []
         for tool in LLMClient._sanitize_chat_completion_tools(tools):
@@ -2707,8 +2789,6 @@ class LLMClient:
                 "description": LLMClient._stringify_tool_description(function.get("description")),
                 "input_schema": function.get("parameters") or {"type": "object", "properties": {}},
             })
-        if cache_control and anthropic_tools:
-            anthropic_tools[-1] = {**anthropic_tools[-1], "cache_control": {"type": "ephemeral"}}
         return anthropic_tools
 
     @staticmethod
@@ -2814,7 +2894,15 @@ class LLMClient:
 
         raw_usage = resp_dict.get("usage") or {}
         usage: Dict[str, Any] = {
-            "prompt_tokens": int(raw_usage.get("input_tokens") or 0),
+            # v6.77.0: Anthropic EXCLUDES cache reads/writes from `input_tokens`, while
+            # `prompt_tokens` is the OpenAI-semantics TOTAL input every consumer assumes —
+            # `pricing.regular_input = prompt_tokens - cached - cache_write` clamped fresh
+            # input to 0 on a cache-heavy call (and cache_hit_rate could exceed 1.0).
+            "prompt_tokens": (
+                int(raw_usage.get("input_tokens") or 0)
+                + int(raw_usage.get("cache_read_input_tokens") or 0)
+                + int(raw_usage.get("cache_creation_input_tokens") or 0)
+            ),
             "completion_tokens": int(raw_usage.get("output_tokens") or 0),
             "cached_tokens": int(raw_usage.get("cache_read_input_tokens") or 0),
             "cache_write_tokens": int(raw_usage.get("cache_creation_input_tokens") or 0),
@@ -2848,6 +2936,9 @@ class LLMClient:
         _clamp_note = self._pop_effort_clamp_disclosure()
         if _clamp_note:
             usage["reasoning_effort_clamped"] = _clamp_note
+        _cache_note = self._pop_cache_breakpoint_disclosure()
+        if _cache_note:
+            usage["prompt_cache_breakpoints_reduced"] = _cache_note
 
         message: Dict[str, Any] = {
             "role": "assistant",
@@ -2910,20 +3001,13 @@ class LLMClient:
             payload["temperature"] = temperature
         self._apply_rejected_param_cache(payload, usage_model)
 
-        anthropic_tools = self._build_anthropic_tools(
-            tools,
-            cache_control=True,
-        )
+        anthropic_tools = self._build_anthropic_tools(tools)
         if anthropic_tools:
             payload["tools"] = anthropic_tools
             anthropic_tool_choice = self._build_anthropic_tool_choice(tool_choice)
             if anthropic_tool_choice:
                 payload["tool_choice"] = anthropic_tool_choice
-        prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
-            payload.get("system"),
-            payload.get("messages"),
-            payload.get("tools"),
-        )
+        prompt_cache_ttl = self._normalize_payload_cache_ttl(target, payload)
 
         url = f"{str(target.get('base_url') or '').rstrip('/')}/messages"
         headers = {
@@ -3475,13 +3559,9 @@ class LLMClient:
             ]
             if server_web_tool:
                 prepared_tools.append(server_web_tool)
-            if prepared_tools and cache_model.startswith("anthropic/"):
-                for idx in range(len(prepared_tools) - 1, -1, -1):
-                    if isinstance(prepared_tools[idx].get("function"), dict):
-                        last_tool = {**prepared_tools[idx]}
-                        last_tool["cache_control"] = {"type": "ephemeral"}
-                        prepared_tools[idx] = last_tool
-                        break
+            # Tool cache markers are placed once, at the send-time payload finalizer
+            # (`_normalize_payload_cache_ttl`) — it is the only point that sees tools,
+            # system and messages together and can order their TTLs.
             kwargs["tools"] = prepared_tools
             kwargs["tool_choice"] = tool_choice
 
@@ -3629,6 +3709,10 @@ class LLMClient:
         _clamp_note = self._pop_effort_clamp_disclosure()
         if _clamp_note:
             usage["reasoning_effort_clamped"] = _clamp_note
+        # Same disclosure norm for a ≤4-cap cache-marker reduction (v6.77.0): never silent.
+        _cache_note = self._pop_cache_breakpoint_disclosure()
+        if _cache_note:
+            usage["prompt_cache_breakpoints_reduced"] = _cache_note
 
         return msg, usage
 
@@ -3931,10 +4015,7 @@ class LLMClient:
                     response_format=response_format,
                     cache_affinity=cache_affinity,
                 )
-                prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
-                    kwargs.get("messages"),
-                    kwargs.get("tools"),
-                )
+                prompt_cache_ttl = self._normalize_payload_cache_ttl(target, kwargs)
                 resp = self._create_chat_completion_with_retries(
                     _oa_client.chat.completions.create,
                     kwargs,
@@ -3964,10 +4045,7 @@ class LLMClient:
             # Cached clients are built without a timeout; honor the caller's
             # per-request timeout instead of silently using the SDK default.
             kwargs["timeout"] = float(timeout)
-        prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
-            kwargs.get("messages"),
-            kwargs.get("tools"),
-        )
+        prompt_cache_ttl = self._normalize_payload_cache_ttl(target, kwargs)
         resp = self._create_chat_completion_with_retries(
             client.chat.completions.create,
             kwargs,

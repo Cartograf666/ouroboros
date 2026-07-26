@@ -103,32 +103,55 @@ def strip_leading_env_assignments(argv: List[str]) -> List[str]:
 
 
 _SEGMENT_SEPARATORS = frozenset({";", ";;", "&&", "||", "|", "|&", "&", "(", ")", "\n"})
+# The characters the punctuation lexer below treats as SYNTAX. Every one of them is also
+# a legal byte inside an argument, so which role a given occurrence plays is decided by
+# QUOTING — information ``shlex`` discards. ``_LITERAL_MARK`` carries it across the lexer.
+_PUNCTUATION_CHARS = ";&|()<>"
+# NUL is the one byte that can never reach a real command line (``execve`` rejects it),
+# which makes it the safe marker for "this character came from inside quotes / an escape".
+# A NUL already present in the raw text is doubled on entry, so the marking round-trips.
+_LITERAL_MARK = "\x00"
 
 
-def _normalize_unquoted_newlines(text: str) -> str:
-    """Turn unquoted newlines AND backtick command-substitution delimiters into
-    ``;`` so they act as command separators.
+def _normalize_shell_source(text: str) -> str:
+    """Rewrite a command into the form the punctuation lexer can tokenize WITHOUT
+    losing either of the two things it would otherwise destroy.
 
-    The shell treats an unquoted newline like ``;``. ``shlex.split`` instead
-    folds it into surrounding whitespace, which let ``cmd1\\ncmd2`` masquerade
-    as a single command and slip a glued ``git`` invocation past per-segment
-    inspection. Backslash-newline line-continuations collapse to a space (also
-    matching the shell); quoted newlines are preserved verbatim. Unquoted
-    backticks (legacy command substitution `` `git -C <runtime> reset` ``) are
-    turned into ``;`` so the substituted command becomes its own segment and is
-    inspected — ``$()`` is already split by the punctuation lexer, backticks are
-    not. Single-quoted backticks stay literal (no substitution).
+    Unquoted newlines and backtick command substitutions become ``;``. The shell treats
+    an unquoted newline like ``;``; ``shlex.split`` instead folds it into surrounding
+    whitespace, which let ``cmd1\\ncmd2`` masquerade as a single command and slip a glued
+    ``git`` invocation past per-segment inspection. Backslash-newline line-continuations
+    collapse to a space (also matching the shell); quoted newlines are preserved verbatim.
+    Unquoted backticks (legacy command substitution `` `git -C <runtime> reset` ``) become
+    ``;`` so the substituted command is its own segment and is inspected — ``$()`` is
+    already split by the punctuation lexer, backticks are not. Single-quoted backticks
+    stay literal.
+
+    And in the OTHER direction: a punctuation character that is QUOTED (or backslash
+    escaped) is a literal argument byte, not syntax, so it is emitted preceded by
+    ``_LITERAL_MARK``. ``shlex`` strips quotes and hands back bare text, after which
+    ``echo '&&' x`` and ``echo && x`` are the same token list — two DIFFERENT commands
+    with one identity, which is a false-green path in ``_outcome_receipts``. The mark
+    survives lexing inside its token, so ``shell_tokens_typed`` can still tell the two
+    apart; it is stripped again before any token is returned.
     """
     out: List[str] = []
     quote: str | None = None
     i = 0
+    text = text.replace(_LITERAL_MARK, _LITERAL_MARK * 2)
     n = len(text)
+
+    def emit_literal(ch: str) -> None:
+        if ch in _PUNCTUATION_CHARS:
+            out.append(_LITERAL_MARK)
+        out.append(ch)
+
     while i < n:
         c = text[i]
         if quote:
-            out.append(c)
+            emit_literal(c)
             if c == "\\" and quote == '"' and i + 1 < n:
-                out.append(text[i + 1])
+                emit_literal(text[i + 1])
                 i += 2
                 continue
             if c == quote:
@@ -142,6 +165,15 @@ def _normalize_unquoted_newlines(text: str) -> str:
             out.append(" ")
             i += 2
             continue
+        elif c == "\\" and i + 1 < n and text[i + 1] in _PUNCTUATION_CHARS:
+            # ``\&`` is a literal ampersand, not the operator — the shell's own rule.
+            # OUTSIDE quotes the mark alone does not suffice: the lexer would still see
+            # a bare punctuation character and split the token there, so the character is
+            # also re-quoted (it can never be ``'`` itself) and the adjacent quoting is
+            # concatenated back into one token exactly as the shell would.
+            out.append(_LITERAL_MARK + "'" + text[i + 1] + "'")
+            i += 2
+            continue
         elif c == "\n":
             out.append(";")
         elif c == "`":
@@ -150,6 +182,106 @@ def _normalize_unquoted_newlines(text: str) -> str:
             out.append(c)
         i += 1
     return "".join(out)
+
+
+def _unmark(token: str) -> str:
+    """Drop the ``_LITERAL_MARK`` bytes ``_normalize_shell_source`` inserted, restoring
+    the token exactly as the shell would pass it."""
+    if _LITERAL_MARK not in token:
+        return token
+    out: List[str] = []
+    i = 0
+    while i < len(token):
+        if token[i] == _LITERAL_MARK and i + 1 < len(token):
+            out.append(token[i + 1])
+            i += 2
+            continue
+        out.append(token[i])
+        i += 1
+    return "".join(out)
+
+
+def shell_tokens_typed(raw_cmd: Any) -> List[tuple[str, bool]] | None:
+    """Tokens of a shell command paired with whether each one is a CONTROL OPERATOR —
+    real syntax — rather than a literal argument that merely spells like one.
+
+    THE tokenizer of this module; ``shell_tokens`` and ``canonical_command_text`` are
+    its two views. The flag is the piece ``shlex`` cannot give back: it strips quotes
+    before yielding tokens, so ``echo '&&' x`` and ``echo && x`` arrive identical.
+    ``_normalize_shell_source`` marks quoted/escaped punctuation on the way IN, this
+    reads the mark, and the mark never leaves (tokens come back unmarked).
+
+    A list is already tokenized, so every element is a literal argument: a caller
+    passing argv cannot have glued an operator, and ``["a", "&&", "b"]`` really does
+    run ``a`` with two arguments. Returns ``None`` when the text cannot be lexed
+    (unbalanced quotes) so each caller picks its own fallback rather than inheriting a
+    silent one.
+    """
+    if isinstance(raw_cmd, (list, tuple)):
+        return [(str(x), False) for x in raw_cmd]
+    text = _normalize_shell_source(str(raw_cmd or ""))
+    try:
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=_PUNCTUATION_CHARS)
+        lexer.whitespace_split = True
+        raw = [t for t in lexer if t]
+    except ValueError:
+        return None
+    return [
+        (_unmark(t), _LITERAL_MARK not in t and all(ch in _PUNCTUATION_CHARS for ch in t))
+        for t in raw
+    ]
+
+
+def shell_tokens(raw_cmd: Any) -> List[str] | None:
+    """Operator-aware tokens of a shell command, control operators KEPT as their own
+    tokens — the TEXT view of ``shell_tokens_typed``, shared by ``shell_segments``
+    (which then drops the separators) and, indirectly, by every guard built on it.
+
+    Robust against operators glued to adjacent words (``a;b``, ``a&&b``, ``$(cmd)``)
+    and unquoted newlines — the cases plain ``shlex.split`` fuses into a single token.
+    Quotes are respected, so whitespace INSIDE a quoted argument stays inside its token.
+    A token that merely SPELLS like an operator is indistinguishable here by design:
+    the guards that split on this view treat a quoted ``&&`` as a separator and so
+    inspect MORE segments, which is the fail-safe direction. Callers that need the
+    distinction (identity, not guarding) read ``shell_tokens_typed``.
+    """
+    typed = shell_tokens_typed(raw_cmd)
+    return None if typed is None else [token for token, _ in typed]
+
+
+def canonical_command_text(raw_cmd: Any) -> str:
+    """The COMPARISON-STABLE form of a shell command: the same command written two
+    cosmetically different ways yields the same text, and two DIFFERENT commands never
+    do.
+
+    Structural, not textual: the command is tokenized by ``shell_tokens_typed`` and
+    rebuilt with exactly one space between tokens, so only the whitespace BETWEEN tokens
+    is collapsed. Whitespace INSIDE a token is part of the argument and survives verbatim
+    (re-quoted through ``shlex.quote``) — a flat ``" ".join(text.split())`` instead
+    rewrites ``python -c "assert v == 'a  b'"`` into a command that asserts something
+    else, and that mattered: this text is a verification's IDENTITY in
+    ``_outcome_receipts``, so collapsing it let a green close an unrelated red.
+
+    Nothing is dropped and nothing is re-classified. A token is rendered bare only when
+    the lexer saw it as SYNTAX, so ``a && b`` and ``a '&&' b`` (which runs ``a`` with two
+    arguments) canonicalize apart — round-5: the old form stripped leading/trailing
+    separator-looking tokens AFTER ``shlex`` had discarded quoting, so
+    ``shlex.join([..., "&&"])`` canonicalized to the same text as the argv WITHOUT that
+    final argument, and a passing run of one could clear a failing run of the other. A
+    trailing ``;`` or newline is likewise kept: it is a no-op to the shell, but proving
+    that requires knowing it was syntax, and failing to equate two spellings of one
+    command only ever leaves a red standing.
+
+    Falls back to the merely STRIPPED raw text when the command cannot be lexed
+    (unbalanced quotes): that can only fail to equate two spellings of one command,
+    never equate two different ones.
+    """
+    typed = shell_tokens_typed(raw_cmd)
+    if typed is None:
+        return str(raw_cmd or "").strip()
+    return " ".join(
+        token if is_operator else shlex.quote(token) for token, is_operator in typed
+    )
 
 
 def shell_segments(raw_cmd: Any) -> List[List[str]]:
@@ -163,16 +295,9 @@ def shell_segments(raw_cmd: Any) -> List[List[str]]:
     Lists are assumed already tokenized (a caller passing an argv list cannot
     glue operators) and are split on standalone separator tokens only.
     """
-    if isinstance(raw_cmd, list):
-        tokens = [str(x) for x in raw_cmd]
-    else:
-        text = _normalize_unquoted_newlines(str(raw_cmd or ""))
-        try:
-            lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>")
-            lexer.whitespace_split = True
-            tokens = [t for t in lexer if t]
-        except ValueError:
-            tokens = [t for t in str(raw_cmd or "").split() if t]
+    tokens = shell_tokens(raw_cmd)
+    if tokens is None:
+        tokens = [t for t in str(raw_cmd or "").split() if t]
     segments: List[List[str]] = []
     current: List[str] = []
     for token in tokens:

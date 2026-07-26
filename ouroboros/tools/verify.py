@@ -16,6 +16,10 @@ import shlex
 import subprocess
 from typing import Any, List
 
+from ouroboros._outcome_receipts import (
+    CHECK_RENDERING_DECLARED_TEXT,
+    CHECK_RENDERING_SHLEX_JOIN,
+)
 from ouroboros.outcomes import append_verification_receipt
 from ouroboros.platform_layer import bootstrap_process_path
 from ouroboros.shell_parse import normalize_check_argv
@@ -26,6 +30,10 @@ from ouroboros.utils import utc_now_iso
 # silent); the tool-result preview is bounded separately for transport.
 _RECEIPT_OUTPUT_CAP = 20000
 _TOOL_OUTPUT_CAP = 4000
+# The `no_visible_machine_contract` receipt carries the agent's OWN stated proxy and
+# residual risk — decision-shaping cognitive evidence a reviewer reads, so it goes
+# through the same disclosed bound as every other durable receipt field.
+_RECEIPT_DECLARED_SUMMARY_CAP = 1000
 
 
 def _bounded(text: Any, cap: int) -> str:
@@ -466,7 +474,9 @@ def _verify_and_record(
                     **({"env": run_env} if run_env is not None else {}),
                 )
         except subprocess.TimeoutExpired:
-            receipt.update({"status": "fail", "returncode": None, "matched": False, "check": " ".join(argv), "summary": f"check timed out after {timeout}s"})
+            # Same renderer as the completed-run receipt below, so it carries the same
+            # stamp: a timeout red must be reconcilable by the later green of that argv.
+            receipt.update({"status": "fail", "returncode": None, "matched": False, "check": shlex.join(argv), "check_rendering": CHECK_RENDERING_SHLEX_JOIN, "summary": f"check timed out after {timeout}s"})
             append_verification_receipt(drive_root, task_id, receipt)
             return f"verify_and_record [{kind}] FAIL: check timed out after {timeout}s. Receipt recorded."
         # Full output captured in-handler BEFORE any transport truncation.
@@ -483,7 +493,17 @@ def _verify_and_record(
         else:
             matched = (not expected_s) or _expected_matches(out, expected_s, match_mode)
         passed = (rc == 0) and matched
-        receipt.update({"status": "pass" if passed else "fail", "returncode": rc, "matched": bool(matched), "check": " ".join(argv), "summary": _bounded(out, _RECEIPT_OUTPUT_CAP)})
+        # `shlex.join`, never `" ".join` (v6.78.0): this text is the verification's
+        # IDENTITY downstream (`_outcome_receipts.receipt_canonical_identity`), and a
+        # space-join is not injective — argv `["echo","a b"]` and `["echo","a","b"]`
+        # rendered identically, so a green on one could clear a red on the other.
+        # `shlex.join` is the exact inverse of the lexer that identity re-tokenizes with
+        # (`shell_parse.shell_tokens`), so the stored text round-trips back to this argv.
+        # The rendering is STAMPED beside the text (round 8): changing the renderer without
+        # recording which one ran re-opened the very collision above ACROSS versions — an
+        # old space-joined `echo a b` and a new `shlex.join` of a different argv read the
+        # same. The stamp makes the two incomparable instead of falsely equal.
+        receipt.update({"status": "pass" if passed else "fail", "returncode": rc, "matched": bool(matched), "check": shlex.join(argv), "check_rendering": CHECK_RENDERING_SHLEX_JOIN, "summary": _bounded(out, _RECEIPT_OUTPUT_CAP)})
         # C: after-only artifact-lifecycle FLAG (status unchanged — flag-only). If the agent
         # declared artifact_paths, record whether each still exists after the check, probed via
         # the SAME surface as the check, so a build-then-delete is visible to the advisory reviewer.
@@ -525,7 +545,8 @@ def _verify_and_record(
 
     # no_visible_machine_contract: an honest escape hatch — no host run, the agent's
     # best proxy + residual risk is recorded as a receipt and judged by a reviewer.
-    receipt.update({"status": "declared", "check": str(check or ""), "summary": (expected_s or str(check or ""))[:1000]})
+    # The agent's own text, not a render of an argv that ran — its own rendering stamp.
+    receipt.update({"status": "declared", "check": str(check or ""), "check_rendering": CHECK_RENDERING_DECLARED_TEXT, "summary": _bounded(expected_s or str(check or ""), _RECEIPT_DECLARED_SUMMARY_CAP)})
     append_verification_receipt(drive_root, task_id, receipt)
     return (
         "verify_and_record [no_visible_machine_contract] DECLARED: no host-checkable contract; "

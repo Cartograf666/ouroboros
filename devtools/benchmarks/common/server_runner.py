@@ -80,7 +80,11 @@ _ISO_SETTINGS_ALLOW_EXACT = frozenset({
     # falls back to the "auto" default and the end-of-task review never runs).
     "OUROBOROS_TASK_REVIEW_MODE", "OUROBOROS_REVIEW_ENFORCEMENT",
     "CLAUDE_CODE_MODEL", "CLAUDE_AGENT_SDK_MODEL",
+    # The DERIVED auto-low flag travels with the context mode: without it a host
+    # sitting in an auto-downgraded `low` would hand the isolated server a bare
+    # `low`, and get_owner_context_mode resolves an absent flag fail-closed.
     "TOTAL_BUDGET", "OUROBOROS_PER_TASK_COST_USD", "OUROBOROS_CONTEXT_MODE",
+    "OUROBOROS_CONTEXT_MODE_AUTO_LOW",
 })
 
 
@@ -161,6 +165,46 @@ def absorbed_cycles_done(data_root: pathlib.Path) -> int:
         return 0
 
 
+def patch_settings_ports(settings_path: pathlib.Path, *, host: str, port: int,
+                         host_service_port: int) -> dict:
+    """Write the chosen ports INTO a settings.json, returning the merged config.
+
+    THE reason this exists rather than exporting the ports in the environment: the server
+    applies settings.json OVER the environment at startup (``apply_settings_to_env``), so an
+    env-only ``OUROBOROS_HOST_SERVICE_PORT`` is overwritten by whatever the settings file says
+    — or by the 8767 default when it says nothing — and every server started from a shared
+    template collides on that port. Shared with the generated OSWorld lanes, which need the
+    same per-instance isolation ``IsolatedServer`` gets.
+    """
+    settings_path = pathlib.Path(settings_path)
+    cfg: dict = {}
+    try:
+        if settings_path.exists():
+            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cfg = loaded
+    except (OSError, ValueError):
+        cfg = {}
+    cfg["OUROBOROS_SERVER_HOST"] = host
+    cfg["OUROBOROS_SERVER_PORT"] = int(port)
+    cfg["OUROBOROS_HOST_SERVICE_PORT"] = int(host_service_port)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return cfg
+
+
+def supervisor_state_is_ready(state: dict) -> bool:
+    """THE readiness contract for an Ouroboros server, from the frozen `/api/state` shape.
+
+    `/api/health` answering 200 is NOT readiness: it can succeed while the supervisor is
+    still starting, which is exactly why `supervisor_ready` exists as a separate field. A
+    ready server also has at least one worker — `supervisor_ready` with `workers_total == 0`
+    accepts a task that nothing will pick up. Shared so every launch path (this class and the
+    generated OSWorld lanes) asks the same question instead of each inventing its own.
+    """
+    return bool(state.get("supervisor_ready")) and int(state.get("workers_total") or 0) > 0
+
+
 class IsolatedServer:
     """A throwaway Ouroboros server bound to an isolated clone + data root + port."""
 
@@ -204,20 +248,9 @@ class IsolatedServer:
         return env
 
     def _patch_settings_ports(self) -> None:
-        """Write the chosen free ports INTO settings.json. The server applies
-        settings.json over env at startup (apply_settings_to_env), so the host-service
-        port must live in settings or it falls back to the default 8767 and collides
-        with the live server."""
-        cfg: dict = {}
-        try:
-            if self.settings_path.exists():
-                cfg = json.loads(self.settings_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            cfg = {}
-        cfg["OUROBOROS_SERVER_HOST"] = self.host
-        cfg["OUROBOROS_SERVER_PORT"] = self.port
-        cfg["OUROBOROS_HOST_SERVICE_PORT"] = self.host_service_port
-        self.settings_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        """Write the chosen free ports INTO settings.json (see `patch_settings_ports`)."""
+        patch_settings_ports(self.settings_path, host=self.host, port=self.port,
+                             host_service_port=self.host_service_port)
 
     def start(self, ready_timeout: float = 180) -> "IsolatedServer":
         self._patch_settings_ports()
@@ -241,6 +274,7 @@ class IsolatedServer:
         return _api(self.base_url, "GET", "/api/state", timeout=timeout)
 
     def _wait_ready(self, timeout: float) -> None:
+        """Poll until the SUPERVISOR is ready (see `supervisor_state_is_ready`)."""
         deadline = time.time() + timeout
         last = ""
         while time.time() < deadline:
@@ -248,7 +282,7 @@ class IsolatedServer:
                 raise RuntimeError(f"isolated server exited early (rc={self.proc.returncode})")
             try:
                 st = self._state()
-                if st.get("supervisor_ready") and int(st.get("workers_total") or 0) > 0:
+                if supervisor_state_is_ready(st):
                     # Owner Q9=A+B: the identity attestation rides inside the readiness path
                     # every IsolatedServer driver must run, so no driver can skip it. It is a
                     # ONE-SHOT step here (not part of the polled probe): a raise inside the

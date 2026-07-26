@@ -378,12 +378,20 @@ def test_gaia_adapter_wires_settings_and_solver(tmp_path):
     assert "subset=2023_level1" in argv
     assert "--log-format" in argv and "json" in argv
     assert callable(ouroboros_solver.ouroboros_solver())
-    args = types.SimpleNamespace(split="validation", level=1, limit=3, solve_model="google/gemini-2.5-pro")
-    run_gaia._write_manifest(tmp_path, args, argv, settings_path)
+    # allow_dirty_seed=True keeps this assertion independent of the AMBIENT checkout state:
+    # the seed gate is exercised deterministically in the dedicated test below.
+    args = types.SimpleNamespace(
+        split="validation", level=1, limit=3, solve_model="google/gemini-2.5-pro",
+        allow_dirty_seed=True,
+    )
+    admitted = run_gaia._admit_run(tmp_path, args, argv)
+    run_gaia._augment_manifest(admitted, args, tmp_path, settings_path)
     manifest = json.loads((tmp_path / "run_manifest.json").read_text(encoding="utf-8"))
     assert manifest["official_command"] == argv
     assert manifest["requested_count"] == 3
-    assert manifest["model_slots"]["OUROBOROS_MODEL"] == "google/gemini-2.5-pro"
+    # `model_slots` is settings-derived, so it exists only on the augmented (retained) dict --
+    # the file itself is rewritten with it by the finalization seam in main().
+    assert admitted["model_slots"]["OUROBOROS_MODEL"] == "google/gemini-2.5-pro"
     assert "web_search" in open(REPO_ROOT / "devtools" / "benchmarks" / "gaia" / "inspect_solver" / "ouroboros_solver.py", encoding="utf-8").read()
     assert "claude_code_edit" in open(REPO_ROOT / "devtools" / "benchmarks" / "gaia" / "inspect_solver" / "ouroboros_solver.py", encoding="utf-8").read()
 
@@ -1869,7 +1877,50 @@ def test_terminal_bench_network_preflight_uses_configured_provider(tmp_path, mon
     assert "openai_preflight_status 401" in (tmp_path / "network-preflight.txt").read_text(encoding="utf-8")
 
 
-def test_terminal_bench_openrouter_credit_preflight_blocks_low_credit(tmp_path, monkeypatch):
+def test_terminal_bench_openrouter_credit_preflight_uses_authoritative_limit_remaining(tmp_path, monkeypatch):
+    """v6.79.0: the preflight reads `/api/v1/key` `limit_remaining` through the shared helper.
+
+    The old `/api/v1/credits` arithmetic (`total_credits − total_usage`) is the metric documented
+    to lie on a nearly exhausted key, so this pins BOTH facts: the endpoint actually called, and
+    that the credits-style body no longer decides anything."""
+    import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
+
+    calls = []
+
+    class _Response:
+        def __init__(self, body):
+            self._body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self._body
+
+    def fake_urlopen(req, timeout=0):
+        assert req.headers["Authorization"] == "Bearer or-key"
+        calls.append(req.full_url)
+        # A body that the DEAD credits arithmetic would have read as $10 of headroom.
+        return _Response(b'{"data":{"limit_remaining":0.25,"total_credits":10,"total_usage":0}}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    agent = tb_agent.OuroborosTerminalBenchAgent(logs_dir=tmp_path, openrouter_min_credit_usd=1.0)
+
+    with pytest.raises(RuntimeError, match="remaining \\$0.25 below threshold \\$1.00"):
+        agent._openrouter_credit_preflight({})
+
+    assert calls == ["https://openrouter.ai/api/v1/key"]
+    payload = json.loads((tmp_path / "openrouter-credit-preflight.json").read_text(encoding="utf-8"))
+    assert payload["remaining_usd"] == 0.25
+    assert payload["source"] == "openrouter:/api/v1/key:limit_remaining"
+
+
+def test_terminal_bench_openrouter_preflight_admits_an_uncapped_key(tmp_path, monkeypatch):
+    """`limit: null` means NO cap, not "$0 left" — an uncapped key must not be refused."""
     import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
 
     class _Response:
@@ -1880,21 +1931,16 @@ def test_terminal_bench_openrouter_credit_preflight_blocks_low_credit(tmp_path, 
             return False
 
         def read(self):
-            return b'{"data":{"total_credits":10,"total_usage":9.75}}'
+            return b'{"data":{"limit":null,"usage":123.0}}'
 
-    def fake_urlopen(req, timeout=0):
-        assert req.headers["Authorization"] == "Bearer or-key"
-        return _Response()
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=0: _Response())
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
     agent = tb_agent.OuroborosTerminalBenchAgent(logs_dir=tmp_path, openrouter_min_credit_usd=1.0)
 
-    with pytest.raises(RuntimeError, match="remaining \\$0.25 below threshold \\$1.00"):
-        agent._openrouter_credit_preflight({})
+    agent._openrouter_credit_preflight({})
 
     payload = json.loads((tmp_path / "openrouter-credit-preflight.json").read_text(encoding="utf-8"))
-    assert payload["remaining_usd"] == 0.25
+    assert payload["ok"] is True and payload["uncapped"] is True and payload["remaining_usd"] is None
 
 
 def test_run_ouroboros_task_terminal_nonzero_exit_is_not_interruption(tmp_path):
@@ -2447,7 +2493,7 @@ def test_benchmark_output_helpers_reject_repo_internal_outputs(tmp_path, monkeyp
     with pytest.raises(ValueError, match="benchmark run output must not be under repo"):
         swe_predictions.main()
 
-    monkeypatch.setattr(sys, "argv", ["run_harbor_smoke.py", "--run-root", str(REPO_ROOT / "devtools" / "bad_run")])
+    monkeypatch.setattr(sys, "argv", ["run_harbor_smoke.py", "--allow-dirty-seed", "--run-root", str(REPO_ROOT / "devtools" / "bad_run")])
     with pytest.raises(ValueError, match="benchmark run output must not be under repo"):
         harbor_smoke.main()
 
@@ -2473,6 +2519,8 @@ def test_terminal_bench_smoke_writes_manifest_and_planned_ledger(tmp_path, monke
         "argv",
         [
             "run_harbor_smoke.py",
+            # State-independent: this asserts ledger/denominator behaviour, not the seed gate.
+            "--allow-dirty-seed",
             "--run-root",
             str(run_root),
             "--model",
@@ -2576,7 +2624,7 @@ def test_terminal_bench_explicit_execute_uses_requested_denominator(tmp_path, mo
     monkeypatch.setattr(
         sys,
         "argv",
-        ["run_harbor_smoke.py", "--run-root", str(run_root), "--task", "task-a", "--task", "task-b", "--execute"],
+        ["run_harbor_smoke.py", "--allow-dirty-seed", "--run-root", str(run_root), "--task", "task-a", "--task", "task-b", "--execute"],
     )
 
     assert harbor_smoke.main() == 0
@@ -2604,7 +2652,7 @@ def test_terminal_bench_explicit_execute_rejects_unexpected_observed_task(tmp_pa
     monkeypatch.setattr(
         sys,
         "argv",
-        ["run_harbor_smoke.py", "--run-root", str(run_root), "--task", "task-a", "--execute"],
+        ["run_harbor_smoke.py", "--allow-dirty-seed", "--run-root", str(run_root), "--task", "task-a", "--execute"],
     )
 
     assert harbor_smoke.main() == 2
@@ -2633,7 +2681,7 @@ def test_terminal_bench_explicit_execute_rejects_missing_requested_task(tmp_path
     monkeypatch.setattr(
         sys,
         "argv",
-        ["run_harbor_smoke.py", "--run-root", str(run_root), "--task", "task-a", "--task", "task-b", "--execute"],
+        ["run_harbor_smoke.py", "--allow-dirty-seed", "--run-root", str(run_root), "--task", "task-a", "--task", "task-b", "--execute"],
     )
 
     assert harbor_smoke.main() == 2
@@ -2656,7 +2704,7 @@ def test_terminal_bench_execute_fails_closed_on_unparseable_harbor_result(tmp_pa
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(harbor_smoke.subprocess, "run", fake_run)
-    monkeypatch.setattr(sys, "argv", ["run_harbor_smoke.py", "--run-root", str(run_root), "--execute"])
+    monkeypatch.setattr(sys, "argv", ["run_harbor_smoke.py", "--allow-dirty-seed", "--run-root", str(run_root), "--execute"])
 
     assert harbor_smoke.main() == 2
     rows = [json.loads(line) for line in (run_root / "result_index.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -2680,7 +2728,7 @@ def test_terminal_bench_execute_fails_closed_on_partial_deterministic_result(tmp
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(harbor_smoke.subprocess, "run", fake_run)
-    monkeypatch.setattr(sys, "argv", ["run_harbor_smoke.py", "--run-root", str(run_root), "--n-tasks", "2", "--execute"])
+    monkeypatch.setattr(sys, "argv", ["run_harbor_smoke.py", "--allow-dirty-seed", "--run-root", str(run_root), "--n-tasks", "2", "--execute"])
 
     assert harbor_smoke.main() == 2
     rows = [json.loads(line) for line in (run_root / "result_index.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -2701,7 +2749,7 @@ def test_terminal_bench_execute_writes_ledger_when_harbor_invocation_fails(tmp_p
     monkeypatch.setattr(
         sys,
         "argv",
-        ["run_harbor_smoke.py", "--run-root", str(run_root), "--task", "task-a", "--task", "task-b", "--execute"],
+        ["run_harbor_smoke.py", "--allow-dirty-seed", "--run-root", str(run_root), "--task", "task-a", "--task", "task-b", "--execute"],
     )
 
     assert harbor_smoke.main() == 2
@@ -2863,6 +2911,11 @@ def test_osworld_cli_default_repo_root_blocks_repo_internal_output(tmp_path, mon
         "argv",
         [
             "osworld_adapter_skeleton.py",
+            # This test pins OUTPUT ISOLATION, not seed provenance: its repo_root is a bare
+            # directory with no git identity, so the v6.75.0 clean-seed gate would refuse
+            # first and mask what is under test. The gate itself is covered separately
+            # (test_benchmark_manifest_seed_gate_fails_closed_by_default) against a real repo.
+            "--allow-dirty-seed",
             "--osworld-root",
             str(osworld),
             "--osworld-server-url",
@@ -2896,6 +2949,11 @@ def test_osworld_cli_omitted_data_root_defaults_to_output_isolation(tmp_path, mo
         "argv",
         [
             "osworld_adapter_skeleton.py",
+            # This test pins OUTPUT ISOLATION, not seed provenance: its repo_root is a bare
+            # directory with no git identity, so the v6.75.0 clean-seed gate would refuse
+            # first and mask what is under test. The gate itself is covered separately
+            # (test_benchmark_manifest_seed_gate_fails_closed_by_default) against a real repo.
+            "--allow-dirty-seed",
             "--osworld-root",
             str(osworld),
             "--osworld-server-url",
@@ -2931,6 +2989,11 @@ def test_osworld_cli_rejects_explicit_live_data_root(tmp_path, monkeypatch):
         "argv",
         [
             "osworld_adapter_skeleton.py",
+            # This test pins OUTPUT ISOLATION, not seed provenance: its repo_root is a bare
+            # directory with no git identity, so the v6.75.0 clean-seed gate would refuse
+            # first and mask what is under test. The gate itself is covered separately
+            # (test_benchmark_manifest_seed_gate_fails_closed_by_default) against a real repo.
+            "--allow-dirty-seed",
             "--osworld-root",
             str(osworld),
             "--osworld-server-url",
@@ -3328,6 +3391,63 @@ def test_gaia_anti_leak_instruction_shape_and_all_solvers():
     for fname in ("ouroboros_solver.py", "codex_solver.py", "hermes_solver.py", "claude_code_solver.py"):
         src = (gaia_dir / fname).read_text(encoding="utf-8")
         assert "GAIA_ANTI_LEAK_INSTRUCTION" in src, f"{fname} does not append the anti-leak instruction"
+
+
+def test_gaia_epistemic_instruction_shape_and_all_solvers():
+    """v6.79.0 (owner Q20=1+4 / Q22): the epistemic-grounding rule is a GAIA-adapter prompt
+    constant appended by all four solvers, under the same wording locks as the anti-leak text.
+
+    It is a DISCLOSURE duty, not a retrieval duty — the owner's stated worry was Ouroboros
+    googling trivia it already knows — so the text must not order the agent to search."""
+    from devtools.benchmarks.gaia.inspect_solver import (
+        GAIA_ANTI_LEAK_INSTRUCTION,
+        GAIA_EPISTEMIC_INSTRUCTION,
+        GAIA_FORMAT_INSTRUCTION,
+    )
+    from devtools.benchmarks.gaia.leak_targets import LEAK_QUERY_RE
+
+    assert GAIA_EPISTEMIC_INSTRUCTION.strip()
+    assert GAIA_EPISTEMIC_INSTRUCTION not in (GAIA_ANTI_LEAK_INSTRUCTION, GAIA_FORMAT_INSTRUCTION)
+    assert "gaia" not in GAIA_EPISTEMIC_INSTRUCTION.lower()
+    assert "FINAL ANSWER" not in GAIA_EPISTEMIC_INSTRUCTION
+    assert not LEAK_QUERY_RE.search(GAIA_EPISTEMIC_INSTRUCTION)
+    lowered = GAIA_EPISTEMIC_INSTRUCTION.lower()
+    # Disclosure, not a search mandate: it must not demand searching/browsing, and it must
+    # keep the explicit carve-out for facts the model already knows.
+    for banned in ("search the web", "always search", "must search", "use web_search", "browse the web"):
+        assert banned not in lowered, banned
+    assert "already know" in lowered
+    assert "unverified" in lowered
+
+    gaia_dir = REPO_ROOT / "devtools" / "benchmarks" / "gaia" / "inspect_solver"
+    for fname in ("ouroboros_solver.py", "codex_solver.py", "hermes_solver.py", "claude_code_solver.py"):
+        src = (gaia_dir / fname).read_text(encoding="utf-8")
+        assert "GAIA_EPISTEMIC_INSTRUCTION" in src, f"{fname} does not append the epistemic instruction"
+
+    # The leakage audit strips every SSOT instruction before scanning, so an echoed prompt
+    # cannot self-flag a sample.
+    from devtools.benchmarks.gaia import audit_leakage as audit
+
+    assert GAIA_EPISTEMIC_INSTRUCTION in audit._PROMPT_BOILERPLATE
+    assert audit._strip_prompt_boilerplate("Q." + GAIA_EPISTEMIC_INSTRUCTION).strip() == "Q."
+
+
+def test_epistemic_rule_stays_out_of_the_global_system_prompt():
+    """Owner Q20/Q22 scoped the rule to the GAIA adapter ONLY: no global grounding duty in
+    `prompts/SYSTEM.md` (it would push the runtime into searching for trivia) and no typed
+    contract field. This is the invariant that keeps a future 'while we are here' edit honest."""
+    system_md = (REPO_ROOT / "prompts" / "SYSTEM.md").read_text(encoding="utf-8").lower()
+    for banned in (
+        "epistemic honesty",
+        "source your external claims",
+        "source your claims",
+        "cite a primary source",
+        "check it against a primary source",
+    ):
+        assert banned not in system_md, f"SYSTEM.md must not carry the GAIA grounding rule: {banned}"
+
+    contracts = (REPO_ROOT / "ouroboros" / "contracts" / "task_contract.py").read_text(encoding="utf-8")
+    assert "epistemic" not in contracts.lower(), "Q20/Q22 explicitly rejected a typed contract field"
 
 
 def test_gaia_claude_code_solver_uses_stream_json_and_writes_trace(monkeypatch, tmp_path):
@@ -3943,14 +4063,21 @@ def test_runtime_attestation_lineage_allows_descendants_only(tmp_path):
 def test_runtime_attestation_is_wired_into_url_attaching_readiness_paths():
     """Owner Q9=A+B: the shared helper exists AND every launcher that attaches to a live server
     URL calls it from its own readiness/admission path. This meta-test names the CONCRETE entry
-    points landed in this phase; CLB's host-engine path is covered through IsolatedServer, and
-    the CLB-docker stand-in plus the three OSWorld launchers are their own phase's migration
-    (they are asserted here as KNOWN-PENDING so the list can never silently claim them)."""
+    points, with their ARITY, so a call that would TypeError cannot pass as "wired". CLB's
+    host-engine path is covered through IsolatedServer; the CLB-docker stand-in never calls
+    `_wait_ready`, so its attestation arrives via the tracked operator patch and is asserted in
+    `tests/test_continual_learning_launcher.py`. TB and GAIA are structurally immune (owner
+    Q10) and deliberately have no lines here."""
     bench = REPO_ROOT / "devtools" / "benchmarks"
     wired = {
         # shared readiness seam: every IsolatedServer driver (evolve_smoke + CLB host engine)
         bench / "common" / "server_runner.py": "runtime_attestation(self.base_url, self.clone)",
         bench / "programbench" / "run_programbench_e2e.py": "runtime_attestation(str(args.ouroboros_url), repo_dir)",
+        # OSWorld: the step loop attests inside `_preflight`, the cu_bridge before its first
+        # POST /api/tasks, and the preflight-only skeleton alongside its reachability probes.
+        bench / "osworld" / "run_step_agent.py": "runtime_attestation(config.ouroboros_url, config.repo_dir)",
+        bench / "osworld" / "run_cu_bridge_agent.py": "runtime_attestation(args.ouroboros_url, repo_dir)",
+        bench / "osworld" / "osworld_adapter_skeleton.py": "runtime_attestation(ouroboros_url, repo_root)",
     }
     for path, call in wired.items():
         assert call in path.read_text(encoding="utf-8"), f"{path.name} lost its attestation call"
@@ -3960,12 +4087,16 @@ def test_runtime_attestation_is_wired_into_url_attaching_readiness_paths():
     entrypoint = (bench / "swe_bench_pro" / "e1v2" / "entrypoint_pro.sh").read_text(encoding="utf-8")
     assert "/api/health" in entrypoint and "runtime_skew" in entrypoint
 
-    pending = [
-        bench / "osworld" / "run_step_agent.py",
-        bench / "osworld" / "run_cu_bridge_agent.py",
-        bench / "osworld" / "osworld_adapter_skeleton.py",
-    ]
-    assert all("runtime_attestation" not in path.read_text(encoding="utf-8") for path in pending)
+    # Every wired call above must actually BIND against the shared helper's signature: a
+    # name-only check would pass a call missing the required `repo_dir` positional (which is
+    # how the commit half of owner Q7=B is reported) and only fail at run time.
+    import ast
+
+    from devtools.benchmarks.common.manifests import runtime_attestation
+    signature = inspect.signature(runtime_attestation)
+    for call in wired.values():
+        node = ast.parse(call, mode="eval").body
+        signature.bind(*node.args, **{kw.arg: kw.value for kw in node.keywords})
 
 
 def test_swe_pro_grade_reports_tri_state_verdicts(tmp_path, monkeypatch):
@@ -4307,56 +4438,148 @@ def test_finalize_run_manifest_records_a_typed_outcome_on_every_exit_path(tmp_pa
     assert _extra()["exit_code"] == 1
 
 
-# Calls that must NEVER run before `admit_benchmark_run()` in a migrated launcher. One named
-# constant so it stays extendable: separate review rounds each found a different pre-admission
-# operation (a seed-shape assertion, a volume archival, an artefact write), so the "admission is
-# the outer boundary" rule is guarded by a test instead of by review.
-_PRE_ADMISSION_DENIED_NAMES = frozenset({
-    "assert_seed_is_git_directory", "ensure_util_image", "dump_state", "runtime_attestation",
-    "snapshot", "restore", "reflections", "seed_stamp", "run_one", "run_instance",
-    "preflight_cleanroom_container", "prepare_seeded_workspace", "create_submission_tarball",
-    "run_official_eval", "write_json", "write_jsonl", "write_result_index", "append_result_index",
-    "write_text", "write_bytes", "mkdir", "unlink", "rmtree", "touch", "rename", "chmod",
-    "urlopen", "Popen", "check_output", "check_call",
-})
-# Matched as a prefix on any dotted segment, so `docker_pull_if_missing` / `subprocess.run` /
-# `shutil.rmtree` are all caught without enumerating them.
-_PRE_ADMISSION_DENIED_PREFIXES = ("subprocess", "docker", "shutil")
+# --------------------------------------------------------------------------- #
+# The structural launcher gate (devtools/benchmarks/common/launcher_audit.py)
+#
+# The guard used to live here as test-local `ast` helpers, and that is why it only ever knew
+# about ONE launcher shape and ONE hop of LOCAL helpers. It is now a module: the same entry
+# point audits the real launchers and a SYNTHETIC violating one, which is the only way to
+# tell "the gate works" from "today's code happens to be clean".
+# --------------------------------------------------------------------------- #
+
+# A synthetic launcher-shaped module for pinning the pre-admission resolver itself.
+# Deliberately not a real launcher: the gate's BEHAVIOUR is what must not regress.
+_GUARD_PROBE_SOURCE = '''
+def _looks_innocent(path):
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=path)
+
+def _two_levels_down(path):
+    return _looks_innocent(path)
+
+def _three_levels_down(path):
+    return _two_levels_down(path)
+
+def _pure(a, b):
+    return f"{a}/{b}"
+
+def _steps_aside(root):
+    root.mkdir(parents=True, exist_ok=True)
+    return None
+
+def main():
+    args = parse_args()
+    if args.collect_only:
+        _steps_aside(args.out)
+        return 0
+    label = _pure(args.a, args.b)
+    provenance = _looks_innocent(args.repo)
+    manifest = admit_benchmark_run(args.out, label=label, extra=provenance)
+    return finish(manifest)
+'''
+
+# A synthetic launcher that violates BOTH invariants, in the exact shapes round 6 found:
+# `ensure_outside_repo` (an IMPORTED helper that mkdirs what it validates) called before
+# admission, and an output path confined against a module-level constant while the run's
+# provenance is attested against the checkout the launcher was HANDED.
+_VIOLATING_LAUNCHER_SOURCE = '''
+import pathlib
+from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_run_manifest
+from devtools.benchmarks.common.run_roots import ensure_outside_repo
+
+REPO = pathlib.Path(__file__).resolve().parents[3]
 
 
-def _dotted_callee(node) -> str:
-    parts: list[str] = []
-    current = node
-    while isinstance(current, ast.Attribute):
-        parts.append(current.attr)
-        current = current.value
-    if isinstance(current, ast.Name):
-        parts.append(current.id)
-    return ".".join(reversed(parts))
+def main():
+    args = parse_args()
+    repo_dir = pathlib.Path(args.repo_dir).expanduser()
+    out = ensure_outside_repo(pathlib.Path(args.out_dir), REPO)
+    manifest = admit_benchmark_run(out / "run_manifest.json", run_root=out, repo_dir=repo_dir)
+    with finalize_run_manifest(out / "run_manifest.json", manifest) as final:
+        return 0
+'''
+
+# The same launcher with both invariants honoured: the pure `assert_*` form (no mkdir) before
+# admission, and the handed-in checkout as the confinement authority.
+_CLEAN_LAUNCHER_SOURCE = _VIOLATING_LAUNCHER_SOURCE.replace(
+    "import ensure_outside_repo", "import assert_outside_repo",
+).replace(
+    "out = ensure_outside_repo(pathlib.Path(args.out_dir), REPO)",
+    "out = assert_outside_repo(pathlib.Path(args.out_dir), repo_dir)",
+)
 
 
-def _denied_pre_admission_call(dotted: str) -> str:
-    segments = dotted.split(".")
-    if _PRE_ADMISSION_DENIED_NAMES.intersection(segments):
-        return sorted(_PRE_ADMISSION_DENIED_NAMES.intersection(segments))[0]
-    for segment in segments:
-        for prefix in _PRE_ADMISSION_DENIED_PREFIXES:
-            if segment.startswith(prefix):
-                return segment
-    return ""
+# INVARIANT C. A synthetic launcher that publishes its manifest from inside the seam, in the
+# exact shape the real ones had: a helper named for the RECORDS it keeps, whose body happens to
+# write the manifest too. The name says nothing; only the body does.
+_SEAM_PUBLICATION_DEFECT_SOURCE = '''
+import pathlib
+from devtools.benchmarks.common.manifests import (
+    admit_benchmark_run, finalize_run_manifest, write_json,
+)
+from devtools.benchmarks.common.run_roots import assert_outside_repo
 
 
-def _calls_before(function: ast.FunctionDef, stop_callee: str) -> list[str]:
-    """Dotted callee names in the statements of ``function`` that PRECEDE ``stop_callee``."""
-    seen: list[str] = []
-    for statement in function.body:
-        if any(isinstance(node, ast.Call) and _dotted_callee(node.func).endswith(stop_callee)
-               for node in ast.walk(statement)):
-            return seen
-        seen.extend(
-            _dotted_callee(node.func) for node in ast.walk(statement) if isinstance(node, ast.Call)
-        )
-    raise AssertionError(f"{function.name}() never calls {stop_callee}")
+def _write_records(run_dir, manifest, outcome):
+    write_json(run_dir / "task_outcome.json", outcome)
+    write_json(run_dir / "task_run_manifest.json", manifest)
+    return outcome
+
+
+def main():
+    args = parse_args()
+    repo_dir = pathlib.Path(args.repo_dir).expanduser()
+    out = assert_outside_repo(pathlib.Path(args.out_dir), repo_dir)
+    manifest = admit_benchmark_run(out / "run_manifest.json", run_root=out, repo_dir=repo_dir)
+    with finalize_run_manifest(out / "run_manifest.json", manifest) as final:
+        final["outcome"] = "completed"
+        return _write_records(out, manifest, {"ok": True})
+'''
+
+# The corrected twin: the records helper keeps its OUTCOME sidecar and stops publishing the
+# manifest, which the seam writes on every exit path anyway.
+_SEAM_PUBLICATION_FIXED_SOURCE = _SEAM_PUBLICATION_DEFECT_SOURCE.replace(
+    '    write_json(run_dir / "task_run_manifest.json", manifest)\n', "")
+
+# The same publication with the filename moved one line up into a local — the `run_pro` shape,
+# which a check that only read the call site would wave through.
+_SEAM_PUBLICATION_INDIRECT_SOURCE = _SEAM_PUBLICATION_DEFECT_SOURCE.replace(
+    '    write_json(run_dir / "task_run_manifest.json", manifest)',
+    '    manifest_path = run_dir / "task_run_manifest.json"\n'
+    '    write_json(manifest_path, manifest)')
+
+
+def test_the_launcher_gate_forbids_publishing_a_manifest_inside_the_seam():
+    """INVARIANT C, pinned against a violator, its corrected twin and its indirect form.
+
+    `finalize_run_manifest` merges the terminal outcome/exit_code/refusal into the manifest when
+    its context EXITS. Anything written from inside publishes a PRE-MERGE record — for a refusal,
+    the admission seam's generic payload saying exit_code 1 while the process will exit 2. Two
+    review rounds fixed this in `run_cu_bridge_agent` and a by-hand sweep still missed
+    `run_step_agent` and `run_pro`, because the sweep asked "is there a second copy that can go
+    stale?" when the hazard is "is anything published before the merge?" — true of a single-path
+    launcher too. Hence a gate.
+
+    Judged by EFFECT: the helper is called `_write_records`, the real ones `_write_task_records`
+    and `_write_cu_outcome`. No name-based check finds any of the three.
+    """
+    from devtools.benchmarks.common import launcher_audit
+
+    # The offending helper is not named anywhere in the gate -- resolution is the rule.
+    assert "_write_records" not in launcher_audit.WRITE_PRIMITIVES
+    assert not (launcher_audit.WRITE_PRIMITIVES
+                & {"_write_task_records", "_write_cu_outcome", "_write_records"})
+
+    violations = launcher_audit.audit_source(_SEAM_PUBLICATION_DEFECT_SOURCE, name="seam.py")
+    assert len(violations) == 1, violations
+    assert "publishes a manifest from INSIDE an active finalize_run_manifest" in violations[0]
+    assert "_write_records -> write_json" in violations[0]
+
+    # ...the same defect with the filename bound to a local one line earlier is still caught...
+    indirect = launcher_audit.audit_source(_SEAM_PUBLICATION_INDIRECT_SOURCE, name="seam.py")
+    assert len(indirect) == 1 and "_write_records -> write_json" in indirect[0], indirect
+
+    # ...and the corrected twin passes, so the invariant is not simply always-red.
+    assert launcher_audit.audit_source(_SEAM_PUBLICATION_FIXED_SOURCE, name="seam.py") == []
 
 
 def test_every_migrated_launcher_routes_through_both_manifest_seams():
@@ -4364,6 +4587,13 @@ def test_every_migrated_launcher_routes_through_both_manifest_seams():
     `benchmark_run_manifest()` with its own `write_json()` again (no durable refusal) or skip the
     finalization block (no final outcome). Named files, so a new launcher cannot join silently and
     the launchers whose migration belongs to a LATER phase cannot be silently claimed."""
+    # v6.76.0 promoted these three helpers out of this test module and into the shared gate;
+    # this test uses that SSOT rather than keeping a second, weaker copy of the same walk.
+    from devtools.benchmarks.common.launcher_audit import (
+        _dotted_callee, calls_before as _calls_before,
+        denied_pre_admission_call as _denied_pre_admission_call,
+    )
+
     bench = REPO_ROOT / "devtools" / "benchmarks"
     migrated = [
         bench / "programbench" / "run_programbench.py",
@@ -4373,6 +4603,13 @@ def test_every_migrated_launcher_routes_through_both_manifest_seams():
         bench / "harness_bench_fast" / "run_harness_bench_fast.py",
         bench / "swe_bench_pro" / "e1v2" / "run_pro.py",
         bench / "swe_bench_pro" / "e1v2" / "auto_run.py",
+        bench / "gaia" / "run_gaia.py",
+        bench / "terminal_bench" / "run_tb.py",
+        bench / "terminal_bench" / "run_harbor_smoke.py",
+        bench / "continual_learning" / "run_clb.py",
+        bench / "osworld" / "run_step_agent.py",
+        bench / "osworld" / "run_cu_bridge_agent.py",
+        bench / "osworld" / "osworld_adapter_skeleton.py",
     ]
     for path in migrated:
         source = path.read_text(encoding="utf-8")
@@ -4411,18 +4648,678 @@ def test_every_migrated_launcher_routes_through_both_manifest_seams():
                 f"{path.name}: {dotted}() runs BEFORE admit_benchmark_run() in {owner}() -- a "
                 f"refusal there leaves no durable manifest (denied token: {denied})"
             )
-    pending = [
-        bench / "gaia" / "run_gaia.py",
-        bench / "continual_learning" / "run_clb.py",
-        bench / "terminal_bench" / "run_tb.py",
-        bench / "terminal_bench" / "run_harbor_smoke.py",
-        bench / "osworld" / "run_step_agent.py",
-        bench / "osworld" / "run_cu_bridge_agent.py",
-        bench / "osworld" / "osworld_adapter_skeleton.py",
-    ]
-    for path in pending:
-        assert "benchmark_run_manifest(" in path.read_text(encoding="utf-8")
+    # The pending set is EMPTY on this tree: CL-Bench and the three OSWorld launchers migrated
+    # in v6.76.0, GAIA and both Terminal-Bench launchers in v6.79.0. Asserted against the gate's
+    # own list so the two enumerations cannot drift apart silently.
+    from devtools.benchmarks.common import launcher_audit
 
+    assert launcher_audit.PENDING_LAUNCHERS == ()
+    assert len(migrated) == len(launcher_audit.MIGRATED_LAUNCHERS)
+
+
+# One synthetic per CALL FORM a write primitive can wear. The destination model is derived from
+# each primitive's real signature, so this matrix is what proves the derivation covers the forms
+# rather than asserting it. The first two are the ones a reviewer found missing from the
+# hand-written position table it replaced.
+_SEAM_FORM_TEMPLATE = '''
+import json
+import os
+import pathlib
+import shutil
+from devtools.benchmarks.common.manifests import (
+    admit_benchmark_run, finalize_run_manifest, write_json, write_jsonl,
+)
+from devtools.benchmarks.common.run_roots import assert_outside_repo
+from ouroboros.utils import atomic_write_json, write_text_atomic
+
+
+def main():
+    args = parse_args()
+    repo_dir = pathlib.Path(args.repo_dir).expanduser()
+    out = assert_outside_repo(pathlib.Path(args.out_dir), repo_dir)
+    manifest = admit_benchmark_run(out / "run_manifest.json", run_root=out, repo_dir=repo_dir)
+    with finalize_run_manifest(out / "run_manifest.json", manifest) as final:
+        final["outcome"] = "completed"
+        {statement}
+        return 0
+'''
+
+_SEAM_WRITE_FORMS = (
+    # (label, statement, the callee the report must name)
+    ("os.rename publishes to argument ONE",
+     'os.rename(tmp, out / "run_manifest.json")', "os.rename"),
+    ("standalone write_text takes the path positionally",
+     'write_text(out / "run_manifest.json", body)', "write_text"),
+    ("standalone write_bytes takes the path positionally",
+     'write_bytes(out / "run_manifest.json", blob)', "write_bytes"),
+    ("receiver-style write_text names its destination as the receiver",
+     '(out / "run_manifest.json").write_text(body)', "write_text"),
+    ("receiver-style rename publishes to its target argument",
+     'tmp.rename(out / "run_manifest.json")', "rename"),
+    ("os.replace publishes to argument ONE",
+     'os.replace(tmp, out / "run_manifest.json")', "os.replace"),
+    ("shutil.move publishes to argument ONE",
+     'shutil.move(tmp, out / "run_manifest.json")', "shutil.move"),
+    ("json.dump publishes to its fp argument",
+     'json.dump(manifest, open(out / "run_manifest.json", "w"))', "json.dump"),
+    ("the destination may arrive as a KEYWORD",
+     'write_json(path=out / "run_manifest.json", payload=manifest)', "write_json"),
+    ("write_jsonl", 'write_jsonl(out / "run_manifest.json", rows)', "write_jsonl"),
+    ("atomic_write_json", 'atomic_write_json(out / "run_manifest.json", manifest)',
+     "atomic_write_json"),
+    ("write_text_atomic", 'write_text_atomic(out / "run_manifest.json", text)',
+     "write_text_atomic"),
+    # ...and the local hop, which is how `run_pro` spelled it.
+    ("the destination bound to a local one line earlier",
+     'manifest_path = out / "run_manifest.json"\n        write_json(manifest_path, manifest)',
+     "write_json"),
+)
+
+
+@pytest.mark.parametrize("label, statement, callee", _SEAM_WRITE_FORMS,
+                         ids=[form[2] + "/" + form[0][:28] for form in _SEAM_WRITE_FORMS])
+def test_invariant_c_places_the_destination_of_every_write_form(label, statement, callee):
+    """Every call form a write primitive wears is caught, and the coverage is PROVEN per form.
+
+    The first cut of Invariant C carried a hand-enumerated position table, and it was wrong in
+    exactly the way hand-enumerated tables are: `rename` was mapped to argument 0 although
+    `os.rename(src, dst)` publishes to argument 1, and standalone `write_text(path, ...)` had no
+    positional destination at all — so an in-seam `os.rename(tmp, .../run_manifest.json)` passed
+    silently. A gate whose whole subject is incomplete models of where a write goes cannot carry
+    one. Destinations now come from each primitive's REAL signature, and this matrix is the proof
+    that the derivation covers the forms rather than an assertion that it does.
+    """
+    from devtools.benchmarks.common import launcher_audit
+
+    source = _SEAM_FORM_TEMPLATE.format(statement=statement)
+    violations = launcher_audit.audit_source(source, name="form.py")
+    assert len(violations) == 1, (label, violations)
+    assert "publishes a manifest from INSIDE an active finalize_run_manifest" in violations[0]
+    assert callee in violations[0], (label, violations[0])
+    assert launcher_audit.UNRESOLVED_WRITE not in violations[0]
+
+    # The same form writing a NON-manifest artefact is not a publication -- per form, so the
+    # matrix cannot pass by being uniformly red.
+    benign = launcher_audit.audit_source(
+        source.replace("run_manifest.json", "task_outcome.json").replace(
+            'admit_benchmark_run(out / "task_outcome.json"',
+            'admit_benchmark_run(out / "run_manifest.json"').replace(
+            'finalize_run_manifest(out / "task_outcome.json"',
+            'finalize_run_manifest(out / "run_manifest.json"'),
+        name="form.py")
+    assert benign == [], (label, benign)
+
+
+def test_invariant_c_derives_destinations_from_real_signatures_not_a_hand_written_table():
+    """The positions come from the callable, so they cannot drift out of step with it."""
+    import os
+
+    from devtools.benchmarks.common import launcher_audit
+
+    # Each primitive resolves to at least one REAL signature...
+    for leaf in launcher_audit.WRITE_PRIMITIVES:
+        assert launcher_audit.primitive_signatures(leaf), leaf
+
+    # ...and those signatures are the live ones, not a copy. `rename` is the case in point: two
+    # different callables share the name, and the union of both is what closes the hole.
+    assert ("src", "dst") in {positional for positional, _every
+                              in launcher_audit.primitive_signatures("rename")}
+    assert ("self", "target") in {positional for positional, _every
+                                  in launcher_audit.primitive_signatures("rename")}
+    assert tuple(inspect.signature(os.rename).parameters)[:2] == ("src", "dst")
+
+
+def test_invariant_c_fails_closed_on_a_write_form_it_cannot_place(monkeypatch):
+    """An unplaceable write is REPORTED, never assumed harmless.
+
+    A write whose destination no signature can name is the state the hand-written table was
+    silently in for every form it omitted. Failing closed converts that silence into a report:
+    the gate says it cannot tell, instead of saying there is nothing there.
+    """
+    from devtools.benchmarks.common import launcher_audit
+
+    source = _SEAM_FORM_TEMPLATE.format(statement='write_json(out / "run_manifest.json", manifest)')
+    assert launcher_audit.audit_source(source, name="closed.py")      # placed: a plain violation
+
+    # Strip the primitive's home so nothing can place it, exactly as an unmodelled form is.
+    monkeypatch.setitem(launcher_audit._PRIMITIVE_HOMES, "write_json", ())
+    launcher_audit.primitive_signatures.cache_clear()
+    try:
+        violations = launcher_audit.audit_source(source, name="closed.py")
+    finally:
+        # Drop the patched answer BEFORE monkeypatch restores the table, so no later test in this
+        # process sees a cached "unplaceable" verdict for a primitive that is placeable again.
+        launcher_audit.primitive_signatures.cache_clear()
+    assert len(violations) == 1, violations
+    assert launcher_audit.UNRESOLVED_WRITE in violations[0]
+    assert "no real signature places its destination" in violations[0]
+
+
+def test_the_launcher_gate_does_not_confuse_a_recorded_manifest_path_with_a_publication():
+    """Recording a manifest PATH in a payload is not writing to it — the vacuity guard.
+
+    CL-Bench's `collect_results` writes `results.json` whose payload lists pointers to the
+    external runner's sidecar manifests (`.../cl_bench/*/run_manifest.json`). A first cut of
+    Invariant C inspected every argument of the write and reported that as a publication. Only
+    the DESTINATION counts; an always-red gate is as useless as a vacuously green one.
+    """
+    from devtools.benchmarks.common import launcher_audit
+
+    pointer_payload = _SEAM_PUBLICATION_FIXED_SOURCE.replace(
+        '    write_json(run_dir / "task_outcome.json", outcome)',
+        '    write_json(run_dir / "results.json",\n'
+        '               {"sidecars": sorted(str(p) for p in run_dir.glob("*/run_manifest.json"))})')
+    assert launcher_audit.audit_source(pointer_payload, name="pointers.py") == []
+
+
+def test_the_launcher_gate_catches_a_synthetic_violator_of_both_invariants():
+    """The gate is pinned against a launcher that BREAKS it, not only against clean ones.
+
+    Round 6 found `ensure_outside_repo` running before admission in four launchers, and the
+    guard had missed it for six rounds because it is IMPORTED: the resolver followed only local
+    definitions, so an imported mutator was invisible unless somebody had thought to name it in
+    the denylist. A denylist is a list of yesterday's bugs. This asserts the RESOLUTION: the
+    two `ensure_*` names are NOT in the denylist, and the violation is still reported — by
+    reading, one module over, what the helper's body actually does.
+    """
+    from devtools.benchmarks.common import launcher_audit
+
+    assert not (launcher_audit.PRE_ADMISSION_DENIED_NAMES
+                & {"ensure_outside_repo", "ensure_file_output_outside_repo"})
+    assert launcher_audit.denied_pre_admission_call("ensure_outside_repo") == ""
+
+    violations = launcher_audit.audit_source(_VIOLATING_LAUNCHER_SOURCE, name="synthetic.py")
+    # INVARIANT A, caught through the imported hop and reported as `helper -> what it does`.
+    assert any("BEFORE admit_benchmark_run()" in v and "ensure_outside_repo -> mkdir" in v
+               for v in violations), violations
+    # INVARIANT B: the run is attested against `--repo-dir` but confined against `REPO`.
+    assert any("confines paths ONLY against module scope" in v and "REPO" in v
+               for v in violations), violations
+    assert len(violations) == 2
+
+    # ...and the corrected launcher passes, so the gate is not simply always-red.
+    assert launcher_audit.audit_source(_CLEAN_LAUNCHER_SOURCE, name="synthetic.py") == []
+
+
+def test_the_launcher_gate_reproduces_both_round_six_confinement_defects():
+    """Invariant B, on the two real shapes: a helper that resolves its own authority, and a
+    launcher that validates its out-dir against its own checkout instead of the executed one."""
+    from devtools.benchmarks.common import launcher_audit
+
+    # The `confined_claims_dir` shape: the authority came from `repo_root_from_devtools()`, so
+    # `--repo-dir /other/clone --claim-dir /other/clone/.claims` wrote lock and marker state
+    # into the execution checkout.
+    claims_defect = '''
+from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_run_manifest
+from devtools.benchmarks.common.run_roots import assert_outside_repo, repo_root_from_devtools
+
+
+def confined_claims_dir(claims_dir):
+    return assert_outside_repo(claims_dir, repo_root_from_devtools())
+
+
+def main():
+    args = parse_args()
+    repo_dir = args.repo_dir
+    claims = confined_claims_dir(args.claim_dir)
+    manifest = admit_benchmark_run(args.out, repo_dir=repo_dir)
+    with finalize_run_manifest(args.out, manifest) as final:
+        return 0
+'''
+    violations = launcher_audit.audit_source(claims_defect, name="claims_defect.py")
+    assert any("confined_claims_dir() confines paths ONLY against module scope" in v
+               and "repo_root_from_devtools" in v for v in violations), violations
+
+    # The `run_clb.main` shape: `--out-dir` validated against the launcher's own REPO, so
+    # admission artefacts could land inside the execution clone being attested.
+    clb_defect = '''
+import pathlib
+from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_run_manifest
+from devtools.benchmarks.common.run_roots import assert_outside_repo
+
+REPO = pathlib.Path(__file__).resolve().parents[3]
+
+
+def main():
+    args = parse_args()
+    execution_clone = pathlib.Path(args.ouroboros_clone)
+    out = assert_outside_repo(pathlib.Path(args.out_dir), REPO)
+    manifest = admit_benchmark_run(out / "run_manifest.json", repo_dir=execution_clone)
+    with finalize_run_manifest(out / "run_manifest.json", manifest) as final:
+        return 0
+'''
+    violations = launcher_audit.audit_source(clb_defect, name="clb_defect.py")
+    assert any("main() confines paths ONLY against module scope" in v and "REPO" in v
+               for v in violations), violations
+    # Confining against BOTH checkouts — which is what run_clb.py does now — is accepted: the
+    # invariant is agreement with the attested checkout, not a ban on constants.
+    fixed = clb_defect.replace(
+        "    out = assert_outside_repo(pathlib.Path(args.out_dir), REPO)",
+        "    out = pathlib.Path(args.out_dir)\n"
+        "    for authority in (REPO, execution_clone):\n"
+        "        out = assert_outside_repo(out, authority)",
+    )
+    assert launcher_audit.audit_source(fixed, name="clb_fixed.py") == []
+
+
+def test_the_launcher_gate_leaves_static_launchers_alone():
+    """A launcher that attests a STATICALLY derived root and confines against that same root is
+    CONSISTENT, and flagging it would push the gate straight back toward per-case exemptions.
+    The in-repo prediction writers (`swebench_predictions`, `pro_predictions`) are exactly this
+    shape, and there is no other checkout for them to be wrong about."""
+    from devtools.benchmarks.common import launcher_audit
+
+    static_launcher = '''
+import pathlib
+from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_run_manifest
+from devtools.benchmarks.common.run_roots import assert_file_output_outside_repo
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+
+
+def main():
+    args = parse_args()
+    output = assert_file_output_outside_repo(pathlib.Path(args.output), REPO_ROOT)
+    manifest = admit_benchmark_run(args.manifest_output, repo_dir=REPO_ROOT)
+    with finalize_run_manifest(args.manifest_output, manifest) as final:
+        return 0
+'''
+    assert launcher_audit.audit_source(static_launcher, name="static.py") == []
+
+
+def test_pre_admission_resolver_sees_through_helpers_and_past_step_aside_branches():
+    """Pin the RESOLVER, not just its current verdict.
+
+    Two rounds in a row, pre-admission work slipped past it by living one level down inside a
+    local helper the denylist does not name (`_ensure_vmrun_on_path` probing the filesystem,
+    `_install_optional_dependency_stubs` mutating `sys.modules`, `repo_provenance` shelling out
+    to git, `_read_task_ids` running `uv run ... list` with a 60s timeout). So the guard is
+    maintained by what a helper DOES. The complement matters too: a branch that always leaves
+    the function is not on the path to admission — those are the deliberate step-aside paths
+    that exist to leave no footprint — and flagging them would push the guard back toward the
+    per-case exemptions it is supposed to replace.
+    """
+    from devtools.benchmarks.common import launcher_audit
+
+    unit = launcher_audit._Unit(ast.parse(_GUARD_PROBE_SOURCE), "probe.py")
+    prefix = launcher_audit.calls_before(unit.functions["main"], "admit_benchmark_run")
+
+    # The helper that hides a subprocess IS caught, and the report names the helper.
+    assert launcher_audit.resolve_denied("_looks_innocent", unit) == "_looks_innocent -> subprocess"
+    # ...which is exactly what walking main()'s pre-admission statements now reports.
+    denied = [d for d in (launcher_audit.resolve_denied(c, unit) for c in prefix) if d]
+    assert denied == ["_looks_innocent -> subprocess"]
+    # A pure helper is not flagged.
+    assert launcher_audit.resolve_denied("_pure", unit) == ""
+    # The step-aside branch (`if args.collect_only: ...; return 0`) never reaches admission, so
+    # its mutating helper is not on the guarded path -- though the helper itself is still
+    # recognised as mutating, so the exclusion is about the PATH, not about the denylist.
+    assert "_steps_aside" not in prefix
+    assert launcher_audit.resolve_denied("_steps_aside", unit) == "_steps_aside -> mkdir"
+    # The branch TEST runs on the way past, so it is still walked.
+    assert "parse_args" in prefix
+    # TWO hops are resolved, and a hop now CROSSES MODULES — both are the round-6 fix. The old
+    # guard resolved ONE hop of LOCAL definitions only, which is why an imported helper whose
+    # own body called another imported helper was invisible twice over. A three-hop chain is
+    # still out of the gate's reach and stays a review question; asserted so the real depth is
+    # documented rather than implied.
+    assert launcher_audit.resolve_denied("_two_levels_down", unit) == \
+        "_two_levels_down -> _looks_innocent -> subprocess"
+    assert launcher_audit.resolve_denied("_three_levels_down", unit) == ""
+
+
+def test_swe_pro_manifest_records_the_derived_model_not_the_template(tmp_path, monkeypatch):
+    """The manifest must name the model that RAN.
+
+    A live SWE-Pro smoke found `run_manifest.json` reporting `anthropic/claude-sonnet-4.5`
+    while `_run_settings.json`, the container environment and the in-container settings all
+    agreed the run was on `openai/gpt-5.5`. `model_slot_snapshot` had been handed `--settings`
+    — the TEMPLATE — while `derive_run_settings` applies `pin_single_model(--solve-model)` on
+    top of it. Nothing in the artefact contradicted an auditor who believed the wrong name,
+    which is precisely the failure this release exists to remove.
+
+    Note what a weaker test would have done here: `model_slots["OUROBOROS_MODEL"]` is non-empty
+    in the BUGGY case too. So this pins it to the DERIVED file and asserts the two disagree.
+    """
+    import importlib
+
+    from devtools.benchmarks.common.manifests import model_slot_snapshot
+
+    run_pro = importlib.import_module("devtools.benchmarks.swe_bench_pro.e1v2.run_pro")
+    template = tmp_path / "settings_template.json"
+    template.write_text(json.dumps({
+        "OUROBOROS_MODEL": "anthropic/claude-sonnet-4.5",
+        "OUROBOROS_MODEL_HEAVY": "anthropic/claude-sonnet-4.5",
+        "TOTAL_BUDGET": 50.0,
+    }), encoding="utf-8")
+    out_dir = tmp_path / "run"
+    out_dir.mkdir()
+
+    derived = run_pro.derive_run_settings(str(template), out_dir, "openai/gpt-5.5", 50.0, 5.0)
+    assert derived == out_dir / "_run_settings.json"
+
+    # The container is handed the FILE and a fresh environment, so the launcher's own env is
+    # not part of that server's configuration and must not be reported as if it were.
+    monkeypatch.setenv("OUROBOROS_MODEL", "some/host-env-model")
+    assert model_slot_snapshot(derived, env_overrides=False)["OUROBOROS_MODEL"] == "openai/gpt-5.5"
+    # ...and the template, which is what the manifest used to record, names a DIFFERENT model:
+    # the exact disagreement the smoke observed.
+    assert model_slot_snapshot(template, env_overrides=False)["OUROBOROS_MODEL"] == \
+        "anthropic/claude-sonnet-4.5"
+
+    # The call site takes the value `derive_run_settings` RETURNED, not `args.settings`.
+    tree = ast.parse((REPO_ROOT / "devtools" / "benchmarks" / "swe_bench_pro" / "e1v2"
+                      / "run_pro.py").read_text(encoding="utf-8"))
+    snapshots = [node for node in ast.walk(tree)
+                 if isinstance(node, ast.Call)
+                 and getattr(node.func, "id", "") == "model_slot_snapshot"]
+    assert len(snapshots) == 1
+    assert getattr(snapshots[0].args[0], "id", "") == "seed"
+    assert [(kw.arg, kw.value.value) for kw in snapshots[0].keywords] == [("env_overrides", False)]
+
+
+def test_the_gate_catches_pre_admission_reads_parses_probes_and_nested_admission_args():
+    """Round 7: the gate documented a WIDER class than it enforced.
+
+    It denied MUTATION, but the invariant it states is that nothing which can FAIL may precede
+    the persisted manifest — and a run that dies parsing its dataset leaves no manifest at all,
+    so it is invisible rather than merely footprint-free, which is strictly worse. Four migrated
+    launchers were still doing exactly that (`_records`/`_rows` reading `--input`,
+    `preflight_model_slots` reading settings, `read_csv_order`/`load_pro_rows` reading the task
+    order and downloading the dataset), and a fifth shape hid in plain sight: a call nested in
+    the admission call's own ARGUMENT LIST, which Python evaluates before entering the callee.
+
+    The four shapes are pinned here as synthetic launchers, then the corrected launcher is
+    asserted to PASS, so the widening cannot be satisfied by a gate that is always red.
+    """
+    from devtools.benchmarks.common import launcher_audit
+
+    def audit(body, name):
+        return launcher_audit.audit_source(
+            "import pathlib\n"
+            "from devtools.benchmarks.common.manifests import "
+            "admit_benchmark_run, finalize_run_manifest\n"
+            "from devtools.benchmarks.common.run_roots import assert_outside_repo\n"
+            "\nREPO = pathlib.Path(__file__).resolve().parents[3]\n\n" + body,
+            name=name,
+        )
+
+    # 1. A DATASET READ one hop down, the `_records`/`_rows` shape.
+    read = audit('''
+def _records(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def main():
+    args = parse_args()
+    rows = _records(pathlib.Path(args.input))
+    manifest = admit_benchmark_run(args.out, repo_dir=REPO, requested_task_ids=rows)
+    with finalize_run_manifest(args.out, manifest) as final:
+        return 0
+''', "read.py")
+    assert any("_records() runs BEFORE" in v and "_records -> read_text" in v
+               for v in read), read
+
+    # 2. A PARSE that opens the file itself, the `read_csv_order` shape.
+    parse = audit('''
+def read_csv_order(path):
+    with path.open(encoding="utf-8") as handle:
+        return sorted(csv.DictReader(handle), key=lambda row: int(row["idx"]))
+
+
+def main():
+    args = parse_args()
+    order = read_csv_order(pathlib.Path(args.csv))
+    manifest = admit_benchmark_run(args.out, repo_dir=REPO, requested_task_ids=order)
+    with finalize_run_manifest(args.out, manifest) as final:
+        return 0
+''', "parse.py")
+    assert any("read_csv_order -> open" in v for v in parse), parse
+
+    # 3. A MODEL-SLOT PROBE that reads settings and refuses, the `preflight_model_slots` shape.
+    #    Reported by the read; the refusal is what made it fatal.
+    probe = audit('''
+def preflight_model_slots(settings_path):
+    settings = json.loads(pathlib.Path(settings_path).read_text(encoding="utf-8"))
+    if not settings:
+        raise SystemExit("model slot preflight failed")
+    return settings
+
+
+def main():
+    args = parse_args()
+    slots = preflight_model_slots(args.settings)
+    manifest = admit_benchmark_run(args.out, repo_dir=REPO, harness=slots)
+    with finalize_run_manifest(args.out, manifest) as final:
+        return 0
+''', "probe.py")
+    assert any("preflight_model_slots -> read_text" in v for v in probe), probe
+
+    # 4. A CALL NESTED IN THE ADMISSION ARGUMENTS, the `_collect_attestations` shape. Evaluated
+    #    before `admit_benchmark_run` is even entered, and previously invisible because the
+    #    walk STOPPED at the statement holding the admission call.
+    nested = audit('''
+def _collect_attestations(paths):
+    return [json.loads(pathlib.Path(raw).read_text(encoding="utf-8")) for raw in paths]
+
+
+def main():
+    args = parse_args()
+    manifest = admit_benchmark_run(
+        args.out, repo_dir=REPO,
+        extra={"runtime_attestations": _collect_attestations(args.attestation)},
+    )
+    with finalize_run_manifest(args.out, manifest) as final:
+        return 0
+''', "nested.py")
+    assert any("_collect_attestations() runs BEFORE" in v and "read_text" in v
+               for v in nested), nested
+
+    # 5. A DEFERRED NON-STDLIB IMPORT, the `load_pro_rows`/`_load_instances` shape. Not a call
+    #    at all, so no callee-name rule could ever have seen it; its ImportError (or an offline
+    #    hub) killed the process with nothing on disk.
+    dataset = audit('''
+def load_pro_rows(ids):
+    from datasets import load_dataset
+    return load_dataset("ScaleAI/SWE-bench_Pro", split="test")
+
+
+def main():
+    args = parse_args()
+    rows = load_pro_rows(args.ids)
+    manifest = admit_benchmark_run(args.out, repo_dir=REPO, requested_task_ids=rows)
+    with finalize_run_manifest(args.out, manifest) as final:
+        return 0
+''', "dataset.py")
+    assert any("load_pro_rows -> deferred import datasets" in v for v in dataset), dataset
+
+    # THE CORRECTED SHAPE PASSES. Declared selector at admission, resolved ids amended after —
+    # the chicken-and-egg has one answer and this is it.
+    fixed = audit('''
+def _records(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def main():
+    args = parse_args()
+    manifest = admit_benchmark_run(
+        args.out, repo_dir=REPO, requested_task_ids=[], extra={"input": str(args.input)},
+    )
+    with finalize_run_manifest(args.out, manifest) as final:
+        rows = _records(pathlib.Path(args.input))
+        manifest["requested_task_ids"] = [row["instance_id"] for row in rows]
+        manifest["requested_count"] = len(rows)
+        return 0
+''', "fixed.py")
+    assert fixed == [], fixed
+
+
+def test_the_gate_separates_argv_shaped_refusals_from_state_shaped_ones():
+    """Where the widened invariant draws its line, pinned so it is not re-litigated.
+
+    Argument parsing and pure path arithmetic MUST precede admission — they compute the
+    manifest's own path — and their refusals are a deterministic function of argv. A bare
+    existence probe is the one permitted middle: it reads no content, cannot fail on malformed
+    input, and is what lets `scored_claim_state` answer "another lane already scored this" and
+    step aside leaving zero footprint. The combination is what is denied: a helper that PROBES
+    and can also REFUSE produces a refusal no argv can explain, which is exactly the class that
+    needs a durable manifest.
+    """
+    from devtools.benchmarks.common import launcher_audit
+
+    source = '''
+import pathlib
+
+
+def refuse_live_repo_clone(clone):
+    resolved = pathlib.Path(clone).expanduser().resolve(strict=False)
+    if resolved == LIVE:
+        raise SystemExit("--ouroboros-clone must never be the live repo")
+    return resolved
+
+
+def scored_claim_state(claims_dir, key):
+    if (claims_dir / f"{key}.scored").exists():
+        return "already_scored"
+    return ""
+
+
+def check_clone(clone):
+    if not (clone / "devtools").exists():
+        raise SystemExit("not an Ouroboros checkout")
+'''
+    unit = launcher_audit._Unit(ast.parse(source), "line.py")
+    # Pure-argv refusal: allowed before admission.
+    assert launcher_audit.resolve_denied("refuse_live_repo_clone", unit) == ""
+    # Probe that only RETURNS: allowed, and this is deliberate, not an oversight.
+    assert launcher_audit.resolve_denied("scored_claim_state", unit) == ""
+    # Probe + refusal: denied.
+    assert launcher_audit.resolve_denied("check_clone", unit) == \
+        "check_clone -> refuses on probed state"
+    # The probe names are recognised, and none of them is denied on its own.
+    assert "exists" in launcher_audit.STATE_PROBE_NAMES
+    assert not (launcher_audit.STATE_PROBE_NAMES & launcher_audit.PRE_ADMISSION_DENIED_NAMES)
+    # A stdlib deferred import is not a dependency on the state of the world.
+    assert launcher_audit.resolve_denied("_is_default_desktop_server", launcher_audit._Unit(
+        ast.parse('''
+def _is_default_desktop_server(url):
+    from urllib.parse import urlparse
+    return urlparse(url).port == 8765
+'''), "stdlib.py")) == ""
+
+
+def test_the_gate_catches_a_refusal_authority_derived_from___file__():
+    """Invariant B's second shape, found by a live CL-Bench smoke rather than by review.
+
+    `run_clb.refuse_live_repo_clone` compared `--ouroboros-clone` against `REPO`, a
+    `__file__`-derived module constant, so running a PINNED SEED's own launcher and handing it
+    that same seed — the recipe METHODOLOGY prescribes — was refused, while the live repo the
+    guard exists to protect went unmentioned. The two trees coincide only in the development
+    workspace. Same class as the `confined_claims_dir` finding, different syntax (a comparison
+    rather than a call), which is why the call-shaped detector missed it.
+    """
+    from devtools.benchmarks.common import launcher_audit
+
+    defect = '''
+import pathlib
+from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_run_manifest
+from devtools.benchmarks.common.run_roots import assert_outside_repo
+
+REPO = pathlib.Path(__file__).resolve().parents[3]
+
+
+def refuse_live_repo_clone(clone):
+    resolved = pathlib.Path(clone).expanduser().resolve(strict=False)
+    if resolved == REPO.resolve(strict=False):
+        raise SystemExit("--ouroboros-clone must be a dedicated CLONE, never the live repo")
+    return resolved
+
+
+def main():
+    args = parse_args()
+    execution_clone = refuse_live_repo_clone(pathlib.Path(args.ouroboros_clone))
+    out = assert_outside_repo(pathlib.Path(args.out_dir), execution_clone)
+    manifest = admit_benchmark_run(out / "run_manifest.json", repo_dir=execution_clone)
+    with finalize_run_manifest(out / "run_manifest.json", manifest) as final:
+        return 0
+'''
+    violations = launcher_audit.audit_source(defect, name="refusal_defect.py")
+    assert any("refuse_live_repo_clone() REFUSES against ['REPO']" in v
+               and "__file__" in v for v in violations), violations
+
+    # Refusing against the LIVE runtime instead — what run_clb.py does now — passes.
+    fixed = defect.replace(
+        "    if resolved == REPO.resolve(strict=False):\n"
+        '        raise SystemExit("--ouroboros-clone must be a dedicated CLONE, never the live repo")',
+        "    for live in live_repo_roots():\n"
+        "        if resolved == live.expanduser().resolve(strict=False):\n"
+        '            raise SystemExit("--ouroboros-clone must never be the LIVE repo")',
+    )
+    assert launcher_audit.audit_source(fixed, name="refusal_fixed.py") == []
+
+
+def test_the_gate_resolves_imported_first_party_helpers_only():
+    """The resolver opens FIRST-PARTY modules only. Stdlib and third-party callees stay
+    unresolved (the gate must not depend on what happens to be installed) and are covered by
+    the name/prefix denylist instead."""
+    from devtools.benchmarks.common import launcher_audit
+
+    source = '''
+from devtools.benchmarks.common.run_roots import (
+    assert_outside_repo, ensure_file_output_outside_repo, ensure_outside_repo,
+)
+from json import dumps
+import shutil
+
+
+def _wrapper(path, repo):
+    from devtools.benchmarks.common.manifests import write_json
+    return write_json(path, {})
+'''
+    unit = launcher_audit._Unit(ast.parse(source), "imports.py")
+    assert unit.imports["ensure_outside_repo"] == "devtools.benchmarks.common.run_roots"
+    # A first-party import is opened and its body read: BOTH `ensure_*` helpers are caught by
+    # what they do, one and two modules-hops away, with neither of them in the denylist.
+    assert launcher_audit.resolve_denied("ensure_outside_repo", unit) == \
+        "ensure_outside_repo -> mkdir"
+    assert launcher_audit.resolve_denied("ensure_file_output_outside_repo", unit) == \
+        "ensure_file_output_outside_repo -> ensure_outside_repo -> mkdir"
+    # The pure `assert_*` form is what a pre-admission caller must use, and it is NOT flagged.
+    assert launcher_audit.resolve_denied("assert_outside_repo", unit) == ""
+    # A FUNCTION-LEVEL import is in the map too — the OSWorld launchers import their shared
+    # claim helpers inside the functions that use them, and an import the resolver cannot see
+    # is an imported mutator it cannot follow.
+    assert unit.imports["write_json"] == "devtools.benchmarks.common.manifests"
+    # A stdlib import is not opened; nothing is claimed about it.
+    assert launcher_audit.resolve_denied("dumps", unit) == ""
+    # ...but the name/prefix denylist still covers third-party mutators without resolving them:
+    # the name hit wins when there is one, and the prefix catches whole families.
+    assert launcher_audit.denied_pre_admission_call("shutil.rmtree") == "rmtree"
+    assert launcher_audit.denied_pre_admission_call("shutil.copytree") == "shutil"
+    assert launcher_audit.denied_pre_admission_call("docker_pull_if_missing") == \
+        "docker_pull_if_missing"
+
+
+def test_every_migrated_launcher_passes_the_structural_gate():
+    """THE GATE. Every launcher under the admission contract, both invariants, one report.
+
+    Fix the CLASS, not the cases. Six review rounds produced eighteen criticals whose per-round
+    count went UP, because each round patched the call sites it happened to find. This answers
+    the question for the whole family at once, and a launcher that joins the family later joins
+    the gate with it. The seams themselves are pointless if a launcher can pair
+    `benchmark_run_manifest()` with its own `write_json()` again (no durable refusal) or skip
+    the finalization block (no final outcome), so those are checked here too.
+    """
+    from devtools.benchmarks.common import launcher_audit
+
+    assert launcher_audit.audit_all_launchers() == []
+    # Named files, so a new launcher cannot join silently and the launchers whose migration
+    # belongs to a LATER phase cannot be silently claimed.
+    for path in launcher_audit.launcher_paths():
+        assert path.is_file(), path
+    for rel in launcher_audit.PENDING_LAUNCHERS:
+        source = (launcher_audit.BENCH_ROOT / rel).read_text(encoding="utf-8")
+        assert "benchmark_run_manifest(" in source
 
 def test_runtime_attestation_decides_commit_availability_before_skew(tmp_path, monkeypatch):
     """Reason ORDER is part of the fail-closed contract. A checkout with no readable commit that
@@ -4836,6 +5733,123 @@ def _refusal_case_auto_run(tmp_path, monkeypatch):
     return auto_run.main, out_dir / "auto_run_manifest.json"
 
 
+def _refusal_case_run_clb(tmp_path, monkeypatch):
+    """CL-Bench refuses on the EXECUTION clone's provenance. The clone here is a bare
+    non-git directory, so the verdict is a property of the fixture, never of the ambient
+    checkout (and no `--allow-dirty-seed`, because the refusal IS what is under test)."""
+    from devtools.benchmarks.continual_learning import run_clb
+
+    clone = tmp_path / "execution-clone"
+    (clone / "devtools" / "benchmarks" / "common").mkdir(parents=True)
+    out = tmp_path / "clb-run"
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_clb.py", "--ouroboros-clone", str(clone), "--out-dir", str(out), "--dry-run"],
+    )
+    return run_clb.main, out / "run_manifest.json"
+
+
+def _refusal_case_run_step_agent(tmp_path, monkeypatch):
+    from devtools.benchmarks.osworld import run_step_agent
+
+    repo_dir = tmp_path / "repo"                 # bare dir: no git identity, ambient-free
+    repo_dir.mkdir()
+    (repo_dir / "VERSION").write_text("6.76.0\n", encoding="utf-8")
+    task = tmp_path / "OSWorld" / "evaluation_examples" / "examples" / "chrome" / "abc.json"
+    task.parent.mkdir(parents=True)
+    task.write_text(json.dumps({"id": "abc", "instruction": "no-op"}), encoding="utf-8")
+    results = tmp_path / "results"
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_step_agent.py", "--osworld-root", str(tmp_path / "OSWorld"), "--task", str(task),
+         "--result_dir", str(results), "--repo-dir", str(repo_dir),
+         "--data-dir", str(tmp_path / "data"), "--settings-path", str(tmp_path / "settings.json"),
+         "--ouroboros-url", "http://127.0.0.1:9", "--provider_name", "docker",
+         "--model", "m"],
+    )
+    manifest = (results / "pyautogui" / "screenshot_a11y_tree" / "m" / "chrome" / "abc"
+                / "task_run_manifest.json")
+    return run_step_agent.main, manifest
+
+
+def _refusal_case_run_cu_bridge_agent(tmp_path, monkeypatch):
+    """Admitted, then refused by the runtime attestation (nothing listens on the URL), so the
+    finalization seam — not the admission payload — has to record the real status."""
+    from devtools.benchmarks.osworld import run_cu_bridge_agent as rcb
+
+    osworld = tmp_path / "OSWorld"
+    (osworld / "evaluation_examples" / "examples" / "chrome").mkdir(parents=True)
+    task = osworld / "evaluation_examples" / "examples" / "chrome" / "abc.json"
+    task.write_text(json.dumps({"id": "abc", "instruction": "no-op"}), encoding="utf-8")
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "VERSION").write_text("6.76.0\n", encoding="utf-8")
+    results = tmp_path / "results"
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_cu_bridge_agent.py", "--osworld-root", str(osworld), "--provider_name", "docker",
+         "--path_to_vm", "/vm/Ubuntu.qcow2", "--task", str(task), "--result_dir", str(results),
+         "--repo-dir", str(repo_dir), "--data-dir", str(tmp_path / "data"),
+         "--settings-path", str(tmp_path / "settings.json"),
+         "--ouroboros-url", "http://127.0.0.1:9",
+         "--target-file", str(tmp_path / "target.txt"), "--allow-dirty-seed"],
+    )
+    return rcb.main, results / "chrome" / "abc" / "task_run_manifest.json"
+
+
+def _refusal_case_run_cu_bridge_agent_seed_gate(tmp_path, monkeypatch):
+    """The SEED-GATE refusal, with NO `--claim-dir`, so this attempt OWNS the task.
+
+    Owning it means the launcher keeps two copies of the record: the append-only
+    `attempts/<id>/task_run_manifest.json` and the shared canonical
+    `run_dir/task_run_manifest.json` a scorer reads — and the case above cannot reach this
+    branch at all, because it passes `--allow-dirty-seed`. The seed is a REAL git repo left
+    deliberately dirty, so the refusal is a property of the fixture and never of whatever
+    checkout (or sandbox layout) the test itself happens to run inside.
+    """
+    from devtools.benchmarks.osworld import run_cu_bridge_agent as rcb
+
+    osworld = tmp_path / "OSWorld"
+    (osworld / "evaluation_examples" / "examples" / "chrome").mkdir(parents=True)
+    task = osworld / "evaluation_examples" / "examples" / "chrome" / "abc.json"
+    task.write_text(json.dumps({"id": "abc", "instruction": "no-op"}), encoding="utf-8")
+    repo_dir = tmp_path / "repo"
+    _git_repo(repo_dir)
+    (repo_dir / "VERSION").write_text("6.76.0\n", encoding="utf-8")   # uncommitted => seed_dirty
+    results = tmp_path / "results"
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_cu_bridge_agent.py", "--osworld-root", str(osworld), "--provider_name", "docker",
+         "--path_to_vm", "/vm/Ubuntu.qcow2", "--task", str(task), "--result_dir", str(results),
+         "--repo-dir", str(repo_dir), "--data-dir", str(tmp_path / "data"),
+         "--settings-path", str(tmp_path / "settings.json"),
+         "--ouroboros-url", "http://127.0.0.1:9",
+         "--target-file", str(tmp_path / "target.txt")],
+    )
+    return rcb.main, results / "chrome" / "abc" / "task_run_manifest.json"
+
+
+def _refusal_case_osworld_adapter_skeleton(tmp_path, monkeypatch):
+    from devtools.benchmarks.osworld import osworld_adapter_skeleton as skeleton
+
+    repo_root = tmp_path / "repo"                # bare dir: no git identity, ambient-free
+    osworld = tmp_path / "OSWorld"
+    payload = tmp_path / "unix_computer_use"
+    output_root = tmp_path / "runs" / "osworld"
+    for path in (repo_root, osworld, payload):
+        path.mkdir(parents=True)
+    (osworld / "evaluation_examples").mkdir()
+    monkeypatch.setattr(skeleton, "DEFAULT_REPO_ROOT", repo_root)
+    monkeypatch.setattr(skeleton, "DEFAULT_DATA_ROOT", tmp_path / "live-data")
+    monkeypatch.setattr(
+        sys, "argv",
+        ["osworld_adapter_skeleton.py", "--osworld-root", str(osworld),
+         "--ouroboros-url", "http://127.0.0.1:9", "--osworld-server-url", "http://127.0.0.1:9",
+         "--unix-computer-use-payload", str(payload), "--output-root", str(output_root)],
+    )
+    return skeleton.main, output_root / "osworld_preflight.run_manifest.json"
+
+
 _REFUSAL_CASES = (
     _refusal_case_programbench,
     _refusal_case_programbench_e2e,
@@ -4844,6 +5858,11 @@ _REFUSAL_CASES = (
     _refusal_case_harness_bench_fast,
     _refusal_case_run_pro,
     _refusal_case_auto_run,
+    _refusal_case_run_clb,
+    _refusal_case_run_step_agent,
+    _refusal_case_run_cu_bridge_agent,
+    _refusal_case_run_cu_bridge_agent_seed_gate,
+    _refusal_case_osworld_adapter_skeleton,
 )
 
 
@@ -4869,6 +5888,126 @@ def test_migrated_launcher_exit_status_matches_the_recorded_exit_code(build_case
     )
     assert status != 0                      # every case here is a failure path
     assert extra["outcome"] not in ("started", "completed")
+
+
+def test_cu_bridge_refusal_mirrors_the_terminal_record_to_the_canonical_manifest(
+    tmp_path, monkeypatch, capsys
+):
+    """The SHARED canonical manifest must carry the SAME terminal record as the attempt's own.
+
+    `run_cu_bridge_agent` is the one launcher whose record lives in two places: the attempt's
+    append-only copy, which the finalization seam writes, and the canonical
+    `run_dir/task_run_manifest.json`, which a separate mirror writes for whichever attempt owns
+    the task. The mirror is only correct AFTER the seam's context manager has exited, because
+    that exit is what merges the terminal `outcome`/`exit_code`/`refusal` into the manifest.
+    The seed-gate branch used to mirror from INSIDE its seam and then `return` past the outer
+    `finally`, so the artefact a scorer reads kept the admission seam's GENERIC refusal —
+    `exit_code` 1 and no terminal outcome — while the process really exited 2. That is the
+    "recorded status != real status" defect this release exists to eliminate, inside the
+    machinery built to forbid it, on a path any operator hits with a dirty seed and no
+    `--claim-dir`.
+    """
+    main, canonical = _refusal_case_run_cu_bridge_agent_seed_gate(tmp_path, monkeypatch)
+    status = _process_status_of(main)
+    capsys.readouterr()
+    assert status == 2
+
+    recorded = json.loads(canonical.read_text(encoding="utf-8"))
+    extra = recorded["extra"]
+    assert recorded["seed_gate"]["reason"] == "seed_dirty"      # the fixture's own verdict
+    assert extra["outcome"] == "refused"
+    assert extra["exit_code"] == status
+    assert extra["refusal"] == {"stage": "seed_gate", "reason": "seed_dirty", "exit_code": status}
+    assert extra["allow_dirty_seed"] is False
+    # The canonical OUTCOME sidecar names the same refusal in this launcher's own vocabulary.
+    outcome = json.loads((canonical.parent / "task_outcome.json").read_text(encoding="utf-8"))
+    assert (outcome["status"], outcome["reason_code"]) == ("blocked", "seed_gate_failed")
+
+    # ...and it is byte-for-byte the attempt's OWN record, not merely a plausible one: the two
+    # copies of a single run's provenance may never tell different stories about how it ended.
+    attempts = sorted((canonical.parent / "attempts").iterdir())
+    assert len(attempts) == 1
+    assert json.loads((attempts[0] / "task_run_manifest.json").read_text(encoding="utf-8")) == recorded
+
+
+def test_step_agent_refusal_writes_its_manifest_only_on_admission_and_on_seam_exit(
+    tmp_path, monkeypatch, capsys
+):
+    """Invariant C, behaviourally, on the launcher whose canonical path IS the seam's own.
+
+    `run_step_agent` keeps ONE manifest, so round nine's "is there a second copy that can go
+    stale?" sweep cleared it — wrongly, because the hazard is publishing before the merge, which
+    a single-path launcher does just as readily. `_write_task_records` wrote the manifest from
+    inside the seam, so a reader could observe `exit_code` 1 on a run that exits 2, and an
+    interruption in that window left it durable.
+
+    The property is the WRITE SEQUENCE at that path: the deliberate admission record, then the
+    seam's terminal write on exit, and nothing in between. Asserting only the final content
+    passes just as happily with an extra pre-merge publication.
+    """
+    from devtools.benchmarks.common import manifests
+    from devtools.benchmarks.osworld import run_step_agent
+
+    main, manifest_path = _refusal_case_run_step_agent(tmp_path, monkeypatch)
+    target = manifest_path.resolve(strict=False)
+    writes: list[dict] = []
+    real_write_json = manifests.write_json
+
+    def _recording_write_json(path, payload):
+        if Path(path).resolve(strict=False) == target:
+            writes.append(json.loads(json.dumps(payload)))      # snapshot exactly AS WRITTEN
+        return real_write_json(path, payload)
+
+    # Both bindings: the seam writes through `manifests`, the launcher through its own import,
+    # so watching one name only would miss half the writes to the very path under test.
+    monkeypatch.setattr(manifests, "write_json", _recording_write_json)
+    monkeypatch.setattr(run_step_agent, "write_json", _recording_write_json)
+    assert _process_status_of(main) == 2
+    capsys.readouterr()
+
+    states = [((w.get("extra") or {}).get("outcome"), (w.get("extra") or {}).get("exit_code"))
+              for w in writes]
+    # The admission record is written BEFORE any seam is open and is deliberately durable — that
+    # is the whole point of `admit_benchmark_run`. Any write BETWEEN it and the seam's exit is
+    # the forbidden pre-merge publication; before the fix there were three.
+    assert states == [("refused", 1), ("refused", 2)], states
+
+
+def test_cu_bridge_refusal_publishes_the_canonical_manifest_exactly_once(
+    tmp_path, monkeypatch, capsys
+):
+    """The canonical manifest is published ONCE, after the seam — never in a pre-merge state.
+
+    Asserting the FINAL content is not enough: it passes just as happily when the record is
+    published TWICE — first from inside `finalize_run_manifest` carrying the admission seam's
+    generic `exit_code` 1, then corrected on seam exit — which is exactly how this window
+    survived the round that fixed the final artefact. The intermediate publish is observable:
+    OSWorld ships multi-lane in this release, the canonical path is what a concurrent reader
+    consumes, and an interruption inside the window leaves the wrong record durably. So the
+    property under test is the WRITE SEQUENCE at that path, not its last element.
+    """
+    from devtools.benchmarks.osworld import run_cu_bridge_agent as rcb
+
+    main, canonical = _refusal_case_run_cu_bridge_agent_seed_gate(tmp_path, monkeypatch)
+    target = canonical.resolve(strict=False)
+    published: list[dict] = []
+    real_write_json = rcb.write_json
+
+    def _recording_write_json(path, payload):
+        if Path(path).resolve(strict=False) == target:
+            published.append(json.loads(json.dumps(payload)))      # snapshot exactly AS WRITTEN
+        return real_write_json(path, payload)
+
+    monkeypatch.setattr(rcb, "write_json", _recording_write_json)
+    assert _process_status_of(main) == 2
+    capsys.readouterr()
+
+    states = [((p.get("extra") or {}).get("outcome"), (p.get("extra") or {}).get("exit_code"))
+              for p in published]
+    assert len(published) == 1, f"canonical manifest published {len(published)} times: {states}"
+    # ...and the single published state is the real one, so no reader can ever observe a record
+    # disagreeing with the status the process exits with.
+    assert states == [("refused", 2)]
 
 
 def test_runtime_attestation_requires_the_contracted_runtime_version_field(tmp_path, monkeypatch):
@@ -4919,3 +6058,769 @@ def test_runtime_attestation_requires_the_contracted_runtime_version_field(tmp_p
     attested = manifests.runtime_attestation("http://127.0.0.1:9/", repo)
     assert attested["ok"] is True and attested["reason"] == ""
     assert attested["runtime_version"] == "6.75.0"
+
+
+# --- v6.79.0 P5.3/P5.4: harbor dataset identity, env passthrough, GAIA/TB seed gate ---
+
+def _write_cached_task(cache_root, org, name, digest, timeout_sec):
+    task = cache_root / org / name / digest
+    task.mkdir(parents=True, exist_ok=True)
+    (task / "task.toml").write_text(
+        f"[agent]\ntimeout_sec = {timeout_sec}\n", encoding="utf-8"
+    )
+    return task / "task.toml"
+
+
+def test_harbor_task_cache_lookup_uses_dataset_org_not_a_hardcoded_one(tmp_path, monkeypatch):
+    """The adapter used to hardcode org `terminal-bench`, so every non-TB dataset silently ran
+    deadline-blind. The org now comes from the threaded dataset identity."""
+    import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
+
+    cache = tmp_path / "packages"
+    _write_cached_task(cache, "terminal-bench", "shared-name", "aaa", 600)
+    _write_cached_task(cache, "harbor-index", "shared-name", "bbb", 1800)
+    monkeypatch.setattr(tb_agent.OuroborosTerminalBenchAgent, "_PACKAGE_CACHE_DIR", cache)
+
+    logs = tmp_path / "logs" / "shared-name__trialhash" / "agent"
+    logs.mkdir(parents=True)
+    for dataset, expected in (
+        ("terminal-bench/terminal-bench-2-1", 600),
+        ("harbor-index/harbor-index-1-0", 1800),
+    ):
+        agent = tb_agent.OuroborosTerminalBenchAgent(logs_dir=logs, dataset=dataset)
+        assert agent._cached_task_toml("shared-name").parent.parent.parent.name == dataset.split("/")[0]
+        assert agent._resolve_task_timeout_from_dataset(object()) == expected
+
+
+def test_harbor_task_cache_lookup_refuses_an_ambiguous_task_name(tmp_path, monkeypatch):
+    """Same-named tasks in two orgs and no dataset org at all: returning either one would hand
+    the agent a FOREIGN wall-clock cap, so the name-only lookup refuses (deadline-blind is the
+    honest degradation). A single owner is still resolved when the dataset names no org."""
+    import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
+
+    cache = tmp_path / "packages"
+    _write_cached_task(cache, "terminal-bench", "collide", "aaa", 600)
+    _write_cached_task(cache, "scale-ai", "collide", "bbb", 1200)
+    _write_cached_task(cache, "gaia", "only-here", "ccc", 900)
+    monkeypatch.setattr(tb_agent.OuroborosTerminalBenchAgent, "_PACKAGE_CACHE_DIR", cache)
+
+    agent = tb_agent.OuroborosTerminalBenchAgent(logs_dir=tmp_path, dataset="")
+    assert agent._cached_task_toml("collide") is None
+    assert agent._cached_task_toml("only-here") is not None
+    assert agent._cached_task_toml("absent") is None
+
+
+def test_harbor_task_cache_lookup_never_borrows_another_orgs_timeout(tmp_path, monkeypatch):
+    """An EXPLICIT dataset org is authoritative: no cross-owner fallback, ever.
+
+    This previously fell back from a missing configured org to "any unique cache owner", and an
+    earlier revision of the ambiguity test asserted that borrow as intended behaviour. It is not
+    a lenient fallback — the borrowed field is the wall-clock cap, so the trial silently runs
+    under another benchmark's deadline. Frontier-Bench (600s verifier caps) next to
+    Terminal-Bench 2.1 (3600s) is the live 6x case, and both are routinely cached side by side
+    on the same host."""
+    import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
+    from devtools.benchmarks.terminal_bench import run_tb
+
+    cache = tmp_path / "packages"
+    # Only terminal-bench has this task cached; frontier-bench does not.
+    _write_cached_task(cache, "terminal-bench", "borrowed-task", "aaa", 3600)
+    monkeypatch.setattr(tb_agent.OuroborosTerminalBenchAgent, "_PACKAGE_CACHE_DIR", cache)
+
+    logs = tmp_path / "logs" / "borrowed-task__trialhash" / "agent"
+    logs.mkdir(parents=True)
+    fb = tb_agent.OuroborosTerminalBenchAgent(logs_dir=logs, dataset=run_tb.FRONTIER_BENCH_DATASET)
+    assert fb._cached_task_toml("borrowed-task") is None
+    assert fb._resolve_task_timeout_from_dataset(object()) is None   # deadline-blind, not 3600
+    # ...while the org that really owns the task still resolves its own cap.
+    tb = tb_agent.OuroborosTerminalBenchAgent(logs_dir=logs, dataset=run_tb.DEFAULT_DATASET)
+    assert tb._resolve_task_timeout_from_dataset(object()) == 3600
+
+
+def test_frontier_bench_wall_clock_cap_resolves_from_its_own_cache_org(tmp_path, monkeypatch):
+    """Frontier-Bench needs NO adapter change: harbor caches its tasks under org `frontier-bench`
+    (verified against harbor 0.18.0, which populates
+    `~/.cache/harbor/tasks/packages/frontier-bench/<task>/<digest>/task.toml`), so the already
+    dataset-parametric lookup resolves FB's own cap even while TB2.1 caches a same-named task.
+    FB caps are an order above TB2.1's (median 7200s), so picking the wrong org is not cosmetic."""
+    import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
+    from devtools.benchmarks.terminal_bench import run_tb
+
+    cache = tmp_path / "packages"
+    _write_cached_task(cache, "terminal-bench", "bun-sourcemap-leak", "aaa", 600)
+    _write_cached_task(cache, "frontier-bench", "bun-sourcemap-leak", "bbb", 1800)
+    monkeypatch.setattr(tb_agent.OuroborosTerminalBenchAgent, "_PACKAGE_CACHE_DIR", cache)
+
+    logs = tmp_path / "logs" / "bun-sourcemap-leak__trialhash" / "agent"
+    logs.mkdir(parents=True)
+    agent = tb_agent.OuroborosTerminalBenchAgent(logs_dir=logs, dataset=run_tb.FRONTIER_BENCH_DATASET)
+    assert agent._cached_task_toml("bun-sourcemap-leak").parent.parent.parent.name == "frontier-bench"
+    assert agent._resolve_task_timeout_from_dataset(object()) == 1800
+
+
+def test_run_tb_job_config_carries_dataset_and_deep_merges_a_base_config(tmp_path):
+    from devtools.benchmarks.terminal_bench import run_tb
+
+    base = tmp_path / "base.json"
+    base.write_text(json.dumps({
+        "environment": {"env": {"UPSTREAM": "keep"}, "type": "docker"},
+        "agents": [{"name": "Upstream Agent", "kwargs": {"dropped": True}}],
+        "verifier": {"timeout_multiplier": 1.0},
+    }), encoding="utf-8")
+    cfg = run_tb.HarborCommandConfig(
+        dataset="harbor-index/harbor-index-1-0", model="m", k=5, jobs_dir=tmp_path / "jd",
+        harbor_bin="harbor", n_concurrent=1, task_filters=[], settings_path=tmp_path / "s.json",
+        execute=False, light_model="m", base_job_config=base,
+    )
+    path = run_tb._write_agent_job_config(cfg)
+    written = json.loads(path.read_text(encoding="utf-8"))
+
+    # Upstream keys survive untouched; our agents[] block wins whole (name must stay ours,
+    # a null/foreign agents[0].name permanently invalidates a submission).
+    assert written["environment"] == {"env": {"UPSTREAM": "keep"}, "type": "docker"}
+    assert written["verifier"] == {"timeout_multiplier": 1.0}
+    assert len(written["agents"]) == 1
+    assert written["agents"][0]["name"] == "Ouroboros Installed"
+    assert "dropped" not in written["agents"][0]["kwargs"]
+    assert written["agents"][0]["kwargs"]["dataset"] == "harbor-index/harbor-index-1-0"
+
+
+def test_run_tb_forwards_agent_and_verifier_env_without_leaking_values(tmp_path):
+    from devtools.benchmarks.terminal_bench import run_tb
+
+    cfg = run_tb.HarborCommandConfig(
+        dataset=run_tb.DEFAULT_DATASET, model="m", k=5, jobs_dir=tmp_path, harbor_bin="harbor",
+        n_concurrent=1, task_filters=["t1"], settings_path=tmp_path / "s.json", execute=False,
+        light_model="m", agent_env=("AWS_REGION=us-east-1",), verifier_env=("OPENAI_API_KEY=sk-secret",),
+    )
+    cmd = run_tb.harbor_command(cfg)
+
+    assert cmd[cmd.index("--ae") + 1] == "AWS_REGION=us-east-1"
+    assert cmd[cmd.index("--ve") + 1] == "OPENAI_API_KEY=sk-secret"
+    safe = run_tb.redacted_command(cmd)
+    assert "sk-secret" not in " ".join(safe)
+    assert "OPENAI_API_KEY=<redacted>" in safe and "AWS_REGION=<redacted>" in safe
+    # Nothing else about the command changes.
+    assert [tok for tok in safe if "=" not in tok] == [tok for tok in cmd if "=" not in tok]
+
+
+def _harbor_job_tree(root, *, cleartext: str, partial: str) -> dict:
+    """A synthetic harbor 0.18.0 job tree, using harbor's REAL filenames and layout.
+
+    Ground truth (installed harbor 0.18.0, `harbor/job.py`): the job config is
+    `<jobs-dir>/<job_name>/config.json` — one timestamp level below the `--jobs-dir` our
+    launcher passes — written as `self.config.model_dump_json(indent=4, exclude_defaults=True)`,
+    and the same env dicts are re-serialized into the job `lock.json` and every trial's
+    `config.json` / `lock.json` / `result.json`. `--ae` lands in `agents[].env`, `--ve` in
+    `verifier.env`. Harbor's own `templatize_sensitive_env` writes a value VERBATIM when the
+    NAME does not match `KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|AUTH`, and only partially
+    (`value[:4] + "****" + value[-3:]`) when it does — both forms are planted here."""
+    job = root / "job" / "2026-07-25__12-00-00"
+    trial = job / "some-task__abc123"
+    (trial / "agent").mkdir(parents=True)
+    written = {}
+    env_block = {"JUDGE_API_KEY": partial, "MY_BEARER": cleartext}
+    for name in ("config.json", "lock.json"):
+        p = job / name
+        p.write_text(json.dumps({"verifier": {"env": env_block}, "agents": [{"env": env_block}]},
+                                indent=4), encoding="utf-8")
+        written[str(p)] = True
+    for name in ("config.json", "lock.json", "result.json"):
+        p = trial / name
+        p.write_text(json.dumps({"config": {"verifier": {"env": env_block}}}, indent=4),
+                     encoding="utf-8")
+        written[str(p)] = True
+    # harbor's only un-redacted path (`trial.py` writes `traceback.format_exc()`), plus an
+    # agent-written log: both can carry the resolved cleartext value.
+    (trial / "exception.txt").write_text(f"RuntimeError: Command: docker -e MY_BEARER={cleartext}\n",
+                                         encoding="utf-8")
+    (trial / "agent" / "session.log").write_text(f"env MY_BEARER={cleartext}\n", encoding="utf-8")
+    return written
+
+
+def test_scrub_covers_the_harbor_written_job_config_for_ae_ve_values(tmp_path, monkeypatch):
+    """The leak this closes: harbor persists its own JobConfig (and lock/result files) into the
+    job dir that gets PUBLICLY uploaded, so a `--ve` value is on disk even though the launcher's
+    own artifacts carry names only. The scrub must sweep the whole tree BY VALUE.
+
+    Deterministic and self-contained: the tree is built here, the secret is obviously fake, and
+    nothing depends on the ambient checkout or on a real key."""
+    from devtools.benchmarks.terminal_bench import run_tb
+    from devtools.benchmarks.terminal_bench import scrub_submission_secrets as scrub
+
+    fake = "FAKEfake-judge-key-0000000000deadbeef"   # obviously fake; never a real credential
+    # 1. The launcher really does hand this value to harbor's `--ve`.
+    cmd = run_tb.harbor_command(run_tb.HarborCommandConfig(
+        dataset=run_tb.DEFAULT_DATASET, model="m", k=5, jobs_dir=tmp_path / "jobs",
+        harbor_bin="harbor", n_concurrent=1, task_filters=["t1"],
+        settings_path=tmp_path / "s.json", execute=False, light_model="m",
+        verifier_env=(f"JUDGE_API_KEY={fake}",),
+    ))
+    assert cmd[cmd.index("--ve") + 1] == f"JUDGE_API_KEY={fake}"
+    assert fake not in " ".join(run_tb.redacted_command(cmd))
+
+    # 2. A submission copy of the job dir, in harbor's real shape.
+    root = tmp_path / "job_copy"
+    root.mkdir()
+    partial = scrub.harbor_redacted_form(fake)
+    assert partial and partial != fake                    # harbor leaks 7 chars, not zero
+    _harbor_job_tree(root, cleartext=fake, partial=partial)
+    sources = tmp_path / "fake_settings.json"
+    sources.write_text(json.dumps({"OPENROUTER_API_KEY": "FAKEfake-other-value-1111"}),
+                       encoding="utf-8")
+
+    # 3. Scrub, then assert the value is gone from EVERY file in the tree.
+    monkeypatch.setattr(sys, "argv", ["scrub", "--root", str(root), "--secrets-from", str(sources),
+                                      "--env-passthrough", f"JUDGE_API_KEY={fake}"])
+    assert scrub.main() == 0
+    files = [p for p in root.rglob("*") if p.is_file()]
+    assert len(files) >= 7
+    for path in files:
+        raw = path.read_bytes()
+        assert fake.encode() not in raw, f"cleartext survived in {path}"
+        assert partial.encode() not in raw, f"harbor's partial form survived in {path}"
+    # Structure preserved: the config is still valid JSON with the key present, value redacted.
+    cfg = json.loads((root / "job" / "2026-07-25__12-00-00" / "config.json").read_text(encoding="utf-8"))
+    assert cfg["verifier"]["env"]["MY_BEARER"] == "<REDACTED:JUDGE_API_KEY>"
+
+
+def test_scrub_keeps_every_passthrough_occurrence_of_a_repeated_env_name(tmp_path, monkeypatch):
+    """One env NAME, two DIFFERENT values (agent phase vs verifier phase) — the real shape when a
+    judge key and an agent key share a name, or when a flag is repeated. Keying the passthrough
+    needles on the NAME alone dropped the earlier value, so a CORRECT scrub invocation published
+    that credential in harbor's job tree. Every distinct occurrence must survive collection."""
+    from devtools.benchmarks.terminal_bench import scrub_submission_secrets as scrub
+
+    agent_value = "FAKEfake-agent-value-000000000000aaaa"    # obviously fake; never a credential
+    verifier_value = "FAKEfake-verifier-value-11111111bbbb"
+    name = "SHARED_API_KEY"
+
+    # Collection alone must retain both values (plus each one's harbor partial form).
+    needles, refusals = scrub.collect_env_passthrough(
+        [f"{name}={agent_value}", f"{name}={verifier_value}"]
+    )
+    assert refusals == []
+    assert sorted(needles.values()) == sorted([
+        agent_value, verifier_value,
+        scrub.harbor_redacted_form(agent_value), scrub.harbor_redacted_form(verifier_value),
+    ])
+    # An exact repeat is the same secret, not a second one: it must not inflate the needle set.
+    repeated, _ = scrub.collect_env_passthrough([f"{name}={agent_value}"] * 3)
+    assert len(repeated) == 2   # the value plus its harbor partial form
+
+    # End-to-end: both values are planted in harbor's own job tree and both must be gone.
+    root = tmp_path / "job_copy"
+    job = root / "job" / "2026-07-25__12-00-00"
+    job.mkdir(parents=True)
+    (job / "config.json").write_text(
+        json.dumps({"agents": [{"env": {name: agent_value}}],
+                    "verifier": {"env": {name: verifier_value}}}, indent=4),
+        encoding="utf-8",
+    )
+    sources = tmp_path / "fake_settings.json"
+    sources.write_text(json.dumps({"OPENROUTER_API_KEY": "FAKEfake-other-value-1111"}),
+                       encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [
+        "scrub", "--root", str(root), "--secrets-from", str(sources),
+        "--env-passthrough", f"{name}={agent_value}",
+        "--env-passthrough", f"{name}={verifier_value}",
+    ])
+    assert scrub.main() == 0
+    raw = (job / "config.json").read_bytes()
+    assert agent_value.encode() not in raw and verifier_value.encode() not in raw
+    # Structure preserved: both entries are still present, each redacted under its own label.
+    cfg = json.loads((job / "config.json").read_text(encoding="utf-8"))
+    assert cfg["agents"][0]["env"][name].startswith("<REDACTED:")
+    assert cfg["verifier"]["env"][name].startswith("<REDACTED:")
+    assert cfg["agents"][0]["env"][name] != cfg["verifier"]["env"][name]
+
+
+def test_scrub_fails_closed_on_an_unsweepable_ae_ve_value_and_changes_nothing(tmp_path, monkeypatch):
+    """A value we cannot sweep safely must ABORT before any write: a maybe-scrubbed tree that
+    then gets uploaded is strictly worse than no submission at all."""
+    from devtools.benchmarks.terminal_bench import scrub_submission_secrets as scrub
+
+    root = tmp_path / "job_copy"
+    root.mkdir()
+    target = root / "job" / "2026-07-25__12-00-00"
+    target.mkdir(parents=True)
+    before = json.dumps({"verifier": {"env": {"SHORT_TOKEN": "ab1"}}}, indent=4)
+    (target / "config.json").write_text(before, encoding="utf-8")
+    sources = tmp_path / "fake_settings.json"
+    sources.write_text(json.dumps({"OPENROUTER_API_KEY": "FAKEfake-other-value-1111"}),
+                       encoding="utf-8")
+
+    for bad in ("SHORT_TOKEN=ab1",           # too short to sweep safely
+                "WORDY_TOKEN=onlyletters",   # not credential-shaped
+                "NOEQUALS"):                 # malformed pair
+        monkeypatch.setattr(sys, "argv", ["scrub", "--root", str(root), "--secrets-from",
+                                          str(sources), "--env-passthrough", bad])
+        assert scrub.main() == 2, bad
+        assert (target / "config.json").read_text(encoding="utf-8") == before, bad
+
+
+def test_scrub_sweeps_and_verifies_json_escaped_forms_not_only_the_literal(tmp_path, monkeypatch):
+    r"""The false all-clear this closes. Harbor persists env values through JSON serializers, so
+    a value containing a quote, a backslash, a control character or a non-ASCII character is on
+    disk ESCAPED (``abc"1234`` is stored as ``abc\"1234``). A literal-only sweep walked past it
+    AND the literal-only verify then printed zero leftovers — a scrubber that misses a secret and
+    reports success is worse than no scrubber, because it turns "check this by hand" into a tool
+    verdict. Both passes must see every persisted form.
+
+    Self-contained: values are obviously fake, the tree is built here, nothing reads the ambient
+    checkout, the cwd or any real credential source."""
+    from devtools.benchmarks.terminal_bench import scrub_submission_secrets as scrub
+
+    # One awkward value per escape class the reviewer named. Obviously fake, never credentials.
+    awkward = {
+        "QUOTE_TOKEN": 'FAKEfake-quote-"-0000000001',
+        "BACKSLASH_TOKEN": "FAKEfake-backslash-\\-0000002",
+        "CONTROL_TOKEN": "FAKEfake-control-\x01-0000003",
+        "UNICODE_TOKEN": "FAKEfake-nonascii-é-000004",
+    }
+
+    # 1. The encoded forms are the SERIALIZER's output, not a hand-kept escape table.
+    assert scrub.json_encoded_forms(awkward["QUOTE_TOKEN"]) == ['FAKEfake-quote-\\"-0000000001']
+    assert scrub.json_encoded_forms(awkward["BACKSLASH_TOKEN"]) == ["FAKEfake-backslash-\\\\-0000002"]
+    assert scrub.json_encoded_forms(awkward["CONTROL_TOKEN"]) == ["FAKEfake-control-\\u0001-0000003"]
+    # ensure_ascii=True escapes the non-ASCII char; ensure_ascii=False leaves it == the literal,
+    # which is already swept as its own needle, so exactly one extra form is produced.
+    assert scrub.json_encoded_forms(awkward["UNICODE_TOKEN"]) == ["FAKEfake-nonascii-\\u00e9-000004"]
+    # A value with nothing to escape adds no needle at all.
+    assert scrub.json_encoded_forms("FAKEfake-plain-00000005") == []
+    expanded = scrub.expand_encoded_forms({"QUOTE_TOKEN": awkward["QUOTE_TOKEN"]})
+    assert expanded["QUOTE_TOKEN"] == awkward["QUOTE_TOKEN"]
+    assert expanded["QUOTE_TOKEN:json"] == 'FAKEfake-quote-\\"-0000000001'
+
+    # 2. A harbor-shaped tree holding each value in BOTH serializer configurations, plus the raw
+    #    literals in an un-redacted log (harbor's traceback path).
+    root = tmp_path / "job_copy"
+    job = root / "job" / "2026-07-25__12-00-00"
+    job.mkdir(parents=True)
+    payload = {"verifier": {"env": dict(awkward)}, "agents": [{"env": dict(awkward)}]}
+    (job / "config.json").write_text(       # pydantic/serde shape: raw UTF-8
+        json.dumps(payload, indent=4, ensure_ascii=False), encoding="utf-8")
+    (job / "lock.json").write_text(         # python json default shape: \uXXXX
+        json.dumps(payload, indent=4, ensure_ascii=True), encoding="utf-8")
+    (job / "exception.txt").write_text(
+        "".join(f"RuntimeError: docker -e {name}={value}\n" for name, value in awkward.items()),
+        encoding="utf-8")
+    # A --secrets-from value needs the same treatment; expansion is not passthrough-only.
+    from_source = 'FAKEfake-source-"-000000006'
+    sources = tmp_path / "fake_settings.json"
+    sources.write_text(json.dumps({"OPENROUTER_API_KEY": from_source}), encoding="utf-8")
+    (job / "settings_echo.json").write_text(
+        json.dumps({"OPENROUTER_API_KEY": from_source}, indent=4), encoding="utf-8")
+
+    argv = ["scrub", "--root", str(root), "--secrets-from", str(sources)]
+    for name, value in awkward.items():
+        argv += ["--env-passthrough", f"{name}={value}"]
+    monkeypatch.setattr(sys, "argv", list(argv))
+
+    # 3. Every form of every value must be gone — this is what failed before the fix.
+    assert scrub.main() == 0
+    files = [p for p in root.rglob("*") if p.is_file()]
+    for path in files:
+        raw = path.read_bytes()
+        for value in (*awkward.values(), from_source):
+            assert value.encode() not in raw, f"literal survived in {path}"
+            for form in scrub.json_encoded_forms(value):
+                assert form.encode() not in raw, f"JSON-escaped form survived in {path}"
+    # Structure preserved: still valid JSON, keys intact, values redacted.
+    for name in ("config.json", "lock.json"):
+        cfg = json.loads((job / name).read_text(encoding="utf-8"))
+        assert sorted(cfg["verifier"]["env"]) == sorted(awkward)
+        for redacted in cfg["verifier"]["env"].values():
+            assert redacted.startswith("<REDACTED:")
+
+    # 4. The VERIFY pass must refuse to declare success while an escaped form remains. Re-planting
+    #    only the escaped form is precisely the case that used to exit 0 with the secret on disk.
+    (job / "lock.json").write_text(
+        json.dumps({"verifier": {"env": {"QUOTE_TOKEN": awkward["QUOTE_TOKEN"]}}},
+                   indent=4, ensure_ascii=False),
+        encoding="utf-8")
+    planted = (job / "lock.json").read_text(encoding="utf-8")
+    assert 'FAKEfake-quote-\\"-0000000001' in planted        # escaped form only
+    assert awkward["QUOTE_TOKEN"] not in planted             # literal is NOT on disk
+    monkeypatch.setattr(scrub, "_sweep_file", lambda path, secrets: (0, []))  # verify pass alone
+    monkeypatch.setattr(sys, "argv", list(argv))
+    assert scrub.main() == 1
+
+
+def test_run_tb_submission_subtree_is_derived_from_the_dataset():
+    from devtools.benchmarks.terminal_bench import run_tb
+
+    # TB2.1 keeps its published layout byte-identical.
+    assert run_tb.submission_subtree("terminal-bench/terminal-bench-2-1") == ("terminal-bench", "2.1")
+    # Another dataset no longer lands in the TB2.1 tree.
+    assert run_tb.submission_subtree("harbor-index/harbor-index-1-0") == ("harbor-index", "1.0")
+    family, version = run_tb.submission_subtree("some-org/unversioned")
+    assert (family, version) == ("unversioned", "")
+
+
+def test_run_tb_submission_subtree_components_are_confined():
+    """`submission_root` is validated, but the job dir is DERIVED from it — so the components that
+    are about to be created are what must be checked, not their already-checked ancestor. Pure
+    function: no env, no cwd, no repo path, nothing derived from `__file__`."""
+    from devtools.benchmarks.terminal_bench import run_tb
+
+    # Accepted shapes are unchanged, derived and explicit alike (trailing slash still tolerated).
+    assert run_tb.confined_submission_subtree("", dataset="terminal-bench/terminal-bench-2-1") == [
+        "terminal-bench", "2.1",
+    ]
+    assert run_tb.confined_submission_subtree("terminal-bench/2.1", dataset="ignored") == ["terminal-bench", "2.1"]
+    assert run_tb.confined_submission_subtree("frontier-bench/", dataset="ignored") == ["frontier-bench"]
+
+    for escape in ("..", "../..", "../../../etc", "terminal-bench/../../..", ".", "./x", "/abs/path", "/"):
+        with pytest.raises(ValueError):
+            run_tb.confined_submission_subtree(escape, dataset="terminal-bench/terminal-bench-2-1")
+
+    # Windows forms: `\` is a separator and `C:` a drive qualifier there, and this repo's CI matrix
+    # runs all three OSes — a value that is an inert directory name on POSIX escapes on Windows.
+    for windows_form in ("..\\..\\evil", "sub\\dir", "C:\\evil", "C:/evil", "C:evil", "\\\\server\\share", "\\evil"):
+        with pytest.raises(ValueError):
+            run_tb.confined_submission_subtree(windows_form, dataset="terminal-bench/terminal-bench-2-1")
+
+    # The DERIVED path is untrusted too: `--dataset` reaches it through submission_subtree(), which
+    # splits the name without judging it.
+    assert run_tb.submission_subtree("org/..-2-1") == ("..", "2.1")
+    with pytest.raises(ValueError):
+        run_tb.confined_submission_subtree("", dataset="org/..-2-1")
+
+
+def test_run_tb_refuses_an_escaping_subtree_before_creating_anything(tmp_path, monkeypatch):
+    """The refusal must land ahead of the first mkdir, so a rejected run leaves no directories at
+    all. Hermetic: cwd is redirected into tmp_path, so a regression that reaches the run-root
+    default writes there and is caught by the emptiness assertion instead of touching a checkout."""
+    from devtools.benchmarks.terminal_bench import run_tb
+
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="single safe path component"):
+        run_tb.main([
+            "--model", "anthropic/claude-sonnet-5",
+            "--submission-root", str(tmp_path / "submission"),
+            "--run-root", str(tmp_path / "run"),
+            "--submission-subtree", "../../../escaped",
+        ])
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_gaia_and_tb_launchers_run_the_shared_seed_gate(tmp_path, monkeypatch):
+    """P5.4: GAIA and TB dropped their v6.75.0 `require_clean=False` pins AND route both manifest
+    seams, so the refusal is DURABLE: the record reaches disk and no other artefact does. Asserting
+    only `pytest.raises` is what let an inert handler pass review, so every launcher's PERSISTED
+    outcome is checked here. Deterministic — the gate runs against a PURPOSE-BUILT dirty repo,
+    never the ambient checkout."""
+    import devtools.benchmarks.gaia.run_gaia as run_gaia
+    from devtools.benchmarks.common.manifests import BenchmarkAdmissionRefused
+    from devtools.benchmarks.terminal_bench import run_harbor_smoke, run_tb
+
+    seed = tmp_path / "seed"
+    _git_repo(seed)
+    (seed / "VERSION").write_text("6.79.0\n", encoding="utf-8")
+    _git_commit_all(seed)
+    monkeypatch.setattr(run_gaia, "REPO", seed)
+    monkeypatch.setattr(run_tb, "repo_root_from_devtools", lambda: seed)
+    monkeypatch.setattr(run_harbor_smoke, "repo_root_from_devtools", lambda: seed)
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+
+    def _extra(run_dir):
+        return json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))["extra"]
+
+    # Clean seed: GAIA admits, records the gate verdict, augments the manifest with the
+    # settings-derived slots, and the finalization seam names the terminal outcome.
+    clean = tmp_path / "clean"
+    assert run_gaia.main(["--out-dir", str(clean), "--solve-model", "m", "--dry-run"]) == 0
+    manifest = json.loads((clean / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["seed_gate"]["ok"] is True and manifest["seed_gate"]["require_clean"] is True
+    assert manifest["model_slots"]["OUROBOROS_MODEL"] == "m"
+    assert manifest["extra"]["outcome"] == "dry_run" and manifest["extra"]["exit_code"] == 0
+
+    # Dirty seed: refused before anything is spent -- and the REFUSAL is on disk, so a shard
+    # wrapper reading run_manifest.json can tell "refused" from "never started" or "crashed".
+    (seed / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    dirty = tmp_path / "dirty-gaia"
+    with pytest.raises(BenchmarkAdmissionRefused, match="seed_dirty"):
+        run_gaia.main(["--out-dir", str(dirty), "--solve-model", "m", "--dry-run"])
+    extra = _extra(dirty)
+    assert extra["outcome"] == "refused" and extra["exit_code"] == 1
+    assert extra["refusal"] == {"stage": "seed_gate", "reason": "seed_dirty", "exit_code": 1}
+    # The renderer that injects LIVE provider keys into the run dir never ran.
+    assert not (dirty / "settings.json").exists()
+
+    def _no_probe(_harbor_bin):
+        raise AssertionError("harbor --version was probed before admission")
+
+    monkeypatch.setattr(run_tb, "harbor_version", _no_probe)
+    tb_root = tmp_path / "dirty-tb"
+    with pytest.raises(BenchmarkAdmissionRefused, match="seed_dirty"):
+        run_tb.main(["--model", "m", "--run-root", str(tb_root), "--settings-path", str(settings)])
+    assert _extra(tb_root)["refusal"]["stage"] == "seed_gate"
+    # No half-built submission tree (no job dir, no metadata.yaml).
+    assert not (tb_root / "submission" / "submissions").exists()
+
+    smoke_root = tmp_path / "dirty-smoke"
+    monkeypatch.setattr(sys, "argv", ["run_harbor_smoke.py", "--run-root", str(smoke_root),
+                                      "--settings-path", str(settings)])
+    with pytest.raises(BenchmarkAdmissionRefused, match="seed_dirty"):
+        run_harbor_smoke.main()
+    assert _extra(smoke_root)["refusal"]["stage"] == "seed_gate"
+    assert not (smoke_root / "harbor_command.json").exists()
+    assert not (smoke_root / "result_index.jsonl").exists()
+
+    # ...unless the escape is recorded.
+    escaped = tmp_path / "escaped"
+    assert run_gaia.main(["--out-dir", str(escaped), "--solve-model", "m", "--dry-run",
+                          "--allow-dirty-seed"]) == 0
+    recorded = json.loads((escaped / "run_manifest.json").read_text(encoding="utf-8"))
+    assert recorded["seed_gate"]["allow_dirty_seed"] is True
+    assert recorded["seed_gate"]["reason"] == "seed_dirty"
+    assert recorded["extra"]["outcome"] == "dry_run"
+
+
+def _inspect_eval_log(status: str, samples: list[dict], *, error: dict | None = None) -> dict:
+    """A minimal inspect eval log in the shape `--log-format json` writes and run_gaia reads."""
+    log: dict = {"version": 2, "status": status, "eval": {"task": "inspect_evals/gaia"},
+                 "plan": {}, "stats": {}, "samples": samples}
+    if error is not None:
+        log["error"] = error
+    return log
+
+
+def test_run_gaia_cannot_record_a_dead_inspect_eval_as_completed(tmp_path, monkeypatch):
+    """A DEAD eval must reach BOTH the outcome and the exit code — the fail-open this release
+    exists to remove, found inside the release's own machinery.
+
+    In the v6.81.0 GAIA smoke every sample died in `RuntimeError: Timed out executing setup
+    command in sandbox`, nothing was scored, and the run manifest recorded
+    `outcome="completed", exit_code=0`, because `inspect eval` has NO non-zero exit path for a
+    task that raised: it reports the failure in its log and still returns 0. Every leg below
+    therefore pins `harness_exit_code == 0` — the harness lies in all of them, so an
+    implementation that reads the return code cannot pass, and one that only ensured the field
+    is PRESENT cannot either.
+
+    The three outcomes are kept apart deliberately: an eval that raised, an eval that scored
+    nothing, and an eval that scored genuine zeros are different facts, and only the last is a
+    result. Hermetic by construction — purpose-built seed repo, tmp settings, tmp run roots, the
+    port picker and provider-key resolver stubbed, and the eval injected at the `subprocess.run`
+    seam, so nothing depends on OUROBOROS_* env, the cwd, or the ambient checkout.
+    """
+    import devtools.benchmarks.gaia.run_gaia as run_gaia
+
+    seed = tmp_path / "seed"
+    _git_repo(seed)
+    (seed / "VERSION").write_text("6.81.0\n", encoding="utf-8")
+    _git_commit_all(seed)
+    monkeypatch.setattr(run_gaia, "REPO", seed)
+    monkeypatch.setattr(run_gaia, "_free_port", lambda: 19999)
+    monkeypatch.setattr(run_gaia, "_resolve_provider_keys", lambda needed: {})
+    base_settings = tmp_path / "settings_base.json"
+    base_settings.write_text("{}", encoding="utf-8")
+
+    def _run(name: str, log: dict | None) -> tuple[int, dict]:
+        run_dir = tmp_path / name
+
+        def fake_run(cmd, **kwargs):
+            if log is not None:
+                log_dir = Path(cmd[cmd.index("--log-dir") + 1])
+                log_dir.mkdir(parents=True, exist_ok=True)
+                (log_dir / "eval.json").write_text(json.dumps(log), encoding="utf-8")
+            # Exactly what the real CLI does after a dead eval: return 0.
+            return subprocess.CompletedProcess(args=list(cmd), returncode=0)
+
+        monkeypatch.setattr(run_gaia.subprocess, "run", fake_run)
+        code = run_gaia.main(["--out-dir", str(run_dir), "--solve-model", "m",
+                              "--settings", str(base_settings), "--sample-id", "task-a,task-b"])
+        extra = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))["extra"]
+        return code, extra
+
+    # 1. The eval RAISED: an infra zero. The benchmark did not run, so it is not `completed` and
+    #    the process must not exit 0 — a shard wrapper reads that exit code.
+    raised = _inspect_eval_log(
+        "error",
+        [{"id": "task-a", "scores": {}, "error": {"message": "RuntimeError('Timed out executing setup command in sandbox')"}}],
+        error={"message": "RuntimeError('Timed out executing setup command in sandbox')"},
+    )
+    code, extra = _run("raised", raised)
+    assert extra["outcome"] == "eval_error"
+    assert extra["exit_code"] != 0 and code == extra["exit_code"]
+    assert extra["harness_exit_code"] == 0  # the harness claimed success
+    assert "Timed out executing setup command in sandbox" in extra["inspect_eval"]["error"]
+    assert extra["inspect_eval"]["scored_samples"] == 0
+
+    # 2. The eval FINISHED and scored nothing: still not a result, and still not `completed`.
+    code, extra = _run("unscored", _inspect_eval_log("success", []))
+    assert extra["outcome"] == "no_scored_samples"
+    assert extra["exit_code"] != 0 and code == extra["exit_code"]
+    assert extra["harness_exit_code"] == 0
+
+    # 3. GENUINE zeros: samples that reached the official scorer and were marked incorrect. This
+    #    IS a result — real capability data — and must stay `completed` with exit 0, or the
+    #    honest zero becomes indistinguishable from the infra zero in the other direction.
+    scored_zero = _inspect_eval_log("success", [
+        {"id": "task-a", "scores": {"gaia_scorer": {"value": "I"}}},
+        {"id": "task-b", "scores": {"gaia_scorer": {"value": "I"}}},
+    ])
+    code, extra = _run("genuine_zero", scored_zero)
+    assert extra["outcome"] == "completed" and extra["exit_code"] == 0 and code == 0
+    assert extra["inspect_eval"]["scored_samples"] == 2
+
+    # 4. No readable log at all: fail CLOSED. Unknown success is not success — the same rule the
+    #    seed gate applies to unknown cleanliness.
+    code, extra = _run("nolog", None)
+    assert extra["outcome"] == "eval_status_unavailable"
+    assert extra["exit_code"] != 0 and code == extra["exit_code"]
+
+
+def test_run_gaia_never_silently_clips_the_harness_error_it_records(tmp_path):
+    """The record of an infrastructure failure must not itself destroy the evidence.
+
+    The first cut of this fix clipped the message at a hardcoded `[:1000]` — a silent truncation
+    (BIBLE P1 / docs/DEVELOPMENT.md "No silent truncation") in the one place it hurts most: a deep
+    traceback from a sandbox that died is exactly the error whose TAIL is informative. Messages now
+    pass through whole; an implausibly large one is cut only through the shared
+    `truncate_review_artifact` seam, which discloses the cut and the original length, and
+    `error_log` always names the file holding the untouched message and its traceback."""
+    import devtools.benchmarks.gaia.run_gaia as run_gaia
+
+    def _summary(message: str) -> dict:
+        log_path = tmp_path / f"eval-{len(message)}.json"
+        log_path.write_text(json.dumps(_inspect_eval_log(
+            "error", [], error={"message": message})), encoding="utf-8")
+        return run_gaia.read_inspect_eval_summary([log_path]), log_path
+
+    # A 4000-char traceback — four times the old cap — survives INTACT, tail included.
+    long_error = "RuntimeError: sandbox died\n" + "".join(
+        f'  File "frame{i}.py", line {i}, in run\n' for i in range(100)) + "TAIL-MARKER"
+    assert len(long_error) > 1000
+    summary, log_path = _summary(long_error)
+    assert summary["error"] == long_error
+    assert summary["error"].endswith("TAIL-MARKER")
+    assert summary["error_log"] == str(log_path)
+
+    # Beyond the disclosed budget the cut is DISCLOSED, never silent, and names the true length.
+    huge = "x" * (run_gaia._INSPECT_ERROR_DISCLOSED_LIMIT + 5000)
+    summary, log_path = _summary(huge)
+    assert "⚠️ OMISSION NOTE" in summary["error"]
+    assert str(len(huge)) in summary["error"]
+    # ...and the reader reaches the whole thing without guessing which file to open.
+    assert summary["error_log"] == str(log_path)
+
+
+def test_run_tb_classifies_a_harbor_job_by_its_trials_not_its_exit_code():
+    """The sibling swallow: `harbor run` has no non-zero exit path for a job whose trials all
+    ERRORED either (2026-07-04: a job wrote 444 trial `result.json` files and zero rewards while
+    looking healthy), so run_tb decides from the disclosure ledger it already builds.
+
+    Same three-way distinction as GAIA, and the same reason for it: an all-zero reward
+    distribution over SCORED trials is a genuine result, while trials that never reached the
+    verifier are not."""
+    from devtools.benchmarks.terminal_bench.run_tb import classify_harbor_outcome
+
+    # Scored trials, all zero -> a genuine result.
+    assert classify_harbor_outcome({"n_trials": 4, "reward_distribution": {"0.0": 4}}, 0) == ("completed", 0)
+    assert classify_harbor_outcome({"n_trials": 4, "reward_distribution": {"0.0": 3, "1.0": 1}}, 0) == ("completed", 0)
+    # Nothing reached the verifier -> an infra zero, non-zero exit despite harbor's 0.
+    assert classify_harbor_outcome({"n_trials": 444, "reward_distribution": {"null": 444}}, 0) == ("no_scored_trials", 1)
+    assert classify_harbor_outcome({"n_trials": 0, "reward_distribution": {}}, 0) == ("no_scored_trials", 1)
+    # Ledger unavailable -> no evidence of a result; fail closed rather than claim `completed`.
+    assert classify_harbor_outcome(None, 0) == ("trials_unverified", 1)
+    # A harness that DID fail keeps its own status.
+    assert classify_harbor_outcome({"n_trials": 4, "reward_distribution": {"1.0": 4}}, 2) == ("harness_nonzero_exit", 2)
+
+
+def test_run_tb_manifest_records_the_model_the_run_actually_resolved(tmp_path, monkeypatch):
+    """TB's manifest must name the model that RAN, in the SAME field GAIA records it in.
+
+    Presence is deliberately not the property under test. The sibling failure this guards
+    against is SWE-Pro's manifest naming a model that did not run because it snapshotted the
+    settings TEMPLATE instead of the derived settings, so a decoy model is planted in BOTH the
+    host env and the host settings file: an implementation that copies either one still writes a
+    perfectly non-empty `model_slots`, and still fails every equality assertion below. The
+    `--all-model` leg additionally pins the post-override value, the one `--model` alone never
+    sees.
+
+    Hermetic by construction — purpose-built seed repo, tmp settings file, tmp run root, cwd
+    redirected into tmp_path and the harbor probe stubbed — so nothing here depends on this
+    machine's workspace layout or on a harbor binary being installed.
+    """
+    from devtools.benchmarks.common.manifests import MODEL_SLOT_KEYS
+    from devtools.benchmarks.terminal_bench import run_tb
+
+    seed = tmp_path / "seed"
+    _git_repo(seed)
+    monkeypatch.setattr(run_tb, "repo_root_from_devtools", lambda: seed)
+    monkeypatch.setattr(run_tb, "harbor_version", lambda _harbor_bin: "")
+    monkeypatch.chdir(tmp_path)
+    for key in MODEL_SLOT_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps({"OUROBOROS_MODEL": "decoy/template-main",
+                    "OUROBOROS_MODEL_LIGHT": "decoy/template-light"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OUROBOROS_MODEL", "decoy/ambient-main")
+
+    def _manifest(run_root):
+        return json.loads((run_root / "run_manifest.json").read_text(encoding="utf-8"))
+
+    measured = tmp_path / "measured"
+    assert run_tb.main([
+        "--model", "anthropic/claude-fable-5",
+        "--light-model", "google/gemini-3.5-flash",
+        "--run-root", str(measured),
+        "--submission-root", str(tmp_path / "submission"),
+        "--settings-path", str(settings),
+    ]) == 0
+    manifest = _manifest(measured)
+    slots = manifest["model_slots"]
+    # The measured model, NOT the ambient env decoy and NOT the settings-template decoy.
+    assert slots["OUROBOROS_MODEL"] == "anthropic/claude-fable-5"
+    assert slots["OUROBOROS_MODEL_LIGHT"] == "google/gemini-3.5-flash"
+    # The adapter drives HEAVY and the fallback chain off the same kwarg, so they must not
+    # imply a second model.
+    assert slots["OUROBOROS_MODEL_HEAVY"] == "anthropic/claude-fable-5"
+    assert slots["OUROBOROS_MODEL_FALLBACKS"] == "anthropic/claude-fable-5"
+    assert "decoy/ambient-main" not in slots.values()
+    assert "decoy/template-main" not in slots.values()
+    # `model_slots` means the same thing here as in GAIA's manifest: MODEL_SLOT_KEYS only.
+    assert set(slots).issubset(set(MODEL_SLOT_KEYS))
+    # ...and the same fact is on disk from admission onward, in TB's established `extra` shape.
+    assert manifest["extra"]["model"] == "anthropic/claude-fable-5"
+    assert manifest["extra"]["light_model"] == "google/gemini-3.5-flash"
+
+    # --all-model rewrites --model AFTER parsing; the manifest must follow the override, not the
+    # (here empty) --model it was parsed with.
+    single = tmp_path / "single"
+    assert run_tb.main([
+        "--all-model", "openai/gpt-5.6-sol",
+        "--run-root", str(single),
+        "--submission-root", str(tmp_path / "submission"),
+        "--settings-path", str(settings),
+    ]) == 0
+    single_manifest = _manifest(single)
+    assert single_manifest["model_slots"]["OUROBOROS_MODEL"] == "openai/gpt-5.6-sol"
+    assert single_manifest["model_slots"]["OUROBOROS_MODEL_LIGHT"] == "openai/gpt-5.6-sol"
+    assert single_manifest["extra"]["model"] == "openai/gpt-5.6-sol"
+    # Every forwarded slot the single-model run pinned is recorded as that one model.
+    for key in run_tb._ALL_MODEL_SLOT_KEYS:
+        assert single_manifest["model_slots"][key] == "openai/gpt-5.6-sol"
+    # Slots the in-container adapter never forwards stay OUT: recording a model the container
+    # cannot see would be as false as recording the wrong one.
+    assert not set(single_manifest["model_slots"]) & set(run_tb._UNFORWARDED_MODEL_SLOT_KEYS)
+
+
+def test_gaia_and_tb_launchers_add_no_runtime_attestation(tmp_path):
+    """Owner Q10: TB and GAIA are structurally immune (each sample/trial starts its own server
+    from the checkout under test), so they get the seed gate and NOT attestation lines."""
+    tb_dir = REPO_ROOT / "devtools" / "benchmarks" / "terminal_bench"
+    gaia_dir = REPO_ROOT / "devtools" / "benchmarks" / "gaia"
+    for path in (tb_dir / "run_tb.py", tb_dir / "run_harbor_smoke.py", gaia_dir / "run_gaia.py",
+                 gaia_dir / "run_harness.py"):
+        src = path.read_text(encoding="utf-8")
+        assert "runtime_attestation" not in src, f"{path.name} must not attest a live runtime"
+    for path in (tb_dir / "run_tb.py", tb_dir / "run_harbor_smoke.py", gaia_dir / "run_gaia.py"):
+        assert "require_clean=not " in path.read_text(encoding="utf-8"), f"{path.name} lost its seed gate"

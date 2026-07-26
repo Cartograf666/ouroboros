@@ -5,8 +5,10 @@ Run explicitly (it lives under devtools, not tests/, to stay merge-clean):
 """
 from __future__ import annotations
 
+import argparse
 import json
 import pathlib
+import subprocess
 
 import pytest
 
@@ -223,3 +225,149 @@ def test_disclosure_ledger_counts(tmp_path):
     assert led["genuine_failure_count"] == 1  # only t5 is a real wrong answer
     assert led["reward_distribution"].get("1.0") == 1  # normalized bucket (not split '1' vs '1.0')
     assert led["per_task_pass_rate"]["alpha"] == 0.5
+
+
+# --- v6.79.0 readiness flags must not change the leaderboard-faithful command ---
+
+def test_default_command_emits_no_env_passthrough_or_base_config(tmp_path):
+    """The new readiness knobs are strictly opt-in: an unflagged run's argv is unchanged, and
+    the job config still contains exactly our agents[] block."""
+    cmd = run_tb.harbor_command(_cfg(jobs_dir=tmp_path))
+    assert "--ae" not in cmd and "--ve" not in cmd
+    assert run_tb.redacted_command(cmd) == cmd
+    config = json.loads((tmp_path / "agent_job_config.json").read_text(encoding="utf-8"))
+    assert list(config) == ["agents"]
+    assert config["agents"][0]["kwargs"]["dataset"] == "terminal-bench/terminal-bench-2-1"
+
+
+# A stand-in for the thing this guard exists to stop: a shell-expanded credential arriving where
+# a NAME=VALUE pair was expected. Deliberately NOT shaped like a real key -- the point of the test
+# is that this string never appears in an artifact, and a realistic-looking token in a fixture is
+# itself a small leak of the pattern scrubbers look for.
+_UNSPLITTABLE_TOKEN = "NOT-AN-ASSIGNMENT-PLACEHOLDER"
+
+
+@pytest.mark.parametrize("flag", ["--agent-env", "--verifier-env"])
+def test_env_passthrough_without_equals_is_refused_before_any_artifact(flag, tmp_path, capsys):
+    """A `--ve $OPENAI_API_KEY` typo hands this launcher one token with no `=`. Every consumer
+    split on the first `=` and called the left half a NAME, so the WHOLE token -- the credential --
+    was persisted as `verifier_env_keys` in run_manifest.json, printed as `<token>=<redacted>` in
+    the official command, and named in the passthrough warning. It must be refused at parse, with
+    the token never echoed, and nothing written."""
+    run_root = tmp_path / "run"
+    with pytest.raises(SystemExit) as excinfo:
+        run_tb.main(["--run-root", str(run_root), flag, _UNSPLITTABLE_TOKEN])
+    assert excinfo.value.code == 2
+    streams = capsys.readouterr()
+    assert _UNSPLITTABLE_TOKEN not in streams.out
+    assert _UNSPLITTABLE_TOKEN not in streams.err
+    assert "NAME=VALUE" in streams.err
+    # No manifest, no run root, nothing on disk to leak from.
+    assert not list(tmp_path.rglob("run_manifest.json"))
+    assert not run_root.exists()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [_UNSPLITTABLE_TOKEN, "=novalue", "1LEADING_DIGIT=x", "HAS SPACE=x", "HAS\nNEWLINE=x", "a-b=x"],
+)
+def test_env_assignment_requires_a_posix_name_and_an_explicit_equals(bad):
+    """The name is the only half this launcher ever writes down, so it must BE a name: no `=` at
+    all, an empty name, or one carrying a space/newline/dash would inject into the manifest and the
+    warning, or produce a scrub marker nothing can match."""
+    with pytest.raises(argparse.ArgumentTypeError) as excinfo:
+        run_tb.env_assignment(bad)
+    assert bad not in str(excinfo.value)
+    assert run_tb.env_assignment("OPENAI_API_KEY=x=y") == "OPENAI_API_KEY=x=y"
+    assert run_tb.env_assignment("_UNDERSCORE0=") == "_UNDERSCORE0="
+
+
+def test_redacted_command_never_publishes_a_malformed_token_as_a_name():
+    """Defence in depth for an argv assembled outside `main()`: a passthrough value that is not a
+    well-formed `NAME=…` is replaced WHOLESALE, instead of being emitted as `<secret>=<redacted>`."""
+    out = run_tb.redacted_command(["harbor", "--ve", _UNSPLITTABLE_TOKEN, "--ae", "OPENAI_API_KEY=x"])
+    assert out == ["harbor", "--ve", "<redacted>", "--ae", "OPENAI_API_KEY=<redacted>"]
+    assert _UNSPLITTABLE_TOKEN not in " ".join(out)
+
+
+def test_tb21_submission_subtree_is_unchanged():
+    """A derived path must reproduce the published TB2.1 tree exactly."""
+    assert run_tb.submission_subtree(run_tb.DEFAULT_DATASET) == ("terminal-bench", "2.1")
+
+
+# --- Frontier-Bench readiness (dataset identity + execution backend disclosure) ---
+
+def test_frontier_bench_identity_threads_through_job_config_and_argv(tmp_path):
+    """Frontier-Bench is a DATASET, not a second launcher: the same identity that already feeds
+    harbor's `--dataset` must reach the adapter kwarg it uses to pick the per-task cache subtree
+    (`~/.cache/harbor/tasks/packages/frontier-bench/<task>/<digest>`). A parallel mechanism here
+    would silently make FB runs deadline-blind, which is the exact bug v6.79.0 fixed for TB2.1."""
+    cmd = run_tb.harbor_command(_cfg(jobs_dir=tmp_path, dataset=run_tb.FRONTIER_BENCH_DATASET))
+    assert cmd[cmd.index("--dataset") + 1] == "frontier-bench/frontier-bench"
+    config = json.loads((tmp_path / "agent_job_config.json").read_text(encoding="utf-8"))
+    assert config["agents"][0]["kwargs"]["dataset"] == "frontier-bench/frontier-bench"
+
+
+def test_frontier_bench_submission_subtree_carries_no_invented_version():
+    """FB carries its version in the harbor REF (`@v0.1.0`), never in the dataset name, so the
+    name-based derivation must NOT fabricate one: it yields an empty version component that main()
+    drops, instead of mis-parsing `frontier-bench` into a `frontier/bench`-shaped path."""
+    assert run_tb.submission_subtree(run_tb.FRONTIER_BENCH_DATASET) == ("frontier-bench", "")
+
+
+def test_submission_subtree_strips_a_pinned_harbor_ref():
+    """A reproducible FB run pins an immutable ref, and `latest` is mutable — so pinning is the
+    NORMAL case, not an edge one. The ref is registry addressing: it must not leak a literal `@`
+    into a submission directory name, and TB2.1's derivation must survive being pinned too."""
+    assert run_tb.submission_subtree("frontier-bench/frontier-bench@v0.1.0") == ("frontier-bench", "")
+    assert run_tb.submission_subtree("frontier-bench/frontier-bench@sha256:abc123") == ("frontier-bench", "")
+    assert run_tb.submission_subtree("terminal-bench/terminal-bench-2-1@5") == ("terminal-bench", "2.1")
+
+
+def test_harbor_env_backend_is_opt_in_and_absent_by_default(tmp_path):
+    """Backend selection must not perturb the published TB2.1 argv: with no flag, harbor's own
+    default (docker) applies and no `--env` token is emitted."""
+    assert "--env" not in run_tb.harbor_command(_cfg(jobs_dir=tmp_path))
+
+
+def test_harbor_env_backend_is_emitted_when_chosen(tmp_path):
+    """A cloud backend is reachable without a base job config — upstream FB CI uses `--env modal`,
+    and our local docker verification does not make that path unreachable."""
+    cmd = run_tb.harbor_command(_cfg(jobs_dir=tmp_path, harbor_env="modal"))
+    assert cmd[cmd.index("--env") + 1] == "modal"
+
+
+def test_harbor_version_reports_a_fake_binary_and_swallows_failures(monkeypatch):
+    """Harness provenance is best-effort by design: a working binary is reported verbatim, and an
+    un-interrogable one records "" (visibly unknown) instead of aborting a run.
+
+    The three outcomes are injected at the `subprocess.run` seam rather than acted out with a real
+    `#!/bin/sh` script: Windows does not honour a shebang on direct execution, so the script form
+    made `harbor_version` return "" on the Windows CI shard and failed the 0.20.0 assertion there
+    while passing everywhere the author could see."""
+    calls: list[list[str]] = []
+
+    def _fake_run(outcome):
+        def run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        return run
+
+    monkeypatch.setattr(
+        run_tb.subprocess, "run",
+        _fake_run(subprocess.CompletedProcess(args=[], returncode=0, stdout="0.20.0\n", stderr="")),
+    )
+    assert run_tb.harbor_version("harbor") == "0.20.0"
+    assert calls[-1] == ["harbor", "--version"]
+
+    monkeypatch.setattr(
+        run_tb.subprocess, "run",
+        _fake_run(subprocess.CompletedProcess(args=[], returncode=3, stdout="", stderr="boom\n")),
+    )
+    assert run_tb.harbor_version("harbor") == ""
+
+    monkeypatch.setattr(run_tb.subprocess, "run", _fake_run(FileNotFoundError("no such binary")))
+    assert run_tb.harbor_version("does-not-exist") == ""

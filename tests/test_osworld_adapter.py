@@ -246,6 +246,12 @@ def test_preflight_verifies_server_scaffold_settings(tmp_path, monkeypatch):
     vmx.write_text("cfg", encoding="utf-8")
     monkeypatch.setattr(rsa, "provider_preflight_failures", lambda *a, **k: [])
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")  # slash-form model routes via OpenRouter
+    # The preflight also attests the running server's identity (owner Q9/Q10). That check has
+    # its own coverage (test_runtime_attestation_* and the wiring meta-test); here it is
+    # stubbed so THIS test keeps pinning the scaffold-drift gate rather than provenance —
+    # `repo_dir` is a bare directory with no git identity, which the real helper refuses.
+    monkeypatch.setattr(rsa, "runtime_attestation",
+                        lambda url, repo, **kw: {"ok": True, "runtime_version": "6.76.0"})
 
     drifted = {"OUROBOROS_RUNTIME_MODE": "light", "OUROBOROS_SAFETY_MODE": "full",
                "OUROBOROS_MAX_WORKERS": 1, "OUROBOROS_MODEL": "openai/gpt-5.5",

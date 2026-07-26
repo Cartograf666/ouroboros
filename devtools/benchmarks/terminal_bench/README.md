@@ -225,7 +225,15 @@ task.toml [agent].timeout_sec
 Honesty note: Harbor's `AgentContext` does not reliably pass `[agent].timeout_sec`
 to installed agents, but the adapter now has a second legitimate fallback:
 `_resolve_task_timeout_from_dataset` reads the public cached `task.toml` for the
-current task package and forwards that official timeout to Ouroboros. Therefore
+current task package and forwards that official timeout to Ouroboros. Since v6.79.0
+that lookup is DATASET-AWARE: the cache layout is
+`~/.cache/harbor/tasks/packages/<org>/<name>/<digest>/task.toml` and the org is not a
+constant (`terminal-bench/`, `gaia/`, `scale-ai/` coexist there), so the dataset identity
+is threaded from the job config (`dataset` agent-kwarg) and the exact `<org>/<name>`
+subtree is resolved first. A name-only fallback covers multi-org datasets but REFUSES when
+two orgs cache the same task name, so a same-named task from another dataset can never
+hand the agent a foreign cap — the run is deadline-blind instead. See
+`METHODOLOGY.md` § "Dataset identity". Therefore
 deadline milestones and deadline-derived `run_command` caps are usually active on
 leaderboard-shaped cached runs; they are inert only when neither Harbor context nor
 the public task cache exposes a timeout. Passing a synthetic `task_timeout_sec`
@@ -363,7 +371,13 @@ Hard-won facts (verified against harbor 0.18.0 + leaderboard CI source):
   run used `OUROBOROS_BENCH_ALLOW_CONTAINER_SECRETS=1`, every trial carries
   live provider keys in `agent/ouroboros-data/settings.json`. ALWAYS run
   `scrub_submission_secrets.py --root <job_copy> --secrets-from …` on a COPY
-  of the job dir and verify 0 leftovers before uploading.
+  of the job dir and verify 0 leftovers before uploading. If the run used
+  `--agent-env`/`--verifier-env`, ALSO pass each pair as
+  `--env-passthrough NAME=VALUE`: harbor writes those values into its own
+  `config.json`/`lock.json`/`result.json` under the job dir (verbatim when the
+  NAME does not look sensitive, otherwise as a partial `abcd****xyz` form), and
+  they are in no `--secrets-from` source. An unsweepable value aborts the scrub
+  instead of yielding a maybe-scrubbed tree.
 - Auth is GitHub-OAuth on Harbor Hub; headless options: `HARBOR_API_KEY`
   env (API key from the Hub UI, cleanest for servers) or
   `harbor auth login --no-browser` + `--callback-url`.
@@ -439,6 +453,20 @@ python devtools/benchmarks/terminal_bench/run_tb.py \
 
 For a targeted smoke, add repeated `--task` filters before `--execute`, for
 example `--task pypi-server --task hf-model-inference --task qemu-alpine-ssh`.
+
+The launcher refuses to start from a dirty/unidentifiable seed checkout (the shared
+`benchmark_run_manifest` gate, fail-closed since v6.75.0); `--allow-dirty-seed` records the
+exception instead. Additional readiness flags (v6.79.0, all optional and all off by
+default): `--base-job-config PATH` deep-merges an upstream Harbor JobConfig under our
+`agents[]` block, `--agent-env KEY=VALUE` / `--verifier-env KEY=VALUE` forward harbor's own
+`--ae`/`--ve` (values are redacted out of `harbor_command.txt`, stdout and the manifest,
+which keeps NAMES only — but harbor itself PERSISTS those values into the job dir, so a
+submission copy must additionally be scrubbed with `scrub_submission_secrets.py
+--env-passthrough NAME=VALUE`; see METHODOLOGY "Agent/verifier env passthrough"), and
+`--submission-subtree` overrides the submission path derived
+from `--dataset`. Frontier-Bench runs on the pinned 0.18.0 (measured — see METHODOLOGY
+"Frontier-Bench"); a dataset that needs a newer harbor flag runs from `~/ouro/venv-fb`
+(0.20.0) via `--harbor-bin`, leaving `venv-tb` frozen.
 
 ### Terminal-Bench 2.1 smoke
 

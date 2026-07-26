@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import timedelta
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -336,6 +337,225 @@ def plan_text_fingerprint(plan: str) -> str:
     return sha256(plan.encode("utf-8")).hexdigest()
 
 
+# Review identity is the fingerprint of the AGENT-PASSED envelope only. Component
+# hashes exist purely to DIAGNOSE a mismatch, so they may carry host-resolved values
+# (resolved plan_class / context_level) that must never enter the binding identity.
+_PLAN_COMPONENT_KEYS = (
+    "goal", "files_to_touch", "context_notes", "scope",
+    "include_tests", "plan_class", "context_level",
+)
+
+
+def plan_review_component_hashes(request: Any) -> Dict[str, str]:
+    """Per-field hashes of one plan-review envelope, for ENVELOPE_MISMATCH detail."""
+    hashes: Dict[str, str] = {}
+    for key in _PLAN_COMPONENT_KEYS:
+        value = getattr(request, key, None)
+        if key == "scope":
+            value = normalize_plan_scope(value if isinstance(value, dict) else None)
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        hashes[key] = sha256(encoded.encode("utf-8")).hexdigest()[:16]
+    return hashes
+
+
+def plan_envelope_mismatch_fields(stored: Any, submitted: Any) -> List[str]:
+    """Component names that differ between two envelopes.
+
+    Only components present in BOTH maps are compared, so a wave stored before per-slot
+    hashes existed reports nothing. There is no "omitted vs explicitly empty" axis to
+    honour: ``_handle_plan_task`` coerces every omitted optional field to ``""``/``[]``/
+    ``False`` before it is hashed OR fingerprinted, so an omission and an explicit empty
+    are the same envelope — and both already changed the request fingerprint."""
+    stored_map = dict(stored or {})
+    submitted_map = dict(submitted or {})
+    return [
+        key for key in _PLAN_COMPONENT_KEYS
+        if key in stored_map and key in submitted_map
+        and stored_map[key] != submitted_map[key]
+    ]
+
+
+def plan_envelope_mismatch_note(wave: Any, request: Any) -> str:
+    """Free ENVELOPE_MISMATCH warning when a disposition BOUND a drifted envelope.
+
+    Since the binding identity is the agent envelope's own fingerprint and a disposition
+    may only close a review of the SAME fingerprint (``bindable_claimed_wave``), a bound
+    wave can differ only in HOST-RESOLVED components (resolved ``plan_class`` /
+    ``context_level``), which are diagnosed here and deliberately excluded from identity.
+    Agent-authored drift such as ``files_to_touch`` is no longer bindable at all — it is
+    rejected by ``unbindable_disposition_error``, which reports the same field list."""
+    if request is None:
+        return ""
+    drifted = plan_envelope_mismatch_fields(
+        (wave or {}).get("component_hashes"), plan_review_component_hashes(request),
+    )
+    if not drifted:
+        return ""
+    return (
+        "NOTE: ENVELOPE_MISMATCH on: " + ", ".join(drifted) + ". Your review_disposition "
+        "closed the review it named, but that review saw a DIFFERENT envelope for these "
+        "components, so the findings you dispositioned do not cover what changed.\n\n"
+    )
+
+
+def bindable_claimed_wave(
+    state: Any, disposition: Any, plan_text_hash: str, request_fingerprint: str,
+) -> Optional[Dict[str, Any]]:
+    """The wave a disposition HONESTLY names, or None.
+
+    Binds only when all four hold: the claimed ``review_fingerprint`` equals the
+    SUBMITTED envelope's fingerprint, it is the state's latest review fingerprint,
+    that wave's review is an OPEN ``REVIEW_REQUIRED``, and the submitted plan text
+    still hashes to the stored ``plan_text_hash``.
+
+    The envelope-equality condition is the P3 plan gate itself. ``files_to_touch`` is
+    exported in the tool schema as PART OF THE REVIEW IDENTITY ("a review_disposition
+    can only close a review submitted with the SAME list"), and the binding fingerprint
+    is a pure function of the AGENT's envelope, so a claimed fingerprint that differs
+    from the submitted one means the reviewers never saw what is now being planned.
+    Binding it with a warning let a review of ``[a.py]`` authorise ``[a.py, b.py,
+    c.py]`` — stale evidence closing materially expanded scope. A mismatch is therefore
+    UNBINDABLE: the caller fails fast (no wave, no money) and the always-available
+    escape is to omit the disposition and run a real review of the new envelope."""
+    claimed = str((disposition or {}).get("review_fingerprint") or "").strip()
+    if not claimed or not isinstance(state, dict):
+        return None
+    if claimed != str(request_fingerprint or "").strip():
+        return None
+    if str(state.get("latest_review_fingerprint") or "") != claimed:
+        return None
+    for wave in state.get("waves") or []:
+        if str(wave.get("request_fingerprint") or "") != claimed:
+            continue
+        review = wave.get("review") if isinstance(wave.get("review"), dict) else {}
+        if str(review.get("aggregate_signal") or "") != "REVIEW_REQUIRED" or bool(review.get("closed")):
+            return None
+        if not plan_text_hash or str(wave.get("plan_text_hash") or "") != str(plan_text_hash):
+            return None
+        return dict(wave)
+    return None
+
+
+def unbindable_disposition_error(
+    state: Any, fingerprint: str, disposition: Any, plan_text_hash: str = "",
+    request: Any = None,
+) -> str:
+    """Fail-fast text for a non-empty disposition that can close nothing.
+
+    Discarding it silently and paying for a whole scout+reviewer wave hid the real
+    cause from the agent (v6.65.0/1 chose the discard to un-wedge submissions; the
+    wedge escape is preserved EXPLICITLY in this message instead).
+
+    The submitted envelope comes from the CALLER's ``request``: a disposition never
+    carries component hashes, so reading them off it made the ENVELOPE_MISMATCH clause
+    unreachable and the wave's stored hashes write-only data."""
+    claimed = str((disposition or {}).get("review_fingerprint") or "").strip() or "(none)"
+    latest = str((state or {}).get("latest_review_fingerprint") or "") or "(none)"
+    stored_plan_hash = ""
+    for wave in (state or {}).get("waves") or []:
+        if str(wave.get("request_fingerprint") or "") == latest:
+            stored_plan_hash = str(wave.get("plan_text_hash") or "")
+            break
+    plan_matches = bool(plan_text_hash) and stored_plan_hash == str(plan_text_hash)
+    mismatches = plan_envelope_mismatch_fields(
+        (next((w for w in (state or {}).get("waves") or []
+               if str(w.get("request_fingerprint") or "") == latest), {}) or {}).get("component_hashes"),
+        plan_review_component_hashes(request) if request is not None else None,
+    )
+    return (
+        "ERROR: PLAN_REVIEW_DISPOSITION_UNBINDABLE: your review_disposition names "
+        f"review_fingerprint={claimed}, but that does not name an OPEN REVIEW_REQUIRED "
+        "review OF THE ENVELOPE YOU JUST SUBMITTED "
+        f"(latest stored review fingerprint={latest}; submitted request fingerprint="
+        f"{str(fingerprint or '') or '(none)'}; plan text "
+        f"{'matches' if plan_matches else 'does NOT match'} the stored plan)."
+        + (f" ENVELOPE_MISMATCH on: {', '.join(mismatches)}." if mismatches else "")
+        + " Nothing was reviewed and no wave was launched, so no money was spent. Two "
+        "ways forward: (1) OMIT review_disposition entirely — that is ALWAYS available "
+        "and runs a real review of this plan; or (2) re-submit the exact plan and "
+        "envelope that produced the REVIEW_REQUIRED result you are trying to close, "
+        "with its own review_fingerprint."
+    )
+
+
+def quorum_input_token_limit(models: Any, slot_limits: Any) -> int:
+    """Assembly budget for ONE shared prompt fanned across mixed-window slots: the largest cap that
+    still leaves a review QUORUM callable, i.e. the quorum-th largest per-slot cap.
+
+    The global minimum let the SMALLEST window dictate the Atlas for everyone — with caps
+    [545K, 745K, 745K] and quorum 2 it discarded ~200K of context the two large reviewers could
+    have read, and refused an irreducible 600K prompt that those two would have accepted. Here the
+    small slot drops OUT of the quorum instead of shrinking it: ``plan_slot_fit`` then records it as
+    a typed ``preflight_oversize`` result, so a slot that cannot fit is REPORTED as not participating,
+    never silently ignored. Quorum is counted over the CONFIGURED slots, so an unavailable or
+    uncalibrated slot reads 0 and simply cannot be part of the quorum that justifies a bigger prompt."""
+    from ouroboros.config import adaptive_quorum
+
+    limits = dict(slot_limits or {})
+    caps = sorted((int(limits.get(str(m), 0) or 0) for m in (models or [])), reverse=True)
+    if not caps:
+        return 0
+    return caps[min(adaptive_quorum(len(caps)), len(caps)) - 1]
+
+
+def plan_slot_fit(models: Any, slot_limits: Any, estimated_tokens: int) -> tuple:
+    """``(callable_models, oversize_records, error)`` for one shared plan prompt.
+
+    A slot whose calibrated cap the shared prompt exceeds gets a FREE deterministic
+    ``preflight_oversize`` record instead of a call with a guaranteed provider 400.
+    Fewer callable slots than the review quorum is a LOUD typed degradation — never a
+    silent absence of review."""
+    from ouroboros.config import adaptive_quorum
+
+    limits = dict(slot_limits or {})
+    slots = [str(model) for model in (models or [])]
+    callable_models = [m for m in slots if int(estimated_tokens or 0) <= int(limits.get(m, 0) or 0)]
+    oversize = [
+        {
+            "model": m, "request_model": m, "text": "",
+            "error": (
+                f"preflight_oversize: assembled prompt {int(estimated_tokens or 0):,} estimated "
+                f"tokens exceeds this slot's calibrated input cap {int(limits.get(m, 0) or 0):,}"
+            ),
+            "prompt_ref": {}, "response_ref": {},
+            "tokens_in": 0, "tokens_out": 0, "cost": 0.0,
+        }
+        for m in slots if m not in callable_models
+    ]
+    error = ""
+    if slots and len(callable_models) < adaptive_quorum(len(slots)):
+        error = (
+            "⚠️ PLAN_REVIEW_DEGRADED_PREFLIGHT_OVERSIZE: the assembled prompt "
+            f"({int(estimated_tokens or 0):,} estimated tokens) exceeds the calibrated input "
+            "cap of too many reviewer slots ("
+            + ", ".join(f"{m}<={int(limits.get(m, 0) or 0):,}" for m in slots)
+            + "), so fewer than the review quorum remain callable and NO reviewer was "
+            "called. Reduce files_to_touch, choose a smaller context_level, or split the plan."
+        )
+    return callable_models, oversize, error
+
+
+def per_slot_input_token_limits(
+    models: Any,
+    *,
+    context_window: int,
+    output_reserve: int,
+    tokenizer_margin: int,
+) -> Dict[str, int]:
+    """Per-slot calibrated input caps for a prompt fanned across mixed families."""
+    from ouroboros.tools.review_helpers import calibrated_input_token_limit
+
+    return {
+        str(model): calibrated_input_token_limit(
+            str(model),
+            context_window=context_window,
+            output_reserve=output_reserve,
+            tokenizer_margin=tokenizer_margin,
+        )
+        for model in (models or [])
+    }
+
+
 def parse_plan_review_signal(text: str) -> str:
     matches = re.findall(
         r"^\s*AGGREGATE\s*:\s*(GREEN|REVIEW_REQUIRED|REVISE_PLAN)\s*$",
@@ -597,14 +817,6 @@ VACUOUS_DISPOSITION_NOTE = (
     "result for this exact unchanged plan."
 )
 
-UNBINDABLE_DISPOSITION_NOTE = (
-    "\n\nNOTE [PLAN_REVIEW_DISPOSITION_IGNORED_UNBINDABLE]: your review_disposition "
-    "was ignored — no review existed yet for this exact plan, so there was nothing "
-    "it could close; a real review was performed instead. Omit the field entirely "
-    "unless you are closing the immediately preceding REVIEW_REQUIRED result."
-)
-
-
 def vacuous_review_disposition(value: object) -> bool:
     """True for a schema-shaped but semantically empty disposition: models routinely
     fill an optional object param with an empty default instead of omitting it. An
@@ -859,6 +1071,54 @@ def planning_scout_framing(plan_class: str) -> tuple[str, str]:
         "Readonly planning only. Do not edit files, commit, run shell, or request review gates. "
         "Ground findings in the plan's own domain and cite concrete references when possible.",
     )
+
+
+# A scout needs room to self-finalize INSIDE the window the parent still reads, so its deadline
+# sits below the shared cutoff by a reserve of (finalization grace + a dispatch/collection
+# margin). That margin is DERIVED from the grace rather than being a wait constant of its own:
+# `OUROBOROS_FINALIZATION_GRACE_SEC` is already the configured authority for "how long a task
+# needs to wrap up", and an operator who raises it because their models are slow needs the
+# dispatch slack to grow with it — a second knob would be a second thing to keep in sync. Both
+# numbers below are dimensionless fractions of an existing authority, not new timeouts (see the
+# timeout-SSOT rule in docs/DEVELOPMENT.md). At the default 120s grace the margin is 30s.
+# On a window too short to hold the whole reserve, the reserve shrinks to a FRACTION of the
+# window instead of swallowing it: a short-window wave still gets a short, honest child deadline
+# rather than no scouts at all.
+PLANNING_SCOUT_DEADLINE_MARGIN_FRACTION = 0.25
+PLANNING_SCOUT_MAX_RESERVE_FRACTION = 0.25
+
+
+def planning_scout_wave_plan(
+    cutoff_at: str, *, max_workers: int, grace_sec: int, now: Any,
+) -> tuple[str, str]:
+    """Pure admission math for a NEW planning-scout wave: ``(child_deadline_at, refusal)``.
+
+    The child deadline is bound to the window in which its handoff can still be CONSUMED,
+    because the parent stops reading at the wave's one shared cutoff and everything a scout
+    does after that is paid for and thrown away. The deadline is therefore always strictly
+    INSIDE that window: the cutoff minus a reserve derived from ``grace_sec`` alone, capped
+    at a fraction of the window so a short window yields a short deadline instead of a
+    refusal. A wave with no spare worker, or whose window has already closed, is refused
+    before launch with a typed reason instead of being started and then omitted. Callers
+    apply this to NEW waves only: a recovery/collection pass gathers handoffs that are
+    already paid for, and refusing those abandons spend rather than saving it."""
+    from ouroboros.deadline_utils import parse_deadline_ts
+
+    if int(max_workers) < 2:
+        return "", "no spare worker capacity; increase OUROBOROS_MAX_WORKERS to at least 2"
+    cutoff = parse_deadline_ts(str(cutoff_at or ""))
+    if cutoff is None:
+        return "", "the scout cutoff is missing or malformed, so no consumable child window exists"
+    window = (cutoff - now).total_seconds()
+    if window <= 0:
+        return "", (
+            "the scout handoff window has already closed — a child launched now could not "
+            "produce a handoff this wave would still read"
+        )
+    grace = max(0, int(grace_sec))
+    reserve = min(grace + int(grace * PLANNING_SCOUT_DEADLINE_MARGIN_FRACTION),
+                  window * PLANNING_SCOUT_MAX_RESERVE_FRACTION)
+    return (cutoff - timedelta(seconds=reserve)).isoformat(), ""
 
 
 def bounded_planning_reason(value: Any, *, limit: int = 600) -> str:

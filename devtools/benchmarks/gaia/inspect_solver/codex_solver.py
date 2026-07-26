@@ -29,7 +29,11 @@ from devtools.benchmarks.gaia.inspect_solver.ouroboros_solver import (  # noqa: 
     _state_prompt,
 )
 from devtools.benchmarks.common.run_roots import run_root  # noqa: E402
-from devtools.benchmarks.gaia.inspect_solver import GAIA_ANTI_LEAK_INSTRUCTION, GAIA_FORMAT_INSTRUCTION  # noqa: E402
+from devtools.benchmarks.gaia.inspect_solver import (  # noqa: E402
+    GAIA_ANTI_LEAK_INSTRUCTION,
+    GAIA_EPISTEMIC_INSTRUCTION,
+    GAIA_FORMAT_INSTRUCTION,
+)
 from devtools.benchmarks.gaia.bwrap_isolate import wrap as _bwrap_wrap  # noqa: E402
 
 try:
@@ -88,6 +92,9 @@ def run_codex(
     # Anti-lookup rule (SSOT, identical across harnesses; see METHODOLOGY.md).
     if GAIA_ANTI_LEAK_INSTRUCTION not in full_prompt:
         full_prompt += GAIA_ANTI_LEAK_INSTRUCTION
+    # Epistemic-grounding disclosure rule (SSOT, adapter-only; see METHODOLOGY.md).
+    if GAIA_EPISTEMIC_INSTRUCTION not in full_prompt:
+        full_prompt += GAIA_EPISTEMIC_INSTRUCTION
 
     last_msg = work / ".codex_last_message.txt"
     # --json streams JSONL events (tool/web-search activity) to stdout: without it

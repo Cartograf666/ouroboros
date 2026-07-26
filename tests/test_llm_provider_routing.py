@@ -541,8 +541,9 @@ def test_openrouter_gemini_preserves_message_cache_blocks_and_strips_tool_cache(
         ]},
     ]
 
+    or_target = client._resolve_remote_target("openai/gpt-4.1")
     kwargs = client._build_remote_kwargs(
-        client._resolve_remote_target("openai/gpt-4.1"),
+        or_target,
         messages,
         "medium",
         512,
@@ -558,12 +559,14 @@ def test_openrouter_gemini_preserves_message_cache_blocks_and_strips_tool_cache(
     assert kwargs["messages"][0]["content"] == "cached result"
     assert "cache_control" not in kwargs["messages"][1]["content"][0]
     assert "cache_control" not in kwargs["tools"][0]
-    assert client._prompt_cache_ttl_from_payload(kwargs["messages"], kwargs["tools"]) is None
+    # An unsupported OpenRouter family gains no marker at the send-time finalizer either.
+    assert client._normalize_payload_cache_ttl(or_target, kwargs) is None
+    assert "cache_control" not in kwargs["tools"][0]
     assert "cache_control" in messages[0]["content"][0]
     assert "cache_control" in messages[1]["content"][0]
 
     kwargs = client._build_remote_kwargs(
-        client._resolve_remote_target("openai/gpt-4.1"),
+        or_target,
         [{"role": "user", "content": "hi"}],
         "medium",
         512,
@@ -583,7 +586,7 @@ def test_openrouter_gemini_preserves_message_cache_blocks_and_strips_tool_cache(
             },
         }],
     )
-    assert client._prompt_cache_ttl_from_payload(kwargs["messages"], kwargs["tools"]) is None
+    assert client._normalize_payload_cache_ttl(or_target, kwargs) is None
 
 
 def test_build_anthropic_tools_deduplicates_tool_names():
@@ -620,11 +623,13 @@ def test_build_anthropic_tools_deduplicates_tool_names():
         {"type": "function", "function": {"name": "alpha_tool", "description": "a", "parameters": {"type": "object"}}},
     ]
 
-    anthropic_tools = LLMClient._build_anthropic_tools(sorted_tools, cache_control=True)
+    anthropic_tools = LLMClient._build_anthropic_tools(sorted_tools)
 
     assert [tool["name"] for tool in anthropic_tools] == ["alpha_tool", "zeta_tool"]
-    assert "cache_control" not in anthropic_tools[0]
-    assert anthropic_tools[-1]["cache_control"] == {"type": "ephemeral"}
+    # v6.77.0: the builder no longer marks anything — the send-time payload finalizer is
+    # the single home for cache markers (end-to-end lock:
+    # test_chat_anthropic_sends_tool_cache_control_without_ttl).
+    assert all("cache_control" not in tool for tool in anthropic_tools)
 
 
 def test_chat_anthropic_sends_tool_cache_control_without_ttl(monkeypatch):
@@ -704,6 +709,11 @@ def test_normalize_anthropic_response_maps_tool_use(monkeypatch):
     assert usage["resolved_model"] == "anthropic/claude-sonnet-4-6"
     assert usage["cached_tokens"] == 3
     assert usage["cache_write_tokens"] == 2
+    # v6.77.0: Anthropic EXCLUDES cache reads/writes from input_tokens, while every
+    # prompt_tokens consumer (pricing's regular_input subtraction, cache_hit_rate, the
+    # route calibration ratio) assumes the OpenAI-semantics TOTAL input.
+    assert usage["prompt_tokens"] == 11 + 3 + 2
+    assert usage["prompt_tokens"] - usage["cached_tokens"] - usage["cache_write_tokens"] == 11
     assert usage.get("cost") is None
     assert usage.get("cost_estimated") is None
     assert usage.get("cost_final") is False

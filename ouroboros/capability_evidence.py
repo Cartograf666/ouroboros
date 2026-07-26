@@ -223,8 +223,12 @@ def _load(drive_root: Any) -> Dict[str, Any]:
         data.setdefault("effort_ceilings", {})
         data.setdefault("effort_floors", {})
         data.setdefault("rejected_params", {})
+        data.setdefault("token_density", {})
         return data
-    return {"probes": {}, "owner_acks": {}, "effort_ceilings": {}, "effort_floors": {}, "rejected_params": {}}
+    return {
+        "probes": {}, "owner_acks": {}, "effort_ceilings": {},
+        "effort_floors": {}, "rejected_params": {}, "token_density": {},
+    }
 
 
 def _save(drive_root: Any, data: Dict[str, Any]) -> None:
@@ -426,6 +430,187 @@ def get_rejected_params(drive_root: Any, fingerprint: str) -> Set[str]:
         return {str(p) for p in (entry.get("params") or []) if str(p or "").strip()}
     except Exception:
         return set()
+
+
+# --- Measured tokenizer density (v6.80.0) ---------------------------------------
+# Same design as effort_ceilings/rejected_params: a separate namespace
+# ("token_density") keyed by the NORMALIZED MODEL IDENTITY, sharing only the store
+# file and the lock. It NEVER touches window records. This replaces the former
+# hand-set CLAUDE_REAL_TOKENS_PER_ESTIMATED constant and its substring family gate:
+# a tokenizer multiplier table perpetually goes stale, so the ratio is MEASURED at
+# the physical send boundary from (prompt_chars, real prompt_tokens) and is honestly
+# "unknown" otherwise. Value shape:
+#   {"density": float, "observed_at": iso, "source": str,
+#    "pairs": [{"prompt_chars": int, "prompt_tokens": int, "observed_at": iso}]}
+# ``density`` is REAL prompt tokens per ESTIMATED token (chars/4) — the number the
+# review-pack sizing formula divides by. The MAXIMUM of the retained fresh pairs
+# wins (conservative: a denser observation is never averaged away).
+# WRITE THROTTLE (deliberate): this store is one file behind one lock shared with
+# the scope-review hot path, and a lock-starvation incident on the usage ledger
+# under benchmark load is on record, so an observation is persisted only when
+# nothing fresh is known or the density drifted past the tolerance, retention is
+# bounded to _TOKEN_DENSITY_MAX_PAIRS raw pairs per model, and a process-local
+# memo short-circuits the common repeat case without touching disk at all.
+# Fail-open everywhere: any error => no durable knowledge => cold-start behaviour.
+
+_TOKEN_DENSITY_TTL_SEC = 14 * 24 * 3600.0
+_TOKEN_DENSITY_FRESH_SEC = 6 * 3600.0
+_TOKEN_DENSITY_MAX_PAIRS = 5
+_TOKEN_DENSITY_DRIFT_TOLERANCE = 0.05
+# Below this, fixed request scaffolding (roles, JSON keys, tool schemas) dominates
+# the ratio and the measurement says nothing about pack-scale tokenization.
+_TOKEN_DENSITY_MIN_CHARS = 20_000
+_TOKEN_DENSITY_SANE_RANGE = (0.5, 4.0)
+
+# Documented conservative cold-start density: the SAME 1.58x measured on a real
+# code-heavy Claude scope pack, plus margin. It applies where NO observation exists for
+# a model identity, so a fresh install (and every isolated benchmark server, which
+# always starts with an empty store) sizes review packs SMALLER than needed and passes
+# instead of drawing a deterministic provider 400. It is deliberately NOT a global
+# floor on a MEASURED density: it is a Claude-derived number, and flooring every model
+# with it permanently shrank the pack of any lighter tokenizer (an all-GPT scope + triad
+# lost ~27% / ~36% of its pack) with no way for measurement to correct the direction —
+# the hand-set multiplier table D4 forbids, relocated. What keeps a measured value from
+# LOOSENING a cap is MODEL-SCOPED instead: record_token_density stores the running
+# maximum for that identity, so a run of prose-dominated doc-only packs cannot pull a
+# code-heavy model's stored density back down. It is also NOT applied to the main loop's
+# context-fit projection (see context_fit.py).
+COLD_START_TOKEN_DENSITY = 1.65
+# Covers measurement noise plus the serialisation-basis gap: recorded prompt_chars
+# come from the serialized dispatch payload, whose JSON escaping inflates the char
+# count relative to estimate_tokens' raw text, which would otherwise UNDER-state
+# the real density.
+MEASURED_DENSITY_SAFETY_FACTOR = 1.05
+
+_DENSITY_MEMO: Dict[str, Tuple[float, str]] = {}
+
+
+def _density_of(prompt_chars: Any, prompt_tokens: Any) -> float:
+    """Real tokens per chars/4 estimated token, or 0.0 when not measurable."""
+    try:
+        chars = int(prompt_chars or 0)
+        tokens = int(prompt_tokens or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if chars < _TOKEN_DENSITY_MIN_CHARS or tokens <= 0:
+        return 0.0
+    density = tokens / max(1.0, chars / 4.0)
+    low, high = _TOKEN_DENSITY_SANE_RANGE
+    return density if low <= density <= high else 0.0
+
+
+def record_token_density(
+    drive_root: Any,
+    fingerprint: str,
+    *,
+    prompt_chars: Any,
+    prompt_tokens: Any,
+    source: str = "dispatch_usage",
+) -> None:
+    """Persist one measured tokenizer-density observation for a model identity.
+
+    Best-effort and throttled (see the namespace note above); never raises."""
+    fp = str(fingerprint or "").strip()
+    density = _density_of(prompt_chars, prompt_tokens)
+    if not fp or density <= 0:
+        return
+    memo = _DENSITY_MEMO.get(fp)
+    if memo and abs(density - memo[0]) <= _TOKEN_DENSITY_DRIFT_TOLERANCE * memo[0]:
+        return  # nothing new to learn; skip the shared store entirely
+    try:
+        with _STORE_LOCK:
+            data = _load(drive_root)
+            store = data.setdefault("token_density", {})
+            entry = store.get(fp) or {}
+            fresh = _age_seconds(str(entry.get("observed_at") or "")) < _TOKEN_DENSITY_FRESH_SEC
+            known = float(entry.get("density") or 0.0)
+            if fresh and known > 0 and abs(density - known) <= _TOKEN_DENSITY_DRIFT_TOLERANCE * known:
+                _DENSITY_MEMO[fp] = (known, "measured")
+                return
+            pairs = [
+                pair for pair in (entry.get("pairs") or [])
+                if isinstance(pair, dict)
+                and _age_seconds(str(pair.get("observed_at") or "")) < _TOKEN_DENSITY_TTL_SEC
+            ]
+            pairs.append({
+                "prompt_chars": int(prompt_chars or 0),
+                "prompt_tokens": int(prompt_tokens or 0),
+                "observed_at": utc_now_iso(),
+            })
+            pairs = pairs[-_TOKEN_DENSITY_MAX_PAIRS:]
+            merged = max(
+                [_density_of(p.get("prompt_chars"), p.get("prompt_tokens")) for p in pairs] or [density]
+            )
+            # Per-MODEL ratchet, and the reason no global cold-start floor is needed on
+            # the measured path: the stored value is the running maximum for this
+            # identity while the entry is inside its TTL, so a run of prose-dominated
+            # packs cannot pull a code-heavy model's density (and thus its pack cap)
+            # back up. Raw-pair retention is bounded, so `merged` alone would decay.
+            retained = (
+                known
+                if _age_seconds(str(entry.get("observed_at") or "")) < _TOKEN_DENSITY_TTL_SEC
+                else 0.0
+            )
+            store[fp] = {
+                # 6 decimals: 4 was coarse enough that a seeded observation could not
+                # reproduce a given effective density exactly (regression-test seam).
+                "density": round(max(merged, density, retained), 6),
+                "observed_at": utc_now_iso(),
+                "source": str(source or "dispatch_usage"),
+                "pairs": pairs,
+            }
+            _DENSITY_MEMO[fp] = (float(store[fp]["density"]), "measured")
+            _save(drive_root, data)
+    except Exception:
+        log.debug("record_token_density failed", exc_info=True)
+
+
+def get_token_density(drive_root: Any, fingerprint: str) -> float:
+    """Non-expired measured density for a model identity, else 0.0 (fail-open)."""
+    fp = str(fingerprint or "").strip()
+    if not fp:
+        return 0.0
+    try:
+        entry = _load(drive_root).get("token_density", {}).get(fp) or {}
+        if _age_seconds(str(entry.get("observed_at") or "")) >= _TOKEN_DENSITY_TTL_SEC:
+            return 0.0
+        return float(entry.get("density") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def resolve_token_density(drive_root: Any, model_id: str) -> Tuple[float, str]:
+    """``(effective density, provenance)`` for one model, for review-pack sizing.
+
+    Provenance is ``measured`` (an observation exists for this exact normalized
+    model identity; the safety factor is applied) or ``cold_conservative`` (the
+    maximum of every fresh observation and COLD_START_TOKEN_DENSITY). Fail-open:
+    any error resolves to the cold-conservative constant.
+
+    The cold-start constant is MODEL-SCOPED: it bounds the cold path only. Flooring the
+    measured path with it made a Claude-derived number the permanent minimum for every
+    model, so a genuinely lighter tokenizer could never recover its own pack size no
+    matter how much it was measured. The "measurement can only tighten" property is
+    supplied where it belongs — ``record_token_density`` stores the running MAXIMUM per
+    model identity — and ``calibrated_input_token_limit`` still bounds every result by
+    the historical absolute-margin form, so no cap can exceed the pre-measurement one."""
+    try:
+        from ouroboros.provider_models import normalize_model_identity
+        fp = normalize_model_identity(str(model_id or ""))
+    except Exception:
+        fp = str(model_id or "").strip()
+    measured = get_token_density(drive_root, fp)
+    if measured > 0:
+        return (measured * MEASURED_DENSITY_SAFETY_FACTOR, "measured")
+    try:
+        observed = [
+            float((entry or {}).get("density") or 0.0)
+            for entry in (_load(drive_root).get("token_density", {}) or {}).values()
+            if _age_seconds(str((entry or {}).get("observed_at") or "")) < _TOKEN_DENSITY_TTL_SEC
+        ]
+    except Exception:
+        observed = []
+    return max([COLD_START_TOKEN_DENSITY, *observed]), "cold_conservative"
 
 
 # --- Owner acknowledgement (asserted) -----------------------------------------

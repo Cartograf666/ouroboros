@@ -57,6 +57,7 @@ from devtools.benchmarks.gaia.leak_targets import LEAK_QUERY_RE, LEAK_URL_RE  # 
 # names the answer-source concept; the format text contains "final answer").
 from devtools.benchmarks.gaia.inspect_solver import (  # noqa: E402
     GAIA_ANTI_LEAK_INSTRUCTION,
+    GAIA_EPISTEMIC_INSTRUCTION,
     GAIA_FORMAT_INSTRUCTION,
 )
 
@@ -72,7 +73,7 @@ URL_RE = re.compile(r"https?://[^\s\"'<>)\]}]+", re.IGNORECASE)
 # SSOT instruction blobs to strip from full-text traces before scanning, so the
 # echoed prompt cannot self-flag every sample (the anti-leak text names the very
 # concepts LEAK_QUERY_RE looks for).
-_PROMPT_BOILERPLATE = (GAIA_ANTI_LEAK_INSTRUCTION, GAIA_FORMAT_INSTRUCTION)
+_PROMPT_BOILERPLATE = (GAIA_ANTI_LEAK_INSTRUCTION, GAIA_EPISTEMIC_INSTRUCTION, GAIA_FORMAT_INSTRUCTION)
 
 
 def _strip_prompt_boilerplate(text: str, gold: str = "") -> str:

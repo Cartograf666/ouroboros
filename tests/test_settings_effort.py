@@ -359,11 +359,25 @@ def test_get_context_mode_clamps_invalid(monkeypatch):
     assert get_context_mode() == "max"
 
 
-def test_apply_settings_to_env_includes_context_mode(monkeypatch):
-    """apply_settings_to_env propagates OUROBOROS_CONTEXT_MODE to the env."""
+def test_apply_settings_to_env_includes_context_mode(monkeypatch, tmp_path):
+    """apply_settings_to_env propagates an AUTHORED OUROBOROS_CONTEXT_MODE to the env.
+
+    Authored means STORED IN settings.json, and it overrides a contradicting env value. The
+    default that ``load_settings`` substitutes for an absent key is not an owner decision, so
+    projecting it would clobber a value a benchmark launcher forwarded on purpose — see
+    ``test_env_forwarded_modes_survive_the_documented_startup_path``.
+    """
+    from ouroboros import config as cfg
+
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps({"OUROBOROS_CONTEXT_MODE": "low"}), encoding="utf-8")
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path, raising=True)
+    # apply_settings_to_env writes os.environ directly for ~122 keys: own the whole copy.
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    os.environ["OUROBOROS_CONTEXT_MODE"] = "max"
+
     apply_settings_to_env({"OUROBOROS_CONTEXT_MODE": "low"})
     assert os.environ.get("OUROBOROS_CONTEXT_MODE") == "low"
-    os.environ.pop("OUROBOROS_CONTEXT_MODE", None)
 
 
 def test_get_auto_grant_enabled(monkeypatch, tmp_path):

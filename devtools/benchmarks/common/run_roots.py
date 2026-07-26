@@ -52,7 +52,15 @@ def latest_run_root(benchmark: str) -> pathlib.Path | None:
     return max(candidates, key=lambda d: d.stat().st_mtime).resolve(strict=False)
 
 
-def ensure_outside_repo(path: pathlib.Path, repo_dir: pathlib.Path) -> pathlib.Path:
+def assert_outside_repo(path: pathlib.Path, repo_dir: pathlib.Path) -> pathlib.Path:
+    """PURE boundary check: resolve ``path`` and refuse it if it is under repo/ or live data/.
+
+    Split out of ``ensure_outside_repo`` because the two halves are needed at different
+    moments: a caller that must not mutate anything yet (a pre-admission argument check, or a
+    path it will only create later) needs the refusal WITHOUT the ``mkdir`` side effect.
+    Creating the directory as a by-product of validating it also hides the write's real
+    precondition from the call site.
+    """
     resolved = pathlib.Path(path).expanduser().resolve(strict=False)
     repo = pathlib.Path(repo_dir).resolve(strict=False)
     forbidden: list[tuple[str, pathlib.Path]] = [("repo/", repo)]
@@ -63,6 +71,12 @@ def ensure_outside_repo(path: pathlib.Path, repo_dir: pathlib.Path) -> pathlib.P
         except ValueError:
             continue
         raise ValueError(f"benchmark run output must not be under {label}: {resolved}")
+    return resolved
+
+
+def ensure_outside_repo(path: pathlib.Path, repo_dir: pathlib.Path) -> pathlib.Path:
+    """``assert_outside_repo`` plus the mkdir, for callers that want the directory now."""
+    resolved = assert_outside_repo(path, repo_dir)
     resolved.mkdir(parents=True, exist_ok=True)
     return resolved
 
@@ -91,6 +105,18 @@ def safe_join_under(root: pathlib.Path, *parts: str) -> pathlib.Path:
     return resolved
 
 
+def assert_file_output_outside_repo(path: pathlib.Path, repo_dir: pathlib.Path) -> pathlib.Path:
+    """PURE form of ``ensure_file_output_outside_repo``: check the parent, create nothing.
+
+    Every writer of these sidecars creates its own parent (``atomic_write_json`` and
+    ``write_jsonl`` both do), so a caller that only needs the BOUNDARY — in particular one
+    running before its run manifest is persisted — must not pre-create the directory.
+    """
+    resolved = pathlib.Path(path).expanduser().resolve(strict=False)
+    assert_outside_repo(resolved.parent, repo_dir)
+    return resolved
+
+
 def ensure_file_output_outside_repo(path: pathlib.Path, repo_dir: pathlib.Path) -> pathlib.Path:
     resolved = pathlib.Path(path).expanduser().resolve(strict=False)
     ensure_outside_repo(resolved.parent, repo_dir)
@@ -107,6 +133,35 @@ def workspace_root_from_devtools() -> pathlib.Path:
 
 def default_settings_path() -> pathlib.Path:
     return pathlib.Path(os.environ.get("OUROBOROS_SETTINGS_PATH") or _WORKSPACE_ROOT / "data" / "settings.json")
+
+
+def live_repo_roots() -> list[pathlib.Path]:
+    """The LIVE Ouroboros checkout(s) a benchmark must never point itself at.
+
+    Companion to ``live_data_roots()`` and derived from the same authority, because "live" is a
+    property of the RUNTIME's configured layout, never of wherever the caller happens to be
+    executing from. A launcher that answered "is this the live repo?" with
+    ``Path(__file__).parents[N]`` was really asking "is this my own tree?": true of the live
+    repo only in the development workspace, and false in the case we ship, where the launcher
+    IS the pinned seed and a run is legitimately pointed at it (the smoke that found this had
+    to clone the seed twice to get past the refusal). ``$OUROBOROS_REPO_DIR`` is the documented
+    SSOT; the ``repo`` sibling of each live data root covers the default workspace layout,
+    where a seed clone elsewhere on disk never collides.
+    """
+    roots: list[pathlib.Path] = []
+    repo_env = os.environ.get("OUROBOROS_REPO_DIR")
+    if repo_env:
+        roots.append(pathlib.Path(repo_env).expanduser())
+    roots.extend(root.expanduser().parent / "repo" for root in live_data_roots())
+    unique: list[pathlib.Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        resolved = str(root.expanduser().resolve(strict=False))
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(root)
+    return unique
 
 
 def live_data_roots() -> list[pathlib.Path]:

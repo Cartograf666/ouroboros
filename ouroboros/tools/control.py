@@ -890,6 +890,17 @@ def _prepare_child_drives(slot_tasks, task_ids, status_drive_root, memory_mode, 
     return child_drives, ""
 
 
+def _earliest_deadline_at(requested: str, inherited: str) -> str:
+    """The tighter of two ISO deadlines (either may be empty/unparseable)."""
+    from ouroboros.deadline_utils import parse_deadline_ts
+
+    stamps = {text: parse_deadline_ts(text) for text in (requested, inherited) if text}
+    usable = {text: ts for text, ts in stamps.items() if ts is not None}
+    if not usable:
+        return requested or inherited
+    return min(usable, key=lambda text: usable[text])
+
+
 def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
     """Build a delegated child's task contract from a single spec mapping (extracted
     from _schedule_task to keep it under the method size gate; one dict param to stay
@@ -910,7 +921,14 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
         "workspace_mode": spec.get("workspace_mode", ""),
         "project_id": spec.get("parent_project_id", ""),
         "allowed_resources": spec.get("allowed_resources"),
-        "deadline_at": parent_contract.get("deadline_at") if isinstance(parent_contract, dict) else "",
+        # A caller may bind the child to an EARLIER deadline than the parent's when the
+        # parent can only consume the child's handoff inside a narrower window (planning
+        # scouts). Never LATER: the earliest of the two wins, so a requested deadline can
+        # only tighten the inherited one.
+        "deadline_at": _earliest_deadline_at(
+            str(spec.get("deadline_at") or ""),
+            str(parent_contract.get("deadline_at") or "") if isinstance(parent_contract, dict) else "",
+        ),
         "parent_task_id": spec.get("parent_task_id", ""),
         "root_task_id": spec.get("root_task_id"),
         "session_id": spec.get("session_id", ""),
@@ -957,28 +975,88 @@ def _inherited_workspace_from_active_repo(
     return workspace_root, workspace_mode
 
 
-def _schedule_task(
-    ctx: ToolContext,
-    objective: str = "",
-    expected_output: str = "",
-    role: str = "",
-    context: str = "",
-    constraints: str = "",
-    memory_mode: str = "forked",
-    model_lane: str = "auto",
-    write_surface: str = "",
-    write_root: str = "",
-    protected_paths_grant: bool = False,
-    external_tool_grants: Any = None,
-    delegation_intent: str = "",
-    may_mutate: bool = False,
-    may_fan_out: bool = True,
-    max_children: int = 0,
-    required_capabilities: Any = None,
-    **legacy_or_unknown: Any,
-) -> str:
-    if legacy_or_unknown:
-        bad = ", ".join(sorted(str(key) for key in legacy_or_unknown.keys()))
+def schedule_subagent_properties() -> Dict[str, Any]:
+    """SSOT for the schedule_subagent parameter surface: ONE object, TWO derived consumers.
+
+    The PUBLIC schema is the contract (`ToolEntry("schedule_subagent", …)` in `get_tools`, with
+    `additionalProperties: False`), and the handler must refuse exactly what the schema does not
+    expose. Those were previously two hand-maintained copies — this mapping and a frozenset of
+    names sitting beside it, its own comment admitting it "mirrors" the schema. A mirror is only
+    correct until someone adds a parameter to one side, at which point handler validation drifts
+    from what the model can see: a newly published parameter gets refused as "unsupported", or a
+    withdrawn one keeps being accepted. Now `get_tools` builds `properties` from this and
+    `_schedule_task` builds its allowed-key set from `schedule_subagent_param_names()`, so the two
+    cannot disagree (BIBLE P7).
+
+    Returns a FRESH mapping per call, exactly as the inline literal did, so a caller that mutates
+    a returned schema cannot corrupt every later `get_tools()`."""
+    from ouroboros.tool_access import SUBAGENT_CAPABILITIES
+
+    return {
+        "objective": {"type": "string", "description": "Focused child objective. Be specific about scope."},
+        "expected_output": {"type": "string", "description": "Concrete handoff expected from the child."},
+        "role": {"type": "string", "description": "Optional freeform role label for lineage/UI, e.g. architecture-reviewer."},
+        "context": {"type": "string", "description": "Optional parent reference material. It is injected as context, not instructions."},
+        "constraints": {"type": "string", "description": "Optional constraints/non-goals for the child."},
+        "memory_mode": {
+            "type": "string",
+            "enum": sorted(VALID_SUBTASK_MEMORY_MODES),
+            "description": "Child memory mode. Default forked copies stable memory only; empty starts blank. shared is disabled for live local subagents.",
+        },
+        "model_lane": {
+            "type": "string",
+            "enum": ["auto", "main", "heavy", "light", "review", "scope"],
+            "default": "auto",
+            "description": "Model lane for the child. auto uses the cheap Light lane for a read-only child but the strong Heavy lane for a MUTATING first-level child — one that writes (a declared write_surface) OR is granted mutative-descendant intent (may_mutate); main/heavy/light use those configured slots (Heavy = strong acting/coding lane, empty Heavy/Light fall back to Main); review/scope fan out across configured reviewer slots and return a task_group. NOTE: an EXPLICIT main/heavy lane is honored only for children at or below the configured capability depth limit (advanced setting OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT, default 1 = direct children); deeper descendants resolve to Light to bound deep-swarm cost (a visible note is surfaced when an explicit request is capped).",
+        },
+        "write_surface": {
+            "type": "string",
+            # No empty-string member: Google Gemini's function-calling validator
+            # rejects empty enum values (400 INVALID_ARGUMENT). Read-only is the
+            # default by OMITTING this param; `read_only` is an explicit, provider-safe
+            # (non-empty) alias for the SAME read-only path, so an audit/read-only child
+            # can NAME its intent instead of reaching for an acting surface like
+            # self_worktree (the trap behind the read-only-audit cancel-storm). It is NOT
+            # an acting VALID_WRITE_SURFACES member — it normalizes to the omit path.
+            "enum": ["read_only", "self_worktree", "external_workspace", "genesis"],
+            "description": "read_only (or omit) = read-only child auditing THIS repo. Otherwise the isolated write surface for a MUTATIVE child (see tool description). Acting surfaces require mutative subagents enabled (default ON in advanced/pro).",
+        },
+        "write_root": {"type": "string", "description": "For write_surface=external_workspace: the external project directory. OMIT it to build COOPERATIVELY from scratch — the host mints ONE shared git tree the whole subagent tree writes into together (deeper descendants inherit it), and you integrate the result as the sole committer. Ignored for self_worktree and genesis (both auto-provisioned)."},
+        "protected_paths_grant": {"type": "boolean", "default": False, "description": "Allow the child to modify protected paths in its self_worktree. Honored only in pro runtime mode; you still re-check at integration."},
+        "external_tool_grants": {"type": "array", "items": {"type": "string"}, "description": "Optional extension/MCP tool names to grant this mutative child. Denied by default."},
+        "delegation_intent": {"type": "string", "description": "Optional: tell THIS child whether/how to delegate further (e.g. 'build the whole game; spawn your own children per subsystem and let them spawn too'). Propagated structurally into the child's delegation budget and surfaced in its prompt, so a 'use maximum subagents / grandchildren' intent is not lost. Defaults to inheriting the parent's intent."},
+        "may_mutate": {"type": "boolean", "default": False, "description": "Optional: grant this child the intent to spawn MUTATIVE (acting) descendants of its own. Still bounded by the usual mutative-subagent gating and depth/active caps."},
+        "may_fan_out": {"type": "boolean", "default": True, "description": "Optional: whether this child may spawn MULTIPLE children (a wave). Bounded by the per-root active cap."},
+        "max_children": {"type": "integer", "default": 0, "description": "Optional soft cap on this child's own direct children (0 = inherit / configured cap)."},
+        "required_capabilities": {
+            "type": "array",
+            "items": {"type": "string", "enum": list(SUBAGENT_CAPABILITIES)},
+            "description": "Closed-enum capabilities this child must have (e.g. shell/vcs/write/service). The scheduler reconciles this with the selected profile before spawning; do not encode these needs in prose.",
+        },
+    }
+
+
+def schedule_subagent_param_names() -> frozenset:
+    """The handler's closed keyword set, DERIVED from the public schema above.
+
+    Anything the schema does not expose is refused with the strict v6 message instead of being
+    silently accepted — and because the set is derived, "what the schema exposes" is the only
+    definition of it there is."""
+    return frozenset(schedule_subagent_properties())
+
+
+# Runtime-INTERNAL scheduling options, deliberately absent from the public schema and
+# structurally unreachable from a model tool call: they ride in the POSITIONAL-ONLY `internal`
+# mapping, which no keyword argument produced from tool-call JSON can ever bind to. Keeping
+# them out of the signature is also what holds the handler inside the <8-parameter contract.
+_INTERNAL_SCHEDULE_OPTIONS: frozenset = frozenset({"deadline_at"})
+
+
+def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, **params: Any) -> str:
+    allowed_params = schedule_subagent_param_names()
+    unsupported = sorted(str(key) for key in params if key not in allowed_params)
+    if unsupported:
+        bad = ", ".join(unsupported)
         return (
             "⚠️ TOOL_ARG_ERROR (schedule_subagent): unsupported argument(s): "
             f"{bad}. Use the v6 strict schema: objective, expected_output, "
@@ -986,14 +1064,20 @@ def _schedule_task(
             "mutative children) write_surface/write_root/protected_paths_grant/"
             "external_tool_grants."
         )
-    objective = str(objective or "").strip()
-    expected_output = str(expected_output or "").strip()
-    role = str(role or "researcher").strip() or "researcher"
-    context = str(context or "").strip()
-    constraints = str(constraints or "").strip()
-    memory_mode = str(memory_mode or "forked").strip().lower()
+    internal = dict(internal or {})
+    if set(internal) - _INTERNAL_SCHEDULE_OPTIONS:
+        raise TypeError(f"_schedule_task: unknown internal scheduling option(s): "
+                        f"{sorted(set(internal) - _INTERNAL_SCHEDULE_OPTIONS)}")
+    deadline_at = str(internal.get("deadline_at") or "")
+    objective = str(params.get("objective") or "").strip()
+    expected_output = str(params.get("expected_output") or "").strip()
+    role = str(params.get("role") or "researcher").strip() or "researcher"
+    context = str(params.get("context") or "").strip()
+    constraints = str(params.get("constraints") or "").strip()
+    memory_mode = str(params.get("memory_mode") or "forked").strip().lower()
+    may_mutate = params.get("may_mutate", False)
     try:
-        requested_model_lane = normalize_subagent_model_lane(model_lane)
+        requested_model_lane = normalize_subagent_model_lane(params.get("model_lane", "auto"))
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {exc}."
     if not objective:
@@ -1049,7 +1133,7 @@ def _schedule_task(
     workspace_mode = str(getattr(ctx, "workspace_mode", "") or metadata.get("workspace_mode") or "").strip()
     workspace_root, workspace_mode = _inherited_workspace_from_active_repo(ctx, workspace_root, workspace_mode)
     parent_project_id = str(getattr(ctx, "project_id", "") or "").strip()
-    requested_surface = str(write_surface or "").strip().lower()
+    requested_surface = str(params.get("write_surface") or "").strip().lower()
     # `read_only` is a first-class, provider-safe alias for "omit write_surface" (NOT a
     # VALID_WRITE_SURFACES acting surface) — normalize it to the read-only path so
     # constraint selection, mutating detection, and the event all treat it as read-only (P5).
@@ -1059,17 +1143,18 @@ def _schedule_task(
     # cooperatively in ONE host-minted shared tree (helper extracted to keep this
     # method under the size gate).
     effective_write_root, caller_profile, coop_err = resolve_cooperative_write_root(
-        ctx, requested_surface, write_root, workspace_root, metadata)
+        ctx, requested_surface, params.get("write_root", ""), workspace_root, metadata)
     if coop_err:
         return coop_err
     task_constraint = _select_subagent_constraint(
-        requested_surface, effective_write_root, protected_paths_grant, external_tool_grants, workspace_root,
+        requested_surface, effective_write_root, params.get("protected_paths_grant", False),
+        params.get("external_tool_grants"), workspace_root,
         caller_readonly=(caller_profile == "local_readonly_subagent"))
     if isinstance(task_constraint, str):
         return task_constraint
     from ouroboros.tool_access import subagent_profile_satisfies
 
-    required_caps, cap_error = normalize_required_capabilities(required_capabilities)
+    required_caps, cap_error = normalize_required_capabilities(params.get("required_capabilities"))
     if cap_error:
         return f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {cap_error}"
     selected_profile = profile_from_task_constraint(task_constraint)
@@ -1114,8 +1199,9 @@ def _schedule_task(
     child_delegation_budget = child_budget_for_schedule(
         parent_contract,
         current_depth=current_depth, new_depth=new_depth, max_depth=max_depth,
-        may_mutate=may_mutate, may_fan_out=may_fan_out, max_children=max_children,
-        intent_note=delegation_intent,
+        may_mutate=may_mutate, may_fan_out=params.get("may_fan_out", True),
+        max_children=params.get("max_children", 0),
+        intent_note=params.get("delegation_intent", ""),
     )
 
     events_to_emit: List[Dict[str, Any]] = []
@@ -1131,7 +1217,7 @@ def _schedule_task(
             "workspace_root": workspace_root, "workspace_mode": workspace_mode, "parent_project_id": parent_project_id,
             "allowed_resources": allowed_resources, "parent_contract": parent_contract,
             "parent_task_id": parent_task_id, "root_task_id": root_task_id, "session_id": session_id,
-            "child_delegation_budget": child_delegation_budget,
+            "child_delegation_budget": child_delegation_budget, "deadline_at": str(deadline_at or ""),
         })
         envelope = build_subagent_envelope(
             task_id=tid,
@@ -1711,8 +1797,6 @@ _PROMOTE_CHAT_DESCRIPTION = (
 
 
 def get_tools() -> List[ToolEntry]:
-    from ouroboros.tool_access import SUBAGENT_CAPABILITIES
-
     return [
         ToolEntry("set_tool_timeout", {
             "name": "set_tool_timeout",
@@ -1848,48 +1932,14 @@ def get_tools() -> List[ToolEntry]:
                 "verify through the task's own interface. Always retrieve "
                 "the handoff with get_task_result, wait_task, or wait_tasks before relying on its results."
             ),
-            "parameters": {"type": "object", "properties": {
-                "objective": {"type": "string", "description": "Focused child objective. Be specific about scope."},
-                "expected_output": {"type": "string", "description": "Concrete handoff expected from the child."},
-                "role": {"type": "string", "description": "Optional freeform role label for lineage/UI, e.g. architecture-reviewer."},
-                "context": {"type": "string", "description": "Optional parent reference material. It is injected as context, not instructions."},
-                "constraints": {"type": "string", "description": "Optional constraints/non-goals for the child."},
-                "memory_mode": {
-                    "type": "string",
-                    "enum": sorted(VALID_SUBTASK_MEMORY_MODES),
-                    "description": "Child memory mode. Default forked copies stable memory only; empty starts blank. shared is disabled for live local subagents.",
-                },
-                "model_lane": {
-                    "type": "string",
-                    "enum": ["auto", "main", "heavy", "light", "review", "scope"],
-                    "default": "auto",
-                    "description": "Model lane for the child. auto uses the cheap Light lane for a read-only child but the strong Heavy lane for a MUTATING first-level child — one that writes (a declared write_surface) OR is granted mutative-descendant intent (may_mutate); main/heavy/light use those configured slots (Heavy = strong acting/coding lane, empty Heavy/Light fall back to Main); review/scope fan out across configured reviewer slots and return a task_group. NOTE: an EXPLICIT main/heavy lane is honored only for children at or below the configured capability depth limit (advanced setting OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT, default 1 = direct children); deeper descendants resolve to Light to bound deep-swarm cost (a visible note is surfaced when an explicit request is capped).",
-                },
-                "write_surface": {
-                    "type": "string",
-                    # No empty-string member: Google Gemini's function-calling validator
-                    # rejects empty enum values (400 INVALID_ARGUMENT). Read-only is the
-                    # default by OMITTING this param; `read_only` is an explicit, provider-safe
-                    # (non-empty) alias for the SAME read-only path, so an audit/read-only child
-                    # can NAME its intent instead of reaching for an acting surface like
-                    # self_worktree (the trap behind the read-only-audit cancel-storm). It is NOT
-                    # an acting VALID_WRITE_SURFACES member — it normalizes to the omit path.
-                    "enum": ["read_only", "self_worktree", "external_workspace", "genesis"],
-                    "description": "read_only (or omit) = read-only child auditing THIS repo. Otherwise the isolated write surface for a MUTATIVE child (see tool description). Acting surfaces require mutative subagents enabled (default ON in advanced/pro).",
-                },
-                "write_root": {"type": "string", "description": "For write_surface=external_workspace: the external project directory. OMIT it to build COOPERATIVELY from scratch — the host mints ONE shared git tree the whole subagent tree writes into together (deeper descendants inherit it), and you integrate the result as the sole committer. Ignored for self_worktree and genesis (both auto-provisioned)."},
-                "protected_paths_grant": {"type": "boolean", "default": False, "description": "Allow the child to modify protected paths in its self_worktree. Honored only in pro runtime mode; you still re-check at integration."},
-                "external_tool_grants": {"type": "array", "items": {"type": "string"}, "description": "Optional extension/MCP tool names to grant this mutative child. Denied by default."},
-                "delegation_intent": {"type": "string", "description": "Optional: tell THIS child whether/how to delegate further (e.g. 'build the whole game; spawn your own children per subsystem and let them spawn too'). Propagated structurally into the child's delegation budget and surfaced in its prompt, so a 'use maximum subagents / grandchildren' intent is not lost. Defaults to inheriting the parent's intent."},
-                "may_mutate": {"type": "boolean", "default": False, "description": "Optional: grant this child the intent to spawn MUTATIVE (acting) descendants of its own. Still bounded by the usual mutative-subagent gating and depth/active caps."},
-                "may_fan_out": {"type": "boolean", "default": True, "description": "Optional: whether this child may spawn MULTIPLE children (a wave). Bounded by the per-root active cap."},
-                "max_children": {"type": "integer", "default": 0, "description": "Optional soft cap on this child's own direct children (0 = inherit / configured cap)."},
-                "required_capabilities": {
-                    "type": "array",
-                    "items": {"type": "string", "enum": list(SUBAGENT_CAPABILITIES)},
-                    "description": "Closed-enum capabilities this child must have (e.g. shell/vcs/write/service). The scheduler reconciles this with the selected profile before spawning; do not encode these needs in prose.",
-                },
-            }, "required": ["objective", "expected_output"], "additionalProperties": False},
+            "parameters": {
+                "type": "object",
+                # DERIVED, not restated: schedule_subagent_properties() is the single source
+                # this schema and the handler's allowed-key set both read from.
+                "properties": schedule_subagent_properties(),
+                "required": ["objective", "expected_output"],
+                "additionalProperties": False,
+            },
         }, _schedule_task),
         # cancel_task + peek_task + discard_child_result are registered by ouroboros/tools/join_ledger.py.
         ToolEntry("request_deep_self_review", {

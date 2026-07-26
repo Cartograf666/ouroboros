@@ -172,7 +172,164 @@ Content hashes remain legitimate in two roles only: (a) an INTEGRITY CHECK on an
 already-known identity (`text_sha256` inside a ref verifies the row wasn't
 swapped — it is never the lookup key), and (b) content-ADDRESSING where the
 content IS the identity (artifact stores, observability blobs, join-ledger
-result hashes, staged-diff review bindings). For semantic matching of fuzzy
+result hashes, staged-diff review bindings). One NAMED exception inside role (b),
+v6.78.0 / owner Q28=B: a verification RECEIPT is reconciled by ONE TYPED
+IDENTITY KEY — its `criterion_id` when it has one, else its canonical `check` text, else
+(for the artifact-observation class, which runs no command) its observed `paths` SET —
+because with no criterion id the check text / observed path set IS that verification's
+identity (there is no earlier ingress point to capture, and a class whose identity is
+dropped can never reconcile itself: a red "report.md missing" must be clearable by the
+byte-identical green observation once the file exists). Two receipts name the same
+verification when the key's KIND and VALUE both match, never across kinds. The key
+replaced a per-component FALLBACK CHAIN, and the reason is worth stating as a rule: a
+chain is not an equivalence relation. It was not transitive — `{c1, check}` matched
+`{check}`, `{check}` matched `{c2, check}`, while `c1` and `c2` are explicitly different
+criteria — so one check-only green reconciled two distinct reds, "collapse the candidates
+onto the identity they name" was not even well defined, and the outstanding set came out
+order-dependent. No care at the call sites can repair a relation that is not an
+equivalence; keying makes sameness the KERNEL of a function (reflexive, symmetric,
+transitive by construction) and makes an existing `criterion_id` authoritative
+STRUCTURALLY rather than by a rule someone must remember. It is a SIMPLIFICATION —
+strictly fewer branches — and it fails in the SAFE direction: strictly fewer
+reconciliations, so a red the chain used to clear may now stay open. Concretely, a re-run
+that OMITS the `criterion_id` it carried before no longer clears its own red; the cost is
+one advisory nudge and one advisory reviewer flag, never a false green. Read that as the
+design, not a regression. If omission tolerance is ever genuinely needed, the only sound
+route is to carry the id forward STRUCTURALLY at receipt ingress (`tools/verify.py`) —
+never to infer it back from shared command text under another name. Two paths deliberately
+keep the older any-later-grounding rule, because there the key cannot do its job: a
+receipt with NO key at all (nothing to protect — a malformed `artifact_observation` with
+no paths would otherwise mint an unclearable red), and the MASKED-pass path, where the
+only text identity is the masked command itself and the prescribed remediation ("drop the
+masking pipe") necessarily changes it, so a byte-identical clean re-run cannot exist.
+On that masked path the `criterion_id` key alone binds, by the same equality: a masked
+receipt that NAMES a criterion is cleared only by a later clean receipt naming that SAME
+criterion — one that merely omits its id does NOT clear it — and the any-later-clean
+fallback reaches only a masked receipt that names no criterion. Command text never
+participates there, in either direction. **And whatever decides must be what is
+reported.** Both relations and both disclosures read ONE mode-aware projection —
+`receipt_reconciliation_key(receipt, masked=…)`, with the mode read off the receipt by
+`receipt_is_masked_pass` for the per-row question (`receipt_disclosed_reconciliation_key`)
+— so `reconciliation_identity` and `expected_whitespace_normalized` name the authority
+that actually cleared the receipt instead of re-deriving one beside it. Re-deriving is how
+round 6 arrived: an id-less masked pass, reconciled by ANY later clean grounding, was
+disclosed to the acceptance reviewer as `check`-governed with
+`expected_whitespace_normalized=true`, while `_reconciles_masked` never looked at check
+text at all. That flag is now FALSE across the whole masked path. A host-attested artifact
+that misstates its own basis is worse than one that says nothing: the reviewer cannot
+discount evidence whose provenance it has been told wrongly, and "the reporting path reads
+the deciding path" is the general fix — the same move that collapsed the projection/
+comparison split in round 4 and the fallback chain in round 5.
+
+Round 7 was that same class one kind over: `expected_whitespace_normalized` also read true
+for `artifact_paths`, whose observed set is compared BYTE-FOR-BYTE (every whitespace byte of
+a filename counts), so the fix for one kind had simply never been asked of the others. The
+durable form is to answer the question ONCE PER KIND, next to the kinds: `IDENTITY_KINDS` is
+the closed, ordered table of reconciliation identity kinds, each row carrying its name, how
+to read its value off a `ReceiptIdentity`, and whether that identity is canonical command
+text; `ReceiptIdentity.key` iterates the table and `KIND_NORMALIZES_COMMAND_TEXT` is the
+total lookup the flag performs — true for `check`, false for `criterion_id`,
+`artifact_paths` and `none`, with a `KeyError` rather than a default for a kind that skipped
+the table. The general rule: when a disclosure describes a property of a closed set of
+kinds, put the property IN the set, so a new kind cannot be added without answering, and a
+per-kind fix cannot be mistaken for a fix of the class. Every component that
+participates carries into BOTH fixed reviewer projections
+(`verification_receipt_ledger_row`, `_accept_verification_summary`), and it does so
+through ONE shared renderer — `_outcome_receipts.receipt_identity_projection` — rather
+than two independently maintained key lists, so the two surfaces cannot drift apart
+about the identity the reconciliation used. Three rules make that claim literal rather
+than aspirational. First, a projection that BOUNDS a list discloses the bounding, and it
+does so through ONE shared helper — `_outcome_receipts.disclosed_list_projection` — not a
+hand-rolled `[:N]` per call site: every bounded list on a cognitive-review surface emits
+`<key>_omitted` (the exact count, 0 included), bounds each string through the SSOT
+`utils.truncate_review_artifact` so a clipped value carries its own omission note, and
+adds a hash of the FULL set (`paths_identity_sha256` for the path identity `_reconciles`
+compares; `urls_identity_sha256` for the native-retrieval URL set) wherever the complete
+evidence is not reachable from the store the bounded row lives in — the receipt lists need
+no hash because the whole receipt is durable in the per-task `verification_receipts.jsonl`.
+Bounding a set is allowed; hiding that you bounded it is the P1 violation, and a review
+round that finds one surviving `[:N]` on such a surface should sweep the phase for the
+rest rather than patch the instance. Second, "is anything still outstanding?" is a
+question about a SET of identities, so it is answered by an outstanding SET
+(`unreconciled_failed` / `unreconciled_masked`, each candidate scanned against ALL later
+reconcilers) and never by a single latest-POINTER, which a newer candidate silently
+overwrites: fail A, fail B, pass B once reported no red at all, and masked c1, masked c2,
+clean c2 lost c1 the same way. The `latest_*` helpers are projections of that set, and the
+acceptance summary carries its SIZE (`unreconciled_red_count`,
+`check_exit_masking_unreconciled_count`) so a second outstanding item cannot hide behind a
+flag that reads as if it described exactly one. Third, the acceptance summary projects the
+identity of the UNRECONCILED RED (`unreconciled_red_identity`) and not only of the latest
+receipt: a later green of a DIFFERENT verification leaves an earlier red standing, so a
+reviewer shown `unreconciled_red=true` beside a green `latest_*` would see a flag whose
+cause is nowhere in the packet. A flag without its cause is not reconstructible. Fourth —
+the rule the first three kept re-learning instance by instance — there is exactly ONE
+canonical identity derivation (`_outcome_receipts.receipt_canonical_identity`, built on
+the shared `shell_parse.canonical_command_text` seam and `canonical_path_set`), and
+comparison, hashing, counting and projection all read THAT object. A phase that carries a
+normalized/set-shaped identity for comparison and a raw/ordered one for display will keep
+producing findings where the two disagree: a lossy comparison form (`" ".join(x.split())`
+collapses whitespace inside quoted arguments, so two checks asserting different things
+compare equal and a green closes an unrelated red), rows counted where identities were
+promised, and a hash describing a set the carried items do not. The derivation implies an
+ORDER, and the order is always canonicalize the RAW values → render → bound: rendering
+is lossy (redaction, truncation), so de-duplicating after it drops distinct values while
+the omitted count still reports zero.
+
+Two consequences of that fourth rule are worth writing down rather than rediscovering.
+**The receipt store's `check` rendering changed in v6.78.0**: `tools/verify.py` now writes
+`shlex.join(argv)` where it wrote `" ".join(argv)`. A space-join is not injective — argv
+`["echo","a b"]` and `["echo","a","b"]` rendered to the same text, and since that text IS
+the verification's identity downstream, a green on one could clear a red on the other.
+`shlex.join` is the exact inverse of the lexer `canonical_command_text` re-tokenizes with,
+so the stored text round-trips back to the argv that ran — which only holds because that
+lexer now preserves QUOTING: `shlex` strips quotes before yielding tokens, so `echo '&&' x`
+and `echo && x` arrived identical, and the canonicalizer's leading/trailing separator strip
+then dropped a literal final `&&` argument as if it were syntax. Quoted and escaped
+punctuation is marked on the way into the lexer and the mark is read back off the tokens,
+so a literal argument that merely spells like an operator can never be mistaken for one;
+nothing is stripped afterwards. Path values are likewise left byte-for-byte alone — a
+leading or trailing space is a legal filename byte, and trimming it let observations of two
+different files reconcile. The rule behind all three: a normalization that discards
+information the identity depends on is not a normalization.
+
+**Changing a stored rendering means versioning it.** The cross-version cost of that switch
+was first written down here as safe in ONE direction — an old receipt carries `echo a b`
+where a new one for the same argv carries `echo 'a b'`, so they fail to reconcile, and a
+non-reconciling red STAYS RED. True, and not the whole picture: an old red and a new green
+from DIFFERENT argvs can render IDENTICALLY (`["echo","a b"]` and `["echo","a","b"]` were
+both space-joined to `echo a b`), and there the new green cleared the old red — a false
+green produced by the change made to remove one. Reasoning about a format migration one
+direction at a time is how that got missed; ask both, always. The root was that the receipt
+did not record WHICH renderer produced its text, so the comparator could not tell the two
+formats apart. It records it now: `check_rendering` is stamped beside the text by every
+writer that renders one (`shlex_join` for a rendered argv, `declared_text` for the agent's
+own verbatim text), an absent stamp reads `unversioned`, and the check identity is the
+RENDERING PAIRED WITH THE TEXT. Receipts from different renderings are therefore never the
+same verification — an `unversioned` receipt is not known-equal to a versioned one, it is
+UNKNOWN, and unknown must not clear a red. Two `unversioned` receipts still match each
+other, which is both the behaviour they had before the upgrade and the most that can be
+recovered from strings already on disk. An unrecognised future rendering is automatically
+its own namespace, so the next renderer change is safe without a code change — but it must
+still take a new stamp value, and a writer that stores a `check` without one is a bug (a
+test walks `verify.py`'s receipt writers and asserts every check-writing one stamps).
+The direction is now honestly stated: cross-version reconciliation is strictly LESS likely,
+so an upgrade may leave standing a red that was really fixed. A false red costs a human a
+second look; a false green costs the thing this whole surface exists for. The other two
+identities were asked the same question and neither has the hole: the MASKED path keys on
+the agent-authored `criterion_id`, which no writer ever re-rendered, and the observed
+`paths` set is stored RAW and canonicalized by the READER, so both eras are compared on
+today's terms — the phase's path change (dropping `.strip()`) was a comparator change, not
+a stored-format one. **And one KNOWN, deliberately
+deferred limit:** `tools/verify.py` bounds an `artifact_observation` receipt's observed
+path set at twenty (`paths[:20]`) with no omission count, so two observations differing
+only past the twentieth path are indistinguishable IN THE STORE. Unlike every bound above
+it, this one is on what gets written DURABLY, not on what gets projected — there is no
+complete set behind it for a downstream projection to recover, and `paths_identity_sha256`
+can only ever hash what the writer wrote. Fixing it means changing what the durable store
+holds and deserves its own scope. It is recorded here so it is a known limit rather than a
+silent one. It is ADVISORY only — it shapes a nudge and a
+disclosed reviewer flag (`expected_whitespace_normalized`), never a gate — so a
+mismatch costs at most one advisory nudge and can never lose a record. For semantic matching of fuzzy
 entities, use the LLM-first pattern (`semantic_dedup`: exact fingerprint as a
 cheap first pass, an LLM as the authority, fail-open) — never string equality.
 The enforcement shape is a REQUIRED typed argument at the consuming seam
@@ -220,14 +377,25 @@ per-feature nicety:
   an unconfigured provider.
 - **Scope-review ≥1M floor (BIBLE P3).** A direct-provider-only setup fills the
   scope-reviewer slot with its own model (mirroring the Cloud.ru pattern). Where the
-  single provider has no 1M-context model, BIBLE P3's AUDITED, owner-opt-in degraded
-  advisory scope review (`OUROBOROS_SCOPE_REVIEW_DEGRADED`) is the disclosed fallback;
-  the ≥1M floor is never lowered as a code default and the blocking triad still
-  reviews the staged diff in full. Since v6.55.0 the no-evidence 1M sentinel keys on
+  single provider has no 1M-context model, the disclosed fallback (v6.80.0) is the
+  owner-selected `low` context mode: whole-repository scope review is then declaredly
+  not performed and every commit records a typed `skipped_low_context_mode` evidence
+  row (the deprecated `OUROBOROS_SCOPE_REVIEW_FLOOR` is NOT that fallback — writing it
+  changes nothing). The ≥1M floor is never lowered as a code default, the removed
+  `OUROBOROS_SCOPE_REVIEW_DEGRADED` partial-coverage reviewer is NOT replaced by
+  anything that looks like the gate, and the blocking triad still reviews the staged
+  diff in full in both modes. Since v6.55.0 the no-evidence 1M sentinel keys on
   the shipped default reviewer (claude-fable-5), so an OpenAI-only install — whose
   designated scope reviewer stays `openai/gpt-5.5` — runs in the visible sub-floor
   window until Capability Evidence lands (generative probe or
-  `/api/owner/capability-ack`); the blocking triad is unaffected.
+  `/api/owner/capability-ack`); the blocking triad is unaffected. That ack is
+  REACHABLE from the UI: a scope-slot change makes the settings save probe the slot's
+  own route and return `review_capability_notices` carrying the same
+  `needs_ack:{route, route_fp, evidence}` payload the Max gate uses, which
+  `settings.js` renders through the same confirm flow. And an install that was
+  AUTO-downgraded to `low` can declare that `low` by re-selecting it in either owner
+  control (`/api/state` exposes `context_mode_auto_low` so the no-op click is not
+  short-circuited), which is what makes the fallback above reachable at all.
 - **Documented exceptions.** A few provider-specific extras are deliberately NOT
   universal: `web_search` (OpenAI Responses, OpenRouter server tool, Anthropic
   server tool, optional ddgs) and the Claude Agent SDK tools (Anthropic). These
@@ -392,6 +560,16 @@ If a core governance artifact cannot fit in the available context budget:
 - A reference-doc **navigation map** (full sections one `read_file` away) and a
   named on-demand pointer are visible, lossless representations — NOT silent
   truncation. The low context mode uses these; it never applies `[:N]` to a doc.
+- String bounding goes through the SSOT `utils.truncate_review_artifact`, never a
+  hand-rolled `text[:cap] + marker`. Besides the marker, that helper carries an
+  anti-waste FLOOR: a cut saving fewer characters than its own omission note is pure
+  damage, so below it the text passes through whole. A local re-implementation loses
+  the floor and can return a value LONGER than the input it "shortened" (a `…[+N
+  chars]` marker is 11 characters, so any overflow under that grew the field).
+- Bounding a LIST is subject to the same rule as bounding a string: a `[:N]` slice
+  must be accompanied by an explicit omitted COUNT, and — where the slice touches an
+  identity that something downstream compares — a durable hash or reference for the
+  full set (see `_outcome_receipts.receipt_identity_projection`).
 
 ### Invariant: Owner-facing surfaces show the full text (v6.70.0)
 
@@ -493,25 +671,46 @@ path. The shared `REVIEW_PROMPT_TOKEN_BUDGET` / `_SCOPE_BUDGET_TOKEN_LIMIT`
 `_SCOPE_MAX_TOKENS` for OUTPUT inside the reviewer's 1M context window plus
 substantial tokenizer headroom (currently 155K tokens):
 `_SCOPE_INPUT_TOKEN_LIMIT = min(920K, 1M − _SCOPE_MAX_TOKENS − margin)`.
-The cap is model-aware on two axes: Claude-family scope reviewers tokenize
-code-heavy packs at ~2.5 chars/token (~1.58x the chars/4 estimate), so
-`_effective_scope_input_limit` returns the calibrated
-`_ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT` (≈545K estimated tokens) for them, and a
-KNOWN reviewer window from Capability Evidence (`_scope_reviewer_window` ->
-`ouroboros.capability_evidence`; no static per-model table, v6.33.0) replaces the
-assumed 1M with reserves scaled to the window (`_window_scaled_reserves`) so a
-small-window slot keeps a positive input limit. The P3 floor is also an explicit
-binary config (`OUROBOROS_SCOPE_REVIEW_FLOOR` = `blocking_1m` default | `advisory`).
-A known sub-1M scope reviewer has advisory-only verdict authority and cannot
-satisfy the default `blocking_1m` gate, even after a clean response. If the
-irreducible canonical-docs prompt cannot fit, or the provider's real tokenizer
-rejects it as oversized, the default floor fails closed without an authoritative
-verdict; only the explicit owner-selected `advisory` floor keeps the disclosed
-non-blocking `budget_exceeded` result. Non-size provider failures remain
-fail-closed. The retained explicit degraded scope builder is diagnostic-only:
-`parallel_review` does not auto-launch it as a second substantive P3 call. Its
-findings are advisory-only and never replace the full-cap blocking scope-review
-floor. `docs/CHECKLISTS.md` remains the single source of truth for review items;
+The cap is model-aware on two axes. (1) Tokenizer DENSITY: Claude-family reviewers
+tokenize code-heavy packs at ~2.5 chars/token (~1.58x the chars/4 estimate), and since
+v6.80.0 that ratio is MEASURED per model at the physical send boundary and stored in
+the `token_density` namespace of `capability_evidence.json` — the hand-set
+`CLAUDE_REAL_TOKENS_PER_ESTIMATED = 1.65` and the `is_claude_family_model` substring
+gate are DELETED (a multiplier table is a perpetual-staleness anti-pattern; facts are
+measured or honestly unknown). `calibrated_input_token_limit` takes the STRICTEST of
+the 920K budget cap, `(window − output_reserve) / density`, and the historical
+`window − output_reserve − tokenizer_margin`, so it never exceeds the previous cap; a
+model with no observation uses the documented conservative cold-start density and
+therefore sizes DOWN. That cold-start density bounds the COLD path ONLY —
+`resolve_token_density` returns `measured × safety` with NO cold floor once an
+observation exists, because the constant is Claude-derived and flooring the measured
+path with it would permanently charge a lighter tokenizer for Claude's density.
+"Measurement can only ever TIGHTEN a cap" is enforced PER MODEL IDENTITY in the store
+instead: `record_token_density` keeps the RUNNING MAXIMUM, and one normalized model
+identity collects observations from every surface (the shipped `claude-fable-5` is both
+the scope reviewer and a triad slot), so a run of prose-dominated doc-only packs
+measuring ~1.1 cannot hand the next code-heavy scope pack a LOOSER cap than today's;
+the historical absolute-margin form bounds every cap regardless. `_effective_scope_input_limit` computes it PER CALL — the former
+import-time `_ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT` (≈545K) froze the pre-measurement
+value for the whole process. (2) WINDOW: a known reviewer window from Capability
+Evidence (`_scope_reviewer_window_evidence` -> `ouroboros.capability_evidence`; no
+static per-model table, v6.33.0) replaces the assumed 1M with reserves scaled to the
+window (`_window_scaled_reserves`) so a small-window slot keeps a positive input
+limit, and it now returns PROVENANCE (`confirmed` | `asserted` |
+`unknown_conservative` | `designated_default_sentinel`) so diagnostics stop calling a
+conservative fallback "known".
+Whether scope review applies at all is decided by the owner-only
+`OUROBOROS_CONTEXT_MODE`, read as the OWNER-SELECTED value (`get_owner_context_mode`).
+There is no floor CONFIG any more: `OUROBOROS_SCOPE_REVIEW_FLOOR` is deprecated and
+ENFORCEMENT-INERT since v6.80.0 — its owner endpoint, contract field and self-lowering
+guards are kept intact and the stored value is preserved and echoed with a deprecation
+notice, but nothing consults it and there is no getter for it. In `max` a known sub-1M scope reviewer has advisory-only
+verdict authority and cannot satisfy the blocking gate, even after a clean response;
+if the irreducible canonical-docs prompt cannot fit, or the provider's real tokenizer
+rejects it as oversized, the gate fails CLOSED without an authoritative verdict.
+Non-size provider failures remain fail-closed. In `low` no reviewer is called and a
+typed `skipped_low_context_mode` row is recorded instead — the owner's policy coupling,
+never a coverage claim. `docs/CHECKLISTS.md` remains the single source of truth for review items;
 do not duplicate or fork checklist policy here.
 
 ### External PR readiness is not commit authorization
@@ -635,11 +834,11 @@ Before every commit, verify the following:
 - `devtools/` is tracked operator code, not runtime core. It may contain benchmark harness adapters, smoke runners, and reproducibility helpers that should be versioned with Ouroboros, but runtime modules under `ouroboros/`, `server.py`, web modules, and build scripts must not import it.
 - `devtools/` is not included in the Python runtime package discovery; it is repository-side operator tooling, not an installed dependency of the Ouroboros app.
 - `devtools/` is not an immune-system bypass. If a commit touches `devtools/`, triad/scope reviewers inspect those touched files fully. Unrelated `devtools/` files use the Atlas `excluded_dir` disposition and stay coverage-manifest-only in broad packs so benchmark harness code does not drown normal core reviews.
-- Benchmark adapters must preserve official task instructions, official scoring/evaluation commands, and official artifact formats. They may build predictions, launch official runners, normalize logs, or aggregate official outputs, but must not implement benchmark-specific prompt hacks, routing hacks, or replacement scoring.
+- Benchmark adapters must preserve official task instructions, official scoring/evaluation commands, and official artifact formats. They may build predictions, launch official runners, normalize logs, or aggregate official outputs, but must not implement benchmark-specific prompt hacks, routing hacks, or replacement scoring. CARVE-OUT (explicit, owner Q20/Q22, v6.79.0): a NEGATIVE or DISCLOSURE-shaped instruction of the `GAIA_ANTI_LEAK_INSTRUCTION` / `GAIA_EPISTEMIC_INSTRUCTION` class is not a prompt hack and belongs in the adapter. Such text may forbid answer-key lookup and require the agent to say when a claim is unverified; it must NOT tell the agent how to solve the task, name the benchmark, or reveal answer-shaping hints, it must be a single SSOT constant appended identically by every solver of that harness (so cross-harness comparisons stay fair), it must be disclosed in that benchmark's METHODOLOGY.md, and it must stay OUT of `prompts/SYSTEM.md` and out of the typed task contract — a runtime-wide grounding duty would make ordinary tasks search the web for facts the model already knows.
 - Generated benchmark runs, datasets, container outputs, logs, predictions, and submissions belong under `/Users/anton/Ouroboros/bench_runs/` or another explicit output root outside `repo/`, never under `devtools/`.
 - SWE-bench Pro patch capture must be provenance-based, not filename-pattern-based: pre-existing base-untracked files may be excluded from `model_patch` by a base snapshot, while genuinely new agent-created files must remain included. Keep diagnostic status artifacts honest about whether they are pre-filter or post-filter.
 - SWE-bench Pro install transports must fail fast with typed infra reasons for permanent environment failures (for example musl pyexpat/pip/server-import failures) instead of retrying them as provider/network transients.
-- Run provenance is a GATE, not a report. Build the run manifest through `benchmark_run_manifest()` ONCE, immediately after argument parsing or readiness — that call is where the clean-seed gate runs (`require_clean=True` by default; the launcher flag `--allow-dirty-seed` records the exception) — then write it to disk at once (a later refusal must still leave a durable record of what was refused and why), keep that dict, augment it, and rewrite it at the end with the final outcome. A manifest written after the work cannot refuse anything, and one that never records how the run ended cannot be audited. Nothing that costs money or mutates shared state (image pulls, volume writes, container starts) may precede that gate. `benchmark_run_manifest` sits exactly on the 8-parameter limit: further knobs ride through `metadata`/`**overrides`, never as new parameters. Since v6.75.0 that lifecycle is TWO SHARED SEAMS, not a per-launcher convention: `admit_benchmark_run(manifest_path, **manifest_kwargs)` builds, persists and only then enforces (a refusal raises `BenchmarkAdmissionRefused`, a `RuntimeError` carrying the manifest, so the record of what was refused is durable), and `finalize_run_manifest(manifest_path, manifest)` is the single finalization seam — a context manager whose yielded mapping is merged into `manifest["extra"]` and written on every exit path, including an escaping exception (`outcome: crashed` plus a typed `error`). Never pair `benchmark_run_manifest()` with your own `write_json()` in a launcher again: a meta-test in `tests/test_devtools_benchmarks.py` names every migrated launcher and fails if one does. ADMISSION IS THE OUTER BOUNDARY: everything in a launcher before `admit_benchmark_run()` must be argument parsing and pure local derivation — no filesystem assertion, no docker, no subprocess, no network, no state mutation, and nothing that can itself refuse evaluated inside the admission call's argument list (Python evaluates arguments first, so such a refusal writes no manifest at all). The same meta-test walks each launcher with `ast` and fails on a denylisted pre-admission call; put the check inside the finalization block and record a typed `refusal` instead. THE RECORDED `exit_code` MUST BE THE PROCESS'S EXIT STATUS: after writing one, RETURN it — do not re-raise, because an escaping non-`SystemExit` exception exits the process with 1 no matter what the manifest says. Recording 1 and letting the exception escape is equally valid; a parametrised behavioural test in `tests/test_devtools_benchmarks.py` drives every migrated launcher into a refusal path and compares the two.
+- Run provenance is a GATE, not a report. Build the run manifest through `benchmark_run_manifest()` ONCE, immediately after argument parsing or readiness — that call is where the clean-seed gate runs (`require_clean=True` by default; the launcher flag `--allow-dirty-seed` records the exception) — then write it to disk at once (a later refusal must still leave a durable record of what was refused and why), keep that dict, augment it, and rewrite it at the end with the final outcome. A manifest written after the work cannot refuse anything, and one that never records how the run ended cannot be audited. Nothing that costs money or mutates shared state (image pulls, volume writes, container starts) may precede that gate. `benchmark_run_manifest` sits exactly on the 8-parameter limit: further knobs ride through `metadata`/`**overrides`, never as new parameters. Since v6.75.0 that lifecycle is TWO SHARED SEAMS, not a per-launcher convention: `admit_benchmark_run(manifest_path, **manifest_kwargs)` builds, persists and only then enforces (a refusal raises `BenchmarkAdmissionRefused`, a `RuntimeError` carrying the manifest, so the record of what was refused is durable), and `finalize_run_manifest(manifest_path, manifest)` is the single finalization seam — a context manager whose yielded mapping is merged into `manifest["extra"]` and written on every exit path, including an escaping exception (`outcome: crashed` plus a typed `error`). Never pair `benchmark_run_manifest()` with your own `write_json()` in a launcher again: a meta-test in `tests/test_devtools_benchmarks.py` names every migrated launcher and fails if one does. ADMISSION IS THE OUTER BOUNDARY: everything in a launcher before `admit_benchmark_run()` must be argument parsing and pure local derivation — no filesystem assertion, no docker, no subprocess, no network, no state mutation, and nothing that can itself refuse evaluated inside the admission call's argument list (Python evaluates arguments first, so such a refusal writes no manifest at all). The same meta-test walks each launcher with `ast` and fails on a denylisted pre-admission call; put the check inside the finalization block and record a typed `refusal` instead. THE RECORDED `exit_code` MUST BE THE PROCESS'S EXIT STATUS: after writing one, RETURN it — do not re-raise, because an escaping non-`SystemExit` exception exits the process with 1 no matter what the manifest says. Recording 1 and letting the exception escape is equally valid; a parametrised behavioural test in `tests/test_devtools_benchmarks.py` drives every migrated launcher into a refusal path and compares the two. AND THE RECORDED OUTCOME MUST COME FROM THE HARNESS'S OWN RESULT, NEVER FROM ITS EXIT CODE: `inspect eval` returns 0 for an eval that raised and `harbor run` returns 0 for a job whose trials all errored, so a launcher that maps `returncode == 0` to `outcome: completed` records an infrastructure failure as a successful run (v6.81.0 GAIA smoke: every sample killed by a sandbox setup timeout, nothing scored, manifest `completed`/`exit_code: 0`). Read the harness's own artefact — inspect's log `status` plus per-sample `scores`, harbor's trial rewards — and keep three facts APART: a harness that raised, a harness that finished and scored nothing (both infrastructure zeros, both non-`completed` and non-zero exit), and a harness that scored genuine zeros (a real result, `completed`). An unreadable artefact is a fourth, fail-closed case, not a pass: unknown success is not success.
 - Provenance compares three DIFFERENT identities and never conflates them: the immutable seed stamp (equality), the live HEAD of an evolving volume (a LINE OF DESCENT via `merge-base --is-ancestor` — an evolution run legitimately moves HEAD forward), and the version a running server reports over HTTP. A refusal must be a ONE-SHOT step, never part of a polled readiness probe whose loop reads any non-zero rc as "not ready yet". Volume seeding stays conditional: an existing `.git` is an evolved volume and is never re-seeded.
 - New helpers for provenance/preflight belong in `devtools/benchmarks/common/manifests.py`, which stays stdlib-only at module import (launchers include a container-side agent that must not gain a runtime-package dependency) — import from `ouroboros` lazily inside the function that needs it.
 
@@ -764,6 +963,28 @@ Before every commit, verify the following:
   (`OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT`) are coerced to the light lane. Enabled/reviewed extension tools and enabled MCP tools may remain
   callable by owner policy, subject to inherited `task_contract.allowed_resources`
   such as no-network/no-web.
+- A NEW `plan_task` scout wave is admitted before launch, and only a NEW one: worker capacity,
+  the shared review-wave budget gate (`review_helpers.review_wave_budget_gate` — no second budget
+  authority), and a consumable window. Each scout's deadline is bound to that window (the wave's
+  shared cutoff minus the finalization grace and a margin, the reserve capped at a fraction of a
+  short window) instead of inheriting the parent deadline verbatim, and a wave whose window has
+  already closed is refused with a typed reason rather than started and then omitted. The
+  recovery/collection path is NEVER gated: those handoffs are already paid for, so declining them
+  would abandon spend. With `OUROBOROS_MAX_SUBAGENT_DEPTH=0` scouts are refused by the same
+  delegation gate as any other child, and `plan_task` then completes on its existing
+  `degraded_evidence` path — no wedge, no second wave.
+- Runtime-internal scheduling knobs do NOT become `schedule_subagent` parameters.
+  `control._schedule_task` is `(ctx, internal, /, **params)`: `params` is validated against
+  `control.schedule_subagent_param_names()`, which is DERIVED from
+  `control.schedule_subagent_properties()` — the single source the published JSON schema in
+  `get_tools` is also built from (unknown keys get the strict v6 refusal). There is no separate
+  mirror of the schema to keep in sync, and none may be reintroduced: a hand-maintained copy is
+  correct only until one side gains a parameter, at which point the handler refuses something the
+  model can see or accepts something it cannot (BIBLE P7). Internal-only options instead travel in
+  the POSITIONAL-ONLY `internal` mapping keyed by `_INTERNAL_SCHEDULE_OPTIONS` — structurally
+  unreachable from tool-call JSON, which is keyword-only. That is what keeps the handler inside the
+  <8-parameter contract; the scout `deadline_at` is the first such option. Add an internal knob to
+  that closed set, never to the signature and never to the public schema.
 - `plan_task` planning scouts use the same live-subagent worker pool and one
   shared terminal-or-cutoff wait boundary. Poll in
   `OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC` slices, but wait for every started scout
@@ -851,7 +1072,7 @@ Before every commit, verify the following:
 - [ ] Before dispatching any post-task consolidation or synthesis worker, read `usage_breakdown` once for the whole root subtree and pass the same loop-local snapshot to summary and reflection. It is explicitly non-final (`cost_final=false`, `cost_with_children_partial=true`) and carries child-inclusive accounted cost, reservations, unresolved upper bound, unknown/unmetered count, ledger integrity, and capture time. A read failure is unavailable/null, never `$0`. Consolidation, summary, and reflection model spend belongs only to the existing terminal checkpoint; do not add another ledger or reconciliation LLM call.
 - [ ] Runtime notices after the first user/assistant/tool turn are user notices, not new `role=system` messages. `LLMClient` defensively demotes non-leading system messages at the provider boundary; source call-sites should still append `[SYSTEM NOTICE]` user turns so provider payloads, local templates, and prompt authority stay consistent.
 - [ ] Keep stable policy/governance first and dynamic evidence last. Prompt-cache support is deliberately narrow: direct OpenAI `prompt_cache_key`, OpenRouter `session_id` (or a caller-declared `cache_affinity` for surfaces whose rounds repeat with changing evidence, e.g. review), and one exact retry without the named parameter only when the provider explicitly rejects that parameter. Do not add provider hops, body rerouting, or a generic cache/retry framework.
-- [ ] **Cache-friendliness invariant.** Any change that builds or reorders prompt/context content must not degrade prompt caching: never insert dynamic values (timestamps, hashes, round counters, per-task identity) into a stable cached prefix, never move stable governance content behind dynamic evidence, and never strip or bypass existing `cache_control` markers / cache-affinity keys. Review surfaces mark their stable prefix via `review_helpers.cached_prompt_blocks` (block-level `cache_control` with the review TTL); the boundary each builder reports must contain only byte-stable content. The acceptance substrate (v6.74.0) marks TWO segments — byte-stable governance, then the task-stable contract (goal/scope/checklist/policy) — leaves the per-pass evidence tail unmarked (it changes every pass by design; the exact review binding is useless as a breakpoint because an unchanged binding never makes a second call), keeps slot identity at the TAIL of the mutable part, and asserts `review_substrate.assert_cache_breakpoint_cap` (≤4 declared breakpoints) on the final payload — reuse that assertion in new multi-segment builders. This is checklist item `cache_friendliness` in `docs/CHECKLISTS.md`.
+- [ ] **Cache-friendliness invariant.** Any change that builds or reorders prompt/context content must not degrade prompt caching: never insert dynamic values (timestamps, hashes, round counters, per-task identity) into a stable cached prefix, never move stable governance content behind dynamic evidence, and never strip or bypass existing `cache_control` markers / cache-affinity keys. Review surfaces mark their stable prefix via `review_helpers.cached_prompt_blocks` (block-level `cache_control` with the review TTL); the boundary each builder reports must contain only byte-stable content. The acceptance substrate (v6.74.0) marks TWO segments — byte-stable governance, then the task-stable contract (goal/scope/checklist/policy) — leaves the per-pass evidence tail unmarked (it changes every pass by design; the exact review binding is useless as a breakpoint because an unchanged binding never makes a second call), keeps slot identity at the TAIL of the mutable part, and asserts `review_substrate.assert_cache_breakpoint_cap` (≤4 declared breakpoints) on the final payload — reuse that assertion in new multi-segment builders. (v6.77.0) A builder no longer places tool markers or orders TTLs itself: `llm.LLMClient._normalize_payload_cache_ttl` finalizes the ASSEMBLED provider payload at every physical-send boundary — it promotes earlier existing breakpoints to `1h` when any later one asks for `1h` (Anthropic requires longer TTLs first; a 5m tools marker before a 1h system marker is a hard 400), marks the last tool schema when the tools segment carries none, and on a >4 payload keeps the four earliest anchors while dropping tail markers with a disclosed `prompt_cache_breakpoints_reduced` usage field. Declare your intended TTL on the blocks you own and let the finalizer order them; the assertion above remains the LOUD builder-side layer (the finalizer is the fail-soft transport guard), and routes that cannot carry markers are left byte-identical, so never re-add a per-builder marking site. This is checklist item `cache_friendliness` in `docs/CHECKLISTS.md`.
 - [ ] OpenRouter reasoning continuity belongs to OpenRouter conversations only. Direct/local payloads strip OpenRouter round-trip metadata; OpenRouter payloads with `reasoning_details` disable provider fallback to avoid endpoint-bound thought-signature corruption.
 - [ ] Claude Agent SDK edit prompts must preserve the full governance prompt. Use the gateway's system-prompt file handoff when the installed SDK exposes one; do not truncate BIBLE/ARCHITECTURE/DEVELOPMENT/CHECKLISTS to avoid argv or transport limits.
 - [ ] Provider failures must be classified before retrying the same request.
@@ -888,7 +1109,7 @@ Before every commit, verify the following:
 - [ ] Every direct child result needs an exact-hash disposition through the existing `tree_note(kind="decision")` tagged payload (`type=child_result_disposition`, child id, `integrated | irrelevant | deferred`, complete-result SHA-256; note text is rationale). The typed task-tree row is the sole authority; task-result disposition fields are derived reads, never a mirrored write. The join-ledger helper alone validates lineage and current content. Stale or malformed payloads change nothing. `deferred` suppresses only the unchanged reminder and forces an honest degraded/best-effort terminal answer until the item is resolved. Explicit cancellation wins a late-completion race and bounded child scratch is removed without preserving another copy.
 - [ ] Host task acceptance is root-only. Queued/headless/scheduled roots are reviewed in `auto` and `required`; direct eligibility is the union of `outcomes.turn_has_reviewable_effects` and a typed deliverable/criterion. Ordinary read-only tool activity, pure conversation, and meta/routing controls are not reviewed, and child reviews remain advisory. Eligibility must use structured facts, never keywords (Bible P3/P5). For an eligible root under `auto|required`, agent-callable `task_acceptance_review` validates/stores evidence and optional agent disposition but makes zero reviewer calls; it returns `deferred_to_host_acceptance`, `authoritative=false`, and the evidence revision. The call itself never widens eligibility; child and `off` behavior remain unchanged.
 - [ ] Before root acceptance, atomically fence new descendants under the queue lock and prove recursive subtree quiescence from the existing task-status SSOT. Split-drive ACK, subtree, and acceptance-timing reads/writes use canonical `budget_drive_root`. Preserve the prior verdict until the replacement is recorded. A revision must explicitly reopen the fence; terminal/degraded outcomes seal it.
-- [ ] The host runs the authoritative acceptance panel once per unchanged candidate-hash/evidence-revision/fence binding. Task-acceptance actors receive one substantive call and at most two physical attempts total. Record transport status, parse status, and valid-response semantic verdict separately, with actor model/provider, role, coverage, panel id, quorum contribution, reason, enforcement impact, and binding hashes. Public task/event/UI records receive only the compact projection; full model payloads remain in private audit storage. `adaptive_quorum` applies; any contributing FAIL fails, DEGRADED abstains, and no quorum is `review_degraded`. Clean requires PASS + solved + supported criterion evidence. Chat and Logs must use the same severity reducer, and degraded review or best-effort/degraded objective must never render as green solved. Do not add task scope review or reuse the commit gate.
+- [ ] The host runs the authoritative acceptance panel once per unchanged candidate-hash/evidence-revision/fence binding. Task-acceptance actors receive one substantive call and at most two physical attempts total. Record transport status, parse status, and valid-response semantic verdict separately, with actor model/provider, role, coverage, panel id, quorum contribution, reason, enforcement impact, and binding hashes. Public task/event/UI records receive only the compact projection; full model payloads remain in private audit storage. `adaptive_quorum` applies; any contributing FAIL fails, DEGRADED abstains (the reviewer verdict vocabulary `PASS|FAIL|DEGRADED` is NOT narrowable — `_contract_valid_actors`, the deliberate-DEGRADED capsule rail and the host's core-overflow DEGRADED all depend on it), and no quorum is a terminal HOST decision. The host acceptance decision itself is written ONLY by `loop._set_acceptance_decision` and has exactly three owner-facing states — `accepted | revision_requested | finalized_unaccepted` — each with a typed `reason` from an existing structured fact; an unknown status fails closed to `finalized_unaccepted` keeping its raw token as the reason. When you add a writer, add its reason to the closed set AND check every value-keyed reader: `outcomes.derive_loop_outcome` keys the deadline-reserve degradation on the status+reason PAIR, and breaking that pairing is a silent false green. The agent may write only `agent_disposition`/`agent_rationale`, merged into the host decision, never replacing it. Clean requires PASS + solved + supported criterion evidence. Chat and Logs must use the same severity reducer, and degraded review or best-effort/degraded objective must never render as green solved. Do not add task scope review or reuse the commit gate.
 - [ ] The acceptance improvement loop is a reviewer-authored DIALOGUE (v6.74.0): obligation identity comes from the reviewer's typed `disposition_kind`/`obligation_id` (an unknown re-raise id fails closed to `new`, disclosed — never a silent fresh hash id); a re-raise reopens the row WITHOUT wiping the agent's argument (`previous_disposition`/`previous_reason`/`reopened_count` survive into the evidence catalog and the obligations clause); termination beyond a clean PASS/accepted rebuttal happens ONLY via the reviewers' quorum `dialogue_status` judgement reduced over ALL contract-valid actors (`aggregate_dialogue_status` — never `_contributing_actors`, which drops a DEGRADED slot's vote) or a real rail — no host counters, no answer/verdict hashes, no keyword gates (P5). Changes here must cover: malformed reviewer output, unknown/stale `obligation_id` on a re_raise, partial panel failure, multi-slot dialogue-status disagreement (the reducer's precedence), replay/restart durability of obligation rows, false completion, and the backward-compatible default when the new fields are absent.
 - [ ] An explicit `max_improvement_passes` binds under every legacy policy. Required+Blocking without one has no local count cap, but real deadline/budget/lifecycle rails remain. The first acceptance review reserves at least 200s; later passes use the canonical event-derived `max(floor, 1.5×EWMA)` (`alpha=0.5`). Only the root runs global post-task synthesis once and persists one phase checkpoint in the canonical `budget_drive_root`. Recovery is startup-only: replay `pending_once`, degrade indeterminate `running` without another paid call, and let the normal supervisor copy-back/artifact path materialize child results without overwriting a terminal canonical phase.
 

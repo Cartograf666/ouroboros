@@ -1,4 +1,5 @@
 import pathlib
+import re
 
 import pytest
 
@@ -80,6 +81,28 @@ def test_readme_version_history_stays_within_minor_row_limit():
 
     warnings = check_history_limit(readme)
     assert not [w for w in warnings if "minor rows" in w]
+
+
+def test_readme_version_history_rows_render_as_three_cells():
+    """GFM splits a table row on EVERY unescaped `|` — including one inside a code
+    span. A row that inlines a pipe-separated vocabulary (`a | b`, `PASS|FAIL`)
+    unescaped is parsed as 5+ cells against a 3-column table, and GitHub silently
+    DROPS everything after the third cell: the v6.78.0 row lost its whole disclosed-
+    narrowing tail that way. Every Version History row must carry exactly the 4
+    unescaped pipes of a 3-cell row."""
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+
+    rows = [
+        line for line in readme.splitlines()
+        if re.match(r"^\| \d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)? \|", line)
+    ]
+    assert len(rows) >= 2, "Version History rows not found"
+    offenders = {
+        line.split("|")[1].strip(): len(re.findall(r"(?<!\\)\|", line))
+        for line in rows
+        if len(re.findall(r"(?<!\\)\|", line)) != 4
+    }
+    assert not offenders, f"escape the inner pipes in these rows: {offenders}"
 
 
 def test_readme_documents_release_tag_prerequisite_for_build_scripts():

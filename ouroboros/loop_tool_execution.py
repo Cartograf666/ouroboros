@@ -37,6 +37,7 @@ from ouroboros.utils import (
     sanitize_tool_args_for_log,
     sanitize_tool_result_for_log,
     truncate_for_log,
+    truncate_review_artifact,
     utc_now_iso,
 )
 
@@ -1092,16 +1093,25 @@ def process_tool_results(
                         llm_trace["acceptance_decision"] = _dec
                     agent_decision = parsed.get("agent_decision") if isinstance(parsed.get("agent_decision"), dict) else {}
                     if agent_decision:
-                        llm_trace["acceptance_decision"] = {
-                            "status": str(agent_decision.get("disposition") or ""),
-                            "source": str(agent_decision.get("source") or "agent_task_acceptance_review_tool"),
-                            "rationale": str(agent_decision.get("rationale") or "")[:500],
-                            "agent_disposition": str(agent_decision.get("disposition") or ""),
-                            "agent_rationale": str(agent_decision.get("rationale") or "")[:500],
-                            # Carried forward, not overwritten (review round 3): the
-                            # payload delivers dissent_noted and agent_decision together.
-                            **({"dissent_noted": True} if parsed.get("dissent_noted") else {}),
-                        }
+                        # v6.78.0 (P4.1, owner Q23=A): the HOST is the only writer of the
+                        # acceptance verdict. The agent's stance is MERGED as its own
+                        # `agent_disposition`/`agent_rationale` (already projected and
+                        # already carried forward across host writes) and can no longer
+                        # overwrite `status`/`source`/`rationale`. A merge, not a fresh
+                        # dict: assigning a new dict here would clobber an earlier host
+                        # verdict even after dropping the three keys.
+                        _dec = llm_trace.get("acceptance_decision") if isinstance(llm_trace.get("acceptance_decision"), dict) else {}
+                        _dec.setdefault("source", "agent_task_acceptance_review_tool")
+                        _dec["agent_disposition"] = str(agent_decision.get("disposition") or "")
+                        # DISCLOSED bound (BIBLE P1): the agent's stance is reviewer-facing
+                        # evidence, so a clipped rationale carries its own omission note
+                        # rather than ending mid-argument as if that were all it said.
+                        _dec["agent_rationale"] = truncate_review_artifact(
+                            str(agent_decision.get("rationale") or ""), limit=500,
+                        )
+                        if parsed.get("dissent_noted"):
+                            _dec["dissent_noted"] = True
+                        llm_trace["acceptance_decision"] = _dec
                         # v6.54.4 obligations layer: apply the agent's per-obligation
                         # dispositions onto the host-collected per-task obligations.
                         ob_dispositions = agent_decision.get("obligation_dispositions")
@@ -1116,7 +1126,9 @@ def process_tool_results(
                                 entry = by_id.get(str(ob.get("id") or ""))
                                 if entry:
                                     ob["disposition"] = str(entry.get("disposition") or "")
-                                    ob["disposition_reason"] = str(entry.get("reason") or "")[:500]
+                                    ob["disposition_reason"] = truncate_review_artifact(
+                                        str(entry.get("reason") or ""), limit=500,
+                                    )
                                     # "agent_disposed", not "disposed": this status renders inside the
                                     # host_attested catalog and must not read as host adjudication
                                     # (host lifecycle values stay "open"/"disposed_by_re_review").

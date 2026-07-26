@@ -15,12 +15,12 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
-from devtools.benchmarks.common.manifests import benchmark_run_manifest, repo_provenance, write_json
+from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_run_manifest
 from devtools.benchmarks.common.result_index import task_result_row, write_result_index
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
-    ensure_file_output_outside_repo,
-    ensure_outside_repo,
+    assert_file_output_outside_repo,
+    assert_outside_repo,
     repo_root_from_devtools,
     run_root as default_run_root,
 )
@@ -66,6 +66,9 @@ def harbor_command(
         "install_timeout_sec=1200",
         "--agent-kwarg",
         "server_start_timeout_sec=240",
+        # Dataset identity for the adapter's per-task cache lookup (org is not a constant).
+        "--agent-kwarg",
+        f"dataset={dataset}",
     ]
     if host_settings_path:
         cmd.extend(["--agent-kwarg", f"host_settings_path={host_settings_path}"])
@@ -160,19 +163,23 @@ def main() -> int:
     parser.add_argument("--settings-path", default="")
     parser.add_argument("--isolated-data-root", default="")
     parser.add_argument("--ledger-output", default="", help="denominator-preserving JSONL result ledger")
-    parser.add_argument("--require-clean-source", action="store_true")
+    parser.add_argument(
+        "--allow-dirty-seed",
+        action="store_true",
+        help="record and proceed with an unclean/unidentifiable seed checkout instead of refusing",
+    )
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
 
     repo_root = repo_root_from_devtools()
     settings_path = pathlib.Path(args.settings_path).expanduser() if args.settings_path else default_settings_path()
-    run_root = ensure_outside_repo(
+    run_root = assert_outside_repo(
         pathlib.Path(args.run_root).expanduser() if args.run_root else default_run_root("terminal_bench"),
         repo_root,
     )
-    source = repo_provenance(repo_root)
-    if args.require_clean_source and source.get("dirty"):
-        raise RuntimeError("Terminal-Bench publishable mode requires a clean Ouroboros source tree")
+    # The shared seed gate below (benchmark_run_manifest, fail-closed since v6.75.0) is now the
+    # single authority on source cleanliness; the old opt-in --require-clean-source check was a
+    # weaker duplicate of it.
     actual_include_filters = args.task or []
     effective_n_tasks = len(actual_include_filters) if actual_include_filters else int(args.n_tasks)
     task_names = actual_include_filters or [f"selection-slot-{idx + 1}" for idx in range(effective_n_tasks)]
@@ -191,147 +198,151 @@ def main() -> int:
         options={"execute": args.execute, "host_settings_path": str(settings_path)},
     )
     ledger_output = (
-        ensure_file_output_outside_repo(pathlib.Path(args.ledger_output), repo_root)
+        assert_file_output_outside_repo(pathlib.Path(args.ledger_output), repo_root)
         if args.ledger_output
         else run_root / "result_index.jsonl"
     )
-    run_root.mkdir(parents=True, exist_ok=True)
-    manifest = benchmark_run_manifest(
+    manifest_path = run_root / "run_manifest.json"
+    # Admission is the outermost REFUSAL point, not the outermost side effect: `ensure_outside_repo`
+    # above already created `run_root` (it mkdirs). So a refused run leaves that directory holding
+    # nothing but the persisted refusal — no harbor invocation, no ledger, no settings render.
+    manifest = admit_benchmark_run(
+        manifest_path,
         benchmark="terminal_bench",
         run_root=run_root,
         repo_dir=repo_root,
         requested_task_ids=list(actual_include_filters),
-        # v6.75.0: the shared seed gate now defaults to require_clean=True. This launcher
-        # keeps its pre-v6.75.0 behaviour until its own phase adds --allow-dirty-seed.
-        require_clean=False,
-        metadata={
-            "argv": sys.argv,
-            "output_paths": {"harbor_output_dir": str(run_root)},
-            "dataset": args.dataset,
-            "harness": {"agent_import": AGENT_IMPORT, "harbor_bin": args.harbor_bin},
-            "official_command": cmd,
-            "timeout_sec": None,
-            "isolated_data_root": args.isolated_data_root,
-            "settings_path": settings_path,
-            "extra": {
-                "n_tasks": effective_n_tasks,
-                "requested_n_tasks_arg": int(args.n_tasks),
-                "n_concurrent": int(args.n_concurrent),
-                "source_dirty_allowed": not args.require_clean_source,
-                "selection": {
-                    "mode": "explicit_task_ids" if actual_include_filters else "deterministic_first_n",
-                    "requested_slots": task_names,
-                    "include_filters": actual_include_filters,
-                },
+        require_clean=not args.allow_dirty_seed,
+        argv=sys.argv,
+        output_paths={"harbor_output_dir": str(run_root)},
+        dataset=args.dataset,
+        harness={"agent_import": AGENT_IMPORT, "harbor_bin": args.harbor_bin},
+        official_command=cmd,
+        timeout_sec=None,
+        isolated_data_root=args.isolated_data_root,
+        settings_path=settings_path,
+        extra={
+            "outcome": "started",
+            "n_tasks": effective_n_tasks,
+            "requested_n_tasks_arg": int(args.n_tasks),
+            "n_concurrent": int(args.n_concurrent),
+            "source_dirty_allowed": bool(args.allow_dirty_seed),
+            "selection": {
+                "mode": "explicit_task_ids" if actual_include_filters else "deterministic_first_n",
+                "requested_slots": task_names,
+                "include_filters": actual_include_filters,
             },
         },
     )
     if not actual_include_filters:
         manifest["requested_count"] = effective_n_tasks
-    write_json(run_root / "run_manifest.json", manifest)
-    (run_root / "harbor_command.json").write_text(json.dumps({"run_root": str(run_root), "cmd": cmd, "agent_import": AGENT_IMPORT}, indent=2), encoding="utf-8")
-    status = "planned"
-    reason = "command_generated"
-    official_eval_status = "not_run"
-    print(shlex.join(cmd))
-    returncode = 0
-    harbor_result: pathlib.Path | None = None
-    harbor_result_error = ""
-    observed_outcomes: list[dict[str, object]] = []
-    if args.execute:
-        before_results = set(_harbor_results(run_root))
-        try:
-            completed = subprocess.run(cmd, cwd=repo_root, env=_harbor_child_env(repo_root))
-        except Exception as exc:
-            harbor_result_error = f"{type(exc).__name__}: {exc}"
-            status = "harness_failed"
-            reason = "harbor_invocation_failed"
-            official_eval_status = "failed"
-            returncode = 2
-        else:
-            returncode = completed.returncode
-            status = "harness_completed" if returncode == 0 else "harness_failed"
-            reason = "harbor_returncode_0" if returncode == 0 else "harbor_returncode_nonzero"
-            official_eval_status = "completed" if returncode == 0 else "failed"
+    with finalize_run_manifest(manifest_path, manifest) as final:
+        (run_root / "harbor_command.json").write_text(json.dumps({"run_root": str(run_root), "cmd": cmd, "agent_import": AGENT_IMPORT}, indent=2), encoding="utf-8")
+        status = "planned"
+        reason = "command_generated"
+        official_eval_status = "not_run"
+        print(shlex.join(cmd))
+        returncode = 0
+        harbor_result: pathlib.Path | None = None
+        harbor_result_error = ""
+        observed_outcomes: list[dict[str, object]] = []
+        if args.execute:
+            before_results = set(_harbor_results(run_root))
             try:
-                harbor_result = _new_harbor_result(run_root, before_results)
+                completed = subprocess.run(cmd, cwd=repo_root, env=_harbor_child_env(repo_root))
             except Exception as exc:
-                harbor_result_error = str(exc)
+                harbor_result_error = f"{type(exc).__name__}: {exc}"
                 status = "harness_failed"
-                reason = "harbor_result_unresolved"
+                reason = "harbor_invocation_failed"
                 official_eval_status = "failed"
-                returncode = returncode or 2
-        if harbor_result is not None:
-            observed_outcomes = _harbor_task_outcomes(harbor_result)
-            observed_ids = {str(item.get("instance_id") or "") for item in observed_outcomes}
-            expected_ids = set(actual_include_filters)
-            if not observed_outcomes and effective_n_tasks > 0:
-                harbor_result_error = "Harbor result contained no parseable task outcomes"
-            elif expected_ids and not observed_ids.issubset(expected_ids):
-                extras = sorted(observed_ids - expected_ids)
-                harbor_result_error = f"Harbor result included unexpected task ids: {extras}"
-            elif expected_ids:
-                missing = sorted(expected_ids - observed_ids)
-                if missing:
-                    harbor_result_error = f"Harbor result omitted requested task ids: {missing}"
-            elif len(observed_outcomes) != effective_n_tasks:
-                harbor_result_error = (
-                    f"Harbor result completed {len(observed_outcomes)} outcomes, expected {effective_n_tasks}"
+                returncode = 2
+            else:
+                returncode = completed.returncode
+                status = "harness_completed" if returncode == 0 else "harness_failed"
+                reason = "harbor_returncode_0" if returncode == 0 else "harbor_returncode_nonzero"
+                official_eval_status = "completed" if returncode == 0 else "failed"
+                try:
+                    harbor_result = _new_harbor_result(run_root, before_results)
+                except Exception as exc:
+                    harbor_result_error = str(exc)
+                    status = "harness_failed"
+                    reason = "harbor_result_unresolved"
+                    official_eval_status = "failed"
+                    returncode = returncode or 2
+            if harbor_result is not None:
+                observed_outcomes = _harbor_task_outcomes(harbor_result)
+                observed_ids = {str(item.get("instance_id") or "") for item in observed_outcomes}
+                expected_ids = set(actual_include_filters)
+                if not observed_outcomes and effective_n_tasks > 0:
+                    harbor_result_error = "Harbor result contained no parseable task outcomes"
+                elif expected_ids and not observed_ids.issubset(expected_ids):
+                    extras = sorted(observed_ids - expected_ids)
+                    harbor_result_error = f"Harbor result included unexpected task ids: {extras}"
+                elif expected_ids:
+                    missing = sorted(expected_ids - observed_ids)
+                    if missing:
+                        harbor_result_error = f"Harbor result omitted requested task ids: {missing}"
+                elif len(observed_outcomes) != effective_n_tasks:
+                    harbor_result_error = (
+                        f"Harbor result completed {len(observed_outcomes)} outcomes, expected {effective_n_tasks}"
+                    )
+                if harbor_result_error:
+                    status = "harness_failed"
+                    reason = "harbor_result_unresolved"
+                    official_eval_status = "failed"
+                    returncode = returncode or 2
+                # The finalization seam rewrites the manifest on EVERY exit path, so these
+                # observed-result fields need no separate write here.
+                manifest["output_paths"]["harbor_result"] = str(harbor_result)
+                manifest["observed_task_ids"] = [str(item["instance_id"]) for item in observed_outcomes]
+                manifest["official_result_summary"] = {
+                    "result_path": str(harbor_result),
+                    "completed_outcomes": len(observed_outcomes),
+                }
+        ledger_tasks: list[dict[str, object]] = []
+        if observed_outcomes and not harbor_result_error:
+            ledger_tasks.extend(observed_outcomes)
+            recorded_ids = {str(item.get("instance_id") or "") for item in ledger_tasks}
+            if actual_include_filters:
+                for task in task_names:
+                    if task not in recorded_ids:
+                        ledger_tasks.append({"instance_id": task, "reward": None})
+            while not actual_include_filters and len(ledger_tasks) < effective_n_tasks:
+                ledger_tasks.append({"instance_id": f"selection-slot-missing-{len(ledger_tasks) + 1}", "reward": None})
+        else:
+            ledger_tasks.extend({"instance_id": task, "reward": None} for task in task_names)
+        write_result_index(
+            ledger_output,
+            [
+                task_result_row(
+                    benchmark="terminal_bench",
+                    instance_id=str(task["instance_id"]),
+                    status=status,
+                    metadata={
+                        "reason_code": reason,
+                        "official_eval_status": official_eval_status,
+                        "output_paths": {
+                            "harbor_output_dir": str(run_root),
+                            "manifest": str(run_root / "run_manifest.json"),
+                            "harbor_result": str(harbor_result) if harbor_result is not None else "",
+                        },
+                        "error": harbor_result_error,
+                        "details": {
+                            "returncode": returncode,
+                            "include_filters": actual_include_filters,
+                            "n_tasks": effective_n_tasks,
+                            "official_reward": task.get("reward"),
+                        },
+                    },
                 )
-            if harbor_result_error:
-                status = "harness_failed"
-                reason = "harbor_result_unresolved"
-                official_eval_status = "failed"
-                returncode = returncode or 2
-            manifest["output_paths"]["harbor_result"] = str(harbor_result)
-            manifest["observed_task_ids"] = [str(item["instance_id"]) for item in observed_outcomes]
-            manifest["official_result_summary"] = {
-                "result_path": str(harbor_result),
-                "completed_outcomes": len(observed_outcomes),
-            }
-            write_json(run_root / "run_manifest.json", manifest)
-    ledger_tasks: list[dict[str, object]] = []
-    if observed_outcomes and not harbor_result_error:
-        ledger_tasks.extend(observed_outcomes)
-        recorded_ids = {str(item.get("instance_id") or "") for item in ledger_tasks}
-        if actual_include_filters:
-            for task in task_names:
-                if task not in recorded_ids:
-                    ledger_tasks.append({"instance_id": task, "reward": None})
-        while not actual_include_filters and len(ledger_tasks) < effective_n_tasks:
-            ledger_tasks.append({"instance_id": f"selection-slot-missing-{len(ledger_tasks) + 1}", "reward": None})
-    else:
-        ledger_tasks.extend({"instance_id": task, "reward": None} for task in task_names)
-    write_result_index(
-        ledger_output,
-        [
-            task_result_row(
-                benchmark="terminal_bench",
-                instance_id=str(task["instance_id"]),
-                status=status,
-                metadata={
-                    "reason_code": reason,
-                    "official_eval_status": official_eval_status,
-                    "output_paths": {
-                        "harbor_output_dir": str(run_root),
-                        "manifest": str(run_root / "run_manifest.json"),
-                        "harbor_result": str(harbor_result) if harbor_result is not None else "",
-                    },
-                    "error": harbor_result_error,
-                    "details": {
-                        "returncode": returncode,
-                        "include_filters": actual_include_filters,
-                        "n_tasks": effective_n_tasks,
-                        "official_reward": task.get("reward"),
-                    },
-                },
-            )
-            for task in ledger_tasks
-        ],
-    )
-    if not args.execute:
-        return 0
-    return returncode
+                for task in ledger_tasks
+            ],
+        )
+        if not args.execute:
+            final.update({"outcome": "command_generated", "exit_code": 0})
+            return 0
+        final.update({"outcome": status, "exit_code": int(returncode)})
+        return returncode
 
 
 if __name__ == "__main__":

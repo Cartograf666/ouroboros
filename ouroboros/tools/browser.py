@@ -653,8 +653,10 @@ def _blocks_context_mode_self_lowering_js(value: str) -> bool:
 
 
 def _blocks_scope_review_floor_self_lowering_js(value: str) -> bool:
-    """Block browser JS that tries to weaken the owner-only scope-review floor
-    (CW1, v6.34.0) — the click+fetch bypass of the dedicated owner endpoint."""
+    """Block browser JS that tries to write the owner-only scope-review floor
+    (CW1, v6.34.0) — the click+fetch bypass of the dedicated owner endpoint. The key is
+    deprecated and enforcement-inert since v6.80.0 (scope-review applicability follows the
+    owner context mode), but it stays an owner-only stored setting."""
     low = str(value or "").lower()
     return (
         "/api/owner/scope-review-floor" in low
@@ -1101,9 +1103,9 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
             if _blocks_scope_review_floor_self_lowering_js(value):
                 return (
                     "⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: browser JavaScript "
-                    "looks like an attempt to weaken OUROBOROS_SCOPE_REVIEW_FLOOR. "
-                    "The scope-review floor gates the BIBLE P3 blocking review — it is "
-                    "owner-controlled, and the agent must not lower it."
+                    "looks like an attempt to write OUROBOROS_SCOPE_REVIEW_FLOOR. The "
+                    "floor is a deprecated, enforcement-inert owner setting — it is "
+                    "owner-controlled, and the agent must not write it."
                 )
             if _blocks_safety_mode_self_lowering_js(value):
                 return (

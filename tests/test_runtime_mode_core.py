@@ -389,9 +389,11 @@ def test_api_settings_post_clamps_unknown_runtime_mode(tmp_path, monkeypatch):
         out.update(saved)
         return out
 
-    def fake_save_settings(payload, *, allow_elevation: bool = False, allow_context_lowering: bool = False):
-        # Stands in for both save_settings (allow_elevation) and
-        # _owner_write_settings (allow_context_lowering, added in v6.33.0 P4).
+    def fake_save_settings(payload, *, allow_elevation: bool = False, allow_context_lowering: bool = False,
+                           authored_keys=()):
+        # Stands in for both save_settings (allow_elevation) and _owner_write_settings
+        # (allow_context_lowering, added in v6.33.0 P4; authored_keys in v6.80.0 — the caller
+        # names the disk-authored keys it really authors, see prepare_settings_for_persist).
         saved.clear()
         saved.update(payload)
 
@@ -432,9 +434,11 @@ def test_api_settings_post_silently_drops_runtime_mode_changes():
         out.update(saved)
         return out
 
-    def fake_save_settings(payload, *, allow_elevation: bool = False, allow_context_lowering: bool = False):
-        # Stands in for both save_settings (allow_elevation) and
-        # _owner_write_settings (allow_context_lowering, added in v6.33.0 P4).
+    def fake_save_settings(payload, *, allow_elevation: bool = False, allow_context_lowering: bool = False,
+                           authored_keys=()):
+        # Stands in for both save_settings (allow_elevation) and _owner_write_settings
+        # (allow_context_lowering, added in v6.33.0 P4; authored_keys in v6.80.0 — the caller
+        # names the disk-authored keys it really authors, see prepare_settings_for_persist).
         saved.clear()
         saved.update(payload)
 

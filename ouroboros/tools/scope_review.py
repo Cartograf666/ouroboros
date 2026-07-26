@@ -4,8 +4,8 @@ Runs beside triad review and sees touched context plus a generated repo atlas. C
 ``OUROBOROS_REVIEW_ENFORCEMENT``: blocking enforcement blocks, advisory
 enforcement reports them without blocking. Infrastructure failures such as
 model errors, empty output, parse failures, and touched-context errors still
-fail closed. Oversized prompts fail closed under the default blocking floor;
-only the explicit owner advisory floor keeps the visible non-blocking result.
+fail closed, and so does an oversized prompt. In owner-selected ``low`` context
+mode the reviewer is not called at all and a typed skip row is recorded instead.
 """
 
 from __future__ import annotations
@@ -87,55 +87,54 @@ _SCOPE_INPUT_TOKEN_LIMIT = min(
     _SCOPE_MODEL_CONTEXT_WINDOW - _SCOPE_MAX_TOKENS - _SCOPE_OUTPUT_MARGIN_TOKENS,
 )
 
-# Tokenizer-density calibration per reviewer family (rationale + ratio SSOT in
-# review_helpers.calibrated_input_token_limit): Claude-family tokenizers cut
-# code-heavy packs at ~2.5 chars/token, so the chars/4 estimate undercounts by
-# ~1.58x and a 739K-estimated pack drew a deterministic provider 400. The
-# calibration shrinks the PROMPT for the same pinned reviewer — never the
-# reviewer model or the >=1M window floor (BIBLE P3).
+# Tokenizer-density calibration (rationale + SSOT in
+# review_helpers.calibrated_input_token_limit + the capability_evidence
+# ``token_density`` namespace). The density is MEASURED per model, so the limit is
+# computed PER CALL — an import-time constant froze the pre-measurement value for the
+# whole process and no observation could ever reach it. The calibration shrinks the
+# PROMPT for the same pinned reviewer — never the reviewer model or the >=1M window
+# floor (BIBLE P3).
 from ouroboros.tools.review_helpers import (
     calibrated_input_token_limit as _calibrated_input_token_limit,
-    is_claude_family_model as _is_anthropic_family_model,
 )
 
-_ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT = _calibrated_input_token_limit(
-    "anthropic/claude",
-    context_window=_SCOPE_MODEL_CONTEXT_WINDOW,
-    output_reserve=_SCOPE_MAX_TOKENS,
-    tokenizer_margin=_SCOPE_OUTPUT_MARGIN_TOKENS,
-    budget_cap=_SCOPE_BUDGET_TOKEN_LIMIT,
-)
+# Window provenance vocabulary shared with the diagnostics wording (RS5).
+_WINDOW_CONFIRMED = "confirmed"
+_WINDOW_ASSERTED = "asserted"
+_WINDOW_UNKNOWN = "unknown_conservative"
+_WINDOW_SENTINEL = "designated_default_sentinel"
 
-# Opt-in degraded low-context scope review (OUROBOROS_SCOPE_REVIEW_DEGRADED):
-# when the owner selects low context mode for a local/no-1M setup, this may run a
-# window-fitting ADVISORY scope review instead of returning only a fit signal. The atlas
-# selects the highest-scored touched + import-seam + contract files in full and
-# lists the rest as manifest_only (named uncovered files). 90K input + the 100K
-# scope output reserve = 190K, fitting a ~200K reviewer window; truly tiny local
-# reviewers still fail-soft to the skip. It never lowers the blocking scope floor:
-# degraded findings are advisory-only and active only when BOTH low mode and the
-# opt-in are set.
-_LOW_SCOPE_INPUT_TOKEN_LIMIT = 90_000
+# ROUTE FINGERPRINTS whose metadata window was already lazily probed in this process.
+# The lazy probe exists for an OFF-DEFAULT env-only pin, whose route otherwise never
+# reaches a fetching probe call site (the Max-context gate only probes the MAIN route),
+# so the pin was structurally condemned to the conservative sub-floor window.
+#
+# Keyed by the full ROUTE fingerprint, not the model name: capability is a property of
+# provider+base_url+model, and evidence is stored under that same fingerprint. Keyed by
+# model alone, a hot `OPENAI_BASE_URL` / `OPENAI_COMPATIBLE_BASE_URL` /
+# `CLOUDRU_FOUNDATION_MODELS_BASE_URL` / `GIGACHAT_BASE_URL` change produced a route with
+# no evidence and NO second probe, so the next scope review silently fell to the
+# conservative sub-floor and the advertised owner-ack path was unreachable.
+_LAZY_WINDOW_PROBED: set = set()
+# (model, resolved_window) -> provenance label, memoised by the window resolver.
+_WINDOW_PROVENANCE: dict = {}
 
 
-def _degraded_scope_requested() -> bool:
-    """Whether supplemental degraded (advisory) low-context scope feedback is on.
+def _scope_review_skipped_in_low_context() -> bool:
+    """Whether the owner's context mode declares scope review out of scope.
 
-    True when the P3 floor config is 'advisory', OR (legacy) when low context mode
-    is set and OUROBOROS_SCOPE_REVIEW_DEGRADED is enabled. In either case the
-    degraded findings are advisory-only and never satisfy the blocking 1M floor."""
+    Owner policy coupling (v6.80.0), NOT a structural impossibility: a narrow
+    cognitive horizon means whole-repo scope review is declaredly not performed. The
+    triad's blocking staged-diff review is unaffected in every mode.
+
+    Reads the OWNER-SELECTED mode, never the effective one: the /api/settings model
+    auto-downgrade narrows the effective mode on an agent-reachable path, and honouring
+    that here would let the agent switch this gate off for its own commits."""
     try:
-        from ouroboros.config import get_scope_review_floor
-        if get_scope_review_floor() == "advisory":
-            return True
+        from ouroboros.config import get_owner_context_mode
+        return get_owner_context_mode() == "low"
     except Exception:
-        pass
-    try:
-        from ouroboros.config import get_context_mode
-        low = get_context_mode() == "low"
-    except Exception:
-        low = False
-    return low and os.environ.get("OUROBOROS_SCOPE_REVIEW_DEGRADED", "").strip().lower() in ("1", "true", "yes", "on")
+        return False
 
 
 def _is_designated_default_reviewer(model: str) -> bool:
@@ -157,16 +156,21 @@ def _scope_reviewer_window(model: str) -> int:
     absent evidence. Replaces the deleted static per-model window table: a
     confirmed/asserted probe (provider metadata or owner-ack) for the reviewer's REAL
     active route gives the real window. With NO evidence, the 1M blocking-floor
-    sentinel is granted ONLY to the SHIPPED designated reviewer under ``blocking_1m``
-    (the default for fable-5, a real 1M-window model); any other no-evidence reviewer — including an operator's
-    off-default ``OUROBOROS_SCOPE_REVIEW_MODEL`` pin — returns a conservative sub-floor
+    sentinel is granted ONLY to the SHIPPED designated reviewer (fable-5, a real
+    1M-window model); any other no-evidence reviewer returns a conservative sub-floor
     window so the P3 authority check downgrades it (visibly) instead of silently
     treating a 200K model as 1M and overflowing its real window into a provider 400
-    (the v6.46.0 scope-discard bug). A non-default >=1M reviewer must be owner-acked to
-    regain 1M. Hot-path safe (allow_fetch=False): never blocks on the network."""
+    (the v6.46.0 scope-discard bug). A non-default >=1M reviewer must be owner-acked
+    to regain 1M — the fact of a PIN is routing intent, never evidence.
+
+    An off-default pin gets ONE lazy metadata-only probe per process (never
+    generative, never a paid call): without it the pin's route reached no fetching
+    probe call site at all, so the owner's pin could not become "known" through any
+    path. Afterwards the cache answers and the path stays hot-path safe. Provenance
+    for the resolved number is memoised for the diagnostics wording."""
     model = str(model or "")
     try:
-        from ouroboros.capability_evidence import probe
+        from ouroboros.capability_evidence import probe, route_fingerprint
         from ouroboros.config import DATA_DIR, load_settings
         from ouroboros.provider_models import provider_for_model
         settings = load_settings()
@@ -182,51 +186,113 @@ def _scope_reviewer_window(model: str) -> int:
             base_url = str(settings.get("GIGACHAT_BASE_URL") or "")
         # Probe the scope slot, not the active main route (which honors USE_LOCAL_MAIN).
         use_local = provider == "local" or model.endswith(" (local)")
+        route_fp = route_fingerprint(
+            provider="local" if use_local else provider, base_url=base_url, model=model,
+        )
+        lazy = route_fp not in _LAZY_WINDOW_PROBED and not _is_designated_default_reviewer(model)
+        if lazy:
+            _LAZY_WINDOW_PROBED.add(route_fp)
         ev = probe(
             DATA_DIR,
             provider="local" if use_local else provider,
             model=model,
             base_url=base_url,
             use_local=use_local,
-            allow_fetch=False,
+            allow_fetch=bool(lazy),
         )
         if int(ev.window_tokens or 0) > 0:
-            return int(ev.window_tokens)
+            window = int(ev.window_tokens)
+            _WINDOW_PROVENANCE[(model, window)] = (
+                _WINDOW_ASSERTED
+                if str(getattr(ev, "status", "") or "") == "asserted"
+                else _WINDOW_CONFIRMED
+            )
+            return window
     except Exception:
         pass
-    try:
-        from ouroboros.config import get_scope_review_floor
-        floor = get_scope_review_floor()
-    except Exception:
-        floor = "blocking_1m"
-    # blocking_1m declares the SHIPPED reviewer is the >=1M blocking gate; it does not
-    # extend that 1M trust to an arbitrary off-default pin with no evidence.
-    if floor == "blocking_1m" and _is_designated_default_reviewer(model):
+    if _is_designated_default_reviewer(model):
+        _WINDOW_PROVENANCE[(model, _SCOPE_MODEL_CONTEXT_WINDOW)] = _WINDOW_SENTINEL
         return _SCOPE_MODEL_CONTEXT_WINDOW
+    _WINDOW_PROVENANCE[(model, _SCOPE_FAILCLOSED_WINDOW)] = _WINDOW_UNKNOWN
     return _SCOPE_FAILCLOSED_WINDOW
 
 
-def _scope_sub_floor_finding(scope_model: str, window: int) -> dict:
+def _scope_reviewer_window_evidence(model: str) -> tuple:
+    """``(window_tokens, provenance)``.
+
+    Deliberately LAYERED over ``_scope_reviewer_window`` rather than replacing it: that
+    function is the single window seam every caller already uses, and a number supplied
+    by a substituted seam must still get an honest — if coarser — provenance label
+    instead of a fabricated "confirmed"."""
+    window = _scope_reviewer_window(model)
+    memoised = _WINDOW_PROVENANCE.get((str(model or ""), int(window)))
+    if memoised:
+        return window, memoised
+    return window, (
+        _WINDOW_SENTINEL if int(window) >= _SCOPE_MODEL_CONTEXT_WINDOW else _WINDOW_UNKNOWN
+    )
+
+
+def _window_provenance_phrase(window: int, provenance: str) -> str:
+    """Honest four-way wording for a reviewer window (RS5).
+
+    The old single phrasing called every sub-1M window "known", which read as a
+    measured fact even when it was the conservative fallback for an unprobed route."""
+    if provenance == _WINDOW_CONFIRMED:
+        return f"confirmed {window}-token window"
+    if provenance == _WINDOW_ASSERTED:
+        return f"owner-asserted {window}-token window"
+    if provenance == _WINDOW_SENTINEL:
+        return f"designated-default {window}-token sentinel window"
+    return f"unknown window, conservatively treated as {window} tokens"
+
+
+def _low_context_skip_result(scope_model: str) -> "ScopeReviewResult":
+    """Typed, non-blocking record of the owner-declared low-context-mode skip.
+
+    Without a durable row a low-mode commit is forensically indistinguishable from
+    the bug "scope review silently failed to launch" (BIBLE P1: every significant
+    cognitive act stays reconstructible). It rides the SAME review-evidence surface
+    that records the fail-closed results (``build_scope_actor_record``)."""
+    return ScopeReviewResult(
+        blocked=False,
+        status="skipped_low_context_mode",
+        model_id=scope_model,
+        prompt_chars=0,
+        prompt_chars_source="not_assembled",
+        advisory_findings=[{
+            "verdict": "PASS",
+            "severity": "advisory",
+            "item": "scope_review_skipped_low_context_mode",
+            "reason": (
+                "ℹ️ SCOPE_REVIEW_SKIPPED_LOW_CONTEXT_MODE: the owner-selected `low` "
+                "context mode declares whole-repository scope review not performed, so "
+                "no scope reviewer was called and scope did not gate this commit. This "
+                "is an owner policy coupling, not a capability limit: the triad's "
+                "blocking staged-diff review ran in full, as it does in every mode. "
+                "Switch the context mode to `max` to restore the blocking scope gate."
+            ),
+            "model": scope_model,
+        }],
+    )
+
+
+def _scope_sub_floor_finding(scope_model: str, window: int, provenance: str = _WINDOW_UNKNOWN) -> dict:
     return {
         "verdict": "FAIL",
         "severity": "advisory",
         "item": "scope_review_sub_floor",
         "reason": (
             f"⚠️ SCOPE_REVIEW_SUB_FLOOR: scope reviewer {scope_model} resolves to a "
-            f"{window}-token authority window, below the >=1M blocking scope floor "
-            "(BIBLE P3). Its findings are ADVISORY-ONLY and cannot satisfy the "
-            "blocking scope gate; configure a >=1M-window scope model to restore "
+            f"{_window_provenance_phrase(window, provenance)} for authority purposes, "
+            "below the >=1M blocking scope floor (BIBLE P3). Its findings are "
+            "ADVISORY-ONLY and cannot satisfy the blocking scope gate; configure a "
+            ">=1M-window scope model, or owner-ack this route's window, to restore "
             "an authoritative verdict."
         ),
         "model": scope_model,
     }
 
-
-def _blocking_scope_floor() -> bool:
-    """Whether P3 requires an authoritative >=1M scope verdict."""
-    from ouroboros.config import get_scope_review_floor
-
-    return get_scope_review_floor() == "blocking_1m"
 
 def _window_scaled_reserves(window: int) -> tuple:
     """(output_reserve, tokenizer_margin) scaled to the reviewer window.
@@ -245,34 +311,24 @@ def _window_scaled_reserves(window: int) -> tuple:
     return output_reserve, tokenizer_margin
 
 
-def _effective_scope_input_limit(*, degraded: bool = False, scope_model: str = "") -> int:
-    """Scope input token cap for normal vs supplemental degraded review.
+def _effective_scope_input_limit(*, scope_model: str = "") -> int:
+    """Scope input token cap for the configured reviewer, computed PER CALL.
 
-    The commit gate calls the normal full-cap path. Degraded is explicit so the
-    low/no-1M advisory path cannot silently replace the blocking 1M floor.
-    The cap is model-aware on two axes: Claude-family reviewers get the
-    code-density-calibrated cap so the assembled prompt fits their REAL
-    tokenizer (rationale above), and a KNOWN reviewer window (Capability Evidence,
-    not a static table) replaces the assumed 1M so a small-window reviewer gets
-    a fit-sized advisory pack instead of a deterministic provider 400. Its
-    blocking authority is checked separately and fail-closed.
-    """
-    if degraded and _degraded_scope_requested():
-        return _LOW_SCOPE_INPUT_TOKEN_LIMIT
+    Two axes: the model's MEASURED tokenizer density sizes the prompt for its real
+    tokenizer, and a KNOWN reviewer window (Capability Evidence, not a static table)
+    replaces the assumed 1M so a small-window reviewer gets a fit-sized pack instead
+    of a deterministic provider 400. Its blocking authority is checked separately and
+    stays fail-closed."""
     model = scope_model or _get_scope_model()
     window = _scope_reviewer_window(model)
     output_reserve, tokenizer_margin = _window_scaled_reserves(window)
-    if _is_anthropic_family_model(model):
-        if window == _SCOPE_MODEL_CONTEXT_WINDOW:
-            return _ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT
-        return max(0, _calibrated_input_token_limit(
-            model,
-            context_window=window,
-            output_reserve=output_reserve,
-            tokenizer_margin=tokenizer_margin,
-            budget_cap=_SCOPE_BUDGET_TOKEN_LIMIT,
-        ))
-    return max(0, min(_SCOPE_BUDGET_TOKEN_LIMIT, window - output_reserve - tokenizer_margin))
+    return max(0, _calibrated_input_token_limit(
+        model,
+        context_window=window,
+        output_reserve=output_reserve,
+        tokenizer_margin=tokenizer_margin,
+        budget_cap=_SCOPE_BUDGET_TOKEN_LIMIT,
+    ))
 
 # Defense-in-depth cap for deleted-file HEAD content inlined into the prompt.
 _DELETED_INLINE_MAX_BYTES = 1_048_576  # 1 MB
@@ -314,6 +370,8 @@ class ScopeReviewResult:
     # sub_floor|omitted|empty
     status: str = "responded"
     prompt_chars: int = 0
+    # measured (len(prompt)) | estimated_from_tokens (no prompt was assembled)
+    prompt_chars_source: str = "measured"
     tokens_in: int = 0
     tokens_out: int = 0
     cost_usd: float = 0.0
@@ -487,14 +545,13 @@ def _gather_scope_packs(
     all_touched_paths: list,
     fixed_prompt_tokens: int = 0,
     drive_root: Optional[pathlib.Path] = None,
-    degraded: bool = False,
     compact: bool = False,
     scope_model: str = "",
 ) -> str:
     """Collect the bounded wider repository atlas, failing closed on git errors."""
     # Canonical docs and touched files are injected explicitly; avoid duplicating them.
     already_included = frozenset(set(all_touched_paths) | set(_CANONICAL_CONTEXT_DOCS))
-    _input_limit = _effective_scope_input_limit(degraded=degraded, scope_model=scope_model)
+    _input_limit = _effective_scope_input_limit(scope_model=scope_model)
     try:
         atlas = compile_review_context_atlas(
             ReviewContextAtlasRequest(
@@ -522,6 +579,15 @@ def _gather_scope_packs(
         raise RuntimeError(f"review_context_atlas error: {exc}") from exc
 
     return repo_pack_section
+
+
+def _record_ladder_steps(steps: list) -> None:
+    """Attach the aggregated guaranteed-fit ladder trace to the context manifest."""
+    if not steps:
+        return
+    manifest = dict(_SCOPE_CONTEXT_MANIFEST.get({}) or {})
+    manifest["ladder_steps"] = list(steps)
+    _SCOPE_CONTEXT_MANIFEST.set(manifest)
 
 
 def _ladder_terminal_status(scope_model: str, token_count: int) -> "_TouchedContextStatus":
@@ -628,7 +694,6 @@ def _build_scope_prompt(
     review_history: Optional[list] = None,
     scope_review_history: Optional[list] = None,
     drive_root: Optional[pathlib.Path] = None,
-    degraded: bool = False,
     scope_model: str = "",
     governance_repo_dir: Optional[pathlib.Path] = None,
 ) -> tuple:
@@ -740,7 +805,6 @@ def _build_scope_prompt(
         gather_kwargs = {
             "fixed_prompt_tokens": fixed_tokens,
             "drive_root": drive_root,
-            "degraded": degraded,
             "scope_model": scope_model,
             "compact": compact,
         }
@@ -765,7 +829,7 @@ def _build_scope_prompt(
     # changes stay fully visible in the staged diff); 4) remove unchanged diff
     # context while preserving every +/- line. Only an
     # irreducible prompt still not fitting fails CLOSED (fixed_overflow).
-    input_limit = _effective_scope_input_limit(degraded=degraded, scope_model=scope_model)
+    input_limit = _effective_scope_input_limit(scope_model=scope_model)
     _atlas_min_allowance = 35_000  # manifest reserve + hard headroom, see review_context_atlas
     diff_only_paths: list = []
     degradable = sorted(
@@ -775,6 +839,10 @@ def _build_scope_prompt(
     compact = False
     compact_diff_attempted = False
     last_known_tokens = 0
+    # One AGGREGATED record of the guaranteed-fit ladder (RS5): a per-step event
+    # stream would be noise, but a silent ladder makes an oversized pack
+    # unexplainable after the fact (BIBLE P1).
+    ladder_steps: list = []
     while True:
         prompt = _assemble_prompt(current_files_section)
         fixed_prompt_tokens = estimate_tokens(prompt)
@@ -798,8 +866,17 @@ def _build_scope_prompt(
                 raise RuntimeError("scope review atlas placeholder missing")
             prompt = head + atlas_text + tail
             prompt_tokens = estimate_tokens(prompt)
+            ladder_steps.append({
+                "step": "compact_atlas" if compact else "full_atlas",
+                "tokens_before": last_known_tokens,
+                "tokens_after": prompt_tokens,
+                "diff_only_files": len(diff_only_paths),
+                "zero_context_diff": compact_diff_attempted,
+                "deficit": max(0, prompt_tokens - input_limit),
+            })
             last_known_tokens = prompt_tokens
             if prompt_tokens <= input_limit:
+                _record_ladder_steps(ladder_steps)
                 return prompt, None
             if not compact:
                 # Retry the same touched set with the compact atlas first.
@@ -821,6 +898,7 @@ def _build_scope_prompt(
             # Terminal pack status: >=1M authority is fixed_overflow; a sub-floor
             # pack is budget_exceeded here and the authority policy turns it into
             # a block unless the owner explicitly selected advisory scope.
+            _record_ladder_steps(ladder_steps)
             return None, _ladder_terminal_status(
                 scope_model or _get_scope_model(),
                 last_known_tokens or fixed_prompt_tokens,
@@ -840,7 +918,6 @@ def _log_scope_result(
     prompt_chars: int = 0,
     prompt_tokens: int = 0,
     model_id: str = "",
-    degraded: bool = False,
 ) -> None:
     """Append a scope_review_complete event to events.jsonl.
 
@@ -851,7 +928,7 @@ def _log_scope_result(
     prompt_tokens = int(prompt_tokens or 0)
     if prompt_tokens <= 0 and prompt_chars:
         prompt_tokens = max(0, int(prompt_chars) // 4)
-    input_limit = _effective_scope_input_limit(degraded=degraded, scope_model=model_id)
+    input_limit = _effective_scope_input_limit(scope_model=model_id)
     try:
         append_jsonl(ctx.drive_logs() / "events.jsonl", {
             "ts": utc_now_iso(), "type": "scope_review_complete",
@@ -1007,13 +1084,8 @@ def _scope_oversize_result(
     tokens_out: int = 0,
     cost_usd: float = 0.0,
 ) -> "ScopeReviewResult":
-    """Return a visible oversize result under the configured authority floor."""
-    blocking_floor = _blocking_scope_floor()
-    authority_note = (
-        "The blocking scope gate has no authoritative verdict. "
-        if blocking_floor
-        else "Scope review downgraded to a non-blocking warning. "
-    )
+    """Return a visible, fail-closed oversize result."""
+    authority_note = "The blocking scope gate has no authoritative verdict. "
     advisory = {
         "verdict": "FAIL",
         "severity": "advisory",
@@ -1028,15 +1100,14 @@ def _scope_oversize_result(
         "model": scope_model_id,
     }
     return ScopeReviewResult(
-        blocked=blocking_floor,
+        blocked=True,
         block_message=(
             "⚠️ SCOPE_REVIEW_BLOCKED: the provider rejected the scope prompt as "
             "oversized, so the required >=1M blocking scope gate produced no "
             "authoritative verdict. Split the staged change or restore a fitting "
             ">=1M reviewer route."
-            if blocking_floor else ""
         ),
-        status="fixed_overflow" if blocking_floor else "budget_exceeded",
+        status="fixed_overflow",
         model_id=scope_model_id,
         prompt_chars=prompt_chars,
         tokens_in=tokens_in,
@@ -1061,29 +1132,34 @@ def _handle_prompt_signals(
 
     if context_status.status == "budget_exceeded":
         token_count = context_status.token_count
-        # Back-compute prompt chars from the budget-gate token estimate.
-        _prompt_chars_est = token_count * 4
         # Report the REAL window-scaled reserves, not the 1M constants.
-        _window = _scope_reviewer_window(scope_model) if scope_model else _SCOPE_MODEL_CONTEXT_WINDOW
+        _window, _provenance = (
+            _scope_reviewer_window_evidence(scope_model) if scope_model
+            else (_SCOPE_MODEL_CONTEXT_WINDOW, _WINDOW_SENTINEL)
+        )
         _output_reserve, _ = _window_scaled_reserves(_window)
-        blocking_floor = _blocking_scope_floor()
         log.warning(
             "Scope review prompt (~%d tokens) exceeds reviewer input limit (%d); "
-            "blocking_floor=%s.",
+            "window=%d provenance=%s (fail-closed).",
             token_count,
             input_limit,
-            blocking_floor,
+            _window,
+            _provenance,
         )
         return ScopeReviewResult(
-            blocked=blocking_floor,
+            blocked=True,
             block_message=(
                 "⚠️ SCOPE_REVIEW_BLOCKED: the configured reviewer cannot fit the "
-                "irreducible scope prompt within its known sub-1M window, so the "
+                "irreducible scope prompt within its "
+                f"{_window_provenance_phrase(_window, _provenance)}, so the "
                 "required >=1M blocking scope gate has no authoritative verdict."
-                if blocking_floor else ""
             ),
-            status="sub_floor" if blocking_floor else "budget_exceeded",
-            prompt_chars=_prompt_chars_est,
+            status="sub_floor",
+            # No prompt string exists on this path (the fit ladder returned a
+            # sentinel), so the char count is DERIVED from the token estimate and
+            # labelled as such instead of masquerading as a measurement.
+            prompt_chars=token_count * 4,
+            prompt_chars_source="estimated_from_tokens",
             advisory_findings=[{
                 "verdict": "FAIL",
                 "severity": "advisory",
@@ -1091,13 +1167,10 @@ def _handle_prompt_signals(
                 "reason": (
                     f"⚠️ SCOPE_REVIEW_SKIPPED: Full scope-review prompt (~{token_count} tokens) "
                     f"exceeds the scope input budget ({input_limit} tokens, "
-                    f"reserving {_output_reserve} for output within a {_window}-token window). "
-                    + (
-                        "The blocking scope gate has no authoritative verdict. "
-                        if blocking_floor
-                        else "Scope review downgraded to a non-blocking warning. "
-                    )
-                    + "Consider reducing codebase size or configuring a >=1M reviewer."
+                    f"reserving {_output_reserve} for output within its "
+                    f"{_window_provenance_phrase(_window, _provenance)}). "
+                    "The blocking scope gate has no authoritative verdict. "
+                    "Consider reducing codebase size or configuring a >=1M reviewer."
                 ),
                 "model": scope_model or "scope_reviewer",
             }],
@@ -1114,6 +1187,7 @@ def _handle_prompt_signals(
             blocked=True,
             status="fixed_overflow",
             prompt_chars=token_count * 4,
+            prompt_chars_source="estimated_from_tokens",
             block_message=(
                 f"⚠️ SCOPE_REVIEW_BLOCKED: the irreducible scope prompt (checklist + canonical "
                 f"docs + staged diff) is ~{token_count} estimated tokens and exceeds the scope "
@@ -1168,65 +1242,33 @@ def _apply_scope_authority(
     critical_findings: List[dict],
     advisory_findings: List[dict],
     *,
-    degraded: bool,
     scope_model_id: str,
     prompt_tokens_est: int,
     result_kwargs: dict,
 ) -> tuple[List[dict], List[dict], Optional[ScopeReviewResult]]:
-    """Apply the established one-pass P3 advisory downgrade semantics."""
-    if degraded and _effective_scope_input_limit(degraded=True) == _LOW_SCOPE_INPUT_TOKEN_LIMIT:
-        for finding in critical_findings:
-            finding["severity"] = "advisory"
-            finding["reason"] = "[degraded scope review] " + str(finding.get("reason", ""))
-        advisory_findings = list(critical_findings) + list(advisory_findings)
-        critical_findings = []
-        advisory_findings.append({
-            "verdict": "FAIL",
-            "severity": "advisory",
-            "item": "scope_review_degraded",
-            "reason": (
-                "⚠️ SCOPE_REVIEW_DEGRADED: ran on a window-fitting repository pack "
-                "(owner-selected low context mode + degraded review opt-in) and is "
-                "ADVISORY-ONLY. The coverage manifest lists which files are full vs "
-                "manifest-only — findings are real but full-content coverage is partial, "
-                "so they do not block; the blocking >=1M scope floor is unchanged."
-            ),
-            "model": scope_model_id,
-        })
+    """Apply the established one-pass P3 sub-floor downgrade semantics."""
+    window, provenance = _scope_reviewer_window_evidence(scope_model_id)
+    if not (window and window < _SCOPE_MODEL_CONTEXT_WINDOW):
         return critical_findings, advisory_findings, None
-
-    known_window = _scope_reviewer_window(scope_model_id)
-    sub_floor = bool(known_window and known_window < _SCOPE_MODEL_CONTEXT_WINDOW)
-    floor = "blocking_1m" if _blocking_scope_floor() else "advisory"
-    if sub_floor:
-        prefix = "[sub-floor scope reviewer] "
-        for finding in critical_findings:
-            finding["severity"] = "advisory"
-            finding["reason"] = prefix + str(finding.get("reason", ""))
-        advisory_findings = list(critical_findings) + list(advisory_findings)
-        critical_findings = []
-        advisory_findings.append(_scope_sub_floor_finding(scope_model_id, known_window))
-        if floor == "blocking_1m":
-            return critical_findings, advisory_findings, ScopeReviewResult(
-                blocked=True,
-                block_message=(
-                    f"⚠️ SCOPE_REVIEW_BLOCKED: scope reviewer {scope_model_id} has a "
-                    f"known {known_window}-token window, below the required >=1M floor. "
-                    "Its advisory findings were preserved, but it cannot supply the "
-                    "authoritative scope verdict required to commit."
-                ),
-                critical_findings=critical_findings,
-                advisory_findings=advisory_findings,
-                status="sub_floor",
-                **result_kwargs,
-            )
-    elif critical_findings and floor == "advisory":
-        for finding in critical_findings:
-            finding["severity"] = "advisory"
-            finding["reason"] = "[advisory scope floor] " + str(finding.get("reason", ""))
-        advisory_findings = list(critical_findings) + list(advisory_findings)
-        critical_findings = []
-    return critical_findings, advisory_findings, None
+    for finding in critical_findings:
+        finding["severity"] = "advisory"
+        finding["reason"] = "[sub-floor scope reviewer] " + str(finding.get("reason", ""))
+    advisory_findings = list(critical_findings) + list(advisory_findings)
+    critical_findings = []
+    advisory_findings.append(_scope_sub_floor_finding(scope_model_id, window, provenance))
+    return critical_findings, advisory_findings, ScopeReviewResult(
+        blocked=True,
+        block_message=(
+            f"⚠️ SCOPE_REVIEW_BLOCKED: scope reviewer {scope_model_id} has a "
+            f"{_window_provenance_phrase(window, provenance)}, below the required "
+            ">=1M floor. Its advisory findings were preserved, but it cannot supply "
+            "the authoritative scope verdict required to commit."
+        ),
+        critical_findings=critical_findings,
+        advisory_findings=advisory_findings,
+        status="sub_floor",
+        **result_kwargs,
+    )
 
 
 def run_scope_review(
@@ -1238,9 +1280,10 @@ def run_scope_review(
     review_history: Optional[list] = None,
     scope_review_history: Optional[list] = None,  # prior scope rounds for this commit
     scope_model: Optional[str] = None,
-    degraded: bool = False,
 ) -> ScopeReviewResult:
-    """Run normal blocking scope review or explicit supplemental degraded review."""
+    """Run the blocking scope review, or record the owner-declared low-mode skip."""
+    if _scope_review_skipped_in_low_context():
+        return _low_context_skip_result(scope_model or _get_scope_model())
     try:
         governance_repo, repo_dir = review_repo_dirs_for(ctx)
     except (TypeError, ValueError) as exc:
@@ -1259,7 +1302,6 @@ def run_scope_review(
             review_history=review_history,
             scope_review_history=scope_review_history,
             drive_root=pathlib.Path(ctx.drive_root) if getattr(ctx, "drive_root", None) else None,
-            degraded=degraded,
             scope_model=scope_model_id,
             governance_repo_dir=governance_repo,
         )
@@ -1279,7 +1321,7 @@ def run_scope_review(
     signal_result = _handle_prompt_signals(
         prompt,
         context_status,
-        input_limit=_effective_scope_input_limit(degraded=degraded, scope_model=scope_model_id),
+        input_limit=_effective_scope_input_limit(scope_model=scope_model_id),
         scope_model=scope_model_id,
     )
     if signal_result is not None:
@@ -1301,13 +1343,13 @@ def run_scope_review(
     if llm_error:
         if _is_provider_oversize_error(llm_error):
             # The estimate-based budget gate passed but the provider's REAL
-            # tokenizer rejected the prompt as oversize. Authority policy below
-            # blocks the default >=1M gate and only preserves non-blocking behavior
-            # for an explicit advisory scope floor.
+            # tokenizer rejected the prompt as oversize: there is no authoritative
+            # verdict, so the >=1M gate fails CLOSED (since v6.80.0 no setting can
+            # make this non-blocking; the owner's only control is the context mode).
             log.warning(
                 "Scope reviewer rejected the prompt as oversize "
-                "(estimate-gate passed; real tokenizer denser). Applying the "
-                "configured scope-floor authority policy. Error: %s", llm_error,
+                "(estimate-gate passed; real tokenizer denser). Failing the "
+                "blocking scope gate closed. Error: %s", llm_error,
             )
             return _scope_oversize_result(
                 scope_model_id=scope_model_id,
@@ -1342,13 +1384,13 @@ def run_scope_review(
         # the "prompt is too long" text — so the llm_error oversize branch above never
         # fires and the empty body would otherwise hard-block as empty_response. With
         # INDEPENDENT size evidence (see _provider_error_is_oversize), route through
-        # the same authority-aware oversize result as the raised-error path. A
+        # the same fail-closed oversize result as the raised-error path. A
         # non-size 400 (auth/param/policy) stays blocking below.
         _pe_msg = str((_usage.get("provider_error") or {}).get("message") or "")
         log.warning(
             "Scope reviewer hit provider_error code=400 oversize (empty body; "
-            "estimate-gate passed). Applying the configured scope-floor authority "
-            "policy. provider_error: %s", _pe_msg or "(no message)",
+            "estimate-gate passed). Failing the blocking scope gate closed. "
+            "provider_error: %s", _pe_msg or "(no message)",
         )
         return _scope_oversize_result(
             scope_model_id=scope_model_id,
@@ -1441,7 +1483,6 @@ def run_scope_review(
         ctx,
         critical_findings,
         advisory_findings,
-        degraded=degraded,
         scope_model_id=scope_model_id,
         prompt_tokens_est=_prompt_tokens_est,
         result_kwargs=result_kwargs,
@@ -1455,7 +1496,6 @@ def run_scope_review(
         prompt_chars=_prompt_chars,
         prompt_tokens=_prompt_tokens_est,
         model_id=scope_model_id,
-        degraded=degraded,
     )
 
     if critical_findings:

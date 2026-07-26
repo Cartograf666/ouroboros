@@ -36,9 +36,9 @@ from devtools.benchmarks.common.manifests import (
     SeedShapeRefused,
     admit_benchmark_run,
     finalize_run_manifest,
-    write_json,
+    model_slot_snapshot,
 )
-from devtools.benchmarks.common.run_roots import ensure_outside_repo
+from devtools.benchmarks.common.run_roots import assert_outside_repo, ensure_outside_repo
 from devtools.benchmarks.common.model_slots import pin_single_model
 
 PRO = pathlib.Path(__file__).resolve().parent              # .../swe_bench_pro/e1v2/
@@ -850,32 +850,27 @@ def main() -> int:
     if not api_key and not os.environ.get("OPENAI_API_KEY", "").strip():
         print("error: neither OPENROUTER_API_KEY nor OPENAI_API_KEY is set", file=sys.stderr); return 2
 
-    out_dir = ensure_outside_repo(pathlib.Path(args.out_dir).expanduser(), SRC)
-    order = read_full_order() if args.full_set else read_csv_order(pathlib.Path(args.csv).expanduser())
-    ids = order[args.start - 1: args.start - 1 + args.limit]
-    print(f"[pro] sequence ({len(ids)}): " + " -> ".join(norm(i)[:40] for i in ids), file=sys.stderr)
-    rows = load_pro_rows(ids)
-
+    out_dir = assert_outside_repo(pathlib.Path(args.out_dir).expanduser(), SRC)
+    # NOTHING but argv-shaped derivation until admission inside `_run_schedule`. The task order
+    # comes from a CSV read or a `datasets` download and the row bodies from Hugging Face, so
+    # resolving them here killed the process — on a missing CSV, a parse error, an ImportError,
+    # an offline hub — with no manifest on disk at all. The DECLARED selector below is pure
+    # argv and is what admission records; the resolved ids amend it immediately afterwards.
+    # (`settings_snapshot` used to be read here too and threaded through `_run_schedule`, which
+    # never used it: a pre-admission file read for a dead parameter.)
     vsuf = (getattr(args, "volume_suffix", "") or "")
-    settings_snapshot = {}
-    try:
-        settings_snapshot = json.loads(pathlib.Path(args.settings).expanduser().read_text(encoding="utf-8"))
-    except Exception:
-        settings_snapshot = {}
-    return _run_schedule(args, out_dir, ids, rows, vsuf, settings_snapshot, api_key)
+    return _run_schedule(args, out_dir, vsuf, api_key)
 
 
-def _run_schedule(args, out_dir: pathlib.Path, ids: list, rows: dict, vsuf: str,
-                  settings_snapshot: dict, api_key: str) -> int:
+def _run_schedule(args, out_dir: pathlib.Path, vsuf: str, api_key: str) -> int:
     """The run itself, split out of ``main()`` so the schedule keeps one scope of its own.
 
-    ``missing`` is DERIVED here rather than passed: it is a pure function of ``ids`` and
-    ``rows``, and this signature has to stay inside the 8-parameter cap the review checklist
-    asserts (``docs/DEVELOPMENT.md``).
+    Task DISCOVERY happens here, after admission, for the reason above; ``missing`` is derived
+    from it. This signature has to stay inside the 8-parameter cap the review checklist asserts
+    (``docs/DEVELOPMENT.md``).
     """
-    missing = [i for i in ids if i not in rows]
-    if missing:
-        print(f"[pro] !! missing from dataset (skip): {missing}", file=sys.stderr)
+    selector = {"source": "full_set" if args.full_set else str(pathlib.Path(args.csv).expanduser()),
+                "start": int(args.start), "limit": int(args.limit)}
     # Provenance + admission, BEFORE the first paid task: until v6.75.0 this driver wrote no
     # manifest at all, so the universal seed gate could not protect the one benchmark where a
     # dirty seed actually happened. The manifest is built once here (the gate runs inside it),
@@ -888,10 +883,14 @@ def _run_schedule(args, out_dir: pathlib.Path, ids: list, rows: dict, vsuf: str,
         benchmark="swe_bench_pro",
         run_root=out_dir,
         repo_dir=SRC,
-        requested_task_ids=list(ids),
+        requested_task_ids=[],
         require_clean=not args.allow_dirty_seed,
         argv=sys.argv,
         dataset="ScaleAI/SWE-bench_Pro",
+        # The TEMPLATE, which is all that exists at admission time; `derive_run_settings` writes
+        # the per-run `_run_settings.json` later. `model_slots` is RE-SNAPSHOTTED from that
+        # derived file below — see the comment there: recording the template made the manifest
+        # name a model the run never used.
         settings_path=pathlib.Path(args.settings).expanduser(),
         timeout_sec=args.solve_timeout,
         output_paths={
@@ -906,8 +905,10 @@ def _run_schedule(args, out_dir: pathlib.Path, ids: list, rows: dict, vsuf: str,
             "evolution": bool(args.self_improve),
             "cadence": args.cadence,
             "volume_suffix": vsuf,
+            "selector": selector,
         },
-        extra={"missing_from_dataset": missing, "outcome": "started"},
+        extra={"missing_from_dataset": {"pending": "dataset_loads_after_admission"},
+               "outcome": "started"},
     )
     # `admit_benchmark_run` persisted it ALREADY, before anything could refuse — including the
     # seed gate itself, whose refusal payload reaches disk before it raises. A manifest that only
@@ -916,6 +917,19 @@ def _run_schedule(args, out_dir: pathlib.Path, ids: list, rows: dict, vsuf: str,
     # The shared finalization seam below rewrites it with the FINAL typed outcome on every exit
     # path, so an unhandled failure can no longer leave the record saying `started`.
     with finalize_run_manifest(manifest_path, manifest, outcome="completed") as final:
+        # TASK DISCOVERY, inside the admitted run: the CSV read / dataset download and every way
+        # they can fail are now recorded by the finalization seam. The manifest is then AMENDED
+        # with the ids the declared selector resolved to.
+        order = read_full_order() if args.full_set else read_csv_order(pathlib.Path(args.csv).expanduser())
+        ids = order[args.start - 1: args.start - 1 + args.limit]
+        print(f"[pro] sequence ({len(ids)}): " + " -> ".join(norm(i)[:40] for i in ids), file=sys.stderr)
+        rows = load_pro_rows(ids)
+        missing = [i for i in ids if i not in rows]
+        if missing:
+            print(f"[pro] !! missing from dataset (skip): {missing}", file=sys.stderr)
+        manifest["requested_task_ids"] = [str(task_id) for task_id in ids]
+        manifest["requested_count"] = len(ids)
+        manifest["extra"]["missing_from_dataset"] = missing
         # Seed SHAPE is asserted here, after the manifest is on disk — not before admission. A
         # worktree-pointer `.git` is precisely the refusal whose durable record matters (the
         # container `cp -a`s the pointer and the agent ends up with no git identity), and checking
@@ -928,7 +942,11 @@ def _run_schedule(args, out_dir: pathlib.Path, ids: list, rows: dict, vsuf: str,
                           "refusal": {"stage": "seed_shape", "exit_code": 2,
                                       "reason": refused.reason}})
             return 2
-        write_json(manifest_path, manifest)
+        # The amendments above ride the RETAINED dict: `finalize_run_manifest` writes this same
+        # path on every exit path, merging the terminal outcome/exit_code as it goes. Publishing
+        # here instead put a pre-merge record — no terminal outcome at all — at the path a
+        # reader consumes, and an interruption before context exit left it durable.
+        # Enforced for the whole family by launcher_audit Invariant C.
         ensure_util_image()  # pull the --pull=never utility image once, AFTER admission
         VREPO, VDATA = "obo-repo" + vsuf, "obo-data" + vsuf
         if args.reset_state:
@@ -981,6 +999,16 @@ def _run_schedule(args, out_dir: pathlib.Path, ids: list, rows: dict, vsuf: str,
                                        post_task_evolution=args.self_improve, cadence=args.cadence,
                                        review_slots=args.review_slots, review_effort=args.review_effort,
                                        runtime_mode=args.runtime_mode, image_input_mode=args.image_input_mode)
+            # THE MANIFEST MUST NAME THE MODEL THAT RAN. `model_slot_snapshot` was given
+            # `--settings` — the TEMPLATE — but `derive_run_settings` has just applied
+            # `pin_single_model(--solve-model)` on top of it, so a run genuinely executed on
+            # gpt-5.5 shipped a manifest naming the template's sonnet-4.5, with nothing in the
+            # artefact to contradict an auditor who believed it (found by the live SWE-Pro
+            # smoke, v6.76.0). Re-snapshotted from the DERIVED settings the container is about
+            # to be handed; `harness.settings_template` keeps the template on record.
+            manifest["model_slots"] = model_slot_snapshot(seed, env_overrides=False)
+            manifest["harness"]["settings_template"] = str(pathlib.Path(args.settings).expanduser())
+            manifest["harness"]["settings_derived"] = str(seed)
             print(f"\n[pro] === task {i}/{len(ids)}: {norm(cid)[:50]} === spent=${spent:.2f} cap=${task_total:.2f} lang={row.get('repo_language')}", file=sys.stderr)
             res = normalize_result(run_instance(cid, row, args, api_key, seed, task_total), cid, args)
             if res["model_patch"].strip():

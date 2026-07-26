@@ -22,7 +22,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from devtools.benchmarks.common.manifests import repo_provenance, write_json
+from devtools.benchmarks.common.manifests import openrouter_key_remaining, repo_provenance, write_json
 
 try:  # Harbor is an optional benchmark dependency.
     from harbor.agents.installed.base import BaseInstalledAgent
@@ -214,6 +214,9 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
         disable_agent_web = str(kwargs.pop("disable_agent_web", "true")).strip().lower() not in (
             "0", "false", "no", "off", "",
         )
+        # Dataset identity ("<org>/<name>"), threaded from the job config so the adapter can
+        # resolve the right per-task cache subtree instead of assuming one hardcoded org.
+        dataset = str(kwargs.pop("dataset", "") or "")
         ouroboros_model = str(kwargs.pop("ouroboros_model", ""))
         ouroboros_light_model = str(kwargs.pop("ouroboros_light_model", "google/gemini-3.5-flash"))
         leave_server_running_for_verifier = bool(kwargs.pop("leave_server_running_for_verifier", True))
@@ -248,6 +251,7 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
         self.safety_mode = safety_mode
         self.task_review_mode = task_review_mode
         self.disable_agent_web = bool(disable_agent_web)
+        self.dataset = dataset
         self.ouroboros_model = ouroboros_model
         self.ouroboros_light_model = ouroboros_light_model
         self.leave_server_running_for_verifier = bool(leave_server_running_for_verifier)
@@ -285,45 +289,52 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
         return keys
 
     def _openrouter_credit_preflight(self, settings: dict[str, Any]) -> None:
+        """Refuse to start a trial on a key that cannot pay for it.
+
+        Reads the shared ``openrouter_key_remaining`` helper, i.e. the authoritative
+        ``/api/v1/key`` ``limit_remaining``. The old ``/api/v1/credits`` arithmetic
+        (``total_credits − total_usage``) is the metric documented to LIE on a nearly
+        exhausted key — a key with $0.23 left passed that check and killed half a run — so it
+        is gone rather than kept as a fallback. An UNCAPPED key (``limit: null`` → None) has
+        no threshold to fail. Transport failures stay non-blocking (the trial would surface
+        provider errors anyway and the log is preserved); an unauthorized key still refuses."""
         key = str(os.environ.get("OPENROUTER_API_KEY") or settings.get("OPENROUTER_API_KEY") or "").strip()
         if not key:
             return
         threshold = max(0.0, float(self.openrouter_min_credit_usd or 0.0))
         if threshold <= 0:
             return
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/credits",
-            headers={"Authorization": f"Bearer {key}"},
-            method="GET",
-        )
+        record = self.logs_dir / "openrouter-credit-preflight.json"
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            remaining = openrouter_key_remaining(key)
         except urllib.error.HTTPError as exc:
             if exc.code in {401, 403}:
                 raise RuntimeError("OpenRouter credit preflight failed: token is unauthorized") from exc
-            # Do not block on transient credit endpoint failures; model calls will
-            # still surface provider errors, and publishable runs preserve logs.
-            (self.logs_dir / "openrouter-credit-preflight.json").write_text(
+            record.write_text(
                 json.dumps({"ok": False, "status": exc.code, "warning": "non-blocking"}, indent=2),
                 encoding="utf-8",
             )
             return
         except Exception as exc:
-            (self.logs_dir / "openrouter-credit-preflight.json").write_text(
+            record.write_text(
                 json.dumps({"ok": False, "error": type(exc).__name__, "warning": "non-blocking"}, indent=2),
                 encoding="utf-8",
             )
             return
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        total = float(data.get("total_credits") or data.get("credits") or data.get("credit_limit") or 0.0)
-        used = float(data.get("total_usage") or data.get("usage") or 0.0)
-        remaining = total - used if total else float(data.get("remaining_credits") or data.get("remaining") or 0.0)
-        (self.logs_dir / "openrouter-credit-preflight.json").write_text(
-            json.dumps({"ok": True, "remaining_usd": remaining, "threshold_usd": threshold}, indent=2),
+        record.write_text(
+            json.dumps(
+                {
+                    "ok": True,
+                    "source": "openrouter:/api/v1/key:limit_remaining",
+                    "uncapped": remaining is None,
+                    "remaining_usd": remaining,
+                    "threshold_usd": threshold,
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
-        if remaining < threshold:
+        if remaining is not None and remaining < threshold:
             raise RuntimeError(
                 f"OpenRouter credit preflight failed: remaining ${remaining:.2f} below threshold ${threshold:.2f}"
             )
@@ -372,8 +383,12 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
             "OUROBOROS_RETURN_REASONING",
             # Working-context mode (low | max) for context-ablation runs: the
             # container has no settings.json, so without this forward the
-            # runtime silently falls back to the default ("max").
+            # runtime silently falls back to the default ("max"). The derived
+            # auto-low flag travels with it: get_owner_context_mode resolves an
+            # absent flag fail-closed, so a bare forwarded `low` is not read as an
+            # owner-declared scope-review skip.
             "OUROBOROS_CONTEXT_MODE",
+            "OUROBOROS_CONTEXT_MODE_AUTO_LOW",
             "TOTAL_BUDGET",
             "OUROBOROS_PER_TASK_COST_USD",
             "OUROBOROS_SOFT_TIMEOUT_SEC",
@@ -1017,6 +1032,45 @@ PY
     _WEB_TOOLS_MIRROR = ("web_search", "browse_page", "browser_action", "youtube_transcript")
     _DELEGATED_VISION_TOOLS = ("analyze_screenshot", "vlm_query")
 
+    # Harbor's package cache: <cache>/tasks/packages/<org>/<name>/<digest>/task.toml
+    # (harbor.models.task.id:PackageTaskId.get_local_path, verified against harbor 0.18/0.20).
+    _PACKAGE_CACHE_DIR = Path.home() / ".cache" / "harbor" / "tasks" / "packages"
+
+    def _cached_task_toml(self, task_name: str) -> Path | None:
+        """Resolve one cached ``task.toml`` for ``task_name`` — or None, never a guess.
+
+        The org is NOT a constant: the cache already holds `terminal-bench/`, `gaia/` and
+        `scale-ai/` side by side, and a dataset such as Harbor-Index ships tasks from several
+        orgs at once, so the pre-v6.79.0 hardcoded `terminal-bench` literal simply missed every
+        non-TB dataset. AgentContext carries no task identity (checked in harbor 0.18 and 0.20),
+        so the org comes from the configured dataset.
+
+        A configured org is AUTHORITATIVE: when `self.dataset` names one, only that org's cache
+        is consulted, and a miss returns None. There is no cross-owner fallback in that case.
+        Borrowing a same-named task from another org is not a lenient fallback, it is running
+        the task under a different benchmark's parameters — and the parameter in question is the
+        wall-clock cap, which decides pass or fail. `frontier-bench/frontier-bench` verifier
+        caps are 600s against terminal-bench-2-1's 3600s, so a silent borrow between exactly
+        those two orgs (the two most likely to be cached side by side here) misprices the
+        deadline by 6x. Deadline-blind is the honest degradation.
+
+        The name-only lookup remains only for a dataset with NO org (unqualified name), and
+        even there it REFUSES an ambiguous name cached under two orgs."""
+        base = self._PACKAGE_CACHE_DIR
+        org = self.dataset.split("/", 1)[0] if "/" in self.dataset else ""
+        if org:
+            matches = sorted((base / org / task_name).glob("*/task.toml"))
+        else:
+            owners = sorted({
+                path.parent.parent.parent.name
+                for path in base.glob(f"*/{task_name}/*/task.toml")
+            })
+            if len(owners) != 1:
+                return None
+            matches = sorted((base / owners[0] / task_name).glob("*/task.toml"))
+        # Newest matching package version (avoid a stale cached digest).
+        return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
+
     def _resolve_task_timeout_from_dataset(self, context: Any) -> int | None:
         """Read the per-task agent wall-clock cap from the cached task.toml.
 
@@ -1040,14 +1094,10 @@ PY
         if not task_name:
             return None
         try:
-            import glob as _glob
-            base = Path.home() / ".cache" / "harbor" / "tasks" / "packages" / "terminal-bench" / task_name
-            matches = _glob.glob(str(base / "**" / "task.toml"), recursive=True)
-            if not matches:
+            chosen = self._cached_task_toml(task_name)
+            if chosen is None:
                 return None
-            # Pick the newest matching task.toml (avoid a stale cached package version).
-            chosen = max(matches, key=lambda p: os.path.getmtime(p))
-            text = Path(chosen).read_text(encoding="utf-8")
+            text = chosen.read_text(encoding="utf-8")
         except Exception:
             return None
         # Parse [agent].timeout_sec without a toml dependency (the field is a simple float/int).

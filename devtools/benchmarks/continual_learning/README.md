@@ -37,8 +37,9 @@ separately:
   `bench-config/external-adapters/ouroboros/`) together with the adapter's own
   METHODOLOGY. If the adapter is missing from your checkout, restore it from
   that bundle.
-- The adapter needs a **dedicated Ouroboros clone** (`--ouroboros-clone`,
-  never the live repo) whose `devtools/benchmarks/common/server_runner.py` it
+- The adapter needs a **dedicated Ouroboros clone** (`--ouroboros-clone`, never
+  the LIVE repo — `$OUROBOROS_REPO_DIR`; a pinned seed IS allowed to be the
+  checkout you launched from) whose `devtools/benchmarks/common/server_runner.py` it
   imports, plus (docker path) the `clbench-ouroboros:dev` image and the
   runner-side `clbench_skill/remote_work` skill source (renamed from
   `clbench_remote` 2026-07-09 — bench-identifying tells stripped from the

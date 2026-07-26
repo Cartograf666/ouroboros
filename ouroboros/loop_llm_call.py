@@ -8,6 +8,7 @@ Extracted from loop.py to keep the main loop orchestrator focused.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import pathlib
 import queue
@@ -22,12 +23,91 @@ from ouroboros.llm import LLMClient, LocalContextTooLargeError, add_usage
 from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
 from ouroboros.usage_accounting import UsageAccountingError
-from ouroboros.utils import append_jsonl, emit_log_event, sanitize_tool_result_for_log, utc_now_iso
+from ouroboros.utils import append_jsonl, emit_log_event, sanitize_tool_result_for_log, truncate_review_artifact, utc_now_iso
 from ouroboros.config import get_context_mode
 
 log = logging.getLogger(__name__)
 
 MAIN_LOOP_MAX_TOKENS = 65_536
+
+# Retrieval transparency (v6.78.0, owner Q20/Q22): native provider web search happens
+# INSIDE the solve model's own request, so `usage["web_search_sources"]` /
+# `usage["server_tool_use"]` are the only host-attested evidence that the answer was
+# grounded in fetched pages. `add_usage` accumulates numeric token keys only, so
+# without this fold the fact dies at the per-call boundary and the acceptance reviewer
+# never learns whether an answer came from retrieval or from the model's own knowledge.
+# Counts plus capped URLs only — no titles, no snippets (leak-safe, bounded).
+_RETRIEVAL_URL_CAP = 20
+_RETRIEVAL_URL_CHARS = 200
+
+
+def fold_retrieval_usage(accumulated_usage: Dict[str, Any], usage: Dict[str, Any]) -> None:
+    """Accumulate ONE call's native-retrieval facts onto the running usage dict.
+
+    Bounding here is DISCLOSED, never silent (BIBLE P1), on the same three-part contract
+    as ``_outcome_receipts.disclosed_list_projection``: bounded values, an exact
+    ``urls_omitted`` count, and ``urls_identity_sha256`` over the FULL set — which the
+    reviewer-facing projection in ``review_evidence`` then re-uses through that shared
+    helper. This function cannot BE that helper: it is a streaming accumulator folded
+    once per LLM call over a whole task, so it never holds the complete list the
+    one-shot projection takes as input. What it can share, and does, is the per-string
+    bound (the SSOT ``truncate_review_artifact``, so a clipped URL carries its own
+    omission note instead of being silently shortened) and an O(1)-memory rolling chain
+    hash standing in for the full-set hash."""
+    sources = usage.get("web_search_sources")
+    sources = [s for s in sources if isinstance(s, dict)] if isinstance(sources, list) else []
+    server_tool_use = usage.get("server_tool_use") if isinstance(usage.get("server_tool_use"), dict) else {}
+    try:
+        requests = int(server_tool_use.get("web_search_requests") or 0)
+    except (TypeError, ValueError):
+        requests = 0
+    if not requests and sources:
+        requests = 1  # provider reported citations without a request counter
+    if not requests and not sources:
+        return
+    record = accumulated_usage.get("retrieval")
+    record = record if isinstance(record, dict) else {"web_search_requests": 0, "source_count": 0, "urls": []}
+    record["web_search_requests"] = int(record.get("web_search_requests") or 0) + requests
+    # Total fetched sources, so a `urls` list clipped at the cap stays disclosed.
+    record["source_count"] = int(record.get("source_count") or 0) + len(sources)
+    urls = record.get("urls")
+    urls = list(urls) if isinstance(urls, list) else []
+    # Dedup keys over the FULL RAW url, one per RETAINED entry (so this stays O(cap)
+    # memory like the rest of the accumulator). Round 3: deduping on the RENDERED value
+    # silently lost evidence — two DISTINCT long URLs sharing the retained prefix and
+    # length render byte-identically, so the second was skipped while `urls_omitted`
+    # still reported 0, i.e. a fetched URL vanished from evidence that promises an exact
+    # omission count (BIBLE P1). Raw keys make a repeat a true repeat and every distinct
+    # URL either carried or counted.
+    seen = record.get("urls_dedup_sha256")
+    seen = list(seen) if isinstance(seen, list) else []
+    omitted = int(record.get("urls_omitted") or 0)
+    identity = str(record.get("urls_identity_sha256") or "")
+    for source in sources:
+        raw = str(source.get("url") or "").strip()
+        if not raw:
+            continue
+        # Rolling chain hash over every fetched URL's RAW value (never the rendered one,
+        # which two distinct URLs can share) in arrival order: an O(1)-memory
+        # durable identity of the FULL set (recomputable from the per-call `llm_response`
+        # observability payloads, which keep the raw `usage`), so the bounded list below
+        # stays checkable against what the model actually fetched.
+        identity = hashlib.sha256(f"{identity}\n{raw}".encode("utf-8")).hexdigest()
+        key = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        if key in seen:
+            continue  # the SAME url fetched again, already carried in `urls`
+        if len(urls) < _RETRIEVAL_URL_CAP:
+            urls.append(truncate_review_artifact(raw, limit=_RETRIEVAL_URL_CHARS))
+            seen.append(key)
+        else:
+            omitted += 1
+    record["urls"] = urls
+    record["urls_dedup_sha256"] = seen
+    # Exact count of fetched URLs the capped list does NOT carry (repeats among the
+    # omitted are counted each time — the identity hash covers the exact full sequence).
+    record["urls_omitted"] = omitted
+    record["urls_identity_sha256"] = identity
+    accumulated_usage["retrieval"] = record
 
 # Per-class retry policy: TRANSIENT provider failures (finish_reason=null
 # glitches, 429/5xx/overloaded) get a larger same-model attempt budget than
@@ -757,6 +837,7 @@ def call_llm_with_retry(
                 use_local=use_local,
             )
             add_usage(accumulated_usage, usage)
+            fold_retrieval_usage(accumulated_usage, usage)
             response_ref: Dict[str, Any] = {}
             try:
                 response_ref = persist_call(

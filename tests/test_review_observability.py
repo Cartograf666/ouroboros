@@ -191,16 +191,18 @@ def test_all_three_models_ok_no_degraded(tmp_path):
 # ── Test 5: budget_exceeded status on scope ───────────────────────────────────
 
 def test_scope_budget_exceeded_status(monkeypatch):
-    """The explicit advisory floor preserves the visible budget_exceeded status."""
+    """v6.80.0: a pack that cannot fit the reviewer's window has no authoritative
+    verdict, so it fails CLOSED as sub_floor — the removed advisory floor was the only
+    thing that used to keep this non-blocking — while staying fully visible."""
     from ouroboros.tools.scope_review import _handle_prompt_signals, _TouchedContextStatus
 
-    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "advisory")
     ctx_status = _TouchedContextStatus(status="budget_exceeded", token_count=800_001)
     result = _handle_prompt_signals(None, ctx_status)
 
     assert result is not None
-    assert result.blocked is False
-    assert result.status == "budget_exceeded"
+    assert result.blocked is True
+    assert result.status == "sub_floor"
+    assert result.advisory_findings[0]["item"] == "scope_review_skipped"
     assert result.model_id == ""  # populated by run_scope_review after return
 
 
@@ -693,14 +695,15 @@ def test_scope_budget_exceeded_has_prompt_chars(tmp_path, monkeypatch):
     """
     from ouroboros.tools.scope_review import _handle_prompt_signals, _TouchedContextStatus
 
-    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "advisory")
     token_count = 800_000  # exceeds the 750K gate
     context_status = _TouchedContextStatus(status="budget_exceeded", token_count=token_count)
     result = _handle_prompt_signals(None, context_status)
 
     assert result is not None
-    assert result.blocked is False
-    assert result.status == "budget_exceeded"
+    assert result.blocked is True
+    assert result.status == "sub_floor"
+    # The count is DERIVED from the token estimate on this path and says so (RS5).
+    assert result.prompt_chars_source == "estimated_from_tokens"
     assert result.prompt_chars > 0, (
         f"prompt_chars must be non-zero on budget_exceeded path; got {result.prompt_chars}"
     )

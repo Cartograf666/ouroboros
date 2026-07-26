@@ -640,7 +640,8 @@ def test_required_blocking_bare_fail_abstains_without_false_veto(monkeypatch, tm
     )
     assert out is False
     assert len(messages) == 2  # no empty or fabricated revision capsule
-    assert trace["acceptance_decision"]["status"] == "review_degraded"
+    assert trace["acceptance_decision"]["status"] == "finalized_unaccepted"
+    assert trace["acceptance_decision"]["reason"] == "review_degraded"
     assert trace["acceptance_obligations"] == []
 
 
@@ -653,7 +654,9 @@ def test_review_skipped_inside_reserve_finalizes_loudly(monkeypatch, tmp_path):
     )
     assert out is False and len(messages) == 2  # no review round, no injection
     assert trace["review_decision"]["skipped"] == "review_skipped_deadline_reserve"
-    assert trace["acceptance_decision"]["status"] == "review_skipped_deadline_reserve"
+    # v6.78.0: the pacing reason is the typed `reason`; the status is canonical.
+    assert trace["acceptance_decision"]["status"] == "finalized_unaccepted"
+    assert trace["acceptance_decision"]["reason"] == "review_skipped_deadline_reserve"
     assert "review_runs" not in trace  # the review never ran
 
     outcome = derive_loop_outcome("FINAL ANSWER: best available answer", {}, trace)
@@ -680,7 +683,8 @@ def test_obligations_finalize_best_effort_when_passes_exhausted(monkeypatch, tmp
     )
     assert out is False  # gates exhausted -> finalize
     decision = trace["acceptance_decision"]
-    assert decision["status"] == "best_effort_open_obligations"
+    assert decision["status"] == "finalized_unaccepted"
+    assert decision["reason"] == "open_obligations"
     assert decision["open_obligations"]  # visible in the outcome
 
 
@@ -784,7 +788,8 @@ def test_pass_best_effort_is_not_clean_and_does_not_close_obligations(monkeypatc
     )
     assert out is False
     assert trace["acceptance_obligations"][0]["status"] == "open"
-    assert trace["acceptance_decision"]["status"] == "best_effort_open_obligations"
+    assert trace["acceptance_decision"]["status"] == "finalized_unaccepted"
+    assert trace["acceptance_decision"]["reason"] == "open_obligations"
 
 
 def test_no_obligations_when_contributing_set_empty():
@@ -824,7 +829,8 @@ def test_degraded_re_review_keeps_obligations_open_without_false_pass(monkeypatc
     assert out is False
     ob = trace["acceptance_obligations"][0]
     assert ob["status"] == "open" and not ob["disposition"]
-    assert trace["acceptance_decision"]["status"] == "review_degraded"
+    assert trace["acceptance_decision"]["status"] == "finalized_unaccepted"
+    assert trace["acceptance_decision"]["reason"] == "review_degraded"
     assert trace["acceptance_decision"]["open_obligations"] == ["ob-1"]
 
 
