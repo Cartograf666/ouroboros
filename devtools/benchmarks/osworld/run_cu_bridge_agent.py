@@ -646,11 +646,13 @@ def _write_cu_outcome(run: CuBridgeRun, reward: float | None, status: str, reaso
         "claim_owner": bool(run.owns_task), **(extra or {}),
     }
     publication_errors: list[str] = []
+    failed_destinations: set[str] = set()
 
     def _publish(destination: str, write) -> None:
         try:
             write()
         except Exception as exc:  # noqa: BLE001 - one dead destination must not silence the rest
+            failed_destinations.add(destination)
             publication_errors.append(f"{destination}: {type(exc).__name__}: {exc}")
             print(f"[bridge] publication FAILED at {destination}: {type(exc).__name__}: {exc}",
                   file=sys.stderr, flush=True)
@@ -690,14 +692,48 @@ def _write_cu_outcome(run: CuBridgeRun, reward: float | None, status: str, reaso
     # The row says which attempt it came from and whether that attempt held the claim (a
     # pre-claim block is not the owner), so a reader deduping by instance_id can tell the
     # holder's row from a bystander's.
-    _publish("result_index", lambda: append_result_index(run.result_root, task_result_row(
-        benchmark="osworld", instance_id=run.example_id, status=status, reason_code=reason,
-        official_eval_status="completed" if reward is not None else "not_run",
-        output_paths={"task_outcome": str(run.attempt_dir / "task_outcome.json")},
-        error=error, details={"domain": run.domain, "reward": reward,
-                              "attempt_dir": str(run.attempt_dir),
-                              "claim_owner": bool(run.owns_task), **(extra or {})},
-    )))
+    def _ledger_row() -> dict[str, Any]:
+        """Describe the publication that HAPPENED, not the one this writer set out to do.
+
+        The row is built HERE, at append time, so it sees every destination attempted before
+        it. Independence made each destination survive its siblings' failures; it also made
+        this row reachable when the artefact it describes was never written. Three things
+        therefore follow the actual result rather than the intent:
+
+        * the `task_outcome` POINTER is emitted only if that write succeeded — a row naming a
+          path that does not exist is worse than a row naming none, because a reader has no
+          way to distinguish it from a file that was deleted later;
+        * the STATUS degrades to `partially_published`, because `completed` is a claim about
+          the record, and publication did not reach it. The status the RUN reached is kept
+          verbatim in `details.outcome_status`, so nothing is lost, only relocated to a field
+          that is not read as "this row is whole";
+        * the collected `publication_errors` ride along, so the gap is legible without
+          stat()-ing the filesystem.
+
+        `official_eval_status` and `details.reward` are deliberately UNTOUCHED: they describe
+        the evaluation, which really did complete, and demoting them would re-create the
+        score-erasing bug this writer exists to prevent.
+        """
+        partial = bool(publication_errors)
+        output_paths: dict[str, str] = {}
+        if "attempt_outcome" not in failed_destinations:
+            output_paths["task_outcome"] = str(run.attempt_dir / "task_outcome.json")
+        return task_result_row(
+            benchmark="osworld", instance_id=run.example_id,
+            status="partially_published" if partial else status,
+            reason_code=reason,
+            official_eval_status="completed" if reward is not None else "not_run",
+            output_paths=output_paths,
+            error=error, details={"domain": run.domain, "reward": reward,
+                                  "attempt_dir": str(run.attempt_dir),
+                                  "claim_owner": bool(run.owns_task),
+                                  "outcome_status": status,
+                                  **({"publication_errors": list(publication_errors)}
+                                     if partial else {}),
+                                  **(extra or {})},
+        )
+
+    _publish("result_index", lambda: append_result_index(run.result_root, _ledger_row()))
     if publication_errors:
         # The sidecars were written BEFORE the later stages failed, so they carry the score but
         # not yet the fact that publication was partial. Amend them so the durable record

@@ -366,8 +366,90 @@ def test_dry_run_records_seed_escape_and_attestation_path(tmp_path):
                           .read_text(encoding="utf-8"))
     extra = manifest["extra"]
     assert extra["allow_dirty_seed"] is True
-    # docker is the launcher default, so the disclosure must name the patched path
+    # docker is the launcher default, and this clone is UNPATCHED: the disclosure must say the
+    # run is unattested. Naming the patch because `--docker` was passed asserted a provenance
+    # check that never ran — the same defect as a manifest naming a model that never ran. The
+    # previous form of this assertion pinned that bug: it demanded the false claim.
+    assert extra["runtime_attested"] is False
+    assert "UNATTESTED" in extra["runtime_attestation_path"]
+    assert extra["adapter_operator_patches"]["patches"][
+        "clb_docker_runtime_attestation.v6746"] is False
+
+
+def test_dry_run_claims_attestation_only_when_the_patch_is_in_the_execution_clone(tmp_path):
+    """The mirror: a clone that REALLY carries the hook is recorded as attested.
+
+    Both directions matter. Deriving the field from the tree is only correct if it still
+    reports the patched path when the patch is there — otherwise the fix would trade a false
+    claim for a false denial, and an auditor would discount an attested run.
+    """
+    runner = _fake_runner(tmp_path)
+    (runner / "src" / "systems" / "ouroboros" / "_docker_launcher.py").write_text(
+        "class DockerOuroborosEngine:\n"
+        "    def _attest_runtime(self, clone):\n        pass\n",
+        encoding="utf-8")
+    clone = _fake_clone(tmp_path)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = run_clb.main([
+            "--runner-path", str(runner), "--ouroboros-clone", str(clone),
+            "--path", "bridge", "--allow-dirty-seed", "--dry-run",
+        ])
+    assert rc == 0
+    extra = json.loads((Path(json.loads(buf.getvalue())["run_root"]) / "run_manifest.json")
+                       .read_text(encoding="utf-8"))["extra"]
+    assert extra["runtime_attested"] is True
     assert "clb_docker_runtime_attestation" in extra["runtime_attestation_path"]
+    assert "UNATTESTED" not in extra["runtime_attestation_path"]
+
+
+def test_fidelity_follows_the_execution_clone_not_the_pinned_commit_constant(tmp_path):
+    """The three "declared-only" knobs are enforced iff their operator patch is in the clone.
+
+    The report described the PINNED adapter, so on a patched clone it announced a gap that the
+    patches had closed: it claimed safety `full`, advisory enforcement and no `claude_code_edit`
+    exclusion for a run that was really running `light`/`blocking` with all nine tools disabled.
+    Understating enforcement is the safer direction but it is still a manifest that does not
+    match its run, and a reader who trusts it discounts a stricter run than they were given.
+    """
+    runner = _fake_runner(tmp_path)
+    adapter = runner / "src" / "systems" / "ouroboros"
+    clone = _fake_clone(tmp_path)
+
+    def _fidelity_of():
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run_clb.main([
+                "--runner-path", str(runner), "--ouroboros-clone", str(clone),
+                "--path", "bridge", "--allow-dirty-seed", "--dry-run",
+            ])
+        assert rc == 0
+        return json.loads(buf.getvalue())["fidelity"]
+
+    unpatched = _fidelity_of()
+    for knob in ("OUROBOROS_SAFETY_MODE", "OUROBOROS_REVIEW_ENFORCEMENT",
+                 "CLBENCH_SOLVE_DISABLED_TOOLS"):
+        assert knob in unpatched["declared_only_pinned_adapter_gap"]
+        assert knob not in unpatched["enforced_via_operator_patch"]
+
+    # Now apply the two forwarding patches' markers, as the operator does before a real run.
+    (adapter / "_docker_launcher.py").write_text(
+        "ov['OUROBOROS_SAFETY_MODE'] = os.environ['OUROBOROS_SAFETY_MODE']\n", encoding="utf-8")
+    (adapter / "run_clbench_bridge_agent.py").write_text(
+        "DISABLED_TOOLS = os.environ.get('CLBENCH_SOLVE_DISABLED_TOOLS', '').split(',')\n",
+        encoding="utf-8")
+
+    patched = _fidelity_of()
+    assert patched["declared_only_pinned_adapter_gap"] == {}
+    for knob in ("OUROBOROS_SAFETY_MODE", "OUROBOROS_REVIEW_ENFORCEMENT",
+                 "CLBENCH_SOLVE_DISABLED_TOOLS"):
+        assert knob in patched["enforced_via_operator_patch"]
+    # The declared values are the ones the patched clone really applies.
+    assert patched["enforced_via_operator_patch"]["OUROBOROS_SAFETY_MODE"]["declared"] == "light"
+    assert patched["enforced_via_operator_patch"][
+        "OUROBOROS_REVIEW_ENFORCEMENT"]["declared"] == "blocking"
+    assert "claude_code_edit" in patched["enforced_via_operator_patch"][
+        "CLBENCH_SOLVE_DISABLED_TOOLS"]["declared"]
 
 
 def test_seed_gate_binds_to_the_execution_clone_and_records_the_launcher_separately(tmp_path):

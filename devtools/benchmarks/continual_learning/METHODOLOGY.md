@@ -166,7 +166,9 @@ for the exact apply order). Runtime attestation for the docker engine path
 arrives the same way (`clb_docker_runtime_attestation.v6746.patch`): the host
 engine is attested inside `IsolatedServer._wait_ready()`, but the docker engine
 is a thin stand-in that never calls it. The manifest records which path attested
-the run under `extra.runtime_attestation_path`.
+the run under `extra.runtime_attestation_path`, derived from whether that patch is
+actually applied in the execution clone — an absent attestation is recorded as
+absent (`extra.runtime_attested: false`), never assumed from the `--docker` flag.
 
 The run's SEED gate is bound to the EXECUTION clone — the `--ouroboros-clone`
 checkout the external adapter boots its agent servers from — not to this
@@ -233,24 +235,36 @@ channel the pinned external adapter actually honors: `--system-params`
 (model, `max_workers`, evolution, resume, timeouts) and child env
 (`OUROBOROS_EFFORT_TASK`, `OUROBOROS_OR_PROVIDER`, `OUROBOROS_TOTAL_BUDGET`).
 
-Three knobs have **no forward channel in the pinned adapter (56764d6)** and are
-declared-only (manifest `fidelity.declared_only_pinned_adapter_gap` + stderr
-warnings):
+Three knobs have **no forward channel in the pinned adapter (56764d6)** and
+depend on tracked operator patches being applied in the EXECUTION CLONE:
 
 - `OUROBOROS_SAFETY_MODE=light` — effective on the host engine path (env
-  inheritance), dropped by the docker engine's explicit `-e` list. Fix:
-  forward it as one more `-e` pair in `_docker_launcher._start`.
-- `OUROBOROS_REVIEW_ENFORCEMENT=blocking` — same channel and same gap as
-  safety mode: effective on the host engine path via env inheritance, dropped
-  by the docker engine's explicit `-e` list. Fix: the same one-line `-e` pair.
-- `CLBENCH_SOLVE_DISABLED_TOOLS` (incl. `claude_code_edit`) — the standard
-  path submits solve tasks without `disabled_tools`; the bridge hardcodes its
-  own 8-tool list. Fix: read the env list and pass `disabled_tools` in the
-  `/api/tasks` submit body (both engines' `submit()`).
+  inheritance); the docker engine forwards only an explicit `-e` list.
+  Forwarded by `clb_env_campaign_overrides.v6745.patch`, which lets an
+  exported value win over the engine's parity defaults in `_overrides`.
+- `OUROBOROS_REVIEW_ENFORCEMENT=blocking` — same channel, same gap, same
+  patch.
+- `CLBENCH_SOLVE_DISABLED_TOOLS` (incl. `claude_code_edit`) — the pinned
+  bridge hardcodes `DISABLED_TOOLS = []`. Read from env by
+  `clb_disabled_tools_env.v6745.patch`, so every declared tool reaches the
+  task contract.
 
-Until the adapter carries those three forwards, docker-path runs execute with
-safety `full`, advisory review enforcement, and without the `claude_code_edit`
-exclusion; any published number must say so.
+**Whether these are in force is a fact about the clone, not about the flags.**
+The launcher probes the execution clone for each patch's marker
+(`adapter_patch_probe`) and records the verdict per knob: enforced knobs land
+under `fidelity.enforced_via_operator_patch`, unenforced ones under
+`fidelity.declared_only_pinned_adapter_gap` with a stderr warning, and the raw
+probe under `fidelity.adapter_operator_patches`. The same probe decides
+`extra.runtime_attestation_path` / `extra.runtime_attested`: on the docker path
+the attestation exists only if `clb_docker_runtime_attestation.v6746.patch` is
+applied, and a run without it is recorded as UNATTESTED rather than claiming a
+check that never ran.
+
+On an **unpatched** clone, docker-path runs execute with safety `full`,
+advisory review enforcement, and without the `claude_code_edit` exclusion; any
+published number must say so. On a **patched** clone all three are applied, and
+the manifest says that instead — reading the gap off the flags understated runs
+that were in fact stricter than declared.
 
 ## 7. Honest limits
 

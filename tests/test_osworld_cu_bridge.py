@@ -1411,3 +1411,43 @@ def test_cu_bridge_keeps_the_outcome_files_when_the_ledger_cannot_be_appended(
         "the dead destination must be disclosed, not swallowed"
     attempts = sorted((run_dir / "attempts").glob("*/task_outcome.json"))
     assert json.loads(attempts[-1].read_text(encoding="utf-8"))["reward"] == 1.0
+
+
+def test_cu_bridge_ledger_row_never_points_at_an_outcome_that_was_not_written(
+        tmp_path, monkeypatch):
+    """The ledger row must describe the publication that HAPPENED, not the one intended.
+
+    Independent destinations stopped one dead record from erasing an obtained score — but
+    independence cuts both ways: the row is now written even when the artefact it points at
+    is not. Emitting `output_paths.task_outcome` unconditionally, with the pre-failure status
+    and without the collected `publication_errors`, makes the index assert a completed,
+    readable outcome file that does not exist. An operator must be able to tell "scored,
+    fully published" from "scored, partially published" from the row alone.
+    """
+    rcb_mod, _env = _cu_bridge_stubs(monkeypatch, tmp_path, reward=1.0)
+    argv, results = _cu_bridge_argv(tmp_path, tmp_path / "claims")
+    monkeypatch.setattr(sys, "argv", argv)
+    real_write_json = rcb_mod.write_json
+
+    def _dead_attempt_outcome(path, payload):
+        target = Path(path)
+        if target.name == "task_outcome.json" and "attempts" in target.parts:
+            raise OSError("attempt outcome destination is dead")
+        return real_write_json(path, payload)
+
+    monkeypatch.setattr(rcb_mod, "write_json", _dead_attempt_outcome)
+
+    assert rcb_mod.main() == 1
+    row = json.loads((results / "result_index.jsonl").read_text(
+        encoding="utf-8").splitlines()[-1])
+    # No pointer to a destination that failed: the file genuinely is not there.
+    assert not list((results / "chrome" / "abc" / "attempts").glob("*/task_outcome.json"))
+    assert "task_outcome" not in row["output_paths"], \
+        "the row must not point at an artefact whose write failed"
+    # The status publication never achieved must not be reported as if it had been.
+    assert row["status"] != "completed"
+    # ...while everything the run DID achieve still reaches the ledger.
+    assert row["official_eval_status"] == "completed"
+    assert row["details"]["reward"] == 1.0
+    assert any("attempt_outcome" in e for e in row["details"]["publication_errors"]), \
+        "the row must carry the collected publication errors"

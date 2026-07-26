@@ -821,6 +821,10 @@ def test_every_settings_writer_routes_through_the_shared_prologue():
         ("ouroboros/tools/core.py", "_data_write"):
             "names SETTINGS_PATH only to REFUSE agent writes to it.",
     }
+    # Keys are POSIX-normalised: `str(WindowsPath(...))` is backslash-separated, so on Windows
+    # every `exempt` lookup below would miss and every hardcoded assertion at the end would
+    # fail — turning the tripwire into either a red matrix or, worse, a guard that flags the
+    # exempted writers while silently vouching for nothing.
     writers = {}
     for path in sorted(pathlib.Path("ouroboros").rglob("*.py")) + [pathlib.Path("server.py")]:
         src = path.read_text(encoding="utf-8")
@@ -831,7 +835,7 @@ def test_every_settings_writer_routes_through_the_shared_prologue():
                 continue
             seg = ast.get_source_segment(src, node) or ""
             if "SETTINGS_PATH" in seg and re.search(r"\.write_text\(|atomic_write_json\(|json\.dump\(", seg):
-                writers[(str(path), node.name)] = "prepare_settings_for_persist" in seg
+                writers[(path.as_posix(), node.name)] = "prepare_settings_for_persist" in seg
 
     unrouted = {k for k, routed in writers.items() if not routed and k not in exempt}
     assert not unrouted, (
