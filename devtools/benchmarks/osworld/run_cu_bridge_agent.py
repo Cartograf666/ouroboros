@@ -120,7 +120,49 @@ _GUI_ACTION_TOOLS = frozenset({
 _DENIED_SKILL_EXT_TOOLS = ("add_connection", "activate_connection", "use_local", "clear_active_connection")
 
 
-def _effective_disabled_tools(allow_a11y: bool) -> list[str]:
+GATE_PREAMBLE = (
+    "You are inspecting a real Ubuntu desktop inside an OSWorld VM to answer ONE question "
+    "about the task below: does the premise it takes for granted actually hold here?\n"
+    "You CANNOT act on this VM right now — the mouse and keyboard tools are not available to "
+    "you in this phase, by construction. Look and read only. Use screenshot + view_image to "
+    "see the desktop, window_list to see what is open, and remote_exec for READ-ONLY checks "
+    "(listing a directory, reading a version, checking a device node). Do not modify anything: "
+    "no writes, no installs, no configuration changes.\n"
+    "\n"
+    "Decide which of these three the task is, and end your final message with that single word "
+    "on its own line:\n"
+    "- INFEASIBLE — an essential PRE-EXISTING target or capability that the task presupposes is "
+    "absent: the file/photo/record it tells you to act on is not there, the installed "
+    "application genuinely lacks the feature, the hardware or account does not exist. Say which "
+    "one, and how you observed it.\n"
+    "- PROCEED — the premise holds, or the task asks you to CREATE the thing (creating is the "
+    "work, not a missing premise), or the missing detail is mentioned only as motivation while "
+    "the required action is still possible.\n"
+    "- UNDETERMINED — you could not establish it from looking alone, or the only obstacle was a "
+    "network error, a rate limit or an anti-bot block. Those are not infeasibility.\n"
+    "\n"
+    "When in doubt, answer UNDETERMINED. A wrong INFEASIBLE ends the task for nothing; "
+    "UNDETERMINED simply hands the work to the next phase, which has full capability.\n\nTask:\n"
+)
+
+
+def _gate_verdict(latest: dict[str, Any] | None) -> str:
+    """The gate's typed verdict, read from the phase-A agent's terminal answer.
+
+    Fails OPEN: anything that is not an explicit standalone INFEASIBLE — PROCEED,
+    UNDETERMINED, an unparseable answer, a crashed or timed-out phase — proceeds to the
+    full-capability phase. The gate may only ever REMOVE a task the agent is affirmatively
+    certain about; it can never strand one on silence.
+    """
+    text = _terminal_answer_text(latest)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if line in {"INFEASIBLE", "PROCEED", "UNDETERMINED"}:
+            return line
+    return "UNDETERMINED"
+
+
+def _effective_disabled_tools(allow_a11y: bool, *, gate_phase: bool = False) -> list[str]:
     """Per-task disabled-tool list = the host-tool complement of the allowlist,
     plus the skill's connection-switching ext tools (the runner pins the VM
     connection), plus ``ax_tree`` unless ``--allow-a11y`` is given (screenshot-only
@@ -133,6 +175,14 @@ def _effective_disabled_tools(allow_a11y: bool) -> list[str]:
     if not allow_a11y:
         disabled.append(extension_surface_name(SKILL_NAME, "ax_tree"))
     disabled.append("schedule_subagent")  # operator 2026-07-23: subagents=0 no-swarm campaign
+    if gate_phase:
+        # The premise phase cannot act: the mutating GUI surface is ABSENT, not merely
+        # discouraged, so the agent cannot manufacture the premise it is being asked to
+        # judge. Reading tools stay (screenshot/view_image/window_list/wait) and remote_exec
+        # stays for read-only probes — read-only by instruction, since discriminating a
+        # reading shell command from a writing one in code would be exactly the kind of
+        # pattern gate the constitution forbids for a semantic decision.
+        disabled += [extension_surface_name(SKILL_NAME, t) for t in sorted(_GUI_ACTION_TOOLS)]
     return disabled
 
 
@@ -497,6 +547,13 @@ def main() -> int:
     p.add_argument("--allow-a11y", action="store_true",
                    help="expose the ax_tree (accessibility) tool; the run is then NOT screenshot-only "
                         "(disclose 'Additional a11y tree used: Yes'). Off by default.")
+    p.add_argument("--feasibility-gate", action="store_true",
+                   help="run a read-only premise phase before the task: a first Ouroboros task with the "
+                        "mutating GUI tools absent, which answers INFEASIBLE / PROCEED / UNDETERMINED. "
+                        "Only an explicit INFEASIBLE ends the example (translated to the official FAIL); "
+                        "everything else, including any gate error, proceeds to the full-capability phase. "
+                        "Off by default. A run using it posts TWO tasks per example, so the manifest "
+                        "reports one_run_per_task=false — see METHODOLOGY.md §7.")
     p.add_argument("--allow-live-server", action="store_true",
                    help="permit pointing --ouroboros-url at the live desktop server port 8765 (debug only).")
     p.add_argument("--allow-dirty-seed", action="store_true",
@@ -620,7 +677,12 @@ def main() -> int:
                     # HONEST contract: reset()/evaluate() are official, but GUI actions
                     # go to the guest /execute channel and are NOT recorded in
                     # DesktopEnv.action_history/traj.jsonl (only a translated FAIL is).
-                    "adapter": "host_cu_bridge", "one_run_per_task": True,
+                    # Two tasks per example when the premise phase runs, so this must say so:
+                    # a manifest still claiming one run per task while the adapter posts two
+                    # would misreport the protocol.
+                    "adapter": "host_cu_bridge",
+                    "one_run_per_task": not bool(args.feasibility_gate),
+                    "feasibility_gate_phase": bool(args.feasibility_gate),
                     "official_actions": False, "official_reset_evaluate": True,
                     "action_channel": "guest_execute_not_env_step",
                     "a11y_enabled": bool(args.allow_a11y),
@@ -1066,42 +1128,102 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
         )
         (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
-        created = _api(args.ouroboros_url, "POST", "/api/tasks", {
-            "description": prompt, "memory_mode": "empty",
-            "disabled_tools": _effective_disabled_tools(args.allow_a11y),
-            # The task-acceptance panel already runs on every OSWorld task and was, until now,
-            # given no criteria at all (acceptance_claims was [] on all 361 tasks of the
-            # v6.81.0 run while the panel returned clean_pass on 324 of them). These four
-            # claims cost no extra model call: they tell the reviewer that already runs what
-            # a completed OSWorld task must be able to say for itself. They are deliberately
-            # general — no task id, no application, no evaluator behaviour.
-            "acceptance_claims": _ACCEPTANCE_CLAIMS,
-        })
-        task_id = str(created.get("task_id") or "")
-        if not task_id:
-            raise RuntimeError(f"task creation returned no task_id: {created!r}")
-        (run_dir / "ouroboros_task_id.txt").write_text(task_id, encoding="utf-8")
-
-        final_statuses = {"completed", "failed", "cancelled", "rejected_duplicate"}
-        t_deadline = time.time() + max(60, int(args.task_timeout_sec))
-        latest: dict[str, Any] = {}
-        while True:
-            if time.time() >= t_deadline:
-                try:
-                    _api(args.ouroboros_url, "POST", f"/api/tasks/{task_id}/cancel", {})
-                except Exception:
-                    pass
-                latest = {"status": "timeout"}
-                break
+        # --- premise phase (opt-in) -------------------------------------------------
+        # A separate task whose mutating GUI tools are ABSENT, so the premise cannot be
+        # manufactured while it is being judged. Only an explicit INFEASIBLE stops the
+        # example; PROCEED, UNDETERMINED, an unreadable answer, a timeout or any exception
+        # all fall through to the full-capability phase below. The gate can therefore only
+        # remove a task the agent was affirmatively certain about, never strand one.
+        gate_verdict = ""
+        if args.feasibility_gate:
             try:
-                result = _api(args.ouroboros_url, "GET", "/api/tasks/" + task_id, timeout=30)
-            except Exception:
-                time.sleep(5)
-                continue
-            latest = result if isinstance(result, dict) else {}
-            if str(latest.get("status") or "") in final_statuses:
-                break
-            time.sleep(8)
+                gate_created = _api(args.ouroboros_url, "POST", "/api/tasks", {
+                    "description": GATE_PREAMBLE + instruction, "memory_mode": "empty",
+                    "disabled_tools": _effective_disabled_tools(args.allow_a11y, gate_phase=True),
+                })
+                gate_task_id = str(gate_created.get("task_id") or "")
+                if not gate_task_id:
+                    raise RuntimeError(f"gate task creation returned no task_id: {gate_created!r}")
+                gate_deadline = time.time() + max(60, int(args.task_timeout_sec) // 4)
+                gate_latest: dict[str, Any] = {}
+                while True:
+                    if time.time() >= gate_deadline:
+                        try:
+                            _api(args.ouroboros_url, "POST", f"/api/tasks/{gate_task_id}/cancel", {})
+                        except Exception:
+                            pass
+                        gate_latest = {"status": "timeout"}
+                        break
+                    try:
+                        gr = _api(args.ouroboros_url, "GET", "/api/tasks/" + gate_task_id, timeout=30)
+                    except Exception:
+                        time.sleep(5)
+                        continue
+                    gate_latest = gr if isinstance(gr, dict) else {}
+                    if str(gate_latest.get("status") or "") in {
+                        "completed", "failed", "cancelled", "rejected_duplicate"
+                    }:
+                        break
+                    time.sleep(8)
+                gate_verdict = _gate_verdict(gate_latest)
+                (run_dir / "feasibility_gate.json").write_text(
+                    json.dumps({"verdict": gate_verdict, "task_id": gate_task_id,
+                                "answer": _terminal_answer_text(gate_latest),
+                                "status": gate_latest.get("status")},
+                               ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as exc:  # noqa: BLE001 - a broken gate must never cost a task
+                gate_verdict = "UNDETERMINED"
+                (run_dir / "feasibility_gate.json").write_text(
+                    json.dumps({"verdict": gate_verdict,
+                                "error": f"{type(exc).__name__}: {exc}"},
+                               ensure_ascii=False, indent=2), encoding="utf-8")
+
+        latest: dict[str, Any] = {}
+        task_id = ""  # bound in both branches: the counters read it below
+        if gate_verdict == "INFEASIBLE":
+            # Synthesize the terminal answer the working phase would have produced and let
+            # the SINGLE existing path below do the rest: the FAIL translation, evaluate(),
+            # and the claim-marker sequence that protects against double scoring all live
+            # there and must not be duplicated here.
+            latest = {"status": "completed", "result": "TASK_INFEASIBLE", "total_rounds": 0,
+                      "feasibility_gate": gate_verdict}
+            (run_dir / "ouroboros_task_id.txt").write_text("(gate: no working task)", encoding="utf-8")
+        else:
+            created = _api(args.ouroboros_url, "POST", "/api/tasks", {
+                "description": prompt, "memory_mode": "empty",
+                "disabled_tools": _effective_disabled_tools(args.allow_a11y),
+                # The task-acceptance panel already runs on every OSWorld task and was, until now,
+                # given no criteria at all (acceptance_claims was [] on all 361 tasks of the
+                # v6.81.0 run while the panel returned clean_pass on 324 of them). These four
+                # claims cost no extra model call: they tell the reviewer that already runs what
+                # a completed OSWorld task must be able to say for itself. They are deliberately
+                # general — no task id, no application, no evaluator behaviour.
+                "acceptance_claims": _ACCEPTANCE_CLAIMS,
+            })
+            task_id = str(created.get("task_id") or "")
+            if not task_id:
+                raise RuntimeError(f"task creation returned no task_id: {created!r}")
+            (run_dir / "ouroboros_task_id.txt").write_text(task_id, encoding="utf-8")
+
+            final_statuses = {"completed", "failed", "cancelled", "rejected_duplicate"}
+            t_deadline = time.time() + max(60, int(args.task_timeout_sec))
+            while True:
+                if time.time() >= t_deadline:
+                    try:
+                        _api(args.ouroboros_url, "POST", f"/api/tasks/{task_id}/cancel", {})
+                    except Exception:
+                        pass
+                    latest = {"status": "timeout"}
+                    break
+                try:
+                    result = _api(args.ouroboros_url, "GET", "/api/tasks/" + task_id, timeout=30)
+                except Exception:
+                    time.sleep(5)
+                    continue
+                latest = result if isinstance(result, dict) else {}
+                if str(latest.get("status") or "") in final_statuses:
+                    break
+                time.sleep(8)
         (run_dir / "ouroboros_task_final.json").write_text(json.dumps(latest, ensure_ascii=False, indent=2), encoding="utf-8")
         # Hand the RUNTIME's own terminal reason to every outcome path below (including the
         # adapter_error ones). Set here, once, rather than threaded as a parameter: the poll is

@@ -190,3 +190,33 @@ For current official OSWorld comparisons, run on the official
 environment/architecture. Google Drive tasks need `client_secrets.json`; if it
 is unavailable, use the documented 361-task exclusion path rather than counting
 harness setup crashes as model failures.
+
+## Feasibility gate (`--feasibility-gate`, opt-in, off by default)
+
+A read-only premise phase that runs BEFORE the working task. It is a separate Ouroboros
+task whose mutating GUI tools (`click`, `move`, `left_click_drag`, `mouse_down`,
+`mouse_up`, `type_text`, `key`, `hold_key`, `scroll`) are **absent from the capability
+envelope**, not merely discouraged — so the premise cannot be manufactured while it is
+being judged. Reading stays available (`screenshot`/`view_image`/`window_list`/`wait`)
+and `remote_exec` stays for read-only probes; read-only there is an instruction, not an
+enforcement, because deciding in code whether a shell command reads or writes would be
+exactly the kind of pattern gate that BIBLE P5 forbids for a semantic decision.
+
+The phase answers one of three words: `INFEASIBLE`, `PROCEED`, `UNDETERMINED`.
+
+**It fails OPEN.** Only an explicit standalone `INFEASIBLE` ends the example (translated
+into the official `env.step("FAIL")` through the same path a self-declared infeasibility
+takes, so the claim-marker and scoring sequence is not duplicated). `PROCEED`,
+`UNDETERMINED`, an unparseable answer, a timeout, a crashed phase or any exception all
+fall through to the full-capability phase. The gate can therefore only remove a task the
+agent was affirmatively certain about; it can never strand one on silence.
+
+Cost and disclosure: a gated run posts TWO tasks per example, so the manifest reports
+`one_run_per_task: false` and `feasibility_gate_phase: true`, and the per-example
+verdict is written to `feasibility_gate.json` in the task directory. Expect roughly
+double the per-example warm-up and acceptance-review cost. See METHODOLOGY.md §7 (4a).
+
+**Validate before trusting it.** The failure mode that matters is a false `INFEASIBLE` on
+a feasible task: that scores a hard zero. Measure the false-INFEASIBLE rate on a
+stratified control set of feasible tasks — not just the recall on infeasible ones —
+before enabling it for a scored run.
