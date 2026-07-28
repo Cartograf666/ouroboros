@@ -309,31 +309,57 @@ leaderboard run without the disclosures below.
    `final_answer: null` while the text sat in the runtime result. Outcomes written before
    this fix under-report what the agent said; the reward figures are unaffected.
 
-4c. **`--feasibility-gate` (opt-in, off by default) posts TWO tasks per example.** A
-   read-only premise phase runs first, with the mutating GUI tools absent from its
-   capability envelope, and answers INFEASIBLE / PROCEED / UNDETERMINED on its last line.
-   Only an explicit INFEASIBLE ends the example — translated into the official
-   `env.step("FAIL")` through the same single path an agent-declared infeasibility takes,
-   so scoring and the claim-marker sequence keep exactly one caller. Everything else
-   (PROCEED, UNDETERMINED, an unparseable answer, a timeout, a crashed phase, any
-   exception) falls through to the full-capability phase: the gate can only remove a task
-   the agent was affirmatively certain about, never strand one.
+4c. **`--feasibility-gate` (opt-in, off by default) posts up to THREE tasks per
+   example.** A read-only premise phase runs first, with the mutating GUI tools absent
+   from its capability envelope, and answers INFEASIBLE / PROCEED / UNDETERMINED on its
+   last line. An INFEASIBLE verdict does not stand alone: an independent CHALLENGER
+   round (fresh session, `memory_mode: "empty"`, same envelope) re-reads the same VM,
+   and only agreement ends the example — translated into the official
+   `env.step("FAIL")` through the same single path an agent-declared infeasibility
+   takes, so scoring and the claim-marker sequence keep exactly one caller. Everything
+   else (PROCEED, UNDETERMINED, challenger disagreement, an unparseable answer, a
+   timeout whose cancel confirmed, a crashed phase, any exception) falls through to the
+   full-capability phase: the gate can only remove a task two independent readings were
+   affirmatively certain about, never strand one. The single deliberate exception to
+   fail-open is a premise round whose CANCEL DID NOT CONFIRM: a zombie premise session
+   shares the lane's server and skill connection file, so the attempt aborts as a typed
+   infra row (`blocked` / `gate_cancel_unconfirmed`, claim released) rather than let it
+   act on the VM the worker is scored on.
 
-   Three disclosures belong with any gated number. (i) The manifest reports
-   `one_run_per_task: false` and `feasibility_gate_phase: true`, and each outcome carries
-   `infeasible_source` (`feasibility_gate` vs `agent_final_answer`) plus the phase's own
-   rounds — a gate-terminated example must not be readable as an agent that worked and
-   then declared infeasibility. (ii) The claim staleness bound is widened by the phase's
-   window; without that a gated holder consumes the margin the formula reserves for the
-   unbounded `evaluate()`, and a second lane can reclaim and re-score a task still being
-   worked. (iii) The phase closes the GUI vector only: `remote_exec` remains a general
-   shell, read-only by instruction and not by enforcement, so the working phase is
-   re-`reset()` afterwards and the guarantee is "harder to manufacture", not "impossible".
+   Disclosures that belong with any gated number. (i) The manifest reports
+   `one_run_per_task: false`, `feasibility_gate_phase: true` and
+   `feasibility_gate_challenger: true`, and each outcome carries `infeasible_source`
+   (`feasibility_gate` vs `agent_final_answer`) plus each round's own rounds — a
+   gate-terminated example must not be readable as an agent that worked and then
+   declared infeasibility. (ii) The claim staleness bound is widened by TWO premise
+   windows (`_gate_claim_window_sec`); without that a gated holder consumes the margin
+   the formula reserves for the unbounded `evaluate()`, and a second lane can reclaim
+   and re-score a task still being worked. (iii) The phase closes the GUI vector only:
+   `remote_exec` remains a general shell, read-only by instruction and not by
+   enforcement — so `feasibility_gate.json` carries each round's full tool trace
+   (verbatim args, not previews) for offline audit, and the working phase is
+   re-reset afterwards.
 
-   Expect roughly double the per-example warm-up and acceptance-review cost. The number
-   that decides whether it is worth paying is the FALSE-INFEASIBLE rate on feasible tasks
-   — a wrong verdict scores a hard zero — and it must be measured on a stratified control
-   set of feasible tasks before the gate is used for a scored run.
+   Both resets — initial and post-gate — are VERIFIED (`_reset_verified`): OSWorld's own
+   `reset()` fails open when the guest server misses its setup probe window, silently
+   skipping every setup step and returning a pristine VM ("Environment setup complete."
+   with nothing set up). The runner asserts the machine-checkable postcondition
+   (`is_environment_used` true whenever the task config is non-empty, plus a screenshot
+   over the same HTTP path the agent's tools use), forces the snapshot revert before
+   every retry (an unforced retry runs setup on top of the partial state), republishes
+   the VM endpoint after the post-gate reset (the docker provider can change IP/ports
+   on recreate), and turns exhaustion into a typed infra row (`reset_unverified`,
+   reward `null`, claim released) — a setup the harness could not verify must never
+   become a capability zero. Note the silent-skip flaw affects UNGATED runs too, on
+   their single reset: numbers measured before this verification existed may include
+   silent-setup zeros and are not strictly comparable with numbers measured after.
+
+   Expect roughly double the per-example warm-up and acceptance-review cost (triple on
+   killed examples). The number that decides whether it is worth paying is the
+   FALSE-INFEASIBLE rate on feasible tasks — a wrong verdict scores a hard zero — and
+   it must be measured on a stratified control set of feasible tasks before the gate is
+   used for a scored run, WITH the control classes interleaved in the task list (a
+   blocked layout delivers the flattering class first and the deciding class last).
 
 5. **Observation modality.** Screenshot-only by DEFAULT: `ax_tree` is disabled
    per task unless `--allow-a11y`. A run with `--allow-a11y` must be reported as

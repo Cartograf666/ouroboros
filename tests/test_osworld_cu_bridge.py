@@ -356,9 +356,13 @@ def test_cu_bridge_claim_is_acquired_inside_the_try_that_releases_it():
     assert body.index("from desktop_env.desktop_env import DesktopEnv") < body.index("release_task_claim(")
     # A lane that never took the lock must not delete the holder's lockfile.
     assert "if claims_dir is not None and claim_fd is not None:" in src
-    # The runtime attestation admits the run before the claim and before the first paid POST.
+    # The runtime attestation admits the run before the claim and before the first paid POST
+    # of the RUN FLOW. Anchored on `body` (the flow, from the claim declaration on), not the
+    # whole file: module-level helpers defined above the flow (`_gate_round`) legitimately
+    # contain the same POST literal but are only ever CALLED from inside the flow.
     assert src.index("runtime_attestation(args.ouroboros_url, repo_dir)") < src.index("acquire_task_claim(\n")
-    assert src.index("runtime_attestation(args.ouroboros_url, repo_dir)") < src.index('"POST", "/api/tasks"')
+    first_paid_post_in_flow = src.index("claim_fd: int | None = None") + body.index('"POST", "/api/tasks"')
+    assert src.index("runtime_attestation(args.ouroboros_url, repo_dir)") < first_paid_post_in_flow
 
 
 def test_cu_bridge_refuses_before_the_claim_when_attestation_fails(tmp_path, monkeypatch, capsys):
@@ -1528,16 +1532,20 @@ def test_gate_window_is_zero_when_disabled_and_floored_when_enabled():
     assert rcb._gate_window_sec(_GateArgs(feasibility_gate=True, task_timeout_sec=100)) == 60.0
 
 
-def test_gate_window_enters_the_claim_staleness_bound():
-    """The gate occupies the claim holder BEFORE the working task. If its window is not in
-    the staleness bound, a second lane can reclaim a task the first is still working and
-    both will score it."""
+def test_gate_claim_window_covers_both_premise_rounds():
+    """The gate occupies the claim holder BEFORE the working task. If its occupancy is not
+    in the staleness bound, a second lane can reclaim a task the first is still working and
+    both will score it. The occupancy is TWO rounds, not one: an INFEASIBLE verdict runs an
+    independent challenger before the kill may stand, and a holder legitimately inside that
+    second round must not look stale."""
     from devtools.benchmarks.osworld.run_step_agent import claim_stale_sec
 
+    args = _GateArgs(feasibility_gate=True, task_timeout_sec=3600)
+    assert rcb._gate_claim_window_sec(args) == 2 * rcb._gate_window_sec(args) == 1800.0
     base = claim_stale_sec(3600, 900, 900)
-    gated = base + rcb._gate_window_sec(_GateArgs(feasibility_gate=True, task_timeout_sec=3600))
-    assert gated == base + 900.0
-    assert rcb._gate_window_sec(_GateArgs(feasibility_gate=False)) == 0.0, "ungated runs unchanged"
+    assert base + rcb._gate_claim_window_sec(args) == base + 1800.0
+    assert rcb._gate_claim_window_sec(_GateArgs(feasibility_gate=False)) == 0.0, \
+        "ungated runs unchanged"
 
 
 def test_terminal_answer_text_prefers_final_answer_then_falls_back():
@@ -1574,3 +1582,165 @@ def test_acceptance_claims_are_general_and_well_formed():
                       "infeasible task", "1 in 13"):
         assert forbidden not in blob, forbidden
     assert len({c["id"] for c in claims}) == len(claims), "claim ids must be unique"
+
+class _FakeResetEnv:
+    """DesktopEnv stand-in for _reset_verified: scripted setup outcomes per attempt.
+
+    `plan` is a list of per-attempt behaviours: "ok" (setup succeeds), "silent"
+    (reset returns but setup silently failed — the OSWorld fail-open path),
+    "noshot" (no screenshot), "raise" (reset raises).
+    """
+
+    def __init__(self, plan, config=({"type": "download"},)):
+        self.plan = list(plan)
+        self.config = list(config)
+        self.is_environment_used = False
+        self.calls = 0
+        self.used_flag_at_entry: list[bool] = []
+
+    def reset(self, task_config=None):
+        self.used_flag_at_entry.append(self.is_environment_used)
+        behaviour = self.plan[min(self.calls, len(self.plan) - 1)]
+        self.calls += 1
+        # reset() always clears the flag after the revert, like the real one.
+        self.is_environment_used = False
+        if behaviour == "raise":
+            raise RuntimeError("boot failed")
+        if behaviour == "ok":
+            self.is_environment_used = True
+        self._behaviour = behaviour
+
+    def _get_obs(self):
+        return {"screenshot": b"" if self._behaviour == "noshot" else b"\x89PNG"}
+
+
+def test_reset_verified_rejects_the_silent_setup_skip_and_recovers_on_retry():
+    """Regression for the 2026-07-28 smoke: OSWorld's reset() skips ALL setup steps when
+    the guest probe times out, raises nothing, and logs "Environment setup complete." The
+    working phase then opens on a VM without the task's files. The postcondition is
+    machine-checkable (`is_environment_used`), so the helper must reject such an attempt
+    and succeed on a later healthy one."""
+    env = _FakeResetEnv(["silent", "ok"])
+    rec = rcb._reset_verified(env, {"config": env.config}, retries=3,
+                              deadline=time.time() + 300, wait_after_sec=0,
+                              sleep=lambda _s: None)
+    assert rec["attempts"] == 2
+    assert env.calls == 2
+
+
+def test_reset_verified_forces_the_snapshot_revert_before_every_retry():
+    """After a failed setup `is_environment_used` is False, and OSWorld's reset() then
+    SKIPS the snapshot revert ("environment is clean") — an unforced retry would run
+    setup on top of the partial state. The helper must force the flag True before the
+    retry so the revert actually happens."""
+    env = _FakeResetEnv(["silent", "silent", "ok"])
+    rcb._reset_verified(env, {"config": env.config}, retries=3,
+                        deadline=time.time() + 300, wait_after_sec=0,
+                        sleep=lambda _s: None)
+    assert env.used_flag_at_entry == [False, True, True]
+
+
+def test_reset_verified_exhaustion_is_a_typed_infra_error_not_a_pass():
+    env = _FakeResetEnv(["silent"])
+    with pytest.raises(rcb.ResetUnverified) as exc:
+        rcb._reset_verified(env, {"config": env.config}, retries=2,
+                            deadline=time.time() + 300, wait_after_sec=0,
+                            sleep=lambda _s: None)
+    assert "silently failed" in str(exc.value)
+    assert isinstance(exc.value.record.get("log_tail"), list)
+
+
+def test_reset_verified_accepts_a_task_with_no_setup_config():
+    """A task with an empty config never sets `is_environment_used`; that is OSWorld's
+    documented behaviour, not a failure. Requiring the flag unconditionally would turn
+    every no-setup task into an infra abort."""
+    env = _FakeResetEnv(["silent"], config=())
+    rec = rcb._reset_verified(env, {"config": []}, retries=1,
+                              deadline=time.time() + 300, wait_after_sec=0,
+                              sleep=lambda _s: None)
+    assert rec["attempts"] == 1
+
+
+def test_reset_verified_still_rejects_a_missing_screenshot():
+    env = _FakeResetEnv(["noshot", "ok"])
+    rec = rcb._reset_verified(env, {"config": env.config}, retries=3,
+                              deadline=time.time() + 300, wait_after_sec=0,
+                              sleep=lambda _s: None)
+    assert rec["attempts"] == 2
+
+
+@pytest.mark.parametrize(
+    "gate_record,expected",
+    [
+        # Only two independent INFEASIBLE readings kill the task.
+        ({"verdict": "INFEASIBLE", "challenger": {"verdict": "INFEASIBLE"}}, True),
+        # Every disagreement or absence fails open into the working phase.
+        ({"verdict": "INFEASIBLE", "challenger": {"verdict": "PROCEED"}}, False),
+        ({"verdict": "INFEASIBLE", "challenger": {"verdict": "UNDETERMINED"}}, False),
+        ({"verdict": "INFEASIBLE", "challenger": {"status": "timeout"}}, False),
+        ({"verdict": "INFEASIBLE"}, False),
+        ({"verdict": "PROCEED", "challenger": {"verdict": "INFEASIBLE"}}, False),
+        ({}, False),
+    ],
+)
+def test_kill_stands_only_on_two_independent_infeasible_verdicts(gate_record, expected):
+    assert rcb._kill_confirmed(gate_record) is expected
+
+
+def test_gate_cancel_unconfirmed_is_the_one_condition_that_may_not_fail_open():
+    """A premise round whose cancel did not confirm leaves a zombie session sharing the
+    lane's server and skill connection file — it would act on the same VM the worker is
+    scored on. Detection must be exact: timeouts whose cancel DID confirm proceed."""
+    assert rcb._gate_cancel_unconfirmed({"status": "timeout", "cancel_confirmed": False})
+    assert rcb._gate_cancel_unconfirmed({"status": "timeout"})
+    assert not rcb._gate_cancel_unconfirmed({"status": "timeout", "cancel_confirmed": True})
+    assert not rcb._gate_cancel_unconfirmed({"status": "completed"})
+    assert not rcb._gate_cancel_unconfirmed({})
+
+
+def test_gate_round_posts_a_fresh_memory_gate_phase_task_and_reads_the_verdict(monkeypatch):
+    posted = {}
+
+    def fake_api(url, method, path, payload=None, timeout=None):
+        if method == "POST" and path == "/api/tasks":
+            posted.update(payload)
+            return {"task_id": "gate-1"}
+        if method == "GET":
+            return {"status": "completed", "result": "the pack list has no such locale.\nINFEASIBLE",
+                    "total_rounds": 4}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(rcb, "_api", fake_api)
+    args = _GateArgs(feasibility_gate=True, task_timeout_sec=3600)
+    args.allow_a11y = False
+    args.ouroboros_url = "http://127.0.0.1:1"
+    rec = rcb._gate_round(args.ouroboros_url, args, "change the UI language", role="challenger")
+    assert rec["verdict"] == "INFEASIBLE" and rec["role"] == "challenger"
+    assert rec["task_id"] == "gate-1" and rec["llm_rounds"] == 4
+    # Independence and confinement travel in the payload itself.
+    assert posted["memory_mode"] == "empty"
+    assert set(rcb._effective_disabled_tools(False, gate_phase=True)) <= set(posted["disabled_tools"])
+
+
+def test_gate_tool_trace_carries_full_args_for_the_offline_audit(tmp_path):
+    """The read-only promise is auditable only if the sidecar carries every shell command
+    VERBATIM: the GAIA leakage audit was blinded by exactly this (truncated previews on one
+    arm). Rows from other tasks and non-skill tools must not leak into the trace."""
+    from ouroboros.extension_loader import extension_name_prefix
+
+    prefix = extension_name_prefix(rcb.SKILL_NAME)
+    long_cmd = "find / -name '*.pak' " + "-o -name 'x' " * 120
+    log_dir = tmp_path / "state" / "headless_tasks" / "gate42" / "data" / "logs"
+    log_dir.mkdir(parents=True)
+    rows = [
+        {"type": "tool_call", "tool": prefix + "remote_exec", "args": {"command": long_cmd}},
+        {"type": "tool_call", "tool": prefix + "screenshot", "args": {}, "is_error": False},
+        {"type": "tool_call", "tool": "web_search", "args": {"q": "not a skill tool"}},
+        {"type": "llm_round", "tool": prefix + "remote_exec"},
+    ]
+    (log_dir / "tools.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    trace = rcb._gate_tool_trace(tmp_path, "gate42")
+    assert [t["tool"] for t in trace] == ["remote_exec", "screenshot"]
+    assert trace[0]["args"]["command"] == long_cmd, "args must be verbatim, not a preview"
+    assert rcb._gate_tool_trace(tmp_path, "") == []
+    assert rcb._gate_tool_trace(tmp_path, "no-such-task") == []

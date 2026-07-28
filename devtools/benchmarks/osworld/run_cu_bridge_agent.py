@@ -30,13 +30,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -156,14 +158,25 @@ GATE_SUFFIX = (
 
 
 def _gate_window_sec(args: Any) -> float:
-    """Holder occupancy added by the premise phase, or 0 when the gate is off.
+    """Holder occupancy added by ONE premise round, or 0 when the gate is off.
 
-    This is the SAME expression the phase's own deadline uses; the two must not drift,
+    This is the SAME expression the round's own deadline uses; the two must not drift,
     because the claim staleness bound is computed from it.
     """
     if not getattr(args, "feasibility_gate", False):
         return 0.0
     return float(max(60, int(args.task_timeout_sec) // 4))
+
+
+def _gate_claim_window_sec(args: Any) -> float:
+    """Worst-case premise-phase occupancy for the claim staleness bound.
+
+    Two rounds, not one: an INFEASIBLE verdict triggers an independent challenger
+    round before the kill is allowed to stand, and a holder legitimately inside that
+    second round must not look stale to another lane. This constant and the number of
+    rounds the flow can actually run are the same fact — change them together.
+    """
+    return 2.0 * _gate_window_sec(args)
 
 
 def _gate_verdict(latest: dict[str, Any] | None) -> str:
@@ -211,6 +224,233 @@ def _effective_disabled_tools(allow_a11y: bool, *, gate_phase: bool = False) -> 
         # this guarantee is partial.
         disabled += [extension_surface_name(SKILL_NAME, t) for t in sorted(_GUI_ACTION_TOOLS)]
     return disabled
+
+
+class _DesktopEnvLogCapture(logging.Handler):
+    """Scoped capture of OSWorld's own log records during a reset.
+
+    desktop_env reports its setup failures at ERROR level, but the benchmark
+    process installs no handler for the "desktopenv" loggers — so the only
+    witness of a failed setup was never written anywhere. This handler exists
+    for the diagnostic sidecar ONLY: control flow reads the machine-checkable
+    postcondition in `_reset_verified`, never these strings.
+    """
+
+    def __init__(self, logger_name: str = "desktopenv", keep: int = 60):
+        super().__init__(level=logging.INFO)
+        self._lines: deque[str] = deque(maxlen=keep)
+        self._logger = logging.getLogger(logger_name)
+
+    def emit(self, record: logging.LogRecord) -> None:  # noqa: D102
+        try:
+            self._lines.append(f"{record.levelname} {record.name}: {record.getMessage()}")
+        except Exception:  # noqa: BLE001 - a diagnostic must never break the reset
+            pass
+
+    def __enter__(self) -> "_DesktopEnvLogCapture":
+        self._logger.addHandler(self)
+        return self
+
+    def __exit__(self, *_exc: Any) -> bool:
+        self._logger.removeHandler(self)
+        return False
+
+    def tail(self) -> list[str]:
+        return list(self._lines)
+
+
+class ResetUnverified(RuntimeError):
+    """env.reset() finished without a VERIFIED task setup (see _reset_verified)."""
+
+    def __init__(self, message: str, record: dict[str, Any]):
+        super().__init__(message)
+        self.record = record
+
+
+def _reset_verified(env: Any, example: dict[str, Any], *, retries: int, deadline: float,
+                    wait_after_sec: float,
+                    sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
+    """env.reset() with the postcondition OSWorld itself does not enforce.
+
+    OSWorld's reset() is fail-open: when the guest server never answers the setup
+    probe (~100s), it skips EVERY setup step, logs "Environment setup complete."
+    and returns a pristine VM — no exception, no False (desktop_env.py, the
+    setup-retry loop falls through). The 2026-07-28 smoke measured what that does
+    downstream: working phases opened on VMs without the task's files and honestly
+    declared the premise absent; the feasible-control mean fell 0.737 -> 0.459.
+
+    The postcondition IS machine-readable: `env.is_environment_used` is set True
+    iff setup ran to success with a non-empty config, so this helper asserts it.
+    Two further points, both load-bearing:
+
+    - Before every RETRY, `is_environment_used` is forced True. After a failed
+      setup it is still False, and reset() skips the snapshot revert for "clean"
+      environments — an unforced retry would run setup ON TOP of the partial
+      state instead of from the pristine image.
+    - The screenshot probe doubles as the endpoint-health probe: it travels the
+      same guest-server HTTP path the agent's tools use.
+
+    Returns a small diagnostic record on success; raises ResetUnverified when the
+    budget is exhausted. The caller maps that to a typed INFRA row (reward None,
+    claim released) — a setup the harness could not verify must never become a
+    capability zero.
+    """
+    last_err = ""
+    with _DesktopEnvLogCapture() as capture:
+        for attempt in range(1, max(1, int(retries)) + 1):
+            if time.time() >= deadline:
+                last_err = last_err or "deadline reached before the first attempt"
+                break
+            if attempt > 1:
+                env.is_environment_used = True
+            try:
+                env.reset(task_config=example)
+                if wait_after_sec > 0:
+                    sleep(wait_after_sec)
+                obs = env._get_obs()
+                shot = obs.get("screenshot") if isinstance(obs, dict) else None
+                if not (isinstance(shot, (bytes, bytearray)) and shot):
+                    last_err = f"attempt {attempt}: no screenshot"
+                    sleep(5)
+                    continue
+                if getattr(env, "config", None) and not getattr(env, "is_environment_used", False):
+                    last_err = (f"attempt {attempt}: setup silently failed "
+                                "(is_environment_used=False with a non-empty task config)")
+                    sleep(5)
+                    continue
+                return {"attempts": attempt, "log_tail": capture.tail()}
+            except Exception as exc:  # noqa: BLE001 - retried, then surfaced typed
+                last_err = f"attempt {attempt}: {type(exc).__name__}: {exc}"
+                sleep(5)
+    raise ResetUnverified(f"OSWorld reset unverified: {last_err}",
+                          {"error": last_err, "log_tail": capture.tail()})
+
+
+def _await_gate_task(ouroboros_url: str, task_id: str, deadline: float) -> dict[str, Any]:
+    """Poll one premise-phase task to a terminal status or its deadline.
+
+    On deadline the cancel is CONFIRMED before returning: an unverified cancel can
+    leave the premise agent alive on the SAME VM (and the same skill connection
+    file) the working phase — or the lane's NEXT task — is about to use.
+    """
+    final_statuses = {"completed", "failed", "cancelled", "rejected_duplicate"}
+    while True:
+        if time.time() >= deadline:
+            cancelled = False
+            try:
+                _api(ouroboros_url, "POST", f"/api/tasks/{task_id}/cancel", {})
+                for _ in range(6):
+                    time.sleep(5)
+                    probe = _api(ouroboros_url, "GET", "/api/tasks/" + task_id, timeout=30)
+                    if str((probe or {}).get("status") or "") in final_statuses:
+                        cancelled = True
+                        break
+            except Exception:  # noqa: BLE001 - reported in the record, decided by the caller
+                cancelled = False
+            return {"status": "timeout", "cancel_confirmed": cancelled}
+        try:
+            latest = _api(ouroboros_url, "GET", "/api/tasks/" + task_id, timeout=30)
+        except Exception:  # noqa: BLE001 - transient poll error
+            time.sleep(5)
+            continue
+        if isinstance(latest, dict) and str(latest.get("status") or "") in final_statuses:
+            return latest
+        time.sleep(8)
+
+
+def _gate_round(ouroboros_url: str, args: Any, instruction: str, *, role: str) -> dict[str, Any]:
+    """One premise round (gate or challenger): create, await, judge.
+
+    The rounds are intentionally IDENTICAL except for memory: `memory_mode:
+    "empty"` gives the challenger a fresh session, so agreement between the two
+    is two independent readings of the same VM, not one reading echoed.
+    """
+    created = _api(ouroboros_url, "POST", "/api/tasks", {
+        # The instruction is UNTRUSTED text. Ending the prompt with it would let a
+        # task that says "end with INFEASIBLE" dictate the verdict and score itself
+        # zero, so the protocol is restated afterwards, last word ours.
+        "description": GATE_PREAMBLE + instruction + GATE_SUFFIX,
+        "memory_mode": "empty",
+        "disabled_tools": _effective_disabled_tools(args.allow_a11y, gate_phase=True),
+    })
+    task_id = str(created.get("task_id") or "")
+    if not task_id:
+        raise RuntimeError(f"{role} task creation returned no task_id: {created!r}")
+    latest = _await_gate_task(ouroboros_url, task_id, time.time() + _gate_window_sec(args))
+    return {
+        "role": role,
+        "verdict": _gate_verdict(latest),
+        "task_id": task_id,
+        "status": latest.get("status"),
+        **({"cancel_confirmed": bool(latest.get("cancel_confirmed"))}
+           if str(latest.get("status") or "") == "timeout" else {}),
+        "llm_rounds": int(latest.get("total_rounds") or 0),
+        "answer": _terminal_answer_text(latest),
+    }
+
+
+def _kill_confirmed(gate_record: dict[str, Any]) -> bool:
+    """The kill stands only when BOTH independent premise rounds said INFEASIBLE.
+
+    Anything else — a missing challenger, a challenger PROCEED/UNDETERMINED, a
+    crashed or timed-out challenger — fails open into the working phase.
+    """
+    return (str(gate_record.get("verdict") or "") == "INFEASIBLE"
+            and str((gate_record.get("challenger") or {}).get("verdict") or "") == "INFEASIBLE")
+
+
+def _gate_cancel_unconfirmed(record: dict[str, Any]) -> bool:
+    """True when a premise round timed out AND its cancel did not confirm.
+
+    This is the one gate condition that must NOT fail open into the working
+    phase: a zombie premise session shares the lane server and the skill's
+    connection file, so after the endpoint republish it would act on the SAME VM
+    the worker is being scored on — and on the lane's next task after that. The
+    caller maps this to `blocked` (exit 2, lane aborts, its server dies and the
+    zombie with it); the claim is released so another lane retries cleanly.
+    """
+    return (str(record.get("status") or "") == "timeout"
+            and not record.get("cancel_confirmed"))
+
+
+def _gate_tool_trace(data_dir: Path, ouro_task_id: str, latest_status: Any = None) -> list[dict[str, Any]]:
+    """Full tool trace of one premise round, for the offline audit (never raises).
+
+    COMPLETE args, not previews: the GAIA leakage audit's blind spot was a
+    detector fed truncated output (result_preview cut at 2005 chars hid the
+    evidence on exactly one arm). tools.jsonl stores tool-call args untruncated,
+    so the sidecar carries every shell command the round ran, verbatim — the
+    read-only promise is enforceable only if the audit can see all of it.
+    """
+    trace: list[dict[str, Any]] = []
+    try:
+        from ouroboros.extension_loader import extension_name_prefix
+
+        prefix = extension_name_prefix(SKILL_NAME)
+        log_path = data_dir / "state" / "headless_tasks" / ouro_task_id / "data" / "logs" / "tools.jsonl"
+        if not (ouro_task_id and log_path.is_file()):
+            return trace
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(row, dict) or row.get("type") != "tool_call":
+                continue
+            tool = str(row.get("tool") or "")
+            if not tool.startswith(prefix):
+                continue
+            trace.append({
+                "tool": tool[len(prefix):],
+                "args": row.get("args"),
+                "is_error": bool(row.get("is_error")),
+            })
+    except Exception:  # noqa: BLE001 - a sidecar must never change the flow
+        pass
+    return trace
 
 
 def _refuse_live_data_dir(data_dir: Path) -> None:
@@ -716,6 +956,9 @@ def main() -> int:
                     "adapter": "host_cu_bridge",
                     "one_run_per_task": not bool(args.feasibility_gate),
                     "feasibility_gate_phase": bool(args.feasibility_gate),
+                    # An INFEASIBLE verdict is confirmed by an independent second premise
+                    # session before it may end the example; disagreement fails open.
+                    "feasibility_gate_challenger": bool(args.feasibility_gate),
                     "official_actions": False, "official_reset_evaluate": True,
                     "action_channel": "guest_execute_not_env_step",
                     "a11y_enabled": bool(args.allow_a11y),
@@ -1057,9 +1300,11 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
                 # window has to enter the staleness bound. Leaving it out let a gated
                 # holder consume the whole margin that the formula reserves for the
                 # unbounded evaluate(), after which a second lane could take a task the
-                # first was still legitimately working — and both would score it.
+                # first was still legitimately working — and both would score it. The
+                # CLAIM window is two rounds (gate + challenger), not one — see
+                # _gate_claim_window_sec.
                 stale_sec=claim_stale_sec(args.task_timeout_sec, args.startup_timeout_sec,
-                                          args.claim_margin_sec) + _gate_window_sec(args),
+                                          args.claim_margin_sec) + _gate_claim_window_sec(args),
                 repo_dir=repo_dir,
                 metadata=f"pid={os.getpid()} task={claim_key} result_dir={run_dir}\n",
             )
@@ -1121,29 +1366,23 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
             headless=not args.show_vm, os_type="Ubuntu", require_a11y_tree=False,
             enable_proxy=_enable_proxy,
         )
-        # Reset with retries to a usable screenshot. Its own fresh startup window
-        # (mirrors run_step_agent._initial_observation_with_retries): a slow VM boot
-        # must not eat the reset budget, which is what sharing one deadline would do.
-        deadline = time.time() + max(1, int(args.startup_timeout_sec))
-        last_err = ""
-        ok = False
-        for attempt in range(1, max(1, int(args.reset_retries)) + 1):
-            if time.time() >= deadline:
-                break
-            try:
-                env.reset(task_config=example)
-                if args.wait_after_reset_sec > 0:
-                    time.sleep(args.wait_after_reset_sec)
-                obs = env._get_obs()
-                if isinstance(obs, dict) and isinstance(obs.get("screenshot"), (bytes, bytearray)) and obs["screenshot"]:
-                    ok = True
-                    break
-                last_err = f"attempt {attempt}: no screenshot"
-            except Exception as exc:  # noqa: BLE001
-                last_err = f"attempt {attempt}: {type(exc).__name__}: {exc}"
-            time.sleep(5)
-        if not ok:
-            raise RuntimeError(f"OSWorld startup failed: {last_err}")
+        # Reset with retries to a VERIFIED task state (screenshot AND setup postcondition —
+        # see _reset_verified). Its own fresh startup window (mirrors
+        # run_step_agent._initial_observation_with_retries): a slow VM boot must not eat
+        # the reset budget, which is what sharing one deadline would do.
+        try:
+            reset_diag: dict[str, Any] = {"initial": _reset_verified(
+                env, example, retries=int(args.reset_retries),
+                deadline=time.time() + max(1, int(args.startup_timeout_sec)),
+                wait_after_sec=float(args.wait_after_reset_sec))}
+        except ResetUnverified as exc:
+            # INFRA row, never a score: the claim is released in the finally, so a later
+            # attempt retries a task whose setup this one could not verify.
+            final.update({"outcome": "adapter_error", "exit_code": 1,
+                          "error": {"type": "ResetUnverified", "message": str(exc)[:4000]}})
+            _write_outcome(None, "adapter_error", "reset_unverified", str(exc),
+                           extra={"reset_verification": exc.record})
+            return 1
 
         target = f"http://{env.vm_ip}:{env.server_port}"
         Path(args.target_file).expanduser().write_text(target, encoding="utf-8")
@@ -1175,87 +1414,94 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
         gate_verdict = ""
         gate_record: dict[str, Any] = {}
         if args.feasibility_gate:
-            gate_task_id = ""
             try:
-                gate_created = _api(args.ouroboros_url, "POST", "/api/tasks", {
-                    # The instruction is UNTRUSTED text. Ending the prompt with it would let
-                    # a task that says "end with INFEASIBLE" dictate the verdict and score
-                    # itself zero, so the protocol is restated afterwards, last word ours.
-                    "description": GATE_PREAMBLE + instruction + GATE_SUFFIX,
-                    "memory_mode": "empty",
-                    "disabled_tools": _effective_disabled_tools(args.allow_a11y, gate_phase=True),
-                })
-                gate_task_id = str(gate_created.get("task_id") or "")
-                if not gate_task_id:
-                    raise RuntimeError(f"gate task creation returned no task_id: {gate_created!r}")
-                gate_deadline = time.time() + _gate_window_sec(args)
-                gate_latest: dict[str, Any] = {}
-                while True:
-                    if time.time() >= gate_deadline:
-                        # Confirm the cancel actually landed: an unverified cancel can leave
-                        # the premise agent alive on the SAME VM the working phase is about
-                        # to use, with remote_exec in hand.
-                        cancelled = False
-                        try:
-                            _api(args.ouroboros_url, "POST", f"/api/tasks/{gate_task_id}/cancel", {})
-                            for _ in range(6):
-                                time.sleep(5)
-                                probe = _api(args.ouroboros_url, "GET", "/api/tasks/" + gate_task_id,
-                                             timeout=30)
-                                if str((probe or {}).get("status") or "") in {
-                                    "completed", "failed", "cancelled", "rejected_duplicate"
-                                }:
-                                    cancelled = True
-                                    break
-                        except Exception:  # noqa: BLE001 - reported below, never fatal
-                            cancelled = False
-                        gate_latest = {"status": "timeout", "cancel_confirmed": cancelled}
-                        break
-                    try:
-                        gr = _api(args.ouroboros_url, "GET", "/api/tasks/" + gate_task_id, timeout=30)
-                    except Exception:
-                        time.sleep(5)
-                        continue
-                    gate_latest = gr if isinstance(gr, dict) else {}
-                    if str(gate_latest.get("status") or "") in {
-                        "completed", "failed", "cancelled", "rejected_duplicate"
-                    }:
-                        break
-                    time.sleep(8)
-                # Compute the verdict BEFORE any sidecar write: an earlier draft had the
-                # write inside the same try, so a failing disk silently downgraded a real
-                # INFEASIBLE to UNDETERMINED and the record then disagreed with the verdict.
-                gate_verdict = _gate_verdict(gate_latest)
-                gate_record = {
-                    "verdict": gate_verdict, "task_id": gate_task_id,
-                    "status": gate_latest.get("status"),
-                    "llm_rounds": int(gate_latest.get("total_rounds") or 0),
-                    "answer": _terminal_answer_text(gate_latest),
-                }
+                # Verdict and record are computed BEFORE any sidecar write: an earlier draft
+                # had the write inside the same try, so a failing disk silently downgraded a
+                # real INFEASIBLE to UNDETERMINED and the record disagreed with the verdict.
+                gate_record = _gate_round(args.ouroboros_url, args, instruction, role="gate")
+                gate_verdict = str(gate_record["verdict"])
+                if gate_verdict == "INFEASIBLE":
+                    # Independent confirmation before the kill stands. The economics are
+                    # asymmetric: at baseline the gate's whole edge over the prompt-only arm
+                    # was ~2 tasks, so ONE false kill on a feasible task erases half of it,
+                    # while a missed infeasible still has the working phase's own
+                    # TASK_INFEASIBLE path behind it. A fresh session (memory_mode empty)
+                    # re-reads the same VM; only agreement kills, disagreement fails open.
+                    gate_record["challenger"] = _gate_round(args.ouroboros_url, args,
+                                                            instruction, role="challenger")
+                    if not _kill_confirmed(gate_record):
+                        gate_verdict = "UNDETERMINED"
+                        gate_record["verdict"] = "UNDETERMINED"
+                        gate_record["overruled_by_challenger"] = True
             except Exception as exc:  # noqa: BLE001 - a broken gate must never cost a task
                 gate_verdict = "UNDETERMINED"
-                gate_record = {"verdict": gate_verdict, "task_id": gate_task_id,
+                # Merge over whatever was already recorded (e.g. a completed first round
+                # whose CHALLENGER creation then raised) instead of discarding it: the
+                # record should show the round that ran, and the error that stopped there.
+                gate_record = {**gate_record, "verdict": gate_verdict,
                                "error": f"{type(exc).__name__}: {exc}"}
+            # Full tool trace of each round, for the offline read-only audit. Enrichment
+            # only — a trace failure must not change the verdict.
+            gate_record["tool_trace"] = _gate_tool_trace(
+                data_dir, str(gate_record.get("task_id") or ""))
+            if isinstance(gate_record.get("challenger"), dict):
+                gate_record["challenger"]["tool_trace"] = _gate_tool_trace(
+                    data_dir, str(gate_record["challenger"].get("task_id") or ""))
             try:
                 (run_dir / "feasibility_gate.json").write_text(
                     json.dumps(gate_record, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception:  # noqa: BLE001 - a sidecar must never change the verdict
                 pass
+            # The one gate condition that must NOT fail open: a round whose cancel did not
+            # confirm leaves a zombie premise session sharing this lane's server and skill
+            # connection file — after the endpoint republish below it would act on the SAME
+            # VM the worker is scored on, and on the lane's next task after that. Exit 2
+            # aborts the lane (its server dies, and the zombie with it); the claim is
+            # released unscored, so another lane retries cleanly.
+            if _gate_cancel_unconfirmed(gate_record) or _gate_cancel_unconfirmed(
+                    gate_record.get("challenger") or {}):
+                final.update({"outcome": "blocked", "exit_code": 2,
+                              "refusal": {"stage": "feasibility_gate",
+                                          "reason": "gate_cancel_unconfirmed",
+                                          "exit_code": 2}})
+                _write_outcome(None, "blocked", "gate_cancel_unconfirmed",
+                               extra={"feasibility_gate": dict(gate_record)})
+                return 2
 
         if args.feasibility_gate and gate_verdict != "INFEASIBLE":
             # The premise phase acted on the VM that evaluate() will score. remote_exec is
             # left available to it and is read-only BY INSTRUCTION ONLY — and the whole
             # reason this gate exists is that prose instructions did not hold. Re-reset so
             # the working phase starts from the task's pristine state and nothing the gate
-            # touched can be scored as the agent's work.
+            # touched can be scored as the agent's work. VERIFIED, not bare: the bare
+            # re-reset here is what destroyed the 2026-07-28 smoke (silent setup skip).
             try:
-                env.reset(task_config=example)
-                if args.wait_after_reset_sec > 0:
-                    time.sleep(args.wait_after_reset_sec)
-            except Exception as exc:  # noqa: BLE001
-                return _write_outcome(None, "adapter_error", "gate_reset_failed",
-                                      error=f"{type(exc).__name__}: {exc}",
-                                      extra={"feasibility_gate": dict(gate_record)})
+                reset_diag["post_gate"] = _reset_verified(
+                    env, example, retries=int(args.reset_retries),
+                    deadline=time.time() + max(1, int(args.startup_timeout_sec)),
+                    wait_after_sec=float(args.wait_after_reset_sec))
+            except ResetUnverified as exc:
+                final.update({"outcome": "adapter_error", "exit_code": 1,
+                              "error": {"type": "ResetUnverified", "message": str(exc)[:4000]}})
+                _write_outcome(None, "adapter_error", "reset_unverified", str(exc),
+                               extra={"feasibility_gate": dict(gate_record),
+                                      "reset_verification": exc.record})
+                return 1
+            # The docker provider recreates the container on revert, so the VM's IP and
+            # ports can CHANGE across this reset — republish the endpoint or the worker's
+            # tools keep talking to the dead pre-gate container.
+            target = f"http://{env.vm_ip}:{env.server_port}"
+            Path(args.target_file).expanduser().write_text(target, encoding="utf-8")
+            state_target = _publish_target(data_dir, target)
+            (run_dir / "bridge.json").write_text(json.dumps({
+                "target": target, "skill": enabled, "target_file": args.target_file,
+                "state_target_file": str(state_target),
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            (run_dir / "reset_verification.json").write_text(
+                json.dumps(reset_diag, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:  # noqa: BLE001 - diagnostic sidecar only
+            pass
 
         latest: dict[str, Any] = {}
         task_id = ""  # bound in both branches: the counters read it below

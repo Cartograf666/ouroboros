@@ -204,25 +204,52 @@ exactly the kind of pattern gate that BIBLE P5 forbids for a semantic decision.
 
 The phase answers one of three words: `INFEASIBLE`, `PROCEED`, `UNDETERMINED`.
 
-**It fails OPEN.** Only an explicit standalone `INFEASIBLE` ends the example (translated
-into the official `env.step("FAIL")` through the same path a self-declared infeasibility
+**It fails OPEN, and a kill needs TWO independent readings.** An `INFEASIBLE` verdict
+triggers a CHALLENGER round — a fresh session (`memory_mode: "empty"`, same read-only
+envelope) that re-reads the same VM. Only agreement ends the example (translated into
+the official `env.step("FAIL")` through the same path a self-declared infeasibility
 takes, so the claim-marker and scoring sequence is not duplicated). `PROCEED`,
-`UNDETERMINED`, an unparseable answer, a timeout, a crashed phase or any exception all
-fall through to the full-capability phase. The gate can therefore only remove a task the
-agent was affirmatively certain about; it can never strand one on silence.
+`UNDETERMINED`, challenger disagreement, an unparseable answer, a timeout whose cancel
+confirmed, a crashed phase or any exception all fall through to the full-capability
+phase. The economics are asymmetric: one false kill on a feasible task erases roughly
+the gate's whole measured edge, while a missed infeasible still has the working phase's
+own `TASK_INFEASIBLE` path behind it.
+
+The one condition that does NOT fail open: a premise round whose cancel did not confirm.
+That leaves a zombie session sharing the lane's server and skill connection file, able
+to act on the VM the worker is scored on (and on the lane's next task). The attempt
+aborts as a typed infra row (`blocked` / `gate_cancel_unconfirmed`, exit 2 so the lane —
+and with it the zombie's server — dies; the claim is released for a clean retry).
 
 Known limit, stated plainly: this closes the GUI vector, not the shell. `remote_exec` is
 a general shell and is read-only in this phase by instruction only — enforcing it in code
-would be the pattern gate the constitution forbids for a semantic decision. The working
-phase is therefore re-`reset()` after a PROCEED/UNDETERMINED verdict, so anything the
-premise phase touched is discarded before the state that gets scored.
+would be the pattern gate the constitution forbids for a semantic decision. Two
+mitigations follow. (1) `feasibility_gate.json` carries each round's FULL tool trace
+(verbatim args, no previews) for offline audit of that promise. (2) The working phase is
+re-reset after a PROCEED/UNDETERMINED verdict, so anything the premise phase touched is
+discarded before the state that gets scored.
 
-Cost and disclosure: a gated run posts TWO tasks per example, so the manifest reports
-`one_run_per_task: false` and `feasibility_gate_phase: true`, and the per-example
-verdict is written to `feasibility_gate.json` in the task directory. Expect roughly
-double the per-example warm-up and acceptance-review cost. See METHODOLOGY.md §7 (4c).
+**Both resets are VERIFIED** (`_reset_verified`). OSWorld's own `reset()` fails open:
+when the guest server misses the setup probe window it skips every setup step, logs
+"Environment setup complete." and returns a pristine VM — no exception, nothing visible
+(the 2026-07-28 smoke lost the feasible-control mean 0.737 → 0.459 to exactly this on
+the bare post-gate reset). The runner asserts `is_environment_used` whenever the task
+config is non-empty, keeps the screenshot probe (same HTTP path the agent's tools use),
+forces the snapshot revert before every retry, republishes the VM endpoint after the
+post-gate reset (docker recreate can change IP/ports), and turns exhaustion into a typed
+infra row (`reset_unverified`, reward `null`, claim released) instead of a capability
+zero. `reset_verification.json` in the task directory records attempts and the captured
+`desktopenv` log tail per reset.
+
+Cost and disclosure: a gated run posts two tasks per example (three when a kill is
+confirmed), so the manifest reports `one_run_per_task: false`,
+`feasibility_gate_phase: true` and `feasibility_gate_challenger: true`, and the
+per-example verdicts land in `feasibility_gate.json`. Expect roughly double the
+per-example warm-up and acceptance-review cost. See METHODOLOGY.md §7 (4c).
 
 **Validate before trusting it.** The failure mode that matters is a false `INFEASIBLE` on
-a feasible task: that scores a hard zero. Measure the false-INFEASIBLE rate on a
-stratified control set of feasible tasks — not just the recall on infeasible ones —
-before enabling it for a scored run.
+a feasible task: that scores a hard zero. Measure BOTH the false-INFEASIBLE rate and the
+paired score delta against a prior run on a stratified control set of feasible tasks —
+not just the recall on infeasible ones — before enabling it for a scored run, and
+interleave the classes in the task list: a blocked layout delivers the flattering class
+first and the deciding class last.
