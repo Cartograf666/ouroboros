@@ -1463,3 +1463,114 @@ def test_cu_bridge_ledger_row_never_points_at_an_outcome_that_was_not_written(
         "the manifest must not point at an artefact whose write failed either"
     assert (manifest.get("output_paths") or {}).get("attempt_dir"), \
         "...while the pointer that IS valid survives"
+
+
+# --- feasibility gate (opt-in premise phase) ---------------------------------------
+
+
+class _GateArgs:
+    """Minimal stand-in for the parsed CLI namespace the gate helpers read."""
+
+    def __init__(self, *, feasibility_gate: bool, task_timeout_sec: int = 3600):
+        self.feasibility_gate = feasibility_gate
+        self.task_timeout_sec = task_timeout_sec
+
+
+@pytest.mark.parametrize(
+    "latest,expected",
+    [
+        ({"result": "~/Desktop is empty; nothing to act on.\nINFEASIBLE"}, "INFEASIBLE"),
+        ({"result": "The file is there.\nPROCEED"}, "PROCEED"),
+        ({"result": "Cloudflare blocked the page.\nUNDETERMINED"}, "UNDETERMINED"),
+        # Everything below must FAIL OPEN: the working phase still runs.
+        ({"result": "a discussion that never states a verdict"}, "UNDETERMINED"),
+        ({"result": "I weighed whether this is INFEASIBLE and decided it is not"}, "UNDETERMINED"),
+        ({"status": "timeout"}, "UNDETERMINED"),
+        ({}, "UNDETERMINED"),
+        (None, "UNDETERMINED"),
+        # The terminal answer field wins over the runtime result body.
+        ({"final_answer": "PROCEED", "result": "INFEASIBLE"}, "PROCEED"),
+    ],
+)
+def test_gate_verdict_fails_open_unless_explicitly_infeasible(latest, expected):
+    assert rcb._gate_verdict(latest) == expected
+
+
+def test_gate_verdict_reads_the_answer_not_a_recap_of_the_options():
+    """Regression: reverse-scanning every line for a keyword read a model's own
+    enumeration of the three options as its verdict, turning a PROCEED into a scored
+    hard zero. Only the last line — what the prompt actually asks for — may decide."""
+    recap = (
+        "I inspected the desktop as instructed.\n\n"
+        "Ruling out each option in turn:\n"
+        "UNDETERMINED\n"
+        "PROCEED\n"
+        "INFEASIBLE\n\n"
+        "None of those obstacles apply here: the file exists and the app supports the\n"
+        "feature, so the task is clearly PROCEED.\n"
+    )
+    assert rcb._gate_verdict({"result": recap}) != "INFEASIBLE"
+
+
+def test_gate_verdict_tolerates_formatting_but_not_prose():
+    # Ordinary formatting of a real verdict is accepted.
+    for ok in ("INFEASIBLE", "INFEASIBLE.", "**INFEASIBLE**", "`infeasible`"):
+        assert rcb._gate_verdict({"result": ok}) == "INFEASIBLE", ok
+    # A verdict embedded in a sentence is NOT a verdict: fail open instead of guessing.
+    for not_a_verdict in ("the answer is INFEASIBLE", "INFEASIBLE, probably", ""):
+        assert rcb._gate_verdict({"result": not_a_verdict}) != "INFEASIBLE", not_a_verdict
+
+
+def test_gate_window_is_zero_when_disabled_and_floored_when_enabled():
+    assert rcb._gate_window_sec(_GateArgs(feasibility_gate=False)) == 0.0
+    assert rcb._gate_window_sec(_GateArgs(feasibility_gate=True, task_timeout_sec=3600)) == 900.0
+    # Floor: a tiny task timeout must not shrink the phase to nothing.
+    assert rcb._gate_window_sec(_GateArgs(feasibility_gate=True, task_timeout_sec=100)) == 60.0
+
+
+def test_gate_window_enters_the_claim_staleness_bound():
+    """The gate occupies the claim holder BEFORE the working task. If its window is not in
+    the staleness bound, a second lane can reclaim a task the first is still working and
+    both will score it."""
+    from devtools.benchmarks.osworld.run_step_agent import claim_stale_sec
+
+    base = claim_stale_sec(3600, 900, 900)
+    gated = base + rcb._gate_window_sec(_GateArgs(feasibility_gate=True, task_timeout_sec=3600))
+    assert gated == base + 900.0
+    assert rcb._gate_window_sec(_GateArgs(feasibility_gate=False)) == 0.0, "ungated runs unchanged"
+
+
+def test_terminal_answer_text_prefers_final_answer_then_falls_back():
+    assert rcb._terminal_answer_text({"final_answer": "done", "result": "other"}) == "done"
+    # The documented fallback: the field that actually carries the text on this runner.
+    assert rcb._terminal_answer_text({"final_answer": "", "result": "the real answer"}) == "the real answer"
+    assert rcb._terminal_answer_text({"final_answer": "   ", "result": "x"}) == "x"
+    assert rcb._terminal_answer_text({}) == ""
+    assert rcb._terminal_answer_text(None) == ""
+
+
+def test_gate_phase_removes_the_mutating_tools_and_keeps_the_reading_ones():
+    normal = set(rcb._effective_disabled_tools(False))
+    gated = set(rcb._effective_disabled_tools(False, gate_phase=True))
+    assert normal < gated, "the gate phase must disable strictly more than the working phase"
+    for mutating in rcb._GUI_ACTION_TOOLS:
+        assert extension_surface_name(rcb.SKILL_NAME, mutating) in gated, mutating
+        assert extension_surface_name(rcb.SKILL_NAME, mutating) not in normal, mutating
+    # Observation and read-only probing must survive, or the phase cannot establish anything.
+    for readable in ("screenshot", "window_list", "wait", "remote_exec"):
+        assert extension_surface_name(rcb.SKILL_NAME, readable) not in gated, readable
+
+
+def test_acceptance_claims_are_general_and_well_formed():
+    """These travel to the reviewer that already runs. They must carry no task id, no
+    application name and nothing about how the benchmark grades."""
+    from ouroboros.contracts.task_contract import normalize_acceptance_claims
+
+    claims = rcb._ACCEPTANCE_CLAIMS
+    assert claims, "the panel runs either way; empty claims is what we are fixing"
+    assert normalize_acceptance_claims(claims), "must survive the contract normalizer"
+    blob = json.dumps(claims).lower()
+    for forbidden in ("osworld", "evaluator", "gimp", "chrome", "libreoffice", "reward",
+                      "infeasible task", "1 in 13"):
+        assert forbidden not in blob, forbidden
+    assert len({c["id"] for c in claims}) == len(claims), "claim ids must be unique"

@@ -309,6 +309,32 @@ leaderboard run without the disclosures below.
    `final_answer: null` while the text sat in the runtime result. Outcomes written before
    this fix under-report what the agent said; the reward figures are unaffected.
 
+4c. **`--feasibility-gate` (opt-in, off by default) posts TWO tasks per example.** A
+   read-only premise phase runs first, with the mutating GUI tools absent from its
+   capability envelope, and answers INFEASIBLE / PROCEED / UNDETERMINED on its last line.
+   Only an explicit INFEASIBLE ends the example — translated into the official
+   `env.step("FAIL")` through the same single path an agent-declared infeasibility takes,
+   so scoring and the claim-marker sequence keep exactly one caller. Everything else
+   (PROCEED, UNDETERMINED, an unparseable answer, a timeout, a crashed phase, any
+   exception) falls through to the full-capability phase: the gate can only remove a task
+   the agent was affirmatively certain about, never strand one.
+
+   Three disclosures belong with any gated number. (i) The manifest reports
+   `one_run_per_task: false` and `feasibility_gate_phase: true`, and each outcome carries
+   `infeasible_source` (`feasibility_gate` vs `agent_final_answer`) plus the phase's own
+   rounds — a gate-terminated example must not be readable as an agent that worked and
+   then declared infeasibility. (ii) The claim staleness bound is widened by the phase's
+   window; without that a gated holder consumes the margin the formula reserves for the
+   unbounded `evaluate()`, and a second lane can reclaim and re-score a task still being
+   worked. (iii) The phase closes the GUI vector only: `remote_exec` remains a general
+   shell, read-only by instruction and not by enforcement, so the working phase is
+   re-`reset()` afterwards and the guarantee is "harder to manufacture", not "impossible".
+
+   Expect roughly double the per-example warm-up and acceptance-review cost. The number
+   that decides whether it is worth paying is the FALSE-INFEASIBLE rate on feasible tasks
+   — a wrong verdict scores a hard zero — and it must be measured on a stratified control
+   set of feasible tasks before the gate is used for a scored run.
+
 5. **Observation modality.** Screenshot-only by DEFAULT: `ax_tree` is disabled
    per task unless `--allow-a11y`. A run with `--allow-a11y` must be reported as
    "Additional a11y tree used: Yes" (the leaderboard separates Screenshot /

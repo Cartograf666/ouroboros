@@ -211,10 +211,16 @@ takes, so the claim-marker and scoring sequence is not duplicated). `PROCEED`,
 fall through to the full-capability phase. The gate can therefore only remove a task the
 agent was affirmatively certain about; it can never strand one on silence.
 
+Known limit, stated plainly: this closes the GUI vector, not the shell. `remote_exec` is
+a general shell and is read-only in this phase by instruction only — enforcing it in code
+would be the pattern gate the constitution forbids for a semantic decision. The working
+phase is therefore re-`reset()` after a PROCEED/UNDETERMINED verdict, so anything the
+premise phase touched is discarded before the state that gets scored.
+
 Cost and disclosure: a gated run posts TWO tasks per example, so the manifest reports
 `one_run_per_task: false` and `feasibility_gate_phase: true`, and the per-example
 verdict is written to `feasibility_gate.json` in the task directory. Expect roughly
-double the per-example warm-up and acceptance-review cost. See METHODOLOGY.md §7 (4a).
+double the per-example warm-up and acceptance-review cost. See METHODOLOGY.md §7 (4c).
 
 **Validate before trusting it.** The failure mode that matters is a false `INFEASIBLE` on
 a feasible task: that scores a hard zero. Measure the false-INFEASIBLE rate on a
