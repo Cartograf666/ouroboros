@@ -374,10 +374,10 @@ index 0000000..f6e4724
 +__all__ = ["OuroborosSystem"]
 diff --git a/src/systems/ouroboros/_docker_launcher.py b/src/systems/ouroboros/_docker_launcher.py
 new file mode 100644
-index 0000000..1196ca1
+index 0000000..af9165e
 --- /dev/null
 +++ b/src/systems/ouroboros/_docker_launcher.py
-@@ -0,0 +1,635 @@
+@@ -0,0 +1,647 @@
 +"""DockerOuroborosEngine — runs the isolated Ouroboros server INSIDE a Docker container
 +(leak-proof: the CL-Bench DB lives in the host shim, never mounted into the container).
 +
@@ -638,7 +638,13 @@ index 0000000..1196ca1
 +        return self._server
 +
 +    def shim_url_for_agent(self, host_shim_url: str) -> str:
-+        """The container reaches a host-loopback shim via host.docker.internal."""
++        """URL the CONTAINER should use for the host shim.
++
++        A loopback-bound shim is only reachable through the host.docker.internal alias;
++        a shim already bound to the docker bridge IP (CLBENCH_SHIM_BIND, the Linux
++        rootful-daemon recipe) is reachable verbatim and must NOT be rewritten."""
++        if os.environ.get("CLBENCH_SHIM_BIND", "").strip() not in ("", "127.0.0.1", "localhost"):
++            return host_shim_url
 +        return host_shim_url.replace("127.0.0.1", "host.docker.internal").replace("localhost", "host.docker.internal")
 +
 +    def _overrides(self) -> dict:
@@ -888,6 +894,12 @@ index 0000000..1196ca1
 +            subprocess.run(["docker", "rm", "-f", self._cname], capture_output=True)
 +            run = subprocess.run(
 +                ["docker", "run", "-d", "--rm", "--init", "--name", self._cname,
++                 # Operator port (campaign v6.56.0, re-confirmed on the official path
++                 # 2026-07-28): on a ROOTFUL daemon the container writes root-owned files
++                 # into the bind-mounted data root and the host-side bridge dies with
++                 # PermissionError on state/skills/remote_work/shim_target.txt. Running as
++                 # the operator uid keeps the mount readable/writable from both sides.
++                 "--user", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/obo/data",
 +                 "--add-host=host.docker.internal:host-gateway",
 +                 "-p", f"127.0.0.1:{hostport}:8765",
 +                 "-v", repo_mount, "-v", f"{self._data_root}:/obo/data", "-w", "/obo/repo",
@@ -1290,10 +1302,10 @@ index 0000000..64f9ff1
 +        self.close()
 diff --git a/src/systems/ouroboros/_live_bridge.py b/src/systems/ouroboros/_live_bridge.py
 new file mode 100644
-index 0000000..dd1ba6c
+index 0000000..5f9d3b7
 --- /dev/null
 +++ b/src/systems/ouroboros/_live_bridge.py
-@@ -0,0 +1,1140 @@
+@@ -0,0 +1,1147 @@
 +"""Live-task bridge: skill mechanics under the OFFICIAL CL-Bench runner.
 +
 +The runner keeps ownership of the task/DB/rewards and drives the standard
@@ -1427,8 +1439,14 @@ index 0000000..dd1ba6c
 +
 +    # ------------------------------------------------------------- lifecycle
 +    def start(self) -> str:
-+        """Bind 127.0.0.1:<free port> (the proven docker recipe: container reaches it
-+        via host.docker.internal / --add-host host-gateway) and serve in a daemon thread."""
++        """Bind <CLBENCH_SHIM_BIND or 127.0.0.1>:<free port> and serve in a daemon thread.
++
++        Operator port (campaign v6.56.0, re-confirmed on the official path 2026-07-28):
++        on Linux `--add-host host.docker.internal:host-gateway` resolves to the docker
++        BRIDGE gateway, which cannot reach a host listener bound to loopback — every
++        submit_action then dies with connection-refused and the evaluator scores
++        `num_queries: 0` with a null action (observed: 30/30 questions, $43 burned for
++        nothing). Bind to the bridge IP (e.g. 172.17.0.1) for rootful-daemon runs."""
 +        bridge = self
 +
 +        class _Handler(BaseHTTPRequestHandler):
@@ -1464,7 +1482,8 @@ index 0000000..dd1ba6c
 +                action = body.get("action", body) if isinstance(body, dict) else body
 +                self._send(200, bridge._step(action))
 +
-+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
++        _bind = os.environ.get("CLBENCH_SHIM_BIND", "127.0.0.1")
++        self._server = ThreadingHTTPServer((_bind, 0), _Handler)
 +        host, port = self._server.server_address
 +        self.url = f"http://{host}:{port}"
 +        threading.Thread(target=self._server.serve_forever, daemon=True).start()
