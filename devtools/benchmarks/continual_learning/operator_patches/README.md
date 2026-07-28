@@ -184,3 +184,17 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
     `collect_results` carries `runtime_outcome` into `results.json` /
     `result_index.jsonl`, defaulting to `{"available": false}` for rows written
     before this patch — a stated gap, never a silent absence.
+
+## Addendum (v6.81.0 submission campaign, 2026-07-28)
+
+9. `adapter_official_submission.v681.patch` — the ENTIRE merged submission adapter as one
+   delta against upstream `5f8c50eb` (post cohort-fix). Base: colleague's official-path
+   adapter (final_answer_delivery, live recovery, 47 parity tests) + all v6.81.0 campaign
+   ports (env override loop incl. runtime/safety/context/split efforts, vision pin,
+   CLBENCH_SOLVE_DISABLED_TOOLS, per-question cap, docker runtime attestation, credential
+   scoping) + NEW: engine-task cost -> CL-Bench UsageEvent (official manifests otherwise
+   under-report cost ~1000x; colleague's manifest showed $0.54 vs ~$530 actual).
+   Apply with `git apply` onto a clean checkout of upstream 5f8c50eb. This patch
+   SUPERSEDES patches 1-8 for the official-path (run-all) flow; the bridge-path patches
+   remain for archaeology. Working tree: /mnt/data/a.razzhigaev/clb_official_v681/bench,
+   branch `ouroboros-submission`.
