@@ -265,6 +265,50 @@ leaderboard run without the disclosures below.
    runtime never emits cannot be listed. Report truncated tasks separately from
    honest failures; `max_rounds_effective` alone will not tell you they
    happened. The current Verified leaderboard standard is 100 steps.
+4a. **Scaffold revision after the v6.81.0 run — disclose which revision produced a
+   number.** Pairwise trace forensics against a published verified run on the same 361
+   tasks and the same model showed the two runs statistically indistinguishable on the
+   333 feasible tasks (0.804 vs 0.808) with ~90% of the deficit concentrated on the 27
+   tasks whose evaluator is `infeasible`. Reading our own traces there found a
+   reproducible behaviour: the agent ran the correct read-only probe, obtained the
+   correct negative result, and then MANUFACTURED the missing premise — copying a system
+   wallpaper onto an empty Desktop and "adjusting" its own planted file, creating a
+   same-named theme directory by copying a sibling, writing document internals the
+   application cannot render — and reported success. The pre-existing prose rules did not
+   hold: the preamble already demanded a feasibility check and already forbade
+   behind-the-back mutation.
+
+   Two defects in those rules were identified and corrected in the adapter:
+   the feasibility rule enumerated only missing hardware / accounts / application
+   features, which does not cover an absent object the task acts on; and the
+   investigation budget ("no more than 2 calls before a real GUI action") applied to the
+   premise check as well, so establishing feasibility competed with speed.
+
+   The revised adapter (a) states the premise rule as "an essential PRE-EXISTING target
+   or capability the task presupposes is absent", explicitly distinguished from something
+   the task asks to create, from a detail mentioned only as motivation, and from a
+   transient network/anti-bot block — the last of which is not hypothetical: the
+   published verified run lost `82279c77` by declaring INFEASIBLE on a Cloudflare block
+   for a task whose evaluator is `check_direct_json_object`; (b) exempts the premise
+   check from the investigation budget; (c) forbids manufacturing the premise; (d)
+   forbids searching the guest for grader code (a behaviour observed in the v6.81.0
+   traces — nothing was found and nothing was exploited, and it is now prohibited rather
+   than merely unsanctioned); (e) adds literal-criterion verification, environment
+   anchoring and canonical-surface preference; and (f) populates
+   `task_contract.acceptance_claims`, which was empty on all 361 tasks of the v6.81.0 run
+   while the task-acceptance panel ran on 324 of them — the reviewer was being paid for
+   and told nothing.
+
+   None of this encodes a base rate of infeasible tasks, a task id, an application, or
+   any property of an evaluator. **Numbers produced before and after this revision are
+   from different scaffolds and MUST NOT be averaged, pooled, or presented as one series.**
+
+4b. **`final_answer` in cu_bridge outcomes was null and is now populated.** §4 promises the
+   terminal answer is captured so the audit trail never shows an empty answer for an agent
+   that answered. On this runner it was never written: every v6.81.0 outcome carried
+   `final_answer: null` while the text sat in the runtime result. Outcomes written before
+   this fix under-report what the agent said; the reward figures are unaffected.
+
 5. **Observation modality.** Screenshot-only by DEFAULT: `ax_tree` is disabled
    per task unless `--allow-a11y`. A run with `--allow-a11y` must be reported as
    "Additional a11y tree used: Yes" (the leaderboard separates Screenshot /

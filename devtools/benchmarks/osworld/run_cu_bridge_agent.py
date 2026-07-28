@@ -232,13 +232,26 @@ OSWORLD_PREAMBLE = (
     "screenshot, _click, _type_text, _key, _scroll, _left_click_drag, _move, _wait, "
     "_remote_exec) and enable them.\n"
     "\n"
-    "FIRST, DO A FEASIBILITY CHECK: before executing a long plan, decide "
-    "whether the task is possible on this VM with the installed apps, hardware, accounts, "
-    "and allowed tools. Use at most 1-2 concise remote_exec probes if needed (e.g. hardware "
-    "exists? app feature exists? required file exists?). If the requested result requires "
-    "missing hardware, unavailable accounts/cloud/collaboration infrastructure, or a feature "
-    "the installed application genuinely does not provide, do not keep trying — end your "
-    "final message with only: TASK_INFEASIBLE.\n"
+    "FIRST, ESTABLISH THAT THE TASK'S PREMISE HOLDS. Before executing a plan, confirm that "
+    "what the task takes for granted actually exists here: the object it acts on, the "
+    "capability it needs, the hardware, the account. Probe with read-only checks until you "
+    "can answer; this premise check does NOT count against the investigation limit below.\n"
+    "Declare TASK_INFEASIBLE when an essential PRE-EXISTING target or capability that the "
+    "task presupposes is absent — for example the file/photo/record it tells you to act on is "
+    "not there, or the installed application genuinely lacks the feature, or the hardware or "
+    "account does not exist. Distinguish this from three things that are NOT infeasibility: "
+    "(1) something the task itself asks you to CREATE — create it; (2) a detail mentioned only "
+    "as motivation or background rather than as the object of the required action — if the required "
+    "action is still possible, do it; (3) a transient network, rate-limit or anti-bot block — "
+    "retry and try another route before concluding anything.\n"
+    "NEVER MANUFACTURE THE PREMISE. If the thing the task presupposes is missing, do not create "
+    "a stand-in for it and then operate on your own creation: do not copy some other file into "
+    "place to serve as the missing one, do not build a same-named substitute for a resource "
+    "that does not exist, and do not write application config or document internals from the "
+    "shell to simulate a result the application itself cannot produce. Producing a convincing "
+    "artefact is not completing the task; if the premise is absent, say so.\n"
+    "Do not search the filesystem for the grader, its code, or expected answers, and do not "
+    "shape your work around guesses about how it is implemented. Solve the task as stated.\n"
     "\n"
     "PRIMARY RULE — HUMAN GUI CONTROL:\n"
     "- For application tasks (Thunderbird, Chrome, LibreOffice, VS Code, GIMP, VLC, OS "
@@ -260,7 +273,9 @@ OSWORLD_PREAMBLE = (
     "DISABLED — do not look for them.)\n"
     "\n"
     "BE FAST — every tool call costs ~30s, so MINIMIZE calls:\n"
-    "- Do not spend more than 2 calls on investigation before taking a real GUI action.\n"
+    "- Do not spend more than 2 calls on investigation before taking a real GUI action. This "
+    "budget covers exploration of HOW to do the task; the premise check above is separate and "
+    "is never the thing you cut to save calls.\n"
     "- Batch 2-4 confident GUI actions before the next screenshot+view_image. Do NOT screenshot "
     "after every single keystroke.\n"
     "- Prefer keyboard shortcuts when faster (menus via Alt, Ctrl+S to save, etc.).\n"
@@ -280,9 +295,44 @@ OSWORLD_PREAMBLE = (
     "requirement is not fully met (including a change made but not saved/applied), keep working; declare "
     "done only when the observed state matches the task. If the task is genuinely impossible on this VM, "
     "end with TASK_INFEASIBLE.\n"
+    "VERIFY THE LITERAL CRITERION, NOT A STAND-IN. When the task names a specific interface — a "
+    "command to run, a module to import, a file at an exact path, a setting in a named dialog — "
+    "check THAT one, not something you believe implies it. Read the whole thing you are checking: "
+    "never conclude from a truncated preview of the output, because the difference is usually just "
+    "past where you cut. After you fix something, re-check what you changed; after your last fix, "
+    "and after any application crash or restart, re-check the full set of requirements.\n"
+    "WHEN THE TASK IS VAGUE, THE ENVIRONMENT IS THE SPECIFICATION. If a file is already open, a "
+    "tab already loaded, a slide already on screen or a selection already made, that is what the "
+    "task means — work on it rather than finding or creating your own equivalent elsewhere. "
+    "Leaving it for something else is a deliberate choice you should re-check, not a default.\n"
+    "PREFER THE APPLICATION'S OWN WAY. When the app has a named command, menu item or dialog that "
+    "directly expresses what is asked, use it instead of reimplementing the effect at a lower "
+    "level. Low-level work is right when the task asks for it or the app offers no first-class "
+    "path — then confirm the result inside the target application afterwards.\n"
     "Be decisive and efficient. When the task is verifiably complete in the real app, stop. "
     "If genuinely infeasible, end your final message with only: TASK_INFEASIBLE\n\nTask:\n"
 )
+
+# Acceptance criteria handed to the task-acceptance reviewer that already runs on every
+# OSWorld task. Phrased as claims the delivery must be able to support from the trace, so the
+# reviewer adjudicates observations rather than the agent's narrative. Nothing here names a
+# task, an application or anything about how the benchmark grades.
+_ACCEPTANCE_CLAIMS = [
+    {"id": "premise_integrity",
+     "claim": "Nothing the task presupposed was manufactured by me: I did not put a stand-in "
+              "file/resource in place and then act on it, did not build a same-named substitute "
+              "for something absent, and did not write application config or document internals "
+              "to simulate a result the application itself did not produce."},
+    {"id": "literal_criterion",
+     "claim": "Where the task named a specific command, module, path or dialog, I verified that "
+              "exact one, on complete output rather than a truncated preview."},
+    {"id": "environment_anchor",
+     "claim": "Where the task's target was underspecified, I acted on what the environment had "
+              "already opened/selected, or state explicitly why departing from it was correct."},
+    {"id": "observed_state",
+     "claim": "My completion claim rests on state I observed after the change, not on having "
+              "performed the steps."},
+]
 
 _COMPUTER_USE_SHORT_TOOLS = (
     "list_connections", "test_connection", "screenshot", "click", "move",
@@ -318,6 +368,22 @@ def _text_declares_infeasible(value: Any) -> bool:
     return isinstance(value, str) and any(
         line.strip() == "TASK_INFEASIBLE" for line in value.splitlines()
     )
+
+
+def _terminal_answer_text(latest: dict[str, Any] | None) -> str:
+    """The agent's terminal answer, with the documented fallback.
+
+    ``final_answer`` is empty on this runner's tasks while the answer text lands in
+    ``result``; an artefact whose ``final_answer`` is null for an agent that answered
+    misreports what happened, which is exactly what METHODOLOGY §4 exists to prevent.
+    """
+    if not isinstance(latest, dict):
+        return ""
+    for key in ("final_answer", "result"):
+        value = latest.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
 
 
 def _final_answer_declares_infeasible(latest: dict[str, Any]) -> bool:
@@ -661,6 +727,11 @@ def _write_cu_outcome(run: CuBridgeRun, reward: float | None, status: str, reaso
         "ok": status == "completed",
         "task_id": run.example_id, "domain": run.domain, "reward": reward,
         "status": status, "reason_code": reason, "error": error,
+        # METHODOLOGY §4 promises the terminal answer is captured so the audit trail never
+        # shows an empty answer for an agent that did answer. On this runner it was never
+        # populated: every cu_bridge outcome carried final_answer=null while the text sat in
+        # the runtime result. Falling back to `result` is exactly the documented behaviour.
+        "final_answer": _terminal_answer_text(run.runtime_result),
         "runtime_outcome": runtime_terminal_disclosure(run.runtime_result),
         "result_dir": str(run.run_dir), "attempt_dir": str(run.attempt_dir),
         "claim_owner": bool(run.owns_task), **(extra or {}),
@@ -998,6 +1069,13 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
         created = _api(args.ouroboros_url, "POST", "/api/tasks", {
             "description": prompt, "memory_mode": "empty",
             "disabled_tools": _effective_disabled_tools(args.allow_a11y),
+            # The task-acceptance panel already runs on every OSWorld task and was, until now,
+            # given no criteria at all (acceptance_claims was [] on all 361 tasks of the
+            # v6.81.0 run while the panel returned clean_pass on 324 of them). These four
+            # claims cost no extra model call: they tell the reviewer that already runs what
+            # a completed OSWorld task must be able to say for itself. They are deliberately
+            # general — no task id, no application, no evaluator behaviour.
+            "acceptance_claims": _ACCEPTANCE_CLAIMS,
         })
         task_id = str(created.get("task_id") or "")
         if not task_id:
