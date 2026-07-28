@@ -340,19 +340,30 @@ leaderboard run without the disclosures below.
    (verbatim args, not previews) for offline audit, and the working phase is
    re-reset afterwards.
 
-   Both resets — initial and post-gate — are VERIFIED (`_reset_verified`): OSWorld's own
-   `reset()` fails open when the guest server misses its setup probe window, silently
-   skipping every setup step and returning a pristine VM ("Environment setup complete."
-   with nothing set up). The runner asserts the machine-checkable postcondition
+   **Every reset republishes the VM endpoint**, and this is the load-bearing repair.
+   `DockerProvider.revert_to_snapshot` stops the container and `start_emulator`
+   REALLOCATES ports (`_get_available_port(5000)`), so the VM's address changes on every
+   reset. The 2026-07-28 v1 smoke wrote the endpoint once, before the gate (measured:
+   83/83 task dirs had `bridge.json` older than their gate record), so after the
+   post-gate reset the working phase kept driving the PRE-GATE address — which, with 16
+   lanes allocating from the same port range, another lane's container could already
+   own. Feasible-control mean 0.737 -> 0.459, and the signature was unmistakable in the
+   traces: workers reported an empty Desktop and missing task files, and in one case
+   acted on a completely different task's presentation. Republishing after the post-gate
+   reset removed the whole class (v2: 0 regressions vs 9 at the comparable stage).
+
+   Both resets are additionally VERIFIED (`_reset_verified`) against a SECOND, distinct
+   fail-open in OSWorld itself: `reset()` skips every setup step when the guest server
+   misses its probe window, then logs "Environment setup complete." and returns a
+   pristine VM with no exception. The runner asserts the machine-checkable postcondition
    (`is_environment_used` true whenever the task config is non-empty, plus a screenshot
    over the same HTTP path the agent's tools use), forces the snapshot revert before
-   every retry (an unforced retry runs setup on top of the partial state), republishes
-   the VM endpoint after the post-gate reset (the docker provider can change IP/ports
-   on recreate), and turns exhaustion into a typed infra row (`reset_unverified`,
-   reward `null`, claim released) — a setup the harness could not verify must never
-   become a capability zero. Note the silent-skip flaw affects UNGATED runs too, on
-   their single reset: numbers measured before this verification existed may include
-   silent-setup zeros and are not strictly comparable with numbers measured after.
+   every retry (an unforced retry runs setup on top of the partial state), and turns
+   exhaustion into a typed infra row (`reset_unverified`, reward `null`, claim released)
+   — a setup the harness could not verify must never become a capability zero. Reported
+   honestly: this second guard has not yet fired in production (v2: 24 post-gate resets,
+   0 retries), so it is defence in depth, not the measured fix. It does close a real
+   pre-existing flaw that affects UNGATED runs too, on their single reset.
 
    Expect roughly double the per-example warm-up and acceptance-review cost (triple on
    killed examples). The number that decides whether it is worth paying is the

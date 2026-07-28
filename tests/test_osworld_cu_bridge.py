@@ -1744,3 +1744,22 @@ def test_gate_tool_trace_carries_full_args_for_the_offline_audit(tmp_path):
     assert trace[0]["args"]["command"] == long_cmd, "args must be verbatim, not a preview"
     assert rcb._gate_tool_trace(tmp_path, "") == []
     assert rcb._gate_tool_trace(tmp_path, "no-such-task") == []
+
+
+def test_the_post_gate_reset_republishes_the_vm_endpoint():
+    """The repair the v1 smoke actually needed. DockerProvider.revert_to_snapshot stops
+    the container and start_emulator REALLOCATES ports, so the VM address changes on
+    every reset. v1 published it once, before the gate (83/83 task dirs had bridge.json
+    older than their gate record), so the working phase drove the pre-gate address —
+    which another lane's container could already own. Pin the ordering: the post-gate
+    reset must be followed by a target write and a _publish_target call, before the
+    working task is created."""
+    src = (Path(__file__).resolve().parent.parent
+           / "devtools" / "benchmarks" / "osworld" / "run_cu_bridge_agent.py").read_text(encoding="utf-8")
+    post_gate = src.index('reset_diag["post_gate"]')
+    republish = src.index("_publish_target(data_dir, target)", post_gate)
+    worker_post = src.index('"acceptance_claims": _ACCEPTANCE_CLAIMS', post_gate)
+    assert post_gate < republish < worker_post, \
+        "the endpoint must be republished after the post-gate reset and before the worker starts"
+    # And the target file the skill reads must be rewritten too, not just the sidecar.
+    assert src.index("Path(args.target_file).expanduser().write_text(target", post_gate) < republish

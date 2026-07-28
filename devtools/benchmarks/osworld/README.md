@@ -229,17 +229,27 @@ mitigations follow. (1) `feasibility_gate.json` carries each round's FULL tool t
 re-reset after a PROCEED/UNDETERMINED verdict, so anything the premise phase touched is
 discarded before the state that gets scored.
 
-**Both resets are VERIFIED** (`_reset_verified`). OSWorld's own `reset()` fails open:
-when the guest server misses the setup probe window it skips every setup step, logs
-"Environment setup complete." and returns a pristine VM — no exception, nothing visible
-(the 2026-07-28 smoke lost the feasible-control mean 0.737 → 0.459 to exactly this on
-the bare post-gate reset). The runner asserts `is_environment_used` whenever the task
+**Every reset republishes the VM endpoint — this is the repair that mattered.**
+`DockerProvider.revert_to_snapshot` stops the container and `start_emulator` reallocates
+ports, so the VM's address changes on every reset. The 2026-07-28 v1 smoke published it
+once, before the gate (83/83 task dirs had `bridge.json` older than their gate record),
+so the working phase kept driving the pre-gate address — which, with 16 lanes allocating
+from one port range, another lane's container could already own. Feasible-control mean
+fell 0.737 → 0.459, with workers reporting empty Desktops, missing task files, and in one
+case acting on a different task's presentation entirely. Republishing removed the class:
+0 regressions in v2 against 9 at the comparable stage of v1.
+
+**Both resets are also VERIFIED** (`_reset_verified`) against a second, independent
+fail-open — this one inside OSWorld: when the guest server misses the setup probe window
+`reset()` skips every setup step, logs "Environment setup complete." and returns a
+pristine VM with no exception. The runner asserts `is_environment_used` whenever the task
 config is non-empty, keeps the screenshot probe (same HTTP path the agent's tools use),
-forces the snapshot revert before every retry, republishes the VM endpoint after the
-post-gate reset (docker recreate can change IP/ports), and turns exhaustion into a typed
-infra row (`reset_unverified`, reward `null`, claim released) instead of a capability
-zero. `reset_verification.json` in the task directory records attempts and the captured
-`desktopenv` log tail per reset.
+forces the snapshot revert before every retry, and turns exhaustion into a typed infra
+row (`reset_unverified`, reward `null`, claim released) instead of a capability zero.
+Stated honestly: this guard has not fired in production yet (v2: 24 post-gate resets, 0
+retries) — it is defence in depth, not the measured fix, though it does close a real
+pre-existing flaw that affects ungated runs on their single reset.
+`reset_verification.json` records attempts and the captured `desktopenv` log tail.
 
 Cost and disclosure: a gated run posts two tasks per example (three when a kill is
 confirmed), so the manifest reports `one_run_per_task: false`,
