@@ -1290,10 +1290,10 @@ index 0000000..64f9ff1
 +        self.close()
 diff --git a/src/systems/ouroboros/_live_bridge.py b/src/systems/ouroboros/_live_bridge.py
 new file mode 100644
-index 0000000..59b54fd
+index 0000000..dd1ba6c
 --- /dev/null
 +++ b/src/systems/ouroboros/_live_bridge.py
-@@ -0,0 +1,1107 @@
+@@ -0,0 +1,1140 @@
 +"""Live-task bridge: skill mechanics under the OFFICIAL CL-Bench runner.
 +
 +The runner keeps ownership of the task/DB/rewards and drives the standard
@@ -1724,34 +1724,70 @@ index 0000000..59b54fd
 +        self._usage_harvested: set[str] = set()
 +        self._usage_pending: dict[str, str] = {}
 +
-+    def _harvest_task_usage(self, tid: Optional[str], status: str, *, block: bool = False) -> None:
++    def _harvest_task_usage(self, tid: Optional[str], status: str, *, block: bool = False,
++                            budget_sec: float = 25.0) -> None:
 +        """Record one terminal engine task's cost into the usage buffer (idempotent).
 +
-+        cost_usd lands on the task record at the post-task cost checkpoint, which for a
-+        completed outcome can trail the terminal status by seconds. The turn-critical
-+        callers (scope close / next-question open) must NOT wait for it — they make ONE
-+        quick read and, if the cost is not there yet, park the tid for close() to finish
-+        with bounded retries off the hot path (parity test: terminal fail-fast < 15s)."""
++        Review contract (codex adapter review, 2026-07-28):
++        - authoritative cost = cost_usd_with_children (subtree rollup) when present,
++          else cost_usd; a row is FINAL only when the record says so (cost_final=True
++          or cost_accounting_status == "available");
++        - the recorded status comes from the TASK RECORD, never from a synthetic
++          caller label; a non-final read must never clobber a pending retry;
++        - hot path (block=False) performs exactly ONE short-socket GET (<=3s), no
++          polling, no sleeps (terminal fail-fast contract);
++        - block=True obeys one wall-clock budget shared by every HTTP call inside;
++          on budget exhaustion the last seen cost is recorded with cost_final=False
++          rather than silently dropped."""
 +        if not tid or tid in self._usage_harvested:
 +            return
-+        attempts = 4 if block else 1
-+        cost = None
-+        try:
-+            for i in range(attempts):
-+                res = self.engine.server.wait_task(tid, timeout=8 if block else 3) or {}
-+                cost = res.get("cost_usd")
-+                if cost is not None or status not in ("completed", "degraded"):
-+                    break
-+                if block and i + 1 < attempts:
-+                    time.sleep(5)
-+        except Exception as exc:  # noqa: BLE001 — usage harvest must never break the run
-+            _log(f"usage harvest failed for {tid}: {type(exc).__name__}: {str(exc)[:120]}")
-+        if cost is None and not block and status in ("completed", "degraded"):
-+            self._usage_pending[tid] = status   # close() finishes the read with retries
-+            return
++        from . import run_clbench_bridge_agent as _rb  # lazy: import cycle
++        base = self.engine.server.base_url
++        deadline = time.time() + (budget_sec if block else 0.0)
++        rec: dict = {}
++        while True:
++            try:
++                rec = _rb._api(base, "GET", "/api/tasks/" + tid, timeout=3) or {}
++            except Exception as exc:  # noqa: BLE001 — harvest must never break the run
++                _log(f"usage harvest read failed for {tid}: {type(exc).__name__}: {str(exc)[:120]}")
++                rec = rec or {}
++            cost_children = rec.get("cost_usd_with_children")
++            cost_own = rec.get("cost_usd")
++            cost = cost_children if cost_children is not None else cost_own
++            final = bool(rec.get("cost_final")) or (
++                str(rec.get("cost_accounting_status") or "") == "available")
++            if final and cost is not None:
++                break
++            if not block or time.time() + 3.0 >= deadline:
++                if not block:
++                    # park for close()/finalize_usage() to finish with retries
++                    self._usage_pending.setdefault(tid, str(rec.get("status") or status))
++                    return
++                break  # blocking budget exhausted: record what we have, marked non-final
++            time.sleep(min(3.0, max(0.5, deadline - time.time())))
 +        self._usage_harvested.add(tid)
 +        self._usage_pending.pop(tid, None)
-+        self.usage_buffer.append({"task_id": tid, "status": status, "cost_usd": cost})
++        self.usage_buffer.append({
++            "task_id": tid,
++            "status": str(rec.get("status") or status),
++            "cost_usd": (rec.get("cost_usd_with_children")
++                         if rec.get("cost_usd_with_children") is not None
++                         else rec.get("cost_usd")),
++            "cost_final": bool(rec.get("cost_final")) or (
++                str(rec.get("cost_accounting_status") or "") == "available"),
++        })
++
++    def finalize_usage(self, budget_sec: float = 25.0) -> None:
++        """Terminal-cost finalization before control returns to the runner (the runner
++        never calls reset()/close() on the success path — review BLOCKER 1). One shared
++        wall-clock budget across the current task and every parked pending tid."""
++        deadline = time.time() + budget_sec
++        if self._task_id:
++            self._harvest_task_usage(self._task_id, self._task_status(), block=True,
++                                     budget_sec=max(1.0, deadline - time.time()))
++        for _tid, _st in list(self._usage_pending.items()):
++            self._harvest_task_usage(_tid, _st, block=True,
++                                     budget_sec=max(1.0, deadline - time.time()))
 +
 +    # ------------------------------------------------------------- runner side
 +    def respond(self, query: Any):
@@ -1779,10 +1815,7 @@ index 0000000..59b54fd
 +
 +    def close(self) -> None:
 +        try:
-+            if self._task_id:
-+                self._harvest_task_usage(self._task_id, self._task_status(), block=True)
-+            for _tid, _st in list(self._usage_pending.items()):
-+                self._harvest_task_usage(_tid, _st, block=True)
++            self.finalize_usage()
 +        except Exception:
 +            pass
 +        try:
@@ -3590,10 +3623,10 @@ index 0000000..04baa56
 +    raise SystemExit(main())
 diff --git a/src/systems/ouroboros/system.py b/src/systems/ouroboros/system.py
 new file mode 100644
-index 0000000..7970a64
+index 0000000..5a394a8
 --- /dev/null
 +++ b/src/systems/ouroboros/system.py
-@@ -0,0 +1,568 @@
+@@ -0,0 +1,580 @@
 +"""Ouroboros bridge: run the Ouroboros self-modifying agent as a CL-Bench system.
 +
 +Mapping (see plan):
@@ -3771,12 +3804,20 @@ index 0000000..7970a64
 +        return self._name
 +
 +    def observe(self, observation: Observation, next_query: Optional[Query] = None) -> None:
-+        self._drain_engine_usage()
 +        """Fold task feedback into the running conversation (so the next turn sees it)."""
 +        if self.engine == "ouroboros" and self.loop == "live" and self._live is not None:
 +            # Live loop: relay the official observation VERBATIM to the in-session agent
 +            # (this is the parity guarantee — no rewriting). Bookkeeping below still runs.
 +            self._live.observe(observation, next_query)
++            if next_query is None:
++                # End of the sequence: the runner consumes usage right after observe and
++                # NEVER calls reset()/close() on the success path (review BLOCKER 1) —
++                # finalize terminal engine-task costs NOW, before control returns.
++                try:
++                    self._live.finalize_usage()
++                except Exception:
++                    pass
++            self._drain_engine_usage()
 +        content = (observation.content or "").strip()
 +        if content:
 +            self._last_feedback = content   # OSWorld-style: only the latest result is re-supplied next turn
@@ -3810,9 +3851,13 @@ index 0000000..7970a64
 +
 +    def respond(self, query: Query) -> Response:
 +        self._turns += 1
-+        self._drain_engine_usage()
 +        if self.engine == "ouroboros" and self.loop == "live":
-+            return self._respond_live(query)
++            resp = self._respond_live(query)
++            # Drain AFTER the live turn: rows created by this very call (previous task
++            # went terminal while opening the new scope) land in THIS interaction's
++            # usage, which the runner collects right after respond() returns.
++            self._drain_engine_usage()
++            return resp
 +        if self._cur_instance is not None and query.instance_index != self._cur_instance:
 +            # The previous CL-Bench instance just ended. For stateful E1v2, this is where post-task
 +            # evolution is given a chance to absorb (budget reset + wait_for_absorb).
@@ -5189,3 +5234,169 @@ index 0000000..a134af8
 +    a = ctl.respond(_q())
 +    assert (a.content or "") == ""                   # fallback empty action, not a fabricated one
 +    ctl.close()
+diff --git a/src/systems/ouroboros/test_submission_ports.py b/src/systems/ouroboros/test_submission_ports.py
+new file mode 100644
+index 0000000..144b8f6
+--- /dev/null
++++ b/src/systems/ouroboros/test_submission_ports.py
+@@ -0,0 +1,160 @@
++"""Contract tests for the v6.81 submission ports (codex adapter review, 2026-07-28).
++
++Covers the three review-mandated contracts:
++1. engine-task cost harvest: delayed/final cost recorded exactly once with the subtree
++   total, survives the runner's real lifecycle (no reset()/close() on success), never
++   blocks the hot path;
++2. campaign env-override loop: explicit env wins over parity defaults, AUTO_LOW stays
++   tri-state;
++3. single-model pin: a foreign live vision slot never survives into isolated settings.
++"""
++from __future__ import annotations
++
++import time
++from types import SimpleNamespace
++
++from src.systems.ouroboros import run_clbench_bridge_agent as rb
++from src.systems.ouroboros._live_bridge import LiveController
++from src.systems.ouroboros.system import _fallback_action
++
++
++class _CostServer:
++    """Task record server: cost is absent on the first read, final on the next."""
++
++    base_url = "http://cost-fake"
++
++    def __init__(self):
++        self.reads = 0
++        self.cancelled = []
++
++    def record(self):
++        if self.reads <= 2:
++            return {"status": "completed"}  # terminal, cost not checkpointed yet
++        return {"status": "completed", "cost_usd": 1.0,
++                "cost_usd_with_children": 3.0, "cost_final": True,
++                "cost_accounting_status": "available"}
++
++    def wait_task(self, *a, **k):
++        return {"status": "completed"}
++
++    def cancel_task(self, tid):
++        self.cancelled.append(tid)
++
++
++def _controller(server):
++    ctl = LiveController(engine=SimpleNamespace(server=server, mm="shared",
++                                                on_instance_boundary=lambda: None),
++                         conversation="question", memory_mode="tools",
++                         fallback_action_fn=_fallback_action,
++                         action_timeout_sec=2, task_timeout_sec=5)
++    return ctl
++
++
++def test_engine_usage_final_delayed_cost_is_recorded_once_with_subtree_total(monkeypatch):
++    srv = _CostServer()
++    ctl = _controller(srv)
++
++    def fake_api(base, method, path, body=None, timeout=30.0):
++        assert timeout <= 3.5, "hot-path harvest must use a short socket timeout"
++        srv.reads += 1
++        return srv.record()
++
++    monkeypatch.setattr(rb, "_api", fake_api)
++
++    # Hot path: one non-blocking read sees no cost -> parked, nothing recorded, no sleep.
++    t0 = time.time()
++    ctl._harvest_task_usage("tid-final", "completed", block=False)
++    assert time.time() - t0 < 2, "non-blocking harvest must not poll"
++    assert ctl.usage_buffer == []
++    assert "tid-final" in ctl._usage_pending
++    assert "tid-final" not in ctl._usage_harvested
++
++    # A synthetic 'terminal' label must NOT clobber the pending retry with a null row.
++    ctl._harvest_task_usage("tid-final", "terminal", block=False)
++    assert ctl.usage_buffer == [] and "tid-final" in ctl._usage_pending
++
++    # Finalization (what observe(next_query=None) triggers): reads the FINAL record and
++    # records the SUBTREE total exactly once.
++    ctl.finalize_usage(budget_sec=10)
++    rows = [r for r in ctl.usage_buffer if r["task_id"] == "tid-final"]
++    assert len(rows) == 1
++    assert rows[0]["cost_usd"] == 3.0, "must prefer cost_usd_with_children"
++    assert rows[0]["cost_final"] is True
++    assert rows[0]["status"] == "completed", "status must come from the task record"
++
++    # Idempotence: further terminal paths must not duplicate the event.
++    ctl._harvest_task_usage("tid-final", "completed", block=True)
++    ctl.close()
++    assert len([r for r in ctl.usage_buffer if r["task_id"] == "tid-final"]) == 1
++
++
++def test_engine_usage_budget_exhaustion_records_nonfinal_not_lost(monkeypatch):
++    ctl = _controller(_CostServer())
++    monkeypatch.setattr(rb, "_api",
++                        lambda *a, **k: {"status": "failed", "cost_usd": 0.42})
++    ctl._harvest_task_usage("tid-fail", "failed", block=True, budget_sec=1.0)
++    rows = [r for r in ctl.usage_buffer if r["task_id"] == "tid-fail"]
++    assert len(rows) == 1
++    assert rows[0]["cost_usd"] == 0.42, "failed tasks with billable calls must be recorded"
++    assert rows[0]["cost_final"] is False, "non-final read must be marked as such"
++
++
++def test_docker_overrides_explicit_campaign_knobs_win_and_auto_low_stays_tristate(monkeypatch):
++    from src.systems.ouroboros._docker_launcher import DockerOuroborosEngine
++
++    def overrides(env: dict) -> dict:
++        for k in ("OUROBOROS_RUNTIME_MODE", "OUROBOROS_TASK_REVIEW_MODE",
++                  "OUROBOROS_REVIEW_ENFORCEMENT", "OUROBOROS_EFFORT_TASK",
++                  "OUROBOROS_EFFORT_REVIEW", "OUROBOROS_EFFORT_SCOPE_REVIEW",
++                  "OUROBOROS_SAFETY_MODE", "OUROBOROS_CONTEXT_MODE",
++                  "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_MAX_SUBAGENT_DEPTH"):
++            monkeypatch.delenv(k, raising=False)
++        for k, v in env.items():
++            monkeypatch.setenv(k, v)
++        eng = DockerOuroborosEngine.__new__(DockerOuroborosEngine)
++        eng.model = "anthropic/claude-sonnet-4.6"
++        eng.evolution = False
++        eng.resume = False
++        eng.cadence = ""
++        eng.steer = ""
++        return eng._overrides()
++
++    ov = overrides({})
++    assert ov["OUROBOROS_RUNTIME_MODE"] == "advanced"
++    assert ov["OUROBOROS_TASK_REVIEW_MODE"] == "auto"
++    assert ov["OUROBOROS_REVIEW_ENFORCEMENT"] == "advisory"
++    assert "OUROBOROS_CONTEXT_MODE_AUTO_LOW" not in ov, "absent env must stay UNKNOWN"
++    assert ov["OUROBOROS_MODEL_VISION"] == "anthropic/claude-sonnet-4.6"
++
++    ov = overrides({"OUROBOROS_RUNTIME_MODE": "pro", "OUROBOROS_TASK_REVIEW_MODE": "required",
++                    "OUROBOROS_REVIEW_ENFORCEMENT": "blocking", "OUROBOROS_SAFETY_MODE": "off",
++                    "OUROBOROS_EFFORT_TASK": "high", "OUROBOROS_EFFORT_REVIEW": "low",
++                    "OUROBOROS_EFFORT_SCOPE_REVIEW": "low", "OUROBOROS_CONTEXT_MODE": "max",
++                    "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "false",
++                    "OUROBOROS_MAX_SUBAGENT_DEPTH": "0"})
++    assert ov["OUROBOROS_RUNTIME_MODE"] == "pro"
++    assert ov["OUROBOROS_TASK_REVIEW_MODE"] == "required"
++    assert ov["OUROBOROS_REVIEW_ENFORCEMENT"] == "blocking"
++    assert ov["OUROBOROS_SAFETY_MODE"] == "off"
++    assert ov["OUROBOROS_EFFORT_TASK"] == "high"
++    assert ov["OUROBOROS_EFFORT_REVIEW"] == "low", "split review effort must survive"
++    assert ov["OUROBOROS_EFFORT_SCOPE_REVIEW"] == "low"
++    assert ov["OUROBOROS_CONTEXT_MODE"] == "max"
++    assert ov["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
++    assert ov["OUROBOROS_MAX_SUBAGENT_DEPTH"] == "0"
++
++
++def test_single_model_pin_overrides_foreign_live_vision_slot(monkeypatch):
++    from src.systems.ouroboros._docker_launcher import DockerOuroborosEngine
++
++    monkeypatch.delenv("OUROBOROS_CONTEXT_MODE", raising=False)
++    eng = DockerOuroborosEngine.__new__(DockerOuroborosEngine)
++    eng.model = "anthropic/claude-sonnet-4.6"
++    eng.evolution = False
++    eng.resume = False
++    eng.cadence = ""
++    eng.steer = ""
++    ov = eng._overrides()
++    live = {"OUROBOROS_MODEL_VISION": "openai::foreign-model", "TOTAL_BUDGET": 60.0}
++    merged = {**live, **ov}  # build_isolated_settings applies overrides after live settings
++    assert merged["OUROBOROS_MODEL_VISION"] == "anthropic/claude-sonnet-4.6"
