@@ -1846,3 +1846,35 @@ def test_a_dead_guest_control_server_ends_the_attempt_as_infra_not_a_zero():
     assert '"guest_control_server_lost"' in src
     flow = src[src.index("claim_fd: int | None = None"):]
     assert flow.index("_guest_endpoint_healthy(env)") < flow.index('"guest_control_server_lost"')
+
+
+def test_forensics_clauses_are_pinned_in_the_worker_prompt():
+    """The v6.81.1 forensics attributed ~7.5 lost points to five recurring worker
+    behaviours (own hex instead of the app's named swatch; retyping instead of
+    clipboard transfer; collateral edits beyond the asked diff; ordinals counted
+    over headings; finishing off the graded surface). Each got a preamble clause;
+    pin them so a later prompt edit cannot silently drop one."""
+    p = rcb.OSWORLD_PREAMBLE
+    for phrase in (
+        "A VALUE NAMED BY WORD IS THE APP'S NAMED VALUE",
+        "TRANSFER TEXT VERBATIM, NEVER RETYPE",
+        "TOUCH ONLY WHAT THE TASK NAMES",
+        "ORDINALS COUNT REAL ITEMS",
+        "FINISH ON THE GRADED SURFACE",
+        "Shift+Enter",
+        "ALREADY in the requested state",
+    ):
+        assert phrase in p, phrase
+
+
+def test_gate_rubric_covers_named_mode_scope_and_prohibition():
+    """Forensics: two gate PROCEEDs reinterpreted a named mode ('batch') and a launch
+    scope (per-app vs per-folder) as working-phase details, and one prohibition
+    ('without configuring X') was never verified as satisfiable — all three hide the
+    premise in a modifier rather than a noun. Pin the 4d branch; the fail-open default
+    must survive it."""
+    p = rcb.GATE_PREAMBLE
+    assert "NAMED MODE, SCOPE AND PROHIBITION" in p
+    for phrase in ("MODE OF OPERATION", "APPLY SCOPE", "PROHIBITION"):
+        assert phrase in p, phrase
+    assert "When in doubt, answer UNDETERMINED" in p, "fail-open stays the default"
