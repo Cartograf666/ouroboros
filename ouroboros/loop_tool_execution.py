@@ -1016,7 +1016,61 @@ def handle_tool_calls(
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-    return process_tool_results(results, messages, llm_trace, emit_progress)
+    return process_tool_results(results, messages, llm_trace, emit_progress, tools=tools)
+
+
+def _maybe_auto_attach_image(
+    exec_result: Dict[str, Any],
+    tools: Optional[ToolRegistry],
+) -> None:
+    """Same-round image attachment for tool results that explicitly offer one.
+
+    A successful result whose JSON carries ``auto_attach_image: <local path>`` — a
+    typed, opt-in field (the unix_computer_use screenshot emits it) — gets that
+    image attached to the conversation immediately, through the SAME
+    implementation the ``view_image`` tool uses: identical trust boundary
+    (allowed roots, size cap, fail-closed MIME sniff), identical durable copy
+    under ``uploads/views``, identical message shape (the mid-round user(image)
+    injection the transport already repairs adjacency for). This removes the
+    mandatory second ``view_image`` round per observation, which consumed ~21%
+    of the round budget on computer-use benches (v6.81.0 OSWorld run: 3,830
+    view_image rounds after 3,893 screenshots).
+
+    Parses the FULL result, not the truncated view: per-tool truncation can cut
+    the JSON tail. Failure of any kind is strictly non-fatal and must never
+    convert a successful tool call into a failed one — the result still carries
+    the path, so the agent can view it manually, which is exactly the pre-6.81.1
+    behavior.
+
+    EXTENSION tool results only (the ``ext_`` surface): this capability is
+    defined for first-party skills, whose payloads the review/grant lifecycle
+    already governs. MCP results are untrusted server-supplied data — honoring
+    the field there would let a remote server convert an agent-chosen context
+    mutation into a data-driven automatic one. (The perimeter below would still
+    hold — same roots/size/MIME as view_image — but the narrower surface is the
+    honest contract.)"""
+    if tools is None or exec_result.get("is_error"):
+        return
+    if not str(exec_result.get("fn_name") or "").startswith("ext_"):
+        return
+    raw = exec_result.get("result")
+    if not isinstance(raw, str) or '"auto_attach_image"' not in raw:
+        return
+    try:
+        parsed = json.loads(raw)
+        path = parsed.get("auto_attach_image") if isinstance(parsed, dict) else None
+        if not isinstance(path, str) or not path:
+            return
+        ctx = getattr(tools, "_ctx", None)
+        if ctx is None:
+            return
+        from ouroboros.tools.vision import attach_local_image_to_context
+
+        ok, note = attach_local_image_to_context(ctx, path)
+        if not ok:
+            log.debug("auto-attach skipped for %s: %s", path, note)
+    except Exception:  # noqa: BLE001 - attachment is an enhancement, never a failure
+        log.debug("auto-attach image failed", exc_info=True)
 
 
 def process_tool_results(
@@ -1024,6 +1078,7 @@ def process_tool_results(
     messages: List[Dict[str, Any]],
     llm_trace: Dict[str, Any],
     emit_progress: Callable[[str], None],
+    tools: Optional[ToolRegistry] = None,
 ) -> int:
     """Append tool results to messages/trace and return error count."""
     error_count = 0
@@ -1135,6 +1190,13 @@ def process_tool_results(
                                     ob["status"] = "agent_disposed"
             except Exception:
                 log.debug("Failed to parse task_acceptance_review tool result", exc_info=True)
+
+    # Auto-attach AFTER the round's complete tool-message block, never between two
+    # tool messages answering the same assistant turn: the user(image) injection
+    # then preserves tool-result contiguity BY CONSTRUCTION instead of relying on
+    # the transport's adjacency repair to fix an interleaving we created ourselves.
+    for exec_result in results:
+        _maybe_auto_attach_image(exec_result, tools)
 
     return error_count
 

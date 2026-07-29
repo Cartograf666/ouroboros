@@ -418,27 +418,27 @@ def _emit_usage(ctx: ToolContext, usage: Dict[str, Any], model: str) -> None:
         log.debug("Failed to emit VLM usage event", exc_info=True)
 
 
-def _view_image(ctx: ToolContext, path: str = "") -> str:
-    """Bring a LOCAL image file into the active model's context NATIVELY.
+def attach_local_image_to_context(ctx: ToolContext, path: str) -> Tuple[bool, str]:
+    """Attach a LOCAL image file to the active conversation as a native image block.
 
-    Resource class: local_file_to_model (NOT a web tool — it never touches the
-    network, so it is available even under allowed_resources.web=false). For a
-    vision-capable active remote route the image is injected as a native image
-    content block (the agent sees it INLINE in its own reasoning, like a browser
-    screenshot); send-time routing may caption/omit for blind/local routes. LOCAL PATHS ONLY
-    (no URL / no base64), same trust boundary as read_file. Prefer this over
-    vlm_query when you need to reason about the image yourself (charts, renders,
-    screenshots, photos, scanned/printed text)."""
+    The single implementation behind BOTH the agent-called ``view_image`` tool and
+    the host's same-round auto-attachment of tool-result images (results carrying
+    ``auto_attach_image``, v6.81.1). One body on purpose: the two paths must never
+    drift in trust boundary (allowed roots + protected-artifact policy + size cap +
+    fail-closed MIME sniff via ``_load_local_image_payload``), durable-copy
+    behavior (``uploads/views``) or message shape. Returns ``(ok, message)``;
+    never raises. Blind/local routes need no guard here — send-time routing
+    captions/omits image blocks for routes that cannot see them."""
     if not path:
-        return "⚠️ Provide a local image file path."
+        return False, "⚠️ Provide a local image file path."
     payload, err = _load_local_image_payload(ctx, path)
     if err:
-        return err
+        return False, err
     b64, mime = payload["base64"], payload["mime"]
 
     messages = getattr(ctx, "messages", None)
     if not isinstance(messages, list):
-        return "⚠️ VIEW_IMAGE_UNAVAILABLE: no active conversation to attach the image to."
+        return False, "⚠️ VIEW_IMAGE_UNAVAILABLE: no active conversation to attach the image to."
 
     import pathlib
     import base64 as _b64
@@ -470,11 +470,26 @@ def _view_image(ctx: ToolContext, path: str = "") -> str:
             "_source_path": source_path,
         },
     ])
-    return (
+    return True, (
         f"'{src_name}' is now attached as a local image block. Vision-capable remote routes can "
         f"inspect it inline; blind/local routes may receive a caption or placeholder at send time. "
         f"It was read from local disk; this is NOT a web tool."
     )
+
+
+def _view_image(ctx: ToolContext, path: str = "") -> str:
+    """Bring a LOCAL image file into the active model's context NATIVELY.
+
+    Resource class: local_file_to_model (NOT a web tool — it never touches the
+    network, so it is available even under allowed_resources.web=false). For a
+    vision-capable active remote route the image is injected as a native image
+    content block (the agent sees it INLINE in its own reasoning, like a browser
+    screenshot); send-time routing may caption/omit for blind/local routes. LOCAL PATHS ONLY
+    (no URL / no base64), same trust boundary as read_file. Prefer this over
+    vlm_query when you need to reason about the image yourself (charts, renders,
+    screenshots, photos, scanned/printed text)."""
+    _ok, message = attach_local_image_to_context(ctx, path)
+    return message
 
 
 def get_tools() -> List[ToolEntry]:

@@ -66,7 +66,11 @@ IMAGE_BLOCK_CHAR_EQUIVALENT = 4_400
 # Live image blocks kept in the transcript (single counter across owner
 # uploads, browser screenshots, and transport injections). Older images are
 # replaced by a caption placeholder pointing to the re-view path.
-MAX_LIVE_IMAGE_BLOCKS = 3
+# 3 -> 5 (v6.81.1, owner decision 2026-07-29): with tool-result images now
+# auto-attached (screenshots arrive every observation round), 3 kept too little
+# visual history for compare-two-screens reasoning; 5 costs at most ~2.2K extra
+# estimated tokens per request and only when that many images are actually live.
+MAX_LIVE_IMAGE_BLOCKS = 5
 
 # --- Scratchpad size thresholds (SSOT; previously scattered literals) -------
 # Context-section soft budget for the rendered scratchpad (warn-only).

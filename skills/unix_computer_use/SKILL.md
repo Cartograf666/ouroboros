@@ -1,7 +1,7 @@
 ---
 name: unix_computer_use
 description: Local and remote desktop observation/input tools with coordinate normalization (local macOS/Linux by default; optional OSWorld HTTP and SSH Mac backends).
-version: 0.3.0
+version: 0.4.0
 type: extension
 entry: plugin.py
 runtime: python3
@@ -26,11 +26,18 @@ Tools:
 - `screenshot` captures the desktop, downscales the image to fit WXGA
   (1280x800, configurable) and persists the exact image-to-input coordinate
   transform. Pass coordinates read off the returned image directly to the
-  input tools — they are remapped automatically. The returned `path` is intended
-  to be readable by `view_image`.
-- `click` (left/right/middle, double/triple), `move`, `left_click_drag`,
-  `mouse_down`/`mouse_up`, `cursor_position`, `type_text`, `key`, `hold_key`,
-  `scroll`, and `wait` execute input through platform tools when available.
+  input tools — they are remapped automatically. The result carries the typed
+  `auto_attach_image` field, so the host attaches the image to the
+  conversation in the same round (v6.81.1) — no `view_image` call is needed
+  for a fresh capture; the returned `path` stays `view_image`-readable for
+  re-viewing later.
+- `click` (left/right/middle, double/triple), the thin aliases
+  `double_click`/`triple_click` (models call these names unprompted), `move`,
+  `left_click_drag`, `mouse_down`/`mouse_up`, `cursor_position`, `type_text`,
+  `key`, `hold_key`, `scroll`, and `wait` execute input through platform tools
+  when available. Pointer coordinates pass through one normalizer that accepts
+  the malformations models actually emit (the pair packed into `x` with `y`
+  absent or duplicated) and fails loudly on anything ambiguous.
 - `window_list` lists visible windows/processes where the platform exposes a
   lightweight backend.
 - `ax_tree` returns a set-of-marks accessibility snapshot of the frontmost

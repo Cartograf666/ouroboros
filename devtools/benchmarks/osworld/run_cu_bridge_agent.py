@@ -110,6 +110,13 @@ def _host_denied_tools() -> list[str]:
 _GUI_ACTION_TOOLS = frozenset({
     "click", "move", "left_click_drag", "mouse_down", "mouse_up",
     "type_text", "key", "hold_key", "scroll",
+    # v6.81.1: the skill registers these as thin click aliases. They are the same
+    # mutating surface under other names — leaving them out of this set let the
+    # "cannot act by construction" premise phase click the VM through an alias
+    # and under-counted gui_action_calls in the disclosure counters (caught by
+    # both triad reviewers on the release diff). Any future click alias MUST be
+    # added here in the same commit that registers it.
+    "double_click", "triple_click",
 })
 
 
@@ -126,22 +133,42 @@ GATE_PREAMBLE = (
     "You are inspecting a real Ubuntu desktop inside an OSWorld VM to answer ONE question "
     "about the task below: does the premise it takes for granted actually hold here?\n"
     "You CANNOT act on this VM right now — the mouse and keyboard tools are not available to "
-    "you in this phase, by construction. Look and read only. Use screenshot + view_image to "
-    "see the desktop, window_list to see what is open, and remote_exec for READ-ONLY checks "
-    "(listing a directory, reading a version, checking a device node). Do not modify anything: "
-    "no writes, no installs, no configuration changes.\n"
+    "you in this phase, by construction. Look and read only. Use screenshot to see the desktop "
+    "(the image attaches to the conversation automatically), window_list to see what is open, "
+    "and remote_exec for READ-ONLY checks (listing a directory, reading a version, checking a "
+    "device node). Do not modify anything: no writes, no installs, no configuration changes.\n"
     "\n"
-    "Decide which of these three the task is, and end your final message with that single word "
-    "on its own line:\n"
-    "- INFEASIBLE — an essential PRE-EXISTING target or capability that the task presupposes is "
-    "absent: the file/photo/record it tells you to act on is not there, the installed "
-    "application genuinely lacks the feature, the hardware or account does not exist. Say which "
-    "one, and how you observed it.\n"
-    "- PROCEED — the premise holds, or the task asks you to CREATE the thing (creating is the "
-    "work, not a missing premise), or the missing detail is mentioned only as motivation while "
-    "the required action is still possible.\n"
-    "- UNDETERMINED — you could not establish it from looking alone, or the only obstacle was a "
-    "network error, a rate limit or an anti-bot block. Those are not infeasibility.\n"
+    # A rubric, not an example list. The v6.81.0 run's false INFEASIBLEs shared one shape:
+    # the gate judged whether the OUTCOME would be meaningful ("no saved Etsy password to
+    # check", "the font is not installed", "sar is not installed") instead of whether the
+    # REQUESTED ACTION is performable. Enumerating those cases as exceptions would be a
+    # keyword patch; the decomposition below is the semantic fix.
+    "Work through this rubric IN ORDER, briefly and explicitly, before any verdict:\n"
+    "1. ACTION — what observable action does the task actually request? Not the outcome you "
+    "imagine: \"navigate to the passwords page\" requests navigation, not a stored password.\n"
+    "2. REFERENT — which PRE-EXISTING thing must exist for that action: a file, a record, an "
+    "application feature, a device, an account?\n"
+    "3. BLOCKING — is that referent absent HERE, and does its absence block the requested "
+    "action itself, not merely make its result less meaningful?\n"
+    "4. ACQUISITION — could the working agent obtain or create the missing thing by ordinary "
+    "means the instruction does not forbid (installing a package from the standard "
+    "repositories, creating a file or folder, enabling a built-in option)? If yes, its "
+    "absence is WORK for the next phase, not a broken premise. If the instruction forbids "
+    "the only acquisition path (\"using X only\") or this sandbox blocks it, it IS broken.\n"
+    "5. STORE-OR-RENDER — for \"set/change <setting> to <value>\" tasks: does the target "
+    "merely STORE the value (a name, a string, a path)? A stored name does not require the "
+    "named resource to be installed or functional.\n"
+    "6. PLACEHOLDERS — if the instruction itself contains unbound template variables or "
+    "symbolic names that neither the instruction nor the environment binds to any concrete "
+    "value, the premise is broken.\n"
+    "\n"
+    "Then end your final message with exactly one of these words on its own line:\n"
+    "- INFEASIBLE — the rubric showed an essential pre-existing referent or capability that "
+    "is absent, blocking, and not acquirable. Say which one and how you observed it.\n"
+    "- PROCEED — the premise holds, or the missing thing is acquirable/creatable work, or it "
+    "is mentioned only as motivation while the requested action remains possible.\n"
+    "- UNDETERMINED — you could not establish it from looking alone, or the only obstacle "
+    "was a network error, a rate limit or an anti-bot block. Those are not infeasibility.\n"
     "\n"
     "When in doubt, answer UNDETERMINED. A wrong INFEASIBLE ends the task for nothing; "
     "UNDETERMINED simply hands the work to the next phase, which has full capability.\n\nTask:\n"
@@ -171,12 +198,12 @@ def _gate_window_sec(args: Any) -> float:
 def _gate_claim_window_sec(args: Any) -> float:
     """Worst-case premise-phase occupancy for the claim staleness bound.
 
-    Two rounds, not one: an INFEASIBLE verdict triggers an independent challenger
-    round before the kill is allowed to stand, and a holder legitimately inside that
-    second round must not look stale to another lane. This constant and the number of
-    rounds the flow can actually run are the same fact — change them together.
+    ONE round since v6.81.1 (the confirming challenger was removed — its full-run
+    ledger showed correlated errors and a net loss). This constant and the number
+    of premise rounds the flow can actually run are the same fact — change them
+    together.
     """
-    return 2.0 * _gate_window_sec(args)
+    return _gate_window_sec(args)
 
 
 def _gate_verdict(latest: dict[str, Any] | None) -> str:
@@ -359,11 +386,10 @@ def _await_gate_task(ouroboros_url: str, task_id: str, deadline: float) -> dict[
 
 
 def _gate_round(ouroboros_url: str, args: Any, instruction: str, *, role: str) -> dict[str, Any]:
-    """One premise round (gate or challenger): create, await, judge.
+    """One premise round: create the gate task, await it, judge the last line.
 
-    The rounds are intentionally IDENTICAL except for memory: `memory_mode:
-    "empty"` gives the challenger a fresh session, so agreement between the two
-    is two independent readings of the same VM, not one reading echoed.
+    ``role`` survives in the record for cross-run readability (v6.81.0 records
+    carry role="challenger" rows; since v6.81.1 exactly one round runs).
     """
     created = _api(ouroboros_url, "POST", "/api/tasks", {
         # The instruction is UNTRUSTED text. Ending the prompt with it would let a
@@ -387,16 +413,6 @@ def _gate_round(ouroboros_url: str, args: Any, instruction: str, *, role: str) -
         "llm_rounds": int(latest.get("total_rounds") or 0),
         "answer": _terminal_answer_text(latest),
     }
-
-
-def _kill_confirmed(gate_record: dict[str, Any]) -> bool:
-    """The kill stands only when BOTH independent premise rounds said INFEASIBLE.
-
-    Anything else — a missing challenger, a challenger PROCEED/UNDETERMINED, a
-    crashed or timed-out challenger — fails open into the working phase.
-    """
-    return (str(gate_record.get("verdict") or "") == "INFEASIBLE"
-            and str((gate_record.get("challenger") or {}).get("verdict") or "") == "INFEASIBLE")
 
 
 def _gate_cancel_unconfirmed(record: dict[str, Any]) -> bool:
@@ -583,17 +599,18 @@ OSWORLD_PREAMBLE = (
     "for tasks whose wording explicitly asks for command-line work/conversion/media tools.\n"
     "\n"
     "VISION LOOP — do exactly this for GUI work:\n"
-    "  1. screenshot (returns a 'path') -> immediately view_image(path) so you SEE the desktop.\n"
-    "  2. Read coordinates off that viewed image, then act with click/key/type_text/scroll.\n"
-    "  3. Take another screenshot+view_image only after a meaningful UI state change.\n"
-    "view_image is your visual channel. (vlm_query, analyze_screenshot and browser tools are "
-    "DISABLED — do not look for them.)\n"
+    "  1. screenshot — the image is ATTACHED to the conversation automatically; you see the "
+    "desktop in the same round. Do NOT call view_image on a screenshot you just took.\n"
+    "  2. Read coordinates off that attached image, then act with click/key/type_text/scroll.\n"
+    "  3. Take another screenshot only after a meaningful UI state change.\n"
+    "view_image remains available for OTHER local files (a saved export, an older screenshot). "
+    "(vlm_query, analyze_screenshot and browser tools are DISABLED — do not look for them.)\n"
     "\n"
     "BE FAST — every tool call costs ~30s, so MINIMIZE calls:\n"
     "- Do not spend more than 2 calls on investigation before taking a real GUI action. This "
     "budget covers exploration of HOW to do the task; the premise check above is separate and "
     "is never the thing you cut to save calls.\n"
-    "- Batch 2-4 confident GUI actions before the next screenshot+view_image. Do NOT screenshot "
+    "- Batch 2-4 confident GUI actions before the next screenshot. Do NOT screenshot "
     "after every single keystroke.\n"
     "- Prefer keyboard shortcuts when faster (menus via Alt, Ctrl+S to save, etc.).\n"
     "- If remote_exec is legitimately needed, use at most 1-2 concise read-only checks before the "
@@ -603,6 +620,22 @@ OSWORLD_PREAMBLE = (
     "Anti-loop: if the same action fails twice, change approach (different menu path, "
     "keyboard), but stay in the GUI for app tasks; never fall back to pixel analysis or profile "
     "hacking.\n"
+    "\n"
+    "ENVIRONMENT PITFALLS (task-general rules, each learned the hard way):\n"
+    "- An app that still holds a file open keeps its OWN in-memory copy: if you edited that "
+    "file out-of-band, any later save from the app silently overwrites your edit. Reconcile "
+    "before finishing — make the app reload the file (its Reload/Revert flow, or close "
+    "WITHOUT saving and reopen), and for tasks about editing an open document leave that "
+    "window OPEN at the end so the final state is the live one. (For close/force-quit "
+    "tasks, closed IS the requested state.)\n"
+    "- When the task asks for terminal/command-line work, do it in the VISIBLE terminal app "
+    "— that is the interaction the task describes. remote_exec is a side channel: a fresh "
+    "bash -lc starting in $HOME that leaves no trace in the desktop session and does not "
+    "inherit the visible terminal's working directory; for \"current directory\" tasks, "
+    "find that terminal's cwd first.\n"
+    "- Never kill a process via pkill -f/pgrep -f <name>: the pattern can match YOUR OWN "
+    "shell command and kill it mid-flight. Resolve the PID by exact executable "
+    "(pgrep -x <exe>, or /proc/<pid>/exe), then kill that PID.\n"
     "OSWorld evaluates the VM state, not your chat answer. Unless the task explicitly asks you "
     "to write an answer in a document/app, a textual answer in chat is not success: leave the "
     "requested browser tab, file, setting, app state, or saved artifact in the VM.\n"
@@ -956,9 +989,11 @@ def main() -> int:
                     "adapter": "host_cu_bridge",
                     "one_run_per_task": not bool(args.feasibility_gate),
                     "feasibility_gate_phase": bool(args.feasibility_gate),
-                    # An INFEASIBLE verdict is confirmed by an independent second premise
-                    # session before it may end the example; disagreement fails open.
-                    "feasibility_gate_challenger": bool(args.feasibility_gate),
+                    # v6.81.1: single-verdict gate. The v6.81.0 confirming challenger was
+                    # removed after its full-run ledger (0 saves, 1 loss, correlated with
+                    # every false kill) — disclosed here so a reader of both runs' manifests
+                    # sees the scaffold difference.
+                    "feasibility_gate_challenger": False,
                     "official_actions": False, "official_reset_evaluate": True,
                     "action_channel": "guest_execute_not_env_step",
                     "a11y_enabled": bool(args.allow_a11y),
@@ -1300,9 +1335,8 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
                 # window has to enter the staleness bound. Leaving it out let a gated
                 # holder consume the whole margin that the formula reserves for the
                 # unbounded evaluate(), after which a second lane could take a task the
-                # first was still legitimately working — and both would score it. The
-                # CLAIM window is two rounds (gate + challenger), not one — see
-                # _gate_claim_window_sec.
+                # first was still legitimately working — and both would score it. See
+                # _gate_claim_window_sec (one premise round since v6.81.1).
                 stale_sec=claim_stale_sec(args.task_timeout_sec, args.startup_timeout_sec,
                                           args.claim_margin_sec) + _gate_claim_window_sec(args),
                 repo_dir=repo_dir,
@@ -1418,21 +1452,15 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
                 # Verdict and record are computed BEFORE any sidecar write: an earlier draft
                 # had the write inside the same try, so a failing disk silently downgraded a
                 # real INFEASIBLE to UNDETERMINED and the record disagreed with the verdict.
+                # SINGLE verdict since v6.81.1. The v6.81.0 run carried a confirming
+                # "challenger" round (same prompt, fresh session) whose full-run ledger
+                # read: 20 invocations, 0 feasible tasks saved, 1 officially-infeasible
+                # task LOST (480bcfea: gate right, challenger overrode), 215 worker
+                # rounds burned — and it CONFIRMED all 4 of the gate's false kills.
+                # Identical-prompt re-reads produce correlated errors, not independent
+                # checks; the protection it promised does not exist by construction.
                 gate_record = _gate_round(args.ouroboros_url, args, instruction, role="gate")
                 gate_verdict = str(gate_record["verdict"])
-                if gate_verdict == "INFEASIBLE":
-                    # Independent confirmation before the kill stands. The economics are
-                    # asymmetric: at baseline the gate's whole edge over the prompt-only arm
-                    # was ~2 tasks, so ONE false kill on a feasible task erases half of it,
-                    # while a missed infeasible still has the working phase's own
-                    # TASK_INFEASIBLE path behind it. A fresh session (memory_mode empty)
-                    # re-reads the same VM; only agreement kills, disagreement fails open.
-                    gate_record["challenger"] = _gate_round(args.ouroboros_url, args,
-                                                            instruction, role="challenger")
-                    if not _kill_confirmed(gate_record):
-                        gate_verdict = "UNDETERMINED"
-                        gate_record["verdict"] = "UNDETERMINED"
-                        gate_record["overruled_by_challenger"] = True
             except Exception as exc:  # noqa: BLE001 - a broken gate must never cost a task
                 gate_verdict = "UNDETERMINED"
                 # Merge over whatever was already recorded (e.g. a completed first round
@@ -1444,9 +1472,6 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
             # only — a trace failure must not change the verdict.
             gate_record["tool_trace"] = _gate_tool_trace(
                 data_dir, str(gate_record.get("task_id") or ""))
-            if isinstance(gate_record.get("challenger"), dict):
-                gate_record["challenger"]["tool_trace"] = _gate_tool_trace(
-                    data_dir, str(gate_record["challenger"].get("task_id") or ""))
             try:
                 (run_dir / "feasibility_gate.json").write_text(
                     json.dumps(gate_record, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1458,8 +1483,7 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
             # VM the worker is scored on, and on the lane's next task after that. Exit 2
             # aborts the lane (its server dies, and the zombie with it); the claim is
             # released unscored, so another lane retries cleanly.
-            if _gate_cancel_unconfirmed(gate_record) or _gate_cancel_unconfirmed(
-                    gate_record.get("challenger") or {}):
+            if _gate_cancel_unconfirmed(gate_record):
                 final.update({"outcome": "blocked", "exit_code": 2,
                               "refusal": {"stage": "feasibility_gate",
                                           "reason": "gate_cancel_unconfirmed",

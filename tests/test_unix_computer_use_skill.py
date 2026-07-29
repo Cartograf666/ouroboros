@@ -523,3 +523,168 @@ def test_ax_tree_parses_set_of_marks(tmp_path, monkeypatch):
     assert first["id"] == 1 and first["role"] == "Button" and first["title"] == "Reload"
     assert first["center_x"] == 115 and first["center_y"] == 60
     assert "raw=true" in result["coordinate_note"]
+
+
+def test_coerce_point_normalizes_the_shapes_models_actually_emit():
+    """109 tool errors in the v6.81.0 OSWorld run were exactly these malformations,
+    each costing a full round: the pair packed into x with y missing or duplicated.
+    Ambiguity must still fail loudly — guessing coordinates clicks somewhere real."""
+    from skills.unix_computer_use.plugin import _coerce_point
+
+    assert _coerce_point(663, 500) == (663, 500)
+    assert _coerce_point("663", "500") == (663, 500)
+    assert _coerce_point(663.4, 499.6) == (663, 500)
+    # The observed pair-in-x shapes:
+    assert _coerce_point("663, 500", None) == (663, 500)
+    assert _coerce_point("516, 498", "") == (516, 498)
+    assert _coerce_point("663, 500", 500) == (663, 500)   # y duplicates the pair
+    assert _coerce_point("663, 500", "663") == (663, 500)
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        _coerce_point("663, 500", 42)      # pair AND an unrelated y — ambiguous
+    with _pytest.raises(ValueError):
+        _coerce_point("663", None)         # single number, y truly missing
+    with _pytest.raises(ValueError):
+        _coerce_point("1, 2, 3", None)     # three numbers
+    with _pytest.raises(ValueError):
+        _coerce_point(True, 5)             # a bool is not a coordinate
+    # ABSENT and UNPARSEABLE are different facts (v6.81.1 review round 3):
+    with _pytest.raises(ValueError):
+        _coerce_point("663, 500", "invalid")   # garbage y is not an absent y
+    with _pytest.raises(ValueError):
+        _coerce_point("663, 500", "500, 42")   # multi-number y contradicts the pair
+    with _pytest.raises(ValueError):
+        _coerce_point("663", "abc")            # single x, unparseable y
+    with _pytest.raises(ValueError):
+        _coerce_point(None, 500)               # x truly missing
+
+
+def test_click_aliases_and_screenshot_auto_attach_are_registered(tmp_path, monkeypatch):
+    """double_click/triple_click were called 111 times in one run and every call burned a
+    round on "Unknown tool". And the screenshot result must carry the typed
+    auto_attach_image field the host's same-round attachment reads — NOT a reuse of
+    view_image_ready, whose meaning stays "a path you may view manually"."""
+    import skills.unix_computer_use.plugin as plugin
+
+    registered = {}
+
+    class _Api:
+        def register_tool(self, name, fn, **kw):
+            registered[name] = (fn, kw)
+
+        def get_state_dir(self):
+            return str(tmp_path)
+
+        def skill_job_dir(self, job_id):
+            d = tmp_path / "jobs" / job_id
+            d.mkdir(parents=True, exist_ok=True)
+            return str(d)
+
+    # Aliases route into click with the right multiplier and tolerate the pair-in-x shape.
+    calls = []
+    monkeypatch.setattr(plugin._ComputerUse, "click",
+                        lambda self, **kw: calls.append(kw) or "{}", raising=True)
+    plugin.register(_Api())
+    assert "double_click" in registered and "triple_click" in registered
+    fn, _kw = registered["triple_click"]
+    fn(x="663, 500")
+    assert calls and calls[-1].get("triple") is True and calls[-1].get("x") == "663, 500"
+    # click/move schemas must NOT require y (recovered from the pair by _coerce_point).
+    for tool in ("click", "move", "double_click", "triple_click"):
+        assert registered[tool][1]["schema"].get("required") == ["x"], tool
+
+
+def test_pair_in_x_recovery_works_at_the_handler_boundary(tmp_path, monkeypatch):
+    """Review round 5 caught the claimed recovery NOT working for mouse_down: the legacy
+    -1 default reached _coerce_point as a conflicting y and rejected the very shape the
+    normalizer exists to accept. Prove recovery at the HANDLER boundary for every pointer
+    tool, not just at the pure function: a coordinate-parse failure returns a parse
+    error; a successful parse proceeds to backend selection (here: no backend available,
+    which is the proof that coercion PASSED)."""
+    import skills.unix_computer_use.plugin as plugin
+
+    class _Api:
+        def register_tool(self, *a, **k):
+            pass
+
+        def get_state_dir(self):
+            return str(tmp_path)
+
+        def skill_job_dir(self, job_id):
+            d = tmp_path / "jobs" / job_id
+            d.mkdir(parents=True, exist_ok=True)
+            return str(d)
+
+    monkeypatch.setattr(plugin, "_platform", lambda: "linux")
+    monkeypatch.setattr(plugin, "_session_type", lambda: "x11")
+    monkeypatch.setattr(plugin, "_which", lambda _name: "")
+    impl = plugin._ComputerUse(_Api())
+    monkeypatch.setattr(plugin._ComputerUse, "_is_remote", lambda self: False)
+
+    def outcome(result_json):
+        d = json.loads(result_json)
+        assert d.get("ok") is False
+        return d["error"]
+
+    # Pair-in-x with the y omitted: must reach backend selection on every tool.
+    assert "backend" in outcome(impl.mouse_down(x="663, 500"))
+    assert "backend" in outcome(impl.mouse_up(x="663, 500"))
+    assert "backend" in outcome(impl.left_click_drag(start_x="10, 20", end_x="30, 40"))
+    # No coordinates at all stays the legal "press where the pointer is" form.
+    assert "backend" in outcome(impl.mouse_down())
+    assert "backend" in outcome(impl.mouse_down(x=-1, y=-1))
+    # Contradictory input still fails loudly BEFORE any backend is consulted.
+    assert "ambiguous" in outcome(impl.mouse_down(x="663, 500", y=42))
+    assert "cannot parse" in outcome(impl.left_click_drag(start_x="abc", end_x="30, 40"))
+
+
+def test_real_screenshot_producers_emit_auto_attach_image(tmp_path, monkeypatch):
+    """The host hook reads the typed field from REAL results, so the producers — not
+    only a synthetic fixture — must be pinned: the remote builder and the local
+    screenshot path both emit `auto_attach_image` pointing at the downscaled image,
+    alongside the unchanged `view_image_ready` contract."""
+    import skills.unix_computer_use.plugin as plugin
+
+    class _Api:
+        def register_tool(self, *a, **k):
+            pass
+
+        def get_state_dir(self):
+            return str(tmp_path)
+
+        def skill_job_dir(self, job_id):
+            d = tmp_path / "jobs" / job_id
+            d.mkdir(parents=True, exist_ok=True)
+            return str(d)
+
+    impl = plugin._ComputerUse(_Api())
+    # A real 1x1 PNG so _png_dimensions and the downscaler see a valid image.
+    png = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+           b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0"
+           b"\x00\x00\x00\x03\x00\x01\x0e\xdd\x1d\xf4\x00\x00\x00\x00IEND\xaeB`\x82")
+    raw = tmp_path / "jobs" / "j1" / "output"
+    raw.mkdir(parents=True, exist_ok=True)
+    shot = raw / "shot.png"
+    shot.write_bytes(png)
+
+    remote = json.loads(impl._remote_screenshot_result(
+        backend="osworld_http", raw_path=shot, max_width=1280, max_height=800,
+        input_w=1, input_h=1))
+    assert remote["ok"] is True
+    assert remote["view_image_ready"] is True
+    assert remote["auto_attach_image"] == remote["path"]
+
+    # Local path: force the linux/scrot branch with a fake capture that writes the PNG.
+    monkeypatch.setattr(plugin, "_platform", lambda: "linux")
+    monkeypatch.setattr(plugin, "_session_type", lambda: "x11")
+    monkeypatch.setattr(plugin, "_which", lambda name: "/usr/bin/scrot" if name == "scrot" else "")
+    import pathlib as _pl
+
+    def fake_run(cmd, timeout=0):
+        _pl.Path(cmd[-1]).write_bytes(png)
+        return 0, "", ""
+    monkeypatch.setattr(plugin, "_run", lambda cmd, **kw: fake_run(cmd))
+    monkeypatch.setattr(plugin._ComputerUse, "_is_remote", lambda self: False)
+    local = json.loads(impl.screenshot(job_id="j2"))
+    assert local.get("ok") is True, local
+    assert local["auto_attach_image"] == local["path"]

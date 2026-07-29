@@ -1532,18 +1532,19 @@ def test_gate_window_is_zero_when_disabled_and_floored_when_enabled():
     assert rcb._gate_window_sec(_GateArgs(feasibility_gate=True, task_timeout_sec=100)) == 60.0
 
 
-def test_gate_claim_window_covers_both_premise_rounds():
+def test_gate_claim_window_tracks_the_single_premise_round():
     """The gate occupies the claim holder BEFORE the working task. If its occupancy is not
     in the staleness bound, a second lane can reclaim a task the first is still working and
-    both will score it. The occupancy is TWO rounds, not one: an INFEASIBLE verdict runs an
-    independent challenger before the kill may stand, and a holder legitimately inside that
-    second round must not look stale."""
+    both will score it. Since v6.81.1 the premise phase is exactly ONE round (the
+    confirming challenger was removed: 20 invocations, 0 saves, 1 loss, and it confirmed
+    every false kill — correlated errors, not an independent check), so the claim window
+    must equal one gate window, not two."""
     from devtools.benchmarks.osworld.run_step_agent import claim_stale_sec
 
     args = _GateArgs(feasibility_gate=True, task_timeout_sec=3600)
-    assert rcb._gate_claim_window_sec(args) == 2 * rcb._gate_window_sec(args) == 1800.0
+    assert rcb._gate_claim_window_sec(args) == rcb._gate_window_sec(args) == 900.0
     base = claim_stale_sec(3600, 900, 900)
-    assert base + rcb._gate_claim_window_sec(args) == base + 1800.0
+    assert base + rcb._gate_claim_window_sec(args) == base + 900.0
     assert rcb._gate_claim_window_sec(_GateArgs(feasibility_gate=False)) == 0.0, \
         "ungated runs unchanged"
 
@@ -1561,7 +1562,15 @@ def test_gate_phase_removes_the_mutating_tools_and_keeps_the_reading_ones():
     normal = set(rcb._effective_disabled_tools(False))
     gated = set(rcb._effective_disabled_tools(False, gate_phase=True))
     assert normal < gated, "the gate phase must disable strictly more than the working phase"
-    for mutating in rcb._GUI_ACTION_TOOLS:
+    # NAMED literals, deliberately not derived from _GUI_ACTION_TOOLS: the v6.81.1 review
+    # caught the aliases registered in the skill but missing from that set — the gate could
+    # click through them. A test iterating the same incomplete set cannot catch that class,
+    # so this list is the independent statement of what "mutating" means.
+    mutating_tools = ("click", "double_click", "triple_click", "move", "left_click_drag",
+                      "mouse_down", "mouse_up", "type_text", "key", "hold_key", "scroll")
+    assert set(mutating_tools) == set(rcb._GUI_ACTION_TOOLS), \
+        "a click alias was registered without updating _GUI_ACTION_TOOLS (or vice versa)"
+    for mutating in mutating_tools:
         assert extension_surface_name(rcb.SKILL_NAME, mutating) in gated, mutating
         assert extension_surface_name(rcb.SKILL_NAME, mutating) not in normal, mutating
     # Observation and read-only probing must survive, or the phase cannot establish anything.
@@ -1669,22 +1678,19 @@ def test_reset_verified_still_rejects_a_missing_screenshot():
     assert rec["attempts"] == 2
 
 
-@pytest.mark.parametrize(
-    "gate_record,expected",
-    [
-        # Only two independent INFEASIBLE readings kill the task.
-        ({"verdict": "INFEASIBLE", "challenger": {"verdict": "INFEASIBLE"}}, True),
-        # Every disagreement or absence fails open into the working phase.
-        ({"verdict": "INFEASIBLE", "challenger": {"verdict": "PROCEED"}}, False),
-        ({"verdict": "INFEASIBLE", "challenger": {"verdict": "UNDETERMINED"}}, False),
-        ({"verdict": "INFEASIBLE", "challenger": {"status": "timeout"}}, False),
-        ({"verdict": "INFEASIBLE"}, False),
-        ({"verdict": "PROCEED", "challenger": {"verdict": "INFEASIBLE"}}, False),
-        ({}, False),
-    ],
-)
-def test_kill_stands_only_on_two_independent_infeasible_verdicts(gate_record, expected):
-    assert rcb._kill_confirmed(gate_record) is expected
+def test_the_confirming_challenger_stays_removed():
+    """v6.81.1 removed the second premise round. Its full-run ledger: 20 invocations,
+    0 feasible tasks saved, 1 officially-infeasible task lost, 215 worker rounds burned,
+    and it CONFIRMED all 4 of the gate's false kills — an identical-prompt re-read
+    produces correlated errors, not an independent check. Guard the removal: the flow
+    must post exactly ONE premise task per example and carry no challenger machinery."""
+    assert not hasattr(rcb, "_kill_confirmed")
+    src = (Path(__file__).resolve().parent.parent
+           / "devtools" / "benchmarks" / "osworld" / "run_cu_bridge_agent.py").read_text(encoding="utf-8")
+    flow = src[src.index("claim_fd: int | None = None"):]
+    assert flow.count("_gate_round(") == 1, "exactly one premise round per example"
+    assert '"feasibility_gate_challenger": False' in src, \
+        "the manifest must disclose the challenger's absence to cross-run readers"
 
 
 def test_gate_cancel_unconfirmed_is_the_one_condition_that_may_not_fail_open():
@@ -1714,8 +1720,8 @@ def test_gate_round_posts_a_fresh_memory_gate_phase_task_and_reads_the_verdict(m
     args = _GateArgs(feasibility_gate=True, task_timeout_sec=3600)
     args.allow_a11y = False
     args.ouroboros_url = "http://127.0.0.1:1"
-    rec = rcb._gate_round(args.ouroboros_url, args, "change the UI language", role="challenger")
-    assert rec["verdict"] == "INFEASIBLE" and rec["role"] == "challenger"
+    rec = rcb._gate_round(args.ouroboros_url, args, "change the UI language", role="gate")
+    assert rec["verdict"] == "INFEASIBLE" and rec["role"] == "gate"
     assert rec["task_id"] == "gate-1" and rec["llm_rounds"] == 4
     # Independence and confinement travel in the payload itself.
     assert posted["memory_mode"] == "empty"
@@ -1763,3 +1769,18 @@ def test_the_post_gate_reset_republishes_the_vm_endpoint():
         "the endpoint must be republished after the post-gate reset and before the worker starts"
     # And the target file the skill reads must be rewritten too, not just the sidecar.
     assert src.index("Path(args.target_file).expanduser().write_text(target", post_gate) < republish
+
+
+def test_gate_preamble_is_a_rubric_not_an_exception_list():
+    """The v6.81.0 false kills shared one shape: the gate judged whether the OUTCOME
+    would be meaningful instead of whether the REQUESTED ACTION is performable. The fix
+    is a semantic decomposition; pin its load-bearing steps so a later edit cannot
+    quietly regress the prompt into an example list."""
+    p = rcb.GATE_PREAMBLE
+    for step in ("ACTION", "REFERENT", "BLOCKING", "ACQUISITION", "STORE-OR-RENDER",
+                 "PLACEHOLDERS"):
+        assert step in p, step
+    assert "When in doubt, answer UNDETERMINED" in p, "fail-open stays the default"
+    # The forced two-round vision loop is gone: screenshots attach automatically.
+    assert "view_image(path)" not in rcb.OSWORLD_PREAMBLE
+    assert "attached" in rcb.OSWORLD_PREAMBLE.lower()

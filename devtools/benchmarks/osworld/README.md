@@ -202,18 +202,25 @@ and `remote_exec` stays for read-only probes; read-only there is an instruction,
 enforcement, because deciding in code whether a shell command reads or writes would be
 exactly the kind of pattern gate that BIBLE P5 forbids for a semantic decision.
 
-The phase answers one of three words: `INFEASIBLE`, `PROCEED`, `UNDETERMINED`.
+The phase works through a STRUCTURED RUBRIC — requested action → pre-existing referent
+→ does absence block the action → is the missing thing acquirable by means the
+instruction does not forbid → does a "set X to Y" target merely store the value →
+unbound placeholders — and answers one of three words on its last line: `INFEASIBLE`,
+`PROCEED`, `UNDETERMINED`. The rubric replaced a description-by-example (v6.81.1): the
+v6.81.0 false kills all judged whether the OUTCOME would be meaningful ("no saved Etsy
+password to check", "the font is not installed") instead of whether the requested
+ACTION was performable.
 
-**It fails OPEN, and a kill needs TWO independent readings.** An `INFEASIBLE` verdict
-triggers a CHALLENGER round — a fresh session (`memory_mode: "empty"`, same read-only
-envelope) that re-reads the same VM. Only agreement ends the example (translated into
-the official `env.step("FAIL")` through the same path a self-declared infeasibility
-takes, so the claim-marker and scoring sequence is not duplicated). `PROCEED`,
-`UNDETERMINED`, challenger disagreement, an unparseable answer, a timeout whose cancel
-confirmed, a crashed phase or any exception all fall through to the full-capability
-phase. The economics are asymmetric: one false kill on a feasible task erases roughly
-the gate's whole measured edge, while a missed infeasible still has the working phase's
-own `TASK_INFEASIBLE` path behind it.
+**It fails OPEN, on a SINGLE verdict.** Only an explicit `INFEASIBLE` ends the example
+(translated into the official `env.step("FAIL")` through the same path a self-declared
+infeasibility takes, so the claim-marker and scoring sequence is not duplicated).
+`PROCEED`, `UNDETERMINED`, an unparseable answer, a timeout whose cancel confirmed, a
+crashed phase or any exception all fall through to the full-capability phase, which
+keeps its own mid-task `TASK_INFEASIBLE` path. The v6.81.0 revision ran a confirming
+CHALLENGER round on every `INFEASIBLE`; its own full-run ledger removed it — 20
+invocations, 0 feasible tasks saved, 1 officially-infeasible task lost, 215 worker
+rounds burned, and it confirmed all four of the gate's false kills. An identical-prompt
+re-read produces correlated errors, not an independent check.
 
 The one condition that does NOT fail open: a premise round whose cancel did not confirm.
 That leaves a zombie session sharing the lane's server and skill connection file, able
@@ -224,7 +231,7 @@ and with it the zombie's server — dies; the claim is released for a clean retr
 Known limit, stated plainly: this closes the GUI vector, not the shell. `remote_exec` is
 a general shell and is read-only in this phase by instruction only — enforcing it in code
 would be the pattern gate the constitution forbids for a semantic decision. Two
-mitigations follow. (1) `feasibility_gate.json` carries each round's FULL tool trace
+mitigations follow. (1) `feasibility_gate.json` carries the round's FULL tool trace
 (verbatim args, no previews) for offline audit of that promise. (2) The working phase is
 re-reset after a PROCEED/UNDETERMINED verdict, so anything the premise phase touched is
 discarded before the state that gets scored.
@@ -251,11 +258,13 @@ retries) — it is defence in depth, not the measured fix, though it does close 
 pre-existing flaw that affects ungated runs on their single reset.
 `reset_verification.json` records attempts and the captured `desktopenv` log tail.
 
-Cost and disclosure: a gated run posts two tasks per example (three when a kill is
-confirmed), so the manifest reports `one_run_per_task: false`,
-`feasibility_gate_phase: true` and `feasibility_gate_challenger: true`, and the
-per-example verdicts land in `feasibility_gate.json`. Expect roughly double the
-per-example warm-up and acceptance-review cost. See METHODOLOGY.md §7 (4c).
+Cost and disclosure: a gated run posts UP TO two tasks per example — one when the gate
+ends the example, two when the working phase runs — so the manifest reports
+`one_run_per_task: false`, `feasibility_gate_phase: true` and
+`feasibility_gate_challenger: false` (v6.81.0 manifests say `true` — the flag exists so
+readers of both runs see the scaffold difference), and the per-example verdict lands in
+`feasibility_gate.json`. Expect roughly double the per-example warm-up and
+acceptance-review cost on examples whose working phase runs. See METHODOLOGY.md §7 (4c).
 
 **Validate before trusting it.** The failure mode that matters is a false `INFEASIBLE` on
 a feasible task: that scores a hard zero. Measure BOTH the false-INFEASIBLE rate and the

@@ -254,7 +254,12 @@ leaderboard run without the disclosures below.
    actions); an Ouroboros round is not step-equivalent. `task_outcome.json`
    records `budget_counters` (`llm_rounds`, `screenshots`, `gui_action_calls`,
    `remote_exec_calls`) and `max_rounds_effective`; report these alongside any
-   score. **A task the USD rail truncated is NOT a capability failure.** Read
+   score. Since v6.81.1 the round is ALSO not comparable to earlier Ouroboros
+   runs' rounds: screenshot images auto-attach in the same round, where every
+   earlier run spent a second `view_image` round per observation (v6.81.0:
+   3,830 of 16,367 rounds — ~21% of the budget — were that second round). When
+   comparing across the boundary, compare `screenshots`/`gui_action_calls`
+   counts, not raw `llm_rounds`. **A task the USD rail truncated is NOT a capability failure.** Read
    `runtime_outcome` in `task_outcome.json` / `result_index.jsonl`: it carries
    the runtime's own `reason_code`, a `truncated` flag and the `resource_limit`
    block. `truncated` is true for every code in
@@ -266,7 +271,15 @@ leaderboard run without the disclosures below.
    honest failures; `max_rounds_effective` alone will not tell you they
    happened. The current Verified leaderboard standard is 100 steps.
 4a. **Scaffold revision after the v6.81.0 run — disclose which revision produced a
-   number.** Pairwise trace forensics against a published verified run on the same 361
+   number.** (v6.81.1 adds a further prompt revision, disclosed here under the same
+   rule: the working preamble gains an "ENVIRONMENT PITFALLS" section of task-general
+   state rules — live-app in-memory copies must be reconciled after out-of-band edits,
+   terminal tasks belong in the visible terminal, PIDs are resolved by exact
+   executable, never by self-matching `-f` patterns — derived from graded-run
+   forensics but deliberately phrased without any claim about what an evaluator
+   inspects; the vision-loop instruction drops its mandatory `view_image` step because
+   screenshots now auto-attach; and the premise-gate prompt becomes the structured
+   rubric of §4c. Numbers from before and after this revision must not be pooled.) Pairwise trace forensics against a published verified run on the same 361
    tasks and the same model showed the two runs statistically indistinguishable on the
    333 feasible tasks (0.804 vs 0.808) with ~90% of the deficit concentrated on the 27
    tasks whose evaluator is `infeasible`. Reading our own traces there found a
@@ -309,34 +322,45 @@ leaderboard run without the disclosures below.
    `final_answer: null` while the text sat in the runtime result. Outcomes written before
    this fix under-report what the agent said; the reward figures are unaffected.
 
-4c. **`--feasibility-gate` (opt-in, off by default) posts up to THREE tasks per
-   example.** A read-only premise phase runs first, with the mutating GUI tools absent
-   from its capability envelope, and answers INFEASIBLE / PROCEED / UNDETERMINED on its
-   last line. An INFEASIBLE verdict does not stand alone: an independent CHALLENGER
-   round (fresh session, `memory_mode: "empty"`, same envelope) re-reads the same VM,
-   and only agreement ends the example — translated into the official
-   `env.step("FAIL")` through the same single path an agent-declared infeasibility
-   takes, so scoring and the claim-marker sequence keep exactly one caller. Everything
-   else (PROCEED, UNDETERMINED, challenger disagreement, an unparseable answer, a
-   timeout whose cancel confirmed, a crashed phase, any exception) falls through to the
-   full-capability phase: the gate can only remove a task two independent readings were
-   affirmatively certain about, never strand one. The single deliberate exception to
-   fail-open is a premise round whose CANCEL DID NOT CONFIRM: a zombie premise session
-   shares the lane's server and skill connection file, so the attempt aborts as a typed
-   infra row (`blocked` / `gate_cancel_unconfirmed`, claim released) rather than let it
-   act on the VM the worker is scored on.
+4c. **`--feasibility-gate` (opt-in, off by default) posts UP TO two tasks per
+   example** — one when the gate ends the example as INFEASIBLE (no working task is
+   created), two when the working phase runs. A
+   read-only premise phase runs first, with the mutating GUI tools absent from its
+   capability envelope. Its prompt is a STRUCTURED RUBRIC, not an example list — the
+   v6.81.0 false kills all judged whether the outcome would be meaningful instead of
+   whether the requested action is performable, and enumerating those cases as
+   exceptions would be a keyword patch. The rubric walks: requested ACTION →
+   pre-existing REFERENT it needs → does absence BLOCK that action → is the missing
+   thing ACQUIRABLE by means the instruction does not forbid → does a "set X to Y"
+   target merely STORE the value → unbound PLACEHOLDERS in the instruction itself.
+   Verdict is the last line: INFEASIBLE / PROCEED / UNDETERMINED.
+
+   A single verdict decides (v6.81.1). The v6.81.0 revision additionally ran a
+   confirming CHALLENGER round; its own full-run ledger removed it — 20 invocations,
+   0 feasible tasks saved, 1 officially-infeasible task lost, 215 worker rounds
+   burned, and it CONFIRMED all four of the gate's false kills. An identical-prompt
+   re-read produces correlated errors, not an independent check. Only an explicit
+   INFEASIBLE ends the example — translated into the official `env.step("FAIL")`
+   through the same single path an agent-declared infeasibility takes. Everything
+   else (PROCEED, UNDETERMINED, an unparseable answer, a timeout whose cancel
+   confirmed, a crashed phase, any exception) falls through to the full-capability
+   phase, which keeps its own mid-task `TASK_INFEASIBLE` path. The single deliberate
+   exception to fail-open is a premise round whose CANCEL DID NOT CONFIRM: a zombie
+   premise session shares the lane's server and skill connection file, so the attempt
+   aborts as a typed infra row (`blocked` / `gate_cancel_unconfirmed`, claim released)
+   rather than let it act on the VM the worker is scored on.
 
    Disclosures that belong with any gated number. (i) The manifest reports
    `one_run_per_task: false`, `feasibility_gate_phase: true` and
-   `feasibility_gate_challenger: true`, and each outcome carries `infeasible_source`
-   (`feasibility_gate` vs `agent_final_answer`) plus each round's own rounds — a
-   gate-terminated example must not be readable as an agent that worked and then
-   declared infeasibility. (ii) The claim staleness bound is widened by TWO premise
-   windows (`_gate_claim_window_sec`); without that a gated holder consumes the margin
-   the formula reserves for the unbounded `evaluate()`, and a second lane can reclaim
-   and re-score a task still being worked. (iii) The phase closes the GUI vector only:
+   `feasibility_gate_challenger: false` (the v6.81.0 manifests say `true` — the flag
+   exists so readers of both runs see the scaffold difference), and each outcome
+   carries `infeasible_source` (`feasibility_gate` vs `agent_final_answer`) plus the
+   phase's own rounds. (ii) The claim staleness bound is widened by ONE premise window
+   (`_gate_claim_window_sec`); without that a gated holder consumes the margin the
+   formula reserves for the unbounded `evaluate()`, and a second lane can reclaim and
+   re-score a task still being worked. (iii) The phase closes the GUI vector only:
    `remote_exec` remains a general shell, read-only by instruction and not by
-   enforcement — so `feasibility_gate.json` carries each round's full tool trace
+   enforcement — so `feasibility_gate.json` carries the round's full tool trace
    (verbatim args, not previews) for offline audit, and the working phase is
    re-reset afterwards.
 
@@ -365,8 +389,10 @@ leaderboard run without the disclosures below.
    0 retries), so it is defence in depth, not the measured fix. It does close a real
    pre-existing flaw that affects UNGATED runs too, on their single reset.
 
-   Expect roughly double the per-example warm-up and acceptance-review cost (triple on
-   killed examples). The number that decides whether it is worth paying is the
+   Expect roughly double the per-example warm-up and acceptance-review cost on
+   examples whose working phase runs; a gate-killed example pays only the premise
+   round (~4 LLM rounds median in the v6.81.0 run). The number that decides whether
+   it is worth paying is the
    FALSE-INFEASIBLE rate on feasible tasks — a wrong verdict scores a hard zero — and
    it must be measured on a stratified control set of feasible tasks before the gate is
    used for a scored run, WITH the control classes interleaved in the task list (a

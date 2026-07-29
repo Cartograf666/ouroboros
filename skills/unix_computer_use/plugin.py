@@ -148,6 +148,58 @@ def _which(name: str) -> str:
     return shutil.which(name) or ""
 
 
+def _coerce_point(x: Any, y: Any) -> tuple[int, int]:
+    """Normalize pointer coordinates from the shapes models actually emit.
+
+    Accepted: ints/floats; numeric strings ("663"); and the recurring
+    malformation where BOTH coordinates arrive in one string — ``x="663, 500"``
+    with ``y`` absent, or with ``y`` a single number duplicating one of the
+    pair's. The v6.81.0 OSWorld run hit exactly this 109 times across 100
+    tasks, each costing a full round on a ValueError.
+
+    ABSENT (None / empty string) and UNPARSEABLE are different facts: an absent
+    y may be recovered from a pair in x; a non-empty y that parses to nothing
+    ("invalid") or to several numbers ("500, 42") is contradictory input and
+    raises ValueError naming both values — a genuinely garbled call must fail
+    loudly, not be guessed into a real pointer action.
+    """
+    def parse(value: Any, *, name: str) -> list[int] | None:
+        """None == genuinely absent; a list is always non-empty; garbage raises."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError(f"boolean is not a coordinate: {name}={value!r}")
+        if isinstance(value, (int, float)):
+            return [int(round(value))]
+        text = str(value)
+        if not text.strip():
+            return None
+        found = re.findall(r"-?\d+(?:\.\d+)?", text)
+        if not found:
+            raise ValueError(f"cannot parse {name} coordinate from {value!r}")
+        return [int(round(float(n))) for n in found]
+
+    xs = parse(x, name="x")
+    ys = parse(y, name="y")
+    if xs is None:
+        raise ValueError(f"missing x coordinate (y={y!r})")
+    if len(xs) == 1:
+        if ys is None:
+            raise ValueError(f"missing y coordinate (x={x!r})")
+        if len(ys) == 1:
+            return xs[0], ys[0]
+        raise ValueError(f"ambiguous y coordinate: x={x!r}, y={y!r}")
+    if len(xs) == 2:
+        # The whole point arrived in x. Accept a truly absent y, or a SINGLE
+        # y that merely repeats one of the pair's numbers (the observed
+        # duplication shape). A multi-number or disagreeing y contradicts the
+        # pair and must not be silently resolved either way.
+        if ys is None or (len(ys) == 1 and ys[0] in xs):
+            return xs[0], xs[1]
+        raise ValueError(f"ambiguous coordinates: x={x!r} carries a pair but y={y!r} disagrees")
+    raise ValueError(f"cannot parse coordinates from x={x!r}, y={y!r}")
+
+
 def _run(cmd: list[str], *, timeout: int = _TIMEOUT_SEC) -> tuple[int, str, str]:
     proc = subprocess.run(
         cmd,
@@ -550,6 +602,11 @@ class _ComputerUse:
             "input_height": input_h,
             "downscaled": img_path != raw_path,
             "view_image_ready": True,
+            # Typed opt-in for the host's same-round image attachment (v6.81.1).
+            # DISTINCT from view_image_ready, which only ever meant "a path you
+            # may view manually" — reusing it would retroactively change the
+            # contract of every result that already carries it.
+            "auto_attach_image": str(view_path),
         }
         if img_path != raw_path:
             result["full_resolution_path"] = str(raw_path)
@@ -917,6 +974,7 @@ class _ComputerUse:
             "capture_width_px": px_w, "capture_height_px": px_h,
             "input_width": input_w, "input_height": input_h,
             "downscaled": img_path != out_path,
+            "auto_attach_image": str(img_path),
         }
         if img_path != out_path:
             result["full_resolution_path"] = str(out_path)
@@ -952,12 +1010,16 @@ class _ComputerUse:
             "capabilities": self._capabilities(),
         })
 
-    def click(self, *, x: int, y: int, button: str = "left", double: bool = False,
+    def click(self, *, x: int, y: int | None = None, button: str = "left", double: bool = False,
               triple: bool = False, raw: bool = False) -> str:
         plat = _platform()
         button = str(button or "left").strip().lower()
         if button not in ("left", "right", "middle"):
             return _json({"ok": False, "error": f"unknown button {button!r} (use left/right/middle)"})
+        try:
+            x, y = _coerce_point(x, y)
+        except ValueError as exc:
+            return _json({"ok": False, "error": str(exc)})
         if int(x) < 0 or int(y) < 0:
             return _json({"ok": False, "error": f"negative coordinates not allowed ({x},{y})"})
         ix, iy, note = self._map_xy(x, y, raw=raw)
@@ -995,8 +1057,12 @@ class _ComputerUse:
             return self._backend_unavailable("click")
         return self._exec_input(cmd, extra=note)
 
-    def move(self, *, x: int, y: int, raw: bool = False) -> str:
+    def move(self, *, x: int, y: int | None = None, raw: bool = False) -> str:
         plat = _platform()
+        try:
+            x, y = _coerce_point(x, y)
+        except ValueError as exc:
+            return _json({"ok": False, "error": str(exc)})
         if int(x) < 0 or int(y) < 0:
             return _json({"ok": False, "error": f"negative coordinates not allowed ({x},{y})"})
         ix, iy, note = self._map_xy(x, y, raw=raw)
@@ -1013,9 +1079,14 @@ class _ComputerUse:
             return self._backend_unavailable("mouse-move")
         return self._exec_input(cmd, extra=note)
 
-    def left_click_drag(self, *, start_x: int, start_y: int, end_x: int, end_y: int,
-                        raw: bool = False) -> str:
+    def left_click_drag(self, *, start_x: Any, start_y: Any = None, end_x: Any = None,
+                        end_y: Any = None, raw: bool = False) -> str:
         plat = _platform()
+        try:
+            start_x, start_y = _coerce_point(start_x, start_y)
+            end_x, end_y = _coerce_point(end_x, end_y)
+        except ValueError as exc:
+            return _json({"ok": False, "error": str(exc)})
         for v in (start_x, start_y, end_x, end_y):
             if int(v) < 0:
                 return _json({"ok": False, "error": "negative coordinates not allowed"})
@@ -1047,10 +1118,10 @@ class _ComputerUse:
             return self._backend_unavailable("drag")
         return self._exec_input(cmd, extra=note)
 
-    def mouse_down(self, *, x: int = -1, y: int = -1, button: str = "left", raw: bool = False) -> str:
+    def mouse_down(self, *, x: Any = None, y: Any = None, button: str = "left", raw: bool = False) -> str:
         return self._mouse_press(x=x, y=y, button=button, raw=raw, press=True)
 
-    def mouse_up(self, *, x: int = -1, y: int = -1, button: str = "left", raw: bool = False) -> str:
+    def mouse_up(self, *, x: Any = None, y: Any = None, button: str = "left", raw: bool = False) -> str:
         return self._mouse_press(x=x, y=y, button=button, raw=raw, press=False)
 
     def _mouse_press(self, *, x: int, y: int, button: str, raw: bool, press: bool) -> str:
@@ -1058,7 +1129,23 @@ class _ComputerUse:
         button = str(button or "left").strip().lower()
         if button not in ("left", "right", "middle"):
             return _json({"ok": False, "error": f"unknown button {button!r} (use left/right/middle)"})
-        has_xy = int(x) >= 0 and int(y) >= 0
+        # Coordinates are OPTIONAL here ("press where the pointer is"). ABSENT is
+        # None or the legacy -1 sentinel — both mean the same and are mapped to
+        # None BEFORE coercion, so mouse_down(x="663, 500") recovers the pair
+        # exactly like click does instead of treating the sentinel as a
+        # conflicting y (v6.81.1 review round 5). A provided coordinate goes
+        # through the same normalizer as click/move.
+        x = None if (isinstance(x, int) and x == -1) else x
+        y = None if (isinstance(y, int) and y == -1) else y
+        if x is None and y is None:
+            has_xy = False
+            x = y = -1
+        else:
+            try:
+                x, y = _coerce_point(x, y)
+            except ValueError as exc:
+                return _json({"ok": False, "error": str(exc)})
+            has_xy = int(x) >= 0 and int(y) >= 0
         ix = iy = 0
         note: dict[str, Any] = {}
         if has_xy:
@@ -1596,10 +1683,19 @@ def register(api: Any) -> None:
     api.register_tool("use_local", lambda: impl.use_local(), description="Return computer-use tools to the local desktop backend.", schema={"type": "object", "properties": {}}, timeout_sec=5)
     api.register_tool("clear_active_connection", lambda: impl.clear_active_connection(), description="Alias for use_local: clear any active remote connection.", schema={"type": "object", "properties": {}}, timeout_sec=5)
     api.register_tool("capabilities", lambda: impl.capabilities(), description="Report available computer-use backends, session type, and coordinate contract.", schema={"type": "object", "properties": {}}, timeout_sec=5)
-    api.register_tool("screenshot", impl.screenshot, description="Capture the desktop, downscale to <=WXGA, persist the image->input coordinate transform, and return the PNG path.", schema={"type": "object", "properties": {"job_id": {"type": "string", "default": "manual"}, "max_width": {"type": "integer", "default": _MAX_IMAGE_W}, "max_height": {"type": "integer", "default": _MAX_IMAGE_H}}}, timeout_sec=25)
-    api.register_tool("click", impl.click, description="Click at screenshot-space coordinates (auto-remapped; raw=true for native input space).", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}, "double": {"type": "boolean", "default": False}, "triple": {"type": "boolean", "default": False}}, "required": ["x", "y"]}, timeout_sec=10)
-    api.register_tool("move", impl.move, description="Move the mouse pointer to screenshot-space coordinates.", schema={"type": "object", "properties": _xy, "required": ["x", "y"]}, timeout_sec=10)
-    api.register_tool("left_click_drag", impl.left_click_drag, description="Press the left button at start coordinates, drag to end coordinates, release.", schema={"type": "object", "properties": {"start_x": {"type": "integer"}, "start_y": {"type": "integer"}, "end_x": {"type": "integer"}, "end_y": {"type": "integer"}, "raw": {"type": "boolean", "default": False}}, "required": ["start_x", "start_y", "end_x", "end_y"]}, timeout_sec=15)
+    api.register_tool("screenshot", impl.screenshot, description="Capture the desktop, downscale to <=WXGA, persist the image->input coordinate transform, and return the PNG path. The image is attached to the conversation automatically — no view_image call is needed to see it.", schema={"type": "object", "properties": {"job_id": {"type": "string", "default": "manual"}, "max_width": {"type": "integer", "default": _MAX_IMAGE_W}, "max_height": {"type": "integer", "default": _MAX_IMAGE_H}}}, timeout_sec=25)
+    # y is deliberately NOT in `required` for click/move: models recurringly emit the
+    # whole point inside x ("663, 500") with y omitted, and a required-field rejection
+    # then fires BEFORE the handler's _coerce_point can recover the pair.
+    api.register_tool("click", impl.click, description="Click at screenshot-space coordinates (auto-remapped; raw=true for native input space).", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}, "double": {"type": "boolean", "default": False}, "triple": {"type": "boolean", "default": False}}, "required": ["x"]}, timeout_sec=10)
+    # Models call these names unprompted (111 such calls in one OSWorld run, all
+    # previously "Unknown tool"): register them as thin aliases of click.
+    api.register_tool("double_click", lambda **kw: impl.click(**{**kw, "double": True}), description="Alias of click with double=true.", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}}, "required": ["x"]}, timeout_sec=10)
+    api.register_tool("triple_click", lambda **kw: impl.click(**{**kw, "triple": True}), description="Alias of click with triple=true.", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}}, "required": ["x"]}, timeout_sec=10)
+    api.register_tool("move", impl.move, description="Move the mouse pointer to screenshot-space coordinates.", schema={"type": "object", "properties": _xy, "required": ["x"]}, timeout_sec=10)
+    # start_y/end_y are recoverable from a pair packed into start_x/end_x, so only
+    # the x-side fields stay required (same rationale as click/move above).
+    api.register_tool("left_click_drag", impl.left_click_drag, description="Press the left button at start coordinates, drag to end coordinates, release.", schema={"type": "object", "properties": {"start_x": {"type": "integer"}, "start_y": {"type": "integer"}, "end_x": {"type": "integer"}, "end_y": {"type": "integer"}, "raw": {"type": "boolean", "default": False}}, "required": ["start_x", "end_x"]}, timeout_sec=15)
     api.register_tool("mouse_down", impl.mouse_down, description="Press and hold a mouse button (left only on macOS), optionally at coordinates.", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}}}, timeout_sec=10)
     api.register_tool("mouse_up", impl.mouse_up, description="Release a held mouse button, optionally at coordinates.", schema={"type": "object", "properties": {**_xy, "button": {"type": "string", "default": "left"}}}, timeout_sec=10)
     api.register_tool("cursor_position", lambda: impl.cursor_position(), description="Report the current pointer position in native input coordinates.", schema={"type": "object", "properties": {}}, timeout_sec=10)
@@ -1610,4 +1706,4 @@ def register(api: Any) -> None:
     api.register_tool("wait", impl.wait, description="Sleep up to 10s so the UI can settle before the next observation.", schema={"type": "object", "properties": {"ms": {"type": "integer", "default": 500}}}, timeout_sec=12)
     api.register_tool("window_list", lambda: impl.window_list(), description="List visible desktop windows/processes when a backend is available.", schema={"type": "object", "properties": {}}, timeout_sec=10)
     api.register_tool("ax_tree", lambda: impl.ax_tree(), description="Set-of-marks accessibility snapshot of the frontmost window (macOS; numbered clickable elements) with honest degradation.", schema={"type": "object", "properties": {}}, timeout_sec=25)
-    api.register_tool("remote_exec", impl.remote_exec, description="Run a shell command on the active remote connection only (OSWorld/Linux guest or SSH Mac); refuses on local backend.", schema={"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer", "default": 60}}, "required": ["command"]}, timeout_sec=120)
+    api.register_tool("remote_exec", impl.remote_exec, description="Run a shell command on the active remote connection only; refuses on local backend. OSWorld/Linux guest: each call is a FRESH `bash -lc` starting in $HOME. SSH Mac: each call runs through the remote account's login shell via ssh. Either way this is NOT the visible desktop terminal: it does not inherit that terminal's working directory and leaves nothing in its shell history.", schema={"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer", "default": 60}}, "required": ["command"]}, timeout_sec=120)
