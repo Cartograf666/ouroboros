@@ -6,6 +6,7 @@ These exercise the pure helpers only — no OSWorld VM, no Ouroboros server.
 from __future__ import annotations
 
 import json
+import pathlib
 import os
 import sys
 import time
@@ -50,8 +51,11 @@ def test_connection_switching_ext_tools_are_denied_vm_control_stays():
         return extension_surface_name("unix_computer_use", n)
     for n in ("add_connection", "activate_connection", "use_local", "clear_active_connection"):
         assert ext(n) in disabled, f"{n} must be denied to the untrusted task"
-    for n in ("screenshot", "click", "type_text", "key", "scroll", "remote_exec",
-              "list_connections", "test_connection"):
+    # v6.81.1: list_connections/test_connection JOIN the denied set — both echo the
+    # bridge URL, and a trace showed an agent using that URL to hunt for the grader.
+    for n in ("list_connections", "test_connection"):
+        assert ext(n) in disabled, f"{n} leaks the bridge URL and must be denied"
+    for n in ("screenshot", "click", "type_text", "key", "scroll", "remote_exec"):
         assert ext(n) not in disabled, f"{n} must stay available for the fixed VM connection"
 
 
@@ -1777,10 +1781,68 @@ def test_gate_preamble_is_a_rubric_not_an_exception_list():
     is a semantic decomposition; pin its load-bearing steps so a later edit cannot
     quietly regress the prompt into an example list."""
     p = rcb.GATE_PREAMBLE
-    for step in ("ACTION", "REFERENT", "BLOCKING", "ACQUISITION", "STORE-OR-RENDER",
-                 "PLACEHOLDERS"):
+    for step in ("ACTION", "REFERENT", "BLOCKING", "ACQUISITION", "SAME-THING CHECK",
+                 "CHECK, DO NOT ASSUME", "STORE-OR-RENDER", "PLACEHOLDERS"):
         assert step in p, step
     assert "When in doubt, answer UNDETERMINED" in p, "fail-open stays the default"
     # The forced two-round vision loop is gone: screenshots attach automatically.
     assert "view_image(path)" not in rcb.OSWORLD_PREAMBLE
     assert "attached" in rcb.OSWORLD_PREAMBLE.lower()
+
+
+def test_the_bench_agent_cannot_reach_the_bridge_url():
+    """A v6.81.1 trace shows an agent reading the bridge port out of a tool result and
+    curling `<bridge>/evaluate` — looking for the grader. It failed only because
+    remote_exec runs inside the guest, where that port is not the host's: containment by
+    luck of topology, not by design. Two things must hold: the screenshot result must not
+    carry the URL, and the connection tools that echo it must be denied to the agent."""
+    import skills.unix_computer_use.plugin as plugin
+
+    denied = set(rcb._DENIED_SKILL_EXT_TOOLS)
+    assert {"list_connections", "test_connection"} <= denied, denied
+    disabled = set(rcb._effective_disabled_tools(False))
+    for tool in ("list_connections", "test_connection"):
+        assert extension_surface_name(rcb.SKILL_NAME, tool) in disabled, tool
+    # The success path of the remote screenshot must not emit the bridge URL.
+    src = pathlib.Path(plugin.__file__).read_text(encoding="utf-8")
+    shot = src[src.index("def _osworld_screenshot"):src.index("def _test_osworld")]
+    assert '"target": target' not in shot, "the bridge URL is back in the screenshot result"
+
+
+def test_the_working_prompt_forbids_forcing_state_from_underneath_the_app():
+    """v6.81.1 run, chrome/ae78f875: after establishing the requested UI control no longer
+    exists, the agent wrote Chrome's PREF cookie from the DevTools console and then
+    decrypted Chrome's Safe-Storage keyring to 'verify' it. It scored 0 only because that
+    task's evaluator is infeasible-only — the same technique on a feasible task would have
+    produced undeserved credit. State must be reachable through the application's own
+    surface, and a tool restriction must cover discovery too."""
+    p = rcb.OSWORLD_PREAMBLE
+    assert "documented" in p and "underneath" in p, p[:0]
+    for phrase in ("developer console", "credential", "TASK_INFEASIBLE"):
+        assert phrase in p, phrase
+    assert "including finding things" in p, "tool restrictions must cover discovery"
+
+
+def test_a_dead_guest_control_server_ends_the_attempt_as_infra_not_a_zero():
+    """v6.81.1, vs_code/7c4cc09e: the agent killed /home/user/server/main.py and then
+    worked blind for the rest of its budget — every screenshot 500'd but was recorded
+    as a success. A task whose environment died is INFRA (reward null, claim released),
+    never a capability zero. The probe must fail CLOSED: an unknown state reads as
+    unhealthy, or the watchdog is decorative."""
+    class _Env:
+        vm_ip = "127.0.0.1"
+        server_port = 1  # nothing listens
+
+    assert rcb._guest_endpoint_healthy(_Env(), timeout=0.4) is False
+    # Before the endpoint is published there is nothing to judge.
+    class _Unpublished:
+        vm_ip = ""
+        server_port = ""
+    assert rcb._guest_endpoint_healthy(_Unpublished()) is True
+    # The grace window is a real duration, and the flow reports a typed reason.
+    assert rcb._GUEST_DOWN_GRACE_SEC >= 60
+    src = (Path(__file__).resolve().parent.parent
+           / "devtools" / "benchmarks" / "osworld" / "run_cu_bridge_agent.py").read_text(encoding="utf-8")
+    assert '"guest_control_server_lost"' in src
+    flow = src[src.index("claim_fd: int | None = None"):]
+    assert flow.index("_guest_endpoint_healthy(env)") < flow.index('"guest_control_server_lost"')

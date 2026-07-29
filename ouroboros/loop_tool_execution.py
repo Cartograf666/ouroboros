@@ -343,9 +343,37 @@ def _truncate_tool_result(
     return s[:limit] + f"\n... (truncated from {len(s)} chars, limit={limit})"
 
 
+def _structured_tool_failure(result: Any) -> bool:
+    """True when a tool's own JSON payload declares the call failed (``ok: false``).
+
+    The ⚠️-prefix convention below only covers results the CORE composes. Extension
+    (skill) tools return a JSON envelope instead, so a failed call arrived carrying
+    `{"ok": false, "error": ...}` with no marker — and was recorded as a SUCCESS.
+    Measured in the v6.81.1 OSWorld run: 329 such rows (302 remote_exec, 20
+    screenshot, 5 key, 2 click), including screenshot HTTP 500s after an agent
+    killed the guest control server and then kept "working" blind. Everything that
+    reads outcomes — the error counter, the anti-loop heuristic, monitoring, the
+    reflection trace — believed those calls worked.
+
+    Deliberately narrow: the payload must be a JSON OBJECT whose top-level `ok` is
+    exactly False. A tool returning prose, a list, or `ok` as data-not-status is
+    untouched.
+    """
+    text = str(result or "").lstrip()
+    if not text.startswith("{") or '"ok"' not in text:
+        return False
+    try:
+        payload = json.loads(text)
+    except Exception:  # noqa: BLE001 - not JSON, not our case
+        return False
+    return isinstance(payload, dict) and payload.get("ok") is False
+
+
 def _is_tool_execution_failure(tool_ok: bool, result: Any) -> bool:
     """Treat only executor/runtime failures as UI tool failures."""
     if not tool_ok:
+        return True
+    if _structured_tool_failure(result):
         return True
     text = str(result or "")
     if text.startswith("⚠️ SHELL_REGEX_AUTO_CORRECTED"):
@@ -365,7 +393,12 @@ def _extract_result_metadata(fn_name: str, result: Any, is_error: bool) -> Dict[
     """Extract structured outcome facts for summaries and reflections."""
     text = str(result or "")
     status = "error" if is_error else "ok"
-    if text.startswith("⚠️ TOOL_TIMEOUT"):
+    if _structured_tool_failure(result):
+        # A typed status, not the generic "error": an extension tool that answered
+        # honestly is a different fact from an executor crash, and the trace should
+        # say which happened.
+        status = "tool_reported_failure"
+    elif text.startswith("⚠️ TOOL_TIMEOUT"):
         status = "timeout"
     elif text.startswith("⚠️ SHELL_REGEX_AUTO_CORRECTED") and "⚠️ ARTIFACT_OUTPUT_ERROR" in text:
         status = "artifact_output_error"
@@ -1052,6 +1085,10 @@ def _maybe_auto_attach_image(
     if tools is None or exec_result.get("is_error"):
         return
     if not str(exec_result.get("fn_name") or "").startswith("ext_"):
+        return
+    # A payload that declares its own failure must not have an image lifted out of
+    # it, even when the executor call itself did not raise.
+    if _structured_tool_failure(exec_result.get("result")):
         return
     raw = exec_result.get("result")
     if not isinstance(raw, str) or '"auto_attach_image"' not in raw:

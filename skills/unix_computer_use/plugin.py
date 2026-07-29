@@ -641,11 +641,11 @@ class _ComputerUse:
             with urllib.request.urlopen(target + "/screenshot", timeout=20) as resp:
                 data = resp.read(_MAX_REMOTE_SHOT_BYTES + 1)
         except Exception as exc:  # noqa: BLE001
-            return _json({"ok": False, "error": f"/screenshot failed: {type(exc).__name__}: {exc}", "target": target})
+            return _json({"ok": False, "error": f"/screenshot failed: {type(exc).__name__}: {exc}", "backend": "osworld_http"})
         if not data:
-            return _json({"ok": False, "error": "/screenshot returned empty body", "target": target})
+            return _json({"ok": False, "error": "/screenshot returned empty body", "backend": "osworld_http"})
         if len(data) > _MAX_REMOTE_SHOT_BYTES:
-            return _json({"ok": False, "error": f"/screenshot exceeded {_MAX_REMOTE_SHOT_BYTES} byte cap", "target": target})
+            return _json({"ok": False, "error": f"/screenshot exceeded {_MAX_REMOTE_SHOT_BYTES} byte cap", "backend": "osworld_http"})
         out_path.write_bytes(data)
         px_w, px_h = _png_dimensions(out_path)
         return self._remote_screenshot_result(
@@ -655,7 +655,14 @@ class _ComputerUse:
             max_height=max_height,
             input_w=px_w,
             input_h=px_h,
-            extra={"target": target},
+            # NOT `target`: the bridge URL is control-plane, and putting it in an
+            # agent-visible result is how an agent learns where the harness lives.
+            # Measured in the v6.81.1 OSWorld run: one agent read the port out of a
+            # screenshot result and curled `<bridge>/evaluate` looking for the grader
+            # (it failed only because remote_exec runs inside the guest, where that
+            # port is not the host's — containment by luck of topology, not design).
+            # The host keeps the target in bridge.json for observability.
+            extra={"backend_endpoint": "osworld_http"},
         )
 
     def _test_osworld(self, conn: dict[str, Any], name: str) -> str:
@@ -1228,7 +1235,17 @@ class _ComputerUse:
             backend = str(conn.get("backend") or "").lower()
             # typewrite silently drops non-ASCII, so paste it via the in-VM clipboard
             # (base64-safe), like official OSWorld agents; ssh_macos `t:` handles unicode.
-            if backend == "osworld_http" and any(ord(ch) > 127 for ch in text):
+            #
+            # ASCII is NOT automatically safe either: pyautogui types shift-symbols by
+            # pressing the unshifted key with SHIFT held, and on the guest's keymap that
+            # mis-resolves for the angle brackets. Measured byte-for-byte in the
+            # v6.81.1 OSWorld run (task gimp/62f7fd55): the agent typed
+            # `<?xml version="1.0"...` and the file on disk read `>?xml version="1.0"...`
+            # — every `<` arrived as `>` (hexdump `3e` where `3c` was sent), silently
+            # corrupting any XML/HTML/shell-redirect the agent types. Route those through
+            # the same clipboard path instead of trusting the keystroke translation.
+            if backend == "osworld_http" and (any(ord(ch) > 127 for ch in text)
+                                              or "<" in text or ">" in text):
                 b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
                 clip_code = (
                     f"import base64, pyperclip; pyperclip.copy(base64.b64decode('{b64}')"
@@ -1286,6 +1303,24 @@ class _ComputerUse:
         combo = str(keys or "").strip()
         if not combo:
             return _json({"ok": False, "error": "keys is required"})
+        # WHITESPACE = a SEQUENCE of combos, executed in order ("Left Left",
+        # "shift+Right shift+Right"). Splitting only on '+' made both shapes fail,
+        # and fail differently: the modified form errored with a nonsense modifier
+        # ("unknown key modifier(s): ['right shift']"), while the bare form
+        # SILENTLY no-opped — `pyautogui.press('left left')` is simply ignored, so
+        # the agent believed a keypress happened that never did. Both were measured
+        # in the v6.81.1 OSWorld run; the silent one is the more dangerous.
+        steps = combo.split()
+        if len(steps) > 1:
+            results = []
+            for step in steps:
+                out = self.key(keys=step)
+                results.append(json.loads(out))
+                if not results[-1].get("ok"):
+                    return _json({"ok": False, "error": f"step {step!r} failed: "
+                                                        f"{results[-1].get('error')}",
+                                  "steps_done": len(results) - 1, "steps_total": len(steps)})
+            return _json({"ok": True, "sequence": steps, "steps": len(steps)})
         plat = _platform()
         mods, base, err = self._parse_combo(combo)
         if err:

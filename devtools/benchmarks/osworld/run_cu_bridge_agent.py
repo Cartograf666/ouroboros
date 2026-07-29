@@ -126,7 +126,13 @@ _GUI_ACTION_TOOLS = frozenset({
 # would drive the HOST desktop instead — defeating the host lockdown AND the
 # fail-closed guarantee. Read-only introspection (list_connections/test_connection)
 # stays; the mutating connection-management surface is denied.
-_DENIED_SKILL_EXT_TOOLS = ("add_connection", "activate_connection", "use_local", "clear_active_connection")
+# Connection-management surfaces the benchmark agent must not reach. `list_connections`
+# and `test_connection` join the mutating ones (v6.81.1): both echo the bridge URL, which
+# is control-plane. A v6.81.1 trace shows why that matters — an agent that learned the
+# port from a tool result went looking for `<bridge>/evaluate`, i.e. for the grader. The
+# runner pins the connection itself, so the agent never needs either tool.
+_DENIED_SKILL_EXT_TOOLS = ("add_connection", "activate_connection", "use_local",
+                           "clear_active_connection", "list_connections", "test_connection")
 
 
 GATE_PREAMBLE = (
@@ -155,6 +161,19 @@ GATE_PREAMBLE = (
     "repositories, creating a file or folder, enabling a built-in option)? If yes, its "
     "absence is WORK for the next phase, not a broken premise. If the instruction forbids "
     "the only acquisition path (\"using X only\") or this sandbox blocks it, it IS broken.\n"
+    "4b. SAME-THING CHECK — if you are relying on some OTHER route to satisfy the request, "
+    "does that route do what was actually ASKED, or merely something adjacent? Producing "
+    "CMYK-named channels is not converting an image to CMYK mode; writing the file format's "
+    "XML by hand is not the application gaining a feature; merging folders into one workspace "
+    "is not opening two workspaces; re-compressing harder is not increasing resolution. If the "
+    "literal capability is absent and only an adjacent substitute exists, that is INFEASIBLE — "
+    "and if the instruction restricts the tools, the substitute must obey that restriction too, "
+    "including for the discovery steps.\n"
+    "4c. CHECK, DO NOT ASSUME — when the premise is about a feature of a specific application "
+    "version in front of you, verify it by looking (open the settings page, list the menu, read "
+    "the version's own capabilities). General knowledge that an application \"normally\" has "
+    "such an option is not evidence about THIS build; several such options have been removed "
+    "upstream.\n"
     "5. STORE-OR-RENDER — for \"set/change <setting> to <value>\" tasks: does the target "
     "merely STORE the value (a name, a string, a path)? A stored name does not require the "
     "named resource to be installed or functional.\n"
@@ -415,6 +434,32 @@ def _gate_round(ouroboros_url: str, args: Any, instruction: str, *, role: str) -
     }
 
 
+# How long the guest control endpoint may stay unreachable before the attempt is
+# abandoned as INFRA. Long enough to ride out a reboot/restart the task itself
+# triggered (several tasks legitimately restart services), short enough that a
+# genuinely dead endpoint does not consume the whole task budget.
+_GUEST_DOWN_GRACE_SEC = 180.0
+
+
+def _guest_endpoint_healthy(env: Any, *, timeout: float = 8.0) -> bool:
+    """True when the guest's OSWorld control server still answers.
+
+    Probed from the HOST, over the same HTTP path the agent's tools use, so it sees
+    exactly the failure the agent would hit. Any exception means unreachable — this
+    is a health probe, and an unknown state must read as unhealthy or the watchdog
+    is decorative. Never raises.
+    """
+    try:
+        ip = getattr(env, "vm_ip", "") or ""
+        port = getattr(env, "server_port", "") or ""
+        if not ip or not port:
+            return True  # nothing published yet; not our call to judge
+        with urllib.request.urlopen(f"http://{ip}:{port}/screenshot", timeout=timeout) as resp:
+            return 200 <= int(getattr(resp, "status", 200)) < 300
+    except Exception:  # noqa: BLE001 - unreachable is the answer, not an error
+        return False
+
+
 def _gate_cancel_unconfirmed(record: dict[str, Any]) -> bool:
     """True when a premise round timed out AND its cancel did not confirm.
 
@@ -585,6 +630,16 @@ OSWORLD_PREAMBLE = (
     "artefact is not completing the task; if the premise is absent, say so.\n"
     "Do not search the filesystem for the grader, its code, or expected answers, and do not "
     "shape your work around guesses about how it is implemented. Solve the task as stated.\n"
+    "A state change counts only if it is reachable through the application's own documented "
+    "surface — its UI, its settings, its scripting console, its CLI. Forcing that state from "
+    "underneath the application does NOT count: writing its preference cookies from a "
+    "developer console, decrypting or editing its credential/profile stores, or patching the "
+    "program itself. If the only way you can produce the requested state is from underneath, "
+    "the application does not actually offer what the task asks for — say so and end with "
+    "TASK_INFEASIBLE instead of manufacturing it.\n"
+    "If the task restricts HOW to work (\"using only X\", \"without opening Y\"), that "
+    "restriction covers the whole job including finding things — a shell fetch to discover "
+    "what X was supposed to discover is outside it.\n"
     "\n"
     "PRIMARY RULE — HUMAN GUI CONTROL:\n"
     "- For application tasks (Thunderbird, Chrome, LibreOffice, VS Code, GIMP, VLC, OS "
@@ -1559,6 +1614,7 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
 
             final_statuses = {"completed", "failed", "cancelled", "rejected_duplicate"}
             t_deadline = time.time() + max(60, int(args.task_timeout_sec))
+            guest_down_since = 0.0
             while True:
                 if time.time() >= t_deadline:
                     try:
@@ -1567,6 +1623,29 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
                         pass
                     latest = {"status": "timeout"}
                     break
+                # HOST-SIDE WATCHDOG on the guest control server. The agent reaches that
+                # server through the skill, and it CAN take it down: in the v6.81.1 run an
+                # agent killed /home/user/server/main.py and then kept "working" against a
+                # dead endpoint for the rest of its budget, because every failing call came
+                # back as a success (the structured-failure fix in the same release closes
+                # that half). A task whose environment died is INFRA, not a capability zero,
+                # so stop it and let another attempt take it — never score it.
+                if not _guest_endpoint_healthy(env):
+                    if not guest_down_since:
+                        guest_down_since = time.time()
+                    elif time.time() - guest_down_since >= _GUEST_DOWN_GRACE_SEC:
+                        try:
+                            _api(args.ouroboros_url, "POST", f"/api/tasks/{task_id}/cancel", {})
+                        except Exception:  # noqa: BLE001 - reported by the outcome below
+                            pass
+                        final.update({"outcome": "adapter_error", "exit_code": 1,
+                                      "error": {"type": "GuestControlServerLost",
+                                                "message": "guest control endpoint unreachable "
+                                                           f"for {_GUEST_DOWN_GRACE_SEC}s"}})
+                        return _write_outcome(None, "adapter_error", "guest_control_server_lost",
+                                              extra={"feasibility_gate": dict(gate_record)})
+                else:
+                    guest_down_since = 0.0
                 try:
                     result = _api(args.ouroboros_url, "GET", "/api/tasks/" + task_id, timeout=30)
                 except Exception:

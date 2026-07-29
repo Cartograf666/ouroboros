@@ -688,3 +688,72 @@ def test_real_screenshot_producers_emit_auto_attach_image(tmp_path, monkeypatch)
     local = json.loads(impl.screenshot(job_id="j2"))
     assert local.get("ok") is True, local
     assert local["auto_attach_image"] == local["path"]
+
+
+def test_angle_brackets_route_through_the_clipboard_not_keystrokes(tmp_path, monkeypatch):
+    """Measured in the v6.81.1 OSWorld run: the agent typed `<?xml ...` and the guest
+    file read `>?xml ...` — every `<` arrived as `>` (hex 3e where 3c was sent), because
+    pyautogui types shift-symbols by holding SHIFT over the unshifted key and the guest
+    keymap mis-resolves the angle brackets. ASCII is therefore not automatically safe;
+    such text must take the same base64 clipboard path non-ASCII already takes."""
+    import skills.unix_computer_use.plugin as plugin
+
+    class _Api:
+        def register_tool(self, *a, **k): pass
+        def get_state_dir(self): return str(tmp_path)
+        def skill_job_dir(self, j): return str(tmp_path)
+
+    impl = plugin._ComputerUse(_Api())
+    monkeypatch.setattr(plugin._ComputerUse, "_is_remote", lambda self: True)
+    monkeypatch.setattr(plugin._ComputerUse, "_active_connection",
+                        lambda self: ("osw", {"backend": "osworld_http"}))
+    sent = []
+    monkeypatch.setattr(plugin._ComputerUse, "_remote_pyautogui",
+                        lambda self, conn, code, note=None, timeout=None:
+                            sent.append((code, note)) or json.dumps({"ok": True}))
+
+    impl.type_text(text='<?xml version="1.0"?>')
+    assert sent, "nothing was sent"
+    code, note = sent[-1]
+    assert "pyperclip" in code and "b64decode" in code, code[:120]
+    assert (note or {}).get("method") == "clipboard"
+    # Plain ASCII without the mangled symbols still uses the fast keystroke path.
+    sent.clear()
+    impl.type_text(text="hello world")
+    assert "typewrite" in sent[-1][0]
+
+
+def test_key_accepts_a_whitespace_separated_sequence_of_combos(tmp_path, monkeypatch):
+    """Two measured failures, both fixed here: `shift+Right shift+Right` errored with a
+    nonsense modifier ('right shift'), and the bare form `Left Left` SILENTLY no-opped —
+    pyautogui.press('left left') is ignored, so the agent believed a keypress happened
+    that never did. Whitespace now means 'a sequence, in order'."""
+    import skills.unix_computer_use.plugin as plugin
+
+    class _Api:
+        def register_tool(self, *a, **k): pass
+        def get_state_dir(self): return str(tmp_path)
+        def skill_job_dir(self, j): return str(tmp_path)
+
+    impl = plugin._ComputerUse(_Api())
+    monkeypatch.setattr(plugin._ComputerUse, "_is_remote", lambda self: True)
+    monkeypatch.setattr(plugin._ComputerUse, "_active_connection",
+                        lambda self: ("osw", {"backend": "osworld_http"}))
+    codes = []
+    monkeypatch.setattr(plugin._ComputerUse, "_remote_pyautogui",
+                        lambda self, conn, code, note=None, timeout=None:
+                            codes.append(code) or json.dumps({"ok": True}))
+
+    out = json.loads(impl.key(keys="shift+Right shift+Right shift+Right"))
+    assert out["ok"] is True and out["steps"] == 3, out
+    assert all("hotkey('shift'" in c for c in codes), codes
+    codes.clear()
+    out = json.loads(impl.key(keys="Left Left"))
+    assert out["ok"] is True and out["steps"] == 2, out
+    assert all("press('left')" in c for c in codes), codes
+    # A failing step stops the sequence and says which one.
+    codes.clear()
+    monkeypatch.setattr(plugin._ComputerUse, "_remote_pyautogui",
+                        lambda self, conn, code, note=None, timeout=None: json.dumps({"ok": True}))
+    bad = json.loads(impl.key(keys="ctrl+s bogusmod+x"))
+    assert bad["ok"] is False and "bogusmod" in bad["error"], bad

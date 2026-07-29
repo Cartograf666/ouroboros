@@ -1687,3 +1687,48 @@ def test_tool_results_carrying_auto_attach_image_get_the_image_same_round(tmp_pa
         [dict(rows[0], tool_call_id="c5")], [], {"tool_calls": []},
         emit_progress=lambda _m: None)
     assert errors3 == 0
+
+
+def test_a_tool_that_reports_its_own_failure_is_not_recorded_as_success():
+    """Measured in the v6.81.1 OSWorld run: 329 tool calls returned `{"ok": false, ...}`
+    in their JSON envelope and were recorded `is_error: false` / status "ok" — 302
+    remote_exec, 20 screenshot, 5 key, 2 click. One agent killed the guest control
+    server and then worked blind through 500-ing screenshots that all read as successes.
+    The ⚠️-prefix convention only covers core-composed results; extension tools answer
+    with JSON, so the failure has to be read from the payload."""
+    from ouroboros.loop_tool_execution import (
+        _extract_result_metadata,
+        _is_tool_execution_failure,
+        _structured_tool_failure,
+    )
+
+    fail = '{"ok": false, "error": "/screenshot failed: HTTPError: 500"}'
+    ok = '{"ok": true, "path": "/x/shot.png"}'
+    assert _structured_tool_failure(fail) is True
+    assert _is_tool_execution_failure(True, fail) is True
+    assert _extract_result_metadata("ext_1_r_x_screenshot", fail, False)["status"] == "tool_reported_failure"
+    # Success and non-JSON prose are untouched.
+    for benign in (ok, "plain text output", "", '["ok", false]', '{"ok": "false"}'):
+        assert _structured_tool_failure(benign) is False, benign
+        assert _is_tool_execution_failure(True, benign) is False, benign
+    # A core ⚠️ result keeps its own typed status, not the new one.
+    assert _extract_result_metadata("run_command", "⚠️ SHELL_EXIT_ERROR: 1", True)["status"] == "non_zero_exit"
+
+
+def test_auto_attach_skips_a_result_that_declared_failure(tmp_path, monkeypatch):
+    """A screenshot payload saying ok:false must not have an image lifted out of it."""
+    import json as _json
+    from types import SimpleNamespace
+
+    from ouroboros.loop_tool_execution import _maybe_auto_attach_image
+
+    attached = []
+    import ouroboros.tools.vision as vision
+    monkeypatch.setattr(vision, "attach_local_image_to_context",
+                        lambda ctx, path: attached.append(path) or (True, "ok"))
+    tools = SimpleNamespace(_ctx=SimpleNamespace(messages=[], drive_root=str(tmp_path)))
+    failed = {"fn_name": "ext_1_r_unix_computer_use_screenshot", "is_error": False,
+              "result": _json.dumps({"ok": False, "error": "boom",
+                                     "auto_attach_image": "/x/shot.png"})}
+    _maybe_auto_attach_image(failed, tools)
+    assert attached == [], "an image was attached from a failed result"
