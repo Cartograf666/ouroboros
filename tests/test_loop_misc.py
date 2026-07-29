@@ -1732,3 +1732,25 @@ def test_auto_attach_skips_a_result_that_declared_failure(tmp_path, monkeypatch)
                                      "auto_attach_image": "/x/shot.png"})}
     _maybe_auto_attach_image(failed, tools)
     assert attached == [], "an image was attached from a failed result"
+
+
+def test_undecodable_image_fails_the_attach_not_the_provider_call():
+    """A truncated PNG passes header checks; forwarding its bytes used to become a
+    non-retryable provider 400 rounds later (5 task deaths in the v6.81.1 OSWorld
+    run). The payload builder must raise at build time so the attach seam maps it
+    to a tool-visible warning instead."""
+    import io
+    import pytest
+    from PIL import Image
+
+    from ouroboros.tools import vision
+
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 16), (1, 2, 3)).save(buf, format="PNG")
+    good = buf.getvalue()
+    corrupt = good[:40] + b"\x00" * 400
+
+    with pytest.raises(ValueError, match="IMAGE_UNDECODABLE"):
+        vision._downscale_image_for_vlm(corrupt, "image/png")
+    out, mime = vision._downscale_image_for_vlm(good, "image/png")
+    assert out == good and mime == "image/png"

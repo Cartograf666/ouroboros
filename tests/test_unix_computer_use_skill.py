@@ -658,10 +658,14 @@ def test_real_screenshot_producers_emit_auto_attach_image(tmp_path, monkeypatch)
             return str(d)
 
     impl = plugin._ComputerUse(_Api())
-    # A real 1x1 PNG so _png_dimensions and the downscaler see a valid image.
-    png = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-           b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0"
-           b"\x00\x00\x00\x03\x00\x01\x0e\xdd\x1d\xf4\x00\x00\x00\x00IEND\xaeB`\x82")
+    # A GENUINELY decodable PNG: the previous hand-rolled 1x1 fixture carried a
+    # broken IDAT stream — exactly the corruption class the integrity check now
+    # rejects — and only ever passed because validation stopped at the header.
+    import io as _io
+    from PIL import Image as _Image
+    _buf = _io.BytesIO()
+    _Image.new("RGB", (1, 1), (255, 0, 0)).save(_buf, format="PNG")
+    png = _buf.getvalue()
     raw = tmp_path / "jobs" / "j1" / "output"
     raw.mkdir(parents=True, exist_ok=True)
     shot = raw / "shot.png"
@@ -757,3 +761,84 @@ def test_key_accepts_a_whitespace_separated_sequence_of_combos(tmp_path, monkeyp
                         lambda self, conn, code, note=None, timeout=None: json.dumps({"ok": True}))
     bad = json.loads(impl.key(keys="ctrl+s bogusmod+x"))
     assert bad["ok"] is False and "bogusmod" in bad["error"], bad
+
+
+def test_multiline_and_long_text_route_through_the_clipboard(tmp_path, monkeypatch):
+    """Forensics on the v6.81.1 run counted lost paragraph breaks and dropped
+    characters in retyped documents as concrete scoring failures: typewrite
+    presses Enter per "\\n" and sheds keystrokes on long streams. Multi-line and
+    long payloads must take the same clipboard path as non-ASCII."""
+    import skills.unix_computer_use.plugin as plugin
+
+    class _Api:
+        def register_tool(self, *a, **k): pass
+        def get_state_dir(self): return str(tmp_path)
+        def skill_job_dir(self, j): return str(tmp_path)
+
+    impl = plugin._ComputerUse(_Api())
+    monkeypatch.setattr(plugin._ComputerUse, "_is_remote", lambda self: True)
+    monkeypatch.setattr(plugin._ComputerUse, "_active_connection",
+                        lambda self: ("osw", {"backend": "osworld_http"}))
+    sent = []
+    monkeypatch.setattr(plugin._ComputerUse, "_remote_pyautogui",
+                        lambda self, conn, code, note=None, timeout=None:
+                            sent.append((code, note)) or json.dumps({"ok": True}))
+
+    impl.type_text(text="para one\npara two")
+    assert (sent[-1][1] or {}).get("method") == "clipboard"
+    sent.clear()
+    impl.type_text(text="x" * 201)
+    assert (sent[-1][1] or {}).get("method") == "clipboard"
+    sent.clear()
+    impl.type_text(text="short single line")
+    assert "typewrite" in sent[-1][0]
+
+
+def _valid_png_bytes() -> bytes:
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 16), (10, 20, 30)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_corrupt_screenshot_fails_closed_and_refetches(tmp_path, monkeypatch):
+    """A zero-padded PNG keeps a valid IHDR, so header checks pass while the body
+    is garbage; in v6.81.1 five tasks died rounds later on a non-retryable
+    provider 400. The fetch path must re-request on an undecodable body and
+    fail CLOSED (ok:false) if it never decodes — never publish a corrupt path."""
+    import io
+    import urllib.request
+    import skills.unix_computer_use.plugin as plugin
+
+    good = _valid_png_bytes()
+    corrupt = good[:40] + b"\x00" * 400  # valid signature+IHDR, zero-padded body
+
+    class _Api:
+        def register_tool(self, *a, **k): pass
+        def get_state_dir(self): return str(tmp_path)
+        def skill_job_dir(self, j): return str(tmp_path)
+
+    impl = plugin._ComputerUse(_Api())
+    bodies = [corrupt, good]
+
+    class _Resp:
+        def __init__(self, data): self._d = data
+        def read(self, n=-1): return self._d
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda url, timeout=0: _Resp(bodies.pop(0)))
+    monkeypatch.setattr(plugin.time, "sleep", lambda s: None)
+    out = json.loads(impl._osworld_screenshot(
+        {"target": "http://127.0.0.1:1"}, max_width=1280, max_height=720))
+    assert out.get("ok") is True, out
+    assert not bodies, "second (good) body was not fetched"
+
+    # All three attempts corrupt -> fail closed, no published path.
+    bodies = [corrupt, corrupt, corrupt]
+    out = json.loads(impl._osworld_screenshot(
+        {"target": "http://127.0.0.1:1"}, max_width=1280, max_height=720))
+    assert out.get("ok") is False
+    assert "screenshot_corrupt" in str(out.get("error"))

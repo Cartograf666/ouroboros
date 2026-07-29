@@ -117,6 +117,34 @@ def _png_dimensions(path: pathlib.Path) -> tuple[int, int]:
     return 0, 0
 
 
+def _png_intact(path: pathlib.Path) -> bool:
+    """Full-decode integrity check, not just the IHDR.
+
+    A truncated/zero-padded PNG keeps a valid 24-byte header, so
+    ``_png_dimensions`` alone cannot see the damage; in the v6.81.1 OSWorld run
+    such a file passed header checks, survived ``_downscale`` (which swallows
+    the PIL error and returns the corrupt source) and then killed the whole
+    task with a non-retryable provider 400 ("Could not process image"). Decode
+    the WHOLE image before ever reporting ok:true. Without PIL, fall back to
+    requiring the IEND trailer — weaker, but it still catches truncation.
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(max(0, path.stat().st_size - 16))
+                return b"IEND" in fh.read()
+        except Exception:
+            return False
+    try:
+        with Image.open(path) as im:
+            im.load()
+        return True
+    except Exception:
+        return False
+
+
 def _macos_logical_size() -> tuple[int, int]:
     """Logical (point) DESKTOP size via AppleScript; (0, 0) on failure.
 
@@ -575,13 +603,15 @@ class _ComputerUse:
         extra: dict[str, Any] | None = None,
     ) -> str:
         px_w, px_h = _png_dimensions(raw_path)
-        if px_w <= 0 or px_h <= 0:
-            # Not a decodable PNG — don't claim success on garbage; drop the file.
+        if px_w <= 0 or px_h <= 0 or not _png_intact(raw_path):
+            # Not a fully decodable PNG — don't claim success on garbage; a valid
+            # 24-byte header over zero-padded data must fail here, not rounds
+            # later as a provider 400. Drop the file.
             try:
                 raw_path.unlink()
             except OSError:
                 pass
-            return _json({"ok": False, "backend": backend, "error": "remote screenshot is not a valid PNG"})
+            return _json({"ok": False, "backend": backend, "error": "remote screenshot is not a fully decodable PNG"})
         if input_w <= 0 or input_h <= 0:
             input_w, input_h = px_w, px_h
         max_w = max(320, min(int(max_width or _MAX_IMAGE_W), 4096))
@@ -637,16 +667,35 @@ class _ComputerUse:
         out_dir = pathlib.Path(self.api.skill_job_dir("osworld_http")) / "output"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"screenshot-{int(time.time())}-{uuid.uuid4().hex[:6]}.png"
-        try:
-            with urllib.request.urlopen(target + "/screenshot", timeout=20) as resp:
-                data = resp.read(_MAX_REMOTE_SHOT_BYTES + 1)
-        except Exception as exc:  # noqa: BLE001
-            return _json({"ok": False, "error": f"/screenshot failed: {type(exc).__name__}: {exc}", "backend": "osworld_http"})
-        if not data:
-            return _json({"ok": False, "error": "/screenshot returned empty body", "backend": "osworld_http"})
-        if len(data) > _MAX_REMOTE_SHOT_BYTES:
-            return _json({"ok": False, "error": f"/screenshot exceeded {_MAX_REMOTE_SHOT_BYTES} byte cap", "backend": "osworld_http"})
-        out_path.write_bytes(data)
+        # Bounded re-fetch on a corrupt payload: a truncated body from the guest
+        # is transient (mid-write read), but once persisted it used to survive
+        # header-only checks and detonate rounds later as a provider 400.
+        last_err = ""
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(target + "/screenshot", timeout=20) as resp:
+                    data = resp.read(_MAX_REMOTE_SHOT_BYTES + 1)
+            except Exception as exc:  # noqa: BLE001
+                return _json({"ok": False, "error": f"/screenshot failed: {type(exc).__name__}: {exc}", "backend": "osworld_http"})
+            if not data:
+                return _json({"ok": False, "error": "/screenshot returned empty body", "backend": "osworld_http"})
+            if len(data) > _MAX_REMOTE_SHOT_BYTES:
+                return _json({"ok": False, "error": f"/screenshot exceeded {_MAX_REMOTE_SHOT_BYTES} byte cap", "backend": "osworld_http"})
+            # Write-then-validate-then-rename: the published path never holds
+            # a partially written or undecodable image.
+            tmp_path = out_path.with_suffix(".part")
+            tmp_path.write_bytes(data)
+            if _png_intact(tmp_path):
+                tmp_path.rename(out_path)
+                break
+            last_err = f"undecodable PNG ({len(data)} bytes) on attempt {attempt + 1}/3"
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            time.sleep(0.5)
+        else:
+            return _json({"ok": False, "error": f"screenshot_corrupt: {last_err}", "backend": "osworld_http"})
         px_w, px_h = _png_dimensions(out_path)
         return self._remote_screenshot_result(
             backend="osworld_http",
@@ -1244,8 +1293,14 @@ class _ComputerUse:
             # — every `<` arrived as `>` (hexdump `3e` where `3c` was sent), silently
             # corrupting any XML/HTML/shell-redirect the agent types. Route those through
             # the same clipboard path instead of trusting the keystroke translation.
+            # Multi-line and long payloads also go via clipboard: typewrite presses
+            # Enter for each "\n" (submitting forms / running partial shell lines)
+            # and long keystroke streams drop characters under load. Forensics on
+            # the v6.81.1 run counted lost paragraph breaks and leading spaces in
+            # retyped documents as concrete task failures.
             if backend == "osworld_http" and (any(ord(ch) > 127 for ch in text)
-                                              or "<" in text or ">" in text):
+                                              or "<" in text or ">" in text
+                                              or "\n" in text or len(text) > 200):
                 b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
                 clip_code = (
                     f"import base64, pyperclip; pyperclip.copy(base64.b64decode('{b64}')"

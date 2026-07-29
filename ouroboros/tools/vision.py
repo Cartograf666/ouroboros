@@ -152,17 +152,30 @@ def _detect_image_mime_for_vlm(raw: bytes) -> str:
 
 
 def _downscale_image_for_vlm(raw: bytes, mime: str) -> Tuple[bytes, str]:
-    """Cap very large image payloads before sending them to the VLM provider."""
+    """Cap very large image payloads before sending them to the VLM provider.
+
+    Raises ``ValueError`` on an image PIL cannot fully decode: a truncated
+    PNG keeps a parseable header, and forwarding its bytes turns into a
+    non-retryable provider 400 ("Could not process image") that kills the
+    task rounds later. Fail here, where the caller still maps errors to a
+    tool-visible ⚠️ message. Without PIL the check is skipped (permissive).
+    """
     if len(raw) <= _VLM_MAX_PROVIDER_BYTES:
         try:
             from PIL import Image
             import io
-
-            with Image.open(io.BytesIO(raw)) as img:
-                if max(img.size) <= _VLM_MAX_IMAGE_SIDE:
-                    return raw, mime
         except Exception:
             return raw, mime
+        try:
+            with Image.open(io.BytesIO(raw)) as img:
+                img.load()
+                if max(img.size) <= _VLM_MAX_IMAGE_SIDE:
+                    return raw, mime
+        except Exception as exc:
+            raise ValueError(
+                f"⚠️ IMAGE_UNDECODABLE: {type(exc).__name__}: {exc} — the file is "
+                "truncated or corrupt; re-capture it instead of retrying the attach."
+            ) from exc
 
     try:
         from PIL import Image
