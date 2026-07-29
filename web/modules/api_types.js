@@ -110,6 +110,9 @@
  * @property {string=} task_group_id
  * @property {string=} task_event
  * @property {string=} status
+ * @property {boolean=} cancelable
+ *   v6.82 (P5): host-attested — this frame's task is a supervisor-queue task that
+ *   POST /api/tasks/{id}/cancel can force-cancel (never set for direct-chat turns).
  * @property {?number=} cost_usd
  * @property {"available"|"unavailable"=} cost_accounting_status
  * @property {string=} cost_accounting_error
@@ -469,6 +472,10 @@
  * @typedef {Object} TaskCancelResponse
  * @property {boolean} ok
  * @property {string} task_id
+ * @property {boolean=} cascade
+ *   v6.82 (P5): echoed only when the request body {"cascade": true} asked for the
+ *   subtree cancel, which is complete by the time this answer is sent; the plain
+ *   single-task envelope is unchanged.
  */
 
 /**
@@ -501,4 +508,4 @@
  * @property {boolean=} ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.81.1';
+export const GATEWAY_CONTRACT_VERSION = '6.82.0';

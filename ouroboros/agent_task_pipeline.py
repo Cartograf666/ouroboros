@@ -12,6 +12,7 @@ from dataclasses import replace
 from typing import Any, Callable, Dict, List
 
 from ouroboros.task_results import (
+    TASK_COST_META_FIELDS,
     STATUS_COMPLETED,
     STATUS_FAILED,
     load_task_result,
@@ -1205,6 +1206,20 @@ Rounds: {rounds}, Cost: {cost_text}
 """
 
 
+def _summary_row_cost_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
+    """Flat task-scope cost fields for the task_summary chat row (v6.82 P1).
+
+    Mapped explicitly from the pre-synthesis usage snapshot
+    (``_pre_synthesis_usage_snapshot``): only the snapshot's own honest keys are
+    copied. Its schema deliberately differs from the full nine-field browser set
+    — it carries no ``cost_usd``/``cost_accounting_error`` — and a non-root
+    snapshot without accounting keys yields nothing. Never fabricates values;
+    the terminal ``task_results`` checkpoint stays the final authority (history
+    replay overrides these row values with it when the result file survives).
+    """
+    return {key: usage[key] for key in TASK_COST_META_FIELDS if key in usage}
+
+
 def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evidence=None):
     """Generate a detailed task summary and inject it into chat.jsonl."""
     try:
@@ -1235,6 +1250,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
                 "chat_id": int(task.get("chat_id") or 0),
                 "tool_calls": n_tool_calls, "rounds": rounds,
                 "outcome_axes": outcome_axes, "reason_code": reason_code,
+                **_summary_row_cost_fields(usage),
                 **({"review_projection": review_projection} if review_projection.get("panels") else {}),
             })
             return
@@ -1282,6 +1298,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
                 "chat_id": int(task.get("chat_id") or 0),
                 "tool_calls": n_tool_calls, "rounds": rounds,
                 "outcome_axes": outcome_axes, "reason_code": reason_code,
+                **_summary_row_cost_fields(usage),
                 **({"review_projection": review_projection} if review_projection.get("panels") else {}),
             })
     except Exception:

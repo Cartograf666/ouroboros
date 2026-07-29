@@ -106,6 +106,25 @@ def test_onboarding_compact_access_step_keeps_default_width_two_column():
     assert "@media (max-width: 760px)" in css
 
 
+def test_settings_more_providers_collapse_keeps_inputs_mounted():
+    """Rarely used provider cards (Cloud.ru, GigaChat) collapse under a
+    "More providers" details wrapper, but their inputs must stay mounted:
+    settings.js applyInputValue has no null guard, so a missing input id
+    breaks settings load. The wrapper auto-opens when configured."""
+    ui = _read("web/modules/settings_ui.js")
+    settings = _read("web/modules/settings.js")
+    css = _read("web/settings.css")
+
+    assert 'id="settings-more-providers"' in ui
+    assert ui.count("advanced: true") == 2  # cloudru + gigachat only
+    assert "PROVIDER_CARDS.filter((card) => !card.advanced)" in ui
+    assert "PROVIDER_CARDS.filter((card) => card.advanced)" in ui
+    assert "syncMoreProvidersDisclosure" in settings
+    assert ".settings-more-providers > summary" in css
+    # About tab footer stays removed (v6.82 cosmetic pass).
+    assert "Joi Lab" not in ui
+
+
 def test_subagent_write_surface_badge_in_both_card_paths():
     """The write=<surface> badge must render on BOTH the Logs path
     (summarizeLogEvent) and the Chat live-card path (summarizeChatLiveEvent),
@@ -192,8 +211,8 @@ def test_server_navigation_and_chat_static_contracts():
     assert 'id="s-total-budget"' in ui
     assert 'id="s-settings-per-task-cost"' in ui
     assert "setupContract.budgetFields" in settings
-    assert "'anthropic/claude-opus-4.7'" in settings
-    assert "'anthropic::claude-opus-4-7'" in settings
+    assert "'anthropic/claude-sonnet-5'" in settings
+    assert "'anthropic::claude-sonnet-5'" in settings
     assert "currentSettings?.[field.settingKey]" in settings
     assert "window.addEventListener('ouro:settings-updated'" in settings
     assert "source: 'settings'" in settings

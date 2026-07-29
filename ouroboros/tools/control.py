@@ -1710,8 +1710,13 @@ def _wait_for_tasks(
     """Wait for multiple subtasks and return a compact structural projection per child."""
     if not isinstance(task_ids, list) or not task_ids:
         return "⚠️ TOOL_ARG_ERROR (wait_tasks): task_ids must be a non-empty list."
-    if len(task_ids) > 50:
-        return "⚠️ TOOL_ARG_ERROR (wait_tasks): task_ids is capped at 50."
+    from ouroboros.config import MAX_ACTIVE_SUBAGENTS_HARD_CAP
+
+    if len(task_ids) > MAX_ACTIVE_SUBAGENTS_HARD_CAP:
+        return (
+            "⚠️ TOOL_ARG_ERROR (wait_tasks): task_ids is capped at "
+            f"{MAX_ACTIVE_SUBAGENTS_HARD_CAP}."
+        )
     normalized_ids: List[str] = []
     for item in task_ids:
         try:

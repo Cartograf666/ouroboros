@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import timedelta
 
-from ouroboros.config import SETTINGS_DEFAULTS
+from ouroboros.config import SETTINGS_DEFAULTS, review_model_uses_local
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now as _planning_now
 from ouroboros.llm import LLMClient
 from ouroboros.review_substrate import review_repo_dirs_for
@@ -1397,6 +1397,7 @@ async def _run_plan_review_slots(
             max_tokens=_PLAN_REVIEW_MAX_TOKENS,
             temperature=0.2,
             role_hint="plan reviewer",
+            use_local=review_model_uses_local(str(model)),
         )
         for idx, model in enumerate(models)
     ]

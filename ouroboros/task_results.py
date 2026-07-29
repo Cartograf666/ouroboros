@@ -9,7 +9,7 @@ import pathlib
 import re
 from typing import Any, Callable, Dict, List, Optional
 
-from ouroboros.utils import atomic_write_json, read_json_dict, update_json_locked, utc_now_iso
+from ouroboros.utils import read_json_dict, update_json_locked, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -21,11 +21,21 @@ STATUS_REJECTED_DUPLICATE = "rejected_duplicate"
 STATUS_FAILED = "failed"
 STATUS_INTERRUPTED = "interrupted"
 STATUS_CANCELLED = "cancelled"
+
 # Intent latch: the agent/owner asked to cancel, but the supervisor has not yet
 # torn the task down. Ranks above running so a late running/scheduled mirror
 # cannot resurrect it, but below the truly-terminal statuses so the eventual
 # STATUS_CANCELLED write still lands.
 STATUS_CANCEL_REQUESTED = "cancel_requested"
+
+# The nine flat task-scope cost fields shared by live task events, progress-row
+# replay, task_summary chat rows, and the persisted result written here (v6.82
+# P1) — one home, so no consumer grows a divergent literal list.
+TASK_COST_META_FIELDS = (
+    "cost_usd", "cost_accounting_status", "cost_accounting_error", "cost_final",
+    "cost_usd_with_children", "cost_with_children_partial", "reserved_usd",
+    "unresolved_upper_bound_usd", "unknown_unmetered",
+)
 
 # Monotonic lifecycle ordering. A write that would move a task *backwards* past
 # the cancel-intent latch or a terminal status is ignored, so a stale
@@ -317,19 +327,11 @@ def write_task_result(
             "updated_at": now,
         }
 
-    try:
-        return update_json_locked(path, _merge)
-    except TimeoutError:
-        # Last-resort visibility: a wedged sibling holding the lock must not
-        # silently drop a (possibly terminal) result. Log loudly and fall back
-        # to the previous unlocked merge so the durable record still lands.
-        log.error("task_results lock timeout for %s; falling back to unlocked merge", task_id)
-        existing = load_task_result(results_drive_root, task_id) or {}
-        merged = _merge(dict(existing))
-        if merged is None:
-            return existing
-        atomic_write_json(path, merged)
-        return merged
+    # Never fall back to an unlocked read/merge/write. Every task-result write is
+    # lifecycle authority; accepting stale state here makes the winner of a
+    # completed-vs-cancelled race depend on timing rather than the monotonic
+    # reducer above. Callers may retry or fail their transition explicitly.
+    return update_json_locked(path, _merge)
 
 
 def persist_plan_review_handoffs(

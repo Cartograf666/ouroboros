@@ -8,11 +8,16 @@ these helpers without creating an import cycle.
 
 from __future__ import annotations
 
+import itertools
+import logging
 import pathlib
 import threading
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.utils import utc_now_iso
+
+log = logging.getLogger(__name__)
 
 
 _PROJECT_DELETE_WORKERS_LOCK = threading.Lock()
@@ -20,13 +25,120 @@ _PROJECT_DELETE_WORKERS: set[tuple[str, str]] = set()
 BUDGET_ROOT_FENCES: Dict[str, Dict[str, Any]] = {}
 
 
+# Tasks whose subtree cancellation has begun (v6.82.0): descendant admission is
+# FENCED under the queue lock, because a schedule event already draining would be
+# admitted after any number of cascade sweeps. Bounded in memory (newest kept) —
+# a cancelled tree is terminal, so an evicted entry names a tree that settled long
+# ago; the registry is per-process by design (a restart has no live descendants to
+# admit, and terminal task results are the durable truth).
+CANCELLED_ROOT_FENCES: Dict[str, str] = {}
+_CANCELLED_ROOT_FENCE_CAP = 4096
+_CANCELLED_ROOT_FENCE_GRACE_SEC = 300.0
+# Ids fenced by cascades that are STILL RUNNING. Pruning protects the union, not
+# just the caller's own set: a second large cascade could otherwise push the cap
+# over and evict an older in-flight cascade's fences, re-opening admission into a
+# tree that is still being torn down. Add-only within a cascade; the whole entry
+# is dropped when that cascade returns.
+_ACTIVE_CASCADE_FENCES: Dict[str, set[str]] = {}
+_CASCADE_TOKEN_SEQ = itertools.count()
+
+
+def _next_cascade_token(task_id: str) -> str:
+    """A unique key for one cascade's protected-fence set (concurrent cascades on
+    the SAME target must not share, or the first to finish unprotects the other)."""
+    return f"{task_id}:{next(_CASCADE_TOKEN_SEQ)}"
+
+
+def _prune_cancellation_fences(*, protected: set[str]) -> None:
+    """Bound the fence registry without evicting ANY in-flight cascade's ids.
+
+    A single cascade may capture up to the per-root child ceiling (500) and several
+    can overlap, so an oldest-first trim must skip the union of every RUNNING
+    cascade's ids — protecting only the caller would let a second cascade evict an
+    older one's fences and re-open admission into a tree still being torn down.
+    Recently completed cascades receive a grace window too. Without it, the next
+    cap-bound cascade could evict the just-completed root immediately after its
+    active ownership was released, admitting a delayed schedule event from the
+    supervisor queue. The cap is therefore soft while active/recent fences exist;
+    a later prune removes them after the grace interval.
+    """
+    if len(CANCELLED_ROOT_FENCES) <= _CANCELLED_ROOT_FENCE_CAP:
+        return
+    live: set[str] = set(protected)
+    for owned in _ACTIVE_CASCADE_FENCES.values():
+        live |= owned
+    for stale in list(CANCELLED_ROOT_FENCES):
+        if len(CANCELLED_ROOT_FENCES) <= _CANCELLED_ROOT_FENCE_CAP:
+            return
+        if stale in live:
+            continue
+        try:
+            stamp = str(CANCELLED_ROOT_FENCES.get(stale) or "").replace("Z", "+00:00")
+            age = datetime.now(timezone.utc).timestamp() - datetime.fromisoformat(stamp).timestamp()
+            if age < _CANCELLED_ROOT_FENCE_GRACE_SEC:
+                continue
+        except (TypeError, ValueError):
+            # Unknown provenance fails safe: keep the fence instead of reopening
+            # admission into a tree whose cancellation age cannot be proven.
+            continue
+        CANCELLED_ROOT_FENCES.pop(stale, None)
+
+
+def root_cancellation_fenced(task: Dict[str, Any], root_task_id: str = "") -> bool:
+    """Whether this task descends from ANY task whose cancellation has begun.
+
+    The full ANCESTRY is walked (not just root/immediate parent): `/api/tasks/{id}/
+    cancel` accepts any live id, so a mid-tree cascade must also refuse a grandchild
+    that a still-live deeper descendant schedules afterwards — its root is the
+    original root and its parent is not the cancelled node. Callers hold the queue
+    lock, so the live maps are a consistent view; the walk is depth-bounded exactly
+    like the cascade snapshot's.
+    """
+    if not CANCELLED_ROOT_FENCES:
+        return False
+    for candidate in (
+        str(root_task_id or "").strip(),
+        str(task.get("root_task_id") or "").strip(),
+        str(task.get("parent_task_id") or "").strip(),
+    ):
+        if candidate and candidate in CANCELLED_ROOT_FENCES:
+            return True
+    q = _queue_module()
+    live: Dict[str, Dict[str, Any]] = {
+        str(item.get("id") or ""): item for item in q.PENDING if isinstance(item, dict)
+    }
+    live.update({
+        str(rid): meta["task"] for rid, meta in q.RUNNING.items()
+        if isinstance(meta, dict) and isinstance(meta.get("task"), dict)
+    })
+    parent = str(task.get("parent_task_id") or "").strip()
+    seen: set[str] = set()
+    while parent and parent not in seen and len(seen) < 100:
+        if parent in CANCELLED_ROOT_FENCES:
+            return True
+        seen.add(parent)
+        ancestor = live.get(parent)
+        parent = str(ancestor.get("parent_task_id") or "").strip() if isinstance(ancestor, dict) else ""
+    return False
+
+
 def apply_budget_root_admission_fence(task: Dict[str, Any], root_task_id: str) -> bool:
-    """Reject new work while a root is explicitly budget-paused.
+    """Reject new work while a root is explicitly budget-paused OR being cancelled.
 
     The monetary authority remains the physical-attempt ledger.  This marker is
     only an admission latch, preventing a budget increase from silently resuming
     a root after one of its dispatches was refused.
+
+    It is also THE root-level admission latch for subtree cancellation (v6.82.0):
+    a cascade cannot rely on re-sweeping, because a `schedule_subagent` event
+    already draining in the supervisor would be admitted after any number of
+    sweeps and leave a live child under a Cancelled root. Both are answers to the
+    same question — "may this root accept new work?" — so they share one latch
+    and one call site instead of growing a second admission check.
     """
+    if root_cancellation_fenced(task, root_task_id):
+        task["_admission_blocked"] = "root_cancelled"
+        return True
     fence = BUDGET_ROOT_FENCES.get(str(root_task_id or ""))
     if not isinstance(fence, dict) or str(fence.get("status") or "") not in {
         "active", "paused",
@@ -260,14 +372,464 @@ def clear_acceptance_fence_for_root(root_task_id: str) -> bool:
         return q.ACCEPTANCE_FENCES.pop(root_task_id, None) is not None
 
 
+def task_subtree_is_live(task_id: str) -> bool:
+    """Cheap liveness pre-check for the HTTP cascade-cancel path (v6.82).
+
+    True when the task itself is queued/running, when it still has live
+    descendants in the queue, or when its persisted result sits in the
+    ``cancel_requested`` latch (finished mid-teardown — the per-task cancel's
+    finalize-on-miss branch still has honest work to do). Everything else is
+    inactive and must keep today's 404 contract.
+    """
+    q = _queue_module()
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return False
+    with q._queue_lock:
+        self_running = task_id in q.RUNNING
+        self_pending = any(
+            isinstance(task, dict) and str(task.get("id") or "") == task_id
+            for task in q.PENDING
+        )
+        descendants = [
+            str(row.get("task_id") or "")
+            for row in _live_descendants_locked(q, task_id, exclude_task_id=task_id)
+        ]
+    if self_pending:
+        return True
+    # A row whose DURABLE result already settled is a worker winding down, not
+    # live work: its own finalizer owns the removal, and counting it as live would
+    # make a cascade fail its postcondition and answer 503 for the documented
+    # natural-completion race. The durable reads happen OUTSIDE the queue lock.
+    if self_running and not _durable_settled_status(q, task_id):
+        return True
+    if any(tid and not _durable_settled_status(q, tid) for tid in descendants):
+        return True
+    try:
+        from ouroboros.task_results import STATUS_CANCEL_REQUESTED, load_task_result
+
+        existing = load_task_result(q.DRIVE_ROOT, task_id) or {}
+        return str(existing.get("status") or "") == STATUS_CANCEL_REQUESTED
+    except Exception:
+        return False
+
+
 def cancel_task_by_id(task_id: str, *, cascade: bool = False) -> bool:
-    """Cancel a task and, when requested, its atomically captured live subtree."""
+    """Cancel a task and, when requested, its atomically captured live subtree.
+
+    The cascade is SYNCHRONOUS end to end (v6.82.0): the caller is answered only
+    once the tree is actually torn down. That single decision is what removes the
+    whole family of split-transaction hazards an ack-before-teardown design needs
+    machinery for — no durable pre-acknowledgement latch, no partial-latch
+    taxonomy, no fence ownership handed between a begin and a background teardown,
+    no rollback that could withdraw a concurrent cascade's fences. What remains is
+    the ADMISSION FENCE plus bounded re-sweeps.
+
+    A cascade RE-SWEEPS: the snapshot is taken under the queue lock, but a
+    `schedule_subagent` event already in the supervisor's drain queue can be
+    admitted after it, so one snapshot alone could leave a late descendant
+    running under a Cancelled root. Each sweep cancels what it saw; the loop
+    stops when a fresh snapshot finds nothing new (bounded, so a pathological
+    spawner cannot wedge the caller — the cancelled root's own worker is dead by
+    then, so late arrivals are a draining queue, not an ongoing source).
+
+    Every id gets a TYPED outcome from `queue.cancel_task_custody` — a boolean
+    OR-aggregate would report success while a child that REFUSED to die is still
+    live. Only terminalized ids are marked done; a failed id is retried by the
+    next sweep. The call ends with an UNCONDITIONAL postcondition: it returns True
+    only if nothing of the subtree is live any more.
+
+    Completion always wins: custody is never taken from a task that already
+    reached its own terminal result, and the durable write is refused by the
+    result writer's monotonic guard if it settles mid-teardown.
+    """
     q = _queue_module()
     task_id = str(task_id or "").strip()
     if not task_id:
         return False
     if not cascade:
         return q._cancel_task_by_id_single(task_id)
+    # Close admission for the TARGET before the first snapshot (a schedule event
+    # already draining would otherwise slip in), then each sweep fences every id it
+    # captures — so a child naming a since-removed descendant as its parent is still
+    # refused. The fence is the authority; the sweeps only catch children admitted
+    # before it existed.
+    cascade_token = _next_cascade_token(task_id)
+    with q._queue_lock:
+        CANCELLED_ROOT_FENCES[task_id] = utc_now_iso()
+        _ACTIVE_CASCADE_FENCES[cascade_token] = {task_id}
+        _prune_cancellation_fences(protected={task_id})
+    cancelled = False
+    already: set[str] = set()
+    failed: set[str] = set()
+    try:
+        for _sweep in range(4):
+            swept, outcomes = _cancel_subtree_sweep(q, task_id, already, cascade_token)
+            cancelled = swept or cancelled
+            if not outcomes:
+                break
+            # ONLY terminalized ids are done. A `failed` id (stubborn process,
+            # refused persistence) stays out of `already` so the next sweep
+            # retries it.
+            already.update(
+                tid for tid, state in outcomes.items() if state in q._CANCEL_TERMINALIZED
+            )
+            failed = {tid for tid, state in outcomes.items() if state == q.CANCEL_FAILED}
+        # UNCONDITIONAL postcondition. For a CASCADE the answer is a property of the
+        # TREE, not a tally of who did the killing: success means nothing of the
+        # subtree is live and nothing refused custody. (A concurrent cascade over
+        # an overlapping subtree may legitimately have done the work — reporting
+        # that as a failure would turn a settled tree into a 503. The endpoint's
+        # own liveness pre-check still answers 404 for a tree that was never live.)
+        still_live = task_subtree_is_live(task_id)
+        if failed or still_live:
+            log.error(
+                "Subtree cancellation for %s did not settle (failed=%s, still_live=%s)",
+                task_id, sorted(failed), still_live,
+            )
+            return False
+        if not cancelled:
+            log.info("Subtree %s was already down when this cascade ran", task_id)
+        return True
+    finally:
+        # The protected set is dropped only HERE — after the postcondition — so a
+        # concurrent cascade's pruning can never evict this cascade's fences while
+        # any of its checks still run.
+        with q._queue_lock:
+            _ACTIVE_CASCADE_FENCES.pop(cascade_token, None)
+
+
+# Typed per-id cancellation outcome (v6.82.0). A boolean cannot distinguish
+# "cancelled", "it had already finished on its own" and "refused/failed" — and a
+# cascade that OR-aggregates booleans reports success while a child is still live.
+CANCEL_CANCELLED = "cancelled"
+CANCEL_ALREADY_SETTLED = "already_settled"
+CANCEL_NOT_FOUND = "not_found"
+CANCEL_FAILED = "failed"
+_CANCEL_TERMINALIZED = frozenset({CANCEL_CANCELLED, CANCEL_ALREADY_SETTLED, CANCEL_NOT_FOUND})
+
+
+def _durable_settled_status(q: Any, task_id: str) -> str:
+    """The task's own already-final outcome, or "" — read once, off the hot path."""
+    try:
+        from ouroboros.task_results import STATUS_CANCEL_REQUESTED, load_task_result
+        from ouroboros.task_status import FINAL_STATUSES
+
+        status = str((load_task_result(q.DRIVE_ROOT, task_id) or {}).get("status") or "")
+        # cancel_requested is a latch, not an outcome the task reached itself.
+        return status if status in (FINAL_STATUSES - {STATUS_CANCEL_REQUESTED}) else ""
+    except Exception:
+        log.debug("Could not read durable status for %s", task_id, exc_info=True)
+        return ""
+
+
+def cancel_task_custody(task_id: str) -> str:
+    """Cancel one task and return a TYPED outcome, never a bare boolean.
+
+    CUSTODY model, in three strictly ordered phases:
+
+    1. UNDER THE QUEUE LOCK — capture. A pending task leaves q.PENDING; a running
+       task keeps its authoritative q.RUNNING row and its worker slot is marked
+       ``reaping`` so no other actor can dispatch, reap, or respawn it.
+       A task that already reached its OWN terminal result is not captured at
+       all: natural completion wins, keeps its result AND its own event.
+    2. OUTSIDE THE LOCK — kill and JOIN the worker. Process teardown must never
+       hold the global queue lock (it blocks every admission and dispatch for
+       the duration), and the death must be CONFIRMED, not assumed.
+    3. Only after confirmed death AND a successful durable write does the task
+       become publicly cancelled: terminal result, `task_done`, worker respawn,
+       drive cleanup, snapshot. If either step fails, custody is RESTORED (the
+       task goes back where it came from) and the outcome is ``failed`` — the
+       caller must not report a cancellation that did not happen.
+    """
+    q = _queue_module()
+    from supervisor import workers
+
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return CANCEL_NOT_FOUND
+
+    # ---- phase 1: capture under the lock -----------------------------------
+    with q._queue_lock:
+        settled = _durable_settled_status(q, task_id)
+        if settled:
+            # Natural completion (or an earlier cancel) already decided this task.
+            # A QUEUED row for a task with a terminal result is a ghost and is
+            # dropped; a RUNNING row is NOT touched — that worker is finishing its
+            # own cycle and its finalizer owns the removal. Taking the row without
+            # killing the process would orphan it, and killing it would destroy the
+            # completion this branch exists to protect. The bounded re-sweeps give
+            # the finalizer time; if it is still there at the end the postcondition
+            # reports honestly instead of claiming a settled tree.
+            for index, item in enumerate(list(q.PENDING)):
+                if str(item.get("id")) == task_id:
+                    q.PENDING.pop(index)
+                    break
+            return CANCEL_ALREADY_SETTLED
+
+        captured_pending = None
+        for index, item in enumerate(list(q.PENDING)):
+            if str(item.get("id")) == task_id:
+                captured_pending = q.PENDING.pop(index)
+                break
+        captured_worker = None
+        captured_meta = None
+        if captured_pending is None:
+            for worker in workers.WORKERS.values():
+                if worker.busy_task_id == task_id:
+                    if getattr(worker, "reaping", False):
+                        # The slot is ALREADY owned — by the reaper or another
+                        # in-flight custody. Exactly one owner kills, publishes
+                        # and respawns; a second taker would double-kill and
+                        # double-respawn the slot. `failed` is honest here: the
+                        # task is not settled yet, the caller's sweep retries,
+                        # and the postcondition keeps refusing success until the
+                        # real owner confirms death and persists the outcome.
+                        return CANCEL_FAILED
+                    captured_worker = worker
+                    # ONE ownership state, shared with the reaper: the slot is
+                    # marked `reaping` (assign_tasks, ensure_workers_healthy and
+                    # the crash detector all skip it), and the task REMAINS in
+                    # RUNNING — authoritatively visible, lineage intact — until
+                    # its death is confirmed and its terminal result persisted.
+                    # Popping the row here would blind task_subtree_is_live for
+                    # the whole off-lock kill window, letting a concurrent
+                    # cascade report a settled tree over a still-live process.
+                    captured_meta = dict(q.RUNNING.get(task_id) or {})
+                    captured_worker.reaping = True
+                    break
+
+    if captured_pending is not None:
+        return _finish_captured_pending(task_id, captured_pending)
+    if captured_worker is not None:
+        return _finish_captured_running(task_id, captured_worker, captured_meta or {})
+    return _finalize_cancel_requested_on_miss(task_id)
+
+
+def _restore_custody(task_id: str, *, pending: Any = None, worker: Any = None) -> None:
+    """Release custody after a failed cancellation.
+
+    A captured PENDING task is put back in the queue. A RUNNING task needs no
+    re-insert — capture never removed its row, so there is no ghost state to
+    reconstruct; releasing the slot marker is the whole restore (a stranded
+    ``reaping`` slot is skipped by assign and the health check forever).
+    """
+    q = _queue_module()
+    with q._queue_lock:
+        if pending is not None and all(str(t.get("id")) != task_id for t in q.PENDING):
+            q.PENDING.append(pending)
+        if worker is not None:
+            worker.reaping = False
+
+
+def _finish_captured_pending(task_id: str, task: Dict[str, Any]) -> str:
+    """A queued task has no process: persist first, publish second."""
+    q = _queue_module()
+    from ouroboros.task_results import STATUS_CANCELLED, load_task_result, write_task_result
+
+    try:
+        existing = load_task_result(q.DRIVE_ROOT, task_id) or {}
+        stored = write_task_result(
+            q.DRIVE_ROOT, task_id, STATUS_CANCELLED,
+            **q._cancel_result_fields(
+                task, existing=existing, result="Task cancelled by user/agent request.",
+            ),
+        )
+    except Exception:
+        log.warning("Cancel persistence failed for pending task %s", task_id, exc_info=True)
+        _restore_custody(task_id, pending=task)
+        return CANCEL_FAILED
+    if str((stored or {}).get("status") or "") != STATUS_CANCELLED:
+        # The writer's monotonic guard refused it: the task settled on its own
+        # between capture and write. Its outcome and event stand.
+        return CANCEL_ALREADY_SETTLED
+    q._emit_cancel_task_done(task, task_id)
+    q.persist_queue_snapshot(reason="cancel_pending")
+    return CANCEL_CANCELLED
+
+
+def _finish_captured_running(task_id: str, worker: Any, meta: Dict[str, Any]) -> str:
+    """A running task: CONFIRM the process is dead, persist, then publish."""
+    q = _queue_module()
+    from ouroboros.platform_layer import kill_pid_tree
+    from ouroboros.task_results import STATUS_CANCELLED, load_task_result, write_task_result
+
+    task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
+
+    # ---- phase 2: kill and join OUTSIDE the lock ---------------------------
+    # EVERY exit from this phase restores custody: an exception from the platform
+    # kill, the service-pid lookup or a join would otherwise strand a possibly-live
+    # worker outside RUNNING, where `task_subtree_is_live` cannot see it and the
+    # cascade would report a settled tree.
+    try:
+        keep = q._kept_service_pids()
+        if worker.proc.pid:
+            kill_pid_tree(worker.proc.pid, exclude_pids=keep)
+        elif worker.proc.is_alive():
+            worker.proc.terminate()
+        worker.proc.join(timeout=5)
+        if worker.proc.is_alive() and worker.proc.pid:
+            kill_pid_tree(worker.proc.pid, exclude_pids=keep)
+            worker.proc.join(timeout=2)
+    except Exception:
+        log.error("Worker teardown for %s raised; cancellation refused", task_id, exc_info=True)
+        _restore_custody(task_id, worker=worker)
+        return CANCEL_FAILED
+    if worker.proc.is_alive():
+        # A stubborn process is NOT a cancelled task: restoring custody keeps the
+        # tree honest (still live, still owned by this worker) so the caller can
+        # report a refusal instead of an imaginary success.
+        log.error("Worker for %s survived kill escalation; cancellation refused", task_id)
+        _restore_custody(task_id, worker=worker)
+        return CANCEL_FAILED
+
+    # POST-KILL child-drive re-check, the reaper's own step: forked/workspace/
+    # subagent tasks self-finalize on the CHILD drive and are copied back only on
+    # task_done. A worker that died after writing its child result but before
+    # copy-back would otherwise lose to our cancelled write, and
+    # copy_child_task_result later refuses to overwrite it. The process is dead
+    # now, so this decision is final.
+    try:
+        from ouroboros.headless import copy_child_task_result
+        from ouroboros.task_status import FINAL_STATUSES
+
+        child_result = copy_child_task_result(pathlib.Path(q.DRIVE_ROOT), task)
+        if child_result and str(child_result.get("status") or "") in FINAL_STATUSES:
+            return _publish_cancelled_task(
+                q, task_id, task, worker, child_result,
+                {"cost_accounting_status": "unavailable", "cost_final": False},
+            )
+    except Exception:
+        log.debug("Child-drive terminal re-check failed for %s", task_id, exc_info=True)
+
+    # Cost reconstruction is EVIDENCE, not custody: a ledger read that fails must
+    # degrade to unknown fields rather than strand a task whose worker is already
+    # dead (supervisor/events.py::_authoritative_terminal_cost treats unavailable
+    # accounting the same way).
+    try:
+        cost_fields = q.reconstruct_task_cost(
+            str(task_id), fields=True, drive_root=pathlib.Path(q.DRIVE_ROOT),
+        )
+    except Exception:
+        log.warning("Cost reconstruction failed for cancelled %s", task_id, exc_info=True)
+        cost_fields = {"cost_accounting_status": "unavailable", "cost_final": False,
+                       "cost_accounting_error": "ledger_unavailable", "cost_usd": None}
+    try:
+        existing = load_task_result(q.DRIVE_ROOT, task_id) or {}
+        stored = write_task_result(
+            q.DRIVE_ROOT, task_id, STATUS_CANCELLED,
+            **q._cancel_result_fields(
+                task, existing=existing, **cost_fields,
+                result="Running task cancelled and worker terminated.",
+            ),
+        )
+    except Exception:
+        log.warning("Cancel persistence failed for running task %s", task_id, exc_info=True)
+        _restore_custody(task_id, worker=worker)
+        return CANCEL_FAILED
+
+    # ---- DURABLE BOUNDARY CROSSED -----------------------------------------
+    # The task's terminal truth is on disk. Everything past this line is
+    # publication and slot hygiene: it is FAIL-SOFT and idempotent, because
+    # answering 503 now would report a cancellation that demonstrably happened,
+    # and a raising respawn must never leave the slot stranded at `reaping`.
+    return _publish_cancelled_task(q, task_id, task, worker, stored, cost_fields)
+
+
+def _publish_cancelled_task(
+    q: Any, task_id: str, task: Dict[str, Any], worker: Any,
+    stored: Dict[str, Any], cost_fields: Dict[str, Any],
+) -> str:
+    """Publish the STORED terminal truth and reconcile the worker slot.
+
+    The event carries whatever actually settled: if the worker wrote its own
+    natural result before we killed it, the monotonic guard refused our
+    cancellation — publishing nothing would leave that card unresolved until a
+    reload, so the stored status is emitted instead.
+    """
+    from supervisor import workers
+
+    from ouroboros.task_results import STATUS_CANCELLED
+
+    settled_status = str((stored or {}).get("status") or STATUS_CANCELLED)
+    # The row leaves RUNNING only NOW — death confirmed, terminal result durable.
+    # A natural task_done that raced us may have consumed the row already; that
+    # handler also emitted the terminal event, so whoever pops the row owns the
+    # emit and the card resolves exactly once.
+    with q._queue_lock:
+        row_owned = q.RUNNING.pop(task_id, None) is not None
+    try:
+        from ouroboros.tools.services import archive_task_service_logs
+        archive_task_service_logs(pathlib.Path(q.DRIVE_ROOT), str(task_id), task)
+    except Exception:
+        log.debug("Failed to archive service logs for cancelled task %s", task_id, exc_info=True)
+    if row_owned:
+        try:
+            q._emit_cancel_task_done(task, task_id, cost_fields=cost_fields, status=settled_status)
+        except Exception:
+            log.warning("Failed to publish terminal event for %s", task_id, exc_info=True)
+    # Respawn recovery is the REAPER'S canonical step 5, not a private variant:
+    # membership check + respawn under the queue lock (mutually exclusive with
+    # shutdown's kill_workers), and on failure the marker is cleared UNDER THE
+    # LOCK so the crash detector can recover the slot on a later tick.
+    try:
+        with q._queue_lock:
+            if worker.wid in workers.WORKERS:
+                workers.respawn_worker(worker.wid)
+    except Exception:
+        log.warning("Respawn after cancelling %s failed; clearing reaping for recovery", task_id, exc_info=True)
+        try:
+            with q._queue_lock:
+                slot = workers.WORKERS.get(worker.wid)
+                if slot is not None:
+                    slot.reaping = False
+        except Exception:
+            log.debug("Could not clear the slot marker for %s", task_id, exc_info=True)
+    if str(task.get("delegation_role") or "") == "subagent":
+        try:
+            from ouroboros.headless import remove_subagent_task_drive
+            remove_subagent_task_drive(q.DRIVE_ROOT, str(task_id))
+        except Exception:
+            log.debug("Failed to remove cancelled subagent drive for %s", task_id, exc_info=True)
+    try:
+        q.persist_queue_snapshot(reason="cancel_running")
+    except Exception:
+        log.debug("Snapshot after cancelling %s failed", task_id, exc_info=True)
+    return CANCEL_ALREADY_SETTLED if settled_status != STATUS_CANCELLED else CANCEL_CANCELLED
+
+
+def _finalize_cancel_requested_on_miss(task_id: str) -> str:
+    """Neither queued nor running: promote a pending cancel latch to cancelled."""
+    q = _queue_module()
+    from ouroboros.task_results import (
+        STATUS_CANCEL_REQUESTED, STATUS_CANCELLED, load_task_result, write_task_result,
+    )
+
+    try:
+        existing = load_task_result(q.DRIVE_ROOT, task_id) or {}
+        if str(existing.get("status") or "") != STATUS_CANCEL_REQUESTED:
+            return CANCEL_NOT_FOUND
+        write_task_result(
+            q.DRIVE_ROOT, task_id, STATUS_CANCELLED,
+            **q._cancel_result_fields(
+                existing, existing=existing,
+                result="Task cancelled (finished before supervisor teardown).",
+            ),
+        )
+        q._emit_cancel_task_done(existing, task_id)
+        q.persist_queue_snapshot(reason="cancel_finalize")
+        return CANCEL_CANCELLED
+    except Exception:
+        log.debug("Cancel finalize-on-miss failed for %s", task_id, exc_info=True)
+        return CANCEL_FAILED
+
+
+
+def _cancel_subtree_sweep(
+    q: Any, task_id: str, already: set[str], cascade_token: str = "",
+) -> Tuple[bool, Dict[str, str]]:
+    """One snapshot pass over the live subtree of ``task_id``: fence what it sees,
+    then cancel it. Returns ``(cancelled_anything, {task_id: typed_outcome})``."""
     with q._queue_lock:
         live: Dict[str, Dict[str, Any]] = {
             str(task["id"]): task
@@ -304,21 +866,62 @@ def cancel_task_by_id(task_id: str, *, cascade: bool = False) -> bool:
                 except (TypeError, ValueError):
                     pass
                 descendants.append((distance, live_id))
-        cancel_order = [item[1] for item in sorted(descendants, reverse=True)] + [task_id]
-    q.append_jsonl(
-        pathlib.Path(q.DRIVE_ROOT) / "logs" / "supervisor.jsonl",
-        {
-            "ts": utc_now_iso(),
-            "type": "task_cancel_subtree_snapshot",
-            "root_task_id": task_id,
-            "descendant_task_ids": cancel_order[:-1],
-            "descendant_count": len(cancel_order) - 1,
-        },
-    )
+        cancel_order = [
+            item[1] for item in sorted(descendants, reverse=True)
+            if item[1] not in already
+        ]
+        if task_id not in already:
+            cancel_order.append(task_id)
+        # Fence EVERY id captured in this snapshot before the lock is released:
+        # once custody removes them from PENDING/RUNNING, a
+        # still-draining schedule event names a parent that no longer exists in the
+        # live maps, so the ancestry walk could not reconstruct the chain. Naming
+        # the whole captured subtree makes the refusal a direct parent match.
+        for fenced_id in cancel_order:
+            CANCELLED_ROOT_FENCES[fenced_id] = utc_now_iso()
+        if cascade_token:
+            # Everything this sweep fenced joins the cascade's protected set for as
+            # long as the cascade runs — not just for this one prune call.
+            _ACTIVE_CASCADE_FENCES.setdefault(cascade_token, set()).update(cancel_order)
+        _prune_cancellation_fences(protected={task_id, *cancel_order})
+    if not cancel_order:
+        return False, {}
+    _append_cascade_snapshot_log(q, task_id, cancel_order, already)
+    outcomes: Dict[str, str] = {}
     cancelled = False
     for live_id in cancel_order:
-        cancelled = q._cancel_task_by_id_single(live_id) or cancelled
-    return cancelled
+        # Children first (cancel_order is depth-sorted), each with its own typed
+        # result — the parent's success can never mask a child's refusal.
+        outcomes[live_id] = q.cancel_task_custody(live_id)
+        cancelled = outcomes[live_id] == q.CANCEL_CANCELLED or cancelled
+    return cancelled, outcomes
+
+
+def _append_cascade_snapshot_log(
+    q: Any, task_id: str, cancel_order: List[str], already: set[str],
+) -> None:
+    """Record the captured snapshot — FAIL-SOFT.
+
+    The durable latch and the fences are already committed by the time this runs,
+    so letting a telemetry write raise would abort the transaction after the tree
+    was fenced and latched: the caller would answer 503 and never schedule the
+    teardown, leaving a cancel-requested tree still running. Losing a log line is
+    the strictly smaller loss.
+    """
+    try:
+        q.append_jsonl(
+            pathlib.Path(q.DRIVE_ROOT) / "logs" / "supervisor.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "task_cancel_subtree_snapshot",
+                "root_task_id": task_id,
+                "descendant_task_ids": [tid for tid in cancel_order if tid != task_id],
+                "descendant_count": len([tid for tid in cancel_order if tid != task_id]),
+                "resweep": bool(already),
+            },
+        )
+    except Exception:
+        log.warning("Failed to log the cascade snapshot for %s", task_id, exc_info=True)
 
 
 def resume_budget_paused_task(task_id: str) -> Dict[str, Any]:

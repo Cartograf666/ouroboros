@@ -17,7 +17,7 @@ from typing import Any, Optional, Sequence
 
 from ouroboros.platform_layer import pid_lock_acquire as _compat_pid_lock_acquire
 from ouroboros.platform_layer import pid_lock_release as _compat_pid_lock_release
-from ouroboros.provider_models import compute_direct_review_models_fallback, migrate_model_value
+from ouroboros.provider_models import compute_direct_review_models_fallback, local_only_review_route_env, migrate_model_value, review_model_uses_local as review_model_uses_local
 
 
 # Paths
@@ -73,7 +73,7 @@ SETTINGS_DEFAULTS = {
     "GIGACHAT_USER": "",
     "GIGACHAT_PASSWORD": "",
     "GIGACHAT_SCOPE": "GIGACHAT_API_PERS",
-    "GIGACHAT_BASE_URL": "https://gigachat.devices.sberbank.ru/api/v1",
+    "GIGACHAT_BASE_URL": "https://api.giga.chat/v1",
     "GIGACHAT_VERIFY_SSL_CERTS": "true",
     "GIGACHAT_PROFANITY_CHECK": "",
     "ANTHROPIC_API_KEY": "",
@@ -81,13 +81,13 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_NETWORK_PASSWORD": "",
     "OUROBOROS_SERVER_HOST": "127.0.0.1",
     "OUROBOROS_HOST_SERVICE_PORT": 8767,
-    "OUROBOROS_MODEL": "google/gemini-3.5-flash",
+    "OUROBOROS_MODEL": "x-ai/grok-4.5",
     # Worker lanes. Empty means "use OUROBOROS_MODEL" (same shape as consciousness),
     # so the owner sets ONE model by default and optionally overrides a lane. HEAVY is
     # the strong acting/coding lane (mutative first-level subagents); LIGHT is the cheap
-    # bulk lane (auto / deep subagents). (HEAVY renamed from the legacy MODEL_CODE.)
+    # bulk lane (auto / deep subagents); real cheap default since v6.82.0.
     "OUROBOROS_MODEL_HEAVY": "",
-    "OUROBOROS_MODEL_LIGHT": "",
+    "OUROBOROS_MODEL_LIGHT": "google/gemini-3.6-flash",
     "OUROBOROS_MODEL_VISION": "",
     "OUROBOROS_IMAGE_INPUT_MODE": "auto",
     # Background consciousness is a high-horizon cognitive loop, not a cheap
@@ -96,8 +96,8 @@ SETTINGS_DEFAULTS = {
     # Cross-model resilience CHAIN (comma-separated, ordered). A single model is a
     # 1-element chain; empty disables cross-model fallback. Resilience slot — keeps a
     # real default, unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
-    "OUROBOROS_MODEL_FALLBACKS": "anthropic/claude-sonnet-4.6",
-    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "openai/gpt-5.5-pro",
+    "OUROBOROS_MODEL_FALLBACKS": "openai/gpt-5.6-luna",
+    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "openai/gpt-5.6-sol-pro",
     "CLAUDE_CODE_MODEL": "opus[1m]",
     "OUROBOROS_MAX_WORKERS": 10,
     "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT": 6,
@@ -200,7 +200,7 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_GENERATIVE_PROBE": "1",
     "OUROBOROS_GENERATIVE_PROBE_CHARS": "5000000",
     # Pre-commit review: comma-separated provider-tagged model list
-    "OUROBOROS_REVIEW_MODELS": "anthropic/claude-fable-5,openai/gpt-5.6-sol,google/gemini-3.5-flash",
+    "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.6-terra,google/gemini-3.6-flash,deepseek/deepseek-v4-pro",
     # Pre-commit review enforcement: advisory | blocking
     "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
     # Auto-grant reviewed-skill requests by default; grants stay bound to the
@@ -237,16 +237,16 @@ SETTINGS_DEFAULTS = {
     "MCP_SERVERS": [],
     "MCP_TOOL_TIMEOUT_SEC": 60,
     # Scope review: one or more reviewer slots; enforcement follows OUROBOROS_REVIEW_ENFORCEMENT.
-    "OUROBOROS_SCOPE_REVIEW_MODELS": "anthropic/claude-fable-5",
-    "OUROBOROS_SCOPE_REVIEW_MODEL": "anthropic/claude-fable-5",
+    "OUROBOROS_SCOPE_REVIEW_MODELS": "openai/gpt-5.6-terra",
+    "OUROBOROS_SCOPE_REVIEW_MODEL": "openai/gpt-5.6-terra",
     # DEPRECATED, enforcement-inert (v6.80.0): stored, owner-only (dedicated audited
     # endpoint), but NOTHING consults it — whether the BIBLE P3 blocking scope review
     # applies follows owner-only OUROBOROS_CONTEXT_MODE. Degraded opt-in key: removed.
     "OUROBOROS_SCOPE_REVIEW_FLOOR": "blocking_1m",
     "OUROBOROS_TASK_REVIEW_MODE": "auto",
     # LLM safety-supervisor coverage (owner-only, like runtime/context mode):
-    #   full (default)  — LLM check on every POLICY_CHECK tool + non-whitelisted
-    #                     POLICY_CHECK_CONDITIONAL shell (today's behavior).
+    #   full (shipped default; fail-closed fallbacks land here; a FRESH wizard
+    #                     authors "light") — LLM check on POLICY_CHECK + cond. shell.
     #   light           — LLM check ONLY on POLICY_CHECK integration tools;
     #                     POLICY_CHECK_CONDITIONAL shell/verify fall to the
     #                     deterministic whitelist + registry guards (no LLM).
@@ -321,8 +321,7 @@ def _main_model() -> str:
 
 
 def get_light_model() -> str:
-    """Return the light-model slot; empty falls back to OUROBOROS_MODEL (only main
-    carries a real default — heavy/light/consciousness are empty->main)."""
+    """Light slot; empty falls back to Main (heavy/consciousness stay empty->main)."""
     return str(os.environ.get("OUROBOROS_MODEL_LIGHT", "") or "").strip() or _main_model()
 
 
@@ -580,6 +579,7 @@ def get_review_models() -> list[str]:
     default_str = SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"]
     models_str = os.environ.get("OUROBOROS_REVIEW_MODELS", default_str) or default_str
     models = _parse_model_list(models_str)
+    models = [_main_model()] * max(1, len(models)) if local_only_review_route_env() else models
     provider = _exclusive_direct_remote_provider_env()
     if not provider:
         return models
@@ -618,6 +618,7 @@ def get_scope_review_models() -> list[str]:
         models = [singular]
     if not models:
         models = _parse_model_list(default_str)
+    models = [_main_model()] * max(1, len(models)) if local_only_review_route_env() else models
     provider = _exclusive_direct_remote_provider_env()
     if not provider:
         return models
@@ -792,11 +793,15 @@ def _bounded_positive_int_setting(key: str, *, default: int, hard_max: int, min_
     return max(min_value, min(parsed, hard_max))
 
 
+# ONE per-root subagent ceiling (v6.82: 50->500): clamp below, supervisor/events.py, wait_tasks; ARCHITECTURE §7.
+MAX_ACTIVE_SUBAGENTS_HARD_CAP = 500
+
+
 def get_max_active_subagents_per_root() -> int:
     return _bounded_positive_int_setting(
         "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT",
         default=int(SETTINGS_DEFAULTS["OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT"]),
-        hard_max=50,
+        hard_max=MAX_ACTIVE_SUBAGENTS_HARD_CAP,
     )
 
 
@@ -1240,19 +1245,22 @@ def read_version() -> str:
 
 
 # Settings file locking
-_SETTINGS_LOCK = pathlib.Path(str(SETTINGS_PATH) + ".lock")
+def _settings_lock_path() -> pathlib.Path:
+    # Call-time so a repointed SETTINGS_PATH locks beside its own file.
+    return pathlib.Path(str(SETTINGS_PATH) + ".lock")
 
 
 def _acquire_settings_lock(timeout: float = 2.0) -> Optional[int]:
     start = time.time()
+    lock_path = _settings_lock_path()
     while time.time() - start < timeout:
         try:
-            fd = os.open(str(_SETTINGS_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             return fd
         except FileExistsError:
             try:
-                if time.time() - _SETTINGS_LOCK.stat().st_mtime > 10:
-                    _SETTINGS_LOCK.unlink()
+                if time.time() - lock_path.stat().st_mtime > 10:
+                    lock_path.unlink()
                     continue
             except Exception:
                 pass
@@ -1263,13 +1271,14 @@ def _acquire_settings_lock(timeout: float = 2.0) -> Optional[int]:
 
 
 def _release_settings_lock(fd: Optional[int]) -> None:
-    if fd is not None:
-        try:
-            os.close(fd)
-        except Exception:
-            pass
+    if fd is None:  # never acquired; a concurrent writer's lock must stay
+        return
     try:
-        _SETTINGS_LOCK.unlink()
+        os.close(fd)
+    except Exception:
+        pass
+    try:
+        _settings_lock_path().unlink()
     except Exception:
         pass
 
@@ -1365,18 +1374,34 @@ def save_settings(
     settings: dict,
     *,
     allow_elevation: bool = False,
+    onboarding_safety_default: bool = False,
 ) -> None:
     """Persist settings and enforce owner-only mode ratchets.
 
     Elevation above the boot baseline is refused after initialization (``allow_elevation``
     is then inert to agent-reachable subprocesses; production entry points must call
     ``initialize_runtime_mode_baseline`` before agent code). Context-mode lowering and
-    clearing the derived auto-low flag likewise require the explicit owner path."""
+    clearing the derived auto-low flag likewise require the explicit owner path.
+
+    ``onboarding_safety_default`` is a NARROW boolean authorizing exactly one
+    transition — a FRESH install (no settings file yet) authoring
+    ``OUROBOROS_SAFETY_MODE="light"``; everything else keeps the ratchet."""
     _guard_live_settings_write()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     fd = _acquire_settings_lock()
+    if fd is None:
+        raise TimeoutError(f"Could not acquire settings lock {_settings_lock_path()} within 2 seconds")
     try:
-        settings = prepare_settings_for_persist(settings)
+        authored_keys: tuple[str, ...] = ()
+        allow_safety_lowering = False
+        if onboarding_safety_default:
+            wants_light = str(settings.get("OUROBOROS_SAFETY_MODE", "") or "").strip().lower() == "light"
+            if wants_light and not SETTINGS_PATH.exists():
+                authored_keys = ("OUROBOROS_SAFETY_MODE",)
+                allow_safety_lowering = True
+        settings = prepare_settings_for_persist(
+            settings, authored_keys=authored_keys,
+            allow_safety_lowering=allow_safety_lowering)
         # Baseline: the in-process pin, else the STRICTEST of the inherited env pin and disk. The env pin only
         # exists so a subprocess inherits the parent's ratchet, so it may only TIGHTEN — letting it RAISE the
         # baseline is the caller-controlled "previous value" hole of _settings_file_value on a fourth key (a

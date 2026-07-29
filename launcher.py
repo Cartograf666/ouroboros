@@ -924,7 +924,15 @@ def _claude_code_status_payload(settings: dict | None = None) -> dict:
 def _run_first_run_wizard() -> bool:
     """Show setup wizard if no runtime provider or local model is configured."""
     settings, provider_defaults_changed, _provider_default_keys = apply_runtime_provider_defaults(_load_settings())
-    if provider_defaults_changed:
+    # Persist the pre-wizard normalization ONLY for an install that already has a
+    # settings file. On a FRESH install this save would CREATE the file before the
+    # wizard runs, and the wizard's safety-light authorship is gated on exactly
+    # that freshness (a local-first launch with LOCAL_MODEL_SOURCE in the
+    # environment reaches here with changed=True and would silently lose Light).
+    # Nothing is dropped: the wizard save persists the same normalized settings.
+    from ouroboros.config import SETTINGS_PATH as _settings_path
+
+    if provider_defaults_changed and _settings_path.exists():
         _save_settings(settings)
     _apply_settings_to_env(settings)
     if has_startup_ready_provider(settings):
@@ -939,10 +947,28 @@ def _run_first_run_wizard() -> bool:
             prepared_settings, error = prepare_onboarding_settings(data, settings)
             if error:
                 return error
+            # Rev.3-2 (v6.82.0): a FRESH wizard save explicitly authors the
+            # new-install "light" safety coverage (prepare_onboarding_settings only
+            # adds it when the settings file carries no explicit choice). Name the
+            # key as authored and allow this owner-driven onboarding write past the
+            # full->light ratchet; every other save path keeps the ratchet intact.
+            # The DESKTOP host authors it — the shared validator must not, because
+            # web/Docker onboarding posts the same payload through the non-owner
+            # generic /api/settings path. Eligibility is a fresh install (no
+            # settings file); the persist seam re-proves it under the lock.
+            from ouroboros.settings_setup_contract import wizard_authors_safety_light
+
+            wizard_authors_safety = wizard_authors_safety_light()
+            if wizard_authors_safety:
+                prepared_settings["OUROBOROS_SAFETY_MODE"] = "light"
             settings.update(prepared_settings)
             settings.update(apply_runtime_provider_defaults(settings)[0])
             try:
-                _save_settings(settings)
+                save_settings(
+                    settings,
+                    allow_elevation=True,
+                    onboarding_safety_default=wizard_authors_safety,
+                )
                 _apply_settings_to_env(settings)
                 _wizard_done["ok"] = True
                 for window in webview.windows:

@@ -33,7 +33,7 @@ const VALUE_FIELDS = [
 ];
 const _SAFETY_MODE_RANK = { full: 2, light: 1, off: 0 };
 const NUMBER_FIELDS = [
-    ['s-workers', 'OUROBOROS_MAX_WORKERS', 10], ['s-active-subagents', 'OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT', 3], ['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 2, true],
+    ['s-workers', 'OUROBOROS_MAX_WORKERS', 10], ['s-active-subagents', 'OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT', 6], ['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 2, true],
     ['s-tool-timeout', 'OUROBOROS_TOOL_TIMEOUT_SEC', 600], ['s-local-port', 'LOCAL_MODEL_PORT', 8766], ['s-local-gpu-layers', 'LOCAL_MODEL_N_GPU_LAYERS', -1, true],
     ['s-local-ctx', 'LOCAL_MODEL_CONTEXT_LENGTH', 16384], ['s-gc-retention-days', 'OUROBOROS_GC_RETENTION_DAYS', 7],
     ['s-bg-wakeup-min', 'OUROBOROS_BG_WAKEUP_MIN', 30], ['s-bg-wakeup-max', 'OUROBOROS_BG_WAKEUP_MAX', 7200], ['s-bg-max-rounds', 'OUROBOROS_BG_MAX_ROUNDS', 10],
@@ -266,23 +266,39 @@ function collectSecretValue(id, body) {
 
 // Fallback picker pills mirror config defaults plus useful direct-provider ids.
 const SETTINGS_FALLBACK_MODELS = [
-    'google/gemini-3.5-flash',
-    'anthropic/claude-fable-5',
-    'anthropic/claude-sonnet-4.6',
-    'anthropic/claude-opus-4.8',
-    'anthropic::claude-opus-4-8',
-    'anthropic/claude-opus-4.7',
-    'anthropic::claude-opus-4-7',
-    'anthropic::claude-opus-4-6',
-    'anthropic::claude-sonnet-4-6',
-    'openai::gpt-5.5',
-    'openai::gpt-5.4-mini',
+    'x-ai/grok-4.5',
+    'google/gemini-3.6-flash',
+    'openai/gpt-5.6-terra',
     'openai/gpt-5.6-sol',
-    'openai/gpt-5.5',
-    'anthropic/claude-opus-4.6',
+    'openai/gpt-5.6-luna',
+    'openai::gpt-5.6-terra',
+    'openai::gpt-5.6-sol',
+    'openai::gpt-5.6-luna',
+    'anthropic/claude-sonnet-5',
+    'anthropic/claude-opus-5',
+    'anthropic::claude-sonnet-5',
+    'anthropic::claude-opus-5',
+    'anthropic::claude-opus-4-6',
+    'deepseek/deepseek-v4-pro',
 ];
 
 let settingsModelCatalogItems = SETTINGS_FALLBACK_MODELS.map((value) => ({ value, label: 'Suggested model' }));
+
+/**
+ * Pure predicate (v6.82 P2): should the collapsed Settings "More providers"
+ * section auto-open? True only for a USABLE credential — a Cloud.ru key, a
+ * GigaChat OAuth credential, or a COMPLETE GigaChat basic-auth pair. Base
+ * URLs/scope/TLS fields always carry shipped defaults and never count.
+ * Exported for dependency-free node tests.
+ */
+export function moreProvidersCredentialConfigured({
+    cloudruKey = '', gigachatCredentials = '', gigachatUser = '', gigachatPassword = '',
+} = {}) {
+    const has = (v) => Boolean(String(v ?? '').trim());
+    return has(cloudruKey)
+        || has(gigachatCredentials)
+        || (has(gigachatUser) && has(gigachatPassword));
+}
 
 export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const page = document.createElement('div');
@@ -521,11 +537,33 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             input.value = s[field.settingKey] ?? field.default ?? '';
         });
         applyMcpSettings(s);
+        syncMoreProvidersDisclosure();
         resetSecretClearFlags(page);
         syncEffortSegments(page);
         syncRuntimeModeBridgeState();
         syncPostTaskEvolutionUi();
         refreshSafetySkipCounter();  // fire-and-forget; fills the 24h audited-skip note
+    }
+
+    function syncMoreProvidersDisclosure() {
+        // Auto-open the collapsed "More providers" section when a usable
+        // provider CREDENTIAL inside it is configured, so a set-up
+        // Cloud.ru/GigaChat install is never hidden. Non-secret inputs
+        // (base URLs, scope, verify-ssl) always carry shipped defaults and
+        // must NOT count as "configured". Runs after applySettings; never
+        // force-closes an owner-opened section.
+        const wrapper = byId('settings-more-providers');
+        if (!wrapper) return;
+        const value = (id) => {
+            const input = byId(id);
+            return input ? input.value : '';
+        };
+        if (moreProvidersCredentialConfigured({
+            cloudruKey: value('s-cloudru-key'),
+            gigachatCredentials: value('s-gigachat-credentials'),
+            gigachatUser: value('s-gigachat-user'),
+            gigachatPassword: value('s-gigachat-password'),
+        })) wrapper.open = true;
     }
 
     function _renderNetworkHint(meta) {

@@ -3,7 +3,7 @@ import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
-import { apiClient, apiFetch } from './api_client.js';
+import { apiClient, apiFetch, cancelTask } from './api_client.js';
 import {
     compactModel,
     formatReviewProjection,
@@ -12,7 +12,9 @@ import {
     normalizeLogTs,
     summarizeChatLiveEvent,
     taskOutcomeSeverity,
+    taskTerminalPhase,
 } from './log_events.js';
+import { openConfirmDialog } from './confirm_dialog.js';
 
 // Row-surface disclosure guard (v6.71.0), pure for node tests: returns the
 // lineKey to toggle for a click landing on `target`, or '' when the click must
@@ -125,8 +127,13 @@ export function headerBudgetPresentation(data) {
  */
 export function taskCostMeta(payload = {}) {
     const has = (key) => Object.prototype.hasOwnProperty.call(payload, key);
+    // Task-scope accounting evidence only (v6.82 P1): a bare `cost_usd` is NOT
+    // enough — llm_round_finished carries a per-round delta under that key, and
+    // rendering it as task cost lied on the card. Subagent progress_meta and
+    // task_done/task_cost_finalized frames carry cost_accounting_status /
+    // cost_final alongside cost_usd, so honest task-scope frames still qualify.
     const hasAccountingEvidence = [
-        'cost_usd', 'cost_accounting_status', 'cost_final',
+        'cost_accounting_status', 'cost_final',
         'cost_usd_with_children', 'cost_with_children_partial',
         'reserved_usd', 'unresolved_upper_bound_usd', 'unknown_unmetered',
     ].some(has);
@@ -161,11 +168,148 @@ export function taskCostMeta(payload = {}) {
     return meta;
 }
 
-function withTaskCostMeta(summary, payload, { replace = false } = {}) {
-    const accountingMeta = taskCostMeta(payload);
-    if (!accountingMeta.length) return summary;
-    const existing = replace ? [] : (Array.isArray(summary?.meta) ? summary.meta : []);
-    return { ...summary, meta: [...existing, ...accountingMeta] };
+/**
+ * Project one frame's task-scope cost evidence into the sticky structured form
+ * `{meta, ts, final}` (v6.82 P1). Returns null when the frame carries NO
+ * task-scope accounting evidence (e.g. an llm_round_finished per-round delta)
+ * — such frames must never touch a card's cost.
+ */
+export function taskCostProjection(payload = {}, rawTs = '') {
+    const meta = taskCostMeta(payload);
+    if (!meta.length) return null;
+    const unavailable = payload.cost_accounting_status === 'unavailable';
+    return {
+        meta,
+        ts: rawTimestampEpoch(rawTs),
+        // Only a SETTLED ledger value is final. "unavailable" is an honest
+        // unknown, not a settled truth: marking it final let one transient
+        // ledger-read failure outrank every later real reading.
+        final: payload.cost_final === true,
+        unavailable,
+    };
+}
+
+/**
+ * Sticky per-card cost precedence (v6.82 P1). Rank unavailable < pending < final:
+ * an honest reading always outranks an unknown (one transient ledger-read failure
+ * must not pin the card for the whole run) and a settled value outranks both.
+ * Among equal rank the newer raw source timestamp wins, so an older history replay
+ * can never overwrite newer evidence; frames without evidence (null `next`) keep
+ * the previous projection, so an unavailable snapshot is still sticky.
+ */
+export function mergeStickyCostMeta(previous, next) {
+    if (!next || !Array.isArray(next.meta) || !next.meta.length) return previous || null;
+    if (!previous || !Array.isArray(previous.meta) || !previous.meta.length) return next;
+    // Rank: unavailable < pending < final. An `unavailable` snapshot is sticky (a
+    // costless frame must not erase it) but must NOT outrank a later HONEST reading:
+    // one transient ledger-read failure would otherwise pin the card to "cost
+    // unavailable" for the rest of the run.
+    const rank = (p) => (p.final ? 2 : (p.unavailable ? 0 : 1));
+    const prevRank = rank(previous);
+    const nextRank = rank(next);
+    if (prevRank !== nextRank) return nextRank > prevRank ? next : previous;
+    const prevTs = Number(previous.ts);
+    const nextTs = Number(next.ts);
+    if (Number.isFinite(prevTs) && Number.isFinite(nextTs) && nextTs < prevTs) return previous;
+    // A frame whose source timestamp is unreadable must not defeat a
+    // timestamped previous value of equal finality.
+    if (Number.isFinite(prevTs) && !Number.isFinite(nextTs)) return previous;
+    return next;
+}
+
+/**
+ * Reset the sticky presentation state (collapsed activity + cost projection)
+ * introduced in v6.82 P1. Used by resetLiveCardRecord; pure over the record
+ * shape so dependency-free node tests can exercise the recycle path.
+ */
+export function clearStickyCardState(record) {
+    if (!record) return record;
+    record.collapsedActivity = '';
+    record.costMeta = null;
+    // The activity CLOCK and the full-text reference are cycle state too: a
+    // recycled slot ('bg-consciousness', 'active') would otherwise open showing
+    // the previous cycle's "Latest" time and its tooltip.
+    record.latestActivityTs = '';
+    if (record.activityEl) {
+        record.activityEl.textContent = '';
+        record.activityEl.removeAttribute('title');
+    }
+    return record;
+}
+
+/**
+ * Decide the collapsed activity line text (v6.82 P1), shared by root and
+ * subagent cards. Root cards show the latest activity headline ONLY when a
+ * coined name occupies the title — an unnamed card's title already shows the
+ * activity, so the line is suppressed to avoid duplication. Subagent titles
+ * keep the role·model·id identity, so their routed progress body always feeds
+ * the line. A frame without new activity keeps `previous`, so finishing a card
+ * never blanks its last activity.
+ */
+export const COLLAPSED_ACTIVITY_MAX = 400;
+
+export function projectCollapsedActivity({
+    isSubagent = false, suggestedName = '', headline = '', body = '', previous = '',
+} = {}) {
+    const candidate = String((isSubagent ? body : headline) || '').trim()
+        || String(previous || '').trim();
+    if (!isSubagent && !String(suggestedName || '').trim()) return '';
+    // BOUNDED, and the bound is DISCLOSED. The line is fed the uncut text (never a
+    // timeline preview), but a single card line is not a place to render an
+    // unbounded narration: it is clipped at a generous ceiling with an explicit
+    // ellipsis, and applyLiveCardState keeps the complete text on the element's
+    // title so the full value stays reachable rather than destroyed (BIBLE P1 —
+    // truncation is allowed when it is visible and the whole text survives).
+    if (candidate.length <= COLLAPSED_ACTIVITY_MAX) return candidate;
+    return candidate.slice(0, COLLAPSED_ACTIVITY_MAX - 1).trimEnd() + '…';
+}
+
+// Logical slots that may host multiple independent cycles (v6.82: hoisted to
+// module scope so cancelRunEligibility shares the same truth as the card layer).
+export const REUSABLE_TASK_IDS = new Set(['bg-consciousness', 'active']);
+
+// v6.82 (P5): terminal card phases. 'cancelled' is a first-class terminal phase
+// so a force-cancelled root resolves its card instead of re-inflating.
+export function isTerminalTaskPhase(phase = '', terminal = false) {
+    return Boolean(terminal) || ['done', 'lifecycle_error', 'cancelled'].includes(phase);
+}
+
+/**
+ * v6.82 (P5): may this live card offer the "Cancel run" action?
+ * Card shape alone cannot answer it — an in-process direct-chat turn mints an
+ * ordinary non-reusable, non-subagent card (supervisor/workers.py builds it a
+ * real uuid task id) yet has no queue entry to cancel. So eligibility requires
+ * the supervisor's host-attested `cancelable` progress-meta marker on top of
+ * the structural gates: a ROOT (non-subagent) pooled card, not a reusable slot,
+ * not finished, not converted into a project chip.
+ */
+export function cancelRunEligibility({
+    groupId = '', isSubagent = false, finished = false, cancelable = false, converted = false,
+} = {}) {
+    return Boolean(cancelable)
+        && !isSubagent
+        && !finished
+        && !converted
+        && Boolean(String(groupId || '').trim())
+        && !REUSABLE_TASK_IDS.has(String(groupId || ''));
+}
+
+function withTaskCostMeta(summary, payload, { replace = false, rawTs = '' } = {}) {
+    const projection = taskCostProjection(payload, rawTs);
+    // `replace` frames (task_done/task_cost_finalized) never keep the
+    // summarizer's own meta strings — even without accounting evidence a
+    // terminal frame must not render an ungated bare cost string.
+    // Cost renders from the card's STICKY record.costMeta (applyLiveCardState),
+    // never from this frame's meta list: the sticky projection is the SINGLE
+    // cost renderer. Summarizer-built `cost=` strings are dropped
+    // UNCONDITIONALLY — a frame whose payload carries no task-scope accounting
+    // evidence must show no money at all, not a bare per-call number.
+    const base = replace ? { ...summary, meta: [] } : summary;
+    const out = projection ? { ...base, costProjection: projection } : { ...base };
+    if (Array.isArray(out.meta) && out.meta.length) {
+        out.meta = out.meta.filter((entry) => !String(entry || '').startsWith('cost='));
+    }
+    return out;
 }
 
 function showTaskIncidentToast(msg) {
@@ -859,10 +1003,6 @@ export function createChatInstance({
         return Boolean(record?.root?.isConnected && !record.finished && !isBackgroundTaskId(record.groupId));
     }
 
-    function isTerminalTaskPhase(phase = '', terminal = false) {
-        return Boolean(terminal) || ['done', 'lifecycle_error'].includes(phase);
-    }
-
     function createTaskUiState(taskId) {
         if (!taskId) return null;
         const taskState = {
@@ -1024,8 +1164,11 @@ export function createChatInstance({
         if (phase) taskState.completedPhase = phase;
     }
 
-    // Logical slots that may host multiple independent cycles.
-    const REUSABLE_TASK_IDS = new Set(['bg-consciousness', 'active']);
+    // v6.82 (P5): task ids whose progress carried the supervisor's host-attested
+    // `cancelable` marker (queue tasks the cancel endpoint can genuinely reach).
+    // Learned from live WS frames and history replay alike, possibly before the
+    // card exists, so it lives beside the card records rather than on them.
+    const cancelableTaskIds = new Set();
 
     function queueTaskLiveUpdate(summary, taskId, ts, dedupeKey = '', rawTs = '') {
         const resolvedTaskId = taskId || activeLiveGroupId || '';
@@ -1073,7 +1216,10 @@ export function createChatInstance({
         const projectId = projectIdFromTask(taskId);
         record.root.dataset.projectCreating = '1';
         const actions = record.turnProjectBtn?.parentElement || record.root.querySelector('.chat-live-actions');
-        if (actions) actions.innerHTML = '<button type="button" class="chat-live-project-btn" disabled>Creating project…</button>';
+        if (actions) {
+            actions.innerHTML = '<button type="button" class="chat-live-project-btn" disabled>Creating project…</button>';
+            record.cancelRunBtn = null;
+        }
         try {
             // One-click convert (owner P1): no name prompt, no extra LLM call.
             // The SERVER derives the project name (gateway/projects.py
@@ -1099,8 +1245,148 @@ export function createChatInstance({
                     event.stopPropagation();
                     turnTaskIntoProject(record);
                 });
+                // P5: innerHTML also dropped a rendered "Cancel run" — restore it.
+                record.cancelRunBtn = null;
+                syncCancelRunButton(record);
             }
         }
+    }
+
+    // v6.82 (P5): "Cancel run" on live pooled ROOT cards. Forced cancel of the
+    // selected task AND its live subtree (explicit cascade — the endpoint's
+    // default stays single-task for headless callers). Gated on the supervisor's
+    // host-attested `cancelable` marker so a direct-chat turn (which mints a
+    // card of the same shape but has no queue entry) never shows a dead button.
+    function ensureLiveActionsEl(record) {
+        if (!record?.root
+            || record.root.dataset.projectCreated === '1'
+            || record.root.dataset.projectCreating === '1') return null;
+        let actions = record.root.querySelector('.chat-live-actions');
+        if (!actions) {
+            actions = document.createElement('div');
+            actions.className = 'chat-live-actions';
+            const timeline = record.timelineEl && record.timelineEl.parentElement === record.root
+                ? record.timelineEl
+                : null;
+            record.root.insertBefore(actions, timeline);
+        }
+        return actions;
+    }
+
+    function syncCancelRunButton(record) {
+        if (!record?.root) return;
+        const eligible = cancelRunEligibility({
+            groupId: record.groupId,
+            isSubagent: record.isSubagent,
+            finished: record.finished,
+            cancelable: cancelableTaskIds.has(record.groupId),
+            converted: record.root.dataset.projectCreated === '1',
+        });
+        const existing = record.root.querySelector('[data-cancel-run]');
+        if (!eligible) {
+            existing?.remove();
+            record.cancelRunBtn = null;
+            return;
+        }
+        if (existing) {
+            record.cancelRunBtn = existing;
+            return;
+        }
+        const actions = ensureLiveActionsEl(record);
+        if (!actions) return;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-xs btn-danger';
+        btn.dataset.cancelRun = '1';
+        btn.textContent = 'Cancel run';
+        btn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            cancelRunFromCard(record);
+        });
+        actions.appendChild(btn);
+        record.cancelRunBtn = btn;
+    }
+
+    async function cancelRunFromCard(record) {
+        const taskId = String(record?.groupId || '').trim();
+        if (!taskId || record.finished) return;
+        const confirmed = await openConfirmDialog({
+            title: 'Cancel this run?',
+            body: 'Cancel this run and all its subagents? Unfinished results and artifacts may be lost.',
+            confirmLabel: 'Cancel run',
+            cancelLabel: 'Keep running',
+            danger: true,
+        });
+        if (!confirmed) return;
+        // Completion-wins race: the task may have finished while the dialog was
+        // open — its task_done already resolved the card, nothing to cancel.
+        if (record.finished) return;
+        const btn = record.cancelRunBtn;
+        if (btn) btn.disabled = true;
+        try {
+            // Answered only after the teardown finished, so a resolved promise
+            // means the run is really down; a refusal throws and is toasted below.
+            await cancelTask(taskId, { cascade: true });
+            // Backend publication is fail-soft past the durable boundary, so a 200
+            // can arrive with the task_done event lost. Reconcile from the durable
+            // record through the same terminal seam replay uses — idempotent with
+            // a later event, so double resolution is harmless.
+            try {
+                const stored = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`).then(
+                    (resp) => (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null,
+                );
+                const status = String(stored?.status || '');
+                if (!record.finished && ['completed', 'failed', 'cancelled', 'cancel_requested', 'rejected_duplicate'].includes(status)) {
+                    finishLiveCard(taskId, taskTerminalPhase(stored));
+                }
+            } catch {
+                // The card still resolves on its own frame if one arrives.
+            }
+            // The card resolves via the existing task_done{status:"cancelled"}
+            // frames; keep the button disabled until that (or removal) happens.
+        } catch (exc) {
+            // 404 = nothing live anymore (natural completion beat the cancel):
+            // graceful no-op, the card resolves on its own terminal frame.
+            if (exc?.status === 404 || record.finished) {
+                // Completion-wins race: the run finished while the request was in
+                // flight, so there is nothing to cancel. RESYNC rather than leave a
+                // dead disabled button — the card resolves on its own terminal
+                // frame, and until then the action is simply no longer offered.
+                // `cancelableTaskIds` is the eligibility AUTHORITY — clearing the
+                // record flag alone left the button mounted and merely re-enabled.
+                cancelableTaskIds.delete(taskId);
+                record.cancelable = false;
+                syncCancelRunButton(record);
+                // REAL resync, not just button removal: 404 says the task is no
+                // longer live, but if its terminal frame was lost this card would
+                // sit "Working" forever. Ask the durable record and resolve the
+                // card through the same terminal seam replay uses.
+                try {
+                    const stored = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`).then(
+                        (resp) => (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null,
+                    );
+                    const status = String(stored?.status || '');
+                    if (record.finished || !status) return;
+                    if (['completed', 'failed', 'cancelled', 'cancel_requested', 'rejected_duplicate'].includes(status)) {
+                        finishLiveCard(taskId, taskTerminalPhase(stored));
+                    }
+                } catch {
+                    // The card still resolves on its own frame if one arrives;
+                    // nothing worse than the pre-resync behavior.
+                }
+                return;
+            }
+            showToast(`Cancel failed: ${exc?.message || exc}`, 'error');
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    function markTaskCancelable(taskId = '') {
+        const id = String(taskId || '').trim();
+        if (!id || cancelableTaskIds.has(id)) return;
+        cancelableTaskIds.add(id);
+        const record = liveCardRecords.get(id);
+        if (record) syncCancelRunButton(record);
     }
 
     // One-way conversion (P3): the WHOLE card becomes a calm "project identity"
@@ -1137,6 +1423,7 @@ export function createChatInstance({
         // calm pointer; the project panel re-renders the full tree from history.
         record.root.replaceChildren(chip);
         record.turnProjectBtn = null;
+        record.cancelRunBtn = null;
         // The task now lives in the project panel, so this card must stop counting
         // as a foreground ACTIVE task in the main chat — otherwise isForegroundLiveCard
         // keeps suppressing the typing indicator / status-badge clear until the
@@ -1206,6 +1493,7 @@ export function createChatInstance({
                         </svg>
                     </div>
                 </div>
+                <div class="chat-live-activity" data-live-activity></div>
                 <div class="chat-live-meta" data-live-meta></div>
             </button>
             ${projectActionHtml}
@@ -1218,10 +1506,14 @@ export function createChatInstance({
             phaseEl: root.querySelector('[data-live-phase]'),
             inlineTypingEl: root.querySelector('[data-live-typing]'),
             titleEl: root.querySelector('[data-live-title]'),
+            activityEl: root.querySelector('[data-live-activity]'),
             countEl: root.querySelector('[data-live-count]'),
             metaEl: root.querySelector('[data-live-meta]'),
             toggleEl: root.querySelector('[data-live-toggle]'),
             turnProjectBtn: root.querySelector('[data-turn-into-project]'),
+            // P5: "Cancel run" button element (rendered lazily by syncCancelRunButton
+            // once the host-attested cancelable marker is known for this task).
+            cancelRunBtn: null,
             timelineEl: root.querySelector('[data-live-timeline]'),
             updates: 0,
             finished: false,
@@ -1242,6 +1534,10 @@ export function createChatInstance({
             // Cluster B: the proactively-coined LLM project name; when set it becomes
             // the card title (the activity headline keeps rendering in the lines below).
             suggestedName: '',
+            // P1 (v6.82): last raw activity candidate (remembered even while the
+            // collapsed line is suppressed on unnamed root cards) + sticky cost.
+            collapsedActivity: '',
+            costMeta: null,
         };
         if (isMain && !options.isSubagent) _pendingCardObjective = '';
         record.summaryButtonEl?.addEventListener('click', () => {
@@ -1293,6 +1589,9 @@ export function createChatInstance({
             if (record.titleEl) record.titleEl.textContent = _pendingName;
         }
         resetLiveCardRecord(record);
+        // P5: the cancelable marker may have arrived (scheduled progress frame /
+        // history replay) before this card was minted.
+        syncCancelRunButton(record);
         return record;
     }
 
@@ -1318,6 +1617,29 @@ export function createChatInstance({
         if (record.isSubagent) return;
         record.suggestedName = nm;
         if (record.titleEl) record.titleEl.textContent = nm;
+        // P1 (v6.82): the collapsed activity line was suppressed while the card
+        // was unnamed; populate it now from the remembered candidate so the live
+        // task_named direct-DOM path does not depend on the next
+        // applyLiveCardState frame. (The pendingSuggestedNames drain path in
+        // createLiveCardRecord relies on the creating frame that immediately
+        // follows record creation — a fresh record has no remembered activity
+        // yet, so there is nothing for the drain itself to populate.)
+        renderCollapsedActivity(record, projectCollapsedActivity({
+            suggestedName: nm,
+            previous: record.collapsedActivity,
+        }));
+    }
+
+    // ONE renderer for the collapsed activity line: text plus the complete-text
+    // reference. Two call sites (frame updates and the late task_named path) drifted
+    // apart before, so a late-named card showed clipped text with no way back to the
+    // full narration; a suppressed line must not leak through a tooltip either.
+    function renderCollapsedActivity(record, text) {
+        if (!record?.activityEl) return;
+        record.activityEl.textContent = text;
+        const full = String(record.collapsedActivity || '');
+        if (text && full && full !== text) record.activityEl.title = full;
+        else record.activityEl.removeAttribute('title');
     }
 
     function ensureSubagentContainer(parentId = '') {
@@ -1374,6 +1696,7 @@ export function createChatInstance({
         record.lastHumanHeadline = '';
         record.expandedLineKeys.clear();
         record._anchorOrderDirty = false;
+        clearStickyCardState(record);
         record.titleEl.textContent = 'Working...';
         record.phaseEl.dataset.phase = 'working';
         record.phaseEl.textContent = 'Working';
@@ -1416,6 +1739,7 @@ export function createChatInstance({
         if (phase === 'thinking') return 'Thinking';
         if (phase === 'working') return 'Working';
         if (phase === 'done') return 'Done';
+        if (phase === 'cancelled') return 'Cancelled';
         if (phase === 'warn') return 'Notice';
         if (phase === 'error' || phase === 'timeout' || phase === 'lifecycle_error') return 'Issue';
         if (!phase) return 'Working';
@@ -1694,6 +2018,33 @@ export function createChatInstance({
         // headline still renders in the timeline lines below. Falls back to the
         // activity headline until the proactive namer has produced a name.
         record.titleEl.textContent = record.suggestedName || activeHeadline;
+        // P1 (v6.82): collapsed activity line. The raw candidate is remembered
+        // even while the line is suppressed (unnamed root card) so a late coined
+        // name can populate it without waiting for the next frame. Root cards
+        // take candidates from HUMAN frames only — terminal/lifecycle fallbacks
+        // ("Done") are phase chips, not activity, and must not overwrite or
+        // duplicate the last meaningful action.
+        // The line takes the FULL companion (fullHeadline/fullBody) whenever the
+        // summarizer carried one: `headline`/`body` are timeline PREVIEWS capped
+        // for the bounded row, and the wrapping activity line has no such bound,
+        // so reusing the preview here would be an undisclosed cut of owner-facing
+        // cognitive text (BIBLE P1 / DEVELOPMENT no-silent-truncation).
+        const rootActivityHeadline = (!record.isSubagent && summary.human)
+            ? String(summary.fullHeadline || activeHeadline || '') : '';
+        const childActivityBody = record.isSubagent
+            ? String(summary.fullBody || summary.body || '') : '';
+        const activityCandidate = String(
+            (record.isSubagent ? childActivityBody : rootActivityHeadline) || '',
+        ).trim();
+        const activityText = projectCollapsedActivity({
+            isSubagent: record.isSubagent,
+            suggestedName: record.suggestedName,
+            headline: record.isSubagent ? '' : rootActivityHeadline,
+            body: childActivityBody,
+            previous: record.collapsedActivity,
+        });
+        if (activityCandidate) record.collapsedActivity = activityCandidate;
+        renderCollapsedActivity(record, activityText);
 
         const shouldRenderLine = summary.visible !== false && Boolean(headline || summary.body);
         // Legacy parent-subagent rows update in place if replayed from old
@@ -1756,10 +2107,22 @@ export function createChatInstance({
             }
         }
         updateLiveCardCount(record);
+        // "Latest" is an ACTIVITY clock, not a bookkeeping clock: a cost-only frame
+        // (task_cost_finalized and friends carry no human narration) must not make a
+        // silent card look freshly active. Only frames that actually said something
+        // move it.
+        if (ts && (summary.human || activityCandidate)) record.latestActivityTs = ts;
+        // P1 (v6.82): sticky cost — only frames carrying task-scope accounting
+        // evidence attach a costProjection; a costless frame re-renders the
+        // previous projection instead of erasing it.
+        if (summary.costProjection) {
+            record.costMeta = mergeStickyCostMeta(record.costMeta, summary.costProjection);
+        }
         record.metaEl.innerHTML = [
             nextGroupId === 'bg-consciousness' ? 'Background thinking' : '',
             ...(Array.isArray(summary.meta) ? summary.meta : []),
-            ts ? `Latest ${ts}` : '',
+            ...((record.costMeta && Array.isArray(record.costMeta.meta)) ? record.costMeta.meta : []),
+            record.latestActivityTs ? `Latest ${record.latestActivityTs}` : '',
         ].filter(Boolean).map((item) => `<span class="chat-live-meta-text">${escapeHtml(item)}</span>`).join('');
         // Incremental updates; full rebuilds stay limited to toggles.
         const lastItem = record.items[record.items.length - 1];
@@ -1775,6 +2138,8 @@ export function createChatInstance({
         hideTypingIndicatorOnly();
         const justFinished = record.finished && !wasFinished;
         const drivesComposerStatus = !isBackgroundTaskId(nextGroupId);
+        // P5: a finished card must not keep offering "Cancel run".
+        if (justFinished) syncCancelRunButton(record);
         if (record.finished) {
             setLiveCardTypingVisible(record, false);
             markTaskComplete(nextGroupId, summary.phase || 'done');
@@ -1812,7 +2177,8 @@ export function createChatInstance({
         const wasFinished = record.finished;
         record.finished = true;
         record.root.dataset.finished = '1';
-        const activePhase = ['error', 'timeout', 'warn'].includes(phase) ? phase : 'done';
+        syncCancelRunButton(record);
+        const activePhase = ['error', 'timeout', 'warn', 'cancelled'].includes(phase) ? phase : 'done';
         record.phaseEl.dataset.phase = activePhase;
         record.phaseEl.textContent = formatLiveCardPhaseLabel(activePhase);
         record.phaseEl.className = `chat-live-phase ${activePhase}`;
@@ -1859,15 +2225,19 @@ export function createChatInstance({
         const record = liveCardRecords.get(taskId);
         const reasonCode = msg?.reason_code ? String(msg.reason_code) : '';
         const severity = taskOutcomeSeverity(msg || {});
+        const terminalPhase = taskTerminalPhase(msg || {});
         const failedResult = severity === 'error';
-        const doneHeadline = failedResult && reasonCode
-            ? `Done: ${reasonCode}`
-            : (severity === 'warn'
-                ? (reasonCode ? `Finished with warnings: ${reasonCode}` : 'Finished with warnings')
-                : ((record && record.lastHumanHeadline) || 'Done'));
+        // P5: a cancelled root says "Cancelled", never a generic "Done" headline.
+        const doneHeadline = severity === 'cancelled'
+            ? 'Cancelled'
+            : (failedResult && reasonCode
+                ? `Done: ${reasonCode}`
+                : (severity === 'warn'
+                    ? (reasonCode ? `Finished with warnings: ${reasonCode}` : 'Finished with warnings')
+                    : ((record && record.lastHumanHeadline) || 'Done')));
         applyLiveCardState(
             {
-                phase: severity === 'warn' ? 'warn' : (failedResult ? 'error' : 'done'),
+                phase: terminalPhase,
                 headline: doneHeadline,
                 body: reviewDetails,
                 visible: Boolean(reviewDetails),
@@ -1875,14 +2245,14 @@ export function createChatInstance({
                 promote: true,
                 terminal: true,
                 expandByDefault: Boolean(reviewDetails),
-                meta: taskCostMeta(msg),
+                costProjection: taskCostProjection(msg, rawTs),
             },
             taskId,
             normalizeLogTs(rawTs),
             `task_done|${taskId}`,
             { suppressDomInsert, rawTs },
         );
-        finishLiveCard(taskId, severity === 'warn' ? 'warn' : (failedResult ? 'error' : 'done'));
+        finishLiveCard(taskId, terminalPhase);
         scheduleTaskUiCleanup(taskState);
     }
 
@@ -1896,7 +2266,9 @@ export function createChatInstance({
 
     const SUBAGENT_EVENT_PHASE = {
         scheduled: 'start', running: 'working', completed: 'done', completed_warn: 'warn',
-        failed: 'error', rejected: 'warn', cancelled: 'warn', interrupted: 'warn',
+        // 'cancelled' is a first-class terminal phase (v6.82 P5) — a cancelled
+        // child must read as Cancelled, not as a generic amber "Notice".
+        failed: 'error', rejected: 'warn', cancelled: 'cancelled', interrupted: 'warn',
     };
     const SUBAGENT_EVENT_LABEL = {
         scheduled: 'scheduled', running: 'running', completed: 'done', completed_warn: 'done with warnings',
@@ -1932,6 +2304,15 @@ export function createChatInstance({
         const rawTs = msg?.ts || new Date().toISOString();
         if (registerEphemeralDecisionFrame(msg)) return;
         if (!taskId) return;
+        // P5: host-attested cancelable marker (live WS frames AND history replay —
+        // progress rows persist it through _PROGRESS_META_FIELDS). The supervisor
+        // stamps it ONLY on lineage-resolved non-subagent ROOTS (with the RUNNING
+        // row's authoritative lineage on the same frame), so the marker itself is
+        // the truth — re-deriving rootness from frame shape here would wrongly
+        // reject a timeout-retry root, whose root_task_id names the ORIGINAL task
+        // while the endpoint can cancel its current id. A direct-chat turn never
+        // carries the marker.
+        if (msg?.cancelable === true && msg?.task_id) markTaskCancelable(String(msg.task_id));
         // Subagent lifecycle pings render as child cards linked to the parent;
         // they must not update the parent card's terminal state.
         const lifecycleParent = String(msg?.parent_task_id || '').trim();
@@ -1977,7 +2358,7 @@ export function createChatInstance({
             lifecycle: msg?.lifecycle || null,
         });
         if (!summary) return;
-        const presented = withTaskCostMeta(summary, msg);
+        const presented = withTaskCostMeta(summary, msg, { rawTs });
         queueTaskLiveUpdate(presented, taskId, normalizeLogTs(rawTs), presented.dedupeKey || '', rawTs);
         // Cluster B: history progress recs carry the coined name (live progress does
         // not — the live path uses the separate `task_named` event). Apply it after the
@@ -2028,7 +2409,6 @@ export function createChatInstance({
         if (evt.error) detailParts.push(`[ERROR]\n${String(evt.error)}`);
         const metaBits = [`child=${shortChild}`];
         if (role) metaBits.push(`role=${role}`);
-        metaBits.push(...taskCostMeta(evt));
         forceTaskCard(parentId, tsValue);
         const childState = getTaskUiState(childId, true);
         if (childState && !childState.completed) childState.forceCard = true;
@@ -2042,17 +2422,43 @@ export function createChatInstance({
             promote: true,
             expandByDefault: Boolean(reviewDetails),
             meta: metaBits,
+            costProjection: taskCostProjection(evt, tsValue),
             dedupeKey: `subagent-lifecycle:${childId}`,
             terminal: ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(event),
         }, childId, normalizeLogTs(tsValue || new Date().toISOString()), `subagent-lifecycle:${childId}`, tsValue);
         return true;
     }
 
+    // Record a terminal child's latest narration as its collapsed activity
+    // without touching phase, timeline or finished state (P1, v6.82).
+    function rememberSubagentActivity(childId, msg) {
+        const record = liveCardRecords.get(childId);
+        if (!record || !record.activityEl) return;
+        const line = String(msg?.content || msg?.text || '').trim().split('\n').filter(Boolean).pop() || '';
+        if (!line) return;
+        // The complete line is kept: this is owner-facing cognitive text, and the
+        // CSS wraps it (`overflow-wrap:anywhere`), so a hardcoded slice here would
+        // be an undisclosed cut (BIBLE P1 / DEVELOPMENT no-silent-truncation).
+        record.collapsedActivity = line;
+        renderCollapsedActivity(record, projectCollapsedActivity({
+            isSubagent: true,
+            body: record.collapsedActivity,
+            previous: record.collapsedActivity,
+        }));
+    }
+
     // A known child's own (non-lifecycle) progress updates the linked child card.
     function routeSubagentProgressToCard(childId, msg) {
         const info = subagentChildParents.get(childId);
         if (!info) return;
-        if (subagentTerminalChildren.has(childId)) return;  // never revive a finished child
+        if (subagentTerminalChildren.has(childId)) {
+            // Never revive a finished child's phase/timeline — but its last
+            // narration is still its collapsed activity (P1, v6.82): on replay
+            // terminal children are pre-marked before pass 1, so without this a
+            // finished child card would show an empty activity line.
+            rememberSubagentActivity(childId, msg);
+            return;
+        }
         const { parentId, role, model } = info;
         const shortChild = String(childId).slice(0, 8);
         const line = String(msg?.content || msg?.text || '').trim().split('\n').filter(Boolean).pop() || '';
@@ -2068,6 +2474,9 @@ export function createChatInstance({
             phase: 'working',
             headline,
             body: line.slice(0, 200),
+            // The timeline row stays a bounded preview; the collapsed activity
+            // line reads this uncut companion instead (P1: no silent cut).
+            fullBody: line,
             visible: true,
             promote: true,
             meta,
@@ -2086,7 +2495,7 @@ export function createChatInstance({
         forceTaskCard(parentId, rawTs);
         const record = getSubagentCardRecord(childId, parentId, role);
         const priorTerminalPhase = record?.finished ? String(record.phaseEl?.dataset?.phase || '') : '';
-        const resultPhase = ['warn', 'error'].includes(priorTerminalPhase) ? priorTerminalPhase : 'done';
+        const resultPhase = ['warn', 'error', 'cancelled'].includes(priorTerminalPhase) ? priorTerminalPhase : 'done';
         const meta = [`child=${shortChild}`];
         if (role) meta.push(`role=${role}`);
         queueTaskLiveUpdate({
@@ -2171,6 +2580,7 @@ export function createChatInstance({
             if (info) getSubagentCardRecord(taskId, info.parentId, info.role);
             const presented = withTaskCostMeta(summary, evt, {
                 replace: eventType === 'task_done' || eventType === 'task_cost_finalized',
+                rawTs,
             });
             queueTaskLiveUpdate(presented, taskId, normalizeLogTs(rawTs), presented.dedupeKey || '', rawTs);
             return;
@@ -2195,6 +2605,7 @@ export function createChatInstance({
         if (!summary) return;
         const presented = withTaskCostMeta(summary, evt, {
             replace: eventType === 'task_done' || eventType === 'task_cost_finalized',
+            rawTs,
         });
         queueTaskLiveUpdate(presented, taskId, normalizeLogTs(rawTs), presented.dedupeKey || '', rawTs);
         updateSubagentCardFromEvent(evt, rawTs);
@@ -2477,7 +2888,7 @@ export function createChatInstance({
                         const hadToolCalls = (msg.tool_calls || 0) > 0;
                         const hadMultipleRounds = (msg.rounds || 0) > 1;
                         const severity = taskOutcomeSeverity(msg);
-                        const needsVisibleTerminal = severity === 'error' || severity === 'warn';
+                        const needsVisibleTerminal = severity === 'error' || severity === 'warn' || severity === 'cancelled';
                         if (hadToolCalls || hadMultipleRounds || needsVisibleTerminal) {
                             const taskState = getTaskUiState(taskId, true);
                             if (taskState) taskState.forceCard = true;
@@ -2575,8 +2986,9 @@ export function createChatInstance({
                         if (terminalRecord.outcome_axes || terminalRecord.review_projection || terminalRecord.reason_code) {
                             appendTaskSummaryToLiveCard(terminalRecord);
                         } else {
-                            const severity = taskOutcomeSeverity(terminalRecord);
-                            finishLiveCard(tid, severity === 'warn' ? 'warn' : (severity === 'error' ? 'error' : 'done'));
+                            // P5: shared terminal mapping — a cancelled root replays
+                            // as "Cancelled", never as a generic "Done".
+                            finishLiveCard(tid, taskTerminalPhase(terminalRecord));
                         }
                     }
                 }

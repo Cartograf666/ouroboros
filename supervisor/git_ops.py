@@ -194,8 +194,12 @@ def _clear_update_intent() -> None:
         log.warning("Failed to clear update intent marker", exc_info=True)
 
 def git_capture(cmd: List[str]) -> Tuple[int, str, str]:
+    # Same reason as utils.run_cmd: this stderr is PARSED (`_maybe_repair_git_index`
+    # matches English git diagnostics), so the operator's locale must not decide
+    # whether a repairable index error is recognised.
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
     for _attempt in range(2):
-        r = subprocess.run(cmd, cwd=str(REPO_DIR), capture_output=True, text=True)
+        r = subprocess.run(cmd, cwd=str(REPO_DIR), capture_output=True, text=True, env=env)
         stderr = (r.stderr or "").strip()
         if r.returncode == 0:
             return r.returncode, (r.stdout or "").strip(), stderr

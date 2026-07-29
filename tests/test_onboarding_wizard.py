@@ -267,9 +267,9 @@ def test_build_onboarding_html_contains_multistep_markers():
     assert "Choose review mode" in html
     assert "Set your budget" in html
     assert "Local model settings" in html
-    assert "openai::gpt-5.5" in html
-    assert "openai::gpt-5.4-mini" in html
-    assert "anthropic::claude-sonnet-4-6" in html
+    assert "openai::gpt-5.6-terra" in html
+    assert "openai::gpt-5.6-luna" in html
+    assert "anthropic::claude-sonnet-5" in html
     assert "OPENAI_BASE_URL: ''" not in html
     assert "OPENAI_COMPATIBLE_API_KEY: ''" not in html
     assert "OPENAI_COMPATIBLE_BASE_URL: ''" not in html
@@ -299,6 +299,38 @@ def test_build_onboarding_html_adapts_to_multi_provider_access():
     assert "LOCAL_ROUTING_MODE: trim(state.localSource) ? (trim(state.localRoutingMode) || 'cloud') : 'cloud'" in html
 
 
+def test_setup_contract_groups_rarely_used_providers():
+    """The provider-field ``group`` column drives the onboarding layout:
+    Cloud.ru and both OpenAI-compatible fields collapse under "More options"
+    while OpenRouter stays pinned at index 0 of the always-visible group."""
+    contract = build_setup_contract("web")
+    fields = contract["providerFields"]
+
+    assert fields[0]["settingKey"] == "OPENROUTER_API_KEY"
+    assert {field["settingKey"]: field["group"] for field in fields} == {
+        "OPENROUTER_API_KEY": "primary",
+        "OPENAI_API_KEY": "primary",
+        "CLOUDRU_FOUNDATION_MODELS_API_KEY": "more",
+        "ANTHROPIC_API_KEY": "primary",
+        "OPENAI_COMPATIBLE_BASE_URL": "more",
+        "OPENAI_COMPATIBLE_API_KEY": "more",
+    }
+
+
+def test_build_onboarding_html_collapses_rarely_used_providers():
+    html = build_onboarding_html({})
+
+    # Second access-step collapse hosting the "more" provider group.
+    assert 'data-collapse="more-providers"' in html
+    assert 'data-collapse="local-model"' in html
+    assert "More options" in html
+    assert "hasMoreProviderValue()" in html
+    # Both collapses bind through scoped data-collapse selectors; the old
+    # singular selector only ever reached the FIRST details element.
+    assert "root.querySelector('.wizard-collapse')" not in html
+    assert "moreProvidersOpen" in html
+
+
 def test_setup_contract_has_no_secret_values():
     contract = build_setup_contract("web")
     text = repr(contract)
@@ -315,8 +347,8 @@ def test_setup_contract_has_no_secret_values():
     assert "sk-or-v1-super-secret" not in text
     assert "sk-ant-super-secret" not in text
     suggestions = build_setup_bootstrap({}, "web")["modelSuggestions"]
-    assert "anthropic/claude-opus-4.7" in suggestions
-    assert "anthropic::claude-opus-4-7" in suggestions
+    assert "anthropic/claude-sonnet-5" in suggestions
+    assert "anthropic::claude-sonnet-5" in suggestions
 
 
 def test_api_settings_exposes_setup_contract_without_secrets(tmp_path):
@@ -406,3 +438,138 @@ def test_onboarding_overlay_surfaces_restart_required_message():
     assert "showRestartRequiredOverlay" in source
     assert "event.data.restart_required" in source
     assert "Continue in current mode" in source
+
+
+# --- v6.82.0 rev.3-2: the wizard save authors safety "light" for NEW installs ---
+
+
+def _fresh_settings_path(monkeypatch, tmp_path):
+    from ouroboros import config as cfg
+
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", tmp_path / "settings.json")
+    return cfg
+
+
+def test_fresh_install_is_eligible_for_light_but_the_shared_validator_never_authors_it(
+    monkeypatch, tmp_path,
+):
+    """A fresh install (no settings file) is ELIGIBLE for the new-install "light"
+    coverage, but only the DESKTOP launcher authors it: the shared validator is also
+    the web/Docker path, which posts through the non-owner generic /api/settings.
+    SETTINGS_DEFAULTS itself stays "full" (rev.3-2)."""
+    from ouroboros.config import SETTINGS_DEFAULTS
+    from ouroboros.settings_setup_contract import wizard_authors_safety_light
+
+    assert SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MODE"] == "full"
+    _fresh_settings_path(monkeypatch, tmp_path)  # no file on disk
+    assert wizard_authors_safety_light() is True
+
+    payload = _base_payload()
+    payload["OPENAI_API_KEY"] = "sk-openai-1234567890"
+    prepared, error = prepare_onboarding_settings(payload, {"OUROBOROS_SAFETY_MODE": "full"})
+
+    assert error is None
+    # The validator passes the CURRENT value through untouched — no authorship here.
+    assert prepared["OUROBOROS_SAFETY_MODE"] == "full"
+
+
+def test_wizard_save_respects_explicitly_stored_safety_mode(monkeypatch, tmp_path):
+    """An install whose settings file explicitly carries a safety mode keeps it —
+    re-running the wizard never lowers (or raises) an explicit owner choice."""
+    import json
+
+    cfg = _fresh_settings_path(monkeypatch, tmp_path)
+    cfg.SETTINGS_PATH.write_text(json.dumps({"OUROBOROS_SAFETY_MODE": "full"}), encoding="utf-8")
+
+    payload = _base_payload()
+    payload["OPENAI_API_KEY"] = "sk-openai-1234567890"
+    prepared, error = prepare_onboarding_settings(payload, {"OUROBOROS_SAFETY_MODE": "full"})
+
+    assert error is None
+    assert prepared["OUROBOROS_SAFETY_MODE"] == "full"
+
+
+def test_wizard_authored_light_persists_and_generic_save_still_refuses(monkeypatch, tmp_path):
+    """End-to-end persist seam: the launcher's wizard save names the key as authored
+    and is allowed past the full->light ratchet; a plain (non-authored) save of the
+    same lowering keeps raising PermissionError (the ratchet is untouched)."""
+    import json
+
+    from ouroboros import config as cfg
+
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    monkeypatch.delenv("OUROBOROS_SAFETY_MODE", raising=False)
+
+    with pytest.raises(PermissionError, match="OUROBOROS_SAFETY_MODE lowering refused"):
+        cfg.save_settings({"OUROBOROS_SAFETY_MODE": "light", "TOTAL_BUDGET": 10})
+
+    cfg.save_settings(
+        {"OUROBOROS_SAFETY_MODE": "light", "TOTAL_BUDGET": 10},
+        onboarding_safety_default=True,
+    )
+    stored = json.loads(cfg.SETTINGS_PATH.read_text(encoding="utf-8"))
+    assert stored["OUROBOROS_SAFETY_MODE"] == "light"
+
+    # The narrow flag authorizes EXACTLY the fresh-install light authorship: once a
+    # settings file exists it cannot lower again, and it can never authorize "off".
+    with pytest.raises(PermissionError, match="OUROBOROS_SAFETY_MODE lowering refused"):
+        cfg.save_settings(
+            {"OUROBOROS_SAFETY_MODE": "off", "TOTAL_BUDGET": 10},
+            onboarding_safety_default=True,
+        )
+    cfg.SETTINGS_PATH.unlink()
+    with pytest.raises(PermissionError, match="OUROBOROS_SAFETY_MODE lowering refused"):
+        cfg.save_settings(
+            {"OUROBOROS_SAFETY_MODE": "off", "TOTAL_BUDGET": 10},
+            onboarding_safety_default=True,
+        )
+
+
+def test_web_onboarding_host_never_authors_light(monkeypatch, tmp_path):
+    """The web/Docker wizard posts the SAME payload through generic /api/settings,
+    which drops the owner-only safety key — so a fresh web setup keeps Full. Pinned
+    because the shared validator (used by both hosts) must never author it."""
+    from ouroboros.gateway import settings as gw_settings
+
+    _fresh_settings_path(monkeypatch, tmp_path)
+    payload = _base_payload()
+    payload["OPENAI_API_KEY"] = "sk-openai-1234567890"
+    prepared, error = prepare_onboarding_settings(payload, {"OUROBOROS_SAFETY_MODE": "full"})
+    assert error is None
+    assert prepared["OUROBOROS_SAFETY_MODE"] == "full"
+    # And the generic settings surface (the web wizard's save path) drops the key.
+    source = pathlib.Path(gw_settings.__file__).read_text(encoding="utf-8")
+    assert '"OUROBOROS_SAFETY_MODE",' in source
+
+
+def test_settings_save_refuses_lock_timeout_without_deleting_the_owner_lock(
+    monkeypatch, tmp_path,
+):
+    """A contending writer keeps both its lock and the prior settings bytes."""
+    from ouroboros import config as cfg
+
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text('{"TOTAL_BUDGET": 7}', encoding="utf-8")
+    lock_path = tmp_path / "settings.json.lock"
+    lock_path.write_text("other-writer", encoding="utf-8")
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "_acquire_settings_lock", lambda timeout=2.0: None)
+
+    with pytest.raises(TimeoutError, match="settings lock"):
+        cfg.save_settings({"TOTAL_BUDGET": 99})
+
+    assert settings_path.read_text(encoding="utf-8") == '{"TOTAL_BUDGET": 7}'
+    assert lock_path.read_text(encoding="utf-8") == "other-writer"
+
+
+def test_launcher_binds_the_settings_writer_the_wizard_callback_calls():
+    """The desktop wizard save callback calls `save_settings(...)` directly; pin that
+    the name is BOUND in launcher's namespace (a NameError there would break every
+    fresh desktop onboarding, and launcher.py is outside most deterministic gates)."""
+    import launcher
+
+    assert callable(getattr(launcher, "save_settings", None))
+    source = pathlib.Path(launcher.__file__).read_text(encoding="utf-8")
+    assert "onboarding_safety_default=wizard_authors_safety" in source

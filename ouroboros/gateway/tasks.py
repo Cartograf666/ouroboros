@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import pathlib
 import time
 import uuid
@@ -56,6 +57,8 @@ from ouroboros.workspace_preflight import (
 )
 from ouroboros.workspace_executor import normalize_executor_ref
 
+
+log = logging.getLogger(__name__)
 
 _LOG_SOURCES = (
     ("progress", ("logs", "progress.jsonl")),
@@ -541,20 +544,150 @@ async def api_task_artifact(request: Request):
     return FileResponse(path)
 
 
+def _record_cascade_incident(task_id: str, kind: str, detail: str = "") -> None:
+    """Durably record a cascade outcome the owner must be able to see.
+
+    The client already holds ``ok:true`` and the card only resolves on a real
+    ``task_done``, so a cascade that RAISED or that cancelled NOTHING is a silent
+    lie unless it is recorded. Both land on the supervisor's own drive root (the
+    same log every other cancel artifact uses) and are pushed to the live owner
+    surfaces when a bridge exists.
+    """
+    row = {"type": kind, "task_id": task_id}
+    if detail:
+        row["error"] = detail
+    try:
+        from supervisor import queue as supervisor_queue
+        from ouroboros.utils import append_jsonl, utc_now_iso
+
+        append_jsonl(
+            pathlib.Path(supervisor_queue.DRIVE_ROOT) / "logs" / "supervisor.jsonl",
+            {"ts": utc_now_iso(), **row},
+        )
+    except Exception:
+        log.debug("Failed to persist cascade cancel incident for %s", task_id, exc_info=True)
+    try:
+        from supervisor.message_bus import try_get_bridge
+
+        bridge = try_get_bridge()
+        if bridge is not None:
+            from ouroboros.utils import utc_now_iso
+
+            bridge.push_log({"ts": utc_now_iso(), **row})
+    except Exception:
+        log.debug("Failed to surface cascade cancel incident for %s", task_id, exc_info=True)
+
+
+def _run_cascade_cancel(task_id: str) -> bool:
+    """Subtree cancel for the HTTP cascade path, AWAITED by its caller.
+
+    Returns True when the subtree is settled — cancelled, or already terminal
+    (the benign completion-wins race) — and False when the teardown failed or
+    refused while the tree is STILL live, which the endpoint reports rather than
+    answering ok:true for a cancellation that did not happen. Failures stay
+    durable and owner-visible as incidents either way.
+    """
+    try:
+        from supervisor.queue import cancel_task_by_id
+
+        if not cancel_task_by_id(task_id, cascade=True):
+            # A cascade that cancelled nothing is only an incident when the subtree
+            # is STILL live: the ordinary completion-wins race (the task reached
+            # terminal between the pre-check and this call) is the benign case the
+            # UI already handles, and reporting it would train the owner to ignore
+            # the real "refused to cancel" signal.
+            from supervisor.task_lifecycle import task_subtree_is_live
+
+            if task_subtree_is_live(task_id):
+                _record_cascade_incident(task_id, "task_cancel_cascade_noop")
+                return False
+        return True
+    except Exception as exc:
+        log.warning("Cascade cancel failed for %s", task_id, exc_info=True)
+        _record_cascade_incident(task_id, "task_cancel_cascade_error", repr(exc))
+        return False
+
+
+# Sentinel telling "the body did not parse" apart from a legitimate JSON null.
+_NO_BODY = object()
+
+
 async def api_task_cancel(request: Request) -> JSONResponse:
     try:
         task_id = validate_task_id(request.path_params.get("task_id"))
     except ValueError as exc:
         return json_error(str(exc), 400)
-    try:
-        from supervisor.queue import cancel_task_by_id
+    # Optional JSON body {"cascade": true} (v6.82): cancel the task AND its
+    # atomically-snapshotted live subtree, answering only once that teardown has
+    # finished. An absent/empty body keeps today's single-task behavior
+    # byte-identical for headless callers (the CLI posts {}).
+    # An ABSENT body keeps the legacy single-task path; a body that is PRESENT but
+    # unparseable (or not a JSON object) is a client error. Collapsing the two would
+    # answer a malformed cascade request by quietly cancelling only the root and
+    # leaving its descendants running.
+    raw_body = (await request.body()) or b""
+    if raw_body.strip():
+        body = await request_json_or(request, _NO_BODY)
+        if body is _NO_BODY or not isinstance(body, dict):
+            return json_error("request body must be a JSON object", 400, task_id=task_id)
+    else:
+        body = {}
+    # STRICT boolean (DEVELOPMENT.md): a string "false" must never select the
+    # destructive subtree path, and a non-boolean value is a client error rather
+    # than a silent single-task cancel.
+    raw_cascade = body.get("cascade")
+    if raw_cascade is not None and not isinstance(raw_cascade, bool):
+        return json_error("cascade must be a boolean", 400, task_id=task_id)
+    cascade = raw_cascade is True
+    if not cascade:
+        try:
+            from supervisor.queue import (
+                CANCEL_CANCELLED, CANCEL_FAILED, cancel_task_custody,
+            )
 
-        ok = cancel_task_by_id(task_id)
+            # The TYPED outcome, not a boolean: a task whose worker refused to die
+            # is neither cancelled nor absent, and answering 404 for it would tell
+            # the caller the task is gone while it keeps running.
+            outcome = await asyncio.to_thread(cancel_task_custody, task_id)
+        except Exception as exc:
+            return json_exception(exc, 503)
+        if outcome == CANCEL_FAILED:
+            return json_error(
+                "cancellation did not settle; the task is still live",
+                503, task_id=task_id,
+            )
+        if outcome != CANCEL_CANCELLED:
+            # LEGACY CONTRACT preserved: the plain path has always answered 404 for
+            # an INACTIVE task, and one that already settled on its own is exactly
+            # that — the typed outcome must not silently widen the envelope.
+            return json_error("task not found or not active", 404, task_id=task_id)
+        return JSONResponse({"ok": True, "task_id": task_id})
+    # Cascade path: ONE synchronous transaction. The caller is answered only once
+    # the subtree is actually torn down, which is what makes the whole
+    # split-transaction family (durable pre-acknowledgement latch, partial-latch
+    # taxonomy, ownership handed to a background teardown, rollbacks that could
+    # withdraw a concurrent cascade's fences) unnecessary rather than merely
+    # guarded. The cost is honest and bounded: a large tree makes the caller wait
+    # for the worker kills and joins it asked for. Off the event loop; process
+    # kills and joins deliberately happen outside the supervisor queue lock. Repeats are
+    # idempotent (the per-task cancel finalizes-on-miss) and a fully-cancelled tree
+    # is no longer live, so it answers 404 like any other inactive task.
+    try:
+        from supervisor.task_lifecycle import task_subtree_is_live
+
+        if not await asyncio.to_thread(task_subtree_is_live, task_id):
+            return json_error("task not found or not active", 404, task_id=task_id)
+        settled = await asyncio.to_thread(_run_cascade_cancel, task_id)
+        if not settled:
+            # The teardown refused or failed while the subtree is STILL live: an
+            # ok:true here would report a cancellation that did not happen.
+            return json_error(
+                "subtree cancellation did not settle; the tree is still live",
+                503, task_id=task_id,
+            )
     except Exception as exc:
         return json_exception(exc, 503)
-    if not ok:
-        return json_error("task not found or not active", 404, task_id=task_id)
-    return JSONResponse({"ok": True, "task_id": task_id})
+    return JSONResponse({"ok": True, "task_id": task_id, "cascade": True})
 
 
 async def api_task_resume(request: Request) -> JSONResponse:

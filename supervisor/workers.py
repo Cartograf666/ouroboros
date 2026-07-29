@@ -438,6 +438,13 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
             _broadcast_task_named({"type": "task_named", "task_id": tid, "suggested_name": title})
         except Exception:
             log.debug("promote: suggested_name persist/broadcast failed for %s", tid, exc_info=True)
+    # v6.82 (P5) disclosed residual: a PROMOTED root carries the host-attested
+    # `cancelable` marker from its first RUNNING relay, not from enqueue — the
+    # promote path emits no owner-facing progress frame of its own, and minting a
+    # marker-only bubble would either add chat noise or bypass the canonical
+    # message seam (tests/test_heartbeat_presentation.py). While it is still
+    # PENDING the Dashboard Activity row cancels it; the card action appears once
+    # it starts.
     return {"status": "scheduled", "task_id": tid}
 
 

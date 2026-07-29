@@ -481,7 +481,13 @@ def estimate_tokens(text: str) -> int:
 
 
 def run_cmd(cmd: List[str], cwd: Optional[pathlib.Path] = None) -> str:
-    res = subprocess.run(cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True)
+    # Tool output is PARSED (git error signatures, porcelain text), so it must not
+    # depend on the operator's locale: a Russian-locale git answers «метка … уже
+    # существует» where the code and its tests match "already exists".
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    res = subprocess.run(
+        cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True, env=env,
+    )
     if res.returncode != 0:
         raise RuntimeError(
             f"Command failed: {' '.join(cmd)}\n\nSTDOUT:\n{res.stdout}\n\nSTDERR:\n{res.stderr}"

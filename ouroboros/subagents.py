@@ -68,10 +68,20 @@ def _use_local_for_lane(lane: str, model: str) -> bool:
     if not pair:
         return False
     model_key, local_key = pair
-    slot_value = str(os.environ.get(model_key, "") or SETTINGS_DEFAULTS.get(model_key, "") or "").strip()
-    if not slot_value and lane in {"heavy", "light"}:
-        # Empty Heavy/Light resolves to the Main model -> follow Main's local flag, so
-        # USE_LOCAL_MAIN governs the effective model rather than being silently ignored.
+    # ENV PRESENCE decides, not string equality: an absent/empty Heavy or Light slot
+    # is the inherit-from-Main case even when Main happens to equal that slot's
+    # shipped default, so substituting the default here would silently demand the
+    # lane's own local flag for a lane that is really running Main.
+    env_slot = str(os.environ.get(model_key, "") or "").strip()
+    slot_value = env_slot if lane in {"heavy", "light"} else (
+        env_slot or str(SETTINGS_DEFAULTS.get(model_key, "") or "").strip()
+    )
+    if lane in {"heavy", "light"} and (not slot_value or (model and model != slot_value)):
+        # A Heavy/Light lane that RESOLVED TO THE MAIN MODEL — because its slot is
+        # empty, or because the slot value is not what the lane actually runs —
+        # follows Main's local flag, so USE_LOCAL_MAIN governs the effective model
+        # rather than being silently ignored (v6.82: Light ships a real default, so
+        # "empty slot" alone no longer identifies the inherit-from-Main case).
         return _use_local_for_lane("main", model)
     return (
         bool(model)

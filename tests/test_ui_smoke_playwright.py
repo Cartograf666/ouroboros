@@ -1019,6 +1019,82 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
 
 
 @pytest.mark.ui_browser
+def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(direct_server_with_data):
+    """v6.82 P1: a collapsed NAMED card shows the latest activity in the
+    dedicated [data-live-activity] line under the coined title; an UNNAMED card
+    hides the line (its title already shows the activity — no duplication)."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    data_dir = direct_server_with_data["data_dir"]
+    logs_dir = data_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "chat.jsonl").write_text("", encoding="utf-8")
+    (logs_dir / "progress.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-07-29T10:00:00+00:00",
+            "chat_id": 1,
+            "task_id": "named-act",
+            "content": "Analyzing the dataset",
+        }) + "\n" + json.dumps({
+            "ts": "2026-07-29T10:00:01+00:00",
+            "chat_id": 1,
+            "task_id": "unnamed-act",
+            "content": "Doing things without a name",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    task_results = data_dir / "task_results"
+    task_results.mkdir(parents=True, exist_ok=True)
+    (task_results / "named-act.json").write_text(json.dumps({
+        "task_id": "named-act",
+        "status": "completed",
+        "suggested_name": "Data Analysis",
+        "cost_usd": 0.42,
+        "cost_accounting_status": "available",
+        "cost_final": True,
+    }) + "\n", encoding="utf-8")
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                named = page.locator('.chat-live-card[data-task-id="named-act"]')
+                named.wait_for(state="attached", timeout=30_000)
+                unnamed = page.locator('.chat-live-card[data-task-id="unnamed-act"]')
+                unnamed.wait_for(state="attached", timeout=30_000)
+                # The coined name holds the title; the activity line carries the
+                # latest activity and stays populated on the finished card.
+                page.wait_for_function(
+                    "() => document.querySelector('.chat-live-card[data-task-id=\"named-act\"]"
+                    " [data-live-title]')?.textContent === 'Data Analysis'",
+                    timeout=30_000,
+                )
+                named_activity = named.locator('[data-live-activity]')
+                assert named_activity.text_content().strip() == "Analyzing the dataset"
+                assert named_activity.is_visible()
+                # Sticky terminal cost renders in the meta row from the result truth.
+                assert "cost=$0.42" in named.locator('[data-live-meta]').inner_text()
+                # The unnamed card's title IS its activity; the line stays empty
+                # and takes no space (CSS :empty).
+                assert "Doing things without a name" in unnamed.locator('[data-live-title]').text_content()
+                unnamed_activity = unnamed.locator('[data-live-activity]')
+                assert unnamed_activity.text_content().strip() == ""
+                assert not unnamed_activity.is_visible()
+                page.screenshot(path=str(data_dir.parent / "collapsed-activity.png"), full_page=True)
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
 def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_server_with_data):
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
@@ -1713,6 +1789,231 @@ def test_ui_smoke_mobile_composer_toolbar_does_not_overlap_input(direct_server):
         raise
 
 
+def _drawer_swipe_binder_assertions(page) -> None:
+    """Shared body for the drawer swipe-left binder checks (any browser/device).
+
+    HONESTY NOTE: this dispatches SYNTHESIZED PointerEvents from JS, so it
+    verifies the gestures.js binder wiring (touch-only filter, pointerup
+    decision, enabled() gating, commit → setMobileDrawerOpen(false)) — it does
+    NOT exercise native touch-scroll/touch-action arbitration, which only a
+    real compositor gesture can.
+    """
+    page.wait_for_selector("#chat-input", timeout=30_000)
+    page.click("[data-mobile-nav-toggle]")
+    page.wait_for_selector("#primary-sidebar.open", timeout=5_000)
+    # A synthesized left swipe on the sidebar surface: pointerdown, a real
+    # ~40ms dwell (the binder times the gesture), then pointerup 120px left.
+    page.evaluate(
+        """async () => {
+            const sidebar = document.getElementById('primary-sidebar');
+            const fire = (type, x, y) => sidebar.dispatchEvent(new PointerEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                pointerId: 7,
+                pointerType: 'touch',
+                isPrimary: true,
+                clientX: x,
+                clientY: y,
+            }));
+            fire('pointerdown', 280, 300);
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            fire('pointerup', 160, 306);
+        }"""
+    )
+    page.wait_for_function(
+        "() => !document.getElementById('primary-sidebar').classList.contains('open')",
+        timeout=5_000,
+    )
+    # The committed swipe armed a ~400ms scoped click suppressor (a synthetic
+    # dispatch produces no matching click to consume it) — let it expire so the
+    # reopen click below is not the one it swallows.
+    page.wait_for_timeout(450)
+    # The same displacement from a MOUSE pointer must be ignored (touch-only).
+    page.click("[data-mobile-nav-toggle]")
+    page.wait_for_selector("#primary-sidebar.open", timeout=5_000)
+    still_open = page.evaluate(
+        """async () => {
+            const sidebar = document.getElementById('primary-sidebar');
+            const fire = (type, x, y) => sidebar.dispatchEvent(new PointerEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                pointerId: 8,
+                pointerType: 'mouse',
+                isPrimary: true,
+                clientX: x,
+                clientY: y,
+            }));
+            fire('pointerdown', 280, 300);
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            fire('pointerup', 160, 306);
+            return document.getElementById('primary-sidebar').classList.contains('open');
+        }"""
+    )
+    assert still_open, "mouse pointer sequence must not trigger the touch-only swipe binder"
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_mobile_drawer_swipe_left_binder_closes_drawer_synthetic_pointer(direct_server):
+    """Chromium mobile emulation: synthesized pointer swipe-left closes the drawer.
+
+    Verifies gestures.js BINDER WIRING via synthetic PointerEvents (see
+    _drawer_swipe_binder_assertions), not native gesture arbitration.
+    """
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True)
+            try:
+                page.goto(direct_server, wait_until="domcontentloaded", timeout=30_000)
+                _drawer_swipe_binder_assertions(page)
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_chromium_real_touch_closes_both_mobile_surfaces(direct_server):
+    """Compositor touch input, including hit-testing/capture/selection, closes
+    both release-triggered mobile surfaces. This complements the synthetic
+    binder unit above, which cannot reveal lost pointer capture or text
+    selection created while a finger leaves the narrow project header."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    def touch_swipe(cdp, start, end):
+        sx, sy = start
+        ex, ey = end
+        cdp.send("Input.emulateTouchFromMouseEvent", {
+            "type": "mousePressed", "x": int(sx), "y": int(sy),
+            "button": "left", "clickCount": 1,
+        })
+        for step in range(1, 7):
+            cdp.send("Input.emulateTouchFromMouseEvent", {
+                "type": "mouseMoved",
+                "x": int(sx + (ex - sx) * step / 6),
+                "y": int(sy + (ey - sy) * step / 6),
+                "button": "left", "clickCount": 1,
+            })
+        cdp.send("Input.emulateTouchFromMouseEvent", {
+            "type": "mouseReleased", "x": int(ex), "y": int(ey),
+            "button": "left", "clickCount": 1,
+        })
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={"width": 375, "height": 812},
+                is_mobile=True, has_touch=True, device_scale_factor=1,
+            )
+            page = context.new_page()
+            try:
+                page.goto(direct_server, wait_until="domcontentloaded", timeout=30_000)
+                page.wait_for_selector("#chat-input", timeout=30_000)
+                cdp = context.new_cdp_session(page)
+
+                toggle = page.locator("#page-chat [data-mobile-nav-toggle]")
+                toggle.click()
+                page.wait_for_selector("#primary-sidebar.open", timeout=5_000)
+                page.wait_for_timeout(250)  # finish the 180ms drawer transition
+                sidebar = page.locator("#primary-sidebar").bounding_box()
+                assert sidebar
+                touch_swipe(
+                    cdp,
+                    (min(sidebar["x"] + sidebar["width"] - 20, 300), sidebar["y"] + 220),
+                    (sidebar["x"] + 25, sidebar["y"] + 220),
+                )
+                page.wait_for_function(
+                    "() => !document.body.classList.contains('nav-drawer-open')",
+                    timeout=5_000,
+                )
+                page.wait_for_timeout(250)
+
+                created = page.evaluate(
+                    """async () => {
+                        const response = await fetch('/api/projects', {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({id: 'touch-project', name: 'Touch Project'}),
+                        });
+                        return {ok: response.ok, body: await response.json()};
+                    }"""
+                )
+                assert created["ok"], created
+                page.reload(wait_until="domcontentloaded", timeout=30_000)
+                toggle = page.locator("#page-chat [data-mobile-nav-toggle]")
+                toggle.click()
+                page.wait_for_timeout(250)
+                project = page.locator('[data-project-id="touch-project"]')
+                project.wait_for(state="visible", timeout=30_000)
+                project.click()
+                page.wait_for_function(
+                    "() => document.body.classList.contains('project-panel-open')",
+                    timeout=5_000,
+                )
+                page.wait_for_timeout(350)
+                bar = page.locator(".project-panel-bar").bounding_box()
+                assert bar
+                touch_swipe(
+                    cdp,
+                    (bar["x"] + bar["width"] / 2, bar["y"] + 15),
+                    (bar["x"] + bar["width"] / 2, bar["y"] + 180),
+                )
+                page.wait_for_function(
+                    "() => !document.body.classList.contains('project-panel-open')",
+                    timeout=5_000,
+                )
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_webkit_iphone_drawer_swipe_left_binder_synthetic_pointer(direct_server):
+    """WebKit + iPhone descriptor: same synthetic-pointer BINDER wiring check.
+
+    Skips cleanly when the local Playwright install has no WebKit build.
+    """
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    try:
+        with sync_playwright() as pw:
+            iphone = pw.devices.get("iPhone 13")
+            if not iphone:
+                pytest.skip("Playwright iPhone 13 device descriptor unavailable")
+            try:
+                browser = pw.webkit.launch(headless=True)
+            except PlaywrightError as exc:
+                if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+                    pytest.skip(f"Playwright WebKit browser is not installed: {exc}")
+                raise
+            context = browser.new_context(**iphone)
+            page = context.new_page()
+            try:
+                page.goto(direct_server, wait_until="domcontentloaded", timeout=30_000)
+                _drawer_swipe_binder_assertions(page)
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
 @pytest.mark.ui_browser
 def test_ui_smoke_direct_mode_chat_scrolls_on_desktop(direct_server):
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
@@ -2290,6 +2591,99 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
                     if str(entry.get("model") or "") == "openai-compatible::scope-reviewer-x"
                 ]
                 assert acked, "no route-scoped capability evidence was stored for the acked reviewer"
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_server_with_data):
+    """v6.82 P5: "Cancel run" renders ONLY on live marker-attested root cards
+    (never on marker-less direct-turn-shaped cards, subagent children, or the
+    reusable background slot), opens a confirm dialog, and a cancelled root
+    replays as an honest warn-toned "Cancelled" — never a generic "Done"."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    data_dir = direct_server_with_data["data_dir"]
+    logs_dir = data_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "chat.jsonl").write_text("", encoding="utf-8")
+    rows = [
+        # Pooled live root: carries the supervisor's host-attested marker.
+        {"ts": "2026-07-29T10:00:00+00:00", "chat_id": 1, "task_id": "live-root",
+         "content": "Working on the big thing", "cancelable": True},
+        # Direct-chat-turn shape: same card shape, NO marker -> no button.
+        {"ts": "2026-07-29T10:00:01+00:00", "chat_id": 1, "task_id": "direct-turn",
+         "content": "Inline turn narration"},
+        # Subagent child of the live root: marker present but child cards never
+        # offer the action (the root cascade covers them).
+        {"ts": "2026-07-29T10:00:02+00:00", "chat_id": 1, "task_id": "sub-child1",
+         "content": "Collecting evidence", "delegation_role": "subagent",
+         "subagent_event": "scheduled", "subagent_task_id": "sub-child1",
+         "parent_task_id": "live-root", "subagent_role": "researcher",
+         "cancelable": True},
+        # Reusable background-consciousness slot: never eligible.
+        {"ts": "2026-07-29T10:00:03+00:00", "chat_id": 1, "task_id": "bg-consciousness",
+         "content": "Background thinking", "cancelable": True},
+        # A root that was force-cancelled before this reload.
+        {"ts": "2026-07-29T10:00:04+00:00", "chat_id": 1, "task_id": "gone-root",
+         "content": "Was working before the cancel", "cancelable": True},
+    ]
+    (logs_dir / "progress.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8",
+    )
+    task_results = data_dir / "task_results"
+    task_results.mkdir(parents=True, exist_ok=True)
+    (task_results / "gone-root.json").write_text(json.dumps({
+        "task_id": "gone-root",
+        "status": "cancelled",
+        "reason_code": "cancelled",
+        "outcome_axes": {
+            "lifecycle": {"status": "cancelled"},
+            "execution": {"status": "cancelled"},
+        },
+    }) + "\n", encoding="utf-8")
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                live = page.locator('.chat-live-card[data-task-id="live-root"]')
+                live.wait_for(state="attached", timeout=30_000)
+                cancel_btn = live.locator('[data-cancel-run]')
+                cancel_btn.wait_for(state="attached", timeout=30_000)
+                assert cancel_btn.inner_text().strip() == "Cancel run"
+                # Marker-less direct-turn shape, subagent child, reusable slot,
+                # and the finished cancelled root must NOT offer the action.
+                for absent_id in ("direct-turn", "sub-child1", "bg-consciousness", "gone-root"):
+                    card = page.locator(f'.chat-live-card[data-task-id="{absent_id}"]')
+                    card.wait_for(state="attached", timeout=30_000)
+                    assert card.locator('[data-cancel-run]').count() == 0, absent_id
+                # The cancelled root replays as an honest Cancelled state.
+                gone_phase = page.locator('.chat-live-card[data-task-id="gone-root"] [data-live-phase]')
+                page.wait_for_function(
+                    "() => document.querySelector('.chat-live-card[data-task-id=\"gone-root\"]"
+                    " [data-live-phase]')?.textContent === 'Cancelled'",
+                    timeout=30_000,
+                )
+                assert "cancelled" in (gone_phase.get_attribute("class") or "")
+                # Confirm dialog wiring: open, then keep the run running.
+                cancel_btn.click()
+                dialog = page.locator('.confirm-dialog')
+                dialog.wait_for(state="visible", timeout=10_000)
+                assert "Cancel this run and all its subagents?" in dialog.inner_text()
+                dialog.locator('[data-confirm-cancel]').last.click()
+                dialog.wait_for(state="detached", timeout=10_000)
+                assert cancel_btn.is_enabled()
+                page.screenshot(path=str(data_dir.parent / "cancel-run.png"), full_page=True)
             finally:
                 browser.close()
     except PlaywrightError as exc:

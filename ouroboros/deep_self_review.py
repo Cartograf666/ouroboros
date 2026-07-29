@@ -346,7 +346,18 @@ def is_review_available() -> Tuple[bool, Optional[str]]:
         if provider_has_credentials("openrouter"):
             return True, configured
         if provider_has_credentials("openai") and not os.environ.get("OPENAI_BASE_URL"):
-            return True, "openai::" + configured.split("/", 1)[1]
+            slug = configured.split("/", 1)[1]
+            if slug.endswith("-pro"):
+                # A `-pro` suffix is an OpenRouter ROUTING slug (reasoning
+                # mode), not an OpenAI model id — `gpt-5.6-sol-pro` 404s on
+                # api.openai.com (live-probed 2026-07-29). Only for these does
+                # the direct route's own default take over; an owner's explicit
+                # pin of a REAL model keeps the mechanical rewrite below, so a
+                # pinned openai/gpt-5.5 still runs deep review on gpt-5.5.
+                from ouroboros.provider_models import OPENAI_DIRECT_DEFAULTS
+
+                return True, OPENAI_DIRECT_DEFAULTS["deep_self_review"]
+            return True, "openai::" + slug
         return False, None
     if provider_has_credentials(provider):
         return True, configured

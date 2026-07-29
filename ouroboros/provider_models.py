@@ -113,6 +113,25 @@ def model_has_credentials(model: str) -> bool:
     return provider_has_credentials(provider_for_model(model))
 
 
+def local_only_review_route_env() -> bool:
+    """Whether review slots must inherit the configured local Main route."""
+    local_main = str(os.environ.get("USE_LOCAL_MAIN", "") or "").strip().lower()
+    if local_main not in {"1", "true", "yes", "on"}:
+        return False
+    return not any(
+        provider_has_credentials(provider)
+        for provider in (
+            "openrouter", "openai", "anthropic", "cloudru", "gigachat",
+            "openai-compatible",
+        )
+    )
+
+
+def review_model_uses_local(model: str) -> bool:
+    """Return the transport route for a resolved review slot."""
+    return local_only_review_route_env() or provider_for_model(str(model or "").strip()) == "local"
+
+
 def resolve_credentialed_model(default_model: str) -> str:
     """Return ``default_model`` if its provider is credentialed, else the first
     configured model slot whose provider has credentials (light → fallback →
@@ -221,10 +240,27 @@ def provider_credential_plan(settings: dict) -> dict:
 
 
 OPENAI_DIRECT_DEFAULTS = {
-    "main": "openai::gpt-5.5",
-    "heavy": "openai::gpt-5.5",
-    "light": "openai::gpt-5.4-mini",
-    "fallback": "openai::gpt-5.4-mini",
+    "main": "openai::gpt-5.6-terra",
+    "heavy": "openai::gpt-5.6-sol",
+    "light": "openai::gpt-5.6-luna",
+    "fallback": "openai::gpt-5.6-luna",
+    # Deep self-review is a real slot with a SHIPPED default; without a
+    # per-provider value a direct-only install keeps an unreachable
+    # OpenRouter-form id it has no credential for (v6.82.0). Only providers whose
+    # model genuinely carries the >=1M window this review sizes against get one —
+    # Cloud.ru and GigaChat are documented BELOW that floor, so filling their slot
+    # would advertise a deep review that is doomed to overflow its real route.
+    #
+    # DELIBERATELY plain Sol, NOT the OpenRouter default's `-pro`: that suffix is an
+    # OpenRouter slug, not an OpenAI model id. Live-probed 2026-07-29 against
+    # api.openai.com: `gpt-5.6-sol-pro` on /v1/chat/completions -> 404; the pro
+    # reasoning mode exists only on /v1/responses as `reasoning.mode="pro"` (200),
+    # and passing `reasoning` to /v1/chat/completions -> 400 "Unknown parameter".
+    # Every LLM call in llm.py is a chat.completions call, so a direct-OpenAI
+    # install runs deep review on plain Sol — an owner-accepted capability
+    # difference from the OpenRouter default, disclosed in README/ARCHITECTURE
+    # rather than papered over with a slug that does not exist.
+    "deep_self_review": "openai::gpt-5.6-sol",
 }
 
 CLOUDRU_DIRECT_DEFAULTS = {
@@ -235,17 +271,24 @@ CLOUDRU_DIRECT_DEFAULTS = {
 }
 
 GIGACHAT_DIRECT_DEFAULTS = {
-    "main": "gigachat::GigaChat-3-Ultra",
-    "heavy": "gigachat::GigaChat-3-Ultra",
-    "light": "gigachat::GigaChat-3-Ultra",
-    "fallback": "gigachat::GigaChat-3-Ultra",
+    # Ultra is available only to individuals in Freemium. GigaChat 2 Max is
+    # available to personal and legal-entity paid plans as well, so it is the
+    # strongest current default that does not strand B2B/CORP installs.
+    "main": "gigachat::GigaChat-2-Max",
+    "heavy": "gigachat::GigaChat-2-Max",
+    "light": "gigachat::GigaChat-2-Max",
+    "fallback": "gigachat::GigaChat-2-Max",
 }
 
 ANTHROPIC_DIRECT_DEFAULTS = {
-    "main": "anthropic::claude-opus-4-8",
-    "heavy": "anthropic::claude-opus-4-8",
-    "light": "anthropic::claude-sonnet-4-6",
-    "fallback": "anthropic::claude-sonnet-4-6",
+    "main": "anthropic::claude-sonnet-5",
+    "heavy": "anthropic::claude-opus-5",
+    "light": "anthropic::claude-sonnet-5",
+    "fallback": "anthropic::claude-opus-4-6",
+    # Deep self-review is a real slot with a SHIPPED default; without a
+    # per-provider value a direct-only install keeps an unreachable
+    # OpenRouter-form id it has no credential for (v6.82.0).
+    "deep_self_review": "anthropic::claude-opus-5",
 }
 
 _DIRECT_PROVIDER_DEFAULTS = {

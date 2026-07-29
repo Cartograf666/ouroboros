@@ -139,6 +139,24 @@ def test_updated_at_is_written(drive):
     assert tr.load_task_result(drive, "t").get("updated_at")
 
 
+def test_lock_timeout_never_falls_back_to_an_unlocked_authoritative_write(
+    drive, monkeypatch,
+):
+    """A timeout preserves prior lifecycle truth instead of accepting stale state."""
+    tr.write_task_result(drive, "locked", tr.STATUS_RUNNING, result="working")
+
+    def _timeout(*_args, **_kwargs):
+        raise TimeoutError("held by concurrent writer")
+
+    monkeypatch.setattr(tr, "update_json_locked", _timeout)
+    with pytest.raises(TimeoutError, match="concurrent writer"):
+        tr.write_task_result(drive, "locked", tr.STATUS_COMPLETED, result="done")
+
+    stored = tr.load_task_result(drive, "locked")
+    assert stored["status"] == tr.STATUS_RUNNING
+    assert stored["result"] == "working"
+
+
 def test_llm_project_name_uses_cleaned_model_title():
     """v6.40: the real LLM naming path returns the model's title run through clean_model_title
     (lexical clean — strips wrapping quotes, P5), not the raw model string."""

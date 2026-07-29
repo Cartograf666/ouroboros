@@ -191,3 +191,16 @@ def test_skill_delete_contract_matches_runtime_shape():
         "extension_reason",
         "error",
     } <= fields
+
+
+def test_v682_cancellation_contract_fields_are_mirrored_in_both_languages():
+    """The additive cancellation ABI (v6.82) must exist in BOTH mirrors: the
+    host-attested cancelable marker and the cancel endpoint's cascade echo."""
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    python_contract = (repo / "ouroboros" / "gateway" / "contracts.py").read_text(encoding="utf-8")
+    js_contract = (repo / "web" / "modules" / "api_types.js").read_text(encoding="utf-8")
+
+    assert "cancelable: NotRequired[bool]" in python_contract
+    assert "cascade: bool" in python_contract
+    assert "@property {boolean=} cancelable" in js_contract
+    assert "@property {boolean=} cascade" in js_contract

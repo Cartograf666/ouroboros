@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
 from ouroboros.llm import LLMClient
+from ouroboros.config import review_model_uses_local
 from ouroboros.review_substrate import review_repo_dirs_for
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.review_context_atlas import (
@@ -63,7 +64,14 @@ from ouroboros.utils import (
 log = logging.getLogger(__name__)
 _SCOPE_REQUIRED_ITEMS = SCOPE_REQUIRED_ITEMS  # compatibility export used by tests/review tooling
 
-_SCOPE_MODEL_DEFAULT = "anthropic/claude-fable-5"
+# Shipped designated scope reviewer (v6.82.0). Window evidence, checked 2026-07-29:
+# OpenAI's own model guide AND OpenRouter /models both state gpt-5.6-terra
+# context_length=1,050,000 — a MODEL property documented by the provider itself, not
+# inferred from one router — so the >=1M BIBLE P3 floor holds on the direct and the
+# routed spelling alike, exactly as the sentinel spanned spellings for the previous
+# designated default (v6.55.0-v6.81: anthropic/claude-fable-5). The sentinel still
+# grants only the conservative 1M figure, and a real probe/owner-ack supersedes it.
+_SCOPE_MODEL_DEFAULT = "openai/gpt-5.6-terra"
 _SCOPE_MAX_TOKENS = 100_000  # 100K output tokens
 _SCOPE_REVIEW_SLOT_TIMEOUT_SEC = 900
 from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET as _REVIEW_BUDGET
@@ -138,7 +146,8 @@ def _scope_review_skipped_in_low_context() -> bool:
 
 
 def _is_designated_default_reviewer(model: str) -> bool:
-    """True iff ``model`` is the shipped default reviewer, across provider spellings."""
+    """True iff ``model`` is the shipped default reviewer (``openai/gpt-5.6-terra``),
+    across provider spellings (``openai::gpt-5.6-terra``, ``openrouter::openai/...``)."""
     def _normalized(m: str) -> str:
         text = str(m or "").strip()
         if text.startswith("openrouter::"):
@@ -156,8 +165,9 @@ def _scope_reviewer_window(model: str) -> int:
     absent evidence. Replaces the deleted static per-model window table: a
     confirmed/asserted probe (provider metadata or owner-ack) for the reviewer's REAL
     active route gives the real window. With NO evidence, the 1M blocking-floor
-    sentinel is granted ONLY to the SHIPPED designated reviewer (fable-5, a real
-    1M-window model); any other no-evidence reviewer returns a conservative sub-floor
+    sentinel is granted ONLY to the SHIPPED designated reviewer (gpt-5.6-terra, a real
+    >=1M-window model — 1.05M per OpenRouter /models metadata, checked 2026-07-29);
+    any other no-evidence reviewer returns a conservative sub-floor
     window so the P3 authority check downgrades it (visibly) instead of silently
     treating a 200K model as 1M and overflowing its real window into a provider 400
     (the v6.46.0 scope-discard bug). A non-default >=1M reviewer must be owner-acked
@@ -185,7 +195,7 @@ def _scope_reviewer_window(model: str) -> int:
         elif provider == "gigachat":
             base_url = str(settings.get("GIGACHAT_BASE_URL") or "")
         # Probe the scope slot, not the active main route (which honors USE_LOCAL_MAIN).
-        use_local = provider == "local" or model.endswith(" (local)")
+        use_local = review_model_uses_local(model)
         route_fp = route_fingerprint(
             provider="local" if use_local else provider, base_url=base_url, model=model,
         )
@@ -999,6 +1009,7 @@ def _call_scope_llm(prompt: str, scope_model: str | None = None, ctx: ToolContex
             max_tokens=_scope_output_tokens,
             temperature=0.2,
             role_hint="scope reviewer",
+            use_local=review_model_uses_local(scope_model),
         )
         result = run_review_request(
             request,

@@ -56,6 +56,19 @@ class FakeLLM:
         return {"content": json.dumps(body)}, {"prompt_tokens": 10, "completion_tokens": 5}
 
 
+def test_review_slot_passes_explicit_local_transport_to_llm(tmp_path):
+    llm = FakeLLM()
+    result = run_review_request(
+        ReviewRequest(surface="scope", goal="review locally", task_id="local-review"),
+        slots=[ReviewSlot(slot_id="local", model="owner/local-main", use_local=True)],
+        drive_root=tmp_path,
+        llm=llm,
+    )
+
+    assert result.actors
+    assert llm.calls and llm.calls[0]["use_local"] is True
+
+
 class FencedArrayLLM:
     def chat(self, **kwargs):
         body = (

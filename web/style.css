@@ -345,6 +345,7 @@ body.resizing-panels { user-select: none; }
 .chat-live-actions {
     display: flex;
     justify-content: flex-end;
+    gap: var(--space-2);
     padding: 0 var(--space-3) var(--space-2);
 }
 
@@ -1807,9 +1808,9 @@ button.chat-file:hover,
     background: rgba(34, 197, 94, 0.10);
 }
 
-.chat-live-phase:is(.warn, .alive, .empty),
-.chat-live-line-phase:is(.warn, .alive, .empty),
-.log-entry .log-phase:is(.warn, .alive, .empty),
+.chat-live-phase:is(.warn, .alive, .empty, .cancelled),
+.chat-live-line-phase:is(.warn, .alive, .empty, .cancelled),
+.log-entry .log-phase:is(.warn, .alive, .empty, .cancelled),
 .evo-runtime-pill.starting {
     color: var(--amber);
     border-color: rgba(245, 158, 11, 0.25);
@@ -1856,6 +1857,23 @@ button.chat-file:hover,
     min-width: 0;
     line-height: 1.45;
     white-space: pre-wrap;
+}
+
+/* P1 (v6.82): collapsed activity line under the title row. Root cards render
+   it only when a coined name holds the title (JS leaves it empty otherwise);
+   subagent cards always feed it from their routed progress. Empty ⇒ hidden, so
+   it reserves no space. Anywhere-wrap at ALL widths keeps the narrow-container
+   layout (chatcol query below) safe for long URLs/paths. */
+.chat-live-activity {
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.4;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.chat-live-activity:empty {
+    display: none;
 }
 
 .chat-live-count {
@@ -2141,6 +2159,15 @@ button.chat-file:hover,
 
 /* Early mobile overrides; late-defined selectors are handled at file end. */
 @media (max-width: 640px) {
+    /* P3 (v6.82): gesture-surface touch-action arbitration — the drawer keeps
+       vertical panning (its .sidebar-scroll child scrolls on y) while the
+       browser yields horizontal pans to the swipe-to-close binder. */
+    #primary-sidebar.gesture-surface-swipe-x {
+        touch-action: pan-y;
+        -webkit-user-select: none;
+        user-select: none;
+    }
+
     /* Prevent iOS zoom on input focus. */
     textarea, input[type="text"], input[type="password"], input[type="email"], select {
         font-size: 16px !important;
@@ -3263,6 +3290,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 }
 
 @media (max-width: 900px) {
+
     .evo-runtime-head {
         flex-direction: column;
     }
@@ -3295,7 +3323,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .about-credits { display: flex; flex-direction: column; gap: 8px; font-size: 14px; }
 .about-links { display: flex; gap: 16px; justify-content: center; margin-top: 4px; }
 .about-links a { color: var(--accent); text-decoration: none; }
-.about-footer { margin-top: auto; padding-top: 32px; color: var(--text-muted); font-size: 12px; }
 
 .costs-scroll { overflow-y: auto; flex: 1; padding: 16px 20px; }
 .costs-budget-card {
@@ -5705,6 +5732,15 @@ textarea.chat-input {
 }
 
 @media (max-width: 900px) {
+    /* P3 (v6.82): the project-panel HEADER gives up vertical panning (it has
+       no vertical scroll of its own); the panel body below is deliberately
+       NOT a gesture surface. */
+    .project-panel-bar.gesture-surface-swipe-y {
+        touch-action: pan-x;
+        -webkit-user-select: none;
+        user-select: none;
+    }
+
     /* Mobile/narrow: the project thread overlays the content area. */
     .project-panel {
         position: fixed;

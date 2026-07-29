@@ -109,9 +109,14 @@ def test_remove_subagent_drive_does_not_promote_custom_late_result(tmp_path):
 
 
 def test_cancel_running_subagent_removes_drive_source():
-    src = _read("supervisor/queue.py")
-    assert "remove_subagent_task_drive(DRIVE_ROOT, str(task_id))" in src
+    # The cancellation custody family lives in task_lifecycle (queue re-exports it).
+    src = _read("supervisor/task_lifecycle.py")
+    assert "remove_subagent_task_drive(q.DRIVE_ROOT, str(task_id))" in src
     assert "delegation_role" in src  # gated on subagent role
+    # ORDER matters: the drive may only be reclaimed after the process is confirmed
+    # dead, or a still-running worker loses its scratch out from under it.
+    death_check = src.index("survived kill escalation")
+    assert src.index("remove_subagent_task_drive") > death_check
 
 
 # ───────────────────────── #9: orphan worker reaping ────────────────────────

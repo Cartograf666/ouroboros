@@ -1346,7 +1346,6 @@ def test_owner_scope_review_floor_deprecation_notice_crosses_the_wire(tmp_path, 
     settings_path.write_text(json.dumps({"TOTAL_BUDGET": "10"}), encoding="utf-8")
     monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
     monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(cfg, "_SETTINGS_LOCK", pathlib.Path(str(settings_path) + ".lock"))
 
     app = Starlette(routes=[
         Route("/api/owner/scope-review-floor", endpoint=api_owner_scope_review_floor, methods=["POST"]),

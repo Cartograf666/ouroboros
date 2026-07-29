@@ -314,3 +314,22 @@ def test_resolve_credentialed_model_parses_fallbacks_chain(monkeypatch):
     # The resolver must parse the chain and return the credentialed SECOND entry — not
     # test the raw comma-string as one (broken) model id, nor skip past it.
     assert resolve_credentialed_model("gigachat::GigaChat") == "anthropic/claude-sonnet-4.6"
+
+
+def test_empty_light_slot_inherits_main_routing_even_when_models_match(monkeypatch):
+    """ENV PRESENCE decides the inherit-from-Main case, not string equality. A
+    local-only install whose Main happens to equal the shipped Light default must
+    still route the Light lane locally — it is running Main, not the Light slot."""
+    from ouroboros.config import SETTINGS_DEFAULTS
+    from ouroboros.subagents import _use_local_for_lane
+
+    shared = SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"]
+    monkeypatch.setenv("OUROBOROS_MODEL", shared)
+    monkeypatch.delenv("OUROBOROS_MODEL_LIGHT", raising=False)
+    monkeypatch.setenv("USE_LOCAL_MAIN", "true")
+    monkeypatch.delenv("USE_LOCAL_LIGHT", raising=False)
+
+    assert _use_local_for_lane("light", shared) is True
+    # A slot the owner really configured still governs itself.
+    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", shared)
+    assert _use_local_for_lane("light", shared) is False

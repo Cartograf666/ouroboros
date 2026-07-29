@@ -5,7 +5,8 @@
 // schedules are READ-ONLY ("managed by skill") because the lifecycle resync would
 // overwrite a direct toggle (supervisor/queue.py) — control those via the skill itself.
 
-import { apiFetch } from './api_client.js';
+import { apiFetch, cancelTask } from './api_client.js';
+import { showToast } from './toast.js';
 
 function esc(value) {
     return String(value ?? '').replace(/[&<>"']/g, (c) => (
@@ -138,8 +139,16 @@ export function initActivity({ mount, ws } = {}) {
         btn.disabled = true;
         try {
             if (act === 'task-cancel') {
-                if (!window.confirm('Cancel this task?')) return;
-                await apiFetch(`/api/tasks/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+                // Same declared semantics as the chat card's "Cancel run" (v6.82):
+                // the task AND its live subtree, so cancelling an orchestrator here
+                // never orphans its running subagents.
+                if (!window.confirm('Cancel this task and all its subagents?')) return;
+                // The endpoint answers only once the teardown is done, so a
+                // successful response means the subtree really is cancelled; a
+                // refusal throws and is surfaced below.
+                // The endpoint answers only after the teardown, so the refresh
+                // below already sees terminal state — no settling delay needed.
+                await cancelTask(id, { cascade: true });
             } else if (act === 'schedule-delete') {
                 if (!window.confirm('Delete this schedule?')) return;
                 await apiFetch(`/api/schedules/${encodeURIComponent(id)}`, { method: 'DELETE' });
@@ -161,8 +170,13 @@ export function initActivity({ mount, ws } = {}) {
                 ws?.send?.({ type: 'command', cmd: `/bg ${on ? 'stop' : 'start'}` });
                 await new Promise((resolve) => setTimeout(resolve, 400));
             }
-        } catch {
-            // best-effort; the refresh below reflects the actual state
+        } catch (exc) {
+            // A 404 is the documented completion race (the run finished on its own)
+            // and the refresh below tells that story. Anything else is a real
+            // failure — a refused cancel must not read as a silent no-op click.
+            if (exc?.status !== 404) {
+                showToast(`Action failed: ${exc?.message || exc}`, 'error');
+            }
         } finally {
             busy = false;
             await refresh();

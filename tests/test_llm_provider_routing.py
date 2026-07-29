@@ -780,7 +780,7 @@ def test_resolve_gigachat_target_uses_defaults(monkeypatch):
     assert target["provider"] == "gigachat"
     assert target["api_key"] == "giga-creds"
     assert target["scope"] == "GIGACHAT_API_PERS"
-    assert target["base_url"] == "https://gigachat.devices.sberbank.ru/api/v1"
+    assert target["base_url"] == "https://api.giga.chat/v1"
     assert target["verify_ssl_certs"] is True
     assert target["usage_model"] == "gigachat/GigaChat-2-Max"
 

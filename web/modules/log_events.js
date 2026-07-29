@@ -144,6 +144,13 @@ function describeStartupChecks(checks) {
 
 export function taskOutcomeSeverity(evt) {
     const lifecycle = String(evt.outcome_axes?.lifecycle?.status || evt.status || '').toLowerCase();
+    // v6.82 (P5): a cancelled task is neither Done nor Failed — it is honestly
+    // Cancelled. Checked first: forced teardown routinely leaves failure-shaped
+    // side facts (e.g. artifacts missing on a cancelled workspace task) that must
+    // not relabel an owner-requested cancellation as a failure.
+    if (lifecycle === 'cancelled' || lifecycle === 'cancel_requested') {
+        return 'cancelled';
+    }
     const execution = String(evt.outcome_axes?.execution?.status || '').toLowerCase();
     const objective = String(evt.outcome_axes?.objective?.status || '').toLowerCase();
     const review = String(evt.outcome_axes?.review?.status || evt.review_status?.status || '').toLowerCase();
@@ -175,6 +182,17 @@ function taskDoneFailure(evt) {
     return taskOutcomeSeverity(evt) === 'error';
 }
 
+// v6.82 (P5): one shared severity→card-phase mapping for terminal task frames,
+// so live task_done, history task_summary rows, and the terminal-status replay
+// fallback all resolve a cancelled root to the same honest 'cancelled' phase.
+export function taskTerminalPhase(evt) {
+    const severity = taskOutcomeSeverity(evt);
+    if (severity === 'cancelled') return 'cancelled';
+    if (severity === 'error') return 'error';
+    if (severity === 'warn') return 'warn';
+    return 'done';
+}
+
 function taskOutcomeMeta(evt) {
     const axes = evt.outcome_axes || {};
     return [
@@ -186,6 +204,9 @@ function taskOutcomeMeta(evt) {
 
 function taskDoneLabel(evt) {
     const reasonCode = evt.reason_code ? String(evt.reason_code) : '';
+    if (taskOutcomeSeverity(evt) === 'cancelled') {
+        return 'Cancelled';
+    }
     if (taskDoneFailure(evt)) {
         return reasonCode ? `Failed: ${reasonCode}` : `Failed ${evt.task_type || 'task'}`;
     }
@@ -396,14 +417,13 @@ export function summarizeLogEvent(evt) {
     if (t === 'task_done') {
         const reasonCode = evt.reason_code ? String(evt.reason_code) : '';
         const artifactStatus = evt.artifact_bundle?.status || evt.artifact_status || '';
-        const severity = taskOutcomeSeverity(evt);
         const reviewDetails = formatReviewProjection(evt.review_projection);
         const unavailable = evt.cost_accounting_status === 'unavailable';
         const ownValue = evt.cost_usd ?? evt.cost;
         const ownCost = unavailable
             ? 'cost unavailable'
             : (ownValue != null ? `${formatLogMoney(ownValue)}${evt.cost_final === false ? ' (pending)' : ''}` : '');
-        return view(severity === 'error' ? 'error' : (severity === 'warn' ? 'warn' : 'done'), taskDoneLabel(evt), {
+        return view(taskTerminalPhase(evt), taskDoneLabel(evt), {
             body: reviewDetails,
             meta: taskMeta(
                 ...taskOutcomeMeta(evt),
@@ -568,9 +588,10 @@ export function summarizeChatLiveEvent(evt) {
         const status = String(lifecycle.status || '').toLowerCase();
         const stale = Boolean(lifecycle.stale);
         const phase = status === 'succeeded' ? 'done'
-            : ['failed', 'cancelled', 'interrupted'].includes(status) ? 'lifecycle_error'
-                : stale ? 'warn'
-                    : 'working';
+            : status === 'cancelled' ? 'cancelled'
+                : ['failed', 'interrupted'].includes(status) ? 'lifecycle_error'
+                    : stale ? 'warn'
+                        : 'working';
         const label = lifecycle.phase || status || 'working';
         const target = lifecycle.target ? `\`${lifecycle.target}\`` : 'skill';
         const headline = progressText.preview || `Skill ${lifecycle.kind || 'operation'}: ${target} — ${label}`;
@@ -585,7 +606,7 @@ export function summarizeChatLiveEvent(evt) {
             fullBody: body,
             visible: true,
             promote: true,
-            terminal: phase === 'done' || phase === 'lifecycle_error',
+            terminal: ['done', 'lifecycle_error', 'cancelled'].includes(phase),
             human: true,
             dedupeKey: lifecycle.id ? `lifecycle:${lifecycle.id}:${status}:${label}:${stale ? 'stale' : 'fresh'}` : key(status, label),
         });
@@ -606,10 +627,14 @@ export function summarizeChatLiveEvent(evt) {
             traceText.full ? `[TRACE]\n${traceText.full}` : '',
             errorText.full ? `[ERROR]\n${errorText.full}` : '',
         ].filter(Boolean);
+        // 'cancelled'/'interrupted' are STOPS, not failures (v6.82 P5 parity with
+        // chat.js SUBAGENT_EVENT_PHASE): a cancelled child must not read as a red
+        // Issue on the one surface that lacks distinct lineage.
         const phase = ['completed'].includes(event) ? 'done'
-            : ['failed', 'rejected', 'cancelled', 'interrupted'].includes(event) ? 'lifecycle_error'
-                : event === 'scheduled' ? 'start'
-                    : 'working';
+            : event === 'cancelled' ? 'cancelled'
+                : ['failed', 'rejected', 'interrupted'].includes(event) ? 'lifecycle_error'
+                    : event === 'scheduled' ? 'start'
+                        : 'working';
         const label = event || 'update';
         return chatView({
             phase,
@@ -764,7 +789,7 @@ export function summarizeChatLiveEvent(evt) {
 
     if (t === 'task_done') {
         const severity = taskOutcomeSeverity(evt);
-        const failed = severity === 'error';
+        const phase = taskTerminalPhase(evt);
         const reviewDetails = formatReviewProjection(evt.review_projection);
         const unavailable = evt.cost_accounting_status === 'unavailable';
         const ownValue = evt.cost_usd ?? evt.cost;
@@ -775,8 +800,8 @@ export function summarizeChatLiveEvent(evt) {
             ? `+children=${formatLogMoney(evt.cost_usd_with_children)}${evt.cost_with_children_partial ? ' (partial)' : ''}`
             : '';
         return chatView({
-            phase: severity === 'warn' ? 'warn' : (failed ? 'error' : 'done'),
-            headline: failed || severity === 'warn' ? taskDoneLabel(evt) : 'Done',
+            phase,
+            headline: severity === 'done' ? 'Done' : taskDoneLabel(evt),
             body: reviewDetails,
             visible: true,
             promote: true,

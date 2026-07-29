@@ -13,6 +13,7 @@ from ouroboros.config import (
     get_image_input_mode,
     get_vision_caption_timeout_sec,
     get_vision_model,
+    review_model_uses_local,
 )
 
 
@@ -80,9 +81,9 @@ def test_review_models_default_in_config():
     assert val  # non-empty
     models = [m.strip() for m in val.split(",") if m.strip()]
     assert models == [
-        "anthropic/claude-fable-5",
-        "openai/gpt-5.6-sol",
-        "google/gemini-3.5-flash",
+        "openai/gpt-5.6-terra",
+        "google/gemini-3.6-flash",
+        "deepseek/deepseek-v4-pro",
     ]
 
 
@@ -92,7 +93,7 @@ def test_review_enforcement_default_in_config():
 
 
 def test_scope_review_and_task_review_defaults_in_config():
-    assert SETTINGS_DEFAULTS.get("OUROBOROS_SCOPE_REVIEW_MODELS") == "anthropic/claude-fable-5"
+    assert SETTINGS_DEFAULTS.get("OUROBOROS_SCOPE_REVIEW_MODELS") == "openai/gpt-5.6-terra"
     assert SETTINGS_DEFAULTS.get("OUROBOROS_TASK_REVIEW_MODE") == "auto"
 
 
@@ -183,7 +184,7 @@ def test_get_review_models_falls_back_to_main_light_light_in_openai_only_mode(mo
     2 unique) instead of the legacy [main]*N so both commit triad and
     plan_task have a quorum-safe reviewer list out of the box. The light slot
     picks up the provider default (OPENAI_DIRECT_DEFAULTS['light'] =
-    openai::gpt-5.4-mini) when OUROBOROS_MODEL_LIGHT is not explicitly set."""
+    openai::gpt-5.6-luna) when OUROBOROS_MODEL_LIGHT is not explicitly set."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -191,18 +192,18 @@ def test_get_review_models_falls_back_to_main_light_light_in_openai_only_mode(mo
     monkeypatch.delenv("OPENAI_COMPATIBLE_API_KEY", raising=False)
     monkeypatch.delenv("CLOUDRU_FOUNDATION_MODELS_API_KEY", raising=False)
     monkeypatch.delenv("OUROBOROS_MODEL_LIGHT", raising=False)
-    monkeypatch.setenv("OUROBOROS_MODEL", "openai::gpt-5.5")
+    monkeypatch.setenv("OUROBOROS_MODEL", "openai::gpt-5.6-terra")
     monkeypatch.setenv(
         "OUROBOROS_REVIEW_MODELS",
-        "openai/gpt-5.5,google/gemini-3.5-flash,anthropic/claude-opus-4.6",
+        "openai/gpt-5.6-terra,google/gemini-3.6-flash,anthropic/claude-opus-4.6",
     )
 
     models = get_review_models()
 
     assert models == [
-        "openai::gpt-5.5",
-        "openai::gpt-5.4-mini",
-        "openai::gpt-5.4-mini",
+        "openai::gpt-5.6-terra",
+        "openai::gpt-5.6-luna",
+        "openai::gpt-5.6-luna",
     ]
 
 
@@ -245,7 +246,7 @@ def test_get_review_models_preserves_explicit_official_openai_list(monkeypatch):
 
 def test_get_review_models_falls_back_to_main_light_light_in_anthropic_only_mode(monkeypatch):
     """v4.39.0: same direct-provider fallback as OpenAI — [main, light, light]
-    with light = ANTHROPIC_DIRECT_DEFAULTS['light'] = anthropic::claude-sonnet-4-6
+    with light = ANTHROPIC_DIRECT_DEFAULTS['light'] = anthropic::claude-sonnet-5
     when OUROBOROS_MODEL_LIGHT is not explicitly set."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -264,8 +265,8 @@ def test_get_review_models_falls_back_to_main_light_light_in_anthropic_only_mode
 
     assert models == [
         "anthropic::claude-opus-4-6",
-        "anthropic::claude-sonnet-4-6",
-        "anthropic::claude-sonnet-4-6",
+        "anthropic::claude-sonnet-5",
+        "anthropic::claude-sonnet-5",
     ]
 
 
@@ -274,7 +275,8 @@ def test_get_review_models_and_scope_route_to_gigachat_in_gigachat_only_mode(mon
     env (no other provider) must route the commit triad AND the scope reviewer to
     gigachat:: models, never to an empty list or an unconfigured foreign provider —
     the single-isolated-provider invariant (docs/DEVELOPMENT.md "Provider
-    Independence"). GIGACHAT_DIRECT_DEFAULTS uses GigaChat-3-Ultra for every slot,
+    Independence"). GIGACHAT_DIRECT_DEFAULTS uses the universally available
+    GigaChat-2-Max for every slot,
     so the quorum-safe fallback degrades to [main, main, main]."""
     monkeypatch.setenv("GIGACHAT_CREDENTIALS", "giga-creds")
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -284,7 +286,7 @@ def test_get_review_models_and_scope_route_to_gigachat_in_gigachat_only_mode(mon
     monkeypatch.delenv("OPENAI_COMPATIBLE_API_KEY", raising=False)
     monkeypatch.delenv("CLOUDRU_FOUNDATION_MODELS_API_KEY", raising=False)
     monkeypatch.delenv("OUROBOROS_MODEL_LIGHT", raising=False)
-    monkeypatch.setenv("OUROBOROS_MODEL", "gigachat::GigaChat-3-Ultra")
+    monkeypatch.setenv("OUROBOROS_MODEL", "gigachat::GigaChat-2-Max")
     monkeypatch.setenv(
         "OUROBOROS_REVIEW_MODELS",
         "openai/gpt-5.5,google/gemini-3.5-flash,anthropic/claude-opus-4.8",
@@ -295,11 +297,40 @@ def test_get_review_models_and_scope_route_to_gigachat_in_gigachat_only_mode(mon
     scope_models = get_scope_review_models()
 
     assert review_models == [
-        "gigachat::GigaChat-3-Ultra",
-        "gigachat::GigaChat-3-Ultra",
-        "gigachat::GigaChat-3-Ultra",
+        "gigachat::GigaChat-2-Max",
+        "gigachat::GigaChat-2-Max",
+        "gigachat::GigaChat-2-Max",
     ]
     assert scope_models and all(m.startswith("gigachat::") for m in scope_models)
+
+
+def test_from_zero_local_only_review_slots_inherit_main_and_stay_local(monkeypatch):
+    """A fresh local-only install must not contact shipped remote reviewers."""
+    for key in (
+        "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+        "OPENAI_BASE_URL", "OPENAI_COMPATIBLE_API_KEY",
+        "OPENAI_COMPATIBLE_BASE_URL", "CLOUDRU_FOUNDATION_MODELS_API_KEY",
+        "GIGACHAT_CREDENTIALS", "GIGACHAT_USER", "GIGACHAT_PASSWORD",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LOCAL_MODEL_SOURCE", "owner/local.gguf")
+    monkeypatch.setenv("USE_LOCAL_MAIN", "true")
+    monkeypatch.setenv("OUROBOROS_MODEL", "owner/local-main")
+    monkeypatch.setenv(
+        "OUROBOROS_REVIEW_MODELS",
+        "openai/gpt-5.6-terra,google/gemini-3.6-flash,deepseek/deepseek-v4-pro",
+    )
+    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_MODELS", "openai/gpt-5.6-terra")
+
+    assert get_review_models() == ["owner/local-main"] * 3
+    assert get_scope_review_models() == ["owner/local-main"]
+    assert review_model_uses_local("owner/local-main") is True
+
+    from ouroboros.review_substrate import reviewer_slots
+
+    slots = reviewer_slots()
+    assert [slot.model for slot in slots] == ["owner/local-main"] * 3
+    assert all(slot.use_local for slot in slots)
 
 
 def test_get_review_enforcement_default(monkeypatch):

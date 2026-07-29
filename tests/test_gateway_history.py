@@ -282,6 +282,140 @@ def test_chat_history_preserves_subagent_reconciliation_metadata(tmp_path):
     assert rec["required_capabilities"] == ["shell", "vcs"]
 
 
+def test_chat_history_task_summary_row_passes_flat_cost_fields_through(tmp_path):
+    """v6.82 P1: agent_task_pipeline writes the pre-synthesis cost snapshot onto
+    the task_summary chat row; history replay must pass those flat fields
+    through so a reload still shows the card's cost (no result file present)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    row_cost = {
+        "cost_accounting_status": "available",
+        "cost_final": False,
+        "cost_usd_with_children": 1.234567,
+        "cost_with_children_partial": True,
+        "reserved_usd": 0.25,
+        "unresolved_upper_bound_usd": 0.5,
+        "unknown_unmetered": 0,
+    }
+    (logs / "chat.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-07-29T00:00:00Z",
+            "direction": "system",
+            "type": "task_summary",
+            "task_id": "cost-summary",
+            "chat_id": 1,
+            "text": "Task cost-summary finished.",
+            "tool_calls": 2,
+            "rounds": 3,
+            **row_cost,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    rec = next(item for item in payload if item.get("task_id") == "cost-summary")
+    for field, expected in row_cost.items():
+        assert rec.get(field) == expected
+    # The snapshot honestly lacks cost_usd — replay must not fabricate it.
+    assert "cost_usd" not in rec
+
+
+def test_chat_history_attaches_terminal_cost_truth_from_task_result(tmp_path):
+    """v6.82 P1: a terminal task_results/<id>.json carries the final cost truth;
+    it is attached to the surviving progress anchor on replay."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text("", encoding="utf-8")
+    (logs / "progress.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-07-29T00:00:00Z",
+            "content": "working on it",
+            "task_id": "cost-terminal",
+            "chat_id": 1,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    results = tmp_path / "task_results"
+    results.mkdir()
+    (results / "cost-terminal.json").write_text(
+        json.dumps({
+            "task_id": "cost-terminal",
+            "status": "completed",
+            "cost_usd": 1.5,
+            "cost_accounting_status": "available",
+            "cost_final": True,
+            "cost_usd_with_children": 2.75,
+            "cost_with_children_partial": False,
+        }),
+        encoding="utf-8",
+    )
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    rec = next(item for item in payload if item.get("task_id") == "cost-terminal")
+    assert rec["task_terminal_status"] == "completed"
+    assert rec["cost_usd"] == 1.5
+    assert rec["cost_final"] is True
+    assert rec["cost_usd_with_children"] == 2.75
+    assert rec["cost_with_children_partial"] is False
+    assert rec["cost_accounting_status"] == "available"
+
+
+def test_chat_history_terminal_cost_truth_overrides_row_embedded_snapshot(tmp_path):
+    """v6.82 P1 precedence: the persisted task result's cost fields OVERRIDE the
+    row-embedded (pre-synthesis, non-final) task_summary snapshot on replay."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-07-29T00:00:00Z",
+            "direction": "system",
+            "type": "task_summary",
+            "task_id": "cost-override",
+            "chat_id": 1,
+            "text": "Task cost-override finished.",
+            "tool_calls": 1,
+            "rounds": 2,
+            "cost_accounting_status": "available",
+            "cost_final": False,
+            "cost_usd_with_children": 1.0,
+            "cost_with_children_partial": True,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+    results = tmp_path / "task_results"
+    results.mkdir()
+    (results / "cost-override.json").write_text(
+        json.dumps({
+            "task_id": "cost-override",
+            "status": "completed",
+            "cost_usd": 0.9,
+            "cost_accounting_status": "available",
+            "cost_final": True,
+            "cost_usd_with_children": 2.5,
+            "cost_with_children_partial": False,
+        }),
+        encoding="utf-8",
+    )
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    rec = next(item for item in payload if item.get("task_id") == "cost-override")
+    assert rec["cost_final"] is True
+    assert rec["cost_usd_with_children"] == 2.5
+    assert rec["cost_with_children_partial"] is False
+    assert rec["cost_usd"] == 0.9
+
+
 def test_chat_history_preserves_nullable_cost_status_and_bounds(tmp_path):
     logs = tmp_path / "logs"
     logs.mkdir()
@@ -315,3 +449,32 @@ def test_chat_history_preserves_nullable_cost_status_and_bounds(tmp_path):
     for field, expected in cost_meta.items():
         assert field in rec
         assert rec[field] == expected
+
+
+def test_chat_history_preserves_cancelable_marker(tmp_path):
+    """v6.82 (P5): the supervisor's host-attested `cancelable` progress-meta marker
+    must survive history replay, or a reloaded live root card would lose its
+    "Cancel run" action while the task is still running."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text("", encoding="utf-8")
+    (logs / "progress.jsonl").write_text(
+        json.dumps(
+            {
+                "ts": "2026-07-29T00:00:00Z",
+                "content": "Scheduled task root1: do the thing",
+                "task_id": "root1",
+                "is_progress": True,
+                "cancelable": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    rec = next(item for item in payload if item.get("task_id") == "root1")
+    assert rec["cancelable"] is True

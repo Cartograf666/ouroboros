@@ -23,7 +23,7 @@ from typing import Any, Dict, List
 
 log = logging.getLogger("review_substrate")
 
-from ouroboros.config import get_review_models
+from ouroboros.config import get_review_models, review_model_uses_local
 from ouroboros.llm import LLMClient
 from ouroboros.observability import new_call_id, persist_call, redact_projection
 from ouroboros.provider_models import provider_for_model
@@ -64,6 +64,7 @@ class ReviewSlot:
     max_tokens: int = 16_384
     temperature: float | None = None
     role_hint: str = ""
+    use_local: bool = False
 
 
 @dataclass
@@ -813,7 +814,8 @@ def build_improvement_capsule(
 def reviewer_slots(models: List[str] | None = None, *, effort: str = "medium", role_hint: str = "") -> List[ReviewSlot]:
     raw_models = models if models is not None else get_review_models()
     return [
-        ReviewSlot(slot_id=f"slot_{idx + 1}", model=str(model), effort=effort, role_hint=role_hint)
+        ReviewSlot(slot_id=f"slot_{idx + 1}", model=str(model), effort=effort,
+                   role_hint=role_hint, use_local=review_model_uses_local(str(model)))
         for idx, model in enumerate(raw_models or [])
         if str(model or "").strip()
     ]
@@ -1416,19 +1418,17 @@ class ReviewCoordinator:
                 "max_tokens": int(request.max_tokens or slot.max_tokens),
                 "temperature": request.temperature if request.temperature is not None else slot.temperature,
                 "no_proxy": bool(request.no_proxy),
-                # Stable per-(surface, subject) OpenRouter session affinity:
-                # review rounds repeat with changing evidence, so the default
-                # first-user-message session key would fragment sticky routing
+                # Stable per-surface session affinity: changing evidence would
+                # otherwise fragment default first-user-message sticky routing
                 # (and the provider cache) on every round. Deliberately NO
                 # slot_id in the key — same-model slots keep today's
                 # provider-concentration behavior.
                 "cache_affinity": f"{request.surface}:{request.task_id or 'review'}",
-                # Bound the TRANSPORT read timeout to the slot's logical timeout so a stalled
-                # provider connection fails fast (and is retried / recorded as a timeout actor)
-                # instead of hanging on the 3600s default read — which left the slot thread
-                # blocked and the whole review process unable to exit. The outer queue/wait_for
-                # timeout governs the LOGIC; this governs the SOCKET.
+                # Bound the socket to the logical slot timeout so a stalled
+                # connection cannot leave the whole review process unable to exit.
+                # The outer queue/wait_for still governs the logical deadline.
                 "timeout": float(slot.timeout_sec) if slot.timeout_sec else None,
+                "use_local": bool(slot.use_local),
             }
             chat = getattr(self.llm, "chat", None)
             p3_actor = request.surface in {"multi_model_review", "scope_review"}

@@ -1125,13 +1125,13 @@ class TestScopeReviewModule:
         assert "SCOPE_REVIEW_BLOCKED" in source
         assert "fail" in source.lower() or "block" in source.lower()
 
-    def test_scope_review_default_is_fable(self):
+    def test_scope_review_default_is_terra(self):
         mod = _get_module("ouroboros.tools.scope_review")
-        assert "fable-5" in mod._SCOPE_MODEL_DEFAULT
+        assert "gpt-5.6-terra" in mod._SCOPE_MODEL_DEFAULT
         # Verify the getter returns the shipped default when no override env var is set
         import os
         if not os.environ.get("OUROBOROS_SCOPE_REVIEW_MODEL"):
-            assert "fable-5" in mod._get_scope_model()
+            assert "gpt-5.6-terra" in mod._get_scope_model()
         # else: env override is active — default check not applicable in this env
 
     def test_scope_review_model_configurable_via_env(self):
@@ -2154,11 +2154,11 @@ def test_scope_reviewer_window_fail_closed_on_absent_evidence(monkeypatch, tmp_p
     assert w_designated == sr._SCOPE_MODEL_CONTEXT_WINDOW, w_designated
 
     # Direct-provider and explicit OpenRouter spellings of the same shipped reviewer
-    # are also the designated default. Regression guard for anthropic::claude-fable-5
-    # being reduced to bare "claude-fable-5" and then misclassified as off-default.
-    w_direct = sr._scope_reviewer_window("anthropic::claude-fable-5")
+    # are also the designated default. Regression guard for a provider spelling
+    # (openai::/openrouter::) being misclassified as off-default.
+    w_direct = sr._scope_reviewer_window("openai::gpt-5.6-terra")
     assert w_direct == sr._SCOPE_MODEL_CONTEXT_WINDOW, w_direct
-    w_openrouter = sr._scope_reviewer_window("openrouter::anthropic/claude-fable-5")
+    w_openrouter = sr._scope_reviewer_window("openrouter::openai/gpt-5.6-terra")
     assert w_openrouter == sr._SCOPE_MODEL_CONTEXT_WINDOW, w_openrouter
 
 

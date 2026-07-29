@@ -35,6 +35,20 @@ export function jsonPost(url, payload = {}, options = {}) {
     }, options);
 }
 
+/**
+ * Cancel a task. With {cascade:true} the server also cancels the task's live
+ * subtree and answers only once that teardown has finished; without it the
+ * request stays the synchronous single-task cancel (no body — headless compat).
+ * Shared by the Chat live-card "Cancel run" action and the Activity tab.
+ * @param {string} taskId
+ * @param {{cascade?: boolean}} [options]
+ * @returns {Promise<import('./api_types.js').TaskCancelResponse>}
+ */
+export function cancelTask(taskId, { cascade = false } = {}) {
+    const url = `/api/tasks/${encodeURIComponent(taskId)}/cancel`;
+    return cascade ? jsonPost(url, { cascade: true }) : fetchJson(url, { method: 'POST' });
+}
+
 export function cleanExtensionRoute(value) {
     const route = String(value || '').trim().replace(/^\/+/, '');
     const parts = route.split('/').filter(Boolean);

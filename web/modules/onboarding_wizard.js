@@ -42,6 +42,9 @@
         saving: false,
         modelsDirty: false,
         localSourceOpen: Boolean(INITIAL_STATE.localSource),
+        moreProvidersOpen: Boolean(
+            INITIAL_STATE.cloudruKey || INITIAL_STATE.compatibleBaseUrl || INITIAL_STATE.compatibleApiKey,
+        ),
         localStatusText: 'Status: Offline',
         localStatusTone: 'muted',
         localTestResult: '',
@@ -70,6 +73,21 @@
 
     function hasLocalModel() {
         return trim(state.localSource).length > 0;
+    }
+
+    // "group" comes from the shared setup contract: "more" fields live inside
+    // the collapsed "More options" disclosure; everything else stays in the
+    // always-visible access grid. Inputs are mounted in the DOM either way.
+    function primaryProviderFields() {
+        return PROVIDER_FIELDS.filter((field) => field.group !== 'more');
+    }
+
+    function moreProviderFields() {
+        return PROVIDER_FIELDS.filter((field) => field.group === 'more');
+    }
+
+    function hasMoreProviderValue() {
+        return moreProviderFields().some((field) => trim(state[field.stateKey]).length > 0);
     }
 
     function hasAnthropicKeyConfigured() {
@@ -537,6 +555,7 @@
         const selectedProfile = activeProviderProfile();
         const localPreset = trim(state.localPreset);
         const localSourceOpen = state.localSourceOpen || hasLocalModel();
+        const moreProvidersOpen = state.moreProvidersOpen || hasMoreProviderValue();
         return `
             <div class="step-header">
                 <div>
@@ -549,13 +568,27 @@
                     <p>${escapeHtml(PROVIDER_PROFILES[selectedProfile]?.providerCopy || '')}</p>
                 </div>
                 <div class="field-grid">
-                    ${PROVIDER_FIELDS.map((field) => providerKeyField({
+                    ${primaryProviderFields().map((field) => providerKeyField({
                         ...field,
                         value: state[field.stateKey],
                     })).join('')}
                 </div>
+            <details class="wizard-collapse" data-collapse="more-providers" ${moreProvidersOpen ? 'open' : ''}>
+                <summary>
+                    <span>More options</span>
+                    <span class="selection-badge">${hasMoreProviderValue() ? 'Configured' : 'Optional'}</span>
+                </summary>
+                <div class="wizard-collapse-body">
+                    <div class="field-grid">
+                        ${moreProviderFields().map((field) => providerKeyField({
+                            ...field,
+                            value: state[field.stateKey],
+                        })).join('')}
+                    </div>
+                </div>
+            </details>
             ${renderClaudeCliControls()}
-            <details class="wizard-collapse" ${localSourceOpen ? 'open' : ''}>
+            <details class="wizard-collapse" data-collapse="local-model" ${localSourceOpen ? 'open' : ''}>
                 <summary>
                     <span>Local model settings</span>
                     <span class="selection-badge">${hasLocalModel() ? 'Configured' : 'Optional'}</span>
@@ -636,7 +669,7 @@
                         note: slot.note,
                     })).join('')}
                 </div>
-            <div class="wizard-inline-note">Direct providers use <code>openai::gpt-5.5</code>, <code>cloudru::zai-org/GLM-4.7</code>, and <code>anthropic::claude-sonnet-4-6</code>. OpenAI-compatible endpoints use <code>openai-compatible::your-model-name</code>. Plain <code>openai/...</code> or <code>anthropic/...</code> stays router-style by design.</div>
+            <div class="wizard-inline-note">Direct providers use <code>openai::gpt-5.6-terra</code>, <code>cloudru::zai-org/GLM-4.7</code>, and <code>anthropic::claude-sonnet-5</code>. OpenAI-compatible endpoints use <code>openai-compatible::your-model-name</code>. Plain <code>openai/...</code> or <code>anthropic/...</code> stays router-style by design.</div>
         `;
     }
 
@@ -818,12 +851,21 @@
     }
 
     function bindProvidersStep() {
-        const details = root.querySelector('.wizard-collapse');
-        if (details) {
-            details.addEventListener('toggle', () => {
-                state.localSourceOpen = details.open;
-            });
-        }
+        // Scoped per-collapse binding: a bare `.wizard-collapse` selector only
+        // reaches the FIRST details element, which silently drops the toggle
+        // persistence of every later collapse on the step.
+        const collapseStateKeys = {
+            'more-providers': 'moreProvidersOpen',
+            'local-model': 'localSourceOpen',
+        };
+        Object.entries(collapseStateKeys).forEach(([collapseId, stateKey]) => {
+            const details = root.querySelector(`[data-collapse="${collapseId}"]`);
+            if (details) {
+                details.addEventListener('toggle', () => {
+                    state[stateKey] = details.open;
+                });
+            }
+        });
             const localPreset = document.getElementById('local-preset');
             const localSource = document.getElementById('local-source');
         const localFilename = document.getElementById('local-filename');

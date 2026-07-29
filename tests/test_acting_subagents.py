@@ -1307,7 +1307,6 @@ def test_gc_retention_migration_folds_and_drops_legacy(tmp_path, monkeypatch):
         "OUROBOROS_SERVICE_LOG_RETENTION_DAYS": 14,
     }), encoding="utf-8")
     monkeypatch.setattr(config, "SETTINGS_PATH", sp)
-    monkeypatch.setattr(config, "_SETTINGS_LOCK", pathlib.Path(str(sp) + ".lock"))
     monkeypatch.delenv("OUROBOROS_GC_RETENTION_DAYS", raising=False)
     s = config.load_settings()
     # Seeded from the worktree key (customized 30 != former default 7); no orphan.
@@ -1326,7 +1325,6 @@ def test_gc_migration_prefers_customized_over_default_earlier_key(tmp_path, monk
         "OUROBOROS_SERVICE_LOG_RETENTION_DAYS": 30,         # customized (former default 14) -> must win
     }), encoding="utf-8")
     monkeypatch.setattr(config, "SETTINGS_PATH", sp)
-    monkeypatch.setattr(config, "_SETTINGS_LOCK", pathlib.Path(str(sp) + ".lock"))
     monkeypatch.delenv("OUROBOROS_GC_RETENTION_DAYS", raising=False)
     s = config.load_settings()
     assert s.get("OUROBOROS_GC_RETENTION_DAYS") == 30  # customized value preserved, not the default 7
@@ -1342,7 +1340,6 @@ def test_gc_migration_all_defaults_collapse_to_unified_default(tmp_path, monkeyp
         "OUROBOROS_SERVICE_LOG_RETENTION_DAYS": 14,         # former default
     }), encoding="utf-8")
     monkeypatch.setattr(config, "SETTINGS_PATH", sp)
-    monkeypatch.setattr(config, "_SETTINGS_LOCK", pathlib.Path(str(sp) + ".lock"))
     monkeypatch.delenv("OUROBOROS_GC_RETENTION_DAYS", raising=False)
     s = config.load_settings()
     # No customized value -> fall back to first present (worktree 7) == unified default.

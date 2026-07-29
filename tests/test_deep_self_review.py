@@ -8,6 +8,7 @@ from unittest import mock
 
 import pytest
 
+from ouroboros.provider_models import OPENAI_DIRECT_DEFAULTS
 from ouroboros.deep_self_review import (
     build_review_pack,
     is_review_available,
@@ -128,7 +129,11 @@ class TestIsReviewAvailable:
             os.environ.pop("OPENAI_BASE_URL", None)
             available, model = is_review_available()
         assert available is True
-        assert model == "openai::gpt-5.5-pro"
+        # The direct route lands on the PROVIDER default, not a mechanical
+        # `openai::` + router-slug rewrite: `-pro` is an OpenRouter routing slug
+        # that 404s on api.openai.com (live-probed 2026-07-29).
+        assert model == OPENAI_DIRECT_DEFAULTS["deep_self_review"]
+        assert not model.endswith("-pro")
 
     def test_none(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -733,3 +738,80 @@ class TestOmissionSectionBound:
         assert "a.py (oversized: >1MB)" in parts[0]
         assert "b.bin (binary/media: binary)" in parts[0]
         assert "oversized=1" in parts[0]
+
+
+def test_direct_openai_deep_review_sends_a_real_openai_model_id():
+    """PHYSICAL-PAYLOAD proof, not a defaults-table assertion.
+
+    The OpenRouter default is the slug `openai/gpt-5.6-sol-pro`. That `-pro`
+    suffix is an OpenRouter routing slug, NOT an OpenAI model id: live-probed
+    2026-07-29, `gpt-5.6-sol-pro` on api.openai.com /v1/chat/completions returns
+    404, while pro reasoning exists only on /v1/responses as
+    `reasoning.mode="pro"` (200) — and /v1/chat/completions rejects a `reasoning`
+    parameter outright (400 "Unknown parameter"). Every LLM call in llm.py is a
+    chat.completions call, so the direct-OpenAI deep-review slot ships plain Sol
+    and this test pins what actually reaches the wire.
+    """
+    import os
+    from unittest import mock
+
+    from ouroboros.llm import LLMClient
+    from ouroboros.provider_models import OPENAI_DIRECT_DEFAULTS
+
+    slot = OPENAI_DIRECT_DEFAULTS["deep_self_review"]
+    assert slot.startswith("openai::"), slot
+
+    mock_resp = mock.Mock()
+    mock_resp.model_dump.return_value = {
+        "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    with mock.patch("openai.OpenAI") as mock_openai_cls:
+        mock_oa = mock.Mock()
+        mock_oa.chat.completions.create.return_value = mock_resp
+        mock_openai_cls.return_value = mock_oa
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-direct-test"}, clear=False):
+            LLMClient().chat(
+                messages=[{"role": "user", "content": "hi"}],
+                model=slot, max_tokens=8, no_proxy=True,
+            )
+        assert mock_oa.chat.completions.create.called
+        payload = mock_oa.chat.completions.create.call_args.kwargs
+
+    # The id on the wire is a REAL OpenAI model, never the OpenRouter slug.
+    assert payload["model"] == "gpt-5.6-sol"
+    assert not payload["model"].endswith("-pro")
+    # ...and no `reasoning` object is smuggled onto a chat.completions call, which
+    # the live API rejects with 400 (the only pro carrier is the Responses API).
+    assert "reasoning" not in payload
+    assert "reasoning" not in (payload.get("extra_body") or {})
+
+
+def test_direct_fallback_preserves_an_explicit_real_model_pin():
+    """Only router-only `-pro` slugs are substituted by the provider default; an
+    owner's explicit pin of a REAL OpenAI model keeps the mechanical rewrite."""
+    import os
+    from unittest import mock
+
+    from ouroboros.provider_models import OPENAI_DIRECT_DEFAULTS
+
+    env = {"OPENAI_API_KEY": "sk-test"}
+    with mock.patch.dict(os.environ, env, clear=False):
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        os.environ.pop("OPENAI_BASE_URL", None)
+        with mock.patch(
+            "ouroboros.deep_self_review.get_deep_self_review_model",
+            return_value="openai/gpt-5.5",
+        ):
+            available, model = is_review_available()
+        assert available is True
+        assert model == "openai::gpt-5.5", "an explicit real-model pin survives"
+        with mock.patch(
+            "ouroboros.deep_self_review.get_deep_self_review_model",
+            return_value="openai/gpt-5.5-pro",
+        ):
+            available, model = is_review_available()
+        assert available is True
+        assert model == OPENAI_DIRECT_DEFAULTS["deep_self_review"], (
+            "a router-only -pro slug lands on the provider default"
+        )

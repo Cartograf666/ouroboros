@@ -460,6 +460,7 @@ async def _query_model(
                 max_tokens=_out_budget,
                 temperature=0.2,
                 role_hint="multi-model review",
+                use_local=_cfg.review_model_uses_local(model),
             )
             loop = asyncio.get_running_loop()
             run_result = await asyncio.wait_for(

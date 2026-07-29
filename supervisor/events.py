@@ -11,7 +11,11 @@ import uuid
 from typing import Any, Dict, Optional
 
 from ouroboros.utils import append_jsonl, atomic_write_json, truncate_for_log, utc_now_iso
-from ouroboros.config import get_max_active_subagents_per_root, get_max_subagent_depth
+from ouroboros.config import (
+    MAX_ACTIVE_SUBAGENTS_HARD_CAP,
+    get_max_active_subagents_per_root,
+    get_max_subagent_depth,
+)
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE
 from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES
 from ouroboros.task_results import (
@@ -139,7 +143,8 @@ def _depth_reservation_admits(
     still admit a child whose parent is a RUNNING subagent that has NO active
     direct child yet — one reserved direct child per running subagent — so a deep
     cooperative build is not starved by a wide first level. Bounded by a hard
-    ceiling (2x the cap, capped at the documented per-root hard max 50) so the
+    ceiling (2x the cap, capped at the documented per-root hard max
+    ``config.MAX_ACTIVE_SUBAGENTS_HARD_CAP`` = 500) so the
     reservation can never unbound the tree; structural depth/max_children gates
     still apply on top."""
     parent = str(parent_id or "").strip()
@@ -158,7 +163,7 @@ def _depth_reservation_admits(
     )
     if direct_children >= 1:
         return False
-    hard_ceiling = min(50, 2 * max(1, int(max_active)))
+    hard_ceiling = min(MAX_ACTIVE_SUBAGENTS_HARD_CAP, 2 * max(1, int(max_active)))
     return _active_subagent_count(root_task_id, pending, running) < hard_ceiling
 
 
@@ -839,6 +844,7 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
         # so stamp the EMITTING task's last_progress_at. (A productively-waiting parent is
         # kept alive separately by _subtree_progressing detecting fresh DESCENDANT progress,
         # not by re-stamping its own last_progress_at from child narration.)
+        progress_meta = evt.get("progress_meta") if isinstance(evt.get("progress_meta"), dict) else None
         _running = getattr(ctx, "RUNNING", None)
         if is_progress and task_id and isinstance(_running, dict):
             _m = _running.get(task_id)
@@ -846,6 +852,41 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             # cancel that popped this task is never resurrected.
             if isinstance(_m, dict):
                 _m["last_progress_at"] = time.time()
+                # v6.82 (P5): host-attested cancelable marker. RUNNING membership is
+                # the supervisor's own truth that this frame belongs to a queue task
+                # that /api/tasks/{id}/cancel can force-cancel. An in-process
+                # direct-chat turn is never in RUNNING, so its card never shows a
+                # dead "Cancel run" button. Covers pooled roots that skip the
+                # scheduled notice (e.g. promote_chat_to_task). The marker is
+                # LINEAGE-GATED here and carries the RUNNING row's authoritative
+                # lineage: only a resolved ROOT is stamped (a timeout-retry root
+                # counts — its root_task_id names the original, which is exactly
+                # why the frontend must trust this attestation rather than
+                # re-deriving rootness from frame shape), and a subagent's
+                # narration never mints a root-shaped card with a live Cancel.
+                # Copy-on-write: the worker's own event dict is never mutated.
+                task_row = _m.get("task") if isinstance(_m.get("task"), dict) else {}
+                progress_meta = dict(progress_meta or {})
+                for lineage_key in ("root_task_id", "parent_task_id", "delegation_role"):
+                    value = str(task_row.get(lineage_key) or "").strip()
+                    if value and not progress_meta.get(lineage_key):
+                        progress_meta[lineage_key] = value
+                try:
+                    from ouroboros.task_results import resolve_task_lineage
+
+                    lineage = resolve_task_lineage(
+                        task_id,
+                        metadata=task_row.get("metadata"),
+                        root_task_id=task_row.get("root_task_id"),
+                        parent_task_id=task_row.get("parent_task_id"),
+                        delegation_role=task_row.get("delegation_role"),
+                        original_task_id=task_row.get("original_task_id"),
+                        timeout_retry_from=task_row.get("timeout_retry_from"),
+                    )
+                    if bool(lineage["is_root_task"]):
+                        progress_meta["cancelable"] = True
+                except Exception:
+                    log.debug("cancelable lineage resolution failed for %s", task_id, exc_info=True)
         bound_chat = _bound_project_chat_id(ctx, task_id, evt.get("parent_task_id"), evt.get("root_task_id"))
         chat_id = bound_chat or int(evt["chat_id"])
         ctx.send_with_budget(
@@ -855,7 +896,7 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             fmt=fmt,
             is_progress=is_progress,
             task_id=task_id,
-            progress_meta=evt.get("progress_meta") if isinstance(evt.get("progress_meta"), dict) else None,
+            progress_meta=progress_meta,
             ts=(str(raw_ts) if raw_ts else None),
         )
     except Exception as e:
@@ -1181,7 +1222,12 @@ def _finish_task_done_dispatch(
         if task_id:
             ctx.RUNNING.pop(str(task_id), None)
         if worker_id in ctx.WORKERS and ctx.WORKERS[worker_id].busy_task_id == task_id:
-            ctx.WORKERS[worker_id].busy_task_id = None
+            # A `reaping` slot is OWNED — by the reaper or by an in-flight
+            # cancellation custody. Its owner confirms process death and then
+            # respawns or releases; freeing the slot from here would hand a
+            # mid-kill process back to assignment.
+            if not getattr(ctx.WORKERS[worker_id], "reaping", False):
+                ctx.WORKERS[worker_id].busy_task_id = None
     if task_id:
         try:
             clear_acceptance_fence_for_root(str(task_id))
@@ -2448,11 +2494,11 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         queued_behind_active_cap = False
         if delegation_role == "subagent" and _subagent_cap_blocks(root_task_id, parent_id, pending_ref, running_ref, max_active):
             active_count = _active_subagent_count(root_task_id, pending_ref, running_ref)
-            if active_count >= 50:
+            if active_count >= MAX_ACTIVE_SUBAGENTS_HARD_CAP:
                 log.warning("Rejected subagent due to hard active child cap: root=%s desc=%s", root_task_id, desc[:100])
                 detail = (
                     "Subagent rejected: hard active child limit "
-                    f"(50) exceeded for root_task_id={root_task_id}."
+                    f"({MAX_ACTIVE_SUBAGENTS_HARD_CAP}) exceeded for root_task_id={root_task_id}."
                 )
                 _reject_schedule_task(
                     ctx, tid=tid, chat_id=chat_id, delegation_role=delegation_role,
@@ -2558,6 +2604,13 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
                     "project_id": str(admitted.get("_project_id") or project_id),
                     "project_lifecycle": fence_status,
                 }
+            elif blocked_reason == "root_cancelled":
+                detail = (
+                    "Subagent not scheduled: its root's subtree cancellation has "
+                    "begun, so the tree accepts no new work."
+                )
+                reason_code = blocked_reason
+                extra = {"root_task_id": str(root_task_id or "")}
             elif blocked_reason == "root_budget_fence":
                 detail = (
                     "Subagent not scheduled: the root budget is paused and requires an "
@@ -2612,6 +2665,14 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "requested_model_lane": requested_model_lane,
             "effective_model_lane": effective_model_lane,
             "model": model,
+            # v6.82 (P5): host-attested cancelability, ROOTS ONLY. Every task
+            # admitted here is a supervisor-queue task the cancel endpoint can
+            # reach, but the marker exists to gate the ROOT card's "Cancel run"
+            # button — a subagent row must never carry it (its card is a child
+            # card, and a lineage-less replay of a marked child row could mint a
+            # root-shaped card with a live Cancel). Direct-chat turns never pass
+            # through this path (or RUNNING).
+            "cancelable": delegation_role != "subagent",
         }
         if delegation_role == "subagent":
             progress_meta.update(_subagent_scheduled_meta(

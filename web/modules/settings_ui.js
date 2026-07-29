@@ -12,12 +12,12 @@ const SETTINGS_TABS = [
 // Guard markers: renderTabStrip emits behavior/advanced tabs at runtime.
 
 const MODEL_CARDS = [
-    ['Main', 'Primary reasoning model.', 's-model', 's-local-main', 'google/gemini-3.5-flash'],
+    ['Main', 'Primary reasoning model.', 's-model', 's-local-main', 'x-ai/grok-4.5'],
     ['Heavy', 'Strong acting/coding lane for mutative first-level subagents. Empty uses Main.', 's-model-heavy', 's-local-heavy', ''],
-    ['Light', 'Fast summaries, lightweight tasks, and all deep subagents. Empty uses Main.', 's-model-light', 's-local-light', ''],
+    ['Light', 'Fast summaries, lightweight tasks, and all deep subagents. Empty uses Main.', 's-model-light', 's-local-light', 'google/gemini-3.6-flash'],
     ['Vision', 'Caption and VLM lane. Empty uses Main.', 's-model-vision', '', ''],
     ['Consciousness', 'High-horizon background consciousness. Empty uses Main.', 's-model-consciousness', 's-local-consciousness', ''],
-    ['Fallback', 'Resilience and degraded path (comma-separated chain).', 's-model-fallback', 's-local-fallback', 'anthropic/claude-sonnet-4.6'],
+    ['Fallback', 'Resilience and degraded path (comma-separated chain).', 's-model-fallback', 's-local-fallback', 'openai/gpt-5.6-luna'],
 ];
 
 const EFFORT_FIELDS = [
@@ -71,7 +71,7 @@ const PROVIDER_CARDS = [
     {
         id: 'openai', title: 'OpenAI', icon: '/static/providers/openai.svg', hint: 'Official OpenAI API',
         fields: [{ id: 's-openai', settingKey: 'OPENAI_API_KEY', label: 'OpenAI API Key', placeholder: 'sk-...' }],
-        note: 'Use model values like <code>openai::gpt-5.5</code> in the Models tab to route models directly here. If OpenRouter is absent and the shipped defaults are still untouched, Ouroboros auto-remaps them to official OpenAI defaults.',
+        note: 'Use model values like <code>openai::gpt-5.6-terra</code> in the Models tab to route models directly here. If OpenRouter is absent and the shipped defaults are still untouched, Ouroboros auto-remaps them to official OpenAI defaults.',
     },
     {
         id: 'compatible', title: 'OpenAI Compatible', icon: '/static/providers/openai-compatible.svg', hint: 'Custom OpenAI-style endpoint',
@@ -82,28 +82,31 @@ const PROVIDER_CARDS = [
         note: 'Use this card for custom base URLs. Built-in web search only works with the official OpenAI Responses API, so keep <code>OPENAI_BASE_URL</code> empty when you want <code>web_search</code>.',
     },
     {
-        id: 'cloudru', title: 'Cloud.ru Foundation Models', icon: '/static/providers/cloudru.svg', hint: 'Cloud.ru OpenAI-compatible runtime',
+        // advanced: rendered inside the collapsed "More providers" section.
+        // Inputs stay mounted either way — settings.js applyInputValue has no
+        // null guard, so every input id must always exist in the DOM.
+        id: 'cloudru', title: 'Cloud.ru Foundation Models', icon: '/static/providers/cloudru.svg', hint: 'Cloud.ru OpenAI-compatible runtime', advanced: true,
         fields: [
             { id: 's-cloudru-key', settingKey: 'CLOUDRU_FOUNDATION_MODELS_API_KEY', label: 'API Key', placeholder: 'Cloud.ru Foundation Models API key' },
             { id: 's-cloudru-base-url', label: 'Base URL', placeholder: 'https://foundation-models.api.cloud.ru/v1' },
         ],
     },
     {
-        id: 'gigachat', title: 'GigaChat', icon: '/static/providers/gigachat.svg', hint: 'Sber GigaChat via the gigachat library',
+        id: 'gigachat', title: 'GigaChat', icon: '/static/providers/gigachat.svg', hint: 'Sber GigaChat via the gigachat library', advanced: true,
         fields: [
             { id: 's-gigachat-credentials', settingKey: 'GIGACHAT_CREDENTIALS', label: 'Authorization Key', placeholder: 'Base64 client_id:secret (OAuth)' },
             { id: 's-gigachat-scope', label: 'Scope', placeholder: 'GIGACHAT_API_PERS' },
             { id: 's-gigachat-user', label: 'User (basic auth, optional)', placeholder: 'username' },
             { id: 's-gigachat-password', settingKey: 'GIGACHAT_PASSWORD', label: 'Password (basic auth, optional)', placeholder: 'password' },
-            { id: 's-gigachat-base-url', label: 'Base URL', placeholder: 'https://gigachat.devices.sberbank.ru/api/v1' },
+            { id: 's-gigachat-base-url', label: 'Base URL', placeholder: 'https://api.giga.chat/v1' },
             { id: 's-gigachat-verify-ssl', label: 'Verify SSL Certs', placeholder: 'true / false' },
         ],
-        note: 'Use model values like <code>gigachat::GigaChat-3-Ultra</code> in the Models tab to route directly through GigaChat. Authenticate with either an Authorization Key (OAuth, scope usually <code>GIGACHAT_API_PERS</code>/<code>GIGACHAT_API_CORP</code>) or User + Password.',
+        note: 'Use model values like <code>gigachat::GigaChat-2-Max</code> in the Models tab to route directly through GigaChat. Authenticate with either an Authorization Key (OAuth, scope <code>GIGACHAT_API_PERS</code>, <code>GIGACHAT_API_B2B</code>, or <code>GIGACHAT_API_CORP</code>) or User + Password.',
     },
     {
         id: 'anthropic', title: 'Anthropic', icon: '/static/providers/anthropic.png', hint: 'Direct runtime plus Claude tooling',
         fields: [{ id: 's-anthropic', settingKey: 'ANTHROPIC_API_KEY', label: 'Anthropic API Key', placeholder: 'sk-ant-...' }],
-        note: 'Use model values like <code>anthropic::claude-sonnet-4-6</code> in the Models tab to route models directly through Anthropic. Claude tooling still reuses this key.',
+        note: 'Use model values like <code>anthropic::claude-sonnet-5</code> in the Models tab to route models directly through Anthropic. Claude tooling still reuses this key.',
         extra: `
             <div class="settings-toolbar" id="settings-claude-code-panel" hidden>
                 <button type="button" class="settings-ghost-btn" id="btn-claude-code-install">Repair Runtime</button>
@@ -258,7 +261,16 @@ export function renderSettingsPage() {
                         Configure remote providers and the optional network gate. Secret fields now have explicit
                         <code>Clear</code> actions so masked values can be removed intentionally.
                     </div>
-                    ${PROVIDER_CARDS.map(providerSettingsCard).join('')}
+                    ${PROVIDER_CARDS.filter((card) => !card.advanced).map(providerSettingsCard).join('')}
+                    <details class="settings-more-providers" id="settings-more-providers">
+                        <summary>
+                            <span class="settings-provider-title"><span>More providers</span></span>
+                            <span class="settings-provider-hint">Cloud.ru Foundation Models and GigaChat</span>
+                        </summary>
+                        <div class="settings-more-providers-body">
+                            ${PROVIDER_CARDS.filter((card) => card.advanced).map(providerSettingsCard).join('')}
+                        </div>
+                    </details>
                     <div class="form-section compact">
                         <h3>Legacy Compatibility</h3>
                         <div class="form-row">
@@ -329,12 +341,12 @@ export function renderSettingsPage() {
                         <div class="form-grid two">
                             <div class="form-field">
                                 <label>Scope Review Slots</label>
-                                <input id="s-scope-review-models" placeholder="openai/gpt-5.5">
+                                <input id="s-scope-review-models" placeholder="openai/gpt-5.6-terra">
                                 <div class="settings-inline-note">Comma-separated scope reviewer slots. Empty falls back to the legacy single scope model setting.</div>
                             </div>
                             <div class="form-field">
                                 <label>Deep Self-Review Model</label>
-                                <input id="s-deep-self-review-model" placeholder="openai/gpt-5.5-pro">
+                                <input id="s-deep-self-review-model" placeholder="openai/gpt-5.6-sol-pro">
                                 <div class="settings-inline-note">Dedicated model slot for deep self-review. Empty uses the shipped default.</div>
                             </div>
                             <div class="form-field">
@@ -447,8 +459,8 @@ export function renderSettingsPage() {
                         <h3>Safety Supervisor</h3>
                         <div class="settings-section-copy">
                             Coverage of the LLM safety-supervisor layer (a separate axis from Runtime Mode).
-                            <code>Full</code> is today's behavior &mdash; every guarded tool call gets the LLM safety check.
-                            <code>Light</code> keeps the LLM check only for integration-policy tools; conditional shell/verify fall to the deterministic guards.
+                            <code>Full</code> &mdash; every guarded tool call gets the LLM safety check.
+                            <code>Light</code> keeps the LLM check only for integration-policy tools; conditional shell/verify fall to the deterministic guards. Light is the default for new DESKTOP setups (authored by the first-run wizard); existing installs, web and Docker keep Full.
                             <code>Off</code> makes no LLM safety calls. In every mode the deterministic registry sandbox, protected-path policy, and light-mode guards STAY ON &mdash; the LLM supervisor is a layer, not the floor. Lowering coverage emits a durable audit event per waved-through call.
                             <br><strong>Human controlled:</strong> saved via the owner endpoint (the agent cannot lower its own supervision); applies on the next task.
                         </div>
@@ -711,7 +723,7 @@ export function renderSettingsPage() {
                             </div>
                             <div class="form-field">
                                 <label>Active Subagents / Root</label>
-                                <input id="s-active-subagents" type="number" min="1" max="50" value="3">
+                                <input id="s-active-subagents" type="number" min="1" max="500" value="6">
                             </div>
                             <div class="form-field">
                                 <label>Subagent Depth</label>
@@ -793,7 +805,6 @@ export function renderSettingsPage() {
                                 <a href="https://github.com/razzant/ouroboros" target="_blank" rel="noopener noreferrer">GitHub</a>
                             </div>
                         </div>
-                        <div class="about-footer">Joi Lab</div>
                     </div>
                 </section>
             </div>

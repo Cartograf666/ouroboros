@@ -926,7 +926,11 @@ def test_wait_tools_reject_invalid_ids_and_cap_batch(tmp_path):
 
     assert "TOOL_ARG_ERROR" in _wait_for_task(ctx, "../settings", timeout_sec=0)
     assert "TOOL_ARG_ERROR" in _wait_for_tasks(ctx, ["ok123", "../bad"], timeout_sec=0)
-    assert "capped at 50" in _wait_for_tasks(ctx, [f"task{i}" for i in range(51)], timeout_sec=0)
+    from ouroboros.config import MAX_ACTIVE_SUBAGENTS_HARD_CAP
+    assert MAX_ACTIVE_SUBAGENTS_HARD_CAP == 500
+    assert "capped at 500" in _wait_for_tasks(
+        ctx, [f"task{i}" for i in range(MAX_ACTIVE_SUBAGENTS_HARD_CAP + 1)], timeout_sec=0
+    )
 
 
 def test_wait_for_task_reports_rejected_duplicate(tmp_path):

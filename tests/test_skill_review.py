@@ -861,6 +861,14 @@ def test_review_skill_quorum_failure_on_one_responder(tmp_path, monkeypatch):
 
     skills_root = _build_skill(tmp_path)
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    monkeypatch.setattr(
+        "ouroboros.config.get_review_models",
+        lambda: [
+            "openai/gpt-5.5",
+            "google/gemini-3.5-flash",
+            "anthropic/claude-opus-4.6",
+        ],
+    )
     ctx = _make_ctx(tmp_path)
     advisory_evidence = {
         "status": "completed",

@@ -19,6 +19,7 @@ import { initActivity } from './modules/activity.js';
 import { initUpdateStatus } from './modules/update_status.js';
 import { initDashboard } from './modules/dashboard.js';
 import { hydrateNavIcons } from './modules/page_icons.js';
+import { bindSwipe } from './modules/gestures.js';
 
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
 
@@ -184,6 +185,40 @@ document.addEventListener('click', (event) => {
 });
 navDrawerBackdrop?.addEventListener('click', () => setMobileDrawerOpen(false));
 hydrateNavIcons();
+
+// ---------------------------------------------------------------------------
+// Mobile dismiss gestures (v6.82.0 P3): exactly two release-triggered swipes.
+// One shared matchMedia instance per gesture surface — the drawer collapses at
+// ≤640px while the project overlay takes over at ≤900px; these deliberately
+// stay separate per-surface queries (no invented global "mobile" predicate).
+// Both gestures yield to the soft-keyboard lock (body.keyboard-open owns
+// document-level touch while the keyboard is up). The touch-action arbitration
+// classes live in web/style.css and are applied here at bind time so
+// index.html markup pins stay untouched.
+// ---------------------------------------------------------------------------
+const drawerSwipeMedia = window.matchMedia('(max-width: 640px)');
+const projectOverlaySwipeMedia = window.matchMedia('(max-width: 900px)');
+if (primarySidebar) {
+    primarySidebar.classList.add('gesture-surface-swipe-x');
+    bindSwipe(primarySidebar, {
+        direction: 'left',
+        enabled: () => navState.mobileDrawerOpen
+            && drawerSwipeMedia.matches
+            && !document.body.classList.contains('keyboard-open'),
+        onCommit: () => setMobileDrawerOpen(false),
+    });
+}
+const projectPanelBar = projectPanel?.querySelector('.project-panel-bar');
+if (projectPanelBar) {
+    projectPanelBar.classList.add('gesture-surface-swipe-y');
+    bindSwipe(projectPanelBar, {
+        direction: 'down',
+        enabled: () => Boolean(navState.activeProjectId)
+            && projectOverlaySwipeMedia.matches
+            && !document.body.classList.contains('keyboard-open'),
+        onCommit: () => closeProjectPanel(),
+    });
+}
 
 const ctx = {
     ws,

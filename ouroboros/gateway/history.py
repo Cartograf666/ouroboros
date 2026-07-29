@@ -13,6 +13,7 @@ from starlette.responses import JSONResponse
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.gateway._helpers import iter_jsonl_objects
+from ouroboros.task_results import TASK_COST_META_FIELDS as _TASK_COST_META_FIELDS
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.utils import utc_now_iso
 
@@ -50,15 +51,8 @@ _PROGRESS_META_FIELDS = (
     "required_capabilities",
     "write_surface",
     "status",
-    "cost_usd",
-    "cost_accounting_status",
-    "cost_accounting_error",
-    "cost_final",
-    "cost_usd_with_children",
-    "cost_with_children_partial",
-    "reserved_usd",
-    "unresolved_upper_bound_usd",
-    "unknown_unmetered",
+    "cancelable",
+    *_TASK_COST_META_FIELDS,
     "result",
     "result_truncated",
     "trace_summary",
@@ -387,6 +381,13 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
         rec["reason_code"] = str(entry.get("reason_code") or "")
     if isinstance(entry.get("review_projection"), dict):
         rec["review_projection"] = dict(entry.get("review_projection") or {})
+    # v6.82 P1: the summary row now carries the flat task-scope cost snapshot
+    # written by agent_task_pipeline; replay it so a reload still shows cost.
+    # _annotate_terminal_task_truth later OVERRIDES these with the persisted
+    # task_results values when the result file survives (row = fallback only).
+    for key in _TASK_COST_META_FIELDS:
+        if key in entry:
+            rec[key] = entry[key]
 
 
 def _annotate_terminal_task_truth(
@@ -429,6 +430,13 @@ def _annotate_terminal_task_truth(
                 review_projection = result.get("review_projection")
                 if isinstance(review_projection, dict):
                     terminal_truth["review_projection"] = dict(review_projection)
+                # v6.82 P1: attach the persisted terminal cost truth. Applied via
+                # message.update() below, so it OVERRIDES any row-embedded
+                # task_summary snapshot values (the result file is authoritative;
+                # the row snapshot is the pruned-result fallback).
+                for key in _TASK_COST_META_FIELDS:
+                    if key in result:
+                        terminal_truth[key] = result[key]
                 terminal_truth_by_task[task_id] = terminal_truth
             suggested_name = str(result.get("suggested_name") or "").strip()
             if suggested_name:

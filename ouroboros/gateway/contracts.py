@@ -108,6 +108,10 @@ class ChatOutbound(TypedDict):
     task_group_id: NotRequired[str]
     task_event: NotRequired[str]
     status: NotRequired[str]
+    # v6.82 (P5): host-attested marker — this frame's task is a supervisor-queue
+    # task that POST /api/tasks/{id}/cancel can force-cancel (never set for
+    # in-process direct-chat turns). Gates the UI "Cancel run" card action.
+    cancelable: NotRequired[bool]
     # Monetary projections are nullable when the physical-attempt ledger cannot
     # be read.  ``None`` is deliberately distinct from a confirmed $0 result.
     cost_usd: NotRequired[Optional[float]]
@@ -693,6 +697,10 @@ class TaskEvent(TypedDict, total=False):
 class TaskCancelResponse(TypedDict, total=False):
     ok: bool
     task_id: str
+    # v6.82 (P5): echoed when the optional request body {"cascade": true} asked
+    # for the subtree cancel, which is COMPLETE by the time this answer is sent;
+    # the plain envelope is unchanged.
+    cascade: bool
     error: str
 
 

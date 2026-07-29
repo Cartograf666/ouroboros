@@ -74,7 +74,7 @@ def _assert_basic_response(result, expected_provider=None):
 _PROVIDER_MATRIX = [
     ("openrouter",       "OPENROUTER_API_KEY",                 "anthropic/claude-sonnet-4.6", "openrouter"),
     ("openai_direct",    "OPENAI_API_KEY",                     "openai::gpt-4o-mini",         "openai"),
-    ("anthropic_direct", "ANTHROPIC_API_KEY",                  "anthropic::claude-sonnet-4-6", "anthropic"),
+    ("anthropic_direct", "ANTHROPIC_API_KEY",                  "anthropic::claude-sonnet-5", "anthropic"),
     ("cloudru",          "CLOUDRU_FOUNDATION_MODELS_API_KEY",  "cloudru::zai-org/GLM-4.7",    "cloudru"),
 ]
 
@@ -241,7 +241,7 @@ _COMPETING_KEYS = [
 _ISOLATION_MATRIX = [
     ("openrouter",       "OPENROUTER_API_KEY",                 "anthropic/claude-sonnet-4.6"),
     ("openai_direct",    "OPENAI_API_KEY",                     "openai::gpt-4o-mini"),
-    ("anthropic_direct", "ANTHROPIC_API_KEY",                  "anthropic::claude-sonnet-4-6"),
+    ("anthropic_direct", "ANTHROPIC_API_KEY",                  "anthropic::claude-sonnet-5"),
     ("cloudru",          "CLOUDRU_FOUNDATION_MODELS_API_KEY",  "cloudru::zai-org/GLM-4.7"),
 ]
 

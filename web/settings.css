@@ -123,6 +123,36 @@
     padding: 0 18px 18px;
 }
 
+/* Collapsed "More providers" wrapper: rarely used provider cards (Cloud.ru,
+   GigaChat) stay mounted inside it whether it is open or not. The summary
+   reuses the provider-card visual grammar (shared ui-card border/background
+   variables) so it reads as a peer of the cards above it. */
+.settings-more-providers > summary {
+    list-style: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 16px 18px;
+    border: 1px solid var(--ui-card-border);
+    border-radius: var(--radius);
+    background: var(--ui-card-bg);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.settings-more-providers > summary::-webkit-details-marker {
+    display: none;
+}
+
+.settings-more-providers-body {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    padding-top: 18px;
+}
+
 .settings-extension-sections {
     display: flex;
     flex-direction: column;
@@ -723,7 +753,8 @@
         padding: 14px;
     }
 
-    .settings-provider-card summary {
+    .settings-provider-card summary,
+    .settings-more-providers > summary {
         padding: 14px 14px;
     }
 

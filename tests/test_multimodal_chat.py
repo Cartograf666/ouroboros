@@ -23,6 +23,9 @@ class TestSupportsVision:
         assert supports_vision("openai/gpt-5.5") is True
         assert supports_vision("google/gemini-3.5-flash") is True
         assert supports_vision("anthropic::claude-opus-4-8") is True
+        # The v6.82.0 direct Anthropic defaults stay vision-capable.
+        assert supports_vision("anthropic::claude-sonnet-5") is True
+        assert supports_vision("anthropic::claude-opus-5") is True
         assert supports_vision("deepseek/deepseek-chat") is False
         assert supports_vision("") is False
         assert supports_vision("some-model (local)") is False

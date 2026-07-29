@@ -57,8 +57,7 @@ def isolated_settings(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cfg, "DATA_DIR", data_dir, raising=True)
     monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path, raising=True)
-    # Lock file path is derived from SETTINGS_PATH at call time; refresh it.
-    monkeypatch.setattr(cfg, "_SETTINGS_LOCK", pathlib.Path(str(settings_path) + ".lock"), raising=True)
+    # The lock path derives from SETTINGS_PATH at call time.
     cfg.reset_runtime_mode_baseline_for_tests()
     yield settings_path
     cfg.reset_runtime_mode_baseline_for_tests()

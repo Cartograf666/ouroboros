@@ -375,6 +375,11 @@ per-feature nicety:
   (`direct_provider_review_models_fallback`, consumed by `get_review_models` /
   `get_scope_review_models`) so no slot — model OR reviewer — is left pointing at
   an unconfigured provider.
+  EXCEPTION (v6.82.0): the deep-self-review slot is filled only for providers whose
+  model carries the >=1M window that review sizes against — OpenAI and Anthropic.
+  Cloud.ru and GigaChat are documented below that floor, so their shipped deep value
+  is CLEARED instead (an explicit owner value is never touched) and deep review is
+  honestly unavailable rather than advertised and doomed to overflow its route.
 - **Scope-review ≥1M floor (BIBLE P3).** A direct-provider-only setup fills the
   scope-reviewer slot with its own model (mirroring the Cloud.ru pattern). Where the
   single provider has no 1M-context model, the disclosed fallback (v6.80.0) is the
@@ -385,10 +390,12 @@ per-feature nicety:
   `OUROBOROS_SCOPE_REVIEW_DEGRADED` partial-coverage reviewer is NOT replaced by
   anything that looks like the gate, and the blocking triad still reviews the staged
   diff in full in both modes. Since v6.55.0 the no-evidence 1M sentinel keys on
-  the shipped default reviewer (claude-fable-5), so an OpenAI-only install — whose
-  designated scope reviewer stays `openai/gpt-5.5` — runs in the visible sub-floor
-  window until Capability Evidence lands (generative probe or
-  `/api/owner/capability-ack`); the blocking triad is unaffected. That ack is
+  the shipped default reviewer (openai/gpt-5.6-terra as of v6.82.0; 1.05M window per
+  OpenRouter /models metadata, checked 2026-07-29), so an install pinning any OTHER
+  reviewer runs in the visible sub-floor window until Capability Evidence lands
+  (generative probe or `/api/owner/capability-ack`); an OpenAI-only install's
+  designated scope reviewer is now the same terra model (direct spelling), so it keeps
+  the sentinel; the blocking triad is unaffected. That ack is
   REACHABLE from the UI: a scope-slot change makes the settings save probe the slot's
   own route and return `review_capability_notices` carrying the same
   `needs_ack:{route, route_fp, evidence}` payload the Max gate uses, which
@@ -396,6 +403,27 @@ per-feature nicety:
   AUTO-downgraded to `low` can declare that `low` by re-selecting it in either owner
   control (`/api/state` exposes `context_mode_auto_low` so the no-op click is not
   short-circuited), which is what makes the fallback above reachable at all.
+- **Local-only installs keep the local route.** Light and Fallback ship real remote
+  defaults since v6.82.0, so `server_runtime._clear_shipped_defaults_for_local_only`
+  blanks an UNTOUCHED shipped default in those slots when no remote credential is
+  configured. The two outcomes DIFFER and both are intended: an empty Light slot
+  inherits Main, which is the local route, while an empty Fallbacks slot disables the
+  cross-model fallback chain (`config.parse_fallback_chain`) rather than inheriting
+  anything — an unreachable chain is worse than none. A slot the owner explicitly
+  routed to local (`USE_LOCAL_LIGHT` / `USE_LOCAL_FALLBACK`) is REACHABLE and is never
+  cleared, and an explicit model choice is never cleared. Lane inheritance keys off
+  ENV PRESENCE, not string equality, so an empty Light slot follows Main even when
+  Main happens to equal Light's shipped default. When adding a slot default, ask
+  whether a local-only install can still reach it; if not, it belongs in that guard —
+  together with the PRIOR shipped value, because an upgraded local-only file still
+  carries it.
+  Review and scope-review slots follow the same rule at call time: a local-only
+  install normalizes each configured slot to local Main and carries explicit local
+  routing through `ReviewSlot`; Max-mode scope review may still fail honestly when
+  the local context is below the 1M floor, while owner-selected Low records the
+  established typed scope skip instead of contacting an unconfigured provider.
+- **Direct-OpenAI deep review runs plain Sol.** The shipped OpenRouter default is the slug `openai/gpt-5.6-sol-pro`; that `-pro` is an OpenRouter routing slug, not an OpenAI model id (live-probed 2026-07-29: 404 on `/v1/chat/completions`). OpenAI exposes pro reasoning only as `reasoning.mode="pro"` on `/v1/responses`, and `/v1/chat/completions` rejects a `reasoning` parameter (400). Every LLM call in `llm.py` is a chat.completions call, so `OPENAI_DIRECT_DEFAULTS` ships `openai::gpt-5.6-sol` — an owner-accepted capability difference, not an oversight. Adding a Responses-API lane is the follow-up that would close it; until then never put a `-pro` id in a direct slot.
+- **Anthropic-only disclosures.** The auto-filled review triad for an Anthropic-only direct install is the loud single-model [sonnet-5]×3 (main==light — deliberate), and the auto scope slot runs in the visible sub-floor window until Capability Evidence or an owner acknowledgement lands, because the designated-default sentinel moved off the Anthropic family with the v6.82.0 defaults.
 - **Documented exceptions.** A few provider-specific extras are deliberately NOT
   universal: `web_search` (OpenAI Responses, OpenRouter server tool, Anthropic
   server tool, optional ddgs) and the Claude Agent SDK tools (Anthropic). These
@@ -687,7 +715,7 @@ observation exists, because the constant is Claude-derived and flooring the meas
 path with it would permanently charge a lighter tokenizer for Claude's density.
 "Measurement can only ever TIGHTEN a cap" is enforced PER MODEL IDENTITY in the store
 instead: `record_token_density` keeps the RUNNING MAXIMUM, and one normalized model
-identity collects observations from every surface (the shipped `claude-fable-5` is both
+identity collects observations from every surface (the shipped `gpt-5.6-terra` is both
 the scope reviewer and a triad slot), so a run of prose-dominated doc-only packs
 measuring ~1.1 cannot hand the next code-heavy scope pack a LOOSER cap than today's;
 the historical absolute-margin form bounds every cap regardless. `_effective_scope_input_limit` computes it PER CALL — the former

@@ -75,6 +75,52 @@ def test_task_summary_row_carries_chat_id_for_trivial_task(tmp_path):
     assert summaries and summaries[0]["chat_id"] == 1234
 
 
+def test_task_summary_row_carries_flat_snapshot_cost_fields(tmp_path):
+    """v6.82 P1: the task_summary chat row carries the pre-synthesis snapshot's
+    flat cost fields (previously discarded into prose) so history replay can
+    show honest card cost. Fields absent from the snapshot (cost_usd,
+    cost_accounting_error) are never fabricated."""
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir(parents=True)
+    snapshot_usage = {
+        "rounds": 1,
+        "cost": 0.0,
+        # _pre_synthesis_usage_snapshot root-shape keys:
+        "cost_snapshot_at": "2026-07-29T00:00:00Z",
+        "cost_final": False,
+        "cost_with_children_partial": True,
+        "cost_usd_with_children": 1.25,
+        "reserved_usd": 0.1,
+        "unresolved_upper_bound_usd": 0.2,
+        "unknown_unmetered": 0,
+        "ledger_integrity": "ok",
+        "cost_accounting_status": "available",
+    }
+    pipeline._run_task_summary(
+        env=None,
+        llm=None,
+        task={"id": "p2", "type": "task", "text": "hi", "chat_id": 1},
+        usage=snapshot_usage,
+        llm_trace={"tool_calls": [], "reasoning_notes": []},
+        drive_logs=drive_logs,
+    )
+    rows = [
+        json.loads(line)
+        for line in (drive_logs / "chat.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    row = next(r for r in rows if r.get("type") == "task_summary")
+    assert row["cost_final"] is False
+    assert row["cost_with_children_partial"] is True
+    assert row["cost_usd_with_children"] == 1.25
+    assert row["reserved_usd"] == 0.1
+    assert row["unresolved_upper_bound_usd"] == 0.2
+    assert row["unknown_unmetered"] == 0
+    assert row["cost_accounting_status"] == "available"
+    assert "cost_usd" not in row
+    assert "cost_accounting_error" not in row
+
+
 def test_task_summary_uses_configured_light_model_when_openrouter_present(monkeypatch):
     from ouroboros.consolidator import _consolidation_route
 

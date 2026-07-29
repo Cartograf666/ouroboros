@@ -16,7 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from supervisor.state import (
     load_state, append_jsonl, atomic_write_text,
-    QUEUE_SNAPSHOT_PATH, budget_remaining, EVOLUTION_BUDGET_RESERVE, reconstruct_task_cost,
+    QUEUE_SNAPSHOT_PATH, budget_remaining, EVOLUTION_BUDGET_RESERVE,
+    reconstruct_task_cost as reconstruct_task_cost,
 )
 from supervisor.message_bus import send_with_budget
 from ouroboros.config import (
@@ -878,9 +879,13 @@ def _emit_cancel_task_done(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     cost_fields: Optional[Dict[str, Any]] = None,
+    status: str = "cancelled",
 ) -> None:
     """Emit a task_done event after a cancel so the UI live card resolves.
     Covers both the agent-tool path (_handle_cancel_task) and the HTTP path.
+    ``status`` carries the STORED terminal truth: when a worker wrote its own
+    natural result just before the kill, the card must resolve to THAT outcome
+    rather than be left unresolved until a reload.
     Cost fields carry reconstructed totals so a cancelled evolution cycle records
     its real spend in the campaign tally instead of zeros."""
     try:
@@ -891,8 +896,11 @@ def _emit_cancel_task_done(
                 "task_id": str(task_id),
                 "task_type": str((task or {}).get("type") or ""),
                 "chat_id": chat_id,
-                "status": "cancelled",
-                "outcome_axes": terminal_outcome_axes(lifecycle="cancelled", execution="cancelled", reason_code="cancelled", review_trigger="supervisor_terminal"),
+                "status": status,
+                "outcome_axes": terminal_outcome_axes(
+                    lifecycle=status, execution=status, reason_code=status,
+                    review_trigger="supervisor_terminal",
+                ),
                 **(cost_fields or {
                     "cost_accounting_status": "available", "cost_final": True,
                     "cost_usd": cost_usd, "total_rounds": total_rounds,
@@ -948,108 +956,21 @@ def _cancel_result_fields(
     return payload
 
 
+# Cancellation custody lives in supervisor.task_lifecycle (module-size boundary);
+# re-exported so `supervisor.queue` stays the single import surface for callers.
+from supervisor.task_lifecycle import (  # noqa: E402, F401 -- intentional public re-exports
+    CANCEL_ALREADY_SETTLED,
+    CANCEL_CANCELLED,
+    CANCEL_FAILED,
+    CANCEL_NOT_FOUND,
+    _CANCEL_TERMINALIZED,
+    cancel_task_custody,
+)
+
+
 def _cancel_task_by_id_single(task_id: str) -> bool:
-    """Cancel one pending or running task; subtree snapshotting is done by the caller."""
-    from supervisor import workers
-
-    with _queue_lock:
-        for i, t in enumerate(list(PENDING)):
-            if t["id"] == task_id:
-                PENDING.pop(i)
-                try:
-                    from ouroboros.task_results import STATUS_CANCELLED, load_task_result, write_task_result
-                    existing = load_task_result(DRIVE_ROOT, task_id) or {}
-                    write_task_result(
-                        DRIVE_ROOT, task_id, STATUS_CANCELLED,
-                        **_cancel_result_fields(
-                            t,
-                            existing=existing,
-                            result="Task cancelled by user/agent request.",
-                        ),
-                    )
-                except Exception:
-                    pass
-                _emit_cancel_task_done(t, task_id)
-                persist_queue_snapshot(reason="cancel_pending")
-                return True
-
-        for w in workers.WORKERS.values():
-            if w.busy_task_id == task_id:
-                meta = RUNNING.pop(task_id, None) or {}
-                task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
-                # Reconstruct real cost from durable llm_usage: the worker is about
-                # to be killed without finalizing, so the rollup/task_done would
-                # otherwise record zeros for a cancelled (e.g. evolution) cycle.
-                c_cost_fields = reconstruct_task_cost(str(task_id), fields=True)
-                try:
-                    from ouroboros.task_results import STATUS_CANCELLED, load_task_result, write_task_result
-                    existing = load_task_result(DRIVE_ROOT, task_id) or {}
-                    write_task_result(
-                        DRIVE_ROOT, task_id, STATUS_CANCELLED,
-                        **_cancel_result_fields(
-                            task,
-                            existing=existing,
-                            **c_cost_fields,
-                            result="Running task cancelled and worker terminated.",
-                        ),
-                    )
-                except Exception:
-                    pass
-                _emit_cancel_task_done(
-                    task, task_id,
-                    cost_fields=c_cost_fields,
-                )
-                from ouroboros.platform_layer import kill_pid_tree
-                # Tree-kill the worker (a bare terminate() can orphan its
-                # foreground subprocess tree), but spare deliberately-kept
-                # services: a cancel is neither a session change nor a panic.
-                _keep = _kept_service_pids()
-                if w.proc.pid:
-                    kill_pid_tree(w.proc.pid, exclude_pids=_keep)
-                elif w.proc.is_alive():
-                    w.proc.terminate()
-                w.proc.join(timeout=5)
-                if w.proc.is_alive() and w.proc.pid:
-                    kill_pid_tree(w.proc.pid, exclude_pids=_keep)
-                    w.proc.join(timeout=2)
-                try:
-                    from ouroboros.tools.services import archive_task_service_logs
-                    archive_task_service_logs(pathlib.Path(DRIVE_ROOT), str(task_id), task)
-                except Exception:
-                    log.debug("Failed to archive service logs for cancelled task %s", task_id, exc_info=True)
-                worker_stopped = not w.proc.is_alive()
-                workers.respawn_worker(w.wid)
-                if worker_stopped and str(task.get("delegation_role") or "") == "subagent":
-                    try:
-                        from ouroboros.headless import remove_subagent_task_drive
-                        remove_subagent_task_drive(DRIVE_ROOT, str(task_id))
-                    except Exception:
-                        log.debug("Failed to remove cancelled subagent drive for %s", task_id, exc_info=True)
-                persist_queue_snapshot(reason="cancel_running")
-                return True
-
-        try:
-            from ouroboros.task_results import (
-                STATUS_CANCEL_REQUESTED, STATUS_CANCELLED, load_task_result, write_task_result,
-            )
-            existing = load_task_result(DRIVE_ROOT, task_id) or {}
-            if str(existing.get("status") or "") == STATUS_CANCEL_REQUESTED:
-                write_task_result(
-                    DRIVE_ROOT, task_id, STATUS_CANCELLED,
-                    **_cancel_result_fields(
-                        existing,
-                        existing=existing,
-                        result="Task cancelled (finished before supervisor teardown).",
-                    ),
-                )
-                # Cancel-wins: cancellation is lifecycle authority — a result that
-                # landed before the latch is discarded, no snapshot, no recovery.
-                _emit_cancel_task_done(existing, task_id)
-                persist_queue_snapshot(reason="cancel_finalize")
-                return True
-        except Exception:
-            log.debug("Cancel finalize-on-miss failed for %s", task_id, exc_info=True)
-    return False
+    """Boolean facade for the pre-v6.82 single-task callers."""
+    return cancel_task_custody(task_id) in {CANCEL_CANCELLED, CANCEL_ALREADY_SETTLED}
 
 
 def cancel_running_evolution_tasks(reason: str = "evolution stopped") -> List[str]:
