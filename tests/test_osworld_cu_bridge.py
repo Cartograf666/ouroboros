@@ -2026,6 +2026,33 @@ def test_gate_turns_are_enforced_per_task_from_the_live_event_log(tmp_path):
     assert rcb._live_policy_turns(tmp_path / "nope", task_id) is None
 
 
+def test_unused_gate_reserve_is_returned_to_the_worker(tmp_path):
+    """The static reserve is worst-case: the gate is budgeted 14 turns but spent a
+    mean of 4 on the v6.83.0 run, so a flat max_steps-14-1 threw ~10 turns away on
+    every example and 13 of 56 opus failures died at 89-92 turns INSIDE a 100-turn
+    budget. Returning the unused reserve must keep the declared total intact."""
+    budget = rcb._step_budget(_ns(max_steps=100, feasibility_gate=True),
+                              {"value": 99, "source": "settings"})
+    # Gate spent 4 -> worker may use 95, and 4 + 95 + 1 terminal == 100.
+    assert rcb._worker_round_cap(budget, 4) == 95
+    assert 4 + 95 + budget["terminal_turn_reserve"] == budget["max_steps_claimed"]
+    # A gate that used its whole reserve leaves the old conservative number.
+    assert rcb._worker_round_cap(budget, 14) == 85
+    # No declared budget -> nothing to publish.
+    assert rcb._worker_round_cap(rcb._step_budget(_ns(), {"value": 200, "source": "default"}), 4) is None
+
+    # The cap is written where the server hot-reloads it from.
+    sp = tmp_path / "settings.json"
+    sp.write_text(json.dumps({"OUROBOROS_MAX_ROUNDS": 99, "OTHER": "keep"}), encoding="utf-8")
+    rec = rcb._publish_worker_round_cap(sp, 95)
+    assert rec["applied"] is True and rec["previous"] == 99
+    on_disk = json.loads(sp.read_text(encoding="utf-8"))
+    assert on_disk["OUROBOROS_MAX_ROUNDS"] == 95 and on_disk["OTHER"] == "keep"
+    # An unwritable target is disclosed, never fatal (the stricter cap stays).
+    bad = rcb._publish_worker_round_cap(tmp_path / "nope" / "settings.json", 95)
+    assert bad["applied"] is False and "error" in bad
+
+
 def test_a_gate_terminated_example_is_not_a_budget_fault():
     """A gate INFEASIBLE ends the example before the working phase, so the worker
     used exactly zero policy turns — a KNOWN count. Treating it as unknown made

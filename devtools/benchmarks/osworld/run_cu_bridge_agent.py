@@ -29,6 +29,7 @@ without installing Ouroboros inside the VM.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -717,6 +718,79 @@ def _step_budget(args: Any, effective_rounds: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@contextlib.contextmanager
+def _official_evaluate_cwd(osworld_root: Path):
+    """Evaluate with the checkout root as CWD, exactly like the official runner.
+
+    Evaluator fixtures are declared RELATIVE to the checkout
+    (``{"type": "local_file", "path": "evaluation_examples/examples/.../x_gold.txt"}``)
+    and ``get_local_file`` tests that string with a bare ``os.path.exists``, so the
+    grader silently resolves it against the PROCESS CWD. The official harness runs
+    from the checkout root and never notices; this bridge does not, and the getter
+    then returns None — a task whose answer was byte-exact scores 0 with only a
+    line in the lane log (measured: multi_apps/7f35355e produced the correct
+    25.27 and still scored 0.0).
+
+    Scoped to the evaluate call and restored on every path: our own paths are
+    absolute, but a process-wide chdir is a bigger promise than this needs.
+    """
+    previous = os.getcwd()
+    try:
+        os.chdir(str(osworld_root))
+        yield
+    finally:
+        try:
+            os.chdir(previous)
+        except OSError:  # noqa: BLE001 - the original cwd vanished; nothing to restore to
+            pass
+
+
+def _worker_round_cap(budget: dict[str, Any], gate_turns: int | None) -> int | None:
+    """Turns the WORKER may use, once the gate's actual consumption is known.
+
+    The static reserve is worst-case: the gate is budgeted 14 turns but spent a
+    mean of 4 on the v6.83.0 run, so a flat ``max_steps - 14 - 1`` threw away
+    ~10 turns of every example and 13 of 56 opus failures died at 89-92 total
+    turns inside a 100-turn budget. Returning the UNUSED reserve keeps the
+    declared total intact (gate + worker + 1 terminal <= max_steps) while giving
+    long-horizon tasks the turns they were always entitled to.
+
+    None when no budget is declared (nothing to enforce).
+    """
+    claimed = int(budget.get("max_steps_claimed") or 0)
+    if not claimed:
+        return None
+    used = int(gate_turns or 0)
+    return max(1, claimed - used - int(budget.get("terminal_turn_reserve") or 1))
+
+
+def _publish_worker_round_cap(settings_path: Path, cap: int) -> dict[str, Any]:
+    """Write the worker's round cap into the lane settings the server hot-reloads.
+
+    ``Agent.handle_task`` re-applies settings from disk at the start of EVERY
+    task, so writing this between the gate and the worker is what makes the cap
+    per-phase without a per-task API. Adapter-only: no core contract changes.
+    Never raises — a failure leaves the previous (stricter) cap in force, which
+    can only under-spend the budget, never exceed it.
+    """
+    record: dict[str, Any] = {"requested": int(cap), "applied": False}
+    try:
+        path = Path(settings_path)
+        settings = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        if not isinstance(settings, dict):
+            record["error"] = "settings.json is not an object"
+            return record
+        record["previous"] = settings.get("OUROBOROS_MAX_ROUNDS")
+        settings["OUROBOROS_MAX_ROUNDS"] = int(cap)
+        tmp = path.with_suffix(".part")
+        tmp.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        record["applied"] = True
+    except Exception as exc:  # noqa: BLE001 - disclosure, never fatal
+        record["error"] = f"{type(exc).__name__}: {exc}"
+    return record
+
+
 def _refuse_wrong_dataset_commit(expected: str, checkout: dict[str, Any]) -> None:
     """Refuse a checkout that is not the one the campaign is graded against.
 
@@ -754,7 +828,10 @@ def _refuse_uncapped_step_claim(budget: dict[str, Any]) -> None:
     """
     if not budget.get("enforced"):
         return
-    worker_cap = int(budget.get("action_capable_round_cap") or 0)
+    # The runner republishes the worker cap after the gate (see
+    # `_publish_worker_round_cap`), so the base setting only has to be within the
+    # declared total; the per-phase value is what the loop actually enforces.
+    worker_cap = int(budget.get("max_steps_claimed") or 0) - int(budget.get("terminal_turn_reserve") or 1)
     if worker_cap < 1:
         raise SystemExit(
             f"--max-steps={budget.get('max_steps_claimed')} leaves no working turns after the "
@@ -1915,6 +1992,14 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
             run.runtime_result = None
             (run_dir / "ouroboros_task_id.txt").write_text("", encoding="utf-8")
         else:
+            # Return the gate's UNUSED reserve to the worker before its task is
+            # created: the server hot-reloads settings at every task start, so this
+            # is the per-phase cap without a per-task API. Total stays <= max_steps.
+            _budget = (run.base_manifest.get("harness") or {}).get("step_budget") or {}
+            _cap = _worker_round_cap(_budget, (gate_record or {}).get("policy_turns"))
+            if _cap is not None:
+                run.base_manifest["harness"]["worker_round_cap"] = _publish_worker_round_cap(
+                    settings_path, _cap)
             created = _api(args.ouroboros_url, "POST", "/api/tasks", {
                 "description": prompt, "memory_mode": "empty",
                 "disabled_tools": _effective_disabled_tools(args.allow_a11y),
@@ -2017,7 +2102,8 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
             # Counters that omit it under-report a two-task example as a one-task example.
             budget_counters["feasibility_gate"] = dict(gate_record)
 
-        reward = float(env.evaluate())
+        with _official_evaluate_cwd(osworld_root):
+            reward = float(env.evaluate())
         # FAIL-CLOSED DURABLE CLAIM TRANSITION, before the score is projected ANYWHERE.
         # Deferring the marker to the `finally` below meant a disk error or a process death
         # after the official score was written left no marker at all, and another lane reran a
