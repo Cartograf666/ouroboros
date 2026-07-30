@@ -2232,3 +2232,79 @@ def test_evaluate_runs_in_the_checkout_and_restores_cwd(tmp_path):
     except RuntimeError:
         pass
     assert _os.getcwd() == start, "cwd must be restored even when evaluate raises"
+
+
+def test_v685_contract_and_carveout_clauses():
+    """The v6.84.0 run lost 15.46 raw points to the leader across 19 tasks, 8 of them
+    one class: the work was done and never checked against the surface the grader
+    reads. The contract makes that a structured obligation rather than advice; the
+    other clauses each answer a named losing task."""
+    p = rcb.OSWORLD_PREAMBLE
+    # The atomic contract — written before mutation, closed before finishing.
+    assert "WRITE THE CONTRACT BEFORE YOU TOUCH ANYTHING" in p
+    assert "CLOSE THE CONTRACT BEFORE YOU FINISH" in p
+    assert "OBSERVED SATISFIED" in p and "NOT VERIFIED" in p
+    # Singular referent: 05dd4c1d applied the change to both candidates to cover
+    # either reading and scored 0.
+    assert "never apply the change to all of them to cover both readings" in p
+    # gsettings carve-out (bedcedc4: refused the platform's own config CLI).
+    assert "gsettings/dconf" in p and "prefs.js" in p
+    # Infeasibility shapes (5ca86c6f discovery, 2e6f678f mode, 971cbb5b narrower trigger).
+    assert "discovery is part of the job" in p
+    assert "found the verdict and ignored it" in p
+    # The false colour motivation is gone (8472fece: the grader reads no reference file).
+    assert "the reference file was authored from that same palette" not in p
+
+
+def test_task_scoped_proxy_gives_each_task_its_own_session(tmp_path):
+    """The shared config is one entry on the rotating gateway, so every request drew a
+    new exit IP — fatal for any site that ties a session to an address. A per-task
+    `;sessid.<tag>` keeps one exit per trajectory without pinning a whole lane."""
+    import json as _json
+    import os as _os
+    src = tmp_path / "proxy.json"
+    src.write_text(_json.dumps([{"host": "gw.example.com", "port": 823,
+                                 "username": "acct", "password": "p"}]), encoding="utf-8")
+    run_dir = tmp_path / "run" / "domain" / "task"
+    run_dir.mkdir(parents=True)
+    out = rcb._task_scoped_proxy_config(str(src), run_dir, "deadbeefcafe0001")
+    assert out != str(src)
+    cfg = _json.loads(open(out).read())
+    assert cfg[0]["username"] == "acct;sessid.deadbeefcafe0001"
+    assert cfg[0]["password"] == "p", "credentials must survive scoping"
+    assert _os.stat(out).st_mode & 0o777 == 0o600, "the task config carries a credential"
+    # Idempotent: an already-scoped username is not double-suffixed.
+    again = rcb._task_scoped_proxy_config(out, run_dir, "0000")
+    assert _json.loads(open(again).read())[0]["username"].count(";sessid.") == 1
+    # Unreadable input falls back to the shared config rather than failing the task.
+    assert rcb._task_scoped_proxy_config(str(tmp_path / "nope.json"), run_dir, "x") \
+        == str(tmp_path / "nope.json")
+
+
+def test_setup_effect_probe_is_advisory_and_never_raises():
+    """Upstream logs a guest command that failed as 'executed successfully', so a
+    setup step can silently no-op and take the task's premise with it (chrome/3299584d:
+    apt install jq did nothing, the agent honestly reported the task impossible and
+    scored 0 while doing nothing at all would have scored 1). The probe records what
+    is missing; it must never fail a task by itself."""
+    class _Ctl:
+        def __init__(self, present): self.present = present
+        def execute_python_command(self, code):
+            return {"output": "1" if self.present else "0"}
+
+    class _Env:
+        def __init__(self, present): self.controller = _Ctl(present)
+
+    example = {"config": [
+        {"type": "execute", "parameters": {"command": ["apt-get", "install", "-y", "jq"]}},
+        {"type": "download", "parameters": {}},
+    ]}
+    ok = rcb._verify_setup_effect(_Env(True), example)
+    assert ok["checked"] == 1 and ok["missing"] == []
+    bad = rcb._verify_setup_effect(_Env(False), example)
+    assert bad["missing"] == ["jq"]
+
+    class _Boom:
+        controller = property(lambda self: (_ for _ in ()).throw(RuntimeError("x")))
+    out = rcb._verify_setup_effect(_Boom(), example)
+    assert isinstance(out, dict), "diagnostics must never raise"

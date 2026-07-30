@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -832,6 +833,81 @@ def _proxy_trace_shows_exhaustion(data_dir: Path, task_id: str) -> bool:
     return False
 
 
+def _verify_setup_effect(env: Any, example: dict[str, Any]) -> dict[str, Any]:
+    """Check that the task's setup COMMANDS actually succeeded (never raises).
+
+    Upstream's ``SetupController._execute_setup`` treats any HTTP 200 from the guest
+    as success and never inspects the command's exit status, so a setup step that
+    fails inside the VM is logged as "Command executed successfully". Measured on
+    chrome/3299584d: the task's ``apt install jq`` silently did nothing, the premise
+    the gate had verified was gone by the time the worker ran, the agent honestly
+    reported the task impossible and scored 0 — while doing nothing at all would
+    have scored 1.
+
+    We re-run each setup ``execute`` step's own command as a READ-ONLY presence
+    probe where that is meaningful (a package/binary the step installs), and report
+    what we found. Advisory: the caller records it in the manifest rather than
+    failing the task, because a false alarm here would cost a scored task.
+    """
+    report: dict[str, Any] = {"checked": 0, "missing": []}
+    try:
+        for step in (example.get("config") or []):
+            if not isinstance(step, dict) or step.get("type") != "execute":
+                continue
+            cmd = step.get("parameters", {}).get("command")
+            parts = cmd if isinstance(cmd, list) else str(cmd or "").split()
+            # Only the unambiguous shape: an install of a named binary.
+            if "install" not in parts:
+                continue
+            tail = [p for p in parts[parts.index("install") + 1:] if not p.startswith("-")]
+            for pkg in tail:
+                report["checked"] += 1
+                try:
+                    out = env.controller.execute_python_command(
+                        f"import shutil,sys; sys.stdout.write('1' if shutil.which({pkg!r}) else '0')"
+                    )
+                    if "1" not in str((out or {}).get("output", "")):
+                        report["missing"].append(pkg)
+                except Exception:  # noqa: BLE001 - probe only
+                    pass
+    except Exception as exc:  # noqa: BLE001 - never fail a task on diagnostics
+        report["error"] = f"{type(exc).__name__}: {exc}"
+    return report
+
+
+def _task_scoped_proxy_config(config_path: str, run_dir: Path, tag: str) -> str:
+    """Write a task-local proxy config whose username carries a sticky session id.
+
+    The shared config is a single entry on the rotating gateway, so every lane of
+    every concurrent campaign draws a fresh exit IP per request. That breaks any
+    site that ties a session to an address (a search that re-challenges, a booking
+    flow that loses its cart) and concentrates all our traffic on one account's
+    reputation. DataImpulse binds a session with a ``;sessid.<value>`` suffix on
+    the username, so one task keeps one exit for its whole trajectory while
+    different tasks land on different exits.
+
+    Returns the new path, or the original on any failure — a proxy we could not
+    scope is still better than none, and this must never fail a task.
+    """
+    try:
+        entries = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        if not isinstance(entries, list) or not entries:
+            return config_path
+        scoped = []
+        for e in entries:
+            e = dict(e)
+            user = str(e.get("username") or "")
+            if user and ";sessid." not in user:
+                e["username"] = f"{user};sessid.{tag}"
+            scoped.append(e)
+        out = run_dir / "proxy_task.json"
+        out.write_text(json.dumps(scoped, indent=2), encoding="utf-8")
+        os.chmod(out, 0o600)
+        return str(out)
+    except Exception:  # noqa: BLE001 - fall back to the shared config
+        return config_path
+
+
 def _proxy_config_is_live(config_path: str, *, timeout: float = 20.0) -> bool:
     """Probe the FIRST proxy in the config with a real HTTPS CONNECT (never raises).
 
@@ -1054,7 +1130,12 @@ OSWORLD_PREAMBLE = (
     "shape your work around guesses about how it is implemented. Solve the task as stated.\n"
     "A state change counts only if it is reachable through the application's own documented "
     "surface — its UI, its settings, its own CLI (its scripting console only where the task "
-    "itself asks for scripting). Forcing that state from "
+    "itself asks for scripting). The desktop environment's OWN documented configuration CLI "
+    "(gsettings/dconf) is such a surface, not a way round: it writes the same store the "
+    "Settings app writes. Look for the control in the GUI first; if this build genuinely does "
+    "not render the row and no settings page exposes it, set the key with that CLI, name the "
+    "key, and read it back. What stays forbidden is reaching into an application's PRIVATE "
+    "state — prefs.js, profile directories, document XML, credential stores. Forcing that state from "
     "underneath the application does NOT count: writing its preference cookies from a "
     "developer console, decrypting or editing its credential/profile stores, or patching the "
     "program itself. If the only way you can produce the requested state is from underneath, "
@@ -1160,8 +1241,9 @@ OSWORLD_PREAMBLE = (
     "a size, a count — beats a preset and must be entered exactly. A colour WORD on its own is "
     "not a numeric value: do not infer a pure-primary hex from it. Wording like \"exactly "
     "these colours, no variations\" means DO NOT substitute a neighbouring shade (no dark red "
-    "for red) — it does NOT mean type a raw hex: pick the palette entry whose name is the word "
-    "the task used, because the reference file was authored from that same palette.\n"
+    "for red) — it does NOT mean type a raw hex. Use the app's palette entry of that name, "
+    "and when the task calls a colour by a PRIMARY name (red, green, blue), prefer the entry "
+    "closest to that primary over a decorative shade of the same name.\n"
     "TRANSFER TEXT VERBATIM, NEVER RETYPE. When content must move between files, apps or "
     "pages, move it through copy/paste from the source AS DISPLAYED — retyping silently "
     "drops leading spaces, paragraph breaks and separators, and 'fixing' the content while "
@@ -1193,6 +1275,21 @@ OSWORLD_PREAMBLE = (
     "the canonical settings page or the produced artifact in view, not an unrelated tab; "
     "and remove your own failed intermediate output (an error dialog, a broken paste, a "
     "stray scratch file) from the surfaces you touched before declaring done.\n"
+    "WRITE THE CONTRACT BEFORE YOU TOUCH ANYTHING. In your first message after reading the "
+    "screen, list the task's obligations as a short numbered checklist — one line each, in "
+    "the task's own words: the OBJECT (which file/slide/row/setting, named exactly), the "
+    "REQUIRED STATE (the literal value, format or text, with every qualifier the task states "
+    "— a scope, a condition, a unit), the ORDER or POSITION if the task implies one, what "
+    "must stay UNCHANGED, and where the result must PERSIST (saved file, app store, active "
+    "page). If an obligation names a referent that resolves to several candidates, pick ONE, "
+    "say which and why, and never apply the change to all of them to cover both readings — a "
+    "second edit is a defect even if the first was right.\n"
+    "CLOSE THE CONTRACT BEFORE YOU FINISH. Go through that checklist one item at a time and "
+    "mark each: OBSERVED SATISFIED (say what you looked at), NOT VERIFIED, or IMPOSSIBLE (say "
+    "what you observed). You may only declare done when every item reads OBSERVED SATISFIED. "
+    "An item you cannot verify is not an item you may assume; go and look. If closing the "
+    "contract reveals a gap, make ONE targeted repair and re-check that item — do not rewrite "
+    "work that already satisfied its item.\n"
     "VERIFY BY INDEPENDENT READ-BACK, NOT BY YOUR OWN MEMORY. Before you declare done, confirm "
     "the result from the surface the grader will read, freshly: re-open the SAVED file and read "
     "the exact cells/paragraphs/shapes you claim you changed; read the application's own "
@@ -1204,7 +1301,14 @@ OSWORLD_PREAMBLE = (
     "offers, or an optional residual is NOT task infeasibility. Declare TASK_INFEASIBLE only "
     "after OBSERVING that the literal requested state has no allowed route. If another "
     "allowed route reaches that same state, use and verify it — but do not present an "
-    "adjacent result as if it were the thing asked for.\n"
+    "adjacent result as if it were the thing asked for. Three shapes where the gap IS the "
+    "verdict rather than a caveat: (a) the task restricts the means (\"using only X\") and "
+    "the only way to FIND what you need is outside X — discovery is part of the job, not a "
+    "free preliminary; (b) the task asks for a named MODE of operation and the application "
+    "only offers the single-item action you would repeat in a loop; (c) the mechanism you "
+    "found triggers on something NARROWER than the task states (a folder-open hook where the "
+    "task says every launch). If you write that the real path is impossible and then deliver "
+    "a substitute anyway, you have found the verdict and ignored it.\n"
     "Be decisive and efficient. When the task is verifiably complete in the real app, stop. "
     "If genuinely infeasible, end your final message with only: TASK_INFEASIBLE\n\nTask:\n"
 )
@@ -1954,6 +2058,13 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
         # fact (proxy_required/proxy_enabled/proxy_exhausted_in_trace) for disclosure —
         # it is never dropped, because the lane makes a single pass over the tasks.
         _proxy_present = os.path.exists(_proxy_cfg)
+        if _proxy_present:
+            # One sticky exit per task (see _task_scoped_proxy_config). The tag is
+            # derived from the run and example so a retry of the same task on the
+            # same run reuses its exit, while neighbours never share one.
+            _proxy_cfg = _task_scoped_proxy_config(
+                _proxy_cfg, run_dir,
+                hashlib.sha256(f"{run_dir.parent.name}:{example_id}".encode()).hexdigest()[:16])
         # Probe only when THIS task is proxy-flagged: 312 of 361 tasks never touch
         # the proxy, and probing on all of them adds 361 external round trips per
         # campaign whose only possible effect is a spurious failure.
@@ -2101,6 +2212,12 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
                     env, example, retries=int(args.reset_retries),
                     deadline=time.time() + max(1, int(args.startup_timeout_sec)),
                     wait_after_sec=float(args.wait_after_reset_sec))
+                # The post-gate reset re-runs setup, and upstream reports a guest
+                # command that failed as "executed successfully". Record whether the
+                # things setup claims to install are actually present, so a premise
+                # that vanished between gate and worker is visible in the artefact
+                # instead of surfacing as an honest-but-scored-zero infeasible.
+                reset_diag["setup_effect"] = _verify_setup_effect(env, example)
             except ResetUnverified as exc:
                 final.update({"outcome": "adapter_error", "exit_code": 1,
                               "error": {"type": "ResetUnverified", "message": str(exc)[:4000]}})
