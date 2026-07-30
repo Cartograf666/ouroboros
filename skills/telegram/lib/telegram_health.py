@@ -1,8 +1,8 @@
 """Telegram bridge: health snapshot + read-only task list panels."""
 from __future__ import annotations
 
-import os
 import pathlib
+import shutil
 import time
 from typing import Dict
 
@@ -96,8 +96,7 @@ def _collect_health(api, lang: str = "en") -> str:
     else:
         out.append(f"✅ {s['incidents']}: {s['clean']}")
     try:
-        st = os.statvfs(str(data))
-        free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
+        free_gb = shutil.disk_usage(data).free / (1024 ** 3)
         logs_mb = _dir_size_mb(data / "logs")
         unit = "ГБ" if lang == "ru" else "GB"
         munit = "МБ" if lang == "ru" else "MB"
