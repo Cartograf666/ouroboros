@@ -188,10 +188,12 @@ GATE_PREAMBLE = (
     "working phase just converts a clean INFEASIBLE into a manufactured artifact later.\n"
     "5. STORE-OR-RENDER — for \"set/change <setting> to <value>\" tasks: does the target "
     "merely STORE the value (a name, a string, a path)? A stored name does not require the "
-    "named resource to be installed or functional. The reverse also holds: if the task asks "
-    "for something to be DISPLAYED or VISIBLE, storing the flag is not the action — and if "
-    "you have OBSERVED that the thing to display does not exist here (no such device, no such "
-    "data), the premise is absent.\n"
+    "named resource to be installed or functional. The reverse holds only NARROWLY: when the "
+    "task asks for something to be DISPLAYED, that is infeasible only if the underlying "
+    "pre-existing referent or the rendering capability itself was VERIFIED ABSENT (no such "
+    "device exists, no such data exists). Merely hidden, disabled, not yet loaded or fetched, "
+    "or something the requested action would itself create or reveal, is WORK — answer "
+    "PROCEED, or UNDETERMINED when read-only inspection cannot decide.\n"
     "6. PLACEHOLDERS — if the instruction itself contains unbound template variables or "
     "symbolic names that neither the instruction nor the environment binds to any concrete "
     "value, the premise is broken.\n"
@@ -734,8 +736,9 @@ def _official_evaluate_cwd(osworld_root: Path):
     line in the lane log (measured: multi_apps/7f35355e produced the correct
     25.27 and still scored 0.0).
 
-    Scoped to the evaluate call and restored on every path: our own paths are
-    absolute, but a process-wide chdir is a bigger promise than this needs.
+    Scoped to the evaluate call and restored on every path. It exists ONLY to
+    resolve relative fixture paths: the env's cache root is passed absolute at
+    construction, so nothing else is allowed to depend on this window.
     """
     previous = os.getcwd()
     try:
@@ -763,7 +766,10 @@ def _worker_round_cap(budget: dict[str, Any], gate_turns: int | None) -> int | N
     claimed = int(budget.get("max_steps_claimed") or 0)
     if not claimed:
         return None
-    used = int(gate_turns or 0)
+    # UNKNOWN is not zero: an unreadable gate count must keep the worst-case
+    # reserve, otherwise a worker could take claimed-1 turns after an
+    # unmeasured gate and blow the declared total.
+    used = int(gate_turns) if gate_turns is not None else int(budget.get("gate_turn_reserve") or 0)
     return max(1, claimed - used - int(budget.get("terminal_turn_reserve") or 1))
 
 
@@ -785,8 +791,13 @@ def _publish_worker_round_cap(settings_path: Path, cap: int) -> dict[str, Any]:
             return record
         record["previous"] = settings.get("OUROBOROS_MAX_ROUNDS")
         settings["OUROBOROS_MAX_ROUNDS"] = int(cap)
-        tmp = path.with_suffix(".part")
+        # Unique temp (a fixed sibling collides between lanes) and the ORIGINAL
+        # mode preserved: this file carries provider credentials and is 0600, but
+        # a fresh write would take the process umask (0664 here).
+        mode = path.stat().st_mode & 0o777 if path.is_file() else 0o600
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.part")
         tmp.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.chmod(tmp, mode)
         tmp.replace(path)
         record["applied"] = True
     except Exception as exc:  # noqa: BLE001 - disclosure, never fatal
@@ -801,20 +812,22 @@ def _proxy_trace_shows_exhaustion(data_dir: Path, task_id: str) -> bool:
     407) inside a proxy:true task means the residential upstream ran out mid-run;
     that is an infra fault to quarantine, not an agent failure to score.
     """
-    candidates = [
-        data_dir / "state" / "headless_tasks" / task_id / "data" / "logs" / "tools.jsonl",
-        data_dir / "logs" / "tools.jsonl",
-    ]
-    for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    if "TRAFFIC_EXHAUSTED" in line or "407 " in line or "Proxy Authentication" in line:
-                        return True
-        except OSError:
-            continue
+    # TASK-LOCAL ONLY. The lane-wide aggregate carries every earlier task on the
+    # same server, so falling back to it quarantined later tasks for a neighbour's
+    # outage (3 of them were wins in the previous run). No task id, no verdict.
+    path = data_dir / "state" / "headless_tasks" / task_id / "data" / "logs" / "tools.jsonl"
+    if not task_id or not path.is_file():
+        return False
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                # The unambiguous upstream signature only. A bare "407" appears in
+                # page content and ordinary prose; matching it read origin data as
+                # proxy failure.
+                if "TRAFFIC_EXHAUSTED" in line:
+                    return True
+    except OSError:
+        return False
     return False
 
 
@@ -1057,13 +1070,14 @@ OSWORLD_PREAMBLE = (
     "type_text, key, scroll, drag. This should be MOST of your actions, like a human using "
     "the VM. Do not replace a GUI workflow with prefs.js edits, UNO/Basic macros, "
     "python-pptx, profile hacks, XML edits, or other behind-the-back mutations.\n"
-    "- remote_exec is NOT your main channel for tasks ABOUT AN APPLICATION'S STATE (a "
-    "setting, a document's on-screen content, a UI action) — do those in the GUI. But for "
-    "genuine BATCH OR FILE-PROCESSING work — split/merge/convert files, transform many items, "
-    "extract data across files — the command line is the RIGHT tool and the installed "
-    "utilities (pdfseparate/pdfunite, imagemagick, ffmpeg, unzip, etc.) are the efficient "
-    "path; do not hand-drive a print dialog N times for what one command does. Read-only "
-    "checks may bundle into the same turn as the next GUI action.\n"
+    "- Use the shell for requested FILE-LEVEL batch operations — split/merge/convert/extract "
+    "— where the deliverable is a new file or set of files (pdfseparate/pdfunite, "
+    "ffmpeg, unzip; check a tool exists before relying on it): do not hand-drive a print "
+    "dialog N times for what one "
+    "command does, then open the produced files in the named application and verify them "
+    "there. Do NOT use the shell, UNO/Basic macros, python-pptx, XML or profile edits to "
+    "mutate an open application's document, preferences or UI state — that work belongs in "
+    "the GUI. Read-only checks may bundle into the same turn as the next GUI action.\n"
     "\n"
     "VISION LOOP — do exactly this for GUI work:\n"
     "  1. screenshot — the image is ATTACHED to the conversation automatically; you see the "
@@ -1077,12 +1091,17 @@ OSWORLD_PREAMBLE = (
     "tool call inside that message costs the same single turn. Tool calls are effectively "
     "free — turns are the scarce resource (measured on the previous full run: 94% of turns "
     "carried one lonely call; the budget allows several times more work in the same turns):\n"
-    "- When the next few actions are confident, issue them as ONE BATCH of 4-8 calls in one "
-    "turn — clicks, keys, typing — with a single screenshot as the LAST call of the batch to "
-    "see the combined result. A dialog you have walked before (wizard pages, print flows, "
-    "repeated per-item edits) is exactly what batching is for.\n"
-    "- Split a batch only where an action's TARGET depends on what the previous action "
-    "reveals (a menu you have not seen yet); do not split it out of caution alone.\n"
+    "- Batch only consecutive actions whose focus, target and expected postcondition are "
+    "ALREADY established — a dialog you have walked before, repeated per-item edits — with a "
+    "single screenshot as the LAST call. 2-6 calls is typical, not a minimum. Batched calls "
+    "fire back-to-back with NO settling time (the round trip between turns used to provide "
+    "~5s), so put a short `wait` before that screenshot whenever an action opens or closes a "
+    "dialog, switches document or triggers a save — a screenshot taken too early shows the "
+    "previous screen. A failing call does NOT stop the rest of its batch, so never batch past "
+    "a step whose failure would send later calls into the wrong window.\n"
+    "- Observe before any speculative Enter/Return, drag, save, modal transition or "
+    "dynamic-page step, and whenever a failure would make a later action unsafe. Split when "
+    "the next action's target, focus, safety or correctness depends on the result.\n"
     "- Do not spend more than 2 turns on investigation before acting; the premise check "
     "above is separate and is never the thing you cut.\n"
     "- Prefer keyboard shortcuts when faster (menus via Alt, Ctrl+S to save, etc.).\n"
@@ -1132,14 +1151,12 @@ OSWORLD_PREAMBLE = (
     "directly expresses what is asked, use it instead of reimplementing the effect at a lower "
     "level. Low-level work is right when the task asks for it or the app offers no first-class "
     "path — then confirm the result inside the target application afterwards.\n"
-    "REALIZE A NAMED STATE THROUGH A NAMED CONTROL — BUT AN EXACT VALUE WINS. When the task "
-    "names a mode or action in words (\"dark mode\", a bulleted list, \"Hide Docks\"), use "
-    "the application's own toggle/command rather than reconstructing the effect by hand. BUT "
-    "when the task states an EXACT value (a specific hex like 00FF00, an RGB triple, a named "
-    "colour that maps to a standard code), enter THAT exact value even if a palette offers a "
-    "similarly-named swatch: an app's 'Blue' preset (e.g. 2A6099) is NOT pure blue 0000FF, and "
-    "the grader checks the stored value, not the swatch name. Match what the task literally "
-    "specifies; only fall back to the named preset when the task gives no exact value.\n"
+    "REALIZE A NAMED STATE THROUGH THE APPLICATION'S NAMED CONTROL. When the task names a "
+    "mode, style or action in words (\"dark mode\", a bulleted list, \"green\", \"Hide "
+    "Docks\"), use the app's own toggle, command or palette entry rather than reconstructing "
+    "the effect by hand. An explicit NUMERIC value written in the task — a hex, an RGB triple, "
+    "a size, a count — beats a preset and must be entered exactly. A colour WORD on its own is "
+    "not a numeric value: do not infer a pure-primary hex from it.\n"
     "TRANSFER TEXT VERBATIM, NEVER RETYPE. When content must move between files, apps or "
     "pages, move it through copy/paste from the source AS DISPLAYED — retyping silently "
     "drops leading spaces, paragraph breaks and separators, and 'fixing' the content while "
@@ -1156,10 +1173,11 @@ OSWORLD_PREAMBLE = (
     "often DISPLAY a default as if selected while nothing is stored.\n"
     "ORDINALS COUNT WHAT THE TASK COUNTS. Resolve \"first/second/Nth line|item|entry\" in "
     "visual reading order, and state your resolved mapping (\"second item = ...\") before "
-    "acting. Do NOT blanket-exclude titles or headings: on a slide or a document the Nth "
-    "'line' or 'text box' often IS a heading, and the grader may target exactly it. Exclude "
-    "an element only when the task's own wording makes it not-an-item (e.g. it says \"list "
-    "items\" and the heading is plainly not a list entry).\n"
+    "acting. When the elements form a BULLETED OR NUMBERED LIST, count only the actual list "
+    "entries: a title and an unbulleted lead-in label (typically ending in ':') are not list "
+    "lines, even when the task says only \"line\". Otherwise — text boxes, table rows, "
+    "shapes, plain paragraphs — a heading COUNTS as the Nth item, because the Nth text box on "
+    "a slide often IS the title and the grader may target exactly it.\n"
     "FINISH ON THE GRADED SURFACE. Quote the machine-visible identifier you are setting "
     "byte-exactly and compare case-sensitively (an id, a filename, a settings key); encode "
     "EVERY qualifier the task states (a scope, a 'when' condition, a unit), not just the "
@@ -1174,10 +1192,11 @@ OSWORLD_PREAMBLE = (
     "file you produced, read it back with a DIFFERENT tool than the one that wrote it (do not "
     "grep your own output and call it verified). If read-back does not match the requirement, "
     "keep working.\n"
-    "YOUR OWN ADMISSION IS THE VERDICT. If you find yourself writing that the real path is "
-    "impossible here, or that what you are about to deliver is a stand-in for the thing "
-    "asked for, then that IS the finding — end with TASK_INFEASIBLE instead of delivering "
-    "the substitute.\n"
+    "A failed route, a hypothetical limitation, a harmless fallback the application itself "
+    "offers, or an optional residual is NOT task infeasibility. Declare TASK_INFEASIBLE only "
+    "after OBSERVING that the literal requested state has no allowed route. If another "
+    "allowed route reaches that same state, use and verify it — but do not present an "
+    "adjacent result as if it were the thing asked for.\n"
     "Be decisive and efficient. When the task is verifiably complete in the real app, stop. "
     "If genuinely infeasible, end your final message with only: TASK_INFEASIBLE\n\nTask:\n"
 )
@@ -1926,7 +1945,12 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
         # proxy:true task that then still hits a dead route is quarantined below, not
         # scored as a capability zero.
         _proxy_present = os.path.exists(_proxy_cfg)
-        _enable_proxy = _proxy_present and _proxy_config_is_live(_proxy_cfg)
+        # Probe only when THIS task is proxy-flagged: 312 of 361 tasks never touch
+        # the proxy, and probing on all of them adds 361 external round trips per
+        # campaign whose only possible effect is a spurious failure.
+        _proxy_needed = bool(example.get("proxy"))
+        _enable_proxy = _proxy_present and (
+            _proxy_config_is_live(_proxy_cfg) if _proxy_needed else True)
         if _enable_proxy:
             os.environ["PROXY_CONFIG_FILE"] = os.path.abspath(_proxy_cfg)
         run.base_manifest["harness"]["proxy"] = {
@@ -1951,6 +1975,18 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
             action_space="pyautogui", screen_size=(1920, 1080),
             headless=not args.show_vm, os_type="Ubuntu", require_a11y_tree=False,
             enable_proxy=_enable_proxy,
+            # ABSOLUTE, PER-CAMPAIGN cache root. DesktopEnv defaults to the RELATIVE
+            # "cache", so setup (original CWD) and evaluation (checkout CWD, see
+            # _official_evaluate_cwd) resolved the same string to DIFFERENT
+            # directories: cache_file getters looked where setup had not written,
+            # and get_vm_wallpaper opened a path whose parent did not exist —
+            # FileNotFoundError, which evaluate() turns into a silent 0 (two tasks
+            # that score 1.0 on both models). Per-CAMPAIGN, not per-task: the
+            # cache holds the downloaded cloud_file golds of 171 tasks, so a fresh
+            # dir per task would re-download them all; and not shared between the
+            # two concurrent campaigns, which is how one model's pulled artefact
+            # could be scored as the other's.
+            cache_dir=str((Path(args.result_dir).parent / "osworld_cache").resolve()),
         )
         # Reset with retries to a VERIFIED task state (screenshot AND setup postcondition —
         # see _reset_verified). Its own fresh startup window (mirrors
@@ -2099,8 +2135,16 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
             _budget = (run.base_manifest.get("harness") or {}).get("step_budget") or {}
             _cap = _worker_round_cap(_budget, (gate_record or {}).get("policy_turns"))
             if _cap is not None:
-                run.base_manifest["harness"]["worker_round_cap"] = _publish_worker_round_cap(
-                    settings_path, _cap)
+                _pub = _publish_worker_round_cap(settings_path, _cap)
+                run.base_manifest["harness"]["worker_round_cap"] = _pub
+                if not _pub.get("applied"):
+                    # A stale cap from an EARLIER task on this lane may be larger
+                    # than this example allows, so an unapplied write is not
+                    # "keep the stricter value" — it is an unknown budget.
+                    raise RuntimeError(
+                        f"worker round cap {_cap} could not be published to {settings_path}: "
+                        f"{_pub.get('error')}"
+                    )
             created = _api(args.ouroboros_url, "POST", "/api/tasks", {
                 "description": prompt, "memory_mode": "empty",
                 "disabled_tools": _effective_disabled_tools(args.allow_a11y),
@@ -2203,15 +2247,6 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
             # Counters that omit it under-report a two-task example as a one-task example.
             budget_counters["feasibility_gate"] = dict(gate_record)
 
-        # Proxy quarantine: a proxy:true task whose trace carries 407 TRAFFIC_EXHAUSTED
-        # got a dead upstream mid-run — an INFRASTRUCTURE failure, not a capability zero.
-        # Publish it as an unscored infra null so it is retried and kept out of the
-        # capability denominator, exactly like a lost guest control server.
-        if bool(example.get("proxy")) and _proxy_trace_shows_exhaustion(data_dir, task_id):
-            return _write_outcome(None, "quarantined", "proxy_unavailable",
-                                  extra={"proxy_exhausted": True,
-                                         "budget_counters": budget_counters})
-
         with _official_evaluate_cwd(osworld_root):
             reward = float(env.evaluate())
         # FAIL-CLOSED DURABLE CLAIM TRANSITION, before the score is projected ANYWHERE.
@@ -2220,6 +2255,20 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
         # task that already had one — the pre-registered "first scored attempt wins" rule
         # violated in the direction that corrupts results. `mark_task_scored` raises
         # `ClaimMarkerNotDurable` rather than swallowing the failure.
+        # Proxy quarantine — AFTER the official score exists, and only for a task
+        # that actually FAILED. Quarantining before evaluation would have discarded
+        # 17 Opus wins in the previous run: an agent that meets a dead proxy and
+        # reroutes still solves the task, and the 407 stays in its trace forever.
+        # A win is never infrastructure.
+        if (reward == 0.0 and bool(example.get("proxy")) and _enable_proxy
+                and task_id and _proxy_trace_shows_exhaustion(data_dir, task_id)):
+            _write_outcome(None, "quarantined", "proxy_unavailable",
+                           extra={"proxy_exhausted": True, "official_reward_discarded": reward,
+                                  "budget_counters": budget_counters})
+            final.update({"outcome": "quarantined", "exit_code": 1,
+                          "reason": "proxy_unavailable"})
+            return 1
+
         if claims_dir is not None and claim_fd is not None:
             try:
                 mark_task_scored(claims_dir, claim_key, repo_dir=repo_dir,

@@ -1862,7 +1862,7 @@ def test_forensics_clauses_are_pinned_in_the_worker_prompt():
     p = rcb.OSWORLD_PREAMBLE
     for phrase in (
         # v6.84.0 corrected wordings (the v6.83.0 originals cited-while-losing were fixed)
-        "REALIZE A NAMED STATE THROUGH A NAMED CONTROL",
+        "REALIZE A NAMED STATE THROUGH THE APPLICATION'S NAMED CONTROL",
         "TRANSFER TEXT VERBATIM, NEVER RETYPE",
         "TOUCH ONLY WHAT THE TASK NAMES",
         "ORDINALS COUNT WHAT THE TASK COUNTS",
@@ -2026,6 +2026,16 @@ def test_gate_turns_are_enforced_per_task_from_the_live_event_log(tmp_path):
     assert rcb._live_policy_turns(tmp_path / "nope", task_id) is None
 
 
+def test_unknown_gate_turns_keep_the_full_reserve(tmp_path):
+    """UNKNOWN is not zero. If the gate's turn count cannot be read, granting
+    claimed-1 turns would let the worker blow the declared total after an
+    unmeasured gate — the audit would then call the already-scored campaign
+    non-comparable. Fail closed: keep the worst-case reserve."""
+    budget = rcb._step_budget(_ns(max_steps=100, feasibility_gate=True),
+                              {"value": 99, "source": "settings"})
+    assert rcb._worker_round_cap(budget, None) == 100 - rcb._GATE_TURN_RESERVE - 1
+
+
 def test_unused_gate_reserve_is_returned_to_the_worker(tmp_path):
     """The static reserve is worst-case: the gate is budgeted 14 turns but spent a
     mean of 4 on the v6.83.0 run, so a flat max_steps-14-1 threw ~10 turns away on
@@ -2089,10 +2099,24 @@ def test_v684_prompt_fixes_are_present_and_harmful_clauses_gone():
     p = rcb.OSWORLD_PREAMBLE
     # 1. Budget is turns, not calls; batching is encouraged.
     assert "YOUR BUDGET IS ASSISTANT TURNS, NOT TOOL CALLS" in p
-    assert "ONE BATCH of 4-8 calls" in p
     assert "every tool call costs ~30s" not in p  # the mistaxed clause is gone
-    # 2a. Exact value beats the app's named swatch.
-    assert "AN EXACT VALUE WINS" in p and "0000FF" in p
+    # Batching must carry its safety guard: adversarial review found 8 prior 1.0s
+    # that depended on observing after a speculative Enter/drag/save.
+    assert "Observe before any speculative Enter/Return, drag, save" in p
+    assert "2-6 calls is typical, not a minimum" in p
+    # Batching removes the ~5s settle the per-turn round trip used to provide, and a
+    # failing call does not stop its batch (measured: 43% of intra-batch gaps < 1s).
+    assert "NO settling time" in p and "does NOT stop the rest of its batch" in p
+    # Ordinals: a bulleted list excludes title+lead-in even when the task says "line"
+    # (impress/550ce7e7, opus 1.0, cited the removed clause while winning); anything
+    # else counts the heading (impress/3161d64e, 5cfb9197 — both 1.0 on both models).
+    assert "BULLETED OR NUMBERED LIST, count only the actual list" in p
+    assert "a heading COUNTS as the Nth item" in p
+    # 2a. A numeric literal beats a preset; a colour WORD does not (two pinned
+    # tasks require LibreOffice's named Green 00A933, one requires pure 0000FF —
+    # no prompt wording wins all three, so we keep the named-control default).
+    assert "explicit NUMERIC value" in p
+    assert "colour WORD on its own is not a numeric value" in p
     # 2b. Already-in-state judged from stored value, not the render.
     assert "STORED value the grader" in p
     assert "is ALREADY in the requested state, verifying that and stopping is a correct completion" not in p
@@ -2100,15 +2124,23 @@ def test_v684_prompt_fixes_are_present_and_harmful_clauses_gone():
     assert "ORDINALS COUNT WHAT THE TASK COUNTS" in p
     assert "excluding titles, headings and unbulleted lead-in" not in p
     # 3. CLI allowed for batch/file work.
-    assert "BATCH OR FILE-PROCESSING work" in p and "pdfseparate" in p
+    assert "pdfseparate" in p
     # 4. Independent read-back + snapshot/diff.
     assert "VERIFY BY INDEPENDENT READ-BACK" in p and "DIFFERENT tool" in p
     assert "compare before vs after and undo" in p
-    # 5. Own-admission -> verdict (worker), and the display counter-branch (gate rubric).
-    assert "YOUR OWN ADMISSION IS THE VERDICT" in p
+    # 5. Infeasibility wording must stay NARROW: a failed route or a fallback the
+    # app itself offers is not infeasibility (9 prior 1.0 traces used the words
+    # "impossible"/"not possible" mid-run and still won).
+    assert "A failed route" in p and "is NOT task infeasibility" in p
+    assert "only after OBSERVING" in p
+    assert "YOUR OWN ADMISSION IS THE VERDICT" not in p, "the lexical slogan false-kills wins"
     g = rcb.GATE_PREAMBLE
-    assert "DISPLAYED or VISIBLE" in g and "storing the flag is not the action" in g
+    assert "VERIFIED ABSENT" in g
+    assert "Merely hidden, disabled, not yet loaded" in g, "hidden != absent"
     assert "When in doubt, answer UNDETERMINED" in g, "fail-open default must survive"
+    # 3. Shell is for file-level deliverables, never for app state.
+    assert "FILE-LEVEL batch operations" in p
+    assert "mutate an open application's document, preferences or UI state" in p
 
 
 def test_proxy_health_gate_fails_closed(monkeypatch, tmp_path):

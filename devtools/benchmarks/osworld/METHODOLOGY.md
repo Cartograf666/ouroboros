@@ -270,6 +270,28 @@ leaderboard run without the disclosures below.
    runtime never emits cannot be listed. Report truncated tasks separately from
    honest failures; `max_rounds_effective` alone will not tell you they
    happened. The current Verified leaderboard standard is 100 steps.
+4a-bis. **Scaffold revisions v6.83.0 and v6.84.0 — a NEW series, not comparable to
+   earlier numbers.** v6.83.0 introduced a declared and enforced step budget (one step
+   = one top-level policy turn, matching the official `predict() -> actions[]`
+   boundary; 100 total = gate + worker + one terminal turn), residential-proxy routing
+   for `proxy:true` tasks, and a package of working-prompt clauses. v6.84.0 revises
+   that package on measured evidence from the v6.83.0 runs: the budget clause is
+   restated in TURNS (the previous wording charged tool calls and produced 1.01 calls
+   per turn across ~11k turns, i.e. the runs used about a third of their action
+   budget); three clauses that agents demonstrably cited while losing are corrected
+   (an explicit numeric value beats a preset, "already in the requested state" is
+   judged from the stored value rather than the render, and ordinals count list
+   entries only inside an actual list); the shell is admitted for file-level batch
+   deliverables while application state stays GUI-only; verification requires an
+   independent read-back; and the premise rubric gains a narrow display branch.
+   Harness: the official evaluator now runs with the checkout root as CWD against an
+   absolute per-campaign cache, the gate's unused turn reserve is returned to the
+   worker, proxy routing is gated on a live probe, and a `proxy:true` task whose own
+   trace shows an exhausted upstream and which scored a hard zero is published as an
+   unscored infrastructure result rather than a capability zero (disclose the count).
+   Numbers from v6.84.0 MUST NOT be pooled or averaged with v6.81.x or v6.83.0
+   numbers, and a delta across that boundary is a scaffold delta, not a model delta.
+
 4a. **Scaffold revision after the v6.81.0 run — disclose which revision produced a
    number.** (v6.81.1 adds a further prompt revision, disclosed here under the same
    rule: the working preamble gains an "ENVIRONMENT PITFALLS" section of task-general
