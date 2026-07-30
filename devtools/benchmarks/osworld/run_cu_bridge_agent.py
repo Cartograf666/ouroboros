@@ -2119,7 +2119,11 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
             # must EXCLUDE examples whose audit says they overran it.
             "step_budget_audit": _audit_step_budget(
                 (run.base_manifest.get("harness") or {}).get("step_budget") or {},
-                _policy_turns(latest),
+                # A gate INFEASIBLE ends the example before the working phase, so
+                # the worker consumed exactly ZERO policy turns. That is a known
+                # count, not an unknown one — reporting it as unavailable would
+                # fail closed on the very outcome the gate exists to produce.
+                0 if gate_infeasible else _policy_turns(latest),
                 (gate_record or {}).get("policy_turns"),
                 gate_expected=bool(args.feasibility_gate),
             ),

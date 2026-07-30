@@ -2026,6 +2026,20 @@ def test_gate_turns_are_enforced_per_task_from_the_live_event_log(tmp_path):
     assert rcb._live_policy_turns(tmp_path / "nope", task_id) is None
 
 
+def test_a_gate_terminated_example_is_not_a_budget_fault():
+    """A gate INFEASIBLE ends the example before the working phase, so the worker
+    used exactly zero policy turns — a KNOWN count. Treating it as unknown made
+    the fail-closed audit flag the very outcome the gate exists to produce
+    (caught live on os/a462a795 minutes into the v6.83.0 run)."""
+    budget = rcb._step_budget(_ns(max_steps=100, feasibility_gate=True),
+                              {"value": 85, "source": "settings"})
+    gated = rcb._audit_step_budget(budget, 0, 4, gate_expected=True)
+    assert gated["budget_fault"] is False and gated["policy_turns_used"] == 4
+    # A genuinely unknown worker count still fails closed.
+    unknown = rcb._audit_step_budget(budget, None, 4, gate_expected=True)
+    assert unknown["budget_fault"] is True
+
+
 def test_a_checkout_other_than_the_campaign_pin_is_refused_before_the_vm_boots():
     """The graded-spec pin decides both the instruction the agent receives and the
     evaluator that scores it. Recording a mismatch in the manifest is a report:
