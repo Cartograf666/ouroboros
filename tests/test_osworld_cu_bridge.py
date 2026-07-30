@@ -2112,6 +2112,13 @@ def test_v684_prompt_fixes_are_present_and_harmful_clauses_gone():
     # else counts the heading (impress/3161d64e, 5cfb9197 — both 1.0 on both models).
     assert "BULLETED OR NUMBERED LIST, count only the actual list" in p
     assert "a heading COUNTS as the Nth item" in p
+    # Smoke evidence: 05dd4c1d aligned the document-order shape (Shape;135) while the
+    # gold targets the visually higher one (Shape;136) — slide ordinals need an ORDER.
+    assert "order them by POSITION, top-to-bottom" in p
+    assert "never by document order, selection order or Tab order" in p
+    # Smoke evidence: 04578141 read "exactly these colours, no variations" as a licence
+    # to type raw 00FF00 through Custom Color; the gold is palette Green 00A933, tol 0.
+    assert "it does NOT mean type a raw hex" in p
     # 2a. A numeric literal beats a preset; a colour WORD does not (two pinned
     # tasks require LibreOffice's named Green 00A933, one requires pure 0000FF —
     # no prompt wording wins all three, so we keep the named-control default).
