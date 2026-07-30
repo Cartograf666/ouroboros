@@ -289,14 +289,17 @@ class TestVlmQueryTool(unittest.TestCase):
 
         ctx = self._make_ctx()
 
-        # Minimal valid 1x1 PNG (89 bytes)
-        png_bytes = (
-            b'\x89PNG\r\n\x1a\n'
-            b'\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
-            b'\x08\x02\x00\x00\x00\x90wS\xde'
-            b'\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N'
-            b'\x00\x00\x00\x00IEND\xaeB`\x82'
-        )
+        # A GENUINELY decodable 1x1 PNG. The hand-rolled literal that lived here
+        # was labelled "minimal valid" but carried a broken IDAT stream; it only
+        # passed because nothing decoded it. The payload builder now rejects an
+        # undecodable image at build time (a truncated PNG used to reach the
+        # provider and come back as a non-retryable 400), so the fixture has to
+        # be a real picture.
+        import io as _io
+        from PIL import Image as _Image
+        _buf = _io.BytesIO()
+        _Image.new("RGB", (1, 1), (255, 0, 0)).save(_buf, format="PNG")
+        png_bytes = _buf.getvalue()
 
         tmpdir, uploads = self._make_uploads_dir()
         img_path = uploads / "test.png"

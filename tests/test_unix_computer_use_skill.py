@@ -807,7 +807,6 @@ def test_corrupt_screenshot_fails_closed_and_refetches(tmp_path, monkeypatch):
     is garbage; in v6.81.1 five tasks died rounds later on a non-retryable
     provider 400. The fetch path must re-request on an undecodable body and
     fail CLOSED (ok:false) if it never decodes — never publish a corrupt path."""
-    import io
     import urllib.request
     import skills.unix_computer_use.plugin as plugin
 

@@ -33,6 +33,20 @@ class _API:
 
 
 def _fake_png(path: pathlib.Path, width: int, height: int) -> None:
+    """A REAL png of the requested size.
+
+    This used to write only a signature + IHDR: enough for the old header-only
+    dimension read, but undecodable. Screenshot results now fail closed on an
+    image that does not fully decode (a truncated PNG kept a valid header and
+    detonated later as a provider 400), so a header-shaped stub would exercise
+    the rejection path in every test that just needs a picture."""
+    from PIL import Image
+    Image.new("RGB", (width, height), (7, 11, 13)).save(path, format="PNG")
+
+
+def _header_only_png(path: pathlib.Path, width: int, height: int) -> None:
+    """Signature + IHDR only — valid header, undecodable body (the corruption
+    class the integrity check exists to catch)."""
     path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + struct.pack(">II", width, height))
 
 
@@ -79,7 +93,13 @@ def test_remote_screenshot_result_confined_and_transform(tmp_path):
     # copied to a data/uploads directory (OS-agnostic: check both separators).
     assert "/uploads/" not in out and "\\uploads\\" not in out
     assert '"view_image_ready": true' in out
-    assert '"sx": 1.0' in out
+    # 1920x1080 capped at 1280x800 downscales to 1280x720, so the transform maps
+    # image space back to input space at 1.5x. The previous expectation of sx=1.0
+    # only held because the stub PNG was undecodable and _downscale silently
+    # no-oped on it — an identity transform over a full-resolution image is the
+    # coordinate-space mismatch this transform exists to prevent.
+    assert '"image_width": 1280' in out and '"image_height": 720' in out
+    assert '"sx": 1.5' in out
     assert '"input_w": 1920' in out
 
 # ---------------------------------------------------------------------------
@@ -232,11 +252,28 @@ def test_remote_screenshot_cap_and_invalid_png_cleanup(tmp_path, monkeypatch):
     out = _json_mod.loads(impl.screenshot())
     assert out["ok"] is False and "cap" in out["error"]
 
-    # Garbage (non-PNG) bytes -> not ok, file removed.
+    # Garbage (non-PNG) bytes -> not ok, file removed. The fetch path retries a
+    # corrupt body a bounded number of times and then fails CLOSED; nothing is
+    # published either way, which is the property this test guards.
     monkeypatch.setattr(mod.urllib.request, "urlopen", lambda *a, **k: _Resp(b"not-a-png-body"))
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
     out = _json_mod.loads(impl.screenshot())
-    assert out["ok"] is False and "valid PNG" in out["error"]
+    assert out["ok"] is False and "screenshot_corrupt" in out["error"]
     shot_dir = tmp_path / "state" / "skills" / "unix_computer_use" / "jobs" / "osworld_http" / "output"
+    assert not list(shot_dir.glob("*.png"))
+    assert not list(shot_dir.glob("*.part"))
+
+    # A VALID header over a zero-padded body is the dangerous case: it passes a
+    # header-only dimension read, so it must be rejected on decode, not accepted.
+    import io as _io
+    from PIL import Image as _Image
+    _buf = _io.BytesIO()
+    _Image.new("RGB", (8, 8), (1, 2, 3)).save(_buf, format="PNG")
+    header_ok_body_dead = _buf.getvalue()[:40] + b"\x00" * 200
+    monkeypatch.setattr(mod.urllib.request, "urlopen",
+                        lambda *a, **k: _Resp(header_ok_body_dead))
+    out = _json_mod.loads(impl.screenshot())
+    assert out["ok"] is False and "screenshot_corrupt" in out["error"]
     assert not list(shot_dir.glob("*.png"))
 
 

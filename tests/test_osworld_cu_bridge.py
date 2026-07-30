@@ -1878,3 +1878,68 @@ def test_gate_rubric_covers_named_mode_scope_and_prohibition():
     for phrase in ("MODE OF OPERATION", "APPLY SCOPE", "PROHIBITION"):
         assert phrase in p, phrase
     assert "When in doubt, answer UNDETERMINED" in p, "fail-open stays the default"
+
+
+def _ns(**kw):
+    from types import SimpleNamespace
+    kw.setdefault("feasibility_gate", False)
+    kw.setdefault("max_steps", 0)
+    return SimpleNamespace(**kw)
+
+
+def test_step_budget_uses_policy_turns_not_gui_actions():
+    """A leaderboard step is one top-level policy turn: the official loop increments
+    step_idx once per agent.predict() and executes every action that call emitted
+    inside that step. The earlier 0.42-actions-per-round mapping compared a turn
+    against an action. The declared budget must reserve the gate phase AND one
+    tool-less terminal turn out of the claim, so a forced finalization is never
+    step N+1."""
+    b = rcb._step_budget(_ns(max_steps=100, feasibility_gate=True),
+                         {"value": 85, "source": "settings"})
+    assert b["step_semantics"] == "top_level_policy_turn"
+    assert b["max_steps_claimed"] == 100 and b["enforced"] is True
+    assert b["terminal_turn_reserve"] == 1
+    assert b["gate_turn_reserve"] == rcb._GATE_TURN_RESERVE
+    assert b["action_capable_round_cap"] == 100 - rcb._GATE_TURN_RESERVE - 1
+    # Without the gate phase its reserve is not withheld.
+    b2 = rcb._step_budget(_ns(max_steps=100), {"value": 99, "source": "settings"})
+    assert b2["gate_turn_reserve"] == 0 and b2["action_capable_round_cap"] == 99
+    # No claim -> nothing enforced, and the run is not comparable.
+    b3 = rcb._step_budget(_ns(), {"value": 200, "source": "default"})
+    assert b3["enforced"] is False and b3["max_steps_claimed"] is None
+
+
+def test_a_step_claim_the_server_cannot_honor_is_refused_before_the_vm_boots():
+    """Enforcement lives in the runtime round cap; the runner must PROVE that cap is
+    at or below the declared budget before anything costs money. 'Most tasks finish
+    early' is not a substitute — comparability is a per-task property."""
+    import pytest
+
+    over = rcb._step_budget(_ns(max_steps=100), {"value": 200, "source": "settings"})
+    with pytest.raises(SystemExit, match="exceeds"):
+        rcb._refuse_uncapped_step_claim(over)
+    ok = rcb._step_budget(_ns(max_steps=100), {"value": 99, "source": "settings"})
+    rcb._refuse_uncapped_step_claim(ok)  # must not raise
+    # A claim so small the reserves swallow it is refused too.
+    tiny = rcb._step_budget(_ns(max_steps=1, feasibility_gate=True), {"value": 1, "source": "env"})
+    with pytest.raises(SystemExit, match="no working turns"):
+        rcb._refuse_uncapped_step_claim(tiny)
+    # An unenforced run is never refused (it simply is not comparable).
+    rcb._refuse_uncapped_step_claim(rcb._step_budget(_ns(), {"value": 999, "source": "default"}))
+
+
+def test_post_run_audit_counts_gate_turns_and_marks_overruns_not_comparable():
+    """The audit reads what the example ACTUALLY consumed (worker + gate turns), so a
+    drifted config, a resumed task or a second execution root surfaces as an overrun.
+    It never rewrites the reward: it marks the row non-comparable, which is what an
+    aggregate claiming 'Max steps: N' must exclude."""
+    budget = rcb._step_budget(_ns(max_steps=100, feasibility_gate=True),
+                              {"value": 85, "source": "settings"})
+    inside = rcb._audit_step_budget(budget, {"llm_rounds": 80, "feasibility_gate": {"llm_rounds": 5}})
+    assert inside["policy_turns_used"] == 85 and inside["within_budget"] is True
+    assert inside["comparable"] is True
+    over = rcb._audit_step_budget(budget, {"llm_rounds": 98, "feasibility_gate": {"llm_rounds": 6}})
+    assert over["policy_turns_used"] == 104 and over["comparable"] is False
+    # Undeclared budget: nothing to audit against, and that is stated rather than implied.
+    assert rcb._audit_step_budget(rcb._step_budget(_ns(), {"value": 200, "source": "default"}),
+                                  {"llm_rounds": 5})["audited"] is False

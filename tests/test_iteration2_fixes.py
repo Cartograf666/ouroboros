@@ -39,14 +39,24 @@ def _stub_tool_timeout_settings(monkeypatch):
         pass
     yield
 
-# Minimal valid 1x1 PNG.
-_PNG_1x1 = (
-    b"\x89PNG\r\n\x1a\n"
-    b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x08\x02\x00\x00\x00\x90wS\xde"
-    b"\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N"
-    b"\x00\x00\x00\x00IEND\xaeB`\x82"
-)
+def _real_png_1x1() -> bytes:
+    """A genuinely decodable 1x1 PNG.
+
+    The literal that lived here was labelled "minimal valid" but carried a
+    broken IDAT stream and only ever passed because nothing decoded it. Image
+    attachment now rejects an undecodable payload at build time (a truncated
+    screenshot used to reach the provider and return a non-retryable 400), so
+    these fixtures must be real pictures."""
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (1, 1), (255, 0, 0)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+_PNG_1x1 = _real_png_1x1()
 
 
 # ----------------------------- #1 review knob -----------------------------

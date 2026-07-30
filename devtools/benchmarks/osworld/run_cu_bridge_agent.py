@@ -449,6 +449,10 @@ def _gate_round(ouroboros_url: str, args: Any, instruction: str, *, role: str) -
 # abandoned as INFRA. Long enough to ride out a reboot/restart the task itself
 # triggered (several tasks legitimately restart services), short enough that a
 # genuinely dead endpoint does not consume the whole task budget.
+# Policy turns the read-only gate phase may consume, reserved out of the declared
+# step budget. Measured on the v6.81.1 361-task run: mean 4.1, median 3, max 14.
+_GATE_TURN_RESERVE = 14
+
 _GUEST_DOWN_GRACE_SEC = 180.0
 
 
@@ -559,6 +563,93 @@ def _effective_max_rounds(settings_path: Path) -> dict[str, Any]:
         except ValueError:
             pass
     return {"value": 200, "source": "default"}
+
+
+def _step_budget(args: Any, effective_rounds: dict[str, Any]) -> dict[str, Any]:
+    """Typed step-budget provenance for the manifest (never raises).
+
+    A leaderboard "step" is ONE TOP-LEVEL POLICY TURN: the official loop
+    increments ``step_idx`` once per ``agent.predict()`` and executes every
+    action that call emitted inside that one step
+    (``lib_run_single.py`` on the graded pin), so a turn that emits four
+    clicks is one step, not four. Our ``llm_rounds`` is therefore the
+    step-equivalent — and the earlier "0.42 GUI actions per round" mapping
+    compared a turn against an action and understated our budget by ~2.4x.
+
+    The declared budget covers EVERY policy turn the example consumes: the
+    read-only gate phase (a separate task, measured mean 4.1 / max 14 turns on
+    the v6.81.1 run) plus the working phase plus one reserved tool-less
+    terminal turn, so a forced finalization cannot become step N+1.
+    """
+    claimed = max(0, int(getattr(args, "max_steps", 0) or 0))
+    gate_reserve = _GATE_TURN_RESERVE if getattr(args, "feasibility_gate", False) else 0
+    terminal_reserve = 1
+    worker_cap = claimed - gate_reserve - terminal_reserve if claimed else 0
+    return {
+        "step_semantics": "top_level_policy_turn",
+        "step_definition_ref": "OSWorld lib_run_single.py: step_idx += 1 per agent.predict()",
+        "max_steps_claimed": claimed or None,
+        "enforced": bool(claimed),
+        "gate_turn_reserve": gate_reserve,
+        "terminal_turn_reserve": terminal_reserve,
+        "action_capable_round_cap": worker_cap or None,
+        "server_round_cap": effective_rounds,
+    }
+
+
+def _refuse_uncapped_step_claim(budget: dict[str, Any]) -> None:
+    """Refuse a step claim the bench server would not actually honor.
+
+    Enforcement lives in the RUNTIME cap (the loop refuses to open a round past
+    ``OUROBOROS_MAX_ROUNDS``), so the runner's job is to prove that cap is at or
+    below the declared budget BEFORE anything costs money. A post-hoc "most
+    tasks finished early" argument cannot substitute: comparability is a
+    per-task property.
+    """
+    if not budget.get("enforced"):
+        return
+    worker_cap = int(budget.get("action_capable_round_cap") or 0)
+    if worker_cap < 1:
+        raise SystemExit(
+            f"--max-steps={budget.get('max_steps_claimed')} leaves no working turns after the "
+            f"gate ({budget.get('gate_turn_reserve')}) and terminal ({budget.get('terminal_turn_reserve')}) "
+            "reserves"
+        )
+    server = budget.get("server_round_cap") or {}
+    server_value = int(server.get("value") or 0)
+    if server_value > worker_cap:
+        raise SystemExit(
+            f"server round cap {server_value} (source: {server.get('source')}) exceeds the "
+            f"{worker_cap} action-capable turns implied by --max-steps="
+            f"{budget.get('max_steps_claimed')}; set OUROBOROS_MAX_ROUNDS={worker_cap} in the "
+            "lane settings.json so the declared budget is the one the runtime enforces"
+        )
+
+
+def _audit_step_budget(budget: dict[str, Any], counters: dict[str, Any]) -> dict[str, Any]:
+    """Post-run check that the example actually stayed inside the declared budget.
+
+    Reads the counters the run already collects (worker turns + gate turns)
+    rather than trusting the cap: a config that drifted, a resumed task or a
+    second execution root would all show up here as an overrun. A failed audit
+    does not rewrite the reward — it marks the example NOT comparable, which is
+    what an aggregate must exclude.
+    """
+    if not budget.get("enforced"):
+        return {"audited": False, "reason": "no step budget declared"}
+    worker = int(counters.get("llm_rounds") or 0)
+    gate = int(((counters.get("feasibility_gate") or {}).get("llm_rounds")) or 0)
+    total = worker + gate
+    claimed = int(budget.get("max_steps_claimed") or 0)
+    return {
+        "audited": True,
+        "policy_turns_used": total,
+        "worker_turns": worker,
+        "gate_turns": gate,
+        "max_steps_claimed": claimed,
+        "within_budget": total <= claimed,
+        "comparable": total <= claimed,
+    }
 
 
 def _collect_budget_counters(data_dir: Path, latest: dict[str, Any], ouro_task_id: str) -> dict[str, Any]:
@@ -969,6 +1060,14 @@ def main() -> int:
     p.add_argument("--claim-margin-sec", type=float, default=900.0,
                    help="extra slack on top of task+startup timeouts before another lane may treat a "
                         "claim lock as stale (default 900).")
+    p.add_argument("--max-steps", type=int, default=0,
+                   help="declare a leaderboard-comparable step budget and ENFORCE it fail-closed. A "
+                        "step is one top-level policy turn, matching OSWorld's predict()->actions[] "
+                        "boundary (lib_run_single.py increments step_idx once per predict() and "
+                        "executes every action it emitted inside that step) — NOT one GUI action. The "
+                        "budget covers the gate phase plus the working phase plus one reserved "
+                        "tool-less terminal turn. 0 (default) disables the cap and the run is then "
+                        "not comparable to a 'Max steps: N' leaderboard row.")
     args = p.parse_args()
 
     # Guards: never drive the live desktop server or publish a bench connection
@@ -1351,11 +1450,16 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
     # both of which are forbidden before the run is on disk.
     checkout = osworld_checkout_info(osworld_root)
     run.base_manifest["dataset"] = _dataset_name(str(checkout.get("variant") or "unknown"))
+    effective_rounds = _effective_max_rounds(settings_path)
     run.base_manifest["harness"] = {
         **(run.base_manifest.get("harness") or {}),
         "osworld_checkout": checkout,
-        "max_rounds_effective": _effective_max_rounds(settings_path),
+        "max_rounds_effective": effective_rounds,
+        "step_budget": _step_budget(args, effective_rounds),
     }
+    # Fail CLOSED before the VM boots: a declared step budget the server cannot
+    # honor would publish a "Max steps: N" claim the run never enforced.
+    _refuse_uncapped_step_claim(run.base_manifest["harness"]["step_budget"])
 
     example = json.loads(task_path.read_text(encoding="utf-8"))
     run.example_id = str(example.get("id") or run.example_id)
@@ -1836,6 +1940,12 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
             "a11y_enabled": bool(args.allow_a11y),
             "budget_counters": budget_counters,
             "max_rounds_effective": _effective_max_rounds(settings_path),
+            # Per-example comparability verdict: an aggregate claiming "Max steps: N"
+            # must EXCLUDE examples whose audit says they overran it.
+            "step_budget_audit": _audit_step_budget(
+                (run.base_manifest.get("harness") or {}).get("step_budget") or {},
+                budget_counters,
+            ),
             **({"osworld_fail_info": fail_info} if infeasible_declared else {}),
         })
         if published.get("publication_errors"):
