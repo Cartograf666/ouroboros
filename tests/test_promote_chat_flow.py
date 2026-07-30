@@ -177,6 +177,91 @@ def test_promote_event_enqueues_first_class_task(tmp_path, monkeypatch):
     assert all_task_bindings(tmp_path).get("abc12345") == project["chat_id"]
 
 
+def test_promoted_skill_repair_is_canonical_confined_managed_task(tmp_path, monkeypatch):
+    import supervisor.workers as workers
+
+    payload = tmp_path / "skills" / "external" / "alpha"
+    payload.mkdir(parents=True)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    enqueued = []
+    ctx = types.SimpleNamespace(
+        enqueue_task=lambda task: enqueued.append(task),
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+
+    result = workers.promote_chat_to_task({
+        "type": "promote_chat_to_task",
+        "task_id": "repair01",
+        "objective": "Repair alpha and re-run review",
+        "chat_id": 1,
+        "task_constraint": {
+            "mode": "skill_repair",
+            "skill_name": "alpha",
+            "payload_root": "skills/external/alpha",
+            "allow_enable": True,
+            "allow_review": False,
+            "extra_allowlist": ["run_command"],
+        },
+    }, ctx)
+
+    assert result == {"status": "scheduled", "task_id": "repair01"}
+    assert len(enqueued) == 1
+    task = enqueued[0]
+    assert task.get("_ephemeral_turn") is None
+    assert task["task_constraint"] == {
+        "mode": "skill_repair",
+        "skill_name": "alpha",
+        "payload_root": "skills/external/alpha",
+        "allow_enable": False,
+        "allow_review": True,
+    }
+    assert task["task_contract"]["objective"] == "Repair alpha and re-run review"
+
+
+def test_promoted_skill_repair_rejects_missing_payload(tmp_path, monkeypatch):
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    enqueued = []
+    ctx = types.SimpleNamespace(
+        enqueue_task=lambda task: enqueued.append(task),
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+
+    result = workers.promote_chat_to_task({
+        "task_id": "repair02",
+        "objective": "Repair missing alpha",
+        "task_constraint": {
+            "mode": "skill_repair",
+            "skill_name": "alpha",
+            "payload_root": "skills/external/alpha",
+        },
+    }, ctx)
+
+    assert result == {
+        "status": "needs_manual_target",
+        "reason": "skill_repair_payload_missing",
+        "task_id": "repair02",
+    }
+    assert enqueued == []
+
+    invalid = workers.promote_chat_to_task({
+        "task_id": "repair03",
+        "objective": "Repair escaped payload",
+        "task_constraint": {
+            "mode": "skill_repair",
+            "skill_name": "alpha",
+            "payload_root": "skills/external/alpha/../../memory",
+        },
+    }, ctx)
+    assert invalid == {
+        "status": "needs_manual_target",
+        "reason": "invalid_skill_repair_constraint",
+        "task_id": "repair03",
+    }
+    assert enqueued == []
+
+
 def test_promote_route_persists_source_ref_and_fails_closed_on_binding_error(tmp_path, monkeypatch):
     import supervisor.workers as workers
     from ouroboros.projects_registry import create_project, project_binding_for_task

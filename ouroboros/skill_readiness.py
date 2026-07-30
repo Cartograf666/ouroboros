@@ -3,7 +3,7 @@ from __future__ import annotations
 import pathlib
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ouroboros.skill_review_status import skill_review_gate
 
@@ -18,6 +18,7 @@ class SkillReadiness:
     owner_action_blockers: List[str] = field(default_factory=list)
     review_gate: Dict[str, Any] = field(default_factory=dict)
     grant_status: Dict[str, Any] = field(default_factory=dict)
+    conflict: Dict[str, Any] = field(default_factory=dict)
 
 
 def skill_readiness_for_execution(
@@ -26,6 +27,7 @@ def skill_readiness_for_execution(
     *,
     require_enabled: bool = True,
     require_grants: bool = True,
+    skills: Optional[List[Any]] = None,
 ) -> SkillReadiness:
     blockers: List[str] = []
     agent_fixable: List[str] = []
@@ -50,6 +52,17 @@ def skill_readiness_for_execution(
     if require_enabled and not getattr(skill, "enabled", False):
         blockers.append("skill_disabled")
         owner_action.append("skill_disabled")
+
+    from ouroboros.skill_loader import discover_skills, skill_conflict_status
+
+    peers = skills if skills is not None else discover_skills(pathlib.Path(drive_root))
+    conflict = skill_conflict_status(skill, peers) or {}
+    if conflict:
+        names = list(conflict.get("skills") or [])
+        suffix = f":{','.join(names)}" if names else ""
+        msg = f"skill_conflict{suffix}"
+        blockers.append(msg)
+        owner_action.append(msg)
 
     grants: Dict[str, Any] = {}
     if require_grants:
@@ -89,4 +102,5 @@ def skill_readiness_for_execution(
         owner_action_blockers=owner_action,
         review_gate=gate,
         grant_status=grants,
+        conflict=conflict,
     )

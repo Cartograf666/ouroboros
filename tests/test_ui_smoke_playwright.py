@@ -694,12 +694,14 @@ def test_ui_smoke_phase3_declarative_widgets_and_settings(direct_server_with_dat
                 )
                 assert card.locator('.widget-status').inner_text() == "Loading data"  # declared loading label reused
                 assert card.locator('canvas[data-widget-chart-key="id:gap-chart"]').count() == 1  # content kept during refetch
+                # The fixture declares max_ticks=3. Wait for its final value so
+                # no scheduled renderAll can detach the geometry probes below.
                 page.wait_for_function(
                     """(prev) => {
                         const el = document.querySelector('canvas[data-widget-chart-key="id:gap-chart"]');
                         if (!el) return false;
                         const cfg = JSON.parse(el.dataset.widgetChartConfig || '{}');
-                        return cfg.data?.datasets?.[0]?.data?.[0] > prev;
+                        return cfg.data?.datasets?.[0]?.data?.[0] >= prev + 3;
                     }""",
                     arg=first_point,
                     timeout=10_000,
@@ -2050,6 +2052,10 @@ def test_ui_smoke_direct_mode_chat_scrolls_on_desktop(direct_server):
                 page.goto(direct_server, wait_until="domcontentloaded", timeout=30_000)
                 page.get_by_role("button", name="Chat").click()
                 page.wait_for_selector("#chat-messages", timeout=30_000)
+                # Wait for the initial history rebuild to finish before injecting
+                # synthetic rows; otherwise that authoritative rebuild may erase
+                # the probe immediately after insertion on slower startup paths.
+                page.wait_for_selector("#chat-messages .chat-bubble.assistant", timeout=30_000)
                 # A viewport change can re-render the chat from the (empty) real
                 # history and drop injected probe nodes, so injection is a helper
                 # re-run before every measurement instead of a one-shot setup.

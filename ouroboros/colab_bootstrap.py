@@ -236,28 +236,25 @@ def _gateway_request(host: str, port: int) -> Callable[..., tuple]:
     return _call
 
 
-def ensure_telegram_bridge_live(
+def ensure_native_telegram_live(
     host: str = "127.0.0.1",
     port: int = 8765,
     *,
     settings: Optional[Dict[str, Any]] = None,
-    slug: str = "telegram-bridge",
-    command_mode: str = "full_access",
     timeout: float = 180.0,
     request: Optional[Callable[..., tuple]] = None,
 ) -> Dict[str, Any]:
-    """Install, review, grant, enable, and configure the Telegram bridge over loopback.
+    """Grant, enable, and configure the bundled native Telegram skill.
 
-    Headless Colab has no UI to manage skills, so this brings the bridge fully
-    live after the server is started, including setting the bridge command mode
-    (default ``full_access``) so owner slash commands actually work — otherwise
-    the bridge installs in ``strict`` mode and blocks every slash command. It is
-    best-effort: it returns a status dict and never raises, so a failure here
-    cannot crash the notebook.
+    The native payload is seeded and hash-trusted by the launcher. Headless
+    Colab only performs the same owner-policy steps the Skills UI would perform:
+    grant the API-projected missing items when persisted auto-grant is enabled,
+    enable the skill, then save its Telegram settings. It never installs from a
+    marketplace or runs a skill review.
     """
     settings = settings or {}
     call = request or _gateway_request(host, port)
-    status: Dict[str, Any] = {"ok": False, "slug": slug, "steps": []}
+    status: Dict[str, Any] = {"ok": False, "skill": "telegram", "steps": []}
 
     # 1. Wait until the server accepts loopback requests (the gateway client has
     #    no built-in retry, and the notebook starts the server as a subprocess).
@@ -278,79 +275,131 @@ def ensure_telegram_bridge_live(
     status["steps"].append("ready")
 
     if not str(settings.get("TELEGRAM_BOT_TOKEN") or "").strip():
-        status["warning"] = "TELEGRAM_BOT_TOKEN is empty; bridge will install but cannot poll Telegram"
+        status["warning"] = "TELEGRAM_BOT_TOKEN is empty; Telegram cannot poll messages"
 
-    quoted = urllib.parse.quote(slug)
+    quoted = urllib.parse.quote("telegram")
 
-    # Auto-grant is NOT forced here: it is governed by the persisted
-    # OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS setting (default-on, merged from any
-    # existing Drive settings.json), so an owner who deliberately disabled it is
-    # respected. With the default on, the install-time review grants the bridge's
-    # keys; if an owner turned it off, the enable step below surfaces the missing
-    # grants instead of silently overriding the owner's policy.
-
-    # 2. Install from the live catalog. This synchronously runs tri-model skill
-    #    review, which can take minutes, so use a review-scale timeout rather
-    #    than the default 60s (otherwise a slow review looks like an install
-    #    failure even though the server is still working).
-    try:
-        _code, payload = call("POST", "/api/marketplace/ouroboroshub/install", {"slug": slug}, timeout=1800.0)
-    except Exception as exc:
-        status["error"] = f"install request failed: {exc}"
-        return status
-    err = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
-    already = "already installed" in err.lower()
-    if err and not already:
-        status["error"] = f"install failed: {err}"
-        return status
-    status["steps"].append("already_installed" if already else "installed")
-
-    # 3b. The already-installed path does NOT re-run install-time review/grants,
-    #     so a Drive-persisted bridge whose review/grants state is missing or
-    #     stale (e.g. an interrupted earlier session) would fail to enable below.
-    #     Re-run review (auto-grant is on) to guarantee the enable precondition.
-    if already:
+    # 2. Discover the launcher-seeded native skill and read its authoritative
+    #    grant/conflict projection. Missing native payloads are packaging errors,
+    #    not a reason to fall back to a Hub install.
+    skill = None
+    while time.time() < deadline:
         try:
-            _code, payload = call("POST", f"/api/skills/{quoted}/review", timeout=1800.0)
-        except Exception as exc:
-            status["error"] = f"re-review request failed: {exc}"
-            return status
-        rerr = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
-        if rerr:
-            status["error"] = f"re-review failed: {rerr}"
-            return status
-        status["steps"].append("reviewed")
+            code, payload = call("GET", "/api/extensions")
+        except Exception:
+            time.sleep(1.0)
+            continue
+        rows = payload.get("skills") if isinstance(payload, dict) and isinstance(payload.get("skills"), list) else []
+        candidate = next(
+            (
+                row for row in rows
+                if isinstance(row, dict) and str(row.get("name") or "") == "telegram"
+            ),
+            None,
+        )
+        if (
+            isinstance(code, int)
+            and code < 400
+            and candidate is not None
+            and str(candidate.get("source") or "").lower() == "native"
+            and str(candidate.get("review_profile") or "") == "native_seed"
+            and candidate.get("executable_review") is True
+            and candidate.get("review_stale") is False
+        ):
+            skill = candidate
+            break
+        time.sleep(1.0)
+    if skill is None:
+        status["error"] = "bundled native skill 'telegram' did not reach a fresh executable native-trust verdict"
+        return status
+    conflict = skill.get("conflict") if isinstance(skill.get("conflict"), dict) else None
+    if conflict:
+        names = [str(name) for name in (conflict.get("skills") or []) if str(name)]
+        status["error"] = (
+            "cannot enable native 'telegram' while conflicting skills are enabled: "
+            + ", ".join(names)
+        )
+        status["conflict"] = conflict
+        return status
+    status["steps"].append("discovered")
 
-    # 4. Enable (gateway enforces fresh executable review + all grants).
+    # 3. Respect the persisted owner auto-grant choice. Grant only the missing
+    #    items projected by the API; never invent permissions in the notebook.
+    grants = skill.get("grants") if isinstance(skill.get("grants"), dict) else {}
+    missing = [
+        str(item)
+        for item in [
+            *(grants.get("missing_keys") or []),
+            *(grants.get("missing_permissions") or []),
+        ]
+        if str(item).strip()
+        and str(item).strip().lower() not in {"chat.document", "subscribe_event:chat.document"}
+    ]
+    auto_raw = settings.get(
+        "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS",
+        SETTINGS_DEFAULTS.get("OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS", "true"),
+    )
+    auto_grant = auto_raw if isinstance(auto_raw, bool) else str(auto_raw).strip().lower() in {"1", "true", "yes", "on"}
+    if missing and not auto_grant:
+        status["error"] = (
+            "native Telegram needs owner grants, but automatic grants are disabled: "
+            + ", ".join(missing)
+        )
+        status["missing_grants"] = missing
+        return status
+    if missing:
+        try:
+            code, payload = call(
+                "POST",
+                f"/api/skills/{quoted}/grants",
+                {"items": missing},
+            )
+        except Exception as exc:
+            status["error"] = f"grant request failed: {exc}"
+            return status
+        err = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
+        if (isinstance(code, int) and code >= 400) or err:
+            status["error"] = f"grant failed: {err or f'HTTP {code}'}"
+            return status
+        status["steps"].append("granted")
+
+    # 4. Enable through the canonical lifecycle endpoint.
     try:
-        _code, payload = call("POST", f"/api/skills/{quoted}/toggle", {"enabled": True})
+        code, payload = call("POST", f"/api/skills/{quoted}/toggle", {"enabled": True})
     except Exception as exc:
         status["error"] = f"enable request failed: {exc}"
         return status
     err = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
-    if err:
-        status["error"] = f"enable failed: {err}"
+    if (isinstance(code, int) and code >= 400) or err:
+        status["error"] = f"enable failed: {err or f'HTTP {code}'}"
         return status
     status["steps"].append("enabled")
 
-    # 5. Set the bridge command mode so owner slash commands are allowed. Without
-    #    this the bridge defaults to `strict` and rejects every slash command.
-    #    The skill's settings/save route is mounted once the extension is enabled;
-    #    settings.json is empty at this point (no chat pinned yet), so this is safe.
-    if command_mode:
+    # 5. Preserve the working PoC behavior: full owner commands, all-message
+    #    mirroring, and the Mini App enabled.
+    desired_settings = {
+        "TELEGRAM_COMMAND_MODE": "full_access",
+        "TELEGRAM_MIRROR_MODE": "all",
+        "TELEGRAM_MINIAPP_ENABLED": "on",
+    }
+    if any(str(value or "").strip() for value in desired_settings.values()):
         try:
-            code, payload = call("POST", f"/api/extensions/{quoted}/settings/save", {"TELEGRAM_COMMAND_MODE": command_mode})
+            code, payload = call(
+                "POST",
+                f"/api/extensions/{quoted}/settings/save",
+                desired_settings,
+            )
         except Exception as exc:
-            status["command_mode_ok"] = False
-            status["warning"] = f"bridge enabled but command mode not applied (slash commands stay restricted): {exc}"
+            status["settings_ok"] = False
+            status["warning"] = f"Telegram enabled but settings were not applied: {exc}"
         else:
-            cm_err = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
-            if (isinstance(code, int) and code >= 400) or cm_err:
-                status["command_mode_ok"] = False
-                status["warning"] = f"bridge enabled but command mode not applied (slash commands stay restricted): {cm_err or f'HTTP {code}'}"
+            settings_err = str((payload or {}).get("error") or "") if isinstance(payload, dict) else ""
+            if (isinstance(code, int) and code >= 400) or settings_err:
+                status["settings_ok"] = False
+                status["warning"] = f"Telegram enabled but settings were not applied: {settings_err or f'HTTP {code}'}"
             else:
-                status["steps"].append(f"command_mode:{command_mode}")
-                status["command_mode_ok"] = True
+                status["steps"].append("settings_saved")
+                status["settings_ok"] = True
 
     status["ok"] = True
     return status

@@ -915,6 +915,65 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
     image_data = incoming.get("image_data")
     task_constraint = incoming.get("task_constraint")
     task_metadata = incoming.get("task_metadata")
+    from ouroboros.contracts.task_constraint import normalize_task_constraint
+
+    normalized_constraint = normalize_task_constraint(task_constraint)
+    if normalized_constraint and normalized_constraint.mode == "skill_repair":
+        # Repair is already a typed, narrowly confined task request. Sending it
+        # through the conversation decision lane would combine skill_repair with
+        # _ephemeral_turn: ephemeral hides the repair mutators while heal mode
+        # blocks promotion. Promote it directly without weakening either policy.
+        from supervisor.workers import promote_chat_to_task
+
+        ctx.consciousness.inject_observation(
+            f"Message from my human: {incoming.get('log_text') or ''}"
+        )
+        task_id = uuid.uuid4().hex[:8]
+        event = {
+            "type": "promote_chat_to_task",
+            "task_id": task_id,
+            "objective": text or image_caption,
+            "chat_id": chat_id,
+            "client_message_id": client_message_id,
+            "task_constraint": task_constraint,
+            "routed_from_main": True,
+        }
+        origin_ref = incoming.get("origin_message_ref")
+        if isinstance(origin_ref, dict) and origin_ref:
+            event["source_ref"] = origin_ref
+            event["source_text"] = str(incoming.get("log_text") or "")
+        else:
+            event["origin_suppressed"] = True
+        try:
+            outcome = promote_chat_to_task(event, ctx)
+        except Exception:
+            log.warning("Direct skill-repair promotion failed", exc_info=True)
+            outcome = {
+                "status": "needs_manual_target",
+                "reason": "repair_promotion_failed",
+                "task_id": task_id,
+            }
+        outcome = outcome if isinstance(outcome, dict) else {"status": "scheduled", "task_id": task_id}
+        outcome_status = str(outcome.get("status") or "needs_manual_target")
+        if outcome_status != "scheduled":
+            reason = str(outcome.get("reason") or outcome_status)
+            try:
+                ctx.send_with_budget(
+                    chat_id,
+                    f"⚠️ Repair task was not started ({reason}). Please retry from the skill card.",
+                )
+            except Exception:
+                log.debug("Repair promotion refusal notification failed", exc_info=True)
+        _record_routing_receipt(
+            bridge,
+            ctx,
+            chat_id=chat_id,
+            client_message_id=client_message_id,
+            action="promote_chat_to_task",
+            target=str(outcome.get("task_id") or task_id),
+            status=outcome_status,
+        )
+        return
     reserved_project = _reserved_project_for_chat(ctx, chat_id)
     project_id = (
         str(reserved_project.get("id") or "")

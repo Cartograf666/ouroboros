@@ -36,7 +36,7 @@ from ouroboros.colab_bootstrap import (
     clone_or_update_repo,
     collect_colab_secrets,
     configure_colab_personal_origin,
-    ensure_telegram_bridge_live,
+    ensure_native_telegram_live,
     export_colab_env,
     masked_secret_status,
     server_command,
@@ -86,14 +86,14 @@ server = subprocess.Popen(
 )
 print("Ouroboros server PID:", server.pid)
 
-# Install + review + grant + enable the Telegram bridge over the loopback gateway.
-bridge_status = ensure_telegram_bridge_live(settings=settings)
-print("Telegram bridge:", bridge_status)
-if bridge_status.get("ok") and bridge_status.get("command_mode_ok"):
+# Grant, enable, and configure the bundled native Telegram skill over loopback.
+telegram_status = ensure_native_telegram_live(settings=settings)
+print("Native Telegram:", telegram_status)
+if telegram_status.get("ok") and telegram_status.get("settings_ok"):
     print("Message your Telegram bot now. Your first owner slash command (e.g. /status) registers your chat and asks you to send it once more;")
     print("after that, owner commands like /status and /panic run immediately.")
-elif bridge_status.get("ok"):
-    print("Bridge installed and enabled, but full_access command mode was not applied:", bridge_status.get("warning"))
-    print("Slash commands stay restricted until you set TELEGRAM_COMMAND_MODE=full_access in the bridge settings.")
+elif telegram_status.get("ok"):
+    print("Telegram is enabled, but its settings were not applied:", telegram_status.get("warning"))
+    print("Set full_access, mirror mode all, and Mini App on in the Telegram skill settings.")
 else:
-    print("Bridge not live yet:", bridge_status.get("error") or bridge_status)
+    print("Native Telegram not live yet:", telegram_status.get("error") or telegram_status)

@@ -148,7 +148,9 @@ def test_extension_manifest_state_scans_run_on_worker_thread(tmp_path, monkeypat
 
     response = asyncio.run(extensions_api.api_extension_manifest(_skill_request(tmp_path)))
 
-    assert _decode_response(response)["name"] == "alpha"
+    payload = _decode_response(response)
+    assert payload["name"] == "alpha"
+    assert payload["manifest"]["conflicts"] == []
     assert find_threads and all(thread_id != loop_thread for thread_id in find_threads)
     assert state_threads and all(thread_id != loop_thread for thread_id in state_threads)
 
@@ -192,4 +194,3 @@ def test_lifecycle_queue_reconcile_runs_on_worker_thread(tmp_path, monkeypatch):
 
     assert "active" in _decode_response(response)
     assert reconcile_threads and all(thread_id != loop_thread for thread_id in reconcile_threads)
-

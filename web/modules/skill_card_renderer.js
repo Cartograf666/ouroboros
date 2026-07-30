@@ -36,6 +36,15 @@ function repairReady(skill) {
         && (skill.review_status === 'blockers' || (Boolean(skill.load_error) && !missingGrantLoadError(skill)));
 }
 
+function skillConflictReason(skill) {
+    const conflict = skill?.conflict && typeof skill.conflict === 'object' ? skill.conflict : null;
+    if (!conflict || conflict.code !== 'skill_conflict') return '';
+    const names = Array.isArray(conflict.skills) ? conflict.skills.filter(Boolean) : [];
+    if (!names.length) return 'conflicts with another enabled skill';
+    const omitted = Number(conflict.omitted || 0);
+    return `conflicts with ${names.join(', ')}${omitted > 0 ? ` (+${omitted} more)` : ''}`;
+}
+
 function primaryAction(skill, reviewInProgress, repairInProgress, live) {
     if (reviewInProgress) return { label: 'Reviewing...', disabled: true };
     if (repairInProgress) return { label: 'Repairing...', disabled: true };
@@ -90,13 +99,15 @@ function statusChip(skill, action, live) {
         return `<span class="skills-status-chip skills-status-danger">${escapeHtml(lifecycleFailedLabel(skill.lifecycle_kind))}</span>`;
     }
     let status = { tone: 'muted', label: 'Off' };
+    const conflictReason = skillConflictReason(skill);
     if (!grantReady(skill)) status = { tone: 'warn', label: 'Needs access grant' };
     else if (skill.lifecycle_virtual && isRateLimitError(skill.load_error)) status = { tone: 'warn', label: 'Rate limited' };
     else if (skill.load_error) status = { tone: 'danger', label: 'Failed to load' };
+    else if (conflictReason) status = { tone: 'danger', label: conflictReason.charAt(0).toUpperCase() + conflictReason.slice(1) };
     else if (!reviewReady(skill)) status = { tone: 'warn', label: 'Needs review' };
     else if (skill.enabled && skill.type === 'extension') {
         status = skill.live_loaded && (skill.dispatch_live || hasSkillUiTab(skill, live))
-            ? { tone: 'ok', label: 'Active' }
+            ? { tone: 'ok', label: 'Loaded' }
             : { tone: 'warn', label: skill.live_loaded ? 'Loaded — UI tab pending' : 'Enabled — not loaded' };
     } else if (skill.enabled) status = { tone: 'ok', label: 'Enabled' };
     const attrs = action.action ? `data-skill="${escapeHtml(skill.name)}" data-skill-action="${escapeHtml(action.action)}" role="button" tabindex="0"` : '';
@@ -183,7 +194,7 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
     const repairInProgress = repairingSkills.has(skill.name);
     const action = primaryAction(skill, reviewInProgress, repairInProgress, live);
     const actionAttrs = action.action ? `data-skill="${safeName}" data-skill-action="${escapeHtml(action.action)}" role="button" tabindex="0"` : '';
-    const lockReason = !skill.enabled && ((skill.review_gate?.executable_review === false && (skill.review_gate.summary || skill.review_gate.blocking_reason)) || (skill.review_stale ? 'review is stale — re-review the skill first' : ''));
+    const lockReason = !skill.enabled && (skillConflictReason(skill) || (skill.review_gate?.executable_review === false && (skill.review_gate.summary || skill.review_gate.blocking_reason)) || (skill.review_stale ? 'review is stale — re-review the skill first' : ''));
     const source = (skill.source || 'native').toLowerCase();
     const market = source === 'clawhub' || source === 'ouroboroshub';
     const payloadRoot = skill.payload_root || '';

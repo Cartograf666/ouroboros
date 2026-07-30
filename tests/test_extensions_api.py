@@ -34,11 +34,13 @@ def _write_ext(
     permissions: list[str],
     plugin: str,
     env_from_settings: list[str] | None = None,
+    conflicts: list[str] | None = None,
 ) -> pathlib.Path:
     skill_dir = repo_root / name
     skill_dir.mkdir(parents=True, exist_ok=True)
     perms_yaml = json.dumps(permissions)
     env_yaml = json.dumps(env_from_settings or [])
+    conflicts_yaml = json.dumps(conflicts or [])
     (skill_dir / "SKILL.md").write_text(
         (
             "---\n"
@@ -49,6 +51,7 @@ def _write_ext(
             "entry: plugin.py\n"
             f"permissions: {perms_yaml}\n"
             f"env_from_settings: {env_yaml}\n"
+            f"conflicts: {conflicts_yaml}\n"
             "---\n"
             "body\n"
         ),
@@ -389,6 +392,70 @@ def test_api_skill_toggle_enables_and_loads_extension(tmp_path, monkeypatch):
         assert data["extension_action"] == "extension_unloaded"
         assert broadcasts[-1]["action"] == "extension_unloaded"
         assert "ext_toggle" not in extension_loader.snapshot()["extensions"]
+    finally:
+        _stop_patches(patches)
+
+
+def test_api_projects_conflict_and_refuses_enable_until_peer_is_disabled(
+    tmp_path, monkeypatch
+):
+    from ouroboros.skill_loader import (
+        SkillReviewState,
+        compute_content_hash,
+        save_enabled,
+        save_review_state,
+    )
+
+    skills_root = tmp_path / "skills"
+    plugin = "def register(api):\n    pass\n"
+    telegram_dir = _write_ext(
+        skills_root,
+        "telegram",
+        permissions=[],
+        plugin=plugin,
+        conflicts=["telegram-bridge"],
+    )
+    _write_ext(
+        skills_root,
+        "telegram-bridge",
+        permissions=[],
+        plugin=plugin,
+    )
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    try:
+        save_review_state(
+            drive_root,
+            "telegram",
+            SkillReviewState(
+                status="pass",
+                content_hash=compute_content_hash(telegram_dir, manifest_entry="plugin.py"),
+            ),
+        )
+        save_enabled(drive_root, "telegram-bridge", True)
+
+        index = client.get("/api/extensions")
+        assert index.status_code == 200, index.text
+        row = next(item for item in index.json()["skills"] if item["name"] == "telegram")
+        assert row["conflicts"] == ["telegram-bridge"]
+        assert row["conflict"] == {
+            "code": "skill_conflict",
+            "skills": ["telegram-bridge"],
+            "omitted": 0,
+        }
+
+        blocked = client.post("/api/skills/telegram/toggle", json={"enabled": True})
+        assert blocked.status_code == 409, blocked.text
+        assert blocked.json()["conflict"] == row["conflict"]
+
+        disabled = client.post(
+            "/api/skills/telegram-bridge/toggle",
+            json={"enabled": False},
+        )
+        assert disabled.status_code == 200, disabled.text
+        enabled = client.post("/api/skills/telegram/toggle", json={"enabled": True})
+        assert enabled.status_code == 200, enabled.text
+        assert enabled.json()["enabled"] is True
     finally:
         _stop_patches(patches)
 

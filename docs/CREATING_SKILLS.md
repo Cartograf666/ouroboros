@@ -83,6 +83,7 @@ scripts:                            # type=script only
   - name: fetch.py                  # name resolves under scripts/ unless slashes/extensions
     description: Fetch and render
 permissions: [net, tool, route, widget, read_settings]   # see "Permissions"
+conflicts: [legacy-weather]            # optional incompatible installed skill names
 env_from_settings: [OPENROUTER_API_KEY]                  # core keys require an owner grant
 when_to_use: User asks for the weather forecast.
 timeout_sec: 60                     # default 60, hard cap 300
@@ -127,6 +128,12 @@ execute), and required for `script` / `extension`. Allowed values are
 `deno`, `ruby`, `go`. The actual binary is resolved through
 `shutil.which` at exec time, so the operator's host must ship the
 runtime; otherwise `skill_exec` fails closed with a clear error.
+
+`conflicts` is an optional list of canonical skill names (letters, numbers,
+dash, underscore, or dot; at most 32 entries). If either enabled skill names
+the other, both readiness and extension loading fail closed with a typed
+conflict until the owner disables one. Ouroboros never resolves a conflict by
+automatically disabling, deleting, or moving either payload.
 
 ## Lifecycle: install → review → enable → execute
 

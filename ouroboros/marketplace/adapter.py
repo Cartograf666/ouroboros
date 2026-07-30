@@ -93,6 +93,7 @@ def _manifest_frontmatter_dict(manifest: SkillManifest) -> Dict[str, Any]:
         "scripts": [dict(s) for s in manifest.scripts],
         "entry": manifest.entry,
         "permissions": list(manifest.permissions),
+        "conflicts": list(manifest.conflicts),
         "ui_tab": dict(manifest.ui_tab) if manifest.ui_tab else None,
     }
     front.update(manifest.raw_extra or {})

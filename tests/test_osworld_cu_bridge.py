@@ -2200,16 +2200,18 @@ def test_proxy_exhaustion_is_recorded_never_used_to_drop_a_task(tmp_path):
 
 
 def test_settings_cap_publication_preserves_0600(tmp_path):
-    """The lane settings file carries provider credentials at 0600. A fresh write
-    takes the process umask (0664 here), so the cap update must not widen it."""
+    """Preserve the observed credential-file mode; require 0600 where POSIX modes exist."""
     import json as _json
     import os as _os
     sp = tmp_path / "settings.json"
     sp.write_text(_json.dumps({"OUROBOROS_MAX_ROUNDS": 99, "OPENROUTER_API_KEY": "x"}),
                   encoding="utf-8")
     _os.chmod(sp, 0o600)
+    original_mode = _os.stat(sp).st_mode & 0o777
+    if _os.name != "nt":
+        assert original_mode == 0o600
     assert rcb._publish_worker_round_cap(sp, 95)["applied"] is True
-    assert _os.stat(sp).st_mode & 0o777 == 0o600
+    assert _os.stat(sp).st_mode & 0o777 == original_mode
     assert not list(tmp_path.glob("*.part")), "no credential-bearing temp left behind"
 
 

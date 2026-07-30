@@ -1334,6 +1334,7 @@ def review_skill(
             "runtime": skill.manifest.runtime,
             "timeout_sec": skill.manifest.timeout_sec,
             "permissions": list(skill.manifest.permissions),
+            "conflicts": list(skill.manifest.conflicts),
             "env_from_settings": list(skill.manifest.env_from_settings),
             "requires": list(skill.manifest.requires),
             "scripts": list(skill.manifest.scripts),

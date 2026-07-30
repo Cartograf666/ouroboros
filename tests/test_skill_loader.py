@@ -18,6 +18,7 @@ from ouroboros.skill_loader import (
     VALID_REVIEW_STATUSES,
     compute_content_hash,
     discover_skills,
+    enabled_skill_conflicts,
     find_skill,
     list_available_for_execution,
     load_enabled,
@@ -25,6 +26,7 @@ from ouroboros.skill_loader import (
     load_skill,
     save_enabled,
     save_review_state,
+    skill_conflict_status,
     skill_review_gate,
     skill_state_dir,
     summarize_skills,
@@ -93,6 +95,78 @@ def test_discover_skills_uses_data_plane_native_bucket(tmp_path):
     skills = discover_skills(drive_root, repo_path="")
     names = {s.name for s in skills}
     assert "weather" in names
+
+
+@pytest.mark.parametrize("declaration_owner", ["telegram", "telegram-bridge"])
+def test_enabled_skill_conflicts_are_symmetric_for_one_sided_declarations(
+    tmp_path, declaration_owner
+):
+    drive_root = tmp_path / "drive"
+    native_root = drive_root / "skills" / "native"
+    for name, other in (("telegram", "telegram-bridge"), ("telegram-bridge", "telegram")):
+        conflicts = f"conflicts: [{other}]\n" if name == declaration_owner else ""
+        _write_skill(
+            native_root,
+            name,
+            manifest=(
+                "---\n"
+                f"name: {name}\n"
+                "description: Telegram fixture.\n"
+                "version: 1.0.0\n"
+                "type: instruction\n"
+                f"{conflicts}"
+                "---\n"
+            ),
+        )
+    save_enabled(drive_root, "telegram-bridge", True)
+
+    skills = discover_skills(drive_root, repo_path="")
+    telegram = next(skill for skill in skills if skill.name == "telegram")
+    assert enabled_skill_conflicts(telegram, skills) == ["telegram-bridge"]
+    assert skill_conflict_status(telegram, skills) == {
+        "code": "skill_conflict",
+        "skills": ["telegram-bridge"],
+        "omitted": 0,
+    }
+    from ouroboros.skill_readiness import skill_readiness_for_execution
+
+    readiness = skill_readiness_for_execution(
+        drive_root,
+        telegram,
+        require_enabled=False,
+        require_grants=False,
+        skills=skills,
+    )
+    assert readiness.conflict["code"] == "skill_conflict"
+    assert any(item.startswith("skill_conflict:") for item in readiness.owner_action_blockers)
+
+
+def test_missing_and_disabled_conflict_targets_are_inert(tmp_path):
+    drive_root = tmp_path / "drive"
+    native_root = drive_root / "skills" / "native"
+    _write_skill(
+        native_root,
+        "telegram",
+        manifest=(
+            "---\nname: telegram\ndescription: Telegram\nversion: 1.0.0\n"
+            "type: instruction\nconflicts: [telegram-bridge]\n---\n"
+        ),
+    )
+    skills = discover_skills(drive_root, repo_path="")
+    telegram = skills[0]
+    assert enabled_skill_conflicts(telegram, skills) == []
+
+    _write_skill(
+        native_root,
+        "telegram-bridge",
+        manifest=(
+            "---\nname: telegram-bridge\ndescription: Old\nversion: 1.0.0\n"
+            "type: instruction\n---\n"
+        ),
+    )
+    skills = discover_skills(drive_root, repo_path="")
+    telegram = next(skill for skill in skills if skill.name == "telegram")
+    assert enabled_skill_conflicts(telegram, skills) == []
 
 
 def test_load_skill_parses_manifest_and_computes_hash(tmp_path):

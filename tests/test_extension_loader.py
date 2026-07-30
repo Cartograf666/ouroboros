@@ -780,6 +780,88 @@ def test_load_extension_refuses_disabled(tmp_path):
     assert "disabled" in err
 
 
+def test_reload_all_fails_closed_when_conflicting_extensions_are_both_enabled(tmp_path):
+    repo_root = tmp_path / "skills"
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir()
+    plugin = (
+        "def register(api):\n"
+        "    api.register_tool('ping', lambda ctx: 'ok', description='ping', schema={})\n"
+    )
+    telegram_dir = _write_ext_skill(
+        repo_root,
+        "telegram",
+        plugin_body=plugin,
+        permissions=["tool"],
+        extra_frontmatter="conflicts: [telegram-bridge]\n",
+    )
+    bridge_dir = _write_ext_skill(
+        repo_root,
+        "telegram-bridge",
+        plugin_body=plugin,
+        permissions=["tool"],
+    )
+    for name, skill_dir in (("telegram", telegram_dir), ("telegram-bridge", bridge_dir)):
+        loaded = find_skill(drive_root, name, repo_path=str(repo_root))
+        assert loaded is not None
+        save_enabled(drive_root, name, True)
+        save_review_state(
+            drive_root,
+            name,
+            SkillReviewState(status="pass", content_hash=loaded.content_hash),
+        )
+
+    results = extension_loader.reload_all(
+        drive_root,
+        lambda: {},
+        repo_path=str(repo_root),
+    )
+
+    assert results == {
+        "telegram": "skill_conflict",
+        "telegram-bridge": "skill_conflict",
+    }
+    assert extension_loader.snapshot()["extensions"] == []
+
+    save_enabled(drive_root, "telegram-bridge", False)
+    state = extension_loader.reconcile_extension(
+        "telegram",
+        drive_root,
+        lambda: {},
+        repo_path=str(repo_root),
+    )
+    assert state["action"] == "extension_loaded"
+    assert "telegram" in extension_loader.snapshot()["extensions"]
+
+
+def test_reconcile_reuses_one_discovered_peer_snapshot(tmp_path, monkeypatch):
+    loaded, repo_root, drive_root = _prepare_extension(
+        tmp_path,
+        "single_scan",
+        "def register(api):\n    pass\n",
+        permissions=[],
+    )
+    calls = 0
+    real_discover = extension_loader.discover_skills
+
+    def counted_discover(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_discover(*args, **kwargs)
+
+    monkeypatch.setattr(extension_loader, "discover_skills", counted_discover)
+
+    state = extension_loader.reconcile_extension(
+        loaded.name,
+        drive_root,
+        lambda: {},
+        repo_path=str(repo_root),
+    )
+
+    assert state["action"] == "extension_loaded"
+    assert calls == 1
+
+
 def test_reconcile_extension_stays_loaded_in_light_mode(tmp_path, monkeypatch):
     """v5.1.2 Frame A: ``light`` no longer unloads extensions. The
     ``runtime_mode_light`` reason is gone from

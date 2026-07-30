@@ -800,6 +800,37 @@ def test_toggle_skill_persists_enable_state(tmp_path, monkeypatch):
     assert disabled_resp["enabled"] is False
 
 
+def test_toggle_and_exec_refuse_enabled_peer_conflict(tmp_path, monkeypatch):
+    skills_root = tmp_path / "skills"
+    alpha_manifest = _valid_script_manifest("alpha").replace(
+        "scripts:\n",
+        "conflicts: [beta]\nscripts:\n",
+    )
+    alpha_dir = _build_skill(skills_root, "alpha", manifest=alpha_manifest)
+    _build_skill(skills_root, "beta")
+    ctx = _make_ctx(tmp_path)
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    _mark_reviewed(ctx.drive_root, alpha_dir, "alpha")
+    save_enabled(ctx.drive_root, "beta", True)
+
+    toggle = skill_exec_mod._handle_toggle_skill(
+        ctx,
+        skill="alpha",
+        enabled=True,
+    )
+    assert "SKILL_TOGGLE_ERROR" in toggle
+    assert "beta" in toggle
+
+    save_enabled(ctx.drive_root, "alpha", True)
+    execution = skill_exec_mod._handle_skill_exec(
+        ctx,
+        skill="alpha",
+        script="scripts/hello.py",
+    )
+    assert "SKILL_EXEC_BLOCKED" in execution
+    assert "beta" in execution
+
+
 def test_toggle_skill_allows_warnings_review(tmp_path, monkeypatch):
     skills_root = tmp_path / "skills"
     skill_dir = _build_skill(skills_root, "alpha")

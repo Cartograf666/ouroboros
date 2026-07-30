@@ -197,6 +197,36 @@ def _report_binding_failure(task_id: str, project_id: str, exc: Exception, *, pa
         log.debug("project_binding_failed event write failed", exc_info=True)
 
 
+def _canonical_promoted_repair_constraint(value: Any) -> tuple[Optional[dict], str]:
+    """Pin and validate the authority envelope for a promoted skill repair."""
+    from ouroboros.contracts.skill_payload_policy import resolve_constrained_payload_path
+    from ouroboros.contracts.task_constraint import TaskConstraint, normalize_task_constraint
+
+    constraint = normalize_task_constraint(value)
+    if constraint is None or constraint.mode != "skill_repair":
+        return None, ""
+    canonical = TaskConstraint(
+        mode="skill_repair",
+        skill_name=constraint.skill_name,
+        payload_root=constraint.payload_root,
+        allow_enable=False,
+        allow_review=True,
+    )
+    try:
+        payload_dir = resolve_constrained_payload_path(DRIVE_ROOT, canonical, ".")
+    except (TypeError, ValueError):
+        return None, "invalid_skill_repair_constraint"
+    if not payload_dir.is_dir():
+        return None, "skill_repair_payload_missing"
+    return {
+        "mode": canonical.mode,
+        "skill_name": canonical.skill_name,
+        "payload_root": canonical.payload_root,
+        "allow_enable": False,
+        "allow_review": True,
+    }, ""
+
+
 def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     """Enqueue a first-class pooled owner task from a conversation-lane promote.
 
@@ -210,6 +240,15 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     objective = str(evt.get("objective") or "").strip()
     if not objective:
         return {"status": "needs_manual_target", "reason": "empty_objective", "task_id": tid}
+    repair_constraint, constraint_error = _canonical_promoted_repair_constraint(
+        evt.get("task_constraint")
+    )
+    if constraint_error:
+        return {
+            "status": "needs_manual_target",
+            "reason": constraint_error,
+            "task_id": tid,
+        }
     try:
         chat_id = int(evt.get("chat_id") or 0)
     except (TypeError, ValueError):
@@ -236,6 +275,10 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         "title": title,
         "source": "promote_chat_to_task",
     }
+    if repair_constraint is not None:
+        # Must be present before attach_task_contract so the managed root task
+        # enters execution with its confined repair profile, never ephemeral.
+        task["task_constraint"] = repair_constraint
     # Ingress-captured origin identity rides the task record (post-hoc UI convert
     # reads it from the persisted result — never re-derived from content).
     if isinstance(evt.get("source_ref"), dict) and evt.get("source_ref"):

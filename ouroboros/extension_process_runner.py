@@ -711,9 +711,20 @@ def _skill_for_dispatch(skill_name: str, drive_root: pathlib.Path, skills_repo_p
 def _load_child_extension(skill_name: str, drive_root: pathlib.Path, repo_dir: pathlib.Path, skills_repo_path: pathlib.Path) -> None:
     from ouroboros.config import load_settings
     from ouroboros.extension_loader import load_extension
+    from ouroboros.skill_loader import discover_skills
 
-    skill = _skill_for_dispatch(skill_name, drive_root, skills_repo_path)
-    err = load_extension(skill, load_settings, drive_root=drive_root, _force_in_process=True)
+    skills = discover_skills(drive_root, repo_path=str(skills_repo_path))
+    skill = next((item for item in skills if item.name == skill_name), None)
+    if skill is None:
+        raise ExtensionProcessError(f"extension skill {skill_name!r} is missing")
+    err = load_extension(
+        skill,
+        load_settings,
+        drive_root=drive_root,
+        skills=skills,
+        repo_path=str(skills_repo_path),
+        _force_in_process=True,
+    )
     if err:
         raise ExtensionProcessError(err)
 

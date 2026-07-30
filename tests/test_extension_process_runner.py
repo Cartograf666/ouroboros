@@ -88,6 +88,37 @@ def test_extension_child_runner_uses_host_python_for_host_dependencies():
     assert pathlib.Path(_child_python()).resolve() == pathlib.Path(sys.executable).resolve()
 
 
+def test_child_extension_load_reuses_one_discovered_peer_snapshot(tmp_path, monkeypatch):
+    from ouroboros import extension_process_runner as runner
+    from ouroboros import skill_loader
+
+    loaded, repo_root, drive_root = _prepare_extension(
+        tmp_path,
+        "child_single_scan",
+        "def register(api):\n    pass\n",
+        permissions=[],
+    )
+    calls = 0
+    real_discover = skill_loader.discover_skills
+
+    def counted_discover(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_discover(*args, **kwargs)
+
+    monkeypatch.setattr(skill_loader, "discover_skills", counted_discover)
+    monkeypatch.setattr("ouroboros.config.load_settings", lambda: {})
+
+    runner._load_child_extension(
+        loaded.name,
+        drive_root,
+        pathlib.Path(__file__).resolve().parents[1],
+        repo_root,
+    )
+
+    assert calls == 1
+
+
 def test_extension_child_returncode_formats_signal_names():
     from ouroboros.extension_process_runner import _format_child_returncode
 

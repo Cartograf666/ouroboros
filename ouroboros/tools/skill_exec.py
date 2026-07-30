@@ -23,6 +23,7 @@ from ouroboros.skill_loader import (
     find_skill,
     grant_status_for_skill,
     save_enabled,
+    skill_conflict_status,
     skill_review_gate,
     skill_state_dir,
     summarize_skills,
@@ -624,6 +625,13 @@ def _handle_skill_exec(
             "Enable it after review in the Skills UI (Phase 5) or via "
             "the dedicated enable tool."
         )
+    conflict = skill_conflict_status(loaded, discover_skills(drive_root))
+    if conflict:
+        names = list(conflict.get("skills") or [])
+        return (
+            f"⚠️ SKILL_EXEC_BLOCKED: skill {skill_name!r} conflicts with "
+            f"enabled skills {names}. Disable the conflicting skill first."
+        )
     try:
         current_hash = compute_content_hash(
             loaded.skill_dir,
@@ -909,6 +917,13 @@ def _handle_toggle_skill(
                 f"— loader rejected it ({loaded.load_error})."
             )
         if coerced:
+            conflict = skill_conflict_status(loaded, discover_skills(drive_root))
+            if conflict:
+                names = list(conflict.get("skills") or [])
+                return (
+                    f"⚠️ SKILL_TOGGLE_ERROR: cannot enable {loaded.name!r} while "
+                    f"conflicting skills are enabled: {names}. Disable them first."
+                )
             stale = loaded.review.is_stale_for(loaded.content_hash)
             gate = skill_review_gate(loaded.review.status, stale=stale)
             grants = grant_status_for_skill(drive_root, loaded)

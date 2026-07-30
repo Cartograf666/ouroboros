@@ -14,7 +14,7 @@ import pathlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from ouroboros.contracts.skill_manifest import SkillManifest, SkillManifestError, parse_skill_manifest_text
+from ouroboros.contracts.skill_manifest import SkillManifest, SkillManifestError, canonical_skill_name, parse_skill_manifest_text
 from ouroboros.contracts.plugin_api import FORBIDDEN_SKILL_SETTINGS
 from ouroboros.skill_review_status import STATUS_BLOCKERS, STATUS_CLEAN, STATUS_PENDING, STATUS_WARNINGS, VALID_SKILL_REVIEW_STATUSES, aggregate_skill_review_status, normalize_skill_review_status, skill_review_gate
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
@@ -179,13 +179,7 @@ def _sanitize_skill_name(name: str) -> str:
     Keep alphanumerics, dashes, underscores, and dots; replace everything
     else with ``_``. Empty / pathological inputs become ``"_unnamed"``.
     """
-    cleaned = "".join(
-        ch if ch.isalnum() or ch in "-_." else "_" for ch in str(name or "").strip()
-    )
-    cleaned = cleaned.strip("._")
-    if not cleaned:
-        return "_unnamed"
-    return cleaned[:64]  # also bound length to keep state paths sane
+    return canonical_skill_name(name)
 
 
 def is_self_authored_skill_dir(
@@ -1095,6 +1089,48 @@ def find_skill(
     return None
 
 
+_MAX_CONFLICT_PROJECTION = 8
+
+
+def enabled_skill_conflicts(
+    skill: LoadedSkill,
+    skills: List[LoadedSkill],
+) -> List[str]:
+    """Return enabled installed peers conflicting with ``skill``.
+
+    A declaration on either side is authoritative, so one-sided manifests are
+    enforced symmetrically. Missing and disabled peers are deliberately inert.
+    """
+    declared = set(skill.manifest.conflicts or [])
+    conflicts = {
+        peer.name
+        for peer in skills
+        if peer.name != skill.name
+        and peer.enabled
+        and (
+            peer.name in declared
+            or skill.name in set(peer.manifest.conflicts or [])
+        )
+    }
+    return sorted(conflicts)
+
+
+def skill_conflict_status(
+    skill: LoadedSkill,
+    skills: List[LoadedSkill],
+) -> Optional[Dict[str, Any]]:
+    """Return a bounded API-safe projection of enabled peer conflicts."""
+    names = enabled_skill_conflicts(skill, skills)
+    if not names:
+        return None
+    visible = names[:_MAX_CONFLICT_PROJECTION]
+    return {
+        "code": "skill_conflict",
+        "skills": visible,
+        "omitted": len(names) - len(visible),
+    }
+
+
 def list_available_for_execution(
     drive_root: pathlib.Path,
     *,
@@ -1104,8 +1140,9 @@ def list_available_for_execution(
     from ouroboros.skill_readiness import skill_readiness_for_execution
 
     out: List[LoadedSkill] = []
-    for skill in discover_skills(drive_root, repo_path=repo_path):
-        if skill.available_for_execution and skill_readiness_for_execution(drive_root, skill).ready:
+    skills = discover_skills(drive_root, repo_path=repo_path)
+    for skill in skills:
+        if skill.available_for_execution and skill_readiness_for_execution(drive_root, skill, skills=skills).ready:
             out.append(skill)
     return out
 
@@ -1138,7 +1175,7 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
     for s in skills:
         stale = s.review.is_stale_for(s.content_hash)
         gate = skill_review_gate(s.review.status, stale=stale)
-        readiness = skill_readiness_for_execution(drive_root, s)
+        readiness = skill_readiness_for_execution(drive_root, s, skills=skills)
         grant_status = readiness.grant_status or grant_status_for_skill(drive_root, s)
         grants_usable = grant_status.get("usable", True)
         runnable = s.available_for_execution and readiness.ready
@@ -1169,6 +1206,8 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
             "blocked_by_grants": not grants_usable,
             "load_error": s.load_error,
             "source": s.source,
+            "conflicts": list(s.manifest.conflicts or []),
+            "conflict": readiness.conflict or None,
         })
     return {
         "count": len(skills),
@@ -1187,6 +1226,7 @@ __all__ = [
     "AutoGrantOutcome", "LoadedSkill", "HASH_EXEMPT_CONTROL_FILENAMES",
     "SkillReviewState", "auto_grant_if_enabled",
     "VALID_REVIEW_STATUSES", "compute_content_hash", "discover_skills", "find_skill",
+    "enabled_skill_conflicts", "skill_conflict_status",
     "grant_status_for_skill", "is_self_authored_skill_dir", "list_available_for_execution",
     "load_enabled", "load_review_state", "load_skill_grants", "load_skill",
     "requested_core_setting_keys", "review_status_allows_execution", "skill_review_gate",

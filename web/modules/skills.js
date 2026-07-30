@@ -359,7 +359,7 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
                 await postWithFeedback('/api/command', {
                     cmd: prompt,
                     task_constraint: { mode: 'skill_repair', skill_name: skill.name || name, payload_root: skill.payload_root || '', allow_enable: false, allow_review: true },
-                    visible_text: `Repair request sent for ${name}. Ouroboros will decide and, if accepted, start a repair task (watch for its live card) and re-run review.`,
+                    visible_text: `Repair request sent for ${name}. Watch for its live card; if the task cannot start, chat will show why. Review re-runs when it finishes.`,
                     visible_task_id: `skill_repair_${name}`,
                 });
                 showToast(`${name}: repair request sent to Ouroboros`, 'ok');

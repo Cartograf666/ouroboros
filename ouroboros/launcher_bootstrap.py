@@ -456,7 +456,7 @@ def verify_claude_runtime(context: BootstrapContext) -> bool:
 
 
 _SEED_COMPLETE_MARKER = ".bootstrap-seed-complete"
-_POST_BOOTSTRAP_NEW_NATIVE_SEEDS = frozenset({"unix_computer_use"})
+_POST_BOOTSTRAP_NEW_NATIVE_SEEDS = frozenset({"telegram", "unix_computer_use"})
 
 
 def _read_skill_manifest_version(skill_dir: pathlib.Path) -> str:
@@ -722,6 +722,18 @@ def _seed_skills_into(seed_dir: pathlib.Path, target_root: pathlib.Path, log_obj
     marker_path = native_root / _SEED_COMPLETE_MARKER
     if marker_path.is_file():
         # Bootstrap already ran; do not resurrect deleted seed skills.
+        try:
+            from ouroboros.skill_loader import discover_skills
+
+            installed_names = {
+                skill.name for skill in discover_skills(target_root.parent)
+            }
+        except Exception:
+            log_obj.warning(
+                "New native skill seeding skipped: installed skill names could not be inspected",
+                exc_info=True,
+            )
+            return 0
         copied = 0
         for name in sorted(_POST_BOOTSTRAP_NEW_NATIVE_SEEDS):
             entry = seed_dir / name
@@ -731,6 +743,12 @@ def _seed_skills_into(seed_dir: pathlib.Path, target_root: pathlib.Path, log_obj
                 continue
             if dest.exists() or not any((entry / candidate).is_file() for candidate in ("SKILL.md", "skill.json")):
                 continue
+            if name in installed_names:
+                log_obj.warning(
+                    "New bundled native skill %s was not seeded because an installed payload already uses that name",
+                    name,
+                )
+                continue
             try:
                 shutil.copytree(entry, dest)
                 (dest / ".seed-origin").write_text(
@@ -739,6 +757,7 @@ def _seed_skills_into(seed_dir: pathlib.Path, target_root: pathlib.Path, log_obj
                 )
                 offered_marker.write_text("offered\n", encoding="utf-8")
                 copied += 1
+                installed_names.add(name)
                 _stamp_native_seed_trust(target_root.parent, dest, log_obj)
             except OSError as exc:
                 log_obj.warning("Failed to copy new bundled native skill %s -> %s: %s", entry, dest, exc)

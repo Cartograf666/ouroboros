@@ -369,6 +369,8 @@
  * @property {boolean=} is_self_authored
  * @property {Object=} grants
  * @property {string[]=} permissions
+ * @property {string[]=} conflicts
+ * @property {{code: "skill_conflict", skills: string[], omitted: number}=} conflict
  */
 
 /**
@@ -508,4 +510,4 @@
  * @property {boolean=} ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.84.0';
+export const GATEWAY_CONTRACT_VERSION = '6.85.0';

@@ -49,7 +49,7 @@ from ouroboros.extension_ui_validation import (
 from ouroboros.gateway.host_service import AUTH_TOKEN_FILENAME
 from ouroboros.provider_models import MODEL_PROVIDER_CREDENTIAL_KEYS
 from ouroboros.extension_isolated_deps import _isolated_python_site_dirs, async_isolated_site_dirs_scope, isolated_site_dirs_scope, is_skill_cache_path
-from ouroboros.skill_loader import _SKILL_DIR_CACHE_NAMES, LoadedSkill, SkillPayloadUnreadable, compute_content_hash, discover_skills, find_skill, grant_status_for_skill, requested_core_setting_keys, skill_review_gate, skill_state_dir
+from ouroboros.skill_loader import _SKILL_DIR_CACHE_NAMES, _sanitize_skill_name, LoadedSkill, SkillPayloadUnreadable, compute_content_hash, discover_skills, find_skill, grant_status_for_skill, requested_core_setting_keys, skill_conflict_status, skill_review_gate, skill_state_dir
 from ouroboros.skill_token import SkillToken
 from ouroboros.tools.skill_exec import _scrub_env
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
@@ -1300,6 +1300,8 @@ def _extension_runtime_state(
     *,
     current_hash: str | None = None,
     drive_root: pathlib.Path | None = None,
+    skills: Optional[List[LoadedSkill]] = None,
+    repo_path: str | None = None,
 ) -> Dict[str, Any]:
     """Return the liveness authority for one extension."""
     from ouroboros.config import get_runtime_mode
@@ -1325,6 +1327,12 @@ def _extension_runtime_state(
     review_gate = skill_review_gate(skill.review.status, stale=review_stale)
     if drive_root is None:
         drive_root = pathlib.Path(skill.skill_dir).parent.parent.parent
+    peers = list(skills) if skills is not None else discover_skills(
+        pathlib.Path(drive_root), repo_path=repo_path
+    )
+    if not any(peer.name == skill.name for peer in peers):
+        peers.append(skill)
+    conflict = skill_conflict_status(skill, peers)
     grant_status = grant_status_for_skill(pathlib.Path(drive_root), skill)
     grants_usable = bool(grant_status.get("usable", True))
     reason = "ready"
@@ -1338,6 +1346,9 @@ def _extension_runtime_state(
     elif not skill.enabled:
         desired_live = False
         reason = "disabled"
+    elif conflict:
+        desired_live = False
+        reason = "skill_conflict"
     elif not review_gate["executable_review"]:
         desired_live = False
         reason = review_gate["blocking_reason"]
@@ -1358,6 +1369,7 @@ def _extension_runtime_state(
         "review_gate": review_gate,
         "executable_review": review_gate["executable_review"],
         "grant_status": grant_status,
+        "conflict": conflict,
         "load_error": skill.load_error or (load_failure.error if matched_failure and load_failure else None),
         "desired_live": desired_live,
         "live_loaded": live_loaded,
@@ -1404,11 +1416,16 @@ def runtime_state_for_skill_name(
     drive_root: pathlib.Path,
     *,
     repo_path: str | None = None,
+    skills: Optional[List[LoadedSkill]] = None,
 ) -> Dict[str, Any]:
     from ouroboros.config import get_skills_repo_path
 
     resolved_repo_path = get_skills_repo_path() if repo_path is None else repo_path
-    skill = find_skill(drive_root, skill_name, repo_path=resolved_repo_path)
+    peers = list(skills) if skills is not None else discover_skills(
+        drive_root, repo_path=resolved_repo_path
+    )
+    safe_name = _sanitize_skill_name(skill_name)
+    skill = next((item for item in peers if item.name == safe_name), None)
     if skill is None:
         with _lock:
             live_loaded = skill_name in _extensions
@@ -1426,12 +1443,30 @@ def runtime_state_for_skill_name(
             "loaded_matches_current": False,
             "reason": "missing",
         }
-    return _apply_deps_block(_extension_runtime_state(skill, drive_root=pathlib.Path(drive_root)), pathlib.Path(drive_root), skill)
+    return _apply_deps_block(
+        _extension_runtime_state(
+            skill,
+            drive_root=pathlib.Path(drive_root),
+            skills=peers,
+            repo_path=resolved_repo_path,
+        ),
+        pathlib.Path(drive_root),
+        skill,
+    )
 
 
-def runtime_state_for_loaded_skill(skill: "LoadedSkill", drive_root: pathlib.Path | None = None) -> Dict[str, Any]:
+def runtime_state_for_loaded_skill(
+    skill: "LoadedSkill",
+    drive_root: pathlib.Path | None = None,
+    *,
+    skills: Optional[List[LoadedSkill]] = None,
+) -> Dict[str, Any]:
     """Runtime state for an already-discovered skill; avoids repeated FS walks."""
-    state = _extension_runtime_state(skill, drive_root=pathlib.Path(drive_root) if drive_root is not None else None)
+    state = _extension_runtime_state(
+        skill,
+        drive_root=pathlib.Path(drive_root) if drive_root is not None else None,
+        skills=skills,
+    )
     return _apply_deps_block(state, pathlib.Path(drive_root), skill) if drive_root is not None else state
 
 
@@ -1471,6 +1506,7 @@ def reconcile_extension(
     settings_reader: Callable[[], Dict[str, Any]],
     *,
     repo_path: str | None = None,
+    skills: Optional[List[LoadedSkill]] = None,
     retry_load_error: bool = False,
     revert_enabled_on_error: bool = False,
 ) -> Dict[str, Any]:
@@ -1481,13 +1517,29 @@ def reconcile_extension(
     """
     lifecycle_lock = _lifecycle_lock_for(skill_name)
     with lifecycle_lock:
-        state = runtime_state_for_skill_name(skill_name, drive_root, repo_path=repo_path)
+        from ouroboros.config import get_skills_repo_path
+
+        resolved_repo_path = get_skills_repo_path() if repo_path is None else repo_path
+        peers = list(skills) if skills is not None else discover_skills(
+            drive_root, repo_path=resolved_repo_path
+        )
+        state = runtime_state_for_skill_name(
+            skill_name,
+            drive_root,
+            repo_path=resolved_repo_path,
+            skills=peers,
+        )
         loaded_present = bool(state.get("loaded_present"))
         was_live = bool(state.get("live_loaded"))
         if retry_load_error and state.get("reason") == "load_error" and not was_live:
             with _lock:
                 _load_failures.pop(skill_name, None)
-            state = runtime_state_for_skill_name(skill_name, drive_root, repo_path=repo_path)
+            state = runtime_state_for_skill_name(
+                skill_name,
+                drive_root,
+                repo_path=resolved_repo_path,
+                skills=peers,
+            )
             loaded_present = bool(state.get("loaded_present"))
             was_live = bool(state.get("live_loaded"))
         elif state.get("reason") == "load_error" and not loaded_present:
@@ -1525,10 +1577,8 @@ def reconcile_extension(
             _request_server_reconcile_if_worker(drive_root, skill_name, reason="already_live")
             return state
 
-        from ouroboros.config import get_skills_repo_path
-
-        resolved_repo_path = get_skills_repo_path() if repo_path is None else repo_path
-        loaded = find_skill(drive_root, skill_name, repo_path=resolved_repo_path)
+        safe_name = _sanitize_skill_name(skill_name)
+        loaded = next((item for item in peers if item.name == safe_name), None)
         if loaded is None:
             state["reason"] = "missing"
             state["action"] = "extension_inactive"
@@ -1537,7 +1587,13 @@ def reconcile_extension(
         if loaded_present:
             unload_extension(skill_name)
         try:
-            err = load_extension(loaded, settings_reader, drive_root=drive_root)
+            err = load_extension(
+                loaded,
+                settings_reader,
+                drive_root=drive_root,
+                skills=peers,
+                repo_path=resolved_repo_path,
+            )
         except Exception as exc:  # an unexpected raise must still revert enable + record
             log.exception("extension %s reconcile load raised", skill_name)
             err = f"skill {skill_name!r} load failure: {type(exc).__name__}: {exc}"
@@ -1554,7 +1610,12 @@ def reconcile_extension(
             _revert_enabled_after_load_error(revert_enabled_on_error, drive_root, skill_name, state)
             _request_server_reconcile_if_worker(drive_root, skill_name, reason="load_error")
             return state
-        refreshed = runtime_state_for_skill_name(skill_name, drive_root, repo_path=resolved_repo_path)
+        refreshed = runtime_state_for_skill_name(
+            skill_name,
+            drive_root,
+            repo_path=resolved_repo_path,
+            skills=peers,
+        )
         refreshed["action"] = "extension_loaded"
         _request_server_reconcile_if_worker(drive_root, skill_name, reason="loaded")
         return refreshed
@@ -1658,6 +1719,8 @@ def load_extension(
     settings_reader: Callable[[], Dict[str, Any]],
     *,
     drive_root: Optional[pathlib.Path] = None,
+    skills: Optional[List[LoadedSkill]] = None,
+    repo_path: str | None = None,
     _force_in_process: bool = False,
 ) -> Optional[str]:
     """Load a fresh-reviewed enabled extension, returning a UI-safe error.
@@ -1684,7 +1747,19 @@ def load_extension(
             f"skill {skill.name!r} payload unreadable at load time: "
             f"{exc}. Fix filesystem state and re-enable."
         )
-    runtime_state = _extension_runtime_state(skill, current_hash=current_hash, drive_root=pathlib.Path(drive_root))
+    runtime_state = _extension_runtime_state(
+        skill,
+        current_hash=current_hash,
+        drive_root=pathlib.Path(drive_root),
+        skills=skills,
+        repo_path=repo_path,
+    )
+    if runtime_state["reason"] == "skill_conflict":
+        conflict_names = list((runtime_state.get("conflict") or {}).get("skills") or [])
+        return (
+            f"skill {skill.name!r} conflicts with enabled skills "
+            f"{conflict_names}. Disable the conflicting skill first."
+        )
     # Light mode permits reviewed extensions; stale review and other gates remain.
     gate = runtime_state.get("review_gate") or skill_review_gate(
         skill.review.status,
@@ -1947,6 +2022,7 @@ def reload_all(
                 drive_root,
                 settings_reader,
                 repo_path=repo_path,
+                skills=skills,
                 retry_load_error=True,
             )
             load_error = state.get("load_error")

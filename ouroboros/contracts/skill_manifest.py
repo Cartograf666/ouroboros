@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional
 
 
 SKILL_MANIFEST_SCHEMA_VERSION = 1
+MAX_SKILL_CONFLICTS = 32
+MAX_SKILL_NAME_LENGTH = 64
 
 VALID_SKILL_TYPES = frozenset({"instruction", "script", "extension"})
 VALID_SKILL_RUNTIMES = frozenset({
@@ -48,6 +50,18 @@ class SkillManifestError(ValueError):
     """Manifest has structural contract damage."""
 
 
+def canonical_skill_name(name: str) -> str:
+    """Return the canonical bounded identifier used for skill state and routing."""
+    cleaned = "".join(
+        ch if ch.isalnum() or ch in "-_." else "_"
+        for ch in str(name or "").strip()
+    )
+    cleaned = cleaned.strip("._")
+    if not cleaned:
+        return "_unnamed"
+    return cleaned[:MAX_SKILL_NAME_LENGTH]
+
+
 @dataclass
 class SkillManifest:
     """Structural description of one skill package."""
@@ -67,6 +81,7 @@ class SkillManifest:
     # Extension manifests point at a Python entry module.
     entry: str = ""
     permissions: List[str] = field(default_factory=list)
+    conflicts: List[str] = field(default_factory=list)
     subscribe_events: List[str] = field(default_factory=list)
     companion_processes: List[Dict[str, Any]] = field(default_factory=list)
     scheduled_tasks: List[Dict[str, Any]] = field(default_factory=list)
@@ -192,6 +207,7 @@ def _manifest_from_mapping(data: Dict[str, Any], *, body: str) -> SkillManifest:
         "scripts",
         "entry",
         "permissions",
+        "conflicts",
         "subscribe_events",
         "companion_processes",
         "scheduled_tasks",
@@ -307,6 +323,22 @@ def _manifest_from_mapping(data: Dict[str, Any], *, body: str) -> SkillManifest:
             f"expected {SKILL_MANIFEST_SCHEMA_VERSION}"
         )
 
+    conflicts = _string_list(data.get("conflicts"))
+    if len(conflicts) > MAX_SKILL_CONFLICTS:
+        raise SkillManifestError(
+            f"'conflicts' may contain at most {MAX_SKILL_CONFLICTS} skill names"
+        )
+    canonical_conflicts: List[str] = []
+    for conflict in conflicts:
+        canonical = canonical_skill_name(conflict)
+        if canonical == "_unnamed" or conflict != canonical:
+            raise SkillManifestError(
+                f"conflicts entry {conflict!r} must be a canonical skill name "
+                f"(letters/numbers plus '-', '_', or '.', max {MAX_SKILL_NAME_LENGTH} characters)"
+            )
+        if canonical not in canonical_conflicts:
+            canonical_conflicts.append(canonical)
+
     return SkillManifest(
         name=str(data.get("name") or "").strip(),
         description=str(data.get("description") or "").strip(),
@@ -321,6 +353,7 @@ def _manifest_from_mapping(data: Dict[str, Any], *, body: str) -> SkillManifest:
         scripts=scripts,
         entry=str(data.get("entry") or "").strip(),
         permissions=_string_list(data.get("permissions")),
+        conflicts=canonical_conflicts,
         subscribe_events=_string_list(data.get("subscribe_events")),
         companion_processes=companion_processes,
         scheduled_tasks=scheduled_tasks,
@@ -351,10 +384,13 @@ def _derive_name_from_body(text: str) -> str:
 
 __all__ = [
     "SKILL_MANIFEST_SCHEMA_VERSION",
+    "MAX_SKILL_CONFLICTS",
+    "MAX_SKILL_NAME_LENGTH",
     "VALID_SKILL_TYPES",
     "VALID_SKILL_RUNTIMES",
     "VALID_SKILL_PERMISSIONS",
     "SkillManifest",
     "SkillManifestError",
+    "canonical_skill_name",
     "parse_skill_manifest_text",
 ]

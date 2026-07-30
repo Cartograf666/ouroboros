@@ -830,8 +830,17 @@ def test_skill_manifest_is_tolerant_of_missing_fields():
     text = "# Hello World Skill\n\nJust a guide.\n"
     manifest = parse_skill_manifest_text(text)
     assert manifest.type == "instruction"
+    assert manifest.conflicts == []
     assert manifest.is_instruction()
     assert manifest.body.strip().startswith("# Hello World Skill")
+
+
+def test_skill_manifest_conflicts_is_a_frozen_optional_field():
+    assert "conflicts" in SkillManifest.__dataclass_fields__
+    manifest = parse_skill_manifest_text(
+        "---\nname: telegram\nconflicts: [telegram-bridge]\n---\n# Telegram\n"
+    )
+    assert manifest.conflicts == ["telegram-bridge"]
 
 
 def test_skill_manifest_scheduled_tasks_contract():

@@ -37,6 +37,7 @@ from ouroboros.skill_loader import (
     requested_skill_permissions,
     review_status_allows_execution,
     save_skill_grants,
+    skill_conflict_status,
     skill_review_gate,
     _sanitize_skill_name,
 )
@@ -241,7 +242,7 @@ def _build_extensions_index(drive_root, repo_path):
     except Exception:
         log.debug("Failed to sync skill schedules", exc_info=True)
     runtime_states = {
-        s.name: runtime_state_for_loaded_skill(s, drive_root)
+        s.name: runtime_state_for_loaded_skill(s, drive_root, skills=skills)
         for s in skills
         if s.manifest.is_extension()
     }
@@ -313,6 +314,8 @@ def _build_extensions_index(drive_root, repo_path):
             "enabled": s.enabled,
             **_review_fields(s, github_token_configured=_gh_token_configured),
             "permissions": list(s.manifest.permissions or []),
+            "conflicts": list(getattr(s.manifest, "conflicts", []) or []),
+            "conflict": skill_conflict_status(s, skills),
             "load_error": runtime_states.get(s.name, {}).get("load_error", s.load_error),
             "desired_live": runtime_states.get(s.name, {}).get("desired_live", False),
             "live_loaded": runtime_states.get(s.name, {}).get("live_loaded", False),
@@ -397,6 +400,7 @@ async def api_extension_manifest(request: Request) -> JSONResponse:
                 "type": loaded.manifest.type,
                 "entry": loaded.manifest.entry,
                 "permissions": list(loaded.manifest.permissions or []),
+                "conflicts": list(getattr(loaded.manifest, "conflicts", []) or []),
                 "env_from_settings": list(loaded.manifest.env_from_settings or []),
                 "scheduled_tasks": list(getattr(loaded.manifest, "scheduled_tasks", []) or []),
                 "ui_tab": loaded.manifest.ui_tab,
@@ -641,6 +645,20 @@ async def api_skill_toggle(request: Request) -> JSONResponse:
         if enabled and loaded.load_error:
             return {"error": f"cannot enable: {loaded.load_error}", "status_code": 400}
         if enabled:
+            conflict = skill_conflict_status(
+                loaded,
+                discover_skills(drive_root, repo_path=repo_path),
+            )
+            if conflict:
+                names = list(conflict.get("skills") or [])
+                return {
+                    "error": (
+                        "cannot enable while conflicting skills are enabled: "
+                        + ", ".join(names)
+                    ),
+                    "status_code": 409,
+                    "conflict": conflict,
+                }
             stale = loaded.review.is_stale_for(loaded.content_hash)
             grants = grant_status_for_skill(drive_root, loaded)
             gate = skill_review_gate(loaded.review.status, stale=stale)
@@ -707,7 +725,6 @@ async def api_skill_toggle(request: Request) -> JSONResponse:
         save_enabled(drive_root, loaded.name, enabled)
         try:
             from supervisor.queue import sync_skill_schedules
-            from ouroboros.skill_loader import discover_skills
 
             sync_skill_schedules(discover_skills(drive_root, repo_path=repo_path), drive_root=drive_root)
         except Exception:
@@ -732,7 +749,6 @@ async def api_skill_toggle(request: Request) -> JSONResponse:
                 # surface the concrete load error.
                 try:
                     from supervisor.queue import sync_skill_schedules
-                    from ouroboros.skill_loader import discover_skills
                     sync_skill_schedules(discover_skills(drive_root, repo_path=repo_path), drive_root=drive_root)
                 except Exception:
                     log.debug("api_skill_toggle revert schedule sync failed", exc_info=True)

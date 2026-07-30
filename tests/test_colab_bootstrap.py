@@ -59,71 +59,149 @@ def test_get_colab_secret_optional_returns_empty_without_prompt(monkeypatch):
     # required=False must never block on getpass when the secret is absent.
     assert get_colab_secret("OUROBOROS_TEST_ABSENT_KEY", required=False) == ""
 
-def test_ensure_telegram_bridge_live_installs_enables_and_sets_full_access():
-    from ouroboros.colab_bootstrap import ensure_telegram_bridge_live
+def _native_telegram_index(*, missing=None, conflict=None):
+    return {
+        "skills": [{
+            "name": "telegram",
+            "source": "native",
+            "review_profile": "native_seed",
+            "executable_review": True,
+            "review_stale": False,
+            "conflict": conflict,
+            "grants": {
+                "missing_keys": list(missing or []),
+                "missing_permissions": [],
+            },
+        }]
+    }
+
+
+def test_ensure_native_telegram_grants_enables_and_sets_poc_modes(monkeypatch):
+    from ouroboros.colab_bootstrap import ensure_native_telegram_live
     calls = []
+    index_calls = 0
+    monkeypatch.setattr("ouroboros.colab_bootstrap.time.sleep", lambda _seconds: None)
     def fake_request(method, path, body=None, timeout=None):
+        nonlocal index_calls
         calls.append((method, path, body, timeout))
         if path == "/api/health":
             return 200, {"ok": True}
-        if path.endswith("/toggle"):
-            return 200, {"ok": True, "enabled": True}
+        if path == "/api/extensions":
+            index_calls += 1
+            payload = _native_telegram_index(missing=["TELEGRAM_BOT_TOKEN"])
+            payload["skills"][0]["grants"]["missing_permissions"] = ["subscribe_event:chat.outbound"]
+            if index_calls == 1:
+                payload["skills"][0]["executable_review"] = False
+                payload["skills"][0]["review_stale"] = True
+            return 200, payload
+        if path.endswith("/grants"):
+            assert index_calls == 2
         return 200, {"ok": True}
-    status = ensure_telegram_bridge_live(settings={"TELEGRAM_BOT_TOKEN": "x"}, request=fake_request, timeout=5)
-    assert status["ok"] is True and status["command_mode_ok"] is True
-    assert status["steps"] == ["ready", "installed", "enabled", "command_mode:full_access"]
+    status = ensure_native_telegram_live(
+        settings={
+            "TELEGRAM_BOT_TOKEN": "x",
+            "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS": "true",
+        },
+        request=fake_request,
+        timeout=5,
+    )
+    assert status["ok"] is True and status["settings_ok"] is True
+    assert status["steps"] == ["ready", "discovered", "granted", "enabled", "settings_saved"]
     triples = [(m, p, b) for (m, p, b, t) in calls]
-    assert ("POST", "/api/skills/telegram-bridge/toggle", {"enabled": True}) in triples
-    assert ("POST", "/api/extensions/telegram-bridge/settings/save", {"TELEGRAM_COMMAND_MODE": "full_access"}) in triples
-    # Auto-grant must NOT be force-POSTed; it is governed by the persisted setting.
-    assert all(p != "/api/owner/auto-grant" for (m, p, b) in triples)
-    # Install uses a review-scale timeout, not the default 60s (synchronous tri-model review).
-    install_timeout = next(t for (m, p, b, t) in calls if p == "/api/marketplace/ouroboroshub/install")
-    assert install_timeout is not None and install_timeout >= 600
+    assert ("POST", "/api/skills/telegram/grants", {"items": ["TELEGRAM_BOT_TOKEN", "subscribe_event:chat.outbound"]}) in triples
+    assert ("POST", "/api/skills/telegram/toggle", {"enabled": True}) in triples
+    assert (
+        "POST",
+        "/api/extensions/telegram/settings/save",
+        {
+            "TELEGRAM_COMMAND_MODE": "full_access",
+            "TELEGRAM_MIRROR_MODE": "all",
+            "TELEGRAM_MINIAPP_ENABLED": "on",
+        },
+    ) in triples
+    assert all("marketplace" not in path and not path.endswith("/review") for _, path, _ in triples)
+    assert all("chat.document" not in str(body) for _, _, body in triples)
 
-def test_ensure_telegram_bridge_live_command_mode_failure_is_not_silent():
-    from ouroboros.colab_bootstrap import ensure_telegram_bridge_live
+
+def test_ensure_native_telegram_respects_disabled_auto_grant():
+    from ouroboros.colab_bootstrap import ensure_native_telegram_live
+    calls = []
+    def fake_request(method, path, body=None, timeout=None):
+        calls.append((method, path, body))
+        if path == "/api/health":
+            return 200, {}
+        if path == "/api/extensions":
+            return 200, _native_telegram_index(missing=["TELEGRAM_BOT_TOKEN"])
+        return 200, {}
+    status = ensure_native_telegram_live(
+        settings={
+            "TELEGRAM_BOT_TOKEN": "x",
+            "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS": "false",
+        },
+        request=fake_request,
+        timeout=5,
+    )
+    assert status["ok"] is False
+    assert "automatic grants are disabled" in status["error"]
+    assert all(not path.endswith(("/grants", "/toggle")) for _, path, _ in calls)
+
+
+def test_ensure_native_telegram_settings_failure_is_not_silent():
+    from ouroboros.colab_bootstrap import ensure_native_telegram_live
     def fake_request(method, path, body=None, timeout=None):
         if path == "/api/health":
             return 200, {}
-        if path.endswith("/toggle"):
-            return 200, {"enabled": True}
+        if path == "/api/extensions":
+            return 200, _native_telegram_index()
         if path.endswith("/settings/save"):
             return 404, {"error": "route not found"}
         return 200, {}
-    status = ensure_telegram_bridge_live(settings={"TELEGRAM_BOT_TOKEN": "x"}, request=fake_request, timeout=5)
-    # Bridge installed+enabled, but command mode not applied — must not claim it silently.
+    status = ensure_native_telegram_live(settings={"TELEGRAM_BOT_TOKEN": "x"}, request=fake_request, timeout=5)
     assert status["ok"] is True
-    assert status.get("command_mode_ok") is False
+    assert status.get("settings_ok") is False
     assert status.get("warning")
-    assert "command_mode:full_access" not in status["steps"]
+    assert "settings_saved" not in status["steps"]
 
-def test_ensure_telegram_bridge_live_handles_already_installed_and_warns_missing_token():
-    from ouroboros.colab_bootstrap import ensure_telegram_bridge_live
+
+def test_ensure_native_telegram_reports_conflict_without_disabling_peer():
+    from ouroboros.colab_bootstrap import ensure_native_telegram_live
+    calls = []
     def fake_request(method, path, body=None, timeout=None):
+        calls.append((method, path, body))
         if path == "/api/health":
             return 200, {}
-        if path == "/api/marketplace/ouroboroshub/install":
-            return 409, {"error": "telegram-bridge is already installed"}
-        if path.endswith("/toggle"):
-            return 200, {"enabled": True}
+        if path == "/api/extensions":
+            return 200, _native_telegram_index(conflict={
+                "code": "skill_conflict",
+                "skills": ["telegram-bridge"],
+                "omitted": 0,
+            })
         return 200, {}
-    status = ensure_telegram_bridge_live(request=fake_request, timeout=5)
-    assert status["ok"] is True and "already_installed" in status["steps"]
-    assert status.get("warning")  # empty TELEGRAM_BOT_TOKEN warning
+    status = ensure_native_telegram_live(
+        settings={"TELEGRAM_BOT_TOKEN": "x"},
+        request=fake_request,
+        timeout=5,
+    )
+    assert status["ok"] is False
+    assert "telegram-bridge" in status["error"]
+    assert all(not path.endswith("/toggle") for _, path, _ in calls)
 
-def test_ensure_telegram_bridge_live_reports_server_not_ready():
-    from ouroboros.colab_bootstrap import ensure_telegram_bridge_live
-    status = ensure_telegram_bridge_live(request=lambda *a, **k: (503, {}), timeout=0.2)
+
+def test_ensure_native_telegram_reports_server_not_ready():
+    from ouroboros.colab_bootstrap import ensure_native_telegram_live
+    status = ensure_native_telegram_live(request=lambda *a, **k: (503, {}), timeout=0.2)
     assert status["ok"] is False and "ready" in status["error"]
 
-def test_ensure_telegram_bridge_live_stops_on_enable_error():
-    from ouroboros.colab_bootstrap import ensure_telegram_bridge_live
+
+def test_ensure_native_telegram_stops_on_enable_error():
+    from ouroboros.colab_bootstrap import ensure_native_telegram_live
     def fake_request(method, path, body=None, timeout=None):
         if path == "/api/health":
             return 200, {}
+        if path == "/api/extensions":
+            return 200, _native_telegram_index()
         if path.endswith("/toggle"):
             return 409, {"error": "cannot enable until requested key and permission grants are approved"}
         return 200, {}
-    status = ensure_telegram_bridge_live(settings={"TELEGRAM_BOT_TOKEN": "x"}, request=fake_request, timeout=5)
+    status = ensure_native_telegram_live(settings={"TELEGRAM_BOT_TOKEN": "x"}, request=fake_request, timeout=5)
     assert status["ok"] is False and "enable failed" in status["error"]

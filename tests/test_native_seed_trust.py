@@ -100,6 +100,7 @@ def test_externally_facing_permissions_stay_disabled(seed_env):
     )
     assert review.status == "clean"
     assert load_enabled(data_root, "weather_like") is False
+    assert not (data_root / "state" / "skills" / "weather_like" / "grants.json").exists()
 
 
 def test_flag_off_skips_stamp_entirely(seed_env, monkeypatch):

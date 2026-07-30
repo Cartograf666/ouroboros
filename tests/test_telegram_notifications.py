@@ -1,0 +1,214 @@
+import asyncio, importlib.util, json, sys, types
+from pathlib import Path
+
+import pytest
+
+
+def _load():
+    """Load plugin (which imports the lib modules) and return the notifier module
+    where the budget/task notification helpers now live (post lib split)."""
+    root = Path(__file__).resolve().parents[1] / "skills" / "telegram"
+    pkg = types.ModuleType("tg_nt"); pkg.__path__ = [str(root)]; sys.modules["tg_nt"] = pkg
+    spec = importlib.util.spec_from_file_location("tg_nt.plugin", root / "plugin.py")
+    m = importlib.util.module_from_spec(spec); sys.modules[spec.name] = m
+    spec.loader.exec_module(m)
+    return sys.modules["tg_nt.lib.telegram_notifier"]
+
+
+class _Rec:
+    sent = []
+    def __init__(self, token): pass
+    async def send_message(self, chat_id, text, parse_mode="HTML"):
+        _Rec.sent.append((chat_id, text)); return 1
+
+
+def _api(tmp_path):
+    data = tmp_path / "data"
+    sd = data / "state" / "skills" / "telegram-bridge"; sd.mkdir(parents=True)
+    (data / "logs").mkdir(parents=True, exist_ok=True)
+
+    class A:
+        def get_state_dir(self): return str(sd)
+        def get_settings(self, k): return {}  # _Rec ignores the token value
+        def log(self, *a, **k): pass
+    return A(), data
+
+
+def test_budget_threshold_notify(tmp_path, monkeypatch):
+    nt = _load(); api, data = _api(tmp_path); _Rec.sent = []
+    monkeypatch.setattr(nt, "TelegramClient", _Rec)
+    snapshots = iter([
+        {"spent_usd": 850, "budget_limit": 1000, "budget_pct": 85},
+        {"spent_usd": 850, "budget_limit": 1000, "budget_pct": 85},
+        {"spent_usd": 920, "budget_limit": 1000, "budget_pct": 92},
+    ])
+
+    async def runtime_state(_api):
+        return next(snapshots)
+
+    monkeypatch.setattr(nt, "_load_runtime_state", runtime_state)
+    # This compatibility projection is deliberately stale. Notifications must
+    # follow the authoritative /api/state snapshot above instead.
+    (data / "state" / "state.json").write_text(json.dumps({"spent_usd": 9999}), encoding="utf-8")
+    (data / "settings.json").write_text(json.dumps({"TOTAL_BUDGET": 1}), encoding="utf-8")
+    settings = {"TELEGRAM_NOTIFY_BUDGET": "on"}; state = {}
+    asyncio.run(nt._check_budget_notify(api, settings, 42, state, "en"))
+    assert len(_Rec.sent) == 1 and "85%" in _Rec.sent[0][1] and state["budget_threshold"] == 80
+    asyncio.run(nt._check_budget_notify(api, settings, 42, state, "en"))   # same → no new
+    assert len(_Rec.sent) == 1
+    asyncio.run(nt._check_budget_notify(api, settings, 42, state, "en"))
+    assert len(_Rec.sent) == 2 and "92%" in _Rec.sent[1][1] and state["budget_threshold"] == 90
+
+
+def test_budget_notification_uses_authoritative_percentage(tmp_path, monkeypatch):
+    nt = _load(); api, _data = _api(tmp_path); _Rec.sent = []
+    monkeypatch.setattr(nt, "TelegramClient", _Rec)
+
+    async def runtime_state(_api):
+        return {"spent_usd": 850, "budget_limit": 1000, "budget_pct": 79}
+
+    monkeypatch.setattr(nt, "_load_runtime_state", runtime_state)
+    asyncio.run(nt._check_budget_notify(api, {"TELEGRAM_NOTIFY_BUDGET": "on"}, 42, {}, "en"))
+    assert _Rec.sent == []
+
+
+def test_budget_notification_is_silent_without_bounded_accounting(tmp_path, monkeypatch):
+    nt = _load(); api, _data = _api(tmp_path); _Rec.sent = []
+    monkeypatch.setattr(nt, "TelegramClient", _Rec)
+    snapshots = iter([
+        {},
+        {"spent_usd": None, "budget_limit": 1000, "budget_pct": None},
+        {"spent_usd": "unavailable", "budget_limit": 1000, "budget_pct": "unavailable"},
+        {"spent_usd": 850, "budget_limit": 0, "budget_pct": 0},
+    ])
+
+    async def runtime_state(_api):
+        return next(snapshots)
+
+    monkeypatch.setattr(nt, "_load_runtime_state", runtime_state)
+    settings = {"TELEGRAM_NOTIFY_BUDGET": "on"}
+    state = {}
+    for _ in range(4):
+        asyncio.run(nt._check_budget_notify(api, settings, 42, state, "en"))
+    assert _Rec.sent == []
+    assert "budget_threshold" not in state
+
+
+def test_tasks_notify_primes_then_fires(tmp_path, monkeypatch):
+    nt = _load(); api, data = _api(tmp_path); _Rec.sent = []
+    monkeypatch.setattr(nt, "TelegramClient", _Rec)
+    chat = data / "logs" / "chat.jsonl"
+    chat.write_text(json.dumps({"type": "task_summary", "task_id": "old1", "rounds": 3,
+                                "outcome_axes": {"lifecycle": "completed"}}) + "\n", encoding="utf-8")
+    settings = {"TELEGRAM_NOTIFY_TASKS": "on"}; state = {}
+    asyncio.run(nt._check_tasks_notify(api, settings, 42, state, "en"))   # primes, no send
+    assert _Rec.sent == [] and "old1" in state["notified_task_ids"]
+    with open(chat, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "task_summary", "task_id": "new1", "rounds": 5,
+                            "outcome_axes": {"lifecycle": "completed"}}) + "\n")
+    asyncio.run(nt._check_tasks_notify(api, settings, 42, state, "en"))
+    assert len(_Rec.sent) == 1 and "new1" in _Rec.sent[0][1] and "5r" in _Rec.sent[0][1]
+
+
+def test_task_summary_scan_uses_bounded_live_tail(tmp_path, monkeypatch):
+    nt = _load(); api, data = _api(tmp_path)
+    path = data / "logs" / "chat.jsonl"
+    seen = {}
+
+    def tail(actual_path, *, max_entries, tail_bytes):
+        seen.update(path=actual_path, max_entries=max_entries, tail_bytes=tail_bytes)
+        return ([{"type": "task_summary", "task_id": "bounded"}], True)
+
+    monkeypatch.setattr(nt, "_jsonl_tail", tail)
+    rows = nt._summary_ids_in_tail(api, limit=123)
+
+    assert rows == [("bounded", {"type": "task_summary", "task_id": "bounded"})]
+    assert seen == {"path": path, "max_entries": 123, "tail_bytes": 256 * 1024}
+
+
+def test_notify_disabled_is_silent(tmp_path, monkeypatch):
+    nt = _load(); api, data = _api(tmp_path); _Rec.sent = []
+    monkeypatch.setattr(nt, "TelegramClient", _Rec)
+    (data / "state" / "state.json").write_text(json.dumps({"spent_usd": 999}), encoding="utf-8")
+    (data / "settings.json").write_text(json.dumps({"TOTAL_BUDGET": 1000}), encoding="utf-8")
+    asyncio.run(nt._check_budget_notify(api, {"TELEGRAM_NOTIFY_BUDGET": "off"}, 42, {}, "en"))
+    assert _Rec.sent == []
+
+
+def test_budget_notification_retries_before_advancing_ledger(tmp_path, monkeypatch):
+    nt = _load(); api, data = _api(tmp_path)
+
+    class Flaky:
+        attempts = 0
+        def __init__(self, _token): pass
+        async def send_message(self, *_args, **_kwargs):
+            Flaky.attempts += 1
+            if Flaky.attempts == 1:
+                raise nt.TelegramTransportError("offline")
+            return 1
+
+    monkeypatch.setattr(nt, "TelegramClient", Flaky)
+
+    async def runtime_state(_api):
+        return {"spent_usd": 850, "budget_limit": 1000, "budget_pct": 85}
+
+    monkeypatch.setattr(nt, "_load_runtime_state", runtime_state)
+    settings = {"TELEGRAM_NOTIFY_BUDGET": "on"}; state = {}
+    asyncio.run(nt._check_budget_notify(api, settings, 42, state, "en"))
+    assert "budget_threshold" not in state
+    asyncio.run(nt._check_budget_notify(api, settings, 42, state, "en"))
+    assert Flaky.attempts == 2 and state["budget_threshold"] == 80
+
+
+def test_task_notification_retries_before_advancing_ledger(tmp_path, monkeypatch):
+    nt = _load(); api, data = _api(tmp_path)
+
+    class Flaky:
+        attempts = 0
+        def __init__(self, _token): pass
+        async def send_message(self, *_args, **_kwargs):
+            Flaky.attempts += 1
+            if Flaky.attempts == 1:
+                raise nt.TelegramTransportError("offline")
+            return 1
+
+    monkeypatch.setattr(nt, "TelegramClient", Flaky)
+    (data / "logs" / "chat.jsonl").write_text(
+        json.dumps({"type": "task_summary", "task_id": "retry1", "outcome_axes": {"lifecycle": "completed"}}) + "\n",
+        encoding="utf-8",
+    )
+    settings = {"TELEGRAM_NOTIFY_TASKS": "on"}; state = {"notified_task_ids": []}
+    asyncio.run(nt._check_tasks_notify(api, settings, 42, state, "en"))
+    assert state["notified_task_ids"] == []
+    asyncio.run(nt._check_tasks_notify(api, settings, 42, state, "en"))
+    assert Flaky.attempts == 2 and state["notified_task_ids"] == ["retry1"]
+
+
+def test_notifier_ignores_ambient_chat_id(monkeypatch):
+    nt = _load()
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+    assert nt._pinned_chat_id({}) == 0
+
+
+def test_permanent_notification_rejection_reaches_supervisor(tmp_path, monkeypatch):
+    nt = _load(); api, _data = _api(tmp_path)
+
+    class Rejected:
+        def __init__(self, _token): pass
+        async def send_message(self, *_args, **_kwargs):
+            raise nt.TelegramRequestRejected("rejected", status_code=401)
+
+    monkeypatch.setattr(nt, "TelegramClient", Rejected)
+    with pytest.raises(nt.TelegramRequestRejected):
+        asyncio.run(nt._push_notification(api, 42, "notice"))
+
+
+def test_notifier_local_failure_reaches_supervisor(tmp_path, monkeypatch):
+    nt = _load(); api, _data = _api(tmp_path)
+
+    def broken_settings(_api):
+        raise RuntimeError("local notifier defect")
+
+    monkeypatch.setattr(nt, "_load_settings", broken_settings)
+    with pytest.raises(RuntimeError, match="local notifier defect"):
+        asyncio.run(nt._make_notifier(api)())

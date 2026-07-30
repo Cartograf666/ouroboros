@@ -99,22 +99,51 @@ def test_seed_marker_allows_only_new_post_bootstrap_native_skill(tmp_path, fake_
     target_root = tmp_path / "data" / "skills"
     native_root = target_root / "native"
     _write_skill(seed_dir, "weather", version="1.0.0")
+    _write_skill(seed_dir, "telegram", version="1.0.0")
     _write_skill(seed_dir, "unix_computer_use", version="0.1.0")
     native_root.mkdir(parents=True)
     (native_root / ".bootstrap-seed-complete").write_text("already seeded\n", encoding="utf-8")
 
     copied = _seed_skills_into(seed_dir, target_root, fake_log)
 
-    assert copied == 1
+    assert copied == 2
     assert not (native_root / "weather").exists()
+    assert (native_root / "telegram" / "SKILL.md").is_file()
     assert (native_root / "unix_computer_use" / "SKILL.md").is_file()
     marker = (native_root / "unix_computer_use" / ".seed-origin").read_text(encoding="utf-8")
     assert "post_bootstrap_new_seed=true" in marker
     assert (native_root / ".post-bootstrap-seed-unix_computer_use").is_file()
+    assert (native_root / ".post-bootstrap-seed-telegram").is_file()
 
     shutil.rmtree(native_root / "unix_computer_use")
     assert _seed_skills_into(seed_dir, target_root, fake_log) == 0
     assert not (native_root / "unix_computer_use").exists()
+    assert (native_root / "telegram").is_dir()
+
+
+def test_post_bootstrap_seed_preserves_existing_same_name_payload(tmp_path, fake_log):
+    from ouroboros.launcher_bootstrap import _seed_skills_into
+
+    seed_dir = tmp_path / "repo_skills"
+    target_root = tmp_path / "data" / "skills"
+    native_root = target_root / "native"
+    external_root = target_root / "external"
+    _write_skill(seed_dir, "telegram", version="1.0.0")
+    existing = _write_skill(external_root, "telegram", version="0.9.0")
+    original = (existing / "SKILL.md").read_bytes()
+    native_root.mkdir(parents=True)
+    (native_root / ".bootstrap-seed-complete").write_text(
+        "already seeded\n", encoding="utf-8"
+    )
+
+    assert _seed_skills_into(seed_dir, target_root, fake_log) == 0
+    assert (existing / "SKILL.md").read_bytes() == original
+    assert not (native_root / "telegram").exists()
+    assert not (native_root / ".post-bootstrap-seed-telegram").exists()
+
+    shutil.rmtree(existing)
+    assert _seed_skills_into(seed_dir, target_root, fake_log) == 1
+    assert (native_root / "telegram" / "SKILL.md").is_file()
 
 
 # ---------------------------------------------------------------------------
