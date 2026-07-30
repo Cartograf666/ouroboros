@@ -779,8 +779,9 @@ def _publish_worker_round_cap(settings_path: Path, cap: int) -> dict[str, Any]:
     ``Agent.handle_task`` re-applies settings from disk at the start of EVERY
     task, so writing this between the gate and the worker is what makes the cap
     per-phase without a per-task API. Adapter-only: no core contract changes.
-    Never raises — a failure leaves the previous (stricter) cap in force, which
-    can only under-spend the budget, never exceed it.
+    Never raises here; the CALLER aborts the attempt on failure, because a cap
+    left over from an earlier task on this lane may be LARGER than this example
+    allows — an unapplied write is an unknown budget, not a safe one.
     """
     record: dict[str, Any] = {"requested": int(cap), "applied": False}
     try:
@@ -1052,7 +1053,8 @@ OSWORLD_PREAMBLE = (
     "Do not search the filesystem for the grader, its code, or expected answers, and do not "
     "shape your work around guesses about how it is implemented. Solve the task as stated.\n"
     "A state change counts only if it is reachable through the application's own documented "
-    "surface — its UI, its settings, its scripting console, its CLI. Forcing that state from "
+    "surface — its UI, its settings, its own CLI (its scripting console only where the task "
+    "itself asks for scripting). Forcing that state from "
     "underneath the application does NOT count: writing its preference cookies from a "
     "developer console, decrypting or editing its credential/profile stores, or patching the "
     "program itself. If the only way you can produce the requested state is from underneath, "
@@ -1175,9 +1177,10 @@ OSWORLD_PREAMBLE = (
     "visual reading order, and state your resolved mapping (\"second item = ...\") before "
     "acting. When the elements form a BULLETED OR NUMBERED LIST, count only the actual list "
     "entries: a title and an unbulleted lead-in label (typically ending in ':') are not list "
-    "lines, even when the task says only \"line\". Otherwise — text boxes, table rows, "
-    "shapes, plain paragraphs — a heading COUNTS as the Nth item, because the Nth text box on "
-    "a slide often IS the title and the grader may target exactly it.\n"
+    "lines, even when the task says only \"line\". For SLIDE OBJECTS — text boxes, shapes, "
+    "table rows — a heading COUNTS as the Nth item, because the Nth text box on a slide often "
+    "IS the title and the grader may target exactly it. In DOCUMENT PROSE, keep excluding the "
+    "document title, headings and a centred question/subtitle line when counting paragraphs.\n"
     "FINISH ON THE GRADED SURFACE. Quote the machine-visible identifier you are setting "
     "byte-exactly and compare case-sensitively (an id, a filename, a settings key); encode "
     "EVERY qualifier the task states (a scope, a 'when' condition, a unit), not just the "
@@ -1942,8 +1945,9 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
         # proxy:true tasks through a dead upstream that answers 407 TRAFFIC_EXHAUSTED —
         # worse than no proxy (measured: chrome-with-dead-proxy 0.16 vs 0.76 direct).
         # Only enable after a live CONNECT probe through the gateway succeeds; a
-        # proxy:true task that then still hits a dead route is quarantined below, not
-        # scored as a capability zero.
+        # proxy:true task that still meets a dead route runs DIRECT and records that
+        # fact (proxy_required/proxy_enabled/proxy_exhausted_in_trace) for disclosure —
+        # it is never dropped, because the lane makes a single pass over the tasks.
         _proxy_present = os.path.exists(_proxy_cfg)
         # Probe only when THIS task is proxy-flagged: 312 of 361 tasks never touch
         # the proxy, and probing on all of them adds 361 external round trips per
@@ -2255,20 +2259,6 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
         # task that already had one — the pre-registered "first scored attempt wins" rule
         # violated in the direction that corrupts results. `mark_task_scored` raises
         # `ClaimMarkerNotDurable` rather than swallowing the failure.
-        # Proxy quarantine — AFTER the official score exists, and only for a task
-        # that actually FAILED. Quarantining before evaluation would have discarded
-        # 17 Opus wins in the previous run: an agent that meets a dead proxy and
-        # reroutes still solves the task, and the 407 stays in its trace forever.
-        # A win is never infrastructure.
-        if (reward == 0.0 and bool(example.get("proxy")) and _enable_proxy
-                and task_id and _proxy_trace_shows_exhaustion(data_dir, task_id)):
-            _write_outcome(None, "quarantined", "proxy_unavailable",
-                           extra={"proxy_exhausted": True, "official_reward_discarded": reward,
-                                  "budget_counters": budget_counters})
-            final.update({"outcome": "quarantined", "exit_code": 1,
-                          "reason": "proxy_unavailable"})
-            return 1
-
         if claims_dir is not None and claim_fd is not None:
             try:
                 mark_task_scored(claims_dir, claim_key, repo_dir=repo_dir,
@@ -2358,6 +2348,18 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
                                   else ("agent_final_answer" if infeasible_declared else "")),
             "feasibility_gate": dict(gate_record),
             "a11y_enabled": bool(args.allow_a11y),
+            # Proxy provenance is RECORDED, never acted on: the lane makes a single
+            # pass over the task list, so skipping an example deletes it from the
+            # campaign instead of retrying it (measured on the previous run: by the
+            # time a long task released its claim, every other lane had already
+            # passed it). A complete 361 denominator with disclosed proxy facts is
+            # honest; a silently shorter one is not. `proxy_required and not
+            # proxy_enabled` means this example ran DIRECT — a different protocol,
+            # and the scoring report must say so.
+            "proxy_required": bool(example.get("proxy")),
+            "proxy_enabled": bool(_enable_proxy),
+            "proxy_exhausted_in_trace": (
+                bool(task_id) and _proxy_trace_shows_exhaustion(data_dir, task_id)),
             "budget_counters": budget_counters,
             "max_rounds_effective": _effective_max_rounds(settings_path),
             # Per-example comparability verdict: an aggregate claiming "Max steps: N"

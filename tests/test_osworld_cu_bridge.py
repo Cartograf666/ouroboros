@@ -2163,16 +2163,63 @@ def test_proxy_health_gate_fails_closed(monkeypatch, tmp_path):
     assert rcb._proxy_config_is_live(str(tmp_path / "missing.json")) is False
 
 
-def test_proxy_exhaustion_quarantine_reads_the_trace(tmp_path):
-    """A proxy:true task whose trace carries 407 TRAFFIC_EXHAUSTED got a dead
-    upstream mid-run — infra, not capability. The detector scans the same
-    tools.jsonl the counters read."""
+def test_proxy_exhaustion_is_recorded_never_used_to_drop_a_task(tmp_path):
+    """A proxy outage must be DISCLOSED, not acted on. The lane makes a single pass
+    over the task list, so an unscored return deletes the example from the campaign
+    instead of retrying it (measured: by the time a long task released its claim,
+    every other lane had already walked past it). An earlier draft quarantined
+    BEFORE evaluation and would have discarded 17 opus wins whose agents met a dead
+    proxy and rerouted anyway."""
+    import inspect
+    src = inspect.getsource(rcb)
     logs = tmp_path / "state" / "headless_tasks" / "t1" / "data" / "logs"
     logs.mkdir(parents=True)
     tj = logs / "tools.jsonl"
-    tj.write_text('{"tool":"remote_exec","result":"curl: (56) ... 407 TRAFFIC_EXHAUSTED"}\n',
+    tj.write_text('{"tool":"remote_exec","result":"curl: ... 407 TRAFFIC_EXHAUSTED"}\n',
                   encoding="utf-8")
     assert rcb._proxy_trace_shows_exhaustion(tmp_path, "t1") is True
-    tj.write_text('{"tool":"click","result":"ok"}\n', encoding="utf-8")
+    # TASK-LOCAL: a neighbour's outage on the shared lane log must not count (the
+    # lane-wide fallback quarantined 3 later wins in replay).
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs" / "tools.jsonl").write_text('{"result":"TRAFFIC_EXHAUSTED"}\n',
+                                                   encoding="utf-8")
+    assert rcb._proxy_trace_shows_exhaustion(tmp_path, "no-such-task") is False
+    # A bare "407" in page content or in the agent's own command is not a verdict.
+    tj.write_text('{"tool":"type_text","args":{"text":"HTTP 407 explained"}}\n', encoding="utf-8")
     assert rcb._proxy_trace_shows_exhaustion(tmp_path, "t1") is False
-    assert rcb._proxy_trace_shows_exhaustion(tmp_path, "nonexistent") is False
+    # SAFETY PROPERTY: no code path turns proxy trouble into an unscored outcome.
+    assert "proxy_unavailable" not in src, "a proxy outage must never drop a task"
+    assert '"proxy_required"' in src and '"proxy_exhausted_in_trace"' in src
+
+
+def test_settings_cap_publication_preserves_0600(tmp_path):
+    """The lane settings file carries provider credentials at 0600. A fresh write
+    takes the process umask (0664 here), so the cap update must not widen it."""
+    import json as _json
+    import os as _os
+    sp = tmp_path / "settings.json"
+    sp.write_text(_json.dumps({"OUROBOROS_MAX_ROUNDS": 99, "OPENROUTER_API_KEY": "x"}),
+                  encoding="utf-8")
+    _os.chmod(sp, 0o600)
+    assert rcb._publish_worker_round_cap(sp, 95)["applied"] is True
+    assert _os.stat(sp).st_mode & 0o777 == 0o600
+    assert not list(tmp_path.glob("*.part")), "no credential-bearing temp left behind"
+
+
+def test_evaluate_runs_in_the_checkout_and_restores_cwd(tmp_path):
+    """Relative evaluator fixtures resolve against the process CWD and the official
+    runner works from the checkout root, so the scoped context must enter it — and
+    restore on every path, including an exception."""
+    import os as _os
+    start = _os.getcwd()
+    checkout = tmp_path / "OSWorld"
+    checkout.mkdir()
+    with rcb._official_evaluate_cwd(checkout):
+        assert _os.path.realpath(_os.getcwd()) == _os.path.realpath(str(checkout))
+    assert _os.getcwd() == start
+    try:
+        with rcb._official_evaluate_cwd(checkout):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert _os.getcwd() == start, "cwd must be restored even when evaluate raises"

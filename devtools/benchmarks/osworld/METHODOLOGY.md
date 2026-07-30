@@ -233,9 +233,11 @@ leaderboard run without the disclosures below.
    iff the last recorded action is `FAIL`, so this matches the official
    semantics; a `FAIL` on a feasible task scores 0. Detection reads only the
    terminal answer (never intermediate reasoning) to avoid spurious flips.
-4. **Budget is rounds + wall-clock + a per-task USD rail, NOT leaderboard
-   steps.** There is no per-task STEP cap. There are THREE caps, and the one
-   that binds in practice is the third:
+4. **Budget is rounds + wall-clock + a per-task USD rail — and, since v6.84.0,
+   ALSO a declared leaderboard step cap.** Before v6.84.0 there was no per-task
+   STEP cap; `--max-steps` now declares one and the runtime enforces it (see
+   4a-bis). The other three caps still apply, and the one that binds in
+   practice is the third:
    - the bench server's `OUROBOROS_MAX_ROUNDS` (default 200);
    - `--task_timeout_sec` wall clock;
    - **the runtime's per-task USD reservation rail**
@@ -251,7 +253,11 @@ leaderboard run without the disclosures below.
      to prevent.
 
    A leaderboard "step" is one model turn (which may batch several pyautogui
-   actions); an Ouroboros round is not step-equivalent. `task_outcome.json`
+   actions). CORRECTED in v6.84.0: an Ouroboros top-level policy round IS that
+   turn — the official loop increments `step_idx` once per `agent.predict()` and
+   executes every action that turn emitted. The earlier claim of
+   non-equivalence compared a TURN against an ACTION and understated our budget
+   by roughly 2.4x. `task_outcome.json`
    records `budget_counters` (`llm_rounds`, `screenshots`, `gui_action_calls`,
    `remote_exec_calls`) and `max_rounds_effective`; report these alongside any
    score. Since v6.81.1 the round is ALSO not comparable to earlier Ouroboros
@@ -437,9 +443,18 @@ leaderboard run without the disclosures below.
    tasks are unsolvable without sudo. Keep run artifacts access-controlled since
    the password appears in `prompt.txt`.
 8. **Proxy policy.** OSWorld-Verified flags 52 tasks `"proxy": true`
-   (anti-crawling / regional access). The bridge enables the proxy pool only
-   when a proxy config file exists; otherwise a proxy task runs WITHOUT proxy
-   and may fail on bot-detection. For a clean campaign, either provide a valid
+   (anti-crawling / regional access). CORRECTED in v6.84.0: config existence is
+   no longer sufficient — the bridge probes the configured gateway with a live
+   CONNECT for each proxy-flagged task and enables the pool only if that
+   succeeds, because a config pointing at an exhausted account still exists on
+   disk while answering 407, and a DEAD proxy scores worse than none (measured:
+   chrome-with-dead-proxy 0.249 mean vs 0.679 for everything else). When no live
+   route exists the task still RUNS, direct, and its outcome records
+   `proxy_required`, `proxy_enabled` and `proxy_exhausted_in_trace`; the scoring
+   report must disclose how many proxy-flagged tasks ran on the direct protocol,
+   because that is a protocol difference, not a capability result. Tasks are
+   never dropped from the denominator for it: the lane makes a single pass over
+   the task list, so skipping an example deletes it from the campaign. For a clean campaign, either provide a valid
    proxy config or publish the "proxy unavailable" subset separately rather than
    counting those as model failures.
 9. **Overlapping runs and the dedup rule (v6.76.0). PRE-REGISTERED — this
