@@ -383,7 +383,78 @@ def _reset_verified(env: Any, example: dict[str, Any], *, retries: int, deadline
                           {"error": last_err, "log_tail": capture.tail()})
 
 
-def _await_gate_task(ouroboros_url: str, task_id: str, deadline: float) -> dict[str, Any]:
+def _live_policy_turns(data_dir: Path, task_id: str) -> int | None:
+    """Policy turns of a RUNNING task, counted from its own event log.
+
+    ``loop_outcome`` is written only at FINALIZATION
+    (``agent_task_pipeline`` writes it on the terminal paths), so a poll of
+    ``GET /api/tasks/<id>`` on a running task never carries it — reading it
+    there yields None forever and any enforcement built on it is dead code.
+    The live authority is the ``llm_round`` event, emitted in
+    ``loop_llm_call`` at the very statement that increments
+    ``accumulated_usage["rounds"]``, so counting those events for this task
+    equals the ``loop_outcome.usage.total_rounds`` it will eventually report.
+
+    Returns None when the log is not readable yet — the caller must treat that
+    as "unknown", never as zero.
+    """
+    candidates = [
+        data_dir / "state" / "headless_tasks" / task_id / "data" / "logs" / "events.jsonl",
+        data_dir / "logs" / "events.jsonl",
+    ]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        rounds = 0
+        matched_any = False
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or '"llm_round"' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:  # noqa: BLE001 - a torn tail line is not a count
+                        continue
+                    if not isinstance(row, dict) or row.get("type") != "llm_round":
+                        continue
+                    # The shared log carries every task; the per-task log carries one.
+                    if str(row.get("task_id") or "") != task_id:
+                        continue
+                    matched_any = True
+                    rounds += 1
+        except OSError:
+            continue
+        if matched_any or path.parent.parent.name == task_id:
+            return rounds
+    return None
+
+
+def _policy_turns(latest: dict[str, Any]) -> int | None:
+    """Top-level POLICY TURNS from a task result, or None when unavailable.
+
+    The flat ``total_rounds`` on a task result is NOT this number: it is
+    reconstructed from ``usage_breakdown(...)["physical_calls"]`` and also counts
+    safety checks, acceptance reviewers and retries. Measured on the v6.81.1
+    361-task run, the two disagree on 344 of 346 examples (physical exceeds
+    policy by up to 13 turns), so auditing a step budget against the flat field
+    would mark compliant examples non-comparable. The loop's own count is the
+    authority. Returns None rather than 0 when the field is missing: a step-cap
+    audit must fail CLOSED, and "unknown" coerced to zero would pass silently.
+    """
+    usage = ((latest.get("loop_outcome") or {}).get("usage") or {})
+    value = usage.get("total_rounds")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _await_gate_task(ouroboros_url: str, task_id: str, deadline: float,
+                     turn_budget: int = 0, data_dir: Path | None = None) -> dict[str, Any]:
     """Poll one premise-phase task to a terminal status or its deadline.
 
     On deadline the cancel is CONFIRMED before returning: an unverified cancel can
@@ -412,6 +483,30 @@ def _await_gate_task(ouroboros_url: str, task_id: str, deadline: float) -> dict[
             continue
         if isinstance(latest, dict) and str(latest.get("status") or "") in final_statuses:
             return latest
+        # Per-task ENFORCEMENT of the gate's share of the step budget. The
+        # runtime cap (`OUROBOROS_MAX_ROUNDS`) is server-wide and the gate is a
+        # SEPARATE task, so without this the gate could consume the worker's
+        # whole allowance and the example could exceed the declared budget.
+        # Cancelling the gate is safe by construction: an absent verdict is
+        # UNDETERMINED, which proceeds to the working phase (fail-open).
+        if turn_budget > 0 and data_dir is not None:
+            # LIVE count from the task's own event log: the finalization-only
+            # `loop_outcome` is absent while the task is running.
+            used = _live_policy_turns(data_dir, task_id)
+            if used is not None and used >= turn_budget:
+                cancelled = False
+                try:
+                    _api(ouroboros_url, "POST", f"/api/tasks/{task_id}/cancel", {})
+                    for _ in range(6):
+                        time.sleep(5)
+                        probe = _api(ouroboros_url, "GET", "/api/tasks/" + task_id, timeout=30)
+                        if str((probe or {}).get("status") or "") in final_statuses:
+                            cancelled = True
+                            break
+                except Exception:  # noqa: BLE001 - recorded, decided by the caller
+                    cancelled = False
+                return {"status": "turn_budget_exhausted", "cancel_confirmed": cancelled,
+                        "policy_turns": used, "turn_budget": turn_budget}
         time.sleep(8)
 
 
@@ -432,12 +527,23 @@ def _gate_round(ouroboros_url: str, args: Any, instruction: str, *, role: str) -
     task_id = str(created.get("task_id") or "")
     if not task_id:
         raise RuntimeError(f"{role} task creation returned no task_id: {created!r}")
-    latest = _await_gate_task(ouroboros_url, task_id, time.time() + _gate_window_sec(args))
+    latest = _await_gate_task(ouroboros_url, task_id, time.time() + _gate_window_sec(args),
+                              turn_budget=_gate_turn_budget(args),
+                              data_dir=Path(args.data_dir))
     return {
         "role": role,
         "verdict": _gate_verdict(latest),
         "task_id": task_id,
         "status": latest.get("status"),
+        # POLICY turns (loop authority), not the flat physical-call field.
+        # Finalized tasks report it; runner-terminated ones carry the live count;
+        # a timeout falls back to the event log rather than reporting nothing (the
+        # longest-running gate must not be the one counted as zero).
+        "policy_turns": (latest.get("policy_turns")
+                         if latest.get("policy_turns") is not None
+                         else (_policy_turns(latest)
+                               if _policy_turns(latest) is not None
+                               else _live_policy_turns(Path(args.data_dir), task_id))),
         **({"cancel_confirmed": bool(latest.get("cancel_confirmed"))}
            if str(latest.get("status") or "") == "timeout" else {}),
         "llm_rounds": int(latest.get("total_rounds") or 0),
@@ -485,7 +591,10 @@ def _gate_cancel_unconfirmed(record: dict[str, Any]) -> bool:
     caller maps this to `blocked` (exit 2, lane aborts, its server dies and the
     zombie with it); the claim is released so another lane retries cleanly.
     """
-    return (str(record.get("status") or "") == "timeout"
+    # Both runner-initiated terminations qualify: the wall-clock timeout and the
+    # step-budget cancel. They cancel the SAME way, so an unconfirmed cancel
+    # leaves the same zombie premise session on the scored VM.
+    return (str(record.get("status") or "") in {"timeout", "turn_budget_exhausted"}
             and not record.get("cancel_confirmed"))
 
 
@@ -565,6 +674,17 @@ def _effective_max_rounds(settings_path: Path) -> dict[str, Any]:
     return {"value": 200, "source": "default"}
 
 
+def _gate_turn_budget(args: Any) -> int:
+    """Policy turns the gate phase may use when a step budget is declared.
+
+    Zero (no enforcement) when no budget is declared: the gate is then bounded
+    only by its wall-clock window, exactly as before this flag existed.
+    """
+    if not int(getattr(args, "max_steps", 0) or 0):
+        return 0
+    return _GATE_TURN_RESERVE if getattr(args, "feasibility_gate", False) else 0
+
+
 def _step_budget(args: Any, effective_rounds: dict[str, Any]) -> dict[str, Any]:
     """Typed step-budget provenance for the manifest (never raises).
 
@@ -597,6 +717,32 @@ def _step_budget(args: Any, effective_rounds: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _refuse_wrong_dataset_commit(expected: str, checkout: dict[str, Any]) -> None:
+    """Refuse a checkout that is not the one the campaign is graded against.
+
+    The graded-spec pin decides BOTH the instruction handed to the agent and the
+    evaluator that scores it, so it is a gate, not a manifest footnote. Empty
+    ``expected`` keeps the old report-only behaviour for exploratory runs; a
+    campaign passes it (``--expect-dataset-commit`` / ``OSWORLD_EXPECT_COMMIT``)
+    and any drift then costs nothing because it stops before the VM boots.
+    """
+    want = str(expected or "").strip().lower()
+    if not want:
+        return
+    got = str((checkout or {}).get("git_commit") or "").strip().lower()
+    if not got:
+        raise SystemExit(
+            "--expect-dataset-commit was given but the OSWorld checkout has no readable git "
+            f"identity ({checkout!r}); refusing rather than grading against an unknown spec"
+        )
+    if not (got.startswith(want) or want.startswith(got)):
+        raise SystemExit(
+            f"OSWorld checkout is {got[:12]} but this campaign is graded against {want[:12]}; "
+            "point --osworld-root at the campaign checkout (a different checkout supplies "
+            "different task instructions AND a different evaluator)"
+        )
+
+
 def _refuse_uncapped_step_claim(budget: dict[str, Any]) -> None:
     """Refuse a step claim the bench server would not actually honor.
 
@@ -626,29 +772,42 @@ def _refuse_uncapped_step_claim(budget: dict[str, Any]) -> None:
         )
 
 
-def _audit_step_budget(budget: dict[str, Any], counters: dict[str, Any]) -> dict[str, Any]:
+def _audit_step_budget(budget: dict[str, Any], worker_turns: int | None,
+                       gate_turns: int | None, *, gate_expected: bool = False) -> dict[str, Any]:
     """Post-run check that the example actually stayed inside the declared budget.
 
-    Reads the counters the run already collects (worker turns + gate turns)
-    rather than trusting the cap: a config that drifted, a resumed task or a
-    second execution root would all show up here as an overrun. A failed audit
-    does not rewrite the reward — it marks the example NOT comparable, which is
-    what an aggregate must exclude.
+    Both inputs are POLICY turns from the loop's own accounting (see
+    ``_policy_turns``), never the flat physical-call field — those disagree on
+    almost every example and the flat one runs higher.
+
+    An overrun here is a HARNESS FAULT, not a filtering criterion: enforcement
+    is supposed to make it unreachable (the runtime cap bounds the worker, the
+    runner cancels the gate at its reserve), so seeing one means the enforcement
+    drifted. Excluding such an example from the scored denominator would quietly
+    shrink the denominator the methodology fixes at the attempted-task count, so
+    the audit reports ``budget_fault`` and the CAMPAIGN is what must be treated
+    as non-comparable — a decision for the operator, not a silent per-row drop.
+    Missing counts fail CLOSED (unknown is not compliance).
     """
     if not budget.get("enforced"):
         return {"audited": False, "reason": "no step budget declared"}
-    worker = int(counters.get("llm_rounds") or 0)
-    gate = int(((counters.get("feasibility_gate") or {}).get("llm_rounds")) or 0)
-    total = worker + gate
     claimed = int(budget.get("max_steps_claimed") or 0)
+    if worker_turns is None or (gate_expected and gate_turns is None):
+        missing = "worker" if worker_turns is None else "gate"
+        return {"audited": True, "counts_available": False, "budget_fault": True,
+                "reason": f"{missing} policy turn count unavailable",
+                "max_steps_claimed": claimed}
+    total = int(worker_turns) + int(gate_turns or 0)
     return {
         "audited": True,
+        "counts_available": True,
+        "turn_source": "loop_outcome.usage.total_rounds",
         "policy_turns_used": total,
-        "worker_turns": worker,
-        "gate_turns": gate,
+        "worker_turns": int(worker_turns),
+        "gate_turns": int(gate_turns or 0),
         "max_steps_claimed": claimed,
         "within_budget": total <= claimed,
-        "comparable": total <= claimed,
+        "budget_fault": total > claimed,
     }
 
 
@@ -661,7 +820,15 @@ def _collect_budget_counters(data_dir: Path, latest: dict[str, Any], ouro_task_i
     """
     from ouroboros.extension_loader import extension_name_prefix
 
-    counters: dict[str, Any] = {"llm_rounds": int(latest.get("total_rounds") or 0)}
+    # `llm_rounds` is the FLAT task-result field: physical model calls (safety
+    # checks, acceptance reviewers and retries included), kept for continuity
+    # with earlier runs. `policy_turns` is the loop's own turn count and is the
+    # step-equivalent — the two disagree on nearly every example.
+    counters: dict[str, Any] = {
+        "llm_rounds": int(latest.get("total_rounds") or 0),
+        "physical_model_calls": int(latest.get("total_rounds") or 0),
+        "policy_turns": _policy_turns(latest),
+    }
     prefix = extension_name_prefix(SKILL_NAME)
     child = latest.get("child_drive_root")
     log_path = (Path(child) / "logs" / "tools.jsonl") if child else (
@@ -1060,6 +1227,12 @@ def main() -> int:
     p.add_argument("--claim-margin-sec", type=float, default=900.0,
                    help="extra slack on top of task+startup timeouts before another lane may treat a "
                         "claim lock as stale (default 900).")
+    p.add_argument("--expect-dataset-commit", default=os.environ.get("OSWORLD_EXPECT_COMMIT", ""),
+                   help="the dataset commit this campaign is GRADED against. When set, a checkout "
+                        "whose HEAD differs (or whose git identity is unreadable) is refused before "
+                        "the VM boots. A run manifest recording a mismatch is a report, not a gate: "
+                        "the 2026-07-29 probe graded 21/75 tasks against a three-week-older checkout "
+                        "while every manifest faithfully recorded the mismatch and nobody read it.")
     p.add_argument("--max-steps", type=int, default=0,
                    help="declare a leaderboard-comparable step budget and ENFORCE it fail-closed. A "
                         "step is one top-level policy turn, matching OSWorld's predict()->actions[] "
@@ -1458,8 +1631,10 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
         "step_budget": _step_budget(args, effective_rounds),
     }
     # Fail CLOSED before the VM boots: a declared step budget the server cannot
-    # honor would publish a "Max steps: N" claim the run never enforced.
+    # honor would publish a "Max steps: N" claim the run never enforced, and a
+    # checkout other than the campaign's grades a different exam.
     _refuse_uncapped_step_claim(run.base_manifest["harness"]["step_budget"])
+    _refuse_wrong_dataset_commit(getattr(args, "expect_dataset_commit", ""), checkout)
 
     example = json.loads(task_path.read_text(encoding="utf-8"))
     run.example_id = str(example.get("id") or run.example_id)
@@ -1944,7 +2119,9 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
             # must EXCLUDE examples whose audit says they overran it.
             "step_budget_audit": _audit_step_budget(
                 (run.base_manifest.get("harness") or {}).get("step_budget") or {},
-                budget_counters,
+                _policy_turns(latest),
+                (gate_record or {}).get("policy_turns"),
+                gate_expected=bool(args.feasibility_gate),
             ),
             **({"osworld_fail_info": fail_info} if infeasible_declared else {}),
         })

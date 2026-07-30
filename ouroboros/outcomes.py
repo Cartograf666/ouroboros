@@ -234,6 +234,9 @@ _LEDGER_NON_FAILURE_STATUSES = (
     # refused_out_of_scope: an artifact_observation whose path is outside the observable
     # roots is a POLICY refusal (honest telemetry), NOT a verification failure (v6.57.0).
     | frozenset({"refused_out_of_scope"})
+    # tool_reported_failure: the tool RAN and answered honestly ({"ok": false} — a
+    # diagnostic reporting what it was called to find). A finding, not a failure.
+    | frozenset({"tool_reported_failure"})
 )
 
 

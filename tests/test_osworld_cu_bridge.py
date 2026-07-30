@@ -1479,9 +1479,14 @@ def test_cu_bridge_ledger_row_never_points_at_an_outcome_that_was_not_written(
 class _GateArgs:
     """Minimal stand-in for the parsed CLI namespace the gate helpers read."""
 
-    def __init__(self, *, feasibility_gate: bool, task_timeout_sec: int = 3600):
+    def __init__(self, *, feasibility_gate: bool, task_timeout_sec: int = 3600,
+                 data_dir: str = "/nonexistent-bench-data", max_steps: int = 0):
         self.feasibility_gate = feasibility_gate
         self.task_timeout_sec = task_timeout_sec
+        # The gate poll reads the task's LIVE event log to enforce its turn
+        # share, so the namespace carries the bench data dir like the real one.
+        self.data_dir = data_dir
+        self.max_steps = max_steps
 
 
 @pytest.mark.parametrize(
@@ -1928,18 +1933,109 @@ def test_a_step_claim_the_server_cannot_honor_is_refused_before_the_vm_boots():
     rcb._refuse_uncapped_step_claim(rcb._step_budget(_ns(), {"value": 999, "source": "default"}))
 
 
-def test_post_run_audit_counts_gate_turns_and_marks_overruns_not_comparable():
-    """The audit reads what the example ACTUALLY consumed (worker + gate turns), so a
-    drifted config, a resumed task or a second execution root surfaces as an overrun.
-    It never rewrites the reward: it marks the row non-comparable, which is what an
-    aggregate claiming 'Max steps: N' must exclude."""
+def test_audit_reads_policy_turns_not_physical_calls():
+    """The flat `total_rounds` on a task result is reconstructed from
+    physical_calls — safety checks, acceptance reviewers and retries included —
+    and on the v6.81.1 run it disagreed with the loop's own turn count on 344 of
+    346 examples, running up to 13 higher. Auditing a step budget against it
+    would mark compliant examples as overruns. Pin the loop field as the source
+    and pin fail-closed behaviour when it is missing."""
     budget = rcb._step_budget(_ns(max_steps=100, feasibility_gate=True),
                               {"value": 85, "source": "settings"})
-    inside = rcb._audit_step_budget(budget, {"llm_rounds": 80, "feasibility_gate": {"llm_rounds": 5}})
-    assert inside["policy_turns_used"] == 85 and inside["within_budget"] is True
-    assert inside["comparable"] is True
-    over = rcb._audit_step_budget(budget, {"llm_rounds": 98, "feasibility_gate": {"llm_rounds": 6}})
-    assert over["policy_turns_used"] == 104 and over["comparable"] is False
-    # Undeclared budget: nothing to audit against, and that is stated rather than implied.
+    # A result whose physical and policy counts deliberately differ.
+    latest = {"total_rounds": 97, "loop_outcome": {"usage": {"total_rounds": 84}}}
+    assert rcb._policy_turns(latest) == 84
+    inside = rcb._audit_step_budget(budget, rcb._policy_turns(latest), 5)
+    assert inside["policy_turns_used"] == 89 and inside["budget_fault"] is False
+    assert inside["turn_source"] == "loop_outcome.usage.total_rounds"
+    # Same example audited against the physical count would have been a fault.
+    assert 97 + 5 > 100
+    # Missing loop accounting fails CLOSED rather than coercing to zero.
+    assert rcb._policy_turns({"total_rounds": 40}) is None
+    blind = rcb._audit_step_budget(budget, rcb._policy_turns({"total_rounds": 40}), 3)
+    assert blind["counts_available"] is False and blind["budget_fault"] is True
+    # A real overrun is a harness fault, not a row-filtering criterion.
+    over = rcb._audit_step_budget(budget, 99, 6)
+    assert over["policy_turns_used"] == 105 and over["budget_fault"] is True
+    assert "comparable" not in over
+    # Undeclared budget: nothing to audit against, and that is stated.
     assert rcb._audit_step_budget(rcb._step_budget(_ns(), {"value": 200, "source": "default"}),
-                                  {"llm_rounds": 5})["audited"] is False
+                                  5, 0)["audited"] is False
+
+
+def test_gate_turns_are_enforced_per_task_from_the_live_event_log(tmp_path):
+    """The runtime round cap is SERVER-wide and the gate is a separate task, so a
+    reserve that is only arithmetic lets the gate consume the worker's allowance.
+
+    The enforcement must read the LIVE counter: `loop_outcome` is written only at
+    finalization, so polling a running task for it yields None forever and any
+    check built on it is dead code. `llm_round` events are emitted at the same
+    statement that increments the loop's round counter, so counting them equals
+    the turn count the task will eventually report."""
+    task_id = "gate123"
+    logs = tmp_path / "state" / "headless_tasks" / task_id / "data" / "logs"
+    logs.mkdir(parents=True)
+    events = logs / "events.jsonl"
+
+    def _write_rounds(n: int) -> None:
+        events.write_text("".join(
+            json.dumps({"type": "llm_round", "task_id": task_id, "round": i + 1}) + "\n"
+            for i in range(n)
+        ), encoding="utf-8")
+
+    _write_rounds(3)
+    assert rcb._live_policy_turns(tmp_path, task_id) == 3
+    # A finalization-only shape is NOT what the runtime serves while running.
+    assert rcb._policy_turns({"status": "running", "total_rounds": 9}) is None
+
+    calls = {"cancel": 0}
+    polls = {"n": 0}
+
+    def fake_api(url, method, path, payload=None, timeout=None):
+        if path.endswith("/cancel"):
+            calls["cancel"] += 1
+            return {}
+        polls["n"] += 1
+        if calls["cancel"]:
+            return {"status": "cancelled"}
+        # The gate crosses its reserve between the first and second poll.
+        _write_rounds(3 if polls["n"] < 2 else rcb._GATE_TURN_RESERVE)
+        return {"status": "running"}
+
+    orig_api, orig_sleep = rcb._api, rcb.time.sleep
+    rcb._api = fake_api
+    rcb.time.sleep = lambda s: None
+    try:
+        out = rcb._await_gate_task("http://x", task_id, time.time() + 3600,
+                                   turn_budget=rcb._GATE_TURN_RESERVE, data_dir=tmp_path)
+    finally:
+        rcb._api, rcb.time.sleep = orig_api, orig_sleep
+
+    assert out["status"] == "turn_budget_exhausted"
+    assert out["policy_turns"] == rcb._GATE_TURN_RESERVE
+    assert calls["cancel"] == 1
+    # An unconfirmed cancel of THIS status is a zombie premise session, exactly
+    # like the timeout path — it must not fail open into the working phase.
+    assert rcb._gate_cancel_unconfirmed({"status": "turn_budget_exhausted"}) is True
+    assert rcb._gate_cancel_unconfirmed(
+        {"status": "turn_budget_exhausted", "cancel_confirmed": True}) is False
+    # No declared budget -> no per-task enforcement (unchanged legacy behaviour).
+    assert rcb._gate_turn_budget(_ns(feasibility_gate=True)) == 0
+    assert rcb._gate_turn_budget(_ns(max_steps=100, feasibility_gate=True)) == rcb._GATE_TURN_RESERVE
+    # An unreadable log is UNKNOWN, never zero.
+    assert rcb._live_policy_turns(tmp_path / "nope", task_id) is None
+
+
+def test_a_checkout_other_than_the_campaign_pin_is_refused_before_the_vm_boots():
+    """The graded-spec pin decides both the instruction the agent receives and the
+    evaluator that scores it. Recording a mismatch in the manifest is a report:
+    on 2026-07-29 a 75-task probe graded 21 tasks against a three-week-older
+    checkout while every manifest faithfully recorded it and nobody read it."""
+    import pytest
+
+    rcb._refuse_wrong_dataset_commit("", {"git_commit": "whatever"})  # opt-in: no claim, no gate
+    rcb._refuse_wrong_dataset_commit("091f5ef1d5544bc", {"git_commit": "091f5ef1d5544bc74953c"})
+    with pytest.raises(SystemExit, match="graded against"):
+        rcb._refuse_wrong_dataset_commit("091f5ef1", {"git_commit": "7a17d3abc86d5"})
+    with pytest.raises(SystemExit, match="no readable git identity"):
+        rcb._refuse_wrong_dataset_commit("091f5ef1", {"git_commit": ""})

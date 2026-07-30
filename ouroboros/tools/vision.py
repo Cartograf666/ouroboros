@@ -171,10 +171,35 @@ def _downscale_image_for_vlm(raw: bytes, mime: str) -> Tuple[bytes, str]:
                 img.load()
                 if max(img.size) <= _VLM_MAX_IMAGE_SIDE:
                     return raw, mime
+        except Image.DecompressionBombError:
+            # A VALID but very large image. Not corruption — forward it; the
+            # size rails below/above are what bound it.
+            return raw, mime
         except Exception as exc:
+            # A truncated-but-renderable file (a partially downloaded JPEG) still
+            # yields a usable frame under Pillow's tolerant mode; only refuse what
+            # cannot be rendered at all, which is the zero-padded-PNG class that
+            # used to reach the provider and come back as a non-retryable 400.
+            try:
+                from PIL import ImageFile
+
+                previous = ImageFile.LOAD_TRUNCATED_IMAGES
+                ImageFile.LOAD_TRUNCATED_IMAGES = True
+                try:
+                    with Image.open(io.BytesIO(raw)) as img:
+                        img.load()
+                        if max(img.size) <= _VLM_MAX_IMAGE_SIDE:
+                            return raw, mime
+                finally:
+                    ImageFile.LOAD_TRUNCATED_IMAGES = previous
+            except Exception:  # noqa: BLE001 - genuinely undecodable, fall through
+                pass
+            else:
+                return raw, mime
             raise ValueError(
-                f"⚠️ IMAGE_UNDECODABLE: {type(exc).__name__}: {exc} — the file is "
-                "truncated or corrupt; re-capture it instead of retrying the attach."
+                f"⚠️ IMAGE_UNDECODABLE: {type(exc).__name__}: {exc} — the image cannot "
+                "be rendered at all (truncated or corrupt beyond recovery); re-capture "
+                "it instead of retrying the attach."
             ) from exc
 
     try:

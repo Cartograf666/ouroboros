@@ -175,7 +175,13 @@ def test_remote_type_text_unicode_uses_clipboard_ascii_uses_typewrite(tmp_path):
     _mod, impl = _osworld_impl(tmp_path, cap, [_OK])
     out = _json_mod.loads(impl.type_text(text="привет"))
     code = cap[-1][-1]
-    assert "pyperclip" in code and "base64.b64decode" in code and "hotkey('ctrl', 'v')" in code
+    # The chord is chosen inside the guest call: a terminal ignores Ctrl+V (it
+    # wants Ctrl+Shift+V) while the hotkey still reports success, so a terminal
+    # paste would silently type nothing; sending both everywhere would paste
+    # twice in an ordinary field.
+    assert "pyperclip" in code and "base64.b64decode" in code
+    assert "hotkey('ctrl','v')" in code and "hotkey('ctrl','shift','v')" in code
+    assert "getwindowclassname" in code
     assert out.get("method") == "clipboard"
 
     cap.clear()

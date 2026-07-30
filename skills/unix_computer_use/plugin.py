@@ -1302,11 +1302,28 @@ class _ComputerUse:
                                               or "<" in text or ">" in text
                                               or "\n" in text or len(text) > 200):
                 b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+                # Chord selection happens INSIDE this one guest call: a terminal
+                # ignores Ctrl+V (it wants Ctrl+Shift+V) yet the hotkey itself
+                # succeeds, so a terminal paste would report ok:true having typed
+                # nothing — and sending both chords everywhere would paste twice
+                # in an ordinary field. One round trip, no guessing on the host.
                 clip_code = (
-                    f"import base64, pyperclip; pyperclip.copy(base64.b64decode('{b64}')"
-                    f".decode('utf-8')); pyautogui.hotkey('ctrl', 'v')"
+                    "import base64, subprocess, pyperclip; "
+                    f"pyperclip.copy(base64.b64decode('{b64}').decode('utf-8')); "
+                    "_cls = ''\n"
+                    "try:\n"
+                    "    _cls = subprocess.run(['xdotool','getactivewindow','getwindowclassname'],"
+                    "capture_output=True,text=True,timeout=5).stdout.strip().lower()\n"
+                    "except Exception:\n"
+                    "    _cls = ''\n"
+                    "_term = any(t in _cls for t in "
+                    "('terminal','xterm','konsole','alacritty','kitty'))\n"
+                    "pyautogui.hotkey('ctrl','shift','v') if _term else pyautogui.hotkey('ctrl','v')\n"
+                    "print('paste_target=' + ('terminal' if _term else 'field'))"
                 )
-                out = self._remote_pyautogui(conn, clip_code, note={"method": "clipboard"}, timeout=60)
+                out = self._remote_pyautogui(
+                    conn, clip_code, note={"method": "clipboard"}, timeout=60,
+                )
                 try:
                     if json.loads(out).get("ok"):
                         return out
