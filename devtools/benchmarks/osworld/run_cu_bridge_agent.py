@@ -856,10 +856,16 @@ def _verify_setup_effect(env: Any, example: dict[str, Any]) -> dict[str, Any]:
                 continue
             cmd = step.get("parameters", {}).get("command")
             parts = cmd if isinstance(cmd, list) else str(cmd or "").split()
-            # Only the unambiguous shape: an install of a named binary.
+            # Stop at the first shell separator: a string command like
+            # `apt-get install -y jq && tar xf archive.tgz` otherwise probes `&&`,
+            # the archive path and `rm` as if they were installed binaries.
+            for sep in ("&&", "||", ";", "|"):
+                if sep in parts:
+                    parts = parts[:parts.index(sep)]
             if "install" not in parts:
                 continue
-            tail = [p for p in parts[parts.index("install") + 1:] if not p.startswith("-")]
+            tail = [p for p in parts[parts.index("install") + 1:]
+                    if not p.startswith("-") and "/" not in p and "." not in p][:4]
             for pkg in tail:
                 report["checked"] += 1
                 try:
@@ -875,7 +881,7 @@ def _verify_setup_effect(env: Any, example: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
-def _task_scoped_proxy_config(config_path: str, run_dir: Path, tag: str) -> str:
+def _task_scoped_proxy_config(config_path: str, state_dir: Path, tag: str) -> str:
     """Write a task-local proxy config whose username carries a sticky session id.
 
     The shared config is a single entry on the rotating gateway, so every lane of
@@ -886,6 +892,8 @@ def _task_scoped_proxy_config(config_path: str, run_dir: Path, tag: str) -> str:
     the username, so one task keeps one exit for its whole trajectory while
     different tasks land on different exits.
 
+    Written to a LANE-PRIVATE state directory, never under ``results/``: the file
+    contains the account password and the results tree is what gets published.
     Returns the new path, or the original on any failure — a proxy we could not
     scope is still better than none, and this must never fail a task.
     """
@@ -900,7 +908,10 @@ def _task_scoped_proxy_config(config_path: str, run_dir: Path, tag: str) -> str:
             if user and ";sessid." not in user:
                 e["username"] = f"{user};sessid.{tag}"
             scoped.append(e)
-        out = run_dir / "proxy_task.json"
+        # NEVER under results/: that tree is the publication artefact and this file
+        # carries the account password. Lane-private state dir only.
+        state_dir.mkdir(parents=True, exist_ok=True)
+        out = state_dir / f"proxy_{tag}.json"
         out.write_text(json.dumps(scoped, indent=2), encoding="utf-8")
         os.chmod(out, 0o600)
         return str(out)
@@ -1134,8 +1145,12 @@ OSWORLD_PREAMBLE = (
     "(gsettings/dconf) is such a surface, not a way round: it writes the same store the "
     "Settings app writes. Look for the control in the GUI first; if this build genuinely does "
     "not render the row and no settings page exposes it, set the key with that CLI, name the "
-    "key, and read it back. What stays forbidden is reaching into an application's PRIVATE "
-    "state — prefs.js, profile directories, document XML, credential stores. Forcing that state from "
+    "key, and read it back — but ONLY when the task asks for a value to be STORED. If the "
+    "task asks for something to be DISPLAYED or to actually work, and the device or data "
+    "behind it does not exist here, writing the key stores a boolean and puts nothing on the "
+    "screen: that is TASK_INFEASIBLE, not a workaround. What stays forbidden is reaching "
+    "into an application's PRIVATE state — prefs.js, profile directories, document XML, "
+    "credential stores and app config files of that kind (illustrative, not exhaustive). Forcing that state from "
     "underneath the application does NOT count: writing its preference cookies from a "
     "developer console, decrypting or editing its credential/profile stores, or patching the "
     "program itself. If the only way you can produce the requested state is from underneath, "
@@ -1241,9 +1256,10 @@ OSWORLD_PREAMBLE = (
     "a size, a count — beats a preset and must be entered exactly. A colour WORD on its own is "
     "not a numeric value: do not infer a pure-primary hex from it. Wording like \"exactly "
     "these colours, no variations\" means DO NOT substitute a neighbouring shade (no dark red "
-    "for red) — it does NOT mean type a raw hex. Use the app's palette entry of that name, "
-    "and when the task calls a colour by a PRIMARY name (red, green, blue), prefer the entry "
-    "closest to that primary over a decorative shade of the same name.\n"
+    "for red) — it does NOT mean type a raw hex: pick the palette entry whose name is "
+    "EXACTLY the word the task used, with no Light/Dark qualifier and no trailing number "
+    "(\"Green\", never \"Light Green 2\"), because the reference file was authored from "
+    "that same palette.\n"
     "TRANSFER TEXT VERBATIM, NEVER RETYPE. When content must move between files, apps or "
     "pages, move it through copy/paste from the source AS DISPLAYED — retyping silently "
     "drops leading spaces, paragraph breaks and separators, and 'fixing' the content while "
@@ -1281,15 +1297,21 @@ OSWORLD_PREAMBLE = (
     "REQUIRED STATE (the literal value, format or text, with every qualifier the task states "
     "— a scope, a condition, a unit), the ORDER or POSITION if the task implies one, what "
     "must stay UNCHANGED, and where the result must PERSIST (saved file, app store, active "
-    "page). If an obligation names a referent that resolves to several candidates, pick ONE, "
-    "say which and why, and never apply the change to all of them to cover both readings — a "
-    "second edit is a defect even if the first was right.\n"
+    "page). When the task says ALL / BOTH / EACH / EVERY, or names a plural, the obligation "
+    "genuinely covers every matching element — do them all. Only when the task names a "
+    "SINGULAR referent that resolves to several candidates: pick ONE, say which and why, and "
+    "do not change the others to cover both readings — a second edit is a defect even if the "
+    "first was right. The contract is your working reading, not a vow: if you OBSERVE "
+    "something that contradicts it, say so, revise the item and carry on.\n"
     "CLOSE THE CONTRACT BEFORE YOU FINISH. Go through that checklist one item at a time and "
     "mark each: OBSERVED SATISFIED (say what you looked at), NOT VERIFIED, or IMPOSSIBLE (say "
-    "what you observed). You may only declare done when every item reads OBSERVED SATISFIED. "
-    "An item you cannot verify is not an item you may assume; go and look. If closing the "
-    "contract reveals a gap, make ONE targeted repair and re-check that item — do not rewrite "
-    "work that already satisfied its item.\n"
+    "what you observed that makes it so). An item you cannot verify is not an item you may "
+    "assume — go and look. If closing the contract reveals a gap, repair THAT item and "
+    "re-check it, without rewriting work that already satisfied its own item; repeat until "
+    "the item reads satisfied or you have observed why it cannot. Declare done when every "
+    "item reads OBSERVED SATISFIED. If an item is genuinely IMPOSSIBLE, that is the "
+    "infeasibility finding described below — apply the test there before ending the task, "
+    "and if the rest of the work stands, deliver it rather than abandoning the task.\n"
     "VERIFY BY INDEPENDENT READ-BACK, NOT BY YOUR OWN MEMORY. Before you declare done, confirm "
     "the result from the surface the grader will read, freshly: re-open the SAVED file and read "
     "the exact cells/paragraphs/shapes you claim you changed; read the application's own "
@@ -1307,8 +1329,14 @@ OSWORLD_PREAMBLE = (
     "free preliminary; (b) the task asks for a named MODE of operation and the application "
     "only offers the single-item action you would repeat in a loop; (c) the mechanism you "
     "found triggers on something NARROWER than the task states (a folder-open hook where the "
-    "task says every launch). If you write that the real path is impossible and then deliver "
-    "a substitute anyway, you have found the verdict and ignored it.\n"
+    "task says every launch). If you write that the requested END STATE cannot exist on this "
+    "machine and then deliver a substitute for it anyway, you have found the verdict and "
+    "ignored it. This is about the END STATE, not the route: an obstacle on one route, a "
+    "storage or formatting convention the application imposes on a value you did set, or a "
+    "rounding you had to make is NOT the verdict when the state the task names is reached "
+    "and verified. And a wrong TASK_INFEASIBLE scores zero even when the machine is already "
+    "in the requested state — it is recorded as an official failure and the VM is never "
+    "looked at again. When these shapes are arguable rather than observed, finish the work.\n"
     "Be decisive and efficient. When the task is verifiably complete in the real app, stop. "
     "If genuinely infeasible, end your final message with only: TASK_INFEASIBLE\n\nTask:\n"
 )
@@ -1898,6 +1926,9 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
     auditable — the seam meta-test walks them with `ast` and denies every filesystem, docker,
     subprocess and network call there.
     """
+    # Bound before ANY early return: the shared `finally` unlinks this credential-bearing
+    # file, and a claim-skip path exits long before the proxy block runs.
+    _scoped_proxy_path = ""
     from devtools.benchmarks.osworld.run_step_agent import (
         ClaimMarkerNotDurable,
         acquire_task_claim,
@@ -2058,13 +2089,16 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
         # fact (proxy_required/proxy_enabled/proxy_exhausted_in_trace) for disclosure —
         # it is never dropped, because the lane makes a single pass over the tasks.
         _proxy_present = os.path.exists(_proxy_cfg)
-        if _proxy_present:
-            # One sticky exit per task (see _task_scoped_proxy_config). The tag is
-            # derived from the run and example so a retry of the same task on the
-            # same run reuses its exit, while neighbours never share one.
-            _proxy_cfg = _task_scoped_proxy_config(
-                _proxy_cfg, run_dir,
-                hashlib.sha256(f"{run_dir.parent.name}:{example_id}".encode()).hexdigest()[:16])
+        if _proxy_present and bool(example.get("proxy")):
+            # One sticky exit per task AND per campaign: the tag mixes the run root
+            # (not the domain — the two concurrent campaigns must not collide on the
+            # same session) with the example id, so a retry of the same task in the
+            # same campaign reuses its exit while neighbours never share one.
+            _scoped_proxy_path = _task_scoped_proxy_config(
+                _proxy_cfg, data_dir / "state" / "proxy",
+                hashlib.sha256(
+                    f"{Path(args.result_dir).parent.name}:{example_id}".encode()).hexdigest()[:16])
+            _proxy_cfg = _scoped_proxy_path
         # Probe only when THIS task is proxy-flagged: 312 of 361 tasks never touch
         # the proxy, and probing on all of them adds 361 external round trips per
         # campaign whose only possible effect is a spurious failure.
@@ -2218,6 +2252,9 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
                 # that vanished between gate and worker is visible in the artefact
                 # instead of surfacing as an honest-but-scored-zero infeasible.
                 reset_diag["setup_effect"] = _verify_setup_effect(env, example)
+                # Manifest, not only the sidecar: a premise that vanished between gate
+                # and worker must be auditable from the run's own provenance record.
+                run.base_manifest["harness"]["setup_effect"] = reset_diag["setup_effect"]
             except ResetUnverified as exc:
                 final.update({"outcome": "adapter_error", "exit_code": 1,
                               "error": {"type": "ResetUnverified", "message": str(exc)[:4000]}})
@@ -2530,6 +2567,11 @@ def _run_cu_bridge(args: argparse.Namespace, final: dict[str, Any], run: CuBridg
                   f"{type(publish_exc).__name__}: {publish_exc}", file=sys.stderr, flush=True)
         return 1
     finally:
+        if _scoped_proxy_path:
+            try:
+                os.unlink(_scoped_proxy_path)
+            except OSError:
+                pass
         if env is not None:
             try:
                 env.close()

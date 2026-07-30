@@ -2244,16 +2244,54 @@ def test_v685_contract_and_carveout_clauses():
     assert "WRITE THE CONTRACT BEFORE YOU TOUCH ANYTHING" in p
     assert "CLOSE THE CONTRACT BEFORE YOU FINISH" in p
     assert "OBSERVED SATISFIED" in p and "NOT VERIFIED" in p
+    # An IMPOSSIBLE item must have an exit, or the contract becomes a new route to a
+    # false infeasible; and repair is per item, not one repair for the whole task
+    # (the preamble elsewhere says "keep working" without a limit).
+    assert "repair THAT item" in p and "repeat until" in p
+    assert "deliver it rather than abandoning the task" in p
+    # The infeasibility test is about the END STATE, with the wrong-verdict brake:
+    # three current 1.0 tasks say "the real path is impossible, so here is the
+    # allowed substitute" and still score.
+    assert "about the END STATE, not the route" in p
+    assert "wrong TASK_INFEASIBLE scores zero" in p
+    # gsettings is for STORED values only: os/fe41f596 is officially infeasible,
+    # we score 1.0 on it, and the carve-out otherwise describes it word for word.
+    assert "ONLY when the task asks for a value to be STORED" in p
+    # The colour motivation is TRUE (the gold IS the palette entry) — restored, tightened.
+    assert "EXACTLY the word the task used" in p and "no Light/Dark qualifier" in p
     # Singular referent: 05dd4c1d applied the change to both candidates to cover
     # either reading and scored 0.
-    assert "never apply the change to all of them to cover both readings" in p
+    # Plural instructions must still be done in full: 84 of the 361 instructions say
+    # all/both/each/every, and 65 of those were baseline 1.0s.
+    assert "the obligation genuinely covers every matching element" in p
+    assert "SINGULAR referent that resolves to several candidates" in p
+    # And the contract must not freeze a wrong early reading.
+    assert "not a vow" in p
     # gsettings carve-out (bedcedc4: refused the platform's own config CLI).
     assert "gsettings/dconf" in p and "prefs.js" in p
     # Infeasibility shapes (5ca86c6f discovery, 2e6f678f mode, 971cbb5b narrower trigger).
     assert "discovery is part of the job" in p
     assert "found the verdict and ignored it" in p
-    # The false colour motivation is gone (8472fece: the grader reads no reference file).
-    assert "the reference file was authored from that same palette" not in p
+    # The colour motivation STAYS: an independent replay of the real grader showed the
+    # gold of 8472fece IS the palette entry (2A6099) and scores 0 against its own
+    # evaluator, which measures distance to pure 0000FF (dE 21.09 vs threshold 3.5).
+    # The task is unwinnable by any palette entry; removing the motivation gained
+    # ~nothing and endangered 04578141, a live 1.0 won BECAUSE of it.
+    assert "the reference file was authored from that same palette" in p
+
+
+def test_scoped_proxy_config_never_lands_in_the_published_tree():
+    """The scoped config carries the account PASSWORD. An earlier draft wrote it to
+    results/<domain>/<task>/, which is exactly the tree we archive and publish —
+    0600 protects against other Unix users, it does not redact an uploaded archive.
+    Pin both halves: it goes to lane-private state, and it is removed afterwards."""
+    import inspect
+    src = inspect.getsource(rcb)
+    assert 'run_dir / "proxy_task.json"' not in src, "credential file back in results/"
+    assert 'data_dir / "state" / "proxy"' in src, "must live in lane-private state"
+    assert "os.unlink(_scoped_proxy_path)" in src, "must be removed after the task"
+    # And it is only written for a task that actually needs the proxy.
+    assert 'if _proxy_present and bool(example.get("proxy")):' in src
 
 
 def test_task_scoped_proxy_gives_each_task_its_own_session(tmp_path):
@@ -2265,19 +2303,19 @@ def test_task_scoped_proxy_gives_each_task_its_own_session(tmp_path):
     src = tmp_path / "proxy.json"
     src.write_text(_json.dumps([{"host": "gw.example.com", "port": 823,
                                  "username": "acct", "password": "p"}]), encoding="utf-8")
-    run_dir = tmp_path / "run" / "domain" / "task"
-    run_dir.mkdir(parents=True)
-    out = rcb._task_scoped_proxy_config(str(src), run_dir, "deadbeefcafe0001")
+    state = tmp_path / "lane" / "state" / "proxy"
+    out = rcb._task_scoped_proxy_config(str(src), state, "deadbeefcafe0001")
+    assert "results" not in out, "must not be written under the published results tree"
     assert out != str(src)
     cfg = _json.loads(open(out).read())
     assert cfg[0]["username"] == "acct;sessid.deadbeefcafe0001"
     assert cfg[0]["password"] == "p", "credentials must survive scoping"
     assert _os.stat(out).st_mode & 0o777 == 0o600, "the task config carries a credential"
     # Idempotent: an already-scoped username is not double-suffixed.
-    again = rcb._task_scoped_proxy_config(out, run_dir, "0000")
+    again = rcb._task_scoped_proxy_config(out, state, "0000")
     assert _json.loads(open(again).read())[0]["username"].count(";sessid.") == 1
     # Unreadable input falls back to the shared config rather than failing the task.
-    assert rcb._task_scoped_proxy_config(str(tmp_path / "nope.json"), run_dir, "x") \
+    assert rcb._task_scoped_proxy_config(str(tmp_path / "nope.json"), state, "x") \
         == str(tmp_path / "nope.json")
 
 

@@ -276,6 +276,33 @@ leaderboard run without the disclosures below.
    runtime never emits cannot be listed. Report truncated tasks separately from
    honest failures; `max_rounds_effective` alone will not tell you they
    happened. The current Verified leaderboard standard is 100 steps.
+4a-ter. **Scaffold revision v6.86.0 — again a NEW series.** The working prompt gains
+   an ATOMIC TASK CONTRACT: before the first mutating action the agent writes the
+   task's obligations as a numbered checklist (object, required state with every
+   stated qualifier, order/position, what must stay unchanged, where the result must
+   persist), and before finishing it closes each item as observed-satisfied /
+   not-verified / impossible, with at most one targeted repair. Plural instructions
+   ("all", "each") still cover every matching element; the singular-referent rule
+   applies only to a singular referent resolving to several candidates, and the
+   contract is explicitly revisable on new observation. Three infeasibility shapes
+   are named (discovery outside a stated means restriction; a named mode of operation
+   the application does not ship; a mechanism whose trigger is narrower than the task
+   states). The desktop environment's own documented configuration CLI
+   (gsettings/dconf) is declared a legitimate surface — private application state
+   (prefs.js, profile directories, document XML, credential stores) remains
+   forbidden. The colour clause keeps the app's named palette entry and no longer
+   claims the reference file was authored from that palette (false on at least one
+   graded task, where the metric is distance from a pure primary).
+   Harness: each `proxy:true` task gets its own sticky upstream session
+   (`;sessid.<tag>` keyed on campaign root + example id, so two concurrent campaigns
+   never share an exit), written to LANE-PRIVATE state and deleted after the task —
+   never under `results/`, which is the published tree; and after the post-gate reset
+   the runner probes whether the binaries the task's setup claims to install are
+   actually present, recording the answer in the manifest, because upstream reports a
+   guest command that failed as "executed successfully" and a vanished premise
+   otherwise surfaces as an honest-but-scored-zero infeasible.
+   Numbers from v6.86.0 MUST NOT be pooled with v6.81.x, v6.83.0 or v6.84.0.
+
 4a-bis. **Scaffold revisions v6.83.0 and v6.84.0 — a NEW series, not comparable to
    earlier numbers.** v6.83.0 introduced a declared and enforced step budget (one step
    = one top-level policy turn, matching the official `predict() -> actions[]`
