@@ -1861,13 +1861,13 @@ def test_forensics_clauses_are_pinned_in_the_worker_prompt():
     pin them so a later prompt edit cannot silently drop one."""
     p = rcb.OSWORLD_PREAMBLE
     for phrase in (
-        "A VALUE NAMED BY WORD IS THE APP'S NAMED VALUE",
+        # v6.84.0 corrected wordings (the v6.83.0 originals cited-while-losing were fixed)
+        "REALIZE A NAMED STATE THROUGH A NAMED CONTROL",
         "TRANSFER TEXT VERBATIM, NEVER RETYPE",
         "TOUCH ONLY WHAT THE TASK NAMES",
-        "ORDINALS COUNT REAL ITEMS",
+        "ORDINALS COUNT WHAT THE TASK COUNTS",
         "FINISH ON THE GRADED SURFACE",
         "Shift+Enter",
-        "ALREADY in the requested state",
     ):
         assert phrase in p, phrase
 
@@ -2080,3 +2080,67 @@ def test_a_checkout_other_than_the_campaign_pin_is_refused_before_the_vm_boots()
         rcb._refuse_wrong_dataset_commit("091f5ef1", {"git_commit": "7a17d3abc86d5"})
     with pytest.raises(SystemExit, match="no readable git identity"):
         rcb._refuse_wrong_dataset_commit("091f5ef1", {"git_commit": ""})
+
+
+def test_v684_prompt_fixes_are_present_and_harmful_clauses_gone():
+    """The v6.83.0 forensics found five prompt behaviours the agent CITED while
+    losing points. Pin the corrected wording so a later edit cannot regress them,
+    and assert the exact harmful phrasings are gone."""
+    p = rcb.OSWORLD_PREAMBLE
+    # 1. Budget is turns, not calls; batching is encouraged.
+    assert "YOUR BUDGET IS ASSISTANT TURNS, NOT TOOL CALLS" in p
+    assert "ONE BATCH of 4-8 calls" in p
+    assert "every tool call costs ~30s" not in p  # the mistaxed clause is gone
+    # 2a. Exact value beats the app's named swatch.
+    assert "AN EXACT VALUE WINS" in p and "0000FF" in p
+    # 2b. Already-in-state judged from stored value, not the render.
+    assert "STORED value the grader" in p
+    assert "is ALREADY in the requested state, verifying that and stopping is a correct completion" not in p
+    # 2c. Ordinals no longer blanket-exclude headings.
+    assert "ORDINALS COUNT WHAT THE TASK COUNTS" in p
+    assert "excluding titles, headings and unbulleted lead-in" not in p
+    # 3. CLI allowed for batch/file work.
+    assert "BATCH OR FILE-PROCESSING work" in p and "pdfseparate" in p
+    # 4. Independent read-back + snapshot/diff.
+    assert "VERIFY BY INDEPENDENT READ-BACK" in p and "DIFFERENT tool" in p
+    assert "compare before vs after and undo" in p
+    # 5. Own-admission -> verdict (worker), and the display counter-branch (gate rubric).
+    assert "YOUR OWN ADMISSION IS THE VERDICT" in p
+    g = rcb.GATE_PREAMBLE
+    assert "DISPLAYED or VISIBLE" in g and "storing the flag is not the action" in g
+    assert "When in doubt, answer UNDETERMINED" in g, "fail-open default must survive"
+
+
+def test_proxy_health_gate_fails_closed(monkeypatch, tmp_path):
+    """Config-exists is not proxy-alive: an exhausted account keeps its file but
+    answers 407. The gate must return False on any probe failure so those tasks
+    run direct and get quarantined, never poisoned through a dead upstream."""
+    import json as _json
+    cfg = tmp_path / "proxy.json"
+    cfg.write_text(_json.dumps([{"host": "gw.example.com", "port": 823,
+                                 "username": "u", "password": "p"}]), encoding="utf-8")
+    # A probe that raises (dead proxy) -> not live.
+    import urllib.request
+    def boom(*a, **k):
+        raise OSError("407 TRAFFIC_EXHAUSTED")
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: type("O", (), {"open": boom})())
+    assert rcb._proxy_config_is_live(str(cfg)) is False
+    # Empty / malformed config -> not live.
+    cfg.write_text("[]", encoding="utf-8")
+    assert rcb._proxy_config_is_live(str(cfg)) is False
+    assert rcb._proxy_config_is_live(str(tmp_path / "missing.json")) is False
+
+
+def test_proxy_exhaustion_quarantine_reads_the_trace(tmp_path):
+    """A proxy:true task whose trace carries 407 TRAFFIC_EXHAUSTED got a dead
+    upstream mid-run — infra, not capability. The detector scans the same
+    tools.jsonl the counters read."""
+    logs = tmp_path / "state" / "headless_tasks" / "t1" / "data" / "logs"
+    logs.mkdir(parents=True)
+    tj = logs / "tools.jsonl"
+    tj.write_text('{"tool":"remote_exec","result":"curl: (56) ... 407 TRAFFIC_EXHAUSTED"}\n',
+                  encoding="utf-8")
+    assert rcb._proxy_trace_shows_exhaustion(tmp_path, "t1") is True
+    tj.write_text('{"tool":"click","result":"ok"}\n', encoding="utf-8")
+    assert rcb._proxy_trace_shows_exhaustion(tmp_path, "t1") is False
+    assert rcb._proxy_trace_shows_exhaustion(tmp_path, "nonexistent") is False
