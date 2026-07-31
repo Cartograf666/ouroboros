@@ -26,9 +26,21 @@ class TestTriadRefusalContract:
 
     def test_empty_array_with_sentinel_is_responded(self):
         parsed = parse_model_review_results(
-            {"results": [_actor("Everything checks out.\n[]\nNO_FINDINGS")]}
+            {"results": [_actor("[]\nNO_FINDINGS")]}
         )
         assert parsed.actor_records[0].status == "responded"
+
+    def test_prose_around_the_clean_payload_is_parse_failure(self):
+        """Tightened: a preamble cannot be told from a refusal by structure, so
+        `I cannot review this diff. []\\nNO_FINDINGS` used to enter quorum as
+        clean. The contract asks for the array alone, so prose is refused —
+        including a benign-looking preamble."""
+        for text in (
+            "Everything checks out.\n[]\nNO_FINDINGS",
+            "I cannot review this diff. []\nNO_FINDINGS",
+        ):
+            parsed = parse_model_review_results({"results": [_actor(text)]})
+            assert parsed.actor_records[0].status == "parse_failure", text
 
     def test_empty_array_inside_refusal_prose_is_parse_failure(self):
         refusal = (

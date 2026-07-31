@@ -9,6 +9,7 @@ the same truncation / parse-failure bugs.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -169,26 +170,74 @@ def _normalize_items(items: List[Any]) -> List[Any]:
         return items
 
 
-def _empty_array_is_verified_clean(raw_text: str) -> bool:
+# The review output contract lives beside the parser that enforces it: the
+# advisory path once shipped a prompt asking for NO_FINDINGS while its own
+# parser had no branch for it, so a clean review was recorded as unparseable.
+_REVIEW_JSON_ELEMENT_SCHEMA = """\
+{
+  "item": "<checklist item name>",
+  "verdict": "PASS" | "FAIL",
+  "severity": "critical" | "advisory",
+  "reason": "<for FAIL: file, line/symbol, what is wrong, how to fix>"
+}"""
+
+# Findings-only: nothing-to-report is legitimate, so the empty array needs the
+# sentinel to be distinguishable from a refusal.
+REVIEW_JSON_ARRAY_CONTRACT = f"""\
+Return ONLY a JSON array, optionally followed by the sentinel line described
+below. Each element:
+{_REVIEW_JSON_ELEMENT_SCHEMA}
+If you reviewed everything and found NOTHING to report, return the empty array
+followed by the sentinel word NO_FINDINGS on its own line, and nothing else.
+Prose around the array, or the sentinel without the array, is treated as a
+non-response and excluded from quorum.
+"""
+
+# Required-matrix: the parser rejects an empty array as missing coverage, so
+# offering the sentinel here would contradict it.
+REVIEW_JSON_MATRIX_CONTRACT = f"""\
+Return ONLY a JSON array with one entry per required checklist item. Each element:
+{_REVIEW_JSON_ELEMENT_SCHEMA}
+There is no all-clear shortcut in this mode: an empty array is a non-response.
+Report PASS explicitly for every item you reviewed and found clean.
+"""
+
+
+# The sentinel is optional whitespace-separated trailer, not a stricter shape than
+# the bare array: emitting it must never make a clean response harder to accept.
+_CLEAN_EMPTY_RESPONSE_RE = re.compile(r"^\[\s*\]\s*(?:NO_FINDINGS\s*)?$")
+
+
+def empty_array_is_verified_clean(raw_text: str) -> bool:
     """True when an EMPTY findings array is a verifiable clean verdict.
 
-    Accepted markers: the explicit ``NO_FINDINGS`` sentinel anywhere in the
-    response, or a response whose entire body (modulo code fences) is the bare
-    array itself.
+    Shared by every consumer of ``REVIEW_JSON_ARRAY_CONTRACT`` so the sentinel
+    the prompt asks for is honored identically on each path.
+
+    The WHOLE response must be the clean payload — bare ``[]``, or ``[]``
+    followed by a standalone ``NO_FINDINGS`` line — modulo one optional code
+    fence. Surrounding prose is refused on purpose: a refusal cannot be told
+    from a benign preamble by structure, so "I cannot review this diff.
+    []\\nNO_FINDINGS" must not enter quorum as a clean verdict. This matches what
+    the contract actually asks for ("Return ONLY a JSON array, optionally
+    followed by the sentinel line"); anything looser lets a reviewer opt out of
+    the gate with prose.
     """
-    text = str(raw_text or "")
-    if "NO_FINDINGS" in text:
-        return True
-    stripped = text.strip()
-    if "```" in stripped:
-        # Unwrap a single fenced block: ```json\n[]\n``` or ```\n[]\n```.
-        parts = [chunk.strip() for chunk in stripped.split("```") if chunk.strip()]
-        if len(parts) == 1:
-            body = parts[0]
-            if body.startswith("json"):
-                body = body[4:].strip()
-            stripped = body
-    return stripped == "[]"
+    text = str(raw_text or "").strip()
+    if "```" in text:
+        # Unwrap a fenced block: ```json\n[]\n```, optionally with the sentinel
+        # AFTER the closing fence — a model that fences its JSON puts it there,
+        # and the contract asks for the sentinel on its own line.
+        parts = [chunk.strip() for chunk in text.split("```") if chunk.strip()]
+        if len(parts) == 2 and parts[1] == "NO_FINDINGS":
+            parts = [f"{parts[0]}\nNO_FINDINGS"]
+        if len(parts) != 1:
+            return False
+        text = parts[0]
+        tag, _, rest = text.partition("\n")
+        if rest.strip() and tag.strip().isalnum():
+            text = rest.strip()  # drop a language tag line (json/JSON/text/...)
+    return bool(_CLEAN_EMPTY_RESPONSE_RE.match(text))
 
 
 def parse_model_review_results(
@@ -218,7 +267,7 @@ def parse_model_review_results(
         if parsed is None:
             records.append(_actor_record(actor, idx=idx, model_label=model_label, status="parse_failure", raw_text=raw_text))
             continue
-        if not required and not parsed and not _empty_array_is_verified_clean(raw_text):
+        if not required and not parsed and not empty_array_is_verified_clean(raw_text):
             # Anti-refusal coverage contract: an empty array counts as a real
             # "no findings" verdict only with the explicit NO_FINDINGS sentinel
             # (or a bare `[]`-only response). A `[]` buried in refusal prose
