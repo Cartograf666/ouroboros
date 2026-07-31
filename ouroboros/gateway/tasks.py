@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import pathlib
+import shutil
 import time
 import uuid
 from datetime import datetime, timezone
@@ -89,6 +90,29 @@ _RESERVED_METADATA_KEYS = frozenset({
 })
 
 
+def _cleanup_api_admission_attempt(
+    drive_root: pathlib.Path,
+    task_id: str,
+    admission_token: str,
+    child_drive: Optional[pathlib.Path] = None,
+) -> None:
+    """Release one token and remove only its pre-admission task-local state."""
+    from supervisor.queue import release_task_admission
+
+    release_task_admission(task_id, admission_token)
+    if child_drive is not None:
+        try:
+            from ouroboros.headless import remove_subagent_task_drive
+
+            remove_subagent_task_drive(drive_root, task_id)
+        except Exception:
+            log.warning("Failed to clean child drive for rejected task %s", task_id, exc_info=True)
+    try:
+        shutil.rmtree(task_artifacts_dir(drive_root, task_id, create=False), ignore_errors=True)
+    except Exception:
+        log.warning("Failed to clean admission artifacts for task %s", task_id, exc_info=True)
+
+
 def _external_subagent_label(body: Dict[str, Any], metadata: Dict[str, Any]) -> bool:
     role_values = [
         body.get("delegation_role"),
@@ -148,12 +172,23 @@ def _admission_rejection_response(
     project_id: str,
     workspace_root: Optional[pathlib.Path],
     child_drive: Optional[pathlib.Path],
+    status_code: int = 409,
+    detail: str = "Task was not scheduled because its admission fence is closed.",
 ) -> Optional[JSONResponse]:
     """Terminalize a typed queue refusal so no scheduled phantom remains."""
     if not (isinstance(admitted, dict) and admitted.get("_admission_blocked")):
         return None
     reason_code = str(admitted.get("_admission_blocked") or "admission_fence")
-    detail = "Task was not scheduled because its admission fence is closed."
+    if reason_code in {"duplicate_task_id", "admission_reservation_lost"}:
+        return JSONResponse(
+            {
+                "error": "Task id is already owned by another admission attempt.",
+                "task_id": task_id,
+                "status": "rejected",
+                "admission": {"reason_code": reason_code},
+            },
+            status_code=409,
+        )
     admission = {
         "reason_code": reason_code,
         "project_id": str(admitted.get("_project_id") or project_id),
@@ -181,6 +216,10 @@ def _admission_rejection_response(
             STATUS_FAILED,
             admission_cleanup={"child_drive_removed": bool(removed)},
         )
+    try:
+        shutil.rmtree(task_artifacts_dir(drive_root, task_id, create=False), ignore_errors=True)
+    except Exception:
+        log.warning("Failed to clean rejected task artifacts for %s", task_id, exc_info=True)
     return JSONResponse(
         {
             "error": detail,
@@ -188,8 +227,153 @@ def _admission_rejection_response(
             "status": STATUS_FAILED,
             "admission": admission,
         },
-        status_code=409,
+        status_code=status_code,
     )
+
+
+def _enqueue_api_task_durably(
+    task: Dict[str, Any],
+    *,
+    drive_root: pathlib.Path,
+    task_id: str,
+    admission_token: str,
+    result_fields: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Atomically enqueue, snapshot, and publish the scheduled task result."""
+    from supervisor import queue
+
+    with queue._queue_lock:
+        admitted = queue.enqueue_task(task)
+        if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
+            return admitted
+        if queue.persist_queue_snapshot(reason="api_task_create") is not True:
+            queue.PENDING[:] = [
+                row for row in queue.PENDING
+                if not (
+                    isinstance(row, dict)
+                    and str(row.get("id") or "") == task_id
+                    and str(row.get("_admission_owner_token") or "") == admission_token
+                )
+            ]
+            queue.persist_queue_snapshot(reason="api_task_create_rollback")
+            return {
+                **task,
+                "_admission_blocked": "queue_snapshot_persist_failed",
+                "_admission_status_code": 503,
+            }
+        write_task_result(drive_root, task_id, STATUS_SCHEDULED, **result_fields)
+        queue.release_task_admission(task_id, admission_token)
+        return admitted
+
+
+def _complete_api_task_admission(
+    task: Dict[str, Any],
+    *,
+    drive_root: pathlib.Path,
+    task_id: str,
+    admission_token: str,
+    project_id: str,
+    description: str,
+    allowed_resources: Dict[str, Any],
+    deadline_at: str,
+    workspace_root: Optional[pathlib.Path],
+    workspace_mode: str,
+    memory_mode: str,
+    child_drive: Optional[pathlib.Path],
+    artifacts: List[Dict[str, Any]],
+    metadata: Dict[str, Any],
+) -> JSONResponse:
+    """Publish one API admission or roll back only its token-owned queue row."""
+    result_fields = {
+        "parent_task_id": task.get("parent_task_id"),
+        "root_task_id": task.get("root_task_id"),
+        "session_id": task.get("session_id"),
+        "actor_id": task.get("actor_id"),
+        "delegation_role": task.get("delegation_role"),
+        "project_id": project_id,
+        "description": description,
+        "context": task.get("context"),
+        "expected_output": task.get("expected_output"),
+        "constraints": task.get("constraints"),
+        "allowed_resources": allowed_resources,
+        "deadline_at": deadline_at,
+        "task_contract": task.get("task_contract"),
+        "workspace_root": task.get("workspace_root"),
+        "workspace_mode": workspace_mode,
+        "memory_mode": memory_mode,
+        "child_drive_root": str(child_drive or ""),
+        "budget_drive_root": str(drive_root) if child_drive is not None else "",
+        "artifacts": artifacts,
+        "artifact_status": ARTIFACT_STATUS_PENDING if workspace_root else "",
+        "metadata": metadata,
+        "result": "Task accepted and durably scheduled.",
+    }
+    try:
+        admitted = _enqueue_api_task_durably(
+            task,
+            drive_root=drive_root,
+            task_id=task_id,
+            admission_token=admission_token,
+            result_fields=result_fields,
+        )
+        snapshot_failed = (
+            str(admitted.get("_admission_blocked") or "")
+            == "queue_snapshot_persist_failed"
+        )
+        rejection = _admission_rejection_response(
+            admitted,
+            drive_root=drive_root,
+            task_id=task_id,
+            project_id=project_id,
+            workspace_root=workspace_root,
+            child_drive=child_drive,
+            status_code=503 if snapshot_failed else 409,
+            detail=(
+                "Task was not scheduled because its durable queue snapshot could not be written."
+                if snapshot_failed
+                else "Task was not scheduled because its admission fence is closed."
+            ),
+        )
+        if rejection is not None:
+            return rejection
+    except Exception as exc:
+        try:
+            from supervisor import queue as supervisor_queue
+
+            with supervisor_queue._queue_lock:
+                supervisor_queue.PENDING[:] = [
+                    row for row in supervisor_queue.PENDING
+                    if not (
+                        isinstance(row, dict)
+                        and str(row.get("id") or "") == task_id
+                        and str(row.get("_admission_owner_token") or "")
+                        == admission_token
+                    )
+                ]
+            supervisor_queue.persist_queue_snapshot(
+                reason="api_task_create_failed_rollback"
+            )
+        except Exception:
+            log.warning(
+                "Failed to roll back API task %s after admission error",
+                task_id,
+                exc_info=True,
+            )
+        write_task_result(
+            drive_root,
+            task_id,
+            "failed",
+            **{
+                **result_fields,
+                "artifact_status": ARTIFACT_STATUS_FAILED if workspace_root else "",
+                "result": f"Failed to enqueue task: {exc}",
+            },
+        )
+        _cleanup_api_admission_attempt(
+            drive_root, task_id, admission_token, child_drive
+        )
+        return json_exception(exc, 503)
+    return JSONResponse({"ok": True, "task_id": task_id, "status": STATUS_SCHEDULED})
 
 
 async def api_tasks_create(request: Request) -> JSONResponse:
@@ -209,7 +393,7 @@ async def api_tasks_create(request: Request) -> JSONResponse:
     drive_root = request_drive_root(request)
     repo_dir = request_repo_dir(request)
     try:
-        task_id = validate_task_id(body.get("task_id") or uuid.uuid4().hex[:8])
+        task_id = validate_task_id(body.get("task_id") or uuid.uuid4().hex[:16])
     except ValueError as exc:
         return json_error(str(exc), 400)
     if load_task_result(drive_root, task_id):
@@ -326,7 +510,34 @@ async def api_tasks_create(request: Request) -> JSONResponse:
         deadline_at = datetime.fromtimestamp(time.time() + timeout_sec, timezone.utc).isoformat().replace("+00:00", "Z")
     if deadline_at:
         metadata["deadline_at"] = deadline_at
-    child_drive = prepare_task_drive(drive_root, task_id, effective_drive_mode, project_id=_task_project_id)
+    admission_token = uuid.uuid4().hex
+    from supervisor.queue import reserve_task_admission
+
+    reservation = reserve_task_admission(
+        task_id,
+        admission_token,
+        require_worker_pool=True,
+        drive_root=drive_root,
+    )
+    if reservation.get("status") != "reserved":
+        reason = str(reservation.get("reason") or "admission_reservation_failed")
+        status_code = 503 if reason.startswith("worker_pool_") else 409
+        return json_error(
+            f"task admission refused: {reason}",
+            status_code,
+            task_id=task_id,
+            reason_code=reason,
+            worker_pool_disabled_reason=str(
+                reservation.get("worker_pool_disabled_reason") or ""
+            ),
+        )
+    try:
+        child_drive = prepare_task_drive(
+            drive_root, task_id, effective_drive_mode, project_id=_task_project_id
+        )
+    except Exception as exc:
+        _cleanup_api_admission_attempt(drive_root, task_id, admission_token)
+        return json_exception(exc, 503)
     # v6.52.0 (P1): stage attachments into the SAME drive the task will read from at
     # runtime — the child drive when forked/empty, else the shared drive (matches the
     # task['drive_root'] set at the end of this handler). The returned manifest renders
@@ -334,9 +545,15 @@ async def api_tasks_create(request: Request) -> JSONResponse:
     from ouroboros.artifacts import stage_task_attachments
 
     effective_drive = child_drive or drive_root
-    attachment_manifest = stage_task_attachments(
-        effective_drive, task_id, _normalize_attachments(body.get("attachments"))
-    )
+    try:
+        attachment_manifest = stage_task_attachments(
+            effective_drive, task_id, _normalize_attachments(body.get("attachments"))
+        )
+    except Exception as exc:
+        _cleanup_api_admission_attempt(
+            drive_root, task_id, admission_token, child_drive
+        )
+        return json_exception(exc, 503)
     attachment_images = [m for m in attachment_manifest if m.get("is_image")]
     metadata.setdefault("session_id", str(body.get("session_id") or uuid.uuid4().hex))
     metadata.setdefault("actor_id", str(body.get("actor_id") or "cli"))
@@ -364,14 +581,20 @@ async def api_tasks_create(request: Request) -> JSONResponse:
             }
             metadata["workspace_preflight"] = workspace_preflight_summary
 
-    task_text = _compose_task_text(
-        description,
-        workspace_root=workspace_root,
-        workspace_mode=workspace_mode,
-        memory_mode=memory_mode,
-        workspace_preflight=workspace_preflight_summary,
-        attachments=attachment_manifest,
-    )
+    try:
+        task_text = _compose_task_text(
+            description,
+            workspace_root=workspace_root,
+            workspace_mode=workspace_mode,
+            memory_mode=memory_mode,
+            workspace_preflight=workspace_preflight_summary,
+            attachments=attachment_manifest,
+        )
+    except Exception as exc:
+        _cleanup_api_admission_attempt(
+            drive_root, task_id, admission_token, child_drive
+        )
+        return json_exception(exc, 503)
     task = {
         "id": task_id,
         "type": task_type,
@@ -406,86 +629,39 @@ async def api_tasks_create(request: Request) -> JSONResponse:
         # drive) so build_user_content can resolve staged attachment IMAGES for EVERY task
         # shape — not just child-drive tasks. The child-drive block below re-affirms it.
         "drive_root": str(effective_drive),
+        "_require_unique_task_id": True,
+        "_require_worker_pool": True,
+        "_admission_token": admission_token,
     }
-    task = attach_task_contract(task)
+    try:
+        task = attach_task_contract(task)
+    except Exception as exc:
+        _cleanup_api_admission_attempt(
+            drive_root, task_id, admission_token, child_drive
+        )
+        return json_exception(exc, 503)
     if child_drive is not None:
         task["drive_root"] = str(child_drive)
         task["child_drive_root"] = str(child_drive)
         task["budget_drive_root"] = str(drive_root)
         metadata["child_drive_root"] = str(child_drive)
         metadata["budget_drive_root"] = str(drive_root)
-    write_task_result(
-        drive_root,
-        task_id,
-        STATUS_SCHEDULED,
-        parent_task_id=task.get("parent_task_id"),
-        root_task_id=task.get("root_task_id"),
-        session_id=task.get("session_id"),
-        actor_id=task.get("actor_id"),
-        delegation_role=task.get("delegation_role"),
+    return _complete_api_task_admission(
+        task,
+        drive_root=drive_root,
+        task_id=task_id,
+        admission_token=admission_token,
         project_id=_task_project_id,
         description=description,
-        context=task.get("context"),
-        expected_output=task.get("expected_output"),
-        constraints=task.get("constraints"),
         allowed_resources=allowed_resources,
         deadline_at=deadline_at,
-        task_contract=task.get("task_contract"),
-        workspace_root=task.get("workspace_root"),
+        workspace_root=workspace_root,
         workspace_mode=workspace_mode,
         memory_mode=memory_mode,
-        child_drive_root=str(child_drive or ""),
-        budget_drive_root=str(drive_root) if child_drive is not None else "",
+        child_drive=child_drive,
         artifacts=artifacts,
-        artifact_status=ARTIFACT_STATUS_PENDING if workspace_root else "",
         metadata=metadata,
-        result="Task accepted and scheduled.",
     )
-    try:
-        from supervisor.queue import enqueue_task, persist_queue_snapshot
-
-        admitted = enqueue_task(task)
-        rejection = _admission_rejection_response(
-            admitted,
-            drive_root=drive_root,
-            task_id=task_id,
-            project_id=_task_project_id,
-            workspace_root=workspace_root,
-            child_drive=child_drive,
-        )
-        if rejection is not None:
-            return rejection
-        persist_queue_snapshot(reason="api_task_create")
-    except Exception as exc:
-        write_task_result(
-            drive_root,
-            task_id,
-            "failed",
-            parent_task_id=task.get("parent_task_id"),
-            root_task_id=task.get("root_task_id"),
-            session_id=task.get("session_id"),
-            actor_id=task.get("actor_id"),
-            project_id=_task_project_id,
-            delegation_role=task.get("delegation_role"),
-            description=description,
-            context=task.get("context"),
-            expected_output=task.get("expected_output"),
-            constraints=task.get("constraints"),
-            allowed_resources=allowed_resources,
-            deadline_at=deadline_at,
-            task_contract=task.get("task_contract"),
-            workspace_root=task.get("workspace_root"),
-            workspace_mode=workspace_mode,
-            memory_mode=memory_mode,
-            child_drive_root=str(child_drive or ""),
-            budget_drive_root=str(drive_root) if child_drive is not None else "",
-            artifacts=artifacts,
-            artifact_status=ARTIFACT_STATUS_FAILED if workspace_root else "",
-            metadata=metadata,
-            result=f"Failed to enqueue task: {exc}",
-        )
-        return json_exception(exc, 503)
-    return JSONResponse({"ok": True, "task_id": task_id, "status": STATUS_SCHEDULED})
 
 
 async def api_tasks_list(request: Request) -> JSONResponse:
@@ -982,12 +1158,24 @@ def _supervisor_ready_error(request: Request) -> Optional[JSONResponse]:
     if ready_event is not None and not ready_event.is_set():
         return json_error("supervisor is still starting", 503)
     try:
-        from supervisor.workers import WORKERS
+        from supervisor.workers import worker_pool_admission_state
 
-        if ready_event is not None and not WORKERS:
-            return json_error("supervisor has no running workers", 503)
-    except Exception:
-        pass
+        pool_state = worker_pool_admission_state()
+        if ready_event is not None and not pool_state["available"]:
+            return json_error(
+                "supervisor worker pool is unavailable",
+                503,
+                reason_code="worker_pool_unavailable",
+                worker_pool_disabled_reason=str(pool_state.get("disabled_reason") or ""),
+            )
+    except Exception as exc:
+        if ready_event is not None:
+            return json_error(
+                "supervisor worker-pool state is unavailable",
+                503,
+                reason_code="worker_pool_state_unavailable",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
     return None
 
 

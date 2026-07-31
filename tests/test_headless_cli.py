@@ -45,6 +45,15 @@ from ouroboros.utils import utc_now_iso
 from ouroboros.workspace_preflight import _infer_tools_from_manifests
 
 
+@pytest.fixture(autouse=True)
+def _managed_worker_pool_available(monkeypatch):
+    """HTTP task tests model a ready server unless a case overrides the pool."""
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(workers, "WORKERS", {0: SimpleNamespace()})
+    monkeypatch.setattr(workers, "_WORKER_POOL_DISABLED_REASON", "")
+
+
 def _init_repo_with_file(repo, name="tracked.txt", content="old\n"):
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -76,7 +85,7 @@ def test_task_api_enqueue_workspace_creates_child_drive(tmp_path, monkeypatch):
         return task
 
     monkeypatch.setattr("supervisor.queue.enqueue_task", fake_enqueue)
-    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": True)
     monkeypatch.setattr("ouroboros.workspace_admission.bootstrap_process_path", lambda: bootstrapped.append(True) or [])
 
     app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
@@ -198,6 +207,79 @@ def test_task_api_admission_refusal_is_terminal_not_scheduled_phantom(tmp_path, 
     assert not (data / "state" / "headless_tasks" / "blocked-root").exists()
 
 
+def test_task_api_refuses_when_durable_queue_snapshot_fails(tmp_path, monkeypatch):
+    import supervisor.queue as queue
+    from ouroboros.task_results import STATUS_FAILED, load_task_result
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = tmp_path / "data"
+    (data / "memory").mkdir(parents=True)
+    pending = []
+    monkeypatch.setattr(queue, "DRIVE_ROOT", data)
+    monkeypatch.setattr(queue, "PENDING", pending)
+    monkeypatch.setattr(queue, "RUNNING", {})
+    calls = []
+
+    def persist(reason=""):
+        calls.append(reason)
+        return reason == "api_task_create_rollback"
+
+    monkeypatch.setattr(queue, "persist_queue_snapshot", persist)
+    app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
+    app.state.drive_root = data
+    app.state.repo_dir = repo
+    response = TestClient(app).post(
+        "/api/tasks",
+        json={"description": "must be durable", "task_id": "snapshot-fail"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["admission"]["reason_code"] == "queue_snapshot_persist_failed"
+    assert pending == []
+    assert calls == ["api_task_create", "api_task_create_rollback"]
+    assert load_task_result(data, "snapshot-fail")["status"] == STATUS_FAILED
+    assert not (data / "state" / "headless_tasks" / "snapshot-fail").exists()
+
+
+def test_task_api_releases_reservation_when_payload_composition_fails(
+    tmp_path, monkeypatch,
+):
+    import supervisor.queue as queue
+    from ouroboros.gateway import tasks
+
+    data = tmp_path / "data"
+    repo = tmp_path / "repo"
+    data.mkdir()
+    repo.mkdir()
+    task_id = "compose-failure"
+    real_compose = tasks._compose_task_text
+    monkeypatch.setattr(
+        tasks,
+        "_compose_task_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("compose failed")),
+    )
+    monkeypatch.setattr(queue, "enqueue_task", lambda task: task)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda **_kwargs: True)
+    app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
+    app.state.drive_root = data
+    app.state.repo_dir = repo
+    client = TestClient(app)
+
+    failed = client.post(
+        "/api/tasks", json={"task_id": task_id, "description": "compose me"}
+    )
+    assert failed.status_code == 503
+    assert task_id not in queue.ADMISSION_RESERVATIONS
+    assert not task_artifacts_dir(data, task_id, create=False).exists()
+
+    monkeypatch.setattr(tasks, "_compose_task_text", real_compose)
+    retried = client.post(
+        "/api/tasks", json={"task_id": task_id, "description": "compose me"}
+    )
+    assert retried.status_code == 200, retried.text
+
+
 def test_api_tasks_create_requires_description_not_legacy_aliases(monkeypatch):
     captured = []
     monkeypatch.setattr("supervisor.queue.enqueue_task", lambda task: captured.append(task) or task)
@@ -223,7 +305,7 @@ def test_api_tasks_create_rejects_internal_task_types(tmp_path, monkeypatch):
     (data / "memory").mkdir(parents=True)
 
     monkeypatch.setattr("supervisor.queue.enqueue_task", lambda task: task)
-    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": True)
     monkeypatch.setattr("ouroboros.workspace_admission.bootstrap_process_path", lambda: [])
 
     app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
@@ -267,7 +349,7 @@ def test_task_api_rejects_unsafe_task_id_and_system_workspace(tmp_path, monkeypa
     data = tmp_path / "data"
     data.mkdir()
     monkeypatch.setattr("supervisor.queue.enqueue_task", lambda task: task)
-    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": True)
 
     app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
     app.state.drive_root = data
@@ -324,7 +406,7 @@ def test_task_api_rejects_forged_subagent_without_child_drive_side_effect(tmp_pa
     data = tmp_path / "data"
     data.mkdir()
     monkeypatch.setattr("supervisor.queue.enqueue_task", lambda task: pytest.fail("forged subagent enqueued"))
-    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": True)
 
     app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
     app.state.drive_root = data
@@ -357,7 +439,7 @@ def test_task_api_rejects_external_lineage_forgery(tmp_path, monkeypatch):
     data = tmp_path / "data"
     data.mkdir()
     monkeypatch.setattr("supervisor.queue.enqueue_task", lambda task: pytest.fail("forged lineage enqueued"))
-    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": True)
 
     app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
     app.state.drive_root = data
@@ -389,7 +471,7 @@ def test_task_api_preserves_top_level_actor_id_after_metadata_sanitization(tmp_p
     data.mkdir()
     captured = []
     monkeypatch.setattr("supervisor.queue.enqueue_task", lambda task: captured.append(dict(task)) or task)
-    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": True)
 
     app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
     app.state.drive_root = data
@@ -2463,7 +2545,7 @@ def test_queue_restore_accepts_headless_chat_zero(tmp_path, monkeypatch):
     monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", tmp_path / "queue_snapshot.json")
     monkeypatch.setattr(queue, "append_jsonl", lambda *args, **kwargs: None)
-    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
     (tmp_path / "queue_snapshot.json").write_text(
         json.dumps({
             "ts": utc_now_iso(),

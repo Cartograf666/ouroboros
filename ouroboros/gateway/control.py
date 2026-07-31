@@ -250,9 +250,9 @@ async def api_update_check(_request: Request) -> JSONResponse:
 def _respawn_workers_after_failed_update() -> None:
     """Revive workers when an update aborts after they were stopped (no restart follows)."""
     try:
-        from supervisor.workers import spawn_workers
+        from supervisor.workers import ensure_worker_pool_started
 
-        spawn_workers()
+        ensure_worker_pool_started(allow_disabled_restart=True)
     except Exception:
         log.warning("update_apply: failed to respawn workers after aborted update", exc_info=True)
 

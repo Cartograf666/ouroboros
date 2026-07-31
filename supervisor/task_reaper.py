@@ -514,16 +514,10 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
 
     # 5. Respawn a fresh worker for the slot; on failure, CLEAR reaping so the crash detector
     #    can recover the slot on a later tick instead of stranding it permanently.
-    #    Hold _queue_lock across the membership check AND the respawn so it is mutually
-    #    exclusive with kill_workers (which clears WORKERS under the same lock at shutdown).
-    #    Otherwise the reaper could pass the check, start a replacement process, and insert it
-    #    into WORKERS only AFTER shutdown cleanup already cleared the pool — an orphan worker
-    #    surviving shutdown. _queue_lock is an RLock and respawn_worker re-acquires it
-    #    internally, so taking it here is safe (and a cleared pool makes the check fail closed).
+    #    respawn_worker owns the lifecycle race with shutdown and starts the child
+    #    outside _queue_lock, so a fork can never inherit the RLock from this thread.
     try:
-        with _q._queue_lock:
-            if worker_id in workers_mod.WORKERS:
-                workers_mod.respawn_worker(worker_id)
+        workers_mod.respawn_worker(worker_id)
     except Exception:
         log.warning("Reaper: respawn failed for worker %d; clearing reaping for recovery", worker_id, exc_info=True)
         try:

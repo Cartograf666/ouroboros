@@ -56,6 +56,8 @@ VALID_SUBTASK_MEMORY_MODES = frozenset({"forked", "empty"})
 # schedule_subagent emission within one tool-call round. Process-local: a parent
 # ctx is never shared across processes, so a threading.Lock is sufficient.
 _SCHEDULE_EMIT_LOCK = threading.Lock()
+_PROMOTE_CONFIRM_TIMEOUT_SEC = 15.0
+_PROMOTE_CONFIRM_POLL_SEC = 0.05
 
 
 def _record_scheduled_subagent(ctx: ToolContext, record: Dict[str, Any]) -> None:
@@ -291,11 +293,54 @@ def _emit_control_event(ctx: ToolContext, evt: Dict[str, Any]) -> str:
         )
         setattr(ctx, "_typed_routing_action_emitted", action)
 
+    try:
+        from multiprocessing.reduction import ForkingPickler
+
+        ForkingPickler.dumps(dict(evt))
+    except Exception as exc:
+        log.warning("Control event is not multiprocessing-serializable", exc_info=True)
+        try:
+            root = Path(str(getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
+            append_jsonl(
+                root / "logs" / "supervisor.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "control_event_serialization_failed",
+                    "event_type": str(evt.get("type") or ""),
+                    "task_id": str(evt.get("task_id") or ""),
+                    "routing_token": str(evt.get("routing_token") or ""),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+        except Exception:
+            log.debug("Failed to record control-event serialization failure", exc_info=True)
+        return "serialization_failed"
+
+    def _record_emitted(mode: str) -> None:
+        if str(evt.get("type") or "") != "promote_chat_to_task":
+            return
+        try:
+            root = Path(str(getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
+            append_jsonl(
+                root / "logs" / "supervisor.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "promote_chat_to_task_emitted",
+                    "task_id": str(evt.get("task_id") or ""),
+                    "routing_token": str(evt.get("routing_token") or ""),
+                    "transport_mode": mode,
+                    "sender_pid": os.getpid(),
+                },
+            )
+        except Exception:
+            log.debug("Failed to record promote emission", exc_info=True)
+
     event_queue = getattr(ctx, "event_queue", None)
     if event_queue is not None:
         try:
             event_queue.put_nowait(dict(evt))
             _mark_typed_routing_action()
+            _record_emitted("live")
             return "live"
         except (AttributeError, queue.Full):
             pass
@@ -304,7 +349,131 @@ def _emit_control_event(ctx: ToolContext, evt: Dict[str, Any]) -> str:
     with _SCHEDULE_EMIT_LOCK:
         ctx.pending_events.append(evt)
     _mark_typed_routing_action()
+    _record_emitted("deferred")
     return "deferred"
+
+
+def _promotion_pool_disabled_from_snapshot(ctx: ToolContext) -> str:
+    """Cheap early refusal for the known crash-storm state.
+
+    The supervisor handler remains authoritative.  This projection only keeps
+    source/project side effects from starting when the latest durable snapshot
+    already says the executor pool was deliberately disabled.
+    """
+    try:
+        root = Path(str(getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
+        snapshot = json.loads(
+            (root / "state" / "queue_snapshot.json").read_text(encoding="utf-8")
+        )
+        reason = str(snapshot.get("worker_pool_disabled_reason") or "")
+        if reason not in {"", "unknown"}:
+            return reason
+        if int(snapshot.get("worker_total") or 0) <= 0:
+            return "no_workers"
+        return ""
+    except Exception:
+        return ""
+
+
+def _routing_status_root(ctx: ToolContext) -> Path:
+    return Path(str(getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
+
+
+def _wait_for_promotion_admission(
+    ctx: ToolContext,
+    task_id: str,
+    routing_token: str,
+    *,
+    client_message_id: str = "",
+    timeout_sec: float = _PROMOTE_CONFIRM_TIMEOUT_SEC,
+) -> Dict[str, Any]:
+    """Wait for matching-token admission in the canonical task-result SSOT."""
+    from ouroboros.task_results import load_task_result
+
+    root = _routing_status_root(ctx)
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        result = load_task_result(root, task_id) or {}
+        admission = result.get("promotion_admission")
+        if (
+            isinstance(admission, dict)
+            and str(admission.get("routing_token") or "") == routing_token
+        ):
+            status = str(admission.get("status") or "")
+            if status in {"scheduled", "rejected", "unconfirmed"}:
+                return {**admission, "task_status": str(result.get("status") or "")}
+        # A duplicate id must never overwrite the existing task_result merely
+        # to report the loser.  The exact-token chat annotation is therefore a
+        # negative-only fallback; positive scheduling authority stays solely in
+        # the task-result admission record.
+        if str(client_message_id or "").strip():
+            from ouroboros.project_dialogue import chat_annotation_receipt
+
+            receipt = chat_annotation_receipt(
+                root, str(client_message_id), routing_token
+            )
+            if str(receipt.get("status") or "") in {
+                "needs_manual_target",
+                "rejected",
+                "unconfirmed",
+            }:
+                return receipt
+        if time.monotonic() >= deadline:
+            return {"status": "unconfirmed", "reason": "confirmation_timeout"}
+        time.sleep(_PROMOTE_CONFIRM_POLL_SEC)
+
+
+def _wait_for_routing_annotation(
+    ctx: ToolContext,
+    client_message_id: str,
+    routing_token: str,
+    *,
+    timeout_sec: float = _PROMOTE_CONFIRM_TIMEOUT_SEC,
+) -> Dict[str, Any]:
+    """Wait for an exact existing chat-annotation receipt (manual/steer)."""
+    from ouroboros.project_dialogue import chat_annotation_receipt
+
+    if not str(client_message_id or "").strip():
+        return {"status": "unconfirmed", "reason": "client_message_id_missing"}
+    root = _routing_status_root(ctx)
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        receipt = chat_annotation_receipt(root, client_message_id, routing_token)
+        status = str(receipt.get("status") or "")
+        if status in {"delivered", "needs_manual_target", "unconfirmed"}:
+            return receipt
+        if time.monotonic() >= deadline:
+            return {"status": "unconfirmed", "reason": "confirmation_timeout"}
+        time.sleep(_PROMOTE_CONFIRM_POLL_SEC)
+
+
+def _emit_and_wait_for_routing(
+    ctx: ToolContext,
+    evt: Dict[str, Any],
+) -> tuple[str, Dict[str, Any]]:
+    """Emit one routing event and return only its durable handler outcome."""
+    mode = _emit_control_event(ctx, evt)
+    if mode == "serialization_failed":
+        return mode, {
+            "status": "rejected",
+            "reason": "event_serialization_failed",
+            "detail": "The routing event was not emitted.",
+        }
+    timeout = _PROMOTE_CONFIRM_TIMEOUT_SEC if mode == "live" else 0.0
+    if str(evt.get("type") or "") == "promote_chat_to_task":
+        return mode, _wait_for_promotion_admission(
+            ctx,
+            str(evt.get("task_id") or ""),
+            str(evt.get("routing_token") or ""),
+            client_message_id=str(evt.get("client_message_id") or ""),
+            timeout_sec=timeout,
+        )
+    return mode, _wait_for_routing_annotation(
+        ctx,
+        str(evt.get("client_message_id") or ""),
+        str(evt.get("routing_token") or ""),
+        timeout_sec=timeout,
+    )
 
 
 def _evolution_restart_block_reason(ctx: ToolContext) -> str:
@@ -380,106 +549,6 @@ def _set_tool_timeout(ctx: ToolContext, seconds: int) -> str:
 def _promote_to_stable(ctx: ToolContext, reason: str) -> str:
     ctx.pending_events.append({"type": "promote_to_stable", "reason": reason, "ts": utc_now_iso()})
     return f"Promote to stable requested: {reason}"
-
-
-def _derive_source_project_id(src: str, is_git: bool) -> str:
-    """A filesystem-clean project id from the source itself (repo/folder name) —
-    the `promote_chat_to_task(source=…)` one-liner registers a project even when
-    the agent supplied no project_id/name (triad r2: a main-chat promote used to
-    attach the folder but silently skip registration, breaking the documented
-    capability). Deterministic-hash fallback for non-ASCII names."""
-    import pathlib as _pl
-
-    from ouroboros.project_facts import project_id_from_display_name
-    from ouroboros.project_sources import derive_repo_dir_name
-
-    base = derive_repo_dir_name(src) if is_git else _pl.Path(str(src).rstrip("/")).name
-    return project_id_from_display_name(base or "project")
-
-
-def _resolve_promote_source(ctx: ToolContext, source: str, pid: str) -> tuple[str, str, str, str]:
-    """v6.59.0 (3.3): agent-side attach/clone through the SAME server primitives the
-    New Project dialog uses. ``source`` is a git URL (cloned into the projects root)
-    or an existing folder path (validated attach). Returns (workspace_root, note,
-    error, effective_pid): on success the folder is registered on the project
-    (working_dir + provenance + trusted_at at the canonical DATA_DIR) so the room
-    and later tasks inherit it — a missing pid is DERIVED from the source name so
-    registration never silently skips. Re-sourcing an existing project whose
-    working_dir differs is refused (mirrors the gateway 409, triad r2 scope
-    advisory); a folder-less existing project may gain its first folder. The agent
-    reports loudly; no confirmation wait (owner quiz 13)."""
-    from ouroboros.config import DATA_DIR
-    from ouroboros.project_sources import clone_project_repo, valid_git_url, validate_attach_path
-
-    src = str(source or "").strip()
-    if not src:
-        return "", "", "", pid
-    is_git = valid_git_url(src)
-    pid = str(pid or "").strip() or _derive_source_project_id(src, is_git)
-    try:
-        from ouroboros.projects_registry import get_project
-
-        existing = get_project(DATA_DIR, pid)
-    except Exception:
-        existing = None
-    if is_git:
-        if str((existing or {}).get("working_dir") or "").strip():
-            # Conflict BEFORE the clone side effect (triad r7): a git source always
-            # creates a NEW folder, so it can never match an existing bound folder —
-            # cloning first would leave a dangling directory behind the refusal.
-            return "", "", (
-                f"⚠️ PROJECT_SOURCE_ERROR (conflict): project {pid!r} already has folder "
-                f"{existing.get('working_dir')} — re-sourcing an existing project is not "
-                "supported; pass a different project_id/project_name or omit source to "
-                "work in the existing folder."
-            ), pid
-        cloned, code, detail = clone_project_repo(src, pid or "")
-        if code:
-            return "", "", f"⚠️ PROJECT_SOURCE_ERROR ({code}): {detail}", pid
-        folder, provenance, clone_url = cloned, "cloned", src
-        note = f" [cloned {src} -> {cloned}]"
-    else:
-        from ouroboros.project_sources import is_git_worktree_root
-
-        resolved, err = validate_attach_path(
-            src, system_repo_dir=getattr(ctx, "repo_dir", ""), drive_root=DATA_DIR
-        )
-        if err:
-            return "", "", f"⚠️ PROJECT_SOURCE_ERROR (attach): {err}", pid
-        if not is_git_worktree_root(resolved):
-            # Task admission requires a git worktree root; attaching a non-git
-            # folder would register a project whose room tasks are born dead
-            # (triad r5). Owner opt-in git-init lives in the New Project dialog.
-            return "", "", (
-                f"⚠️ PROJECT_SOURCE_ERROR (attach): {resolved} is not a git repository — "
-                "ask the owner to create the project via New Project with init_git enabled, "
-                "or have them git-init the folder first."
-            ), pid
-        folder, provenance, clone_url = str(resolved), "attached", ""
-        note = f" [attached {resolved} — I now have write+shell there for this project's tasks]"
-    prior_wd = str((existing or {}).get("working_dir") or "").strip()
-    if prior_wd and prior_wd != folder:
-        return "", "", (
-            f"⚠️ PROJECT_SOURCE_ERROR (conflict): project {pid!r} already has folder "
-            f"{prior_wd} — re-sourcing an existing project is not supported; pass a "
-            "different project_id/project_name or omit source to work in the existing folder."
-        ), pid
-    if prior_wd == folder and str((existing or {}).get("provenance") or "").strip() not in ("", "none"):
-        # Same folder, already stamped: idempotent — keep the original trusted_at.
-        return folder, note, "", pid
-    try:
-        from ouroboros.projects_registry import create_project, update_project
-        from ouroboros.utils import utc_now_iso
-
-        create_project(DATA_DIR, pid, origin="promote_chat_to_task")
-        update_project(
-            DATA_DIR, pid,
-            working_dir=folder, provenance=provenance,
-            clone_url=clone_url, trusted_at=utc_now_iso(),
-        )
-    except Exception as exc:
-        return "", "", f"⚠️ PROJECT_SOURCE_ERROR (register): {type(exc).__name__}: {exc}", pid
-    return folder, note, "", pid
 
 
 def _attach_origin_from_metadata(ctx: ToolContext, evt: Dict[str, Any]) -> None:
@@ -558,24 +627,28 @@ def _promote_chat_to_task(
         current_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
     except (TypeError, ValueError):
         current_chat_id = 0
-    # v6.59.0 (3.3): attach/clone the source BEFORE emitting, so the event already
-    # carries the resolved folder ("help me debug this GitHub project" one-liner).
-    # The effective pid comes back: a source given without project_id/name derives
-    # the project from the source name, so registration never silently skips.
-    source_folder, source_note, source_error, pid = _resolve_promote_source(ctx, source, pid)
-    if source_error:
-        return source_error
-    effective_workspace_root = str(workspace_root or "").strip() or source_folder
-    tid = uuid.uuid4().hex[:8]
+    tid = uuid.uuid4().hex[:16]
+    routing_token = uuid.uuid4().hex
+    disabled_reason = _promotion_pool_disabled_from_snapshot(ctx)
+    if disabled_reason:
+        return (
+            f"PROMOTE_REJECTED: task {tid} was not scheduled "
+            f"(worker_pool_unavailable: {disabled_reason}). No project/workspace "
+            "admission side effects were started."
+        )
     evt: Dict[str, Any] = {
         "type": "promote_chat_to_task",
         "task_id": tid,
+        "routing_token": routing_token,
         "objective": goal,
         "expected_output": str(expected_output or "").strip(),
         "project_id": pid,
         "project_name": display_name,
         "title": str(title or "").strip()[:80],
-        "workspace_root": effective_workspace_root,
+        "workspace_root": str(workspace_root or "").strip(),
+        # Source admission is intentionally supervisor-side, after the
+        # authoritative worker-pool and duplicate-id gates.
+        "source": str(source or "").strip(),
         # v6.58.0: "none" opts a project-room task OUT of the room's working_dir
         # default (a folder-less task in a folder-ful project stays possible).
         "workspace": str(workspace or "").strip().lower(),
@@ -591,18 +664,60 @@ def _promote_chat_to_task(
         "ts": utc_now_iso(),
     }
     _attach_origin_from_metadata(ctx, evt)
-    mode = _emit_control_event(ctx, evt)
+    mode, confirmation = _emit_and_wait_for_routing(ctx, evt)
     if display_name:
         scope_note = f" in new project '{display_name}'"
     elif pid:
         scope_note = f" in project '{pid}'"
     else:
         scope_note = ""
+    confirmation_status = str(confirmation.get("status") or "unconfirmed")
+    reason = str(confirmation.get("reason") or "")
+    detail = str(confirmation.get("detail") or "")
+    disabled_reason = str(confirmation.get("worker_pool_disabled_reason") or "")
+    if confirmation_status == "scheduled":
+        source_confirmation = f" [{detail}]" if detail else ""
+        return (
+            f"OK: task {tid}{scope_note} accepted and durably scheduled ({mode}).{source_confirmation} "
+            "The conversation lane stays free; the owner sees a live task card and can "
+            "steer the running task from chat. Use wait_task/get_task_result if its result "
+            "is needed in this conversation."
+        )
+    if confirmation_status in {"rejected", "needs_manual_target"}:
+        shown_reason = (
+            f"{reason}: {disabled_reason}" if disabled_reason else reason
+        )
+        if detail:
+            shown_reason = f"{shown_reason}: {detail}" if shown_reason else detail
+        return (
+            f"PROMOTE_REJECTED: task {tid} was not scheduled"
+            f"{f' ({shown_reason})' if shown_reason else ''}. "
+            "Do not report this task as created."
+        )
+    try:
+        root = Path(str(getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
+        append_jsonl(
+            root / "logs" / "supervisor.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "promote_chat_to_task_unconfirmed",
+                "task_id": tid,
+                "transport_mode": mode,
+                "reason": reason or "confirmation_timeout",
+                "routing_token": routing_token,
+            },
+        )
+    except Exception:
+        log.debug("Failed to record unconfirmed promote", exc_info=True)
+    confirmation_window = (
+        f"within {int(_PROMOTE_CONFIRM_TIMEOUT_SEC)} seconds"
+        if mode == "live"
+        else f"because the event transport returned {mode}"
+    )
     return (
-        f"OK: promoted to supervised task {tid}{scope_note} ({mode}).{source_note} The conversation "
-        "lane stays free; the owner sees a live task card and can steer the running "
-        "task from chat (messages are delivered to its mailbox). Use wait_task/"
-        "get_task_result to follow up if the result is needed in this conversation."
+        f"PROMOTE_UNCONFIRMED: task {tid} admission was not confirmed {confirmation_window}. "
+        "Do not report this task as "
+        "created and do not retry automatically; keep this task id for reconciliation."
     )
 
 
@@ -671,8 +786,10 @@ def _route_to_project(
             else "invalid_project_id" if not pid
             else "target_not_found"
         )
-        mode = _emit_control_event(ctx, {
+        routing_token = uuid.uuid4().hex
+        mode, receipt = _emit_and_wait_for_routing(ctx, {
             "type": "routing_manual_target",
+            "routing_token": routing_token,
             "chat_id": current_chat_id,
             "client_message_id": client_message_id,
             "requested_target": pid or requested_pid[:200],
@@ -680,15 +797,26 @@ def _route_to_project(
             "options": options,
             "ts": utc_now_iso(),
         })
+        if str(receipt.get("status") or "") == "needs_manual_target":
+            durable_options = (
+                receipt.get("options") if isinstance(receipt.get("options"), list) else options
+            )
+            options_text = json.dumps(durable_options, ensure_ascii=False, default=str)
+            return (
+                f"⚠️ NEEDS_MANUAL_TARGET ({failure}, {mode}): no route was dispatched. "
+                f"Host-validated options: {options_text}"
+            )
         return (
-            f"⚠️ NEEDS_MANUAL_TARGET ({failure}, {mode}): no route was dispatched. "
-            "The owner received the concrete host-validated task/project options."
+            f"⚠️ ROUTING_UNCONFIRMED ({failure}, {mode}): no route was dispatched and "
+            "delivery of the manual target options was not confirmed."
         )
-    tid = uuid.uuid4().hex[:8]
+    tid = uuid.uuid4().hex[:16]
+    routing_token = uuid.uuid4().hex
     objective = msg if not str(reason or "").strip() else f"{msg}\n\n(routing reason: {str(reason).strip()})"
     evt: Dict[str, Any] = {
         "type": "promote_chat_to_task",
         "task_id": tid,
+        "routing_token": routing_token,
         "objective": objective,
         "project_id": pid,
         "chat_id": current_chat_id,
@@ -701,11 +829,24 @@ def _route_to_project(
         "ts": utc_now_iso(),
     }
     _attach_origin_from_metadata(ctx, evt)
-    mode = _emit_control_event(ctx, evt)
+    mode, receipt = _emit_and_wait_for_routing(ctx, evt)
     name = str(proj.get("name") or pid)
+    status = str(receipt.get("status") or "unconfirmed")
+    if status == "scheduled":
+        return (
+            f"✉️ Routed to project '{name}' ({pid}) as task {tid}; admission is durably "
+            f"scheduled ({mode}). I'll continue there; this chat stays free for you."
+        )
+    reason_text = str(receipt.get("reason") or "confirmation_timeout")
+    detail = str(receipt.get("detail") or "")
+    if status in {"rejected", "needs_manual_target"}:
+        return (
+            f"⚠️ ROUTE_REJECTED: task {tid} was not routed to project '{name}' "
+            f"({reason_text}{(': ' + detail) if detail else ''})."
+        )
     return (
-        f"✉️ Routed to project '{name}' ({pid}) as task {tid} ({mode}). I'll continue there; "
-        "this chat stays free for you. Follow-ups you send reach the project task's mailbox."
+        f"⚠️ ROUTE_UNCONFIRMED: task {tid} routing to project '{name}' was not durably "
+        "confirmed. Do not report it as routed and do not retry automatically."
     )
 
 
@@ -746,6 +887,7 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
     )
     evt: Dict[str, Any] = {
         "type": "steer_task",
+        "routing_token": uuid.uuid4().hex,
         "target_task_id": target,
         "message": msg,
         "chat_id": current_chat_id,
@@ -758,11 +900,21 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
         if isinstance(_md, dict) else [],
         "ts": utc_now_iso(),
     }
-    mode = _emit_control_event(ctx, evt)
+    mode, receipt = _emit_and_wait_for_routing(ctx, evt)
+    status = str(receipt.get("status") or "unconfirmed")
+    if status == "delivered":
+        return (
+            f"✉️ Steering task {target}: mailbox delivery is durably confirmed ({mode}). "
+            "The task receives it at its next checkpoint."
+        )
+    if status in {"rejected", "needs_manual_target"}:
+        return (
+            f"⚠️ STEER_REJECTED: task {target} was not steered "
+            f"({str(receipt.get('reason') or 'target_not_steerable')})."
+        )
     return (
-        f"✉️ Steering task {target} ({mode}): the message reaches its mailbox at the task's next "
-        "checkpoint. If that task has already finished, you'll get a notice — then answer inline "
-        "or promote_chat_to_task instead."
+        f"⚠️ STEER_UNCONFIRMED: mailbox delivery to task {target} was not durably confirmed "
+        f"({mode}). Do not report the message as delivered."
     )
 
 
@@ -1798,7 +1950,9 @@ _PROMOTE_CHAT_DESCRIPTION = (
     "the project's working folder as its ACTIVE WORKSPACE by default (its file/"
     "shell/git tools operate there, not on the Ouroboros repo); pass "
     "workspace='none' for a folder-less task. Owner follow-ups reach the "
-    "running task via its mailbox."
+    "running task via its mailbox. Report creation only when this tool returns "
+    "OK; PROMOTE_REJECTED or PROMOTE_UNCONFIRMED means the task must not be "
+    "claimed as created, and UNCONFIRMED must not be retried automatically."
 )
 
 

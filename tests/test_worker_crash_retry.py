@@ -13,6 +13,20 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_worker_crash_state():
+    """Crash history is process-global and must not leak between serial tests."""
+    import supervisor.workers as workers
+
+    workers.CRASH_TS.clear()
+    workers._WORKER_POOL_DISABLED_REASON = ""
+    yield
+    workers.CRASH_TS.clear()
+    workers._WORKER_POOL_DISABLED_REASON = ""
+
 
 
 # ---------------------------------------------------------------------------

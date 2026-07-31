@@ -54,8 +54,10 @@ def test_api_tasks_create_carries_disabled_tools(tmp_path, monkeypatch):
     (data / "memory").mkdir(parents=True)
 
     captured = []
+    monkeypatch.setattr("supervisor.workers.WORKERS", {0: object()})
+    monkeypatch.setattr("supervisor.workers._WORKER_POOL_DISABLED_REASON", "")
     monkeypatch.setattr("supervisor.queue.enqueue_task", lambda task: captured.append(dict(task)) or task)
-    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": True)
     monkeypatch.setattr("ouroboros.workspace_admission.bootstrap_process_path", lambda: [])
 
     app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
@@ -81,8 +83,10 @@ def test_api_tasks_create_carries_acceptance_claims(tmp_path, monkeypatch):
     data = tmp_path / "data"
     (data / "memory").mkdir(parents=True)
     captured = []
+    monkeypatch.setattr("supervisor.workers.WORKERS", {0: object()})
+    monkeypatch.setattr("supervisor.workers._WORKER_POOL_DISABLED_REASON", "")
     monkeypatch.setattr("supervisor.queue.enqueue_task", lambda task: captured.append(dict(task)) or task)
-    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": True)
     monkeypatch.setattr("ouroboros.workspace_admission.bootstrap_process_path", lambda: [])
 
     app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])

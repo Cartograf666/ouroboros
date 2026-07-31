@@ -440,7 +440,7 @@ def test_routing_ack_is_typed_and_never_broadcast_as_chat_bubble(monkeypatch):
     assert all(payload.get("type") != "chat" for payload in ws_payloads)
 
 
-def test_manual_target_event_emits_transient_options_but_sidecar_stays_annotation_only(
+def test_manual_target_event_persists_concrete_options_in_latest_annotation(
     tmp_path, monkeypatch,
 ):
     from ouroboros.project_dialogue import latest_chat_annotations
@@ -471,4 +471,4 @@ def test_manual_target_event_emits_transient_options_but_sidecar_stays_annotatio
     assert payload["suppress_bubble"] is True
     sidecar = latest_chat_annotations(tmp_path)["owner-choice-1"]
     assert set(sidecar) >= {"client_message_id", "action", "target", "status"}
-    assert "options" not in sidecar
+    assert sidecar["options"] == event["options"]

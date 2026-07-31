@@ -768,14 +768,12 @@ def _publish_cancelled_task(
             q._emit_cancel_task_done(task, task_id, cost_fields=cost_fields, status=settled_status)
         except Exception:
             log.warning("Failed to publish terminal event for %s", task_id, exc_info=True)
-    # Respawn recovery is the REAPER'S canonical step 5, not a private variant:
-    # membership check + respawn under the queue lock (mutually exclusive with
-    # shutdown's kill_workers), and on failure the marker is cleared UNDER THE
-    # LOCK so the crash detector can recover the slot on a later tick.
+    # Respawn recovery is the REAPER'S canonical step 5, not a private variant.
+    # The helper serializes against shutdown with the lifecycle lock and starts
+    # the child outside the queue lock; on failure the marker is cleared under
+    # the lock so the crash detector can recover the slot on a later tick.
     try:
-        with q._queue_lock:
-            if worker.wid in workers.WORKERS:
-                workers.respawn_worker(worker.wid)
+        workers.respawn_worker(worker.wid)
     except Exception:
         log.warning("Respawn after cancelling %s failed; clearing reaping for recovery", task_id, exc_info=True)
         try:
