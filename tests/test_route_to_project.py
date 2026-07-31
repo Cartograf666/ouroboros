@@ -36,7 +36,8 @@ def test_route_to_existing_project_emits_event_and_receipt(tmp_path):
         "origin_message_text": "continue the engine tuning",
     })
     out = _route_to_project(ctx, "racer", "paraphrased: keep tuning the engine", reason="follow-up")
-    assert out.startswith("✉️ Routed to project 'Racer' (racer)")
+    assert out.startswith("⚠️ ROUTE_UNCONFIRMED:")
+    assert "do not retry automatically" in out.lower()
     assert len(events) == 1
     evt = events[0]
     assert evt["type"] == "promote_chat_to_task"
@@ -46,6 +47,7 @@ def test_route_to_existing_project_emits_event_and_receipt(tmp_path):
     assert "routing reason: follow-up" in evt["objective"]
     assert evt["chat_id"] == 1
     assert evt["task_id"]
+    assert evt["routing_token"]
     assert evt["source_ref"] == origin_ref
     assert evt["source_text"] == "continue the engine tuning"
     assert ctx._typed_routing_action_emitted == "route_to_project"
@@ -59,23 +61,23 @@ def test_route_to_missing_project_emits_typed_manual_target(tmp_path):
     }
     ctx = _ctx(tmp_path, events, task_metadata=metadata)
     out = _route_to_project(ctx, "ghost", "do the thing")
-    assert "NEEDS_MANUAL_TARGET" in out
-    assert events == [{
-        "type": "routing_manual_target",
-        "chat_id": 1,
-        "client_message_id": "owner-1",
-        "requested_target": "ghost",
-        "reason": "target_not_found",
-        "options": [{"task_id": "task-1", "title": "Fix it"}],
-        "ts": events[0]["ts"],
-    }]
+    assert "ROUTING_UNCONFIRMED" in out
+    assert len(events) == 1
+    assert events[0]["type"] == "routing_manual_target"
+    assert events[0]["routing_token"]
+    assert events[0]["chat_id"] == 1
+    assert events[0]["client_message_id"] == "owner-1"
+    assert events[0]["requested_target"] == "ghost"
+    assert events[0]["reason"] == "target_not_found"
+    assert events[0]["options"] == [{"task_id": "task-1", "title": "Fix it"}]
     assert ctx._typed_routing_action_emitted == "routing_manual_target"
 
 
 def test_route_rejects_dirty_project_id(tmp_path):
     events = []
     out = _route_to_project(_ctx(tmp_path, events), "Bad Name!", "msg")
-    assert "NEEDS_MANUAL_TARGET" in out
+    assert "ROUTING_UNCONFIRMED" in out
+    assert events[0]["routing_token"]
     assert events[0]["reason"] == "invalid_project_id"
 
 
@@ -88,7 +90,8 @@ def test_route_empty_target_is_the_typed_abstention_path(tmp_path):
         },
     }
     out = _route_to_project(_ctx(tmp_path, events, task_metadata=metadata), "", "ambiguous follow-up")
-    assert "NEEDS_MANUAL_TARGET" in out
+    assert "ROUTING_UNCONFIRMED" in out
+    assert events[0]["routing_token"]
     assert events[0]["reason"] == "target_unspecified"
     assert events[0]["options"][0]["label"] == "New task in Project"
 

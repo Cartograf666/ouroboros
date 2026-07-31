@@ -444,7 +444,10 @@ def _route_project_chat_to_running_task(
                 active_fence = ACCEPTANCE_FENCES.get(fence_root)
                 if isinstance(active_fence, dict) and str(active_fence.get("status") or "") == "sealed":
                     return ""
-            write_owner_message(task_drive, f"{message}{attachment_note}", tid, msg_id=msg_id)
+            if not write_owner_message(
+                task_drive, f"{message}{attachment_note}", tid, msg_id=msg_id
+            ):
+                return ""
             if direct_lock_held:
                 direct_agent._owner_message_generation = int(
                     getattr(direct_agent, "_owner_message_generation", 0) or 0
@@ -923,15 +926,16 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         # through the conversation decision lane would combine skill_repair with
         # _ephemeral_turn: ephemeral hides the repair mutators while heal mode
         # blocks promotion. Promote it directly without weakening either policy.
-        from supervisor.workers import promote_chat_to_task
+        from supervisor.events import _handle_promote_chat_to_task
 
         ctx.consciousness.inject_observation(
             f"Message from my human: {incoming.get('log_text') or ''}"
         )
-        task_id = uuid.uuid4().hex[:8]
+        task_id = uuid.uuid4().hex[:16]
         event = {
             "type": "promote_chat_to_task",
             "task_id": task_id,
+            "routing_token": uuid.uuid4().hex,
             "objective": text or image_caption,
             "chat_id": chat_id,
             "client_message_id": client_message_id,
@@ -945,7 +949,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         else:
             event["origin_suppressed"] = True
         try:
-            outcome = promote_chat_to_task(event, ctx)
+            outcome = _handle_promote_chat_to_task(event, ctx)
         except Exception:
             log.warning("Direct skill-repair promotion failed", exc_info=True)
             outcome = {
@@ -955,7 +959,15 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
             }
         outcome = outcome if isinstance(outcome, dict) else {"status": "scheduled", "task_id": task_id}
         outcome_status = str(outcome.get("status") or "needs_manual_target")
-        if outcome_status != "scheduled":
+        if outcome_status == "scheduled":
+            try:
+                ctx.send_with_budget(
+                    chat_id,
+                    f"✅ Repair task {task_id} was accepted and durably scheduled.",
+                )
+            except Exception:
+                log.debug("Repair promotion success notification failed", exc_info=True)
+        else:
             reason = str(outcome.get("reason") or outcome_status)
             try:
                 ctx.send_with_budget(
@@ -964,15 +976,6 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
                 )
             except Exception:
                 log.debug("Repair promotion refusal notification failed", exc_info=True)
-        _record_routing_receipt(
-            bridge,
-            ctx,
-            chat_id=chat_id,
-            client_message_id=client_message_id,
-            action="promote_chat_to_task",
-            target=str(outcome.get("task_id") or task_id),
-            status=outcome_status,
-        )
         return
     reserved_project = _reserved_project_for_chat(ctx, chat_id)
     project_id = (
@@ -1903,6 +1906,15 @@ def _shutdown_task_cleanup_args(restart_requested: bool) -> tuple[str, str]:
     return "cancelled", reason
 
 
+def _shutdown_supervisor_event_bus() -> None:
+    try:
+        from supervisor.workers import shutdown_event_q
+
+        shutdown_event_q()
+    except Exception:
+        pass
+
+
 def _execute_panic_stop(consciousness, kill_workers_fn) -> None:
     _execute_panic_stop_impl(
         consciousness,
@@ -2276,6 +2288,7 @@ async def lifespan(app):
             get_bridge().shutdown()
         except Exception:
             pass
+        _shutdown_supervisor_event_bus()
 
 
 app = NetworkAuthGate(Starlette(routes=routes, lifespan=lifespan))

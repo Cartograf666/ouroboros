@@ -5,9 +5,17 @@ from __future__ import annotations
 import types
 
 
-def test_promote_tool_emits_event_with_chat_and_project(tmp_path):
+def _confirm_promote(monkeypatch):
+    monkeypatch.setattr(
+        "ouroboros.tools.control._wait_for_promotion_admission",
+        lambda *_args, **_kwargs: {"status": "scheduled"},
+    )
+
+
+def test_promote_tool_emits_event_with_chat_and_project(tmp_path, monkeypatch):
     from ouroboros.tools.control import _promote_chat_to_task
 
+    _confirm_promote(monkeypatch)
     events = []
     ctx = types.SimpleNamespace(
         pending_events=events,
@@ -16,7 +24,8 @@ def test_promote_tool_emits_event_with_chat_and_project(tmp_path):
         drive_root=tmp_path,
     )
     out = _promote_chat_to_task(ctx, "Build the racer prototype", project_id="racer")
-    assert out.startswith("OK: promoted to supervised task")
+    assert out.startswith("OK: task")
+    assert "accepted and durably scheduled" in out
     assert len(events) == 1
     evt = events[0]
     assert evt["type"] == "promote_chat_to_task"
@@ -38,11 +47,12 @@ def test_promote_tool_rejects_dirty_project_id(tmp_path):
     assert not ctx.pending_events
 
 
-def test_promote_tool_project_name_creates_named_project_event(tmp_path):
+def test_promote_tool_project_name_creates_named_project_event(tmp_path, monkeypatch):
     """LLM-first 'create a named project and work there' (v6.33.0): project_name
     derives a clean id, carries the human display name, and rides title."""
     from ouroboros.tools.control import _promote_chat_to_task
 
+    _confirm_promote(monkeypatch)
     events = []
     ctx = types.SimpleNamespace(
         pending_events=events, event_queue=None, current_chat_id=1, drive_root=tmp_path,
@@ -51,7 +61,7 @@ def test_promote_tool_project_name_creates_named_project_event(tmp_path):
         ctx, "research everything about the airi institute",
         project_name="Airi Research", title="Airi Research",
     )
-    assert out.startswith("OK: promoted to supervised task")
+    assert out.startswith("OK: task")
     assert "new project 'Airi Research'" in out
     evt = events[0]
     assert evt["project_name"] == "Airi Research"
@@ -71,19 +81,20 @@ def test_project_id_from_display_name_handles_non_ascii():
     assert project_id_from_display_name("") == ""
 
 
-def test_promote_tool_cyrillic_project_name_still_creates(tmp_path):
+def test_promote_tool_cyrillic_project_name_still_creates(tmp_path, monkeypatch):
     """promote_chat_to_task(project_name=<cyrillic>) must NOT fail — it derives a
     hash id while keeping the Cyrillic display name (Workflow-caught regression)."""
     from ouroboros.project_facts import project_id_from_display_name
     from ouroboros.tools.control import _promote_chat_to_task
 
+    _confirm_promote(monkeypatch)
     events = []
     ctx = types.SimpleNamespace(
         pending_events=events, event_queue=None, current_chat_id=1, drive_root=tmp_path,
     )
     out = _promote_chat_to_task(ctx, "исследуй динозавров", project_name="динозавры", title="динозавры")
     assert "TOOL_ARG_ERROR" not in out
-    assert out.startswith("OK: promoted")
+    assert out.startswith("OK: task")
     evt = events[0]
     assert evt["project_name"] == "динозавры"
     assert evt["project_id"] == project_id_from_display_name("динозавры")
@@ -100,6 +111,7 @@ def test_promote_event_names_project_from_display_name(tmp_path, monkeypatch):
     enqueued = []
     ctx = types.SimpleNamespace(
         enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
     )
     workers.promote_chat_to_task({
@@ -141,6 +153,7 @@ def test_promote_event_enqueues_first_class_task(tmp_path, monkeypatch):
     enqueued = []
     ctx = types.SimpleNamespace(
         enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
     )
     evt = {
@@ -201,6 +214,7 @@ def test_route_to_project_event_emits_route_receipt_action(tmp_path, monkeypatch
         WORKERS={0: types.SimpleNamespace()},
         bridge=Bridge(),
         enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
         append_jsonl=lambda *args, **kwargs: None,
     )
@@ -208,6 +222,7 @@ def test_route_to_project_event_emits_route_receipt_action(tmp_path, monkeypatch
     _handle_promote_chat_to_task({
         "type": "promote_chat_to_task",
         "task_id": "route01",
+        "routing_token": "route-token-01",
         "objective": "Continue the racer",
         "project_id": "racer",
         "chat_id": 1,
@@ -229,6 +244,7 @@ def test_promoted_skill_repair_is_canonical_confined_managed_task(tmp_path, monk
     enqueued = []
     ctx = types.SimpleNamespace(
         enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
     )
 
@@ -268,6 +284,7 @@ def test_promoted_skill_repair_rejects_missing_payload(tmp_path, monkeypatch):
     enqueued = []
     ctx = types.SimpleNamespace(
         enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
     )
 
@@ -314,6 +331,7 @@ def test_promote_route_persists_source_ref_and_fails_closed_on_binding_error(tmp
     enqueued = []
     ctx = types.SimpleNamespace(
         enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
     )
     from ouroboros.project_dialogue import _text_sha256
@@ -379,6 +397,7 @@ def test_promote_chat_to_task_broadcasts_projects_changed(tmp_path, monkeypatch)
     monkeypatch.setattr(mbus, "get_bridge", lambda: fake_bridge)
     ctx = types.SimpleNamespace(
         enqueue_task=lambda task: None,
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
     )
     workers.promote_chat_to_task({
@@ -631,7 +650,9 @@ def test_route_project_chat_defers_when_multiple_running_tasks(tmp_path, monkeyp
     project_chat = int(proj["chat_id"])
 
     delivered = []
-    monkeypatch.setattr(omb, "write_owner_message", lambda *a, **k: delivered.append(a))
+    monkeypatch.setattr(
+        omb, "write_owner_message", lambda *a, **k: delivered.append(a) or True
+    )
 
     ctx = types.SimpleNamespace(
         DRIVE_ROOT=tmp_path,
@@ -659,7 +680,7 @@ def test_route_project_chat_1to1_delivery_is_idempotent(tmp_path, monkeypatch):
 
     msg_ids = []
     monkeypatch.setattr(omb, "write_owner_message",
-                        lambda drive, text, tid, msg_id=None, **k: msg_ids.append(msg_id))
+                        lambda drive, text, tid, msg_id=None, **k: msg_ids.append(msg_id) or True)
 
     ctx = types.SimpleNamespace(
         DRIVE_ROOT=tmp_path,
@@ -669,6 +690,33 @@ def test_route_project_chat_1to1_delivery_is_idempotent(tmp_path, monkeypatch):
     server._route_project_chat_to_running_task(ctx, project_chat, "go", "cmid-7")
     server._route_project_chat_to_running_task(ctx, project_chat, "go", "cmid-7")
     assert msg_ids == ["cmid-7:pr", "cmid-7:pr"]
+
+
+def test_route_project_chat_does_not_confirm_failed_mailbox_write(tmp_path, monkeypatch):
+    import types
+
+    import ouroboros.owner_mailbox as omb
+    import server
+    from ouroboros.projects_registry import create_project
+
+    project_chat = int(create_project(tmp_path, "racer")["chat_id"])
+    monkeypatch.setattr(omb, "write_owner_message", lambda *_a, **_k: False)
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path,
+        RUNNING={
+            "pr": {
+                "task": {"id": "pr", "chat_id": project_chat},
+                "last_heartbeat_at": 1.0,
+            }
+        },
+    )
+
+    assert (
+        server._route_project_chat_to_running_task(
+            ctx, project_chat, "must be durable", "owner-msg"
+        )
+        == ""
+    )
 
 
 def test_busy_project_chat_routes_to_ephemeral_decision_turn(tmp_path, monkeypatch):
@@ -1127,10 +1175,11 @@ def test_steer_task_tool_emits_event_with_target_and_client_id(tmp_path):
     events = []
     ctx = types.SimpleNamespace(
         pending_events=events, event_queue=None, current_chat_id=1,
+        drive_root=tmp_path,
         task_metadata={"client_message_id": "cm-42"},
     )
     out = _steer_task(ctx, "abc12345", "also add the benchmarks slide")
-    assert out.startswith("✉️ Steering task abc12345")
+    assert out.startswith("⚠️ STEER_UNCONFIRMED")
     assert len(events) == 1
     evt = events[0]
     assert evt["type"] == "steer_task"
@@ -1154,6 +1203,7 @@ def test_main_steer_can_address_project_bound_root_from_host_manifest(tmp_path, 
         pending_events=emitted,
         event_queue=None,
         current_chat_id=1,
+        drive_root=tmp_path,
         task_metadata={
             "client_message_id": "main-42",
             "routing_contract": {"source_lane": "main"},
@@ -1210,6 +1260,7 @@ def test_busy_direct_main_root_is_manifested_and_steerable_without_promotion(tmp
         pending_events=emitted,
         event_queue=None,
         current_chat_id=1,
+        drive_root=tmp_path,
         task_metadata={
             "client_message_id": "followup-1",
             "routing_contract": metadata["routing_contract"],

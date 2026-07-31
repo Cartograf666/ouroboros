@@ -269,6 +269,8 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "delegation_constraint_require_lane": (False, "control_delegation.py:126 rejected call"),
     "deep_self_review_unavailable": (False, "agent.py:705 owner-config gap on a review task"),
     "deep_self_review_error": (False, "agent.py:743 review-stage error on a review task"),
+    "worker_pool_unavailable": (False, "gateway/tasks.py managed-task admission refusal"),
+    "worker_pool_state_unavailable": (False, "gateway/tasks.py fail-closed admission inspection"),
 }
 
 _REASON_CODE_LITERAL = re.compile(

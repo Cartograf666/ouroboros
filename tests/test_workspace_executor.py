@@ -1400,6 +1400,7 @@ def test_docker_executor_rejects_network_none_when_container_has_network(tmp_pat
 def test_api_task_metadata_accepts_normalized_executor_ref(tmp_path, monkeypatch):
     from ouroboros.gateway import tasks
     import supervisor.queue as queue
+    import supervisor.workers as workers
 
     captured: dict[str, object] = {}
 
@@ -1419,6 +1420,7 @@ def test_api_task_metadata_accepts_normalized_executor_ref(tmp_path, monkeypatch
 
     def fake_enqueue(task):
         captured.update(task)
+        return task
 
     _init_repo(tmp_path / "workspace")
     (tmp_path / "data").mkdir()
@@ -1426,7 +1428,9 @@ def test_api_task_metadata_accepts_normalized_executor_ref(tmp_path, monkeypatch
     monkeypatch.setattr(tasks, "request_drive_root", lambda _request: tmp_path / "data")
     monkeypatch.setattr(tasks, "request_repo_dir", lambda _request: tmp_path / "repo")
     monkeypatch.setattr(queue, "enqueue_task", fake_enqueue)
-    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda *a, **k: True)
+    monkeypatch.setattr(workers, "WORKERS", {0: SimpleNamespace()})
+    monkeypatch.setattr(workers, "_WORKER_POOL_DISABLED_REASON", "")
 
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(supervisor_ready_event=None)))
     response = asyncio.run(tasks.api_tasks_create(request))

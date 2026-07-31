@@ -221,6 +221,7 @@ def test_d5_project_scoped_shared_preserves_mode_but_isolates_drive(tmp_path, mo
 
     from ouroboros.gateway import tasks
     from supervisor import queue
+    from supervisor import workers
 
     async def fake_request_json_or(_request, _default):
         return {"description": "x", "project_id": "proj_x", "memory_mode": "shared"}
@@ -240,8 +241,14 @@ def test_d5_project_scoped_shared_preserves_mode_but_isolates_drive(tmp_path, mo
     monkeypatch.setattr(tasks, "request_drive_root", lambda _r: tmp_path / "data")
     monkeypatch.setattr(tasks, "request_repo_dir", lambda _r: tmp_path / "repo")
     monkeypatch.setattr(tasks, "prepare_task_drive", fake_prepare)
-    monkeypatch.setattr(queue, "enqueue_task", lambda task: captured.update(task))
-    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr(
+        queue,
+        "enqueue_task",
+        lambda task: captured.update(task) or task,
+    )
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda *a, **k: True)
+    monkeypatch.setattr(workers, "WORKERS", {0: SimpleNamespace()})
+    monkeypatch.setattr(workers, "_WORKER_POOL_DISABLED_REASON", "")
 
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(supervisor_ready_event=None)))
     response = asyncio.run(tasks.api_tasks_create(request))
