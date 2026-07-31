@@ -198,3 +198,28 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
    SUPERSEDES patches 1-8 for the official-path (run-all) flow; the bridge-path patches
    remain for archaeology. Working tree: /mnt/data/a.razzhigaev/clb_official_v681/bench,
    branch `ouroboros-submission`.
+
+## Addendum (luna ablation campaign, 2026-07-31)
+
+10. `adapter_luna_ablation.v6870.patch` — delta on top of `adapter_official_submission.v681`
+    (i.e. against submission commit `a691cf3`) for the harness ablation that runs Ouroboros
+    and the Codex CLI on the SAME model, `openai/gpt-5.6-luna`. Two changes:
+    - `src/systems/ouroboros/_live_bridge.py`: `_format_repair_action` referenced `_rb`
+      without the lazy import every other use site in that module performs, so the
+      last-resort format-repair branch raised `NameError` the moment it was reached —
+      the exception escaped `respond()`, `_abandon_task()` never ran, and the question
+      was scored as an empty action. One occurrence in 3204 deliveries on sonnet-4.6;
+      the branch matters far more on a weaker model, which is what this campaign runs.
+    - `src/systems/codex/system.py`: an optional custom provider (`provider_base_url`,
+      `provider_env_key`, `provider_id`) so the Codex arm can be pointed at the same
+      OpenRouter endpoint as the Ouroboros arm instead of native OpenAI — otherwise the
+      comparison confounds harness with provider. Codex refuses to redirect its built-in
+      `openai` provider id, so this declares a NEW `model_providers.<id>`, and this CLI
+      generation only loads a custom provider with `wire_api="responses"`. On that path
+      `auth.json` is not written (the key comes from `env_key`) and the recorded usage
+      provider names the route actually taken. Default behaviour is unchanged.
+    Verified: bench suite 649 passed / 7 skipped (`tests/test_bsm_online_model.py` needs
+    task-specific data and fails to collect in any checkout, before and after).
+    Public implementation for the ablation run: branch `ouroboros-luna-ablation` of
+    `razzant/continual-learning-bench`. PR #10's `ouroboros-submission` branch is left
+    untouched so the sonnet-4.6 submission keeps matching the code that produced it.
