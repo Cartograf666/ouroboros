@@ -39,6 +39,11 @@ def _make_repo(tmp_path: Path, version: str = "4.99.1") -> Path:
         '{\n  "name": "ouroboros-web",\n  "version": "0.0.0"\n}\n',
         encoding="utf-8",
     )
+    modules = web / "modules"
+    modules.mkdir()
+    (modules / "api_types.js").write_text(
+        "export const GATEWAY_CONTRACT_VERSION = '0.0.0';\n", encoding="utf-8"
+    )
 
     badge_line = (
         '[![Version 0.0.0]'
@@ -104,6 +109,32 @@ class TestSyncReleaseMetadata:
         )
 
         assert desync == ['web/package.json (expected "version": "1.2.3-rc.4")']
+
+    def test_gateway_contract_version_is_a_release_carrier(self, tmp_path):
+        """tests/test_gateway_parity.py pins GATEWAY_CONTRACT_VERSION to VERSION,
+        so the release tooling must sync it. It did not, and every release had to
+        rediscover the carrier through a red CI run."""
+        repo = _make_repo(tmp_path, "1.2.3")
+
+        changed = sync_release_metadata(str(repo))
+        api_types = repo / "web" / "modules" / "api_types.js"
+
+        assert "web/modules/api_types.js" in changed
+        assert "GATEWAY_CONTRACT_VERSION = '1.2.3'" in api_types.read_text(encoding="utf-8")
+
+    def test_stale_gateway_contract_version_is_reported(self, tmp_path):
+        repo = _make_repo(tmp_path, "1.2.3")
+        sync_release_metadata(str(repo))
+        api_types = repo / "web" / "modules" / "api_types.js"
+        api_types.write_text("export const GATEWAY_CONTRACT_VERSION = '1.2.2';\n", encoding="utf-8")
+
+        desync = version_carrier_desyncs(
+            "1.2.3",
+            api_types_text=api_types.read_text(encoding="utf-8"),
+            detailed=True,
+        )
+
+        assert desync == ["web/modules/api_types.js (expected GATEWAY_CONTRACT_VERSION = '1.2.3')"]
 
     def test_syncs_architecture_header(self, tmp_path):
         repo = _make_repo(tmp_path, "1.2.3")

@@ -2310,7 +2310,12 @@ def test_task_scoped_proxy_gives_each_task_its_own_session(tmp_path):
     cfg = _json.loads(open(out).read())
     assert cfg[0]["username"] == "acct;sessid.deadbeefcafe0001"
     assert cfg[0]["password"] == "p", "credentials must survive scoping"
-    assert _os.stat(out).st_mode & 0o777 == 0o600, "the task config carries a credential"
+    from ouroboros.observability import posix_private_modes_supported
+
+    if posix_private_modes_supported():
+        # Windows does not express privacy through POSIX mode bits, so asserting
+        # them there fails on every run without saying anything about security.
+        assert _os.stat(out).st_mode & 0o777 == 0o600, "the task config carries a credential"
     # Idempotent: an already-scoped username is not double-suffixed.
     again = rcb._task_scoped_proxy_config(out, state, "0000")
     assert _json.loads(open(again).read())[0]["username"].count(";sessid.") == 1

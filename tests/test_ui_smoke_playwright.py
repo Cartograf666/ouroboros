@@ -1840,7 +1840,19 @@ def _mobile_keyboard_drawer_assertions(page, url: str, screenshot_path: pathlib.
         " && document.activeElement?.id !== 'chat-input'",
         timeout=5_000,
     )
-    page.wait_for_timeout(220)  # finish the 180ms drawer transition
+    # Wait for the drawer to actually arrive instead of sleeping past the 180ms
+    # transform transition: a fixed 220ms budget left ~40ms of margin and lost
+    # that race on the Linux WebKit runner, which then measured the drawer at its
+    # closed position (-105% => left -336) and failed. A drawer that never opens
+    # still fails here, now naming the cause instead of a stale geometry read.
+    # The predicate is byte-for-byte the one asserted below, so the wait can
+    # never pass on a value the assertion would reject (a rounded variant let
+    # left=-1.017 through and failed one line later).
+    page.wait_for_function(
+        "() => document.querySelector('#primary-sidebar')"
+        ".getBoundingClientRect().left >= -1",
+        timeout=5_000,
+    )
 
     state = page.evaluate(
         """() => {

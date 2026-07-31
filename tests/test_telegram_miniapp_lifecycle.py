@@ -460,6 +460,7 @@ def test_stop_sidecar_bounds_cancellation_resistant_proxy_close(
     asyncio.run(scenario())
 
 
+@pytest.mark.serial
 def test_stuck_proxy_close_hard_exits_companion_process() -> None:
     code = """
 import asyncio
@@ -485,7 +486,12 @@ asyncio.run(companion.stop_sidecar(None, None, Sidecar()))
         env={**os.environ, "PYTHONPATH": str(SCRIPTS_DIR)},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=1.0,
+        # Patience for a real interpreter to boot, not the behaviour under test:
+        # `_SIDECAR_STOP_GRACE_SEC = 0.01` is what keeps the stuck-close fast, and
+        # the assertion below is what proves the hard exit. A 1s budget could not
+        # cover Python startup on a loaded Windows runner, so this test failed CI
+        # for a reason unrelated to the contract it guards.
+        timeout=60.0,
         check=False,
     )
     assert result.returncode == companion._STUCK_CLEANUP_EXIT_CODE

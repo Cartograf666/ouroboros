@@ -115,6 +115,7 @@ def version_carrier_desyncs(
     web_package_text: str = "",
     readme_text: str = "",
     arch_text: str = "",
+    api_types_text: str = "",
     detailed: bool = False,
 ) -> List[str]:
     """Return release-carrier mismatch labels for already-read file contents."""
@@ -137,6 +138,14 @@ def version_carrier_desyncs(
             desync.append(f"README.md badge (expected {version} / {badge_token})" if detailed else "README.md badge")
     if arch_text and extract_architecture_header_version(arch_text) != version:
         desync.append(f"docs/ARCHITECTURE.md header (expected # Ouroboros v{version})" if detailed else "ARCHITECTURE.md header")
+    # tests/test_gateway_parity.py pins this to VERSION, so it is a release
+    # carrier like the others; leaving it out of the sync made every release
+    # rediscover it through a red CI run instead of the tool that exists for it.
+    if api_types_text and f"GATEWAY_CONTRACT_VERSION = '{version}'" not in api_types_text:
+        desync.append(
+            f"web/modules/api_types.js (expected GATEWAY_CONTRACT_VERSION = '{version}')"
+            if detailed else "web/modules/api_types.js"
+        )
     return desync
 
 
@@ -182,6 +191,18 @@ def sync_release_metadata(repo_dir: str) -> List[str]:
         if new_text != text:
             web_package.write_text(new_text, encoding="utf-8")
             changed.append("web/package.json")
+
+    api_types = root / "web" / "modules" / "api_types.js"
+    if api_types.exists():
+        text = api_types.read_text(encoding="utf-8")
+        new_text = re.sub(
+            r"(GATEWAY_CONTRACT_VERSION\s*=\s*')[^']*(')",
+            lambda m: f"{m.group(1)}{version}{m.group(2)}",
+            text,
+        )
+        if new_text != text:
+            api_types.write_text(new_text, encoding="utf-8")
+            changed.append("web/modules/api_types.js")
 
     readme = root / "README.md"
     if readme.exists():

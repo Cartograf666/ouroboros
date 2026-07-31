@@ -200,6 +200,7 @@ def _release_metadata_preflight(
         pyproject_path = repo_dir / "pyproject.toml"
         web_package_path = repo_dir / "web" / "package.json"
         arch_path = repo_dir / "docs" / "ARCHITECTURE.md"
+        api_types_path = repo_dir / "web" / "modules" / "api_types.js"
         version_str = version_path.read_text(encoding="utf-8").strip()
         if not is_release_version(version_str):
             return None
@@ -207,12 +208,14 @@ def _release_metadata_preflight(
         web_package_text = web_package_path.read_text(encoding="utf-8") if web_package_path.exists() else ""
         readme_text = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
         arch_text = arch_path.read_text(encoding="utf-8") if arch_path.exists() else ""
+        api_types_text = api_types_path.read_text(encoding="utf-8") if api_types_path.exists() else ""
         desync = version_carrier_desyncs(
             version_str,
             pyproject_text=pyproject_text,
             web_package_text=web_package_text,
             readme_text=readme_text,
             arch_text=arch_text,
+            api_types_text=api_types_text,
             detailed=True,
         )
         if readme_text:
