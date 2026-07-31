@@ -92,14 +92,95 @@ class Worker:
 
 
 _EVENT_Q = None
+_EVENT_Q_MANAGER = None
+_EVENT_Q_GENERATION = ""
+_EVENT_Q_LOCK = threading.Lock()
+_EVENT_Q_SHUTDOWN = False
+_WORKER_POOL_DISABLED_REASON = ""
+_WORKER_LIFECYCLE_LOCK = threading.RLock()
+
+
+def _serialized_worker_lifecycle(fn):
+    def wrapped(*args, **kwargs):
+        with _WORKER_LIFECYCLE_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapped
 
 
 def get_event_q():
-    """Return EVENT_Q, creating it lazily."""
-    global _EVENT_Q
-    if _EVENT_Q is None:
-        _EVENT_Q = _get_ctx().Queue()
+    """Return the process-lifetime supervisor event bus, creating it lazily.
+
+    Worker-pool generations are replaceable; the producers that publish onto
+    this bus (direct chat, consciousness, active turns, and workers) are not.
+    Rotating the queue during a pool respawn strands those producers on an
+    undrained queue, so only a new server process creates a new bus.
+    """
+    global _EVENT_Q, _EVENT_Q_MANAGER, _EVENT_Q_GENERATION
+    with _EVENT_Q_LOCK:
+        if _EVENT_Q_SHUTDOWN:
+            raise RuntimeError("supervisor event bus is shutting down")
+        if _EVENT_Q is None:
+            # A raw multiprocessing.Queue has an asynchronous feeder and its
+            # pipe can be corrupted when a worker is force-killed mid-frame.
+            # A manager-backed queue serializes synchronously in the producer
+            # and isolates each producer connection, so replacing/killing a
+            # worker generation cannot wedge the process-lifetime bus.
+            _EVENT_Q_MANAGER = _get_ctx().Manager()
+            _EVENT_Q = _EVENT_Q_MANAGER.Queue()
+            _EVENT_Q_GENERATION = f"{os.getpid()}:{uuid.uuid4().hex[:12]}"
+            try:
+                from ouroboros.process_custody import record_process
+
+                manager_proc = getattr(_EVENT_Q_MANAGER, "_process", None)
+                manager_pid = int(getattr(manager_proc, "pid", 0) or 0)
+                if manager_pid:
+                    record_process(
+                        DRIVE_ROOT,
+                        pid=manager_pid,
+                        cmd="multiprocessing SyncManager",
+                        purpose="supervisor_event_queue_manager",
+                        scope="session",
+                        reap_process_group=False,
+                    )
+            except Exception:
+                log.warning("Failed to custody-track event queue manager", exc_info=True)
+            try:
+                append_jsonl(
+                    DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                    {
+                        "ts": utc_now_iso(),
+                        "type": "event_queue_generation_started",
+                        "generation": _EVENT_Q_GENERATION,
+                        "server_pid": os.getpid(),
+                        "start_method": _WORKER_START_METHOD,
+                    },
+                )
+            except Exception:
+                log.debug("Failed to record event queue generation", exc_info=True)
     return _EVENT_Q
+
+
+def shutdown_event_q() -> None:
+    """Stop the manager on graceful exit; custody reaps it after a hard exit."""
+    global _EVENT_Q, _EVENT_Q_MANAGER, _EVENT_Q_GENERATION, _EVENT_Q_SHUTDOWN
+    with _EVENT_Q_LOCK:
+        _EVENT_Q_SHUTDOWN = True
+        manager = _EVENT_Q_MANAGER
+        _EVENT_Q = None
+        _EVENT_Q_MANAGER = None
+        _EVENT_Q_GENERATION = ""
+    if manager is not None:
+        try:
+            manager.shutdown()
+        except Exception:
+            log.debug("Event queue manager shutdown failed", exc_info=True)
+
+
+def event_queue_generation() -> str:
+    """Stable diagnostic identity for the current server-process event bus."""
+    get_event_q()
+    return _EVENT_Q_GENERATION
 
 
 WORKERS: Dict[int, Worker] = {}
@@ -110,6 +191,38 @@ QUEUE_SEQ_COUNTER_REF: Dict[str, int] = {"value": 0}
 
 # Shared queue lock; queue.py owns the canonical definition.
 from supervisor.queue import _queue_lock
+
+
+def worker_pool_admission_state(ctx: Any = None) -> Dict[str, Any]:
+    """Return the user-facing managed-task executor admission state.
+
+    A busy or reaping pool is still a valid queue target.  Only an explicitly
+    disabled pool, or a genuinely absent pool after supervisor readiness, is
+    unavailable.  Internal boot/update recovery may enqueue before an initial
+    spawn and therefore does not use this user-ingress predicate.
+    """
+    pool = getattr(ctx, "WORKERS", WORKERS) if ctx is not None else WORKERS
+    with _queue_lock:
+        disabled_reason = str(_WORKER_POOL_DISABLED_REASON or "")
+        worker_count = len(pool)
+    available = worker_count > 0 and not disabled_reason
+    return {
+        "available": available,
+        "reason_code": "" if available else "worker_pool_unavailable",
+        "disabled_reason": disabled_reason or ("no_workers" if not worker_count else ""),
+        "worker_count": worker_count,
+    }
+
+
+def ensure_worker_pool_started(n: int = 0, *, allow_disabled_restart: bool = False) -> bool:
+    """Start an absent pool; only explicit internal recovery may clear disablement."""
+    state = worker_pool_admission_state()
+    if state["available"]:
+        return True
+    if state["disabled_reason"] not in {"", "no_workers"} and not allow_disabled_restart:
+        return False
+    spawn_workers(n)
+    return True
 
 
 _chat_agent = None
@@ -227,6 +340,27 @@ def _canonical_promoted_repair_constraint(value: Any) -> tuple[Optional[dict], s
     }, ""
 
 
+def _promote_duplicate_reason(task_id: str, ctx: Any) -> str:
+    """Fail closed if a promoted id is already live, durable, or uncheckable."""
+    pending = getattr(ctx, "PENDING", PENDING)
+    running = getattr(ctx, "RUNNING", RUNNING)
+    with _queue_lock:
+        live_duplicate = any(
+            isinstance(row, dict) and str(row.get("id") or "") == task_id
+            for row in list(pending or [])
+        ) or task_id in (running or {})
+    try:
+        from ouroboros.task_results import load_task_result
+
+        stored_duplicate = bool(
+            load_task_result(getattr(ctx, "DRIVE_ROOT", DRIVE_ROOT), task_id)
+        )
+    except Exception:
+        log.warning("promote: duplicate-id lookup failed for %s", task_id, exc_info=True)
+        return "task_id_lookup_failed"
+    return "duplicate_task_id" if live_duplicate or stored_duplicate else ""
+
+
 def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     """Enqueue a first-class pooled owner task from a conversation-lane promote.
 
@@ -236,10 +370,24 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     """
     from ouroboros.contracts.task_contract import attach_task_contract
 
-    tid = str(evt.get("task_id") or uuid.uuid4().hex[:8])
+    tid = str(evt.get("task_id") or uuid.uuid4().hex[:16])
+    admission_token = str(evt.get("routing_token") or "").strip()
     objective = str(evt.get("objective") or "").strip()
     if not objective:
         return {"status": "needs_manual_target", "reason": "empty_objective", "task_id": tid}
+    # Reject before project/source/workspace side effects. enqueue_task repeats
+    # the check atomically for the tiny race before queue insertion.
+    duplicate_reason = _promote_duplicate_reason(tid, ctx)
+    if duplicate_reason:
+        return {
+            "status": "needs_manual_target",
+            "reason": duplicate_reason,
+            "task_id": tid,
+        }
+
+    evt = dict(evt)
+    source_note = str(evt.get("_source_note") or "")
+    effective_pid = str(evt.get("project_id") or "")
     repair_constraint, constraint_error = _canonical_promoted_repair_constraint(
         evt.get("task_constraint")
     )
@@ -274,6 +422,10 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         "expected_output": expected_output,
         "title": title,
         "source": "promote_chat_to_task",
+        "_require_unique_task_id": True,
+        "_require_worker_pool": True,
+        "_admission_token": admission_token,
+        "promotion_admission_token": admission_token,
     }
     if repair_constraint is not None:
         # Must be present before attach_task_contract so the managed root task
@@ -468,19 +620,34 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
             "project_lifecycle": str(admitted.get("_project_lifecycle") or ""),
             "task_id": tid,
         }
-    # v6.40 "name ANY task card": the agent already coined `title` here (zero extra LLM
-    # call), so persist it as suggested_name + emit task_named so the promoted card shows
-    # the human title up front exactly like a proactively-named direct-chat card, and a
-    # later turn-into-project reuses it. Same-status (SCHEDULED) write — merges, never
-    # regresses; fail-soft.
-    if title:
-        try:
-            from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
-
-            write_task_result(DRIVE_ROOT, tid, STATUS_SCHEDULED, suggested_name=title)
-            _broadcast_task_named({"type": "task_named", "task_id": tid, "suggested_name": title})
-        except Exception:
-            log.debug("promote: suggested_name persist/broadcast failed for %s", tid, exc_info=True)
+    # A positive promote confirmation is allowed only after the durable queue
+    # projection exists.  The event handler writes the scheduled task result
+    # after the routing receipt; keeping that last step outside this function
+    # makes the result itself the cross-process admission receipt.
+    persist_snapshot = getattr(ctx, "persist_queue_snapshot", None)
+    if not callable(persist_snapshot):
+        return {
+            "status": "needs_manual_target",
+            "reason": "queue_snapshot_persist_unavailable",
+            "task_id": tid,
+            "admission_started": True,
+        }
+    try:
+        if persist_snapshot(reason="promote_chat_to_task") is False:
+            return {
+                "status": "needs_manual_target",
+                "reason": "queue_snapshot_persist_failed",
+                "task_id": tid,
+                "admission_started": True,
+            }
+    except Exception:
+        log.warning("promote: queue snapshot persist failed for %s", tid, exc_info=True)
+        return {
+            "status": "needs_manual_target",
+            "reason": "queue_snapshot_persist_failed",
+            "task_id": tid,
+            "admission_started": True,
+        }
     # v6.82 (P5) disclosed residual: a PROMOTED root carries the host-attested
     # `cancelable` marker from its first RUNNING relay, not from enqueue — the
     # promote path emits no owner-facing progress frame of its own, and minting a
@@ -488,7 +655,12 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     # message seam (tests/test_heartbeat_presentation.py). While it is still
     # PENDING the Dashboard Activity row cancels it; the card action appears once
     # it starts.
-    return {"status": "scheduled", "task_id": tid}
+    outcome = {"status": "scheduled", "task_id": tid}
+    if effective_pid:
+        outcome["project_id"] = effective_pid
+    if source_note:
+        outcome["source_note"] = source_note
+    return outcome
 
 
 def _fail_promoted_task_loudly(ctx: Any, task: dict, ws_error: str) -> None:
@@ -1366,14 +1538,22 @@ def reap_orphaned_workers() -> int:
     return len(killed)
 
 
+@_serialized_worker_lifecycle
 def spawn_workers(n: int = 0) -> None:
-    global _CTX, _EVENT_Q
-    # Reap any workers left orphaned by a prior/abrupt server exit before we
-    # spawn fresh ones, so process groups do not accumulate across restarts.
+    global _CTX, _WORKER_POOL_DISABLED_REASON
+    global _LAST_SPAWN_TIME
+    with _queue_lock:
+        if WORKERS:
+            raise RuntimeError(
+                "spawn_workers requires an empty pool; stop the current workers "
+                "or use respawn_worker for one slot"
+            )
+    # Never hold the queue's process-local threading.RLock across fork: a child
+    # would inherit it owned by a vanished thread.  The dedicated lifecycle lock
+    # is not used by worker code and serializes competing full-pool starts/kills.
     reap_orphaned_workers()
-    # Fresh context ensures workers use current code.
     _CTX = mp.get_context(_WORKER_START_METHOD)
-    _EVENT_Q = _CTX.Queue()
+    event_q = get_event_q()
     events_path = DRIVE_ROOT / "logs" / "events.jsonl"
     try:
         events_offset = int(events_path.stat().st_size)
@@ -1388,33 +1568,63 @@ def spawn_workers(n: int = 0) -> None:
             "type": "worker_spawn_start",
             "start_method": _WORKER_START_METHOD,
             "count": count,
+            "event_queue_generation": event_queue_generation(),
+            "event_queue_transport": "manager",
         },
     )
-    WORKERS.clear()
-    for i in range(count):
-        in_q = _CTX.Queue()
-        proc = _CTX.Process(target=worker_main,
-                           args=(i, in_q, _EVENT_Q, str(REPO_DIR), str(DRIVE_ROOT),
-                                 _current_custody_session_id()))
-        proc.daemon = True
-        proc.start()
-        WORKERS[i] = Worker(wid=i, proc=proc, in_q=in_q, busy_task_id=None)
-    global _LAST_SPAWN_TIME
-    _LAST_SPAWN_TIME = time.time()
+    new_workers: Dict[int, Worker] = {}
+    try:
+        for i in range(count):
+            in_q = _CTX.Queue()
+            proc = _CTX.Process(target=worker_main,
+                               args=(i, in_q, event_q, str(REPO_DIR), str(DRIVE_ROOT),
+                                     _current_custody_session_id()))
+            proc.daemon = True
+            proc.start()
+            new_workers[i] = Worker(wid=i, proc=proc, in_q=in_q, busy_task_id=None)
+    except Exception:
+        for worker in new_workers.values():
+            try:
+                worker.proc.terminate()
+                worker.proc.join(timeout=2)
+            except Exception:
+                pass
+        raise
+    with _queue_lock:
+        if WORKERS:
+            for worker in new_workers.values():
+                try:
+                    worker.proc.terminate()
+                    worker.proc.join(timeout=2)
+                except Exception:
+                    pass
+            raise RuntimeError("worker pool appeared during serialized startup")
+        WORKERS.update(new_workers)
+        _WORKER_POOL_DISABLED_REASON = ""
+        _LAST_SPAWN_TIME = time.time()
     _record_worker_pids()
     # Verify asynchronously so spawn does not block the supervisor loop.
     threading.Thread(target=_verify_worker_sha_after_spawn, args=(events_offset,), daemon=True).start()
 
 
+@_serialized_worker_lifecycle
 def kill_workers(
     force: bool = True,
     *,
     result_reason: str = "Worker process crashed (crash storm). Task was not completed.",
     terminal_status: str = "",
     archive_service_logs: bool = True,
+    disable_reason: str = "",
 ) -> None:
+    global _WORKER_POOL_DISABLED_REASON
     from supervisor import queue
     with _queue_lock:
+        if disable_reason:
+            _WORKER_POOL_DISABLED_REASON = str(disable_reason)
+            # Publish the admission fence before slow process-tree teardown so
+            # concurrent ingress can refuse without starting project/workspace
+            # side effects while workers are being joined.
+            queue.persist_queue_snapshot(reason="worker_pool_disabling")
         cleared_running = len(RUNNING)
         from ouroboros.platform_layer import kill_pid_tree
         for w in WORKERS.values():
@@ -1497,19 +1707,55 @@ def _kill_survivors() -> None:
             w.proc.join(timeout=2)
 
 
-def respawn_worker(wid: int) -> None:
+@_serialized_worker_lifecycle
+def respawn_worker(wid: int) -> bool:
+    """Replace one owned slot without forking under the queue RLock.
+
+    The lifecycle lock makes the two-phase check/start/swap mutually exclusive
+    with full-pool shutdown/start.  The identity check after ``proc.start()``
+    prevents a replacement from being installed if the slot was removed while
+    the queue lock was released.
+    """
+    with _queue_lock:
+        old = WORKERS.get(wid)
+    if old is None:
+        return False
     ctx = _get_ctx()
     in_q = ctx.Queue()
     proc = ctx.Process(target=worker_main,
                        args=(wid, in_q, get_event_q(), str(REPO_DIR), str(DRIVE_ROOT),
                              _current_custody_session_id()))
     proc.daemon = True
-    proc.start()
-    # Swap under _queue_lock (an RLock — safe even when the caller already holds
-    # it) so a concurrent assign_tasks cannot enqueue into the slot mid-swap.
+    try:
+        proc.start()
+    except Exception:
+        try:
+            in_q.close()
+            in_q.cancel_join_thread()
+        except Exception:
+            pass
+        raise
+    installed = False
     with _queue_lock:
-        old = WORKERS.get(wid)
-        WORKERS[wid] = Worker(wid=wid, proc=proc, in_q=in_q, busy_task_id=None)
+        if WORKERS.get(wid) is old:
+            WORKERS[wid] = Worker(wid=wid, proc=proc, in_q=in_q, busy_task_id=None)
+            installed = True
+    if not installed:
+        try:
+            from ouroboros.platform_layer import kill_pid_tree
+
+            if proc.pid:
+                kill_pid_tree(proc.pid)
+            elif proc.is_alive():
+                proc.terminate()
+            proc.join(timeout=2)
+        finally:
+            try:
+                in_q.close()
+                in_q.cancel_join_thread()
+            except Exception:
+                pass
+        return False
     # Close the crashed worker's old queue now that nothing can route to it,
     # otherwise its file descriptors / semaphores leak on every respawn.
     if old is not None and getattr(old, "in_q", None) is not None:
@@ -1520,6 +1766,7 @@ def respawn_worker(wid: int) -> None:
             log.debug("Failed to close old worker queue on respawn", exc_info=True)
     _record_worker_pids()
     # Do not reset _LAST_SPAWN_TIME here; respawn grace would hide crash storms.
+    return True
 
 
 def _drop_cancelled_pending() -> None:
@@ -1829,13 +2076,32 @@ def ensure_workers_healthy() -> None:
     if (time.time() - _LAST_SPAWN_TIME) < _SPAWN_GRACE_SEC:
         return
     with _queue_lock:
-        _ensure_workers_healthy_locked(queue)
+        respawn_ids, disable_pool = _ensure_workers_healthy_locked(queue)
+    if disable_pool:
+        # Every lifecycle operation takes lifecycle -> queue lock.  Calling
+        # kill_workers while still holding queue lock would invert that order
+        # against a concurrent respawn and deadlock.
+        kill_workers(disable_reason="worker_crash_storm")
+        CRASH_TS.clear()
+        return
+    for wid in respawn_ids:
+        try:
+            respawn_worker(wid)
+        except Exception:
+            log.warning("Failed to respawn crashed worker %d", wid, exc_info=True)
+            with _queue_lock:
+                slot = WORKERS.get(wid)
+                if slot is not None:
+                    slot.reaping = False
+    if respawn_ids:
+        queue.persist_queue_snapshot(reason="worker_respawn_after_crash")
 
 
-def _ensure_workers_healthy_locked(queue: Any) -> None:
+def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
     busy_crashes = 0
     dead_detections = 0
     crashed_tasks = []
+    respawn_ids: List[int] = []
     for wid, w in list(WORKERS.items()):
         # Variant A: a slot marked `reaping` is owned end-to-end by the background reaper
         # (kill -> join -> archive -> respawn). Its proc is expected to die mid-reap, so the
@@ -1844,6 +2110,9 @@ def _ensure_workers_healthy_locked(queue: Any) -> None:
         if getattr(w, "reaping", False):
             continue
         if not w.proc.is_alive():
+            # Reserve the dead slot before the main loop releases the queue lock
+            # to start its replacement. assign_tasks skips reaping slots.
+            w.reaping = True
             dead_detections += 1
             if w.busy_task_id is not None:
                 busy_crashes += 1
@@ -2082,8 +2351,7 @@ def _ensure_workers_healthy_locked(queue: Any) -> None:
                                 reason_code=reason_code,
                                 **r_cost_fields,
                             )
-            respawn_worker(wid)
-            queue.persist_queue_snapshot(reason="worker_respawn_after_crash")
+            respawn_ids.append(wid)
 
     now = time.time()
     alive_now = sum(1 for w in WORKERS.values() if w.proc.is_alive())
@@ -2095,7 +2363,8 @@ def _ensure_workers_healthy_locked(queue: Any) -> None:
             CRASH_TS.clear()
 
     CRASH_TS[:] = [t for t in CRASH_TS if (now - t) < 60.0]
-    if len(CRASH_TS) >= 3:
+    disable_pool = len(CRASH_TS) >= 3
+    if disable_pool:
         # Do not execv on crash storms; keep direct-chat mode alive.
         st = load_state()
         append_jsonl(
@@ -2119,5 +2388,4 @@ def _ensure_workers_healthy_locked(queue: Any) -> None:
                     "toast_once": f"worker-crash-storm:{int(min(CRASH_TS) if CRASH_TS else now)}",
                 },
             )
-        kill_workers()
-        CRASH_TS.clear()
+    return respawn_ids, disable_pool

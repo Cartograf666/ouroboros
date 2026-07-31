@@ -434,7 +434,7 @@ def enqueue_assisted_resolution_task(tx: Dict[str, Any]) -> str:
     worker for it. Used by both the apply orchestration and boot recovery so the objective +
     structured metadata stay in one place. Returns the task id."""
     from supervisor.queue import enqueue_task
-    from supervisor.workers import spawn_workers
+    from supervisor.workers import ensure_worker_pool_started
 
     task_id = str(tx.get("task_id") or "")
     task = {
@@ -452,9 +452,12 @@ def enqueue_assisted_resolution_task(tx: Dict[str, Any]) -> str:
     }
     enqueue_task(task, front=True)
     try:
-        spawn_workers()
+        if not ensure_worker_pool_started(allow_disabled_restart=True):
+            _g.log.warning(
+                "enqueue_assisted_resolution_task: worker pool remains explicitly disabled"
+            )
     except Exception:
-        _g.log.warning("enqueue_assisted_resolution_task: spawn_workers failed", exc_info=True)
+        _g.log.warning("enqueue_assisted_resolution_task: worker pool start failed", exc_info=True)
     return task_id
 
 
@@ -713,11 +716,14 @@ def abort_orphaned_assisted_tx(task_id: str) -> Dict[str, Any]:
         ok, msg = rollback_managed_update("assisted_resolution_orphaned")
         _log_supervisor({"type": "managed_update_assisted_orphaned_rollback", "ok": ok, "msg": msg})
         try:
-            from supervisor.workers import spawn_workers
+            from supervisor.workers import ensure_worker_pool_started
 
-            spawn_workers()
+            if not ensure_worker_pool_started(allow_disabled_restart=True):
+                _g.log.warning(
+                    "abort_orphaned_assisted_tx: worker pool remains explicitly disabled"
+                )
         except Exception:
-            _g.log.warning("abort_orphaned_assisted_tx: spawn_workers failed", exc_info=True)
+            _g.log.warning("abort_orphaned_assisted_tx: worker pool start failed", exc_info=True)
         return {"acted": True, "rolled_back": ok, "msg": msg}
     finally:
         if lock_fh is not None:

@@ -135,11 +135,17 @@ PENDING: List[Dict[str, Any]] = []
 RUNNING: Dict[str, Dict[str, Any]] = {}
 QUEUE_SEQ_COUNTER_REF: Dict[str, int] = {"value": 0}
 ACCEPTANCE_FENCES: Dict[str, Dict[str, Any]] = {}
+ADMISSION_RESERVATIONS: Dict[str, str] = {}
 
 # Guards PENDING/RUNNING mutations across main loop, direct chat, watchdog.
 _queue_lock = threading.RLock()
 _last_skill_schedule_sync: float = 0.0
 _SKILL_SCHEDULE_SYNC_INTERVAL_SEC: float = 60.0
+
+from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
+    release_task_admission,
+    reserve_task_admission,
+)
 
 # Variant A off-loop worker reaper lives in supervisor/task_reaper.py (extracted for
 # module size). Re-export the thin names the enforce path and tests use; monkeypatching
@@ -158,6 +164,7 @@ def init_queue_refs(pending: List[Dict[str, Any]], running: Dict[str, Dict[str, 
     PENDING = pending
     RUNNING = running
     QUEUE_SEQ_COUNTER_REF = seq_counter_ref
+    ADMISSION_RESERVATIONS.clear()
 
 
 def _task_priority(task_type: str) -> int:
@@ -198,6 +205,59 @@ def enqueue_task(
     t = dict(task)
     attach_task_contract(t)
     with _queue_lock:
+        require_unique_id = bool(t.pop("_require_unique_task_id", False))
+        require_worker_pool = bool(t.pop("_require_worker_pool", False))
+        admission_token = str(t.pop("_admission_token", "") or "")
+        task_id = str(t.get("id") or "").strip()
+        reserved_token = str(ADMISSION_RESERVATIONS.get(task_id) or "")
+        if reserved_token and admission_token != reserved_token:
+            # A reservation owns this id until its request either enqueues or
+            # releases it.  Tokenless internal callers and competing ingress
+            # requests must not be able to consume/collide with that id.
+            t["_admission_blocked"] = "admission_reservation_owned"
+            return t
+        if require_worker_pool:
+            try:
+                from supervisor import workers
+
+                disabled_reason = str(workers._WORKER_POOL_DISABLED_REASON or "")
+                worker_count = len(workers.WORKERS)
+            except Exception:
+                disabled_reason = "state_unavailable"
+                worker_count = 0
+            if disabled_reason or worker_count <= 0:
+                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                    ADMISSION_RESERVATIONS.pop(task_id, None)
+                t["_admission_blocked"] = "worker_pool_unavailable"
+                t["_worker_pool_disabled_reason"] = disabled_reason or "no_workers"
+                return t
+        if admission_token and reserved_token != admission_token:
+            t["_admission_blocked"] = "admission_reservation_lost"
+            return t
+        if require_unique_id and task_id:
+            live_duplicate = task_id in RUNNING or any(
+                isinstance(row, dict) and str(row.get("id") or "") == task_id
+                for row in PENDING
+            )
+            if live_duplicate:
+                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                    ADMISSION_RESERVATIONS.pop(task_id, None)
+                t["_admission_blocked"] = "duplicate_task_id"
+                return t
+            try:
+                from ouroboros.task_results import load_task_result
+
+                if load_task_result(DRIVE_ROOT, task_id):
+                    if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                        ADMISSION_RESERVATIONS.pop(task_id, None)
+                    t["_admission_blocked"] = "duplicate_task_id"
+                    return t
+            except Exception:
+                log.warning("Fresh task-id lookup failed for %s", task_id, exc_info=True)
+                t["_admission_blocked"] = "task_id_lookup_failed"
+                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                    ADMISSION_RESERVATIONS.pop(task_id, None)
+                return t
         project_id = str(t.get("project_id") or "").strip()
         if project_id:
             try:
@@ -209,20 +269,28 @@ def enqueue_task(
                     t["_admission_blocked"] = "project_routing_fence"
                     t["_project_lifecycle"] = lifecycle
                     t["_project_id"] = project_id
+                    if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                        ADMISSION_RESERVATIONS.pop(task_id, None)
                     return t
             except Exception:
                 log.warning("Project admission check failed for %s", project_id, exc_info=True)
                 t["_admission_blocked"] = "project_routing_fence_lookup_failed"
                 t["_project_id"] = project_id
+                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                    ADMISSION_RESERVATIONS.pop(task_id, None)
                 return t
         root_id = str(t.get("root_task_id") or "").strip()
         if root_id and not restoring_snapshot and apply_budget_root_admission_fence(t, root_id):
+            if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                ADMISSION_RESERVATIONS.pop(task_id, None)
             return t
         fence = ACCEPTANCE_FENCES.get(root_id) if root_id else None
         if isinstance(fence, dict) and str(fence.get("status") or "") in {"active", "sealed"}:
             t["_admission_blocked"] = "task_acceptance_fence"
             t["_acceptance_fence_token"] = str(fence.get("token") or "")
             t["_acceptance_fence_status"] = str(fence.get("status") or "active")
+            if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                ADMISSION_RESERVATIONS.pop(task_id, None)
             return t
         QUEUE_SEQ_COUNTER_REF["value"] += 1
         seq = QUEUE_SEQ_COUNTER_REF["value"]
@@ -231,8 +299,12 @@ def enqueue_task(
         t.setdefault("_attempt", int(_att) if _att is not None else 1)
         t["_queue_seq"] = -seq if front else seq
         t["queued_at"] = utc_now_iso()
+        if admission_token:
+            t["_admission_owner_token"] = admission_token
         PENDING.append(t)
         sort_pending()
+        if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+            ADMISSION_RESERVATIONS.pop(task_id, None)
     return t
 
 
@@ -596,7 +668,7 @@ def _kept_service_pids() -> "set[int]":
         return set()
 
 
-def persist_queue_snapshot(reason: str = "") -> None:
+def persist_queue_snapshot(reason: str = "") -> bool:
     """Persist queue snapshot for restart/recovery diagnostics.
 
     Snapshots PENDING/RUNNING under the queue lock: iterating the live dicts
@@ -620,6 +692,9 @@ def persist_queue_snapshot(reason: str = "") -> None:
 
             _ws = list(_workers_mod.WORKERS.values())
             worker_total = len(_ws)
+            worker_pool_disabled_reason = str(
+                getattr(_workers_mod, "_WORKER_POOL_DISABLED_REASON", "") or ""
+            )
             reaping_count = sum(1 for _w in _ws if getattr(_w, "reaping", False))
             assignable_idle_workers = sum(
                 1 for _w in _ws
@@ -627,6 +702,7 @@ def persist_queue_snapshot(reason: str = "") -> None:
             )
         except Exception:
             worker_total = 0
+            worker_pool_disabled_reason = "unknown"
             reaping_count = 0
             assignable_idle_workers = 0
     pending_rows = []
@@ -687,6 +763,7 @@ def persist_queue_snapshot(reason: str = "") -> None:
         "pending_count": len(pending_items), "running_count": len(running_items),
         "reaping_count": reaping_count,
         "worker_total": worker_total,
+        "worker_pool_disabled_reason": worker_pool_disabled_reason,
         "assignable_idle_workers": assignable_idle_workers,
         "acceptance_fences": acceptance_fences,
         "budget_root_fences": budget_root_fences,
@@ -694,9 +771,10 @@ def persist_queue_snapshot(reason: str = "") -> None:
     }
     try:
         atomic_write_text(QUEUE_SNAPSHOT_PATH, json.dumps(payload, ensure_ascii=False, indent=2))
+        return True
     except Exception:
         log.warning("Failed to persist queue snapshot (reason=%s)", reason, exc_info=True)
-        pass
+        return False
 
 
 def parse_iso_to_ts(iso_ts: str) -> Optional[float]:

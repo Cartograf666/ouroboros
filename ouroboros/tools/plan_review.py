@@ -403,7 +403,11 @@ def _planning_swarm_timing(ctx: ToolContext) -> tuple[float, float]:
         remaining = (deadline - _planning_now()).total_seconds()
         max_wait = 0.0 if remaining <= 0 else min(max_wait, remaining / 4.0)
     event_queue = getattr(ctx, "event_queue", None)
-    live = event_queue is not None and event_queue.__class__.__module__ in {"queue", "multiprocessing.queues"}
+    live = event_queue is not None and event_queue.__class__.__module__ in {
+        "queue",
+        "multiprocessing.queues",
+        "multiprocessing.managers",
+    }
     if not live:
         wait_timeout = min(wait_timeout, 0.25)
         max_wait = min(max_wait, wait_timeout)

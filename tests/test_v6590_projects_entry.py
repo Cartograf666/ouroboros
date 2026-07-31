@@ -334,7 +334,7 @@ def test_promote_source_registers_derived_project_and_mirrors_conflict(tmp_path,
 
     import ouroboros.config as config
     from ouroboros.projects_registry import get_project as get_reg_project
-    from ouroboros.tools.control import _resolve_promote_source
+    from ouroboros.promotion_source import resolve_promote_source
 
     data = tmp_path / "data"
     data.mkdir()
@@ -349,11 +349,11 @@ def test_promote_source_registers_derived_project_and_mirrors_conflict(tmp_path,
     # admission requires a git worktree root — no born-dead project rooms).
     nogit = tmp_path / "plain_folder"
     nogit.mkdir()
-    ws0, _, err0, _ = _resolve_promote_source(ctx, str(nogit), "")
+    ws0, _, err0, _ = resolve_promote_source(ctx, str(nogit), "")
     assert ws0 == "" and "not a git repository" in err0
 
     # No pid given: derived from the folder name, registered with provenance facts.
-    ws, note, err, pid = _resolve_promote_source(ctx, str(folder), "")
+    ws, note, err, pid = resolve_promote_source(ctx, str(folder), "")
     assert err == "" and pid == "myrepo" and ws
     entry = get_reg_project(data, "myrepo")
     assert entry is not None
@@ -363,7 +363,7 @@ def test_promote_source_registers_derived_project_and_mirrors_conflict(tmp_path,
     assert trusted_first
 
     # Same folder again: idempotent, original trusted_at preserved.
-    ws2, _, err2, pid2 = _resolve_promote_source(ctx, str(folder), "myrepo")
+    ws2, _, err2, pid2 = resolve_promote_source(ctx, str(folder), "myrepo")
     assert err2 == "" and pid2 == "myrepo" and ws2 == ws
     assert get_reg_project(data, "myrepo")["trusted_at"] == trusted_first
 
@@ -371,7 +371,7 @@ def test_promote_source_registers_derived_project_and_mirrors_conflict(tmp_path,
     other = tmp_path / "other"
     other.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=str(other), check=True)
-    ws3, _, err3, _ = _resolve_promote_source(ctx, str(other), "myrepo")
+    ws3, _, err3, _ = resolve_promote_source(ctx, str(other), "myrepo")
     assert ws3 == "" and "conflict" in err3
     assert get_reg_project(data, "myrepo")["working_dir"] == ws
 
@@ -387,5 +387,5 @@ def test_promote_source_registers_derived_project_and_mirrors_conflict(tmp_path,
     monkeypatch.setattr(
         "ouroboros.project_sources.clone_project_repo", _never_clone
     )
-    ws4, _, err4, _ = _resolve_promote_source(ctx, "https://example.com/myrepo.git", "myrepo")
+    ws4, _, err4, _ = resolve_promote_source(ctx, "https://example.com/myrepo.git", "myrepo")
     assert ws4 == "" and "conflict" in err4
