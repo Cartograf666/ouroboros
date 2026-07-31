@@ -310,6 +310,17 @@ h3 { margin-bottom: 8px; font-size: 16px; letter-spacing: -.018em; }
 .work-sequence > li > span { color: var(--accent-light); font: 11px var(--mono); padding-top: 4px; }
 .work-sequence h3 { font-size: 20px; }
 .work-sequence p { max-width: 600px; margin: 0; color: var(--text-secondary); line-height: 1.62; }
+.work-chapter .wide-media { grid-column: 1 / -1; margin-top: 34px; }
+
+.bench-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.bench-grid .bench-wide { grid-column: 1 / -1; }
+figcaption a { color: var(--accent-light); text-underline-offset: 3px; }
+figcaption a:hover { color: var(--text); }
+figcaption a:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(201,53,69,.12); border-radius: 3px; }
+.bench-note { max-width: var(--reading); margin: 28px 0 0; color: var(--text-secondary); font-size: 15px; line-height: 1.62; }
+.bench-note a { color: var(--accent-light); text-underline-offset: 4px; }
+.bench-note a:hover { color: var(--text); }
+.bench-note a:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(201,53,69,.12); border-radius: 3px; }
 
 .interface-grid { display: grid; grid-template-columns: minmax(0,1.2fr) minmax(400px,.8fr); gap: 18px; align-items: stretch; }
 .media-panel, .wide-media, .install-media {
@@ -449,6 +460,7 @@ body.motion-paused *, body.motion-paused *::before, body.motion-paused *::after 
   .field-hero { gap: 48px; }
   .work-chapter .chapter-heading { position: relative; top: auto; margin-bottom: 10px; }
   .interface-grid { grid-template-columns: 1fr; }
+  .bench-grid { grid-template-columns: 1fr; }
   .cli-panel { min-height: 460px; }
   .body-map { grid-template-columns: repeat(3,1fr); }
   .origin-mark { order: 2; }

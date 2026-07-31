@@ -1,4 +1,4 @@
-# Ouroboros v6.87.3 — Architecture & Reference
+# Ouroboros v6.87.4 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -246,6 +246,7 @@ skills/telegram/            ← Bundled owner-only Telegram text/photo bridge pl
 skills/unix_computer_use/   ← Bundled extension skill payload for supervised desktop observation/input (screenshot with coordinate normalization, window_list, click/drag/type/key/move/scroll, mouse_down/up, hold_key, cursor_position, wait, best-effort AX set-of-marks). v6.63.0 adds explicitly configured REMOTE backends behind a connection registry persisted in skill state (`data/state/skills/unix_computer_use/{connections.json,active_connection.txt}`, atomic writes): `osworld_http` (OSWorld VM's in-guest server — `GET /screenshot`, pyautogui via `POST /execute`; success requires guest returncode 0, non-ASCII typing pastes via the in-VM clipboard, scroll is 1:1 wheel detents, screenshots size-capped + PNG-validated) and `ssh_macos` (screencapture/scp + cliclick over the owner's existing ssh config; no key material stored), plus `remote_exec` (shell on the active REMOTE only; refuses on local). A disabled or registry-missing active connection fails CLOSED — never silently falls back to the local desktop. The manifest declares `net` (needs no grant, but removes the skill from the native auto-enable class — the owner or a bench runner enables explicitly; zero-grant tool/subprocess skills still auto-enable under OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS); it reports missing platform backends instead of guessing. Windows support is a future separate skill (P7).
 packaging/cli/                ← Packaged CLI shell/cmd wrappers and user-local installer launchers copied into desktop artifacts
 Dockerfile                    ← Docker image (web UI runtime)
+site/                         ← Public marketing-site source (Vite). `site/scripts/sync-assets.mjs` copies the canonical `assets/` images into the gitignored `site/public/assets/`, and `pnpm build` renders into the committed `docs/` directory that GitHub Pages serves at ouroboros-agent.ai (`emptyOutDir=false`, so the Markdown documentation living beside the build output survives rebuilds). The homepage carries the public benchmark-evidence chapter — the Terminal-Bench 2.1 / OSWorld-Verified / CL-Bench charts plus links to submissions, public traces, and per-benchmark methodology — and `assets/` stays the single canonical copy of every published image: README and the site reference the same files, and the benchmark claims themselves live in README.md's Benchmarks table.
 ```
 
 ### Gateway Boundary v1

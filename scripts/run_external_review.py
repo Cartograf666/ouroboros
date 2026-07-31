@@ -1132,6 +1132,29 @@ def _prepare_review_configuration(args) -> tuple[dict | None, str, dict]:
     return contributor_snapshot, review_base_commit, resolved_config
 
 
+def _operator_reviewable_diff_chars(fallback_chars: int) -> int:
+    """Size of the TEXTUAL staged diff — what the production gates review.
+
+    The advisory, triad, scope, and fingerprint gates all read
+    ``git diff --cached`` where binary blobs appear as "Binary files differ"
+    stubs; the ``--binary`` patch exists only to replay the exact tree into
+    the frozen checkout. Measuring the advisory hard cap against the binary
+    patch refused image-asset commits for bytes no reviewer model would see.
+    The contributor lane keeps its conservative patch-size measurement, and a
+    failed git invocation falls back to ``fallback_chars`` (the conservative
+    binary-patch size) instead of measuring an empty diff.
+    """
+    result = subprocess.run(
+        ["git", "diff", "--cached"],
+        cwd=str(REPO),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return fallback_chars
+    return len(result.stdout or "")
+
+
 def main() -> int:
     version = (REPO / "VERSION").read_text(encoding="utf-8").strip()
     args = _parse_args()
@@ -1170,9 +1193,13 @@ def main() -> int:
 
     from ouroboros.tools.claude_advisory_review import _MAX_DIFF_CHARS_ERROR
 
-    if len(staged) > _MAX_DIFF_CHARS_ERROR:
+    reviewable_chars = (
+        len(staged) if contributor_snapshot is not None
+        else _operator_reviewable_diff_chars(len(staged))
+    )
+    if reviewable_chars > _MAX_DIFF_CHARS_ERROR:
         print(
-            f"ERROR: staged diff is {len(staged):,} chars — over the advisory hard cap "
+            f"ERROR: staged diff is {reviewable_chars:,} chars — over the advisory hard cap "
             f"({_MAX_DIFF_CHARS_ERROR:,}). Policy: split the phase into smaller "
             "single-intent commits instead of relaxing the gate.",
             file=sys.stderr,
