@@ -988,6 +988,7 @@ async def _run_tunnel_generations(
         tunnel = QuickTunnel(binary, state_dir, sidecar_port)
         result = _GenerationResult.RECONNECT
         stable_ready = False
+        failure_message = ""
         try:
             status.transition(
                 "reconnecting" if failures else "starting",
@@ -1057,9 +1058,10 @@ async def _run_tunnel_generations(
                 result = _GenerationResult.DISABLED
             else:
                 result = _GenerationResult.RECONNECT
+                failure_message = _safe_error(exc)
                 status.transition(
                     "reconnecting",
-                    _safe_error(exc),
+                    failure_message,
                     reason_code="tunnel_generation_failed",
                     attempt=failures + 1,
                 )
@@ -1083,8 +1085,10 @@ async def _run_tunnel_generations(
         delay = _retry_delay(max(1, failures))
         status.transition(
             "reconnecting",
-            "The tunnel generation ended; retrying inside the same companion.",
-            reason_code="tunnel_reconnect_backoff",
+            failure_message or "The tunnel generation ended; retrying inside the same companion.",
+            reason_code=(
+                "tunnel_generation_failed" if failure_message else "tunnel_reconnect_backoff"
+            ),
             attempt=failures,
             next_retry_at_epoch=int(time.time() + delay),
         )
