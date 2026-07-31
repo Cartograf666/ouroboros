@@ -218,6 +218,12 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
       generation only loads a custom provider with `wire_api="responses"`. On that path
       `auth.json` is not written (the key comes from `env_key`) and the recorded usage
       provider names the route actually taken. Default behaviour is unchanged.
+    The provider is declared once in `CODEX_HOME/config.toml` at container start, NOT as
+    per-turn `-c` flags: those share argv with the prompt, and on the longest questions
+    of `database_exploration` the pair overflowed the OS limit — `docker exec` died with
+    `OSError: [Errno 7] Argument list too long`, which is not a recoverable system error,
+    so it killed the whole task after its five rollouts had already scored. Declaring it
+    in config.toml keeps per-turn argv smaller than upstream's.
     Verified: bench suite 649 passed / 7 skipped (`tests/test_bsm_online_model.py` needs
     task-specific data and fails to collect in any checkout, before and after).
     Public implementation for the ablation run: branch `ouroboros-luna-ablation` of

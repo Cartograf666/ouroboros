@@ -1,5 +1,5 @@
 diff --git a/src/systems/codex/system.py b/src/systems/codex/system.py
-index e2df72f..81aa21e 100644
+index e2df72f..40db07d 100644
 --- a/src/systems/codex/system.py
 +++ b/src/systems/codex/system.py
 @@ -376,10 +376,26 @@ class CodexSystem(ContinualLearningSystem):
@@ -40,7 +40,7 @@ index e2df72f..81aa21e 100644
                  "CODEX_HOME": _CONTAINER_HOME,
              },
              logger=logger,
-@@ -524,6 +540,11 @@ class CodexSystem(ContinualLearningSystem):
+@@ -524,6 +540,32 @@ class CodexSystem(ContinualLearningSystem):
                  f"cp {CONTAINER_WORKSPACE}/auth.json {_CONTAINER_HOME}/auth.json",
                  timeout=10,
              )
@@ -48,29 +48,42 @@ index e2df72f..81aa21e 100644
 +            # A custom provider resolves its key from `env_key`, so auth.json is not
 +            # consulted; writing one from an unset OPENAI_API_KEY would only plant an
 +            # empty credential. Verified: codex runs with no auth.json at all here.
-+            self._docker_exec(f"mkdir -p {_CONTAINER_HOME}", timeout=10)
++            #
++            # The provider is declared ONCE in config.toml rather than repeated as `-c`
++            # flags on every turn: those flags ride the same argv as the prompt, and on
++            # this benchmark's longest prompts the pair overflowed the OS limit
++            # (`OSError: [Errno 7] Argument list too long: 'docker'`), which kills the
++            # whole task. Declaring it here also keeps per-turn argv smaller than
++            # upstream's, not larger.
++            config = "\n".join([
++                f'model_provider = "{self._provider_id}"',
++                "",
++                f"[model_providers.{self._provider_id}]",
++                f'name = "{self._provider_name}"',
++                f'base_url = "{self._provider_base_url}"',
++                f'env_key = "{self._provider_env_key}"',
++                'wire_api = "responses"',
++                "",
++            ])
++            self._docker_exec(
++                f"mkdir -p {_CONTAINER_HOME} && "
++                f"cat > {_CONTAINER_HOME}/config.toml <<'CODEX_TOML'\n{config}CODEX_TOML",
++                timeout=10,
++            )
          else:
              self._docker_exec(
                  f"mkdir -p {_CONTAINER_HOME} && "
-@@ -700,6 +721,17 @@ class CodexSystem(ContinualLearningSystem):
+@@ -700,6 +742,9 @@ class CodexSystem(ContinualLearningSystem):
              "--dangerously-bypass-approvals-and-sandbox",
              "--skip-git-repo-check",
          ]
-+        if self._provider_base_url:
-+            pid = self._provider_id
-+            options.extend([
-+                "-c", f'model_providers.{pid}.name="{self._provider_name}"',
-+                "-c", f'model_providers.{pid}.base_url="{self._provider_base_url}"',
-+                "-c", f'model_providers.{pid}.env_key="{self._provider_env_key}"',
-+                # `chat` was removed in this CLI generation; `responses` is the only
-+                # wire api it will load a custom provider with.
-+                "-c", f'model_providers.{pid}.wire_api="responses"',
-+                "-c", f'model_provider="{pid}"',
-+            ])
++        # A custom provider is declared in CODEX_HOME/config.toml at container start,
++        # not here: per-turn `-c` flags share argv with the prompt and overflow on this
++        # benchmark's longest questions. See _start_container.
          if self._reasoning_effort is not None:
              options.extend(["-c", f'model_reasoning_effort="{self._reasoning_effort}"'])
          if self._model_auto_compact_token_limit is not None:
-@@ -910,9 +942,14 @@ class CodexSystem(ContinualLearningSystem):
+@@ -910,9 +955,14 @@ class CodexSystem(ContinualLearningSystem):
              self._record_usage_event(usage)
  
      def _record_usage_event(self, usage: dict[str, int]) -> None:
@@ -86,7 +99,7 @@ index e2df72f..81aa21e 100644
              input_tokens=usage["input_tokens"],
              output_tokens=usage["output_tokens"],
              reasoning_tokens=usage["reasoning_tokens"],
-@@ -921,7 +958,7 @@ class CodexSystem(ContinualLearningSystem):
+@@ -921,7 +971,7 @@ class CodexSystem(ContinualLearningSystem):
          )
          _debug_log_pricing_details(
              model=self._model,
