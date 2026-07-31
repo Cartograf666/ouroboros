@@ -13,7 +13,12 @@ import time
 import copy
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ouroboros.provider_models import PROVIDER_PREFIXES, normalize_anthropic_model_id, normalize_model_identity
+from ouroboros.provider_models import (
+    PROVIDER_PREFIXES,
+    normalize_anthropic_model_id,
+    normalize_model_identity,
+    resolve_minimax_base_url,
+)
 from ouroboros.usage_accounting import (
     AttemptRequest,
     UsageAccountingError,
@@ -50,7 +55,7 @@ def _route_normalizes_cache_breakpoints(target: Dict[str, Any]) -> bool:
     Anthropic ephemeral-cache family the two deleted per-builder marking sites served —
     direct Anthropic plus OpenRouter ``anthropic/*`` (the family fact stays owned by
     ``supports_message_cache_control``). Every other route — direct OpenAI,
-    OpenAI-compatible, Cloud.ru, GigaChat, unsupported OpenRouter families, and Gemini
+    OpenAI-compatible, Cloud.ru, MiniMax, GigaChat, unsupported OpenRouter families, and Gemini
     (whose explicit cache documents no ``ttl`` field, so its markers stay bare) — is
     observed byte-for-byte, never mutated (Provider Independence).
     """
@@ -1204,6 +1209,8 @@ class LLMClient:
             return f"cloudru/{resolved_model}"
         if provider == "gigachat":
             return f"gigachat/{resolved_model}"
+        if provider == "minimax":
+            return f"minimax/{resolved_model}"
         return f"openai-compatible/{resolved_model}"
 
     def _resolve_remote_target(self, model: str) -> Dict[str, Any]:
@@ -1230,6 +1237,18 @@ class LLMClient:
                 "usage_model": self._qualified_model_name(provider, resolved_model),
                 "api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
                 "base_url": "https://api.anthropic.com/v1",
+                "default_headers": {},
+                "supports_openrouter_extensions": False,
+                "supports_generation_cost": False,
+            }
+
+        if provider == "minimax":
+            return {
+                "provider": provider,
+                "resolved_model": resolved_model,
+                "usage_model": usage_model,
+                "api_key": os.environ.get("MINIMAX_API_KEY", ""),
+                "base_url": resolve_minimax_base_url(os.environ.get("MINIMAX_REGION", "")),
                 "default_headers": {},
                 "supports_openrouter_extensions": False,
                 "supports_generation_cost": False,

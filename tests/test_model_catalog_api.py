@@ -26,6 +26,7 @@ def test_model_catalog_tags_provider_values(monkeypatch):
         "OPENAI_COMPATIBLE_BASE_URL": "https://compat.example/v1",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY": "cloudru-key",
         "GIGACHAT_CREDENTIALS": "giga-creds",
+        "MINIMAX_API_KEY": "minimax-key",
     })
 
     async def fake_openrouter(_client, _api_key):
@@ -64,6 +65,8 @@ def test_model_catalog_tags_provider_values(monkeypatch):
     assert "openai-compatible::compatible-pro" in values
     assert "cloudru::cloudru-pro" in values
     assert "gigachat::giga-pro" in values
+    assert "minimax::MiniMax-M3" in values
+    assert "minimax::MiniMax-M2.7" in values
     assert payload["errors"] == []
 
 

@@ -769,6 +769,28 @@ def test_resolve_cloudru_target_uses_default_base_url(monkeypatch):
     assert target["usage_model"] == "cloudru/giga-model"
 
 
+@pytest.mark.parametrize(("region", "expected_base_url"), [
+    ("", "https://api.minimax.io/v1"),
+    ("global_en", "https://api.minimax.io/v1"),
+    ("CN_ZH", "https://api.minimaxi.com/v1"),
+])
+def test_resolve_minimax_target_uses_regional_endpoint(monkeypatch, region, expected_base_url):
+    monkeypatch.setenv("MINIMAX_API_KEY", "minimax-key")
+    if region:
+        monkeypatch.setenv("MINIMAX_REGION", region)
+    else:
+        monkeypatch.delenv("MINIMAX_REGION", raising=False)
+
+    target = LLMClient()._resolve_remote_target("minimax::MiniMax-M3")
+
+    assert target["provider"] == "minimax"
+    assert target["resolved_model"] == "MiniMax-M3"
+    assert target["usage_model"] == "minimax/MiniMax-M3"
+    assert target["api_key"] == "minimax-key"
+    assert target["base_url"] == expected_base_url
+    assert target["supports_openrouter_extensions"] is False
+
+
 def test_resolve_gigachat_target_uses_defaults(monkeypatch):
     monkeypatch.setenv("GIGACHAT_CREDENTIALS", "giga-creds")
     monkeypatch.delenv("GIGACHAT_SCOPE", raising=False)

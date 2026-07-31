@@ -149,7 +149,7 @@ def estimate_cost_optional(model: str, prompt_tokens: int, completion_tokens: in
 def infer_api_key_type(model: str, provider: Optional[str] = None) -> str:
     """Infer which API key is used based on model name."""
     provider_name = str(provider or "").strip().lower()
-    if provider_name in {"local", "openrouter", "openai", "anthropic", "openai-compatible", "cloudru", "gigachat"}:
+    if provider_name in {"local", "openrouter", "openai", "anthropic", "openai-compatible", "cloudru", "gigachat", "minimax"}:
         return provider_name
     raw_model = str(model or "").strip()
     direct_provider = provider_for_model(raw_model)
@@ -166,6 +166,8 @@ def infer_api_key_type(model: str, provider: Optional[str] = None) -> str:
         return "cloudru"
     if normalized.startswith("gigachat/"):
         return "gigachat"
+    if normalized.startswith("minimax/"):
+        return "minimax"
     if normalized.startswith(("anthropic/", "google/", "openai/", "x-ai/", "qwen/")):
         return "openrouter"
     if "claude" in normalized.lower():

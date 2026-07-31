@@ -7,11 +7,29 @@ from __future__ import annotations
 
 import os
 
+# MiniMax exposes the same OpenAI-compatible API on two regional hosts. Keep the
+# mapping centralized so transport, capability evidence, and settings diagnostics
+# fingerprint the exact endpoint selected by the owner.
+MINIMAX_REGION_ENDPOINTS: dict[str, str] = {
+    "global_en": "https://api.minimax.io/v1",
+    "cn_zh": "https://api.minimaxi.com/v1",
+}
+MINIMAX_DEFAULT_REGION = "global_en"
+MINIMAX_MODEL_IDS: tuple[str, ...] = ("MiniMax-M3", "MiniMax-M2.7")
+
+
+def resolve_minimax_base_url(region: str = "") -> str:
+    """Return the configured MiniMax OpenAI-compatible endpoint."""
+    selected = str(region or "").strip().lower() or MINIMAX_DEFAULT_REGION
+    return MINIMAX_REGION_ENDPOINTS.get(selected, MINIMAX_REGION_ENDPOINTS[MINIMAX_DEFAULT_REGION])
+
+
 # Direct-provider prefix → canonical provider name. Un-prefixed models route
 # through OpenRouter. Order matters only for readability; prefixes are disjoint.
 PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
     ("openai::", "openai"),
     ("anthropic::", "anthropic"),
+    ("minimax::", "minimax"),
     ("cloudru::", "cloudru"),
     ("gigachat::", "gigachat"),
     ("openai-compatible::", "openai-compatible"),
@@ -22,6 +40,7 @@ PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
 PROVIDER_ENV_KEYS: dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
     "cloudru": "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
@@ -46,6 +65,7 @@ PROVIDER_CREDENTIAL_GROUPS: dict[str, tuple[str, ...]] = {
     "openrouter": ("OPENROUTER_API_KEY",),
     "openai": ("OPENAI_API_KEY",),
     "anthropic": ("ANTHROPIC_API_KEY",),
+    "minimax": ("MINIMAX_API_KEY", "MINIMAX_REGION"),
     "cloudru": ("CLOUDRU_FOUNDATION_MODELS_API_KEY", "CLOUDRU_FOUNDATION_MODELS_BASE_URL"),
     "gigachat": (
         "GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD", "GIGACHAT_USER",
@@ -121,7 +141,7 @@ def local_only_review_route_env() -> bool:
     return not any(
         provider_has_credentials(provider)
         for provider in (
-            "openrouter", "openai", "anthropic", "cloudru", "gigachat",
+            "openrouter", "openai", "anthropic", "minimax", "cloudru", "gigachat",
             "openai-compatible",
         )
     )
@@ -280,6 +300,14 @@ GIGACHAT_DIRECT_DEFAULTS = {
     "fallback": "gigachat::GigaChat-2-Max",
 }
 
+MINIMAX_DIRECT_DEFAULTS = {
+    "main": "minimax::MiniMax-M3",
+    "heavy": "minimax::MiniMax-M3",
+    "light": "minimax::MiniMax-M2.7",
+    "fallback": "minimax::MiniMax-M2.7",
+    "deep_self_review": "minimax::MiniMax-M3",
+}
+
 ANTHROPIC_DIRECT_DEFAULTS = {
     "main": "anthropic::claude-sonnet-5",
     "heavy": "anthropic::claude-opus-5",
@@ -296,6 +324,7 @@ _DIRECT_PROVIDER_DEFAULTS = {
     "anthropic": ANTHROPIC_DIRECT_DEFAULTS,
     "cloudru": CLOUDRU_DIRECT_DEFAULTS,
     "gigachat": GIGACHAT_DIRECT_DEFAULTS,
+    "minimax": MINIMAX_DIRECT_DEFAULTS,
 }
 
 _ANTHROPIC_MODEL_ALIASES = {
@@ -328,6 +357,12 @@ def migrate_model_value(provider: str, value: str) -> str:
             return text
         if text.startswith("cloudru/"):
             return f"cloudru::{text[len('cloudru/'):]}"
+        return text
+    if provider == "minimax":
+        if text.startswith("minimax::"):
+            return text
+        if text.startswith("minimax/"):
+            return f"minimax::{text[len('minimax/'):]}"
         return text
     return text
 
@@ -416,6 +451,8 @@ def normalize_model_identity(model: str) -> str:
         return f"cloudru/{text[len('cloudru::'):]}"
     if text.startswith("gigachat::"):
         return f"gigachat/{text[len('gigachat::'):]}"
+    if text.startswith("minimax::"):
+        return f"minimax/{text[len('minimax::'):]}"
     if text.startswith("anthropic::"):
         return f"anthropic/{normalize_anthropic_model_id(text[len('anthropic::'):])}"
     if text.startswith("anthropic/"):

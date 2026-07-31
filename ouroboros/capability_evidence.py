@@ -717,7 +717,13 @@ def _provider_metadata_window(
         except Exception:
             return 0
     # CW6: OpenAI-compatible /models probe (vLLM/Ollama/...) before falling to unprobeable.
-    if p == "openai-compatible":
+    if p in {"openai-compatible", "minimax"}:
+        if p == "minimax" and api_key is None:
+            try:
+                from ouroboros.config import load_settings
+                api_key = str((load_settings() or {}).get("MINIMAX_API_KEY") or "")
+            except Exception:
+                api_key = ""
         return _openai_compatible_metadata_window(model, base_url, allow_fetch, api_key=api_key)
     # GigaChat's /models (aget_models) lists model ids but does NOT publish a per-model
     # context window, so a gigachat route stays unprobeable (owner-ack path) — no probe.
@@ -752,7 +758,7 @@ def _metadata_fetch_transport_failed(provider: str, model: str, use_local: bool)
         return False
 
 
-_GENERATIVE_PROBE_PROVIDERS = {"cloudru", "openai-compatible", "openai", "openrouter"}
+_GENERATIVE_PROBE_PROVIDERS = {"cloudru", "openai-compatible", "minimax", "openai", "openrouter"}
 _PROBE_CANARIES = ["OBOCANARYBEGIN7Q", "OBOCANARYMID7Q", "OBOCANARYEND7Q"]
 
 

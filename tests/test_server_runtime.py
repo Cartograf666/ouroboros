@@ -10,6 +10,7 @@ def test_has_startup_ready_provider_accepts_any_remote_key_or_local_routing():
     assert has_startup_ready_provider({"OPENROUTER_API_KEY": "sk-or-test"})
     assert has_startup_ready_provider({"OPENAI_API_KEY": "sk-openai"})
     assert has_startup_ready_provider({"ANTHROPIC_API_KEY": "sk-ant"})
+    assert has_startup_ready_provider({"MINIMAX_API_KEY": "minimax-key"})
     assert has_startup_ready_provider({"OPENAI_COMPATIBLE_BASE_URL": "https://compat.example/v1"})
     assert not has_startup_ready_provider({"OPENAI_COMPATIBLE_API_KEY": "compat-key"})
     assert has_startup_ready_provider({"CLOUDRU_FOUNDATION_MODELS_API_KEY": "cloudru-key"})
@@ -490,6 +491,25 @@ def test_apply_runtime_provider_defaults_cloudru_only_elevates_to_direct():
     assert normalized["OUROBOROS_MODEL_HEAVY"].startswith("cloudru::")
     assert all(m.startswith("cloudru::") for m in normalized["OUROBOROS_REVIEW_MODELS"].split(","))
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"].startswith("cloudru::")
+
+
+def test_apply_runtime_provider_defaults_minimax_only_uses_current_models():
+    normalized, changed, changed_keys = apply_runtime_provider_defaults({
+        "MINIMAX_API_KEY": "minimax-key",
+    })
+
+    assert changed
+    assert "OUROBOROS_MODEL" in changed_keys
+    assert normalized["OUROBOROS_MODEL"] == "minimax::MiniMax-M3"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == "minimax::MiniMax-M3"
+    assert normalized["OUROBOROS_MODEL_LIGHT"] == "minimax::MiniMax-M2.7"
+    assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "minimax::MiniMax-M2.7"
+    assert normalized["OUROBOROS_MODEL_DEEP_SELF_REVIEW"] == "minimax::MiniMax-M3"
+    assert normalized["OUROBOROS_REVIEW_MODELS"] == (
+        "minimax::MiniMax-M3,minimax::MiniMax-M2.7,minimax::MiniMax-M2.7"
+    )
+    assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"] == "minimax::MiniMax-M3"
+    assert normalized["OUROBOROS_SCOPE_REVIEW_MODELS"] == "minimax::MiniMax-M3"
 
 
 def test_apply_runtime_provider_defaults_cloudru_migrates_populated_shipped_defaults():

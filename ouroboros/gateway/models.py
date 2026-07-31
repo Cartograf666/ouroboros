@@ -13,6 +13,7 @@ from starlette.responses import JSONResponse
 
 from ouroboros.config import load_settings
 from ouroboros.gateway._helpers import json_error, json_exception
+from ouroboros.provider_models import MINIMAX_MODEL_IDS
 
 log = logging.getLogger(__name__)
 
@@ -157,6 +158,15 @@ async def _fetch_anthropic_model_catalog(
     return models
 
 
+async def _fetch_minimax_model_catalog(
+    _client: httpx.AsyncClient,
+) -> list[dict[str, str]]:
+    return [
+        _build_model_catalog_entry("minimax", "MiniMax", model_id, model_id)
+        for model_id in MINIMAX_MODEL_IDS
+    ]
+
+
 async def _fetch_gigachat_model_catalog(
     credentials: str,
     scope: str,
@@ -223,6 +233,10 @@ def _provider_specs(
     anthropic_api_key = str(settings.get("ANTHROPIC_API_KEY", "") or "").strip()
     if anthropic_api_key:
         specs.append(("anthropic", lambda client: _fetch_anthropic_model_catalog(client, anthropic_api_key)))
+
+    minimax_api_key = str(settings.get("MINIMAX_API_KEY", "") or "").strip()
+    if minimax_api_key:
+        specs.append(("minimax", _fetch_minimax_model_catalog))
 
     compatible_api_key = str(settings.get("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
     compatible_base_url = str(settings.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
