@@ -1136,3 +1136,215 @@ class TestLLMFallbackExtraction:
 
         assert items == expected
         assert fallback_called == [], "Fallback must NOT be called when direct parse succeeds"
+
+
+class TestAdvisoryCleanSentinel:
+    """The advisory prompt asks for `[] + NO_FINDINGS` as a clean verdict
+    (REVIEW_JSON_ARRAY_CONTRACT). Before this contract was honored here, a
+    reviewer that found nothing was recorded as `parse_failure`, which burned a
+    full serial preflight suite per retry and never surfaced the real cause.
+    Triad already implemented the sentinel; advisory did not.
+    """
+
+    def _run_handler(self, tmp_path, monkeypatch, raw_text):
+        from unittest import mock
+        from ouroboros.tools import claude_advisory_review as adv
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-for-test")
+        monkeypatch.setattr(
+            adv, "_run_claude_advisory",
+            lambda repo_dir, commit_message, ctx, **kwargs: ([], raw_text, "opus", 10),
+        )
+        # Release-metadata preflight (BIBLE P9) runs before the SDK branch under
+        # test, so the fake change set must carry the release artifacts.
+        monkeypatch.setattr(adv, "_get_staged_diff", lambda repo_dir, paths=None: "diff --git a/x.py b/x.py")
+        monkeypatch.setattr(
+            adv, "_get_changed_file_list",
+            lambda repo_dir, paths=None: (
+                "M  x.py\nM  VERSION\nM  pyproject.toml\n"
+                "M  web/package.json\nM  README.md\nM  docs/ARCHITECTURE.md"
+            ),
+        )
+        monkeypatch.setattr(adv, "check_worktree_readiness", lambda *a, **kw: [])
+        monkeypatch.setattr(adv, "_check_worktree_version_sync_shared", lambda *a, **kw: "")
+        monkeypatch.setattr(adv, "compute_snapshot_hash", lambda *a, **kw: "deadbeef")
+
+        ctx = mock.MagicMock()
+        ctx.repo_dir = str(tmp_path)
+        ctx.drive_root = tmp_path
+        ctx.emit_progress_fn = lambda *a, **kw: None
+        ctx.task_id = "t-clean"
+        return json.loads(adv._handle_advisory_pre_review(ctx, commit_message="test commit"))
+
+    def test_sentinel_qualified_empty_array_is_a_clean_run(self, tmp_path, monkeypatch):
+        result = self._run_handler(tmp_path, monkeypatch, "[]\nNO_FINDINGS")
+        assert result.get("status") == "fresh", f"clean advisory misclassified: {result!r}"
+        assert result.get("critical_count") == 0
+        assert "No findings" in (result.get("message") or "")
+        assert "Fix issues" not in (result.get("message") or "")
+
+    def test_bare_empty_array_is_clean_matching_triad(self, tmp_path, monkeypatch):
+        result = self._run_handler(tmp_path, monkeypatch, "[]")
+        assert result.get("status") == "fresh", f"bare [] must match triad semantics: {result!r}"
+
+    def test_empty_array_in_refusal_prose_stays_parse_failure(self, tmp_path, monkeypatch):
+        raw = "I cannot review this diff because it is too large. []"
+        result = self._run_handler(tmp_path, monkeypatch, raw)
+        assert result.get("status") == "parse_failure", (
+            f"refusal prose must not pass as clean: {result!r}"
+        )
+
+    def test_sentinel_without_an_array_is_not_clean(self, tmp_path, monkeypatch):
+        """The sentinel alone is refusal prose. Accepting it would let any
+        reviewer opt out of the gate by saying the word."""
+        result = self._run_handler(
+            tmp_path, monkeypatch, "I cannot review this diff. NO_FINDINGS")
+        assert result.get("status") == "parse_failure", (
+            f"sentinel-only response must not pass as clean: {result!r}"
+        )
+
+    def test_unparseable_array_with_sentinel_is_not_clean(self, tmp_path, monkeypatch):
+        result = self._run_handler(tmp_path, monkeypatch, '[{"item": broken\nNO_FINDINGS')
+        assert result.get("status") == "parse_failure"
+
+
+class TestEmptyArrayIsVerifiedClean:
+    """The shared predicate both advisory and triad classify with. A reviewer
+    must not be able to opt out of the gate by emitting the sentinel word."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("[]\nNO_FINDINGS", True),
+        ("[]", True),
+        ("[] NO_FINDINGS", True),          # sentinel must never make it worse
+        ("[]\r\nNO_FINDINGS", True),        # CRLF
+        ("[ ]\nNO_FINDINGS", True),
+        ("[]\nNO_FINDINGS\nHope that helps!", False),
+        ("```json\n[]\n```", True),
+        ("```json\n[]\n```\nNO_FINDINGS", True),   # fencing model puts the sentinel after the fence
+        ("```\n[]\n```\nNO_FINDINGS", True),
+        ("```JSON\n[]\n```", True),               # tag case must not matter
+        ("```json\n[]\n```\nI cannot review this", False),
+        ("prose ```[]``` NO_FINDINGS", False),
+        ("```json\n[1]\n```\nNO_FINDINGS", False),
+        ("I cannot review this diff. NO_FINDINGS", False),
+        ("NO_FINDINGS", False),
+        ("I cannot review this. [] Please retry.", False),
+        ("I cannot review this diff. []\nNO_FINDINGS", False),
+        ("Everything checks out.\n[]\nNO_FINDINGS", False),
+        ("[] NO_FINDINGS trailing prose", False),
+        ('[{"item": "x", "verdict": "FAIL"}]\nNO_FINDINGS', False),
+        ('[{"item": broken\nNO_FINDINGS', False),
+        ("", False),
+    ])
+    def test_clean_verdict_requires_a_real_empty_array(self, raw, expected):
+        from ouroboros.triad_review import empty_array_is_verified_clean
+        assert empty_array_is_verified_clean(raw) is expected, repr(raw)
+
+    @pytest.mark.parametrize("raw,expected", [
+        ('{"result": "[]\\nNO_FINDINGS"}', True),
+        ('{"result": "[]"}', True),
+        ('{"result": "I cannot review this. []\\nNO_FINDINGS"}', False),
+        ("[]\nNO_FINDINGS", True),
+        ("I cannot review this diff. NO_FINDINGS", False),
+    ])
+    def test_clean_check_sees_through_the_sdk_envelope(self, raw, expected):
+        """_parse_advisory_output unwraps {"result": ...}; the clean check must
+        read the same payload or the fix misses exactly the wrapped shape."""
+        from ouroboros.tools.claude_advisory_review import _is_clean_verdict
+        assert _is_clean_verdict(raw) is expected, repr(raw)
+
+    def test_clean_sentinel_skips_the_paid_fallback_model(self, monkeypatch, tmp_path):
+        """A sentinel-qualified clean verdict has nothing to extract, so the
+        fallback extraction model must not be paid for."""
+        from types import SimpleNamespace
+        from ouroboros.gateways.claude_code import ClaudeCodeResult
+        import ouroboros.gateways.claude_code as gw
+
+        adv_mod = _get_advisory_module()
+        called = []
+        monkeypatch.setattr(adv_mod, "_llm_extract_advisory_items",
+                            lambda raw, ctx: called.append(raw) or [])
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        monkeypatch.setattr(gw, "run_readonly", lambda **kw: ClaudeCodeResult(
+            success=True, result_text="[]\nNO_FINDINGS", session_id="s", cost_usd=0.1,
+            usage={"prompt_tokens": 10, "completion_tokens": 1},
+        ))
+        monkeypatch.setattr(adv_mod, "_get_staged_diff", lambda *a, **kw: "diff")
+        monkeypatch.setattr(adv_mod, "_get_changed_file_list", lambda *a, **kw: "M f.py")
+        monkeypatch.setattr(adv_mod, "build_advisory_changed_context", lambda *a, **kw: (["f.py"], "pack", []))
+        monkeypatch.setattr(adv_mod, "_build_advisory_prompt", lambda *a, **kw: "prompt")
+        ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path,
+                              pending_events=[], emit_progress_fn=lambda *_: None)
+
+        adv_mod._run_claude_advisory(tmp_path, "msg", ctx)
+
+        assert called == [], "clean sentinel must not pay for fallback extraction"
+
+
+class TestReviewRunFailureReason:
+    """`review_status` used to drop the per-run cause, so N identical
+    deterministic failures read as N generic `parse_failure` rows."""
+
+    def _run(self, status="parse_failure", raw=""):
+        from types import SimpleNamespace
+        return SimpleNamespace(status=status, raw_result=raw, items=[], snapshot_hash="h",
+                               commit_message="m", ts="t", snapshot_summary="s", attempt=1,
+                               bypass_reason="", repo_key="", tool_name="", task_id="",
+                               model_used="opus", duration_sec=48.35, prompt_chars=786401)
+
+    def test_rejected_clean_sentinel_is_named(self):
+        from ouroboros.review_evidence import _review_status_run_to_dict
+        data = _review_status_run_to_dict(self._run(raw="[]\nNO_FINDINGS"))
+        assert data["failure_reason"] == "clean_sentinel_rejected"
+
+    def test_sentinel_bearing_prose_is_not_called_a_rejected_clean_verdict(self):
+        """The diagnostic asks the shared predicate, so refusal prose carrying
+        the sentinel is reported as prose — not as a contract regression."""
+        from ouroboros.review_evidence import _review_status_run_to_dict
+        data = _review_status_run_to_dict(
+            self._run(raw="I cannot review this diff. []\nNO_FINDINGS"))
+        assert data["failure_reason"] == "non_json_prose"
+
+    def test_shapes_are_distinguished(self):
+        from ouroboros.review_evidence import _review_status_run_to_dict
+        assert _review_status_run_to_dict(self._run(raw=""))["failure_reason"] == "empty_response"
+        assert _review_status_run_to_dict(self._run(raw="[{bad"))["failure_reason"] == "malformed_array"
+        assert _review_status_run_to_dict(self._run(raw="sorry"))["failure_reason"] == "non_json_prose"
+
+    def test_fresh_run_has_no_failure_reason_but_keeps_diagnostics(self):
+        from ouroboros.review_evidence import _review_status_run_to_dict
+        data = _review_status_run_to_dict(self._run(status="fresh", raw="[]"))
+        assert data["failure_reason"] is None
+        assert not any("raw" in k and k != "failure_reason" for k in data), (
+            "the projection must not echo untrusted reviewer text to the model")
+        assert data["duration_sec"] == 48.35
+        assert data["model_used"] == "opus"
+        assert data["prompt_chars"] == 786401
+
+
+class TestReviewContractModes:
+    """Findings-only mode offers an all-clear; required-matrix mode must not,
+    because its parser rejects an empty array as missing every row."""
+
+    def test_matrix_contract_has_no_all_clear_branch(self):
+        from ouroboros.triad_review import (
+            REVIEW_JSON_ARRAY_CONTRACT, REVIEW_JSON_MATRIX_CONTRACT,
+        )
+        assert "NO_FINDINGS" in REVIEW_JSON_ARRAY_CONTRACT
+        assert "NO_FINDINGS" not in REVIEW_JSON_MATRIX_CONTRACT
+        assert "one entry per required checklist item" in REVIEW_JSON_MATRIX_CONTRACT
+
+    def test_rendered_scope_prompt_offers_no_all_clear(self):
+        """The scope parser rejects an empty array as all eight items missing,
+        so the prompt it is paired with must not advertise the sentinel."""
+        from ouroboros.tools.review_synthesis import build_scope_review_prompt
+
+        rendered = "".join(
+            part for part in build_scope_review_prompt(
+                "files", scope_checklist="cl", canonical_docs="docs",
+                intent_context="intent", history_block="hist", diff_text="diff",
+                repo_pack_placeholder="atlas", critical_calibration="calib",
+            ) if isinstance(part, str)
+        )
+        assert "NO_FINDINGS" not in rendered
+        assert "one entry per required checklist item" in rendered

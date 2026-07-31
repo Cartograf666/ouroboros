@@ -408,19 +408,6 @@ REVIEW_THOROUGHNESS_BLOCK = """\
   and provide a CONCRETE fix suggestion so the developer knows exactly what to change.
 """
 
-REVIEW_JSON_ARRAY_CONTRACT = """\
-Return ONLY a JSON array. Each element:
-{
-  "item": "<checklist item name>",
-  "verdict": "PASS" | "FAIL",
-  "severity": "critical" | "advisory",
-  "reason": "<for FAIL: file, line/symbol, what is wrong, how to fix>"
-}
-If you reviewed everything and found NOTHING to report, return the empty array
-followed by the sentinel word NO_FINDINGS on its own line. An empty array
-without NO_FINDINGS is treated as a non-response and excluded from quorum.
-"""
-
 REVIEW_SEVERITY_THRESHOLDS = """\
 - Bible, security, concrete runtime bugs, and changed safety contracts are critical.
 - Development, version, tool-schema, gateway-contract, and architecture-map violations are critical when the checklist says they are.

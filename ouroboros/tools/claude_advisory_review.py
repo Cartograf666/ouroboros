@@ -15,7 +15,12 @@ import re
 import subprocess
 from typing import List, Optional
 
-from ouroboros.triad_review import extract_json_array
+from ouroboros.triad_review import (
+    REVIEW_JSON_ARRAY_CONTRACT,
+    REVIEW_JSON_MATRIX_CONTRACT,
+    empty_array_is_verified_clean,
+    extract_json_array,
+)
 from ouroboros.skill_review_status import SEVERITY_DRIVEN_ITEMS
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.review_state import (
@@ -38,7 +43,6 @@ from ouroboros.tools.review_helpers import (
     check_worktree_version_sync as _check_worktree_version_sync_shared,
     parse_changed_paths_from_porcelain,
     CRITICAL_FINDING_CALIBRATION,
-    REVIEW_JSON_ARRAY_CONTRACT,
     REVIEW_SEVERITY_THRESHOLDS,
     REVIEW_THOROUGHNESS_BLOCK,
     get_advisory_runtime_diagnostics as _get_runtime_diagnostics,
@@ -373,7 +377,12 @@ def _build_advisory_prompt(
         f"## Severity thresholds\n{REVIEW_SEVERITY_THRESHOLDS}\n\n"
         "## Critical finding calibration (shared with triad and scope reviewers)\n\n"
         f"{critical_calibration}\n\n"
-        f"## Output format\n{REVIEW_JSON_ARRAY_CONTRACT}\n{expected_items_section}\n\n"
+        # A required-item matrix has no all-clear shortcut: _check_expected_items
+        # rejects an empty response as missing every row, so advertising the
+        # sentinel here would ask for output the runtime classifies as malformed.
+        f"## Output format\n"
+        f"{REVIEW_JSON_MATRIX_CONTRACT if expected_items else REVIEW_JSON_ARRAY_CONTRACT}\n"
+        f"{expected_items_section}\n\n"
         f"## CHECKLISTS.md (What to review)\n\n{checklists}\n\n"
         f"{scope_section}\n\n{goal_section}\n\n"
         f"## DEVELOPMENT.md (Engineering standards)\n\n{dev_guide}\n\n"
@@ -821,7 +830,7 @@ def _run_claude_advisory(
 
         items = _parse_advisory_output(raw_text)
 
-        if not items and raw_text and not raw_text.startswith("⚠️ ADVISORY_ERROR"):
+        if _needs_fallback_extraction(items, raw_text):
             items = _llm_extract_advisory_items(raw_text, ctx)
             if items:
                 log.info("Advisory: structural parse failed, LLM fallback extracted %d items", len(items))
@@ -886,6 +895,39 @@ def _run_claude_advisory(
         )
         log.error("Advisory SDK exception:\n%s", err_msg)
         return [], err_msg, model, prompt_chars
+
+
+def _is_clean_verdict(raw_text: str) -> bool:
+    """Clean-verdict check on the SAME text shape ``_parse_advisory_output`` reads.
+
+    That parser passes ``unwrap_result=True`` because the CLI may deliver the
+    review inside a ``{"result": "..."}`` envelope; testing the wrapper instead
+    of its payload would leave the clean verdict unrecognised exactly for the
+    wrapped shape.
+    """
+    text = str(raw_text or "")
+    try:
+        envelope = json.loads(text.strip())
+        if isinstance(envelope, dict) and "result" in envelope:
+            text = str(envelope["result"])
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return empty_array_is_verified_clean(text)
+
+
+def _needs_fallback_extraction(items: list, raw_text: str) -> bool:
+    """True when paying the fallback extraction model can still yield items.
+
+    A sentinel-qualified clean verdict (REVIEW_JSON_ARRAY_CONTRACT) parses to an
+    empty list by design and has nothing to extract, so it must not be charged
+    to the fallback model or later recorded as a parse failure.
+    """
+    return bool(
+        not items
+        and raw_text
+        and not raw_text.startswith("⚠️ ADVISORY_ERROR")
+        and not _is_clean_verdict(raw_text)
+    )
 
 
 def _parse_advisory_output(stdout: str) -> list:
@@ -1464,8 +1506,12 @@ def _handle_advisory_pre_review(
 
     snapshot_summary = f"{changed_files.count(chr(10)) + 1} file(s) changed"
 
-    # Non-empty raw output with no items is parse_failure, not all-clear.
-    run_status = "fresh" if items else "parse_failure"
+    # An empty array counts as a real "no findings" verdict only when the model
+    # emitted the NO_FINDINGS sentinel the prompt asks for (REVIEW_JSON_ARRAY_CONTRACT),
+    # or a bare `[]`-only body. A `[]` buried in refusal prose stays parse_failure.
+    # Same predicate as triad, so one contract cannot mean two things.
+    verified_clean = not items and _is_clean_verdict(raw_result)
+    run_status = "fresh" if (items or verified_clean) else "parse_failure"
     run = _advisory_run_record(
         snapshot_hash, commit_message, run_status,
         repo_key=repo_key, task_id=task_id,
@@ -1519,6 +1565,8 @@ def _handle_advisory_pre_review(
         "session_id": advisory_session_id,
         "readiness_warnings": readiness_warnings,
         "message": (
+            "Advisory review complete. No findings. Run commit_reviewed when ready."
+            if verified_clean else
             f"Advisory review complete. {len(critical_fails)} critical, "
             f"{len(advisory_fails)} advisory findings. "
             "Fix issues and run commit_reviewed when ready."

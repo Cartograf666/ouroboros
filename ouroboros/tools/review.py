@@ -17,7 +17,11 @@ from ouroboros.utils import (
 )
 from ouroboros import config as _cfg
 from ouroboros.tools.registry import ToolEntry, ToolContext
-from ouroboros.triad_review import extract_json_array, parse_model_review_results
+from ouroboros.triad_review import (
+    REVIEW_JSON_ARRAY_CONTRACT,
+    extract_json_array,
+    parse_model_review_results,
+)
 
 log = logging.getLogger(__name__)
 
@@ -91,7 +95,6 @@ from ouroboros.tools.review_helpers import (
     build_rebuttal_section,
     CRITICAL_FINDING_CALIBRATION,
     REPO_ANTI_PATTERN_LOCK_GUARD,
-    REVIEW_JSON_ARRAY_CONTRACT,
     REVIEW_PREAMBLE,
     build_self_verification_template,
     build_review_history_section as _build_review_history_section,

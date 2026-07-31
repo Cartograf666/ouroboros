@@ -1143,6 +1143,31 @@ def build_review_status_payload(projection: Dict[str, Any], *, next_step: str, i
     return payload
 
 
+def _run_failure_reason(run: Any) -> str | None:
+    """Typed cause for a non-parseable advisory run. Diagnostics only.
+
+    Never consumed by the commit gate, freshness, or debt: it exists so a
+    repeated deterministic failure is visible after the FIRST attempt instead of
+    reading as a generic ``parse_failure`` for hours.
+    """
+    if str(getattr(run, "status", "") or "") != "parse_failure":
+        return None
+    from ouroboros.triad_review import empty_array_is_verified_clean
+
+    raw = str(getattr(run, "raw_result", "") or "").strip()
+    if not raw:
+        return "empty_response"
+    if empty_array_is_verified_clean(raw):
+        # A contract-compliant clean verdict was still rejected: that is a
+        # regression of the sentinel contract, not a model failure. Asking the
+        # shared predicate — not a second substring test — is what keeps this
+        # diagnostic honest when the contract changes.
+        return "clean_sentinel_rejected"
+    if raw.startswith("[") or raw.startswith("```"):
+        return "malformed_array"
+    return "non_json_prose"
+
+
 def _review_status_run_to_dict(run: Any) -> Dict[str, Any]:
     findings = [
         item for item in (getattr(run, "items", []) or [])
@@ -1158,6 +1183,19 @@ def _review_status_run_to_dict(run: Any) -> Dict[str, Any]:
         data[key] = str(getattr(run, key, "") or "")
     for key in ("bypass_reason", "repo_key", "tool_name", "task_id"):
         data[key] = str(getattr(run, key, "") or "") or None
+    # Already persisted per run, previously dropped from the projection: without
+    # these the owner sees repeated identical statuses with no usable cause.
+    data["failure_reason"] = _run_failure_reason(run)
+    data["model_used"] = str(getattr(run, "model_used", "") or "") or None
+    duration = getattr(run, "duration_sec", None)
+    data["duration_sec"] = round(float(duration), 2) if duration else None
+    prompt_chars = getattr(run, "prompt_chars", None)
+    data["prompt_chars"] = int(prompt_chars) or None if prompt_chars else None
+    # Deliberately NO raw excerpt here: raw_result is untrusted reviewer output
+    # that can echo secret-bearing diff content, and this projection is returned
+    # to the active model. The typed reason above is derived, not raw, and the
+    # complete text stays in the durable advisory run record addressed by the
+    # snapshot_hash/ts already on this row.
     return data
 
 

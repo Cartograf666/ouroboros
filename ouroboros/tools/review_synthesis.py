@@ -16,10 +16,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 if TYPE_CHECKING:
     from ouroboros.tools.plan_review import _PlanReviewRequest
 
-from ouroboros.triad_review import extract_json_array
+from ouroboros.triad_review import REVIEW_JSON_MATRIX_CONTRACT, extract_json_array
 from ouroboros.tools.review_helpers import (
     REPO_ANTI_PATTERN_LOCK_GUARD,
-    REVIEW_JSON_ARRAY_CONTRACT,
     REVIEW_PREAMBLE,
     emit_review_usage,
 )
@@ -1311,7 +1310,7 @@ in the "item" field; no substitutions):
 8. implicit_contracts
 
 Each element must follow the shared review JSON contract:
-{REVIEW_JSON_ARRAY_CONTRACT}
+{REVIEW_JSON_MATRIX_CONTRACT}
 
 Additional scope-review requirements:
 - "item" must be one of the eight identifiers above — verbatim, case-sensitive.
