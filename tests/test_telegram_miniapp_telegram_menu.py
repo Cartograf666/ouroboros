@@ -157,6 +157,29 @@ def test_external_change_is_never_overwritten(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_exact_original_menu_recovers_stale_installed_snapshot(tmp_path: Path) -> None:
+    remote = FakeTelegram()
+    menu = manager(tmp_path, remote)
+
+    async def run() -> None:
+        await menu.install("https://first.trycloudflare.com/")
+        remote.button = {"type": "default"}
+
+        assert await menu.restore() is False
+        assert not menu.snapshot_path.exists()
+        assert len(remote.set_calls) == 1
+
+        assert await menu.install("https://second.trycloudflare.com/") is True
+        saved = json.loads(menu.snapshot_path.read_text(encoding="utf-8"))
+        assert saved["original"] == {"type": "default"}
+        assert saved["owned"]["web_app"]["url"] == "https://second.trycloudflare.com/"
+        assert remote.button == saved["owned"]
+        assert len(remote.set_calls) == 2
+        await menu._client.aclose()  # type: ignore[union-attr]
+
+    asyncio.run(run())
+
+
 def test_snapshot_exposes_durable_prior_owner_for_cold_reconciliation(tmp_path: Path) -> None:
     remote = FakeTelegram()
     menu = manager(tmp_path, remote)

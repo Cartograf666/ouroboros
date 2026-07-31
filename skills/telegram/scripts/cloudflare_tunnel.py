@@ -52,6 +52,12 @@ MAX_ASSET_BYTES = 70 * 1024 * 1024
 MAX_LOG_BYTES = 64 * 1024
 _DOWNLOAD_HOSTS = frozenset({"github.com", "release-assets.githubusercontent.com"})
 _URL_CANDIDATE_RE = re.compile(r"https://[^\s\"'<>\\]+")
+_LOG_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s\"'<>\\]+", re.IGNORECASE)
+_LOG_CREDENTIAL_RE = re.compile(
+    r"(?i)([\"']?[a-z0-9_.-]*(?:token|secret|password|authorization|cookie|"
+    r"api[_-]?key|credential)[a-z0-9_.-]*[\"']?\s*[:=]\s*)"
+    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^,;}\r\n]+)"
+)
 _QUICK_HOST_RE = re.compile(
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.trycloudflare\.com"
 )
@@ -460,6 +466,23 @@ def _quick_tunnel_url(text: str) -> str | None:
     return None
 
 
+def _safe_log_detail(text: str, maximum: int = 180) -> str:
+    """Return one bounded cloudflared line without URLs or credential values."""
+
+    lines = [
+        " ".join(line.split())
+        for line in str(text or "").splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return ""
+    detail = _LOG_URL_RE.sub("[url]", lines[-1])
+    detail = _LOG_CREDENTIAL_RE.sub(r"\1[redacted]", detail)
+    if len(detail) <= maximum:
+        return detail
+    return detail[: maximum - 1] + "…"
+
+
 class _BoundedLog:
     def __init__(self, maximum: int = MAX_LOG_BYTES) -> None:
         self.maximum = maximum
@@ -712,8 +735,12 @@ class QuickTunnel:
         await asyncio.gather(*self._reader_tasks, return_exceptions=True)
         await self._disarm_watchdog()
         if self._url_future is not None and not self._url_future.done():
+            detail = _safe_log_detail(self.stderr_tail) or _safe_log_detail(self.stdout_tail)
+            suffix = f" Last output: {detail}" if detail else ""
             self._url_future.set_exception(
-                CloudflaredError(f"Cloudflared exited before publishing a URL (exit {returncode}).")
+                CloudflaredError(
+                    f"Cloudflared exited before publishing a URL (exit {returncode}).{suffix}"
+                )
             )
         await asyncio.to_thread(self._cleanup_home)
 
