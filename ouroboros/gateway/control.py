@@ -264,7 +264,19 @@ async def api_update_preflight(_request: Request) -> JSONResponse:
     try:
         from supervisor.update_merge import plan_managed_update_merge
 
-        return JSONResponse({"merge_plan": plan_managed_update_merge(fetch=True)})
+        plan = plan_managed_update_merge(fetch=True)
+        # Evaluate the SAME protected-path authority the apply gate enforces, for the strategy the
+        # dialog would actually offer, so the UI never proposes an action the backend will refuse.
+        offered = "auto_merge" if _supervisor_authored_clean_merge(plan, "auto_merge") else "assisted"
+        blocked = _managed_update_protected_block(plan, offered) if plan.get("available") else []
+        return JSONResponse({
+            "merge_plan": plan,
+            "protected_route": {
+                "offered_strategy": offered,
+                "will_route_manual": bool(blocked),
+                "protected_paths": blocked,
+            },
+        })
     except Exception as exc:
         return json_exception(exc)
 
@@ -292,6 +304,57 @@ def _official_protected_hits(plan: dict) -> list:
         if rc == 0:
             paths |= {p for p in delta.splitlines() if p.strip()}
     return sorted(p for p in paths if _is_protected_for_managed_update(p))
+
+
+# Protected tiers a SUPERVISOR-authored clean merge may carry without owner diff review. Any
+# other tier — notably `safety-critical`, and any path this categorizer does not recognize —
+# stays blocking, so the exemption is fail-closed by construction.
+_AUTO_MERGE_EXEMPT_PROTECTED_CATEGORIES = frozenset({"frozen-contract", "release-invariant"})
+
+
+def _supervisor_authored_clean_merge(plan: dict, strategy: str) -> bool:
+    """Whether this request takes the ZERO-AGENT-AUTHORSHIP branch: a clean 3-way merge of
+    already-reviewed local COMMITTED history with the already-reviewed official release, landed
+    by the supervisor (no conflict markers for the agent to resolve, no uncommitted content).
+
+    Fail-closed: an unreadable dirty count, or a plan claiming `kind == "clean"` while still
+    carrying conflict paths (which `classify_conflicts` defines as impossible), is not trusted.
+    """
+    if strategy != "auto_merge" or str(plan.get("kind") or "") != "clean":
+        return False
+    try:
+        if int(plan.get("local_dirty_count") or 0) > 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return not any(
+        plan.get(key)
+        for key in ("protected_conflict_paths", "code_conflict_paths", "doc_conflict_paths")
+    )
+
+
+def _managed_update_protected_block(plan: dict, strategy: str) -> list:
+    """PROTECTED paths that must route THIS strategy to MANUAL — the single authority shared by
+    the preflight (so the offered action is honest) and the apply gate (so it is enforced).
+
+    The protected-path policy exists to keep the AGENT from authoring changes to protected
+    surfaces. So the gate is scoped to where that authorship can actually happen:
+      - `safety-critical` (BIBLE.md, prompts/SAFETY.md, safety.py, runtime_mode_policy.py,
+        tools/registry.py, tools/extension_dispatch.py) blocks UNCONDITIONALLY — the owner sees
+        every constitutional/safety change before it lands, whoever authored it;
+      - `frozen-contract` / `release-invariant` block wherever the agent resolves or commits the
+        merge (assisted, doc_reconcile, or an auto_merge degrading into assisted), but NOT in the
+        supervisor-authored clean branch, where no agent edit occurs at all.
+    """
+    hits = _official_protected_hits(plan)
+    if not hits or not _supervisor_authored_clean_merge(plan, strategy):
+        return hits
+    from ouroboros.runtime_mode_policy import protected_path_category
+
+    return [
+        p for p in hits
+        if protected_path_category(p) not in _AUTO_MERGE_EXEMPT_PROTECTED_CATEGORIES
+    ]
 
 
 def _start_assisted_merge(plan: dict) -> JSONResponse:
@@ -422,11 +485,12 @@ async def _apply_managed_merge(request: Request, strategy: str) -> JSONResponse:
         # No mutation: hand the UI the plan; recovery artifacts are created only on apply.
         return JSONResponse({"status": "manual", "merge_plan": plan})
 
-    # Official changes to PROTECTED paths (BIBLE/CHECKLISTS/SAFETY + release invariants) route to
-    # MANUAL on EVERY mutating strategy — checked on the initial plan BEFORE any kill_workers /
+    # Official changes to PROTECTED paths route to MANUAL, scoped by category and strategy (see
+    # _managed_update_protected_block): safety-critical always, the other tiers wherever the agent
+    # would author or commit the merge. Checked on the initial plan BEFORE any kill_workers /
     # rescue / materialization, so a read-only handoff never interrupts active tasks. The official
     # delta (base..target) does not change when workers stop, so this pre-kill check is sufficient.
-    protected_hits = _official_protected_hits(plan)
+    protected_hits = _managed_update_protected_block(plan, strategy)
     if protected_hits:
         return JSONResponse(
             {"status": "manual", "reason": "protected_paths", "protected_paths": protected_hits,

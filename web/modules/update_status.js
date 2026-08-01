@@ -80,14 +80,22 @@ export function initUpdateStatus({ showPage, openDashboardTab } = {}) {
         ];
         const base = plan.base_sha ? String(plan.base_sha).slice(0, 8) : '';
         const target = plan.target_sha ? String(plan.target_sha).slice(0, 8) : '';
-        const primary = clean
-            ? '<button data-strategy="auto_merge" class="btn btn-primary">Auto-update</button>'
-            : '<button data-strategy="assisted" class="btn btn-primary">Ouroboros-assisted update</button>';
+        // The backend evaluates its protected-path gate in the preflight for the strategy this
+        // dialog would offer, so we never present an action it will then refuse (protected changes
+        // to safety-critical files always need the owner's own eyes on the diff).
+        const route = (pre && pre.protected_route) || {};
+        const protectedPaths = route.protected_paths || [];
+        const primary = route.will_route_manual
+            ? '<button data-strategy="manual" class="btn btn-primary">Review manually</button>'
+            : (clean
+                ? '<button data-strategy="auto_merge" class="btn btn-primary">Auto-update</button>'
+                : '<button data-strategy="assisted" class="btn btn-primary">Ouroboros-assisted update</button>');
 
         overlay.querySelector('.update-dialog').innerHTML = `
             <h3 class="update-dialog-title">Update ${escapeHtml(base)} → ${escapeHtml(target)}</h3>
             <div class="update-dialog-meta">${plan.local_dirty_count || 0} local change(s)${conflicts.length ? ` · ${conflicts.length} conflict(s)` : ' · clean merge'}</div>
             ${conflicts.length ? `<ul class="update-dialog-conflicts">${conflicts.map((r) => `<li>${escapeHtml(r)}</li>`).join('')}</ul>` : ''}
+            ${route.will_route_manual ? `<div class="update-dialog-note">This release changes protected files, so it needs your own review before it lands:</div><ul class="update-dialog-conflicts">${protectedPaths.map((p) => `<li>${escapeHtml(p)}</li>`).join('')}</ul>` : ''}
             <div class="update-dialog-note">Your local work is preserved in a rescue snapshot first; a smoke test runs before the restart is accepted, and a failed update auto-rolls-back to the current version.</div>
             <div class="update-dialog-actions">
                 ${primary}
