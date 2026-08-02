@@ -570,6 +570,24 @@ def kill_process_group_id(pgid: int) -> None:
         pass
 
 
+def process_group_is_alive(pgid: int) -> bool:
+    """Whether ANY member of Unix process group ``pgid`` is still around (signal 0 probe).
+
+    For callers VERIFYING a kill, so it fails CLOSED: a probe that cannot be answered — Windows,
+    which has no group to probe this way, a refused signal, a bad id — reports the group as still
+    alive, because "we could not tell" is not the same fact as "nothing is left".
+    """
+    if IS_WINDOWS:
+        return True
+    try:
+        os.killpg(int(pgid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError, ValueError):
+        return True
+    return True
+
+
 def process_group_id(pid: int) -> int:
     """Return the Unix process group id for ``pid`` or 0 when unavailable."""
     if IS_WINDOWS:

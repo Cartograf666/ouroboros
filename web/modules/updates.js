@@ -1,6 +1,6 @@
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 import { showToast } from './toast.js';
-import { apiFetch } from './api_client.js';
+import { apiClient, apiFetch } from './api_client.js';
 
 export function initUpdates({ mount, state }) {
     const page = document.createElement('div');
@@ -214,6 +214,53 @@ export function initUpdates({ mount, state }) {
         }
     }
 
+    // The apply POST is a declared contract on BOTH ends — the acknowledgement fields below are
+    // part of `UpdateApplyRequest` — so it crosses the typed gateway boundary rather than a
+    // hand-rolled fetch beside it. Naming it locally keeps the disclosure POST and the bound
+    // acknowledgement re-POST on the same seam, which is what the source-pin fences.
+    async function postApply(body) {
+        try {
+            return await apiClient.updateApply(body);
+        } catch (err) {
+            // The release can move at THREE points: between the disclosure and the bound re-POST,
+            // between that and the fenced re-plan, and between the fence and `prepare_managed_
+            // update`'s own fetch. The first two answer 200 responses `applyUpdate` reads
+            // directly; only this last one is a typed 409, which `jsonPost` RAISES. All three
+            // refuse the drifted release and all three want the same next action from the owner,
+            // so this one is handed BACK as a normal response — one branch below reports all
+            // three, instead of this window falling through to the generic 'Update failed' catch.
+            if (err?.status === 409 && err?.body?.reason === 'release_moved') return err.body;
+            throw err;
+        }
+    }
+
+    // The exclusive update lock is also held by the boot check-on-restart thread while it fetches,
+    // so "lock held" is routinely a transient state the owner did nothing to cause — and the next
+    // click will simply work. Report it as retryable rather than as a failed update.
+    const UPDATE_LOCK_HELD_MESSAGE = 'An update check is already in progress. '
+        + 'Try again in a moment.';
+
+    function isUpdateLockHeldError(err) {
+        return err?.status === 409 && err?.body?.reason === 'update_lock_held';
+    }
+
+    // The backend gates a protected official change even on the replace family — a safety-critical
+    // path OR a protected path whose tier it does not recognize — and answers
+    // `{status: 'manual', requires_acknowledgement: true}` with the exact SHAs + paths it wants
+    // acknowledged. Show that list, then re-POST the acknowledgement BOUND to it — an echo that
+    // does not match exactly is refused, so nothing is ever acknowledged blind.
+    function confirmProtectedAck(data) {
+        const paths = (data.protected_paths || []).map((p) => `  • ${p}`).join('\n');
+        const base = String(data.base_sha || '').slice(0, 8);
+        const target = String(data.target_sha || '').slice(0, 8);
+        return confirm(
+            `This official update (${base} -> ${target}) changes protected files that must be `
+            + `reviewed before a hard reset:\n\n${paths}\n\n`
+            + 'These are safety-critical paths or protected paths of an unrecognized tier. '
+            + 'Applying will hard-reset the checkout to the official version. Continue?',
+        );
+    }
+
     async function applyUpdate() {
         if (!latestStatus?.available) return;
         const safe = latestStatus.safe_to_apply;
@@ -226,22 +273,98 @@ export function initUpdates({ mount, state }) {
             if (!proceed) return;
             strategy = latestStatus.ahead ? 'stash' : 'replace';
         }
-        applyBtn.disabled = true;
-        applyBtn.textContent = 'Preparing...';
-        try {
-            const resp = await apiFetch('/api/update/apply', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ strategy }),
-            });
-            const data = await resp.json().catch(() => ({}));
-            if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-            const keep = data.keep_branch ? ` Local commits preserved as ${data.keep_branch}.` : '';
-            showToast(`Update prepared. Server is restarting.${keep}`, 'success');
-        } catch (err) {
-            showToast('Update failed: ' + (err.message || err), 'error');
+        const restoreBtn = () => {
             applyBtn.disabled = false;
             applyBtn.textContent = safe ? 'Update Now' : 'Update with Options';
+        };
+        applyBtn.disabled = true;
+        applyBtn.textContent = 'Preparing...';
+        let releaseMoved = false;
+        try {
+            let data = await postApply({ strategy });
+            if (data.status === 'manual' && data.requires_acknowledgement) {
+                if (!confirmProtectedAck(data)) {
+                    showToast('Update cancelled — protected changes were not acknowledged.', 'info');
+                    restoreBtn();
+                    return;
+                }
+                data = await postApply({
+                    strategy,
+                    acknowledge_protected: true,
+                    acknowledged_base_sha: data.base_sha,
+                    acknowledged_target_sha: data.target_sha,
+                    acknowledged_protected_paths: data.protected_paths || [],
+                });
+                if (data.status === 'manual' && data.requires_acknowledgement) {
+                    // The release moved between the disclosure and this echo, so the backend
+                    // refused the now-stale acknowledgement and answered with a FRESH disclosure.
+                    // Reported below, NOT re-prompted in place: one dialog per disclosure is what
+                    // keeps the acknowledgement honest, so the owner comes back through a click.
+                    releaseMoved = true;
+                }
+            }
+            // Drift after the owner ACKNOWLEDGED protected changes: naming the confirmation and the
+            // protected review is accurate only on this branch, because only this branch ran a
+            // disclosure dialog.
+            if (releaseMoved) {
+                showToast(
+                    'The official release moved since you confirmed. Click Update again to '
+                    + 'review the new protected changes.',
+                    'info',
+                );
+                restoreBtn();
+                return;
+            }
+            // The other two drift windows — the fenced re-plan's typed reason and prepare's 409 that
+            // `postApply` handed back as a response — can both fire for an UNPROTECTED update where
+            // no acknowledgement dialog ever ran, so the wording stays neutral: claiming the owner
+            // confirmed something, or that protected paths changed, would be false there.
+            if (data.reason === 'release_moved') {
+                showToast(
+                    'The official release changed while this update was being applied. Click '
+                    + 'Update again to recheck the changed release.',
+                    'info',
+                );
+                restoreBtn();
+                return;
+            }
+            if (data.status === 'manual') {
+                // Not a success: the backend handed this update back for owner review.
+                const why = data.reason === 'protected_delta_unverifiable'
+                    ? 'the official delta could not be verified'
+                    : 'it changes protected files';
+                showToast(`Update needs manual handling — ${why}.`, 'error');
+                restoreBtn();
+                return;
+            }
+            const keep = data.keep_branch ? ` Local commits preserved as ${data.keep_branch}.` : '';
+            // `status:'ok'` with `restarting:false` is the terminal frame for an update that LANDED
+            // and then could not get its restart requested. "Server is restarting." tells the owner
+            // to wait for a restart that is never coming, on a checkout that has already moved — and
+            // leaving the button disabled for that wait strands them with no next action. Narrow to
+            // this exact frame so every other terminal answer keeps its wording verbatim.
+            if (data.status === 'ok' && !data.restarting) {
+                const why = data.warning || 'restart the server manually to finish';
+                showToast(`Update applied, but ${why}.${keep}`, 'warning');
+                restoreBtn();
+                return;
+            }
+            // Assisted staging starts a resolution task first — no restart is pending yet, so the
+            // restart wording would promise something this path never does.
+            if (data.status === 'assisted_started') {
+                showToast(`Update fetched; assisted merge resolution started.${keep}`, 'success');
+                return;
+            }
+            showToast(`Update prepared. Server is restarting.${keep}`, 'success');
+        } catch (err) {
+            // A held lock also arrives as a 409, which jsonPost RAISES — without the typed reason
+            // it would read as a failed update rather than the transient state it is.
+            const lockHeld = isUpdateLockHeldError(err);
+            showToast(
+                lockHeld ? UPDATE_LOCK_HELD_MESSAGE : `Update failed: ${err.message || err}`,
+                lockHeld ? 'info' : 'error',
+            );
+            restoreBtn();
         }
     }
 

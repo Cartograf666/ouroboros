@@ -53,6 +53,9 @@ _POPEN_ALLOWLIST = {
     "ouroboros/local_model.py",           # custody record added at spawn
     "ouroboros/extension_companion.py",   # custody write-through added at spawn
     "ouroboros/tools/services.py",        # routed through spawn_supervised
+    # git_fetch_bounded: a short-lived waited fetch in its own session whose timeout path
+    # kills the whole group and reaps the child inline — never a long-lived orphanable spawn.
+    "supervisor/git_ops.py",
 }
 
 

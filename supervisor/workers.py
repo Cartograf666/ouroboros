@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 from supervisor.state import load_state, append_jsonl, reconstruct_task_cost
 from supervisor.message_bus import coerce_chat_identity, send_with_budget
@@ -89,6 +89,11 @@ class Worker:
     # teardown (kill/join/archive/respawn) is handed to the background reaper. The slot
     # is unavailable for assignment until respawn_worker() installs a fresh Worker.
     reaping: bool = False
+    # Set by the child itself once it has finished importing the agent stack and is about to read
+    # `in_q` — i.e. the first instant at which handing this slot a task actually means something.
+    # Membership in WORKERS proves only that `proc.start()` returned. ``None`` for handles built
+    # without a handshake (they simply never answer ready). See ``wait_for_ready_worker``.
+    ready: Any = None
 
 
 _EVENT_Q = None
@@ -214,6 +219,46 @@ def worker_pool_admission_state(ctx: Any = None) -> Dict[str, Any]:
     }
 
 
+WORKER_READY_TIMEOUT_SEC = 60.0
+
+
+def wait_for_ready_worker(timeout: float = WORKER_READY_TIMEOUT_SEC, poll: float = 0.25) -> bool:
+    """Wait, bounded, for at least one worker in the CURRENT pool to prove it can run a task.
+
+    ``worker_pool_admission_state`` counts handles, and a handle exists the moment ``proc.start()``
+    returns — before the child has imported anything. That is an adequate ingress predicate (a task
+    queued for a pool that is still booting simply waits), but it is NOT adequate for a caller that
+    must hand off responsibility for finishing something, because a child that dies during import
+    leaves a full-looking pool with nobody in it. This waits for the child's own handshake instead.
+
+    Returns False as soon as the answer is settled — no live candidate is left, or the pool is
+    empty — so the ceiling is only paid while a worker is genuinely still starting.
+    """
+    deadline = time.monotonic() + max(float(timeout), 0.0)
+    while True:
+        with _queue_lock:
+            candidates = list(WORKERS.values())
+        alive = False
+        for worker in candidates:
+            signal_ = getattr(worker, "ready", None)
+            try:
+                if not worker.proc.is_alive():
+                    continue
+            except Exception:
+                continue
+            alive = True
+            try:
+                if signal_ is not None and signal_.is_set():
+                    return True
+            except Exception:
+                continue
+        if not alive:
+            return False  # every candidate is gone; waiting cannot change that
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(max(float(poll), 0.01))
+
+
 def ensure_worker_pool_started(n: int = 0, *, allow_disabled_restart: bool = False) -> bool:
     """Start an absent pool; only explicit internal recovery may clear disablement."""
     state = worker_pool_admission_state()
@@ -223,6 +268,205 @@ def ensure_worker_pool_started(n: int = 0, *, allow_disabled_restart: bool = Fal
         return False
     spawn_workers(n)
     return True
+
+
+# --- repository-writer admission (v6.88.1) ---------------------------------------------------
+#
+# The multiprocessing pool is not the only thing in this runtime that writes to the checkout: the
+# direct-chat agent runs on its own THREAD inside this process with the full operator-control tool
+# profile, and the ephemeral same-route turn does too. Stopping the worker pool therefore does not
+# establish exclusion on its own — an admitted chat turn can still edit or commit between the
+# managed update's post-stop re-plan and its hard reset, which is exactly what the clean-tree/base
+# proof claims cannot happen.
+#
+# A thread cannot be killed, so the fence works in two halves: close admission so no NEW turn
+# starts, then wait out the turns already inside (`drain_repo_writers`). The flag is a dict rather
+# than a bare global so a test can substitute an isolated one.
+_REPO_WRITER_ADMISSION: Dict[str, str] = {"closed_reason": ""}
+_repo_writer_admission_lock = threading.Lock()
+# The turns that PASSED admission and have not finished yet, guarded by the SAME lock as the flag
+# above — which is the entire point. Admission and registration happen in one hold, so a turn can
+# never be both past the check and invisible to `drain_repo_writers`. Inferring liveness from the
+# chat agent's `_busy` flag alone could not close that window: `_busy` is set deep inside the run,
+# after a state/budget read and (on first use) the construction of the whole agent, so a turn
+# admitted microseconds before the fence closed reported quiescent for that entire startup.
+_ADMITTED_REPO_WRITERS: Dict[str, str] = {}
+_repo_writer_lease_seq = 0
+
+
+def close_repo_writer_admission(reason: str) -> None:
+    """Refuse NEW in-process repository writers (direct/ephemeral chat turns)."""
+    with _repo_writer_admission_lock:
+        _REPO_WRITER_ADMISSION["closed_reason"] = str(reason or "managed_update")
+
+
+def open_repo_writer_admission() -> None:
+    """Re-admit in-process writers. Owned by the update paths that give the pool back — an update
+    that leaves admission closed has silently ended direct chat for the life of the process."""
+    with _repo_writer_admission_lock:
+        _REPO_WRITER_ADMISSION["closed_reason"] = ""
+
+
+def repo_writer_admission_closed() -> str:
+    """The reason admission is closed, or ``""`` when in-process writers are admitted."""
+    with _repo_writer_admission_lock:
+        return str(_REPO_WRITER_ADMISSION.get("closed_reason") or "")
+
+
+def acquire_repo_writer_lease(kind: str) -> Optional[str]:
+    """Admit ONE in-process repository writer, ATOMICALLY with the closed-state read.
+
+    Returns a lease id the caller must release when its turn ends, or ``None`` when admission is
+    closed. Must be taken INSIDE the caller's serialization boundary (``_chat_agent_lock`` /
+    ``_ephemeral_chat_lock``): a turn that read the flag and only then queued behind another turn
+    would otherwise begin after the fence closed, having never looked again.
+    """
+    global _repo_writer_lease_seq
+    with _repo_writer_admission_lock:
+        if str(_REPO_WRITER_ADMISSION.get("closed_reason") or ""):
+            return None
+        _repo_writer_lease_seq += 1
+        lease = f"{kind}#{_repo_writer_lease_seq}"
+        _ADMITTED_REPO_WRITERS[lease] = str(kind)
+        return lease
+
+
+def release_repo_writer_lease(lease: Optional[str]) -> None:
+    """Retire an admitted writer. Owned by a ``finally`` — a leaked lease fails every later fence."""
+    if not lease:
+        return
+    with _repo_writer_admission_lock:
+        _ADMITTED_REPO_WRITERS.pop(lease, None)
+
+
+def admitted_repo_writers() -> List[str]:
+    """The leases of the in-process writers currently admitted."""
+    with _repo_writer_admission_lock:
+        return sorted(_ADMITTED_REPO_WRITERS)
+
+
+def drain_repo_writers(timeout: float = 30.0, poll: float = 0.25) -> List[str]:
+    """Wait for the in-process repository writers already running to finish.
+
+    Returns the descriptions of the writers still live when the deadline passed — an EMPTY list
+    means this process holds no repository writer any more. Callers must have closed admission
+    first, otherwise a fresh turn can start behind the drain.
+
+    The admitted-lease registry is the PRIMARY signal because it is the only one that cannot lag
+    admission; `chat_turn_liveness` and the ephemeral lock are kept as secondary reads so a writer
+    that somehow escaped the lease (or a wedged turn) still shows up here.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        live: List[str] = admitted_repo_writers()
+        try:
+            busy, task_id, _last = chat_turn_liveness()
+        except Exception:
+            # Fail closed on the read: a liveness probe we cannot run is not a proof of quiescence.
+            busy, task_id = True, "unreadable"
+        if busy:
+            live.append(f"direct_chat_turn:{task_id or 'unknown'}")
+        if _ephemeral_chat_lock.locked():
+            live.append("ephemeral_chat_turn")
+        if not live:
+            return []
+        if time.monotonic() >= deadline:
+            return live
+        time.sleep(max(0.01, float(poll)))
+
+
+def terminate_worker_survivors(survivors: List[Any], *, join_timeout: float = 3.0) -> List[Any]:
+    """Force a VERIFIED process-tree termination of workers that outlived ``kill_workers``.
+
+    ``kill_workers`` makes one force-kill pass whose outcome it never checks and then clears
+    ``WORKERS`` regardless, so the update fence is left holding handles it cannot prove are dead.
+    This is the retry that turns "probably dead" into an answer: kill the whole tree, join, and
+    report back only the handles that are STILL alive — or that we could not read at all, because
+    an unreadable handle is not a dead one. A non-empty return means a prior writer may still be
+    running, so no replacement pool may be started.
+    """
+    from ouroboros.platform_layer import kill_pid_tree
+
+    still_alive: List[Any] = []
+    for worker in survivors:
+        try:
+            proc = worker.proc
+            pid = getattr(proc, "pid", None)
+            if pid:
+                kill_pid_tree(int(pid))
+            proc.join(timeout=join_timeout)
+            if proc.is_alive():
+                still_alive.append(worker)
+        except Exception:
+            log.warning("update fence: could not verify worker termination", exc_info=True)
+            still_alive.append(worker)
+    return still_alive
+
+
+# Workers a managed-update fence could not prove dead, LATCHED for the life of the process.
+# Nothing else remembers them: `kill_workers` clears ``WORKERS`` unconditionally, so once the
+# refusal has been answered the survivor exists only here. Without the latch the very next apply
+# would snapshot an empty pool, find no survivors, and hand back a clean fence proof manufactured
+# beside a writer that never died — exactly the coexistence the survivor refusal exists to prevent.
+_UNPROVEN_WORKER_SURVIVORS: List[Any] = []
+_survivor_latch_lock = threading.Lock()
+
+
+def latch_worker_survivors(survivors: List[Any]) -> None:
+    """Remember (by identity) workers a fence could not prove dead."""
+    with _survivor_latch_lock:
+        for worker in survivors:
+            if not any(worker is held for held in _UNPROVEN_WORKER_SURVIVORS):
+                _UNPROVEN_WORKER_SURVIVORS.append(worker)
+
+
+def unproven_worker_survivors() -> List[Any]:
+    """The latched survivors, without retrying anything."""
+    with _survivor_latch_lock:
+        return list(_UNPROVEN_WORKER_SURVIVORS)
+
+
+def reap_latched_worker_survivors() -> List[Any]:
+    """Retry the VERIFIED termination of every latched survivor and keep only what is still
+    unproven; the remainder is returned. An empty return is the only thing that clears the latch,
+    because proving the prior generation dead is the only thing that makes a new fence meaningful.
+    """
+    held = unproven_worker_survivors()
+    if not held:
+        return []
+    still_alive = terminate_worker_survivors(held)
+    with _survivor_latch_lock:
+        _UNPROVEN_WORKER_SURVIVORS[:] = still_alive
+    return list(still_alive)
+
+
+# Repository writers a fence could not clear, LATCHED by label for the life of the process. Same
+# reason the survivor latch exists: the blocked refusal closes writer admission, and without a
+# durable record the admission reconciler's next timer pass would re-open it beside a writer that
+# is still running. Labels (not handles) because these live in OTHER processes.
+_LATCHED_REPO_WRITER_BLOCKERS: List[str] = []
+
+
+def latch_repo_writer_blockers(blockers: List[str]) -> None:
+    """Remember the repository writers a fence could not prove gone."""
+    with _survivor_latch_lock:
+        for label in blockers:
+            text = str(label or "")
+            if text and text not in _LATCHED_REPO_WRITER_BLOCKERS:
+                _LATCHED_REPO_WRITER_BLOCKERS.append(text)
+
+
+def latched_repo_writer_blockers() -> List[str]:
+    """The latched blockers, without retrying anything."""
+    with _survivor_latch_lock:
+        return list(_LATCHED_REPO_WRITER_BLOCKERS)
+
+
+def clear_repo_writer_blockers() -> None:
+    """Drop the blocker latch. Only a caller that has just RE-PROBED the writers and found none may
+    call this — the latch is otherwise the sole record that the checkout is still shared."""
+    with _survivor_latch_lock:
+        _LATCHED_REPO_WRITER_BLOCKERS[:] = []
 
 
 _chat_agent = None
@@ -767,6 +1011,49 @@ def ensure_project_scope(evt: dict, ctx: Any) -> None:
         log.debug("ensure_project_scope: project registration failed for %s", pid, exc_info=True)
 
 
+def _tell_repo_writer_admission_closed(chat_id: int, reason: str) -> None:
+    """Tell the owner a turn was refused because a managed update holds the checkout.
+
+    The turn is not queued for later: admission is closed only while a managed update holds the
+    checkout, and that window ends in either a restart or an explicit re-open, so telling the owner
+    now is more honest than silently deferring a turn whose tools would be refused anyway.
+    """
+    try:
+        send_with_budget(
+            chat_id,
+            "🔒 A managed update is holding the repository, so this turn was not started. "
+            "Try again once the update finishes or the server restarts.",
+        )
+    except Exception:
+        log.debug("Suppressed exception", exc_info=True)
+    log.info("chat turn refused: repository writer admission closed (%s)", reason)
+
+
+def _refuse_closed_repo_writer_admission(chat_id: int) -> bool:
+    """ADVISORY pre-check, taken before the caller queues on its serialization lock.
+
+    It only saves the owner a wait: a turn refused here would be refused by the lease below anyway.
+    It is NOT the admission decision — that one has to be atomic with registering the turn, which
+    a bare flag read cannot be.
+    """
+    reason = repo_writer_admission_closed()
+    if not reason:
+        return False
+    _tell_repo_writer_admission_closed(chat_id, reason)
+    return True
+
+
+def _admit_repo_writer(chat_id: int, kind: str) -> Optional[str]:
+    """The AUTHORITATIVE admission for an in-process chat writer, refusing visibly.
+
+    Returns the lease to release when the turn ends, or ``None`` when the turn must not run.
+    """
+    lease = acquire_repo_writer_lease(kind)
+    if lease is None:
+        _tell_repo_writer_admission_closed(chat_id, repo_writer_admission_closed() or "managed_update")
+    return lease
+
+
 def handle_chat_direct(
     chat_id: int,
     text: str,
@@ -774,14 +1061,27 @@ def handle_chat_direct(
     task_constraint: Optional[dict] = None,
     task_metadata: Optional[dict] = None,
 ) -> None:
+    if _refuse_closed_repo_writer_admission(chat_id):
+        return
     with _chat_agent_lock:
-        _handle_chat_direct_locked(
-            chat_id,
-            text,
-            image_data,
-            task_constraint=task_constraint,
-            task_metadata=task_metadata,
-        )
+        # Re-decided HERE, inside the serialization boundary and atomically with registering this
+        # turn as a live repository writer. The pre-check above happens before the queue: a turn
+        # that passed it and then waited out another turn would otherwise start after the update
+        # fence closed admission, and stay invisible to `drain_repo_writers` for the whole window
+        # before `_run_chat_task` sets the agent's `_busy` flag.
+        lease = _admit_repo_writer(chat_id, "direct_chat")
+        if lease is None:
+            return
+        try:
+            _handle_chat_direct_locked(
+                chat_id,
+                text,
+                image_data,
+                task_constraint=task_constraint,
+                task_metadata=task_metadata,
+            )
+        finally:
+            release_repo_writer_lease(lease)
 
 
 def _handle_chat_direct_locked(
@@ -964,6 +1264,11 @@ def handle_chat_ephemeral(
     mode / effort, not a cheaper lane). Ephemeral turns are serialized among
     themselves and are barred from long-term memory/reflection/evolution writes."""
     from supervisor.state import budget_remaining, load_state
+    # Same repository-writer admission as the locked turn: an ephemeral turn runs the SAME route
+    # (same tool profile), so it can write to the checkout just as the direct turn can. Advisory
+    # here, decided for real inside `_ephemeral_chat_lock` below.
+    if _refuse_closed_repo_writer_admission(chat_id):
+        return
     try:
         remaining = budget_remaining(load_state(), strict=True)
     except Exception:
@@ -975,16 +1280,25 @@ def handle_chat_ephemeral(
         except Exception:
             pass
         return
-    if not getattr(sys, 'frozen', False):
-        sys.path.insert(0, str(REPO_DIR))
-    from ouroboros.agent import make_agent
-
     with _ephemeral_chat_lock:
-        agent = make_agent(repo_dir=str(REPO_DIR), drive_root=str(DRIVE_ROOT), event_queue=get_event_q())
-        _run_chat_task(
-            agent, chat_id, text, image_data,
-            task_constraint=task_constraint, task_metadata=task_metadata, ephemeral=True,
-        )
+        # Inside the serialization boundary, for the reason spelled out on the direct route: a turn
+        # that cleared the advisory check and then queued here must look again before it writes.
+        # Taken BEFORE the agent is imported/built so a refused turn costs nothing.
+        lease = _admit_repo_writer(chat_id, "ephemeral_chat")
+        if lease is None:
+            return
+        try:
+            if not getattr(sys, 'frozen', False):
+                sys.path.insert(0, str(REPO_DIR))
+            from ouroboros.agent import make_agent
+
+            agent = make_agent(repo_dir=str(REPO_DIR), drive_root=str(DRIVE_ROOT), event_queue=get_event_q())
+            _run_chat_task(
+                agent, chat_id, text, image_data,
+                task_constraint=task_constraint, task_metadata=task_metadata, ephemeral=True,
+            )
+        finally:
+            release_repo_writer_lease(lease)
 
 
 def auto_resume_after_restart() -> None:
@@ -1097,7 +1411,7 @@ def _current_custody_session_id() -> str:
 
 
 def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
-                custody_session_id: str = "") -> None:
+                custody_session_id: str = "", ready: Any = None) -> None:
     import os as _os
     # Mark this process as a worker BEFORE importing the agent/LLM stack so the
     # central network-transport policy disables system proxy resolution
@@ -1197,6 +1511,15 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     except Exception as _e:
         _log_worker_crash(wid, _drive, "make_agent", _e, _tb.format_exc())
         return
+    # Ready, and not one statement earlier: everything above can fail (an update that just landed
+    # can break the very import this executes), and a slot that dies here is indistinguishable from
+    # a healthy one to anyone reading `WORKERS`. The signal is raised where the agent exists AND
+    # `in_q` is about to be read, so "ready" means exactly "a task given to this slot will run".
+    if ready is not None:
+        try:
+            ready.set()
+        except Exception:
+            pass
     while True:
         try:
             task = in_q.get()
@@ -1576,12 +1899,13 @@ def spawn_workers(n: int = 0) -> None:
     try:
         for i in range(count):
             in_q = _CTX.Queue()
+            ready = _CTX.Event()
             proc = _CTX.Process(target=worker_main,
                                args=(i, in_q, event_q, str(REPO_DIR), str(DRIVE_ROOT),
-                                     _current_custody_session_id()))
+                                     _current_custody_session_id(), ready))
             proc.daemon = True
             proc.start()
-            new_workers[i] = Worker(wid=i, proc=proc, in_q=in_q, busy_task_id=None)
+            new_workers[i] = Worker(wid=i, proc=proc, in_q=in_q, busy_task_id=None, ready=ready)
     except Exception:
         for worker in new_workers.values():
             try:
@@ -1695,6 +2019,48 @@ def kill_workers(
         )
 
 
+class WorkerTeardown(NamedTuple):
+    """Receipt for one fenced pool teardown: every handle that was in the pool before the kill,
+    plus the teardown error if there was one.
+
+    The error travels WITH the handles rather than as an exception because those two facts are
+    only useful together. `kill_workers` clears ``WORKERS`` partway through and keeps working
+    afterwards (task bookkeeping, queue snapshot, audit append), so a raise from the tail leaves a
+    caller that let the exception through with no handles at all — and no handles reads exactly
+    like "nothing survived", which is the one conclusion an unfinished teardown does not support.
+    """
+
+    fenced: List[Any]
+    error: str
+
+
+@_serialized_worker_lifecycle
+def snapshot_and_kill_workers(**kwargs) -> WorkerTeardown:
+    """Tear the pool down and return the handles that were in it, as ONE lifecycle-serialized
+    step. For `control._fence_workers_for_update`, whose whole value is the exclusion claim it
+    makes: `kill_workers` clears ``WORKERS`` unconditionally, so proving the stop worked means
+    holding the handles from BEFORE the call and re-checking them after.
+
+    Reading ``WORKERS`` in the caller cannot give that proof. Every other mutator takes
+    ``_WORKER_LIFECYCLE_LOCK`` (and ``_queue_lock``), so a ``respawn_worker`` landing between an
+    unlocked snapshot and the kill installs a handle that gets torn down but is never verified —
+    and a snapshot helper that merely took the lock and released it again would leave exactly the
+    same window. The lock is an RLock, so nesting the (also serialized) ``kill_workers`` inside
+    this hold is what actually closes it.
+
+    A failing teardown returns the same receipt with `error` set instead of propagating: the
+    handles are the evidence, and they must reach the caller on the path where the stop is LEAST
+    trustworthy.
+    """
+    with _queue_lock:
+        fenced = list(WORKERS.values())
+    try:
+        kill_workers(**kwargs)
+    except Exception as exc:
+        return WorkerTeardown(fenced, f"{type(exc).__name__}: {exc}")
+    return WorkerTeardown(fenced, "")
+
+
 def _kill_survivors() -> None:
     """Force-kill any workers and their entire descendant trees."""
     from ouroboros.platform_layer import kill_pid_tree
@@ -1722,9 +2088,10 @@ def respawn_worker(wid: int) -> bool:
         return False
     ctx = _get_ctx()
     in_q = ctx.Queue()
+    ready = ctx.Event()
     proc = ctx.Process(target=worker_main,
                        args=(wid, in_q, get_event_q(), str(REPO_DIR), str(DRIVE_ROOT),
-                             _current_custody_session_id()))
+                             _current_custody_session_id(), ready))
     proc.daemon = True
     try:
         proc.start()
@@ -1738,7 +2105,7 @@ def respawn_worker(wid: int) -> bool:
     installed = False
     with _queue_lock:
         if WORKERS.get(wid) is old:
-            WORKERS[wid] = Worker(wid=wid, proc=proc, in_q=in_q, busy_task_id=None)
+            WORKERS[wid] = Worker(wid=wid, proc=proc, in_q=in_q, busy_task_id=None, ready=ready)
             installed = True
     if not installed:
         try:

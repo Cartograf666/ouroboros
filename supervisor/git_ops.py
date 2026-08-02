@@ -177,26 +177,37 @@ def _read_update_intent() -> Dict[str, Any]:
 
 
 def _write_update_intent(payload: Dict[str, Any]) -> None:
-    # Atomic: a torn marker would make the next restart silently skip the
-    # prepared managed update (reader fails closed on parse errors).
+    # Atomic: a torn marker makes the next restart silently skip the prepared managed update
+    # (the reader fails closed on parse errors).
     from ouroboros.utils import atomic_write_json
 
     path = _update_intent_marker_path()
     atomic_write_json(path, payload, trailing_newline=True)
 
 
-def _clear_update_intent() -> None:
+def _clear_update_intent() -> bool:
+    """Remove the update intent marker and answer whether it is PROVEN absent afterwards.
+
+    The intent is a standing instruction the next `checkout_and_reset` consumes, so callers may only
+    drop the update transaction that explains it once this answers True. The marker is re-stat'ed
+    rather than trusting the unlink's own outcome: "we could not tell" is not "it is gone".
+    """
+    path = _update_intent_marker_path()
     try:
-        _update_intent_marker_path().unlink()
+        path.unlink()
     except FileNotFoundError:
-        return
+        return True
     except Exception:
         log.warning("Failed to clear update intent marker", exc_info=True)
+    try:
+        return not path.exists()
+    except Exception:
+        log.warning("Failed to verify update intent marker removal", exc_info=True)
+        return False
 
 def git_capture(cmd: List[str]) -> Tuple[int, str, str]:
-    # Same reason as utils.run_cmd: this stderr is PARSED (`_maybe_repair_git_index`
-    # matches English git diagnostics), so the operator's locale must not decide
-    # whether a repairable index error is recognised.
+    # Same reason as utils.run_cmd: this stderr is PARSED (`_maybe_repair_git_index` matches English
+    # git diagnostics), so the operator's locale must not decide whether an index error is seen.
     env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
     for _attempt in range(2):
         r = subprocess.run(cmd, cwd=str(REPO_DIR), capture_output=True, text=True, env=env)
@@ -207,6 +218,89 @@ def git_capture(cmd: List[str]) -> Tuple[int, str, str]:
             continue
         return r.returncode, (r.stdout or "").strip(), stderr
     return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+
+
+# The managed fetch is the network call every apply passes through, and its callers reach it
+# holding the exclusive, NON-BLOCKING managed-update lock — one of them
+# (`update_merge.plan_managed_update_merge`, re-planning inside
+# `control._apply_replace_family_fenced`) with the entire worker pool already stopped. Five
+# minutes is far longer than any healthy managed fetch and exists only as the last-resort ceiling:
+# over HTTP(S) the low-speed knobs below abort a merely stalled transfer long before it, and on
+# every other transport this is the only thing that ever will.
+MANAGED_FETCH_TIMEOUT_SEC = 300.0
+# `timeout(1)`'s convention, so a caller can tell a terminated stall from a remote that answered.
+FETCH_TIMEOUT_RC = 124
+
+
+def git_fetch_bounded(
+    remote_name: str, *, timeout: float = MANAGED_FETCH_TIMEOUT_SEC
+) -> Tuple[int, str, str]:
+    """``git fetch <remote>`` under a TRANSPORT-INDEPENDENT wall-clock ceiling.
+
+    ``http.lowSpeedLimit`` / ``http.lowSpeedTime`` stay as the graceful-abort layer, but they are
+    curl knobs bounding HTTP(S) ONLY, and nothing guarantees that transport here (the planner
+    fetches whatever the managed manifest resolved — possibly ``ssh://`` or ``git://``). A hang is
+    not an error any ``except`` can convert, so on the fenced path it would leave the pool dead, the
+    lock held, and every later apply answering a lock-held 409. Hence a real clock. Deliberately NOT
+    routed through ``git_capture``: that helper retries once on a repairable index error, doubling
+    any ceiling, and a fetch has no index to repair.
+
+    Returns ``(rc, stdout, stderr)``; ``rc == FETCH_TIMEOUT_RC`` means the ceiling was hit and the
+    fetch was killed.
+    """
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    cmd = [
+        "git", "-c", "http.lowSpeedLimit=1024", "-c", "http.lowSpeedTime=30",
+        "fetch", "--quiet", remote_name,
+    ]
+    # Give the fetch its own kill GROUP so the termination below reaches the transport helpers git
+    # spawns (ssh, git-remote-https, credential helpers): those inherit these pipes, so killing git
+    # alone leaves `communicate()` blocked on an fd nobody is left to close — the very hang this
+    # bounds. POSIX gets a new SESSION (also denying it a controlling terminal, so it cannot stop on
+    # a prompt), Windows a new PROCESS GROUP for `taskkill /T` to walk. That session makes the child
+    # its group LEADER, so the group id IS its pid, recorded at launch: `os.getpgid(proc.pid)`
+    # RAISES once the leader has exited — exactly the case this kill exists for.
+    if os.name == "posix":
+        group = {"start_new_session": True}
+    else:
+        group = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    proc = subprocess.Popen(
+        cmd, cwd=str(REPO_DIR), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env, **group,
+    )
+    pgid = proc.pid if os.name == "posix" else 0  # nothing has reaped it, so the pid is still ours
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        from ouroboros import platform_layer
+
+        try:
+            if os.name == "posix":
+                platform_layer.kill_process_group_id(pgid)
+            else:
+                # `proc.kill()` orphans git's helpers; `kill_pid_tree` is `taskkill /F /T` here.
+                platform_layer.kill_pid_tree(proc.pid)
+        except Exception:
+            log.warning("git_fetch_bounded: could not kill the stalled fetch", exc_info=True)
+        try:
+            out, err = proc.communicate(timeout=10)  # reap the killed child
+        except Exception:
+            out, err = "", ""
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+        # Verified, not assumed, and only AFTER the reap (an unreaped leader is a zombie that still
+        # answers the probe). Anything that outlived SIGKILL is a leaked process on a transport.
+        if os.name == "posix" and platform_layer.process_group_is_alive(pgid):
+            log.warning("git_fetch_bounded: fetch process group %d survived the kill", pgid)
+        detail = (err or "").strip()
+        return FETCH_TIMEOUT_RC, "", (
+            f"fetch from {remote_name!r} exceeded {timeout:.0f}s and was terminated"
+            + (f": {detail}" if detail else "")
+        )
+    return proc.returncode, (out or "").strip(), (err or "").strip()
 
 
 def _stale_git_lock_paths(max_age_sec: float = 15.0) -> List[pathlib.Path]:
@@ -531,12 +625,10 @@ def _create_rescue_snapshot(branch: str, reason: str,
     else:
         info["diff_error"] = diff_err or "git diff failed"
 
-    # Also capture tracked changes as a real, recoverable git object so recovery
-    # is `git stash apply <sha>` / `git checkout <ref> -- .` rather than only a
-    # loose diff file. `git stash create` snapshots staged+unstaged tracked
-    # changes (it omits untracked files, which the copy below preserves). Purely
-    # additive: failure here never blocks the reset and the diff/untracked copy
-    # remain the primary recovery artifacts.
+    # Also capture tracked changes as a real git object so recovery is `git stash apply <sha>` /
+    # `git checkout <ref> -- .` rather than only a loose diff file. `git stash create` snapshots
+    # staged+unstaged tracked changes (untracked files are preserved by the copy below). Purely
+    # additive: failure here never blocks the reset and the diff/untracked copy stay primary.
     rc_stash, stash_sha, _ = git_capture(["git", "stash", "create", f"rescue:{reason}"])
     stash_sha = stash_sha.strip()
     if rc_stash == 0 and stash_sha:
@@ -914,9 +1006,9 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
         if rc_local != 0:
             _run_git_resilient(["git", "reset", "--hard", "HEAD"], cwd=str(REPO_DIR), check=True)
             _run_git_resilient(["git", "clean", "-fd"], cwd=str(REPO_DIR), check=True)
-            # §6 (same detached-HEAD class as BUG1): `-b` with check=False silently swallowed a
-            # "branch already exists" error and proceeded with HEAD possibly detached/wrong;
-            # `-B` force-creates the branch at HEAD and check=True raises a real failure.
+            # §6 (same detached-HEAD class as BUG1): `-b` with check=False swallowed a "branch
+            # already exists" error and proceeded with HEAD possibly detached; `-B` + check=True
+            # force-creates at HEAD and raises a real failure.
             _run_git_resilient(["git", "checkout", "-B", branch], cwd=str(REPO_DIR), check=True)
         else:
             if policy == "rescue_and_reset":
@@ -942,7 +1034,10 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
     if pin_bundle_sha:
         _clear_bootstrap_pin_marker()
     if update_intent_target and str(reason or "") != "ui_update_apply":
-        _clear_update_intent()
+        # An intent surviving the checkout it described is consumed AGAIN next boot, so a removal we
+        # could not prove fails the checkout: callers gate writers coming back on this boolean.
+        if not _clear_update_intent():
+            return False, "Update intent applied but its marker could not be removed"
     return True, "ok"
 
 def sync_runtime_dependencies(reason: str) -> Tuple[bool, str]:
@@ -1168,6 +1263,27 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
         state["safe_to_apply"] = False
         return state
 
+    # Fetch FIRST, then resolve the local side. `current_sha` is the BASE of an update pin
+    # (`prepare_managed_update`), and a network fetch takes long enough for a live writer to advance
+    # HEAD in between — recording HEAD before the fetch made the pin compare a stale value.
+    if fetch and remote_name:
+        # BOUNDED on purpose. TWO callers reach this fetch holding the exclusive managed-update lock
+        # — the boot check-on-restart thread (`server._boot_managed_update_tasks`) and
+        # `prepare_managed_update` — and `acquire_update_lock` is non-blocking, so for as long as
+        # this network call hangs under either of them EVERY owner-initiated apply answers a
+        # lock-held 409. `git_fetch_bounded` keeps that hold finite whatever the transport is;
+        # a fetch that is really progressing is never cut off.
+        #
+        # Holding the lock is NOT an invariant of every caller, and nothing here may assume it: the
+        # read paths — `control._managed_update_payload` and `control.api_update_preflight` — fetch
+        # deliberately WITHOUT it, so they can move the tracking ref while an apply is in flight.
+        # CONTAINED rather than prevented: `control._post_stop_plan_drift` and this module's own
+        # `prepare_managed_update` pin each refuse a release that moved, so the cost is an aborted
+        # apply plus a worker respawn — never an unreviewed one.
+        rc, _out, err = git_fetch_bounded(remote_name)
+        if rc != 0:
+            state["warnings"].append(f"fetch_error:{err or 'unknown error'}")
+
     rc, branch, err = git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
     if rc == 0:
         state["current_branch"] = branch
@@ -1189,11 +1305,6 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
         state["dirty_preview"] = dirty_lines[:20]
     elif err:
         state["warnings"].append(f"status_error:{err}")
-
-    if fetch and remote_name:
-        rc, _out, err = git_capture(["git", "fetch", remote_name])
-        if rc != 0:
-            state["warnings"].append(f"fetch_error:{err or 'unknown error'}")
 
     if not target_ref:
         state["warnings"].append("managed_updates_unavailable")
@@ -1232,13 +1343,43 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
     return state
 
 
-def prepare_managed_update(strategy: str = "replace") -> Tuple[bool, Dict[str, Any]]:
-    """Prepare a user-requested managed update before the process restarts."""
+def prepare_managed_update(
+    strategy: str = "replace",
+    *,
+    expected_base_sha: str = "",
+    expected_target_sha: str = "",
+) -> Tuple[bool, Dict[str, Any]]:
+    """Prepare a user-requested managed update before the process restarts.
+
+    ``expected_base_sha`` / ``expected_target_sha`` pin the preparation to the release the caller
+    already gated and disclosed. This function fetches again, so without the pin the remote could
+    advance between the gate's fetch and this one and a different (unreviewed) release would be
+    prepared under an acknowledgement given for the old one. Checked BEFORE any rescue snapshot,
+    branch preservation or update-intent write, so a drifted request leaves nothing behind.
+
+    The pin only fences the REMOTE side by itself; the caller must hold the update lock with workers
+    stopped so the local base cannot move either (see ``control._apply_replace_family``). A
+    rejection carries the typed ``reason`` ``release_moved``, so the UI reports the same "click
+    Update again" guidance the gate-level drift path produces.
+    """
     status = compute_managed_update_status(fetch=True)
     if not status.get("managed"):
         return False, {"error": "Managed updates are unavailable for this checkout.", "status": status}
     if not status.get("available"):
         return False, {"error": "No managed update is available.", "status": status}
+    for label, expected, actual in (
+        ("base", expected_base_sha, str(status.get("current_sha") or "")),
+        ("target", expected_target_sha, str(status.get("latest_sha") or "")),
+    ):
+        if expected and expected != actual:
+            return False, {
+                "error": (
+                    f"Managed update {label} moved from {expected[:12]} to {actual[:12] or 'unknown'} "
+                    "since it was reviewed; rerun preflight."
+                ),
+                "reason": "release_moved",
+                "status": status,
+            }
 
     strategy = str(strategy or "replace").strip().lower()
     if strategy not in {"replace", "stash", "force"}:
@@ -1315,7 +1456,6 @@ def rollback_to_version(tag_or_sha: str, reason: str = "manual_rollback") -> Tup
     rc_rev, target_sha, err_rev = git_capture(["git", "rev-parse", tag_or_sha])
     if rc_rev != 0:
         return False, f"Cannot resolve {tag_or_sha}: {err_rev}"
-
     # Reset current branch to the target (avoids detached HEAD)
     _guard_live_repo_destructive_git(["git", "reset", "--hard", target_sha])
     rc, _, err = git_capture(["git", "reset", "--hard", target_sha])
@@ -1387,11 +1527,10 @@ def configure_personal_remote(
     """Configure the personal persistence remote (`origin`), ensuring `managed` exists."""
     if not token:
         return False, "Missing GitHub token", ""
-    # Ensure the official update path lives on `managed` BEFORE (re)pointing
-    # `origin` at the personal repo, so replacing a clone-default `origin` that
-    # still points at the official upstream never orphans the official update
-    # remote. Shared by every caller (startup + Settings save). Best-effort:
-    # personal-origin configuration proceeds even if this step fails.
+    # Ensure the official update path lives on `managed` BEFORE (re)pointing `origin` at the
+    # personal repo, so replacing a clone-default `origin` that still points at the official
+    # upstream never orphans the official update remote. Shared by every caller (startup + Settings
+    # save). Best-effort: personal-origin configuration proceeds even if this step fails.
     try:
         ensure_official_update_remote()
     except Exception:

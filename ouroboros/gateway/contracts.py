@@ -6,7 +6,7 @@ TypedDicts document payloads, not runtime validation. Keep discriminating
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 try:  # Python 3.11+
     from typing import Literal, NotRequired, Required, TypedDict  # type: ignore[attr-defined]
@@ -532,6 +532,134 @@ class GitLogResponse(TypedDict):
     sha: str
 
 
+class UpdatePreflightProtectedRoute(TypedDict):
+    offered_strategy: str  # auto_merge | assisted — what the dialog may offer
+    will_route_manual: bool
+    # v6.88.1: "" | protected_paths | protected_delta_unverifiable. An unverifiable official
+    # delta routes to manual with an EMPTY path list (we could not read what the release
+    # touches), so consumers must branch on the reason, never on list truthiness.
+    reason: str
+    protected_paths: list[str]
+
+
+# ``error`` is not an ADDITION to the two keys below but the alternative ENVELOPE: on an unhandled
+# exception the endpoint answers the shared ``json_exception`` error frame, which REPLACES
+# merge_plan/protected_route entirely (the same convention every other endpoint here follows). A
+# single TypedDict could only say that by making both success keys required AND optional at once —
+# it required them, so the declared type described a frame the endpoint can never emit. Two objects
+# and a union say it exactly: check ``error`` first, and only then read the success keys.
+class UpdatePreflightSuccessResponse(TypedDict):
+    merge_plan: Dict[str, Any]
+    protected_route: UpdatePreflightProtectedRoute
+
+
+class UpdatePreflightErrorResponse(TypedDict):
+    error: str
+
+
+UpdatePreflightResponse = Union[
+    UpdatePreflightSuccessResponse,
+    UpdatePreflightErrorResponse,
+]
+
+
+class UpdateApplyRequest(TypedDict, total=False):
+    # auto_merge | assisted | doc_reconcile | manual | replace | stash | force
+    strategy: str
+    # v6.88.1 BOUND acknowledgement of an official change to a protected tier other than
+    # frozen-contract / release-invariant (safety-critical or unrecognized) on the replace family:
+    # every field must echo the disclosure exactly (same SHAs, same path list) or the request
+    # stays routed to manual. An unverifiable delta is never acknowledgeable.
+    acknowledge_protected: bool
+    acknowledged_base_sha: str
+    acknowledged_target_sha: str
+    acknowledged_protected_paths: list[str]
+
+
+# The apply endpoint answers FOUR shapes, discriminated by `status` (and by its absence). They
+# were never declared, so the browser told them apart by probing keys — and the disclosure shape
+# below, the one that carries a safety decision, was the easiest to mistake for a plain failure.
+#
+# Split base + total=False for the same PEP 563 reason as UpdatePreflightResponse above: the
+# discriminator has to land in ``__required_keys__``, and a NotRequired[...] string annotation
+# would not.
+class _UpdateApplyOkRequired(TypedDict):
+    # `Literal`, not `str`: this union is discriminated BY this field, and an unconstrained `str`
+    # made every success variant structurally identical to every other one — so a type checker
+    # accepted `status: "manual"` on the ok shape and could not narrow the union at all, which is
+    # the entire guarantee the split into variants was introduced to provide.
+    status: Literal["ok"]
+    # v6.88.1: FALSE means the update landed and the restart request did not — the checkout has
+    # already moved, so this is not a failure and must not be reported as one (`warning` says what
+    # is left to do by hand).
+    restarting: bool
+
+
+class UpdateApplyOkResponse(_UpdateApplyOkRequired, total=False):
+    warning: str
+    strategy: str  # staged auto_merge only
+    merge_plan: Dict[str, Any]  # staged auto_merge only
+    rescue: Dict[str, Any]  # replace family only (prepare_managed_update's receipt)
+    keep_branch: str  # replace family only: the preserved local branch, "" if none
+
+
+class UpdateApplyAssistedStartedResponse(TypedDict):
+    status: Literal["assisted_started"]  # see _UpdateApplyOkRequired on why this is a Literal
+    task_id: str  # the ONE authorized resolution task; a live worker is holding it
+    merge_plan: Dict[str, Any]
+
+
+class _UpdateApplyManualRequired(TypedDict):
+    status: Literal["manual"]  # see _UpdateApplyOkRequired on why this is a Literal
+
+
+class UpdateApplyManualResponse(_UpdateApplyManualRequired, total=False):
+    # "" (owner asked for manual) | protected_paths | protected_delta_unverifiable | release_moved.
+    # As on the preflight route, branch on the REASON: an unverifiable delta and a fresh disclosure
+    # both arrive with lists that may be empty, and they mean opposite things.
+    reason: str
+    # Present only on the protected DISCLOSURE: the apply may be repeated with the acknowledgement
+    # fields of UpdateApplyRequest echoing base_sha/target_sha/protected_paths exactly.
+    requires_acknowledgement: bool
+    protected_paths: list[str]
+    base_sha: str
+    target_sha: str
+    merge_plan: Dict[str, Any]
+
+
+class _UpdateApplyErrorRequired(TypedDict):
+    error: str
+
+
+class UpdateApplyErrorResponse(_UpdateApplyErrorRequired, total=False):
+    # update_lock_held | release_moved | assisted_resolver_unavailable | worker_fence_failed ...
+    reason: str
+    # `control._plan_error_response` splats the merge plan's OWN keys alongside these two, so an
+    # error frame may carry additional plan fields; `plan_error` is the planner's low-level message
+    # kept separate from the endpoint's, which owns `error`.
+    plan_error: str
+    # Present on every frame that reached `control._rollback_and_respawn`: what the undo of an
+    # already-landed mutation reported. It is a RESULT, not a status — a frame carrying
+    # `reason: "update_recovery_failed"` is one whose rollback could NOT be proven, and the checkout
+    # still needs a restart, so a client must not read the mere presence of this key as recovery.
+    rollback: str
+    # THE reason `error` is checked first. `git_ops.prepare_managed_update` returns its refusals as
+    # {error, status: <the managed-update status DICT>, ...} and the endpoint hands that back
+    # verbatim, so on this variant `status` is a payload — not the union's discriminator. A consumer
+    # that switched on `status` before `error` would read a truthy object here and fall through to
+    # whichever success branch it tests first.
+    status: Dict[str, Any]
+
+
+# Discriminated union: check `error` first (it REPLACES status), then switch on `status`.
+UpdateApplyResponse = Union[
+    UpdateApplyOkResponse,
+    UpdateApplyAssistedStartedResponse,
+    UpdateApplyManualResponse,
+    UpdateApplyErrorResponse,
+]
+
+
 class EvolutionDataResponse(TypedDict):
     points: list[Dict[str, Any]]
     checkpoints: NotRequired[list[Dict[str, Any]]]
@@ -861,6 +989,16 @@ __all__ = [
     "SkillDeleteResponse",
     "UiPreferencesResponse",
     "GitLogResponse",
+    "UpdatePreflightProtectedRoute",
+    "UpdatePreflightSuccessResponse",
+    "UpdatePreflightErrorResponse",
+    "UpdatePreflightResponse",
+    "UpdateApplyRequest",
+    "UpdateApplyOkResponse",
+    "UpdateApplyAssistedStartedResponse",
+    "UpdateApplyManualResponse",
+    "UpdateApplyErrorResponse",
+    "UpdateApplyResponse",
     "EvolutionDataResponse",
     "ScheduledTasksResponse",
     "ScheduleUpsertResponse",

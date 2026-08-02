@@ -19,6 +19,7 @@ from ouroboros.platform_layer import (
     kill_process_group_id,
     kill_process_tree,
     process_group_id,
+    process_group_is_alive,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.tool_access import resolve_shell_cwd
@@ -50,6 +51,9 @@ class ServiceRecord:
     cwd_root: str = ""
     before_outputs: Dict[str, tuple[bool, int, str]] = field(default_factory=dict)
     keep_alive: bool = False
+    # The repository-writer admission lease this service holds while it runs inside the managed
+    # checkout (see `_service_writes_managed_repo`). Empty for every service rooted elsewhere.
+    repo_writer_lease: str = ""
 
 
 _LOCK = threading.Lock()
@@ -57,6 +61,9 @@ _SERVICES: Dict[str, ServiceRecord] = {}
 _SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 _MAX_SERVICE_LOG_BLOB_BYTES = 5_000_000
 _MAX_SERVICE_LOG_TAIL_CHARS = 80_000
+# Mirrors `process_custody._REPO_WRITER_KILL_GRACE_SEC`: how long a signalled process group is
+# allowed to take to actually disappear before we call it a survivor.
+_REPO_WRITER_GROUP_REAP_GRACE_SEC = 3.0
 
 
 from ouroboros.workspace_executor import service_key as _service_key
@@ -161,6 +168,167 @@ def _service_env() -> Dict[str, str]:
     return env
 
 
+# --- repository-writer admission for services (v6.88.1 r6) ------------------------------------
+#
+# A service is a PROCESS that outlives the tool call which started it (`keep_alive` outlives the
+# whole task), and `start_service` runs an arbitrary command in the active workspace. So a service
+# rooted in the managed checkout is a repository writer that the update fence could not see: it
+# enumerates worker handles and in-process chat turns, and this is neither.
+#
+# Rather than a second registry with a second refusal path, such a service takes the SAME
+# admission lease the in-process chat writers take. That makes the EXISTING fence prove it away:
+# admission closed means no new one can start, `terminate_repo_rooted_services` stops the ones
+# already running, and one we could not stop keeps its lease — so `drain_repo_writers` reports it
+# and the fence refuses the update. Services rooted outside the repository (and executor-backed
+# ones, which run against a mapped workspace in their own container) take no lease at all.
+#
+# The lease reaches only the process that took it. `start_service` also runs inside pooled
+# multiprocessing WORKERS, which hold their own copies of this module AND of
+# `supervisor.workers`, so a worker's lease and `_SERVICES` record are invisible to the
+# supervisor's fence — and the service itself is spawned into its own session, so killing the
+# worker does not kill it. The DURABLE side of the same fact is what covers that:
+# `spawn_supervised(repo_writer=...)` marks the process in the custody ledger, which both
+# processes read, and the fence sweeps it with
+# `process_custody.terminate_repo_writer_processes`.
+
+
+def _service_writes_managed_repo(ctx: ToolContext, workdir: pathlib.Path) -> bool:
+    """Whether this service would run INSIDE the managed checkout.
+
+    Fails CLOSED: a root we cannot resolve counts as the repository. That costs nothing on the
+    normal path — admission is open, so the lease is simply granted — and it is the only answer
+    that keeps an unplaceable service off a tree an update is about to hard-reset.
+    """
+    try:
+        repo = pathlib.Path(ctx.repo_dir).resolve(strict=False)
+        resolved = pathlib.Path(workdir).resolve(strict=False)
+    except Exception:
+        return True
+    return resolved == repo or repo in resolved.parents
+
+
+def _acquire_repo_writer_lease(kind: str) -> tuple[str, str]:
+    """Take the admission lease for a repo-rooted service; returns ``(lease, refusal)``.
+
+    A process with no writer-admission registry runs no update fence either (the fence and the
+    registry are the same module state), so there is nothing a refusal could protect there and the
+    service starts unleased — which is also what already happens for worker-started services, whose
+    whole process tree is torn down with their worker.
+    """
+    try:
+        from supervisor.workers import acquire_repo_writer_lease, repo_writer_admission_closed
+    except Exception:
+        return "", ""
+    lease = acquire_repo_writer_lease(kind)
+    if lease:
+        return str(lease), ""
+    return "", (
+        "⚠️ SERVICE_REPO_LOCKED: the managed repository is closed to writers "
+        f"({repo_writer_admission_closed() or 'update in progress'}); retry once it finishes."
+    )
+
+
+def _release_repo_writer_lease(lease: str) -> None:
+    if not lease:
+        return
+    try:
+        from supervisor.workers import release_repo_writer_lease
+
+        release_repo_writer_lease(lease)
+    except Exception:
+        pass
+
+
+def _retire_repo_writer_lease_if_dead(record: ServiceRecord) -> bool:
+    """Release a repo-rooted service's lease, but ONLY once its process is PROVEN gone.
+
+    Returns whether the record holds no lease any more. An unreadable exit status is not a proof
+    of death, so it keeps the lease — and therefore fails the fence — rather than being written
+    over by a hard reset. Neither is the LEADER's exit: the service was spawned into its own
+    process group with an arbitrary command, so a child that inherited the checkout keeps writing
+    to it after the launcher we hold a handle on is gone. Both must be proven gone.
+    """
+    if not record.repo_writer_lease:
+        return True
+    try:
+        if record.proc.poll() is None:
+            return False
+    except Exception:
+        return False
+    if record.pgid > 0 and process_group_is_alive(record.pgid):
+        return False
+    _release_repo_writer_lease(record.repo_writer_lease)
+    record.repo_writer_lease = ""
+    return True
+
+
+def _register_failed_repo_writer_start(
+    *,
+    service_name: str,
+    key: str,
+    task_id: str,
+    cmd: List[Any],
+    workdir: Any,
+    log_path: pathlib.Path,
+    proc: subprocess.Popen,
+    cwd_root: str,
+    repo_writer_lease: str,
+) -> None:
+    """Keep a half-started repo-rooted service reachable after `_start_service` gave up on it.
+
+    A process DID start, so its lease may only go once that process is PROVEN gone — and the
+    caller's teardown is best-effort and allowed to fail. A leaseholder we walked away from would
+    be a repository writer with nothing pointing at it: invisible to the fence and unreleasable
+    forever, which refuses every later managed update. `_SERVICES` is both the only place the fence
+    can find it and the only place its lease can be retired from, so that is where it goes — unless
+    it is already proven dead, in which case the lease is simply handed back here.
+    """
+    # Carry the group id so lease retirement applies the SAME group-outlives-leader proof to a
+    # failed start as to a healthy record (the child is spawned as a session leader, so the pid is
+    # the pgid when the probe cannot answer).
+    try:
+        failed_pgid = int(process_group_id(int(getattr(proc, "pid", 0) or 0)) or 0)
+    except Exception:
+        failed_pgid = 0
+    failed = ServiceRecord(
+        name=service_name, service_id=key, task_id=task_id,
+        cmd=[str(part) for part in cmd], cwd=str(workdir), log_path=log_path,
+        proc=proc, cwd_root=cwd_root, repo_writer_lease=repo_writer_lease,
+        pgid=failed_pgid or int(getattr(proc, "pid", 0) or 0),
+    )
+    if not _retire_repo_writer_lease_if_dead(failed):
+        with _LOCK:
+            _SERVICES[key] = failed
+
+
+def terminate_repo_rooted_services(*, wait: bool = True) -> List[str]:
+    """Stop every service still holding a managed-repository writer lease.
+
+    Returns the leases that could NOT be retired because their process was not proven gone. The
+    caller does not have to act on that list: those leases stay in the admission registry, so the
+    fence's own `drain_repo_writers` reports them and refuses the update on exactly the evidence
+    it uses for every other in-process writer.
+
+    Services that already exited are reconciled here too, which is what keeps a lease from leaking
+    for the life of the process: the registry is only ever read by the fence, and the fence runs
+    this first.
+    """
+    with _LOCK:
+        records = [record for record in _SERVICES.values() if record.repo_writer_lease]
+    undrained: List[str] = []
+    for record in records:
+        if _retire_repo_writer_lease_if_dead(record):
+            continue
+        try:
+            _stop_record(record, wait=wait)
+        except Exception:
+            pass
+        _retire_repo_writer_lease_if_dead(record)
+        if record.repo_writer_lease:
+            undrained.append(record.repo_writer_lease)
+    return undrained
+
+
 def _stop_record(record: ServiceRecord, *, wait: bool = True) -> None:
     if record.pgid:
         kill_process_group_id(record.pgid)
@@ -172,6 +340,20 @@ def _stop_record(record: ServiceRecord, *, wait: bool = True) -> None:
         record.proc.wait(timeout=5)
     except Exception:
         pass
+    # Waiting on the LEADER does not wait for the group we just signalled, and the lease is now only
+    # retired once the group is gone too. Without a grace window here, a group that was killed but
+    # not yet reaped would hold its lease for the whole fence and refuse a legitimate update on
+    # scheduling latency alone. Bounded, so a group that genuinely outlived the kill still refuses.
+    # Gated on the LEASE, not just on having a pgid: every locally spawned service has a pgid, and a
+    # record with no lease has no decision riding on this answer — it would only make ordinary
+    # task/shutdown teardown pay the poll for nothing.
+    if record.repo_writer_lease and record.pgid > 0:
+        deadline = time.monotonic() + _REPO_WRITER_GROUP_REAP_GRACE_SEC
+        while process_group_is_alive(record.pgid):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+    _retire_repo_writer_lease_if_dead(record)
 
 
 def _finalize_service_log_for_drive(drive_root: pathlib.Path, record: ServiceRecord) -> Dict[str, Any]:
@@ -350,6 +532,27 @@ def _start_service(
         existing = _SERVICES.get(key)
         if existing and existing.proc.poll() is None:
             return f"⚠️ SERVICE_ALREADY_RUNNING: {service_name} pid={existing.proc.pid}"
+    if existing is not None and not _retire_repo_writer_lease_if_dead(existing):
+        # A success below OVERWRITES `_SERVICES[key]`, after which nothing can reach this record
+        # again — so its lease is retired here, while it still can be. A writer lease no code can
+        # release refuses every later managed update for the life of the process, and `_SERVICES` is
+        # also the fence's only handle on the group.
+        #
+        # The exited LEADER is no longer proof that the retirement succeeds: it now also requires
+        # the recorded GROUP to be gone, and a leader-exited-but-group-alive record is exactly the
+        # case that check exists for. So the answer is acted on rather than discarded — stop the
+        # group, and if the lease still cannot be handed back, refuse the start instead of dropping
+        # the only record that can ever release it.
+        try:
+            _stop_record(existing)
+        except Exception:
+            pass
+        if existing.repo_writer_lease:
+            return (
+                f"⚠️ SERVICE_REPO_LOCKED: {service_name} was started before and its process group "
+                f"(pgid={existing.pgid}) is still alive, so its managed-repository writer lease "
+                "cannot be released; retry once it exits."
+            )
     try:
         workdir, cwd_root, _allowed_roots = resolve_shell_cwd(ctx, cwd, operation="service")
         workdir = pathlib.Path(workdir).resolve(strict=False)
@@ -397,8 +600,19 @@ def _start_service(
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{service_name}.log"
     log_fh = log_path.open("ab")
+    proc = None
+    repo_writer_lease = ""
     try:
         bootstrap_process_path()
+        # Take the writer lease BEFORE the process exists. The lease is what an update fence
+        # enumerates, so a service spawned first and registered afterwards would be invisible to a
+        # fence that closed in between — left running against the checkout it is about to reset.
+        writes_managed_repo = _service_writes_managed_repo(ctx, workdir)
+        if writes_managed_repo:
+            repo_writer_lease, lease_refusal = _acquire_repo_writer_lease(f"service:{service_name}")
+            if lease_refusal:
+                log_fh.close()
+                return lease_refusal
         # Supervised spawn: the durable custody record means a SIGKILLed worker
         # can no longer orphan this service invisibly — the reaper finds it in
         # the ledger on the next server generation. keep_alive services use
@@ -412,6 +626,10 @@ def _start_service(
             purpose=f"service:{service_name}",
             scope="session" if keep_alive else "task",
             owner_task_id=task_id,
+            # The lease above is process-local, so it is invisible to an update fence running in
+            # the SUPERVISOR when this call is executing inside a pooled worker. The ledger is the
+            # registry both processes share, so the fence finds this service there instead.
+            repo_writer=writes_managed_repo,
             cwd=str(workdir),
             stdout=log_fh,
             stderr=subprocess.STDOUT,
@@ -422,6 +640,40 @@ def _start_service(
         log_fh.close()
     except Exception as exc:
         log_fh.close()
+        from ouroboros.process_custody import RepoWriterCustodyError
+
+        if proc is None and isinstance(exc, RepoWriterCustodyError):
+            # The raise came from INSIDE `spawn_supervised`, before this frame was handed the
+            # object, so the local `proc` is None even though a repository writer is running. The
+            # error carries the handle for exactly this reason: recovered BEFORE the teardown below,
+            # it turns "nothing was ever spawned" back into the two things that can still be done
+            # with a survivor — one more bounded termination attempt here, and a record that keeps
+            # it reachable afterwards.
+            proc = getattr(exc, "proc", None)
+        if proc is not None:
+            try:
+                kill_process_tree(proc)
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        if repo_writer_lease and isinstance(exc, RepoWriterCustodyError) and proc is None:
+            # No handle came back with the error, so the teardown above had nothing to act on. This
+            # error means custody could neither prove the writer dead nor make it visible to the
+            # fence, and handing the lease back would remove the last thing standing between it and
+            # a hard reset. It is retained instead: this process refuses managed updates for as long
+            # as it lives, which is the fail-closed answer to a writer nothing can see. Residual,
+            # named rather than papered over: a pooled worker holds no lease (it runs no fence
+            # either), so there the survivor is left to the next generation's ledger reaper — the
+            # bounded kill rounds inside the repudiation are all that path gets.
+            pass
+        elif repo_writer_lease and proc is None:
+            _release_repo_writer_lease(repo_writer_lease)  # nothing was ever spawned to hold it
+        elif repo_writer_lease:
+            _register_failed_repo_writer_start(
+                service_name=service_name, key=key, task_id=task_id, cmd=cmd, workdir=workdir,
+                log_path=log_path, proc=proc, cwd_root=cwd_root,
+                repo_writer_lease=repo_writer_lease,
+            )
         return f"⚠️ SERVICE_START_ERROR: {type(exc).__name__}: {exc}"
     record = ServiceRecord(
         name=service_name,
@@ -437,6 +689,7 @@ def _start_service(
         cwd_root=cwd_root,
         before_outputs=before_outputs,
         keep_alive=keep_alive,
+        repo_writer_lease=repo_writer_lease,
     )
     with _LOCK:
         _SERVICES[key] = record
@@ -553,9 +806,18 @@ def _stop_service(ctx: ToolContext, name: str = "service") -> str:
         return name_error
     key = _service_key(ctx, service_name)
     with _LOCK:
-        record = _SERVICES.pop(key, None)
+        record = _SERVICES.get(key)
     if record:
-        _stop_record(record)
+        # Stop FIRST, and only then forget it. Popping ahead of the stop meant a service that
+        # survived `kill_process_tree` plus the bounded wait kept its repository-writer lease with
+        # its record already gone — unfindable by the fence and unreleasable by anything, which
+        # refuses every later update. A process that will not die stays in `_SERVICES` instead, so
+        # the fence keeps seeing it and `terminate_repo_rooted_services` keeps retrying it.
+        _stop_record(record)  # retires the lease if (and only if) the process is proven gone
+        if not record.repo_writer_lease:
+            with _LOCK:
+                if _SERVICES.get(key) is record:
+                    del _SERVICES[key]
         payload = _status_payload(record)
         payload["log_finalization"] = _finalize_service_log_for_drive(pathlib.Path(ctx.drive_root), record)
         artifact_note = ""
@@ -697,14 +959,18 @@ def kill_all_services(
     with _LOCK:
         if include_keep_alive:
             records = list(_SERVICES.values())
-            _SERVICES.clear()
         else:
             records = [r for r in _SERVICES.values() if not r.keep_alive]
-            for record in records:
-                _SERVICES.pop(record.service_id, None)
     stopped: List[Dict[str, Any]] = []
     for record in records:
         _stop_record(record, wait=wait)
+        # Removed AFTER the stop, and only if it is no longer holding a repository-writer lease —
+        # same rule as `_stop_service`. Clearing the registry first left a service that outlived
+        # the kill holding a lease no code could reach, which refuses every later managed update.
+        if not record.repo_writer_lease:
+            with _LOCK:
+                if _SERVICES.get(record.service_id) is record:
+                    del _SERVICES[record.service_id]
         payload = _status_payload(record)
         if wait and drive_root is not None:
             payload["log_finalization"] = _finalize_service_log_for_drive(pathlib.Path(drive_root), record)

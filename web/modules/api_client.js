@@ -114,6 +114,42 @@ export const apiClient = {
     /** @returns {Promise<import('./api_types.js').FsDirsResponse>} */
     fsDirs: (path = '') => fetchJson(`/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`, { cache: 'no-store' }),
     updateStatus: () => fetchJson('/api/update/status', { cache: 'no-store' }),
+    /**
+     * The SUCCESS variant, not the wire union: the endpoint answers its error frame through
+     * `json_exception` (HTTP 500), and `fetchJson` throws on a non-ok response — so this promise
+     * never RESOLVES with `{error}`, it rejects with it on `err.body`. Typed as the union, every
+     * caller had to narrow on a key that cannot be there, which is the ergonomic gap the split was
+     * made for. `UpdatePreflightResponse` stays the wire-level type for code reading raw frames.
+     * @returns {Promise<import('./api_types.js').UpdatePreflightSuccessResponse>}
+     */
     updatePreflight: () => jsonPost('/api/update/preflight', {}),
-    updateApply: (strategy) => jsonPost('/api/update/apply', { strategy }),
+    /**
+     * Apply a managed update. The single argument IS the declared request and every field of it is
+     * forwarded verbatim: no key the caller supplied is dropped on the way to the wire, whatever
+     * its value, and a key the caller omitted stays `undefined` — which `JSON.stringify` leaves
+     * out — so an unacknowledged apply still posts exactly `{strategy}`. The optional
+     * acknowledgement is the owner's BOUND override of the replace-family protected gate: the
+     * backend keeps routing to manual unless all three echoed values match the disclosure exactly,
+     * so re-deriving which of them "belong" here would only risk degrading an acknowledged apply
+     * into an unacknowledged one. test_gateway_parity.py pins both the accepted parameters and
+     * this posted literal against the Python `UpdateApplyRequest`, so the surface cannot drift.
+     * The RESPONSE is discriminated: `error` (which replaces `status`), then `status` — 'ok' /
+     * 'assisted_started' / 'manual'. A 409 is raised by `jsonPost`, but its body carries the same
+     * typed frame, so callers normalize `err.body.reason` rather than collapsing it to a message.
+     * @param {import('./api_types.js').UpdateApplyRequest} request
+     * @returns {Promise<import('./api_types.js').UpdateApplyResponse>}
+     */
+    updateApply: ({
+        strategy,
+        acknowledge_protected,
+        acknowledged_base_sha,
+        acknowledged_target_sha,
+        acknowledged_protected_paths,
+    }) => jsonPost('/api/update/apply', {
+        strategy,
+        acknowledge_protected,
+        acknowledged_base_sha,
+        acknowledged_target_sha,
+        acknowledged_protected_paths,
+    }),
 };
