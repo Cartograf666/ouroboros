@@ -20,7 +20,14 @@ import {
     loadOlderControlState,
     nextQuotaEscalation,
 } from './chat_render_batch.js';
-import { serializeParts } from './composer_parts.js';
+import {
+    chipLabel,
+    createComposerParts,
+    normalizeParts,
+    parseContent,
+    serializeParts,
+} from './composer_parts.js';
+import { getSettingsSnapshot } from './settings.js';
 
 // Row-surface disclosure guard (v6.71.0), pure for node tests: returns the
 // lineKey to toggle for a click landing on `target`, or '' when the click must
@@ -32,6 +39,79 @@ export function liveLineRowToggleKey(target, selection = null) {
     if (target.closest('button, a, input, textarea, select, label, summary, [contenteditable="true"]')) return '';
     if (selection && !selection.isCollapsed && line.contains(selection.anchorNode)) return '';
     return (line.dataset && line.dataset.liveLineKey) || '';
+}
+
+/**
+ * Render an owner message: `[context:]` markers become compact chips, every
+ * other segment stays escaped text.
+ *
+ * The RAW serialized string remains the message IDENTITY everywhere — dedup
+ * keys, persisted history, `/api/chat/history` replay, input recall and the WS
+ * frame all carry it unchanged. This function is presentation ONLY: it re-reads
+ * the same bytes through the codec so a marker the owner captured renders as the
+ * chip they saw in the composer instead of raw grammar. Anything that is not an
+ * exactly-formed marker (a lookalike, a half-written range, prose about markers)
+ * comes back from `parseContent` as text and is escaped, so no message can
+ * inject markup and no message loses characters.
+ *
+ * Escaping goes through `escapeHtmlAttr` rather than `escapeHtmlText`: it is a
+ * PURE string escaper (the text variant round-trips through a real DOM element),
+ * so this projection needs no document and node tests exercise it directly. It
+ * escapes a strict superset of what a text node needs, which renders identically.
+ */
+export function renderUserContent(raw) {
+    const text = typeof raw === 'string' ? raw : String(raw ?? '');
+    const parts = parseContent(text);
+    // A plain message — the overwhelming case — renders as one escaped string.
+    if (!parts.length) return escapeHtmlAttr(text);
+    if (parts.length === 1 && parts[0].type === 'text') return escapeHtmlAttr(parts[0].text);
+    const inner = parts.map((part) => {
+        if (part.type !== 'chip') {
+            return `<span class="chat-user-part-text">${escapeHtmlAttr(part.text)}</span>`;
+        }
+        // The captured bytes stay in the payload the agent reads; the UI shows the
+        // referent (path + honest line count), with the full path on hover.
+        const label = chipLabel(part);
+        return `<span class="chat-context-chip" title="${escapeHtmlAttr(part.path)}">`
+            + `${escapeHtmlAttr(label)}</span>`;
+    }).join('');
+    return `<span class="chat-user-parts">${inner}</span>`;
+}
+
+/**
+ * The owner's own words from an ordered composer, with context markers dropped.
+ *
+ * Used for `_pendingCardObjective` (naming a project on "turn into project"):
+ * a serialized `[context: …]` marker is machine grammar, never a human
+ * objective, so a message that is only chips yields no objective at all.
+ */
+export function composerObjectiveText(parts = [], draft = '') {
+    const texts = [];
+    for (const part of Array.isArray(parts) ? parts : []) {
+        if (!part || part.type !== 'text') continue;
+        const value = String(part.text ?? '').trim();
+        if (value) texts.push(value);
+    }
+    const tail = String(draft ?? '').trim();
+    if (tail) texts.push(tail);
+    return texts.join('\n');
+}
+
+/**
+ * READ-ONLY composer model chip (owner decision 24): it shows the MAIN model and
+ * opens Settings → Models; it never writes a setting. The Settings module's
+ * already-fetched `/api/settings` snapshot is the only source — no extra fetch,
+ * no new `/api/state` field. Before that first load there is nothing honest to
+ * show, so the chip stays hidden rather than inventing a default.
+ */
+export function modelChipPresentation(snapshot) {
+    const raw = String(snapshot?.OUROBOROS_MODEL ?? '').trim();
+    if (!raw) return { visible: false, label: '', title: '' };
+    return {
+        visible: true,
+        label: compactModel(raw) || raw,
+        title: `Main model: ${raw} — open Settings → Models`,
+    };
 }
 
 /** Convert a raw source timestamp to sortable epoch milliseconds. */
@@ -487,13 +567,16 @@ export function createChatInstance({
                             <button class="chat-seg" type="button" data-mode="max">Max</button>
                         </div>
                     </div>
+                    <button class="chat-model-chip" id="chat-model-chip" type="button" hidden></button>
                 </div>
                 <div class="chat-text-row">
                     <button class="chat-attach-btn" id="chat-attach" type="button" title="Attach file">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
                     </button>
                     <input type="file" id="chat-file-input" class="chat-file-input-hidden" accept="*/*" multiple>
-                    <textarea id="chat-input" placeholder="Message Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+                    <div class="chat-parts" id="chat-parts">
+                        <textarea id="chat-input" placeholder="Message Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+                    </div>
                     <div class="chat-send-group">
                         <button class="chat-scroll-bottom-btn" id="chat-scroll-bottom" type="button" aria-label="Scroll to latest message" title="Scroll to latest message">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
@@ -528,6 +611,8 @@ export function createChatInstance({
     const fileInput = byId('file-input');
     const attachmentPreview = byId('attachment-preview');
     const scrollBottomBtn = byId('scroll-bottom');
+    const partsHost = byId('parts');
+    const modelChip = byId('model-chip');
     let pendingAttachments = [];
     let attachmentsUploading = false;
     let nestedSubagentsExpanded = false;
@@ -538,6 +623,44 @@ export function createChatInstance({
     // Every ws.on subscription's disposer, released together in destroy().
     const wsDisposers = [];
     const onWs = (event, fn) => wsDisposers.push(ws.on(event, fn));
+
+    // The composer field is an ORDERED sequence of parts — context chips captured
+    // with ⌘L plus committed text — followed by the live input. composer_parts.js
+    // owns that DOM contract and the marker codec; chat.js owns only the send
+    // path, so a chip looks and serializes identically in the chat composer, the
+    // Changes dock and the Files dock. `serialize()` is the single reader of
+    // "everything currently in the field", typed draft included.
+    const composerParts = createComposerParts({
+        container: partsHost,
+        input,
+        // Chips wrap, so the dock's height changes: re-measure the reserve the
+        // transcript pads by (--chat-input-reserve) instead of covering messages.
+        // Adding/removing a chip never fires the textarea's `input` event, so the
+        // draft is persisted from here too — otherwise a captured chip would be
+        // lost on close while typed text survived.
+        onChange: () => {
+            resizeChatInput({ preserveStickiness: false });
+            saveInputDraft();
+        },
+    });
+
+    // Read-only model chip: the Settings snapshot is the ONLY source, refreshed on
+    // the event that module already fires; the click opens Settings → Models.
+    function syncModelChip() {
+        if (!modelChip) return;
+        const view = modelChipPresentation(getSettingsSnapshot());
+        modelChip.hidden = !view.visible;
+        modelChip.textContent = view.label;
+        modelChip.title = view.title;
+    }
+    modelChip?.addEventListener('click', () => {
+        if (typeof openSettingsTab === 'function') openSettingsTab('models');
+    });
+    window.addEventListener('ouro:settings-updated', syncModelChip);
+    // Released through the SAME disposer registry destroy() drains, so a torn-down
+    // panel never keeps a window listener pointing at its removed chip.
+    wsDisposers.push(() => window.removeEventListener('ouro:settings-updated', syncModelChip));
+    syncModelChip();
 
     async function loadUiPreferences() {
         try {
@@ -714,6 +837,15 @@ export function createChatInstance({
     // resync: the data just came from the canonical source. The replay block
     // is fully synchronous, so no live WS frame can ever observe the flag.
     let _historyReplayActive = false;
+    // A reconnect / first-load REBUILD empties the column and refills it. While that
+    // is in flight `isNearBottom()` answers about a transiently near-empty
+    // transcript, so every stickiness consumer reads "the reader is at the bottom"
+    // and queues a jump-to-latest whose frames can land AFTER the reader-anchor
+    // restore — silently moving someone who was reading older messages. The rebuild
+    // therefore owns scroll position for its duration, and the ONE explicit decision
+    // at the end of syncHistory (restore the anchor, or stick only if they really
+    // were at the bottom BEFORE the rebuild) is the authority.
+    let _historyRebuildActive = false;
 
     const persistedHistory = [];
     const seenMessageKeys = new Set();
@@ -1190,7 +1322,12 @@ export function createChatInstance({
             _rebuildBatch.collect(node);
             return;
         }
-        const shouldStick = Boolean(options.forceStick) || isNearBottom();
+        // During a REBUILD the column is transiently near-empty, so `isNearBottom()`
+        // would answer "the reader is at the bottom" for everyone and queue a
+        // jump-to-latest that lands after the anchor restore. The rebuild owns
+        // scroll position; only an explicit forceStick sticks while it runs.
+        const shouldStick = Boolean(options.forceStick)
+            || (!_historyRebuildActive && isNearBottom());
         const isMounted = node.parentNode === messagesDiv;
         if (isMounted && !options.reorderExisting) {
             if (shouldStick) messagesDiv.scrollTop = messagesDiv.scrollHeight;
@@ -1482,6 +1619,9 @@ export function createChatInstance({
                     // P5: innerHTML also dropped a rendered "Cancel run" — restore it.
                     record.cancelRunBtn = null;
                     syncCancelRunButton(record);
+                    // ...and the "Inspect" action lived in the same replaced row.
+                    record.inspectBtn = null;
+                    syncInspectButton(record);
                 });
             }
         }
@@ -1544,6 +1684,46 @@ export function createChatInstance({
         });
         actions.appendChild(btn);
         record.cancelRunBtn = btn;
+    }
+
+    // "Inspect" opens the task inspector for this run. The card knows NOTHING about
+    // the inspector: it dispatches the `ouro:inspect-task` contract and whoever
+    // registered that right-panel kind decides what to mount. No listener ⇒ the
+    // click is a no-op, so the action can never point at a missing surface.
+    function syncInspectButton(record) {
+        if (!record?.root) return;
+        const groupId = String(record.groupId || '').trim();
+        const eligible = Boolean(groupId)
+            && !record.isSubagent
+            && !REUSABLE_TASK_IDS.has(groupId)
+            && record.root.dataset.projectCreated !== '1'
+            && record.root.dataset.projectCreating !== '1';
+        const existing = record.root.querySelector('[data-inspect-task]');
+        if (!eligible) {
+            existing?.remove();
+            record.inspectBtn = null;
+            return;
+        }
+        if (existing) {
+            record.inspectBtn = existing;
+            return;
+        }
+        const actions = ensureLiveActionsEl(record);
+        if (!actions) return;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-xs chat-live-inspect-btn';
+        btn.dataset.inspectTask = '1';
+        btn.textContent = 'Inspect';
+        btn.title = 'Open the task inspector for this run';
+        btn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            window.dispatchEvent(new CustomEvent('ouro:inspect-task', {
+                detail: { taskId: record.groupId },
+            }));
+        });
+        actions.appendChild(btn);
+        record.inspectBtn = btn;
     }
 
     async function cancelRunFromCard(record) {
@@ -1663,6 +1843,14 @@ export function createChatInstance({
         record.root.replaceChildren(chip);
         record.turnProjectBtn = null;
         record.cancelRunBtn = null;
+        record.inspectBtn = null;
+        // The task now lives in the project panel, so this card must stop counting
+        // as a foreground ACTIVE task in the main chat — otherwise isForegroundLiveCard
+        // keeps suppressing the typing indicator / status-badge clear until the
+        // background task ends. Mark it finished; the converted-card guards in
+        // applyLiveCardState/finishLiveCard then ignore any late terminal frame.
+        // (The detached element refs are LEFT intact — nulling them made other
+        // terminal paths like finishLiveCard throw on a post-conversion frame.)
         record.finished = true;
         // Recolor on the next frame so the 250ms fuchsia fade actually animates.
         requestAnimationFrame(() => record.root.classList.add('is-project'));
@@ -1706,10 +1894,19 @@ export function createChatInstance({
         )
             ? `<div class="chat-live-actions"><button type="button" class="chat-live-project-btn" data-turn-into-project>Turn into project</button></div>`
             : '';
+        // Flat agent turn: the card opens with the SENDER row, exactly like a plain
+        // assistant message, so a run reads as the same voice speaking rather than a
+        // separate boxed widget. A subagent card omits it — its title already
+        // carries the role·model·id identity, and repeating "Ouroboros" per child
+        // would be noise, not information.
+        const senderHtml = options.isSubagent
+            ? ''
+            : '<span class="chat-live-sender">Ouroboros</span>';
         root.innerHTML = `
             <button type="button" class="chat-live-summary-button" data-live-summary-button aria-expanded="false" aria-controls="${escapeHtmlAttr(timelineId)}">
                 <div class="chat-live-summary">
                     <div class="chat-live-summary-main">
+                        ${senderHtml}
                         <span class="chat-live-phase working" data-live-phase>Working</span>
                         <div class="chat-live-typing" data-live-typing aria-hidden="true">
                             <span></span><span></span><span></span>
@@ -1745,6 +1942,8 @@ export function createChatInstance({
             // P5: "Cancel run" button element (rendered lazily by syncCancelRunButton
             // once the host-attested cancelable marker is known for this task).
             cancelRunBtn: null,
+            // Phase A: "Inspect" button element (rendered by syncInspectButton).
+            inspectBtn: null,
             timelineEl: root.querySelector('[data-live-timeline]'),
             updates: 0,
             finished: false,
@@ -1829,6 +2028,7 @@ export function createChatInstance({
         // P5: the cancelable marker may have arrived (scheduled progress frame /
         // history replay) before this card was minted.
         syncCancelRunButton(record);
+        syncInspectButton(record);
         return record;
     }
 
@@ -2469,6 +2669,10 @@ export function createChatInstance({
             cancelableTaskIds.delete(record.groupId);
             syncCancelRunButton(record);
         }
+        // Inspecting a FINISHED run is the common case (changes + cost), so this
+        // action survives completion. Re-synced here because app.js's task-binding
+        // pass can drop the whole actions row when a task turns out to be bound.
+        syncInspectButton(record);
         if (record.finished) {
             setLiveCardTypingVisible(record, false);
             markTaskComplete(nextGroupId, summary.phase || 'done');
@@ -2970,7 +3174,13 @@ export function createChatInstance({
         const bubble = document.createElement('div');
         bubble.className = `chat-bubble ${role}` + (isProgress ? ' progress' : '');
         if (pending) bubble.classList.add('pending');
-        if (ephemeral) bubble.dataset.ephemeral = '1';
+        if (ephemeral) {
+            bubble.dataset.ephemeral = '1';
+            // A transient, non-persisted status line (awakened / reconnected) is a
+            // centered pill, not a message. Rich system renderers — skill_review
+            // above all — are persisted disclosures and never take this class.
+            bubble.classList.add('chat-status-event');
+        }
         if (clientMessageId) bubble.dataset.clientMessageId = clientMessageId;
         if (systemType) bubble.dataset.systemType = systemType;
         if (senderSessionId) bubble.dataset.senderSessionId = senderSessionId;
@@ -2978,7 +3188,7 @@ export function createChatInstance({
 
         const sender = getSenderLabel(role, isProgress, systemType, { source, senderLabel, senderSessionId });
         const rendered = role === 'user'
-            ? escapeHtml(text)
+            ? renderUserContent(text)
             : (role === 'system' && systemType === 'skill_review'
                 ? renderSkillReviewDisclosure(text)
                 : renderMarkdown(text));
@@ -3438,6 +3648,16 @@ export function createChatInstance({
                 // dropped synchronously, so a real live completion frame can
                 // never land while it is up.
                 _historyReplayActive = true;
+                // ...and for the SAME replay window the rebuild owns scroll
+                // position: while the column is being emptied and refilled,
+                // `isNearBottom()` answers about a transiently near-empty
+                // transcript, so every stickiness consumer would read "the reader
+                // is at the bottom" and queue a jump-to-latest whose frames land
+                // AFTER the reader-anchor restore. This guard stays up past the
+                // replay, until the ONE explicit decision at the end of syncHistory
+                // (restore the anchor, or stick only if they really were at the
+                // bottom BEFORE the rebuild) — which is the authority.
+                _historyRebuildActive = rebuildAll;
                 try {
                     if (rebuildAll) {
                         // perf2 P4.3 [GPT#14]: one outer withStableViewport for the
@@ -3502,6 +3722,9 @@ export function createChatInstance({
                 const wasFirstLoad = !historyLoaded;
                 historyLoaded = true;
                 lastHistorySyncSucceeded = true;
+                // The column is whole again: stickiness answers honestly from here,
+                // and the branches below are the only places that move the reader.
+                _historyRebuildActive = false;
                 // The durable rebuild superseded the offline fallback paint.
                 offlineBootstrapPainted = false;
                 // perf2 P4.1: ANY successful sync leaves the instance hydrated
@@ -3549,6 +3772,7 @@ export function createChatInstance({
                 console.error('Failed to load chat history:', err);
                 return false;
             } finally {
+                _historyRebuildActive = false;  // never leave scroll wedged on an error path
                 historySyncPromise = null;
                 // A reconnect caller waiting on the active promise owns replay of
                 // pendingReconnectSync above, so its own promise resolves only after
@@ -3656,23 +3880,36 @@ export function createChatInstance({
         input.setSelectionRange(cursor, cursor);
     }
 
+    /**
+     * Send the composer's content. Resolves TRUE only when the message was really
+     * dispatched (delivered, or deliberately queued for reconnect) and FALSE on
+     * every bail-out — a refusal, an offline attachment, a failed upload, a lost
+     * connection, or nothing to send. Callers that hand a draft over from another
+     * screen must clear their own field only on `true`; reporting success for a
+     * refused send would destroy the owner's words.
+     */
     async function sendMessage(planMode = false) {
-        if (sendBtn.disabled) return;  // guard against Enter re-entry during async upload
-        let text = input.value.trim();
+        if (sendBtn.disabled) return false;  // guard against Enter re-entry during async upload
+        // ONE reader for the whole field: committed parts + the typed draft,
+        // serialized by the shared codec. That string is the message identity
+        // everywhere downstream (WS frame, history, dedup, recall) — exactly as it
+        // was when the field was a bare textarea.
+        let text = composerParts.serialize().trim();
         // The owner's pure typed request (before attachment lines) — captured so a
         // live card spawned by this message can name a project from it on a "turn
         // into project" conversion even before the task records its objective (P1,
         // direct-chat case: the server has no title/objective/queue source yet).
-        const objectiveText = text;
+        // Context markers are machine grammar, so only HUMAN text parts count.
+        const objectiveText = composerObjectiveText(composerParts.getParts(), input.value);
         const hasAttachments = pendingAttachments.length > 0;
         let uploadedAttachments = [];
         let attachmentMeta = [];
-        if (!text && !pendingAttachments.length) return;
+        if (!text && !pendingAttachments.length) return false;
         if (pendingAttachments.length) {
             // Upload immediately before send; offline queueing would orphan files.
             if (ws.ws?.readyState !== WebSocket.OPEN) {
                 showToast('Cannot attach file while offline. Reconnect and try again.', 'error');
-                return;
+                return false;
             }
             const staged = [...pendingAttachments];
             const uploaded = [];
@@ -3712,13 +3949,13 @@ export function createChatInstance({
             } catch (e) {
                 await cleanupUploadedAttachments(uploaded);
                 showToast('Upload error: ' + e.message, 'error');
-                return;  // pending attachments and preview remain so the user can retry
+                return false;  // pending attachments and preview remain so the user can retry
             } finally {
                 setAttachmentUploadState(false);
                 setSendBusy(false);
             }
         }
-        if (!text) return;
+        if (!text) return false;
         const forcePlan = !!planMode && !text.startsWith('/');
         const result = ws.send({
             type: 'chat',
@@ -3732,7 +3969,7 @@ export function createChatInstance({
         if (hasAttachments && result?.status !== 'sent') {
             await cleanupUploadedAttachments(uploadedAttachments);
             showToast('Connection lost before send. Reconnect and try again.', 'error');
-            return;
+            return false;
         }
         // One-shot: disarm Swarm now that the message is sent.
         if (planMode) setSwarm(false);
@@ -3743,8 +3980,8 @@ export function createChatInstance({
             updateAttachmentPreview();
         }
         rememberInput(text);
-        input.value = '';
-        clearInputDraft();
+        composerParts.clear();  // drops the committed chips/text AND the live draft
+        clearInputDraft();      // ...and the persisted copy of that field
         addMessage(text, 'user', false, null, false, {
             pending: result?.status === 'queued',
             source: 'web',
@@ -3754,6 +3991,7 @@ export function createChatInstance({
         });
         resizeChatInput({ preserveStickiness: false });
         scrollToBottomAfterLayout();
+        return true;
     }
 
     // Send mode lives on DOM so CSS and click/Enter share one source.
@@ -3939,7 +4177,7 @@ export function createChatInstance({
 
     function updateMessagesPadding(options = {}) {
         const preserveStickiness = options.preserveStickiness !== false;
-        const shouldStick = preserveStickiness && isNearBottom();
+        const shouldStick = preserveStickiness && !_historyRebuildActive && isNearBottom();
         if (pageHeader && messagesDiv) {
             // The main header wraps to two rows on narrow viewports. Reserve its
             // REAL rendered height so scrollTop=0 never hides the first message
@@ -3984,9 +4222,18 @@ export function createChatInstance({
     // Per-thread input draft (P3): destroy-on-close would otherwise lose typed
     // but unsent text. Saved on every input (cheap), restored at instance
     // creation, cleared on send.
+    //
+    // What gets persisted is `composerParts.serialize()` — the field's single
+    // source of truth — NOT the bare textarea. The textarea only holds the live
+    // tail; captured context chips are separate DOM parts, so persisting
+    // `input.value` would silently drop every chip the owner captured. The
+    // serialized marker string round-trips exactly (`parseContent` is the
+    // codec's inverse), so a restored draft comes back as CHIPS, not as literal
+    // marker text the owner would have to re-capture.
     function saveInputDraft() {
         try {
-            if (input.value) sessionStorage.setItem(storeKey(CHAT_DRAFT_KEY), input.value);
+            const serialized = composerParts.serialize();
+            if (serialized) sessionStorage.setItem(storeKey(CHAT_DRAFT_KEY), serialized);
             else sessionStorage.removeItem(storeKey(CHAT_DRAFT_KEY));
         } catch {}
     }
@@ -3997,9 +4244,9 @@ export function createChatInstance({
 
     try {
         const savedDraft = sessionStorage.getItem(storeKey(CHAT_DRAFT_KEY)) || '';
-        if (savedDraft && !input.value) {
-            input.value = savedDraft;
-            inputDraft = savedDraft;
+        if (savedDraft && !composerParts.serialize()) {
+            composerParts.setParts(parseContent(savedDraft));
+            inputDraft = input.value;
             resizeChatInput({ preserveStickiness: false });
         }
     } catch {}
@@ -4567,21 +4814,38 @@ export function createChatInstance({
     });
 
     // Ordered-parts entry points for other screens (Changes / Files docks and the
-    // ⌘L capture path). They go through the EXISTING textarea + sendMessage
-    // authority: the serialized marker string is the message identity everywhere
-    // (WS frame, history, dedup, recall), so nothing about transport changes.
+    // ⌘L capture path). Phase A swapped the internals from the Phase-0 textarea
+    // adapter to the parts editor, so a handed-over chip arrives as a CHIP the
+    // owner can still remove or type between. The send path is unchanged: the
+    // serialized marker string is the message identity everywhere (WS frame,
+    // history, dedup, recall), and `sendMessage` remains the one transport.
     function setDraftParts(parts) {
         const text = serializeParts(parts);
-        input.value = text;
+        // Nothing handed over ⇒ leave the field exactly as the owner left it.
+        if (!text) return composerParts.serialize();
+        // A handoff ADDS to this field; it never wipes it. Whatever was already
+        // here — chips captured earlier plus a half-typed sentence — is committed
+        // AHEAD of the incoming parts, because silently discarding the owner's own
+        // words to make room for a transfer is exactly the loss this stream is
+        // supposed to prevent (BIBLE P1).
+        const kept = composerParts.commitDraft();
+        composerParts.setParts([...kept, ...normalizeParts(parts)]);
         resizeChatInput({ preserveStickiness: false });
-        try { input.focus(); } catch {}
-        return text;
+        composerParts.focus();
+        return composerParts.serialize();
     }
 
     function sendParts(parts, { planMode = false } = {}) {
+        // An EMPTY handoff is not a send. The chat field belongs to the owner, and
+        // since setDraftParts now keeps whatever is already there, firing on an empty
+        // transfer would send a draft they never asked to send.
+        if (!serializeParts(parts).trim()) return Promise.resolve(false);
         const text = setDraftParts(parts);
         if (!text.trim()) return Promise.resolve(false);
-        return Promise.resolve(sendMessage(planMode || swarmArmed())).then(() => true);
+        // Propagate the REAL dispatch outcome: the source dock clears its draft only
+        // on true, so a refused/failed send leaves the owner's words recoverable in
+        // this composer instead of vanishing from both screens.
+        return Promise.resolve(sendMessage(planMode || swarmArmed())).then((ok) => ok === true);
     }
 
     return {
