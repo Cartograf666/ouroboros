@@ -1294,7 +1294,8 @@ background: var(--bg-elevated);           /* cards, menus, composer, controls */
 border: 1px solid var(--surface-border);
 ```
 
-`grep -n "backdrop-filter" web/style.css` must stay empty. If a component
+`grep -n "backdrop-filter" web/style.css` must return NO declaration — the only
+match is the token banner at the top of the file stating that there is none. If a component
 appears to need a blur to separate itself from what is behind it, it needs a
 higher background token or a border — not a filter (removing a
 `backdrop-filter` also dissolves the stacking context it silently created, so
@@ -1435,6 +1436,16 @@ Add a rule inside the region that owns it. `web/app.js` carries the matching
 append-only `/* [anchor:phase-…] */` regions for cross-screen registrations
 (right-panel kinds, the global capture hotkey).
 
+A rule that two screens genuinely share belongs in a `[shared: …]` region, NOT in
+whichever screen's region it was written in first. `[shared: status tone ladder]`
+is the worked example: the done / warn / error tones for small status pills are
+read by the chat's phase pills, the Logs grid's phase column and the Evolution
+runtime pills, so one screen's region deciding another's colours is the thing the
+banners exist to prevent. Every rule there is at least two classes, which is what
+lets it outrank the per-surface pill bases on SPECIFICITY rather than on where the
+region happens to sit in the file — a shared region must never depend on file
+order, because the regions around it are independently owned and get reordered.
+
 ### Responsive and accessible behavior
 
 Navigation, headers, controls, and dialogs must stay operable by pointer and
@@ -1468,7 +1479,7 @@ Every timer, listener, observer, stream, abort controller, chart, and mounted
 widget has a paired disposer. UI preferences such as widget order belong in
 host state, never in extension manifests.
 
-### Navigation sidebar (v6.32.0 redesign; sections + brand + budget v6.88.0)
+### Navigation sidebar (v6.32.0 redesign; sections + brand + budget in the flat-UI redesign)
 
 The desktop navigation is a left `#primary-sidebar` of ROWS (not an icon
 rail): each destination is a `.nav-row` (16px icon + 13px label, 34px tall) and
