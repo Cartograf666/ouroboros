@@ -54,6 +54,18 @@ export function liveLineRowToggleKey(target, selection = null) {
  * comes back from `parseContent` as text and is escaped, so no message can
  * inject markup and no message loses characters.
  *
+ * LOSSLESS-OR-RAW is the guard that makes that last claim true. The chip
+ * projection may only be shown when it is byte-exact: `serializeParts(parts)`
+ * must reproduce the message character for character. It does for everything the
+ * codec itself emits, but arbitrary owner text can parse into parts whose
+ * re-serialization is SHORTER than the original — a marker over a fence longer
+ * than `MAX_CHIP_LINES`, whose bytes the serializer legitimately drops. Rendering
+ * such a projection would collapse hundreds of lines the agent still receives
+ * into a single marker line. When the round-trip is not exact, the WHOLE raw
+ * string is rendered as escaped text: no chips, nothing folded, every byte on
+ * screen. Per-part checks (a range disagreeing with its own fence) still apply to
+ * projections that ARE lossless.
+ *
  * Escaping goes through `escapeHtmlAttr` rather than `escapeHtmlText`: it is a
  * PURE string escaper (the text variant round-trips through a real DOM element),
  * so this projection needs no document and node tests exercise it directly. It
@@ -62,6 +74,8 @@ export function liveLineRowToggleKey(target, selection = null) {
 export function renderUserContent(raw) {
     const text = typeof raw === 'string' ? raw : String(raw ?? '');
     const parts = parseContent(text);
+    // A lossy projection is never shown: fall back to the owner's exact bytes.
+    if (serializeParts(parts) !== text) return escapeHtmlAttr(text);
     // A plain message — the overwhelming case — renders as one escaped string.
     if (!parts.length) return escapeHtmlAttr(text);
     if (parts.length === 1 && parts[0].type === 'text') return escapeHtmlAttr(parts[0].text);
@@ -90,6 +104,30 @@ export function renderUserContent(raw) {
     // and `.chat-user-parts` renders them with `white-space: pre-wrap`.
     }).join('\n');
     return `<span class="chat-user-parts">${inner}</span>`;
+}
+
+/**
+ * Recall projection: how ONE history entry refills the whole composer field.
+ *
+ * Returns `{ parts, input }` — the parts to commit before the live input, and the
+ * text to leave IN the live input so the caret lands in the recalled words. The
+ * field's bytes are the entry either way, because `serialize()` re-joins committed
+ * parts and the draft with the same `\n` the codec used.
+ *
+ * LOSSLESS-OR-RAW, the same invariant `renderUserContent` holds: the parts form is
+ * used ONLY when `serializeParts(parseContent(entry))` reproduces the entry
+ * exactly. An entry the codec cannot round-trip (a fence longer than
+ * `MAX_CHIP_LINES`, whose bytes the serializer legitimately drops) would come back
+ * SHORTER, so ArrowUp-then-Enter would send something the owner never wrote. Such
+ * an entry recalls as ONE verbatim string in the live input, no parts committed,
+ * and re-sending it transmits the identical bytes.
+ */
+export function recallFieldForEntry(entry) {
+    const raw = typeof entry === 'string' ? entry : '';
+    const parts = parseContent(raw);
+    if (serializeParts(parts) !== raw) return { parts: [], input: raw };
+    const tail = parts.length && parts[parts.length - 1].type === 'text' ? parts.pop() : null;
+    return { parts, input: tail ? tail.text : '' };
 }
 
 /**
@@ -3897,16 +3935,21 @@ export function createChatInstance({
      * The entry's TRAILING text, if it has any, is handed to the live input rather
      * than committed: recall has always put the caret in the recalled words so they
      * can be edited, and a parts editor must not take that away. `serialize()`
-     * re-joins committed parts and the draft with the same `\n`, so the field's
-     * bytes are identical either way.
+     * re-joins committed parts and the draft with the same `\n`, so splitting an
+     * entry that way is byte-neutral.
+     *
+     * The split itself is the pure `recallFieldForEntry(entry)`, which also holds
+     * the LOSSLESS-OR-RAW invariant: an entry the codec cannot round-trip byte for
+     * byte recalls as ONE verbatim string in the live input with nothing committed
+     * as parts, so ArrowUp-then-send transmits the identical bytes rather than a
+     * shorter re-serialization.
      */
     function restoreInputHistory(step) {
         if (!inputHistory.length) return;
         const applyEntry = (entry) => {
-            const parts = parseContent(entry);
-            const tail = parts.length && parts[parts.length - 1].type === 'text' ? parts.pop() : null;
-            composerParts.setParts(parts);
-            input.value = tail ? tail.text : '';
+            const field = recallFieldForEntry(entry);
+            composerParts.setParts(field.parts);
+            input.value = field.input;
         };
         if (step < 0) {
             if (input.selectionStart !== 0 || input.selectionEnd !== 0) return;
