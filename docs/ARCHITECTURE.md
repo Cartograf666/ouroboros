@@ -1,4 +1,4 @@
-# Ouroboros v6.88.1 — Architecture & Reference
+# Ouroboros v6.89.0 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -99,7 +99,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── local_model_autostart.py ← Local model startup helper
       ├── deep_self_review.py   ← Deep self-review: Generated Deep Self-Review Atlas repository context + full memory whitelist → 1M-context model. Guaranteed-fit assembly (v6.27.1): the in-prompt OMITTED-files section is bounded (counts per reason + capped sample; full coverage stays in the persisted atlas manifest) and reserved inside the atlas fixed budget; atlas budget_exceeded retries once with the compact manifest, and a final-shrink rebuild (tighter hard budget by the measured overage) replaces the historical fatal 'Review pack too large' error — the gate remains as the fail-closed last assertion. File selection is ranked by import-graph centrality (reverse-import in-degree from code_intelligence, additive bonus ≤600, deep-review-only)
       ├── review.py            ← Code collection, complexity metrics, pre-commit review
-      ├── preflight_runner.py  ← Hermetic serial reviewed-change pytest gate: disposable git worktree, candidate diff replay, temp data/settings/pycache env, and live OUROBOROS_*/secret-class scrub so review tests cannot inherit operator behavior or mutate live repo/data
+      ├── preflight_runner.py  ← Hermetic reviewed-change pytest gate: disposable git worktree, candidate diff replay, temp data/settings/pycache env, and live OUROBOROS_*/secret-class scrub so review tests cannot inherit operator behavior or mutate live repo/data. Runs CI's own two-pass split in that one worktree (parallel `not serial` with `-n auto --dist loadscope --max-worker-restart=0 --timeout=300`, then a flag-free `serial` pass) under ONE total budget, with `LANE_EXCLUSION_EXPR` as the marker-lane SSOT; a dead xdist worker and a missing xdist/timeout plugin are distinct named hard blocks, never a retry and never a silent serial fallback
       ├── review_substrate.py  ← Reviewer-slot coordinator used by task acceptance and planning helpers; duplicate model ids remain independent slots. Actor records keep transport status, parse status, semantic verdict, model/provider, role, coverage, quorum contribution, reason, enforcement impact, and review-binding hashes distinct; only a compact projection reaches task/event/UI records. Task acceptance enforces adaptive quorum, one substantive call and no more than two physical attempts per actor, metric-grounded criterion evidence, provenance, and a public-info-only anti-cheat boundary. Commit/triad/scope P3 orchestration remains a separate one-pass contract.
       ├── review_state.py      ← Durable advisory pre-review state (advisory_review.json)
       ├── triad_review.py      ← Shared multi-model review primitives: JSON-array extraction is reused by repo + skill review; per-actor records, quorum/degraded accounting, and model-error events power the skill-review path. It also owns the review OUTPUT CONTRACT text rendered by the repo-triad, repo-advisory and scope prompts (skill review states its own contract in `skill_review.py`): findings-only (`REVIEW_JSON_ARRAY_CONTRACT`) and required-matrix (`REVIEW_JSON_MATRIX_CONTRACT`, no all-clear — advisory selects it whenever `expected_items` is supplied). A clean findings-only verdict is recognised only when the WHOLE response — modulo one optional code fence — is `[]`, optionally followed by the `NO_FINDINGS` sentinel and nothing else. Any surrounding prose, and the sentinel without the array, are parse failures: a refusal cannot be distinguished from a benign preamble by structure, so neither is accepted. (A valid non-empty array is of course the normal findings path; it is simply never a *clean* verdict, even with the sentinel appended.) Keeping the text beside `empty_array_is_verified_clean` — the parser that enforces it — is what stops the two from drifting apart
@@ -825,13 +825,78 @@ eligibility signal, never remote push success.
 
 Reviewed-change pytest preflight is hermetic. `ouroboros/preflight_runner.py`
 creates a disposable detached worktree, replays the candidate staged/unstaged
-diff plus untracked candidate files, runs the default pytest suite serially with temporary
+diff plus untracked candidate files, runs the default pytest suite with temporary
 `OUROBOROS_DATA_DIR`, `OUROBOROS_SETTINGS_PATH`, and `PYTHONPYCACHEPREFIX`, and
 scrubs inherited `OUROBOROS_*` behavior plus secret-class environment values.
 This prevents tests launched by advisory/commit review from writing live
 `data/settings.json`, inheriting owner runtime modes, or triggering
-launcher-managed reset behavior against the live repo. CI alone owns its
-parallel non-serial plus serial split.
+launcher-managed reset behavior against the live repo.
+
+Since v6.89.0 the gate mirrors CI's split instead of running one serial pass: a
+parallel `not serial` pass (`-n auto --dist loadscope --max-worker-restart=0
+--timeout=300 --timeout-method=thread`) followed by a flag-free `serial` pass, both
+in that SAME worktree and env, under ONE total budget where the serial pass gets the
+remainder. `LANE_EXCLUSION_EXPR` is the single source for the excluded marker lanes
+because a command-line `-m` replaces the `pyproject.toml` `addopts` `-m` outright.
+The gate remains fail-closed and deterministic by naming its degenerate modes rather
+than retrying them: a dead xdist worker is `PARALLEL_WORKER_CRASH` — remediation
+`@pytest.mark.serial` when it genuinely crashed, but "make it faster or split it,
+and do NOT mark it serial" when pytest-timeout's 300s per-test limit killed it,
+because the serial pass carries no per-test timeout and the marker would relocate
+the hang into the lane that cannot bound it; a missing or too-old xdist/timeout
+plugin is `PREFLIGHT_PLUGIN_MISSING` (no silent serial fallback); the first red pass
+fails fast so its output is never truncated by a second pass; and pytest exit 5 is
+green per pass but blocking when every pass collected nothing.
+`OUROBOROS_PREFLIGHT_SERIAL=1` forces the legacy single serial pass as an operator
+rollback lever.
+
+Two properties of that gate are enforced rather than assumed, because a weakened
+parallel pass returns green and is otherwise indistinguishable from a real one.
+First, the parallel lane must really be parallel: the whole inherited `PYTEST_*`
+namespace is scrubbed (`PYTEST_XDIST_AUTO_NUM_WORKERS` decides what `-n auto`
+resolves to, `PYTEST_ADDOPTS` can append `-p no:xdist`) and a worker count clamped
+to at least two is re-injected. Second, plugin presence is verified by importing
+and version-checking xdist and pytest-timeout with the selected interpreter, from a
+non-candidate directory, *before* the worktree exists — a candidate `conftest.py`
+can declare `-n`/`--dist`/`--timeout` with `pytest_addoption` and ignore them, so
+"pytest accepted the flags" is not evidence that the plugins are installed.
+
+Verifying the interpreter proves the plugins are *installed*, not that they *load*:
+ini `addopts` are PREPENDED to the gate's argv, so a candidate `pytest.ini` carrying
+`-p no:xdist -p no:timeout` disarms both before the gate's own flags are read. The
+parallel pass therefore appends `-p xdist -p timeout` (entry-point names, not module
+paths — pytest skips an entry point whose name is already registered, whereas
+`-p xdist.plugin` would register the same module twice and fail an otherwise green
+run), and `consider_preparse` walks `-p` entries in order, so the later unblock wins.
+The *proof* is separate from the fix: the gate writes a small plugin of its own onto
+the run's `PYTHONPATH` and loads it with `-p`, each xdist worker drops a file named
+for its `PYTEST_XDIST_WORKER` id, and a green parallel pass that reports fewer than
+two distinct workers is `PREFLIGHT_PARALLELISM_LOST` — a hard block, since a pass
+that never ran concurrently proves nothing about the parallel-only defects the split
+exists to catch. This closes the *silent* downgrade; a candidate that actively forges
+worker files is out of scope. The check keys on the probe being in the argv rather
+than on `PreflightPass.parallel`, so an explicit caller `pytest_args` carrying its
+own `-n` (forwarded verbatim, never given the probe) is not blocked for evidence the
+gate never asked for.
+
+A candidate that removes every test file (which removes `tests/` with them, since
+git does not track empty directories) is likewise a hard block rather than an
+out-of-scope repository, decided by whether the caller's **phase baseline** carries a
+suite. The baseline is per-phase because the two production entry points observe
+different repository states, and the wrong one is wrong in both directions:
+`tools/review_helpers.py::_run_review_preflight_tests` runs pre-commit, so the
+deletion is only staged and `HEAD` alone already answers — consulting `HEAD~1` there
+false-blocked the first unrelated staged change after a deliberate removal commit,
+whose `HEAD` legitimately has no suite while `HEAD~1` still does.
+`tools/git.py::_run_pre_push_tests` runs POST-commit (`_post_commit_result` is
+reached only after `commit_sha` exists) and therefore sees the deletion already in
+`HEAD` — against a HEAD-only baseline that entry point read "this repository has no
+test suite" and returned green, so it compares `HEAD` **and `HEAD~1`**. The
+post-commit lookback is exactly one commit, so a project that deliberately dropped
+its tests is out of scope again on its next commit. Both
+entry points hand the decision to `run_hermetic_pytest` instead of short-circuiting
+on a missing `tests/` directory, which would skip the gate for exactly the change
+that deletes the gate.
 
 Safety-critical protection is no longer implemented as "copy these files from the
 bundle on every launch". The runtime guardrails are the runtime-mode protected-path
@@ -1830,7 +1895,8 @@ Runtime floors:
 | OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC | 600 | Env-only override read directly by `ouroboros.tools.review`. Per-reviewer model call timeout for multi-model review; timed-out reviewers become ERROR actors and quorum is adaptive to the configured reviewer count (`config.adaptive_quorum`). |
 | OUROBOROS_REVIEW_MAX_TOKENS | 65536 | Env-only override read directly by `ouroboros.tools.review` (v6.61.1). Reviewer RESPONSE reservation for multi-model review; an operator may LOWER it (floor 8192, never above the default) when a mega-diff's input pack plus the default output reservation exceeds a reviewer endpoint's context cap — preserving full review input instead of trimming evidence. Reviewer models are never changed by this knob. |
 | OUROBOROS_REVIEW_ENFORCEMENT | advisory | Review enforcement: `blocking` blocks commit critical findings, fresh-advisory open obligations/debts, and skill `blockers`; `advisory` downgrades those to warnings by operator choice. Fresh advisory with open obligations/debts writes `advisory_obligations_acknowledged`; stale advisory still blocks. Skill `warnings` do not block execution in either mode. |
-| OUROBOROS_PREFLIGHT_TIMEOUT_SEC | 300 | Wall-clock timeout (seconds) for the hermetic reviewed-change pytest preflight (`preflight_runner.run_hermetic_pytest`), the single source shared by the review preflight (`review_helpers`) and the pre-push gate (`tools/git.py`). On timeout (or any crash/exception path) the runner guarantees full process-tree teardown — process group, recursive PID tree, captured escaped-session groups, and a temp-root command-line sweep — so no orphaned test processes survive. |
+| OUROBOROS_PREFLIGHT_TIMEOUT_SEC | 900 | TOTAL wall-clock budget (seconds) for the hermetic reviewed-change pytest preflight (`preflight_runner.run_hermetic_pytest`), the single source shared by the review preflight (`review_helpers`) and the pre-push gate (`tools/git.py`). It covers BOTH passes: the serial pass gets `total − elapsed`, and the timeout message names the pass that burned the budget. On timeout (or any crash/exception path) the runner guarantees full process-tree teardown — process group, recursive PID tree, captured escaped-session groups, and a temp-root command-line sweep — so no orphaned test processes survive, and it sweeps the temp root BETWEEN passes so a pass-1 escapee cannot reach pass 2. Containment is also UNCONDITIONAL, including after a green pass: `platform_layer.ProcessContainer` (POSIX process group + an inherited-environment membership token / Windows kill-on-close Job Object) spawns pytest and is reaped in `finally`, because once the pytest controller exits, a surviving child it never waited on is invisible to both the parent→child walk and the command-line sweep. On POSIX the token is what names a `setsid()` escapee the process group no longer covers: the kernel copies it into every descendant and neither detaching, closing all inherited descriptors nor reparenting to init removes it, and membership is enumerated from live kernel state at reap time (`pids_with_env_marker`) rather than sampled by a poller — a descendant born and orphaned between two samples used to escape both mechanisms outright. The container spawns rather than adopts so that on Windows nothing can be started before job assignment takes effect (the process is created suspended and resumed once it is a member). A timed-out pass also reports the output the child had already flushed, which names the test that hung. |
+| OUROBOROS_PREFLIGHT_SERIAL | unset | Set to `1` to force the preflight back to the legacy SINGLE serial pass (v6.89.0 rollback lever). Scrubbed by `_preflight_env` like every other `OUROBOROS_*` value, so the candidate suite never observes it and the same suite runs either way. |
 | OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS | true | Owner-confirmed setting; default-on as of v6.10.0 (installs without an explicit choice are enabled; existing explicit choices are preserved). When enabled, a fresh executable skill review grants only the manifest-declared settings keys and host permissions for that exact content hash so closed-loop skill development can run without repeated manual grants. Under `blocking`, blocker reviews are not executable and do not auto-grant; under `advisory`, blocker findings may auto-grant only because the current enforcement mode makes the review executable. Plain `/api/settings` POST drops this key; desktop uses the launcher confirmation bridge and web uses `/api/owner/auto-grant`. |
 | OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS | true | Named, hash-pinned, audited exception to manual first review (v6.31.0, CHECKLISTS §Skills): when the LAUNCHER writes a bundled native skill payload (bootstrap seed, post-bootstrap new seed, version resync — all `.seed-origin`-marked), it stamps `review.json` `status=clean` with `reviewer_models=["repo_commit_gate"]` and `review_profile="native_seed"` because those exact bytes passed the repo triad+scope commit gate; zero-grant skills (no secret keys, no privileged permissions, only tool/subprocess surface) also auto-enable when no explicit owner enable/disable choice exists yet. Any later payload edit flips the verdict stale (only the TOP-LEVEL `.seed-origin` marker is hash-exempt), and a `native_seed` verdict whose marker is gone reads back as pending. The flag acts ONLY at launcher seed/resync moments over repo-reviewed bytes — flipping it at runtime grants nothing until the next launcher seeding event, which is why it ships without a dedicated owner-only settings gate (the generic settings self-change detectors still apply). Set to false to keep manual review for native seeds. |
 | OUROBOROS_CONTEXT_MODE | max | Owner-selected context horizon: `max` or `low`. Ordinary Main calls build deterministic route-calibrated projections from one immutable core; an unknown route tries Max (never a silent 200K fallback), and a confirmed overflow may retry the same model once with task-local Low without mutating this global setting. Since v6.80.0 this key is ALSO the single control over BIBLE P3 scope-review applicability (`max`: blocking ≥1M scope gate; `low`: whole-repository scope review declaredly not performed, typed skip row recorded) — an owner policy coupling, not a structural limit; the triad's blocking staged-diff review is unaffected in both modes. Plain `/api/settings` POST drops this key; owner endpoints/CLI control it. |

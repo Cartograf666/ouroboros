@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import pathlib
@@ -11,7 +12,9 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any, List, Optional
+import uuid
+from dataclasses import dataclass
+from typing import Any, Callable, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -30,10 +33,8 @@ _PATH_BOOTSTRAPPED = False
 def local_zoneinfo():
     """Best-effort DST-aware local timezone.
 
-    ``datetime.now().astimezone().tzinfo`` only yields a *fixed* current-offset
-    zone, which drifts by an hour across a DST boundary. Resolve the IANA local
-    zone (via ``TZ`` or ``/etc/localtime``) so callers stay DST-correct; fall
-    back to the fixed offset only when no IANA name can be found.
+    ``astimezone().tzinfo`` is a *fixed* offset that drifts across DST; resolve the IANA
+    zone (``TZ`` or ``/etc/localtime``), falling back to the fixed offset.
     """
     import datetime
     from zoneinfo import ZoneInfo
@@ -127,18 +128,12 @@ def bootstrap_process_path() -> list[str]:
 
 
 def scrub_repo_from_pythonpath(env: dict[str, str], repo_dir: "str | pathlib.Path | None") -> dict[str, str]:
-    """Return a copy of *env* with any ``PYTHONPATH`` entry that resolves to the
-    Ouroboros system repo dir removed.
+    """Return a copy of *env* with any ``PYTHONPATH`` entry resolving to the Ouroboros
+    system repo dir removed.
 
-    A command run inside an EXTERNAL workspace (a target project under
-    ``user_files`` or an external project root, e.g. the SWE-bench dig-direct
-    ``/app``) inherits the worker's ``PYTHONPATH``, which points at the Ouroboros
-    repo so the agent's own tools can import ``ouroboros``/``supervisor``. That
-    same entry lets the target's ``import web``/``import server``/``import
-    ouroboros`` resolve to OUROBOROS's modules instead of the target's, shadowing
-    the project under test. Dropping ONLY the repo entry isolates the target while
-    preserving every other ``PYTHONPATH`` entry (the project's own paths). No-op
-    when ``PYTHONPATH`` is unset/empty or carries no repo entry."""
+    An EXTERNAL-workspace command inherits the worker's ``PYTHONPATH`` repo entry, which
+    makes the target's ``import web``/``server``/``ouroboros`` resolve to OUROBOROS's modules.
+    Dropping ONLY the repo entry isolates the target; no-op without one."""
     out = dict(env)
     raw = out.get("PYTHONPATH", "")
     if not raw or not repo_dir:
@@ -498,22 +493,17 @@ def _win32_unlock(fd: int) -> None:
 def kill_process_tree(proc: subprocess.Popen) -> None:
     """Force-kill a subprocess and its entire process tree.
 
-    On POSIX the immediate process group is SIGKILLed first (fast path for the
-    common case), then any descendants that escaped into their own
-    session/process group are swept by PID. Without that sweep a timed-out or
-    cancelled child which spawned grandchildren in new groups (for example
-    pytest running tests that use ``subprocess_new_group_kwargs``) would leak
-    runaway orphan processes. Descendants are collected BEFORE the kill because
-    once the parent dies its children are reparented and the ppid links we rely
-    on disappear.
+    On POSIX the immediate process group is SIGKILLed first, then descendants that
+    escaped into their own session/group are swept by PID — without that sweep a
+    cancelled child which spawned grandchildren in new groups leaks orphans.
+    Descendants are collected BEFORE the kill: once the parent dies its children are
+    reparented and the ppid links disappear.
     """
     pid = proc.pid
     if IS_WINDOWS:
         try:
-            _hidden_run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                capture_output=True, timeout=10,
-            )
+            _hidden_run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True, timeout=10)
         except Exception:
             pass
         return
@@ -570,13 +560,353 @@ def kill_process_group_id(pgid: int) -> None:
         pass
 
 
-def process_group_is_alive(pgid: int) -> bool:
-    """Whether ANY member of Unix process group ``pgid`` is still around (signal 0 probe).
+# `ProcessContainer` token prefix. Deliberately NOT in the scrubbed `OUROBOROS_*` namespace: a
+# nested container must keep the OUTER token so an outer reap sees the whole tree; uuids compose.
+CONTAINMENT_ENV_PREFIX = "OURO_PROC_CONTAINER_"
 
-    For callers VERIFYING a kill, so it fails CLOSED: a probe that cannot be answered — Windows,
-    which has no group to probe this way, a refused signal, a bad id — reports the group as still
-    alive, because "we could not tell" is not the same fact as "nothing is left".
-    """
+
+# Tri-state membership: UNREADABLE is deliberately NOT a "no" — reading a nondumpable member as a
+# non-member is how a live descendant would leave containment without exiting.
+MARKER_MEMBER = "member"
+MARKER_ABSENT = "absent"
+MARKER_UNREADABLE = "unreadable"
+
+
+def pid_marker_state(pid: int, marker: str) -> str:
+    """Tri-state membership for ONE pid from live kernel state: ABSENT means ANSWERED-not-a-member;
+    UNREADABLE means unanswerable — ``reap`` treats it as a leak. Windows: ABSENT (job = membership)."""
+    if IS_WINDOWS or not marker or int(pid) <= 0:
+        return MARKER_ABSENT
+    if os.path.isdir("/proc"):
+        try:
+            with open(f"/proc/{int(pid)}/environ", "rb") as handle:
+                data = handle.read()
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ESRCH, errno.ENOTDIR):
+                return MARKER_ABSENT  # the pid is gone
+            return MARKER_UNREADABLE  # nondumpable, or another user's process
+        return MARKER_MEMBER if marker.encode("utf-8", "replace") in data else MARKER_ABSENT
+    try:
+        out = subprocess.run(["ps", "-E", "-ww", "-p", str(int(pid)), "-o", "command="],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:
+        # No usable `ps` on a system with no /proc: unanswered, not answered "no".
+        return MARKER_UNREADABLE
+    if out.returncode != 0:
+        # `ps -p` fails only when there is no such process, so this is the liveness probe too.
+        return MARKER_ABSENT
+    if marker in (out.stdout or ""):
+        return MARKER_MEMBER
+    # ALIVE, and `ps` showed no token. Unlike /proc's EACCES, `ps -E` reports a process whose
+    # environment it may not read by OMITTING it — identical to one that never carried the token.
+    # Unanswered, then, and unanswered is a leak: it stops a nondumpable member leaving quietly.
+    return MARKER_UNREADABLE
+
+
+def pid_is_zombie(pid: int) -> bool:
+    """Whether ``pid`` is an already-exited process still holding a table slot. A SIGKILLed child of
+    THIS process keeps its pid, pgid and ``ps`` row until someone ``wait()``s it, and the preflight
+    reaps before waiting pytest; a corpse can execute nothing, so counting it only burns time."""
+    if IS_WINDOWS or int(pid) <= 0:
+        return False
+    try:
+        if os.path.isdir("/proc"):
+            # comm is parenthesised and may contain ')', so state is the field after the LAST.
+            with open(f"/proc/{int(pid)}/stat", "rb") as handle:
+                fields = handle.read().rpartition(b")")[2].split()
+            return bool(fields) and fields[0] == b"Z"
+        out = subprocess.run(["ps", "-o", "state=", "-p", str(int(pid))],
+                             capture_output=True, text=True, timeout=10)
+        return out.returncode == 0 and (out.stdout or "").strip().startswith("Z")
+    except Exception:
+        return False
+
+
+def _proc_start_ticks(pid: int) -> int:
+    """Boot-relative start time (``/proc/<pid>/stat`` field 22), or 0 when it cannot be read."""
+    try:
+        with open(f"/proc/{int(pid)}/stat", "rb") as handle:
+            fields = handle.read().rpartition(b")")[2].split()
+        return int(fields[19]) if len(fields) >= 20 else 0  # rpartition dropped fields 1-2
+    except (OSError, ValueError):
+        return 0
+
+
+def _could_be_hidden_member(pid: int, since_ticks: int) -> bool:
+    """Whether a pid whose ENVIRONMENT cannot be read could still be a container member.
+
+    Dropping such a pid is how a live descendant leaves containment without exiting — ``setsid()``
+    sheds the group and nondumpability sheds the token — so it is enumerated on PLAUSIBILITY and
+    reported undetermined, which blocks. What the kernel publishes however it hid (``stat`` and
+    ``status`` stay world-readable) rules out two things a member cannot be: started BEFORE the
+    container root, which a member is forked FROM, or running under another EFFECTIVE uid, which
+    needs privilege we do not have and would be unsignallable anyway. All else is kept, unanswered
+    reads included: an exited pid re-probes as absent and a stranger costs a clearable false block,
+    while dropping a live member is the leak itself."""
+    started = _proc_start_ticks(pid)
+    if since_ticks > 0 and 0 < started < since_ticks:
+        return False
+    try:
+        with open(f"/proc/{int(pid)}/status", "rb") as handle:
+            for line in handle:
+                if line.startswith(b"Uid:"):  # real, EFFECTIVE, saved, fs
+                    return int(line.split()[2]) == os.geteuid()
+    except (OSError, ValueError, IndexError):
+        return True
+    return True
+
+
+def pids_with_env_marker(marker: str, pgid: int = 0, since_ticks: int = 0) -> "Optional[List[int]]":
+    """Pids that belong to a container, read from live kernel state; ``None`` when the process
+    table could NOT be read at all (conflating that with "empty" reports a clean reap).
+
+    THREE signals, each covering the others' blind spots: the kernel-copied ENVIRONMENT token
+    (survives setsid/fd-closing/reparenting — but is claimed by READING the process, so a member
+    turning nondumpable drops out silently), the kernel-held PROCESS GROUP (names nondumpable and
+    env-replaced members), and on Linux the undetermined-unreadable candidates
+    ``_could_be_hidden_member`` cannot rule out (dated by ``since_ticks``), kept fail-closed.
+    The group is an ENUMERATION input only — ``reap`` never signals by pgid."""
+    if IS_WINDOWS or not marker:
+        return []
+    found: List[int] = []
+    if os.path.isdir("/proc"):
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return None
+        for name in entries:
+            if not name.isdigit():
+                continue
+            state = pid_marker_state(int(name), marker)
+            if (state == MARKER_MEMBER
+                    or (pgid and process_group_id(int(name)) == pgid)
+                    or (state == MARKER_UNREADABLE
+                        and _could_be_hidden_member(int(name), since_ticks))):
+                found.append(int(name))
+        return found
+    try:
+        out = subprocess.run(["ps", "-E", "-ww", "-Ao", "pid=,pgid=,command="],
+                             capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    for line in (out.stdout or "").splitlines():
+        head = line.split(maxsplit=2)
+        if len(head) < 3 or not head[0].isdigit():
+            continue
+        if marker in line or (pgid and head[1] == str(int(pgid))):
+            found.append(int(head[0]))
+    return found
+
+
+# A member can fork between scans and its child inherits the token, so one quiet scan proves little:
+# `reap` needs `_REAP_QUIET_SCANS` scans in a row with nothing live and nothing undeterminable, and
+# FAILS if that has not happened by `_REAP_DEADLINE_SEC`.
+_REAP_QUIET_SCANS = 2
+_REAP_DEADLINE_SEC = 10.0
+_REAP_SETTLE_SEC = 0.05
+
+
+def _containment_leak_reason(alive: List[int], undetermined: List[int]) -> str:
+    """The failure text ``reap`` returns. Both lists are leaks; they differ only in remediation."""
+    parts = []
+    if alive:
+        parts.append("still alive after a best-effort kill: "
+                     + ", ".join(str(pid) for pid in alive))
+    if undetermined:
+        parts.append("liveness could not be determined (the process environment could not be "
+                     "read): " + ", ".join(str(pid) for pid in undetermined))
+    detail = "; ".join(parts) or ("no member was visible in the last scan, but two consecutive "
+                                  "quiet scans were never reached, so nothing is proven gone")
+    return (f"the contained tree could not be proven gone within {_REAP_DEADLINE_SEC:.0f}s — "
+            f"{detail}")
+
+
+class ProcessContainer:
+    """DETECTION for a spawned tree that outlives its root — not a teardown guarantee.
+
+    POSIX offers no guaranteed teardown of a detached descendant (pids are reusable names,
+    membership is not kernel-held, a signal can be refused or land on a recycled stranger), so this
+    container claims an honest ANSWER instead: ``reap`` resolves membership
+    (``pids_with_env_marker``) from the LIVE table at teardown — never from mid-run samples — then
+    attempts one bounded best-effort kill sweep and reports every member still alive or
+    undeterminable to the caller, which hard-blocks. Residual limit on Linux: a descendant that
+    sheds the token, leaves the group AND changes euid; without ``/proc`` (macOS/BSD) one that
+    sheds the token and leaves the group. Windows membership is the Job Object (kernel-enforced
+    teardown — but only when the API confirms it). Prefer ``spawn`` over ``Popen`` + ``adopt``:
+    POSIX ``adopt`` can neither plant the token nor vouch for a pid or group."""
+
+    def __init__(self) -> None:
+        self._job = None
+        # The pid `spawn` started and the group it leads: known WITHOUT having to be read.
+        self._root = 0
+        self._pgid = 0
+        # The root's start time: nothing the container spawned can predate it.
+        self._start_ticks = 0
+        self._suspended = False
+        # Non-empty when containment was never ESTABLISHED: else it reads as "everything reaped".
+        self._setup_error = ""
+        # Unique per instance: a nested preflight and its outer run never claim each other's.
+        self._token = f"{CONTAINMENT_ENV_PREFIX}{uuid.uuid4().hex}"
+
+    def containment_env(self) -> "dict[str, str]":
+        """Environment entries that make a process and its descendants members. ``spawn`` applies
+        these; a caller building its own env for ``Popen`` + ``adopt`` must merge them in."""
+        return {self._token: "1"}
+
+    def spawn(self, argv: List[str], **popen_kwargs) -> subprocess.Popen:
+        """``Popen`` the process already inside the container, with no gap. The token is merged into
+        the caller's ``env`` (defaulting to the inherited one) BEFORE the process exists, so no
+        descendant can start outside the membership. On Windows the root is created SUSPENDED too:
+        a descendant preceding the job assignment would survive terminate/close. ``adopt`` resumes."""
+        kwargs = dict(popen_kwargs)
+        group_kwargs = dict(subprocess_new_group_kwargs())
+        flags = int(kwargs.pop("creationflags", 0)) | int(group_kwargs.pop("creationflags", 0))
+        kwargs.update(group_kwargs)
+        env = kwargs.get("env")
+        kwargs["env"] = {**(os.environ if env is None else env), **self.containment_env()}
+        if IS_WINDOWS:
+            flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
+            self._suspended = True
+        if flags:
+            kwargs["creationflags"] = flags
+        proc = subprocess.Popen(argv, **kwargs)
+        # Knowledge no scan can re-derive: enumeration claims members by READING them, so a root
+        # turning nondumpable before the first scan is in no list. `start_new_session` makes it its
+        # own group LEADER (pgid == pid); enumerating any OTHER pgid would report bystanders.
+        self._root = int(getattr(proc, "pid", 0) or 0)
+        pgid = process_group_id(self._root)
+        self._pgid = pgid if pgid and pgid == self._root else 0
+        self._start_ticks = _proc_start_ticks(self._root)
+        self.adopt(proc)
+        return proc
+
+    def adopt(self, proc: subprocess.Popen) -> None:
+        """Take custody of a just-spawned process; call right after ``Popen``. A no-op on POSIX: the
+        token can only be planted before the process exists, and only ``spawn`` knows the pid and
+        the group it planted it into. A ``Popen`` + ``adopt`` caller must merge
+        ``containment_env()`` into the env it passes, or nothing is contained."""
+        if IS_WINDOWS:
+            self._job = self._adopt_windows(proc)
+            if self._job is None:
+                self._setup_error = (
+                    "the Windows Job Object could not be created, or the pytest root could not "
+                    "be assigned to it, so nothing the run spawned would be kernel-held; the "
+                    "still-suspended root was terminated rather than resumed uncontained"
+                )
+
+    def _adopt_windows(self, proc: subprocess.Popen):
+        """Put ``proc`` in a kill-on-close Job Object; return the handle or None. It is created
+        suspended so nothing escapes before assignment, never LEFT suspended (a caller waiting on it
+        would deadlock), and never resumed uncontained — an unheld root starts descendants that
+        survive terminate/close. A failed create/assign kills the root."""
+        pid = int(getattr(proc, "pid", 0) or 0)
+        job = create_kill_on_close_job()
+        if job is not None and not assign_pid_to_job(job, pid):
+            close_job(job)
+            job = None
+        if job is None:
+            self._suspended = False
+            force_kill_pid(pid)
+            return None
+        if self._suspended:
+            self._suspended = False
+            # If even the resume fails the process is unusable, so tear it down.
+            if not resume_process(pid):
+                terminate_job(job)
+                close_job(job)
+                force_kill_pid(pid)
+                return None
+        return job
+
+    def _scan(self, token: str, pgid: int, known: "set[int]", kill: bool, since: int = 0
+              ) -> "tuple[List[int], List[int], str]":
+        """ONE membership scan: ``(still alive, undeterminable, enumeration error)``. ``kill`` is
+        true for the single sweep only. ``known`` is carried across scans and only ever GROWS: once
+        a pid has been seen as a member, dropping out of a later enumeration proves nothing — that
+        is what a member turning unreadable looks like too."""
+        members = pids_with_env_marker(token, pgid, since)
+        if members is None:
+            return [], [], ("the live process table could not be enumerated, so the container "
+                            "cannot say whether the tree it spawned is still running")
+        me = os.getpid()
+        known.update(pid for pid in members if pid != me)
+        alive: List[int] = []
+        undetermined: List[int] = []
+        for pid in sorted(known):
+            if pid == me or pid_is_zombie(pid):
+                continue  # exited; only its parent's `wait()` frees the table slot
+            state = pid_marker_state(pid, token)
+            if state == MARKER_MEMBER:
+                alive.append(pid)
+                if kill:
+                    # NOTHING stands between the revalidation above and this signal: any lookup
+                    # in that gap is a window for the pid to be recycled onto a stranger.
+                    force_kill_pid(pid)
+            elif pgid and process_group_id(pid) == pgid:
+                # The kernel still places it in the container's own group: alive, and a member
+                # however its environment reads. Reported, never signalled — a pgid is a borrowed
+                # name, so this pid is not proven ours the way a token-bearer is.
+                alive.append(pid)
+            elif state == MARKER_UNREADABLE:
+                undetermined.append(pid)
+        return alive, undetermined, ""
+
+    def reap(self) -> str:
+        """SCAN the container; return "" only when nothing of it is left, else why not. Detection,
+        not guaranteed teardown. ONE bounded best-effort kill sweep runs first; after it nothing is
+        ever signalled again, so a member is targeted at most once and the unavoidable
+        exit-then-reuse race is entered once rather than every 50ms for ten seconds. The rest is
+        rescanning. A member still alive, or one whose liveness could not be DETERMINED (unreadable
+        environment, unenumerable table, a Windows job that will not confirm its own termination),
+        fails naming the pids — "cannot tell" is not "gone". Handles are consumed once."""
+        if IS_WINDOWS:
+            if self._setup_error:
+                return self._setup_error
+            job, self._job = self._job, None
+            if job is None:
+                return ""
+            # Teardown happens HERE, where a failure can still reach the verdict. Terminate AND
+            # close — kill-on-close backstops a termination that did not take.
+            return "; ".join(text for text in (terminate_job(job), close_job(job)) if text)
+        token, self._token = self._token, ""
+        root, self._root = self._root, 0
+        pgid, self._pgid = self._pgid, 0
+        since, self._start_ticks = self._start_ticks, 0
+        if self._setup_error or not token:
+            return self._setup_error
+        # Seeded with the spawned root: a member by construction, not by having been read.
+        known: "set[int]" = {root} if root > 0 else set()
+        deadline = time.monotonic() + _REAP_DEADLINE_SEC
+        alive, undetermined, error = self._scan(token, pgid, known, True, since)  # the ONE sweep
+        last, quiet = (alive, undetermined), 0
+        while not error:
+            if alive or undetermined:
+                quiet, last = 0, (alive, undetermined)
+            else:
+                quiet += 1
+            if quiet >= _REAP_QUIET_SCANS:
+                return ""
+            if time.monotonic() >= deadline:
+                # The last NON-EMPTY scan, not the current one: a scan coming back empty just as the
+                # deadline passes would name no pid, under a remediation that says to kill them.
+                return _containment_leak_reason(*last)
+            time.sleep(_REAP_SETTLE_SEC)
+            alive, undetermined, error = self._scan(token, pgid, known, False, since)
+        return error
+
+    def close(self) -> None:
+        """Release the container handle. Inert after ``reap``, which closes it itself."""
+        if IS_WINDOWS and self._job is not None:
+            close_job(self._job)
+            self._job = None
+
+
+def process_group_is_alive(pgid: int) -> bool:
+    """Whether ANY member of Unix group ``pgid`` remains (signal-0 probe). For callers VERIFYING
+    a kill, so it fails CLOSED: an unanswerable probe (Windows, refused signal, bad id) reports
+    alive — "we could not tell" is not "nothing is left"."""
     if IS_WINDOWS:
         return True
     try:
@@ -611,35 +941,25 @@ def current_process_group_id() -> int:
 def process_start_time(pid: int) -> str:
     """Best-effort stable start-time token for (pid, start_time) fingerprints.
 
-    POSIX: ``ps -o lstart=`` (portable across macOS/Linux); Linux fallback
-    reads /proc/<pid>/stat field 22 (clock ticks since boot). Windows:
-    empty string — callers degrade to pid-liveness semantics there.
-    Returns "" when the pid is gone or the platform offers no stable token.
-    """
+    A bare pid is not an identity — the kernel reuses it. ``(pid, start_time)`` is, which is what
+    lets a caller refuse to signal a pid it merely used to own. POSIX uses ``ps -o lstart=``,
+    falling back to the same /proc field the containment scan dates candidates by, so the
+    fingerprint stays real on an image with no usable ``ps``. Windows returns "" (callers degrade
+    to pid liveness), as does a pid that is already gone."""
     if pid <= 0:
         return ""
     if os.name == "nt":
         return ""
     try:
-        out = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=5,
-        )
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
         text = (out.stdout or "").strip()
         if out.returncode == 0 and text:
             return text
     except Exception:
         pass
-    try:
-        stat_path = pathlib.Path(f"/proc/{pid}/stat")
-        if stat_path.exists():
-            fields = stat_path.read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[-1].split()
-            # rsplit removed fields 1-2 (pid, comm); starttime is field 22 → index 19 here.
-            if len(fields) >= 20:
-                return fields[19]
-    except Exception:
-        pass
-    return ""
+    ticks = _proc_start_ticks(pid)
+    return str(ticks) if ticks else ""
 
 
 def process_command(pid: int) -> str:
@@ -647,12 +967,8 @@ def process_command(pid: int) -> str:
     if IS_WINDOWS:
         return ""
     try:
-        result = subprocess.run(
-            ["ps", "-p", str(int(pid)), "-o", "command="],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
+        result = subprocess.run(["ps", "-p", str(int(pid)), "-o", "command="],
+                                capture_output=True, text=True, timeout=3)
         return result.stdout.strip()
     except Exception:
         return ""
@@ -662,10 +978,7 @@ def force_kill_pid(pid: int) -> None:
     """Force-kill a single process by PID."""
     if IS_WINDOWS:
         try:
-            _hidden_run(
-                ["taskkill", "/F", "/PID", str(pid)],
-                capture_output=True, timeout=10,
-            )
+            _hidden_run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=10)
         except Exception:
             pass
     else:
@@ -678,24 +991,19 @@ def force_kill_pid(pid: int) -> None:
 def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None) -> None:
     """Force-kill a PID tree recursively.
 
-    ``exclude_pids`` are spared along with their own descendants. Used to keep
-    deliberately-kept (``service_teardown=keep``) services alive when a worker is
-    force-killed on cancel/timeout, so a verifier can still reach them; spared
-    children reparent to init and are governed by the custody reaper thereafter.
+    ``exclude_pids`` are spared along with their own descendants, keeping
+    ``service_teardown=keep`` services reachable for a verifier when a worker is
+    force-killed; spared children reparent to init and fall to the custody reaper.
     """
     exclude = {int(p) for p in (exclude_pids or set())}
     if IS_WINDOWS:
         # exclude_pids is a POSIX-only nicety: descendant enumeration relies on
-        # `pgrep -P`, which does not exist on Windows, so honouring exclusions
-        # here would enumerate nothing and LEAK the worker's whole subprocess
-        # tree (only the root would die). taskkill /T reliably kills the tree;
-        # kept-service sparing is not supported on Windows (and leaking the tree
-        # is strictly worse than not sparing). Always tree-kill.
+        # `pgrep -P`, which Windows lacks, so honouring exclusions here would
+        # enumerate nothing and LEAK the worker's whole tree (only the root would
+        # die). taskkill /T always tree-kills; sparing is unsupported on Windows.
         try:
-            _hidden_run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                capture_output=True, timeout=10,
-            )
+            _hidden_run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True, timeout=10)
         except Exception:
             pass
         return
@@ -726,10 +1034,8 @@ def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None) -> None:
 def _collect_descendants(pid: int, result: list[int]) -> None:
     """Recursively collect all descendant PIDs via pgrep."""
     try:
-        out = subprocess.run(
-            ["pgrep", "-P", str(pid)],
-            capture_output=True, text=True, timeout=3,
-        )
+        out = subprocess.run(["pgrep", "-P", str(pid)],
+                             capture_output=True, text=True, timeout=3)
         for line in out.stdout.strip().splitlines():
             line = line.strip()
             if line:
@@ -741,10 +1047,9 @@ def _collect_descendants(pid: int, result: list[int]) -> None:
 
 
 def collect_descendant_pids(pid: int) -> List[int]:
-    """Public: return all descendant PIDs of ``pid`` (depth-first, children last).
+    """Public: all descendant PIDs of ``pid`` (depth-first, children last).
 
-    Keeps process-tree discovery inside the platform layer so callers do not
-    reach into the private recursive helper."""
+    Keeps tree discovery in the platform layer, off the private recursive helper."""
     result: List[int] = []
     try:
         _collect_descendants(int(pid), result)
@@ -756,10 +1061,9 @@ def collect_descendant_pids(pid: int) -> List[int]:
 def kill_processes_referencing(marker: str) -> None:
     """Force-kill any process whose command line references ``marker``.
 
-    Sweeps children that double-forked and were reparented to init, escaping both
-    ``killpg`` (own session) and the ``pgrep -P`` parent->child walk. ``marker``
-    is matched literally (regex specials escaped) so a temp path containing
-    ``.``/``+`` cannot over-match unrelated command lines."""
+    Sweeps children that double-forked to init, escaping both ``killpg`` and the
+    ``pgrep -P`` walk. ``marker`` is matched literally (regex specials escaped) so a
+    temp path containing ``.``/``+`` cannot over-match unrelated command lines."""
     if IS_WINDOWS or not marker:
         return
     try:
@@ -871,52 +1175,40 @@ def embedded_ripgrep_candidates(base_dir: pathlib.Path) -> List[pathlib.Path]:
     return [base_dir / "ripgrep-standalone" / "bin" / "rg"]
 
 
-def resolve_bundled_node() -> Optional[str]:
-    """Return the path to the bundled, signed Node.js runtime if present.
-
-    The packaged app ships an official notarized node under ``node-standalone``
-    (re-signed under the hardened runtime by the build's signing pass). Prefer it
-    over a PATH (e.g. Homebrew) node, which macOS code-signing enforcement can
-    SIGKILL when launched from the packaged process tree.
-    """
+def _resolve_bundled(candidates_for: Callable[[pathlib.Path], List[pathlib.Path]]) -> Optional[str]:
+    """First existing path from ``candidates_for(base)`` over the frozen and source roots."""
     bases: List[pathlib.Path] = []
     frozen_base = getattr(sys, "_MEIPASS", None)
     if frozen_base:
         bases.append(pathlib.Path(frozen_base))
-    # Dev/source layout: node-standalone sits at the repo root (created by the
-    # build scripts), two levels up from this module.
+    # Dev/source layout: the standalone dirs sit at the repo root, two levels up.
     bases.append(pathlib.Path(__file__).resolve().parent.parent)
     for base in bases:
-        for candidate in embedded_node_candidates(base):
+        for candidate in candidates_for(base):
             try:
                 if candidate.is_file():
                     return str(candidate)
             except OSError:
                 continue
     return None
+
+
+def resolve_bundled_node() -> Optional[str]:
+    """Return the path to the bundled, signed Node.js runtime if present.
+
+    The packaged app ships an official notarized node under ``node-standalone``, preferred
+    over a PATH (e.g. Homebrew) node that macOS code-signing enforcement can SIGKILL when
+    launched from the packaged process tree.
+    """
+    return _resolve_bundled(embedded_node_candidates)
 
 
 def resolve_bundled_ripgrep() -> Optional[str]:
     """Return the bundled rg path if present."""
-    bases: List[pathlib.Path] = []
-    frozen_base = getattr(sys, "_MEIPASS", None)
-    if frozen_base:
-        bases.append(pathlib.Path(frozen_base))
-    bases.append(pathlib.Path(__file__).resolve().parent.parent)
-    for base in bases:
-        for candidate in embedded_ripgrep_candidates(base):
-            try:
-                if candidate.is_file():
-                    return str(candidate)
-            except OSError:
-                continue
-    return None
+    return _resolve_bundled(embedded_ripgrep_candidates)
 
 
 # Claude runtime resolution.
-
-from dataclasses import dataclass
-
 
 @dataclass
 class ClaudeRuntimeState:
@@ -928,12 +1220,10 @@ class ClaudeRuntimeState:
     cli_path: str = ""
     cli_version: str = ""
     interpreter_path: str = ""
-
     # Legacy user-site runtime.
     legacy_detected: bool = False
     legacy_sdk_path: str = ""
     legacy_sdk_version: str = ""
-
     # Operational state.
     ready: bool = False
     api_key_set: bool = False
@@ -969,9 +1259,7 @@ def _find_bundled_cli(sdk_path: str) -> Optional[str]:
     """Locate the bundled CLI binary inside the SDK package."""
     cli_name = "claude.exe" if IS_WINDOWS else "claude"
     bundled = pathlib.Path(sdk_path) / "_bundled" / cli_name
-    if bundled.exists() and bundled.is_file():
-        return str(bundled)
-    return None
+    return str(bundled) if bundled.is_file() else None
 
 
 def _probe_cli_version(cli_path: str) -> str:
@@ -982,7 +1270,6 @@ def _probe_cli_version(cli_path: str) -> str:
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
-            import re
             m = re.match(r"([0-9]+\.[0-9]+\.[0-9]+)", result.stdout.strip())
             if m:
                 return m.group(1)
@@ -996,10 +1283,7 @@ def _detect_legacy_user_site_sdk() -> tuple[bool, str, str]:
     sdk_path = _find_sdk_package_path()
     if not sdk_path:
         return False, "", ""
-    normalised = pathlib.Path(sdk_path).resolve()
-    parts_lower = [p.lower() for p in normalised.parts]
-    in_app_bundle = "python-standalone" in parts_lower
-    if in_app_bundle:
+    if "python-standalone" in [p.lower() for p in pathlib.Path(sdk_path).resolve().parts]:
         return False, "", ""
     try:
         import importlib.metadata
@@ -1024,15 +1308,9 @@ def resolve_claude_runtime() -> ClaudeRuntimeState:
     sdk_path = _find_sdk_package_path()
     if sdk_path:
         state.sdk_path = sdk_path
-
-    # App-managed SDK lives inside python-standalone.
-    if sdk_path:
-        normalised = pathlib.Path(sdk_path).resolve()
-        parts_lower = [p.lower() for p in normalised.parts]
+        # App-managed SDK lives inside python-standalone.
+        parts_lower = [p.lower() for p in pathlib.Path(sdk_path).resolve().parts]
         state.app_managed = "python-standalone" in parts_lower
-
-    # Bundled CLI.
-    if sdk_path:
         cli = _find_bundled_cli(sdk_path)
         if cli:
             state.cli_path = cli
@@ -1173,7 +1451,10 @@ if IS_WINDOWS:
     import ctypes
     import ctypes.wintypes
 
-    _kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    # `use_last_error=True` so `ctypes.get_last_error()` reads the code the CALL set: without it
+    # ctypes does not snapshot the thread's last error, and the failure text below would quote
+    # whatever ctypes' own bookkeeping left behind. Same pattern as the file-lock helpers above.
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
 
     _INVALID_HANDLE_VALUE = ctypes.wintypes.HANDLE(-1)
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
@@ -1266,24 +1547,36 @@ def assign_pid_to_job(job_handle: Any, pid: int) -> bool:
         return False
 
 
-def terminate_job(job_handle: Any, exit_code: int = 1) -> None:
-    """Terminate all processes in a Job Object."""
+def terminate_job(job_handle: Any, exit_code: int = 1) -> str:
+    """Terminate all processes in a Job Object; "" on success, else the reason it is unproven.
+
+    A FALSE Win32 BOOL is a failure exactly like a raised call, and swallowing either let
+    ``ProcessContainer.reap`` report a clean teardown while job members were still running."""
     if not IS_WINDOWS or job_handle is None:
-        return
+        return ""
     try:
-        _kernel32.TerminateJobObject(job_handle, exit_code)
-    except Exception:
-        pass
+        if not _kernel32.TerminateJobObject(job_handle, exit_code):
+            return (f"TerminateJobObject returned false (Win32 error {ctypes.get_last_error()}), "
+                    "so the processes held by the job cannot be assumed dead")
+    except Exception as exc:
+        return f"TerminateJobObject failed ({exc}), so the job's processes are unaccounted for"
+    return ""
 
 
-def close_job(job_handle: Any) -> None:
-    """Close a Job Object handle (triggers kill-on-close if set)."""
+def close_job(job_handle: Any) -> str:
+    """Close a Job Object handle (triggers kill-on-close if set); "" on success, else the reason.
+
+    The handle is the last thing holding kill-on-close, so a close that did not happen leaves
+    survivors AND leaks the handle; the caller reports it rather than discarding it."""
     if not IS_WINDOWS or job_handle is None:
-        return
+        return ""
     try:
-        _kernel32.CloseHandle(job_handle)
-    except Exception:
-        pass
+        if not _kernel32.CloseHandle(job_handle):
+            return (f"CloseHandle on the Job Object returned false (Win32 error "
+                    f"{ctypes.get_last_error()}), so kill-on-close never fired")
+    except Exception as exc:
+        return f"CloseHandle on the Job Object failed ({exc}), so kill-on-close never fired"
+    return ""
 
 
 def resume_process(pid: int) -> bool:

@@ -581,6 +581,17 @@ def _apply_with_request(tmp_path, monkeypatch, backlog_id):
     monkeypatch.setattr(lifecycle, "_write_evolution_campaign", lambda c: camp.update(c))
     monkeypatch.setattr(stt, "load_state", lambda: {"owner_chat_id": 7})
     monkeypatch.setattr(stt, "save_state", lambda s: None)
+
+    def _fake_update_state(mutator):
+        # The REAL update_state reads the machine-resolved state file through its private
+        # unlocked loader, so the load_state patch above never reaches it — on a machine whose
+        # LIVE state carries evolution_owner_stopped=True the atomic re-check would then refuse
+        # the enable and apply would return False for reasons outside this test's control.
+        live = {"owner_chat_id": 7}
+        mutator(live)
+        return live
+
+    monkeypatch.setattr(stt, "update_state", _fake_update_state)
     ok = pte.apply_pending_request(tmp_path)
     return ok, camp
 

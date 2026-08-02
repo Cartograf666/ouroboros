@@ -564,13 +564,15 @@ class TestPrePushGate:
         assert callable(_git_commit_with_tests)
 
     def test_pre_push_tests_timeout_is_sufficient(self):
-        """The pre-push/post-commit pytest timeout must be >= 180s.
+        """The pre-push/post-commit pytest budget must be >= 180s.
 
-        The full test suite (~2100+ tests) takes ~2 minutes; a shorter cap
-        produces false TESTS_FAILED on every successful commit. The timeout is
-        owned by ``run_hermetic_pytest`` (default + ``OUROBOROS_PREFLIGHT_TIMEOUT_SEC``
-        env) so callers do not re-pin a stale literal — this guard now anchors on
-        that single source of truth.
+        Since v6.89.0 this is the TOTAL budget across BOTH preflight passes
+        (parallel ``not serial``, then ``serial``, which gets the remainder).
+        The full suite measures ~180s two-pass against ~470-510s for the old
+        single serial pass, so a shorter cap produces false TESTS_FAILED on
+        every successful commit. The budget is owned by ``run_hermetic_pytest``
+        (default + ``OUROBOROS_PREFLIGHT_TIMEOUT_SEC`` env) so callers do not
+        re-pin a stale literal — this guard anchors on that single source of truth.
         """
         from ouroboros.preflight_runner import (
             _DEFAULT_PREFLIGHT_TIMEOUT_SEC,

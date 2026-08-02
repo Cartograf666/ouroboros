@@ -129,6 +129,33 @@ reproducible evidence. Follow the marker and environment guidance in
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for integration, browser,
 portable, and skill-smoke lanes.
 
+### Mark non-parallel-safe tests `serial`
+
+CI and the maintainers' hermetic commit gate both run the suite as **two
+passes**: a parallel `-m "not serial" -n auto` pass, then a `serial` pass. So
+your test runs concurrently with unrelated tests unless you say otherwise.
+
+If a test spawns a real OS process, binds a real port, or mutates a
+module-level global or registry, mark it `@pytest.mark.serial`. Everything else
+must be parallel-safe: use `tmp_path` rather than fixed `/tmp/...` paths,
+`monkeypatch.setenv`/`setattr` rather than bare `os.environ[...] =`, assume no
+execution order, and restore any module global you touch.
+
+This is not a style preference. An unmarked real-process test does not merely
+flake — it can kill an xdist worker, which fails that worker's whole co-located
+batch and surfaces as failures in files you never touched. The commit gate
+reports a dead worker as a `PARALLEL_WORKER_CRASH` **hard block** and never
+retries it, so the fix is never a re-run.
+
+A dead worker has two causes, and the gate's message tells you which one you
+have. If the worker crashed, the marker is the fix. If the parallel pass's 300s
+per-test timeout killed it, the fix is to make that test faster or split it —
+**do not** mark a merely-slow test `serial`, because the serial pass carries no
+per-test timeout, so the hang would simply move into the one lane that cannot
+bound it. See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) “The commit gate
+mirrors the CI split” and item 18 of
+[`docs/CHECKLISTS.md`](docs/CHECKLISTS.md).
+
 Add or update tests for changed behavior. If a test cannot be run in your
 environment, say which one and why rather than marking it as passed.
 

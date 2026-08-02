@@ -1533,14 +1533,20 @@ def _run_review_preflight_tests(
     repo_dir = getattr(ctx, "repo_dir", None)
     if repo_dir is None:
         return None
-    tests_dir = pathlib.Path(repo_dir) / "tests"
-    if not tests_dir.exists():
-        return None
+    # NO `tests/` existence check here: whether the repository is in scope is
+    # run_hermetic_pytest's decision. A missing tests/ means either "never had a
+    # suite" (out of scope) or "this candidate deleted the suite" (a hard block),
+    # and only the runner can tell them apart by consulting HEAD. Short-circuiting
+    # here skipped the gate for exactly the change that deletes the gate.
     MAX_OUTPUT = 8000
     try:
-        from ouroboros.preflight_runner import run_hermetic_pytest
+        from ouroboros.preflight_runner import PRE_COMMIT_PHASE, run_hermetic_pytest
 
-        run_kwargs = {"max_output": MAX_OUTPUT}
+        # This entry point runs BEFORE the commit exists, so the deleted-suite
+        # baseline is HEAD alone. Consulting HEAD~1 here rejected the first
+        # unrelated staged change after a deliberate test-removal commit, whose
+        # HEAD legitimately carries no suite while HEAD~1 still does.
+        run_kwargs = {"max_output": MAX_OUTPUT, "phase": PRE_COMMIT_PHASE}
         if timeout is not None:
             run_kwargs["timeout"] = timeout
         output = run_hermetic_pytest(pathlib.Path(repo_dir), **run_kwargs)

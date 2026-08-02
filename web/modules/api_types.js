@@ -616,4 +616,4 @@
  * @typedef {UpdateApplyOkResponse|UpdateApplyAssistedStartedResponse|UpdateApplyManualResponse|UpdateApplyErrorResponse} UpdateApplyResponse
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.88.1';
+export const GATEWAY_CONTRACT_VERSION = '6.89.0';

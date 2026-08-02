@@ -264,6 +264,28 @@ def clear_update_tx() -> bool:
 _ASSISTED_PHASES = ("materializing_assisted", "assisted_resolution", "committing_assisted")
 
 
+UPDATE_TX_GATE_BLOCKED = "gate_blocked"
+
+
+def mark_update_tx_gate_blocked(reason: str) -> bool:
+    """Re-phase a live update tx to the terminal ``gate_blocked``; True if the marker was rewritten.
+
+    Only for the one path that needs it: a gate REJECTED the update and the rollback that should
+    have erased the tx then failed. What that failure leaves behind is the pre-gate phase, and for
+    an assisted update that is ``committing_assisted`` — which boot recovery reads as "the process
+    died mid-commit", so it promotes the merge to ``pending_boot_smoke`` and finalizes it, landing
+    the exact revision the gate refused, without ever rerunning the gate. ``gate_blocked`` appears
+    in no recovery path, so the next boot logs it and stops instead."""
+    tx = read_update_tx()
+    if not tx:
+        return False
+    tx["phase"] = UPDATE_TX_GATE_BLOCKED
+    tx["gate_blocked_reason"] = reason
+    write_update_tx(tx)
+    _log_supervisor({"type": "managed_update_gate_blocked", "reason": reason})
+    return True
+
+
 def read_update_tx_strict() -> Tuple[str, Dict[str, Any]]:
     """Strict tx read for safety-critical gates (commit authorization, tx-active rejection):
     return ``(status, tx)`` where status is ``"absent"`` / ``"valid"`` / ``"corrupt"``. A
@@ -475,8 +497,19 @@ def rollback_managed_update(reason: str = "update_rollback") -> Tuple[bool, str]
     if not pre:
         return False, "no pre_update_sha in update tx marker"
     rc_h, cur_head, _he = _g.git_capture(["git", "rev-parse", "--short", "HEAD"])
+    forensics = ""
     if rc_h == 0 and cur_head:
-        _g.git_capture(["git", "branch", "-f", f"failed-update-{cur_head}", "HEAD"])
+        # BEFORE anything destructive: the reset below leaves this ref as the only name the
+        # rejected candidate still has, so writing it late would discard it.
+        rc_b, _ob, e_b = _g.git_capture(
+            ["git", "branch", "-f", f"failed-update-{cur_head}", "HEAD"])
+        if rc_b != 0:
+            # BEST-EFFORT, deliberately: this function's job is to get the machine back onto a
+            # working revision. Losing the candidate's name is the smaller loss; it is reported
+            # in the success message, never fatal.
+            forensics = f" (failed-update-{cur_head} could not be recorded: {e_b})"
+            _log_supervisor({"type": "managed_update_forensics_ref_failed",
+                             "head": cur_head, "error": e_b, "reason": reason})
     _g.git_capture(["git", "reset", "--hard", "HEAD"])
     _g.git_capture(["git", "clean", "-fd"])
     rc1, _o1, e1 = _g.git_capture(["git", "checkout", "-B", branch, pre])
@@ -523,7 +556,7 @@ def rollback_managed_update(reason: str = "update_rollback") -> Tuple[bool, str]
         {"ts": utc_now_iso(), "type": "managed_update_rolled_back", "reason": reason,
          "pre_update_sha": pre, "branch": branch},
     )
-    return True, f"rolled back to {pre[:12]}"
+    return True, f"rolled back to {pre[:12]}{forensics}"
 
 
 def _assisted_objective(tx: Dict[str, Any]) -> str:
@@ -779,6 +812,16 @@ def managed_assisted_tx_for(task_id: str) -> Tuple[Dict[str, Any], str]:
     status, tx = read_update_tx_strict()
     if status == "absent":
         return {}, ""
+    if status == "valid" and str(tx.get("phase") or "") == UPDATE_TX_GATE_BLOCKED:
+        # Terminal, and terminal for COMMITS too, not just for boot recovery. The merge under this
+        # marker was rejected by a gate and could not be rolled back, so it is still in the tree:
+        # an ordinary reviewed commit admitted here would build on the refused revision and push it.
+        # Kept out of `_ASSISTED_PHASES` deliberately — no task is authorized to resolve it.
+        return {}, (
+            "⚠️ MANAGED_UPDATE_GATE_BLOCKED: a managed update was rejected by a gate and could not "
+            "be rolled back, so the refused merge is still in the working tree and commits are "
+            f"blocked until the owner clears it. Reason: {tx.get('gate_blocked_reason') or 'unknown'}"
+        )
     if status == "valid" and str(tx.get("phase") or "") in _ASSISTED_PHASES:
         if str(tx.get("task_id") or "") == str(task_id or ""):
             return tx, ""
@@ -1122,6 +1165,13 @@ def finalize_managed_update_on_boot(supervisor_ready: bool = True) -> Dict[str, 
         phase = str(tx.get("phase") or "")
         if phase == "pending_boot_smoke":
             return _finalize_pending_boot_smoke(tx, supervisor_ready)
+        if phase == UPDATE_TX_GATE_BLOCKED:
+            # Terminal by construction. A gate rejected this update and the rollback that should
+            # have erased the tx failed, so the merge is still in the tree — advancing it is the
+            # one thing the gate refused. Recovery stops and leaves the marker for the owner.
+            _log_supervisor({"type": "managed_update_gate_blocked_on_boot",
+                             "reason": str(tx.get("gate_blocked_reason") or "")})
+            return {"finalized": False, "reason": "gate_blocked — left for owner"}
         if phase in _ASSISTED_PHASES:
             return _recover_assisted_on_boot(tx, supervisor_ready)
         return {"finalized": False, "reason": f"unhandled phase {phase}"}

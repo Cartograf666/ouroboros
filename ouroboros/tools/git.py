@@ -984,9 +984,13 @@ def _run_pre_push_tests(ctx: ToolContext) -> Optional[str]:
         return None
     if os.environ.get("OUROBOROS_PRE_PUSH_TESTS", "1") != "1":
         return None
-    tests_dir = pathlib.Path(ctx.repo_dir) / "tests"
-    if not tests_dir.exists():
-        return None
+    # NO `tests/` existence check here. Whether this repository is in scope is
+    # run_hermetic_pytest's decision, because a MISSING tests/ has two meanings
+    # and only it can tell them apart: a repository that never had a suite (out
+    # of scope, returns None) versus a candidate that staged the removal of every
+    # test file, which removes the directory with them since git does not track
+    # empty directories (a hard block). Short-circuiting here skipped the gate for
+    # exactly the change that deletes the gate.
     try:
         from ouroboros.preflight_runner import run_hermetic_pytest
 
@@ -1014,17 +1018,162 @@ def _git_commit_with_tests(ctx: ToolContext) -> Optional[str]:
 
 
 def _post_commit_result(ctx, commit_message, skip_tests, tw_ref):
+    """Run the post-commit gate; return its BLOCKING error text, or None.
+
+    The return value is not decoration. A failing gate used to become warning
+    text in ``tw_ref`` and nothing else, after which the caller went straight on
+    to ``_auto_push`` — so every hard block the preflight can raise (a missing
+    plugin, a lost parallel lane, a crashed worker, a deleted suite) was still
+    pushed to origin, tags included, behind an ``OK:`` result. The commit stays
+    preserved either way; PUBLICATION is what a red gate has to stop.
+    """
     global _consecutive_test_failures
     if skip_tests:
-        return
+        return None
     push_error = _git_commit_with_tests(ctx)
     if push_error:
         _consecutive_test_failures += 1
         _log_test_failure(ctx, commit_message, push_error)
         tw_ref[0] = (f"\n\n⚠️ TESTS_FAILED (commit preserved, "
                      f"consecutive failures: {_consecutive_test_failures}):\n{push_error}")
-    else:
-        _consecutive_test_failures = 0
+        return push_error
+    _consecutive_test_failures = 0
+    return None
+
+
+def _post_commit_gate_block(ctx, commit_message, skip_tests, tw_ref, started_at,
+                            pre_fingerprint, post_fingerprint) -> Optional[str]:
+    """Run the post-commit gate BEFORE anything publishes; blocking text, or None.
+
+    Ordering is the substance here, not the extraction. This used to run after
+    `_auto_tag_on_version_bump`, so a red gate still left an auto-created version
+    tag sitting on an unverified commit. Release-tag verification treats tags as
+    immutable and never retargets them, so that leftover blocked the corrected
+    commit that reused the version, and a later `git push --tags` published a tag
+    created for a revision whose tests had failed. Running first means a failing
+    gate creates no tag, pushes nothing, and never returns the leading `OK:`
+    callers key on — while the commit itself stays preserved for inspection.
+    """
+    error = _post_commit_result(ctx, commit_message, skip_tests, tw_ref)
+    if not error:
+        return None
+    # The same review metadata every sibling failure record carries. This is the newest
+    # terminal outcome in the ledger, so a thinner record here is missing forensics on
+    # exactly the failure class least is known about. The fingerprints are `matched`, not
+    # pending: the caller only reaches this gate once `_verify_reviewed_commit_binding` has
+    # tied the created commit to `post_fingerprint`, so the ledger can say which reviewed
+    # revision the gate rejected instead of leaving that column empty for this class alone.
+    _record_commit_attempt(ctx, commit_message, "failed",
+                           block_reason="post_commit_tests_failed",
+                           block_details=error,
+                           duration_sec=time.time() - started_at,
+                           phase="post_commit_gate",
+                           pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
+                           post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
+                           fingerprint_status="matched",
+                           triad_models=getattr(ctx, "_last_triad_models", []),
+                           scope_model=getattr(ctx, "_last_scope_model", ""),
+                           triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+                           scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
+                           degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
+    return error
+
+
+def _record_binding_mismatch(ctx, commit_message, binding_msg, *, reason, phase,
+                             pre_fingerprint, post_fingerprint, started_at) -> None:
+    """Record the terminal `failed` attempt for a reviewed-binding mismatch.
+
+    The commit-binding and tag-binding sites write the SAME ledger entry and differ only in
+    `block_reason`/`phase`, so the two inline copies were duplication that also cost the caller
+    the 300-line function cap the smoke gate enforces."""
+    _record_commit_attempt(
+        ctx,
+        commit_message,
+        "failed",
+        block_reason=reason,
+        block_details=binding_msg,
+        duration_sec=time.time() - started_at,
+        phase=phase,
+        pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
+        post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
+        fingerprint_status="mismatch",
+        triad_models=getattr(ctx, "_last_triad_models", []),
+        scope_model=getattr(ctx, "_last_scope_model", ""),
+        triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+        scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
+        degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
+    )
+
+
+def _managed_update_gate_rollback(gate_block: str, reason: str = "post_commit_gate") -> str:
+    """Undo a managed-update merge that a post-commit check rejected; annotated block text.
+
+    A managed assisted update writes its transaction as ``committing_assisted`` BEFORE the
+    2-parent merge commit, and that phase means "the process died mid-commit" — boot recovery
+    reads it as an interrupted commit, promotes it to ``pending_boot_smoke`` and can finalize the
+    merge without ever rerunning the check that rejected it. Returning the block on its own would
+    leave exactly that state behind, with HEAD advanced and MERGE_HEAD gone, so an immediate
+    retry fails managed precommit verification too. The existing failed-update path is the right
+    terminal state: the rejected merge is preserved on a ``failed-update-*`` branch, the tree is
+    reset to ``pre_update_sha``, and the tx marker is CLEARED so nothing can promote it later.
+
+    ``reason`` names the rejecting check, and EVERY return that abandons the commit after the
+    ``committing_assisted`` write has to route through here — a red gate and a binding mismatch
+    park the transaction in the identical dangerous phase, so exempting one of them reopens the
+    window for that one."""
+    try:
+        from supervisor.update_merge import rollback_managed_update
+
+        ok, msg = rollback_managed_update(f"assisted_{reason}_failed")
+    except Exception as exc:  # rollback is itself infrastructure; never mask the check's verdict
+        log.warning("managed update rollback after a red post-commit check failed", exc_info=True)
+        ok, msg = False, str(exc)
+    if ok:
+        return gate_block + (
+            "\n\n⚠️ MANAGED_UPDATE_ROLLED_BACK: the update's merge commit failed this check, so it "
+            f"was rolled back ({msg}). The rejected merge is normally preserved on a "
+            "failed-update-* branch — that ref is best-effort, so if the detail above says it "
+            "could not be recorded, the merge is now unreferenced. Fix the tests and re-run the "
+            "update."
+        )
+    # EVERY unsuccessful rollback lands here, returned-False and raised alike: clearing the tx is
+    # the LAST thing a rollback does, and it runs several git commands first, so a raise halfway
+    # through leaves exactly the `committing_assisted` marker this call existed to escape. The
+    # re-phase therefore gets its OWN attempt — sharing the rollback's `try` meant a raise skipped
+    # it entirely while the text below still told the operator the tx was pinned.
+    try:
+        from supervisor.update_merge import mark_update_tx_gate_blocked
+
+        pinned = bool(mark_update_tx_gate_blocked(f"assisted_{reason}_failed"))
+    except Exception:
+        log.warning("pinning the update tx shut after a failed rollback failed", exc_info=True)
+        pinned = False
+    tail = ("The update tx is marked gate_blocked so no boot can finalize it, and the working "
+            "tree still carries the rejected merge — inspect it before restarting."
+            if pinned else
+            "The update tx marker could NOT be re-phased to gate_blocked: if a tx marker remains "
+            "it still reads committing_assisted, which the next boot treats as an interrupted "
+            "commit and can FINALIZE — clear it before restarting.")
+    return gate_block + (
+        "\n\n⚠️ MANAGED_UPDATE_ROLLBACK_FAILED: the update's merge commit failed this check and "
+        f"could NOT be rolled back ({msg}). " + tail
+    )
+
+
+def _record_commit_success(ctx, commit_message, started_at, pre_fingerprint, post_fingerprint):
+    """Record the terminal `succeeded` attempt and clear the per-commit review state."""
+    _record_commit_attempt(ctx, commit_message, "succeeded",
+                           duration_sec=time.time() - started_at,
+                           phase="commit",
+                           pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
+                           post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
+                           fingerprint_status="matched",
+                           triad_models=getattr(ctx, "_last_triad_models", []),
+                           scope_model=getattr(ctx, "_last_scope_model", ""),
+                           triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+                           scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
+                           degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
+    ctx._scope_review_history = {}  # Clear on success — next commit starts fresh
 
 
 def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
@@ -1636,24 +1785,24 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                 "was NOT tagged or pushed; inspect the repository and re-run review on a "
                 f"new exact tree. Detail: {binding_detail}"
             )
-            _record_commit_attempt(
-                ctx,
-                commit_message,
-                "failed",
-                block_reason="review_binding_mismatch",
-                block_details=binding_msg,
-                duration_sec=time.time() - _commit_start,
-                phase="commit_binding",
-                pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
-                post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
-                fingerprint_status="mismatch",
-                triad_models=getattr(ctx, "_last_triad_models", []),
-                scope_model=getattr(ctx, "_last_scope_model", ""),
-                triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
-                scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
-                degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
-            )
-            return binding_msg
+            _record_binding_mismatch(ctx, commit_message, binding_msg,
+                                     reason="review_binding_mismatch", phase="commit_binding",
+                                     pre_fingerprint=pre_fingerprint,
+                                     post_fingerprint=post_fingerprint, started_at=_commit_start)
+            return (_managed_update_gate_rollback(binding_msg, "commit_binding")
+                    if _managed_tx else binding_msg)
+        # BEFORE the tag: a tag is immutable, so one created for a revision the gate then
+        # rejects cannot be moved onto the corrected commit that reuses the version.
+        gate_block = _post_commit_gate_block(ctx, commit_message, skip_tests,
+                                             test_warning_ref, _commit_start,
+                                             pre_fingerprint, post_fingerprint)
+        if gate_block:
+            # A managed update is mid-transaction here (`committing_assisted`, written above),
+            # and this return skips the postcommit step that would otherwise finalize or roll it
+            # back. Route the red gate into the same failure cleanup instead of leaving the tx
+            # parked in a phase boot recovery reads as an interrupted commit.
+            return (_managed_update_gate_rollback(gate_block, "post_commit_gate")
+                    if _managed_tx else gate_block)
         reviewed_binding = post_fingerprint.get("binding", {}) or {}
         # A managed-update merge commit must NOT auto-tag/auto-push pre-restart (an un-smoked
         # update would otherwise reach origin / create a version tag, and a later rollback would
@@ -1678,24 +1827,12 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                 "release-tag verification failed. Nothing was pushed; immutable tags are "
                 f"never retargeted. Detail: {binding_detail}"
             )
-            _record_commit_attempt(
-                ctx,
-                commit_message,
-                "failed",
-                block_reason="review_tag_binding_mismatch",
-                block_details=binding_msg,
-                duration_sec=time.time() - _commit_start,
-                phase="tag_binding",
-                pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
-                post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
-                fingerprint_status="mismatch",
-                triad_models=getattr(ctx, "_last_triad_models", []),
-                scope_model=getattr(ctx, "_last_scope_model", ""),
-                triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
-                scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
-                degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
-            )
-            return binding_msg
+            _record_binding_mismatch(ctx, commit_message, binding_msg,
+                                     reason="review_tag_binding_mismatch", phase="tag_binding",
+                                     pre_fingerprint=pre_fingerprint,
+                                     post_fingerprint=post_fingerprint, started_at=_commit_start)
+            return (_managed_update_gate_rollback(binding_msg, "tag_binding")
+                    if _managed_tx else binding_msg)
         ctx.last_reviewed_commit_sha = commit_sha
         if attribution_binding is not None:
             # The task's own commit moved HEAD: open the next attributed-staging
@@ -1725,19 +1862,8 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                 )
             except Exception:
                 log.debug("Failed to record evolution transaction commit", exc_info=True)
-        _record_commit_attempt(ctx, commit_message, "succeeded",
-                               duration_sec=time.time() - _commit_start,
-                               phase="commit",
-                               pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
-                               post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
-                               fingerprint_status="matched",
-                               triad_models=getattr(ctx, "_last_triad_models", []),
-                               scope_model=getattr(ctx, "_last_scope_model", ""),
-                               triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
-                               scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
-                               degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
-        ctx._scope_review_history = {}  # Clear on success — next commit starts fresh
-        _post_commit_result(ctx, commit_message, skip_tests, test_warning_ref)
+        _record_commit_success(ctx, commit_message, _commit_start,
+                               pre_fingerprint, post_fingerprint)
     finally:
         _release_git_lock(lock)
     if _managed_tx:
