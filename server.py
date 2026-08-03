@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import socket
+import subprocess
 
 import os
 import pathlib
@@ -12,7 +13,7 @@ import sys
 import threading
 import time
 import uuid
-from ouroboros.utils import utc_now_iso
+from ouroboros.utils import read_json_dict, utc_now_iso
 from typing import Any, Dict, Optional
 
 from starlette.applications import Starlette
@@ -1269,11 +1270,18 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             if turn_on and len(parts) > 2:
                 objective = text.split(None, 2)[2].strip()
             if turn_on:
-                from supervisor.evolution_lifecycle import evolution_block_reason
+                from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
 
                 block = evolution_block_reason()
                 if block:
                     ctx.send_with_budget(chat_id, block)
+                    continue
+                try:
+                    if not start_evolution_campaign(objective, source="owner_chat"):
+                        raise RuntimeError("campaign write was refused")
+                except Exception:
+                    log.warning("Failed to start evolution campaign", exc_info=True)
+                    ctx.send_with_budget(chat_id, "⚠️ Evolution stayed OFF: campaign state could not be created.")
                     continue
             st2 = ctx.load_state()
             st2["evolution_mode_enabled"] = bool(turn_on)
@@ -1309,11 +1317,9 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                         f"🛑 Cancelled running evolution task(s): {', '.join(cancelled)}",
                     )
             try:
-                from supervisor.evolution_lifecycle import complete_evolution_campaign, start_evolution_campaign
+                from supervisor.evolution_lifecycle import complete_evolution_campaign
 
-                if turn_on:
-                    start_evolution_campaign(objective, source="owner_chat")
-                else:
+                if not turn_on:
                     # Terminal close (not a resumable pause): /evolve start mints a FRESH
                     # campaign rather than resurrecting this one.
                     complete_evolution_campaign("disabled via owner chat", status="stopped")
@@ -1822,6 +1828,7 @@ def _handle_restart_in_supervisor(evt: Dict[str, Any], ctx: Any) -> None:
         _pending_restart.update({
             "reason": str(evt.get("reason") or "agent_restart_request"),
             "deadline": time.time() + min(max_wait, 1800),
+            "evolution_restart": bool(evt.get("evolution_restart")),
         })
         if st.get("owner_chat_id"):
             ctx.send_with_budget(
@@ -1830,7 +1837,10 @@ def _handle_restart_in_supervisor(evt: Dict[str, Any], ctx: Any) -> None:
                 f"{', '.join(sorted(live))} to finish.",
             )
         return
-    _perform_supervisor_restart(ctx)
+    _perform_supervisor_restart(
+        ctx, restart_reason=str(evt.get("reason") or "agent_restart_request"),
+        evolution_restart=bool(evt.get("evolution_restart")),
+    )
 
 
 def _check_pending_restart_drain(ctx: Any) -> bool:
@@ -1842,8 +1852,12 @@ def _check_pending_restart_drain(ctx: Any) -> bool:
     live = _live_running_task_ids(ctx)
     if live and time.time() < float(_pending_restart.get("deadline") or 0.0):
         return True  # keep draining — events still flow each tick
+    pending = dict(_pending_restart)
     _pending_restart.clear()
-    _perform_supervisor_restart(ctx)
+    _perform_supervisor_restart(
+        ctx, restart_reason=str(pending.get("reason") or "agent_restart_request"),
+        evolution_restart=bool(pending.get("evolution_restart")),
+    )
     # Still "quiescing" this tick: _perform_supervisor_restart sets up the exit
     # (or fail-closed pauses) and returns to the loop — the process exits on the
     # next `while not _restart_requested` check. Returning True keeps the caller
@@ -1851,9 +1865,74 @@ def _check_pending_restart_drain(ctx: Any) -> bool:
     return True
 
 
-def _perform_supervisor_restart(ctx: Any) -> None:
+def _perform_supervisor_restart(
+    ctx: Any, *, restart_reason: str = "agent_restart_request",
+    evolution_restart: bool = False,
+) -> None:
     """Graceful shutdown + exit(42) (the post-drain tail; never sleeps)."""
     st = ctx.load_state()
+    marker = read_json_dict(
+        pathlib.Path(ctx.DRIVE_ROOT) / "state" / "pending_restart_verify.json"
+    ) or {}
+    claim = (
+        marker.get("evolution_claim")
+        if evolution_restart and marker.get("reason") == restart_reason
+        else {}
+    )
+    claim = claim if isinstance(claim, dict) else {}
+    if evolution_restart and not claim:
+        if st.get("owner_chat_id"):
+            ctx.send_with_budget(
+                int(st["owner_chat_id"]),
+                "🧬 Restart cancelled: the exact evolution restart receipt is missing.",
+            )
+        return
+    if claim:
+        from supervisor.evolution_lifecycle import check_evolution_authority
+
+        authority = check_evolution_authority(
+            str(claim.get("campaign_id") or ""),
+            str(claim.get("transaction_id") or ""),
+            str(claim.get("task_id") or ""),
+            commit_sha=str(claim.get("commit_sha") or ""),
+        )
+        if not authority.get("ok"):
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "🧬 Restart cancelled: evolution authority changed "
+                    f"({authority.get('reason') or 'unknown'}).",
+                )
+            return
+        expected_sha = str(claim.get("commit_sha") or "")
+        try:
+            head_proc = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(ctx.REPO_DIR),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            status_proc = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(ctx.REPO_DIR),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            head = head_proc.stdout.strip() if head_proc.returncode == 0 else ""
+            clean = status_proc.returncode == 0 and not status_proc.stdout.strip()
+        except Exception:
+            head = ""
+            clean = False
+        if not expected_sha or head != expected_sha or not clean:
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "🧬 Restart cancelled: the live checkout no longer matches "
+                    "the exact reviewed evolution commit.",
+                )
+            return
     ok, msg = ctx.safe_restart(
         reason="agent_restart_request", unsynced_policy="rescue_and_block",
     )

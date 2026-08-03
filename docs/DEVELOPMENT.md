@@ -794,7 +794,10 @@ Review preflight tests are hermetic. Any pytest run launched by
 with a temporary `OUROBOROS_DATA_DIR` / `OUROBOROS_SETTINGS_PATH`, a temp
 `PYTHONPYCACHEPREFIX`, and no inherited `OUROBOROS_MANAGED_BY_LAUNCHER`. Tests
 may read the live source checkout as the candidate snapshot, but they must not
-write the live repo or live `data/`.
+write the live repo or live `data/`. `tests/conftest.py` must also rebind
+already-imported state/queue/worker roots inside each pytest process and fail
+closed if a state or evolution-campaign write resolves to the captured live data
+root; setting only `OUROBOROS_DATA_DIR` is insufficient for process-global roots.
 
 Self-modification durability is local-first. A successful reviewed local commit
 is the persistence boundary; `origin` push and CI are optional follow-up signals.

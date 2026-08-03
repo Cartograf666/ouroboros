@@ -851,12 +851,11 @@ def emit_task_results(
         pending_events.append({
             "type": "restart_request",
             "reason": restart_reason,
+            "evolution_restart": bool(getattr(ctx, "pending_restart_is_evolution", False)),
             "ts": utc_now_iso(),
         })
-        try:
-            ctx.pending_restart_reason = None
-        except Exception:
-            pass
+        ctx.pending_restart_reason = None
+        ctx.pending_restart_is_evolution = False
 
     if _is_root_post_task(task):
         post_usage = dict(usage or {})

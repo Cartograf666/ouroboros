@@ -355,6 +355,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                     "type": "task_done", "task_id": task_id, "task_type": task_type,
                     "chat_id": done_chat_id, "status": self_status,
                     "reason_code": str((_existing or {}).get("reason_code") or ""),
+                    "metadata": task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
             })
         except Exception:
             log.debug("Reaper: failed to emit task_done for self-finalized %s", task_id, exc_info=True)
