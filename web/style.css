@@ -5815,11 +5815,14 @@ textarea.chat-input {
     }
 }
 
-/* Reviewer Slots (6.2) + Harness Accounts (D30) */
+/* Reviewer Slots (6.2) + Harness Accounts (D30).
+   Borders read the theme's --divider like every other panel surface. They used
+   to name --border, which this dark-only :root never declares, so all three
+   rules silently took their literal grey fallback instead of the token. */
 .reviewer-slots-heading { margin: 14px 0 6px; }
 .reviewer-slot-rows { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
 .reviewer-slot-row {
-    border: 1px solid var(--border, rgba(127, 127, 127, 0.25));
+    border: 1px solid var(--divider);
     border-radius: 8px;
     padding: 8px 10px;
 }
@@ -5837,7 +5840,7 @@ textarea.chat-input {
     display: inline-block;
     padding: 1px 8px;
     border-radius: 999px;
-    border: 1px solid var(--border, rgba(127, 127, 127, 0.35));
+    border: 1px solid var(--divider);
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -5850,7 +5853,7 @@ textarea.chat-input {
     font-size: 22px;
     letter-spacing: 0.18em;
     padding: 8px 12px;
-    border: 1px dashed var(--border, rgba(127, 127, 127, 0.4));
+    border: 1px dashed var(--divider);
     border-radius: 8px;
     display: inline-block;
     user-select: all;

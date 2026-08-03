@@ -66,6 +66,25 @@ test('the device-code disclosure is found wherever the snapshot nests it', () =>
     assert.equal(deviceCodeDisclosure(null), null);
 });
 
+test('a URL-ONLY disclosure renders: the flow discriminates, not the code field', () => {
+    // Claudexor's SetupDeviceCodeDisclosure (packages/schema/src/setup.ts):
+    // `userCode` is EMPTY for the browser-callback (`chatgpt`) and `oauth_url`
+    // flows — the latter is the sign-in link a TERMINAL-mode claude/cursor login
+    // prints. Requiring both fields matched neither, so a published link showed
+    // nothing at all; the login card is the whole point of D30's structural face.
+    for (const flow of ['oauth_url', 'chatgpt']) {
+        const job = { snapshot: { disclosures: { deviceCode: {
+            flow, verificationUrl: 'https://claude.ai/oauth/authorize?x=1', userCode: '',
+        } } } };
+        assert.deepEqual(deviceCodeDisclosure(job),
+            { url: 'https://claude.ai/oauth/authorize?x=1', code: '' }, flow);
+        // …and the card must actually pick the structural face for it.
+        assert.equal(loginCardFace({ mode: 'attach', attachCommand: 'cmd', job }), 'device', flow);
+    }
+    // A node carrying neither is still not a disclosure.
+    assert.equal(deviceCodeDisclosure({ snapshot: { verificationUrl: 'https://a/b' } }), null);
+});
+
 test('job terminal states are the typed set, success is exactly succeeded', () => {
     assert.deepEqual(jobStateSummary({ state: 'succeeded' }),
         { state: 'succeeded', phase: '', terminal: true, succeeded: true });

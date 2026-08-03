@@ -93,12 +93,14 @@ export function routeChoiceGroups({ catalogModels = [], harnesses = [], currentA
     const groups = [{ label: 'API models', options: apiValues }];
     // With no daemon the group used to VANISH, while the section copy above still
     // promised subscription delivery — the owner saw a broken promise and nowhere
-    // to go. Say why it is empty instead of hiding it.
+    // to go. Say why it is empty instead of hiding it. Name the DESTINATION by
+    // its tab: Harness Accounts lives in the Providers panel, this row lives in
+    // Models, so "below" pointed at a page that does not contain it.
     groups.push(sessionValues.length
         ? { label: 'Coding agents — subscriptions', options: sessionValues }
         : { label: 'Coding agents — subscriptions', options: [{
             value: '', disabled: true,
-            label: 'None available — sign in under Harness Accounts below',
+            label: 'None available — sign in under Providers → Harness Accounts',
         }] });
     return groups;
 }

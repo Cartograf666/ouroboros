@@ -77,15 +77,22 @@ export function quotaSummary(snapshots, harnessId, subjectId = '') {
 
 export function deviceCodeDisclosure(job) {
     // The transient read-time projection (never journaled by the daemon):
-    // {verificationUrl, userCode} wherever the flow surfaces one.
+    // {flow, verificationUrl, userCode} wherever the flow surfaces one.
+    //
+    // The FLOW is the discriminator, not field truthiness. Claudexor's
+    // SetupDeviceCodeDisclosure (packages/schema/src/setup.ts) says the code is
+    // EMPTY for the browser-callback (`chatgpt`) and `oauth_url` flows —
+    // `oauth_url` being the sign-in link a TERMINAL-mode claude/cursor login
+    // prints. Demanding a userCode meant those URL-only disclosures matched
+    // nothing, so the engine published a link the card never showed.
     const seen = new Set();
     const stack = [job];
     while (stack.length) {
         const node = stack.pop();
         if (!node || typeof node !== 'object' || seen.has(node)) continue;
         seen.add(node);
-        if (node.verificationUrl && node.userCode) {
-            return { url: String(node.verificationUrl), code: String(node.userCode) };
+        if (node.flow && node.verificationUrl) {
+            return { url: String(node.verificationUrl), code: String(node.userCode || '') };
         }
         for (const value of Object.values(node)) {
             if (value && typeof value === 'object') stack.push(value);
@@ -319,11 +326,17 @@ function renderLoginCard() {
                 tracks the login live.</div>`);
         }
     } else if (face === 'device') {
-        bits.push(`
+        // URL-only flows (`chatgpt`, `oauth_url`) carry no code: show the link
+        // alone rather than numbered steps ending in an empty code box.
+        bits.push(disclosure.code ? `
             <div class="harness-device-code">
                 <p>1. Open <a href="${escapeHtml(disclosure.url)}" target="_blank" rel="noopener">${escapeHtml(disclosure.url)}</a></p>
                 <p>2. Enter this one-time code:</p>
                 <div class="harness-code" data-device-code>${escapeHtml(disclosure.code)}</div>
+            </div>
+        ` : `
+            <div class="harness-device-code">
+                <p>Open <a href="${escapeHtml(disclosure.url)}" target="_blank" rel="noopener">${escapeHtml(disclosure.url)}</a> to finish signing in.</p>
             </div>
         `);
     } else if (face === 'attach') {
