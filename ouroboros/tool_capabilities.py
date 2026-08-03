@@ -4,6 +4,7 @@ from __future__ import annotations
 
 CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file", "list_files", "write_file", "edit_text",
+    "apply_patch", "edit_batch",
     "search_code", "query_code", "plan_task",
     "run_command", "run_script",
     "start_service", "service_status", "service_logs", "stop_service",
@@ -89,6 +90,7 @@ ACTING_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file", "list_files", "search_code", "query_code",
     "vcs_status", "vcs_diff",
     "write_file", "edit_text",
+    "apply_patch", "edit_batch",
     "run_command", "run_script",
     "start_service", "service_status", "service_logs", "stop_service",
     "integrate_subagent_patch", "compare_subagent_patches",
@@ -166,6 +168,10 @@ TOOL_RESULT_LIMITS: dict[str, int] = {
     # tree_read returns the shared task-tree coordination tail (up to 200 entries); the 15k
     # default would truncate the swarm blackboard and defeat the coordination contract.
     "tree_read": 80_000,
+    # apply_patch results carry per-hunk diagnostics; write_file appends the
+    # overwrite diff.
+    "apply_patch": 80_000,
+    "write_file": 80_000,
 }
 
 DEFAULT_TOOL_RESULT_LIMIT: int = 15_000

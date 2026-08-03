@@ -549,6 +549,9 @@ def _light_mode_payload_mutation_allowed(
 ) -> bool:
     """Return True for light-mode data skill payload edits that do not touch repo files."""
 
+    # apply_patch/edit_batch are DELIBERATELY absent: they refuse data-plane roots
+    # entirely (repo lanes only), so they can never be a payload edit — in light
+    # mode they stay under the generic repo-mutation block like any repo write.
     if runtime_mode != "light" or tool_name not in {"edit_text", "write_file"}:
         return False
     requested_root = str(args.get("root", "") or "active_workspace")
@@ -619,6 +622,8 @@ _WORKSPACE_ALLOWED_TOOLS = frozenset({
     "list_files",
     "write_file",
     "edit_text",
+    "apply_patch",
+    "edit_batch",
     "search_code",
     "query_code",
     "run_command",
@@ -695,6 +700,9 @@ _SHELL_GUARDED_TOOLS = _PROCESS_COMMAND_TOOLS | {"verify_and_record"}
 # Path-bearing file tools whose active_workspace/system_repo path arg is normalized
 # ONCE at dispatch (execute) so the handler AND every guard (protected-path,
 # protected-artifact, shrink) resolve the identical target — no desync bypass.
+# apply_patch/edit_batch are DELIBERATELY absent: they carry no top-level `path`
+# arg (paths live inside the patch text / edits[] entries), so their handlers
+# normalize each target themselves via the shared edit_text guard chain.
 _PATH_NORMALIZED_TOOLS = frozenset({"read_file", "write_file", "edit_text", "list_files", "search_code", "query_code"})
 
 
@@ -792,6 +800,8 @@ _REPO_MUTATION_TOOLS = frozenset({
     "commit_reviewed",
     "vcs_commit_reviewed",
     "edit_text",
+    "apply_patch",
+    "edit_batch",
     "vcs_revert",
     "vcs_pull_ff",
     "vcs_restore",
@@ -1224,7 +1234,7 @@ class ToolRegistry:
 
     _FROZEN_TOOL_MODULES = [
         "browser", "ci", "claude_advisory_review", "compact_context", "control",
-        "core", "delegate", "evolution_stats", "git", "git_pr", "git_rollback", "github",
+        "core", "delegate", "edit_ops", "evolution_stats", "git", "git_pr", "git_rollback", "github",
         "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal",
         "recent_tasks",
         "query_code", "review", "search", "services", "shell", "skill_exec", "skill_publish",

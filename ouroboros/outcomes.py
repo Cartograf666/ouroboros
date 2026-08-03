@@ -134,7 +134,7 @@ _BLOCKING_TOOL_STATUSES = frozenset({
     "root_required_active_workspace",
 })
 _RECOVERY_TOOL_NAMES = frozenset({
-    "edit_text",
+    "edit_text", "apply_patch", "edit_batch",
     "run_command",
     "run_script",
     "start_service",
@@ -467,7 +467,7 @@ def infra_failed_axes(reason_code: str, *, lifecycle: str = "failed", review_tri
 # applies directly. (The retired SDK edit gateway was the one cwd-based coding
 # tool; delegated coding now rides the subagent lane, whose integration lands
 # through integrate_subagent_patch below — D10.)
-_ROOT_WRITE_TOOLS = frozenset({"write_file", "edit_text"})
+_ROOT_WRITE_TOOLS = frozenset({"write_file", "edit_text", "apply_patch", "edit_batch"})  # patch/batch refuse scratch roots: any success is a reviewable effect
 _EFFECT_COMMIT_TOOLS = frozenset({"commit_reviewed", "vcs_commit_reviewed"})
 # Exclusion model: only pure scratch is exempt. Every other root is a real surface
 # (deliverable, workspace, repo, skill payload, or a light-mode skill write via
@@ -488,7 +488,7 @@ def reviewable_effect_projection(llm_trace: Dict[str, Any]) -> List[Dict[str, An
     """Return the structured tool effects shared by review and delivery binding.
 
     Reviewable effects are a successful repo commit; a successful write_file/
-    edit_text to any non-scratch root; a successful
+    edit_text/apply_patch/edit_batch to any non-scratch root; a successful
     run_command/run_script/start_service that declared deliverable outputs; or any
     successful tool that registered a canonical artifact (artifact_registered — a
     stopped service's outputs or a user_files write). Pure scratch (root=task_drive)

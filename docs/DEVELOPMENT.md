@@ -883,8 +883,13 @@ report known/unknown cost neutrally, exit nonzero on incomplete review, and neve
 substitute the configured reviewer model.
 
 Preferred workflow for non-trivial edits: choose the right edit tool first —
-`edit_text` for one exact replacement and `write_file` for new files or
-intentional full rewrites — then `advisory_review`, then `commit_reviewed`
+`edit_text` for one exact replacement, `edit_batch` for several exact
+replacements or a counted replace-all (each edit declares how many occurrences
+it expects; a mismatch aborts the whole batch atomically), `apply_patch` for
+scattered multi-file changes (context-anchored hunks, atomic across files),
+and `write_file` for new files or intentional full rewrites (overwrites return
+the diff vs the previous version and block syntactically invalid .py/.json
+unless forced) — then `advisory_review`, then `commit_reviewed`
 immediately on the final diff. After 3 genuine review-verdict blocks of a
 byte-identical staged diff, `commit_reviewed` refuses further attempts
 (`attempt_cap_reached`) before spending another triad+scope run — change the
@@ -950,7 +955,7 @@ Before every commit, verify the following:
 #### Skill Repair Task Constraints
 - Skill repair tasks use structured `task_constraint.mode="skill_repair"`, not prompt markers.
 - In repair mode, edit paths are payload-relative: `plugin.py` means the selected `data/skills/{external,clawhub,ouroboroshub}/<skill>/plugin.py`.
-- Use `edit_text` for one exact replacement and `write_file` only for new files or intentional full rewrites with `root=skill_payload`.
+- Use `edit_text` for one exact replacement and `write_file` only for new files or intentional full rewrites with `root=skill_payload`. (`edit_batch`/`apply_patch` are repo-lane tools and do not accept `root=skill_payload`.)
 - Finish repair with `skill_preflight` and `skill_review`; grants and enablement stay owner-controlled.
 - Repair mode is a stricter UI lane, not the only path for skill authoring. In `runtime_mode=light`, ordinary chat tasks may edit explicit `data/skills/{external,clawhub,ouroboroshub}/<skill>/...` payloads via `write_file`/`edit_text` with `root=skill_payload`, `bucket`, and `skill_name`. Explicit repo/data paths keep their own address space and ignore stale short-form args. Core/repo paths, `data/skills/native/*`, `data/state/skills/*`, marketplace/provenance sidecars, and direct `run_command` writes to repo targets remain blocked.
 - New path checks for skill edits must use `ouroboros.contracts.skill_payload_policy` rather than reimplementing bucket/path traversal logic in each tool.

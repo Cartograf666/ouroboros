@@ -93,6 +93,7 @@ MIGRATED_LAUNCHERS: tuple[str, ...] = (
     "gaia/run_gaia.py",
     "terminal_bench/run_tb.py",
     "terminal_bench/run_harbor_smoke.py",
+    "editbench/run_editbench.py",
 )
 
 # GAIA and both Terminal-Bench launchers were the last pre-seam holdouts and migrated in

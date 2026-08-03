@@ -13,14 +13,14 @@ When a new reviewable concern appears, add it here — not in prompts or docs.
 **Correct sequence (mandatory):**
 
 ```
-1. Finish ALL edits first (`edit_text` / `write_file`)
+1. Finish ALL edits first (`edit_text` / `edit_batch` / `apply_patch` / `write_file`)
 2. advisory_review(commit_message="...")       ← run AFTER all edits, ONCE
 3. commit_reviewed(commit_message="...")       ← run IMMEDIATELY after advisory
 ```
 
 **Rules:**
 - Successful worktree mutations automatically mark advisory as **stale**. This includes
-  `write_file`, `edit_text`, and mutating `run_command` /
+  `write_file`, `edit_text`, `edit_batch`, `apply_patch`, and mutating `run_command` /
   reviewed-commit paths when they change tracked worktree state.
 - Any stale advisory → must re-run advisory before commit_reviewed.
 - Do NOT interleave edits and advisory calls: `edit → advisory → edit → advisory` wastes two

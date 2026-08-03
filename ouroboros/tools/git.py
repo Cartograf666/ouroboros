@@ -1308,8 +1308,31 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
                 "Re-read the file and provide the actual content."
             )
 
+    # Pre-write syntax guard for known formats (from edit_sketch's verification
+    # rails, editbench v2): a full-file overwrite that doesn't even parse is
+    # never intentional — block BEFORE any write, force bypasses (deliberately
+    # invalid fixtures). Runs before the write loop so the batch stays atomic.
+    # P3: the force bypass is never silent — a forced write of invalid content
+    # still discloses what the guard found in the success message.
+    syntax_bypass_notes: List[str] = []
+    from ouroboros.tools.edit_ops import _syntax_check
+
+    for e in write_list:
+        syntax_err = _syntax_check(safe_relpath(e["path"]), e["content"])
+        if not syntax_err:
+            continue
+        if force:
+            syntax_bypass_notes.append(f"{safe_relpath(e['path'])}: {syntax_err}")
+            continue
+        return (
+            f"⚠️ WRITE_BLOCKED_SYNTAX: {syntax_err} for '{e['path']}'. "
+            "Nothing was written. Fix the content, or pass force=true for an "
+            "intentionally invalid file."
+        )
+
     written = []
     written_paths: List[str] = []
+    overwrite_diffs: List[str] = []
     for e in write_list:
         shrink_warning = _check_shrink_guard(ctx, e["path"], e["content"], force=force)
         if shrink_warning:
@@ -1323,10 +1346,20 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             return shrink_warning
         try:
             target = ctx.repo_path(e["path"])
+            old_content: Optional[str] = None
+            if target.exists():
+                try:
+                    old_content = target.read_text(encoding="utf-8")
+                except Exception:
+                    old_content = None
             target.parent.mkdir(parents=True, exist_ok=True)
             write_text(target, e["content"])
             written.append(f"{display_root}:{safe_relpath(e['path'])} ({len(e['content'])} chars)")
             written_paths.append(e["path"])
+            if old_content is not None and old_content != e["content"]:
+                from ouroboros.tools.edit_ops import _unified_diff
+
+                overwrite_diffs.append(_unified_diff(safe_relpath(e["path"]), old_content, e["content"], cap=120))
         except Exception as exc:
             if written:
                 _invalidate_advisory(
@@ -1358,6 +1391,16 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             f"✅ Written {len(written)} file(s): {summary}\n"
             "Files are on disk but NOT committed. Run commit_reviewed when ready.\n"
             "⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
+        )
+    if syntax_bypass_notes:
+        result += (
+            "\n⚠️ SYNTAX_GUARD_BYPASSED (force=true): "
+            + "; ".join(syntax_bypass_notes)
+        )
+    if overwrite_diffs:
+        result += (
+            "\nDiff vs the previous version (verify it matches your intent):\n"
+            + "\n".join(overwrite_diffs)
         )
     protected_written = [] if ctx.is_workspace_mode() else protected_paths_in(written_paths)
     if protected_written and mode_allows_protected_write(_current_runtime_mode()):
