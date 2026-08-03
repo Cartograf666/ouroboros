@@ -79,7 +79,7 @@ export function compactModel(model = '') {
 function subagentHeadline(sid = '', role = '', label = '', model = '') {
     const shortId = String(sid || '').slice(0, 8);
     const cleanRole = String(role || '').trim();
-    const suffix = label ? ` ${label}` : '';
+    const suffix = label ? ` — ${label}` : '';
     // Show the resolved model compactly NEXT TO the role (e.g. "planning-scout · gemini-3.5-flash").
     const modelPart = compactModel(model) ? ` · ${compactModel(model)}` : '';
     if (cleanRole) {
@@ -87,6 +87,17 @@ function subagentHeadline(sid = '', role = '', label = '', model = '') {
     }
     return `Subagent ${shortId || 'child'}${modelPart}${suffix}`;
 }
+
+const SUBAGENT_CARD_LABEL = {
+    scheduled: 'scheduled',
+    running: 'running',
+    completed: 'done',
+    completed_warn: 'done with warnings',
+    failed: 'failed',
+    rejected: 'rejected',
+    cancelled: 'cancelled',
+    interrupted: 'interrupted',
+};
 
 export function formatLogMoney(value) {
     return formatUsd4(value);
@@ -545,6 +556,7 @@ function chatView({
     body = '',
     fullBody = '',
     fullHeadline = '',
+    activityPreview,
     visible = false,
     promote = false,
     terminal = false,
@@ -567,6 +579,9 @@ function chatView({
     };
     if (fullBody) out.fullBody = fullBody;
     if (fullHeadline) out.fullHeadline = fullHeadline;
+    // Explicit emptiness is part of the presentation contract: a review-only
+    // frame has no activity and must not fall back to its disclosure body.
+    if (activityPreview !== undefined) out.activityPreview = String(activityPreview || '');
     if (Array.isArray(meta) && meta.length) out.meta = meta.filter(Boolean);
     // P3 uniform contract: when the WS body was truncated server-side, carry a
     // fetch ref (a task id -> GET /api/tasks/{id}) so the bubble can load the
@@ -604,6 +619,7 @@ export function summarizeChatLiveEvent(evt) {
             body: shortText(body, 220),
             fullHeadline: progressText.full || headline,
             fullBody: body,
+            activityPreview: progressText.preview || shortText(headline, 240),
             visible: true,
             promote: true,
             terminal: ['done', 'lifecycle_error', 'cancelled'].includes(phase),
@@ -614,48 +630,75 @@ export function summarizeChatLiveEvent(evt) {
 
     if ((evt.is_progress || t === 'send_message') && isSubagentEvent(evt)) {
         const sid = subagentId(evt);
-        const event = String(evt.subagent_event || '').toLowerCase();
+        const rawEvent = String(evt.subagent_event || '').toLowerCase();
         const role = String(evt.subagent_role || '').trim();
         const status = String(evt.status || '').trim();
-        const cost = formatLogMoney(evt.cost_usd || evt.cost);
         const resultText = describeText(evt.result || '', 320);
         const traceText = describeText(evt.trace_summary || '', 320);
         const errorText = describeText(evt.error || '', 220);
+        const reviewDetails = formatReviewProjection(evt.review_projection);
+        const reviewText = describeText(reviewDetails, 240);
         const detailParts = [
+            reviewText.full ? `[REVIEW]\n${reviewText.full}` : '',
             progressText.full,
             resultText.full ? `[RESULT]\n${resultText.full}` : '',
             traceText.full ? `[TRACE]\n${traceText.full}` : '',
             errorText.full ? `[ERROR]\n${errorText.full}` : '',
         ].filter(Boolean);
-        // 'cancelled'/'interrupted' are STOPS, not failures (v6.82 P5 parity with
-        // chat.js SUBAGENT_EVENT_PHASE): a cancelled child must not read as a red
-        // Issue on the one surface that lacks distinct lineage.
-        const phase = ['completed'].includes(event) ? 'done'
-            : event === 'cancelled' ? 'cancelled'
-                : ['failed', 'rejected', 'interrupted'].includes(event) ? 'lifecycle_error'
-                    : event === 'scheduled' ? 'start'
-                        : 'working';
-        const label = event || 'update';
+        // A generic "completed" event still carries authoritative outcome axes.
+        // Normalize it once here so every live/replay route gets the same label,
+        // phase and terminal truth from the canonical projector.
+        const completionSeverity = rawEvent === 'completed' ? taskOutcomeSeverity(evt) : 'done';
+        const event = rawEvent === 'completed'
+            ? (completionSeverity === 'cancelled' ? 'cancelled'
+                : completionSeverity === 'error' ? 'failed'
+                    : completionSeverity === 'warn' ? 'completed_warn'
+                        : 'completed')
+            : rawEvent;
+        // Cancelled is distinct; rejected/interrupted remain notices rather than
+        // red failures. Interrupted is retryable and therefore non-terminal.
+        const phase = event === 'completed' ? 'done'
+            : event === 'completed_warn' ? 'warn'
+                : event === 'cancelled' ? 'cancelled'
+                    : event === 'failed' ? 'error'
+                        : ['rejected', 'interrupted'].includes(event) ? 'warn'
+                            : event === 'scheduled' ? 'start'
+                                : 'working';
+        const terminal = ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(event);
+        const label = SUBAGENT_CARD_LABEL[event] || event || 'update';
+        // The compact activity line describes the child's work/result, never the
+        // reviewer rationale. Review remains complete and auto-expanded below.
+        const activity = terminal
+            ? (phase === 'error' && errorText.full ? errorText
+                : resultText.full ? resultText
+                    : errorText.full ? errorText
+                        : traceText.full ? traceText
+                            : progressText)
+            : (progressText.full ? progressText
+                : resultText.full ? resultText
+                    : errorText.full ? errorText
+                        : traceText);
         return chatView({
             phase,
             headline: subagentHeadline(sid, role, label, evt.model),
-            body: progressText.preview || resultText.preview || errorText.preview || '',
+            // Review evidence keeps its established immediately-visible body
+            // when the card auto-expands. The compact card activity is a
+            // separate projection and therefore still describes work/result.
+            body: reviewText.full || activity.preview || '',
             fullBody: detailParts.join('\n\n'),
+            activityPreview: activity.preview || '',
             visible: true,
             promote: true,
             human: true,
+            terminal,
+            expandByDefault: Boolean(reviewText.full),
             // P3: the WS result/trace were capped at 4000 server-side; expose the
             // subagent task id so "show full" can fetch the genuinely-full output.
             fullRef: sid,
             truncated: Boolean(evt.result_truncated || evt.trace_summary_truncated),
             meta: [
-                'subagent',
-                role ? `role=${role}` : '',
                 evt.write_surface ? `write=${evt.write_surface}` : '',
                 status ? `status=${status}` : '',
-                cost ? `cost=${cost}` : '',
-                evt.parent_task_id ? `parent=${evt.parent_task_id}` : '',
-                evt.root_task_id ? `root=${evt.root_task_id}` : '',
             ],
             dedupeKey: `subagent:${sid}:${label}:${status}:${progressText.full || resultText.full || errorText.full || ''}`,
         });
@@ -681,6 +724,7 @@ export function summarizeChatLiveEvent(evt) {
             // the card keeps its last thought as the title instead of "Working...".
             headline: (bgTerminal && !progressText.preview) ? '' : (progressText.preview || 'Working...'),
             fullHeadline: progressText.full || '',
+            activityPreview: progressText.preview || '',
             visible: Boolean(progressText.preview),
             promote: true,
             human: true,

@@ -1845,6 +1845,18 @@ button.chat-file:hover,
     white-space: pre-wrap;
 }
 
+/* Collapsed summaries have a stable compact geometry. Expanded cards keep the
+   ordinary wrapping behavior; complete activity/review/result text lives in
+   their existing timeline disclosure rather than in a mouse-only tooltip. */
+.chat-live-card:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-title,
+.chat-live-card:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+}
+
 /* P1 (v6.82): collapsed activity line under the title row. Root cards render
    it only when a coined name holds the title (JS leaves it empty otherwise);
    subagent cards always feed it from their routed progress. Empty ⇒ hidden, so
@@ -1859,6 +1871,10 @@ button.chat-file:hover,
 }
 
 .chat-live-activity:empty {
+    display: none;
+}
+
+.chat-live-card:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity:empty {
     display: none;
 }
 

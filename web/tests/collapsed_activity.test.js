@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
 
-import { COLLAPSED_ACTIVITY_MAX, clearStickyCardState, projectCollapsedActivity } from '../modules/chat.js';
+import {
+    COLLAPSED_ACTIVITY_MAX,
+    boundActivityPreview,
+    clearStickyCardState,
+    projectCollapsedActivity,
+} from '../modules/chat.js';
+import { summarizeChatLiveEvent } from '../modules/log_events.js';
 
 test('named root card shows the latest activity headline under the coined title', () => {
     assert.equal(projectCollapsedActivity({
@@ -75,7 +80,7 @@ test('clearStickyCardState resets the recycled record activity + cost (reusable 
     assert.equal(record.collapsedActivity, '');
     assert.equal(record.costMeta, null);
     assert.equal(record.activityEl.textContent, '');
-    // The activity clock and the full-text reference are cycle state too.
+    // The activity clock is cycle state too.
     assert.equal(record.latestActivityTs, '');
     assert.equal(record.activityEl.title, '');
 });
@@ -93,49 +98,45 @@ test('a terminal subagent keeps its last narration as collapsed activity (replay
     }), 'Collecting evidence');
 });
 
-test('the activity line is fed the FULL text, never the timeline preview', () => {
-    // The projection itself never cuts: a long line survives verbatim.
-    // Fed from the FULL source (never the timeline preview); the only clipping is
-    // the line's own disclosed bound, exercised by the bounded-line test below.
-    const mid = 'Reading '.repeat(20).trim();
-    assert.equal(projectCollapsedActivity({ suggestedName: 'Data Analysis', headline: mid }), mid);
-    assert.equal(projectCollapsedActivity({ isSubagent: true, body: mid }), mid);
-    // ...and applyLiveCardState feeds it the uncut companions the summarizer
-    // already carries, rather than the bounded `headline`/`body` previews. Pinned
-    // at source because the wiring lives in a DOM-driven frame handler.
-    const source = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    assert.match(source, /summary\.fullHeadline \|\| activeHeadline/);
-    assert.match(source, /summary\.fullBody \|\| summary\.body/);
-    // The routed child progress carries its uncut line alongside the preview.
-    assert.match(source, /body: line\.slice\(0, 200\),[\s\S]{0,220}fullBody: line,/);
-});
-
-test('the line is BOUNDED and the bound is disclosed', () => {
+test('the collapsed projection is whitespace-normalized, bounded and explicit', () => {
     const long = 'x'.repeat(COLLAPSED_ACTIVITY_MAX + 250);
-    const out = projectCollapsedActivity({ suggestedName: 'Data Analysis', headline: long });
+    const out = boundActivityPreview(long);
     assert.equal(out.length, COLLAPSED_ACTIVITY_MAX);
     assert.ok(out.endsWith('…'), 'the cut is visible, never silent');
-    // Text within the bound is untouched.
-    const short = 'Reading the ledger';
-    assert.equal(projectCollapsedActivity({ suggestedName: 'X', headline: short }), short);
-    // ...and the complete narration survives on the element itself.
-    const source = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    assert.match(source, /function renderCollapsedActivity\(record, text\)/);
+    assert.equal(boundActivityPreview('  Reading\n  the   ledger  '), 'Reading the ledger');
+    assert.equal(projectCollapsedActivity({ suggestedName: 'X', headline: long }), out);
 });
 
-test('a suppressed line does not leak its text through a tooltip', () => {
-    // An unnamed root card deliberately shows no activity line; a title attribute
-    // would disclose through hover exactly what the suppression withholds.
-    const source = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    assert.match(source, /if \(text && full && full !== text\) record\.activityEl\.title = full/);
-    // BOTH writers go through the one renderer — including the late task_named path.
+test('root progress keeps a bounded activity preview and a complete timeline companion', () => {
+    const full = `Inspecting evidence\n${'long detail '.repeat(60)}UNIQUE_ROOT_TAIL`;
+    const summary = summarizeChatLiveEvent({
+        type: 'send_message', is_progress: true, task_id: 'root-1', content: full,
+    });
+    assert.ok(summary.activityPreview.length <= COLLAPSED_ACTIVITY_MAX);
+    assert.match(summary.activityPreview, /^Inspecting evidence/);
+    assert.equal(summary.fullHeadline, full);
+    assert.match(summary.fullHeadline, /UNIQUE_ROOT_TAIL$/);
 });
 
-test('every activity writer goes through the one renderer', () => {
-    // Three writers exist: frame updates, the late task_named path, and terminal
-    // subagent replay. A writer that bypasses the renderer clips to the bound
-    // without leaving the complete narration anywhere (BIBLE P1).
-    const source = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    assert.equal((source.match(/renderCollapsedActivity\(record/g) || []).length, 4);
-    assert.doesNotMatch(source, /activityEl\.textContent = projectCollapsedActivity/);
+test('subagent projection keeps identity, compact facts and complete disclosure', () => {
+    const full = `${'Collecting evidence '.repeat(30)}UNIQUE_CHILD_TAIL`;
+    const summary = summarizeChatLiveEvent({
+        type: 'send_message',
+        is_progress: true,
+        delegation_role: 'subagent',
+        subagent_task_id: 'child123456',
+        parent_task_id: 'parent1',
+        root_task_id: 'root1',
+        subagent_role: 'researcher',
+        model: 'anthropic/claude-fable-5',
+        subagent_event: 'running',
+        content: full,
+        write_surface: 'workspace',
+        status: 'running',
+    });
+    assert.match(summary.headline, /researcher · claude-fable-5 \(child123\) — running/);
+    assert.ok(summary.activityPreview.length <= COLLAPSED_ACTIVITY_MAX);
+    assert.match(summary.fullBody, /UNIQUE_CHILD_TAIL$/);
+    assert.deepEqual(summary.meta, ['write=workspace', 'status=running']);
+    assert.doesNotMatch(summary.meta.join(' '), /subagent|role=|parent=|root=/);
 });

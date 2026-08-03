@@ -1021,10 +1021,12 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
 
 
 @pytest.mark.ui_browser
-def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(direct_server_with_data):
-    """v6.82 P1: a collapsed NAMED card shows the latest activity in the
-    dedicated [data-live-activity] line under the coined title; an UNNAMED card
-    hides the line (its title already shows the activity — no duplication)."""
+@pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])
+def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
+    direct_server_with_data,
+    browser_engine,
+):
+    """Collapsed root summaries stay compact without destroying full activity."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -1034,12 +1036,17 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(direct_server_with_da
     logs_dir = data_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     (logs_dir / "chat.jsonl").write_text("", encoding="utf-8")
+    unique_tail = "UNIQUE_FULL_ACTIVITY_TAIL"
+    long_activity = (
+        "Analyzing the dataset and comparing every source. " * 18
+        + "https://example.com/" + "unbroken-segment-" * 18 + unique_tail
+    )
     (logs_dir / "progress.jsonl").write_text(
         json.dumps({
             "ts": "2026-07-29T10:00:00+00:00",
             "chat_id": 1,
             "task_id": "named-act",
-            "content": "Analyzing the dataset",
+            "content": long_activity,
         }) + "\n" + json.dumps({
             "ts": "2026-07-29T10:00:01+00:00",
             "chat_id": 1,
@@ -1061,33 +1068,324 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(direct_server_with_da
 
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            browser_type = getattr(pw, browser_engine)
             try:
+                browser = browser_type.launch(headless=True)
+            except PlaywrightError as exc:
+                if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+                    pytest.skip(f"Playwright {browser_engine} browser is not installed: {exc}")
+                raise
+            try:
+                for width, height, mobile in [(1440, 1000, False), (390, 844, True)]:
+                    context = browser.new_context(
+                        viewport={"width": width, "height": height},
+                        is_mobile=mobile,
+                        has_touch=mobile,
+                    )
+                    page = context.new_page()
+                    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                    named = page.locator('.chat-live-card[data-task-id="named-act"]')
+                    named.wait_for(state="attached", timeout=30_000)
+                    unnamed = page.locator('.chat-live-card[data-task-id="unnamed-act"]')
+                    unnamed.wait_for(state="attached", timeout=30_000)
+                    page.wait_for_function(
+                        "() => document.querySelector('.chat-live-card[data-task-id=\"named-act\"]"
+                        " [data-live-title]')?.textContent === 'Data Analysis'",
+                        timeout=30_000,
+                    )
+                    assert named.get_attribute("data-expanded") == "0"
+                    named_activity = named.locator('[data-live-activity]')
+                    activity_text = named_activity.text_content().strip()
+                    assert activity_text
+                    assert len(activity_text) <= 240
+                    assert activity_text.endswith(("…", "..."))
+                    assert unique_tail not in activity_text
+                    assert named_activity.get_attribute("title") is None
+                    geometry = named.evaluate(
+                        """card => {
+                            const facts = selector => {
+                                const el = card.querySelector(selector);
+                                const style = getComputedStyle(el);
+                                const lineHeight = parseFloat(style.lineHeight);
+                                const rect = el.getBoundingClientRect();
+                                return { lines: rect.height / lineHeight, width: rect.width };
+                            };
+                            return {
+                                title: facts('[data-live-title]'),
+                                activity: facts('[data-live-activity]'),
+                                clientWidth: card.clientWidth,
+                                scrollWidth: card.scrollWidth,
+                            };
+                        }"""
+                    )
+                    assert geometry["title"]["lines"] <= 2.2, geometry
+                    assert geometry["activity"]["lines"] <= 2.2, geometry
+                    assert geometry["scrollWidth"] <= geometry["clientWidth"] + 1, geometry
+                    assert "cost=$0.42" in named.locator('[data-live-meta]').inner_text()
+
+                    unnamed_activity = unnamed.locator('[data-live-activity]')
+                    assert "Doing things without a name" in unnamed.locator('[data-live-title]').text_content()
+                    assert unnamed_activity.text_content().strip() == ""
+                    assert not unnamed_activity.is_visible()
+
+                    named.locator(':scope > [data-live-summary-button]').click()
+                    line_toggle = named.locator(':scope > [data-live-timeline] .chat-live-line-toggle').first
+                    line_toggle.wait_for(state="visible", timeout=5_000)
+                    line_toggle.click()
+                    page.wait_for_function(
+                        "tail => document.querySelector('.chat-live-card[data-task-id=\"named-act\"]')"
+                        ".innerText.includes(tail)",
+                        arg=unique_tail,
+                    )
+                    page.screenshot(
+                        path=str(data_dir.parent / f"compact-activity-{browser_engine}-{width}.png"),
+                        full_page=True,
+                    )
+                    context.close()
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
+@pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])
+def test_ui_smoke_live_card_mutations_preserve_viewport(
+    direct_server_with_data,
+    browser_engine,
+):
+    """Live card growth follows bottom or preserves the visible descendant."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    data_dir = direct_server_with_data["data_dir"]
+    logs_dir = data_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "chat.jsonl").write_text("", encoding="utf-8")
+    (logs_dir / "progress.jsonl").write_text("", encoding="utf-8")
+
+    capture_socket = """() => {
+        const NativeWebSocket = window.WebSocket;
+        window.__testSockets = [];
+        window.WebSocket = class TestWebSocket extends NativeWebSocket {
+            constructor(...args) {
+                super(...args);
+                window.__testSockets.push(this);
+            }
+        };
+    }"""
+    settle = "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+
+    def emit(page, frame):
+        page.evaluate(
+            """frame => {
+                const socket = window.__testSockets?.[0];
+                if (!socket) throw new Error('test socket not captured');
+                socket.dispatchEvent(new MessageEvent('message', {
+                    data: JSON.stringify(frame),
+                }));
+            }""",
+            frame,
+        )
+        page.evaluate(settle)
+
+    def card_top(page, task_id):
+        return page.locator(f'.chat-live-card[data-task-id="{task_id}"]').evaluate(
+            "card => card.getBoundingClientRect().top"
+        )
+
+    def put_at_viewport_top(page, selector):
+        return page.evaluate(
+            """selector => {
+                const messages = document.querySelector('#chat-messages');
+                const anchor = document.querySelector(selector);
+                const before = messages.scrollTop;
+                messages.scrollTop += anchor.getBoundingClientRect().top
+                    - messages.getBoundingClientRect().top;
+                messages.dispatchEvent(new Event('scroll'));
+                return {
+                    moved: Math.abs(messages.scrollTop - before),
+                    remaining: messages.scrollHeight - messages.scrollTop - messages.clientHeight,
+                };
+            }""",
+            selector,
+        )
+
+    try:
+        with sync_playwright() as pw:
+            browser_type = getattr(pw, browser_engine)
+            try:
+                browser = browser_type.launch(headless=True)
+            except PlaywrightError as exc:
+                if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+                    pytest.skip(f"Playwright {browser_engine} browser is not installed: {exc}")
+                raise
+            page = browser.new_page(viewport={"width": 1280, "height": 760})
+            try:
+                page.add_init_script(f"({capture_socket})()")
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                named = page.locator('.chat-live-card[data-task-id="named-act"]')
-                named.wait_for(state="attached", timeout=30_000)
-                unnamed = page.locator('.chat-live-card[data-task-id="unnamed-act"]')
-                unnamed.wait_for(state="attached", timeout=30_000)
-                # The coined name holds the title; the activity line carries the
-                # latest activity and stays populated on the finished card.
                 page.wait_for_function(
-                    "() => document.querySelector('.chat-live-card[data-task-id=\"named-act\"]"
-                    " [data-live-title]')?.textContent === 'Data Analysis'",
+                    "() => window.__testSockets?.some(socket => socket.readyState === WebSocket.OPEN)",
                     timeout=30_000,
                 )
-                named_activity = named.locator('[data-live-activity]')
-                assert named_activity.text_content().strip() == "Analyzing the dataset"
-                assert named_activity.is_visible()
-                # Sticky terminal cost renders in the meta row from the result truth.
-                assert "cost=$0.42" in named.locator('[data-live-meta]').inner_text()
-                # The unnamed card's title IS its activity; the line stays empty
-                # and takes no space (CSS :empty).
-                assert "Doing things without a name" in unnamed.locator('[data-live-title]').text_content()
-                unnamed_activity = unnamed.locator('[data-live-activity]')
-                assert unnamed_activity.text_content().strip() == ""
-                assert not unnamed_activity.is_visible()
-                page.screenshot(path=str(data_dir.parent / "collapsed-activity.png"), full_page=True)
+                page.wait_for_function(
+                    "() => document.querySelector('#chat-messages')?.innerText.includes('Ouroboros has awakened')",
+                    timeout=30_000,
+                )
+
+                emit(page, {
+                    "type": "chat", "role": "assistant", "is_progress": True,
+                    "chat_id": 1, "task_id": "vp-parent",
+                    "content": "Parent begins", "ts": "2026-08-03T10:00:00+00:00",
+                })
+                for idx in range(1, 5):
+                    emit(page, {
+                        "type": "chat", "role": "assistant", "is_progress": True,
+                        "chat_id": 1, "task_id": f"vp-child-{idx}",
+                        "delegation_role": "subagent", "subagent_event": "scheduled",
+                        "subagent_task_id": f"vp-child-{idx}", "parent_task_id": "vp-parent",
+                        "root_task_id": "vp-parent", "subagent_role": f"reader-{idx}",
+                        "content": f"Child {idx} scheduled",
+                        "ts": f"2026-08-03T10:00:0{idx}+00:00",
+                    })
+                for idx in range(1, 11):
+                    emit(page, {
+                        "type": "chat", "role": "assistant", "is_progress": True,
+                        "chat_id": 1, "task_id": f"vp-follow-{idx}",
+                        "content": (f"Following task {idx} " * 14),
+                        "ts": f"2026-08-03T10:01:{idx:02d}+00:00",
+                    })
+                page.wait_for_selector('.chat-live-card[data-task-id="vp-follow-10"]', timeout=30_000)
+
+                # Pinned readers continue following the newest content.
+                before_bottom = page.evaluate(
+                    """() => {
+                        const m = document.querySelector('#chat-messages');
+                        m.scrollTop = m.scrollHeight;
+                        m.dispatchEvent(new Event('scroll'));
+                        return m.scrollHeight;
+                    }"""
+                )
+                page.evaluate(settle)
+                emit(page, {
+                    "type": "chat", "role": "assistant", "is_progress": True,
+                    "chat_id": 1, "task_id": "vp-bottom-child",
+                    "delegation_role": "subagent", "subagent_event": "scheduled",
+                    "subagent_task_id": "vp-bottom-child", "parent_task_id": "vp-follow-10",
+                    "root_task_id": "vp-follow-10", "subagent_role": "bottom-reader",
+                    "content": "A newly mounted child at the bottom",
+                    "ts": "2026-08-03T10:02:00+00:00",
+                })
+                bottom = page.evaluate(
+                    """() => {
+                        const m = document.querySelector('#chat-messages');
+                        return { height: m.scrollHeight, remaining: m.scrollHeight - m.scrollTop - m.clientHeight };
+                    }"""
+                )
+                assert bottom["height"] > before_bottom + 30, bottom
+                assert bottom["remaining"] <= 6, bottom
+
+                # The reader is inside a child. Naming the parent and growing its
+                # visible timeline above that child must keep the child stationary.
+                parent = page.locator('.chat-live-card[data-task-id="vp-parent"]')
+                parent.locator(':scope > [data-live-summary-button]').click()
+                child_selector = '.chat-live-card[data-task-id="vp-child-2"] > [data-live-summary-button]'
+                mid = put_at_viewport_top(page, child_selector)
+                page.evaluate(settle)
+                assert mid["remaining"] > 160, mid
+                child_before = page.locator(child_selector).evaluate("el => el.getBoundingClientRect().top")
+                parent_height_before = parent.evaluate("card => card.getBoundingClientRect().height")
+                emit(page, {
+                    "type": "task_named", "task_id": "vp-parent",
+                    "suggested_name": "A deliberately long generated project name " * 12,
+                })
+                child_after_name = page.locator(child_selector).evaluate("el => el.getBoundingClientRect().top")
+                parent_height_named = parent.evaluate("card => card.getBoundingClientRect().height")
+                assert parent_height_named > parent_height_before + 20
+                assert abs(child_after_name - child_before) <= 6
+
+                for idx in range(8):
+                    emit(page, {
+                        "type": "chat", "role": "assistant", "is_progress": True,
+                        "chat_id": 1, "task_id": "vp-parent",
+                        "content": (f"Visible parent timeline update {idx} " * 10),
+                        "ts": f"2026-08-03T10:03:{idx:02d}+00:00",
+                    })
+                child_after_growth = page.locator(child_selector).evaluate("el => el.getBoundingClientRect().top")
+                parent_height_grown = parent.evaluate("card => card.getBoundingClientRect().height")
+                assert parent_height_grown > parent_height_named + 100
+                assert abs(child_after_growth - child_before) <= 6
+
+                # A child mounted in an earlier card must not move the next
+                # top-level card the reader is looking at.
+                anchor_id = "vp-follow-1"
+                anchor_selector = f'.chat-live-card[data-task-id="{anchor_id}"]'
+                mid = put_at_viewport_top(page, anchor_selector)
+                page.evaluate(settle)
+                assert mid["remaining"] > 160, mid
+                anchor_before = card_top(page, anchor_id)
+                parent_before_mount = parent.evaluate("card => card.getBoundingClientRect().height")
+                emit(page, {
+                    "type": "chat", "role": "assistant", "is_progress": True,
+                    "chat_id": 1, "task_id": "vp-late-child",
+                    "delegation_role": "subagent", "subagent_event": "scheduled",
+                    "subagent_task_id": "vp-late-child", "parent_task_id": "vp-parent",
+                    "root_task_id": "vp-parent", "subagent_role": "late-reader",
+                    "content": "Late child mounted above the reader",
+                    "ts": "2026-08-03T10:04:00+00:00",
+                })
+                assert parent.evaluate("card => card.getBoundingClientRect().height") > parent_before_mount + 30
+                assert abs(card_top(page, anchor_id) - anchor_before) <= 6
+
+                # Terminal auto-collapse is another large height change above the
+                # same reader anchor.
+                parent_before_finish = parent.evaluate("card => card.getBoundingClientRect().height")
+                emit(page, {
+                    "type": "chat", "role": "system", "system_type": "task_summary",
+                    "chat_id": 1, "task_id": "vp-parent", "content": "Parent completed",
+                    "ts": "2026-08-03T10:05:00+00:00",
+                    "outcome_axes": {
+                        "lifecycle": {"status": "completed"}, "execution": {"status": "ok"},
+                        "objective": {"status": "pass"}, "review": {"status": "pass"},
+                        "artifacts": {"status": "ready"},
+                    },
+                })
+                assert parent.get_attribute("data-expanded") == "0"
+                assert parent.evaluate("card => card.getBoundingClientRect().height") < parent_before_finish - 100
+                assert abs(card_top(page, anchor_id) - anchor_before) <= 6
+
+                # Review evidence still auto-expands a child, under the same
+                # viewport contract and without changing the ordinary policy.
+                review_child = page.locator('.chat-live-card[data-task-id="vp-late-child"]')
+                review_before = review_child.evaluate("card => card.getBoundingClientRect().height")
+                emit(page, {
+                    "type": "chat", "role": "assistant", "is_progress": True,
+                    "chat_id": 1, "task_id": "vp-late-child",
+                    "delegation_role": "subagent", "subagent_event": "completed",
+                    "subagent_task_id": "vp-late-child", "parent_task_id": "vp-parent",
+                    "root_task_id": "vp-parent", "subagent_role": "late-reader",
+                    "result": "Review-bearing result " * 16,
+                    "status": "completed", "ts": "2026-08-03T10:06:00+00:00",
+                    "review_projection": {"panels": [{
+                        "panel_id": "viewport-review", "surface": "task_acceptance",
+                        "authority": "host_root", "aggregate_signal": "PASS",
+                        "transport_status": "success", "parse_status": "valid",
+                        "quorum": {"required": 1, "contributed": 1, "configured": 1},
+                        "enforcement_impact": "supports_pass", "reason": "viewport evidence",
+                        "actors": [],
+                    }]},
+                })
+                assert review_child.get_attribute("data-expanded") == "1"
+                assert review_child.evaluate("card => card.getBoundingClientRect().height") > review_before + 20
+                assert abs(card_top(page, anchor_id) - anchor_before) <= 6
+                page.screenshot(
+                    path=str(data_dir.parent / f"live-card-viewport-{browser_engine}.png"),
+                    full_page=True,
+                )
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -1435,6 +1733,13 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
         "review": {"status": "degraded"},
         "artifacts": {"status": "ready"},
     }
+    child_activity_tail = "UNIQUE_CHILD_ACTIVITY_TAIL"
+    child_activity_early = "UNIQUE_CHILD_ACTIVITY_EARLY"
+    child_activity = (
+        child_activity_early + " Searching evidence across repositories.\n"
+        + "Comparing every source and preserving the complete routed narration. " * 14
+        + "\nhttps://example.com/" + "child-evidence-segment-" * 14 + child_activity_tail
+    )
     rows = [
         {
             "ts": "2026-05-25T10:00:00+00:00",
@@ -1457,6 +1762,23 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
             "subagent_role": "researcher",
         },
         {
+            # Real rejection carrier shape: task_id addresses the parent chat,
+            # while subagent_task_id is the child presentation identity.
+            "ts": "2026-05-25T10:00:01.500000+00:00",
+            "chat_id": 1,
+            "task_id": "parent1",
+            "content": "Rejected child should stay a child",
+            "is_progress": True,
+            "delegation_role": "subagent",
+            "subagent_event": "rejected",
+            "subagent_task_id": "rejected1",
+            "parent_task_id": "parent1",
+            "root_task_id": "parent1",
+            "subagent_role": "rejected-reader",
+            "status": "rejected_duplicate",
+            "error": "Active-subagent cap rejected this child",
+        },
+        {
             "ts": "2026-05-25T10:00:02+00:00",
             "chat_id": 1,
             "task_id": "child1",
@@ -1474,7 +1796,7 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
             "ts": "2026-05-25T10:00:02.500000+00:00",
             "chat_id": 1,
             "task_id": "child1",
-            "content": "Searching evidence",
+            "content": child_activity,
             "is_progress": True,
             "delegation_role": "subagent",
             "subagent_event": "progress",
@@ -1559,19 +1881,20 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 assert page.locator(".chat-live-card").first.is_visible()
                 # Subagents render as always-visible child cards nested under
                 # the parent card. Child completion must not finish the parent.
-                page.wait_for_function("() => document.querySelectorAll('.chat-live-card').length === 3", timeout=30_000)
+                page.wait_for_function("() => document.querySelectorAll('.chat-live-card').length === 4", timeout=30_000)
                 page.wait_for_function(
                     "() => { const p = document.querySelector('.chat-live-card:not(.subagent)');"
                     " const c = document.querySelector('.chat-live-card.subagent[data-parent-task-id=\"parent1\"]');"
                     " const g = document.querySelector('.chat-live-card.subagent[data-parent-task-id=\"child1\"]');"
                     " return !!p && !!c && c.closest('.chat-subagents') && c.parentElement.closest('.chat-live-card') === p"
                     " && !!g && g.closest('.chat-subagents') && g.parentElement.closest('.chat-live-card') === c"
-                    " && /researcher \\(child1\\)/.test(c.innerText) && /role=researcher/.test(c.innerText)"
+                    " && /researcher \\(child1\\)/.test(c.innerText)"
                     " && /evidence-mapper \\(grandchi/.test(g.innerText); }",
                     timeout=30_000,
                 )
                 parent = page.locator(".chat-live-card:not(.subagent)").first
-                child = page.locator('.chat-live-card.subagent[data-parent-task-id="parent1"]').first
+                child = page.locator('.chat-live-card.subagent[data-task-id="child1"]')
+                rejected_child = page.locator('.chat-live-card.subagent[data-task-id="rejected1"]')
                 grandchild = page.locator('.chat-live-card.subagent[data-parent-task-id="child1"]').first
                 parent_ts = int(parent.get_attribute("data-ts"))
                 child_ts = int(child.get_attribute("data-ts"))
@@ -1582,11 +1905,11 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 parent_text = parent.inner_text()
                 child_text = child.inner_text()
                 assert "Parent task started" in parent_text
-                assert "1 child" in parent_count.inner_text()
+                assert "2 children" in parent_count.inner_text()
                 assert "researcher (child1)" in child_text
                 assert "1 child" in child_count.inner_text()
-                assert "child=child1" in child_text
-                assert "role=researcher" in child_text
+                assert "child=child1" not in child_text
+                assert "role=researcher" not in child_text
                 assert "panel_child_review" in child_text
                 assert "claude-fable-5" in child_text
                 assert "verdict=DEGRADED" in child_text
@@ -1602,9 +1925,17 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 ).count() == 1
                 assert page.locator("#chat-messages > .chat-live-card.subagent").count() == 0
                 assert parent.get_attribute("data-finished") == "0"
+                assert rejected_child.get_attribute("data-finished") == "1"
+                assert rejected_child.locator(
+                    ":scope > [data-live-summary-button] [data-live-phase]"
+                ).get_attribute("data-phase") == "warn"
                 assert child.get_attribute("data-finished") == "1"
                 assert child.locator(":scope > [data-live-summary-button] [data-live-phase]").first.get_attribute("data-phase") == "warn"
                 assert child.get_attribute("data-subagent-role") == "researcher"
+                child_activity_el = child.locator(":scope > [data-live-summary-button] [data-live-activity]")
+                assert len(child_activity_el.text_content().strip()) <= 240
+                assert child_activity_tail not in child_activity_el.text_content()
+                assert child_activity_el.get_attribute("title") is None
                 assert grandchild.get_attribute("data-finished") == "1"
                 assert grandchild.get_attribute("data-subagent-role") == "evidence-mapper"
                 assert page.locator(".chat-bubble.progress").count() == 0
@@ -1617,9 +1948,16 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 assert child.get_attribute("data-expanded") == "1"
                 assert grandchild.get_attribute("data-expanded") == "0"
                 child_summary = child.locator(":scope > [data-live-summary-button]").first
-                line_toggles = child.locator(".chat-live-line-toggle:visible")
-                if line_toggles.count():
-                    line_toggles.last.click()
+                progress_line = child.locator(".chat-live-line", has_text="Searching evidence").first
+                progress_toggle = progress_line.locator(".chat-live-line-toggle")
+                progress_toggle.wait_for(state="visible", timeout=5_000)
+                progress_toggle.click()
+                assert child_activity_early in progress_line.inner_text()
+                assert child_activity_tail in progress_line.inner_text()
+                review_line = child.locator(".chat-live-line", has_text="panel_child_review").first
+                review_toggle = review_line.locator(".chat-live-line-toggle")
+                review_toggle.wait_for(state="visible", timeout=5_000)
+                review_toggle.click()
                 expanded_text = child.inner_text(timeout=5_000)
                 assert "Final child answer should stay inside the child card." in expanded_text
                 assert "Child result with evidence table" in expanded_text
@@ -1630,11 +1968,10 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 assert "Scheduled subagent child1" not in expanded_text
                 assert child_summary.get_attribute("aria-expanded") == "true"
                 assert child.locator("[data-live-timeline]").first.get_attribute("id")
-                if line_toggles.count():
-                    assert line_toggles.last.get_attribute("aria-controls")
+                assert review_toggle.get_attribute("aria-controls")
 
                 page.reload(wait_until="domcontentloaded", timeout=30_000)
-                page.wait_for_function("() => document.querySelectorAll('.chat-live-card').length === 3", timeout=30_000)
+                page.wait_for_function("() => document.querySelectorAll('.chat-live-card').length === 4", timeout=30_000)
                 page.wait_for_function(
                     "() => { const p = document.querySelector('.chat-live-card:not(.subagent)');"
                     " const c = document.querySelector('.chat-live-card.subagent[data-parent-task-id=\"parent1\"]');"
@@ -1644,17 +1981,27 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                     timeout=30_000,
                 )
                 replay_parent = page.locator(".chat-live-card:not(.subagent)").first
-                replay_child = page.locator('.chat-live-card.subagent[data-parent-task-id="parent1"]').first
+                replay_child = page.locator('.chat-live-card.subagent[data-task-id="child1"]')
+                replay_rejected = page.locator('.chat-live-card.subagent[data-task-id="rejected1"]')
                 replay_grandchild = page.locator('.chat-live-card.subagent[data-parent-task-id="child1"]').first
                 assert replay_parent.get_attribute("data-finished") == "0"
+                assert replay_rejected.get_attribute("data-finished") == "1"
+                assert replay_rejected.locator(
+                    ":scope > [data-live-summary-button] [data-live-phase]"
+                ).get_attribute("data-phase") == "warn"
                 assert replay_child.get_attribute("data-finished") == "1"
                 assert replay_child.locator(":scope > [data-live-summary-button] [data-live-phase]").first.get_attribute("data-phase") == "warn"
                 assert replay_grandchild.get_attribute("data-finished") == "1"
                 assert replay_child.get_attribute("data-expanded") == "1"
                 assert replay_grandchild.get_attribute("data-expanded") == "0"
                 assert "researcher (child1)" in replay_child.inner_text()
-                assert "child=child1" in replay_child.inner_text()
+                assert "child=child1" not in replay_child.inner_text()
+                assert "role=researcher" not in replay_child.inner_text()
                 assert "Final child answer should stay inside the child card." in replay_child.inner_text()
+                replay_progress = replay_child.locator(".chat-live-line", has_text="Searching evidence").first
+                replay_progress.locator(".chat-live-line-toggle").click()
+                assert child_activity_early in replay_progress.inner_text()
+                assert child_activity_tail in replay_progress.inner_text()
                 page.wait_for_timeout(900)  # cover the routine background history sync
                 assert replay_child.locator('.chat-live-line-repeat:not([hidden])').count() == 0
                 page.screenshot(path=str(data_dir.parent / "review-truth-child-reconnect.png"), full_page=True)
@@ -1672,7 +2019,7 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                     }"""
                 )
                 page.reload(wait_until="domcontentloaded", timeout=30_000)
-                page.wait_for_function("() => document.querySelectorAll('.chat-live-card').length === 3", timeout=30_000)
+                page.wait_for_function("() => document.querySelectorAll('.chat-live-card').length === 4", timeout=30_000)
                 const_pref_check = (
                     "() => {"
                     " const c = document.querySelector('.chat-live-card.subagent[data-parent-task-id=\"parent1\"]');"
@@ -2228,9 +2575,13 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
         const deepest = messages.querySelector('.chat-live-card[data-task-id="layout-child-10"]');
         const cardFacts = cards.map((card) => {
             const title = card.querySelector(':scope > .chat-live-summary-button [data-live-title]');
+            const activity = card.querySelector(':scope > .chat-live-summary-button [data-live-activity]');
             const style = getComputedStyle(title);
             const lineHeight = parseFloat(style.lineHeight);
             const titleRect = title.getBoundingClientRect();
+            const activityStyle = getComputedStyle(activity);
+            const activityLineHeight = parseFloat(activityStyle.lineHeight);
+            const activityRect = activity.getBoundingClientRect();
             return {
                 id: card.dataset.taskId,
                 clientWidth: card.clientWidth,
@@ -2238,6 +2589,8 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 titleWidth: titleRect.width,
                 titleHeight: titleRect.height,
                 titleLines: lineHeight > 0 ? titleRect.height / lineHeight : 99,
+                activityLines: activityLineHeight > 0 ? activityRect.height / activityLineHeight : 99,
+                activityTitle: activity.getAttribute('title'),
             };
         });
         const main = root.querySelector(':scope > .chat-live-summary-button .chat-live-summary-main').getBoundingClientRect();
@@ -2269,7 +2622,9 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
         assert facts["rootSideTop"] >= facts["rootMainBottom"] - 1, facts
         assert all(card["scrollWidth"] <= card["clientWidth"] + 1 for card in facts["cardFacts"]), facts
         assert min(card["titleWidth"] for card in facts["cardFacts"]) >= 160, facts
-        assert max(card["titleLines"] for card in facts["cardFacts"]) <= 3.2, facts
+        assert max(card["titleLines"] for card in facts["cardFacts"]) <= 2.2, facts
+        assert max(card["activityLines"] for card in facts["cardFacts"]) <= 2.2, facts
+        assert all(card["activityTitle"] is None for card in facts["cardFacts"]), facts
         deepest = page.locator('.chat-live-card[data-task-id="layout-child-10"]')
         assert "pty-tests · gemini-3.6-flash" in deepest.inner_text()
         deepest.locator(":scope > [data-live-summary-button]").click()
