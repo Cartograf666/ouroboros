@@ -76,6 +76,35 @@ export function compactModel(model = '') {
     return /local/i.test(m) ? `${short} (local)` : short;
 }
 
+// Phase 6, owner directive #1: «бейдж точно нужен, но не рекламный … что ТУТ
+// бабл \ субагент на codex». A small chip carrying the harness this bubble or
+// subagent REALLY ran on — icon plus the short harness name, in the style of
+// the Harness Accounts rows, never a promotional badge.
+//
+// Only a DELEGATED route is a fact worth a chip: the native API path is the
+// ordinary case and prints nothing, so the lane never fills with "api" noise on
+// every ordinary bubble. Absent fact -> null -> no chip element at all.
+const HARNESS_CHIP_ICON = {
+    codex: '◇',
+    claude: '✳',
+    cursor: '▸',
+};
+
+export function executorChip(evt) {
+    const route = String(evt?.executor_route || '').trim();
+    if (!route) return null;
+    // The route id is OPAQUE (`harness` or `harness=model`): print the harness
+    // part only, never interpreted beyond splitting the spelling Claudexor uses.
+    const harness = route.split('=')[0].trim().toLowerCase();
+    if (!harness) return null;
+    return {
+        harness,
+        icon: HARNESS_CHIP_ICON[harness] || '◆',
+        label: harness,
+        title: `This work ran on your ${harness} subscription (delegated session)`,
+    };
+}
+
 function subagentHeadline(sid = '', role = '', label = '', model = '') {
     const shortId = String(sid || '').slice(0, 8);
     const cleanRole = String(role || '').trim();
@@ -566,6 +595,7 @@ function chatView({
     fullRef = '',
     truncated = false,
     expandByDefault = false,
+    chip = null,
 } = {}) {
     const out = {
         phase,
@@ -589,6 +619,9 @@ function chatView({
     if (fullRef) out.fullRef = String(fullRef);
     if (truncated) out.truncated = true;
     if (expandByDefault) out.expandByDefault = true;
+    // Phase 6: the executor chip rides the projection so live and replay routes
+    // paint the same fact; absent stays absent (no placeholder chip).
+    if (chip) out.executorChip = chip;
     return out;
 }
 
@@ -700,6 +733,8 @@ export function summarizeChatLiveEvent(evt) {
                 evt.write_surface ? `write=${evt.write_surface}` : '',
                 status ? `status=${status}` : '',
             ],
+            // «ТУТ … субагент на codex» — the child's own executor chip.
+            chip: executorChip(evt),
             dedupeKey: `subagent:${sid}:${label}:${status}:${progressText.full || resultText.full || errorText.full || ''}`,
         });
     }
@@ -728,6 +763,9 @@ export function summarizeChatLiveEvent(evt) {
             visible: Boolean(progressText.preview),
             promote: true,
             human: true,
+            // «ТУТ бабл … на codex» — an ordinary progress bubble carries the chip
+            // too whenever the frame disclosed a delegated executor.
+            chip: executorChip(evt),
             dedupeKey: progressText.full ? `progress:${progressText.full}` : `progress:${evt.task_id || ''}`,
         });
     }

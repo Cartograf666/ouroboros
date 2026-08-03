@@ -589,16 +589,25 @@ _ADVISORY_SESSION_MAX_SECONDS = 900  # the nanny's time cap replaces the SDK bud
 def advisory_review_route() -> str:
     """The advisory delivery route: ``api`` (Claude Agent SDK, needs the key)
     or ``agent_session`` (a delegated Claudexor run, needs no key). An unknown
-    token raises — a typo must fail loudly, never silently pick a transport."""
-    raw = os.environ.get(ADVISORY_REVIEW_ROUTE_ENV, "").strip().lower()
-    if raw in ("", "api", "api_chat"):
-        return "api"
-    if raw == "agent_session":
-        return "agent_session"
-    raise ValueError(
-        f"{ADVISORY_REVIEW_ROUTE_ENV} names an unknown advisory route {raw!r}; "
-        "valid: api, agent_session"
-    )
+    token raises — a typo must fail loudly, never silently pick a transport.
+
+    Reads the reviewer-slot SSOT (6.1): the structured advisory row when the
+    owner saved one, the legacy ``OUROBOROS_ADVISORY_REVIEW_ROUTE`` env
+    otherwise (the SSOT's own migration read)."""
+    from ouroboros.reviewer_slot_config import advisory_slot_config
+
+    return "api" if advisory_slot_config().kind == "api" else "agent_session"
+
+
+def advisory_slot_enabled() -> bool:
+    """Whether the ONE optional advisory reviewer is enabled (D14).
+
+    ``False`` is a standing owner decision whose constitutional consequence is
+    an AUDITED BYPASS on every reviewed commit — recorded by the pre-commit
+    gate, never a silent skip."""
+    from ouroboros.reviewer_slot_config import advisory_slot_config
+
+    return bool(advisory_slot_config().enabled)
 
 
 def advisory_route_requires_api_key() -> bool:
@@ -629,6 +638,21 @@ def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContex
     )
 
     try:
+        # The advisory row's own target/effort (6.1); None keeps the shared
+        # session-route fallback inside the runner.
+        import dataclasses as _dc
+
+        from ouroboros.reviewer_slot_config import advisory_slot_config
+        from ouroboros.subagents import parse_subagent_harness
+
+        _slot = advisory_slot_config()
+        _session_route = parse_subagent_harness(_slot.target_id) if _slot.target_id else None
+        # D1/6.3: the effort field is the ONE source; any effort embedded in the
+        # target identity is dropped so it can never override the field.
+        if _session_route is not None:
+            _session_route = _dc.replace(_session_route, effort=str(_slot.effort or ""))
+        if _session_route is not None and getattr(_slot, "profile_id", ""):
+            _session_route = _dc.replace(_session_route, profile_id=_slot.profile_id)
         drive = custody_root(ctx) if getattr(ctx, "drive_root", None) else pathlib.Path(repo_dir)
         facts = run_delegated_review_session(
             prompt=prompt,
@@ -639,6 +663,9 @@ def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContex
                 surface="advisory_review",
                 slot_id="advisory_slot_1",
                 timeout_sec=_ADVISORY_SESSION_MAX_SECONDS,
+                # The owner's configured advisory slot route (6.1 SSOT) rides the
+                # invocation — the one identity+delivery value — not a parallel kwarg.
+                session_route=_session_route,
                 # The structured verdict is ASKED here exactly as the substrate's
                 # session slots ask for it (D19): a review surface that never asks can
                 # only reach its verdict through extraction, paying a light-model call
@@ -1533,13 +1560,23 @@ def _handle_advisory_pre_review(
     # reviewed. A misconfigured route token is a loud error, not a bypass.
     try:
         _requires_key = advisory_route_requires_api_key()
+        _advisory_enabled = advisory_slot_enabled()
     except ValueError as exc:
         return _json_response({
             "status": "error",
             "snapshot_hash": snapshot_hash,
             "error": f"⚠️ ADVISORY_ERROR: {exc}",
-            "message": "Fix OUROBOROS_ADVISORY_REVIEW_ROUTE and retry.",
+            "message": "Fix the advisory reviewer configuration "
+                       "(OUROBOROS_REVIEWER_SLOTS / OUROBOROS_ADVISORY_REVIEW_ROUTE) and retry.",
         })
+    if not _advisory_enabled:
+        # The owner switched the advisory slot off (6.2). The constitutional
+        # gate still runs — as an AUDITED BYPASS on this exact snapshot, the
+        # same durable record an explicit per-call skip produces.
+        return _record_bypass(ctx, state, snapshot_hash, commit_message,
+                               "advisory reviewer disabled in settings — audited bypass",
+                               task_id, drive_root,
+                               snapshot_paths=paths)
     if _requires_key and not os.environ.get("ANTHROPIC_API_KEY", ""):
         return _record_bypass(ctx, state, snapshot_hash, commit_message,
                                "ANTHROPIC_API_KEY not set — auto-bypassed (advisory route=api)",

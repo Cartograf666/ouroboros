@@ -104,6 +104,10 @@ class ChatOutbound(TypedDict):
     model_lane: NotRequired[str]
     requested_model_lane: NotRequired[str]
     effective_model_lane: NotRequired[str]
+    # Phase 6: OPAQUE harness id this bubble/subagent really ran on (a
+    # delegated route only); absent/empty means the ordinary native path and
+    # the UI draws no chip.
+    executor_route: NotRequired[str]
     model: NotRequired[str]
     task_group_id: NotRequired[str]
     task_event: NotRequired[str]
@@ -769,6 +773,11 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/mcp/status",
     "POST /api/mcp/refresh",
     "POST /api/mcp/test",
+    "GET /api/reviewer-slots",
+    "GET /api/claudexor/status",
+    "POST /api/claudexor/login",
+    "GET /api/claudexor/login/{job_id}",
+    "DELETE /api/claudexor/login/{job_id}",
     "GET /api/extensions",
     "GET /api/extensions/{skill}/manifest",
     "GET /api/extensions/{skill}/module/{entry}",

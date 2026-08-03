@@ -622,6 +622,12 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
     # produce a real charge, and writing 0.0/cost_final=True over any of them would hide
     # the money from every budget fence AND assert the projection is final.
     spend, estimated = disclosed_spend(summary)
+    # D29: the applied credential-profile id + access profile the deciding
+    # attempt disclosed (authRoute receipt / effectiveAccess), written to the
+    # durable row by default. Null on runs whose engine telemetry predates the
+    # receipt — empty string, never invented.
+    applied_profile = str((summary.get("authRoute") or {}).get("profileId") or "")
+    applied_access = str(summary.get("effectiveAccess") or summary.get("access") or "")
     if not custody.ledger_recorded:
         try:
             from ouroboros.usage_accounting import record_subscription_session
@@ -639,6 +645,8 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
                 cached_tokens=disclosed_tokens(summary.get("cachedInputTokens")),
                 spend_usd=spend,
                 spend_estimated=estimated,
+                credential_profile_id=applied_profile,
+                access_profile=applied_access,
             )
         except Exception:
             log.exception("Failed to record delegated subscription session %s", custody.run_id)
@@ -666,6 +674,11 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
             "cost_final": spend is not None and not estimated,
             "spend_disclosed": spend is not None,
             "spend_estimated": estimated,
+            # D29: the applied account rides the settlement event too, so the
+            # durable event stream answers "which account paid" without joining
+            # to the ledger row.
+            "credential_profile_id": applied_profile,
+            "access_profile": applied_access,
         })
     if custody.settled:
         resolve_containment_fault(drive_root, custody, "settled_terminal")

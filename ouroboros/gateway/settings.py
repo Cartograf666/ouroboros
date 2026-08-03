@@ -635,6 +635,48 @@ def _unrecognised_review_models(models: Any) -> list:
         return []
 
 
+def _candidate_scope_models(settings: Dict[str, Any]) -> list:
+    """Scope-review model candidates from CANDIDATE settings (6.1-aware).
+
+    The structured reviewer-slot value wins when present and parseable: its
+    api_chat scope rows are the routes the >=1M gate applies to (a delegated
+    session row is the declared lower-guarantee mode, D16 — never probed
+    here). Otherwise the legacy comma keys, then the live config."""
+    from ouroboros.config import get_scope_review_models
+
+    raw_structured = str(settings.get("OUROBOROS_REVIEWER_SLOTS") or "").strip()
+    if raw_structured:
+        try:
+            from ouroboros.reviewer_slot_config import parse_reviewer_slots
+
+            return [r.target_id for r in parse_reviewer_slots(raw_structured).scope
+                    if not r.is_session]
+        except ValueError:
+            return []  # refused at the API boundary already; never probe garbage
+    return [
+        m for m in str(
+            settings.get("OUROBOROS_SCOPE_REVIEW_MODELS")
+            or settings.get("OUROBOROS_SCOPE_REVIEW_MODEL")
+            or ""
+        ).replace(",", " ").split() if m
+    ] or list(get_scope_review_models() or [])
+
+
+def _candidate_triad_models(settings: Dict[str, Any]) -> list:
+    """Triad api-row candidates from CANDIDATE settings (6.1-aware mirror of
+    ``_candidate_scope_models``; session rows are never provider model ids)."""
+    raw_structured = str(settings.get("OUROBOROS_REVIEWER_SLOTS") or "").strip()
+    if raw_structured:
+        try:
+            from ouroboros.reviewer_slot_config import parse_reviewer_slots
+
+            return [r.target_id for r in parse_reviewer_slots(raw_structured).triad
+                    if not r.is_session]
+        except ValueError:
+            return []
+    return str(settings.get("OUROBOROS_REVIEW_MODELS") or "").replace(",", " ").split()
+
+
 def _review_capability_notices(settings: Dict[str, Any]) -> list:
     """Owner-facing Capability Evidence notices for the configured review slots.
 
@@ -660,15 +702,9 @@ def _review_capability_notices(settings: Dict[str, Any]) -> list:
     notices: list = []
     try:
         from ouroboros.capability_evidence import ONE_MILLION, confirms_at_least, probe
-        from ouroboros.config import DATA_DIR, get_scope_review_models
+        from ouroboros.config import DATA_DIR
 
-        candidates = [
-            m for m in str(
-                settings.get("OUROBOROS_SCOPE_REVIEW_MODELS")
-                or settings.get("OUROBOROS_SCOPE_REVIEW_MODEL")
-                or ""
-            ).replace(",", " ").split() if m
-        ] or list(get_scope_review_models() or [])
+        candidates = _candidate_scope_models(settings)
         seen: set = set()
         for model in candidates:
             if str(model) in seen:
@@ -1007,6 +1043,55 @@ def _claude_code_status_payload() -> Dict[str, Any]:
     }
 
 
+async def api_reviewer_slots(request: Request) -> JSONResponse:
+    """GET /api/reviewer-slots — the effective slot rows plus «выполняется как».
+
+    One read for the Models page: the parsed SSOT rows (structured or the
+    legacy migration view, labeled by ``source``), the real row limits, and
+    the D22 last-execution projection keyed by slot_id — what each saved row
+    REALLY ran as last time (the UI face of capability_delta). A malformed
+    structured value comes back as a typed ``config_error`` instead of a 500:
+    the page must render the error beside the editor that can fix it.
+    """
+    from ouroboros.reviewer_slot_config import (
+        SCOPE_SLOT_LIMIT,
+        TRIAD_SLOT_LIMIT,
+        load_reviewer_slot_config,
+        reviewer_slot_last_executions,
+    )
+
+    payload: Dict[str, Any] = {
+        "limits": {"triad": TRIAD_SLOT_LIMIT, "scope": SCOPE_SLOT_LIMIT, "advisory": 1},
+        "last_executions": reviewer_slot_last_executions(),
+    }
+    try:
+        config = load_reviewer_slot_config()
+    except ValueError as exc:
+        payload["config_error"] = str(exc)
+        return JSONResponse(payload)
+    # The route object must round-trip profile_id (the Q2 manual credential
+    # pin), or a save after a load silently wipes the owner's pin — reversible
+    # by design, but the round-trip must be honest.
+    def _row(r):
+        route = {"kind": r.kind, "target_id": r.target_id}
+        if r.profile_id:
+            route["profile_id"] = r.profile_id
+        return {"slot_id": r.slot_id, "route": route, "effort": r.effort}
+
+    payload["source"] = config.source
+    payload["triad"] = [_row(r) for r in config.triad]
+    payload["scope"] = [_row(r) for r in config.scope]
+    advisory_route = {"kind": config.advisory.kind, "target_id": config.advisory.target_id}
+    if config.advisory.profile_id:
+        advisory_route["profile_id"] = config.advisory.profile_id
+    payload["advisory"] = {
+        "enabled": config.advisory.enabled,
+        "route": advisory_route,
+        "effort": config.advisory.effort,
+    }
+    return JSONResponse(payload)
+
+
 async def api_settings_get(request: Request) -> JSONResponse:
     settings, _, _ = apply_runtime_provider_defaults(load_settings())
     safe = {k: v for k, v in settings.items()}
@@ -1127,6 +1212,19 @@ async def api_settings_post(request: Request) -> JSONResponse:
             raw_cadence = str(body.get(cadence_key) or "").strip()
             if raw_cadence and not _config.is_valid_post_task_evolution_cadence(raw_cadence):
                 return json_error(f"{cadence_key} must be one of: off, llm, every_n:<positive int>.", 400)
+        # Reviewer-slot SSOT (6.1): refuse a malformed structured value AT SAVE
+        # TIME with its row-precise reason — persisting it would make every
+        # review surface block later with the same message but a worse moment.
+        # Reviewer-slot SSOT (6.1): refuse a malformed structured value with 400;
+        # disclose (never block, recommendation A) the all-delegated API fallback
+        # (D4) from the INCOMING value. Both live in reviewer_slot_save_check.
+        _reviewer_fallback_warning = ""
+        if str(body.get("OUROBOROS_REVIEWER_SLOTS") or "").strip():
+            from ouroboros.reviewer_slot_config import reviewer_slot_save_check
+            try:
+                _reviewer_fallback_warning = reviewer_slot_save_check(str(body["OUROBOROS_REVIEWER_SLOTS"]))
+            except ValueError as exc:
+                return json_error(str(exc), 400)
         parsed_budget: dict[str, float] = {}
         for budget_key in BUDGET_SETTING_KEYS:
             if budget_key not in body:
@@ -1297,6 +1395,8 @@ async def api_settings_post(request: Request) -> JSONResponse:
             pass
 
         warnings = []
+        if _reviewer_fallback_warning:
+            warnings.append(_reviewer_fallback_warning)
         if provider_defaults_changed:
             change_kind = classify_runtime_provider_change(old_effective_settings, current)
             if change_kind == "direct_normalize":
@@ -1366,10 +1466,9 @@ async def api_settings_post(request: Request) -> JSONResponse:
             resp["context_mode_downgraded"] = True
             resp["notice"] = _max_downgrade_notice
         if any(k.startswith("OUROBOROS_SCOPE_REVIEW_MODEL") or k == "OUROBOROS_REVIEW_MODELS"
-               for k in all_changed):
+               or k == "OUROBOROS_REVIEWER_SLOTS" for k in all_changed):
             _unknown = _unrecognised_review_models(
-                str(current.get("OUROBOROS_SCOPE_REVIEW_MODELS") or "").replace(",", " ").split()
-                + str(current.get("OUROBOROS_REVIEW_MODELS") or "").replace(",", " ").split()
+                _candidate_scope_models(current) + _candidate_triad_models(current)
             )
             if _unknown:
                 warnings.append(
@@ -1385,7 +1484,8 @@ async def api_settings_post(request: Request) -> JSONResponse:
         # the model alone left the next scope review at the conservative sub-floor with
         # the advertised owner-ack path unreachable.
         if any(
-            k.startswith("OUROBOROS_SCOPE_REVIEW_MODEL") or k in _REVIEW_ROUTE_BASE_URL_KEYS
+            k.startswith("OUROBOROS_SCOPE_REVIEW_MODEL") or k == "OUROBOROS_REVIEWER_SLOTS"
+            or k in _REVIEW_ROUTE_BASE_URL_KEYS
             for k in all_changed
         ):
             _capability_notices = _review_capability_notices(current)

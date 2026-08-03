@@ -1025,7 +1025,7 @@ def test_claude_sdk_reserves_max_budget_and_settles_actual(data_root, monkeypatc
     monkeypatch.setattr(cc, "ClaudeSDKClient", Client)
     monkeypatch.setattr(cc, "ResultMessage", Result)
 
-    result = asyncio.run(cc._run_edit_async("do work", str(data_root), budget=2.0))
+    result = asyncio.run(cc._run_readonly_async("do work", str(data_root), max_budget_usd=2.0))
     assert result.success is True
     assert result.usage["ledger_attempt_ids"]
     projection = ua.usage_projection(data_root)

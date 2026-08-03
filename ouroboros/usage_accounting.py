@@ -763,6 +763,8 @@ def record_subscription_session(
     reset_at: str = "",
     spend_usd: float | None = None,
     spend_estimated: bool = False,
+    credential_profile_id: str = "",
+    access_profile: str = "",
 ) -> str:
     """Idempotently record one subscription session on the sessions/quota axis.
 
@@ -839,6 +841,13 @@ def record_subscription_session(
         "source": str(source or bound.source or "delegated_subagent"),
         "subscription_route": route_id,
         "subscription_reset_at": str(reset_at or ""),
+        # D29: the APPLIED credential-profile id and access profile ride the
+        # durable row BY DEFAULT — the engine discloses which account and which
+        # access the deciding attempt actually ran under, and a subscription
+        # session that hides that cannot answer "which of my accounts paid".
+        # Empty means the engine reported none (default/native credentials).
+        "credential_profile_id": str(credential_profile_id or ""),
+        "access_profile": str(access_profile or ""),
         "session_id_sha256": identity,
     }
     return _append_single_settled_row(root, row, comparable=(

@@ -128,7 +128,6 @@ TOOL_POLICY: Dict[str, str] = {
     "advisory_review": POLICY_SKIP,
     "start_service": POLICY_CHECK_CONDITIONAL,
     "stop_service": POLICY_SKIP,
-    "claude_code_edit": POLICY_SKIP,
 
     # External skill surface.
     "list_skills": POLICY_SKIP,
@@ -624,8 +623,7 @@ def _resolve_safety_routing() -> Tuple[bool, bool, Optional[str]]:
 _UNCHECKED_WARNING_SUFFIX = (
     "The tool call was allowed so the agent is not hard-blocked on a misconfigured "
     "runtime — the hardcoded sandbox (registry.py SAFETY_CRITICAL_PATHS, mutative-git "
-    "via shell, gh repo/auth) still applies to every tool, and the claude_code_edit "
-    "post-execution revert still applies when the failing call is claude_code_edit."
+    "via shell, gh repo/auth) still applies to every tool."
 )
 
 

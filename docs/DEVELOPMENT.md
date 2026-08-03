@@ -65,11 +65,12 @@ When a Gateway exists, it should follow these guidelines:
 - Stateless where possible.
 
 **Existing Gateways:**
-- `ouroboros/gateways/claude_code.py` — Claude Agent SDK gateway. Two paths: `run_edit`
-  (edit mode) and `run_readonly` (advisory review, no mutating tools). Both pin the
+- `ouroboros/gateways/claude_code.py` — Claude Agent SDK gateway. One live path since
+  D10 retired the `claude_code_edit` tool: `run_readonly` (the api-route advisory review,
+  no mutating tools; `CLAUDE_CODE_MODEL` stays a backend setting for it). It pins the
   delegated trust surface — no settings/MCP config loaded from the target directory —
-  and enforce one derived tool allowlist plus read/write path confinement through
-  PreToolUse hooks. Structured `ClaudeCodeResult` output.
+  and enforces one derived tool allowlist plus read path confinement through PreToolUse
+  hooks. Structured `ClaudeCodeResult` output.
 - `ouroboros/gateways/claudexor.py` — Claudexor v3 control-plane gateway. Loopback
   discovery, protocol-major + minimum-version handshake, project registration, run
   start/poll/cancel. Typed refusals (`ClaudexorUnavailable`,
@@ -946,7 +947,7 @@ Before every commit, verify the following:
 - `run_script` temporary files are created under the active workspace when the task is workspace/executor-backed, then removed after execution. Do not run workspace scripts from the system repo temp path; relative imports, generated files, and toolchain discovery must observe the same cwd the user requested.
 - Declared process outputs may be files or directories. Directory outputs are copied to the canonical artifact store as a bounded manifest plus zip archive; hidden/control/credential-shaped files, excessive file counts, and excessive byte sizes fail closed instead of leaking through artifact registration.
 - In external workspace mode, light-mode self-repo dirty checks snapshot the system repo, not the active workspace. Task-local git operations inside the external workspace are allowed when the task requires them; Ouroboros repo/data paths remain structurally protected, and workspace patch artifacts are captured against the preflight git base.
-- `claude_code_edit` remains a first-class high-capability coding tool for substantial external artifacts; do not remove, hide, or downgrade it when refactoring Tool API names. It may run under external user/task/artifact cwd in direct light tasks, and under active workspace/task/artifact cwd in workspace tasks, while Ouroboros repo/control-plane cwd stays on the reviewed self-modification path. In docker executor-backed external workspaces, mapped active workspace cwd is blocked until a reviewed backend-safe Claude Code path exists; unmapped task/artifact/user cwd remains available where the active profile permits it. Use `outputs=[...]` when it creates deliverables that must be audited.
+- `claude_code_edit` is RETIRED (D10, owner-approved migration, phase 6.4): the SDK edit gateway's job moved to the delegated coding path — a mutating subagent (`schedule_subagent`) whose nanny drives the session with `delegate_start`/`delegate_wait`/`delegate_cancel`, on the owner's subscription when a harness route is configured. Compatibility is one-way and permanent: a saved task contract carrying `disabled_tools=["claude_code_edit"]` also withholds the successor `delegate_start` (registry `_disabled_tools`), and the frozen `GET /api/claude-code/status` + `POST /api/claude-code/install` endpoints stay — the Claude runtime still powers the api-route advisory review. Do not resurrect the tool name.
 - Do not recommend `runtime_data/uploads`, skill payloads, or owner state directories as generic artifact transport.
 
 #### Runtime Cleanup / Retention
@@ -1177,7 +1178,7 @@ Before every commit, verify the following:
 - [ ] Keep stable policy/governance first and dynamic evidence last. Prompt-cache support is deliberately narrow: direct OpenAI `prompt_cache_key`, OpenRouter `session_id` (or a caller-declared `cache_affinity` for surfaces whose rounds repeat with changing evidence, e.g. review), and one exact retry without the named parameter only when the provider explicitly rejects that parameter. Do not add provider hops, body rerouting, or a generic cache/retry framework.
 - [ ] **Cache-friendliness invariant.** Any change that builds or reorders prompt/context content must not degrade prompt caching: never insert dynamic values (timestamps, hashes, round counters, per-task identity) into a stable cached prefix, never move stable governance content behind dynamic evidence, and never strip or bypass existing `cache_control` markers / cache-affinity keys. Review surfaces mark their stable prefix via `review_helpers.cached_prompt_blocks` (block-level `cache_control` with the review TTL); the boundary each builder reports must contain only byte-stable content. The acceptance substrate (v6.74.0) marks TWO segments — byte-stable governance, then the task-stable contract (goal/scope/checklist/policy) — leaves the per-pass evidence tail unmarked (it changes every pass by design; the exact review binding is useless as a breakpoint because an unchanged binding never makes a second call), keeps slot identity at the TAIL of the mutable part, and asserts `review_substrate.assert_cache_breakpoint_cap` (≤4 declared breakpoints) on the final payload — reuse that assertion in new multi-segment builders. (v6.77.0) A builder no longer places tool markers or orders TTLs itself: `llm.LLMClient._normalize_payload_cache_ttl` finalizes the ASSEMBLED provider payload at every physical-send boundary — it promotes earlier existing breakpoints to `1h` when any later one asks for `1h` (Anthropic requires longer TTLs first; a 5m tools marker before a 1h system marker is a hard 400), marks the last tool schema when the tools segment carries none, and on a >4 payload keeps the four earliest anchors while dropping tail markers with a disclosed `prompt_cache_breakpoints_reduced` usage field. Declare your intended TTL on the blocks you own and let the finalizer order them; the assertion above remains the LOUD builder-side layer (the finalizer is the fail-soft transport guard), and routes that cannot carry markers are left byte-identical, so never re-add a per-builder marking site. This is checklist item `cache_friendliness` in `docs/CHECKLISTS.md`.
 - [ ] OpenRouter reasoning continuity belongs to OpenRouter conversations only. Direct/local payloads strip OpenRouter round-trip metadata; OpenRouter payloads with `reasoning_details` disable provider fallback to avoid endpoint-bound thought-signature corruption.
-- [ ] Claude Agent SDK edit prompts must preserve the full governance prompt. Use the gateway's system-prompt file handoff when the installed SDK exposes one; do not truncate BIBLE/ARCHITECTURE/DEVELOPMENT/CHECKLISTS to avoid argv or transport limits.
+- [ ] Claude Agent SDK sessions (the api-route advisory since D10 retired the edit gateway — the edit path's system-prompt file handoff died with it) must preserve the full governance prompt; do not truncate BIBLE/ARCHITECTURE/DEVELOPMENT/CHECKLISTS to avoid argv or transport limits.
 - [ ] Delegated (subscription-harness) work is accounted on its OWN ledger row:
   `usage_accounting.record_subscription_session`, which feeds the separate sessions/quota
   axis (`subscription_sessions` / `subscription_windows`). Its cash has THREE states and
@@ -1190,7 +1191,10 @@ Before every commit, verify the following:
   zero. Do NOT reuse `record_unmetered_external_dispatch` for any of them — it also drops
   the sessions/quota axis. The nanny's own model calls remain ordinary metered attempts
   and keep rolling into the task projection; a subscription session is not counted as a
-  physical provider call.
+  physical provider call. D29: the APPLIED `credential_profile_id` and `access_profile`
+  the engine's `authRoute` receipt / `effectiveAccess` disclosed ride the durable row (and
+  the settled event) BY DEFAULT — empty when telemetry predates the receipt, never
+  invented — so "which account paid, under which access" is answerable from the record.
 - [ ] `cost_final` on a projection is a COUNT of open rows (`non_final_rows`), never a
   truthiness test on a dollar sum: a reserved/dispatched/unresolved row, a settled row
   with an unknown price, and a settled row its writer marked non-final are each open

@@ -83,8 +83,8 @@ def test_summary_and_background_token_budgets():
         assert needle in src, f"{path} must contain {needle}"
 
 
-def test_claude_code_edit_sdk_max_turns():
-    """Edit and advisory paths must share the same default Claude Code turn budget (50)."""
+def test_claude_code_advisory_sdk_max_turns():
+    """The advisory path must use the shared default Claude Code turn budget (50)."""
     import ast
     from pathlib import Path
 
@@ -102,12 +102,9 @@ def test_claude_code_edit_sdk_max_turns():
                     found = True
     assert found, "DEFAULT_CLAUDE_CODE_MAX_TURNS not found in claude_code.py"
 
-    # Verify callers reference the shared constant
-    shell_src = Path("ouroboros/tools/shell.py").read_text(encoding="utf-8")
+    # Verify the surviving caller references the shared constant
     advisory_src = Path("ouroboros/tools/claude_advisory_review.py").read_text(encoding="utf-8")
-    assert "DEFAULT_CLAUDE_CODE_MAX_TURNS" in shell_src
     assert "DEFAULT_CLAUDE_CODE_MAX_TURNS" in advisory_src
-    assert "max_turns=25" not in shell_src
     assert "max_turns=8" not in advisory_src
 
 
@@ -456,7 +453,7 @@ def test_tool_timeout_uses_max_of_settings_and_per_tool():
 
     # settings says 600, per-tool says 1200 → should return 1200
     with patch.object(mod, "load_settings", return_value={"OUROBOROS_TOOL_TIMEOUT_SEC": 600}):
-        result = mod._get_tool_timeout(FakeTools(), "claude_code_edit")
+        result = mod._get_tool_timeout(FakeTools(), "run_command")
     assert result == 1200, f"Expected 1200 (per-tool), got {result}"
 
 

@@ -92,6 +92,11 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
             # the actor record and the substrate call agree on which row spoke.
             try:
                 scope_slots = list(scope_reviewer_slots() or [])
+            except ValueError:
+                # A malformed reviewer-slot configuration must surface as the
+                # typed infra failure it is — a silent single-row fallback here
+                # would spend API money on a row the owner never configured.
+                raise
             except Exception:
                 scope_slots = []
             # Fail-soft as before: a config lookup failure still runs ONE scope row
@@ -114,6 +119,9 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
                     scope_model=slot.model,
                     slot_id=slot.slot_id,
                     route=slot.route,
+                    slot_effort=slot.effort,
+                    session_target=slot.session_target,
+                    session_profile=getattr(slot, "session_profile", ""),
                 )
 
             with _cf.ThreadPoolExecutor(max_workers=min(len(scope_slots), 4)) as scope_pool:

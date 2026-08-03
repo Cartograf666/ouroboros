@@ -148,23 +148,20 @@ def test_registry_hides_missing_credential_tools(tmp_path, monkeypatch):
     reg = ToolRegistry(repo_dir=repo, drive_root=data)
     reg.set_context(ToolContext(repo_dir=repo, drive_root=data, task_id="task-missing-creds"))
 
-    assert "claude_code_edit" not in reg.available_tools()
-    assert reg.get_schema_by_name("claude_code_edit") is None
-    blocked = reg.execute("claude_code_edit", {"prompt": "edit"})
-    assert "CAPABILITY_UNAVAILABLE" in blocked
-    assert "ANTHROPIC_API_KEY" in blocked
-
+    assert "create_github_issue" not in reg.available_tools()
     assert reg.get_schema_by_name("create_github_issue") is None
     assert reg.get_schema_by_name("submit_skill_to_hub") is None
     assert reg.get_schema_by_name("generate_evolution_stats") is None
-    assert "CAPABILITY_UNAVAILABLE" in reg.execute("submit_skill_to_hub", {"skill": "x"})
+    blocked = reg.execute("submit_skill_to_hub", {"skill": "x"})
+    assert "CAPABILITY_UNAVAILABLE" in blocked
+    assert "GITHUB_TOKEN" in blocked
     assert "CAPABILITY_UNAVAILABLE" in reg.execute("generate_evolution_stats", {})
     reg.schemas()
     omissions = reg.capability_omissions()
     assert any(
         item.get("surface") == "tools"
         and item.get("reason") == "missing_credential"
-        and "claude_code_edit" in item.get("tools", [])
+        and "submit_skill_to_hub" in item.get("tools", [])
         for item in omissions
     )
 
@@ -219,6 +216,42 @@ def test_registry_arg_aliases_and_public_tool_arg_errors(tmp_path):
     assert "TOOL_ARG_ERROR (list_skills)" in result
     assert "Accepted parameters: none" in result
     assert "_kwargs" not in result
+
+
+def test_legacy_claude_code_edit_contract_also_disables_delegate_start(tmp_path, monkeypatch):
+    """D10 compatibility shim (registry `_disabled_tools`): a saved contract that
+    carried disabled_tools=["claude_code_edit"] — the retired external coding
+    gateway — must keep withholding the SUCCESSOR delegated-coding verb
+    `delegate_start`. The dead name itself stays in the disabled set too, so old
+    contracts round-trip and the dead name is blocked as disabled, not surfaced
+    as an unknown-tool surprise."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    reg = ToolRegistry(repo_dir=repo, drive_root=data)
+    # sanity: the successor exists by default
+    assert "delegate_start" in reg.available_tools()
+
+    contract = build_task_contract({"description": "x", "disabled_tools": ["claude_code_edit"]})
+    reg.set_context(ToolContext(repo_dir=repo, drive_root=data, task_metadata={"task_contract": contract}))
+
+    avail = set(reg.available_tools())
+    schema_names = {s["function"]["name"] for s in reg.schemas()}
+    assert "delegate_start" not in avail
+    assert "delegate_start" not in schema_names
+    assert reg.get_schema_by_name("delegate_start") is None
+    blocked = reg.execute("delegate_start", {"prompt": "x"})
+    assert "RESOURCE_CONSTRAINT_BLOCKED" in blocked and "disabled_tools" in blocked
+    # The legacy name is inert but still reported as withheld-by-contract.
+    dead = reg.execute("claude_code_edit", {"prompt": "x"})
+    assert "RESOURCE_CONSTRAINT_BLOCKED" in dead and "disabled_tools" in dead
+
+    # A contract that does NOT name claude_code_edit leaves delegate_start alone.
+    contract2 = build_task_contract({"description": "x", "disabled_tools": ["web_search"]})
+    reg.set_context(ToolContext(repo_dir=repo, drive_root=data, task_metadata={"task_contract": contract2}))
+    assert "delegate_start" in set(reg.available_tools())
 
 
 def test_subagent_inherits_disabled_tools():

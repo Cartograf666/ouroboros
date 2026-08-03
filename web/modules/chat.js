@@ -2267,7 +2267,16 @@ export function createChatInstance({
         if (summary.costProjection) {
             record.costMeta = mergeStickyCostMeta(record.costMeta, summary.costProjection);
         }
-        record.metaEl.innerHTML = [
+        // Phase 6 (owner directive #1): the executor chip is STICKY on the card —
+        // a later costless/quiet frame must not erase the fact that this bubble
+        // ran on a harness. Absent fact leaves it absent; no placeholder chip.
+        if (summary.executorChip) record.executorChip = summary.executorChip;
+        const executorChipHtml = record.executorChip
+            ? `<span class="harness-chip chat-live-executor-chip" title="${escapeHtml(record.executorChip.title || '')}">`
+              + `<span aria-hidden="true">${escapeHtml(record.executorChip.icon || '')}</span> `
+              + `${escapeHtml(record.executorChip.label || '')}</span>`
+            : '';
+        record.metaEl.innerHTML = executorChipHtml + [
             nextGroupId === 'bg-consciousness' ? 'Background thinking' : '',
             ...(Array.isArray(summary.meta) ? summary.meta : []),
             ...((record.costMeta && Array.isArray(record.costMeta.meta)) ? record.costMeta.meta : []),

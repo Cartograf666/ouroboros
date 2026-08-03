@@ -87,6 +87,12 @@ class ReviewSlot:
     # Delivery route for this slot. ``use_local`` above is the existing
     # precedent for a per-slot transport hint; ``route`` is the general axis.
     route: ReviewRouteKind = ReviewRouteKind.API_CHAT
+    # agent_session rows only: THIS row's opaque ``harness[=model]`` target
+    # (6.1 — every slot is independently harness-or-API). Empty falls back to
+    # the shared session-route key, which is the whole legacy behavior.
+    session_target: str = ""
+    # Optional manual credential pin (Q2-в); '' = the daemon's rotation (D28).
+    session_profile: str = ""
 
 
 @dataclass
@@ -900,8 +906,17 @@ def scope_reviewer_slots(models: List[str] | None = None, *, effort: str = "medi
     persists. One row therefore carries exactly one identity instead of two that
     disagree. Each row also carries its configured delivery route (D14: every
     scope slot is independently harness-or-API).
+
+    With no explicit ``models`` the rows come from the reviewer-slot SSOT
+    (6.1): stable owner ids, per-row route/target/effort. An explicit list
+    keeps the historical positional behavior for callers that rebuild one row.
     """
     if models is None:
+        from ouroboros.reviewer_slot_config import structured_scope_review_slots
+
+        structured = structured_scope_review_slots()
+        if structured is not None:
+            return structured
         # Resolved at call time so the configured list stays the live authority.
         from ouroboros.config import get_scope_review_models
 
@@ -1103,6 +1118,14 @@ class ReviewCoordinator:
         slot_order = {slot.slot_id: idx for idx, slot in enumerate(slots)}
         slots_by_id = {slot.slot_id: slot for slot in slots}
         actors.sort(key=lambda actor: slot_order.get(actor.slot_id, len(slot_order)))
+        try:
+            # «Выполняется как» (D22): beside each saved row the UI shows what
+            # the row REALLY ran as last time. Disclosure only; best-effort.
+            from ouroboros.reviewer_slot_config import record_reviewer_slot_executions
+
+            record_reviewer_slot_executions(request.surface, actors, slots_by_id)
+        except Exception:
+            log.debug("reviewer-slot last-execution write failed", exc_info=True)
 
         all_findings: List[Dict[str, Any]] = []
         # Split participation faults (a slot errored / timed out / returned empty)

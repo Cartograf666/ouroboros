@@ -741,7 +741,7 @@ def _mutating_run_root(ctx: ToolContext, authority: "DelegatedRunShape") -> tupl
     task record missing its workspace fields. In that state the host would have handed an
     external shell `workspace_write` + `live` on its own repository, and every per-tool
     guard is irrelevant because the harness is a shell, not a tool. The registry already
-    hard-blocks `write_file`/`run_command`/`claude_code_edit` in exactly that state; this
+    hard-blocks `write_file`/`run_command` and their coding siblings in exactly that state; this
     verb was simply not on the list.
 
     A mutating run therefore requires an ACTIVE workspace whose root is the very

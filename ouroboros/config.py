@@ -201,6 +201,7 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_GENERATIVE_PROBE_CHARS": "5000000",
     # Pre-commit review: comma-separated provider-tagged model list
     "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.6-luna,google/gemini-3.6-flash,anthropic/claude-sonnet-5",
+    "OUROBOROS_REVIEWER_SLOTS": "",  # structured slot SSOT (reviewer_slot_config.py); "" = legacy comma keys
     # Pre-commit review enforcement: advisory | blocking
     "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
     # Auto-grant reviewed-skill requests by default; grants stay bound to the
@@ -1572,12 +1573,11 @@ def apply_settings_to_env(settings: dict) -> None:
             os.environ.pop(k, None)
         else:
             os.environ[k] = str(val)
-    if not os.environ.get("OUROBOROS_REVIEW_MODELS"):
-        os.environ["OUROBOROS_REVIEW_MODELS"] = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"])
+    # Reviewer-model floors moved into the structured-slot projection (6.1):
+    from ouroboros.reviewer_slot_config import project_reviewer_slots_into_env
+    project_reviewer_slots_into_env()
     if not os.environ.get("OUROBOROS_REVIEW_ENFORCEMENT"):
         os.environ["OUROBOROS_REVIEW_ENFORCEMENT"] = str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_ENFORCEMENT"])
-    if not os.environ.get("OUROBOROS_SCOPE_REVIEW_MODELS") and not os.environ.get("OUROBOROS_SCOPE_REVIEW_MODEL"):
-        os.environ["OUROBOROS_SCOPE_REVIEW_MODELS"] = str(SETTINGS_DEFAULTS["OUROBOROS_SCOPE_REVIEW_MODELS"])
     if not os.environ.get("OUROBOROS_TASK_REVIEW_MODE"):
         os.environ["OUROBOROS_TASK_REVIEW_MODE"] = str(SETTINGS_DEFAULTS["OUROBOROS_TASK_REVIEW_MODE"])
 

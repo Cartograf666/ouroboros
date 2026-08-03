@@ -1015,6 +1015,9 @@ def _call_scope_llm(
     route: Any = None,
     session_task: str = "",
     session_root: str = "",
+    slot_effort: str = "",
+    session_target: str = "",
+    session_profile: str = "",
 ) -> tuple:
     """Execute the scope review call synchronously — api pack or agent session.
 
@@ -1032,7 +1035,8 @@ def _call_scope_llm(
     from ouroboros.review_execution import ReviewRouteKind
 
     scope_model = scope_model or _get_scope_model()
-    scope_effort = _resolve_effort("scope_review")
+    # 6.1/6.3: the row's own effort wins; the global key stays the default.
+    scope_effort = slot_effort or _resolve_effort("scope_review")
     delegated = str(getattr(route, "value", route) or "") == "agent_session"
     # Output budget scales with the reviewer window: requesting the absolute
     # 100K reserve on a small-window model would 400 on input+max_tokens.
@@ -1100,9 +1104,15 @@ def _call_scope_llm(
             timeout_sec=_SCOPE_REVIEW_SLOT_TIMEOUT_SEC,
             max_tokens=_scope_output_tokens,
             temperature=0.2,
-            # ROUTE is CARRIED, never re-derived: a one-element slot list re-reads ROUTES
-            # **row 1**, which sent a mixed config's api row as agent_session (pack, no task).
+            # ROUTE is CARRIED, never re-derived: the one-element slot list above
+            # re-reads ROUTES **row 1**, which sent a mixed config's api row as
+            # agent_session (pack, no task) — the caller's fanned-out route is the
+            # authority (p5x XG fix, kept through the 6.1 threading).
             route=ReviewRouteKind.AGENT_SESSION if delegated else ReviewRouteKind.API_CHAT,
+            # The fanned-out row's own session target (6.1); '' keeps the
+            # shared session-route fallback.
+            session_target=session_target if delegated else "",
+            session_profile=session_profile if delegated else "",
         )
         result = run_review_request(
             request,
@@ -1134,23 +1144,9 @@ def _call_scope_llm(
         return "", None, error_msg
 
 
-_PROVIDER_OVERSIZE_MARKERS = (
-    # Anthropic: "prompt is too long: 1166914 tokens > 1000000 maximum"
-    "prompt is too long",
-    # Anthropic: "input length and `max_tokens` exceed context limit"
-    "exceed context limit",
-    # OpenAI error code + message variants
-    "context_length_exceeded",
-    "maximum context length",
-)
-
-
-def _is_provider_oversize_error(error_text: str) -> bool:
-    """Mechanical fault classification: does this provider error mean the prompt
-    exceeded the model's REAL context window? Deliberately tight markers — any
-    other provider/transport error keeps the fail-closed blocking path."""
-    low = str(error_text or "").lower()
-    return any(marker in low for marker in _PROVIDER_OVERSIZE_MARKERS)
+# Provider-oversize fault classification moved to triad_review (shared review
+# primitive); the alias keeps this module's historical name for its two readers.
+from ouroboros.triad_review import is_provider_oversize_error as _is_provider_oversize_error  # noqa: E402
 
 
 def _provider_error_is_oversize(usage: dict, prompt_tokens_est: int, scope_model: str) -> bool:
@@ -1408,6 +1404,9 @@ def run_scope_review(
     scope_model: Optional[str] = None,
     slot_id: str = "",  # identity of the configured row this call runs (see scope_reviewer_slots)
     route: Any = None,  # the row's configured delivery (ReviewRouteKind); None/api_chat = api
+    slot_effort: str = "",  # the row's own effort (6.1); "" = global scope_review effort
+    session_target: str = "",  # the row's own harness[=model] target; "" = shared route
+    session_profile: str = "",  # optional credential pin (Q2-в); "" = rotation
 ) -> ScopeReviewResult:
     """Run the blocking scope review, or record the owner-declared low-mode skip."""
     if _scope_review_skipped_in_low_context():
@@ -1482,6 +1481,8 @@ def run_scope_review(
     raw_text, usage, llm_error = _call_scope_llm(
         prompt, scope_model=scope_model_id, ctx=ctx, slot_id=slot_id,
         route=route, session_task=session_task, session_root=str(repo_dir),
+        slot_effort=slot_effort, session_target=session_target,
+        session_profile=session_profile,
     )  # type: ignore[arg-type]
     _usage = dict(usage or {})
     _review_refs = dict(_usage.pop("_review_refs", {}) or {})

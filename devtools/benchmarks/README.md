@@ -90,8 +90,10 @@ All committed bench settings templates share these disclosed defaults:
   without workspace isolation against a live repo, so pro would grant benchmark
   prompts write authority over the system body.
 - `claude_code_edit` disabled in every bench solve task — benches measure the
-  single-model Ouroboros harness; the embedded Claude-Code delegate is a
-  separate experiment.
+  single-model Ouroboros harness; external coding delegates are a separate
+  experiment. (D10 retired the tool itself; the legacy name in these configs
+  stays meaningful because `disabled_tools=["claude_code_edit"]` also withholds
+  the successor `delegate_start`.)
 
 Per-bench METHODOLOGY files carry the full rationale.
 

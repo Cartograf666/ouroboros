@@ -101,9 +101,37 @@ def operator_home() -> pathlib.Path:
 
 
 def discover_daemon(home: Optional[pathlib.Path] = None) -> DaemonEndpoint:
-    """Read ``~/.claudexor/v3/daemon/control-api.json`` plus the referenced token."""
+    """Read the daemon descriptor plus the referenced token.
+
+    With an explicit ``home`` this reads that home's ``~/.claudexor/v3`` layout
+    verbatim. With none, the OWNED daemon is preferred WHEN PROVISIONED (D30):
+    once Ouroboros has spawned its own daemon under the data-plane config dir,
+    every default discovery — delegated subagents, review sessions, the account
+    surfaces — talks to that one, and the operator's personal daemon is left
+    alone. An unprovisioned owned home falls through to the operator layout,
+    which is the entire pre-D30 behavior; the cutover is the owner's own
+    provisioning action, never a silent boot-time switch.
+    """
+    if home is None:
+        from ouroboros.claudexor_daemon import owned_daemon_provisioned, owned_descriptor_path
+
+        if owned_daemon_provisioned():
+            return _endpoint_from_descriptor(owned_descriptor_path())
     root = pathlib.Path(home) if home is not None else operator_home()
-    control_path = root / CONTROL_API_REL
+    return _endpoint_from_descriptor(root / CONTROL_API_REL)
+
+
+def discover_daemon_at(config_dir: pathlib.Path) -> DaemonEndpoint:
+    """Discovery for an explicit ``CLAUDEXOR_CONFIG_DIR`` root.
+
+    Under an override the override IS the complete relocatable root, so the
+    descriptor lives at ``<config_dir>/daemon/control-api.json`` — a different
+    shape from the default ``~/.claudexor/v3`` layout ``discover_daemon`` reads.
+    """
+    return _endpoint_from_descriptor(pathlib.Path(config_dir) / "daemon" / "control-api.json")
+
+
+def _endpoint_from_descriptor(control_path: pathlib.Path) -> DaemonEndpoint:
     try:
         raw = json.loads(control_path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -404,6 +432,66 @@ class ClaudexorGateway:
         body = self._request("POST", f"/v2/runs/{run_id}/control", json_body={"control": control})
         return body if isinstance(body, dict) else {}
 
+    # -- account surfaces (D30: read/translate only; the daemon owns ALL auth
+    # logic — profiles, login jobs, device-code custody, verification) ---------
+
+    def credential_profiles(self) -> Dict[str, Any]:
+        """GET /v2/credential-profiles — profiles + per-harness native rows.
+
+        The daemon's payload already distinguishes the two verification
+        truths the UI must show honestly (Q2-а): ``verification_source``
+        ``local_store`` (material present, liveness UNPROVEN) vs ``vendor``
+        (the vendor answered a request with this credential)."""
+        body = self._request("GET", "/v2/credential-profiles")
+        return body if isinstance(body, dict) else {}
+
+    def create_credential_profile(self, harness_id: str, profile_id: str,
+                                  display_name: str = "") -> Dict[str, Any]:
+        request: Dict[str, Any] = {"harnessId": str(harness_id), "profileId": str(profile_id)}
+        if display_name:
+            request["displayName"] = str(display_name)
+        body = self._request(
+            "POST", "/v2/credential-profiles", json_body=request,
+            headers={"Idempotency-Key": uuid.uuid4().hex},
+        )
+        return body if isinstance(body, dict) else {}
+
+    def harness_models(self, harness_id: str) -> List[Dict[str, Any]]:
+        """GET /v2/harnesses/:id/models — the discovered model list (owner
+        directive: models are a dropdown fed by discovery, never free input)."""
+        from urllib.parse import quote
+
+        body = self._request("GET", f"/v2/harnesses/{quote(str(harness_id), safe='')}/models")
+        models = body.get("models") if isinstance(body, dict) else None
+        return [row for row in (models or []) if isinstance(row, dict)]
+
+    def setup_job_create(self, request: Dict[str, Any], *, idempotency_key: str = "") -> Dict[str, Any]:
+        body = self._request(
+            "POST", "/v2/setup/jobs", json_body=dict(request),
+            headers={"Idempotency-Key": str(idempotency_key or "") or uuid.uuid4().hex},
+        )
+        return body if isinstance(body, dict) else {}
+
+    def setup_job_snapshot(self, job_id: str) -> Dict[str, Any]:
+        """The job snapshot, device-code disclosure included — a transient
+        read-time projection the daemon never journals."""
+        from urllib.parse import quote
+
+        body = self._request("GET", f"/v2/setup/jobs/{quote(str(job_id), safe='')}/snapshot")
+        return body if isinstance(body, dict) else {}
+
+    def setup_job_cancel(self, job_id: str) -> Dict[str, Any]:
+        from urllib.parse import quote
+
+        body = self._request("POST", f"/v2/setup/jobs/{quote(str(job_id), safe='')}/cancel")
+        return body if isinstance(body, dict) else {}
+
+    def patch_settings(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /v2/settings — the daemon's own live settings patch (used once
+        at provisioning to turn on profile rotation, D28)."""
+        body = self._request("POST", "/v2/settings", json_body=dict(request))
+        return body if isinstance(body, dict) else {}
+
 
 # -- applied-fact artifacts ----------------------------------------------------
 
@@ -490,6 +578,7 @@ __all__ = [
     "DaemonEndpoint",
     "attempt_containment",
     "discover_daemon",
+    "discover_daemon_at",
     "engine_at_least",
     "operator_home",
 ]

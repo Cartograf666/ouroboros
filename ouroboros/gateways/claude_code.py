@@ -1,8 +1,10 @@
-"""Claude Agent SDK transport for edit and read-only advisory paths.
+"""Claude Agent SDK transport for the read-only advisory path.
 
 Callers own orchestration and validation. This layer keeps SDK hooks,
 ANTHROPIC_API_KEY auth, bundled CLI resolution, stderr capture, and no
-CLI fallback when the SDK is missing.
+CLI fallback when the SDK is missing. The edit half (`run_edit` /
+`claude_code_edit`) was retired by the owner-approved D10 migration
+(phase 6.4); delegated coding rides the subagent lane now.
 """
 
 from __future__ import annotations
@@ -18,17 +20,12 @@ import re
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from ouroboros.config import get_runtime_mode
 from ouroboros.runtime_mode_policy import (
     SAFETY_CRITICAL_PATHS,
-    is_protected_runtime_path,
-    mode_allows_protected_write,
-    protected_write_block_message,
 )
 from ouroboros.usage_accounting import (
     AttemptRequest,
@@ -62,7 +59,6 @@ _READONLY_CHILD_TIMEOUT_SEC = 900
 # DERIVED from it, so a tool added by a future CLI/SDK release, or an `mcp__*`
 # tool injected by a foreign config, arrives denied instead of enabled.
 READONLY_TOOLS = ("Read", "Grep", "Glob")
-EDIT_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob")
 # Named for the CLI's own deny list (defense in depth behind the closed base
 # surface and the hook). `Agent`/`Task` spawn a subagent whose tool surface and
 # hooks we do not control, so they are never delegated. Only names the CLI
@@ -106,79 +102,6 @@ def clear_stderr_buffer() -> None:
     """Clear captured CLI stderr."""
     with _stderr_lock:
         _stderr_buffer.clear()
-
-
-def _materialize_system_prompt_file(system_prompt: Optional[str]) -> Optional[pathlib.Path]:
-    if not system_prompt:
-        return None
-    temp_dir = pathlib.Path(tempfile.mkdtemp(prefix="ouroboros-claude-system-"))
-    try:
-        temp_dir.chmod(0o700)
-    except OSError:
-        pass
-    prompt_path = temp_dir / "system_prompt.md"
-    prompt_path.write_text(system_prompt, encoding="utf-8")
-    try:
-        prompt_path.chmod(0o600)
-    except OSError:
-        pass
-    return prompt_path
-
-
-def _cleanup_system_prompt_file(prompt_path: Optional[pathlib.Path]) -> None:
-    if prompt_path is None:
-        return
-    try:
-        prompt_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-    try:
-        prompt_path.parent.rmdir()
-    except OSError:
-        pass
-
-
-def _claude_options_has_explicit_param(name: str) -> bool:
-    import inspect
-
-    try:
-        sig = inspect.signature(ClaudeAgentOptions.__init__)
-    except (TypeError, ValueError):
-        return False
-    return name in sig.parameters
-
-
-def _system_prompt_file_value(prompt_path: pathlib.Path) -> Any:
-    sdk_module = sys.modules.get("claude_agent_sdk")
-    prompt_file_cls = getattr(sdk_module, "SystemPromptFile", None) if sdk_module else None
-    if prompt_file_cls is None:
-        return None
-    for factory in (
-        lambda: prompt_file_cls(path=str(prompt_path)),
-        lambda: prompt_file_cls(str(prompt_path)),
-    ):
-        try:
-            return factory()
-        except TypeError:
-            continue
-    return None
-
-
-def _system_prompt_option_kwargs(
-    system_prompt: Optional[str],
-    prompt_path: Optional[pathlib.Path],
-) -> Dict[str, Any]:
-    if not system_prompt:
-        return {}
-    if prompt_path is not None:
-        if _claude_options_has_explicit_param("system_prompt_file"):
-            return {"system_prompt_file": str(prompt_path)}
-        if _claude_options_has_explicit_param("system_prompt_path"):
-            return {"system_prompt_path": str(prompt_path)}
-        prompt_file_value = _system_prompt_file_value(prompt_path)
-        if prompt_file_value is not None and _claude_options_has_explicit_param("system_prompt"):
-            return {"system_prompt": prompt_file_value}
-    return {"system_prompt": system_prompt}
 
 
 SAFETY_CRITICAL = SAFETY_CRITICAL_PATHS
@@ -317,6 +240,16 @@ def _settle_sdk_attempt(reservation: Any, result: ClaudeCodeResult, reported_cos
             log.exception("Failed to mark Claude SDK settlement unresolved")
 
 
+def _claude_options_has_explicit_param(name: str) -> bool:
+    import inspect
+
+    try:
+        sig = inspect.signature(ClaudeAgentOptions.__init__)
+    except (TypeError, ValueError):
+        return False
+    return name in sig.parameters
+
+
 def _deny(reason: str) -> dict:
     """Return a PreToolUse deny decision."""
     return {
@@ -407,89 +340,6 @@ def _resolved(value: Any, base: Optional[pathlib.Path] = None) -> Optional[pathl
         return None
 
 
-def make_path_guard(
-    cwd: str,
-    repo_root: str | None = None,
-    *,
-    protect_runtime_paths: bool = True,
-    write_path_blocker: Callable[[pathlib.Path], str] | None = None,
-):
-    """Block SDK writes outside cwd or runtime-protected paths."""
-    cwd_resolved = pathlib.Path(cwd).resolve()
-    repo_root_resolved = pathlib.Path(repo_root).resolve() if repo_root else None
-
-    async def path_guard(input_data: Any, tool_use_id: str, context: Any) -> dict:
-        tool_name, tool_input = _hook_tool_call(input_data)
-
-        if tool_name not in ("Edit", "Write", "MultiEdit"):
-            return {}
-        if not isinstance(tool_input, dict):
-            # Inputs we cannot read are inputs we cannot confine, and this fence's
-            # contract is that no write leaves `cwd`. Same posture as an unresolvable
-            # path: unusable input is a DENY, never a silent pass.
-            return _deny(
-                f"SAFETY: Write blocked — {tool_name} inputs arrived as "
-                f"{type(tool_input).__name__}, so the target path cannot be confined."
-            )
-
-        file_path = tool_input.get("file_path", "") or tool_input.get("path", "")
-        if not file_path:
-            return {}
-
-        target = _resolved(file_path, cwd_resolved)
-        if target is None:
-            return _deny(
-                f"SAFETY: Write blocked — target path '{file_path}' cannot be resolved."
-            )
-
-        try:
-            target.relative_to(cwd_resolved)
-        except ValueError:
-            return _deny(
-                f"SAFETY: Write blocked — target path '{file_path}' "
-                f"resolves outside the allowed working directory '{cwd}'."
-            )
-        if write_path_blocker is not None:
-            block_reason = write_path_blocker(target)
-            if block_reason:
-                return _deny(
-                    "SAFETY: Write blocked — target path "
-                    f"'{file_path}' is not allowed for this edit root: {block_reason}."
-                )
-
-        # Prefer repo-root relative paths so subdir cwd still hits protection tables.
-        rel = target.relative_to(cwd_resolved).as_posix()
-        if repo_root_resolved is not None:
-            try:
-                rel = target.relative_to(repo_root_resolved).as_posix()
-            except ValueError:
-                pass
-        try:
-            from ouroboros.config import DATA_DIR
-            from ouroboros.tools.core import is_skill_control_plane_path
-
-            if is_skill_control_plane_path(target, pathlib.Path(DATA_DIR).resolve(strict=False)):
-                return _deny(
-                    "SAFETY: Write blocked — skill provenance, "
-                    "launcher seed, marketplace, dependency, and "
-                    "self-authored markers are control-plane state."
-                )
-        except Exception:
-            log.debug("Claude Code skill control-plane guard probe failed", exc_info=True)
-        try:
-            runtime_mode = get_runtime_mode()
-        except Exception:
-            runtime_mode = "advanced"
-        if protect_runtime_paths and is_protected_runtime_path(rel) and not mode_allows_protected_write(runtime_mode):
-            return _deny(protected_write_block_message(
-                path=rel,
-                runtime_mode=runtime_mode,
-                action="delegate-edit",
-            ))
-
-        return {}
-
-    return path_guard
 
 
 def make_tool_allowlist_guard(allowed_tools):
@@ -639,113 +489,6 @@ def _tool_surface_kwargs(allowed_tools) -> Dict[str, Any]:
     if _claude_options_has_explicit_param("tools"):
         kwargs["tools"] = list(permitted)
     return kwargs
-
-
-async def _run_edit_async(
-    prompt: str,
-    cwd: str,
-    model: str = "opus",
-    max_turns: int = DEFAULT_CLAUDE_CODE_MAX_TURNS,
-    budget: Optional[float] = None,
-    system_prompt: Optional[str] = None,
-    repo_root: Optional[str] = None,
-    protect_runtime_paths: bool = True,
-    write_path_blocker: Callable[[pathlib.Path], str] | None = None,
-) -> ClaudeCodeResult:
-    """Run edit-mode SDK with safety hooks."""
-    path_guard = make_path_guard(
-        cwd,
-        repo_root=repo_root,
-        protect_runtime_paths=protect_runtime_paths,
-        write_path_blocker=write_path_blocker,
-    )
-    clear_stderr_buffer()
-
-    system_prompt_file = _materialize_system_prompt_file(system_prompt)
-    options_kwargs: Dict[str, Any] = dict(
-        cwd=cwd,
-        model=model,
-        permission_mode="acceptEdits",
-        max_turns=max_turns,
-        max_budget_usd=budget,
-        stderr=_stderr_callback,
-        hooks={
-            "PreToolUse": [
-                HookMatcher(hooks=[make_tool_allowlist_guard(EDIT_TOOLS)]),
-                HookMatcher(
-                    matcher="Read|Grep|Glob",
-                    hooks=[make_read_guard(cwd, extra_roots=(repo_root,))],
-                ),
-                HookMatcher(matcher="Edit|Write|MultiEdit", hooks=[path_guard]),
-            ],
-        },
-        **_tool_surface_kwargs(EDIT_TOOLS),
-    )
-    options_kwargs.update(_system_prompt_option_kwargs(system_prompt, system_prompt_file))
-
-    result = ClaudeCodeResult(success=True)
-    text_parts: List[str] = []
-    accounting = None
-    accounting_dispatched = False
-
-    try:
-        options = ClaudeAgentOptions(**options_kwargs)
-        async with ClaudeSDKClient(options=options) as client:
-            accounting = _reserve_sdk_attempt(
-                prompt, model, max_budget_usd=budget, source="claude_code.edit",
-            )
-            accounting_dispatched = True
-            await client.query(prompt)
-            async for message in client.receive_response():
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if hasattr(block, "text") and block.text:
-                            text_parts.append(block.text)
-                elif isinstance(message, ResultMessage):
-                    result.session_id = getattr(message, "session_id", "") or ""
-                    reported_cost = getattr(message, "total_cost_usd", None)
-                    result.cost_usd = float(reported_cost or 0)
-                    usage = getattr(message, "usage", None)
-                    result.usage = _normalize_sdk_usage(usage)
-                    _settle_sdk_attempt(accounting, result, reported_cost)
-                    accounting_dispatched = False
-                    subtype = getattr(message, "subtype", "")
-                    if subtype and subtype != "success":
-                        result.success = False
-                        result.error = f"Agent ended with subtype: {subtype}"
-                    elif getattr(message, "is_error", False):
-                        # The CLI reports hard API failures (auth/org rejection,
-                        # connection death) as subtype="success" with
-                        # is_error=True and the error text in `result`. Honor
-                        # is_error so these surface as transport failures
-                        # (ADVISORY_ERROR / status="error"), not parse_failure.
-                        result.success = False
-                        error_text = str(getattr(message, "result", "") or "").strip()
-                        result.error = (
-                            "CLI reported an error result (is_error=true): "
-                            + (error_text[:500] or "(no error text)")
-                        )
-                    break
-            if accounting_dispatched:
-                mark_unresolved(accounting, "Claude SDK stream ended without ResultMessage")
-                accounting_dispatched = False
-    except UsageAccountingError:
-        raise
-    except Exception as e:
-        if accounting is not None and accounting_dispatched:
-            try:
-                mark_unresolved(accounting, f"{type(e).__name__}: {e}")
-            except Exception:
-                log.exception("Failed to mark Claude SDK edit attempt unresolved")
-        result.success = False
-        result.error = f"{type(e).__name__}: {e}"
-    finally:
-        _cleanup_system_prompt_file(system_prompt_file)
-
-    if not result.success:
-        result.stderr_tail = get_last_stderr()
-    result.result_text = "\n".join(text_parts) if text_parts else "(no output)"
-    return result
 
 
 async def _run_readonly_async(
@@ -1059,31 +802,6 @@ def _run_readonly_out_of_process(
         error=error,
         stderr_tail=stderr[-4000:],
     )
-
-
-def run_edit(
-    prompt: str,
-    cwd: str,
-    model: str = "opus[1m]",
-    max_turns: int = DEFAULT_CLAUDE_CODE_MAX_TURNS,
-    budget: Optional[float] = None,
-    system_prompt: Optional[str] = None,
-    repo_root: Optional[str] = None,
-    protect_runtime_paths: bool = True,
-    write_path_blocker: Callable[[pathlib.Path], str] | None = None,
-) -> ClaudeCodeResult:
-    """Synchronous edit-mode SDK entry point."""
-    return _run_async(_run_edit_async(
-        prompt=prompt,
-        cwd=cwd,
-        model=model,
-        max_turns=max_turns,
-        budget=budget,
-        system_prompt=system_prompt,
-        repo_root=repo_root,
-        protect_runtime_paths=protect_runtime_paths,
-        write_path_blocker=write_path_blocker,
-    ))
 
 
 def resolve_claude_code_model(default: str = "opus[1m]") -> str:

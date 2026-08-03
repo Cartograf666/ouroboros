@@ -1,5 +1,7 @@
 import { renderPageHeader, renderSegmentedField, renderTabStrip } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
+import { renderHarnessAccountsSection } from './harness_accounts.js';
+import { renderReviewerSlotsSection } from './reviewer_slots.js';
 
 const SETTINGS_TABS = [
     { value: 'providers', label: 'Providers' },
@@ -20,11 +22,11 @@ const MODEL_CARDS = [
     ['Fallback', 'Resilience and degraded path (comma-separated chain).', 's-model-fallback', 's-local-fallback', 'openai/gpt-5.6-luna'],
 ];
 
+// 6.3: Review and Scope Review efforts moved to per-slot dropdowns on the
+// Models page (Reviewer Slots). Behavior keeps the surface-level lanes.
 const EFFORT_FIELDS = [
     ['s-effort-task', 'Task / Chat', 'medium'],
     ['s-effort-evolution', 'Evolution', 'high'],
-    ['s-effort-review', 'Review', 'high'],
-    ['s-effort-scope-review', 'Scope Review', 'high'],
     ['s-effort-deep-self-review', 'Deep Self-Review', 'high'],
     ['s-effort-consciousness', 'Consciousness', 'high'],
 ];
@@ -112,7 +114,7 @@ const PROVIDER_CARDS = [
                 <button type="button" class="settings-ghost-btn" id="btn-claude-code-install">Repair Runtime</button>
                 <span id="settings-claude-code-status" class="settings-inline-status">Checking Claude runtime...</span>
             </div>
-            <div class="settings-inline-note" id="settings-claude-code-copy" hidden>Claude runtime powers delegated code editing and advisory review. It is managed automatically by the app.</div>
+            <div class="settings-inline-note" id="settings-claude-code-copy" hidden>Claude runtime powers the advisory pre-review on the API route. It is managed automatically by the app.</div>
         `,
     },
 ];
@@ -271,6 +273,7 @@ export function renderSettingsPage() {
                             ${PROVIDER_CARDS.filter((card) => card.advanced).map(providerSettingsCard).join('')}
                         </div>
                     </details>
+                    ${renderHarnessAccountsSection()}
                     <div class="form-section compact">
                         <h3>Legacy Compatibility</h3>
                         <div class="form-row">
@@ -319,31 +322,13 @@ export function renderSettingsPage() {
                         <div class="settings-model-grid">
                             ${MODEL_CARDS.map(([title, copy, inputId, toggleId, defaultValue]) => modelCard({ title, copy, inputId, toggleId, defaultValue })).join('')}
                         </div>
-                        <div class="form-row">
-                            <div class="form-field">
-                                <label>Claude Code Model</label>
-                                <input id="s-claude-code-model" value="opus[1m]" placeholder="sonnet, opus, opus[1m], or full name">
-                                <div class="settings-inline-note">Anthropic model for delegated review/edit integrations. Requires Anthropic key in Providers.</div>
-                            </div>
-                        </div>
                     </div>
 
+                    ${renderReviewerSlotsSection()}
+
                     <div class="form-section">
-                        <h3>Review Models</h3>
-                        <div class="settings-section-copy">Reviewer slots used by plan, task acceptance, and commit review surfaces.</div>
-                        <div class="form-row">
-                            <div class="form-field">
-                                <label>Review Slots</label>
-                                <input id="s-review-models" placeholder="model1,model2,model3">
-                                <div class="settings-inline-note">Comma-separated reviewer slots. Duplicate model IDs are valid independent slots for same-model sampling.</div>
-                            </div>
-                        </div>
+                        <h3>Other Model Slots</h3>
                         <div class="form-grid two">
-                            <div class="form-field">
-                                <label>Scope Review Slots</label>
-                                <input id="s-scope-review-models" placeholder="openai/gpt-5.6-terra">
-                                <div class="settings-inline-note">Comma-separated scope reviewer slots. Empty falls back to the legacy single scope model setting.</div>
-                            </div>
                             <div class="form-field">
                                 <label>Deep Self-Review Model</label>
                                 <input id="s-deep-self-review-model" placeholder="openai/gpt-5.6-sol-pro">

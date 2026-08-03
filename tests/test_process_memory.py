@@ -225,12 +225,12 @@ class TestHelperFunctions:
         trace = {"tool_calls": [
             {"tool": "run_command", "is_error": True, "result": "a" * 5000},
             {"tool": "run_script", "is_error": True, "result": "b" * 5000},
-            {"tool": "claude_code_edit", "is_error": True, "result": "c" * 5000},
+            {"tool": "edit_text", "is_error": True, "result": "c" * 5000},
         ]}
         details = _collect_error_details(trace)
         assert "run_command" in details
         assert "run_script" in details
-        assert "claude_code_edit" in details
+        assert "edit_text" in details
 
     def test_run_reflection_pipeline_maps_usage_keys_correctly(self):
         """_run_reflection maps usage['rounds'] and usage['cost'] to the correct kwargs.

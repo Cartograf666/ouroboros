@@ -2,6 +2,8 @@ import { refreshModelCatalog } from './settings_catalog.js';
 import { bindEffortSegments, syncEffortSegments } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
 import { applyMcpSettings, collectMcpSettings, initMcpSettings } from './mcp_settings.js';
+import { collectReviewerSlots, initReviewerSlots, reloadReviewerSlots } from './reviewer_slots.js';
+import { initHarnessAccounts } from './harness_accounts.js';
 import { SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
 import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
@@ -16,8 +18,13 @@ let setupContract = {};
 const INPUT_FIELDS = [
     ['s-openai-base-url', 'OPENAI_BASE_URL'], ['s-openai-compatible-base-url', 'OPENAI_COMPATIBLE_BASE_URL'], ['s-cloudru-base-url', 'CLOUDRU_FOUNDATION_MODELS_BASE_URL'],
     ['s-gigachat-scope', 'GIGACHAT_SCOPE'], ['s-gigachat-user', 'GIGACHAT_USER'], ['s-gigachat-base-url', 'GIGACHAT_BASE_URL'], ['s-gigachat-verify-ssl', 'GIGACHAT_VERIFY_SSL_CERTS'],
-    ['s-server-host', 'OUROBOROS_SERVER_HOST', '127.0.0.1'], ['s-claude-code-model', 'CLAUDE_CODE_MODEL', 'opus[1m]'],
-    ['s-review-models', 'OUROBOROS_REVIEW_MODELS'], ['s-scope-review-models', 'OUROBOROS_SCOPE_REVIEW_MODELS'], ['s-deep-self-review-model', 'OUROBOROS_MODEL_DEEP_SELF_REVIEW'], ['s-skills-repo-path', 'OUROBOROS_SKILLS_REPO_PATH'],
+    // 6.4 (D10): the Claude Code model picker is gone with claude_code_edit;
+    // CLAUDE_CODE_MODEL stays a backend setting for the api-route advisory.
+    ['s-server-host', 'OUROBOROS_SERVER_HOST', '127.0.0.1'],
+    // 6.1: OUROBOROS_REVIEW_MODELS / OUROBOROS_SCOPE_REVIEW_MODELS are no
+    // longer authored here — the Reviewer Slots section composes the ONE
+    // structured setting; the comma keys stay a backend-derived projection.
+    ['s-deep-self-review-model', 'OUROBOROS_MODEL_DEEP_SELF_REVIEW'], ['s-skills-repo-path', 'OUROBOROS_SKILLS_REPO_PATH'],
     ['s-clawhub-registry-url', 'OUROBOROS_CLAWHUB_REGISTRY_URL'], ['s-websearch-model', 'OUROBOROS_WEBSEARCH_MODEL'], ['s-gh-repo', 'GITHUB_REPO'],
     ['s-local-source', 'LOCAL_MODEL_SOURCE'], ['s-local-filename', 'LOCAL_MODEL_FILENAME'], ['s-local-chat-format', 'LOCAL_MODEL_CHAT_FORMAT'],
     ['s-subagent-worktree-root', 'OUROBOROS_SUBAGENT_WORKTREE_ROOT'], ['s-subagent-projects-root', 'OUROBOROS_SUBAGENT_PROJECTS_ROOT'],
@@ -25,8 +32,10 @@ const INPUT_FIELDS = [
     ['s-evo-objective', 'OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE', ''],
 ];
 const VALUE_FIELDS = [
-    ['s-effort-task', 'OUROBOROS_EFFORT_TASK', 'medium'], ['s-effort-evolution', 'OUROBOROS_EFFORT_EVOLUTION', 'high'], ['s-effort-review', 'OUROBOROS_EFFORT_REVIEW', 'high'],
-    ['s-effort-consciousness', 'OUROBOROS_EFFORT_CONSCIOUSNESS', 'high'], ['s-effort-scope-review', 'OUROBOROS_EFFORT_SCOPE_REVIEW', 'high'], ['s-effort-deep-self-review', 'OUROBOROS_EFFORT_DEEP_SELF_REVIEW', 'high'],
+    // 6.3: Review / Scope Review efforts are per-slot rows on the Models page
+    // now; their global keys remain backend defaults, no longer UI-authored.
+    ['s-effort-task', 'OUROBOROS_EFFORT_TASK', 'medium'], ['s-effort-evolution', 'OUROBOROS_EFFORT_EVOLUTION', 'high'],
+    ['s-effort-consciousness', 'OUROBOROS_EFFORT_CONSCIOUSNESS', 'high'], ['s-effort-deep-self-review', 'OUROBOROS_EFFORT_DEEP_SELF_REVIEW', 'high'],
     ['s-review-enforcement', 'OUROBOROS_REVIEW_ENFORCEMENT', 'advisory'], ['s-task-review-mode', 'OUROBOROS_TASK_REVIEW_MODE', 'auto'], ['s-runtime-mode', 'OUROBOROS_RUNTIME_MODE', 'advanced'],
     ['s-context-mode', 'OUROBOROS_CONTEXT_MODE', 'max'], ['s-image-input-mode', 'OUROBOROS_IMAGE_INPUT_MODE', 'auto'],
     ['s-safety-mode', 'OUROBOROS_SAFETY_MODE', 'full'],
@@ -333,6 +342,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     let settingsBaseline = '';
     let settingsDirty = false;
     initMcpSettings({ onChange: updateSettingsDirtyState });
+    initReviewerSlots({ onChange: () => updateSettingsDirtyState() });
+    initHarnessAccounts();
 
     function anthropicKeyConfigured() {
         const input = byId('s-anthropic');
@@ -603,6 +614,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         renderExtensionSettingsSections(page, sections);
         renderRequestedSkillSecrets(page, extData.skills || [], data);
         renderCustomSecrets(page, data);
+        // Await the reviewer rows BEFORE the clean baseline: their async
+        // arrival must not read as an unsaved owner edit.
+        await reloadReviewerSlots();
         setSettingsCleanBaseline();
         closeSettingsModelPickers();
         _renderNetworkHint(data._meta);
@@ -666,6 +680,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 ? ({ on: 'true', off: 'false' }[mutativeInput?.value] ?? '')
                 : (rawMutative ? ({ true: 'true', false: 'false' }[rawMutative] ?? rawMutative) : ''),
             ...collectMcpSettings(),
+            // 6.1: the ONE structured reviewer-slot setting; {} until the rows
+            // view has loaded, so an unrelated save cannot blank it.
+            ...collectReviewerSlots(),
         };
         setupModelSlots().forEach((slot) => {
             body[slot.settingKey] = fieldValue(slot.settingsInputId);
@@ -673,7 +690,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => {
             const value = fieldValue(id).trim();
-            body[key] = key === 'OUROBOROS_SERVER_HOST' ? value || fallback : value || (key === 'CLAUDE_CODE_MODEL' ? fallback : '');
+            body[key] = key === 'OUROBOROS_SERVER_HOST' ? value || fallback : value || '';
         });
         VALUE_FIELDS
             // Owner-only keys travel through their audited owner endpoints, never

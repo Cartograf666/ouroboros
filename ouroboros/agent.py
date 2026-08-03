@@ -978,6 +978,13 @@ class OuroborosAgent:
             task_type_str = str(task.get("type") or "").lower()
             initial_effort = _initial_effort_for(task, task_type_str)
 
+            # The owner's first phase-6 UI directive: the LEDE must show that THIS
+            # bubble / subagent runs on codex (a chip, not a badge). The fact is
+            # recorded onto the live task metadata that `_subagent_progress_meta`
+            # already projects — read from the ONE record the dispatch resolution
+            # stamped onto the task, never re-derived per surface.
+            self._record_executor_facts(task)
+
             if blocked_reason := str(cap_info.get("executor_blocked_reason") or ""):
                 # p34's typed terminal, rebuilt from the facts cap_info carried
                 # across the (ctx, messages, cap_info) seam. The placeholder
@@ -1276,6 +1283,26 @@ class OuroborosAgent:
             log.warning("Failed to emit task heartbeat event", exc_info=True)
             pass
 
+    def _record_executor_facts(self, task: Dict[str, Any]) -> None:
+        """Stamp the RESOLVED executor/route onto the live task metadata.
+
+        The resolution has exactly one owner (`resolve_subagent_dispatch`, which
+        stamped `effective_executor`/`executor_route` onto the task record at
+        dispatch); this projects that record where the frame assembler below
+        already reads its execution facts, so the UI chip is a projection of the
+        decision rather than a second derivation of it. A blocked or unresolved
+        dispatch records nothing — no fact, no chip.
+        """
+        if not isinstance(self._current_task_metadata, dict):
+            return
+        effective = str(task.get("effective_executor") or "")
+        if not effective or effective == "blocked":
+            return
+        self._current_task_metadata["effective_executor"] = effective
+        # The OPAQUE harness id, verbatim from the route Claudexor was asked for
+        # — Ouroboros never interprets it, and the UI only prints it.
+        self._current_task_metadata["executor_route"] = str(task.get("executor_route") or "")
+
     def _subagent_progress_meta(self, event: str) -> Dict[str, Any]:
         metadata = self._current_task_metadata if isinstance(self._current_task_metadata, dict) else {}
         if str(metadata.get("delegation_role") or "").lower() != "subagent":
@@ -1293,6 +1320,11 @@ class OuroborosAgent:
             "model_lane": str(metadata.get("requested_model_lane") or metadata.get("model_lane") or ""),
             "effective_model_lane": str(metadata.get("effective_model_lane") or ""),
             "model": str(metadata.get("model") or ""),
+            # Phase 6 (owner directive #1): WHERE this subagent really runs. Only
+            # a delegated route is a fact worth a chip — the native path is the
+            # ordinary case and prints nothing, so the lane never fills with
+            # "api" noise. Empty stays empty; the renderer draws no chip.
+            "executor_route": str(metadata.get("executor_route") or ""),
         }
 
     def _start_task_heartbeat_loop(self, task_id: str) -> Optional[threading.Event]:

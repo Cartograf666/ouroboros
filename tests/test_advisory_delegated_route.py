@@ -181,36 +181,6 @@ def test_explicit_skip_still_bypasses_on_the_delegated_route(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
-# Site 2 — the registry credential predicate
-# ---------------------------------------------------------------------------
-
-
-def test_claude_code_edit_credential_detail_is_route_aware(monkeypatch):
-    from ouroboros.tools.registry import _builtin_tool_availability
-
-    task_ctx = SimpleNamespace(task_id="t1", task_metadata={"k": 1}, task_contract={})
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-
-    # API route: byte-identical behavior to today.
-    monkeypatch.delenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, raising=False)
-    available, reason, detail = _builtin_tool_availability("claude_code_edit", task_ctx)
-    assert (available, reason, detail) == (False, "missing_credential", "ANTHROPIC_API_KEY")
-
-    # Delegated route: the SDK transport still needs the key (truth), and the
-    # disclosure names the keyless delegated lane instead of implying the key
-    # is the only path.
-    monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "agent_session")
-    available, reason, detail = _builtin_tool_availability("claude_code_edit", task_ctx)
-    assert available is False and reason == "missing_credential"
-    assert detail.startswith("ANTHROPIC_API_KEY")
-    assert "delegate" in detail
-
-    # With the key present the tool is available on every route (unchanged).
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
-    assert _builtin_tool_availability("claude_code_edit", task_ctx)[0] is True
-
-
-# ---------------------------------------------------------------------------
 # The route reader itself
 # ---------------------------------------------------------------------------
 

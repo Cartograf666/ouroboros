@@ -120,7 +120,9 @@ def test_search_code_has_result_limit():
     for _handoff_tool in ("wait_task", "wait_tasks", "get_task_result"):
         assert _handoff_tool in UNTRUNCATED_TOOL_RESULTS
     from ouroboros.tool_capabilities import FOREGROUND_MUTATIVE_TOOLS
-    assert "claude_code_edit" in FOREGROUND_MUTATIVE_TOOLS
+    # D10 retired claude_code_edit — the only foreground-mutative tool. The
+    # CLASS stays wired (an empty set) so a successor lands as one entry.
+    assert FOREGROUND_MUTATIVE_TOOLS == frozenset()
 
 
 def test_extract_video_frames_visible_where_media_siblings_are_visible():
@@ -571,7 +573,6 @@ def test_local_readonly_subagent_execute_blocks_forbidden_tools(tmp_path, monkey
     blocked_tools = [
         "write_file",
         "edit_text",
-        "claude_code_edit",
         "knowledge_write",
         "update_scratchpad",
         "update_identity",

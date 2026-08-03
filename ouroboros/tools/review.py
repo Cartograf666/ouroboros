@@ -22,6 +22,7 @@ from ouroboros.triad_review import (
     REVIEW_JSON_ARRAY_CONTRACT,
     extract_json_array,
     parse_model_review_results,
+    review_query_error_payload as _review_query_error_payload,
 )
 
 log = logging.getLogger(__name__)
@@ -369,7 +370,8 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
                                 stable_prefix_len: int = 0,
                                 routes: list = None,
                                 session_task: str = "",
-                                session_root: str = "") -> str:
+                                session_root: str = "",
+                                row_plan: dict = None) -> str:
     if models is None:
         models = []
     try:
@@ -380,53 +382,15 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
                 result = pool.submit(
                     asyncio.run,
                     _multi_model_review_async(content, prompt, models, ctx, stable_prefix_len,
-                                              routes, session_task, session_root),
+                                              routes, session_task, session_root, row_plan),
                 ).result()
         except RuntimeError:
             result = asyncio.run(_multi_model_review_async(content, prompt, models, ctx, stable_prefix_len,
-                                                           routes, session_task, session_root))
+                                                           routes, session_task, session_root, row_plan))
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         log.error("Multi-model review failed: %s", e, exc_info=True)
         return json.dumps({"error": f"Review failed: {e}"}, ensure_ascii=False)
-
-
-def _review_query_error_payload(
-    *,
-    ctx: Optional[ToolContext],
-    model: str,
-    messages: list,
-    slot_id: str,
-    error: str,
-) -> dict:
-    # The failure envelope carries the row id too: an errored row is still a row,
-    # and its durable actor record must name the same one its refs do.
-    payload = {"error": error, "usage": {}, "slot_id": slot_id, "prompt_ref": {}, "response_ref": {}}
-    try:
-        from ouroboros.observability import new_call_id, persist_call
-
-        drive_root = review_drive_root(ctx)
-        task_id = str(getattr(ctx, "task_id", "") or "multi_model_review") if ctx is not None else "multi_model_review"
-        call_id = new_call_id(f"review_multi_model_review_{slot_id}_error")
-        payload["prompt_ref"] = persist_call(
-            drive_root,
-            task_id=task_id,
-            call_id=f"{call_id}_prompt",
-            call_type="multi_model_review_prompt",
-            payload={"messages": messages, "slot_id": slot_id, "model": model},
-            manifest={"surface": "multi_model_review", "slot_id": slot_id, "model": model, "synthetic": True},
-        )
-        payload["response_ref"] = persist_call(
-            drive_root,
-            task_id=task_id,
-            call_id=f"{call_id}_error",
-            call_type="multi_model_review_error",
-            payload={"error": error},
-            manifest={"surface": "multi_model_review", "slot_id": slot_id, "model": model, "status": "error", "synthetic": True},
-        )
-    except Exception:
-        pass
-    return payload
 
 
 def _review_output_budget() -> int:
@@ -453,6 +417,9 @@ async def _query_model(
     route: Any = None,
     session_task: str = "",
     session_root: str = "",
+    effort: str = "",
+    session_target: str = "",
+    session_profile: str = "",
 ):
     async with semaphore:
         timeout_sec = _review_model_timeout_sec()
@@ -480,13 +447,15 @@ async def _query_model(
             slot = ReviewSlot(
                 slot_id=slot_id,
                 model=model,
-                effort=_cfg.resolve_effort("review"),
+                effort=effort or _cfg.resolve_effort("review"),
                 timeout_sec=timeout_sec,
                 max_tokens=_out_budget,
                 temperature=0.2,
                 role_hint="multi-model review",
                 use_local=_cfg.review_model_uses_local(model),
                 route=slot_route,
+                session_target=session_target if delegated else "",
+                session_profile=session_profile if delegated else "",
             )
             loop = asyncio.get_running_loop()
             run_result = await asyncio.wait_for(
@@ -537,10 +506,21 @@ async def _multi_model_review_async(content: str, prompt: str,
                                      stable_prefix_len: int = 0,
                                      routes: list = None,
                                      session_task: str = "",
-                                     session_root: str = ""):
+                                     session_root: str = "",
+                                     row_plan: dict = None):
     from ouroboros.review_execution import ReviewRouteKind
 
     row_routes = list(routes or []) + [ReviewRouteKind.API_CHAT] * max(0, len(models) - len(routes or []))
+    # Per-row strength/target/identity vectors (6.1). Absent tails keep the
+    # historical behavior: global effort, shared session route, positional ids.
+    def _row_vector(key, filler):
+        rows = list((row_plan or {}).get(key) or [])
+        return rows + [filler(idx) for idx in range(len(rows), len(models))]
+
+    row_efforts = _row_vector("efforts", lambda idx: "")
+    row_targets = _row_vector("session_targets", lambda idx: "")
+    row_profiles = _row_vector("session_profiles", lambda idx: "")
+    row_ids = _row_vector("slot_ids", lambda idx: slot_id_for_row(idx + 1))
     any_api_rows = any(route is ReviewRouteKind.API_CHAT for route in row_routes[:len(models)])
     if not content:
         return {"error": "content is required"}
@@ -590,8 +570,10 @@ async def _multi_model_review_async(content: str, prompt: str,
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
     llm_client = LLMClient()
     tasks = [
-        _query_model(llm_client, m, messages, semaphore, ctx, slot_id=slot_id_for_row(idx + 1),
-                     route=row_routes[idx], session_task=session_task, session_root=session_root)
+        _query_model(llm_client, m, messages, semaphore, ctx, slot_id=row_ids[idx],
+                     route=row_routes[idx], session_task=session_task, session_root=session_root,
+                     effort=row_efforts[idx], session_target=row_targets[idx],
+                     session_profile=row_profiles[idx])
         for idx, m in enumerate(models)
     ]
     results = await asyncio.gather(*tasks)
@@ -1408,23 +1390,23 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
         log.warning("Failed to build touched file pack for triad review: %s", e)
         current_files_section = f"(touched file pack unavailable: {e})"
 
-    models = _cfg.get_review_models()
-    ctx._last_triad_models = list(models)  # forensic: actual resolved model IDs
-
-    # Per-row delivery (5.1): the commit triad may be delegated (D15). A
-    # malformed route list is an infra failure, never a silent api spend.
-    from ouroboros.review_execution import TRIAD_REVIEW_ROUTES_ENV, ReviewRouteKind
-    from ouroboros.review_substrate import configured_review_routes
+    # Per-row identity/delivery/strength from the ONE reviewer-slot SSOT (6.1):
+    # structured rows when configured, the migrated comma-lists otherwise. A
+    # malformed configuration is an infra failure, never a silent api spend.
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.reviewer_slot_config import commit_triad_delivery
 
     try:
-        row_routes = configured_review_routes(TRIAD_REVIEW_ROUTES_ENV, len(models))
+        row_plan = commit_triad_delivery()
     except ValueError as exc:
         ctx._last_review_block_reason = "infra_failure"
         return _handle_review_block_or_warning(
             ctx, blocking_review,
-            f"⚠️ REVIEW_BLOCKED: invalid review route configuration — {exc}",
-            "Review enforcement=Advisory: invalid review route configuration did not block commit. ",
+            f"⚠️ REVIEW_BLOCKED: invalid reviewer-slot configuration — {exc}",
+            "Review enforcement=Advisory: invalid reviewer-slot configuration did not block commit. ",
         )
+    models, row_routes = row_plan["models"], row_plan["routes"]
+    ctx._last_triad_models = list(models)  # forensic: actual resolved model IDs
     api_models = [m for m, r in zip(models, row_routes) if r is ReviewRouteKind.API_CHAT]
 
     goal_section = build_goal_section(goal, scope, commit_message)
@@ -1490,6 +1472,7 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
             routes=row_routes,
             session_task=session_task,
             session_root=str(target_repo),
+            row_plan=row_plan,
         )
         result = json.loads(result_json)
     except Exception as e:

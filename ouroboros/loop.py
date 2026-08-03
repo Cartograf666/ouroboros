@@ -175,7 +175,7 @@ def _skill_names_touched_by_trace(llm_trace: Dict[str, Any]) -> List[str]:
         if not isinstance(call, dict):
             continue
         tool = str(call.get("tool") or "")
-        if tool not in {"write_file", "edit_text", "claude_code_edit"}:
+        if tool not in {"write_file", "edit_text"}:
             continue
         args = call.get("args") if isinstance(call.get("args"), dict) else {}
         bucket = str(args.get("bucket") or "").strip().lower()
@@ -184,7 +184,7 @@ def _skill_names_touched_by_trace(llm_trace: Dict[str, Any]) -> List[str]:
             if skill_name not in names:
                 names.append(skill_name)
             continue
-        candidates = [str(args.get("cwd") or "")] if tool == "claude_code_edit" else [str(args.get("path") or "")]
+        candidates = [str(args.get("path") or "")]
         for raw in candidates:
             norm = raw.replace("\\", "/").strip().lstrip("/")
             if norm.startswith("data/"):

@@ -52,13 +52,13 @@ def test_shell_and_claude_failures_are_treated_as_tool_failures():
         True,
         "⚠️ CLAUDE_CODE_UNAVAILABLE: ANTHROPIC_API_KEY not set.",
     )
-    core = "⚠️ CORE_PROTECTION_BLOCKED: claude_code_edit attempted to modify protected files."
-    skill = "⚠️ SKILL_PAYLOAD_CONTROL_BLOCKED: claude_code_edit attempted to modify sidecars."
+    core = "⚠️ CORE_PROTECTION_BLOCKED: edit_text attempted to modify protected files."
+    skill = "⚠️ SKILL_PAYLOAD_CONTROL_BLOCKED: edit_text attempted to modify sidecars."
 
     assert _is_tool_execution_failure(True, core)
     assert _is_tool_execution_failure(True, skill)
-    assert _extract_result_metadata("claude_code_edit", core, True)["status"] == "protected_blocked"
-    assert _extract_result_metadata("claude_code_edit", skill, True)["status"] == "skill_payload_control_blocked"
+    assert _extract_result_metadata("edit_text", core, True)["status"] == "protected_blocked"
+    assert _extract_result_metadata("edit_text", skill, True)["status"] == "skill_payload_control_blocked"
 
 
 def test_runtime_policy_blocks_are_semantic_tool_failures():
@@ -206,10 +206,11 @@ def test_shell_regex_autocorrect_nonzero_still_fails():
     assert _extract_result_metadata("run_command", result, True)["status"] == "shell_error"
 
 
-def test_live_tool_log_payload_includes_structured_result_metadata(tmp_path):
+def test_live_tool_log_payload_includes_structured_result_metadata(tmp_path, monkeypatch):
     import pathlib
     import time
     from types import SimpleNamespace
+    import ouroboros.loop_tool_execution as loop_tool_execution
     from ouroboros.loop_tool_execution import _execute_with_timeout
 
     source = (pathlib.Path(__file__).resolve().parents[1] / "ouroboros" / "loop_tool_execution.py").read_text(encoding="utf-8")
@@ -220,14 +221,20 @@ def test_live_tool_log_payload_includes_structured_result_metadata(tmp_path):
     drive_logs = tmp_path / "logs"
     drive_logs.mkdir()
     live_events = []
+    # D10 emptied FOREGROUND_MUTATIVE_TOOLS (claude_code_edit was its only
+    # member); the terminal-wait plumbing stays wired for a successor, so pin
+    # it with a fixture member.
+    monkeypatch.setattr(
+        loop_tool_execution, "FOREGROUND_MUTATIVE_TOOLS", frozenset({"fake_code_tool"})
+    )
     tools = SimpleNamespace(
-        CODE_TOOLS={"claude_code_edit"},
+        CODE_TOOLS={"fake_code_tool"},
         _ctx=SimpleNamespace(event_queue=SimpleNamespace(put_nowait=lambda envelope: live_events.append(envelope))),
         execute=lambda _name, _args: (time.sleep(0.05), "OK")[1],
     )
     result = _execute_with_timeout(
         tools,
-        {"id": "call-1", "function": {"name": "claude_code_edit", "arguments": "{}"}},
+        {"id": "call-1", "function": {"name": "fake_code_tool", "arguments": "{}"}},
         drive_logs,
         timeout_sec=0.001,
         task_id="task-1",

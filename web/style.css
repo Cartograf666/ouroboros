@@ -5813,3 +5813,63 @@ textarea.chat-input {
         transition: none;
     }
 }
+
+/* Reviewer Slots (6.2) + Harness Accounts (D30) */
+.reviewer-slots-heading { margin: 14px 0 6px; }
+.reviewer-slot-rows { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+.reviewer-slot-row {
+    border: 1px solid var(--border, rgba(127, 127, 127, 0.25));
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+.reviewer-slot-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.reviewer-slot-controls select,
+.reviewer-slot-controls input { min-width: 140px; max-width: 100%; }
+.reviewer-slot-meta { font-size: 12px; margin-top: 4px; }
+.reviewer-slot-runs-as { font-size: 12px; margin-top: 2px; font-style: italic; }
+.harness-account-row { align-items: center; }
+.harness-account-main { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; flex: 1; }
+.harness-account-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.harness-chip {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border, rgba(127, 127, 127, 0.35));
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.harness-exhausted { opacity: 0.62; }
+.harness-login-card { margin-top: 8px; }
+.harness-device-code p { margin: 4px 0; }
+.harness-code {
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 22px;
+    letter-spacing: 0.18em;
+    padding: 8px 12px;
+    border: 1px dashed var(--border, rgba(127, 127, 127, 0.4));
+    border-radius: 8px;
+    display: inline-block;
+    user-select: all;
+}
+.harness-attach-command {
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 12px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: rgba(127, 127, 127, 0.12);
+    overflow-x: auto;
+    user-select: all;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+/* Phase 6: per-bubble/subagent executor chip (owner directive: a small chip
+   like Claudexor's, never a promotional badge). Reuses .harness-chip. */
+.chat-live-executor-chip {
+    font-size: 10px;
+    padding: 0 6px;
+    margin-right: 6px;
+    vertical-align: middle;
+    opacity: 0.85;
+}

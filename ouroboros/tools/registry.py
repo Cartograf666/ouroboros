@@ -529,27 +529,8 @@ def _light_mode_payload_mutation_allowed(
 ) -> bool:
     """Return True for light-mode data skill payload edits that do not touch repo files."""
 
-    if runtime_mode != "light" or tool_name not in {"edit_text", "write_file", "claude_code_edit"}:
+    if runtime_mode != "light" or tool_name not in {"edit_text", "write_file"}:
         return False
-    if tool_name == "claude_code_edit":
-        cwd_text = str(args.get("cwd", "") or "")
-        if not cwd_text and effective_constraint and effective_constraint.mode == "skill_repair" and implicit_skill_cwd_allowed:
-            cwd_text = "."
-        elif not cwd_text:
-            return False
-        try:
-            _cwd_path, cwd_root, _allowed_roots = resolve_shell_cwd(ctx, cwd_text)
-            if cwd_root in {"user_files", "task_drive", "artifact_store"}:
-                return True
-        except Exception:
-            pass
-        return is_skill_payload_path(
-            pathlib.Path(ctx.drive_root),
-            cwd_text,
-            constraint=effective_constraint,
-            allow_short_relative=allow_short_relative,
-            allow_control_plane=False,
-        )
     requested_root = str(args.get("root", "") or "active_workspace")
     try:
         requested_root = normalize_root(requested_root)
@@ -583,7 +564,6 @@ _HEAL_MODE_ALLOWED_TOOLS = frozenset({
     "list_files",
     "write_file",
     "edit_text",
-    "claude_code_edit",
     "list_skills",
     "skill_review", "skill_preflight",
 })
@@ -614,30 +594,11 @@ def _heal_protected_payload_sidecar(path_text: str) -> bool:
     return is_skill_payload_control_filename(path_text)
 
 
-def _heal_claude_code_edit_block(ctx: Any, args: Dict[str, Any], task_constraint: Optional[TaskConstraint]) -> str:
-    expected_bucket, expected_skill = constraint_bucket_skill(task_constraint)
-    requested_bucket = str(args.get("bucket", "") or "").strip()
-    requested_skill = str(args.get("skill_name", "") or "").strip()
-    if (
-        (requested_bucket and requested_bucket != expected_bucket)
-        or (requested_skill and requested_skill != expected_skill)
-    ):
-        return (
-            "⚠️ SKILL_REDIRECT_BLOCKED: active skill_repair "
-            "task is scoped to the selected skill payload."
-        )
-    cwd_text = str(args.get("cwd", "") or ".")
-    if not _task_constraint_path_allowed(cwd_text, task_constraint, pathlib.Path(ctx.drive_root)):
-        return "⚠️ HEAL_MODE_BLOCKED: Repair claude_code_edit cwd is limited to the selected skill payload."
-    return ""
-
-
 _WORKSPACE_ALLOWED_TOOLS = frozenset({
     "read_file",
     "list_files",
     "write_file",
     "edit_text",
-    "claude_code_edit",
     "search_code",
     "query_code",
     "run_command",
@@ -808,7 +769,6 @@ def _normalize_dispatch_path_args(ctx: Any, name: str, args: Dict[str, Any]) -> 
 _WEB_TOOLS = frozenset({"web_search", "browse_page", "browser_action", "youtube_transcript"})
 _REPO_MUTATION_TOOLS = frozenset({
     "write_file",
-    "claude_code_edit",
     "commit_reviewed",
     "vcs_commit_reviewed",
     "edit_text",
@@ -873,6 +833,12 @@ def _disabled_tools(ctx: Any) -> frozenset:
         raw = source.get("disabled_tools") if isinstance(source, dict) else None
         if isinstance(raw, (list, tuple)):
             names.update(str(n).strip() for n in raw if str(n).strip())
+    # D10 compatibility: `claude_code_edit` was retired; saved contracts that
+    # withheld the external coding gateway keep withholding its SUCCESSOR — the
+    # delegated coding session's start verb. The dead name stays in the set
+    # too (harmless: nothing registers it), so old contracts round-trip as-is.
+    if "claude_code_edit" in names:
+        names.add("delegate_start")
     return frozenset(names)
 
 
@@ -917,27 +883,6 @@ def _builtin_tool_availability(name: str, ctx: Any = None) -> tuple[bool, str, s
         if not metadata and not contract:
             return True, "", ""
     tool = str(name or "").strip()
-    if tool == "claude_code_edit" and not os.environ.get("ANTHROPIC_API_KEY", "").strip():
-        # Route-aware credential truth (plan 5.8 site 2): this tool's OWN
-        # transport is the Claude Agent SDK, which needs the key on every route
-        # — declaring it available without one would advertise a transport that
-        # cannot run. What IS route-dependent is the disclosure: when the
-        # delegated review route is configured, the refusal names the keyless
-        # path (the delegated subagent lane) instead of implying the key is the
-        # only way to run delegated work. D10 retires this tool entirely.
-        detail = "ANTHROPIC_API_KEY"
-        try:
-            from ouroboros.tools.claude_advisory_review import advisory_route_requires_api_key
-
-            if not advisory_route_requires_api_key():
-                detail = (
-                    "ANTHROPIC_API_KEY (required by this tool's SDK transport even "
-                    "though the advisory runs on the keyless delegated route; for "
-                    "delegated edits use the delegate_* subagent lane)"
-                )
-        except Exception:
-            detail = "ANTHROPIC_API_KEY"
-        return False, "missing_credential", detail
     if tool == "web_search":
         try:
             from ouroboros.tools.search import _available_web_search_backends
@@ -2435,10 +2380,6 @@ class ToolRegistry:
             return "⚠️ HEAL_MODE_BLOCKED: Repair may only review the selected skill."
         if name == "skill_preflight" and str(args.get("skill", "") or "").strip() != heal_skill:
             return "⚠️ HEAL_MODE_BLOCKED: Repair may only preflight the selected skill."
-        if name == "claude_code_edit":
-            block_msg = _heal_claude_code_edit_block(self._ctx, args, task_constraint)
-            if block_msg:
-                return block_msg
         if ext_tool or is_mcp or name not in _HEAL_MODE_ALLOWED_TOOLS:
             return (
                 "⚠️ HEAL_MODE_BLOCKED: Repair tasks may inspect/edit skill "
@@ -2504,7 +2445,7 @@ class ToolRegistry:
                 "The parent must grant dynamic tools explicitly per child."
             )
         # Cover the full repo-mutating surface explicitly (CODE_TOOLS ∪ _REPO_MUTATION_TOOLS):
-        # write_file/edit_text/claude_code_edit AND shell/process tools (run_command/run_script/
+        # write_file/edit_text AND shell/process tools (run_command/run_script/
         # start_service) are all is_code_tool=True, but gating on the union makes the
         # "no OTHER task writes the repo while a merge is staged" contract robust to flag drift.
         if entry is not None and (name in self.CODE_TOOLS or name in _REPO_MUTATION_TOOLS):
@@ -2677,7 +2618,7 @@ class ToolRegistry:
                     "workspace; write only to root=task_drive, root=artifact_store, or root=user_files. "
                     "active_workspace/system_repo map to the live Ouroboros repo and are blocked."
                 )
-            if name in ("claude_code_edit", "run_command", "run_script", "start_service", "integrate_subagent_patch"):
+            if name in ("run_command", "run_script", "start_service", "integrate_subagent_patch"):
                 return (
                     "⚠️ ACTING_NO_WORKSPACE_BLOCKED: shell/coding/service/integration tools need an "
                     "isolated workspace (their default target is the live repo). Schedule a self_worktree "
@@ -2704,7 +2645,7 @@ class ToolRegistry:
             return f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(self._entries.keys()))}"
         raw_bucket = str(args.get("bucket", "") or "")
         raw_skill_name = str(args.get("skill_name", "") or "")
-        short_path_text = str(args.get("cwd", "") or "") if name == "claude_code_edit" else str(args.get("path", "") or "")
+        short_path_text = str(args.get("path", "") or "")
         short_form_decision = decide_payload_short_form(
             bucket=raw_bucket,
             skill_name=raw_skill_name,
@@ -2727,7 +2668,6 @@ class ToolRegistry:
             and name in (
                 "write_file",
                 "edit_text",
-                "claude_code_edit",
             )
         ):
             _root_arg = str(args.get("root", "") or "").strip().lower()
@@ -2748,7 +2688,6 @@ class ToolRegistry:
         if redirect_err and name in (
             "write_file",
             "edit_text",
-            "claude_code_edit",
         ):
             return f"⚠️ SKILL_REDIRECT_BLOCKED: {redirect_err}"
         # Existing skill_repair constraint remains authoritative.

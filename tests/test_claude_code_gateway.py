@@ -7,7 +7,7 @@ so the gateway can be imported and exercised without the real package installed.
 
 We test:
   - ClaudeCodeResult (importable from gateway even w/o SDK via careful mocking)
-  - Path guard and readonly guard hooks (function-level, no SDK dependency)
+  - Readonly guard hook (function-level, no SDK dependency)
   - Orchestration helpers (_load_project_context etc.) now in shell.py
 """
 
@@ -35,10 +35,8 @@ async def _async_gen(items):
 
 from ouroboros.gateways.claude_code import (  # noqa: E402
     ClaudeCodeResult,
-    make_path_guard,
     make_readonly_guard,
     _normalize_sdk_usage,
-    SAFETY_CRITICAL,
 )
 
 # Orchestration helpers now live in shell.py
@@ -82,153 +80,6 @@ class TestClaudeCodeResult:
         assert "changed_files" not in out
         assert "error" not in out
         assert "validation" not in out
-
-
-# ---------------------------------------------------------------------------
-# Path guard hook
-# ---------------------------------------------------------------------------
-
-class TestPathGuard:
-    def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
-
-    def test_allows_file_inside_cwd(self, tmp_path):
-        guard = make_path_guard(str(tmp_path))
-        result = self._run(guard(
-            {"tool_name": "Edit", "tool_input": {"file_path": str(tmp_path / "foo.py")}},
-            "tid-1", None,
-        ))
-        assert result == {}
-
-    def test_blocks_file_outside_cwd(self, tmp_path):
-        guard = make_path_guard(str(tmp_path / "subdir"))
-        (tmp_path / "subdir").mkdir()
-        result = self._run(guard(
-            {"tool_name": "Edit", "tool_input": {"file_path": str(tmp_path / "outside.py")}},
-            "tid-2", None,
-        ))
-        assert result != {}
-        assert "deny" in str(result)
-
-    def test_blocks_safety_critical_file(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-        guard = make_path_guard(str(tmp_path))
-        for critical in SAFETY_CRITICAL:
-            result = self._run(guard(
-                {"tool_name": "Edit", "tool_input": {"file_path": str(tmp_path / critical)}},
-                f"tid-{critical}", None,
-            ))
-            assert "deny" in str(result), f"Should block {critical}"
-
-    def test_blocks_safety_critical_with_backslash_paths(self, tmp_path, monkeypatch):
-        """Safety-critical check must work regardless of OS path separator.
-
-        On Windows os.path.relpath returns backslashes. The guard must normalize
-        to forward slashes (via pathlib.as_posix) before comparing against
-        SAFETY_CRITICAL which uses forward slashes.
-        """
-        monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-        guard = make_path_guard(str(tmp_path))
-        # Simulate a Windows-style resolved path by using the native separator
-        for critical in SAFETY_CRITICAL:
-            # Build path using tmp_path / critical (pathlib handles separators)
-            target = str(tmp_path / critical)
-            result = self._run(guard(
-                {"tool_name": "Edit", "tool_input": {"file_path": target}},
-                f"tid-bslash-{critical}", None,
-            ))
-            assert "deny" in str(result), (
-                f"Should block '{critical}' even with native path separators"
-            )
-
-    def test_can_disable_runtime_path_guard_for_external_workspaces(self, tmp_path):
-        guard = make_path_guard(str(tmp_path), protect_runtime_paths=False)
-        result = self._run(guard(
-            {"tool_name": "Edit", "tool_input": {"file_path": str(tmp_path / ".github" / "workflows" / "ci.yml")}},
-            "tid-external-ci", None,
-        ))
-        assert result == {}
-
-    def test_allows_read_tool(self, tmp_path):
-        guard = make_path_guard(str(tmp_path))
-        result = self._run(guard(
-            {"tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}},
-            "tid-read", None,
-        ))
-        assert result == {}
-
-    def test_blocks_relative_path_escape(self, tmp_path):
-        guard = make_path_guard(str(tmp_path))
-        result = self._run(guard(
-            {"tool_name": "Write", "tool_input": {"file_path": "../../../etc/evil"}},
-            "tid-escape", None,
-        ))
-        assert "deny" in str(result)
-
-    def test_the_write_fence_returns_a_decision_for_every_shape_of_tool_call(self, tmp_path):
-        """A guard that RAISES delivers no permission decision at all.
-
-        The SDK hands the callback ``request_data.get("input")`` — the CLI's JSON, with
-        no default and no type check — and turns an exception out of the callback into a
-        control-protocol ERROR response, which is not a deny. The write then runs
-        unfenced, so every shape a payload can arrive in must come back as a decision.
-
-        v6.87.43 made ``_resolved()`` strict for exactly this reason and shipped with NO
-        test for it: reverting its source hunk leaves this whole file green while
-        ``Write(file_path=42)`` raises ``TypeError`` out of the callback. Strictness also
-        has to stay strict rather than becoming ``str()`` coercion, which fails OPEN by
-        turning ``42`` or ``[]`` into a relative name inside the working directory.
-        """
-        guard = make_path_guard(str(tmp_path))
-
-        # The VALUE is not a string.
-        for value in (42, True, 3.5, b"/etc/passwd", ["/etc/passwd"], {"a": 1}):
-            result = self._run(guard(
-                {"tool_name": "Write", "tool_input": {"file_path": value}}, "tid-v", None,
-            ))
-            assert "deny" in str(result), f"non-str file_path {value!r} must deny, not raise"
-
-        # The INPUTS are not a mapping — the same defect one level out, and the one the
-        # read twin had already normalised away on its own line while this fence kept
-        # calling `.get` on whatever arrived. Unreadable inputs cannot be confined, and
-        # this fence's contract is that no write leaves cwd, so they deny.
-        for payload in (None, [], "x", 42, ["/etc/passwd"]):
-            result = self._run(guard(
-                {"tool_name": "Write", "tool_input": payload}, "tid-i", None,
-            ))
-            assert "deny" in str(result), f"unreadable tool_input {payload!r} must deny, not raise"
-        assert "deny" in str(self._run(guard({"tool_name": "Write"}, "tid-missing", None)))
-
-        # The PAYLOAD itself is not a mapping: no tool name, so this fence has nothing to
-        # say — but it still has to say it rather than raise.
-        assert self._run(guard(None, "tid-p", None)) == {}
-        assert self._run(guard(["Write"], "tid-p2", None)) == {}
-
-        # An ordinary in-cwd write is still allowed, so none of the above is a blanket deny.
-        assert self._run(guard(
-            {"tool_name": "Write", "tool_input": {"file_path": str(tmp_path / "ok.py")}},
-            "tid-ok", None,
-        )) == {}
-
-    def test_applies_external_write_path_blocker(self, tmp_path):
-        guard = make_path_guard(
-            str(tmp_path),
-            protect_runtime_paths=False,
-            write_path_blocker=lambda target: "path is credential-like" if target.name == ".env" else "",
-        )
-
-        blocked = self._run(guard(
-            {"tool_name": "Write", "tool_input": {"file_path": str(tmp_path / ".env")}},
-            "tid-user-files-secret", None,
-        ))
-        allowed = self._run(guard(
-            {"tool_name": "Write", "tool_input": {"file_path": str(tmp_path / "report.html")}},
-            "tid-user-files-report", None,
-        ))
-
-        assert "deny" in str(blocked)
-        assert "credential-like" in str(blocked)
-        assert allowed == {}
 
 
 # ---------------------------------------------------------------------------
@@ -367,18 +218,6 @@ class TestSDKAPISurface:
         from ouroboros.gateways import claude_code
         return inspect.getsource(claude_code)
 
-    def test_edit_path_uses_receive_response(self):
-        """Edit path must use receive_response() — it auto-stops after ResultMessage.
-
-        receive_messages() streams indefinitely and can hang.
-        receive_response() is the correct high-level method.
-        """
-        src = self._gateway_source()
-        assert "receive_response()" in src, "Edit path must call receive_response()"
-        assert "receive_messages()" not in src, (
-            "receive_messages() streams indefinitely — use receive_response() instead"
-        )
-
     def test_readonly_path_uses_sdk_client_lifecycle(self):
         """Read-only path must use ClaudeSDKClient, not query()+early generator break."""
         src = self._gateway_source()
@@ -386,15 +225,20 @@ class TestSDKAPISurface:
         assert "await client.query(prompt)" in src
         assert "async for message in client.receive_response():" in src
         assert "async for message in query(" not in src
+        # receive_messages() streams indefinitely and can hang — the gateway
+        # must only ever use receive_response().
+        assert "receive_messages()" not in src, (
+            "receive_messages() streams indefinitely — use receive_response() instead"
+        )
 
     def test_max_budget_in_constructor(self):
-        """v4.8.1 fix: max_budget_usd should be passed in ClaudeAgentOptions constructor."""
+        """max_budget_usd should be passed in ClaudeAgentOptions constructor."""
         src = self._gateway_source()
         # Should NOT have post-assignment pattern
         assert "options.max_budget_usd" not in src, \
             "max_budget_usd should be in constructor, not post-assigned"
-        # Should have it in the constructor call
-        assert "max_budget_usd=budget" in src, \
+        # Should have it in the constructor kwargs
+        assert "max_budget_usd=max_budget_usd" in src, \
             "max_budget_usd should be passed as constructor kwarg"
 
     def test_query_helper_not_used_by_gateway(self):
@@ -403,134 +247,13 @@ class TestSDKAPISurface:
         assert " query," not in src
         assert "query(prompt=prompt" not in src
 
-    def test_edit_mode_allows_write_tool_for_new_files(self):
-        """Edit mode must allow SDK Write for new-file deliverables."""
-        from ouroboros.gateways.claude_code import EDIT_TOOLS
-
-        assert set(EDIT_TOOLS) == {"Read", "Edit", "Write", "Grep", "Glob"}
-        assert 'matcher="Edit|Write|MultiEdit"' in self._gateway_source()
-
-    def test_edit_path_uses_system_prompt_file_when_sdk_supports_it(self, tmp_path):
-        """Large governance prompt should be handed to supported SDKs by private temp file."""
-        import ouroboros.gateways.claude_code as gw
-        from unittest.mock import patch
-
-        captured: dict = {}
-
-        class FakeOptions:
-            def __init__(self, system_prompt_file=None, **kwargs):
-                captured["system_prompt_file"] = system_prompt_file
-                captured["file_text"] = pathlib.Path(system_prompt_file).read_text(encoding="utf-8")
-                captured["file_exists_during_options"] = pathlib.Path(system_prompt_file).exists()
-                captured.update(kwargs)
-
-        class FakeResult:
-            subtype = "success"
-            session_id = "sid"
-            total_cost_usd = 0
-            usage = {}
-
-        class FakeSDKClient:
-            def __init__(self, options=None):
-                self.options = options
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                return None
-
-            async def query(self, prompt):
-                return None
-
-            async def receive_response(self):
-                yield FakeResult()
-
-        with patch("ouroboros.gateways.claude_code.ClaudeAgentOptions", FakeOptions), \
-             patch("ouroboros.gateways.claude_code.ClaudeSDKClient", FakeSDKClient), \
-             patch("ouroboros.gateways.claude_code.ResultMessage", FakeResult):
-            result = asyncio.get_event_loop().run_until_complete(
-                gw._run_edit_async(
-                    "edit", cwd=str(tmp_path), budget=1.0, system_prompt="FULL GOVERNANCE",
-                )
-            )
-
-        assert result.success is True
-        assert captured["file_text"] == "FULL GOVERNANCE"
-        assert captured["file_exists_during_options"] is True
-        assert not pathlib.Path(captured["system_prompt_file"]).exists()
-
-    def test_edit_path_cleans_system_prompt_file_on_sdk_failure(self, tmp_path):
-        import ouroboros.gateways.claude_code as gw
-        from unittest.mock import patch
-
-        captured: dict = {}
-
-        class FakeOptions:
-            def __init__(self, system_prompt_file=None, **kwargs):
-                captured["system_prompt_file"] = system_prompt_file
-
-        class FailingSDKClient:
-            def __init__(self, options=None):
-                self.options = options
-
-            async def __aenter__(self):
-                raise RuntimeError("sdk failed")
-
-            async def __aexit__(self, *args):
-                return None
-
-        with patch("ouroboros.gateways.claude_code.ClaudeAgentOptions", FakeOptions), \
-             patch("ouroboros.gateways.claude_code.ClaudeSDKClient", FailingSDKClient):
-            result = asyncio.get_event_loop().run_until_complete(
-                gw._run_edit_async(
-                    "edit", cwd=str(tmp_path), budget=1.0, system_prompt="FULL GOVERNANCE",
-                )
-            )
-
-        assert result.success is False
-        assert not pathlib.Path(captured["system_prompt_file"]).exists()
-
 
 # ---------------------------------------------------------------------------
 # SDK-only path: ImportError and failure diagnostics
 # ---------------------------------------------------------------------------
 
 class TestSDKOnlyPath:
-    """claude_code_edit and advisory_pre_review return meaningful errors when SDK missing."""
-
-    def test_claude_code_edit_returns_error_when_sdk_missing(self, monkeypatch, tmp_path):
-        """When SDK ImportError → tool returns install hint, not a crash."""
-        from types import SimpleNamespace
-
-        ctx = SimpleNamespace(
-            repo_dir=tmp_path,
-            drive_root=tmp_path,
-            branch_dev="ouroboros",
-            pending_events=[],
-            emit_progress_fn=lambda _: None,
-        )
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
-
-        import ouroboros.gateways.claude_code as gw_mod
-
-        # Directly test the error message in the function
-        from ouroboros.tools.shell import _claude_code_edit
-
-        # Mock _acquire_git_lock/_release_git_lock so we don't need git
-        import ouroboros.tools.git as git_mod
-        monkeypatch.setattr(git_mod, "_acquire_git_lock", lambda ctx: None)
-        monkeypatch.setattr(git_mod, "_release_git_lock", lambda lock: None)
-        import ouroboros.utils as utils_mod
-        monkeypatch.setattr(utils_mod, "run_cmd", lambda *args, **kwargs: None)
-
-        def raise_import_error(*args, **kwargs):
-            raise ImportError("No module named 'claude_agent_sdk'")
-
-        monkeypatch.setattr(gw_mod, "run_edit", raise_import_error)
-        result = _claude_code_edit(ctx, "Test prompt")
-        assert "CLAUDE_CODE_UNAVAILABLE" in result
-        assert "claude-agent-sdk" in result
+    """advisory_pre_review returns meaningful errors when SDK missing."""
 
     def test_advisory_returns_error_when_sdk_missing(self, monkeypatch, tmp_path):
         """When SDK not installed → advisory returns install hint."""
@@ -1069,9 +792,9 @@ class TestVerifyClaudeRuntime:
     def test_verify_triggers_repair_when_sdk_below_baseline(self, tmp_path):
         """SDK 0.1.50 < baseline 0.1.60 → repair fires even though import + CLI work.
 
-        This guards the upgraded-install compat gap: claude_code_edit and
-        advisory_pre_review would otherwise still send thinking.type=enabled
-        to Opus 4.7 on an install with pre-0.1.60 SDK already present.
+        This guards the upgraded-install compat gap: advisory_pre_review
+        would otherwise still send thinking.type=enabled to Opus 4.7 on an
+        install with pre-0.1.60 SDK already present.
         """
         import logging
         from ouroboros.launcher_bootstrap import BootstrapContext, verify_claude_runtime
@@ -1223,45 +946,15 @@ class TestDelegatedTrustSurface:
             "review", cwd=cwd, effort="high", max_budget_usd=1.0,
         ))
 
-    def _edit_options(self, monkeypatch, cwd="/tmp"):
-        return _run_with_fake_sdk(monkeypatch, lambda gw: gw._run_edit_async(
-            "edit", cwd=cwd, budget=1.0,
-        ))
-
-    @pytest.mark.parametrize("path", ["readonly", "edit"])
-    def test_foreign_settings_and_mcp_config_are_not_loaded(self, monkeypatch, path):
-        options = (
-            self._readonly_options(monkeypatch) if path == "readonly"
-            else self._edit_options(monkeypatch)
-        )
+    # The edit path retired with D10; the readonly runner is the one live path.
+    def test_foreign_settings_and_mcp_config_are_not_loaded(self, monkeypatch):
+        options = self._readonly_options(monkeypatch)
         # A `.claude/settings.json` / `.mcp.json` in the target directory would
         # otherwise be loaded and executed (--print skips the trust prompt).
         assert options["setting_sources"] == []
         assert options["strict_mcp_config"] is True
         assert options["mcp_servers"] == {}
 
-    def test_the_floor_sdk_without_strict_mcp_config_still_constructs_options(self, monkeypatch):
-        """claude-agent-sdk 0.1.60 — the requirements floor — has setting_sources,
-        mcp_servers, tools and effort but NO strict_mcp_config field anywhere
-        (verified against the published wheel). Passing it unconditionally made
-        ``ClaudeAgentOptions(**kwargs)`` raise TypeError, killing BOTH delegated
-        paths on a supported install; the param is probed like ``tools`` and
-        ``effort``. Omission is fail-closed: ``setting_sources=[]`` already keeps
-        the project ``.mcp.json`` out, and the allowlist hook denies ``mcp__*``."""
-        import ouroboros.gateways.claude_code as gw
-
-        class FloorOptions:
-            # 0.1.60's relevant signature: explicit fields, no **kwargs escape.
-            def __init__(self, tools=None, allowed_tools=None, disallowed_tools=None,
-                         setting_sources=None, mcp_servers=None, effort=None):
-                self.tools = tools
-
-        monkeypatch.setattr(gw, "ClaudeAgentOptions", FloorOptions)
-        for surface in (gw.READONLY_TOOLS, gw.EDIT_TOOLS):
-            kwargs = gw._tool_surface_kwargs(surface)
-            assert "strict_mcp_config" not in kwargs
-            constructed = FloorOptions(**kwargs)  # unconditional kwarg -> TypeError
-            assert constructed.tools == list(surface)
 
     def test_readonly_tool_surface_is_closed_and_read_only(self, monkeypatch):
         from ouroboros.gateways.claude_code import READONLY_TOOLS
@@ -1272,22 +965,9 @@ class TestDelegatedTrustSurface:
         for forbidden in ("Agent", "Task", "Bash", "Edit", "Write", "WebFetch"):
             assert forbidden in options["disallowed_tools"]
 
-    def test_edit_tool_surface_keeps_edits_and_forbids_subagents(self, monkeypatch):
-        from ouroboros.gateways.claude_code import EDIT_TOOLS
 
-        options = self._edit_options(monkeypatch)
-        assert options["tools"] == list(EDIT_TOOLS)
-        for forbidden in ("Agent", "Task", "Bash", "NotebookEdit", "WebFetch"):
-            assert forbidden in options["disallowed_tools"]
-        assert "Edit" not in options["disallowed_tools"]
-        assert "Write" not in options["disallowed_tools"]
-
-    @pytest.mark.parametrize("path", ["readonly", "edit"])
-    def test_both_paths_install_pretooluse_guards(self, monkeypatch, path):
-        options = (
-            self._readonly_options(monkeypatch) if path == "readonly"
-            else self._edit_options(monkeypatch)
-        )
+    def test_the_readonly_path_installs_pretooluse_guards(self, monkeypatch):
+        options = self._readonly_options(monkeypatch)
         assert len(options["hooks"]["PreToolUse"]) >= 2
 
 
@@ -1301,12 +981,6 @@ class TestToolAllowlistGuard:
         result = self._run(guard({"tool_name": tool, "tool_input": {}}, "tid", None))
         assert "deny" in str(result)
 
-    def test_edit_surface_allows_its_own_tools_only(self):
-        from ouroboros.gateways.claude_code import EDIT_TOOLS, make_tool_allowlist_guard
-
-        guard = make_tool_allowlist_guard(EDIT_TOOLS)
-        assert self._run(guard({"tool_name": "Write", "tool_input": {}}, "t", None)) == {}
-        assert "deny" in str(self._run(guard({"tool_name": "Agent", "tool_input": {}}, "t", None)))
 
 
 class TestReadGuard:
@@ -1373,6 +1047,26 @@ class TestReadGuard:
             {"tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "elsewhere.txt")}}, "t", None,
         )))
 
+
+
+    def test_read_fence_and_allowlist_decide_on_a_payload_that_is_not_a_dict(self, tmp_path):
+        """The payload is a dict by CONVENTION: the SDK forwards the CLI's JSON with no
+        default and no type check, and an exception out of a PreToolUse callback is an
+        error response, not a deny. Every guard must answer, never raise."""
+        from ouroboros.gateways.claude_code import make_tool_allowlist_guard
+
+        guard = self._guard(tmp_path)
+        allowlist = make_tool_allowlist_guard(("Read",))
+        for payload in (None, [], "x", 42):
+            assert isinstance(self._run(guard(payload, "t", None)), dict)
+            assert "deny" in str(self._run(allowlist(payload, "t", None))), payload
+
+        # And the inputs are still path-checked AS THEY ARRIVE. Normalising a non-dict to
+        # `{}` would drop a bare-string payload out of the fence entirely.
+        assert "deny" in str(self._run(guard(
+            {"tool_name": "Read", "tool_input": "/etc/passwd"}, "t", None,
+        )))
+
     def test_confines_by_value_not_by_an_enumerated_field_name(self, tmp_path):
         """An enumerated field allowlist is the same structurally-incomplete shape this
         module already rejects for tool NAMES: a call whose only path rides a field
@@ -1380,14 +1074,10 @@ class TestReadGuard:
 
         `Glob` carries its path in `pattern` and can omit `path` entirely, so
         `Glob(pattern="/Users/x/.ssh/*")` read outside the workspace unchallenged.
+        (The write-fence halves of the original assertions retired with the D10
+        edit path; the read fence is the surviving consumer of `_resolved`.)
         """
-        from ouroboros.gateways.claude_code import make_read_guard
-
-        guard = make_read_guard(str(tmp_path))
-        # `~` is expanded before the absolute test — in `_resolved`, which owns every
-        # step of turning a value into a path. Untreated it reads as relative, gets
-        # joined onto the workspace root, and is allowed — this was the fix's own
-        # docstring example, asserted in prose and passing in practice.
+        guard = self._guard(tmp_path)
         for tilde in ("~/.ssh/id_rsa", "~/.aws/credentials"):
             assert self._run(guard({"tool_name": "Read",
                                     "tool_input": {"file_path": tilde}}, "t", None)), tilde
@@ -1412,24 +1102,17 @@ class TestReadGuard:
                                "tool_input": {"paths": [str(tmp_path), "/etc/hosts"]}}, "t", None))
         assert out, "a path inside a list escaped the read fence"
 
-        # An unresolvable path denies, whatever makes it unresolvable, and on BOTH
-        # fences. Each earlier widening stopped one exception short of the case the
-        # guard advertised: `OSError` alone missed an embedded null (`ValueError`, legal
-        # in a JSON string), and adding `ValueError` still missed a symlink loop
-        # (`RuntimeError`). A guard that raises out of the PreToolUse callback delivers
-        # no decision at all, which is the one outcome a fence must never produce.
+        # An unresolvable path denies, whatever makes it unresolvable: `OSError` alone
+        # missed an embedded null (`ValueError`, legal in a JSON string) and a symlink
+        # loop (`RuntimeError`). A guard that raises out of the PreToolUse callback
+        # delivers no decision at all — the one outcome a fence must never produce.
         import os as _os
-
-        from ouroboros.gateways.claude_code import make_path_guard
 
         _os.symlink(tmp_path / "loop_b", tmp_path / "loop_a")
         _os.symlink(tmp_path / "loop_a", tmp_path / "loop_b")
-        write_fence = make_path_guard(str(tmp_path))
         for bad in ("/etc/passwd\x00", str(tmp_path / "loop_a" / "x")):
             assert self._run(guard({"tool_name": "Read",
                                     "tool_input": {"file_path": bad}}, "t", None)), bad
-            assert self._run(write_fence({"tool_name": "Write",
-                                          "tool_input": {"file_path": bad}}, "t", None)), bad
 
         # In-workspace values still pass, whatever they are called.
         inside = tmp_path / "a.txt"
@@ -1437,37 +1120,24 @@ class TestReadGuard:
         assert self._run(guard({"tool_name": "Glob",
                                 "tool_input": {"pattern": str(inside)}}, "t", None)) == {}
 
-    def test_both_fences_judge_the_path_the_cli_will_actually_open(self, tmp_path):
+    def test_the_read_fence_judges_the_path_the_cli_will_actually_open(self, tmp_path):
         """A fence must resolve a value the way its CONSUMER resolves it.
 
-        The CLI funnels every tool path through one helper that TRIMS the value and then
-        expands a leading ``~``. `_resolved` did neither, and both omissions fail OPEN
-        the same way: `pathlib` calls anything not starting with a separator relative and
-        joins it onto the workspace, so `" /etc/passwd"` was confined to
-        `<cwd>/ /etc/passwd` and `"~/.ssh/x"` to `<cwd>/~/.ssh/x` while the tool opened
-        `/etc/passwd` and `$HOME/.ssh/x`.
-
-        The trim gap is reachable END TO END, verified against the real CLI: `Grep`/`Glob`
-        hand the hook their `path` verbatim (only `Read`/`Write`/`Edit` pre-normalise
-        `file_path` before hooks run), and `Grep(path=" /outside")` returned a file from
-        outside the read root. The `~` gap is the sprint's twin shape — the read fence had
-        bought it back one layer up in `_path_like_values`, so only the WRITE fence was
-        still exposed, and nothing asked whether the twin needed the same.
-
-        Both are one predicate's question, so both are asserted on BOTH fences.
+        The CLI funnels every tool path through one helper that TRIMS the value and
+        then expands a leading `~`; `pathlib` calls anything not starting with a
+        separator relative and joins it onto the workspace, so `" /etc/passwd"` was
+        confined to `<cwd>/ /etc/passwd` while the tool opened `/etc/passwd`. The
+        trim gap is reachable END TO END via `Grep(path=" /outside")`. (Originally
+        asserted on both fences; the write fence retired with the D10 edit path.)
         """
-        from ouroboros.gateways.claude_code import make_path_guard
-
         read_fence = self._guard(tmp_path)
-        write_fence = make_path_guard(str(tmp_path))
-
         escapes = (
-            "~/.ssh/authorized_keys",   # `~` expansion, the write twin's live gap
-            "~",                        # bare `~` is $HOME, and has no separator in it
+            "~/.ssh/authorized_keys",   # `~` expansion
+            "~",                        # bare `~` is $HOME, no separator in it
             " /etc/passwd",             # leading space, reproduced end to end via Grep
             "\t/etc/passwd",            # `trim()` is not just the space character
-            "　/etc/passwd",        # ...nor just the ASCII ones
-            "﻿/etc/passwd",        # ...and JS trims the BOM where `str.strip` does not
+            "\u3000/etc/passwd",        # ...nor just the ASCII ones
+            "\ufeff/etc/passwd",        # ...and JS trims the BOM where str.strip does not
         )
         for value in escapes:
             assert self._run(read_fence(
@@ -1476,69 +1146,13 @@ class TestReadGuard:
             assert self._run(read_fence(
                 {"tool_name": "Grep", "tool_input": {"pattern": "x", "path": value}}, "t", None,
             )), f"read fence allowed Grep(path={value!r})"
-            assert self._run(write_fence(
-                {"tool_name": "Write", "tool_input": {"file_path": value}}, "t", None,
-            )), f"write fence allowed {value!r}"
 
-        # A `~` value has the shape of a path with no separator in it, so the walker has
-        # to catch it by NAME now that it no longer expands on the way past.
+        # A `~` value has the shape of a path with no separator in it, so the walker
+        # has to catch it by NAME now that it no longer expands on the way past.
         assert self._run(read_fence(
             {"tool_name": "Glob", "tool_input": {"a_field_a_future_cli_adds": "~"}}, "t", None,
         )), "a bare ~ in an unlisted field escaped the read fence"
 
-        # ...and the walker yields the value VERBATIM, which is the half of this change
-        # nothing else would catch: moving the expansion into `_resolved` while leaving
-        # `_path_like_values` expanding on the way past denies every case above just the
-        # same, so only the WORDS of the deny separate the two. They are worth pinning
-        # on their own terms — the reason is what the delegated agent reads, and quoting
-        # a rewritten path both hides which value was rejected and hands the child the
-        # operator's real home directory, which it was never shown and cannot resolve.
-        reason = str(self._run(read_fence(
-            {"tool_name": "Read", "tool_input": {"file_path": "~/.ssh/authorized_keys"}},
-            "t", None,
-        )))
-        assert "'~/.ssh/authorized_keys'" in reason, reason
-        assert f"{pathlib.Path.home()}/.ssh/authorized_keys" not in reason, reason
-
-        # The expansion joins by TEXT for a reason: `Path.home() / "/etc/passwd"` throws
-        # the home prefix away and answers `/etc/passwd`, so a `~/` value with an
-        # absolute tail would stop meaning what the consumer's own substitution means.
-        # Both spellings deny here, so only the resolved path itself shows the difference.
-        from ouroboros.gateways.claude_code import _resolved
-
-        under_home = _resolved("~//etc/passwd", tmp_path)
-        assert under_home != pathlib.Path("/etc/passwd")
-        assert str(under_home).startswith(str(pathlib.Path.home())), under_home
-
-        # Not a blanket deny, and not stricter than the consumer either: the CLI expands
-        # only `~` and `~/`, so `~notauser/x` stays RELATIVE for the tool and the fence
-        # has to agree rather than guess at a home directory the tool will never use.
-        (tmp_path / "sub").mkdir(exist_ok=True)
-        for ok in ("ok.py", "sub/ok.py", " ok.py", "./ok.py", "~notauser/x"):
-            assert self._run(read_fence(
-                {"tool_name": "Read", "tool_input": {"file_path": ok}}, "t", None,
-            )) == {}, f"read fence denied in-workspace {ok!r}"
-            assert self._run(write_fence(
-                {"tool_name": "Write", "tool_input": {"file_path": ok}}, "t", None,
-            )) == {}, f"write fence denied in-workspace {ok!r}"
-
-    def test_read_fence_and_allowlist_decide_on_a_payload_that_is_not_a_dict(self, tmp_path):
-        """The payload is a dict by CONVENTION: the SDK forwards the CLI's JSON with no
-        default and no type check, and an exception out of a PreToolUse callback is an
-        error response, not a deny. Every guard must answer, never raise."""
-        from ouroboros.gateways.claude_code import make_tool_allowlist_guard
-
-        guard = self._guard(tmp_path)
-        allowlist = make_tool_allowlist_guard(("Read",))
-        for payload in (None, [], "x", 42):
-            assert isinstance(self._run(guard(payload, "t", None)), dict)
-            assert "deny" in str(self._run(allowlist(payload, "t", None))), payload
-
-        # And the inputs are still path-checked AS THEY ARRIVE. Normalising a non-dict to
-        # `{}` would drop a bare-string payload out of the fence entirely.
-        assert "deny" in str(self._run(guard(
-            {"tool_name": "Read", "tool_input": "/etc/passwd"}, "t", None,
-        )))
 
 class TestAbandonedChildAccounting:
     """A killed advisory child must not keep its reservation open forever."""
@@ -1689,8 +1303,8 @@ class TestResultMessageIsErrorHonored:
             total_cost_usd = 0
             usage = {}
 
+        # The edit path retired with D10; the readonly runner is the one live path.
         for runner, kwargs in (
-            (gw._run_edit_async, {"budget": 1.0}),
             (gw._run_readonly_async, {"max_budget_usd": 1.0}),
         ):
             out = self._run(runner, FakeErrorResult(), tmp_path, **kwargs)
@@ -1709,8 +1323,8 @@ class TestResultMessageIsErrorHonored:
             total_cost_usd = 0
             usage = {}
 
+        # The edit path retired with D10; the readonly runner is the one live path.
         for runner, kwargs in (
-            (gw._run_edit_async, {"budget": 1.0}),
             (gw._run_readonly_async, {"max_budget_usd": 1.0}),
         ):
             out = self._run(runner, FakeCleanResult(), tmp_path, **kwargs)

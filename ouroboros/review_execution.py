@@ -810,6 +810,10 @@ def run_delegated_review_session(
                 run_request["model"] = route.model
             if route.effort:
                 run_request["effort"] = route.effort
+            if getattr(route, "profile_id", ""):
+                # Manual credential pin (Q2-в, optional): the daemon still owns
+                # rotation for every unpinned row (D28 default).
+                run_request["credentialProfileId"] = route.profile_id
             if schema_asked:
                 run_request["outputSchema"] = output_schema
         if not run_id:
@@ -922,6 +926,10 @@ def run_delegated_review_session(
             "model": str(summary.get("model") or route.model or ""),
             "spend": spend,
             "spend_estimated": estimated,
+            # D22/D29 APPLIED facts, verbatim from the run's own telemetry
+            # receipt — empty when the engine predates it, never invented.
+            "applied_profile": str((summary.get("authRoute") or {}).get("profileId") or ""),
+            "applied_access": str(summary.get("effectiveAccess") or summary.get("access") or ""),
         }
     finally:
         gateway.close()
@@ -1092,6 +1100,29 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         return self._verdict_result()
 
     def _session_route(self) -> Any:
+        # 6.1: a structured row carries ITS OWN opaque target; the shared
+        # session-route key stays as the legacy fallback for rows without one.
+        spec = str(getattr(self.assignment.slot, "session_target", "") or "")
+        if spec:
+            import dataclasses
+
+            from ouroboros.subagents import parse_subagent_harness
+
+            route = parse_subagent_harness(spec)
+            if route is None:
+                raise ReviewRouteUnavailable(
+                    f"agent_session slot {self.assignment.slot.slot_id} has an "
+                    f"unparsable session target {spec!r}"
+                )
+            # D1/6.3: effort has ONE source — the per-slot effort field. The
+            # target_id carries route identity only; any effort a caller
+            # embedded in the spec (`harness=model:effort`) is dropped so the
+            # field can never be silently overridden by the identity string.
+            route = dataclasses.replace(route, effort=str(self.assignment.slot.effort or ""))
+            pin = str(getattr(self.assignment.slot, "session_profile", "") or "")
+            if pin:
+                route = dataclasses.replace(route, profile_id=pin)
+            return route
         route = review_session_route()
         if route is None:
             raise ReviewRouteUnavailable(
@@ -1169,6 +1200,11 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             "resolved_model": facts["model"],
             "delegated_run_id": facts["run_id"],
             "delegated_route": facts["route_id"],
+            # APPLIED account/access (D29): what the engine's receipt disclosed,
+            # '' when telemetry predates it — shown as absent, never as the
+            # requested value dressed up as applied.
+            "applied_profile": facts.get("applied_profile", ""),
+            "applied_access": facts.get("applied_access", ""),
             "output_conformance": conformance,
             "settlement": facts["settlement"],
             # The ledger row is written by settle_run (record_subscription_session);

@@ -487,3 +487,65 @@ ACCEPTANCE_SURFACE_RULES = (
         "terminal judgement ends the loop and surfaces both positions to the owner; it is not a "
         "concession. "
 )
+
+
+def review_query_error_payload(
+    *,
+    ctx: Any,
+    model: str,
+    messages: list,
+    slot_id: str,
+    error: str,
+) -> dict:
+    """Durable failure envelope for one errored multi-model review row.
+
+    The envelope carries the row id too: an errored row is still a row, and
+    its durable actor record must name the same one its refs do. Imports stay
+    lazy so this module's dependency graph remains the primitives it declares.
+    """
+    payload = {"error": error, "usage": {}, "slot_id": slot_id, "prompt_ref": {}, "response_ref": {}}
+    try:
+        from ouroboros.observability import new_call_id, persist_call
+        from ouroboros.tools.review_helpers import review_drive_root
+
+        drive_root = review_drive_root(ctx)
+        task_id = str(getattr(ctx, "task_id", "") or "multi_model_review") if ctx is not None else "multi_model_review"
+        call_id = new_call_id(f"review_multi_model_review_{slot_id}_error")
+        payload["prompt_ref"] = persist_call(
+            drive_root,
+            task_id=task_id,
+            call_id=f"{call_id}_prompt",
+            call_type="multi_model_review_prompt",
+            payload={"messages": messages, "slot_id": slot_id, "model": model},
+            manifest={"surface": "multi_model_review", "slot_id": slot_id, "model": model, "synthetic": True},
+        )
+        payload["response_ref"] = persist_call(
+            drive_root,
+            task_id=task_id,
+            call_id=f"{call_id}_error",
+            call_type="multi_model_review_error",
+            payload={"error": error},
+            manifest={"surface": "multi_model_review", "slot_id": slot_id, "model": model, "status": "error", "synthetic": True},
+        )
+    except Exception:
+        pass
+    return payload
+
+
+_PROVIDER_OVERSIZE_MARKERS = (
+    # Anthropic: "prompt is too long: 1166914 tokens > 1000000 maximum"
+    "prompt is too long",
+    # Anthropic: "input length and `max_tokens` exceed context limit"
+    "exceed context limit",
+    # OpenAI error code + message variants
+    "context_length_exceeded",
+    "maximum context length",
+)
+
+
+def is_provider_oversize_error(error_text: str) -> bool:
+    """Mechanical fault classification: does this provider error mean the prompt
+    exceeded the model's REAL context window? Deliberately tight markers — any
+    other provider/transport error keeps the fail-closed blocking path."""
+    low = str(error_text or "").lower()
+    return any(marker in low for marker in _PROVIDER_OVERSIZE_MARKERS)

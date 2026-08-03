@@ -1208,6 +1208,30 @@ def test_settlement_reads_the_harnesss_own_spend_field(tmp_path, monkeypatch):
     assert retired == ["prj-ours"], "a registration we created is retired on settle"
 
 
+def test_d29_applied_credential_profile_reaches_the_durable_record(tmp_path, monkeypatch):
+    """D29: the APPLIED credential-profile id + access profile the engine's
+    authRoute receipt discloses must land in the durable ledger row AND the
+    settled event by default — 'which account paid' answered from the record."""
+    payload, row, event = _settled_run(tmp_path, monkeypatch, {
+        "state": "succeeded", "spendUsd": 2.5,
+        "authRoute": {"profileId": "koshak", "requested": "subscription"},
+        "effectiveAccess": "readonly",
+    })
+    assert row["credential_profile_id"] == "koshak"
+    assert row["access_profile"] == "readonly"
+    assert event["credential_profile_id"] == "koshak"
+    assert event["access_profile"] == "readonly"
+
+
+def test_d29_absent_authroute_records_empty_never_invented(tmp_path, monkeypatch):
+    """Telemetry that predates the receipt records an empty applied profile —
+    the fact is disclosed as unknown, never fabricated."""
+    _payload, row, event = _settled_run(tmp_path, monkeypatch, {
+        "state": "succeeded", "spendUsd": 0.0})
+    assert row["credential_profile_id"] == ""
+    assert event["credential_profile_id"] == ""
+
+
 def _settled_run(tmp_path, monkeypatch, summary):
     """Drive a real `_settle` for `summary`; return (agent payload, ledger row, envelope).
 

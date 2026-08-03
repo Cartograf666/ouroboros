@@ -55,15 +55,21 @@ def test_effort_defaults_in_config():
 
 
 def test_review_effort_default_carriers_stay_in_sync():
-    """The owner-facing fallback must not drift from config/API defaults."""
+    """The owner-facing fallback must not drift from config/API defaults.
+
+    Since 6.3 moved the Review/Scope efforts off the Behavior tab onto the
+    Models page as per-slot dropdowns, the owner-facing carrier is
+    reviewer_slots.js: an EMPTY slot effort inherits the surface default
+    (OUROBOROS_EFFORT_REVIEW / OUROBOROS_EFFORT_SCOPE_REVIEW), and the optional
+    advisory row defaults low (D14)."""
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[1]
-    settings_ui = (root / "web" / "modules" / "settings_ui.js").read_text(encoding="utf-8")
-    settings_runtime = (root / "web" / "modules" / "settings.js").read_text(encoding="utf-8")
-    assert "['s-effort-review', 'Review', 'high']" in settings_ui
-    assert "['s-effort-review', 'OUROBOROS_EFFORT_REVIEW', 'high']" in settings_runtime
+    slots_ui = (root / "web" / "modules" / "reviewer_slots.js").read_text(encoding="utf-8")
+    assert "review effort" in slots_ui and "scope review effort" in slots_ui
+    assert "effort: 'low'" in slots_ui  # the advisory default (D14)
     assert SETTINGS_DEFAULTS["OUROBOROS_EFFORT_REVIEW"] == "high"
+    assert SETTINGS_DEFAULTS["OUROBOROS_EFFORT_SCOPE_REVIEW"] == "high"
 
 
 def test_deep_self_review_effort_slot(monkeypatch):

@@ -430,7 +430,7 @@ class TestAdvisoryReviewStatusInContext:
         ))
         state.advisory_runs[-1].status = "stale"
         state.last_stale_from_edit_ts = "2026-04-07T10:00:00+00:00"
-        state.last_stale_reason = "claude_code_edit mutated tracked.py"
+        state.last_stale_reason = "edit_text mutated tracked.py"
         state.last_stale_repo_key = repo_key
         state.record_attempt(CommitAttemptRecord(
             ts="2026-04-07T10:01:00+00:00",

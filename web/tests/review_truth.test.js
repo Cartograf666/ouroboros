@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+    executorChip,
     formatReviewProjection,
     summarizeChatLiveEvent,
     taskOutcomeSeverity,
@@ -183,4 +184,51 @@ test('review-only subagent projection explicitly has no collapsed activity', () 
     assert.equal(summary.activityPreview, '');
     assert.match(summary.body, /panel_review_only/);
     assert.equal(summary.expandByDefault, true);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 6, owner directive #1: the per-bubble / per-subagent executor chip.
+// «бейдж точно нужен, но не рекламный … что ТУТ бабл \ субагент на codex»
+// ---------------------------------------------------------------------------
+
+test('a delegated frame yields a small harness chip; an ordinary frame yields none', () => {
+    const chip = executorChip({ executor_route: 'codex' });
+    assert.equal(chip.harness, 'codex');
+    assert.equal(chip.label, 'codex');           // short harness name, not a slogan
+    assert.ok(chip.icon);                        // icon, Claudexor-style
+    assert.match(chip.title, /codex/);
+    // The opaque `harness=model` spelling prints the HARNESS part only.
+    assert.equal(executorChip({ executor_route: 'codex=gpt-5.6-sol' }).label, 'codex');
+    // An unknown harness still gets a chip (a generic mark), never a crash.
+    assert.equal(executorChip({ executor_route: 'opencode' }).label, 'opencode');
+    // ABSENT FACT -> no chip at all: no placeholder, no "api" noise on every
+    // ordinary bubble (the native path is the unremarkable case).
+    assert.equal(executorChip({}), null);
+    assert.equal(executorChip({ executor_route: '' }), null);
+    assert.equal(executorChip(null), null);
+});
+
+test('the chip rides both projections: an ordinary progress bubble and a subagent row', () => {
+    const bubble = summarizeChatLiveEvent({
+        is_progress: true, content: 'working on the thing', task_id: 't1',
+        executor_route: 'codex',
+    });
+    assert.equal(bubble.executorChip.harness, 'codex');
+
+    const subagentRow = summarizeChatLiveEvent({
+        is_progress: true, content: 'child progress',
+        delegation_role: 'subagent', subagent_task_id: 'child-1',
+        subagent_event: 'running', subagent_role: 'implementer',
+        executor_route: 'claude=sonnet-5',
+    });
+    assert.equal(subagentRow.executorChip.harness, 'claude');
+
+    // Neither projection invents a chip when the fact is absent.
+    assert.equal('executorChip' in summarizeChatLiveEvent({
+        is_progress: true, content: 'plain', task_id: 't2',
+    }), false);
+    assert.equal('executorChip' in summarizeChatLiveEvent({
+        is_progress: true, content: 'plain child', delegation_role: 'subagent',
+        subagent_task_id: 'child-2', subagent_event: 'running',
+    }), false);
 });

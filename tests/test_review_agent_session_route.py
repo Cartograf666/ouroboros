@@ -816,8 +816,9 @@ def test_mixed_scope_fanout_sends_each_row_over_its_own_route(tmp_path, monkeypa
     monkeypatch.setattr("ouroboros.review_substrate.run_review_request", _capture)
     monkeypatch.setattr(scope_mod, "_build_scope_prompt",
                         lambda *_a, **_k: ("assembled api pack", None))
-    monkeypatch.setattr(scope_mod, "_scope_reviewer_window_evidence",
-                        lambda *_a, **_k: (1_000_000, "confirmed"))
+    monkeypatch.setattr(scope_mod, "_scope_window",
+                        lambda *_a, **_k: scope_mod.ReviewerWindow(
+                            window_tokens=1_000_000, status="confirmed"))
 
     for slot in scope_reviewer_slots(["m/session", "m/api"]):
         scope_mod.run_scope_review(
@@ -898,8 +899,9 @@ def test_scope_session_delivery_never_builds_the_pack(tmp_path, fake_route, monk
         raise AssertionError("the api pack builder ran for a session slot")
 
     monkeypatch.setattr(scope_mod, "_build_scope_prompt", _pack_must_not_build)
-    monkeypatch.setattr(scope_mod, "_scope_reviewer_window_evidence",
-                        lambda *_a, **_k: (1_000_000, "confirmed"))
+    monkeypatch.setattr(scope_mod, "_scope_window",
+                        lambda *_a, **_k: scope_mod.ReviewerWindow(
+                            window_tokens=1_000_000, status="confirmed"))
     fake_route.detail = _terminal_detail(
         json.dumps({"findings": _scope_matrix_rows()}), conformance="passed",
     )
@@ -932,8 +934,17 @@ def _run_session_scope(tmp_path, fake_route, monkeypatch, *, window, provenance,
     import ouroboros.tools.scope_review as scope_mod
     from ouroboros.review_execution import ReviewRouteKind
 
-    monkeypatch.setattr(scope_mod, "_scope_reviewer_window_evidence",
-                        lambda *_a, **_k: (window, provenance))
+    # Ported onto the evidence-typed resolver (ReviewerWindow): sourced provenance
+    # rides `status`; the conservative fallback is NO evidence (window_tokens=0,
+    # sizing falls back); the designated-default sentinel is a NUMBER with no
+    # status — a routing grant, never a measurement.
+    if provenance in ("confirmed", "asserted"):
+        _resolved = scope_mod.ReviewerWindow(window_tokens=int(window), status=provenance)
+    elif provenance == "designated_default_sentinel":
+        _resolved = scope_mod.ReviewerWindow(window_tokens=int(window), status="")
+    else:
+        _resolved = scope_mod.ReviewerWindow(window_tokens=0, status="")
+    monkeypatch.setattr(scope_mod, "_scope_window", lambda *_a, **_k: _resolved)
     fake_route.detail = _terminal_detail(
         json.dumps({"findings": rows if rows is not None else _scope_matrix_rows()}),
         conformance="passed",
@@ -1022,8 +1033,9 @@ def test_api_scope_row_keeps_the_1m_floor_and_still_blocks_sub_floor(
     pack fitting, so a sub-1M reviewer is still the loud `sub_floor` block."""
     import ouroboros.tools.scope_review as scope_mod
 
-    monkeypatch.setattr(scope_mod, "_scope_reviewer_window_evidence",
-                        lambda *_a, **_k: (200_000, "confirmed"))
+    monkeypatch.setattr(scope_mod, "_scope_window",
+                        lambda *_a, **_k: scope_mod.ReviewerWindow(
+                            window_tokens=200_000, status="confirmed"))
     monkeypatch.setattr(scope_mod, "_build_scope_prompt",
                         lambda *_a, **_k: ("assembled api pack", None))
     monkeypatch.setattr(
@@ -1036,7 +1048,7 @@ def test_api_scope_row_keeps_the_1m_floor_and_still_blocks_sub_floor(
     )
     assert result.status == "sub_floor", result.status
     assert result.blocked is True
-    assert "below the required >=1M floor" in result.block_message
+    assert "does not establish the required >=1M floor" in result.block_message
 
 
 def test_scope_quorum_refuses_a_session_advisory_row_as_authoritative(tmp_path, monkeypatch):
@@ -1059,8 +1071,10 @@ def test_scope_quorum_refuses_a_session_advisory_row_as_authoritative(tmp_path, 
     monkeypatch.setattr(parallel_review, "run_scope_review",
                         lambda _ctx, _msg, **kwargs: rows[kwargs["scope_model"]])
     monkeypatch.setattr(parallel_review, "scope_reviewer_slots", lambda *_a, **_k: [
-        SimpleNamespace(model="api/big", slot_id="scope_slot_1", route=None),
-        SimpleNamespace(model="session/row", slot_id="scope_slot_2", route=None),
+        SimpleNamespace(model="api/big", slot_id="scope_slot_1", route=None,
+                        effort="", session_target="", session_profile=""),
+        SimpleNamespace(model="session/row", slot_id="scope_slot_2", route=None,
+                        effort="", session_target="", session_profile=""),
     ])
     monkeypatch.setattr(parallel_review, "run_cmd", lambda *_a, **_k: "staged diff")
     monkeypatch.setattr(review, "_run_unified_review", lambda *_a, **_k: None)

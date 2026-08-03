@@ -168,7 +168,7 @@ class TestCentralWorktreeInvalidation:
             for entry in mod.get_tools()
             if entry.mutates_worktree
         }
-        for name in ("run_command", "run_script", "claude_code_edit",
+        for name in ("run_command", "run_script",
                      "start_service", "stop_service", "cherry_pick_pr_commits",
                      "stage_pr_merge", "stage_adaptations"):
             assert name in flagged, f"{name} must be mutates_worktree-flagged"

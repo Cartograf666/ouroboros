@@ -148,11 +148,18 @@ class DelegationRoute:
 
     ``route_id`` is passed through to Claudexor verbatim as the primary harness.
     Ouroboros never interprets it — no ``if codex/claude/cursor`` anywhere (AGENTS.md).
+
+    ``profile_id`` is the OPTIONAL manual credential pin (Q2-в, applied as the
+    reversible default pending owner confirmation): empty means the daemon's
+    own rotation policy picks the account (D28 — the default); a value rides
+    the run request verbatim as ``credentialProfileId``. Reviewer-slot rows
+    are the only author today.
     """
 
     route_id: str
     model: str = ""
     effort: str = ""
+    profile_id: str = ""
 
 
 def parse_subagent_harness(value: Any) -> DelegationRoute | None:

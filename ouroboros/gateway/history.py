@@ -67,6 +67,9 @@ _PROGRESS_META_FIELDS = (
     "requested_model_lane",
     "effective_model_lane",
     "model",
+    # Phase 6: the resolved delegated route (a harness id), so a replayed
+    # bubble keeps its executor chip instead of losing it on reload.
+    "executor_route",
     "task_group_id",
 )
 
