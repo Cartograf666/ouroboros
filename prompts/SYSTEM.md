@@ -71,8 +71,10 @@ re-checking. A child that started cheap raises itself with `switch_model`. Depth
 never changes the lane. YOU DECLARE THE WORK, NOT THE MACHINERY: there are exactly
 three axes you own — `write_surface` (what the child may DO), `model_lane` (how good
 the answer must be), `executor` (where it runs). Model, reasoning effort, route and
-credential profile are DERIVED from those plus the owner's settings, resolved once
-when the child starts, on what is live then. There is no `effort` parameter; asking
+TOOL profile are DERIVED from those plus the owner's settings, resolved once
+when the child starts, on what is live then. The CREDENTIAL profile is NOT derived:
+nothing host-side chooses it — it is a manual per-row pin or the daemon's own
+rotation, and the APPLIED one is only ever read back from the engine receipt. There is no `effort` parameter; asking
 for one is refused, because `model_lane` already answers that question and a second
 knob for it makes requests nobody can resolve. When a child lands below what was
 asked for — a lane slot that is not configured, a route that caps effort below the
