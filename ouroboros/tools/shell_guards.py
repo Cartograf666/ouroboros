@@ -85,8 +85,121 @@ _INTERPRETER_ANY_WRITE_RE = re.compile(
 )
 EMBEDDED_RELATIVE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])(?:\.\.?/)+[^\s'\"\\),;\]]+")
 _REDIRECT_TARGET_TOKENS = frozenset({">", ">>", "1>", "1>>", "2>", "2>>", "&>", "&>>"})
-_SCRIPT_INTERPRETERS = frozenset({"python", "python3", "node", "ruby", "perl", "php"})
+# ONE structural owner of "is this executable a script interpreter, and of which
+# family?" (XG-2R.2). The write fences used to match interpreter basenames by exact
+# set plus an ad-hoc `startswith("python")`, so the versioned basenames every other
+# family ships under — ruby3.2, php8.3, perl5.38, node18, the same class INFRA-1
+# fixed for python only — bypassed both guards. A versioned basename IS the
+# interpreter: recognition is by family stem + optional dotted version, not by
+# enumerating spellings. Both fence guards (light_shell_repo_mutation and the
+# registry runtime_data scan) and the protected-artifact interpreter check consume
+# THIS function; do not grow a second classifier next to it.
+_INTERPRETER_FAMILY_STEMS: tuple[tuple[str, str], ...] = (
+    # (basename stem, family) — longer stems before their prefixes ("nodejs" before
+    # "node"). pypy executes python code, so it classifies as the python family.
+    ("python", "python"),
+    ("pypy", "python"),
+    ("nodejs", "node"),
+    ("node", "node"),
+    ("ruby", "ruby"),
+    ("perl", "perl"),
+    ("php", "php"),
+)
+# What may follow the stem: nothing, or a dotted version (ruby3.2, perl5.38.2,
+# node18). Anything else (perldoc, php-fpm, python-config) is NOT the interpreter.
+_INTERPRETER_VERSION_SUFFIX_RE = re.compile(r"^(?:[0-9]+(?:\.[0-9]+)*)?$")
+
+
+def interpreter_family(executable: str) -> str:
+    """The script-interpreter FAMILY of an executable spelling, or "".
+
+    Accepts a bare basename or a full path, any case, with or without ``.exe`` —
+    the same normalization every guard already applies — so a resolver-injected
+    absolute path classifies identically to the basename the model typed.
+    Windowed/ABI python spellings (pythonw, python3.7m) stay in the family:
+    they execute the same code the fence exists to inspect.
+    """
+    name = pathlib.PurePath(str(executable or "")).name.lower().removesuffix(".exe")
+    for stem, family in _INTERPRETER_FAMILY_STEMS:
+        if not name.startswith(stem):
+            continue
+        suffix = name[len(stem):]
+        if family == "python":
+            suffix = suffix.removeprefix("w").removesuffix("m")
+        if _INTERPRETER_VERSION_SUFFIX_RE.match(suffix):
+            return family
+    return ""
+
+
+def _light_writer_command(executable: str) -> bool:
+    """LIGHT_SHELL_WRITER_COMMANDS membership with versioned interpreter spellings
+    canonicalized to their family name (ruby3.2 is `ruby`, perl5.38 is `perl`)."""
+    return (interpreter_family(executable) or executable) in LIGHT_SHELL_WRITER_COMMANDS
+
+
+# Where each family's inline code SITS — a locator, not a safety oracle. Containment
+# does not depend on this table being complete (see light_shell_repo_mutation: an
+# unknown flag makes the invocation unprovable, hence blocked); a missing entry costs
+# only the precision that lets a provable write outside the repo through.
+# Entries verified by execution against the real interpreters (php's from the upstream
+# CLI manual); the spellings that do NOT execute their argument are deliberately
+# absent — `ruby -c`/`perl -c` are compile checks over a FILENAME, `ruby -E` is an
+# encoding selector, `python -e` and `ruby --eval` do not exist, `php -F` takes a file.
+_INTERPRETER_INLINE_FLAGS: Dict[str, tuple[str, ...]] = {
+    "python": ("-c",),
+    "node": ("-e", "--eval", "-p", "--print"),
+    "ruby": ("-e",),
+    "perl": ("-e", "-E"),
+    "php": ("-r", "--run", "-B", "--process-begin", "-R", "--process-code",
+            "-E", "--process-end"),
+}
+
+
+def interpreter_inline_code(argv: List[str]) -> List[str]:
+    """Every inline-code BODY an interpreter argv carries, for its own family.
+
+    Three spellings, all verified to execute: a separate token (``-e CODE``), a
+    joined short flag (``-eCODE``, ``python -cCODE``) and a long flag with ``=``
+    (``node --eval=CODE``). php can carry several bodies at once (-B/-R/-E), so
+    this returns a list. Empty for a non-interpreter, and for an interpreter that
+    was handed a SCRIPT FILE rather than code.
+    """
+    family = interpreter_family(argv[0]) if argv else ""
+    if not family:
+        return []
+    # `-c` is accepted for EVERY family, not just python: `process_shell_guard_args`
+    # normalizes a `run_script` call into the synthetic argv `[interpreter, "-c",
+    # script]` whatever the interpreter is, and that synthetic shape is what the
+    # workspace/protected guards inspect. Reading `-c` per-family only (node wants
+    # `-e`) silently stopped locating those bodies, and a `run_script` writing through
+    # a symlink out of the workspace stopped being seen — the regression this line
+    # exists to prevent (caught by tests/test_headless_cli.py's symlink-escape test).
+    flags = (*_INTERPRETER_INLINE_FLAGS.get(family, ()), "-c")
+    bodies: List[str] = []
+    index = 1
+    while index < len(argv):
+        token = str(argv[index] or "")
+        for flag in flags:
+            if token == flag:
+                if index + 1 < len(argv):
+                    bodies.append(str(argv[index + 1] or ""))
+                    index += 1
+                break
+            if flag.startswith("--") and token.startswith(f"{flag}="):
+                bodies.append(token[len(flag) + 1:])
+                break
+            if not flag.startswith("--") and len(token) > len(flag) and token.startswith(flag):
+                bodies.append(token[len(flag):])
+                break
+        index += 1
+    return [body for body in bodies if body]
+
+
 _SCRIPT_LITERAL_WRITE_RE = {
+    # LITERAL write targets, where a family's write call happens to name one. This is
+    # a PRECISION aid for the allow path (and for writer_target_tokens' other
+    # consumers), never the containment oracle: containment no longer depends on any
+    # write vocabulary being complete (see light_shell_repo_mutation).
     "node": re.compile(
         r"""(?is)(?:fs\.|require\(['"]fs['"]\)\.)"""
         r"""(?:writeFileSync|appendFileSync|createWriteStream|mkdirSync|rmSync|rmdirSync|unlinkSync)\s*\(\s*(['"])(.*?)\1"""
@@ -190,6 +303,38 @@ def _python_path_open_target(node: ast.AST, names: dict[str, str]) -> tuple[str 
     return _python_literal_path(func.value, names), True
 
 
+# Constructs that move execution OUTSIDE what this AST models, making any
+# "no write targets" conclusion worthless: the payload is computed at runtime
+# (exec/eval/compile/__import__) or handed to another process (os.system, popen,
+# subprocess, exec*/spawn*). This is a LANGUAGE-level list — what defeats the
+# parser — not another file-API vocabulary, and it replaces the same idea that was
+# already scattered through `_INTERPRETER_ANY_WRITE_RE`'s "opaque" branch. Seeing
+# any of these means UNKNOWN, which the callers treat as write-capable.
+_PYTHON_OPAQUE_EXEC_NAMES = frozenset({"exec", "eval", "compile", "__import__"})
+_PYTHON_OPAQUE_EXEC_ATTRS = frozenset({
+    "system", "popen", "Popen", "check_call", "check_output", "getoutput", "getstatusoutput",
+    "execv", "execve", "execl", "execle", "execlp", "execvp", "execvpe",
+    "spawnl", "spawnle", "spawnlp", "spawnv", "spawnve", "spawnvp",
+    "import_module", "load_module", "dlopen", "spawn",
+})
+_PYTHON_OPAQUE_SUBPROCESS_ATTRS = frozenset({"run", "call"})
+
+
+def _python_call_is_opaque(node: ast.Call) -> bool:
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in _PYTHON_OPAQUE_EXEC_NAMES
+    if isinstance(func, ast.Attribute):
+        if func.attr in _PYTHON_OPAQUE_EXEC_ATTRS:
+            return True
+        # `run`/`call` are ordinary method names on anything, so they only count
+        # when the receiver really is subprocess.
+        if func.attr in _PYTHON_OPAQUE_SUBPROCESS_ATTRS:
+            receiver = func.value
+            return isinstance(receiver, ast.Name) and receiver.id == "subprocess"
+    return False
+
+
 def _python_write_targets_and_unknown(inline_code: str) -> tuple[list[str], bool]:
     try:
         tree = ast.parse(inline_code)
@@ -232,6 +377,10 @@ def _python_write_targets_and_unknown(inline_code: str) -> tuple[list[str], bool
                 if handle_target is not None:
                     write_handles[node.targets[0].id] = handle_target
         if not isinstance(node, ast.Call):
+            continue
+        if _python_call_is_opaque(node):
+            # Execution leaves the parse here, so "no write targets" proves nothing.
+            unknown = True
             continue
         func = node.func
         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Attribute):
@@ -389,7 +538,7 @@ def _shell_level_write_signal(raw_cmd: Any) -> bool:
         text = str(raw_cmd).lower()
     tokens = [str(token).lower() for token in shell_argv_with_inline(raw_cmd)]
     for token in tokens:
-        if pathlib.PurePath(token).name.removesuffix(".exe") in LIGHT_SHELL_WRITER_COMMANDS:
+        if _light_writer_command(pathlib.PurePath(token).name.removesuffix(".exe")):
             return True
     filtered_tokens: List[str] = []
     i = 0
@@ -513,8 +662,8 @@ def runtime_data_guard_targets(
     """
     argv = [str(t) for t in shell_argv_with_inline(raw_cmd)]
     executable = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe") if argv else ""
-    interpreterish = executable.startswith("python") or executable in {
-        "node", "ruby", "perl", "php", "sh", "bash", "zsh",
+    interpreterish = bool(interpreter_family(executable)) or executable in {
+        "sh", "bash", "zsh",
     }
     # Non-interpreter commands: the caller's coarse writeish decides, as before.
     # Interpreter commands: the coarse token list contains interpreter-CODE
@@ -547,9 +696,21 @@ def runtime_data_guard_targets(
     if project_store_hits:
         return project_store_hits
     inline = shell_command_string(shell_argv(raw_cmd)) or " ".join(argv[1:])
+    # Read-vs-write is decided by PARSING for python and by fail-closed for every
+    # other interpreter (XG-7B3.1 r2). A write vocabulary can never prove the ABSENCE
+    # of a write in arbitrary code — `php -r "file_put_contents(...)"` and
+    # `node -e "eval(process.env.CODE)"` both read as pure READS to any token list —
+    # so the only honest answer for code this module cannot parse is the conservative
+    # scan. Python keeps its AST proof, which is what preserves the v6.54.3 read
+    # allowance the FP evidence was actually about (python scripts opening the task's
+    # own staged attachment).
+    if interpreter_family(executable) and interpreter_family(executable) != "python":
+        return runtime_data_write_targets(
+            raw_cmd, drive_root=drive_root, work_dir=work_dir, allowed_roots=allowed_roots,
+        )
     if not _INTERPRETER_ANY_WRITE_RE.search(inline):
         return []
-    if executable.startswith("python"):
+    if interpreter_family(executable) == "python":
         targets, unknown = _python_write_targets_and_unknown(inline)
         # Trust the AST only when it POSITIVELY resolved every write target
         # (targets found, nothing unknown). A write indicator with zero AST
@@ -748,15 +909,14 @@ def _writer_target_tokens_single(argv: List[str]) -> List[str]:
                 targets.append(arg.split("=", 1)[1])
     elif cmd == "uniq":
         targets.extend(operands[1:2] if len(operands) >= 2 else [])
-    elif cmd in LIGHT_SHELL_WRITER_COMMANDS:
+    elif _light_writer_command(cmd):
         targets.extend(operands)
 
-    if (cmd in _SCRIPT_INTERPRETERS or cmd.startswith("python")) and "-c" in argv:
-        try:
-            inline_code = str(argv[argv.index("-c") + 1])
-        except Exception:
-            inline_code = ""
-        if cmd.startswith("python"):
+    # Inline code, through the ONE per-family flag table: `-c` alone found python
+    # bodies and left `node -e` / `ruby -e` / `php -r` / `perl -e` unparsed, so
+    # their literal write targets were invisible here (XG-7B3.1).
+    for inline_code in interpreter_inline_code(argv):
+        if interpreter_family(cmd) == "python":
             try:
                 tree = ast.parse(inline_code)
             except Exception:
@@ -790,7 +950,7 @@ def _writer_target_tokens_single(argv: List[str]) -> List[str]:
                     ):
                         targets.append(node.func.value.args[0].value)
         else:
-            pattern = _SCRIPT_LITERAL_WRITE_RE.get(cmd)
+            pattern = _SCRIPT_LITERAL_WRITE_RE.get(interpreter_family(cmd))
             if pattern:
                 targets.extend(match.group(2) for match in pattern.finditer(inline_code) if match.group(2))
 
@@ -827,7 +987,7 @@ def shell_writer_targets_protected(raw_cmd: Any) -> bool:
     if executable in {"bash", "sh", "zsh"}:
         inline = shell_command_string(argv)
         return bool(inline and shell_writer_targets_protected(inline))
-    if executable not in LIGHT_SHELL_WRITER_COMMANDS:
+    if not _light_writer_command(executable):
         return False
     target_text = " ".join(writer_target_tokens(argv)).replace("\\", "/").lower()
     return bool(target_text and any(cf in target_text for cf in PROTECTED_RUNTIME_PATHS_LOWER))
@@ -873,19 +1033,84 @@ def workspace_executor_state_write_block(
     )
 
 
+# Characters that make an argv token CODE rather than a path, a module name or a
+# flag value. Structural and family-independent: it is what lets the fence tell
+# `python -m pytest -q` / `node build.js` (no inline code — the content lives in a
+# file, and this fence is not a script-content scanner) from an inline payload,
+# WITHOUT depending on the inline-flag table being complete. An unknown flag
+# carrying code is still recognized here, which is the case the inversion exists for.
+_INLINE_CODE_SHAPE_RE = re.compile(r"""[(){};$`'"]|\[\s*['"]""")
+
+
+def _carries_inline_code(argv: List[str], bodies: List[str]) -> bool:
+    """Whether this interpreter invocation carries code IN ITS ARGV.
+
+    The SHAPE decides, for located bodies and for every other token alike — which is
+    what separates a real payload from a FILENAME sitting behind the same flag
+    (`ruby -c script.rb` compile-checks a file; the synthetic `[interp, "-c", body]`
+    that `process_shell_guard_args` builds for run_script carries code). Membership in
+    the flag table is not enough on its own, and not required either: an unknown flag
+    carrying code is still recognized here, which is the case the inversion exists for.
+    """
+    return any(
+        _INLINE_CODE_SHAPE_RE.search(str(token or ""))
+        for token in (*bodies, *argv[1:])
+    )
+
+
+def _dynamic_write_could_hit_repo(
+    inline: str,
+    *,
+    repo_dir: pathlib.Path,
+    cwd: str = "",
+    work_dir: pathlib.Path | None = None,
+) -> bool:
+    """Whether a write whose TARGET the scan could not resolve might land in the repo.
+
+    Two ways it can: the code names a repo path somewhere in its text (the classic
+    ``repo = Path('<repo>'); (repo / name).write_text(...)`` shape), or the resolved
+    cwd IS inside the repo, where any unresolved RELATIVE path lands.
+
+    Without this, extending inline inspection to `run_command` (XG-7B3.1) refused an
+    ordinary user_files deliverable whose filename the code computes — a real
+    owner workflow, blocked over a write that provably cannot reach the repo.
+    Fail-closed is right where the danger exists, not everywhere.
+    """
+    resolved_work_dir = pathlib.Path(work_dir) if work_dir is not None else None
+    if resolved_work_dir is not None:
+        try:
+            resolved_work_dir.resolve(strict=False).relative_to(pathlib.Path(repo_dir).resolve(strict=False))
+            return True
+        except (OSError, ValueError):
+            pass
+    text = str(inline or "")
+    mentioned = [*embedded_absolute_path_tokens(text), *EMBEDDED_RELATIVE_PATH_RE.findall(text)]
+    return bool(mentioned) and repo_target_mentioned(
+        ["", *mentioned], repo_dir=repo_dir, cwd=cwd, work_dir=work_dir,
+    )
+
+
 def light_shell_repo_mutation(
     raw_cmd: Any,
     *,
     repo_dir: pathlib.Path,
     cwd: str = "",
     work_dir: pathlib.Path | None = None,
-    detect_interpreter_inline: bool = False,
+    detect_interpreter_inline: bool = True,
 ) -> bool:
     """Detect simple shell writer commands that target the repo in light mode.
 
     ``work_dir`` is the RESOLVED shell cwd (v6.74.0 D1) — pass it from
     ``resolve_shell_cwd`` so a resource-root label cwd is never misread as a
-    repo-relative path."""
+    repo-relative path.
+
+    ``detect_interpreter_inline`` DEFAULTS ON (XG-7B3.1). It was opt-in and only
+    `run_script` opted in, so an interpreter's inline code reached the repo
+    unexamined through `run_command`: `node18 -e "...writeFileSync('ordinary.py')"`
+    in light mode mutated the file and only the POST-execution tripwire noticed,
+    which reports and does not roll back. A guard whose reason to fire is what the
+    interpreter executes cannot depend on which tool name invoked it, so the
+    default is now the safe one and a caller has to ask for less."""
     argv = shell_argv(raw_cmd)
     if not argv:
         return False
@@ -916,33 +1141,39 @@ def light_shell_repo_mutation(
                 detect_interpreter_inline=detect_interpreter_inline,
             )
 
-    if executable in LIGHT_SHELL_WRITER_COMMANDS and repo_target_mentioned([argv[0], *writer_target_tokens(argv)], repo_dir=repo_dir, cwd=cwd, work_dir=work_dir):
+    if _light_writer_command(executable) and repo_target_mentioned([argv[0], *writer_target_tokens(argv)], repo_dir=repo_dir, cwd=cwd, work_dir=work_dir):
         return True
 
-    # Versioned interpreter basenames (python3.11, resolver-injected absolute
-    # paths to them) must classify as interpreters too — matching only the
-    # unversioned spellings silently disengaged the inline-write fence on hosts
-    # whose agent python is a versioned binary (same precedent as
-    # writer_target_tokens' `cmd.startswith("python")`).
-    if detect_interpreter_inline and (
-        executable in _SCRIPT_INTERPRETERS or executable.startswith("python")
-    ):
+    # Versioned interpreter basenames classify through the ONE structural family
+    # classifier (XG-2R.2), and inline code is judged by PROOF, not by vocabulary
+    # (XG-7B3.1 r2): the fence asks "can I prove this cannot write into the repo?"
+    # and blocks when it cannot. Chasing write spellings was whack-a-mole by
+    # construction — no token list can prove the ABSENCE of a write in arbitrary
+    # code, and two holes outlived that enumeration (`node -e "eval(process.env.C)"`,
+    # `python -c "exec(open(...).read())"`). Only python can answer the proof, by
+    # parsing; that is what keeps the v6.54.3 read allowance (whose FP evidence was
+    # python scripts opening their own staged attachment). Everything else — other
+    # families, unknown flags, unparseable or computed payloads — is WRITE-CAPABLE and
+    # refused wherever it could reach the repo. Scan side only: advanced/pro is
+    # untouched, and a provable write elsewhere still runs. A SCRIPT or module
+    # invocation (`python -m pytest`) hands nothing inline and is not judged here.
+    if detect_interpreter_inline and interpreter_family(executable):
         inline = shell_command_string(argv) or " ".join(argv[1:])
-        if INTERPRETER_WRITE_RE.search(inline):
-            if executable in {"python", "python3"} or executable.startswith("python"):
-                targets, unknown = _python_write_targets_and_unknown(inline)
-                if targets and repo_target_mentioned([argv[0], *targets], repo_dir=repo_dir, cwd=cwd, work_dir=work_dir):
-                    return True
-                if unknown:
-                    return True
-                return False
-            targets = writer_target_tokens(argv)
-            if targets:
-                return repo_target_mentioned([argv[0], *targets], repo_dir=repo_dir, cwd=cwd, work_dir=work_dir)
-            # Non-Python interpreters with write indicators but no literal target
-            # stay fail-closed: a dynamic path may still target the repo.
-            return True
-        return False
+        bodies = interpreter_inline_code(argv)
+        if _carries_inline_code(argv, bodies):
+            if interpreter_family(executable) == "python":
+                targets, unknown = _python_write_targets_and_unknown(
+                    "\n".join(bodies) if bodies else inline
+                )
+                if not unknown:
+                    # Fully understood: decide on the targets it really has (none = a
+                    # proven read, which stays allowed).
+                    return bool(targets) and repo_target_mentioned(
+                        [argv[0], *targets], repo_dir=repo_dir, cwd=cwd, work_dir=work_dir,
+                    )
+            return _dynamic_write_could_hit_repo(
+                inline, repo_dir=repo_dir, cwd=cwd, work_dir=work_dir,
+            )
 
     if any(ind in cmd_lower for ind in (" > ", " >> ", " | tee ")):
         return repo_target_mentioned(argv, repo_dir=repo_dir, cwd=cwd, work_dir=work_dir)

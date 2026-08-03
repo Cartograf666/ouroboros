@@ -828,6 +828,29 @@ class LLMClient:
         except Exception:
             return ""
 
+    @classmethod
+    def clamp_effort_for_route(cls, model_id: str, effort: str) -> str:
+        """The effort this route will ACTUALLY run: the request clamped into the
+        route's learned ``[floor, ceiling]`` band.
+
+        Public because the SCHEDULER must answer the same question the dispatcher
+        will answer when it discloses a capability delta. It exposes the whole band
+        on purpose: a public ceiling accessor let a caller re-derive the clamp from
+        half the evidence, which is not one reader of the predicate but a second,
+        DISAGREEING copy of it — the route with a learned floor ran an effort no
+        record named. ``_clamp_effort_for_model`` is this plus the per-call
+        disclosure, so the band is decided in exactly one body.
+        """
+        ceiling = cls._effort_ceiling_for(model_id)
+        floor = cls._effort_floor_for(model_id)
+        if not ceiling and not floor:
+            return effort
+        from ouroboros.config import clamp_effort_to, effort_rank
+        applied = clamp_effort_to(effort, ceiling) if ceiling else effort
+        if floor and 0 <= effort_rank(applied) < effort_rank(floor):
+            applied = floor
+        return applied
+
     def _clamp_effort_for_model(self, model_id: str, effort: str) -> str:
         """Clamp a requested effort into the route's learned [floor, ceiling] band.
         Owner values are honored inside the real band; an ACTUAL clamp is recorded on
@@ -837,21 +860,16 @@ class LLMClient:
         silent). ONE disclosure per call with a DIRECTION-DERIVED reason: applied
         below requested → ``learned_ceiling`` (v6.57.0, value-too-high), applied
         above requested → ``learned_floor`` (v6.73.2, reasoning-mandatory endpoints).
-        Ceiling applies first, then the floor wins on a (practically impossible)
-        conflict — a provider-required minimum outranks a learned maximum."""
+        The band itself is ``clamp_effort_for_route`` (ceiling first, then the floor
+        wins on a practically impossible conflict — a provider-required minimum
+        outranks a learned maximum); this method is that plus the disclosure."""
         if not hasattr(self, "_effort_clamp_tls"):
             self._effort_clamp_tls = threading.local()
         # Reset at every payload build: a note left by an ABORTED earlier attempt on
         # this thread must never mis-attribute a clamp to the next call.
         self._effort_clamp_tls.pending = None
-        ceiling = self._effort_ceiling_for(model_id)
-        floor = self._effort_floor_for(model_id)
-        if not ceiling and not floor:
-            return effort
-        from ouroboros.config import clamp_effort_to, effort_rank
-        applied = clamp_effort_to(effort, ceiling) if ceiling else effort
-        if floor and 0 <= effort_rank(applied) < effort_rank(floor):
-            applied = floor
+        from ouroboros.config import effort_rank
+        applied = self.clamp_effort_for_route(model_id, effort)
         if applied != effort:
             self._effort_clamp_tls.pending = {
                 "requested": effort,

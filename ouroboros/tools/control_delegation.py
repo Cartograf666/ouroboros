@@ -63,7 +63,11 @@ def effective_delegation_budget(
     write_surface: str = "",
     role: str = "",
     requested_lane: str = "",
-    effective_lane: str = "",
+    # What the request MEANS (`subagents.intended_lane`), not what the child ends up
+    # running. This gate runs at ADMISSION, before the child is dispatched, so the
+    # effective lane does not exist yet — it used to be handed a schedule-time
+    # resolution, which is a live answer given before the queue wait.
+    intended_lane: str = "",
     active_child_count: int | None = None,
 ) -> DelegationBudgetDecision:
     """Reconcile schedule-time delegation budget with needs and back-constraints.
@@ -119,22 +123,31 @@ def effective_delegation_budget(
         if directive == "require_lane":
             scope = payload.get("scope")
             required_lane = str(scope.get("lane") if isinstance(scope, dict) else scope or "").strip()
-            if required_lane and required_lane != str(effective_lane or "").strip():
+            if required_lane and required_lane != str(intended_lane or "").strip():
                 return DelegationBudgetDecision(
                     False,
                     budget,
                     reason_code="delegation_constraint_require_lane",
-                    # Name the v6.87.7 default change in the refusal. A constraint written
-                    # before it reasoned about the OLD `auto`, which resolved a mutating
-                    # child to `heavy`; the same spawn now resolves `light` and is refused
-                    # with no hint that the default moved under it.
+                    # The refusal states the FACTS this reducer holds — required,
+                    # requested, intended — and nothing about what an omitted lane
+                    # means. It used to restate that default, and the default is
+                    # owned by `subagents.intended_lane`, three modules away: the
+                    # sentence went stale in v6.87.7, was corrected in v6.87.14, and
+                    # went stale AGAIN in v6.87.26, each time telling the model the
+                    # opposite of the truth at the exact moment it is deciding how to
+                    # fix a rejected spawn. A copy of a rule you do not own drifts;
+                    # the remedy below holds whatever the default is.
                     detail=str(
                         payload.get("rationale")
                         or (
                             f"Unresolved delegation constraint requires lane {required_lane!r} "
-                            f"(this child resolved {str(effective_lane or '').strip()!r}). Since "
-                            "v6.87.7 an omitted model_lane resolves to light whatever the child "
-                            "may do — ask for the lane explicitly."
+                            f"(requested {str(requested_lane or '').strip() or 'auto'!r}, "
+                            f"intended {str(intended_lane or '').strip()!r}). Name "
+                            f"model_lane={required_lane!r} explicitly, or "
+                            "override_delegation_constraint("
+                            f"{str(payload.get('constraint_id') or '').strip()!r}) instead. If this "
+                            "install has no such slot the child will run Main and disclose the "
+                            "reduction in capability_delta."
                         )
                     ),
                 )

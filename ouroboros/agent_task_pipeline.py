@@ -32,7 +32,7 @@ from ouroboros.outcomes import (
     normalize_outcome_axes,
 )
 from ouroboros.contracts.task_contract import build_task_contract
-from ouroboros.subagents import build_subagent_envelope
+from ouroboros.subagents import envelope_from_task
 from ouroboros.utils import utc_now_iso, append_jsonl, truncate_review_artifact as _truncate_with_notice
 from ouroboros.post_task_checkpoint import (
     POST_TASK_SYNTHESIS_INFLIGHT as _POST_TASK_SYNTHESIS_INFLIGHT,
@@ -182,7 +182,9 @@ def _build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | 
 
     Computed from the durable ``swarm_fanout`` telemetry this task already emits
     (control.py:_emit_swarm_fanout): the number of children, the number of fan-out
-    waves, the summed inter-wave latency, and the set of effective model lanes used.
+    waves, the summed inter-wave latency, and the set of model lanes REQUESTED —
+    fanout events are written before any child starts, so effective lanes are not
+    knowable here; they live on each child's own dispatch record.
     Returns None for a plain task (no fan-out), so the block only appears on real
     swarms.
 
@@ -222,16 +224,19 @@ def _build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | 
                 inter_wave_latency_total += float(ev.get("inter_wave_latency_sec") or 0.0)
             except (TypeError, ValueError):
                 pass
-            for lane in ev.get("effective_model_lanes") or []:
-                if str(lane or "").strip() and str(lane) not in lanes:
-                    lanes.append(str(lane))
+            # The lane a wave ASKED for. A fan-out event is written before any child
+            # starts, so it cannot know what they ran on — that is a per-child
+            # dispatch fact and lives on each child's own record.
+            lane = str(ev.get("requested_model_lane") or "").strip()
+            if lane and lane not in lanes:
+                lanes.append(lane)
         if not child_ids:
             return None
         return {
             "subagent_count": len(child_ids),
             "wave_count": wave_count,
             "inter_wave_latency_sec_total": round(inter_wave_latency_total, 3),
-            "lanes_used": lanes,
+            "lanes_requested": lanes,
         }
     except Exception:
         log.debug("swarm efficiency rollup failed", exc_info=True)
@@ -1066,27 +1071,8 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
         swarm_efficiency = _build_swarm_efficiency(env, task)
         subagent_envelope = task.get("subagent_envelope") if isinstance(task.get("subagent_envelope"), dict) else {}
         if str(task.get("delegation_role") or "").lower() == "subagent":
-            subagent_envelope = build_subagent_envelope(
-                task_id=str(task.get("id") or ""),
-                parent_task_id=str(task.get("parent_task_id") or ""),
-                root_task_id=str(task.get("root_task_id") or ""),
-                task_group_id=str(task.get("task_group_id") or ""),
-                depth=int(task.get("depth") or 0),
-                role=str(task.get("role") or ""),
-                requested_lane=str(task.get("requested_model_lane") or task.get("model_lane") or "auto"),
-                effective_lane=str(task.get("effective_model_lane") or task.get("model_lane") or "light"),
-                model=str(task.get("model") or ""),
-                reasoning_effort=str(task.get("reasoning_effort") or ""),
-                executor=str(task.get("requested_executor") or ""),
-                resolved_executor=str(task.get("resolved_executor") or ""), executor_reason=str(task.get("executor_reason") or ""),  # what RAN, and why
-                status=status,
-                usage={
-                    "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-                    "completion_tokens": int(usage.get("completion_tokens") or 0),
-                    "rounds": int(usage.get("rounds") or 0),
-                },
-                cost_usd=cost_fields.get("cost_usd"),
-            )
+            subagent_envelope = envelope_from_task(
+                task, status=status, usage=usage, cost_usd=cost_fields.get("cost_usd"))
             if cost_fields.get("cost_accounting_status") != "available":
                 subagent_envelope.update({
                     "cost_usd": None,
@@ -1153,10 +1139,15 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             task_constraint=task.get("task_constraint"),
             model_lane=task.get("model_lane"),
             requested_model_lane=task.get("requested_model_lane"),
+            parent_model_lane=task.get("parent_model_lane"),
+            requested_executor=task.get("requested_executor"),
             effective_model_lane=task.get("effective_model_lane"),
             model=task.get("model"),
             use_local_model=task.get("use_local_model"),
-            requested_executor=task.get("requested_executor"),
+            effective_executor=task.get("effective_executor"),
+            executor_route=task.get("executor_route"),
+            tool_profile=task.get("tool_profile"),
+            capability_delta=task.get("capability_delta"),
             reasoning_effort=task.get("reasoning_effort"),
             task_group_id=task.get("task_group_id"),
             task_group=task.get("task_group"),

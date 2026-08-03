@@ -21,7 +21,6 @@ def test_swarm_fanout_event_shape(tmp_path):
         task_ids=["a", "b"],
         role="researcher",
         requested_model_lane="auto",
-        effective_model_lanes=["light", "light"],
         objective="o" * 300,
         emitted_live=True,
     )
@@ -34,6 +33,10 @@ def test_swarm_fanout_event_shape(tmp_path):
     assert "delegation_role" not in evt and "subagent_task_id" not in evt
     assert evt["requested_count"] == 2 and evt["task_ids"] == ["a", "b"]
     assert evt["slot_count"] == 2
+    # A wave event is written BEFORE any child starts, so it names the lane that was
+    # asked for and never one that was resolved (v6.87.28).
+    assert evt["requested_model_lane"] == "auto"
+    assert "effective_model_lanes" not in evt
     assert len(evt["objective_preview"]) == 200
     assert evt["inter_wave_latency_sec"] is None  # first wave (prev ts was 0)
 
@@ -46,8 +49,7 @@ def test_swarm_fanout_inter_wave_latency_on_second_wave(tmp_path):
         _emit_swarm_fanout(
             ctx, parent_task_id="p", root_task_id="r", depth=1,
             task_group_id="", task_ids=["x"], role="r",
-            requested_model_lane="auto", effective_model_lanes=["light"],
-            objective="o", emitted_live=False,
+            requested_model_lane="auto", objective="o", emitted_live=False,
         )
     evts = [json.loads(line) for line in (logs / "events.jsonl").read_text().splitlines()]
     assert len(evts) == 2
@@ -69,11 +71,13 @@ def test_scheduled_meta_marks_accepted():
         task_constraint={"surface": "external_workspace"},
         task_group_id="g1",
         requested_model_lane="auto",
-        effective_model_lane="light",
         active_subagent_count=2,
         max_active_subagents=6,
     )
     assert meta["accepted"] is True
+    # An ACCEPTANCE card cannot carry an effective lane or a model: the child has not
+    # been dispatched, so nothing has resolved them (v6.87.28).
+    assert "effective_model_lane" not in meta and "model" not in meta
     assert meta["active_subagent_count"] == 2
     assert meta["max_active_subagents"] == 6
     assert meta["subagent_event"] == "scheduled"

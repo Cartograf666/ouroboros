@@ -534,12 +534,11 @@ def test_dispatch_row_auto_with_a_healthy_route_becomes_a_nanny(monkeypatch):
 def test_dispatch_row_auto_with_every_profile_spent_falls_back_to_the_api(monkeypatch):
     """D28 through the REAL dispatch entry point, with the disclosure it owes.
 
-    Three destinations, in p34's own vocabulary (p2's `capability_delta_*` chain lands
-    at synthesis and composes with this): the durable `subagent_executor_resolved` row
-    that `_announce_dispatch_executor` appends, the child's own prompt note, and the
-    parent-facing envelope's `resolved_executor` / `executor_diverged`."""
-    from ouroboros.agent import dispatch_executor_note
-    from ouroboros.subagents import build_subagent_envelope
+    Three destinations (p2's `capability_delta` chain composed with this at
+    synthesis): the durable `subagent_executor_resolved` row the dispatch emits, the
+    child's own prompt note, and the parent-facing envelope's
+    `effective_executor` / `capability_delta`."""
+    from ouroboros.agent import dispatch_executor_note, resolve_dispatch_axes
 
     res = _dispatch("auto", stub=_HealthStub(reset_at="2030-01-01T00:00:00Z"), monkeypatch=monkeypatch)
     assert res.executor == "native" and not res.blocked
@@ -552,13 +551,17 @@ def test_dispatch_row_auto_with_every_profile_spent_falls_back_to_the_api(monkey
     assert "CAPABILITY DELTA" in note and "METERED" in note
     assert "2030-01-01T00:00:00Z" in note
 
-    # Destination 3: the parent reads what actually ran, and that it diverged.
-    envelope = build_subagent_envelope(
-        task_id="t-child", executor="auto", resolved_executor=res.executor,
-        executor_reason=res.reason, status="done")
-    assert envelope["resolved_executor"] == "native"
-    assert envelope["executor_reason"] == SUBSCRIPTION_WINDOW_EXHAUSTED
-    assert envelope["executor_diverged"] is True
+    # Destination 3: the parent reads what actually ran, and that it diverged —
+    # through the REAL resolution seam, not a hand-built envelope: the dispatch
+    # stamps the record and rebuilds the envelope from it (one writer).
+    task = {"id": "t-child", "type": "task", "delegation_role": "subagent",
+            "requested_executor": "auto"}
+    resolve_dispatch_axes(task)
+    envelope = task["subagent_envelope"]
+    assert envelope["executor"] == "auto"
+    assert envelope["effective_executor"] == "native"
+    assert envelope["capability_delta"]["reason"] == SUBSCRIPTION_WINDOW_EXHAUSTED
+    assert envelope["capability_delta"]["reduced"] is True
 
     # And the PIN keeps the opposite answer: it exists to refuse metered spend.
     pinned = _dispatch("harness", stub=_HealthStub(reset_at="2030-01-01T00:00:00Z"),

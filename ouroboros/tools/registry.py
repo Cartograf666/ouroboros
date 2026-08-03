@@ -40,6 +40,7 @@ from ouroboros.shell_parse import (
 from ouroboros.tools.shell_guards import (
     LIGHT_SHELL_WRITER_COMMANDS,
     PROTECTED_RUNTIME_PATHS_LOWER,
+    interpreter_family,
     light_shell_repo_mutation,
     parse_porcelain_paths,
     process_shell_guard_args,
@@ -1939,7 +1940,10 @@ class ToolRegistry:
                 write_target_argvs.append(inline_argv)
         explicit_write_targets = list(dict.fromkeys(str(token) for target_argv in write_target_argvs for token in writer_target_tokens(target_argv) if str(token or "").strip()))
         executable_path_tokens = {str(target_argv[0]) for target_argv in write_target_argvs if target_argv}
-        writeish = shell_has_write_indicator(raw_cmd) or (bool(argv_for_write) and argv_executable in LIGHT_SHELL_WRITER_COMMANDS) or bool(explicit_write_targets)
+        # Writer-command membership canonicalizes versioned interpreter spellings to
+        # their family (`ruby3.2` is `ruby`), so a versioned basename is exactly as
+        # write-suspect as the unversioned one (XG-2R.2).
+        writeish = shell_has_write_indicator(raw_cmd) or (bool(argv_for_write) and (interpreter_family(argv_executable) or argv_executable) in LIGHT_SHELL_WRITER_COMMANDS) or bool(explicit_write_targets)
         if protected_artifact_block := protected_artifact_shell_block_reason(self._ctx, raw_cmd, cwd=str(args.get("cwd") or ""), default_cwd=active_repo_dir_for(self._ctx)):
             return protected_artifact_block
         if writeish and (executor_state_block := workspace_executor_state_write_block(raw_cmd, drive_root=pathlib.Path(self._ctx.drive_root), cwd=str(args.get("cwd") or ""), default_cwd=active_repo_dir_for(self._ctx))):
@@ -2134,7 +2138,9 @@ class ToolRegistry:
                 repo_dir=pathlib.Path(self._ctx.active_repo_dir()),
                 cwd=str(args.get("cwd") or ""),
                 work_dir=pathlib.Path(work_dir),
-                detect_interpreter_inline=str(args.get("__tool_name") or "") == "run_script",
+                # Inline-code inspection now reaches EVERY surface this check guards
+                # (it defaults ON in the fence) — scoping it to `__tool_name ==
+                # "run_script"` let run_command mutate the repo first (XG-7B3.1).
             ):
                 return (
                     "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light refuses "
@@ -2145,13 +2151,16 @@ class ToolRegistry:
                     "reviewed Ouroboros self-modification."
                 )
             runtime_data_executable = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe") if argv else ""
-            # Versioned interpreter basenames (python3.11 etc.) must trigger the
-            # runtime_data scan exactly like their unversioned spellings; the
-            # exact-set match let `python3.11 -c ...` writes bypass the guard.
+            # Versioned interpreter basenames (python3.11, ruby3.2, php8.3,
+            # perl5.38, node18) must trigger the runtime_data scan exactly like
+            # their unversioned spellings. Classification is the shared structural
+            # `interpreter_family` — the exact-set + `startswith("python")` pair
+            # recognized versions of ONE family and let every other family's
+            # versioned spelling bypass the guard (XG-2R.2).
             runtime_data_scan = (
                 writeish
-                or runtime_data_executable in {"python", "python3", "node", "ruby", "perl", "php", "sh", "bash", "zsh"}
-                or runtime_data_executable.startswith("python")
+                or runtime_data_executable in {"sh", "bash", "zsh"}
+                or bool(interpreter_family(runtime_data_executable))
             )
             if runtime_data_scan:
                 own_task_drive = pathlib.Path(self._ctx.task_drive_root())

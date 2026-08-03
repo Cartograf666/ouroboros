@@ -1071,7 +1071,8 @@ Before every commit, verify the following:
   helpers. `wait_task` and `get_task_result` results must remain untruncated
   (full child handoff); `wait_tasks` returns a compact structural projection
   per child (task_id, status, cost_usd, child_result_sha256, outcome_axes,
-  result, trace_summary, duplicate_of) with a disclosed `tasks_note` pointer —
+  result, trace_summary, capability_delta when disclosable, duplicate_of) with
+  a disclosed `tasks_note` pointer —
   the full envelope stays in `task_results/<id>.json` (addressable by
   `child_result_sha256`; `get_task_result` returns the full result text plus
   trace/outcome summaries). Do not re-inline forensics (trace_refs, loop_outcome,

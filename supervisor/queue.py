@@ -726,18 +726,17 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 "project_id": t.get("project_id"),
                 "allowed_resources": t.get("allowed_resources"), "deadline_at": t.get("deadline_at"),
                 "task_contract": t.get("task_contract"),
-                "model_lane": t.get("model_lane"),
+                # Scheduling INTENT survives a restart and is all a PENDING child has;
+                # `parent_model_lane` above all, because an omitted lane inherits it and
+                # only the parent knew it. The derived half rides along for a RUNNING row.
+                "model_lane": t.get("model_lane"), "parent_model_lane": t.get("parent_model_lane"),
                 "requested_model_lane": t.get("requested_model_lane"),
-                "effective_model_lane": t.get("effective_model_lane"),
-                "model": t.get("model"),
-                "use_local_model": t.get("use_local_model"),
-                # Scheduling AXES survive a restart. They live at the task top level
-                # because that is where the agent loop reads them; the copies nested in
-                # `metadata` ride along, but restoring only those would leave a resumed
-                # child running on the task-type default while its record still claimed
-                # the parent's request.
                 "requested_executor": t.get("requested_executor"),
-                "reasoning_effort": t.get("reasoning_effort"),
+                "effective_model_lane": t.get("effective_model_lane"),
+                "model": t.get("model"), "use_local_model": t.get("use_local_model"),
+                "effective_executor": t.get("effective_executor"), "tool_profile": t.get("tool_profile"),
+                "executor_route": t.get("executor_route"), "reasoning_effort": t.get("reasoning_effort"),
+                "capability_delta": t.get("capability_delta"),
                 "task_group_id": t.get("task_group_id"),
                 "task_group": t.get("task_group"),
                 "subagent_envelope": t.get("subagent_envelope"),
@@ -813,7 +812,10 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
             return 0
         if (time.time() - ts_unix) > max_age_sec:
             return 0
-        from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED, load_task_result
+        from ouroboros.task_results import (
+            _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED, STATUS_CANCELLED,
+            load_task_result, write_task_result,
+        )
         raw_fences = snap.get("acceptance_fences", [])
         raw_budget_fences = snap.get("budget_root_fences", [])
         snapshot_pending = [
@@ -841,8 +843,6 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                 },
             )
             try:
-                from ouroboros.task_results import STATUS_CANCELLED, write_task_result
-
                 for task in snapshot_pending:
                     task_id = str(task.get("id") or "")
                     if task_id:
@@ -894,8 +894,6 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                 task_id = str(task.get("id") or "")
                 skipped_fenced.append(task_id)
                 try:
-                    from ouroboros.task_results import STATUS_CANCELLED, write_task_result
-
                     existing = load_task_result(DRIVE_ROOT, task_id) or {}
                     write_task_result(
                         DRIVE_ROOT,
@@ -1341,8 +1339,6 @@ def _enforce_task_timeouts_locked(
         persist_queue_snapshot(reason="task_timeout_reap_queued")
 
 
-
-
 def queue_deep_self_review_task(reason: str, model: str = "", force: bool = False, chat_id: Optional[int] = None) -> Optional[str]:
     """Queue a deep self-review task.
 
@@ -1350,8 +1346,7 @@ def queue_deep_self_review_task(reason: str, model: str = "", force: bool = Fals
     ``/review``) so the queued ack and the task results return to the requester
     instead of always defaulting to the web owner's ``owner_chat_id``.
     """
-    st = load_state()
-    target_chat_id = chat_id if chat_id else st.get("owner_chat_id")
+    target_chat_id = chat_id if chat_id else load_state().get("owner_chat_id")
     if not target_chat_id:
         return None
     if (not force) and queue_has_task_type("deep_self_review"):
@@ -1573,8 +1568,6 @@ def enqueue_evolution_task_if_needed() -> None:
     campaign = start_evolution_campaign(source="idle_evolution")
     tid = uuid.uuid4().hex[:8]
     transaction = begin_evolution_transaction(tid, cycle=cycle, campaign=campaign)
-    from ouroboros.contracts.task_contract import attach_task_contract
-
     task = {
         "id": tid, "type": "evolution",
         "chat_id": int(owner_chat_id),

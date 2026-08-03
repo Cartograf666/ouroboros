@@ -30,6 +30,7 @@ from ouroboros.task_results import (
     write_task_result,
 )
 from ouroboros.outcomes import infra_failed_axes, normalize_outcome_axes
+from ouroboros.subagents import intended_lane as intended_subagent_lane
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
 
 log = logging.getLogger(__name__)
@@ -259,7 +260,6 @@ def _subagent_scheduled_meta(
     task_constraint: Any,
     task_group_id: str,
     requested_model_lane: str,
-    effective_model_lane: str,
     active_subagent_count: int,
     max_active_subagents: int,
 ) -> Dict[str, Any]:
@@ -272,8 +272,10 @@ def _subagent_scheduled_meta(
         "subagent_role": role,
         "write_surface": str((task_constraint or {}).get("surface") or "") if isinstance(task_constraint, dict) else "",
         "task_group_id": task_group_id,
+        # The REQUEST. A card drawn at ACCEPTANCE cannot carry an effective lane or a
+        # model: the child has not been dispatched, so nothing has resolved them. The
+        # running card (written by the worker after dispatch) carries both.
         "model_lane": requested_model_lane,
-        "effective_model_lane": effective_model_lane,
     }
 
 
@@ -375,6 +377,12 @@ def _compose_subagent_text(
         "[HANDOFF CONTRACT]",
         "Return a concise final answer with sections: summary, findings, evidence, blockers, recommended_parent_action.",
     ])
+    # The `[CAPABILITY DELTA]` block used to be composed HERE, from a delta the
+    # scheduling tool call had already resolved. It moved to dispatch in v6.87.28
+    # (`agent.capability_delta_prompt_block`): this text is frozen into the queued
+    # task before the child is admitted, so a reduction discovered when the child
+    # actually starts — which is when live availability is known — could never
+    # reach the copy the child reads.
     tc = task_constraint if isinstance(task_constraint, dict) else {}
     if str(tc.get("mode") or "") == ACTING_SUBAGENT_MODE:
         surface = str(tc.get("surface") or "")
@@ -460,12 +468,13 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     allowed_resources = fields.get("allowed_resources") if isinstance(fields.get("allowed_resources"), dict) else {}
     task_contract = fields.get("task_contract") if isinstance(fields.get("task_contract"), dict) else {}
     parent_id = fields.get("parent_id")
+    # INTENT ONLY. `effective_model_lane`, `model`, `use_local_model`,
+    # `effective_executor`, `reasoning_effort` and `capability_delta` are DERIVED at
+    # dispatch and written by the worker onto the one record; carrying schedule-time
+    # values for them through here is what made two records of the same child.
     requested_model_lane = str(fields.get("requested_model_lane") or fields.get("model_lane") or "auto")
-    effective_model_lane = str(fields.get("effective_model_lane") or requested_model_lane)
-    model = str(fields.get("model") or "")
-    use_local_model = bool(fields.get("use_local_model"))
+    parent_model_lane = str(fields.get("parent_model_lane") or "")
     requested_executor = str(fields.get("requested_executor") or "").strip().lower() or "auto"
-    reasoning_effort = str(fields.get("reasoning_effort") or "").strip().lower()
     task_group_id = str(fields.get("task_group_id") or "")
     task_group = fields.get("task_group") if isinstance(fields.get("task_group"), dict) else {}
     subagent_envelope = fields.get("subagent_envelope") if isinstance(fields.get("subagent_envelope"), dict) else {}
@@ -498,11 +507,8 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
         "task_contract": task_contract,
         "model_lane": requested_model_lane,
         "requested_model_lane": requested_model_lane,
-        "effective_model_lane": effective_model_lane,
-        "model": model,
-        "use_local_model": use_local_model,
+        "parent_model_lane": parent_model_lane,
         "requested_executor": requested_executor,
-        "reasoning_effort": reasoning_effort,
         "task_group_id": task_group_id,
         "task_group": task_group,
         "subagent_envelope": subagent_envelope,
@@ -523,11 +529,8 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
             "task_contract": task_contract,
             "model_lane": requested_model_lane,
             "requested_model_lane": requested_model_lane,
-            "effective_model_lane": effective_model_lane,
-            "model": model,
-            "use_local_model": use_local_model,
+            "parent_model_lane": parent_model_lane,
             "requested_executor": requested_executor,
-            "reasoning_effort": reasoning_effort,
             "task_group_id": task_group_id,
             "task_group": task_group,
             "subagent_envelope": subagent_envelope,
@@ -882,6 +885,38 @@ def _handle_task_heartbeat(evt: Dict[str, Any], ctx: Any) -> None:
             })
         except Exception:
             log.debug("Failed to forward task heartbeat to live logs", exc_info=True)
+
+
+def _handle_task_dispatch_resolved(evt: Dict[str, Any], ctx: Any) -> None:
+    """Merge a worker's dispatch-time resolution into the supervisor's RUNNING copy.
+
+    ``agent.resolve_dispatch_axes`` runs INSIDE the worker process and stamps the
+    worker's own clone of the task; ``assign_tasks`` stored a separate ``dict(task)``
+    in RUNNING before dispatch, and ``persist_queue_snapshot`` serializes THAT copy.
+    Without this merge a restart while a child was running restored the unresolved
+    intent — `effective_model_lane`, `reasoning_effort`, the executor fields and
+    `capability_delta` were lost, and a restore could re-derive different live facts
+    (XG-2R.1, three reviewers converged). The merge is scoped to exactly
+    ``SUBAGENT_RESOLUTION_FIELDS`` — a worker report can never overwrite scheduling
+    intent or supervisor bookkeeping — runs under the queue lock, and persists the
+    snapshot so the resolution is durable before anything else happens to the queue.
+    """
+    from ouroboros.subagents import SUBAGENT_RESOLUTION_FIELDS
+    from supervisor.queue import _queue_lock
+
+    task_id = str(evt.get("task_id") or "")
+    resolution = evt.get("resolution") if isinstance(evt.get("resolution"), dict) else {}
+    if not task_id or not resolution:
+        return
+    with _queue_lock:
+        meta = ctx.RUNNING.get(task_id)
+        task = meta.get("task") if isinstance(meta, dict) else None
+        if not isinstance(task, dict):
+            return
+        for key in SUBAGENT_RESOLUTION_FIELDS:
+            if key in resolution:
+                task[key] = resolution[key]
+    ctx.persist_queue_snapshot(reason="dispatch_resolved")
 
 
 def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
@@ -2692,12 +2727,11 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     drive_root = str(evt.get("drive_root") or "").strip()
     child_drive_root = str(evt.get("child_drive_root") or drive_root).strip()
     budget_drive_root = str(evt.get("budget_drive_root") or "").strip()
+    # INTENT ONLY (see `_build_scheduled_task_payload`): the supervisor forwards what
+    # the parent ASKED for. What the child gets is resolved once, at dispatch.
     requested_model_lane = str(evt.get("requested_model_lane") or evt.get("model_lane") or "auto").strip() or "auto"
-    effective_model_lane = str(evt.get("effective_model_lane") or "").strip() or requested_model_lane
-    model = str(evt.get("model") or "").strip()
-    use_local_model = bool(evt.get("use_local_model"))
+    parent_model_lane = str(evt.get("parent_model_lane") or "").strip()
     requested_executor = str(evt.get("requested_executor") or "").strip().lower() or "auto"
-    reasoning_effort = str(evt.get("reasoning_effort") or "").strip().lower()
     task_group_id = str(evt.get("task_group_id") or "").strip()
     task_group = evt.get("task_group") if isinstance(evt.get("task_group"), dict) else {}
     subagent_envelope = evt.get("subagent_envelope") if isinstance(evt.get("subagent_envelope"), dict) else {}
@@ -2756,11 +2790,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         "required_capabilities": required_capabilities,
         "model_lane": requested_model_lane,
         "requested_model_lane": requested_model_lane,
-        "effective_model_lane": effective_model_lane,
-        "model": model,
-        "use_local_model": use_local_model,
+        "parent_model_lane": parent_model_lane,
         "requested_executor": requested_executor,
-        "reasoning_effort": reasoning_effort,
         "task_group_id": task_group_id,
         "task_group": task_group,
         "subagent_envelope": subagent_envelope,
@@ -2829,7 +2860,7 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
                 write_surface=str((task_constraint or {}).get("surface") or "") if isinstance(task_constraint, dict) else "",
                 role=role,
                 requested_lane=requested_model_lane,
-                effective_lane=effective_model_lane,
+                intended_lane=intended_subagent_lane(requested_model_lane, parent_model_lane),
                 active_child_count=_active_subagent_count(root_task_id, getattr(ctx, "PENDING", []), getattr(ctx, "RUNNING", {})),
             )
             if not decision.ok:
@@ -2983,11 +3014,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "required_capabilities": required_capabilities,
             "model_lane": requested_model_lane,
             "requested_model_lane": requested_model_lane,
-            "effective_model_lane": effective_model_lane,
-            "model": model,
-            "use_local_model": use_local_model,
+            "parent_model_lane": parent_model_lane,
             "requested_executor": requested_executor,
-            "reasoning_effort": reasoning_effort,
             "task_group_id": task_group_id,
             "task_group": task_group,
             "subagent_envelope": subagent_envelope,
@@ -3066,8 +3094,6 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "task_group_id": task_group_id,
             "required_capabilities": required_capabilities,
             "requested_model_lane": requested_model_lane,
-            "effective_model_lane": effective_model_lane,
-            "model": model,
             # v6.82 (P5): host-attested cancelability, ROOTS ONLY. Every task
             # admitted here is a supervisor-queue task the cancel endpoint can
             # reach, but the marker exists to gate the ROOT card's "Cancel run"
@@ -3081,7 +3107,6 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             progress_meta.update(_subagent_scheduled_meta(
                 tid=tid, role=role, task_constraint=task_constraint,
                 task_group_id=task_group_id, requested_model_lane=requested_model_lane,
-                effective_model_lane=effective_model_lane,
                 active_subagent_count=_active_subagent_count(root_task_id, pending_ref, running_ref),
                 max_active_subagents=max_active,
             ))
@@ -3447,6 +3472,7 @@ EVENT_HANDLERS = {
     "budget_pause": _handle_budget_pause,
     "budget_root_fence": _handle_budget_root_fence,
     "task_heartbeat": _handle_task_heartbeat,
+    "task_dispatch_resolved": _handle_task_dispatch_resolved,
     "typing_start": _handle_typing_start,
     "send_message": _handle_send_message,
     "task_done": _handle_task_done,

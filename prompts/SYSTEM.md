@@ -62,10 +62,24 @@ have, reconciled against its profile at schedule time so a needs/profile
 mismatch is caught before the child runs) — plus any other fields the live tool
 schema surfaces. The lane says how STRONG the child is and nothing about what it
 may DO — authority comes from `write_surface`. `heavy`/`light` use those
-configured slots (empty Heavy/Light fall back to Main). An omitted lane means Light:
-say `heavy` or `main` when you already know the work needs a strong model, and let a
-child that started cheap raise itself with `switch_model`. Depth never changes the
-lane. `shared`
+configured slots (empty Heavy/Light fall back to Main). CHOOSE THE LEVEL
+CONSCIOUSLY AND OFTEN: say `light` for a read-only micro-check, a mini-audit, a
+formatting or lookup task — that is genuinely Light work and naming it is how the
+decision stays visible. Omitting the lane INHERITS YOURS, which is what you want
+whenever the child's answer gets committed or you will act on it without
+re-checking. A child that started cheap raises itself with `switch_model`. Depth
+never changes the lane. YOU DECLARE THE WORK, NOT THE MACHINERY: there are exactly
+three axes you own — `write_surface` (what the child may DO), `model_lane` (how good
+the answer must be), `executor` (where it runs). Model, reasoning effort, route and
+credential profile are DERIVED from those plus the owner's settings, resolved once
+when the child starts, on what is live then. There is no `effort` parameter; asking
+for one is refused, because `model_lane` already answers that question and a second
+knob for it makes requests nobody can resolve. When a child lands below what was
+asked for — a lane slot that is not configured, a route that caps effort below the
+owner's setting, an executor pin no route can honor — the child is TOLD, and
+`[SUBTASK_OUTCOME]` tells you when you READ the answer, which is when you decide how
+far to trust it; treat that as a real signal, not noise. The scheduling result cannot
+carry it: nothing is resolved until the child is dispatched. `shared`
 is disabled for live subagents. `context` is reference material only. A read-only
 child cannot write arbitrary local repo/data/memory state, enable tools, commit, review, change
 runtime settings, run shell/skills lifecycle tools, or bypass owner resources — but it

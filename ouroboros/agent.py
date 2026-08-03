@@ -47,11 +47,13 @@ from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.contracts.task_contract import attach_task_contract
 from ouroboros.outcomes import infra_failed_axes
 from ouroboros.subagents import (
-    SUBAGENT_EXECUTORS,
     SubagentExecutorResolution,
-    delegated_run_shape,
-    probe_subagent_executor,
-    resolve_subagent_executor,
+    dispatch_executor_resolution,
+    SUBAGENT_RESOLUTION_FIELDS,
+    SubagentDispatch,
+    capability_delta_disclosures,
+    envelope_from_task,
+    resolve_subagent_dispatch,
 )
 
 
@@ -71,23 +73,11 @@ def resolve_dispatch_executor(task: Dict[str, Any]) -> Optional[SubagentExecutor
     """
     if str(task.get("delegation_role") or "").lower() != "subagent":
         return None
-    requested = str(task.get("requested_executor") or "auto").strip().lower() or "auto"
-    if requested not in SUBAGENT_EXECUTORS:
-        # Durable-data tolerance: the schema already refused anything invalid at
-        # schedule time, so an unknown stored value is stale, not an argument error.
-        requested = "auto"
-    if requested == "native":
-        return resolve_subagent_executor("native")  # nothing to ask the daemon
-    from ouroboros.tool_access import predicted_subagent_profile
-
-    constraint = normalize_task_constraint(task.get("task_constraint"))
-    surface = str(getattr(constraint, "surface", "") or "")
-    # The WHOLE shape, from the one owner of it: health is checked against the run this
-    # child would really start, not against a profile string reassembled here. That is
-    # what lets the dispatcher refuse an engine that cannot confine a mutating run,
-    # before a token is spent, instead of leaving the nanny to discover it.
-    shape = delegated_run_shape(predicted_subagent_profile(write_surface=surface) == "acting_subagent")
-    return probe_subagent_executor(requested, shape=shape)
+    # ONE resolver: `subagents.dispatch_executor_resolution` owns the shape
+    # derivation and the probe, and `resolve_subagent_dispatch` calls the same
+    # body — so the answer this dispatcher acts on and the one the record states
+    # cannot come from two implementations that drift apart.
+    return dispatch_executor_resolution(task)
 
 
 def dispatch_executor_note(decision: Optional[SubagentExecutorResolution]) -> str:
@@ -155,6 +145,26 @@ def executor_blocked_outcome(decision: SubagentExecutorResolution) -> Tuple[str,
         "execution_status": "infra_failed",
         "reason_code": "subagent_executor_unavailable",
     }
+
+
+def _record_executor_resolution(
+    drive_logs: Any, task: Dict[str, Any], dispatch: Optional[SubagentDispatch],
+) -> None:
+    """Durably record the typed substrate decision (re-homed from the retired
+    `_announce_dispatch_executor`): who was asked for, who runs it, why, and —
+    when every plan window is spent — the instant it heals."""
+    if dispatch is None or dispatch.executor_resolution is None:
+        return
+    res = dispatch.executor_resolution
+    append_jsonl(drive_logs / "events.jsonl", {
+        "ts": utc_now_iso(), "type": "subagent_executor_resolved",
+        "task_id": str(task.get("id") or ""),
+        "requested": res.requested,
+        "executor": res.executor,
+        "reason": res.reason,
+        "reset_at": res.reset_at,
+        "route": res.route.route_id if res.route else "",
+    })
 
 
 def _persist_early_origin_stub(drive_root: Any, task: Dict[str, Any]) -> None:
@@ -243,45 +253,97 @@ def _physical_calls_after_budget_rail(budget_root: Any, task_id: str) -> Optiona
         return None
 
 
-def _announce_dispatch_executor(
-    task: Dict[str, Any], drive_logs: Any, messages: List[Dict[str, Any]],
-) -> Optional[SubagentExecutorResolution]:
-    """Resolve WHO runs this task, record the decision, and tell the child about it.
-
-    The visible marker is not decoration: an `auto` child that fell back to the metered
-    native path because the harness was unavailable would otherwise have no way to know
-    it is spending money, and neither would a reader of the transcript.
-    """
-    # A BLOCKED decision ends the child unrun: the pin was the whole point, and running
-    # the loop here would spend exactly the metered money the parent asked to avoid.
-    # Nothing has been spent at this point, so the refusal is free.
-    decision = resolve_dispatch_executor(task)
-    if decision is None:
-        return None
-    append_jsonl(drive_logs / "events.jsonl", {
-        "ts": utc_now_iso(), "type": "subagent_executor_resolved",
-        "task_id": str(task.get("id") or ""),
-        "requested": decision.requested,
-        "executor": decision.executor,
-        "reason": decision.reason,
-        "reset_at": decision.reset_at,
-        "route": decision.route.route_id if decision.route else "",
-    })
-    note = dispatch_executor_note(decision)
-    if note:
-        messages.append({"role": "user", "content": note})
-    return decision
-
-
 def _initial_effort_for(task: Dict[str, Any], task_type: str) -> str:
-    """The effort a task starts on: the parent's explicit request, else the type default.
+    """The effort a task starts on.
 
-    An unrecognized STORED value falls back rather than raising — this is durable data
-    that outlives the schema that wrote it, and `schedule_subagent` already refused
-    anything invalid at the time it was asked for.
+    For a delegated child this is what ``resolve_subagent_dispatch`` derived and
+    wrote onto the record moments ago, which is ``resolve_effort(task_type)`` — read
+    back rather than recomputed so the loop runs the effort the record states. For
+    everything else, and for an unrecognized STORED value (durable data outlives the
+    schema that wrote it), it is the task-type default directly.
     """
-    requested = str(task.get("reasoning_effort") or "").strip().lower()
-    return requested if requested in EFFORT_SCALE else resolve_effort(task_type)
+    stored = str(task.get("reasoning_effort") or "").strip().lower()
+    return stored if stored in EFFORT_SCALE else resolve_effort(task_type)
+
+
+def resolve_dispatch_axes(task: Dict[str, Any]) -> Optional[SubagentDispatch]:
+    """Resolve WHAT THIS CHILD GETS, once, and stamp it onto the record it came from.
+
+    ``None`` when the task is not a delegated child. This is the ONE place a child's
+    model, effort, route, tool profile and effective executor are decided, and the
+    one author of its ``capability_delta``. It writes back onto the live task dict so
+    every downstream surface — the RUNNING task result, the task-metadata projection
+    the loop reads, the completion write, the envelope — describes the SAME
+    resolution instead of each re-deriving its own from whatever it happens to hold.
+    """
+    if str(task.get("delegation_role") or "").lower() != "subagent":
+        return None
+    dispatch = resolve_subagent_dispatch(task, task_type=str(task.get("type") or "task"))
+    task.update(dispatch.record_fields())
+    # The envelope is the child's public description, so it is rebuilt from the
+    # record the resolution just wrote rather than left holding the requested-status
+    # copy the scheduler made — through the ONE record->envelope mapping, so it
+    # cannot describe a different child than the record does.
+    task["subagent_envelope"] = envelope_from_task(task, status=STATUS_RUNNING)
+    return dispatch
+
+
+def emit_dispatch_resolution(
+    event_queue: Any, task: Dict[str, Any], dispatch: Optional[SubagentDispatch],
+) -> None:
+    """Report the dispatch-time resolution back to the supervisor (XG-2R.1).
+
+    ``resolve_dispatch_axes`` stamps the WORKER process's clone of the task; the
+    supervisor's RUNNING copy — the one ``persist_queue_snapshot`` serializes — is a
+    separate dict made at assignment, so without this report a restart restored the
+    unresolved intent and lost `effective_model_lane`, `reasoning_effort`, the
+    executor fields and `capability_delta`. The report rides the SAME worker event
+    channel every other worker fact uses (no second channel);
+    ``supervisor/events.py::_handle_task_dispatch_resolved`` merges exactly
+    ``SUBAGENT_RESOLUTION_FIELDS`` into RUNNING under the queue lock. Best-effort by
+    design: the durable task_result written moments before this remains the record
+    of authority — the merge keeps the supervisor's live mirror and its snapshot
+    telling the same story.
+    """
+    if dispatch is None or event_queue is None:
+        return
+    try:
+        event_queue.put({
+            "type": "task_dispatch_resolved",
+            "task_id": str(task.get("id") or ""),
+            "resolution": {
+                key: task.get(key) for key in SUBAGENT_RESOLUTION_FIELDS if key in task
+            },
+            "ts": utc_now_iso(),
+        })
+    except Exception:
+        log.debug("Failed to report dispatch resolution to the supervisor", exc_info=True)
+
+
+def capability_delta_prompt_block(dispatch: Optional[SubagentDispatch]) -> str:
+    """What the CHILD is told about the gap between what was asked and what it got.
+
+    The child is the only actor that can say "I could not do this well at this
+    strength", and it cannot say so about a fact it was never given. Composed here,
+    at dispatch, because that is when the fact exists: the supervisor builds the
+    child's prompt text before the child is admitted, so a reduction discovered when
+    the child actually starts could never reach that copy.
+    """
+    if dispatch is None:
+        return ""
+    delta = dispatch.delta.as_dict()
+    parts: list[str] = []
+    if delta.get("reduced"):
+        parts.append(
+            "You are running BELOW what your parent asked for: "
+            + "; ".join(capability_delta_disclosures(delta))
+            + f" ({delta.get('reason') or 'unspecified'}). Do the work anyway, but say "
+            "so in blockers if the gap actually limited your answer — do not quietly "
+            "return a weaker result as if it were full strength."
+        )
+    if delta.get("legacy_note"):
+        parts.append(f"Ignored on your record: {delta['legacy_note']}.")
+    return "[CAPABILITY DELTA]\n" + "\n".join(parts) if parts else ""
 
 
 @dataclass(frozen=True)
@@ -474,59 +536,86 @@ class OuroborosAgent:
             log.warning("Worker boot logging failed", exc_info=True)
             return
 
+    def _persist_running_record(self, task: Dict[str, Any]) -> None:
+        """The ONE durable write that says this task started, and what it started ON.
+
+        For a delegated child every derived field here was stamped onto ``task`` by
+        `resolve_dispatch_axes` moments earlier, so model, effort, route, tool
+        profile, effective executor and `capability_delta` all land in a single
+        atomic record instead of being minted by whichever surface writes next.
+
+        CW3: a transient ephemeral decision turn writes NO durable task_result
+        (running OR final) — only its inline answer + card resolution flow via
+        emit_task_results.
+        """
+        if bool(task.get("_ephemeral_turn")):
+            return
+        try:
+            write_task_result(
+                self.env.drive_root,
+                str(task.get("id") or ""),
+                STATUS_RUNNING,
+                chat_id=task.get("chat_id"),
+                parent_task_id=task.get("parent_task_id"),
+                root_task_id=task.get("root_task_id"),
+                session_id=task.get("session_id"),
+                actor_id=task.get("actor_id"),
+                delegation_role=task.get("delegation_role"),
+                project_id=str(task.get("project_id") or ""),
+                role=task.get("role"),
+                description=task.get("description"),
+                objective=task.get("objective") or task.get("description"),
+                expected_output=task.get("expected_output"),
+                constraints=task.get("constraints"),
+                context=task.get("context"),
+                memory_mode=task.get("memory_mode"),
+                drive_root=task.get("drive_root"),
+                child_drive_root=task.get("child_drive_root") or task.get("drive_root"),
+                budget_drive_root=task.get("budget_drive_root"),
+                task_constraint=task.get("task_constraint"),
+                task_contract=task.get("task_contract"),
+                model_lane=task.get("model_lane"),
+                requested_model_lane=task.get("requested_model_lane"),
+                parent_model_lane=task.get("parent_model_lane"),
+                requested_executor=task.get("requested_executor"),
+                effective_model_lane=task.get("effective_model_lane"),
+                model=task.get("model"),
+                use_local_model=task.get("use_local_model"),
+                effective_executor=task.get("effective_executor"),
+                executor_route=task.get("executor_route"),
+                tool_profile=task.get("tool_profile"),
+                capability_delta=task.get("capability_delta"),
+                reasoning_effort=task.get("reasoning_effort"),
+                task_group_id=task.get("task_group_id"),
+                task_group=task.get("task_group"),
+                subagent_envelope=task.get("subagent_envelope"),
+                metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
+                # Ingress-captured owner-message identity (v6.73.0): persisted on the
+                # durable record so a post-hoc "Turn into project" binds the start
+                # message by value, never by content lookup.
+                origin_message_ref=task.get("origin_message_ref"),
+                origin_message_text=task.get("origin_message_text"),
+                result="Task is running.",
+            )
+        except Exception:
+            log.debug("Failed to persist running task status", exc_info=True)
+
     def _prepare_task_context(self, task: Dict[str, Any]) -> Tuple[ToolContext, List[Dict[str, Any]], Dict[str, Any]]:
         """Set up ToolContext, build messages, return (ctx, messages, cap_info)."""
         drive_logs = self.env.drive_path("logs")
         task = attach_task_contract(task)
+        # THE resolution, before anything durable is written about this run: the
+        # RUNNING record below is the single atomic write that states model, effort,
+        # route, profile, effective executor and the one `capability_delta` together.
+        dispatch = resolve_dispatch_axes(task)
+        _record_executor_resolution(drive_logs, task, dispatch)
         sanitized_task = sanitize_task_for_event(task, drive_logs)
         append_jsonl(drive_logs / "events.jsonl", {"ts": utc_now_iso(), "type": "task_received", "task": sanitized_task})
-        # CW3: a transient ephemeral decision turn writes NO durable task_result (running
-        # OR final) — only its inline answer + card resolution flow via emit_task_results.
-        if not bool(task.get("_ephemeral_turn")):
-            try:
-                write_task_result(
-                    self.env.drive_root,
-                    str(task.get("id") or ""),
-                    STATUS_RUNNING,
-                    chat_id=task.get("chat_id"),
-                    parent_task_id=task.get("parent_task_id"),
-                    root_task_id=task.get("root_task_id"),
-                    session_id=task.get("session_id"),
-                    actor_id=task.get("actor_id"),
-                    delegation_role=task.get("delegation_role"),
-                    project_id=str(task.get("project_id") or ""),
-                    role=task.get("role"),
-                    description=task.get("description"),
-                    objective=task.get("objective") or task.get("description"),
-                    expected_output=task.get("expected_output"),
-                    constraints=task.get("constraints"),
-                    context=task.get("context"),
-                    memory_mode=task.get("memory_mode"),
-                    drive_root=task.get("drive_root"),
-                    child_drive_root=task.get("child_drive_root") or task.get("drive_root"),
-                    budget_drive_root=task.get("budget_drive_root"),
-                    task_constraint=task.get("task_constraint"),
-                    task_contract=task.get("task_contract"),
-                    model_lane=task.get("model_lane"),
-                    requested_model_lane=task.get("requested_model_lane"),
-                    effective_model_lane=task.get("effective_model_lane"),
-                    model=task.get("model"),
-                    use_local_model=task.get("use_local_model"),
-                    requested_executor=task.get("requested_executor"),
-                    reasoning_effort=task.get("reasoning_effort"),
-                    task_group_id=task.get("task_group_id"),
-                    task_group=task.get("task_group"),
-                    subagent_envelope=task.get("subagent_envelope"),
-                    metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
-                    # Ingress-captured owner-message identity (v6.73.0): persisted on
-                    # the durable record so a post-hoc "Turn into project" binds the
-                    # start message by value, never by content lookup.
-                    origin_message_ref=task.get("origin_message_ref"),
-                    origin_message_text=task.get("origin_message_text"),
-                    result="Task is running.",
-                )
-            except Exception:
-                log.debug("Failed to persist running task status", exc_info=True)
+        self._persist_running_record(task)
+        # Durable record first, live mirror second: the supervisor's RUNNING copy
+        # (and therefore the queue snapshot) learns the same resolution the record
+        # just persisted, across the process boundary.
+        emit_dispatch_resolution(self._event_queue, task, dispatch)
         self._emit_live_log(
             "context_building_started",
             task_id=str(task.get("id") or ""),
@@ -581,6 +670,10 @@ class OuroborosAgent:
             "model",
             "use_local_model",
             "requested_executor",
+            # `effective_executor`/`capability_delta` are deliberately NOT here: this
+            # projection is only READ for `effective_model_lane` (grandchild
+            # inheritance), the child learns its own reduction from the prompt and the
+            # parent from the durable record. A third copy nobody reads only goes stale.
             "reasoning_effort",
             "task_group_id",
             "task_group",
@@ -739,6 +832,22 @@ class OuroborosAgent:
             soft_cap_tokens=_soft_cap,
             ctx=ctx,
         )
+        # The second of the three places a reduction must reach (the durable record
+        # above is the first, `[SUBTASK_OUTCOME]` the third). It is appended HERE,
+        # after the context is built, because it is a fact about THIS dispatch —
+        # the composed child text it used to live in was frozen at enqueue time.
+        _delta_block = capability_delta_prompt_block(dispatch)
+        if _delta_block:
+            messages.append({"role": "user", "content": _delta_block})
+        # The substrate note is the executor-axis half of the same destination: a
+        # harness child must know it is a NANNY (delegate_start/delegate_wait, not
+        # metered thinking), and an `auto` child that fell back to metered spend
+        # must be able to say so instead of discovering it by spending.
+        _exec_note = dispatch_executor_note(
+            dispatch.executor_resolution if dispatch is not None else None
+        )
+        if _exec_note:
+            messages.append({"role": "user", "content": _exec_note})
 
         budget_remaining = None
         budget_accounting_status = "available"
@@ -757,6 +866,21 @@ class OuroborosAgent:
 
         cap_info["budget_remaining"] = budget_remaining
         cap_info["budget_accounting_status"] = budget_accounting_status
+        # An explicit executor pin that no route can honor ends the task UNRUN: the
+        # caller reads this instead of the loop (D28 — the pin exists to keep the work
+        # off metered API tokens, so re-routing it to paid native execution spends the
+        # money the parent refused). Carried on the existing cap_info projection
+        # rather than a new return value or module-level helper, so synthesis can
+        # adopt p34's `SubagentExecutorResolution`/`executor_blocked_outcome` without
+        # a same-named twin to dedup here.
+        if dispatch is not None and dispatch.blocked:
+            _res = dispatch.executor_resolution
+            cap_info["executor_blocked_reason"] = str(
+                (_res.reason if _res is not None else "")
+                or dispatch.delta.reason or "harness_not_configured"
+            )
+            cap_info["executor_blocked_requested"] = str(_res.requested if _res is not None else "harness")
+            cap_info["executor_blocked_reset_at"] = str(_res.reset_at if _res is not None else "")
         self._emit_live_log(
             "context_building_finished",
             task_id=str(task.get("id") or ""),
@@ -854,15 +978,17 @@ class OuroborosAgent:
             task_type_str = str(task.get("type") or "").lower()
             initial_effort = _initial_effort_for(task, task_type_str)
 
-            executor_decision = _announce_dispatch_executor(task, drive_logs, messages)
-            if executor_decision is not None:
-                # The durable envelope and the parent's result state what actually RAN,
-                # not the request: nothing carried the resolution to them before.
-                task["resolved_executor"] = executor_decision.executor
-                task["executor_reason"] = executor_decision.reason
-
-            if executor_decision is not None and executor_decision.blocked:
-                text, usage = executor_blocked_outcome(executor_decision)
+            if blocked_reason := str(cap_info.get("executor_blocked_reason") or ""):
+                # p34's typed terminal, rebuilt from the facts cap_info carried
+                # across the (ctx, messages, cap_info) seam. The placeholder
+                # method p2 kept for exactly this synthesis is deleted.
+                text, usage = executor_blocked_outcome(SubagentExecutorResolution(
+                    requested=str(cap_info.get("executor_blocked_requested") or "harness"),
+                    executor="blocked",
+                    reason=blocked_reason,
+                    reset_at=str(cap_info.get("executor_blocked_reset_at") or ""),
+                ))
+                llm_trace = {"reasoning_notes": ["subagent_executor_unavailable"], "tool_calls": []}
             elif task_type_str == "deep_self_review":
                 # Deep self-review bypasses the tool loop.
                 try:

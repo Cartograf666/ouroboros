@@ -434,20 +434,12 @@ def migrate_legacy_slot_keys(settings: dict) -> dict:
 
 def get_consciousness_model() -> str:
     """Return the high-horizon background-consciousness model slot."""
-
-    configured = str(os.environ.get("OUROBOROS_MODEL_CONSCIOUSNESS", "") or "").strip()
-    if configured:
-        return configured
-    return (
-        str(os.environ.get("OUROBOROS_MODEL", "") or "").strip()
-        or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL"])
-    )
+    return str(os.environ.get("OUROBOROS_MODEL_CONSCIOUSNESS", "") or "").strip() or _main_model()
 
 # v6.57.0 — EFFORT_SCALE: ORDERED reasoning-effort SSOT (low→high), the single place a tier
 # is defined (settings, llm.py builder, switch_model enum, subagent lanes). xhigh/max extend
 # none..high; llm.py clamps a request DOWN to each model's learned ceiling (BIBLE P1: disclosed).
 EFFORT_SCALE: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
-_VALID_EFFORTS = EFFORT_SCALE
 
 
 def effort_rank(value: str) -> int:
@@ -580,7 +572,7 @@ def resolve_effort(task_type: str) -> str:
         default = "medium"
 
     raw = os.environ.get(key, default)
-    return raw if raw in _VALID_EFFORTS else default
+    return raw if raw in EFFORT_SCALE else default
 
 
 def direct_provider_review_models_fallback(provider: str) -> list[str]:
@@ -670,11 +662,8 @@ def get_scope_review_models() -> list[str]:
 
 def get_deep_self_review_model() -> str:
     """Return the configured deep self-review model slot."""
-
-    return (
-        str(os.environ.get("OUROBOROS_MODEL_DEEP_SELF_REVIEW", "") or "").strip()
-        or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"])
-    )
+    return (str(os.environ.get("OUROBOROS_MODEL_DEEP_SELF_REVIEW", "") or "").strip()
+            or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]))
 
 
 def get_max_workers() -> int:
@@ -1162,9 +1151,7 @@ def _guard_safety_mode_lowering(settings: dict, *, allow_safety_lowering: bool =
 
 def get_skills_repo_path() -> str:
     """Return the configured external skills checkout path, expanding ``~``."""
-    raw = (
-        os.environ.get("OUROBOROS_SKILLS_REPO_PATH", "") or ""
-    ).strip()
+    raw = (os.environ.get("OUROBOROS_SKILLS_REPO_PATH", "") or "").strip()
     if not raw:
         return ""
     try:
@@ -1212,13 +1199,11 @@ def resolve_data_skills_dir(data_dir: pathlib.Path) -> Optional[pathlib.Path]:
 
 def get_ouroboroshub_catalog_url() -> str:
     """Return the official OuroborosHub static catalog URL."""
-
     return str(load_settings().get("OUROBOROS_HUB_CATALOG_URL") or SETTINGS_DEFAULTS["OUROBOROS_HUB_CATALOG_URL"]).strip()
 
 
 def get_ouroboroshub_skills_dir() -> pathlib.Path:
     """Return ``<DATA_DIR>/skills/ouroboroshub/`` (created on demand)."""
-
     target = ensure_data_skills_dir(DATA_DIR) / SKILL_SOURCE_OUROBOROSHUB
     try:
         target.mkdir(parents=True, exist_ok=True)

@@ -43,7 +43,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── packaged_cli_install.py ← Packaged CLI installer planning/execution for user-local command shims
       ├── agent.py             ← Task orchestrator
       ├── agent_startup_checks.py ← Startup verification and health checks
-      ├── agent_task_pipeline.py  ← Task execution pipeline orchestration; emits a per-task `swarm_efficiency` rollup (subagent_count/wave_count/Σ inter-wave latency/lanes_used) for fan-out tasks only, and freezes one shared non-final subtree-cost snapshot for summary/reflection before the terminal checkpoint records final spend
+      ├── agent_task_pipeline.py  ← Task execution pipeline orchestration; emits a per-task `swarm_efficiency` rollup (subagent_count/wave_count/Σ inter-wave latency/lanes_requested — the lanes the fan-out waves ASKED for; a rollup built from pre-dispatch fanout events cannot truthfully report effective lanes, which are per-child dispatch facts on each child's own record) for fan-out tasks only, and freezes one shared non-final subtree-cost snapshot for summary/reflection before the terminal checkpoint records final spend
       ├── mutation_attribution.py ← Root-task baseline capture in the existing task result and clean-at-baseline Git candidate projection; terminal projection includes the committed interval delta
       ├── python_interpreter.py ← One-time pre-guard unversioned-Python resolver for the four user process launch surfaces
       ├── post_task_checkpoint.py ← Durable root post-task phase/final-cost checkpoint shared by task finalization and Project naming recovery
@@ -89,7 +89,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── context_compaction.py ← Context trimming and summarization helpers
       ├── headless.py          ← Headless task child-drive isolation, workspace patch artifacts, and memory export helpers
       ├── coop_checkpoint.py   ← (v6.58.0) `checkpoint_commit_coop_roots` — at ROOT-task finalization, dirty host-minted genesis/coop trees get a local checkpoint commit (`user.name=Ouroboros`); credential-shaped files excluded (disclosed, headless sensitive-pattern SSOT), owner-attached folders NEVER auto-committed, skipped while tree tasks are live, fail-soft per root
-      ├── subagents.py         ← Subagent model-lane resolution, task-group compaction, and structured lineage/usage envelopes
+      ├── subagents.py         ← Subagent axis vocabularies (model lane / executor), the single dispatch-time resolution (`resolve_subagent_dispatch` → `capability_delta`), and structured lineage/usage envelopes
       ├── subagent_worktrees.py ← Acting self_worktree lifecycle: provision/remove/prune isolated git worktrees (outside repo/ and data/) + durable registry (state/subagent_worktrees.json) + cross-process ops lock; startup orphan reconciliation; also provisions durable from-scratch genesis projects (provision_genesis_project, never registry/GC)
       ├── artifacts.py         ← Task-scoped artifact helpers shared by user-file tools, process outputs, and outcome finalization. (v6.52.0, P1) `stage_task_attachments` stages every task's INPUT attachments (CLI/API, GAIA solver, desktop chat) into the agent-readable `artifact_store/attachments/` (skips secret SOURCES via the tool_access SSOT blocklist, bounded), returning a manifest of `read_file(root='artifact_store', path='attachments/<name>')` entries; `collect_task_artifact_records` EXCLUDES that subdir so staged inputs are never recorded as deliverables. (v6.52.2) `record_task_scratch`/`read_task_scratch_fingerprints` persist {abs_path: sha256} FINGERPRINTS of the run_command/run_script `scratch=[...]` ephemeral-verification files to `.scratch_manifest.json` (written to BOTH budget + live drive roots) so `headless.write_workspace_patch_artifacts` EXCLUDES a file from the workspace patch ONLY while its current content still matches (a later real file at the same path is never dropped). (v6.56.0) scratch declarations are IDEMPOTENT/ADOPTABLE: re-declaring a manifest path is ok, and an existing untracked in-cwd file may be adopted — its sha is recorded via the same SSOT writer at declaration time, so the sha-gate still excludes it only while unmodified (tracked / outside-cwd / outside-worktree declarations stay blocked); the undeclared-output guard stat-verifies candidates POST-exec (exists + mtime ≥ start−slack) for both run_command and run_script, so import strings/CLI flags/heredoc bodies no longer read as writes
       ├── retention.py         ← Unified GC retention SSOT: clamp/age-cutoff helpers + legacy-key seed picker used by worktree/task-drive/service-log startup pruning
@@ -173,7 +173,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── tasks.py         ← Headless task create/list/get/cancel/events endpoints over the supervisor queue
       │   ├── logs.py          ← Read-only runtime log tail endpoint for CLI/headless clients
       │   ├── settings.py      ← /api/settings, /api/owner/*, onboarding, Claude runtime status/repair handlers
-      │   ├── control.py       ← reset, command, git/update, and evolution-data handlers; schedule_subagent surfaces effective_lane(s), wait_task emits a burst/absorb advisory when other children are still in flight, and the descriptions steer burst+absorb and cooperative-multi-builder (external_workspace, omit write_root) vs genesis
+      │   ├── control.py       ← reset, command, git/update, and evolution-data handlers; schedule_subagent reports the requested lane only (the axes resolve at dispatch, and a reduction reaches the parent through `capability_delta` in the child's result), wait_task emits a burst/absorb advisory when other children are still in flight, and the descriptions steer burst+absorb and cooperative-multi-builder (external_workspace, omit write_root) vs genesis
       │   ├── schedules.py     ← queue-backed cron schedule HTTP surface (list/upsert/delete)
       │   ├── files.py         ← File Browser + chat upload endpoints
       │   ├── ui_preferences.py ← owner-local UI preferences (`state/ui_preferences.json`): widget order, nested subagent expansion, and UI defaults
@@ -459,10 +459,14 @@ scheduler, dashboard, endpoint, or settings surface. Child lineage is inferred
 from the active `ToolContext` and persisted as `parent_task_id`, `root_task_id`,
 `session_id`, `actor_id`, `delegation_role`, `role`, `memory_mode`,
 `drive_root`, `child_drive_root`, `budget_drive_root`, `task_contract`,
-`task_metadata`, `task_constraint`, `requested_model_lane`,
-`effective_model_lane`, `model`, `use_local_model`, `requested_executor`,
-`reasoning_effort`, `task_group_id`, and
-`subagent_envelope`.
+`task_metadata`, `task_constraint`, and — split into the two halves v6.87.28
+separated — the scheduling INTENT (`requested_model_lane`, `parent_model_lane`,
+`requested_executor`) and the DISPATCH RESOLUTION (`effective_model_lane`, `model`,
+`use_local_model`, `reasoning_effort`, `effective_executor`, `executor_route`,
+`tool_profile`, `capability_delta`), plus `task_group_id` and `subagent_envelope`.
+The intent half is written when the child is scheduled; the resolved half is written
+once, by the worker, when the child is dispatched. They never share a key, so "what
+was asked" can never be overwritten by "what was given".
 
 A child is described by three INDEPENDENT axes, and v6.87.7 is where they stopped
 leaking into one another (BIBLE P2: remove the class, do not re-tune the coupling).
@@ -476,9 +480,9 @@ was "mutating", where mutating meant `write_surface OR may_mutate` — and `may_
 grants the right to spawn mutative DESCENDANTS, so a read-only child drew the expensive
 model because of a permission about its unborn grandchildren. That line and the
 `OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT` cap that force-downgraded nested children
-are both gone: an omitted lane is Light at every depth, an explicit lane is honored at
-every depth, and recursion stays bounded by the structural depth cap, per-root
-concurrency, and the worker pool — the limits that actually bind. A child that starts
+are both gone: an omitted lane is honored the same way at every depth, an explicit lane
+is honored at every depth, and recursion stays bounded by the structural depth cap,
+per-root concurrency, and the worker pool — the limits that actually bind. A child that starts
 cheap and finds the work harder raises its own power with `switch_model`, which is now
 in BOTH child tool allowlists: changing model changes cognitive power, not permissions,
 and a read-only child stays read-only at any model. The `review` and `scope` lanes were
@@ -488,9 +492,111 @@ review all read their slots from config and run on the review substrate). Durabl
 records carrying the old values stay readable; `build_subagent_envelope` coerces an
 unknown stored lane rather than raising.
 
-`schedule_subagent` also exposes `effort` (from `EFFORT_SCALE`; omission inherits
-`resolve_effort(task_type)`, and an unrecognized STORED value falls back the same way
-rather than raising) and `deadline_at`, promoted out of the runtime-internal
+**The lane default and `capability_delta` (v6.87.26).** An omitted `model_lane`
+INHERITS THE PARENT'S effective lane; empty means "no lane on record", which is the
+root agent, and the root runs Main. It used to collapse to `light`: a parent handing a
+child a slice of its own job got a weaker child and no signal, so the one case where
+Light is genuinely right — a read-only micro-check, a mini-audit, a formatting or
+lookup task — was indistinguishable from every case where it was wrong. Light is now
+something a parent SAYS. What the request MEANS is `subagents.intended_lane` — itself,
+or the parent's lane when it said `auto` — a pure predicate with two readers that may
+not own it: the resolution measures the effective lane against it, and the ADMISSION
+gate for a `require_lane` delegation constraint runs before dispatch and so cannot ask
+what the child ended up on.
+
+**Three declared axes, one derivation (v6.87.28).** A parent declares the WORK, not
+the machinery: `write_surface`, `model_lane`, `executor` — and model, effort, route
+and credential profile are DERIVED. `schedule_subagent` published an `effort`
+parameter until v6.87.28 and it broke that twice. It was a second knob for the
+question `model_lane` already answers, so `model_lane: light` with `effort: max` was a
+request nobody could resolve — it pinned the cheapest model to the strongest
+reasoning and no rule reconciled them. And a harness route carries its OWN effort
+(`codex=gpt-5.6-sol:xhigh`), so a parent asking `low` against a route pinned to
+`xhigh` had no rule for who wins: exactly the intent divergence the axes exist to
+design out. It is removed rather than ranked against the lane (BIBLE P2: remove the
+class). The owner's control is unchanged — effort is `config.resolve_effort(task_type)`,
+which is what an omitted `effort` always resolved to, and that was the normal case. A
+call that still passes `effort` is refused by name, and a stored `reasoning_effort`
+on a durable record is IGNORED with the reason stated on the record (`legacy_note`,
+sourced from `subagents.LEGACY_SUBAGENT_FIELDS`, the same sentence the live refusal
+quotes) rather than obeyed or dropped in silence; a load never fails over one.
+
+**One resolution, at dispatch.** There is exactly ONE place where "what was asked"
+meets "what was given": `subagents.resolve_subagent_dispatch`, called by
+`agent.resolve_dispatch_axes` when the worker picks the child up. It derives the
+effective lane, the model, the local-routing flag, the effort, the executor, the
+route and the tool profile together, and emits one typed `capability_delta`
+(`requested_lane`, `resolved_lane`, `effective_lane`, `derived_effort`,
+`effective_effort`, `requested_executor`, `effective_executor`, `reason`, `reduced`,
+`legacy_note`). It runs at DISPATCH because two of its inputs are LIVE — whether a
+harness route exists (`harness_delegation_route`, which returns the route identity
+rather than a bare boolean, so a record naming `harness` can name which one) and what
+band that route's model has learned. Resolving at schedule time answered about a
+moment that had passed by the time the child started: a queued child can wait out a
+whole outage. Resolving in two places — a lane resolver inside the tool call and an
+executor resolver in the worker — produced two records that disagreed about the same
+child. The whole derived half of the record comes from
+`SubagentDispatch.record_fields()`, so an added axis is one edit rather than a
+field-by-field mapping repeated in four modules.
+
+Reductions the delta names today: a Heavy/Light lane whose slot is not configured
+(the resolution REPORTS `main`, the slot the model actually came from, instead of
+claiming a strength nobody configured — the fact was already known inside
+`_use_local_for_lane` and went no further, so `lane_ran_on_main` is the shared
+predicate); a route whose learned band caps the effort below the owner's configured
+value (the STORED effort stays the derived one, because the dispatcher re-clamps per
+model and a fallback route with a wider band must not inherit this one's ceiling —
+`effective_effort` is the WHOLE band through `LLMClient.clamp_effort_for_route`, the
+same body the dispatcher clamps with, so a route with a learned FLOOR reports the
+effort it will really run, and only a result ranking BELOW the derived effort counts
+as a reduction); and an `executor` pin no route can honor — `harness` had no resolver
+at all, so a natively-run child left a durable record under the envelope key
+`executor` claiming a harness had run it. `effective_executor` is that key's twin,
+symmetric with `requested_model_lane`/`effective_model_lane`.
+
+`resolve_subagent_executor` is the rule table for that axis, and it distinguishes the
+REQUEST from a policy default (owner decision D28). `auto` with no route configured
+runs native and says nothing — nothing was asked for. An EXPLICIT `executor: harness`
+that no route can honor is a **typed blocker**: `effective_executor` resolves to
+`blocked`, a third value that is a resolution OUTCOME and deliberately not a member of
+the public `SUBAGENT_EXECUTORS` request vocabulary, and the child ends unrun with
+`reason_code=subagent_executor_unavailable` having spent nothing. It used to resolve to
+`native` with a loud `capability_delta`, which disclosed the wrong thing: the pin
+exists to keep the work off metered API tokens, so re-routing it to paid native
+execution spends the money the parent refused, however loudly it is announced. The
+enforcement sits in `agent.OuroborosAgent._handle_task_scoped`, ahead of the tool loop,
+so "spent nothing" is a property of the control flow rather than a promise; the
+`capability_delta` still reaches the record, the child's prompt and the parent's
+readback. Lane strength is ordered
+by the `LANE_STRENGTH`/`lane_rank` SSOT (`light` < `main` < `heavy`; `auto` has no
+rank — it is a request to inherit, not a strength), the mirror of `config.effort_rank`,
+and `lane_is_weaker` is the single predicate every reader asks.
+`capability_delta_disclosures` is the single RENDERER, so the phrase the child reads
+and the phrase the parent reads cannot drift.
+
+When `reduced` is true the delta reaches the three places a reduction has to reach:
+the durable record and its `subagent_envelope`; the child's own prompt (a
+`[CAPABILITY DELTA]` block, appended at dispatch by `agent.capability_delta_prompt_block`,
+telling it to say so in `blockers` if the gap limited its answer — it used to be
+composed into the child's text at ENQUEUE time, which is before the fact exists); and
+the `[SUBTASK_OUTCOME]` payload the parent reads when it collects the child's ANSWER,
+which is the moment it decides whether to trust a weaker result. The
+`schedule_subagent` result deliberately carries none of it and states the REQUEST
+instead: nothing is resolved when it is written. A pending child's queue snapshot
+carries only intent (including `parent_model_lane`, without which a resumed child
+would resolve `auto` against the lane of record and silently come back weaker than
+the parent that scheduled it); a running child's carries the resolution: the worker
+that resolved it reports the stamped fields back over the ordinary worker event
+channel (`task_dispatch_resolved`), and `supervisor/events.py` merges exactly
+`SUBAGENT_RESOLUTION_FIELDS` into the supervisor-owned RUNNING copy under the queue
+lock — the worker resolves on a process-local clone, so without the merge the
+snapshot would serialize the unresolved intent and a restart would lose the decision.
+A re-dispatch of a requeued child resolves afresh from the same stated intent and
+re-discloses; the residue a prior resolution left on the record (its stored
+`reasoning_effort` beside its `capability_delta`) is recognized as the resolver's own
+writing, never mis-disclosed as an ignored legacy request.
+
+`schedule_subagent` also exposes `deadline_at`, promoted out of the runtime-internal
 `_INTERNAL_SCHEDULE_OPTIONS` channel because the parent is what knows when a child's
 handoff stops being useful. `deadline_at` is NARROWING-ONLY: the earlier of the child's
 and the parent's wins. That narrowing was previously defeated in two ways, both fixed
@@ -518,7 +624,9 @@ bounded wait (default 180s) and returns the full untruncated child handoff.
 `wait_tasks` performs batch waits (default 600s) and returns a compact
 STRUCTURAL projection per child — task_id, status, cost_usd (on every status),
 child_result_sha256 (the join-ledger hash), outcome_axes, result,
-trace_summary, and duplicate_of when applicable — instead of the full
+trace_summary, capability_delta when the child has something to disclose
+(reduced below what was asked, or a legacy stored field ignored), and
+duplicate_of when applicable — instead of the full
 persisted envelope; forensics (trace_refs, loop_outcome, verification_ledger)
 stay on disk in `task_results/<id>.json`, addressable by
 `child_result_sha256` (a disclosed omission, not silent truncation);
@@ -532,7 +640,8 @@ existing tool ThreadPool instead of sequentially (`schedule_subagent` is in
 emission cannot lose records, while the supervisor still drains its event queue
 serially, keeping cap/dedup/enqueue single-threaded. Each spawn wave also writes
 one durable `swarm_fanout` telemetry event to `events.jsonl` (requested count,
-task group, role, requested/effective lanes, depth, inter-wave latency) for
+task group, role, requested lane, depth, inter-wave latency — the REQUEST only:
+a wave event written before any child starts cannot know effective lanes) for
 fan-out observability; it carries no `delegation_role`/`subagent_task_id`, so the
 Logs view renders it as a summary line, not a phantom child card. The supervisor
 tags accepted subagent scheduling with `accepted`, `active_subagent_count`, and
@@ -562,8 +671,9 @@ only under `artifact_store/video_frames` through a host-owned command shape (the
 permitted local coordination/projection paths; not arbitrary workspace/repo
 mutation). Nested readonly `schedule_subagent`
 recursion is visible only within configured depth/cap limits. Depth does not change
-the lane; an omitted lane resolves to Light and a child raises its own power with
-`switch_model` when the work turns out heavier than the parent expected.
+the lane; an omitted lane INHERITS the parent's effective lane (v6.87.26) and a
+child raises its own power with `switch_model` when the work turns out heavier
+than the parent expected.
 
 v6.50.0 adds a reconciliation layer around this contract. `schedule_subagent`
 may carry a closed-enum `required_capabilities` list (for example `shell` or

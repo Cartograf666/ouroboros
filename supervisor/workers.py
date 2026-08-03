@@ -2031,11 +2031,16 @@ def assign_tasks() -> None:
                             child_drive_root=task.get("child_drive_root") or task.get("drive_root"),
                             budget_drive_root=task.get("budget_drive_root"),
                             task_constraint=task.get("task_constraint"),
+                            # INTENT ONLY. This mirror is written at ASSIGNMENT, one
+                            # step before the worker dispatches and resolves the
+                            # child; naming `effective_model_lane`/`model` here wrote
+                            # whatever the record happened to hold, which on a retry
+                            # is the PREVIOUS attempt's resolution and on a fresh
+                            # child is nothing at all.
                             model_lane=task.get("model_lane"),
                             requested_model_lane=task.get("requested_model_lane"),
-                            effective_model_lane=task.get("effective_model_lane"),
-                            model=task.get("model"),
-                            use_local_model=task.get("use_local_model"),
+                            parent_model_lane=task.get("parent_model_lane"),
+                            requested_executor=task.get("requested_executor"),
                             task_group_id=task.get("task_group_id"),
                             task_group=task.get("task_group"),
                             subagent_envelope=task.get("subagent_envelope"),

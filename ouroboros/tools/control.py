@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List
 
 from ouroboros.config import (
-    EFFORT_SCALE,
     apply_settings_to_env,
     get_max_subagent_depth,
     load_settings,
@@ -45,10 +44,9 @@ from ouroboros.task_results import (
 )
 from ouroboros.task_status import load_effective_task_result, wait_for_effective_tasks
 from ouroboros.subagents import (
+    LEGACY_SUBAGENT_FIELDS,
     SUBAGENT_EXECUTORS,
     build_subagent_envelope,
-    compact_task_group,
-    expand_subagent_lane_slots,
     normalize_subagent_executor,
     normalize_subagent_model_lane,
 )
@@ -92,7 +90,6 @@ def _emit_swarm_fanout(
     task_ids: List[str],
     role: str,
     requested_model_lane: str,
-    effective_model_lanes: List[str],
     objective: str,
     emitted_live: bool,
 ) -> None:
@@ -120,8 +117,11 @@ def _emit_swarm_fanout(
         "requested_count": len(task_ids),
         "task_ids": task_ids,
         "role": role,
+        # The REQUEST. What the children actually ran on is a per-child DISPATCH
+        # fact and lives on each child's own record — a wave event written before
+        # any child started cannot know it, and `effective_model_lanes` used to
+        # claim it anyway.
         "requested_model_lane": requested_model_lane,
-        "effective_model_lanes": effective_model_lanes,
         "slot_count": len(task_ids),
         "objective_preview": objective[:200],
         "emitted_live": bool(emitted_live),
@@ -191,28 +191,30 @@ def _finalize_schedule_emission(
     ctx: ToolContext,
     *,
     task_ids: List[str],
-    task_group_id: str,
     requested_model_lane: str,
-    task_group: Dict[str, Any],
     objective: str,
     role: str,
     depth: int,
     parent_task_id: str,
     root_task_id: str,
-    slot_tasks: list,
     emitted_modes: List[str],
     write_surface: str = "",
 ) -> str:
     """Record the scheduled wave, emit swarm_fanout telemetry, and build the
     tool-result string. Extracted from _schedule_task to keep that function
-    within the per-function size budget (P7)."""
+    within the per-function size budget (P7).
+
+    It reports the REQUEST and nothing else. Until v6.87.28 it also printed an
+    `effective_lane=` and a `CAPABILITY_DELTA` line, both produced by resolving the
+    child inside the scheduling call — an answer about live availability, given
+    before the child was queued, let alone started. The reduction now reaches the
+    parent where it can act on it: in `[SUBTASK_OUTCOME]`, when it reads the answer
+    and decides how far to trust it."""
     worker_note = " (live queue emission requested)" if any(m == "live" for m in emitted_modes) else ""
     try:
         _record_scheduled_subagent(ctx, {
             "task_ids": task_ids,
-            "task_group_id": task_group_id,
             "requested_model_lane": requested_model_lane,
-            "task_group": task_group,
             "objective": objective,
             "role": role,
         })
@@ -224,46 +226,52 @@ def _finalize_schedule_emission(
             parent_task_id=parent_task_id,
             root_task_id=root_task_id,
             depth=depth,
-            task_group_id=task_group_id,
+            task_group_id="",
             task_ids=task_ids,
             role=role,
             requested_model_lane=requested_model_lane,
-            effective_model_lanes=[slot.effective_lane for _tid, slot in slot_tasks],
             objective=objective,
             emitted_live=any(m == "live" for m in emitted_modes),
         )
     except Exception:
         pass
-    # B3: surface the RESOLVED model lane(s) to the parent (previously only in
-    # swarm_fanout telemetry / the child envelope) so it can see when auto resolved
-    # to light/heavy without inspecting events.
-    effective_lanes = [slot.effective_lane for _tid, slot in slot_tasks]
     slot_note = _subagent_slot_note(ctx, root_task_id)
-    # v6.57.0 (1.6): preview the child's EFFECTIVE tool profile (shell/writable/lane)
-    # so the parent knows up front whether the child can run shell / write — the wasted
-    # rounds where a prober child hit workspace_blocked came from neither side knowing.
-    def _profile_note(effective_lane: str) -> str:
-        try:
-            from ouroboros.tool_access import predicted_subagent_profile, summarize_subagent_profile
+    # v6.57.0 (1.6): preview the child's EFFECTIVE tool profile (shell/writable) so
+    # the parent knows up front whether the child can run shell / write — the wasted
+    # rounds where a prober child hit workspace_blocked came from neither side
+    # knowing. AUTHORITY only: it carries no lane, because the lane is not resolved
+    # yet and a preview that guesses one is the claim this release removed.
+    profile_note = ""
+    try:
+        from ouroboros.tool_access import predicted_subagent_profile, summarize_subagent_profile
 
-            profile = predicted_subagent_profile(write_surface=write_surface)
-            return "\n" + summarize_subagent_profile(profile, effective_lane=effective_lane)
-        except Exception:
-            return ""
-
-    if len(task_ids) == 1:
-        eff = effective_lanes[0] if effective_lanes else requested_model_lane
-        return (
-            f"Subagent request queued {task_ids[0]}: {objective} (effective_lane={eff})"
-            f"{worker_note}{slot_note}{_profile_note(eff)}"
-        )
-    distinct_lanes = list(dict.fromkeys(effective_lanes))
-    lanes_note = distinct_lanes[0] if len(distinct_lanes) == 1 else ", ".join(distinct_lanes)
+        profile_note = "\n" + summarize_subagent_profile(
+            predicted_subagent_profile(write_surface=write_surface))
+    except Exception:
+        pass
     return (
-        f"Subagent group queued {task_group_id}: {', '.join(task_ids)} "
-        f"(requested_lane={requested_model_lane}, effective_lanes=[{lanes_note}], slots={len(task_ids)})"
-        f"{worker_note}{slot_note}{_profile_note(distinct_lanes[0] if len(distinct_lanes) == 1 else '')}"
+        f"Subagent request queued {task_ids[0]}: {objective} "
+        f"(requested_lane={requested_model_lane})"
+        f"{worker_note}{slot_note}{profile_note}"
     )
+
+
+def disclosable_capability_delta(data: Dict[str, Any]) -> Dict[str, Any]:
+    """The child's delta when it has something to SAY, else ``{}`` — ONE predicate.
+
+    THE terminal parent-facing disclosure, and since v6.87.28 the only parent-facing
+    one: the reduction is not known until the child is dispatched, so no scheduling
+    result can carry it. It is a predicate rather than an inline test because the
+    parent absorbs a child through TWO surfaces — `get_task_result`/`wait_task` read
+    one child in full, `wait_tasks` projects a batch compactly — and the batch one
+    is the surface a fan-out parent actually uses. It had the test in neither place
+    and the disclosure in one, so a parent that scheduled five children and absorbed
+    them in a burst was told nothing about any of them.
+
+    A delta that took nothing away and ignored nothing is noise in every payload.
+    """
+    delta = data.get("capability_delta") if isinstance(data.get("capability_delta"), dict) else {}
+    return delta if (delta.get("reduced") or delta.get("legacy_note")) else {}
 
 
 def _subtask_outcome_summary(data: Dict[str, Any]) -> str:
@@ -273,6 +281,9 @@ def _subtask_outcome_summary(data: Dict[str, Any]) -> str:
     }
     if isinstance(data.get("task_contract"), dict):
         summary["task_contract"] = data.get("task_contract")
+    _delta = disclosable_capability_delta(data)
+    if _delta:
+        summary["capability_delta"] = _delta
     if isinstance(data.get("artifact_bundle"), dict):
         summary["artifact_bundle"] = data.get("artifact_bundle")
     if ledger:
@@ -1031,24 +1042,18 @@ def _populate_subagent_event_extras(
         evt["parent_task_id"] = parent_task_id
 
 
-def _prepare_child_drives(slot_tasks, task_ids, status_drive_root, memory_mode, parent_project_id):
-    """Prepare forked/empty child drives for a scheduled wave. On any failure, clean up
-    every child drive + task-state dir and return ``(drives, error_string)``; otherwise
-    ``(drives, "")``. (Extracted from _schedule_task to keep it under the method gate.)"""
-    child_drives: Dict[str, Path] = {}
+def _prepare_child_drive(tid, status_drive_root, memory_mode, parent_project_id):
+    """Prepare the forked/empty child drive. On failure clean up the drive + the
+    task-state dir and return ``(None, error_string)``; otherwise ``(drive, "")``.
+    (Extracted from _schedule_task to keep it under the method gate.)"""
     if memory_mode not in {"forked", "empty"}:
-        return child_drives, ""
-    for tid, _slot in slot_tasks:
-        try:
-            child_drives[tid] = prepare_task_drive(status_drive_root, tid, memory_mode, project_id=parent_project_id)
-        except Exception as exc:
-            for child_drive in child_drives.values():
-                shutil.rmtree(child_drive, ignore_errors=True)
-            for cleanup_tid in task_ids:
-                shutil.rmtree(task_state_dir(status_drive_root, cleanup_tid), ignore_errors=True)
-            log.warning("Failed to prepare child drive for subtask %s", tid, exc_info=True)
-            return child_drives, f"⚠️ SUBTASK_DRIVE_ERROR: failed to prepare {memory_mode} child drive: {exc}"
-    return child_drives, ""
+        return None, ""
+    try:
+        return prepare_task_drive(status_drive_root, tid, memory_mode, project_id=parent_project_id), ""
+    except Exception as exc:
+        shutil.rmtree(task_state_dir(status_drive_root, tid), ignore_errors=True)
+        log.warning("Failed to prepare child drive for subtask %s", tid, exc_info=True)
+        return None, f"⚠️ SUBTASK_DRIVE_ERROR: failed to prepare {memory_mode} child drive: {exc}"
 
 
 def _earliest_deadline_at(requested: str, inherited: str) -> str:
@@ -1175,7 +1180,7 @@ def schedule_subagent_properties() -> Dict[str, Any]:
             "type": "string",
             "enum": ["auto", "main", "heavy", "light"],
             "default": "auto",
-            "description": "How STRONG this child should be. It says nothing about what the child may DO — authority comes from write_surface. Omit it (auto) for ordinary work: the child runs the cheap Light lane and raises its own power with switch_model if the work turns out to be harder than you expected. Ask for heavy or main when you already know the work needs a strong model — heavy is the strong acting/coding slot, and an empty Heavy/Light slot falls back to Main. Depth does not change the lane.",
+            "description": "How STRONG this child should be. It says nothing about what the child may DO — authority comes from write_surface. CHOOSE CONSCIOUSLY: light for a read-only micro-check, a mini-audit, a formatting or lookup task; heavy for the strong acting/coding slot; main for the ordinary strong model. Omitting it (auto) INHERITS YOUR OWN lane — the right answer when the child's answer gets committed, or when you will act on it without re-checking. Cheap work must be NAMED light, not left unsaid. An empty Heavy/Light slot falls back to Main and the child reports the reduction in capability_delta. Depth does not change the lane; a child that finds the work harder raises itself with switch_model.",
         },
         "write_surface": {
             "type": "string",
@@ -1205,13 +1210,15 @@ def schedule_subagent_properties() -> Dict[str, Any]:
             "type": "string",
             "enum": list(SUBAGENT_EXECUTORS),
             "default": "auto",
-            "description": "WHO runs this child, a third axis alongside power (model_lane) and authority (write_surface). auto follows the owner's configured policy and is the right answer almost always. native pins the child to Ouroboros' own metered loop. harness pins it to the configured delegation harness and REFUSES if that harness is unavailable, rather than silently spending metered money instead.",
+            "description": "WHO runs this child, a third axis alongside power (model_lane) and authority (write_surface). auto follows the owner's configured policy and is the right answer almost always — with no delegation route configured it simply runs native. native pins the child to Ouroboros' own metered loop. harness pins it to the configured delegation harness and is a REFUSAL to spend metered API money: when no harness route is available the child does NOT run, it ends with a typed executor-unavailable outcome (reported in capability_delta), because re-routing the pin to native would spend exactly what the pin prevents. Ask for auto if metered spend is acceptable.",
         },
-        "effort": {
-            "type": "string",
-            "enum": list(EFFORT_SCALE),
-            "description": "Optional reasoning effort for this child. Omit it to inherit the configured effort for the child's task type — that is the normal case. Name one only when you already know this particular child needs to think harder or less hard than its siblings; the child can also raise itself later with switch_model.",
-        },
+        # `effort` was published here until v6.87.28 and is gone. A parent declares
+        # the WORK, not the machinery: `model_lane` already answers "how good must
+        # this answer be", so `model_lane: light` with `effort: max` was a request
+        # nobody could resolve, and a harness route carries its own effort, so a
+        # parent asking `low` against a route pinned to `xhigh` had no rule for who
+        # wins. Effort is derived at dispatch from `config.resolve_effort(task_type)`
+        # — the owner's control over it is exactly what it was before the knob.
         "deadline_at": {
             "type": "string",
             "description": "Optional ISO-8601 UTC instant after which this child's work is worthless to you (e.g. a scout whose handoff you can only consume inside a narrow window). NARROWING ONLY: the earlier of this and the parent's deadline wins, so it can tighten your own deadline but never extend it. Omit it to simply inherit the parent's.",
@@ -1254,10 +1261,6 @@ def _validated_schedule_fields(params: Dict[str, Any]) -> tuple[Dict[str, Any], 
         executor = normalize_subagent_executor(params.get("executor", "auto"))
     except ValueError as exc:
         return {}, f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {exc}."
-    effort = str(params.get("effort") or "").strip().lower()
-    if effort and effort not in EFFORT_SCALE:
-        allowed = ", ".join(EFFORT_SCALE)
-        return {}, f"⚠️ TOOL_ARG_ERROR (schedule_subagent): effort must be one of: {allowed}."
     if deadline_at:
         # `deadline_at` became MODEL-AUTHORED in v6.87.7; it used to be computed by
         # plan_review, where neither check could fail. Both failures below are SILENT
@@ -1296,12 +1299,28 @@ def _validated_schedule_fields(params: Dict[str, Any]) -> tuple[Dict[str, Any], 
         "context": str(params.get("context") or "").strip(),
         "constraints": str(params.get("constraints") or "").strip(),
         "memory_mode": memory_mode, "may_mutate": params.get("may_mutate", False),
-        "model_lane": model_lane, "executor": executor, "effort": effort,
+        "model_lane": model_lane, "executor": executor,
     }, ""
+
+
+# A parameter this tool used to publish, mapped to the durable field it wrote.
+# Separate from "unsupported" because a caller passing one is not guessing: it read
+# a schema that was real, and "unsupported argument" hides that the capability still
+# exists and is now derived. The REASON is not restated here — it is
+# `LEGACY_SUBAGENT_FIELDS`, the same sentence the dispatch resolution puts on the
+# record when it ignores a stored value, so the live refusal and the durable
+# disclosure cannot come to disagree about why the field went away.
+RETIRED_SCHEDULE_PARAMS: Dict[str, str] = {"effort": "reasoning_effort"}
 
 
 def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, **params: Any) -> str:
     allowed_params = schedule_subagent_param_names()
+    retired = sorted(str(key) for key in params if key in RETIRED_SCHEDULE_PARAMS)
+    if retired:
+        return "⚠️ TOOL_ARG_ERROR (schedule_subagent): " + " ".join(
+            f"{name} was withdrawn: {LEGACY_SUBAGENT_FIELDS[RETIRED_SCHEDULE_PARAMS[name]]}. "
+            "Drop it — the owner's configured effort applies, exactly as it did when "
+            f"{name} was omitted." for name in retired)
     unsupported = sorted(str(key) for key in params if key not in allowed_params)
     if unsupported:
         bad = ", ".join(unsupported)
@@ -1329,7 +1348,6 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     may_mutate = fields["may_mutate"]
     requested_model_lane = fields["model_lane"]
     requested_executor = fields["executor"]
-    requested_effort = fields["effort"]
 
     try:
         current_depth = int(getattr(ctx, 'task_depth', 0) or 0)
@@ -1408,29 +1426,17 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         or {}
     )
     executor_ref = _resolve_executor_ref(ctx)
-    # Power comes from the requested lane alone. The write surface and may_mutate
-    # decide AUTHORITY (which tools the child may call, via task_constraint) and no
-    # longer leak into model choice — see resolve_subagent_lane for why.
-    lane_slots = expand_subagent_lane_slots(requested_model_lane, depth=new_depth)
-    if not lane_slots:
-        return "⚠️ SUBTASK_STATUS_ERROR: no subagent lane slots resolved; subagent was not scheduled."
-    slot_tasks = [(uuid.uuid4().hex[:8], slot) for slot in lane_slots]
-    task_ids: List[str] = [task_id for task_id, _slot in slot_tasks]
-    emitted_modes: List[str] = []
-    task_group_id = (
-        f"subagents-{uuid.uuid4().hex[:8]}" if len(lane_slots) > 1 else ""
-    )
-    task_group = compact_task_group(
-        group_id=task_group_id,
-        task_ids=task_ids,
-        requested_lane=requested_model_lane,
-        parent_task_id=parent_task_id,
-        root_task_id=root_task_id_seed,
-        role=role,
-    ) if task_group_id else {}
-    child_drives, _drive_err = _prepare_child_drives(
-        slot_tasks, task_ids, status_drive_root, memory_mode, parent_project_id
-    )
+    # SCHEDULING STATES INTENT AND NOTHING ELSE. The lane, the model, the effort, the
+    # route, the profile and the effective executor are all resolved ONCE, at
+    # dispatch, by `subagents.resolve_subagent_dispatch` — see it for why. What is
+    # recorded here is what the parent ASKED for, plus the parent's own lane, which
+    # is the fact an omitted lane inherits and which only the parent knows.
+    tid = uuid.uuid4().hex[:8]
+    task_ids: List[str] = [tid]
+    root_task_id = root_task_id_seed or tid
+    parent_model_lane = str(metadata.get("effective_model_lane") or "")
+    child_drive, _drive_err = _prepare_child_drive(
+        tid, status_drive_root, memory_mode, parent_project_id)
     if _drive_err:
         return _drive_err
 
@@ -1443,145 +1449,118 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         intent_note=params.get("delegation_intent", ""),
     )
 
-    events_to_emit: List[Dict[str, Any]] = []
-    for tid, slot in slot_tasks:
-        root_task_id = root_task_id_seed or tid
-        slot_role = role
-        if slot.slot_count > 1:
-            slot_role = f"{role}:slot-{slot.slot_index + 1}"
-        child_drive = child_drives.get(tid)
-
-        child_contract = _build_child_subagent_contract({
-            "tid": tid, "objective": objective, "expected_output": expected_output, "constraints": constraints,
-            "workspace_root": workspace_root, "workspace_mode": workspace_mode, "parent_project_id": parent_project_id,
-            "allowed_resources": allowed_resources, "parent_contract": parent_contract,
-            "parent_task_id": parent_task_id, "root_task_id": root_task_id, "session_id": session_id,
-            "child_delegation_budget": child_delegation_budget, "deadline_at": str(deadline_at or ""),
-        })
-        envelope = build_subagent_envelope(
-            task_id=tid,
-            parent_task_id=parent_task_id,
+    child_contract = _build_child_subagent_contract({
+        "tid": tid, "objective": objective, "expected_output": expected_output, "constraints": constraints,
+        "workspace_root": workspace_root, "workspace_mode": workspace_mode, "parent_project_id": parent_project_id,
+        "allowed_resources": allowed_resources, "parent_contract": parent_contract,
+        "parent_task_id": parent_task_id, "root_task_id": root_task_id, "session_id": session_id,
+        "child_delegation_budget": child_delegation_budget, "deadline_at": str(deadline_at or ""),
+    })
+    # The requested-status envelope carries the REQUEST. Its derived half stays
+    # empty until dispatch fills it, so a queued child's public description never
+    # names a lane, a model or an effort that no resolution has produced.
+    envelope = build_subagent_envelope(
+        task_id=tid,
+        parent_task_id=parent_task_id,
+        root_task_id=root_task_id,
+        depth=new_depth,
+        role=role,
+        requested_lane=requested_model_lane,
+        executor=requested_executor,
+        status=STATUS_REQUESTED,
+    )
+    intent_fields = {
+        "model_lane": requested_model_lane,
+        "requested_model_lane": requested_model_lane,
+        "parent_model_lane": parent_model_lane,
+        "requested_executor": requested_executor,
+    }
+    evt = {
+        "type": "schedule_subagent",
+        "description": objective,
+        "objective": objective,
+        "expected_output": expected_output,
+        "constraints": constraints,
+        "role": role,
+        "task_id": tid,
+        "depth": new_depth,
+        "ts": utc_now_iso(),
+        "root_task_id": root_task_id,
+        "session_id": session_id,
+        "actor_id": f"subagent:{role}",
+        "delegation_role": "subagent",
+        "memory_mode": memory_mode,
+        "project_id": parent_project_id,
+        "budget_drive_root": budget_drive_root,
+        "task_constraint": task_constraint,
+        "write_surface": requested_surface,
+        "task_contract": child_contract,
+        "allowed_resources": allowed_resources,
+        "required_capabilities": required_caps,
+        **intent_fields,
+        "subagent_envelope": envelope,
+    }
+    _populate_subagent_event_extras(
+        evt, current_chat_id=current_chat_id, child_drive=child_drive,
+        workspace_root=workspace_root, workspace_mode=workspace_mode,
+        executor_ref=executor_ref, context=context, parent_task_id=parent_task_id,
+    )
+    try:
+        write_task_result(
+            status_drive_root,
+            tid,
+            STATUS_REQUESTED,
+            parent_task_id=parent_task_id or None,
             root_task_id=root_task_id,
-            task_group_id=task_group_id,
-            depth=new_depth,
-            role=slot_role,
-            requested_lane=slot.requested_lane,
-            effective_lane=slot.effective_lane,
-            model=slot.model,
-            reasoning_effort=requested_effort,
-            executor=requested_executor,
-            status=STATUS_REQUESTED,
+            session_id=session_id,
+            actor_id=f"subagent:{role}",
+            delegation_role="subagent",
+            project_id=parent_project_id,
+            role=role,
+            description=objective,
+            objective=objective,
+            expected_output=expected_output,
+            constraints=constraints,
+            context=context,
+            workspace_root=workspace_root,
+            workspace_mode=workspace_mode,
+            executor_ref=executor_ref,
+            allowed_resources=allowed_resources,
+            task_contract=child_contract,
+            required_capabilities=required_caps,
+            chat_id=current_chat_id or None,
+            memory_mode=memory_mode,
+            drive_root=str(child_drive) if child_drive is not None else "",
+            child_drive_root=str(child_drive) if child_drive is not None else "",
+            budget_drive_root=budget_drive_root,
+            task_constraint=task_constraint,
+            **intent_fields,
+            subagent_envelope=envelope,
+            result="Subagent request queued. Awaiting supervisor acceptance.",
         )
-        evt = {
-            "type": "schedule_subagent",
-            "description": objective,
-            "objective": objective,
-            "expected_output": expected_output,
-            "constraints": constraints,
-            "role": slot_role,
-            "task_id": tid,
-            "depth": new_depth,
-            "ts": utc_now_iso(),
-            "root_task_id": root_task_id,
-            "session_id": session_id,
-            "actor_id": f"subagent:{slot_role}",
-            "delegation_role": "subagent",
-            "memory_mode": memory_mode,
-            "project_id": parent_project_id,
-            "budget_drive_root": budget_drive_root,
-            "task_constraint": task_constraint,
-            "write_surface": requested_surface,
-            "task_contract": child_contract,
-            "allowed_resources": allowed_resources,
-            "required_capabilities": required_caps,
-            "model_lane": slot.requested_lane,
-            "requested_model_lane": slot.requested_lane,
-            "effective_model_lane": slot.effective_lane,
-            "model": slot.model,
-            "use_local_model": slot.use_local_model,
-            "requested_executor": requested_executor,
-            "reasoning_effort": requested_effort,
-            "task_group_id": task_group_id,
-            "task_group": task_group,
-            "subagent_envelope": envelope,
-        }
-        _populate_subagent_event_extras(
-            evt, current_chat_id=current_chat_id, child_drive=child_drive,
-            workspace_root=workspace_root, workspace_mode=workspace_mode,
-            executor_ref=executor_ref, context=context, parent_task_id=parent_task_id,
-        )
+    except Exception:
+        log.warning("Failed to persist requested task status for %s", tid, exc_info=True)
         try:
-            write_task_result(
-                status_drive_root,
-                tid,
-                STATUS_REQUESTED,
-                parent_task_id=parent_task_id or None,
-                root_task_id=root_task_id,
-                session_id=session_id,
-                actor_id=f"subagent:{slot_role}",
-                delegation_role="subagent",
-                project_id=parent_project_id,
-                role=slot_role,
-                description=objective,
-                objective=objective,
-                expected_output=expected_output,
-                constraints=constraints,
-                context=context,
-                workspace_root=workspace_root,
-                workspace_mode=workspace_mode,
-                executor_ref=executor_ref,
-                allowed_resources=allowed_resources,
-                task_contract=child_contract,
-                required_capabilities=required_caps,
-                chat_id=current_chat_id or None,
-                memory_mode=memory_mode,
-                drive_root=str(child_drive) if child_drive is not None else "",
-                child_drive_root=str(child_drive) if child_drive is not None else "",
-                budget_drive_root=budget_drive_root,
-                task_constraint=task_constraint,
-                model_lane=slot.requested_lane,
-                requested_model_lane=slot.requested_lane,
-                effective_model_lane=slot.effective_lane,
-                model=slot.model,
-                use_local_model=slot.use_local_model,
-                requested_executor=requested_executor,
-                reasoning_effort=requested_effort,
-                task_group_id=task_group_id,
-                task_group=task_group,
-                subagent_envelope=envelope,
-                result="Subagent request queued. Awaiting supervisor acceptance.",
-            )
+            (status_drive_root / "task_results" / f"{tid}.json").unlink(missing_ok=True)
         except Exception:
-            log.warning("Failed to persist requested task status for %s", tid, exc_info=True)
-            for cleanup_tid in task_ids:
-                try:
-                    (status_drive_root / "task_results" / f"{cleanup_tid}.json").unlink(missing_ok=True)
-                except Exception:
-                    pass
-            for child_drive in child_drives.values():
-                shutil.rmtree(child_drive, ignore_errors=True)
-            return f"⚠️ SUBTASK_STATUS_ERROR: failed to persist requested status for {tid}; subagent was not scheduled."
-        events_to_emit.append(evt)
+            pass
+        if child_drive is not None:
+            shutil.rmtree(child_drive, ignore_errors=True)
+        return f"⚠️ SUBTASK_STATUS_ERROR: failed to persist requested status for {tid}; subagent was not scheduled."
 
-    for evt in events_to_emit:
-        emitted_modes.append(_emit_control_event(ctx, evt))
-
-    _schedule_result = _finalize_schedule_emission(
+    emitted_modes: List[str] = [_emit_control_event(ctx, evt)]
+    return _finalize_schedule_emission(
         ctx,
         task_ids=task_ids,
-        task_group_id=task_group_id,
         requested_model_lane=requested_model_lane,
-        task_group=task_group,
         objective=objective,
         role=role,
         depth=new_depth,
         parent_task_id=parent_task_id,
         root_task_id=root_task_id_seed or current_task_id,
-        slot_tasks=slot_tasks,
         emitted_modes=emitted_modes,
         write_surface=requested_surface,
     )
-    return _schedule_result
 
 
 def _request_deep_self_review(ctx: ToolContext, reason: str) -> str:
@@ -2009,6 +1988,13 @@ def _wait_for_tasks(
             }
             if data.get("duplicate_of"):
                 projected["duplicate_of"] = str(data.get("duplicate_of"))
+            # A capability reduction is a SEMANTIC handoff fact, not forensics: it is
+            # what decides how far to trust this answer, and this is the surface a
+            # fan-out parent absorbs its children through. Same predicate as the
+            # single-child read, so the batch and the singleton cannot disagree.
+            _delta = disclosable_capability_delta(data)
+            if _delta:
+                projected["capability_delta"] = _delta
             public_tasks[str(tid)] = projected
         waited["tasks"] = public_tasks
         waited["tasks_note"] = (
@@ -2286,7 +2272,7 @@ def get_tools() -> List[ToolEntry]:
         }, _wait_for_task, timeout_sec=7200),
         ToolEntry("wait_tasks", {
             "name": "wait_tasks",
-            "description": "Wait for MULTIPLE subtasks at once and return a compact structural projection per child (task_id, status, cost_usd, child_result_sha256, outcome_axes, result, trace_summary, duplicate_of) — the right tool to ABSORB a batch of independent children you scheduled in one burst. The full per-child envelope stays on disk in task_results/<task_id>.json (child_result_sha256 pins the exact result you saw; get_task_result returns the full result text plus trace/outcome summaries). With mode=any_terminal it returns as soon as the FIRST child finishes (handle it, then call again for the rest) instead of blocking serially. The JSON also includes live_child_status (running/scheduled/terminal per child) and may early_return (before all terminal) on a child tree_note blocker/question/interface_contract/delegation_constraint beacon so you can steer or override mid-flight.",
+            "description": "Wait for MULTIPLE subtasks at once and return a compact structural projection per child (task_id, status, cost_usd, child_result_sha256, outcome_axes, result, trace_summary, capability_delta when the child has something to disclose, duplicate_of) — the right tool to ABSORB a batch of independent children you scheduled in one burst. The full per-child envelope stays on disk in task_results/<task_id>.json (child_result_sha256 pins the exact result you saw; get_task_result returns the full result text plus trace/outcome summaries). With mode=any_terminal it returns as soon as the FIRST child finishes (handle it, then call again for the rest) instead of blocking serially. The JSON also includes live_child_status (running/scheduled/terminal per child) and may early_return (before all terminal) on a child tree_note blocker/question/interface_contract/delegation_constraint beacon so you can steer or override mid-flight.",
             "parameters": {"type": "object", "required": ["task_ids"], "properties": {
                 "task_ids": {"type": "array", "items": {"type": "string"}, "description": "Task IDs returned by schedule_subagent."},
                 "timeout_sec": {"type": "integer", "default": 600, "description": "Maximum seconds to wait (default 600)."},
