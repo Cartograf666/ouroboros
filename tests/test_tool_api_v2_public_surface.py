@@ -2,7 +2,6 @@ import pathlib
 import re
 import shlex
 import sys
-from types import ModuleType, SimpleNamespace
 
 from ouroboros.tools.registry import ToolRegistry
 

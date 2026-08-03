@@ -19,7 +19,6 @@ from dataclasses import dataclass, field, replace
 from typing import Any, List, Optional
 
 from ouroboros.llm import LLMClient
-from ouroboros.config import review_model_uses_local
 from ouroboros.review_substrate import review_repo_dirs_for, scope_reviewer_slots
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.review_context_atlas import (
@@ -78,7 +77,7 @@ _SCOPE_REQUIRED_ITEMS = SCOPE_REQUIRED_ITEMS  # compatibility export used by tes
 # routed spelling alike, exactly as the sentinel spanned spellings for the previous
 # designated default (v6.55.0-v6.81: anthropic/claude-fable-5). The sentinel still
 # grants only the conservative 1M figure, and a real probe/owner-ack supersedes it.
-_SCOPE_MODEL_DEFAULT = "openai/gpt-5.6-terra"
+from ouroboros.tools.scope_window import SCOPE_MODEL_DEFAULT as _SCOPE_MODEL_DEFAULT  # noqa: E402
 _SCOPE_MAX_TOKENS = 100_000  # 100K output tokens
 _SCOPE_REVIEW_SLOT_TIMEOUT_SEC = 900
 from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET as _REVIEW_BUDGET
@@ -91,11 +90,13 @@ _SCOPE_BUDGET_TOKEN_LIMIT = _REVIEW_BUDGET
 # tens of thousands of tokens on atlas-heavy prompts. Gate assembled INPUT on a
 # conservative effective cap and retry once with a compact atlas prompt before
 # applying the configured blocking/advisory scope authority.
-_SCOPE_MODEL_CONTEXT_WINDOW = 1_000_000
-# Conservative sub-floor window for UNKNOWN reviewers without Capability Evidence.
-# The P3 authority check makes its findings advisory instead of pretending the
-# route is 1M-capable.
-_SCOPE_FAILCLOSED_WINDOW = 200_000
+# The 1M constitutional window, the conservative sub-floor for unevidenced
+# routes, and the shipped default reviewer identity live in `tools/scope_window`
+# (the window-authority SSOT); imported here under the historical names.
+from ouroboros.tools.scope_window import (  # noqa: E402
+    SCOPE_FAILCLOSED_WINDOW as _SCOPE_FAILCLOSED_WINDOW,
+    SCOPE_MODEL_CONTEXT_WINDOW as _SCOPE_MODEL_CONTEXT_WINDOW,
+)
 _SCOPE_OUTPUT_MARGIN_TOKENS = 155_000
 _SCOPE_INPUT_TOKEN_LIMIT = min(
     _SCOPE_BUDGET_TOKEN_LIMIT,
@@ -111,30 +112,11 @@ _SCOPE_INPUT_TOKEN_LIMIT = min(
 # floor (BIBLE P3).
 from ouroboros.reviewer_window import (
     ReviewerWindow,
-    resolve_reviewer_window as _resolve_reviewer_window,
     window_scaled_reserves as _shared_window_scaled_reserves,
 )
 from ouroboros.tools.review_helpers import (
     calibrated_input_token_limit as _calibrated_input_token_limit,
 )
-
-# Window provenance vocabulary shared with the diagnostics wording (RS5).
-_WINDOW_CONFIRMED = "confirmed"
-_WINDOW_ASSERTED = "asserted"
-_WINDOW_STALE = "stale_unverifiable"
-_WINDOW_UNKNOWN = "unknown_conservative"
-_WINDOW_SENTINEL = "designated_default_sentinel"
-
-# The metadata probe lives with the shared window resolver (`reviewer_window`) and is
-# rate-limited by the TTL on the evidence record, keyed by the full ROUTE fingerprint
-# rather than the model name: capability is a property of provider+base_url+model, and
-# a hot base-URL change must get its own probe rather than silently reusing the old
-# verdict. EVERY scope route gets that probe, the shipped default included: the probe is
-# now the only path to blocking authority, so exempting the default (as the sentinel-era
-# code did) left the one route that gates commits structurally unable to source its
-# window — and rate-limiting it per PROCESS instead of per TTL left an install that
-# outlived the TTL unable to RE-source it (v6.87.45).
-
 
 def _scope_review_skipped_in_low_context() -> bool:
     """Whether the owner's context mode declares scope review out of scope.
@@ -153,101 +135,20 @@ def _scope_review_skipped_in_low_context() -> bool:
         return False
 
 
-def _is_designated_default_reviewer(model: str) -> bool:
-    """True iff ``model`` is the shipped default reviewer (``openai/gpt-5.6-terra``),
-    across provider spellings (``openai::gpt-5.6-terra``, ``openrouter::openai/...``).
 
-    SIZING only. This answers "how big a pack may I assemble for an unevidenced
-    route", never "may this reviewer block a commit": authority is computed from
-    Capability Evidence (``ReviewerWindow.blocking_authority_allowed``) and a model
-    acquires none of it from its name."""
-    def _normalized(m: str) -> str:
-        text = str(m or "").strip()
-        if text.startswith("openrouter::"):
-            text = text[len("openrouter::"):]
-        try:
-            from ouroboros.provider_models import normalize_model_identity
-            return normalize_model_identity(text)
-        except Exception:
-            return text
-    return bool(model) and _normalized(model) == _normalized(_SCOPE_MODEL_DEFAULT)
-
-
-def _scope_window(model: str) -> ReviewerWindow:
-    """The scope reviewer's window AND its blocking authority, as ONE typed result.
-
-    Replaces the deleted static per-model window table: a confirmed/asserted probe
-    (provider metadata or owner-ack) for the reviewer's REAL active route gives the
-    real window, and only such SOURCED, non-stale, >=1M evidence carries blocking
-    authority (BIBLE P3 — "a reviewer whose window cannot be established by sourced
-    Capability Evidence is treated as too small rather than assumed adequate").
-
-    With NO evidence the result still carries a SIZING number so the review is
-    dispatched rather than declined before it starts — the 1M figure for the shipped
-    designated reviewer, a conservative sub-floor for anything else, matching what
-    each can plausibly hold. Neither carries a KNOWN status, so neither can authorise:
-    the sentinel sizes a prompt, it does not sign a verdict. That split is why this
-    returns the whole record instead of a bare int — a number alone cannot say where
-    it came from, and the caller that needs to know then guesses.
-
-    Every route gets one lazy metadata-only fetch per evidence-TTL period (never
-    generative, never a paid call), concurrent resolutions of the same route
-    serialized by the per-route lock; inside the TTL the cache answers and the path
-    stays hot-path safe. How often the network is re-asked is owned by
-    ``capability_evidence.probe``'s record TTL, deliberately NOT by the process
-    lifetime (v6.87.45: a per-process memo outlived the 24h record and wedged
-    every commit once an install stayed up past the TTL)."""
-    model = str(model or "")
-    try:
-        # Probe the scope slot, not the active main route (which honors USE_LOCAL_MAIN).
-        resolved = _resolve_reviewer_window(model, use_local=review_model_uses_local(model))
-        if int(resolved.window_tokens) > 0:
-            return resolved
-    except Exception:
-        pass
-    return ReviewerWindow(
-        window_tokens=(
-            _SCOPE_MODEL_CONTEXT_WINDOW if _is_designated_default_reviewer(model)
-            else _SCOPE_FAILCLOSED_WINDOW
-        ),
-        model=model,
-    )
-
-
-def _scope_window_provenance(window: ReviewerWindow) -> str:
-    """Provenance label for the diagnostics wording (RS5)."""
-    if window.stale:
-        return _WINDOW_STALE
-    if window.status == "asserted":
-        return _WINDOW_ASSERTED
-    if window.status == "confirmed":
-        return _WINDOW_CONFIRMED
-    if int(window.window_tokens) >= _SCOPE_MODEL_CONTEXT_WINDOW:
-        return _WINDOW_SENTINEL
-    return _WINDOW_UNKNOWN
-
-
-def _window_provenance_phrase(window: int, provenance: str, observed_at: str = "") -> str:
-    """Honest five-way wording for a reviewer window (RS5).
-
-    The old single phrasing called every sub-1M window "known", which read as a
-    measured fact even when it was the conservative fallback for an unprobed route;
-    the stale wording exists because an expired record used to be indistinguishable
-    from a live reading in every message the owner ever saw. ``observed_at`` dates the
-    expired reading, which is the difference between "the provider blipped an hour ago"
-    and "this route has been dead for a week" — the only two situations that produce
-    identical wording otherwise (BIBLE P1, provenance)."""
-    if provenance == _WINDOW_CONFIRMED:
-        return f"confirmed {window}-token window"
-    if provenance == _WINDOW_ASSERTED:
-        return f"owner-asserted {window}-token window"
-    if provenance == _WINDOW_STALE:
-        dated = f", last confirmed {observed_at}" if observed_at else ""
-        return f"EXPIRED, unverifiable {window}-token window{dated}"
-    if provenance == _WINDOW_SENTINEL:
-        return f"designated-default {window}-token sentinel window"
-    return f"unknown window, conservatively treated as {window} tokens"
-
+# Window authority moved to `tools/scope_window.py` (module-size gate at
+# synthesis); re-imported under the old private aliases so every caller and
+# test keeps one patch point on THIS module.
+from ouroboros.tools.scope_window import (  # noqa: E402
+    WINDOW_ASSERTED as _WINDOW_ASSERTED,  # noqa: F401 (test-read re-export)
+    WINDOW_CONFIRMED as _WINDOW_CONFIRMED,  # noqa: F401 (test-read re-export)
+    WINDOW_SENTINEL as _WINDOW_SENTINEL,  # noqa: F401 (test-read re-export)
+    WINDOW_STALE as _WINDOW_STALE,  # noqa: F401 (test-read re-export)
+    WINDOW_UNKNOWN as _WINDOW_UNKNOWN,  # noqa: F401 (test-read re-export)
+    scope_window as _scope_window,
+    scope_window_provenance as _scope_window_provenance,
+    window_provenance_phrase as _window_provenance_phrase,
+)
 
 def _low_context_skip_result(scope_model: str) -> "ScopeReviewResult":
     """Typed, non-blocking record of the owner-declared low-context-mode skip.

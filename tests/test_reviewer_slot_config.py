@@ -14,7 +14,6 @@ from ouroboros.reviewer_slot_config import (
     SCOPE_SLOT_LIMIT,
     TRIAD_SLOT_LIMIT,
     advisory_slot_config,
-    commit_scope_rows,
     commit_triad_rows,
     load_reviewer_slot_config,
     parse_reviewer_slots,

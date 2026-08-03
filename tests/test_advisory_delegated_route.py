@@ -11,7 +11,6 @@ agent-session route tests stands in for the Claudexor control plane.
 
 import json
 import subprocess
-from types import SimpleNamespace
 
 import pytest
 

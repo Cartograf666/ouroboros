@@ -11,7 +11,6 @@ import asyncio
 import json
 import pathlib
 import shutil
-import sys
 import threading
 from unittest.mock import patch
 

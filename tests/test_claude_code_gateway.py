@@ -13,7 +13,6 @@ We test:
 
 import asyncio
 import json
-import pathlib
 import sys
 import pytest
 
@@ -1283,7 +1282,6 @@ class TestResultMessageIsErrorHonored:
         import asyncio
         from unittest.mock import patch
 
-        import ouroboros.gateways.claude_code as gw
 
         with patch("ouroboros.gateways.claude_code.ClaudeAgentOptions", lambda **kw: None), \
              patch("ouroboros.gateways.claude_code.ClaudeSDKClient", self._fake_client(fake_result)), \

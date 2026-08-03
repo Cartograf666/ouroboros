@@ -167,6 +167,19 @@ def _record_executor_resolution(
     })
 
 
+def _blocked_executor_terminal(cap_info: Dict[str, Any]) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """p34's typed terminal for a blocked executor pin, rebuilt from the facts
+    cap_info carried across the (ctx, messages, cap_info) seam. The placeholder
+    method p2 kept for exactly this synthesis is deleted; this is the one body."""
+    text, usage = executor_blocked_outcome(SubagentExecutorResolution(
+        requested=str(cap_info.get("executor_blocked_requested") or "harness"),
+        executor="blocked",
+        reason=str(cap_info.get("executor_blocked_reason") or ""),
+        reset_at=str(cap_info.get("executor_blocked_reset_at") or ""),
+    ))
+    return text, usage, {"reasoning_notes": ["subagent_executor_unavailable"], "tool_calls": []}
+
+
 def _persist_early_origin_stub(drive_root: Any, task: Dict[str, Any]) -> None:
     """Durably persist the ingress-captured origin BEFORE the convertible card
     exists (v6.73.0). Merge-write only; the full RUNNING write follows and
@@ -985,17 +998,8 @@ class OuroborosAgent:
             # stamped onto the task, never re-derived per surface.
             self._record_executor_facts(task)
 
-            if blocked_reason := str(cap_info.get("executor_blocked_reason") or ""):
-                # p34's typed terminal, rebuilt from the facts cap_info carried
-                # across the (ctx, messages, cap_info) seam. The placeholder
-                # method p2 kept for exactly this synthesis is deleted.
-                text, usage = executor_blocked_outcome(SubagentExecutorResolution(
-                    requested=str(cap_info.get("executor_blocked_requested") or "harness"),
-                    executor="blocked",
-                    reason=blocked_reason,
-                    reset_at=str(cap_info.get("executor_blocked_reset_at") or ""),
-                ))
-                llm_trace = {"reasoning_notes": ["subagent_executor_unavailable"], "tool_calls": []}
+            if str(cap_info.get("executor_blocked_reason") or ""):
+                text, usage, llm_trace = _blocked_executor_terminal(cap_info)
             elif task_type_str == "deep_self_review":
                 # Deep self-review bypasses the tool loop.
                 try:

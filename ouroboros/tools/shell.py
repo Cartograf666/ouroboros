@@ -9,25 +9,20 @@ import logging
 import os
 import pathlib
 import re
-import shutil
 import shlex
 import signal
 import stat
 import subprocess
-import sys
 import threading
 import time
 import uuid
-from typing import Any, Dict, List
+from typing import Dict, List
 
-from ouroboros.artifacts import artifact_store_path_block_reason, copy_directory_to_task_artifacts, copy_file_to_task_artifacts, record_task_scratch
+from ouroboros.artifacts import copy_directory_to_task_artifacts, copy_file_to_task_artifacts, record_task_scratch
 from ouroboros.platform_layer import bootstrap_process_path, kill_process_tree, scrub_repo_from_pythonpath, subprocess_new_group_kwargs
 from ouroboros.config import SETTINGS_DEFAULTS, get_runtime_mode, load_settings
 from ouroboros.runtime_mode_policy import (
-    core_patch_notice,
     is_protected_runtime_path,
-    mode_allows_protected_write,
-    protected_paths_in,
 )
 from ouroboros.tools.commit_gate import _invalidate_advisory
 from ouroboros.shell_parse import embedded_absolute_path_tokens, is_absolute_path_text, recover_stringified_argv, shell_argv_with_inline
@@ -40,17 +35,8 @@ from ouroboros.tool_access import (
     resolve_shell_cwd,
     user_files_path_block_reason,
 )
-from ouroboros.utils import safe_relpath, utc_now_iso, run_cmd
+from ouroboros.utils import safe_relpath
 from ouroboros.deadline_utils import deadline_remaining_sec
-from ouroboros.contracts.task_constraint import normalize_task_constraint
-from ouroboros.contracts.skill_payload_policy import (
-    SKILL_PAYLOAD_CONTROL_DIRNAMES,
-    SKILL_PAYLOAD_CONTROL_FILENAMES,
-    SkillPayloadPathError,
-    cross_skill_redirect_error,
-    decide_payload_short_form,
-    resolve_skill_payload_target,
-)
 from ouroboros.workspace_executor import execute as executor_execute
 from ouroboros.workspace_executor import executor_ref_from_ctx
 from ouroboros.workspace_executor import map_backend_path as executor_map_backend_path

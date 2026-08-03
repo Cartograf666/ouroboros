@@ -24,7 +24,6 @@ a dict this process happens to still hold.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import pathlib

@@ -98,7 +98,7 @@ def test_owner_floor_write_changes_no_scope_review_behaviour(monkeypatch, tmp_pa
 
     import ouroboros.config as cfg
     from ouroboros.gateway import settings as smod
-    from ouroboros.tools import review_helpers, scope_review as sr
+    from ouroboros.tools import scope_review as sr
 
     monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
     monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "blocking_1m")
@@ -689,7 +689,6 @@ def test_capability_evidence_is_route_aware_not_model_aware(monkeypatch, tmp_pat
     unchanged model produced a route with no evidence, no second probe and no notice —
     the next scope review fell silently to the conservative sub-floor and the advertised
     owner-ack path was unreachable."""
-    from types import SimpleNamespace
 
     import ouroboros.config as cfg
     from ouroboros import capability_evidence as ce

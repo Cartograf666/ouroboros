@@ -1,4 +1,4 @@
-# Ouroboros v6.87.6 — Architecture & Reference
+# Ouroboros v6.89.0 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -89,6 +89,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── context_compaction.py ← Context trimming and summarization helpers
       ├── headless.py          ← Headless task child-drive isolation, workspace patch artifacts, and memory export helpers
       ├── coop_checkpoint.py   ← (v6.58.0) `checkpoint_commit_coop_roots` — at ROOT-task finalization, dirty host-minted genesis/coop trees get a local checkpoint commit (`user.name=Ouroboros`); credential-shaped files excluded (disclosed, headless sensitive-pattern SSOT), owner-attached folders NEVER auto-committed, skipped while tree tasks are live, fail-soft per root
+      ├── delegate_output.py  ← Staged-output + read-receipt cluster for delegated runs (extracted from tools/delegate.py for the module-size gate; delegate.py re-exports it so sibling code and tests keep one name): `_stage_full_output` writes the WHOLE terminal detail atomically under the task drive (`delegated_runs/<run>.json`, sha256 + byte length recorded), and `acknowledge_staged_output_read` — hooked into `read_file`'s task_drive path — credits DELIVERED character ranges until contiguous EOF coverage, then writes the once-per-run durable `delegate_run_output_consumed` row (disclosure, never a gate)
       ├── subagents.py         ← Subagent axis vocabularies (model lane / executor), the single dispatch-time resolution (`resolve_subagent_dispatch` → `capability_delta`), and structured lineage/usage envelopes
       ├── subagent_worktrees.py ← Acting self_worktree lifecycle: provision/remove/prune isolated git worktrees (outside repo/ and data/) + durable registry (state/subagent_worktrees.json) + cross-process ops lock; startup orphan reconciliation; also provisions durable from-scratch genesis projects (provision_genesis_project, never registry/GC)
       ├── artifacts.py         ← Task-scoped artifact helpers shared by user-file tools, process outputs, and outcome finalization. (v6.52.0, P1) `stage_task_attachments` stages every task's INPUT attachments (CLI/API, GAIA solver, desktop chat) into the agent-readable `artifact_store/attachments/` (skips secret SOURCES via the tool_access SSOT blocklist, bounded), returning a manifest of `read_file(root='artifact_store', path='attachments/<name>')` entries; `collect_task_artifact_records` EXCLUDES that subdir so staged inputs are never recorded as deliverables. (v6.52.2) `record_task_scratch`/`read_task_scratch_fingerprints` persist {abs_path: sha256} FINGERPRINTS of the run_command/run_script `scratch=[...]` ephemeral-verification files to `.scratch_manifest.json` (written to BOTH budget + live drive roots) so `headless.write_workspace_patch_artifacts` EXCLUDES a file from the workspace patch ONLY while its current content still matches (a later real file at the same path is never dropped). (v6.56.0) scratch declarations are IDEMPOTENT/ADOPTABLE: re-declaring a manifest path is ok, and an existing untracked in-cwd file may be adopted — its sha is recorded via the same SSOT writer at declaration time, so the sha-gate still excludes it only while unmodified (tracked / outside-cwd / outside-worktree declarations stay blocked); the undeclared-output guard stat-verifies candidates POST-exec (exists + mtime ≥ start−slack) for both run_command and run_script, so import strings/CLI flags/heredoc bodies no longer read as writes
@@ -212,6 +213,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── review_revalidation.py ← Reviewed-commit fingerprint revalidation helpers (blocks when staged diff changes after review)
       │   ├── scope_review.py   ← Scope reviewer (enforcement-aware, budget-aware)
       │   ├── scope_review_session.py ← Scope SESSION delivery (phase 5.2/5.6/5.7): the same task/checklist/contract via the same builder, retrieval pointers instead of assembled packs, governance docs as navigation maps, forensic (non-gating) coverage manifest
+      │   ├── scope_window.py  ← Scope-reviewer WINDOW authority (extracted at the v6.89.0 synthesis for the module-size gate): the evidence-typed `scope_window` resolution (ReviewerWindow; sizing vs blocking authority split), the five-way provenance vocabulary + honest wording, the designated-default identity, and the 1M/200K window constants — `scope_review` re-imports every name under its historical private aliases
       │   ├── scope_review_contract.py ← Pure scope-output parser and one-pass validity contract; owns no routing, retries, or reviewer state
       │   ├── services.py        ← Task-scoped long-running service mini-manager: start/status/logs/stop with process-group cleanup and retained private log blobs
       │   ├── skill_exec.py      ← Phase 3 external-skill surface: list_skills, skill_review, toggle_skill, skill_exec (subprocess runner with cwd confinement, env scrubbing, timeout, runtime allowlist python/python3/bash/node/deno/ruby/go; gated by enabled + fresh executable review + fresh content hash — v5.1.2 Frame A: runtime_mode no longer blocks execution)
@@ -1693,7 +1695,7 @@ stories. Runs ask for `authPreference: subscription` explicitly, because the eng
 default is `auto` = subscription-first WITH policy fallback to a paid key, and that
 fallback is invisible to the host. FOUR cases, each recorded as what it is: a DISCLOSED
 SETTLED zero settles at `0.0` with `cost_final=true` and leaves the projection final (the
-free-session case this row kind exists for); a disclosed settled charge rides the ledger
+free-session case this row kind — the `subscription_session` usage-ledger row — exists for); a disclosed settled charge rides the ledger
 as money and is final; an ESTIMATED amount rides as money with `cost_final=false`,
 because an estimated zero is not a proven free session and an estimated charge is not a
 closed book; an UNDISCLOSED spend writes `cost_usd: null`, which drops `cost_final` for
