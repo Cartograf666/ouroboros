@@ -321,8 +321,11 @@ function renderLoginCard() {
     if (face === 'error') {
         bits.push(`<div class="settings-inline-note" data-tone="error">${escapeHtml(active.error)}</div>`);
         if (active.mode === 'device') {
+            // "above", not "below": the account rows — and their “Via your
+            // terminal” buttons — render before this card, so the old word sent
+            // the user down the page past the control it names.
             bits.push(`<div class="settings-inline-note">The in-app code flow is not available for this agent yet — use
-                “Via your terminal” below: it gives one command to paste into your own terminal, and this card
+                “Via your terminal” above: it gives one command to paste into your own terminal, and this card
                 tracks the login live.</div>`);
         }
     } else if (face === 'device') {

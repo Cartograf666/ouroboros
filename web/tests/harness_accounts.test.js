@@ -59,7 +59,7 @@ test('an exhausted window is shown with its reset time, never hidden', () => {
 
 test('the device-code disclosure is found wherever the snapshot nests it', () => {
     const job = { snapshot: { disclosures: { deviceCode: {
-        flow: 'device_auth', verificationUrl: 'https://auth.example/device', userCode: 'ABCD-1234',
+        flow: 'chatgptDeviceCode', verificationUrl: 'https://auth.example/device', userCode: 'ABCD-1234',
     } } } };
     assert.deepEqual(deviceCodeDisclosure(job), { url: 'https://auth.example/device', code: 'ABCD-1234' });
     assert.equal(deviceCodeDisclosure({ state: 'running' }), null);
@@ -162,7 +162,7 @@ test('the login card prefers a STRUCTURED disclosure over the copy-paste fallbac
     // OAuth disclosure: the structural card wins — no terminal needed.
     assert.equal(loginCardFace({ mode: 'attach', attachCommand: 'cmd', job: {
         state: 'waiting_for_input',
-        snapshot: { disclosures: { deviceCode: { flow: 'device_auth', verificationUrl: 'https://a/b', userCode: 'XY-12' } } },
+        snapshot: { disclosures: { deviceCode: { flow: 'chatgptDeviceCode', verificationUrl: 'https://a/b', userCode: 'XY-12' } } },
     } }), 'device');
     // Errors outrank everything; nothing structured and no command = progress.
     assert.equal(loginCardFace({ error: 'nope', mode: 'attach', attachCommand: 'cmd', job: {} }), 'error');
