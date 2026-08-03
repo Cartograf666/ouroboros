@@ -2508,8 +2508,9 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
 
     A real replayed task tree reaches the configured hard depth of ten. The
     narrow checks use geometry instead of CSS declarations, then reload to
-    cover replay. Wide Main and a narrow Project panel prove the card-local
-    container responds to its actual consumer width rather than the viewport.
+    cover replay. Launcher-default Main and a narrow Project panel prove the
+    card-local container responds to its actual consumer width rather than the
+    viewport.
     """
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
@@ -2676,7 +2677,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 assert_mobile_geometry(mobile)
                 mobile_context.close()
 
-                wide = browser.new_page(viewport={"width": 1280, "height": 900})
+                wide = browser.new_page(viewport={"width": 1100, "height": 750})
                 wide.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 wide.wait_for_selector(
                     '#page-chat .chat-live-card[data-task-id="layout-root"]',
@@ -2690,25 +2691,35 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 assert len(rendered_ids) == 11, rendered_ids
                 wide_facts = wide.evaluate(
                     """() => {
-                        const root = document.querySelector('#page-chat #chat-messages > .chat-live-card[data-task-id="layout-root"]');
-                        const summary = root.querySelector(':scope > .chat-live-summary-button .chat-live-summary');
-                        const main = summary.querySelector('.chat-live-summary-main').getBoundingClientRect();
-                        const side = summary.querySelector('.chat-live-summary-side').getBoundingClientRect();
-                        return {
-                            wrap: getComputedStyle(summary).flexWrap,
-                            mainTop: main.top,
-                            mainBottom: main.bottom,
-                            sideTop: side.top,
-                            sideBottom: side.bottom,
-                            rootClient: root.clientWidth,
-                            rootScroll: root.scrollWidth,
-                        };
+                        const ids = ['layout-root', 'layout-child-01', 'layout-child-02'];
+                        return ids.map((id) => {
+                            const card = document.querySelector(`#page-chat .chat-live-card[data-task-id="${id}"]`);
+                            const summary = card.querySelector(':scope > .chat-live-summary-button .chat-live-summary');
+                            const main = summary.querySelector('.chat-live-summary-main').getBoundingClientRect();
+                            const side = summary.querySelector('.chat-live-summary-side').getBoundingClientRect();
+                            const rect = card.getBoundingClientRect();
+                            return {
+                                id,
+                                left: rect.left,
+                                width: rect.width,
+                                wrap: getComputedStyle(summary).flexWrap,
+                                mainTop: main.top,
+                                mainBottom: main.bottom,
+                                sideTop: side.top,
+                                sideBottom: side.bottom,
+                                client: card.clientWidth,
+                                scroll: card.scrollWidth,
+                            };
+                        });
                     }"""
                 )
-                assert wide_facts["wrap"] == "nowrap", wide_facts
-                assert min(wide_facts["mainBottom"], wide_facts["sideBottom"]) \
-                    > max(wide_facts["mainTop"], wide_facts["sideTop"]), wide_facts
-                assert wide_facts["rootScroll"] <= wide_facts["rootClient"] + 1, wide_facts
+                assert [card["wrap"] for card in wide_facts] == ["nowrap", "nowrap", "wrap"], wide_facts
+                assert wide_facts[1]["left"] - wide_facts[0]["left"] >= 30, wide_facts
+                assert wide_facts[2]["left"] - wide_facts[1]["left"] >= 30, wide_facts
+                assert all(card["scroll"] <= card["client"] + 1 for card in wide_facts), wide_facts
+                for card in wide_facts[:2]:
+                    assert min(card["mainBottom"], card["sideBottom"]) \
+                        > max(card["mainTop"], card["sideTop"]), wide_facts
 
                 with (logs_dir / "progress.jsonl").open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(panel_row) + "\n")
@@ -2740,7 +2751,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                         };
                     }"""
                 )
-                assert panel_facts["panelWidth"] <= 620, panel_facts
+                assert panel_facts["panelWidth"] <= 560, panel_facts
                 assert panel_facts["cardWidth"] >= panel_facts["panelWidth"] * 0.9, panel_facts
                 assert panel_facts["cardScroll"] <= panel_facts["cardClient"] + 1, panel_facts
                 assert panel_facts["titleWidth"] >= 180, panel_facts

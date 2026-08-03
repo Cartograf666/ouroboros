@@ -1861,7 +1861,7 @@ button.chat-file:hover,
    it only when a coined name holds the title (JS leaves it empty otherwise);
    subagent cards always feed it from their routed progress. Empty ⇒ hidden, so
    it reserves no space. Anywhere-wrap at ALL widths keeps the narrow-container
-   layout (chatcol query below) safe for long URLs/paths. */
+   layout (card-local query below) safe for long URLs/paths. */
 .chat-live-activity {
     color: var(--text-muted);
     font-size: 12px;
@@ -1966,9 +1966,11 @@ button.chat-file:hover,
 /* Internal card geometry is owned by the CARD'S actual width. This catches a
    deeply nested child even when the outer chat column is wide. The main row
    takes a real 100% flex basis; flex-wrap alone leaves flex:1 at a zero basis
-   and recreates the one-letter-wide title. Nested indentation is paid once,
-   then flattened so depth cannot consume the text column. */
-@container livecard (max-width: 620px) {
+   and recreates the one-letter-wide title. This component threshold stays
+   below the separate chat-column gutter breakpoint so the launcher-default
+   root and first child keep regular geometry. Nested indentation is paid once,
+   then flattened so deeper cards cannot consume the text column. */
+@container livecard (max-width: 560px) {
     .chat-live-summary {
         flex-wrap: wrap;
     }
