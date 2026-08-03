@@ -1,0 +1,276 @@
+# Claudexor delegated-run gate on ubuntu / windows / macos.
+#
+# WHY THIS WORKFLOW IS NAMED THE WAY IT IS. A green check here says: on this
+# operating system, Ouroboros can drive one small MUTATING task through Claudexor
+# end to end — the delegated run shape itself rides the live lane only (see the
+# fixture lane's named divergences below). It does NOT say that a SUBSCRIPTION
+# harness works on that platform — no subscription can be authenticated in CI (the vendor logins are
+# interactive and machine-bound, and a live OAuth token does not go into a
+# repository secret). That limit is the owner's own open question beside D20, and it
+# is carried in the workflow name, in every job name, and in each job's step summary
+# so that nobody reads this badge as more coverage than it has.
+#
+# TWO LANES, AND WHY.
+#
+#   fixture — Claudexor's `fake-*` harnesses: deterministic, offline, no model, no
+#             credentials, no vendor CLI. Costs $0 and a couple of runner minutes, so
+#             it runs on ordinary pushes and PRs. It is a GATEWAY/PLATFORM SMOKE on this
+#             platform — daemon discovery, protocol handshake, project registration,
+#             the delegated-marker version floor, polling to terminal, reading the
+#             primary artifact to EOF, the child's edit landing on disk, and the
+#             applied-containment facts being read back — driven through the gateway
+#             module directly. The request PINS its route (`harnesses` +
+#             `primaryHarness`): the engine's auto-pool excludes `fake-*` routes by
+#             design, so an unpinned request would never start this lane at all. It
+#             does NOT exercise the production delegation path: the nanny verbs, run
+#             custody, cost settlement, the ledger cut and the capability-delta
+#             disclosures never run here, and the plain EOF read is not the
+#             production custody acknowledgement. The `execution.delegated` marker is
+#             NOT sent on this lane — a delegated mutating run needs
+#             `external_sandbox_full` wherever the host has a kernel boundary, and no
+#             `fake-*` adapter maps that profile, so the delegated run shape rides
+#             the live lane only. Because a `fake-*` adapter runs IN PROCESS, no
+#             child is spawned either. Those gaps are what the live lane and the
+#             local pre-release run are for.
+#
+#   live    — a real harness on an explicit API key, editing a README at low effort on
+#             a weak model (the owner's own test rule, plan §4.10 answer 84). Token
+#             cost is pennies; the real price is minutes and flakiness — three vendor
+#             CLI installs, a cold daemon, and someone else's rate limits. Paying that
+#             on every push would make PR feedback on the seam hostage to vendor
+#             availability, which is the same trade this repository already made for
+#             `integration-test` in ci.yml. So it runs where the other paid lanes run:
+#             ouroboros-stable, manual dispatch, and tags.
+#
+# WHAT MAKES IT RED, ON PURPOSE. There is no "harness unavailable, skipping" branch
+# anywhere below. An absent seam, an engine below the delegated-marker floor, an
+# unreachable daemon, a run that never terminates, a primary artifact that cannot
+# be read to EOF and tied to the run's own claim, or a child that produced no edit
+# are all hard failures with a named reason.
+#
+# A HOST WITH NO OS BOUNDARY IS NOT A FAILURE. Only macOS has a kernel mechanism;
+# the owner has ruled out kernel boundaries elsewhere. Off macOS a delegated run gets
+# a scoped HOME, records no confinement mechanism, discloses that absence as a typed
+# fact, and completes normally (D21). The gate therefore never asserts a boundary and
+# never branches on the platform to decide whether one was expected — it prints the
+# `containment` block whatever it says, so both outcomes are legible.
+
+name: Claudexor platform gate (API keys — subscription auth NOT covered)
+
+on:
+  push:
+    branches: [ouroboros, ouroboros-stable]
+    paths:
+      - 'ouroboros/gateways/**'
+      - 'ouroboros/tools/delegate.py'
+      - 'ouroboros/subagents.py'
+      - 'ouroboros/config.py'
+      - 'scripts/claudexor_platform_smoke.py'
+      - '.github/workflows/claudexor-platform-gate.yml'
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ouroboros]
+    paths:
+      - 'ouroboros/gateways/**'
+      - 'ouroboros/tools/delegate.py'
+      - 'ouroboros/subagents.py'
+      - 'ouroboros/config.py'
+      - 'scripts/claudexor_platform_smoke.py'
+      - '.github/workflows/claudexor-platform-gate.yml'
+  workflow_dispatch:
+    inputs:
+      claudexor_spec:
+        description: 'npm spec for the engine (must resolve to >= the delegated-marker floor in ouroboros/config.py)'
+        required: false
+        default: ''
+      run_live_lane:
+        description: 'Also run the paid live lane (real API keys, real harness)'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claudexor-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # One dialect on all three runners. Windows runners ship Git Bash, so the same
+    # script text is executed everywhere and a platform-specific step is an explicit
+    # `if:`, never an accident of the default shell.
+    shell: bash
+
+env:
+  # The engine floor is owned by ouroboros/config.py
+  # (CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION); this spec must resolve at or above it.
+  # An unresolvable spec is a loud npm failure, which is the correct outcome: it
+  # means the engine this seam requires is not published yet.
+  #
+  # Why `next` and not `^3.3.2`: no stable 3.3.x has ever been published — the
+  # registry jumps 3.2.0 → 3.3.7-rc.0 — so the caret spec was unresolvable from
+  # birth, and npm's prerelease-exclusion rule means it would STAY unresolvable
+  # for every -rc even after one exists. The engine ≥3.3.0 lives on the `next`
+  # dist-tag until a stable 3.3.x lands; flip this back to a caret spec then.
+  # A dispatch run can still pin an exact version via the claudexor_spec input.
+  CLAUDEXOR_NPM_SPEC_DEFAULT: 'claudexor@next'
+  # Windows runners default subprocess/stdout decoding to cp1252; a UnicodeEncodeError
+  # in a diagnostic path would mask the real failure.
+  PYTHONUTF8: '1'
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Fixture lane — free, offline, deterministic. Wiring only.
+  # ────────────────────────────────────────────────────────────────────────────
+  fixture:
+    # The job name is a check name, and a check name is read by people who never open
+    # the summary. It carries the caveat itself, not just the workflow title above it.
+    name: fixture · ${{ matrix.os }} · offline fake harness, no model, no credentials
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # This job starts a daemon that spawns children; do not leave GITHUB_TOKEN
+          # in .git/config where one of them could read it.
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Ouroboros dependencies
+        run: pip install -r requirements.txt
+      - name: Install Claudexor
+        # A floating spec (claudexor@next) is fine for discovery, but the receipt
+        # must carry the exact version that was actually installed — recorded here,
+        # unconditionally, before any later step can fail.
+        run: |
+          set -euo pipefail
+          npm install -g "${CLAUDEXOR_SPEC:-$CLAUDEXOR_NPM_SPEC_DEFAULT}"
+          INSTALLED="$(claudexor --version)"
+          echo "installed claudexor: ${INSTALLED} (spec: ${CLAUDEXOR_SPEC:-$CLAUDEXOR_NPM_SPEC_DEFAULT})" | tee -a "$GITHUB_STEP_SUMMARY"
+        env:
+          CLAUDEXOR_SPEC: ${{ inputs.claudexor_spec }}
+      - name: Start the daemon and report the engine
+        run: |
+          set -euo pipefail
+          claudexor daemon start
+          claudexor about --json || true
+          cat "$HOME/.claudexor/v3/daemon/control-api.json"
+      - name: One delegated task through the seam (fake harness)
+        run: python scripts/claudexor_platform_smoke.py --lane fixture --max-seconds 300
+      - name: Daemon log on failure
+        if: failure()
+        run: tail -n 200 "$HOME/.claudexor/v3/daemon/claudexord.log" || true
+      - name: Stop the daemon
+        if: always()
+        run: claudexor daemon stop || true
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Live lane — real harness, explicit API key, one README edit. Costs money.
+  # ────────────────────────────────────────────────────────────────────────────
+  live:
+    name: live · ${{ matrix.os }} · ${{ matrix.harness }} · API key only, subscription NOT covered
+    if: |
+      github.ref == 'refs/heads/ouroboros-stable'
+      || (github.event_name == 'workflow_dispatch' && inputs.run_live_lane)
+      || startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Both keys the owner named, each on its own harness — 3 x 2 = 6 jobs.
+        # `harness` MUST be an axis rather than an `include`-only key: an include whose
+        # keys are absent from the base matrix is merged into every combination, so two
+        # such entries would collapse into one harness (the last one) instead of
+        # crossing. Being an axis, each include below matches the combinations that
+        # already carry that harness and only attaches the model to them.
+        harness: [claude, codex]
+        include:
+          # Weak model + low effort, per the owner's test rule (plan §4.10, answer 84).
+          - harness: claude
+            model: claude-haiku-4-5
+          - harness: codex
+            model: gpt-5.4-mini
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Ouroboros dependencies
+        run: pip install -r requirements.txt
+      - name: Install Claudexor and the harness CLI
+        run: |
+          set -euo pipefail
+          npm install -g "${CLAUDEXOR_SPEC:-$CLAUDEXOR_NPM_SPEC_DEFAULT}"
+          INSTALLED="$(claudexor --version)"
+          echo "installed claudexor: ${INSTALLED} (spec: ${CLAUDEXOR_SPEC:-$CLAUDEXOR_NPM_SPEC_DEFAULT})" | tee -a "$GITHUB_STEP_SUMMARY"
+          case "${{ matrix.harness }}" in
+            claude) npm install -g @anthropic-ai/claude-code ;;
+            codex)  npm install -g @openai/codex ;;
+            *) echo "unknown harness ${{ matrix.harness }}" >&2; exit 1 ;;
+          esac
+        env:
+          CLAUDEXOR_SPEC: ${{ inputs.claudexor_spec }}
+      - name: Require the API key
+        # A missing secret is a hard red, not a skip: a lane that quietly passes
+        # without credentials is the dishonest green this gate exists to avoid.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.harness }}" in
+            claude) test -n "${ANTHROPIC_API_KEY:-}" || { echo "ANTHROPIC_API_KEY secret is not set" >&2; exit 1; } ;;
+            codex)  test -n "${OPENAI_API_KEY:-}"    || { echo "OPENAI_API_KEY secret is not set" >&2; exit 1; } ;;
+          esac
+      - name: Start the daemon and store the key
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          claudexor daemon start
+          # --from-env, never a positional: the value must not reach a command line,
+          # a process listing or the workflow log.
+          case "${{ matrix.harness }}" in
+            claude) claudexor secrets set anthropic --from-env ANTHROPIC_API_KEY ;;
+            codex)  claudexor secrets set openai    --from-env OPENAI_API_KEY ;;
+          esac
+          claudexor secrets list
+          claudexor capabilities --json || true
+      - name: One delegated README edit through the seam
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python scripts/claudexor_platform_smoke.py \
+            --lane live \
+            --harness "${{ matrix.harness }}" \
+            --model "${{ matrix.model }}" \
+            --effort low \
+            --max-seconds 900
+      - name: Daemon log on failure
+        if: failure()
+        run: tail -n 200 "$HOME/.claudexor/v3/daemon/claudexord.log" || true
+      - name: Stop the daemon
+        if: always()
+        run: claudexor daemon stop || true
