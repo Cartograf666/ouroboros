@@ -147,6 +147,34 @@ def test_atlas_force_includes_protected_workflow_even_under_skipped_github_dir(t
     assert "asset text" not in pack.text
 
 
+def test_atlas_force_includes_the_review_execution_seam(tmp_path):
+    """The v6.87.21 seam module is review-stack surface, not an ordinary dependency.
+
+    ``review_execution.py`` owns the route vocabulary, transport dispatch and
+    api_chat prompt rendering for review slots; a broad review pack that
+    budget-drops it hides the review stack's own execution layer from the
+    reviewers guarding it. Pinned at both levels: the membership predicate and
+    the compiled pack's disposition.
+    """
+    from ouroboros.tools.review_context_atlas import _is_force_include
+
+    assert _is_force_include("ouroboros/review_execution.py") is True
+
+    _write(tmp_path / "ouroboros" / "review_execution.py", "SEAM = True\n")
+    _write(tmp_path / "main.py", "print('main')\n")
+    pack = compile_review_context_atlas(
+        ReviewContextAtlasRequest(
+            repo_dir=tmp_path,
+            tracked_paths=("ouroboros/review_execution.py", "main.py"),
+            fixed_prompt_tokens=100,
+            target_total_tokens=20_000,
+            hard_total_tokens=25_000,
+        )
+    )
+    assert _coverage(pack)["ouroboros/review_execution.py"]["disposition"] == "full"
+    assert "SEAM = True" in pack.text
+
+
 def test_atlas_devtools_manifest_only_unless_touched(tmp_path):
     _write(tmp_path / "devtools" / "benchmarks" / "programbench" / "run.py", "VALUE = 'devtools full text'\n")
     _write(tmp_path / "ouroboros" / "core.py", "print('core')\n")

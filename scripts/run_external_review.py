@@ -102,6 +102,7 @@ _REVIEW_SUBSTRATE_PATHS = frozenset({
     "ouroboros/pricing.py",
     "ouroboros/provider_models.py",
     "ouroboros/preflight_runner.py",
+    "ouroboros/review_execution.py",
     "ouroboros/review_substrate.py",
     "ouroboros/review_state.py",
     "ouroboros/runtime_mode_policy.py",

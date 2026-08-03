@@ -1,0 +1,235 @@
+"""Session delivery for the commit scope reviewer (phase 5.2/5.6/5.7).
+
+The api pack and the session task are TWO deliveries of ONE review: same role,
+checklist, output contract, calibration and intent context. This module owns
+only what is session-specific — retrieval pointers instead of assembled
+evidence, governance docs as navigation maps, and the forensic (never gating)
+coverage manifest. Everything shared is imported from its existing owner, so
+the two deliveries cannot drift apart.
+
+Imports from ``scope_review`` are lazy and one-way at call time: this module is
+itself imported lazily by ``run_scope_review``, so neither import can cycle at
+module load.
+"""
+
+from __future__ import annotations
+
+import pathlib
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
+
+from ouroboros.tools.review_helpers import (
+    CRITICAL_FINDING_CALIBRATION,
+    build_goal_section,
+    build_rebuttal_section,
+    build_scope_section,
+    load_checklist_section,
+    load_governance_doc,
+)
+from ouroboros.tools.review_synthesis import build_scope_review_prompt
+
+
+def governance_nav_maps(repo_dir: pathlib.Path, doc_paths: Tuple[str, ...]) -> str:
+    """The canonical governance docs as navigation maps (5.7).
+
+    Session delivery replaces the inlined canonical texts with the atlas idea
+    reduced to a MAP: every ``##``/``###`` heading with its line range, read on
+    demand by the session with its own tools. ``generate_doc_nav_map`` is the
+    one existing mapper — no second repository scanner (§8 item 8)."""
+    from ouroboros.context_layout import generate_doc_nav_map
+
+    parts: list[str] = []
+    for rel_path in doc_paths:
+        text = load_governance_doc(repo_dir, rel_path, on_missing="placeholder")
+        if str(text or "").strip():
+            parts.append(generate_doc_nav_map(text, title=rel_path, rel_path=rel_path))
+    return (
+        "The governance docs are NOT inlined in session delivery. The maps below "
+        "index them by line range; the paths are relative to the repository root — "
+        "read the sections you need with your own tools.\n\n" + "\n\n---\n\n".join(parts)
+    )
+
+
+@dataclass(frozen=True)
+class ScopeIntentContext:
+    """The intent/history cluster BOTH scope deliveries take, as one value.
+
+    These five always travel together — the api pack builder and the session task
+    builder each need exactly this set — so they ride as one immutable parameter
+    object (the ``ReviewAssignment`` pattern) instead of five parallel arguments
+    that a caller can silently mis-order.
+    """
+
+    goal: str = ""
+    scope: str = ""
+    review_rebuttal: str = ""
+    review_history: Optional[list] = None
+    scope_review_history: Optional[list] = None
+
+
+def build_scope_session_task(
+    repo_dir: pathlib.Path,
+    commit_message: str,
+    intent: ScopeIntentContext,
+    drive_root: Optional[pathlib.Path] = None,
+    governance_repo_dir: Optional[pathlib.Path] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """The scope task in SESSION delivery, plus its forensic coverage manifest.
+
+    Same role, checklist, contract, calibration and intent context as the api
+    pack (5.3), with retrieval pointers instead of assembled evidence (5.2): no
+    touched-file pack, no inlined diff, no atlas. The instruction text is the
+    SAME builder the api pack uses, so the two deliveries cannot drift apart.
+
+    The returned manifest is FORENSICS, not a gate (5.6/D16): it records that
+    coverage is the session's own retrieval — declaredly not host-attested — as
+    the non-blocking ``coverage_incomplete`` fact. The atlas's
+    ``excluded_sensitive`` class is preserved on the host side (nothing
+    sensitive is assembled at all here); what the harness reads with its own
+    tools is not host-filtered, and the manifest says so instead of implying an
+    attestation nobody performed."""
+    from ouroboros.tools.scope_review import (
+        _CANONICAL_CONTEXT_DOCS,
+        _build_review_history_section,
+        _build_scope_history_section,
+    )
+
+    goal, scope, review_rebuttal = intent.goal, intent.scope, intent.review_rebuttal
+    review_history, scope_review_history = intent.review_history, intent.scope_review_history
+
+    scope_checklist = load_checklist_section("Intent / Scope Review Checklist")
+    if not str(scope_checklist or "").strip():
+        raise RuntimeError(
+            "Intent / Scope Review Checklist could not be loaded from docs/CHECKLISTS.md — "
+            "scope review cannot run without its checklist (fail-closed)."
+        )
+    goal_section = build_goal_section(goal, scope, commit_message)
+    scope_section = build_scope_section(scope)
+    rebuttal_section = build_rebuttal_section(review_rebuttal)
+    open_obligations = []
+    if drive_root is not None:
+        try:
+            from ouroboros.review_state import load_state, make_repo_key
+            state = load_state(pathlib.Path(drive_root))
+            open_obligations = state.get_open_obligations(repo_key=make_repo_key(repo_dir))
+        except Exception:
+            open_obligations = []  # Non-fatal: best-effort hint
+    history_section = _build_review_history_section(
+        review_history or [], open_obligations=open_obligations,
+    )
+    scope_history_section = _build_scope_history_section(scope_review_history)
+    nav_docs = governance_nav_maps(
+        pathlib.Path(governance_repo_dir or repo_dir), _CANONICAL_CONTEXT_DOCS,
+    )
+    task_text, _stable_len = build_scope_review_prompt(
+        "(not inlined — session delivery: list the touched files with "
+        "`git diff --cached --name-status` and read them yourself)",
+        scope_checklist=scope_checklist,
+        canonical_docs=nav_docs,
+        intent_context=f"{scope_section}\n\n{goal_section}",
+        history_block=f"{rebuttal_section}{history_section}{scope_history_section}",
+        diff_text="(not inlined — session delivery: run `git diff --cached` in "
+                  "this repository root yourself)",
+        repo_pack_placeholder=(
+            "(no assembled repository pack in session delivery — the navigation "
+            "maps above index the governance docs; retrieve everything else with "
+            "your own tools)"
+        ),
+        critical_calibration=CRITICAL_FINDING_CALIBRATION,
+    )
+    manifest: Dict[str, Any] = {
+        "delivery": "agent_session",
+        "coverage": "agent_retrieval",
+        # Non-blocking by construction (D16): forensics, never a gate, and the
+        # fixed_overflow ladder does not apply to sessions (5.7).
+        "coverage_incomplete": True,
+        "coverage_note": (
+            "the reviewer session retrieves context with its own tools; the host "
+            "assembled no pack, so coverage is DECLAREDLY not host-attested"
+        ),
+        "excluded_sensitive": {"policy": "preserved", "host_enforced": False},
+        "nav_mapped_docs": list(_CANONICAL_CONTEXT_DOCS),
+    }
+    return task_text, manifest
+
+
+# --------------------------------------------------------------------------
+# Session authority (the floor this delivery's verdict actually rests on)
+# --------------------------------------------------------------------------
+# The api (push) delivery's authority rests on the whole assembled pack fitting
+# the reviewer's context, so its floor is the constitutional >=1M. This delivery
+# assembles NO pack, so that floor is not its test — but a verdict may only gate
+# a commit if the reviewer's window has been ESTABLISHED. Hence: SOURCED evidence
+# (confirmed | asserted) at or above SESSION_WINDOW_FLOOR.
+#
+# The floor coincides numerically with scope_review's conservative fallback
+# window, which is exactly why PROVENANCE and not the number is the gate: a
+# reviewer nobody ever probed resolves to that same number under
+# `unknown_conservative`, and admitting it would be "assumed adequate" — the one
+# thing BIBLE P3 forbids ("treated as too small rather than assumed adequate").
+SESSION_WINDOW_FLOOR = 200_000
+SOURCED_PROVENANCE = frozenset({"confirmed", "asserted"})
+
+
+def session_window_is_authoritative(window: Any, provenance: str) -> bool:
+    """Whether a retrieving row's window evidence can carry a BLOCKING verdict."""
+    return str(provenance or "") in SOURCED_PROVENANCE and int(window or 0) >= SESSION_WINDOW_FLOOR
+
+
+def session_window_unproven_finding(scope_model: str, phrase: str) -> Dict[str, Any]:
+    """Disclosure for a retrieving row whose window is not SOURCED >= the floor.
+
+    ``phrase`` is the caller's already-formatted provenance wording, so the
+    honest four-way phrasing keeps its single owner in ``scope_review``."""
+    return {
+        "verdict": "FAIL",
+        "severity": "advisory",
+        "item": "scope_review_session_window_unproven",
+        "reason": (
+            f"⚠️ SCOPE_SESSION_ADVISORY_ONLY: retrieving scope reviewer {scope_model} has a "
+            f"{phrase}, which does not meet the >={SESSION_WINDOW_FLOOR} SOURCED-evidence "
+            "floor this lower-assurance delivery needs to carry a blocking verdict (BIBLE "
+            "P3: a window that cannot be established by evidence is treated as too small, "
+            "never assumed adequate). Its findings are ADVISORY-ONLY, do not satisfy the "
+            "blocking scope gate, and are not counted toward the authoritative scope "
+            "quorum. Owner-ack this route's window, configure a reviewer with confirmed "
+            "window evidence, or deliver this row over the api route to restore an "
+            "authoritative verdict."
+        ),
+        "model": scope_model,
+    }
+
+
+def session_scope_authority(
+    critical_findings: list,
+    advisory_findings: list,
+    *,
+    scope_model: str,
+    window: Any,
+    provenance: str,
+    phrase: str,
+    result_kwargs: Dict[str, Any],
+) -> Tuple[list, list, Any]:
+    """The retrieving delivery's whole authority decision.
+
+    ``(critical, advisory, early_result)``: with SOURCED evidence at or above the
+    floor the row keeps blocking authority and nothing changes (``early_result``
+    is None, so the caller proceeds to its normal blocking logic). Otherwise its
+    criticals are PRESERVED as advisory evidence (never discarded — a real finding
+    stays readable), tagged so their origin is unmistakable, the disclosure names
+    what would restore an authoritative verdict, and the typed
+    ``session_advisory`` result is returned: it does not gate the commit and the
+    scope quorum does not count it as authoritative."""
+    if session_window_is_authoritative(window, provenance):
+        return critical_findings, advisory_findings, None
+    for finding in critical_findings:
+        finding["severity"] = "advisory"
+        finding["reason"] = "[advisory-only session scope reviewer] " + str(finding.get("reason", ""))
+    advisory = list(critical_findings) + list(advisory_findings)
+    advisory.append(session_window_unproven_finding(scope_model, phrase))
+    from ouroboros.tools.scope_review import ScopeReviewResult
+
+    return [], advisory, ScopeReviewResult(
+        blocked=False, critical_findings=[], advisory_findings=advisory,
+        status="session_advisory", **result_kwargs,
+    )

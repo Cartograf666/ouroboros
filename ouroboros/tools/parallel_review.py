@@ -6,6 +6,7 @@ import hashlib
 import logging
 
 from ouroboros.utils import run_cmd
+from ouroboros.review_substrate import scope_reviewer_slots
 from ouroboros.tools.review_helpers import build_scope_actor_record, format_review_history_entry
 from ouroboros.tools.scope_review import (
     run_scope_review,
@@ -87,36 +88,44 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
 
     def _run_scope():
         try:
+            # Identity of every scope row comes from the one SSOT that owns it, so
+            # the actor record and the substrate call agree on which row spoke.
             try:
-                from ouroboros.config import get_scope_review_models
-
-                scope_models = get_scope_review_models()
+                scope_slots = list(scope_reviewer_slots() or [])
             except Exception:
-                scope_models = [_get_scope_model()]
-            scope_models = scope_models or [_get_scope_model()]
+                scope_slots = []
+            # Fail-soft as before: a config lookup failure still runs ONE scope row
+            # rather than blocking the commit outright.
+            scope_slots = scope_slots or scope_reviewer_slots([_get_scope_model()])
+            scope_models = [slot.model for slot in scope_slots]
             ctx._last_scope_model = ",".join(scope_models)
-            def _run_one_scope(model: str):
+            def _run_one_scope(slot):
                 # P3 one-pass contract: one substantive scope call per configured
                 # actor. Transport retry remains inside the same review substrate;
                 # never launch an automatic second degraded review call here.
+                # The row's configured delivery rides with it (5.3: same task,
+                # same criteria, same output contract — only delivery differs;
+                # adaptive_quorum below is delivery-blind and unchanged).
                 return run_scope_review(
                     ctx, commit_message, goal=goal, scope=scope,
                     review_rebuttal=review_rebuttal,
                     review_history=_history_snapshot,
                     scope_review_history=_scope_history,
-                    scope_model=model,
+                    scope_model=slot.model,
+                    slot_id=slot.slot_id,
+                    route=slot.route,
                 )
 
-            with _cf.ThreadPoolExecutor(max_workers=min(len(scope_models), 4)) as scope_pool:
-                futures = [scope_pool.submit(_run_one_scope, model) for model in scope_models]
+            with _cf.ThreadPoolExecutor(max_workers=min(len(scope_slots), 4)) as scope_pool:
+                futures = [scope_pool.submit(_run_one_scope, slot) for slot in scope_slots]
                 results = [future.result() for future in futures]
             ctx._last_scope_raw_results = [
                 build_scope_actor_record(
                     result,
-                    fallback_model_id=getattr(result, "model_id", "") or model,
-                    slot_id=f"scope_slot_{idx + 1}",
+                    fallback_model_id=getattr(result, "model_id", "") or slot.model,
+                    slot_id=slot.slot_id,
                 )
-                for idx, (result, model) in enumerate(zip(results, scope_models))
+                for result, slot in zip(results, scope_slots)
             ]
             # Reviewer-slot SSOT applies to scope too (Bible P3): a single configured
             # scope reviewer is honored but recorded as loud durable degraded-trust,
@@ -126,10 +135,21 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
             # skip, not an authoritative responder (so we never over-block them).
             from ouroboros.config import adaptive_quorum
             _scope_statuses = [str(getattr(r, "status", "") or "") for r in results]
+            # `responded` is the ONLY authoritative status. A retrieving (session) row
+            # whose window is not sourced-proven arrives as `session_advisory`: its
+            # coverage is declaredly not host-attested, so it must never be counted as
+            # the authoritative verdict that satisfies the blocking scope quorum — it is
+            # advisory evidence, and the shortfall it leaves is disclosed below.
             _responded = sum(1 for s in _scope_statuses if s == "responded")
+            _session_advisory = sum(1 for s in _scope_statuses if s == "session_advisory")
             _required = adaptive_quorum(len(scope_models))
             _single_scope_reviewer = len(scope_models) == 1
             _scope_degraded: list = []
+            if _session_advisory:
+                _scope_degraded.append(
+                    f"scope_session_advisory_only: {_session_advisory} retrieving row(s) "
+                    "carried no authoritative verdict (window not sourced-proven)"
+                )
             if _single_scope_reviewer:
                 _scope_degraded.append("single_reviewer_no_diversity")
             elif _responded < _required and not any(getattr(r, "blocked", False) for r in results):
@@ -140,6 +160,7 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
                 "scope_responded_count": _responded,
                 "scope_required_quorum": _required,
                 "single_reviewer_no_diversity": _single_scope_reviewer,
+                "scope_session_advisory_only_count": _session_advisory,
                 "scope_degraded_reasons": _scope_degraded,
             }
             if len(results) == 1:
@@ -215,11 +236,11 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
                     **_scope_quorum_manifest,
                     "actors": [
                         {
-                            "slot_id": f"scope_slot_{idx + 1}",
-                            "model": model,
+                            "slot_id": slot.slot_id,
+                            "model": slot.model,
                             "context_manifest": getattr(result, "context_manifest", {}) or {},
                         }
-                        for idx, (result, model) in enumerate(zip(results, scope_models))
+                        for result, slot in zip(results, scope_slots)
                     ],
                 },
             )

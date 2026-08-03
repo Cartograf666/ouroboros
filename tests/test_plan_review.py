@@ -779,7 +779,7 @@ def test_all_schedule_failures_still_reach_reviewer_panel(monkeypatch, tmp_path)
     monkeypatch.setattr(pr, "_get_review_models", lambda: ["m1", "m2"])
     captured = {}
 
-    async def fake_slots(_ctx, models, _system_prompt, user_content, user_stable_len=0):
+    async def fake_slots(_ctx, models, _system_prompt, user_content, user_stable_len=0, slot_ids=None):
         captured["user_content"] = user_content
         return [{
             "model": model,
@@ -847,7 +847,7 @@ def test_cutoff_omissions_go_directly_to_reviewer_without_inline_model(monkeypat
     monkeypatch.setattr(pr, "build_head_snapshot_section", lambda *_a, **_k: ("", frozenset()))
     captured = {}
 
-    async def fake_slots(_ctx, models, system_prompt, user_content, user_stable_len=0):
+    async def fake_slots(_ctx, models, system_prompt, user_content, user_stable_len=0, slot_ids=None):
         captured["user_content"] = user_content
         return [{
             "model": m,
@@ -948,7 +948,7 @@ def test_scout_change_after_prompt_is_audit_only_without_paid_review_replay(monk
 
     calls = {"panel": 0}
 
-    async def mutate_then_review(_ctx, models, _system_prompt, _user_content, user_stable_len=0):
+    async def mutate_then_review(_ctx, models, _system_prompt, _user_content, user_stable_len=0, slot_ids=None):
         calls["panel"] += 1
         write_task_result(tmp_path, "scout-stale", "completed", result="changed after prompt")
         return [{
@@ -1008,7 +1008,7 @@ def test_paid_review_resumes_evidence_integration_without_panel_replay(monkeypat
     ctx.task_id = "parent-paid-review-resume"
     calls = {"panel": 0, "consumed": 0}
 
-    async def fake_slots(_ctx, models, _system_prompt, _user_content, user_stable_len=0):
+    async def fake_slots(_ctx, models, _system_prompt, _user_content, user_stable_len=0, slot_ids=None):
         calls["panel"] += 1
         return [{
             "model": model,
@@ -1104,7 +1104,7 @@ def test_terminal_zero_ready_scout_wave_still_reaches_reviewer_panel(monkeypatch
     monkeypatch.setattr(pr, "build_head_snapshot_section", lambda *_a, **_k: ("", frozenset()))
     captured = {}
 
-    async def fake_slots(_ctx, models, _system_prompt, user_content, user_stable_len=0):
+    async def fake_slots(_ctx, models, _system_prompt, user_content, user_stable_len=0, slot_ids=None):
         captured["user_content"] = user_content
         return [{
             "model": model, "text": _review_text("GREEN"), "error": None,

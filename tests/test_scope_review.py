@@ -19,6 +19,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -2686,3 +2687,138 @@ def test_cold_start_sizes_down_and_passes_instead_of_400ing(tmp_path, monkeypatc
     )
     from ouroboros.capability_evidence import resolve_token_density
     assert resolve_token_density(tmp_path, "unknown/brand-new-model")[1] == "measured"
+
+
+# --- scope-slot identity: one owner, one id per configured row ----------------
+
+
+def _run_scope_fanout(monkeypatch, tmp_path, models):
+    """Run the parallel scope fan-out over ``models`` and collect every id surface.
+
+    Returns (substrate_ids, actor_record_ids, manifest_ids): the ids the review
+    substrate physically ran the rows under (sorted — the rows run concurrently,
+    so completion order is not meaningful), the ids stamped on the durable actor
+    records, and the ids in the scope context manifest.
+    """
+    from types import SimpleNamespace
+
+    from ouroboros import config, review_substrate
+    from ouroboros.tools import parallel_review, review
+    from ouroboros.tools import scope_review as sr
+
+    rows = [
+        {
+            "item": item,
+            "verdict": "PASS",
+            "severity": "advisory",
+            "reason": "Concrete scope artifact was checked and passes.",
+        }
+        for item in sorted(sr._SCOPE_REQUIRED_ITEMS)
+    ]
+    substrate_ids: list = []
+    lock = threading.Lock()
+
+    def fake_run_review_request(request, *, slots, drive_root, llm, usage_ctx=None):
+        with lock:
+            substrate_ids.extend(slot.slot_id for slot in slots)
+        return SimpleNamespace(actors=[{
+            "slot_id": slots[0].slot_id,
+            "model": slots[0].model,
+            "status": "ok",
+            "raw_text": json.dumps(rows),
+            "usage": {},
+            "prompt_ref": {},
+            "response_ref": {},
+        }])
+
+    monkeypatch.setattr(config, "get_scope_review_models", lambda: list(models))
+    monkeypatch.setattr(review_substrate, "run_review_request", fake_run_review_request)
+    monkeypatch.setattr(sr, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
+    monkeypatch.setattr(sr, "_scope_reviewer_window", lambda _model: 1_000_000)
+    monkeypatch.setattr(parallel_review, "run_cmd", lambda *_a, **_k: "staged diff")
+    monkeypatch.setattr(review, "_run_unified_review", lambda *_a, **_k: None)
+
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path, drive_root=tmp_path, task_id="scope-slot-identity",
+        pending_events=[], _review_history=[], _review_advisory=[], _scope_review_history={},
+    )
+    parallel_review.run_parallel_review(ctx, "identity commit")
+    actor_ids = [str(r.get("slot_id") or "") for r in (ctx._last_scope_raw_results or [])]
+    manifest = (ctx._last_scope_raw_result or {}).get("context_manifest") or {}
+    manifest_ids = [str(a.get("slot_id") or "") for a in (manifest.get("actors") or [])]
+    return sorted(substrate_ids), actor_ids, manifest_ids
+
+
+def test_scope_rows_sharing_a_model_keep_distinct_identities(tmp_path, monkeypatch):
+    """Duplicate model ids are valid independent slots (review_substrate contract,
+    and get_scope_review_models preserves them on purpose). Naming a row after its
+    model collapsed both rows onto one receipt id."""
+    substrate_ids, actor_ids, manifest_ids = _run_scope_fanout(
+        monkeypatch, tmp_path, ["model/a", "model/a"]
+    )
+    assert len(set(substrate_ids)) == 2, substrate_ids
+    assert len(set(actor_ids)) == 2, actor_ids
+    assert len(set(manifest_ids)) == 2, manifest_ids
+
+
+def test_scope_rows_whose_models_sanitize_alike_keep_distinct_identities(tmp_path, monkeypatch):
+    """Two DIFFERENT models can normalize to the same token (``openai::gpt-5`` and
+    ``openai/gpt/5`` both sanitize to ``openai_gpt_5``), which merged two rows."""
+    substrate_ids, actor_ids, manifest_ids = _run_scope_fanout(
+        monkeypatch, tmp_path, ["openai::gpt-5", "openai/gpt/5"]
+    )
+    assert len(set(substrate_ids)) == 2, substrate_ids
+    assert len(set(actor_ids)) == 2, actor_ids
+    assert len(set(manifest_ids)) == 2, manifest_ids
+
+
+def test_scope_row_identity_survives_editing_that_row_model(tmp_path, monkeypatch):
+    """Editing a slot's model in the settings UI must not re-identify the slot:
+    its receipts have to keep lining up with its own history."""
+    before_substrate, before_actors, _ = _run_scope_fanout(
+        monkeypatch, tmp_path, ["model/a", "model/b"]
+    )
+    after_substrate, after_actors, _ = _run_scope_fanout(
+        monkeypatch, tmp_path, ["model/a", "model/EDITED"]
+    )
+    assert before_substrate == after_substrate, (before_substrate, after_substrate)
+    assert before_actors == after_actors, (before_actors, after_actors)
+
+
+def test_scope_actor_records_and_substrate_agree_on_one_identity(tmp_path, monkeypatch):
+    """The durable actor record, the context manifest, and the substrate call that
+    produced the prompt/response refs must name the SAME row. They were derived
+    independently — positionally in the coordinator, from the model in the reviewer —
+    so one row carried two disagreeing identities."""
+    substrate_ids, actor_ids, manifest_ids = _run_scope_fanout(
+        monkeypatch, tmp_path, ["model/a", "model/b"]
+    )
+    assert sorted(substrate_ids) == sorted(actor_ids) == sorted(manifest_ids), (
+        substrate_ids, actor_ids, manifest_ids
+    )
+    # Pinned spelling: durable records written before v6.87.21 already carry these
+    # ids, so historical receipts line up with new ones without a translation table.
+    assert actor_ids == ["scope_slot_1", "scope_slot_2"], actor_ids
+
+
+def test_scope_row_ids_come_from_the_one_mint(tmp_path, monkeypatch):
+    """The coordinator must READ the row's id, not re-derive an identical string.
+
+    parallel_review stamped ``scope_slot_{idx + 1}`` on the actor record and the
+    manifest — byte-identical to the mint's output today, so nothing could tell
+    the two apart. Repointing the ONE mint separates them: a surface that reads it
+    follows, a surface that spells its own literal does not.
+    """
+    from ouroboros import review_substrate
+
+    monkeypatch.setattr(
+        review_substrate, "slot_id_for_row",
+        lambda index, *, prefix=review_substrate.SLOT_ID_PREFIX: f"{prefix}_row{int(index)}",
+    )
+    substrate_ids, actor_ids, manifest_ids = _run_scope_fanout(
+        monkeypatch, tmp_path, ["model/a", "model/b"]
+    )
+    expected = ["scope_slot_row1", "scope_slot_row2"]
+    assert substrate_ids == expected, substrate_ids
+    assert actor_ids == expected, actor_ids
+    assert manifest_ids == expected, manifest_ids

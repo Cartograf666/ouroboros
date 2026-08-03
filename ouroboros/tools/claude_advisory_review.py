@@ -402,37 +402,18 @@ def _build_advisory_prompt(
     return prompt
 
 
-_FALLBACK_EXTRACT_PROMPT = (
-    "The following text is the output of an advisory code review. It may contain narrative\n"
-    "reasoning, tool call traces, and a JSON checklist array. Extract ONLY the JSON checklist\n"
-    "array from this text and return it as a valid JSON array. No prose, no markdown fences.\n\n"
-    "Each element MUST have ALL of these required fields:\n"
-    '  "item":     checklist item name (string)\n  "verdict":  "PASS" or "FAIL" (string)\n'
-    '  "severity": "critical" or "advisory" (string, REQUIRED — do not omit even for PASS entries)\n'
-    '  "reason":   brief explanation (string)\n\n'
-    'Optional field:\n  "obligation_id": stable id for a previously surfaced obligation\n\n'
-    "If a FAIL entry in the source is missing a severity, infer it from context:\n"
-    'treat it as "critical" if it involves bugs, security, or constitutional violations,\notherwise "advisory".\n\n'
-    "If no valid checklist array exists in the text, return an empty JSON array: []\n\n"
-    "Advisory review output to extract from:\n{raw_text}\n"
+
+# The advisory's own output contract, handed to the shared extraction SSOT so one
+# mechanism canonicalizes every review surface while each keeps its own contract.
+_ADVISORY_EXTRACT_CONTRACT = (
+    "A JSON array of checklist entries. Each element MUST have ALL of: "
+    '"item" (checklist item name), "verdict" ("PASS" or "FAIL"), "severity" '
+    '("critical" or "advisory" — REQUIRED even for PASS entries), "reason" (brief '
+    'explanation). Optional: "obligation_id" (stable id of a previously surfaced '
+    "obligation). If a FAIL entry in the source omits severity, infer it from "
+    'context: "critical" for bugs, security or constitutional violations, else '
+    '"advisory". If the text carries no valid checklist array, return [].'
 )
-
-_FALLBACK_HEAD_CHARS = 4_000   # first N chars of raw text (context / tool-call traces)
-_FALLBACK_TAIL_CHARS = 60_000  # last N chars — where the JSON array usually appears
-_FALLBACK_OMISSION_NOTE = (
-    "\n\n[⚠️ OMISSION NOTE: middle section of advisory output omitted "
-    "to fit context window — JSON findings are expected in the tail section above]\n\n"
-)
-
-
-def _build_fallback_window(raw_text: str) -> str:
-    """Build a head+tail raw-output window so tail JSON is retained."""
-    total = _FALLBACK_HEAD_CHARS + _FALLBACK_TAIL_CHARS
-    if len(raw_text) <= total:
-        return raw_text
-    head = raw_text[:_FALLBACK_HEAD_CHARS]
-    tail = raw_text[-_FALLBACK_TAIL_CHARS:]
-    return head + _FALLBACK_OMISSION_NOTE + tail
 
 
 def _resolve_fallback_model() -> str:
@@ -444,23 +425,34 @@ def _resolve_fallback_model() -> str:
 
 
 def _llm_extract_advisory_items(raw_text: str, ctx: object) -> list:
-    """Extract checklist items from narrative advisory output via light model."""
+    """Extract checklist items from narrative advisory output.
+
+    Extraction is the SHARED SSOT (``review_execution.canonicalize_session_verdict``)
+    reading the WHOLE artifact, with the advisory's own output contract. It used to
+    read a 4K head + 60K tail window: a critical raised in the MIDDLE of a long
+    advisory was silently dropped, and because entries may carry ``obligation_id``, a
+    surviving advisory row could even close an obligation whose critical had just been
+    cut away. An artifact too large for the one-send extraction rail is now the typed
+    ``extraction_incomplete`` refusal — never a verdict fabricated from a visible cut.
+    """
     try:
-        from ouroboros.llm import LLMClient  # type: ignore[attr-defined]
+        from ouroboros.review_execution import canonicalize_session_verdict
 
         light_model = _resolve_fallback_model()
-        input_text = _build_fallback_window(raw_text)
-        prompt = _FALLBACK_EXTRACT_PROMPT.format(raw_text=input_text)
-        messages = [{"role": "user", "content": prompt}]
-
-        llm = LLMClient()
-        response, fallback_usage = llm.chat(
-            messages=messages,
-            model=light_model,
-            max_tokens=8192,
-            reasoning_effort="low",
-            no_proxy=True,
+        content, method, fallback_usage = canonicalize_session_verdict(
+            raw_text,
+            # The advisory transport reports no structured-output conformance here, so
+            # the trusted-schema branch is never taken on this path.
+            conformance_passed=False,
+            contract=_ADVISORY_EXTRACT_CONTRACT,
         )
+        if method == "extraction_incomplete":
+            log.warning(
+                "Advisory extraction refused: artifact (%d chars) exceeds the single-send "
+                "extraction bound; reporting no items rather than a windowed guess.",
+                len(str(raw_text or "")),
+            )
+            return []
 
         # Track fallback LLM cost; it is real review spend.
         if fallback_usage and isinstance(ctx, ToolContext):
@@ -476,17 +468,9 @@ def _llm_extract_advisory_items(raw_text: str, ctx: object) -> list:
                 provider=_infer_prov(light_model),
             )
 
-        content = response.get("content", "")
-        if not isinstance(content, str):
-            # Flatten list content blocks.
-            if isinstance(content, list):
-                content = " ".join(
-                    str(b.get("text", "")) for b in content if isinstance(b, dict)
-                )
-            else:
-                content = str(content or "")
-
-        items = _parse_advisory_output(content)
+        # The SSOT already flattened provider content blocks to text; the advisory's
+        # OWN contract post-processing (below) is unchanged and stays here.
+        items = _parse_advisory_output(str(content or ""))
         if not _is_checklist_array(items):
             return []
 
@@ -598,6 +582,165 @@ def _syntax_preflight_staged_py_files(
     )
 
 
+ADVISORY_REVIEW_ROUTE_ENV = "OUROBOROS_ADVISORY_REVIEW_ROUTE"
+_ADVISORY_SESSION_MAX_SECONDS = 900  # the nanny's time cap replaces the SDK budget kill
+
+
+def advisory_review_route() -> str:
+    """The advisory delivery route: ``api`` (Claude Agent SDK, needs the key)
+    or ``agent_session`` (a delegated Claudexor run, needs no key). An unknown
+    token raises — a typo must fail loudly, never silently pick a transport."""
+    raw = os.environ.get(ADVISORY_REVIEW_ROUTE_ENV, "").strip().lower()
+    if raw in ("", "api", "api_chat"):
+        return "api"
+    if raw == "agent_session":
+        return "agent_session"
+    raise ValueError(
+        f"{ADVISORY_REVIEW_ROUTE_ENV} names an unknown advisory route {raw!r}; "
+        "valid: api, agent_session"
+    )
+
+
+def advisory_route_requires_api_key() -> bool:
+    """Whether THIS advisory route needs ANTHROPIC_API_KEY (plan 5.8: the four
+    key checks are route-dependent — an api route requires the key exactly as
+    before; the delegated route runs without it)."""
+    return advisory_review_route() == "api"
+
+
+def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContext):
+    """The advisory as a delegated Claudexor session, rehydrated into the same
+    result structure the SDK path produces (5.8: only the transport changes).
+
+    Runs through the ONE shared delegated-session runner (no second nanny
+    loop). The SDK-side budget kill is lost by construction; the runner's time
+    cap is the nanny-enforced bound. The narrative fallback is unchanged: the
+    existing advisory extractor already canonicalizes non-JSON output (D19).
+    Cost: the run settles through delegate_custody (the subscription-session
+    ledger row); ``cost_usd`` stays 0.0 here so the SDK-path usage emit cannot
+    double-count, and the disclosed spend rides ``usage`` for forensics."""
+    from types import SimpleNamespace
+
+    from ouroboros.delegate_custody import custody_root
+    from ouroboros.review_execution import (
+        REVIEW_SESSION_OUTPUT_SCHEMA,
+        SessionInvocation,
+        run_delegated_review_session,
+    )
+
+    try:
+        drive = custody_root(ctx) if getattr(ctx, "drive_root", None) else pathlib.Path(repo_dir)
+        facts = run_delegated_review_session(
+            prompt=prompt,
+            root=str(repo_dir),
+            custody_drive=drive,
+            invocation=SessionInvocation(
+                task_id=str(getattr(ctx, "task_id", "") or ""),
+                surface="advisory_review",
+                slot_id="advisory_slot_1",
+                timeout_sec=_ADVISORY_SESSION_MAX_SECONDS,
+                # The structured verdict is ASKED here exactly as the substrate's
+                # session slots ask for it (D19): a review surface that never asks can
+                # only reach its verdict through extraction, paying a light-model call
+                # and a capability delta for what the route may support natively.
+                output_schema=REVIEW_SESSION_OUTPUT_SCHEMA,
+            ),
+        )
+    except Exception as exc:
+        return SimpleNamespace(
+            success=False, result_text="(no output)", session_id="", cost_usd=0.0,
+            usage={}, error=f"{type(exc).__name__}: {exc}", stderr_tail="",
+        ), ""
+    spend_final = facts["spend"] if (facts["spend"] is not None and not facts["spend_estimated"]) else None
+    return SimpleNamespace(
+        success=True,
+        result_text=facts["text"],
+        session_id=facts["run_id"],
+        cost_usd=0.0,  # settled by delegate_custody; never re-emitted here
+        usage={
+            "delegated_run_id": facts["run_id"],
+            "delegated_route": facts["route_id"],
+            "cost_disclosed_usd": facts["spend"],
+            "cost_estimated": facts["spend_estimated"],
+            "cost_final_usd": spend_final,
+            "settlement": facts["settlement"],
+            # The structured-verdict facts the substrate's slots also carry: whether
+            # the schema was asked at all, what the run reported, and which route(s)
+            # actually served it. Conformance is TRUSTED only on "passed" — never on
+            # run success (D19).
+            "schema_asked": bool(facts.get("schema_asked")),
+            "output_conformance": facts.get("conformance") or "",
+            "conformance_trusted": (facts.get("conformance") == "passed"),
+            "effective_route_ids": list(facts.get("effective_route_ids") or []),
+            "capability_delta": _advisory_session_deltas(facts),
+        },
+        error="",
+        stderr_tail="",
+    ), str(facts["model"] or facts["route_id"])
+
+
+def _advisory_session_deltas(facts: dict) -> List[dict]:
+    """The same three landings-below-the-ask the substrate discloses (D4).
+
+    Same vocabulary as ``AgentSessionReviewExecutor``, so one disclosure contract
+    covers every delegated review surface instead of two dialects."""
+    route_id = str(facts.get("route_id") or "")
+    conformance = str(facts.get("conformance") or "")
+    deltas: List[dict] = []
+    if not facts.get("schema_asked"):
+        deltas.append({
+            "kind": "capability_delta",
+            "requested": "outputSchema (structured verdict)",
+            "effective": f"no structured output on effective route {route_id}",
+            "reason": "schema_unavailable_on_effective_route",
+        })
+    elif conformance != "passed":
+        deltas.append({
+            "kind": "capability_delta",
+            "requested": "outputSchema (structured verdict)",
+            "effective": f"outputConformance={conformance or 'absent'}",
+            "reason": "schema_not_conformed_on_effective_route",
+        })
+    effective = [str(r) for r in (facts.get("effective_route_ids") or [])]
+    if effective and set(effective) != {route_id}:
+        deltas.append({
+            "kind": "capability_delta",
+            "requested": f"route {route_id} (pinned pool)",
+            "effective": "route(s) " + ", ".join(effective),
+            "reason": "session_ran_off_pinned_route",
+        })
+    return deltas
+
+
+def _advisory_sdk_budget(ctx: ToolContext, active_scope, drive_root, repo_dir) -> Optional[float]:
+    """Remaining budget headroom for the SDK route's hard kill (api route only;
+    the delegated route's bound is the nanny's time cap)."""
+    from ouroboros.usage_accounting import usage_projection
+
+    budget_root = pathlib.Path(
+        drive_root
+        or getattr(ctx, "budget_drive_root", "")
+        or getattr(active_scope, "drive_root", "")
+        or getattr(ctx, "drive_root", "") or repo_dir
+    )
+    root_id = str(
+        (getattr(ctx, "task_metadata", {}) or {}).get("root_task_id")
+        or getattr(active_scope, "root_task_id", "")
+        or getattr(ctx, "task_id", "")
+        or ""
+    )
+    caps: List[float] = []
+    global_limit = getattr(active_scope, "global_limit_usd", None)
+    root_limit = getattr(active_scope, "root_limit_usd", None)
+    if global_limit is not None:
+        global_projection = usage_projection(budget_root, global_limit_usd=float(global_limit))
+        caps.append(max(0.0, float(global_limit) - float(global_projection.get("accounted_usd") or 0.0)))
+    if root_id and root_limit is not None:
+        root_projection = usage_projection(budget_root, root_task_id=root_id)
+        caps.append(max(0.0, float(root_limit) - float(root_projection.get("accounted_usd") or 0.0)))
+    return min(caps) if caps else None
+
+
 def _run_claude_advisory(
     repo_dir: pathlib.Path,
     commit_message: str,
@@ -608,12 +751,21 @@ def _run_claude_advisory(
     options: Optional[dict] = None,
 ) -> tuple:
     """Run read-only advisory review; raw_result starts with ADVISORY_ERROR on failure."""
+    try:
+        delegated_route = advisory_review_route() == "agent_session"
+    except ValueError as exc:
+        return [], f"⚠️ ADVISORY_ERROR: {exc}", "", 0
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return [], "⚠️ ADVISORY_ERROR: ANTHROPIC_API_KEY not set.", "", 0
+    # Route-dependent (plan 5.8 site 1): the api route requires the key exactly
+    # as before; the delegated route runs on the subscription and needs none.
+    if not api_key and not delegated_route:
+        return [], "⚠️ ADVISORY_ERROR: ANTHROPIC_API_KEY not set (advisory route=api).", "", 0
 
-    from ouroboros.gateways.claude_code import resolve_claude_code_model
-    model = resolve_claude_code_model()
+    if delegated_route:
+        model = ""  # the session route resolves its own model; reported after the run
+    else:
+        from ouroboros.gateways.claude_code import resolve_claude_code_model
+        model = resolve_claude_code_model()
     options = dict(options or {})
     drive_root = options.get("drive_root")
     include_repo_diff = bool(options.get("include_repo_diff", True))
@@ -689,59 +841,44 @@ def _run_claude_advisory(
     )
 
     try:
-        from ouroboros.gateways.claude_code import (
-            DEFAULT_CLAUDE_CODE_MAX_TURNS,
-            run_readonly,
-        )
-        from ouroboros.config import resolve_effort
-        from ouroboros.usage_accounting import current_usage_scope
-
-        scope_effort = resolve_effort("scope_review")
-        active_scope = current_usage_scope()
-        max_budget_usd = options.get("max_budget_usd")
-        if max_budget_usd is None:
-            from ouroboros.usage_accounting import usage_projection
-
-            budget_root = pathlib.Path(
-                drive_root
-                or getattr(ctx, "budget_drive_root", "")
-                or getattr(active_scope, "drive_root", "")
-                or getattr(ctx, "drive_root", "") or repo_dir
+        if delegated_route:
+            # 5.8: only the transport changes — the delegated session runs the
+            # SAME advisory prompt in the same repo root and rehydrates the same
+            # result structure. The SDK budget kill is replaced by the runner's
+            # nanny-enforced time cap; cost settles through delegate_custody.
+            scope_effort = ""  # the session route carries its own effort
+            result, model = _run_advisory_delegated(prompt, repo_dir, ctx)
+        else:
+            from ouroboros.gateways.claude_code import (
+                DEFAULT_CLAUDE_CODE_MAX_TURNS,
+                run_readonly,
             )
-            root_id = str(
-                (getattr(ctx, "task_metadata", {}) or {}).get("root_task_id")
-                or getattr(active_scope, "root_task_id", "")
-                or getattr(ctx, "task_id", "")
-                or ""
-            )
-            caps: List[float] = []
-            global_limit = getattr(active_scope, "global_limit_usd", None)
-            root_limit = getattr(active_scope, "root_limit_usd", None)
-            if global_limit is not None:
-                global_projection = usage_projection(budget_root, global_limit_usd=float(global_limit))
-                caps.append(max(0.0, float(global_limit) - float(global_projection.get("accounted_usd") or 0.0)))
-            if root_id and root_limit is not None:
-                root_projection = usage_projection(budget_root, root_task_id=root_id)
-                caps.append(max(0.0, float(root_limit) - float(root_projection.get("accounted_usd") or 0.0)))
-            max_budget_usd = min(caps) if caps else None
-        if active_scope is not None:
-            from dataclasses import replace
-            from ouroboros.usage_accounting import usage_scope
+            from ouroboros.config import resolve_effort
+            from ouroboros.usage_accounting import current_usage_scope
 
-            with usage_scope(replace(
-                active_scope, category="advisory_review", source="claude_advisory_review",
-            )):
+            scope_effort = resolve_effort("scope_review")
+            active_scope = current_usage_scope()
+            max_budget_usd = options.get("max_budget_usd")
+            if max_budget_usd is None:
+                max_budget_usd = _advisory_sdk_budget(ctx, active_scope, drive_root, repo_dir)
+            if active_scope is not None:
+                from dataclasses import replace
+                from ouroboros.usage_accounting import usage_scope
+
+                with usage_scope(replace(
+                    active_scope, category="advisory_review", source="claude_advisory_review",
+                )):
+                    result = run_readonly(
+                        prompt=prompt, cwd=str(repo_dir), model=model,
+                        max_turns=DEFAULT_CLAUDE_CODE_MAX_TURNS,
+                        effort=scope_effort, max_budget_usd=max_budget_usd,
+                    )
+            else:
                 result = run_readonly(
                     prompt=prompt, cwd=str(repo_dir), model=model,
                     max_turns=DEFAULT_CLAUDE_CODE_MAX_TURNS,
                     effort=scope_effort, max_budget_usd=max_budget_usd,
                 )
-        else:
-            result = run_readonly(
-                prompt=prompt, cwd=str(repo_dir), model=model,
-                max_turns=DEFAULT_CLAUDE_CODE_MAX_TURNS,
-                effort=scope_effort, max_budget_usd=max_budget_usd,
-            )
 
         meta = {
             "model": model,
@@ -1036,10 +1173,15 @@ def _record_bypass(ctx: ToolContext, state: "AdvisoryReviewState", snapshot_hash
     except Exception:
         log.debug("Failed to persist advisory bypass visibility", exc_info=True)
     if "ANTHROPIC_API_KEY" in reason:
+        # Route-dependent honesty (plan 5.8 site 4): the key is only the API
+        # route's requirement — the owner also has the keyless delegated route.
         msg = (
-            "⚠️ ANTHROPIC_API_KEY is not set — advisory review skipped automatically. "
+            "⚠️ ANTHROPIC_API_KEY is not set — advisory review skipped automatically "
+            "because the configured advisory route (api) requires it. "
             "Bypass has been durably audited in events.jsonl. "
-            "Set ANTHROPIC_API_KEY in Settings to enable Claude Code advisory reviews."
+            "Set ANTHROPIC_API_KEY in Settings, or switch the advisory to the "
+            "delegated subscription route (OUROBOROS_ADVISORY_REVIEW_ROUTE="
+            "agent_session), which needs no API key."
         )
     else:
         msg = "Advisory review bypassed. Bypass has been durably audited."
@@ -1384,10 +1526,24 @@ def _handle_advisory_pre_review(
     task_id = str(getattr(ctx, "task_id", "") or "")
     state = load_state(drive_root)
 
-    # Auto-bypass missing Anthropic key with an audit record.
-    if not os.environ.get("ANTHROPIC_API_KEY", ""):
+    # Auto-bypass a missing Anthropic key ONLY when the configured advisory
+    # route actually needs it (plan 5.8 site 3 — the dangerous one): on the
+    # delegated route the constitutional gate RUNS instead of recording a
+    # routine-looking "auto-bypassed" over a commit the free route could have
+    # reviewed. A misconfigured route token is a loud error, not a bypass.
+    try:
+        _requires_key = advisory_route_requires_api_key()
+    except ValueError as exc:
+        return _json_response({
+            "status": "error",
+            "snapshot_hash": snapshot_hash,
+            "error": f"⚠️ ADVISORY_ERROR: {exc}",
+            "message": "Fix OUROBOROS_ADVISORY_REVIEW_ROUTE and retry.",
+        })
+    if _requires_key and not os.environ.get("ANTHROPIC_API_KEY", ""):
         return _record_bypass(ctx, state, snapshot_hash, commit_message,
-                               "ANTHROPIC_API_KEY not set — auto-bypassed", task_id, drive_root,
+                               "ANTHROPIC_API_KEY not set — auto-bypassed (advisory route=api)",
+                               task_id, drive_root,
                                snapshot_paths=paths)
 
     # Explicit audited bypass.

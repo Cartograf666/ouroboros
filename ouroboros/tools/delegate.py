@@ -820,6 +820,13 @@ def _start_request(ctx: ToolContext, route: Any, authority: "DelegatedRunShape",
         # here: one predicate decides what this child may do, and the mode follows it.
         "mode": authority.mode,
         "scope": {"kind": "project", "root": root},
+        # PIN, not preference: `primaryHarness` only fronts the engine's
+        # auto-pool, which still holds every other doctor-OK harness — the run
+        # could fail over onto a route the owner never configured. The
+        # explicit one-element `harnesses` pool is the engine's pinning
+        # contract (its own MCP surface spells a forced route exactly this
+        # way): the child rides THIS route or the start refuses typed.
+        "harnesses": [route.route_id],
         "primaryHarness": route.route_id,
         "access": authority.access,
     }

@@ -53,6 +53,11 @@ _REVIEW_STACK_PATHS = frozenset({
     "ouroboros/tools/triad_review.py",
     "ouroboros/tools/claude_advisory_review.py",
     "ouroboros/tools/plan_review.py",
+    # v6.87.21 extracted review execution (route vocabulary, transport dispatch,
+    # api_chat prompt rendering) below the substrate's seam; the seam module is
+    # part of the immune system's review surface and must never be reduced to an
+    # ordinary budget-selected dependency in a broad review pack.
+    "ouroboros/review_execution.py",
     "ouroboros/triad_review.py",
     "ouroboros/review_state.py",
     "ouroboros/review_evidence.py",

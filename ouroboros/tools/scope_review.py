@@ -15,12 +15,12 @@ import inspect
 import logging
 import os
 import pathlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, List, Optional
 
 from ouroboros.llm import LLMClient
 from ouroboros.config import review_model_uses_local
-from ouroboros.review_substrate import review_repo_dirs_for
+from ouroboros.review_substrate import review_repo_dirs_for, scope_reviewer_slots
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.review_context_atlas import (
     ReviewContextAtlasRequest,
@@ -59,7 +59,7 @@ from ouroboros.tools.review_helpers import (
     format_review_history_entry,
     parse_git_name_status,
 )
-from ouroboros.triad_review import extract_json_array
+from ouroboros.triad_review import REVIEW_JSON_MATRIX_CONTRACT, extract_json_array
 from ouroboros.utils import (
     run_cmd,
     utc_now_iso,
@@ -394,7 +394,7 @@ class ScopeReviewResult:
     raw_text: str = ""
     model_id: str = ""
     # responded|error|parse_failure|empty_response|budget_exceeded|fixed_overflow|
-    # sub_floor|omitted|empty
+    # sub_floor|session_advisory|omitted|empty — only `responded` is AUTHORITATIVE
     status: str = "responded"
     prompt_chars: int = 0
     # measured (len(prompt)) | estimated_from_tokens (no prompt was assembled)
@@ -1018,42 +1018,62 @@ def _log_scope_result(
         pass
 
 
-def _call_scope_llm(prompt: str, scope_model: str | None = None, ctx: ToolContext | None = None) -> tuple:
-    """Execute the scope review LLM call synchronously.
+def _call_scope_llm(
+    prompt: str,
+    scope_model: str | None = None,
+    ctx: ToolContext | None = None,
+    slot_id: str = "",
+    route: Any = None,
+    session_task: str = "",
+    session_root: str = "",
+) -> tuple:
+    """Execute the scope review call synchronously — api pack or agent session.
 
     Returns (raw_text, usage, error_msg) — error_msg is non-empty on failure.
     ``usage`` may contain a private ``_review_refs`` entry with durable prompt
     and response refs from the shared review substrate.
-    """
+
+    ``slot_id`` is the identity of the configured row this call belongs to,
+    supplied by whoever fanned the rows out. ``route`` is the row's configured
+    delivery: on ``agent_session`` the substrate's session executor delivers
+    ``session_task`` in ``session_root`` and the api pack is never rendered
+    (5.2); parsing, classification and blocking above this call are identical
+    for both deliveries (5.3)."""
     from ouroboros.config import resolve_effort as _resolve_effort
+    from ouroboros.review_execution import ReviewRouteKind
+
     scope_model = scope_model or _get_scope_model()
     scope_effort = _resolve_effort("scope_review")
+    delegated = str(getattr(route, "value", route) or "") == "agent_session"
     # Output budget scales with the reviewer window: requesting the absolute
     # 100K reserve on a small-window model would 400 on input+max_tokens.
     _scope_output_tokens, _ = _window_scaled_reserves(_scope_reviewer_window(scope_model))
-    # Split at the recorded stable/dynamic boundary so the byte-stable prefix
-    # (instructions + checklist + canonical docs) carries the provider cache
-    # marker while the per-commit tail (diff/atlas/history) stays unmarked.
-    from ouroboros.tools.review_helpers import cached_prompt_blocks
-
-    _stable_len = int(_SCOPE_STABLE_PREFIX_LEN.get() or 0)
-    if 0 < _stable_len <= len(prompt):
-        system_content: Any = cached_prompt_blocks(prompt[:_stable_len], prompt[_stable_len:])
+    if delegated:
+        messages: Any = []
     else:
-        # No recorded boundary (e.g. a caller that did not assemble via
-        # _build_scope_prompt): send a plain string. Marking the WHOLE prompt —
-        # per-commit diff included — as a 1h cache block would pay the extended
-        # write premium on content that never repeats.
-        system_content = prompt
-    messages = [
-        {"role": "system", "content": system_content},
-        {
-            "role": "user",
-            "content": "Review the staged change and context above. Output ONLY a JSON array.",
-        },
-    ]
+        # Split at the recorded stable/dynamic boundary so the byte-stable prefix
+        # (instructions + checklist + canonical docs) carries the provider cache
+        # marker while the per-commit tail (diff/atlas/history) stays unmarked.
+        from ouroboros.tools.review_helpers import cached_prompt_blocks
+
+        _stable_len = int(_SCOPE_STABLE_PREFIX_LEN.get() or 0)
+        if 0 < _stable_len <= len(prompt):
+            system_content: Any = cached_prompt_blocks(prompt[:_stable_len], prompt[_stable_len:])
+        else:
+            # No recorded boundary (e.g. a caller that did not assemble via
+            # _build_scope_prompt): send a plain string. Marking the WHOLE prompt —
+            # per-commit diff included — as a 1h cache block would pay the extended
+            # write premium on content that never repeats.
+            system_content = prompt
+        messages = [
+            {"role": "system", "content": system_content},
+            {
+                "role": "user",
+                "content": "Review the staged change and context above. Output ONLY a JSON array.",
+            },
+        ]
     try:
-        from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+        from ouroboros.review_substrate import ReviewRequest, run_review_request
 
         request = ReviewRequest(
             surface="scope_review",
@@ -1064,16 +1084,34 @@ def _call_scope_llm(prompt: str, scope_model: str | None = None, ctx: ToolContex
             max_tokens=_scope_output_tokens,
             temperature=0.2,
             no_proxy=True,
+            session_task=session_task if delegated else "",
+            session_root=session_root if delegated else "",
+            # The extraction fallback canonicalizes to the SCOPE contract: the
+            # required-matrix shape with the eight verbatim item ids (D19 — the
+            # light model follows the review's own contract, never a looser one).
+            policy=(
+                {
+                    "output_contract": (
+                        REVIEW_JSON_MATRIX_CONTRACT
+                        + "\nRequired item ids (verbatim, one entry each): "
+                        + ", ".join(sorted(SCOPE_REQUIRED_ITEMS))
+                    ),
+                }
+                if delegated
+                else {}
+            ),
         )
-        slot = ReviewSlot(
-            slot_id="scope_slot_1",
-            model=scope_model,
-            effort=scope_effort,
+        # Identity comes from the configured row, never from the row's model.
+        row = scope_reviewer_slots([scope_model], effort=scope_effort)[0]
+        slot = replace(
+            row,
+            slot_id=slot_id or row.slot_id,
             timeout_sec=_SCOPE_REVIEW_SLOT_TIMEOUT_SEC,
             max_tokens=_scope_output_tokens,
             temperature=0.2,
-            role_hint="scope reviewer",
-            use_local=review_model_uses_local(scope_model),
+            # ROUTE is CARRIED, never re-derived: a one-element slot list re-reads ROUTES
+            # **row 1**, which sent a mixed config's api row as agent_session (pack, no task).
+            route=ReviewRouteKind.AGENT_SESSION if delegated else ReviewRouteKind.API_CHAT,
         )
         result = run_review_request(
             request,
@@ -1303,16 +1341,27 @@ def _handle_prompt_signals(
 
 
 def _apply_scope_authority(
-    ctx: ToolContext,
     critical_findings: List[dict],
     advisory_findings: List[dict],
     *,
     scope_model_id: str,
-    prompt_tokens_est: int,
     result_kwargs: dict,
+    delegated: bool = False,
 ) -> tuple[List[dict], List[dict], Optional[ScopeReviewResult]]:
-    """Apply the established one-pass P3 sub-floor downgrade semantics."""
+    """One-pass P3 authority for THIS row's delivery: is the reviewer's window ESTABLISHED
+    enough for its verdict to gate a commit? ``api_chat`` must fit the whole assembled pack
+    (constitutional >=1M; sub-floor BLOCKS); ``agent_session`` assembles none and needs
+    SOURCED window evidence instead (scope_review_session owns that decision). NEITHER is
+    waved through — skipping this for sessions let one gate with no window test at all."""
     window, provenance = _scope_reviewer_window_evidence(scope_model_id)
+    if delegated:
+        from ouroboros.tools.scope_review_session import session_scope_authority
+
+        return session_scope_authority(
+            critical_findings, advisory_findings, scope_model=scope_model_id,
+            window=window, provenance=provenance, result_kwargs=result_kwargs,
+            phrase=_window_provenance_phrase(window, provenance),
+        )
     if not (window and window < _SCOPE_MODEL_CONTEXT_WINDOW):
         return critical_findings, advisory_findings, None
     for finding in critical_findings:
@@ -1345,6 +1394,8 @@ def run_scope_review(
     review_history: Optional[list] = None,
     scope_review_history: Optional[list] = None,  # prior scope rounds for this commit
     scope_model: Optional[str] = None,
+    slot_id: str = "",  # identity of the configured row this call runs (see scope_reviewer_slots)
+    route: Any = None,  # the row's configured delivery (ReviewRouteKind); None/api_chat = api
 ) -> ScopeReviewResult:
     """Run the blocking scope review, or record the owner-declared low-mode skip."""
     if _scope_review_skipped_in_low_context():
@@ -1358,18 +1409,37 @@ def run_scope_review(
             block_message=f"⚠️ SCOPE_REVIEW_BLOCKED: invalid review roots: {exc}.",
         )
     scope_model_id = scope_model or _get_scope_model()
+    delegated = str(getattr(route, "value", route) or "") == "agent_session"
 
     try:
-        prompt, context_status = _build_scope_prompt(
-            repo_dir, commit_message,
-            goal=goal, scope=scope,
-            review_rebuttal=review_rebuttal,
-            review_history=review_history,
-            scope_review_history=scope_review_history,
-            drive_root=pathlib.Path(ctx.drive_root) if getattr(ctx, "drive_root", None) else None,
-            scope_model=scope_model_id,
-            governance_repo_dir=governance_repo,
-        )
+        if delegated:
+            # Session delivery (5.2): same task/checklist/contract, no assembled
+            # pack — the session retrieves with its own tools in the repo root.
+            from ouroboros.tools.scope_review_session import ScopeIntentContext as _Intent
+            from ouroboros.tools.scope_review_session import build_scope_session_task
+
+            session_task, session_manifest = build_scope_session_task(
+                repo_dir, commit_message,
+                _Intent(goal=goal, scope=scope, review_rebuttal=review_rebuttal,
+                        review_history=review_history,
+                        scope_review_history=scope_review_history),
+                drive_root=pathlib.Path(ctx.drive_root) if getattr(ctx, "drive_root", None) else None,
+                governance_repo_dir=governance_repo,
+            )
+            _SCOPE_CONTEXT_MANIFEST.set(session_manifest)
+            prompt, context_status = session_task, None
+        else:
+            session_task = ""
+            prompt, context_status = _build_scope_prompt(
+                repo_dir, commit_message,
+                goal=goal, scope=scope,
+                review_rebuttal=review_rebuttal,
+                review_history=review_history,
+                scope_review_history=scope_review_history,
+                drive_root=pathlib.Path(ctx.drive_root) if getattr(ctx, "drive_root", None) else None,
+                scope_model=scope_model_id,
+                governance_repo_dir=governance_repo,
+            )
     except RuntimeError as exc:
         return ScopeReviewResult(
             blocked=True,
@@ -1383,11 +1453,11 @@ def run_scope_review(
             context_manifest=_current_scope_context_manifest(),
         )
 
+    # Pack-budget signals belong to an ASSEMBLED pack: a session assembles none, so its
+    # context_status is None and this returns None by construction — no route branch.
     signal_result = _handle_prompt_signals(
-        prompt,
-        context_status,
+        prompt, context_status, scope_model=scope_model_id,
         input_limit=_effective_scope_input_limit(scope_model=scope_model_id),
-        scope_model=scope_model_id,
     )
     if signal_result is not None:
         # Keep _handle_prompt_signals as the status SSOT for early exits.
@@ -1397,7 +1467,10 @@ def run_scope_review(
 
     _prompt_chars = len(prompt)  # type: ignore[arg-type]
     _prompt_tokens_est = estimate_tokens(prompt)  # type: ignore[arg-type]
-    raw_text, usage, llm_error = _call_scope_llm(prompt, scope_model=scope_model_id, ctx=ctx)  # type: ignore[arg-type]
+    raw_text, usage, llm_error = _call_scope_llm(
+        prompt, scope_model=scope_model_id, ctx=ctx, slot_id=slot_id,
+        route=route, session_task=session_task, session_root=str(repo_dir),
+    )  # type: ignore[arg-type]
     _usage = dict(usage or {})
     _review_refs = dict(_usage.pop("_review_refs", {}) or {})
     _prompt_ref = dict(_review_refs.get("prompt_ref") or {})
@@ -1545,12 +1618,8 @@ def run_scope_review(
         "response_ref": _response_ref,
     }
     critical_findings, advisory_findings, authority_block = _apply_scope_authority(
-        ctx,
-        critical_findings,
-        advisory_findings,
-        scope_model_id=scope_model_id,
-        prompt_tokens_est=_prompt_tokens_est,
-        result_kwargs=result_kwargs,
+        critical_findings, advisory_findings, scope_model_id=scope_model_id,
+        result_kwargs=result_kwargs, delegated=delegated,
     )
     if authority_block is not None:
         return authority_block

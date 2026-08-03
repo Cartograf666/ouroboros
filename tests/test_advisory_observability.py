@@ -4,6 +4,7 @@ Split from test_commit_gate.py to keep each test module within the ~1000-line li
 """
 import importlib
 import json
+import pathlib
 import os
 import sys
 
@@ -1018,28 +1019,110 @@ class TestLLMFallbackExtraction:
         result = self.mod._llm_extract_advisory_items(raw_text, self._make_ctx())
         assert result == expected
 
-    def test_fallback_window_includes_tail_for_long_inputs(self, monkeypatch):
-        """For inputs longer than head+tail budget, _build_fallback_window must preserve
-        the TAIL (where JSON lives) and show a head excerpt + omission note — not a
-        first-N truncation that would discard the JSON at the end."""
-        head_chars = self.mod._FALLBACK_HEAD_CHARS
-        tail_chars = self.mod._FALLBACK_TAIL_CHARS
+    def test_mid_artifact_critical_survives_the_verdict(self, monkeypatch):
+        """A critical raised in the MIDDLE of a long advisory must reach the verdict.
 
-        # Build a text that is bigger than the combined budget.
-        # Head = 'A' * head_chars, middle filler, tail contains a distinct marker.
-        tail_marker = "TAIL_JSON_MARKER"
-        filler_size = head_chars + tail_chars + 10_000  # clearly over budget
-        preamble = "A" * filler_size
-        raw_text = preamble + tail_marker
+        Extraction used to read a 4K head + 60K tail window: everything between was
+        dropped, so a mid-artifact critical vanished — and because entries may carry
+        `obligation_id`, a surviving advisory row could then close an obligation whose
+        critical had just been cut away. The shared SSOT reads the WHOLE artifact, so
+        either the array is read from it directly or the whole text reaches the
+        extractor — the middle is never cut away before the verdict.
+        """
+        seen = {}
+        expected = [{"item": "bug_hunting", "verdict": "FAIL", "severity": "critical",
+                     "reason": "off-by-one in the mid-artifact path"}]
 
-        window = self.mod._build_fallback_window(raw_text)
+        def fake_chat(_self, **kwargs):
+            seen["prompt"] = kwargs["messages"][0]["content"]
+            return {"content": json.dumps(expected)}, {"cost": 0.0001}
 
-        # Tail marker must be present
-        assert tail_marker in window, "Tail (where JSON lives) must be included in the window"
-        # Omission note must be present for middle-section awareness
-        assert "OMISSION NOTE" in window, "Omission note must mark the skipped middle section"
-        # Window must be shorter than full raw_text
-        assert len(window) < len(raw_text)
+        import ouroboros.llm as llm_mod
+        monkeypatch.setattr(llm_mod.LLMClient, "chat", fake_chat)
+
+        marker = "MID_ARTIFACT_CRITICAL_MARKER"
+        raw_text = ("A" * 80_000) + marker + json.dumps(expected) + ("B" * 80_000)
+        result = self.mod._llm_extract_advisory_items(raw_text, self._make_ctx())
+
+        assert result == expected
+        if "prompt" in seen:  # if a light-model call was needed, it saw everything
+            assert marker in seen["prompt"]
+            assert "OMISSION NOTE" not in seen["prompt"]
+            assert raw_text in seen["prompt"]
+
+    def test_oversize_artifact_refuses_typed_instead_of_guessing(self, monkeypatch):
+        """Beyond the one-send extraction bound the answer is a typed refusal — never
+        a verdict fabricated from whatever part happened to be visible."""
+        calls = []
+
+        def counting_chat(_self, **kwargs):
+            # Counted, NOT raised: an exception here would be swallowed by the
+            # extractor's own guard and the test would pass for the wrong reason.
+            calls.append(kwargs)
+            return {"content": "[]"}, {"cost": 0.0001}
+
+        import ouroboros.llm as llm_mod
+        from ouroboros.review_execution import _EXTRACT_MAX_CHARS
+        monkeypatch.setattr(llm_mod.LLMClient, "chat", counting_chat)
+
+        raw_text = "x" * (_EXTRACT_MAX_CHARS + 1)
+        assert self.mod._llm_extract_advisory_items(raw_text, self._make_ctx()) == []
+        # No windowed read was attempted at all — the refusal is typed, not a guess.
+        assert calls == [], "extraction ran on an artifact over the one-send bound"
+
+    def test_bare_empty_array_from_the_light_model_is_not_a_clean_verdict(self):
+        """TRAP: the canonicalizer legitimately returns "[]" for "no findings here".
+        Cleanliness is judged on the RAW artifact, so moving it onto the canonical
+        text would fabricate a verified-clean verdict out of a failed extraction."""
+        # The light model's "[]" yields no items...
+        assert self.mod._parse_advisory_output("[]") == []
+        # ...and the raw artifact it came from is NOT clean: no NO_FINDINGS sentinel,
+        # no bare-`[]` body — so the run stays parse_failure rather than clean.
+        assert self.mod._is_clean_verdict("I could not complete the review.") is False
+        assert self.mod._is_clean_verdict("blah blah [] blah") is False
+        # The genuine clean shapes still are clean.
+        assert self.mod._is_clean_verdict("[]") is True
+        assert self.mod._is_clean_verdict(json.dumps({"result": "[]\nNO_FINDINGS"})) is True
+
+    def test_delegated_advisory_asks_the_schema_and_discloses_off_pin(self):
+        """The delegated advisory asks for the structured verdict like every other
+        review session, trusts it only on outputConformance == "passed", and emits the
+        same three capability deltas the substrate emits."""
+        from ouroboros.review_execution import REVIEW_SESSION_OUTPUT_SCHEMA
+
+        asked = {}
+
+        def fake_runner(**kwargs):
+            # The delivery knobs now ride ONE immutable invocation value.
+            invocation = kwargs["invocation"]
+            asked.update({f: getattr(invocation, f) for f in
+                          ("task_id", "surface", "slot_id", "output_schema")})
+            return {
+                "text": '[]', "run_id": "run-9", "route_id": "pinned-route",
+                "model": "m", "spend": None, "spend_estimated": False,
+                "settlement": {}, "schema_asked": True, "conformance": "failed",
+                "effective_route_ids": ["other-route"],
+            }
+
+        import ouroboros.review_execution as rx
+        original = rx.run_delegated_review_session
+        rx.run_delegated_review_session = fake_runner
+        try:
+            result, _model = self.mod._run_advisory_delegated(
+                "prompt", pathlib.Path("/tmp"), self._make_ctx(),
+            )
+        finally:
+            rx.run_delegated_review_session = original
+
+        assert asked["output_schema"] == REVIEW_SESSION_OUTPUT_SCHEMA
+        usage = result.usage
+        assert usage["schema_asked"] is True
+        # Reported but NOT conformed => not trusted.
+        assert usage["output_conformance"] == "failed"
+        assert usage["conformance_trusted"] is False
+        reasons = {d["reason"] for d in usage["capability_delta"]}
+        assert reasons == {"schema_not_conformed_on_effective_route",
+                           "session_ran_off_pinned_route"}, reasons
 
     def test_resolve_fallback_model_no_env_uses_config_default(self, monkeypatch):
         """When OUROBOROS_MODEL_LIGHT is unset, the fallback model falls back to Main

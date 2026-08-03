@@ -24,7 +24,6 @@ from ouroboros.headless import prepare_task_drive, task_state_dir
 from ouroboros.contracts.task_contract import (
     build_task_contract,
     normalize_allowed_resources,
-    normalize_bool,
 )
 from ouroboros.tools.control_delegation import (
     _ensure_project_scope,

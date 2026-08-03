@@ -1396,6 +1396,11 @@ def test_the_start_request_asks_for_the_substrate_it_claims(tmp_path, monkeypatc
     delegate._delegate_start(_plain_ctx(tmp_path), "x")
     delegate._CUSTODY.clear()
     assert seen["request"]["authPreference"] == "subscription"
+    # And the configured route is PINNED as the explicit one-element pool:
+    # `primaryHarness` alone only fronts the engine's auto-pool, so without
+    # this the child could fail over onto a harness the owner never named.
+    assert seen["request"]["harnesses"] == ["some-route"]
+    assert seen["request"]["primaryHarness"] == "some-route"
 
 
 def test_a_202_handle_without_a_run_id_is_a_live_run_not_a_failure(tmp_path, monkeypatch):

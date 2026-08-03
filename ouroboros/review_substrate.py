@@ -8,7 +8,6 @@ reviewer slots.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import hashlib
 import json
@@ -27,7 +26,27 @@ from ouroboros.config import get_review_models, review_model_uses_local
 from ouroboros.llm import LLMClient
 from ouroboros.observability import new_call_id, persist_call, redact_projection
 from ouroboros.provider_models import provider_for_model
-from ouroboros.triad_review import ACCEPTANCE_SURFACE_RULES, TIER_CLASSIFICATION_RULES, extract_json_array
+# Everything below the seam. Re-exported here because the substrate is the
+# historical import site for the api_chat prompt renderers; `review_execution`
+# owns them now and must never import this module back.
+from ouroboros.review_execution import (  # noqa: F401  (compat re-exports)
+    AgentSessionReviewExecutor,
+    ApiChatReviewExecutor,
+    ReviewAssignment,
+    ReviewAttemptResult,
+    ReviewRouteKind,
+    ReviewRouteUnavailable,
+    ReviewSlotExecutor,
+    _execute_slot_attempt,
+    _messages_char_count,
+    _render_prompt,
+    _render_prompt_parts,
+    _request_messages,
+    _review_route_executor,
+    assert_cache_breakpoint_cap,
+    configured_review_routes,
+)
+from ouroboros.triad_review import extract_json_array
 from ouroboros.usage_accounting import (
     UsageAccountingError,
     UsageScope,
@@ -65,6 +84,9 @@ class ReviewSlot:
     temperature: float | None = None
     role_hint: str = ""
     use_local: bool = False
+    # Delivery route for this slot. ``use_local`` above is the existing
+    # precedent for a per-slot transport hint; ``route`` is the general axis.
+    route: ReviewRouteKind = ReviewRouteKind.API_CHAT
 
 
 @dataclass
@@ -83,6 +105,13 @@ class ReviewRequest:
     max_tokens: int | None = None
     temperature: float | None = None
     no_proxy: bool = False
+    # Session delivery (agent_session route only; the api_chat route never reads
+    # either). ``session_root`` is the repository root the reviewer session runs
+    # in; ``session_task`` is the surface's compact route-owned task text — the
+    # SAME task/criteria the api pack carries, minus the assembled evidence,
+    # because a delegated reviewer retrieves context with its own tools (D12).
+    session_root: str = ""
+    session_task: str = ""
 
 
 @dataclass
@@ -811,165 +840,78 @@ def build_improvement_capsule(
     return "\n".join(lines)
 
 
-def reviewer_slots(models: List[str] | None = None, *, effort: str = "medium", role_hint: str = "") -> List[ReviewSlot]:
+# Identity prefixes for the configured reviewer surfaces. A surface that fans
+# rows out registers its prefix here rather than spelling one inline, so
+# ``slot_id_for_row`` stays the only place a row id is built.
+SLOT_ID_PREFIX = "slot"
+SCOPE_SLOT_ID_PREFIX = "scope_slot"
+PLAN_SLOT_ID_PREFIX = "plan_slot"
+
+
+def slot_id_for_row(index: int, *, prefix: str = SLOT_ID_PREFIX) -> str:
+    """Identity of the ``index``-th (1-based) configured reviewer row.
+
+    The single mint for reviewer-slot identity, and the reason this module's
+    contract says slot identity is separate from model identity. Naming a row
+    after its own model instead collides two rows that share a model (a supported
+    configuration — ``get_scope_review_models`` preserves duplicates on purpose),
+    collides two model spellings that sanitize alike (``openai::gpt-5`` and
+    ``openai/gpt/5``), and moves a row's identity the moment the owner edits its
+    model, so the row's receipts stop lining up with its own history. The model,
+    the route and the effort are PROPERTIES of a row, never its name.
+    """
+    return f"{prefix}_{int(index)}"
+
+
+def reviewer_slots(
+    models: List[str] | None = None,
+    *,
+    effort: str = "medium",
+    role_hint: str = "",
+    id_prefix: str = SLOT_ID_PREFIX,
+    route_env_key: str = "",
+) -> List[ReviewSlot]:
+    """The configured reviewer rows, each carrying its DELIVERY route.
+
+    ``route_env_key`` names the surface's per-row route list (plan 5.1): the
+    commit triad and scope pass theirs, so a row can be an api_chat call or a
+    delegated agent session. Surfaces that stay on the API by owner decision
+    (task acceptance, plan review — D15) pass NOTHING, which pins every row to
+    ``api_chat`` explicitly rather than by accident.
+    """
     raw_models = models if models is not None else get_review_models()
+    named = [str(model) for model in (raw_models or []) if str(model or "").strip()]
+    routes = configured_review_routes(route_env_key, len(named)) if route_env_key else [
+        ReviewRouteKind.API_CHAT
+    ] * len(named)
     return [
-        ReviewSlot(slot_id=f"slot_{idx + 1}", model=str(model), effort=effort,
-                   role_hint=role_hint, use_local=review_model_uses_local(str(model)))
-        for idx, model in enumerate(raw_models or [])
-        if str(model or "").strip()
+        ReviewSlot(slot_id=slot_id_for_row(idx + 1, prefix=id_prefix), model=model, effort=effort,
+                   role_hint=role_hint, use_local=review_model_uses_local(model),
+                   route=routes[idx])
+        for idx, model in enumerate(named)
     ]
 
 
-def _render_prompt_parts(request: ReviewRequest, slot: ReviewSlot) -> tuple[str, str, str]:
-    """Return (stable_governance, task_stable, dynamic_evidence) for one slot.
+def scope_reviewer_slots(models: List[str] | None = None, *, effort: str = "medium") -> List[ReviewSlot]:
+    """The configured scope-reviewer rows — the single owner of scope-slot identity.
 
-    Cache segmentation (v6.74.0, B1): the byte-stable governance instruction and
-    the task-stable contract (goal/scope/checklist/policy — stable across the
-    improvement passes of ONE task) are the two cache-marked segments; the
-    mutable tail (subject, evidence, refs) is never marked, and the slot label
-    lives at its TAIL so concurrent same-model slots share a warm prefix."""
-    evidence = json.dumps(request.evidence, ensure_ascii=False, indent=2, default=str)
-    refs = json.dumps(request.evidence_refs, ensure_ascii=False, indent=2, default=str)
-    policy = json.dumps(request.policy, ensure_ascii=False, indent=2, default=str)
-    classify_tier = bool(request.policy.get("classify_outcome_tier"))
-    # The tier keys belong in the REQUIRED key list, not trailing prose — models
-    # honor the explicit "Return JSON with keys" list and otherwise drop them,
-    # which silently kills the best_effort/completion-coach lexicon.
-    tier_keys = (
-        ', outcome_tier ("solved"|"best_effort"|"blocked_with_evidence"), completion_coach'
-        if classify_tier
-        else ""
+    Both scope surfaces read their ids from here: the substrate call that produces
+    the durable prompt/response refs, and the actor records the commit attempt
+    persists. One row therefore carries exactly one identity instead of two that
+    disagree. Each row also carries its configured delivery route (D14: every
+    scope slot is independently harness-or-API).
+    """
+    if models is None:
+        # Resolved at call time so the configured list stays the live authority.
+        from ouroboros.config import get_scope_review_models
+
+        models = get_scope_review_models()
+    from ouroboros.review_execution import SCOPE_REVIEW_ROUTES_ENV
+
+    return reviewer_slots(
+        models, effort=effort, role_hint="scope reviewer", id_prefix=SCOPE_SLOT_ID_PREFIX,
+        route_env_key=SCOPE_REVIEW_ROUTES_ENV,
     )
-    # For task acceptance the reviewer makes its derived acceptance criteria
-    # VISIBLE — recorded per-actor in the review trace / objective axis (M4) so
-    # "for whom we review" is auditable. Reviewer reasoning, not a new
-    # authoritative gate (criteria live in actors[].parsed, not a separate phase).
-    criteria_key = (
-        ', criteria_used (the acceptance criteria you re-derived from the full goal narrative '
-        'and checked, as [{criterion, status (supported|missing|partial|rejected), evidence_refs}]; evidence_refs must name concrete '
-        'host-attested receipts/artifacts/tool results for every contributing criterion)'
-        if request.surface == "task_acceptance"
-        else ""
-    )
-    # v6.74.0 acceptance-dialogue keys (A3/A5): reviewer-authored obligation
-    # identity and the typed dialogue judgement. Both live in the REQUIRED key
-    # list for the same reason as the tier keys above.
-    dialogue_key = (
-        ', dialogue_status ("continue_actionable"|"unreachable_here"|"stable_disagreement")'
-        if request.surface == "task_acceptance"
-        else ""
-    )
-    findings_shape = (
-        '[{severity, item, evidence, recommendation, disposition_kind ("new"|"re_raise"), '
-        'obligation_id (required when disposition_kind="re_raise")}]'
-        if request.surface == "task_acceptance"
-        else "[{severity, item, evidence, recommendation}]"
-    )
-    tier_rules = TIER_CLASSIFICATION_RULES if classify_tier else ""
-    acceptance_rules = (
-        ACCEPTANCE_SURFACE_RULES if request.surface == "task_acceptance" else ""
-    )
-    stable = (
-        "You are an independent Ouroboros reviewer slot.\n"
-        f"Surface: {request.surface}\n"
-        f"Role hint: {slot.role_hint or 'general reviewer'}\n\n"
-        "The review subject and evidence packet arrive in the user message.\n\n"
-        f"Return JSON with keys: verdict (PASS|FAIL|DEGRADED){tier_keys}{criteria_key}{dialogue_key}, findings "
-        f"({findings_shape}), and summary. "
-        + tier_rules
-        + acceptance_rules
-        + "If you cannot judge because evidence is missing, return DEGRADED and explain."
-        + "\n\n"  # trailing separator: block-flattening providers glue segments
-    )
-    task_stable = (
-        "Review goal:\n"
-        f"{request.goal}\n\n"
-        "Declared scope:\n"
-        f"{request.scope or '(not specified)'}\n\n"
-        "Checklist / acceptance criteria:\n"
-        f"{request.checklist or '(none supplied)'}\n\n"
-        "Policy:\n"
-        f"{policy}"
-        "\n\n"  # trailing separator inside the cache-marked segment (r1 #3)
-    )
-    dynamic = (
-        "Subject:\n"
-        f"{request.subject}\n\n"
-        "Evidence refs:\n"
-        f"{refs}\n\n"
-        "Evidence packet:\n"
-        f"{evidence}\n\n"
-        # Slot identity stays at the TAIL of the mutable part so duplicate
-        # same-model reviewer slots share one warm prefix for the whole prompt.
-        f"Slot: {slot.slot_id}"
-    )
-    return stable, task_stable, dynamic
-
-
-def _render_prompt(request: ReviewRequest, slot: ReviewSlot) -> str:
-    """Flat compatibility view; segments carry their own trailing separators,
-    so this equals what a block-flattening provider actually receives."""
-    stable, task_stable, dynamic = _render_prompt_parts(request, slot)
-    return stable + task_stable + dynamic
-
-
-# Provider hard limit on declared cache breakpoints; asserted on every final payload (B1).
-_MAX_PROMPT_CACHE_BREAKPOINTS = 4
-
-
-def assert_cache_breakpoint_cap(messages: List[Dict[str, Any]]) -> None:
-    count = 0
-    for message in messages:
-        content = message.get("content") if isinstance(message, dict) else None
-        if isinstance(content, list):
-            count += sum(
-                1 for block in content
-                if isinstance(block, dict) and block.get("cache_control")
-            )
-    if count > _MAX_PROMPT_CACHE_BREAKPOINTS:
-        raise AssertionError(
-            f"prompt declares {count} cache breakpoints "
-            f"(cap {_MAX_PROMPT_CACHE_BREAKPOINTS})"
-        )
-
-
-def _request_messages(request: ReviewRequest, slot: ReviewSlot) -> List[Dict[str, Any]]:
-    if request.messages:
-        messages = [
-            dict(message) if isinstance(message, dict) else {"role": "user", "content": str(message)}
-            for message in request.messages
-        ]
-        assert_cache_breakpoint_cap(messages)  # the cap covers EVERY final payload
-        return messages
-    # Default shape is cache-friendly (v6.74.0, B1): two cache-marked system
-    # segments — the byte-stable governance instruction and the task-stable
-    # contract (goal/scope/checklist/policy, unchanged across a task's
-    # improvement passes) — followed by the unmarked mutable evidence tail as
-    # the user message. The large evidence body changes every pass by design
-    # and is honestly not cached.
-    from ouroboros.tools.review_helpers import cached_prompt_blocks
-
-    stable, task_stable, dynamic = _render_prompt_parts(request, slot)
-    system_blocks = cached_prompt_blocks(stable)
-    system_blocks.extend(cached_prompt_blocks(task_stable))
-    messages = [
-        {"role": "system", "content": system_blocks},
-        {"role": "user", "content": dynamic},
-    ]
-    assert_cache_breakpoint_cap(messages)
-    return messages
-
-
-def _messages_char_count(messages: List[Dict[str, Any]]) -> int:
-    total = 0
-    for message in messages:
-        content = message.get("content") if isinstance(message, dict) else message
-        if isinstance(content, list):
-            total += sum(len(str(block.get("text", block))) if isinstance(block, dict) else len(str(block)) for block in content)
-        else:
-            total += len(str(content or ""))
-    return total
 
 
 def _extract_fenced_json(text: str) -> Any:
@@ -1039,7 +981,22 @@ class ReviewCoordinator:
         usage_ctx: Any = None,
     ):
         self.llm = llm or LLMClient()
-        self.drive_root = pathlib.Path(drive_root) if drive_root is not None else pathlib.Path("../data")
+        if drive_root is not None:
+            self.drive_root = pathlib.Path(drive_root)
+        else:
+            # ISO-DRIP: the default is the ABSOLUTE config SSOT, never the old
+            # cwd-relative "../data" — with any cwd under a repo/ that spelling
+            # names the LIVE data root's sibling, so default-constructed
+            # coordinators dripped synthetic review records into live
+            # observability (and on trees with the absolute-root guard they
+            # silently LOST the records instead: persist_call refuses relative
+            # roots and the coordinator swallows it into empty refs). Same
+            # resolution order the review surfaces already use
+            # (review_drive_root: ctx → DATA_DIR); read late off the module so
+            # test isolation and runtime rebinding are honored.
+            from ouroboros import config
+
+            self.drive_root = pathlib.Path(config.DATA_DIR)
         self.usage_ctx = usage_ctx
 
     def run(self, request: ReviewRequest, slots: List[ReviewSlot]) -> ReviewRunResult:
@@ -1322,10 +1279,36 @@ class ReviewCoordinator:
             panel_id=_review_panel_id(request, actors),
         )
 
+    def _custody_drive_root(self) -> pathlib.Path:
+        """Where a DELEGATED slot's custody rows live: the canonical (budget)
+        drive when the usage context names one, else this coordinator's drive.
+        Data handed to the seam once, so the api_chat route never pays for it."""
+        ctx = self.usage_ctx
+        if ctx is not None and getattr(ctx, "drive_root", None):
+            try:
+                from ouroboros.delegate_custody import custody_root
+
+                return custody_root(ctx)
+            except Exception:
+                log.debug("custody root resolution failed; using coordinator drive", exc_info=True)
+        return self.drive_root
+
     def _error_actor(self, request: ReviewRequest, slot: ReviewSlot, error: str) -> ReviewActorRecord:
         call_id = new_call_id(f"review_{request.surface}_{slot.slot_id}_error")
         base_call_type = request.call_type or f"{request.surface}_review"
-        messages = _request_messages(request, slot)
+        assignment = ReviewAssignment(
+            request=request, slot=slot, call_id=call_id, call_type=base_call_type,
+            custody_root=self._custody_drive_root(),
+        )
+        # The synthetic prompt record is the route's own projection too: a slot
+        # that never started must not build a pack its route would never send.
+        # Best-effort by construction — this is the last-resort record for a slot
+        # that already failed, so a route refusal (or an unrenderable prompt)
+        # must degrade the record, never re-raise inside the failure path.
+        try:
+            prompt_projection = _review_route_executor(assignment, llm=self.llm).prompt_payload()
+        except Exception:
+            prompt_projection = {}
         prompt_ref: Dict[str, Any] = {}
         response_ref: Dict[str, Any] = {}
         try:
@@ -1334,7 +1317,7 @@ class ReviewCoordinator:
                 task_id=request.task_id or "review",
                 call_id=f"{call_id}_prompt",
                 call_type=f"{base_call_type}_prompt",
-                payload={"request": asdict(request), "slot": asdict(slot), "messages": messages},
+                payload={"request": asdict(request), "slot": asdict(slot), **prompt_projection},
                 manifest={"surface": request.surface, "slot_id": slot.slot_id, "model": slot.model, "synthetic": True},
             )
         except Exception:
@@ -1360,9 +1343,17 @@ class ReviewCoordinator:
         )
 
     def _run_slot(self, request: ReviewRequest, slot: ReviewSlot) -> ReviewActorRecord:
-        messages = _request_messages(request, slot)
         call_id = new_call_id(f"review_{request.surface}_{slot.slot_id}")
         base_call_type = request.call_type or f"{request.surface}_review"
+        assignment = ReviewAssignment(
+            request=request, slot=slot, call_id=call_id, call_type=base_call_type,
+            custody_root=self._custody_drive_root(),
+        )
+        # Transport is chosen once, here, through the seam; the prompt itself is
+        # rendered by the route (lazily) rather than by this method, so a route
+        # that does not send an API pack never assembles one.
+        executor = _review_route_executor(assignment, llm=self.llm)
+        prompt_projection = executor.prompt_payload()
         prompt_ref: Dict[str, Any] = {}
         response_ref: Dict[str, Any] = {}
         start = time.time()
@@ -1372,7 +1363,7 @@ class ReviewCoordinator:
                 task_id=request.task_id or "review",
                 call_id=f"{call_id}_prompt",
                 call_type=f"{base_call_type}_prompt",
-                payload={"request": asdict(request), "slot": asdict(slot), "messages": messages},
+                payload={"request": asdict(request), "slot": asdict(slot), **prompt_projection},
                 manifest={"surface": request.surface, "slot_id": slot.slot_id, "model": slot.model},
             )
         except Exception:
@@ -1411,26 +1402,6 @@ class ReviewCoordinator:
                 duration_sec=round(time.time() - start, 3),
             )
         try:
-            chat_kwargs = {
-                "messages": messages,
-                "model": slot.model,
-                "reasoning_effort": slot.effort,
-                "max_tokens": int(request.max_tokens or slot.max_tokens),
-                "temperature": request.temperature if request.temperature is not None else slot.temperature,
-                "no_proxy": bool(request.no_proxy),
-                # Stable per-surface session affinity: changing evidence would
-                # otherwise fragment default first-user-message sticky routing
-                # (and the provider cache) on every round. Deliberately NO
-                # slot_id in the key — same-model slots keep today's
-                # provider-concentration behavior.
-                "cache_affinity": f"{request.surface}:{request.task_id or 'review'}",
-                # Bound the socket to the logical slot timeout so a stalled
-                # connection cannot leave the whole review process unable to exit.
-                # The outer queue/wait_for still governs the logical deadline.
-                "timeout": float(slot.timeout_sec) if slot.timeout_sec else None,
-                "use_local": bool(slot.use_local),
-            }
-            chat = getattr(self.llm, "chat", None)
             p3_actor = request.surface in {"multi_model_review", "scope_review"}
             acceptance_actor = request.surface == "task_acceptance"
             actor_attempts = 2 if (p3_actor or acceptance_actor) else 1
@@ -1450,18 +1421,13 @@ class ReviewCoordinator:
                 _prior_msg, _prior_usage, _prior_text = None, None, ""
                 for actor_attempt in range(actor_attempts):
                     try:
-                        if callable(chat):
-                            msg, usage = chat(**chat_kwargs)
-                        else:
-                            msg, usage = asyncio.run(self.llm.chat_async(**chat_kwargs))
-                        # A provider can yield a null/non-object message on a
-                        # zero-body response. Treat it exactly like empty content:
-                        # retry once on P3, then preserve the fail-closed empty actor.
-                        raw_text = (
-                            str(msg.get("content") or "")
-                            if isinstance(msg, dict)
-                            else ""
+                        # The one seam. A null/non-object provider message comes
+                        # back as empty raw_text: retry once on P3, then preserve
+                        # the fail-closed empty actor.
+                        attempt = _execute_slot_attempt(
+                            assignment, llm=self.llm, executor=executor,
                         )
+                        msg, usage, raw_text = attempt.message, attempt.usage, attempt.raw_text
                     except UsageAccountingError:
                         # Budget/ledger/physical-rail failures are not transport
                         # transients and must remain fail-closed without another
@@ -1514,7 +1480,7 @@ class ReviewCoordinator:
                         break
                     if actor_attempt + 1 >= actor_attempts:
                         break
-            self._emit_usage(request, slot, usage, prompt_chars=_messages_char_count(messages))
+            self._emit_usage(request, slot, usage, prompt_chars=executor.prompt_chars())
             try:
                 response_ref = persist_call(
                     self.drive_root,

@@ -52,6 +52,7 @@ from ouroboros.tools.review_synthesis import (
     addressable_plan_findings,
     vacuous_review_disposition as _vacuous_review_disposition,
     all_planning_tasks_terminal as _all_planning_tasks_known_terminal,
+    assemble_plan_raw_results as _assemble_plan_raw_results,
     bounded_planning_reason as _bounded_planning_reason,
     build_plan_review_system_prompt,
     build_plan_review_user_content,
@@ -61,12 +62,13 @@ from ouroboros.tools.review_synthesis import (
     normalize_plan_scope as _normalize_plan_scope,
     parse_plan_review_signal,
     bindable_claimed_wave as _bindable_claimed_wave,
+    minted_plan_slot_ids as _minted_plan_slot_ids,
     per_slot_input_token_limits as _per_slot_input_token_limits,
     plan_envelope_mismatch_note as _envelope_note,
     plan_review_component_hashes as _plan_component_hashes,
     plan_review_fingerprint as _plan_request_fingerprint,
     plan_context_target_tokens as _plan_context_target_tokens,
-    plan_slot_fit as _plan_slot_fit,
+    plan_slot_fit_with_identity as _plan_slot_fit_with_identity,
     plan_text_fingerprint,
     resolve_plan_context_level as _resolve_plan_context_level,
     quorum_input_token_limit as _quorum_input_token_limit,
@@ -1363,7 +1365,8 @@ async def _run_plan_review_async(
     if estimated_tokens > plan_budget_limit and planning_handoff_raw:
         user_content = user_content.replace(planning_handoff_raw, planning_handoff_compact)
         estimated_tokens = estimate_tokens(system_prompt + user_content)
-    models, oversize_results, fit_error = _plan_slot_fit(models, slot_limits, estimated_tokens)
+    models, callable_slot_ids, oversize_results, fit_error = _plan_slot_fit_with_identity(
+        models, slot_limits, estimated_tokens)
     if fit_error:
         return fit_error
 
@@ -1388,9 +1391,10 @@ async def _run_plan_review_async(
         f"(context={resolved_context_level}, ~{estimated_tokens:,} tokens each)…"
     )
 
-    raw_results = oversize_results + await _run_plan_review_slots(
-        ctx, models, system_prompt, user_content, user_stable_len=user_stable_len,
-    )
+    raw_results = _assemble_plan_raw_results(oversize_results, await _run_plan_review_slots(
+        ctx, models, system_prompt, user_content,
+        user_stable_len=user_stable_len, slot_ids=callable_slot_ids,
+    ))
     return _finalize_plan_review_output(ctx, _PlanReviewFinalization(
         request=request,
         raw_results=raw_results,
@@ -1412,13 +1416,15 @@ async def _run_plan_review_slots(
     models: list[str],
     system_prompt: str,
     user_content: str,
-    user_stable_len: int = 0,
+    user_stable_len: int = 0, slot_ids: list[str] | None = None,
 ) -> list[dict]:
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
 
+    # Owner decision D15: plan review stays api_chat — no route list is consulted here.
+    row_ids = list(slot_ids) if slot_ids is not None else _minted_plan_slot_ids(models)
     slots = [
         ReviewSlot(
-            slot_id=f"plan_slot_{idx + 1}",
+            slot_id=row_id,
             model=str(model),
             effort=_PLAN_REVIEW_EFFORT,
             timeout_sec=_PLAN_REVIEW_SLOT_TIMEOUT_SEC,
@@ -1427,7 +1433,7 @@ async def _run_plan_review_slots(
             role_hint="plan reviewer",
             use_local=review_model_uses_local(str(model)),
         )
-        for idx, model in enumerate(models)
+        for row_id, model in zip(row_ids, models, strict=True)
     ]
     request = ReviewRequest(
         surface="plan_review",
@@ -1460,6 +1466,9 @@ def _plan_raw_result_from_actor(actor: dict, request_model: str) -> dict:
     if actor.get("status") not in {"ok", "empty"} and not error:
         error = str(actor.get("status") or "review failed")
     return {
+        # Identity is CARRIED, never re-derived: the row keeps the slot_id the
+        # substrate ran, so duplicate-model plan rows stay distinguishable.
+        "slot_id": str(actor.get("slot_id") or ""),
         "model": str(usage.get("resolved_model") or actor.get("model") or request_model),
         "request_model": request_model or actor.get("model") or "",
         "text": text,

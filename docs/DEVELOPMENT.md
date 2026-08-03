@@ -804,12 +804,19 @@ MAJOR/MINOR/PATCH version, synchronize all P9 carriers, and run the ordinary
 production review against the exact landing parent/tree/VERSION/tag binding.
 If the target advances, that final binding is rebuilt and reviewed again.
 
-The commit gate is intentionally one-pass: one substantive request per triad
-slot and one per scope slot. Do not reuse task-acceptance retries, generic
+The commit gate is intentionally one-pass: one substantive SESSION OR CALL per
+triad slot and one per scope slot. Do not reuse task-acceptance retries, generic
 capability resolvers, chunk fan-out, or degraded Low retries to multiply P3
-calls. An exception or empty response may repeat the identical request once on
-the same slot/model; both invocations share a hard two-physical-send rail, and a
-persistent error/empty/invalid result blocks. The operator
+calls. On an `api_chat` slot an exception or empty response may repeat the
+identical request once on the same slot/model, and both invocations share a hard
+two-physical-send rail. On an `agent_session` slot the unit is the hosted
+session: its internal tool calls and model turns belong to the harness and are
+never counted as review calls, at most two session LAUNCHES may be reserved for
+the slot (a second only when the first produced no transcript at all), and a
+resend over bad OUTPUT never restarts the session — format recovery is local
+light-model extraction over the transcript already collected, which is not a
+review call and consumes none of the slot's sends. A persistent
+error/empty/invalid result blocks either way. The operator
 wrapper must call this production path, preserve full raw actor output and refs,
 report known/unknown cost neutrally, exit nonzero on incomplete review, and never
 substitute the configured reviewer model.

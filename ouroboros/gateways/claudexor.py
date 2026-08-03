@@ -297,6 +297,18 @@ class ClaudexorGateway:
         body = self._request("GET", "/v2/agent-capabilities")
         return body if isinstance(body, dict) else {}
 
+    def harnesses(self) -> List[Dict[str, Any]]:
+        """GET /v2/harnesses — per-harness status rows WITH the full manifest.
+
+        The agent-capability catalog is a derived projection that deliberately
+        drops the manifest's transport flags (``json_schema_output``,
+        ``interactive``); this is the surface that still carries them, so
+        transport-capability questions are asked here, not of the catalog.
+        """
+        body = self._request("GET", "/v2/harnesses")
+        rows = body.get("harnesses") if isinstance(body, dict) else None
+        return [row for row in (rows or []) if isinstance(row, dict)]
+
     def quota_snapshots(self) -> List[Dict[str, Any]]:
         body = self._request("GET", "/v2/quota")
         snapshots = body.get("snapshots") if isinstance(body, dict) else None

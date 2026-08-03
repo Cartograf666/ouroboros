@@ -26,10 +26,18 @@ class ReviewActorRecord:
     tokens_out: int = 0
     cost_usd: float = 0.0
     slot: int = 0
+    slot_id: str = ""  # the id the row physically ran under, carried not re-derived
     prompt_ref: Dict[str, Any] = field(default_factory=dict)
     response_ref: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        # The durable id is the one the review substrate actually ran this row
+        # under, carried on the envelope. Re-deriving it from the record's
+        # position is wrong whenever position is not row: an oversized skill
+        # review merges C chunk passes over M rows into ONE results list
+        # (skill_review_passes), so position M+1 is row 1 on its second pass.
+        from ouroboros.review_substrate import slot_id_for_row
+
         return {
             "model_id": self.model_id,
             "status": self.status,
@@ -39,7 +47,11 @@ class ReviewActorRecord:
             "tokens_out": self.tokens_out,
             "cost_usd": self.cost_usd,
             "slot": self.slot,
-            "slot_id": f"slot_{self.slot}" if self.slot else "",
+            # LEGACY-READ-ONLY fallback: every live producer stamps slot_id (the one
+            # dispatch entry is review._handle_multi_model_review — skill_review binds
+            # run_review to exactly it, pinned by test), so the positional mint here
+            # can only fire when re-serializing an envelope persisted before the carry.
+            "slot_id": self.slot_id or (slot_id_for_row(self.slot) if self.slot else ""),
             "prompt_ref": dict(self.prompt_ref),
             "response_ref": dict(self.response_ref),
         }
@@ -87,6 +99,7 @@ def _actor_record(
         tokens_out=int(actor.get("tokens_out", 0) or 0),
         cost_usd=float(actor.get("cost_estimate", 0.0) or 0.0),
         slot=idx + 1,
+        slot_id=str(actor.get("slot_id") or ""),
         prompt_ref=dict(actor.get("prompt_ref") or {}),
         response_ref=dict(actor.get("response_ref") or {}),
     )

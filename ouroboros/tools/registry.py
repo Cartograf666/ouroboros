@@ -918,7 +918,26 @@ def _builtin_tool_availability(name: str, ctx: Any = None) -> tuple[bool, str, s
             return True, "", ""
     tool = str(name or "").strip()
     if tool == "claude_code_edit" and not os.environ.get("ANTHROPIC_API_KEY", "").strip():
-        return False, "missing_credential", "ANTHROPIC_API_KEY"
+        # Route-aware credential truth (plan 5.8 site 2): this tool's OWN
+        # transport is the Claude Agent SDK, which needs the key on every route
+        # — declaring it available without one would advertise a transport that
+        # cannot run. What IS route-dependent is the disclosure: when the
+        # delegated review route is configured, the refusal names the keyless
+        # path (the delegated subagent lane) instead of implying the key is the
+        # only way to run delegated work. D10 retires this tool entirely.
+        detail = "ANTHROPIC_API_KEY"
+        try:
+            from ouroboros.tools.claude_advisory_review import advisory_route_requires_api_key
+
+            if not advisory_route_requires_api_key():
+                detail = (
+                    "ANTHROPIC_API_KEY (required by this tool's SDK transport even "
+                    "though the advisory runs on the keyless delegated route; for "
+                    "delegated edits use the delegate_* subagent lane)"
+                )
+        except Exception:
+            detail = "ANTHROPIC_API_KEY"
+        return False, "missing_credential", detail
     if tool == "web_search":
         try:
             from ouroboros.tools.search import _available_web_search_backends
