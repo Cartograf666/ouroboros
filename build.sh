@@ -137,7 +137,7 @@ chmod +x "$CLI_BIN_DIR/ouroboros" "$CLI_BIN_DIR/install-ouroboros-cli"
 # .pyc EXIST and get SEALED inside the signature; nothing is left for the runtime to
 # write. --invalidation-mode unchecked-hash means a read-only bundle never rewrites
 # them (no source-mtime check at import). The env-level PYTHONDONTWRITEBYTECODE guards
-# (launcher.py / python_bytecode_env) remain as defense-in-depth.
+# (launcher.py / embedded_python_env) remain as defense-in-depth.
 echo "--- Precompiling Python bytecode inside app bundle (sealed before signing) ---"
 # Find the bundled embedded interpreter inside the .app so the .pyc magic matches the
 # interpreter that runs at launch; fall back to the build-host copy (same standalone build).

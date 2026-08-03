@@ -22,8 +22,10 @@ _LOCAL_MODEL_DEFAULT_PORT = 8766
 
 def _get_install_command() -> list:
     """Return the llama-cpp-python pip install command."""
-    base = [sys.executable, "-m", "pip", "install", "--upgrade", "llama-cpp-python[server]"]
-    return base
+    from ouroboros.platform_layer import pip_install_target_args
+
+    return [sys.executable, "-m", "pip", "install",
+            *pip_install_target_args(sys.executable), "--upgrade", "llama-cpp-python[server]"]
 
 
 def _get_install_env() -> dict:

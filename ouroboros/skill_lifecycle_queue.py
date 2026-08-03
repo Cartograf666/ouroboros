@@ -145,6 +145,8 @@ def _lifecycle_deadline_sec() -> float:
     silent wedge into a loud, attributable failure. Generous default — skill
     reviews legitimately run for many minutes.
     """
+    from ouroboros.config import SETTINGS_DEFAULTS
+
     raw = os.environ.get("OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC", "")
     try:
         parsed = float(raw)
@@ -152,7 +154,8 @@ def _lifecycle_deadline_sec() -> float:
             return parsed
     except (TypeError, ValueError):
         pass
-    return 1800.0
+    # SSOT: the shipped default lives with the setting, not as a second constant here.
+    return float(SETTINGS_DEFAULTS["OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC"])
 
 
 @contextlib.asynccontextmanager

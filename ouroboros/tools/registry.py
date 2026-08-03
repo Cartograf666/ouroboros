@@ -1239,7 +1239,7 @@ class ToolRegistry:
 
     _FROZEN_TOOL_MODULES = [
         "browser", "ci", "claude_advisory_review", "compact_context", "control",
-        "core", "evolution_stats", "git", "git_pr", "git_rollback", "github",
+        "core", "delegate", "evolution_stats", "git", "git_pr", "git_rollback", "github",
         "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal",
         "recent_tasks",
         "query_code", "review", "search", "services", "shell", "skill_exec", "skill_publish",
@@ -2145,7 +2145,14 @@ class ToolRegistry:
                     "reviewed Ouroboros self-modification."
                 )
             runtime_data_executable = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe") if argv else ""
-            runtime_data_scan = writeish or runtime_data_executable in {"python", "python3", "node", "ruby", "perl", "php", "sh", "bash", "zsh"}
+            # Versioned interpreter basenames (python3.11 etc.) must trigger the
+            # runtime_data scan exactly like their unversioned spellings; the
+            # exact-set match let `python3.11 -c ...` writes bypass the guard.
+            runtime_data_scan = (
+                writeish
+                or runtime_data_executable in {"python", "python3", "node", "ruby", "perl", "php", "sh", "bash", "zsh"}
+                or runtime_data_executable.startswith("python")
+            )
             if runtime_data_scan:
                 own_task_drive = pathlib.Path(self._ctx.task_drive_root())
                 own_artifact_dir = task_artifact_dir_path(

@@ -215,10 +215,8 @@ def review_wave_budget_gate(
             prompt_chars=int(prompt_chars or 0),
             max_completion_tokens=max_completion_tokens,
         )
-        if admission.get("fits", True):
-            return None
-        emit_review_event(ctx, {
-            "type": "review_wave_budget_insufficient",
+        unpriced = int(admission.get("unpriced_slots") or 0)
+        base = {
             "surface": surface,
             "task_id": str(getattr(ctx, "task_id", "") or ""),
             "root_task_id": scope.root_task_id,
@@ -226,7 +224,22 @@ def review_wave_budget_gate(
             "remaining_usd": admission.get("remaining_usd"),
             "limit_usd": admission.get("limit_usd"),
             "slots": admission.get("slots"),
-            **(extra or {}),
+            "unpriced_slots": unpriced,
+        }
+        if admission.get("fits", True):
+            # An admitted wave is normally silent. It must NOT be silent when part of the
+            # estimate was unknowable: "fits, every slot priced" and "fits, but one slot
+            # contributed an unknown zero" are different facts, and a later cost forensic
+            # cannot tell them apart from an absence of events (BIBLE P1 — the gap is
+            # represented, never filled in). This is the only thing that makes the
+            # `unpriced_slots` count in the admission dict observable at all.
+            if unpriced:
+                emit_review_event(ctx, {
+                    "type": "review_wave_budget_partial_unknown", **base, **(extra or {}),
+                })
+            return None
+        emit_review_event(ctx, {
+            "type": "review_wave_budget_insufficient", **base, **(extra or {}),
         })
         return admission
     except Exception:

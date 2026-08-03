@@ -1074,9 +1074,12 @@ async def api_claude_code_install(request: Request) -> JSONResponse:
         # Import SDK baseline at call time: one SSOT, clean endpoint error if broken.
         from ouroboros.launcher_bootstrap import _CLAUDE_SDK_BASELINE as sdk_baseline
 
+        from ouroboros.platform_layer import pip_install_target_args
+
         result = await asyncio.to_thread(
             lambda: _sp.run(
-                [interpreter, "-m", "pip", "install", "--upgrade", sdk_baseline],
+                [interpreter, "-m", "pip", "install",
+                 *pip_install_target_args(interpreter), "--upgrade", sdk_baseline],
                 capture_output=True, text=True, timeout=120,
             )
         )

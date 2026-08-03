@@ -17,7 +17,7 @@ import threading
 from typing import Any, Dict, Optional
 
 from ouroboros.outcomes import EXECUTION_INFRA_FAILED, terminal_outcome_axes
-from ouroboros.utils import append_jsonl, truncate_review_artifact, utc_now_iso
+from ouroboros.utils import append_jsonl, utc_now_iso
 from supervisor.message_bus import send_with_budget
 
 log = logging.getLogger(__name__)
@@ -76,6 +76,45 @@ def ensure_reaper_started() -> None:
             log.warning("Task reaper thread had died; restarting it.")
         _reaper_thread = threading.Thread(target=reaper_loop, name="task-reaper", daemon=True)
         _reaper_thread.start()
+
+
+def request_finalization_grace(
+    task_drive: pathlib.Path, task_id: str, terminal_reason: str, *, chat_id: int, stamp: int,
+) -> None:
+    """Ask a task to finalize cooperatively before the supervisor stops it.
+
+    Both side effects of opening a grace window: the typed ``finalize_now``
+    control on the task's ACTIVE drive (the one the loop drains — the child
+    drive for forked/workspace tasks), which buys a tool-less final answer, and
+    the owner-visible progress toast. Lives here with the rest of the
+    supervisor's terminal-path mechanics so ``queue.py``'s enforce loop keeps
+    only the DECISION.
+    """
+    try:
+        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
+        write_owner_message(task_drive, terminal_reason, task_id, kind=KIND_FINALIZE_NOW)
+    except Exception:
+        log.debug("Failed to write finalize_now control for %s", task_id, exc_info=True)
+    try:
+        from supervisor import workers as _workers_mod
+        _workers_mod.get_event_q().put({
+            "type": "send_message",
+            "chat_id": chat_id,
+            "text": (
+                f"⏳ Task {task_id} reached {terminal_reason}. "
+                "Finalize artifacts/results now; supervisor will stop the task after the grace window."
+            ),
+            "format": "markdown",
+            "is_progress": True,
+            "task_id": task_id,
+            "progress_meta": {
+                "task_incident": terminal_reason,
+                "toast_once": f"{task_id}:{terminal_reason}:{stamp}",
+            },
+            "ts": utc_now_iso(),
+        })
+    except Exception:
+        log.debug("Failed to emit finalization grace warning for %s", task_id, exc_info=True)
 
 
 def _kill_and_confirm_worker_dead(proc: Any, worker_id: int, task_id: str) -> bool:
@@ -374,11 +413,8 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
         # Salvage the last persisted assistant text so a hard kill surfaces real progress.
         salvage_note = ""
         try:
-            from ouroboros.observability import latest_llm_response_text
-            salvaged = latest_llm_response_text(_q._task_drive_for_task(task, task_id), task_id)
-            if salvaged:
-                salvage_note = ("\n\nLast agent output (salvaged best-effort, unreviewed):\n"
-                                + truncate_review_artifact(salvaged, 4000))
+            from ouroboros.observability import salvaged_output_note
+            salvage_note = salvaged_output_note(_q._task_drive_for_task(task, task_id), task_id)
         except Exception:
             log.debug("Reaper: failed to salvage last LLM response for %s", task_id, exc_info=True)
 

@@ -259,7 +259,17 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "provider_unavailable": (True, "loop.py:3185 reroute + fallback exhausted"),
     "children_unabsorbed": (True, "loop.py:4071 forced terminal, child results unabsorbed"),
     "llm_api_error": (True, "loop_llm_call.py:630 transport death; never a fair shot"),
+
     # -- not truncating: a real terminal the agent reached, or a rejected tool call --------
+    # An explicit `executor=harness` request that could not be honored ends the CHILD
+    # unrun rather than silently spending metered money on the native path. It is a
+    # SUBAGENT dispatch terminal: a benchmark trial's reason code is the ROOT task's, and
+    # a blocked child surfaces to its parent as an unabsorbed/failed child, under the
+    # root's own code. Marking it truncating would require adding it to
+    # RUNTIME_TRUNCATION_REASON_CODES and to the PUBLISHED CL-Bench operator patch that
+    # mirrors that tuple — changing the provenance of an already-reported result to
+    # describe a code that cannot appear in it.
+    "subagent_executor_unavailable": (False, "agent.py executor_blocked_outcome; a subagent terminal, never a trial's"),
     "task_exception": (False, "agent.py:777 the attempt ran and crashed; an honest failure"),
     "swarm_force_plan_not_called": (False, "loop.py:4109 policy terminal, agent had its shot"),
     "capability_profile_mismatch": (False, "control_delegation.py:81 rejected delegate call"),

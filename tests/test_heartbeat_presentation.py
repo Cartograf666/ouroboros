@@ -18,7 +18,12 @@ def test_routine_heartbeat_is_not_rendered_as_chat_message() -> None:
 def test_liveness_and_incident_controls_remain_active() -> None:
     from supervisor import queue
 
-    source = inspect.getsource(queue._enforce_task_timeouts_locked)
+    # The enforce loop keeps the DECISION; the grace-window side effects (finalize_now
+    # control + owner incident toast) live in task_reaper.request_finalization_grace.
+    source = "\n".join((
+        inspect.getsource(queue._enforce_task_timeouts_locked),
+        inspect.getsource(queue._request_finalization_grace),
+    ))
     for invariant in (
         "last_heartbeat_at",
         "get_task_idle_timeout_sec",

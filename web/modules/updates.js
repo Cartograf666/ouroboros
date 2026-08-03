@@ -217,14 +217,18 @@ export function initUpdates({ mount, state }) {
     async function applyUpdate() {
         if (!latestStatus?.available) return;
         const safe = latestStatus.safe_to_apply;
-        let strategy = 'replace';
+        // Always the merge-aware strategy. The legacy 'replace'/'stash' escape hatch
+        // hard-resets the checkout to the remote and never consults the merge plan;
+        // 'auto_merge' is the one path that decides from the plan — a clean 3-way
+        // merge lands directly, and conflicts or uncommitted work route to the
+        // reviewed assisted-merge task instead of being reset away.
+        const strategy = 'auto_merge';
         if (!safe) {
             const localBits = divergenceText(latestStatus);
             const proceed = confirm(
-                `This update will replace the active managed checkout with the selected official version.\n\nLocal state: ${localBits}\n\nLocal commits will be preserved on a local-keep-* branch before the active branch moves. Dirty files will be saved in a rescue snapshot. Continue?`,
+                `This update merges the selected official version into the active managed checkout.\n\nLocal state: ${localBits}\n\nA clean merge is applied directly; conflicts or uncommitted changes are handed to Ouroboros as a reviewed merge task. Local work is preserved either way. Continue?`,
             );
             if (!proceed) return;
-            strategy = latestStatus.ahead ? 'stash' : 'replace';
         }
         applyBtn.disabled = true;
         applyBtn.textContent = 'Preparing...';
@@ -236,8 +240,19 @@ export function initUpdates({ mount, state }) {
             });
             const data = await resp.json().catch(() => ({}));
             if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-            const keep = data.keep_branch ? ` Local commits preserved as ${data.keep_branch}.` : '';
-            showToast(`Update prepared. Server is restarting.${keep}`, 'success');
+            if (data.status === 'assisted_started') {
+                showToast('Update needs a merge: Ouroboros is resolving it as a reviewed task. Watch progress in chat.', 'success');
+            } else if (data.status === 'manual') {
+                const why = data.reason === 'protected_paths'
+                    ? ' It changes protected files, so it needs your review.'
+                    : '';
+                showToast(`Update was not applied automatically.${why}`, 'error');
+                applyBtn.disabled = false;
+                applyBtn.textContent = safe ? 'Update Now' : 'Update with Options';
+            } else {
+                const keep = data.keep_branch ? ` Local commits preserved as ${data.keep_branch}.` : '';
+                showToast(`Update prepared. Server is restarting.${keep}`, 'success');
+            }
         } catch (err) {
             showToast('Update failed: ' + (err.message || err), 'error');
             applyBtn.disabled = false;

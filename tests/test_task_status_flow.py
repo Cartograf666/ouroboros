@@ -331,11 +331,21 @@ def test_schedule_task_rejects_legacy_description_schema(tmp_path):
     assert ctx.pending_events == []
     assert not (tmp_path / "task_results").exists()
 
-    # Runtime-INTERNAL scheduling options are not part of the public schema and are not
-    # bindable by keyword (they ride the positional-only mapping), so a model emitting one is
-    # refused exactly like any other unsupported argument.
-    internal_as_kwarg = _schedule_task(ctx, objective="o", expected_output="e", deadline_at="2026-01-01T00:00:00Z")
-    assert "TOOL_ARG_ERROR" in internal_as_kwarg and "deadline_at" in internal_as_kwarg
+    # `deadline_at` is a PUBLIC parameter as of v6.87.7 — the parent LLM is what knows when a
+    # child's handoff stops being useful — so a model emitting it is accepted, not refused.
+    from datetime import timedelta
+
+    from ouroboros.deadline_utils import utc_now
+
+    future = (utc_now() + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    accepted = _schedule_task(ctx, objective="o", expected_output="e", deadline_at=future)
+    assert "TOOL_ARG_ERROR" not in accepted
+    assert ctx.pending_events
+    ctx.pending_events.clear()
+
+    # An option the schema does not expose is still refused with the strict v6 message.
+    unknown_as_kwarg = _schedule_task(ctx, objective="o", expected_output="e", nonesuch="x")
+    assert "TOOL_ARG_ERROR" in unknown_as_kwarg and "nonesuch" in unknown_as_kwarg
     assert ctx.pending_events == []
 
 

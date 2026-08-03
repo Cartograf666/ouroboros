@@ -27,8 +27,14 @@ from typing import Iterable, Sequence
 sys.dont_write_bytecode = True
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
-from ouroboros.launcher_bootstrap import BootstrapContext, bootstrap_repo, check_git, python_bytecode_env
-from ouroboros.platform_layer import IS_MACOS, IS_WINDOWS, embedded_python_candidates, git_install_hint
+from ouroboros.launcher_bootstrap import BootstrapContext, bootstrap_repo, check_git, embedded_python_env
+from ouroboros.platform_layer import (
+    BUNDLE_DIR_ENV,
+    IS_MACOS,
+    IS_WINDOWS,
+    embedded_python_candidates,
+    git_install_hint,
+)
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -82,7 +88,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _set_global_bytecode_suppression(data_dir: pathlib.Path) -> None:
     """WA6: globally suppress bytecode writes for the packaged CLI process itself.
 
-    Parity with ``_inner_cli_env``'s ``python_bytecode_env`` call so the CLI entry
+    Parity with ``_inner_cli_env``'s ``embedded_python_env`` call so the CLI entry
     process and any naive ``os.environ.copy()`` child inherit the suppression. A
     signed+notarized macOS .app must never write ``__pycache__/*.pyc`` into its own
     bundle at runtime — that breaks the codesign seal. Reuses the same
@@ -231,6 +237,7 @@ def _inner_cli_env(runtime: PackagedRuntime) -> dict[str, str]:
             "OUROBOROS_SETTINGS_PATH",
             "OUROBOROS_PID_FILE",
             "OUROBOROS_PORT_FILE",
+            BUNDLE_DIR_ENV,
         }
     }
     keep.update(
@@ -243,9 +250,12 @@ def _inner_cli_env(runtime: PackagedRuntime) -> dict[str, str]:
             "OUROBOROS_PID_FILE": str(runtime.app_root / "ouroboros.pid"),
             "OUROBOROS_APP_VERSION": runtime.app_version,
             "OUROBOROS_PACKAGED_CLI": "1",
+            # The inner CLI runs out of the managed repo; bundled payloads
+            # (node, ripgrep) are only reachable through this root.
+            BUNDLE_DIR_ENV: str(runtime.bundle_root),
         }
     )
-    return python_bytecode_env(runtime.data_dir, keep)
+    return embedded_python_env(runtime.data_dir, keep)
 
 
 def _prepare_start_if_requested(args: list[str], runtime: PackagedRuntime) -> list[str]:

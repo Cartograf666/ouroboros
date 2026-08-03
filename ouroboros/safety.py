@@ -101,6 +101,12 @@ TOOL_POLICY: Dict[str, str] = {
 
     # Control / messaging / internal side effects.
     "schedule_subagent": POLICY_SKIP,
+    # Delegated sessions: the access profile is derived HOST-SIDE from the calling
+    # task's own authority and cannot be widened by the model, so the nanny verbs add
+    # no reach beyond what the task already has (same reasoning as schedule_subagent).
+    "delegate_start": POLICY_SKIP,
+    "delegate_wait": POLICY_SKIP,
+    "delegate_cancel": POLICY_SKIP,
     "cancel_task": POLICY_SKIP,
     # Parent's explicit decision to abandon a child result: stamps parent_decision +
     # records the reason on the tree ledger; tree-scoped, no external effect (like cancel_task).

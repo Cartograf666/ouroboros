@@ -154,6 +154,7 @@ from supervisor.task_reaper import (  # noqa: E402,F401 — re-exported for enfo
     ensure_reaper_started as _ensure_reaper_started,
     reap_queue as _reap_queue,
     reap_timed_out_task as _reap_timed_out_task,
+    request_finalization_grace as _request_finalization_grace,
 )
 
 
@@ -730,6 +731,13 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 "effective_model_lane": t.get("effective_model_lane"),
                 "model": t.get("model"),
                 "use_local_model": t.get("use_local_model"),
+                # Scheduling AXES survive a restart. They live at the task top level
+                # because that is where the agent loop reads them; the copies nested in
+                # `metadata` ride along, but restoring only those would leave a resumed
+                # child running on the task-type default while its record still claimed
+                # the parent's request.
+                "requested_executor": t.get("requested_executor"),
+                "reasoning_effort": t.get("reasoning_effort"),
                 "task_group_id": t.get("task_group_id"),
                 "task_group": t.get("task_group"),
                 "subagent_envelope": t.get("subagent_envelope"),
@@ -1234,6 +1242,15 @@ def _enforce_task_timeouts_locked(
         # progressing. This honors an explicit/caller deadline promptly while never letting
         # the removed blanket wall-clock kill a productively-waiting orchestrator.
         if not ceiling_reached and not deadline_reached and progressing:
+            # The grace latch belongs to ONE finalization episode, not to the task.
+            # A task that answered finalize_now and went back to work has no
+            # outstanding request; leaving the latch set would make the NEXT
+            # terminal condition skip its own grace window entirely (now - the
+            # stale timestamp already exceeds it) and kill the task instantly,
+            # unwarned, under the earlier episode's reason.
+            if meta.pop("finalization_requested_at", None) is not None:
+                meta.pop("finalization_reason", None)
+                RUNNING[task_id] = meta
             continue
 
         if ceiling_reached:
@@ -1247,34 +1264,11 @@ def _enforce_task_timeouts_locked(
             meta["finalization_requested_at"] = now
             meta["finalization_reason"] = terminal_reason
             RUNNING[task_id] = meta
-            # Typed finalize_now control -> cooperative tool-less final answer
-            # inside the grace window. Written to the task's ACTIVE drive (the
-            # one the loop drains; child drive for forked/workspace tasks).
-            try:
-                from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
-                write_owner_message(_task_drive_for_task(task, str(task_id)), terminal_reason, str(task_id), kind=KIND_FINALIZE_NOW)
-            except Exception:
-                log.debug("Failed to write finalize_now control for %s", task_id, exc_info=True)
-            try:
-                from supervisor import workers as _workers_mod
-                _workers_mod.get_event_q().put({
-                    "type": "send_message",
-                    "chat_id": int(task.get("chat_id") or owner_chat_id or 0),
-                    "text": (
-                        f"⏳ Task {task_id} reached {terminal_reason}. "
-                        "Finalize artifacts/results now; supervisor will stop the task after the grace window."
-                    ),
-                    "format": "markdown",
-                    "is_progress": True,
-                    "task_id": str(task_id),
-                    "progress_meta": {
-                        "task_incident": terminal_reason,
-                        "toast_once": f"{task_id}:{terminal_reason}:{int(finalization_requested_at or now)}",
-                    },
-                    "ts": utc_now_iso(),
-                })
-            except Exception:
-                log.debug("Failed to emit finalization grace warning for %s", task_id, exc_info=True)
+            _request_finalization_grace(
+                _task_drive_for_task(task, str(task_id)), str(task_id), terminal_reason,
+                chat_id=int(task.get("chat_id") or owner_chat_id or 0),
+                stamp=int(finalization_requested_at or now),
+            )
             continue
         if finalization_requested_at > 0 and now - finalization_requested_at < FINALIZATION_GRACE_SEC:
             continue

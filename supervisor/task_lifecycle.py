@@ -714,13 +714,25 @@ def _finish_captured_running(task_id: str, worker: Any, meta: Dict[str, Any]) ->
         log.warning("Cost reconstruction failed for cancelled %s", task_id, exc_info=True)
         cost_fields = {"cost_accounting_status": "unavailable", "cost_final": False,
                        "cost_accounting_error": "ledger_unavailable", "cost_usd": None}
+    # Rescue the partial result BEFORE the durable write — symmetrically with the
+    # timeout kill (task_reaper), and for a stronger reason: publication below
+    # DELETES a subagent's drive, so the observability blobs this reads are the
+    # only copy of the work the cancelled task had already done (BIBLE P1). An
+    # owner who cancels a task should not lose strictly more than a supervisor
+    # timeout would.
+    try:
+        from ouroboros.observability import salvaged_output_note
+        salvage_note = salvaged_output_note(q._task_drive_for_task(task, str(task_id)), str(task_id))
+    except Exception:
+        log.debug("Failed to salvage last LLM response for cancelled %s", task_id, exc_info=True)
+        salvage_note = ""
     try:
         existing = load_task_result(q.DRIVE_ROOT, task_id) or {}
         stored = write_task_result(
             q.DRIVE_ROOT, task_id, STATUS_CANCELLED,
             **q._cancel_result_fields(
                 task, existing=existing, **cost_fields,
-                result="Running task cancelled and worker terminated.",
+                result="Running task cancelled and worker terminated." + salvage_note,
             ),
         )
     except Exception:

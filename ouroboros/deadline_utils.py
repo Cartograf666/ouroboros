@@ -25,6 +25,14 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def seconds_until(value: Any) -> Optional[float]:
+    """Non-negative wall-clock seconds until an ISO instant; None when unparsable."""
+    parsed = parse_deadline_ts(value)
+    if parsed is None:
+        return None
+    return max(0.0, (parsed - utc_now()).total_seconds())
+
+
 def deadline_remaining_sec(ctx: Any) -> float:
     meta = getattr(ctx, "task_metadata", {})
     if not isinstance(meta, dict):

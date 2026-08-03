@@ -123,6 +123,9 @@ class ChatOutbound(TypedDict):
     reserved_usd: NotRequired[Optional[float]]
     unresolved_upper_bound_usd: NotRequired[Optional[float]]
     unknown_unmetered: NotRequired[Optional[int]]
+    # v6.87.48: count of OPEN ledger rows — the disclosed cause of
+    # ``cost_final: false``, which can hold with every dollar bucket at zero.
+    non_final_rows: NotRequired[Optional[int]]
     result: NotRequired[str]
     result_truncated: NotRequired[bool]  # P3: WS preview was capped; fetch full via task id
     trace_summary: NotRequired[str]

@@ -1,0 +1,483 @@
+"""Claudexor v3 control-plane transport.
+
+Pure I/O, like every gateway (docs/DEVELOPMENT.md "Gateway Rules"): discover the
+loopback daemon, negotiate the protocol, and translate the typed ``/v2`` surface
+into Python primitives. No routing, no policy, no harness identity branches — the
+caller asks for a CAPABILITY (an access profile, an opaque route id) and reads the
+manifest Claudexor publishes.
+
+Two Claudexor I/O surfaces live here, not one: the HTTP control plane, and the run
+tree Claudexor writes on disk. The engine deliberately records some APPLIED facts
+only as run artifacts (an attempt's harness HOME is one), so a caller that has to
+verify what was enforced has nowhere else to read them — and the path layout is
+Claudexor's, which makes it this module's business rather than a policy caller's.
+
+Token custody: the daemon bearer token grants the ENTIRE ``/v2`` surface. It is
+read here, held in this process only, and never returned to a caller, written into
+a ``ToolContext``, put in a child's environment, or handed to a harness sandbox.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import pathlib
+import uuid
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+from ouroboros.config import CLAUDEXOR_MIN_VERSION, CLAUDEXOR_PROTOCOL_MAJOR
+
+log = logging.getLogger(__name__)
+
+CONTROL_API_REL = ".claudexor/v3/daemon/control-api.json"
+PROTOCOL_HEADER = "X-Claudexor-Protocol-Major"
+_CONNECT_TIMEOUT_SEC = 5.0
+_READ_TIMEOUT_SEC = 60.0
+_ATTEMPTS_REL = "attempts"
+_ATTEMPT_RECORD = "attempt.yaml"
+
+
+class ClaudexorUnavailable(RuntimeError):
+    """Typed lane refusal: the delegated route cannot run right now.
+
+    Carries the machine-readable ``code`` so callers classify instead of matching
+    prose. Never raised for an ordinary in-run failure — only for "this transport
+    is not usable".
+    """
+
+    def __init__(self, code: str, message: str, *, status_code: int = 0) -> None:
+        super().__init__(message)
+        self.code = str(code or "claudexor_unavailable")
+        self.status_code = int(status_code or 0)
+
+
+class ClaudexorSubscriptionWindowExhausted(ClaudexorUnavailable):
+    """The subscription window is spent and heals on a timer, not on payment."""
+
+    def __init__(self, message: str, *, reset_at: str = "", status_code: int = 0) -> None:
+        super().__init__("subscription_window_exhausted", message, status_code=status_code)
+        self.reset_at = str(reset_at or "")
+
+
+@dataclass(frozen=True)
+class DaemonEndpoint:
+    """Loopback control-plane address. ``token`` stays host-side (see module doc)."""
+
+    host: str
+    port: int
+    token: str
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    parts: List[int] = []
+    for chunk in str(value or "").split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts or [0])
+
+
+def engine_at_least(version: str, minimum: str) -> bool:
+    """Is the reported engine at or past ``minimum``? THE version-floor predicate.
+
+    One reader, so the handshake's transport floor and a lane's own feature floor
+    cannot disagree about what "old enough to refuse" means. An unparsable or absent
+    version compares as ``(0,)`` — below every floor, so it fails CLOSED.
+    """
+    return _version_tuple(version) >= _version_tuple(minimum)
+
+
+def operator_home() -> pathlib.Path:
+    """The home ``discover_daemon`` reads the control token from.
+
+    Named once because it is the exact directory a delegated harness must never
+    inherit: it holds ``~/.claudexor/v3/daemon/token``, which grants the whole ``/v2``
+    surface. Both the discovery below and the applied-isolation check read it here.
+    """
+    return pathlib.Path(os.path.expanduser("~"))
+
+
+def discover_daemon(home: Optional[pathlib.Path] = None) -> DaemonEndpoint:
+    """Read ``~/.claudexor/v3/daemon/control-api.json`` plus the referenced token."""
+    root = pathlib.Path(home) if home is not None else operator_home()
+    control_path = root / CONTROL_API_REL
+    try:
+        raw = json.loads(control_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ClaudexorUnavailable(
+            "daemon_not_discovered",
+            f"Claudexor control-api descriptor not found at {control_path}",
+        ) from exc
+    except (OSError, ValueError) as exc:
+        raise ClaudexorUnavailable(
+            "daemon_descriptor_unreadable",
+            f"Claudexor control-api descriptor unreadable: {type(exc).__name__}: {exc}",
+        ) from exc
+    if not isinstance(raw, dict):
+        raise ClaudexorUnavailable("daemon_descriptor_unreadable", "control-api.json is not an object")
+    host = str(raw.get("host") or "").strip()
+    token_path = str(raw.get("tokenPath") or "").strip()
+    try:
+        port = int(raw.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if not host or port <= 0 or not token_path:
+        raise ClaudexorUnavailable(
+            "daemon_descriptor_incomplete",
+            "control-api.json is missing host/port/tokenPath",
+        )
+    try:
+        # The SAME set as the descriptor read four lines up, and for the same reason: a
+        # path out of a JSON descriptor can carry an embedded null and a token file can
+        # hold bytes that are not UTF-8, both of which `read_text` raises as `ValueError`
+        # (`UnicodeDecodeError` is one), and either escaping here is a traceback where a
+        # typed refusal belongs. `RuntimeError` is deliberately NOT in this set, and the
+        # v6.87.44 comment claiming it covered a symlink loop was wrong: `read_text` on a
+        # loop raises `OSError` (ELOOP) — `resolve()` is what raises `RuntimeError`, which
+        # is why `_resolved` in delegate.py catches it and this does not. It was also a
+        # hazard, since `ClaudexorUnavailable` IS a `RuntimeError`: the moment this block
+        # grew a call that refuses typed, the catch would re-wrap it under this code.
+        token = pathlib.Path(token_path).read_text(encoding="utf-8").strip()
+    except (OSError, ValueError) as exc:
+        raise ClaudexorUnavailable(
+            "daemon_token_unreadable",
+            f"Claudexor daemon token unreadable: {type(exc).__name__}",
+        ) from exc
+    if not token:
+        raise ClaudexorUnavailable("daemon_token_unreadable", "Claudexor daemon token file is empty")
+    if not _is_loopback(host):
+        # The token this descriptor points at grants the ENTIRE /v2 control API — start
+        # runs, read every artifact, cancel anything. The loopback boundary was
+        # documented and never enforced, so anything able to write one file under
+        # ~/.claudexor could redirect the bearer to a host it controls: token
+        # exfiltration plus authenticated SSRF, from a file write. Refused BEFORE the
+        # client exists, so no request can be built against a non-loopback endpoint.
+        raise ClaudexorUnavailable(
+            "daemon_endpoint_not_loopback",
+            f"Claudexor control-api descriptor names the non-loopback host {host!r}. The "
+            f"daemon control token grants the whole /v2 surface and is only ever sent to "
+            f"the local daemon; refusing rather than shipping it off-host.",
+        )
+    return DaemonEndpoint(host=host, port=port, token=token)
+
+
+def _is_loopback(host: str) -> bool:
+    """True only for a literal loopback ADDRESS, or the exact name ``localhost``.
+
+    An IP literal is decided by the stdlib (``127.0.0.0/8``, ``::1``, and their
+    zone/bracket spellings), never by string prefixes: ``127.0.0.1.evil.com`` is a
+    NAME, and ``0x7f.1`` is not one this reader will guess at. Resolution is
+    deliberately NOT attempted — a name that resolves to loopback today can resolve
+    elsewhere on the next lookup, so only ``localhost`` (which every platform pins to
+    loopback) is accepted by name. Everything else is refused.
+    """
+    import ipaddress
+
+    candidate = str(host or "").strip().strip("[]")
+    if not candidate:
+        return False
+    if candidate.lower() == "localhost":
+        return True
+    candidate = candidate.split("%", 1)[0]      # drop an IPv6 zone id
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return False
+
+
+class ClaudexorGateway:
+    """Thin typed client over the Claudexor ``/v2`` control API."""
+
+    def __init__(self, endpoint: Optional[DaemonEndpoint] = None, *, home: Optional[pathlib.Path] = None):
+        self._endpoint = endpoint if endpoint is not None else discover_daemon(home)
+        self._engine_version = ""
+        # trust_env=False: a shell HTTP(S)_PROXY must never be able to intercept the
+        # loopback control plane (the bearer token rides these requests).
+        self._client = httpx.Client(
+            base_url=f"http://{self._endpoint.host}:{self._endpoint.port}",
+            timeout=httpx.Timeout(_READ_TIMEOUT_SEC, connect=_CONNECT_TIMEOUT_SEC),
+            trust_env=False,
+            headers={
+                "Authorization": f"Bearer {self._endpoint.token}",
+                PROTOCOL_HEADER: str(CLAUDEXOR_PROTOCOL_MAJOR),
+                "Content-Type": "application/json",
+            },
+        )
+
+    # -- lifecycle -------------------------------------------------------------
+
+    def close(self) -> None:
+        try:
+            self._client.close()
+        except Exception:
+            log.debug("Claudexor client close failed", exc_info=True)
+
+    def __enter__(self) -> "ClaudexorGateway":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+    @property
+    def engine_version(self) -> str:
+        return self._engine_version
+
+    # -- transport -------------------------------------------------------------
+
+    def _request(self, method: str, path: str, *, json_body: Any = None, headers: Optional[Dict[str, str]] = None) -> Any:
+        try:
+            response = self._client.request(method, path, json=json_body, headers=headers or None)
+        except httpx.HTTPError as exc:
+            raise ClaudexorUnavailable(
+                "daemon_unreachable",
+                f"Claudexor daemon unreachable: {type(exc).__name__}: {exc}",
+            ) from exc
+        if response.status_code >= 400:
+            raise self._problem(response)
+        if not response.content:
+            return None
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise ClaudexorUnavailable(
+                "malformed_response",
+                f"Claudexor returned a non-JSON body for {method} {path}: {exc}",
+            ) from exc
+
+    def _problem(self, response: httpx.Response) -> ClaudexorUnavailable:
+        """Translate a ControlProblem body into a typed refusal."""
+        code = f"http_{response.status_code}"
+        message = response.text[:500]
+        context: Dict[str, Any] = {}
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            code = str(body.get("code") or code)
+            message = str(body.get("message") or message)
+            raw_context = body.get("context")
+            context = raw_context if isinstance(raw_context, dict) else {}
+        reset_at = str(context.get("resetsAt") or context.get("resets_at") or context.get("cooldownUntil") or "")
+        if reset_at:
+            return ClaudexorSubscriptionWindowExhausted(
+                message, reset_at=reset_at, status_code=response.status_code,
+            )
+        return ClaudexorUnavailable(code, message, status_code=response.status_code)
+
+    # -- operations ------------------------------------------------------------
+
+    def handshake(self) -> Dict[str, Any]:
+        """Negotiate protocol major and enforce the minimum engine version."""
+        body = self._request(
+            "POST", "/v2/handshake",
+            json_body={"protocolMajor": CLAUDEXOR_PROTOCOL_MAJOR, "client": "ouroboros"},
+        )
+        if not isinstance(body, dict):
+            raise ClaudexorUnavailable("malformed_response", "handshake did not return an object")
+        if not body.get("compatible") or int(body.get("protocolMajor") or 0) != CLAUDEXOR_PROTOCOL_MAJOR:
+            raise ClaudexorUnavailable(
+                "protocol_incompatible",
+                f"Claudexor refused protocol major {CLAUDEXOR_PROTOCOL_MAJOR}: {body!r}",
+            )
+        engine = body.get("engine") if isinstance(body.get("engine"), dict) else {}
+        version = str(engine.get("version") or "")
+        if not engine_at_least(version, CLAUDEXOR_MIN_VERSION):
+            raise ClaudexorUnavailable(
+                "engine_too_old",
+                f"Claudexor {version or 'unknown'} is older than the required {CLAUDEXOR_MIN_VERSION}",
+            )
+        self._engine_version = version
+        return body
+
+    def agent_capabilities(self) -> Dict[str, Any]:
+        body = self._request("GET", "/v2/agent-capabilities")
+        return body if isinstance(body, dict) else {}
+
+    def quota_snapshots(self) -> List[Dict[str, Any]]:
+        body = self._request("GET", "/v2/quota")
+        snapshots = body.get("snapshots") if isinstance(body, dict) else None
+        return [row for row in (snapshots or []) if isinstance(row, dict)]
+
+    def register_project(self, root: str) -> str:
+        """Register a run root and return its project id (idempotent per root).
+
+        Claudexor answers the FIRST run against an unregistered root with
+        404 ``project_not_registered``, so registration is a required step, not an
+        optimization. Re-registering an existing root returns the existing id.
+        """
+        body = self._request(
+            "POST", "/v2/projects",
+            json_body={"root": str(root)},
+            headers={"Idempotency-Key": uuid.uuid4().hex},
+        )
+        project_id = str((body or {}).get("id") or "") if isinstance(body, dict) else ""
+        if not project_id:
+            raise ClaudexorUnavailable("malformed_response", "project registration returned no id")
+        return project_id
+
+    def remove_project(self, project_id: str) -> Dict[str, Any]:
+        """Retire a project registration. Non-destructive: artifacts are retained."""
+        body = self._request("DELETE", f"/v2/projects/{project_id}")
+        return body if isinstance(body, dict) else {}
+
+    def find_project_id(self, root: str) -> str:
+        body = self._request("GET", "/v2/projects")
+        target = str(root)
+        for row in (body or {}).get("projects") or [] if isinstance(body, dict) else []:
+            if isinstance(row, dict) and str(row.get("root") or "") == target:
+                return str(row.get("id") or "")
+        return ""
+
+    def start_run(self, request: Dict[str, Any], *, idempotency_key: str = "") -> Dict[str, Any]:
+        """POST /v2/runs with a caller-built, schema-valid request body.
+
+        ``idempotency_key`` is the caller's LOGICAL INVOCATION ID — minted once per
+        intended invocation, reused verbatim on a transport retry. The engine's replay
+        check (control-api ``handleRunCreate`` → daemon command store) runs BEFORE any
+        preflight: a replayed key with the byte-identical request returns the ORIGINAL
+        accepted job's handle, and a replayed key with a different request digest is a
+        409 ``idempotency_conflict`` — so a retry must reuse the id AND reproduce the
+        body exactly. A fresh random key per POST makes an accepted start whose
+        response was lost come back as a SECOND live run that nothing knows about; a
+        stale content-stable key makes a deliberate re-run come back as the finished
+        OLD run. Callers with no invocation identity keep the random default.
+        """
+        body = self._request(
+            "POST", "/v2/runs",
+            json_body=dict(request),
+            headers={"Idempotency-Key": str(idempotency_key or "") or uuid.uuid4().hex},
+        )
+        if not isinstance(body, dict):
+            raise ClaudexorUnavailable("malformed_response", "run start returned no handle")
+        return body
+
+    def get_run(self, run_id: str) -> Dict[str, Any]:
+        body = self._request("GET", f"/v2/runs/{run_id}")
+        return body if isinstance(body, dict) else {}
+
+    def get_run_artifact(self, run_id: str, path: str) -> bytes:
+        """GET /v2/runs/:id/artifacts/<path> — the FULL artifact body, raw bytes.
+
+        The run detail's ``primaryOutput.text`` is a bounded 256 KiB PREVIEW
+        (control-api ``PRIMARY_OUTPUT_PREVIEW_BYTES``) with ``bytes``/``truncated``
+        beside it; this route is where the full file actually lives. The engine serves
+        text artifacts through ``redactSecrets`` (so the served length may differ from
+        the on-disk ``bytes`` when a secret was rewritten), refuses credential-shaped
+        files with a typed 409, caps text at 4 MiB with a 413, and answers a
+        retention-reclaimed run with a 410 tombstone — all of which surface here as
+        typed ``ClaudexorUnavailable`` refusals, never as a silent empty body.
+        """
+        from urllib.parse import quote
+
+        try:
+            response = self._client.request(
+                "GET", f"/v2/runs/{quote(str(run_id), safe='')}/artifacts/{quote(str(path), safe='/')}")
+        except httpx.HTTPError as exc:
+            raise ClaudexorUnavailable(
+                "daemon_unreachable",
+                f"Claudexor daemon unreachable: {type(exc).__name__}: {exc}",
+            ) from exc
+        if response.status_code >= 400:
+            raise self._problem(response)
+        return response.content
+
+    def cancel_run(self, run_id: str, *, reason: str = "") -> Dict[str, Any]:
+        control: Dict[str, Any] = {"kind": "cancel"}
+        if reason:
+            control["reason"] = str(reason)
+        body = self._request("POST", f"/v2/runs/{run_id}/control", json_body={"control": control})
+        return body if isinstance(body, dict) else {}
+
+
+# -- applied-fact artifacts ----------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AttemptContainment:
+    """What one attempt's harness ACTUALLY ran under, as the engine recorded it.
+
+    TWO axes, one record, because they are two different guarantees and reading only
+    the first is how a `~`-redirect gets reported as a sandbox:
+
+    ``home_isolated`` — the scoped ``HOME``. ``None`` when the attempt recorded no such
+    fact at all: "unverified", which is not "verified false" and must not be collapsed
+    into it by a caller reading a bare boolean. The consequence of a recorded false is a
+    CANCELLATION, so absence must stay absence.
+
+    ``boundary_mechanism`` — the OS-enforced filesystem boundary the engine APPLIED
+    (``""`` when the attempt named none). Silence collapses to "no boundary" here, and
+    deliberately not for the home above: an engine that reports nothing is
+    indistinguishable from an engine that applied nothing, and the consequence of
+    reading it that way is a DISCLOSURE rather than a refusal. That direction is safe;
+    the opposite one would let an unconfined run pass as confined.
+    """
+
+    attempt_id: str
+    home_isolated: Optional[bool]
+    home_dir: str
+    boundary_mechanism: str = ""
+
+
+def attempt_containment(run_dir: str) -> List[AttemptContainment]:
+    """Read every attempt's APPLIED containment facts from the run's own artifacts.
+
+    Claudexor writes ``harness_home_isolated`` / ``harness_home_dir`` and the applied
+    boundary (``confinement_mechanism``, with ``confinement_verified_denied_path`` as
+    its proof) onto ``<runDir>/attempts/<id>/attempt.yaml``, and projects none of them
+    onto any ``/v2`` response, so this file is the only evidence a caller has that the
+    confinement it asked for was applied rather than merely requested.
+
+    The mechanism is read as an OPAQUE string. Which mechanisms exist, and on which
+    hosts, is the engine's business — Ouroboros asks what was applied and never which
+    OS it is sitting on, so the day a second mechanism ships this reader is unchanged.
+
+    Empty means NO EVIDENCE, never "not isolated": the record is written when an
+    attempt finishes, so a young run legitimately has none. Unreadable artifacts are
+    skipped for the same reason — a caller distinguishes absence from a recorded false.
+    """
+    root = pathlib.Path(str(run_dir or "")) / _ATTEMPTS_REL
+    try:
+        attempt_dirs = sorted(entry for entry in root.iterdir() if entry.is_dir())
+    except (OSError, ValueError, RuntimeError):
+        return []
+    import yaml  # type: ignore
+
+    applied: List[AttemptContainment] = []
+    for attempt_dir in attempt_dirs:
+        try:
+            record = yaml.safe_load((attempt_dir / _ATTEMPT_RECORD).read_text(encoding="utf-8"))
+        except (OSError, ValueError, RuntimeError, yaml.YAMLError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        raw = record.get("harness_home_isolated")
+        # A mechanism is only evidence WITH its proof: 3.3.2 records the mechanism
+        # beside the path the policy was executed against and refused, on this host,
+        # before the harness spawned. A name on its own is the promise the applied-fact
+        # block exists to replace, so it is read as no boundary at all.
+        mechanism = str(record.get("confinement_mechanism") or "").strip()
+        proven = str(record.get("confinement_verified_denied_path") or "").strip()
+        applied.append(AttemptContainment(
+            attempt_id=str(record.get("attempt_id") or attempt_dir.name),
+            home_isolated=raw if isinstance(raw, bool) else None,
+            home_dir=str(record.get("harness_home_dir") or ""),
+            boundary_mechanism=mechanism if (mechanism and proven) else "",
+        ))
+    return applied
+
+
+__all__ = [
+    "AttemptContainment",
+    "ClaudexorGateway",
+    "ClaudexorSubscriptionWindowExhausted",
+    "ClaudexorUnavailable",
+    "DaemonEndpoint",
+    "attempt_containment",
+    "discover_daemon",
+    "engine_at_least",
+    "operator_home",
+]

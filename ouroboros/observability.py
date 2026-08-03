@@ -509,6 +509,31 @@ def latest_llm_response_text(drive_root: pathlib.Path, task_id: str) -> str:
     return ""
 
 
+SALVAGED_OUTPUT_NOTE_LIMIT = 4000
+
+
+def salvaged_output_note(drive_root: pathlib.Path, task_id: str) -> str:
+    """Terminal-result suffix carrying the last persisted assistant text, or "".
+
+    SSOT for every supervisor path that ends a task the task did not end itself
+    (timeout kill, owner/agent cancellation). Those paths also DELETE the drive
+    the text lives on, so a path that skips the salvage does not merely omit
+    progress — it destroys the only copy (BIBLE P1). Keeping the note in one
+    place is what makes "did this terminal path rescue the partial result?" a
+    single answerable question instead of a per-call-site habit.
+    """
+    from ouroboros.utils import truncate_review_artifact
+
+    try:
+        salvaged = latest_llm_response_text(pathlib.Path(drive_root), str(task_id))
+    except Exception:
+        return ""
+    if not salvaged:
+        return ""
+    return ("\n\nLast agent output (salvaged best-effort, unreviewed):\n"
+            + truncate_review_artifact(salvaged, SALVAGED_OUTPUT_NOTE_LIMIT))
+
+
 def prune_observability_blobs(
     drive_root: pathlib.Path,
     retention_days: int | None = None,

@@ -919,7 +919,14 @@ def light_shell_repo_mutation(
     if executable in LIGHT_SHELL_WRITER_COMMANDS and repo_target_mentioned([argv[0], *writer_target_tokens(argv)], repo_dir=repo_dir, cwd=cwd, work_dir=work_dir):
         return True
 
-    if detect_interpreter_inline and executable in {"python", "python3", "node", "ruby", "perl", "php"}:
+    # Versioned interpreter basenames (python3.11, resolver-injected absolute
+    # paths to them) must classify as interpreters too — matching only the
+    # unversioned spellings silently disengaged the inline-write fence on hosts
+    # whose agent python is a versioned binary (same precedent as
+    # writer_target_tokens' `cmd.startswith("python")`).
+    if detect_interpreter_inline and (
+        executable in _SCRIPT_INTERPRETERS or executable.startswith("python")
+    ):
         inline = shell_command_string(argv) or " ".join(argv[1:])
         if INTERPRETER_WRITE_RE.search(inline):
             if executable in {"python", "python3"} or executable.startswith("python"):

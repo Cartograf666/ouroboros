@@ -147,8 +147,33 @@ test('cost dashboard distinguishes loading, unavailable, pending, and final zero
     };
     const pending = costDashboardPresentation(base);
     assert.equal(pending.accountedLimit, '$0.00 / $10.00');
+    // An older payload carries no cause. Say only what is known — never invent "0 open".
     assert.equal(pending.final, 'Pending');
     assert.equal(pending.calls, '0');
+
+    // A flag without its cause is not reconstructible. This exact snapshot — every dollar
+    // bucket $0.00, unknown 0, cost_final false — is what an ESTIMATED $0.00 produces, and
+    // it rendered "Pending" with the reason nowhere on the page.
+    assert.equal(costDashboardPresentation({
+        ...base,
+        accounting: { ...base.accounting, non_final_rows: 1 },
+    }).final, 'Pending (1 open)');
+    assert.equal(costDashboardPresentation({
+        ...base,
+        accounting: { ...base.accounting, non_final_rows: 3 },
+    }).final, 'Pending (3 open)');
+    // The count never contradicts the flag it explains, and a settled ledger says "Yes".
+    assert.equal(costDashboardPresentation({
+        ...base,
+        accounting: { ...base.accounting, cost_final: true, non_final_rows: 0 },
+    }).final, 'Yes');
+    // Non-final with ZERO open rows is a real shape, not a contradiction: a torn ledger
+    // tail makes `_with_integrity` clear `cost_final` on its own authority. The cause is
+    // then `integrity_degraded`, so this must NOT fabricate "(0 open)" and blame rows.
+    assert.equal(costDashboardPresentation({
+        ...base,
+        accounting: { ...base.accounting, cost_final: false, non_final_rows: 0 },
+    }).final, 'Pending');
 
     const final = costDashboardPresentation({
         ...base,

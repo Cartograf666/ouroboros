@@ -107,6 +107,12 @@ def test_owner_settings_post_blocked_in_browser():
     assert _is_owner_settings_self_elevation_post(req("POST", base, '{"OUROBOROS_POST_TASK_EVOLUTION":"true"}')) is True
     assert _is_owner_settings_self_elevation_post(req("POST", base, '{"OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS":"on"}')) is True
     assert _is_owner_settings_self_elevation_post(req("POST", base, '{"OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE":"x"}')) is True
+    # P34P1.10: the delegated-executor POLICY. D1 makes the executor axis the OWNER's,
+    # and this key IS that axis — which route answers, on whose subscription. It rides
+    # the generic settings path so the Settings UI can set a route string without
+    # ceremony, so the agent-reachable browser POST is where it has to be refused.
+    assert _is_owner_settings_self_elevation_post(req("POST", base, '{"OUROBOROS_SUBAGENT_HARNESS":"codex=gpt-5.6:high"}')) is True
+    assert _is_owner_settings_self_elevation_post(req("POST", base, '{"OUROBOROS_SUBAGENT_HARNESS":""}')) is True
     assert _is_owner_settings_self_elevation_post(req("GET", base, None)) is False
     assert _is_owner_settings_self_elevation_post(req("POST", base, '{"OPENAI_API_KEY":"x"}')) is False
     assert _is_owner_settings_self_elevation_post(

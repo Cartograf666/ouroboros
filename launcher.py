@@ -48,12 +48,13 @@ from ouroboros.launcher_bootstrap import (
     bootstrap_repo as _bootstrap_repo,
     check_git as _check_git,
     install_deps as _install_deps_impl,
-    python_bytecode_env,
+    embedded_python_env,
     sync_existing_repo_from_bundle as _sync_existing_repo_from_bundle_impl,
     verify_claude_runtime as _verify_claude_runtime,
 )
 from ouroboros.onboarding_wizard import build_onboarding_html, prepare_onboarding_settings
 from ouroboros.platform_layer import (
+    BUNDLE_DIR_ENV,
     IS_MACOS,
     IS_WINDOWS,
     assign_pid_to_job,
@@ -90,7 +91,7 @@ _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) i
 # naive os.environ.copy() child it spawns. A signed+notarized macOS .app must not
 # write __pycache__/*.pyc into its own bundle at runtime — that breaks the codesign
 # seal and triggers AppTranslocation. Uses the same data_dir/state/pycache
-# convention as launcher_bootstrap.python_bytecode_env so caches land outside the
+# convention as launcher_bootstrap.embedded_python_env so caches land outside the
 # bundle. setdefault keeps any explicit caller override.
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 _pycache_dir = DATA_DIR / "state" / "pycache"
@@ -431,7 +432,7 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
 
     settings = _load_settings()
     _apply_settings_to_env(settings)
-    env = python_bytecode_env(DATA_DIR, os.environ.copy())
+    env = embedded_python_env(DATA_DIR, os.environ.copy())
     env["PYTHONPATH"] = str(REPO_DIR)
     saved_host = str(settings.get("OUROBOROS_SERVER_HOST") or "").strip()
     if saved_host:
@@ -441,6 +442,10 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     env["OUROBOROS_REPO_DIR"] = str(REPO_DIR)
     env["OUROBOROS_APP_VERSION"] = str(APP_VERSION)
     env["OUROBOROS_MANAGED_BY_LAUNCHER"] = "1"
+    # The server runs out of the managed repo, not the bundle: without this the
+    # bundled payloads (node, ripgrep) are invisible to it (platform_layer.
+    # bundled_resource_bases).
+    env[BUNDLE_DIR_ENV] = str(_bundle_dir())
 
     server_py = REPO_DIR / "server.py"
     log.info("Starting agent: %s %s (port=%d)", EMBEDDED_PYTHON, server_py, port)

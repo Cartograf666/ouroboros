@@ -127,6 +127,14 @@ def _provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
             "memory sooner — without changing the model or reasoning effort."
         )
     kind = str(accumulated_usage.get("_last_llm_error_kind") or "").strip()
+    if kind == "subscription_window_exhausted":
+        reset_at = str(accumulated_usage.get("_last_llm_reset_at") or "").strip()
+        when = f" It resets at {reset_at}." if reset_at else ""
+        return (
+            " The subscription window for the delegated route is spent. This is "
+            f"TRANSIENT, not a billing refusal — waiting cures it.{when} Retrying is "
+            "scheduled against that reset time, not the ordinary short backoff."
+        )
     if kind in {"quota_exhausted", "auth_error", "request_too_large", "bad_request", "context_overflow"}:
         guidance = {
             "quota_exhausted": "The provider rejected the request for quota/billing reasons; retrying the same request will not help until the key/account limit changes.",
@@ -5472,6 +5480,16 @@ def _cleanup_loop_resources(
     ctx.tools._ctx._delivery_control_required = False
     if ctx.drive_root is None or not ctx.task_id:
         return
+    try:
+        from ouroboros.delegate_custody import custody_root, release_task_runs
+
+        # A delegated run is a resource this task HOLDS, like a service or an executor:
+        # a terminalized parent that leaves one running has a mutating process nothing
+        # is watching. The durable reconciler still covers a worker that dies before
+        # reaching here; this is the ordinary path.
+        release_task_runs(custody_root(ctx.tools._ctx), ctx.task_id)
+    except Exception:
+        log.debug("Failed to release delegated runs for task %s", ctx.task_id, exc_info=True)
     try:
         from ouroboros.owner_mailbox import cleanup_task_mailbox
 

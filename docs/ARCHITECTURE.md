@@ -68,6 +68,8 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── code_search_rg.py    ← Optional ripgrep-backed search helper for search_code; every match is post-filtered through Ouroboros protected/secret gates
       ├── pricing.py           ← Exact-route best-effort provider-catalog lookup with nullable estimates; no static model tariffs and not the monetary ledger
       ├── usage_accounting.py  ← Append-only physical-model-attempt monetary authority: reserved→dispatched→settled|unresolved (or reserved→released), short cross-process check+append+fsync lock, conservative global/root admission, validated sequence replay/torn-tail quarantine, compatibility projections, and resumable legacy import
+      ├── usage_ledger.py      ← Durable append-only ledger SUBSTRATE the line above is built on: cross-process locking, atomic append+fsync, row/transition validation, torn-tail quarantine. One-way seam — accounting imports it, it never imports accounting
+      ├── delegate_custody.py ← Durable custody for delegated (Claudexor) runs: the SSOT is the `delegate_run_*` rows in the canonical event log (no parallel store), replayed into OWNED/FOREIGN/UNKNOWN ownership that survives a worker restart, a per-intention invocation id that rides the wire as the `Idempotency-Key` (the deterministic per-logical-start hash is only the pending-invocation LOOKUP identity, and reuse happens only via the explicit `retry_of` token), atomic settlement (idempotent ledger row + owned-registration retirement, `settled` only when both landed), the typed cancel vocabulary (confirmed | requested | failed | containment_fault_run_may_still_be_live) with durable containment faults that ride the health invariants, and orphan reconciliation on the same owner-is-gone predicate `process_custody` uses; one `daemon_says_absent` predicate decides everywhere that a 404 is the daemon ANSWERING the resource is gone (close the run, discharge the registration) rather than a failure to find out
       ├── llm.py               ← Multi-provider LLM routing (OpenRouter/OpenAI/compatible/Cloud.ru/GigaChat/Anthropic) with adaptive request-parameter normalization for provider capabilities/rejections
       ├── mcp_client.py        ← HTTP/SSE MCP client manager: parses MCP_SERVERS, validates URLs/auth headers, masks tokens, normalizes external tool names as mcp_<server>__<tool>, refreshes tool lists, and dispatches calls through the guarded Python mcp SDK import
       ├── safety.py            ← Policy-based LLM safety check
@@ -161,7 +163,8 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── schema_versions.py ← Opt-in _schema_version helpers
       │   └── plugin_api.py    ← Phase 4: PluginAPI Protocol + ExtensionRegistrationError + FORBIDDEN_EXTENSION_SETTINGS + VALID_EXTENSION_PERMISSIONS + VALID_EXTENSION_ROUTE_METHODS
       ├── gateways/            ← External API adapters (thin transport, no business logic)
-      │   └── claude_code.py   ← Claude Agent SDK gateway (edit path via ClaudeSDKClient lifecycle; read-only advisory path isolated in a Python child process with structured signal/timeout errors and normalized SDK usage)
+      │   ├── claude_code.py   ← Claude Agent SDK gateway (edit path via ClaudeSDKClient lifecycle; read-only advisory path isolated in a Python child process with structured signal/timeout errors and normalized SDK usage)
+      │   └── claudexor.py     ← Claudexor v3 control-plane gateway (loopback discovery, protocol-major + minimum-version handshake, project registration, run start/poll/cancel; the daemon token stays inside this module)
       ├── gateway/             ← Gateway Boundary v1: all browser-facing HTTP/WS route ownership and frontend contract SSOT
       │   ├── contracts.py     ← PRO-frozen HTTP/WS envelope and endpoint index (canonical replacement for the legacy contracts/api_v1.py surface)
       │   ├── router.py        ← Starlette route collector for /api/* and /ws
@@ -211,6 +214,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── project_journal.py ← Thin per-project journal/workpad tools (v6.32.0): journal_write/read (durable milestone memory), workpad_read/write (scratch page), journal_tail_digest (context injection); over-limit writes are rejected, never silently sliced
       │   ├── task_tree.py     ← (v6.38.0) Task-tree coordination tools tree_note/tree_read (the swarm blackboard + child→parent beacons; storage/kind SSOT in ouroboros/task_tree_ledger.py)
       │   ├── join_ledger.py   ← Soft-join decision authority: validates direct lineage and exact current child-result hashes for tagged `tree_note(kind="decision")` dispositions (`integrated`, `irrelevant`, `deferred`), appends the sole authoritative task-tree row, rejects stale hashes as `CHILD_RESULT_STALE`, and keeps `peek_task`, `discard_child_result`, constraint override, cancellation, and shared child-decision helpers. The hash covers status, full result, trace summary, artifact status, and stable artifact identities, not cost/timestamps/queue diagnostics/parent decisions; task-result fields are derived read projections only.
+      │   ├── delegate.py     ← Nanny verbs for DELEGATED subagent cognition on the owner's already-paid Claudexor session: `delegate_start` (host-derived authority — access profile, run mode, isolation and the `delegated` scoped-HOME marker all follow the calling task's own authority via `subagents.delegated_run_shape`; no argument can widen them), a time-bounded `delegate_wait` (progress cursor, containment verification against the run's OWN artifacts, terminal payload bounded inside `tool_result_limit` with the full result staged to the task drive and read back to EOF), and `delegate_cancel` (four typed outcomes — nothing claims terminal without a receipt). Run LIFECYCLE, custody, settlement and reconciliation are `ouroboros/delegate_custody.py`; transport is `gateways/claudexor.py`; route policy is `ouroboros/subagents.py`. This module is nanny BEHAVIOUR only
       │   └── subagent_integration.py ← integrate_subagent_patch: parent's manifest-first integration of an acting subagent's workspace.patch. For self_worktree children it applies into ctx.active_repo_dir() (sha256-verified, 3-way --index, protected-path gated, top-only lineage check, genesis refused), stages but never commits. For external_workspace children it verifies the child wrote in the same active external workspace and records an audited verdict without re-applying the patch; (v6.58.0) a NON-workspace parent integrating a COOP child (write_root = a host-minted tree under the subagent-projects root) gets a read-only verification + a SUCCESSFUL `coop_already_in_tree` no-op verdict instead of a parent-missing error — the work is already in the shared tree, which `coop_checkpoint.checkpoint_commit_coop_roots` checkpoint-commits at root finalization. Also compare_subagent_patches: read-only best-of-N helper that shows several children's candidate patches side by side for LLM-first synthesis
       └── platform_layer.py    ← Cross-platform process/path/locking helpers
 
@@ -328,6 +332,26 @@ before falling back to PATH `rg` and then the Python scanner. Unlike raw shell
 `rg`, the first-class tool enumerates allowed files first and keeps the existing
 protected/secret/subagent filters.
 
+Both resolvers search `platform_layer.bundled_resource_bases()` — the SSOT for
+every bundled payload. Its first base is `OUROBOROS_BUNDLE_DIR`, exported by
+`launcher.start_agent` and `packaged_cli._inner_cli_env`, because the process
+that CONSUMES a bundled payload is normally not the frozen launcher: the server
+and the CLI run as separate children of the embedded interpreter out of the
+managed repo under the data dir, so they have no `sys._MEIPASS` and their
+module parent is the repo, not the bundle. Without the handed-down root, every
+bundled payload reads as absent in exactly the installation that ships it. The
+remaining bases (`sys._MEIPASS`, repo root) serve the frozen process and dev
+builds.
+
+The packaged interpreter also lives inside the signed bundle, so both of
+Python's default write targets are redirected in one place —
+`launcher_bootstrap.embedded_python_env()` sets `PYTHONPYCACHEPREFIX` and
+`PYTHONUSERBASE` under `<data>/state/`, and
+`platform_layer.pip_install_target_args()` adds `--user` for exactly the
+embedded interpreter (never for a dev venv, which refuses `--user`). Every pip
+call that targets the embedded interpreter uses it, and `install_deps` returns
+pip's success instead of discarding its exit code.
+
 External workspace tasks keep `Env.repo_dir` pinned to the Ouroboros repo for
 prompts, BIBLE, architecture/development docs, skills, and review policy.
 `ToolContext` carries an optional `workspace_root`; contextual repo tools resolve
@@ -341,9 +365,9 @@ skill lifecycle stay blocked — except bounded task-tree coordination via
 `tree_note`/`tree_read` and parent-only `override_delegation_constraint` (the
 permitted local-write coordination paths: swarm beacons, shared-frame reads, and
 reasoned override decisions; coordination, not state mutation). Nested readonly delegation is allowed only within
-configured depth/cap limits, and descendants deeper than the configured capability
-depth (`OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT`) are coerced to the light model
-lane. Enabled/reviewed extension and
+configured depth/cap limits. Depth no longer rewrites the model lane: recursion is
+bounded by the structural depth cap and by concurrency, and power comes from the
+requested lane alone. Enabled/reviewed extension and
 MCP tools remain callable by owner policy, subject to `task_contract`
 resource constraints such as `web=false` or `network=false`. The target workspace
 may be left dirty or may contain task-local git commits/branches/tags/pushes when
@@ -436,8 +460,45 @@ from the active `ToolContext` and persisted as `parent_task_id`, `root_task_id`,
 `session_id`, `actor_id`, `delegation_role`, `role`, `memory_mode`,
 `drive_root`, `child_drive_root`, `budget_drive_root`, `task_contract`,
 `task_metadata`, `task_constraint`, `requested_model_lane`,
-`effective_model_lane`, `model`, `use_local_model`, `task_group_id`, and
-`subagent_envelope`. For workspace/forked children,
+`effective_model_lane`, `model`, `use_local_model`, `requested_executor`,
+`reasoning_effort`, `task_group_id`, and
+`subagent_envelope`.
+
+A child is described by three INDEPENDENT axes, and v6.87.7 is where they stopped
+leaking into one another (BIBLE P2: remove the class, do not re-tune the coupling).
+**Authority** — what the child may DO — comes from `write_surface` through
+`task_constraint` and `tool_access.active_tool_profile`. **Power** — how strong the
+child is — comes from `model_lane` (`auto`, `main`, `heavy`, `light`) and nothing
+else. **Executor** — who runs the child — comes from `executor`, a closed enum of
+intents (`auto`, `harness`, `native`) rather than a harness name, so adding a harness
+never touches this contract. Until v6.87.7 `auto` resolved to Heavy whenever the child
+was "mutating", where mutating meant `write_surface OR may_mutate` — and `may_mutate`
+grants the right to spawn mutative DESCENDANTS, so a read-only child drew the expensive
+model because of a permission about its unborn grandchildren. That line and the
+`OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT` cap that force-downgraded nested children
+are both gone: an omitted lane is Light at every depth, an explicit lane is honored at
+every depth, and recursion stays bounded by the structural depth cap, per-root
+concurrency, and the worker pool — the limits that actually bind. A child that starts
+cheap and finds the work harder raises its own power with `switch_model`, which is now
+in BOTH child tool allowlists: changing model changes cognitive power, not permissions,
+and a read-only child stays read-only at any model. The `review` and `scope` lanes were
+removed in the same change — they named a fan-out TOPOLOGY smuggled through a strength
+parameter, and no review surface ever used them (commit, plan, acceptance and skill
+review all read their slots from config and run on the review substrate). Durable
+records carrying the old values stay readable; `build_subagent_envelope` coerces an
+unknown stored lane rather than raising.
+
+`schedule_subagent` also exposes `effort` (from `EFFORT_SCALE`; omission inherits
+`resolve_effort(task_type)`, and an unrecognized STORED value falls back the same way
+rather than raising) and `deadline_at`, promoted out of the runtime-internal
+`_INTERNAL_SCHEDULE_OPTIONS` channel because the parent is what knows when a child's
+handoff stops being useful. `deadline_at` is NARROWING-ONLY: the earlier of the child's
+and the parent's wins. That narrowing was previously defeated in two ways, both fixed
+here — the parent contract was located with a type test that let `ToolContext`'s empty
+`{}` default shadow the real contract in `task_metadata`, and the `**parent_contract`
+spread into the child's merged contract re-injected the parent's `deadline_at` at higher
+precedence than the narrowed value. Any field deliberately narrowed must be re-stated
+after that spread. For workspace/forked children,
 `budget_drive_root` is also the canonical status/result root, so parent tools
 read the same child lifecycle records that the supervisor writes.
 Installed skill payloads exist only on the canonical data root, so the
@@ -500,9 +561,9 @@ bounded media projection such as `extract_video_frames` writing derived frames
 only under `artifact_store/video_frames` through a host-owned command shape (the
 permitted local coordination/projection paths; not arbitrary workspace/repo
 mutation). Nested readonly `schedule_subagent`
-recursion is visible only within configured depth/cap limits, and depth beyond the
-configured capability depth (`OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT`, default 1)
-is coerced to the light lane (an explicit capped main/heavy request surfaces a note).
+recursion is visible only within configured depth/cap limits. Depth does not change
+the lane; an omitted lane resolves to Light and a child raises its own power with
+`switch_model` when the work turns out heavier than the parent expected.
 
 v6.50.0 adds a reconciliation layer around this contract. `schedule_subagent`
 may carry a closed-enum `required_capabilities` list (for example `shell` or
@@ -1440,6 +1501,292 @@ instead of killing the long-lived worker. The child is launched in its own
 process group/session and timeout cleanup kills the process tree, matching the
 extension/subprocess containment pattern.
 
+### Usage ledger substrate vs. accounting policy
+
+`ouroboros/usage_ledger.py` owns the durable append-only JSONL ledger itself:
+cross-process locking, atomic append + fsync, structural validation of every row and
+state transition, and quarantine of a torn tail. It knows what a well-formed ledger row
+IS and nothing else. `ouroboros/usage_accounting.py` is the POLICY on top — scopes,
+reservations, settlement, budget fences, pricing, projections, admission — and imports
+FROM the substrate; the substrate never imports back.
+
+Rationale: the file is the monetary authority (P8 budget integrity), so a change in
+accounting policy must not be able to corrupt it, and a locking or fsync fix must not
+be able to silently alter what a reservation means. The one-way seam makes both
+directions structurally impossible rather than merely discouraged. The split was forced
+by a concrete failure: three concurrent branches each added a modest amount and the
+merged module crossed the 1600-line health gate that no single branch broke — the gate
+correctly reported that the module had two jobs. Private substrate names are re-bound in
+`usage_accounting` so existing call sites (and tests that monkeypatch `_locked`) are
+unaffected.
+
+### Delegated subagents (Claudexor transport + the nanny)
+
+**What a delegated run COSTS, and the one thing the ledger cannot see.** Claudexor
+reports an amount in `summary.spendUsd` and its EXACTNESS in the sibling
+`summary.spendEstimated`, and `delegate_custody.disclosed_spend` is the single reader of
+the pair — it returns `(amount, estimated)` together so no call site can ask half the
+question. `delegate_custody.settle_run` and `_terminal_payload` both go through it, so
+the ledger row and the payload the nanny relays to its parent cannot tell different
+stories. Runs ask for `authPreference: subscription` explicitly, because the engine's
+default is `auto` = subscription-first WITH policy fallback to a paid key, and that
+fallback is invisible to the host. FOUR cases, each recorded as what it is: a DISCLOSED
+SETTLED zero settles at `0.0` with `cost_final=true` and leaves the projection final (the
+free-session case this row kind exists for); a disclosed settled charge rides the ledger
+as money and is final; an ESTIMATED amount rides as money with `cost_final=false`,
+because an estimated zero is not a proven free session and an estimated charge is not a
+closed book; an UNDISCLOSED spend writes `cost_usd: null`, which drops `cost_final` for
+the projection and increments `unknown_unmetered`. Token counts follow the same rule one
+axis over: `delegate_custody.disclosed_tokens` keeps `None` for a count the harness never
+reported, because `int(x or 0)` made a run that disclosed nothing indistinguishable from
+one that genuinely used zero.
+
+The DISCLOSED BOUND: an undisclosed spend contributes `0.0` to `accounted_usd`, because
+there is no amount to charge and inventing a conservative bound would be fabricating a
+number the harness never gave (BIBLE P1 — the gap is represented, never filled in). So a
+`TOTAL_BUDGET` fence cannot stop delegated spend it was never told about; what it gets
+instead is an honest loss of finality. Ouroboros's read-only lane runs as `mode: ask`,
+and the daemon's own note says decision-less runs carry no spend figure, so "undisclosed"
+is the COMMON case on that lane rather than a rare one. Closing this needs a spend
+disclosure from Claudexor, not a guess here.
+
+A delegated subagent is an ORDINARY subagent acting as a **nanny**: it keeps its place
+in the task tree, its deadline and its authority, but instead of thinking on metered
+API tokens it starts a Claudexor run, watches it, and brings the result home. Because
+the nanny IS the host, verification receipts stay host-authored and the harness's
+output is a claim to check, never proof.
+
+`gateways/claudexor.py` is pure transport. It reads
+`~/.claudexor/v3/daemon/control-api.json` for `{host, port, tokenPath}`, negotiates
+`POST /v2/handshake` with `X-Claudexor-Protocol-Major: 3`, and refuses an engine older
+than `config.CLAUDEXOR_MIN_VERSION`. **Token custody:** the daemon bearer token grants
+the ENTIRE `/v2` surface, so it is read, held, and used only inside this module — never
+in a `ToolContext`, a child's environment, or a harness sandbox. The HTTP client runs
+with `trust_env=False` so an ambient proxy variable cannot intercept the loopback
+control plane.
+
+**Custody is durable, because the run is not ours to kill.** A delegated run lives
+inside the daemon, survives our worker, and the bearer token means anything that can
+name it can reach it — so custody in a module dict was custody that died with the
+process, leaving a LIVE mutating run nothing could wait on, cancel or settle while the
+dict refused the OWNING task itself. `ouroboros/delegate_custody.py` makes the AUTHORITY
+the durable rows the event log already carried (`delegate_run_started` and friends,
+written to the canonical/budget root so a child drive's pruning cannot erase them); the
+module dict is a pure memoization of those rows. A lookup answers OWNED, FOREIGN, or
+UNKNOWN — collapsing UNKNOWN into "not yours" is what made a restarted owner
+indistinguishable from an intruder. Every INTENDED start mints a fresh logical
+invocation id (`new_invocation_id`, a per-intention UUID) that rides the wire verbatim
+as the `Idempotency-Key`; the content hash of (task, route, access, root, prompt) is
+only the LOOKUP identity for finding a pending invocation, never the wire key — a
+content-stable key would hand a deliberate re-run of the same prompt the finished OLD
+run. Reuse happens ONLY by explicit token: a start whose outcome is unknown returns
+`pending_invocation_id`, and a `retry_of` call replays the STORED canonical body
+byte-identically under the SAME key, so the engine's replay check returns the run it
+already accepted instead of starting a second one (a re-derived body would digest
+differently and 409). A pending invocation whose owner died before the run row landed
+is recovered by the sweep the same way — stored body, stored key. `reconcile_orphaned_runs`
+settles or cancels every open run whose owning task is no longer in the supervisor's
+live set — the SAME owner-is-gone predicate `process_custody.reap_orphaned_processes`
+uses, because a delegated run has no pid for the process reaper to find. Its in-process
+twin, `release_task_runs`, runs at the loop's own resource-release point (beside service
+teardown and mailbox cleanup), so a terminalizing parent releases what it holds
+immediately instead of leaving it mutating until the next sweep; the durable path still
+covers the worker that dies before reaching its teardown. `maxSeconds` is damage
+limitation, never custody.
+
+**Nothing reports terminal or cancelled without a verified terminal receipt.**
+`delegate_cancel` returns one of four typed outcomes: `confirmed` (the run reads back
+terminal), `requested` (accepted, not obeyed yet), `failed` (a reachable daemon refused
+while the run keeps mutating), and `containment_fault_run_may_still_be_live` (the
+attempt could not be verified at all). The last two record a durable containment fault
+that surfaces as a CRITICAL health invariant until a terminal receipt or a settlement
+clears it — an overpowered mutating run that may still be alive is an incident, not a
+reassuring string in a tool result. `cancel_and_verify` short-circuits on the SAME
+`settled` fact `settle_run` does, and a refused control is never a verdict about the RUN:
+the state read decides, so a run that had already stopped is confirmed instead of
+faulted.
+
+**Absence is an answer, not ignorance.** `daemon_says_absent` (HTTP 404) is the one
+predicate for "the daemon told us this is not there", and it is read at every custody
+surface. A run the daemon does not have is not mutating anything, so it is CLOSED
+(`delegate_run_closed_absent`) rather than settled — there is no terminal detail, and
+inventing a `$0.00` ledger row for a run nobody can describe is the one shape the ledger
+must never produce. A registration the daemon does not have is already retired, so the
+obligation is discharged. Reading either as "unreachable" left the run in `open_runs`,
+re-faulted on every sweep, with a CRITICAL nothing could ever clear. A daemon that is
+merely unreachable still faults: absence and ignorance stay apart.
+
+**Settlement follows the durable fact.** Two independent, idempotent obligations — the
+ledger row and retiring a registration we created — and `settled` is claimed only when
+both landed AND the settlement row itself landed. Writing it over a suppressed failure
+turned a ledger-lock timeout or an unreachable daemon into a permanent leak, because the
+retry could then never happen. `emit` returns `append_jsonl`'s success signal (the
+codebase's own predicate for an important write) instead of discarding it: the rows ARE
+custody here, so a start whose row did not land reports `started_uncustodied` with
+`custody_durable: false` rather than a plain `started` over a run only this process can
+name.
+
+**A large result is delivered, not severed.** `finalSummary`/`primaryOutput` carry the
+run's real work product and Claudexor returns a preview of up to 256 KiB, while the
+generic tool-result cap head-truncates at 15k — which cut the terminal JSON mid-string
+and turned a review verdict into an unparseable fragment that still looked like an
+answer. `delegate_wait` therefore bounds ITSELF against `tool_capabilities.tool_result_limit`
+(the same function the truncator reads), stages the whole terminal detail under the
+task's own `task_drive/delegated_runs/<run>.json`, and returns a typed `output_delivery`
+block: `complete`, `consumed`, total chars, the artifact reference with its line count
+and sha256, and the `read_file(root='task_drive', …, start_line=N, max_lines=M)` recipe —
+the existing owner contract, whose `start_line` is a stable cursor over an immutable
+file, rather than a parallel artifact system. The cut fields are RENAMED to
+`*_preview`, so a consumer reading `primary_output` gets nothing instead of a fragment
+it would mistake for the whole answer, and the result is declared NOT consumed until the
+artifact has been read in full.
+
+**Project registration is a required step, not an optimization.** The first
+`delegate_start` against an unregistered root is answered with HTTP 404
+`project_not_registered`, so the nanny registers the root first. Claudexor has no
+ephemeral roots yet, so a registration WE created is retired when the run settles;
+a pre-existing registration is left alone.
+
+**Daemon lifecycle is attach-only.** `claudexord` is shared per user: a session-scoped
+reap would kill the owner's other runs, and `process_custody` scope `daemon` is never
+reaped at all. There is also nothing to spawn — the daemon's launch command is only
+discoverable THROUGH the daemon. An absent daemon is therefore a typed lane refusal
+(`daemon_not_discovered` / `daemon_unreachable`), after which an `auto` child runs
+natively with a visible marker; it is never a hard task failure.
+
+**Three nanny verbs** (`tools/delegate.py`), registered in BOTH child allowlists:
+`delegate_start`, `delegate_wait`, `delegate_cancel`. There is deliberately no `hurry`:
+Claudexor's only control verb is `cancel`, and cancelling a reviewer destroys the very
+verdict the hurry wanted. `delegate_wait` is time-bounded and progress-aware — it
+returns on a terminal state or on a real advance of the run's JOURNAL cursor
+(`lastSeq`), which is why SSE `: ping` keepalives cannot pose as progress: they never
+reach the cursor. A silent non-terminal run returns a typed `no_progress` reason so the
+nanny keeps reading its mailbox; the hard kill stays with the task watchdog.
+
+**Execution rule table** (`subagents.resolve_subagent_executor`, a pure function whose
+health facts are inputs): `auto` + no route → native; `auto` + healthy → nanny; `auto` +
+spent window → nanny plus a typed `reset_at` so it can decide (wait / partial / native);
+`auto` + otherwise unavailable → native with a visible marker; explicit `harness` +
+unavailable → a typed BLOCKER, because silently spending API money is the one outcome
+an explicit harness request must never produce; `native` → always native.
+
+The table is applied **at dispatch**, in `agent.resolve_dispatch_executor`, which is the
+last moment at which refusing still costs nothing. `subagents.probe_subagent_executor`
+is its impure companion: it gathers the health facts once (handshake, manifest, quota —
+and asks the daemon nothing at all when no route is configured or the request is
+`native`) and hands them to the pure table. A blocked pin ends the child unrun through
+`agent.executor_blocked_outcome` — `infra_failed` / `subagent_executor_unavailable` —
+rather than falling through to the worker, because a fallback would bill the owner for
+precisely the spend the pin was chosen to avoid. The `auto` rows carry a **visible
+marker** into the child's own context (`agent.dispatch_executor_note`): a nanny is told
+to delegate, and a child that fell back to metered tokens is told its route was
+unavailable instead of discovering it by spending. `subagents.route_health` is the ONE
+manifest reader, shared by the dispatcher and by `delegate_start`, so the two cannot
+disagree about the same route.
+
+**Read-only and mutating children share one nanny and one transport.** The only
+difference is the run shape, and the shape has ONE owner —
+`subagents.delegated_run_shape`, which answers a single question: is this an acting
+child? `tools/delegate._derive_authority` asks it of the live `ToolContext`
+(`tool_access.active_tool_profile`) and `agent.resolve_dispatch_executor` asks it of the
+task record (`tool_access.predicted_subagent_profile`); neither reassembles the shape,
+because a profile changed in one place and an isolation or a marker left behind in the
+other is silent and unsafe in exactly one branch.
+
+| task authority | access | mode | isolation | `execution.delegated` |
+|---|---|---|---|---|
+| acting subagent (valid write surface) | `workspace_write` | `agent` | `live` | `true` |
+| anything else, including a fail-closed subagent | `readonly` | `ask` | envelope (default) | not sent |
+
+A mutating child runs `live`, so Claudexor edits **the nanny's own worktree in place**.
+That is what makes the EXISTING workspace-patch capture see the harness's edits with no
+delegation-aware plumbing at all, and it is the same capture that invalidates itself
+(`workspace_head_changed`, patch deleted, status `failed`) if the harness dared to
+commit. The parent then integrates through the unchanged `integrate_subagent_patch`.
+A read-only child has nothing to write back and stays in Claudexor's default envelope —
+`execution.isolation='live'` is agent-only and a non-agent run carrying it is refused at
+the boundary — so this is one transport with one derived difference, not a second
+pipeline and not a second slot.
+
+**A mutating run asks for containment, reads back what it got, and DISCLOSES the gap
+instead of refusing the work.** In place is the one shape where Claudexor otherwise hands
+the harness the operator's REAL `$HOME` — which holds `~/.claudexor/v3/daemon/token`, a
+bearer token for the entire `/v2` control API, so a careless or compromised child could
+start its own runs at any access level and defeat every host-side authority derivation
+above. Four things follow, and they are one mechanism, not four:
+
+- **The marker travels with the isolation.** `execution.delegated: true` rides in the
+  same record as `isolation: live`, built from `delegated_run_shape` in one place, so one
+  cannot be sent without the other.
+- **The version floor is about the SCHEMA, and says so.**
+  `config.CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION` (3.3.0) is the oldest engine whose
+  `RunExecution` accepts `delegated` at all; below it the start is a 400 and no run
+  exists. It is checked inside `subagents.route_health`, the ONE health reader, so the
+  DISPATCHER refuses that engine before a token is spent and the nanny's own
+  `delegate_start` gives the identical typed `engine_rejects_delegated_marker` blocker. It
+  has to be a version and not a capability probe: `RunExecution` is STRICT (an unknown key
+  is a 400, not an ignored field) and the catalog's `runControlKeys` are TOP-LEVEL request
+  keys only, so a nested marker is undiscoverable. READ-ONLY delegation sends no marker
+  and keeps the lower transport floor (`CLAUDEXOR_MIN_VERSION` = 3.2.0, the oldest engine
+  that serves that lane and the one the operator actually runs). THE TWO FLOORS ARE
+  DIFFERENT NUMBERS ON PURPOSE: an engine between them serves read-only and refuses
+  mutating. What this floor is NOT is a proxy for "a boundary was applied" — it was pinned
+  at 3.3.2 for exactly that reason and the proxy lied, because Claudexor's boundary is
+  macOS-only (`docs/DELEGATED_CONFINEMENT.md` §8) and a build declares the same number on
+  every host. Threat model, measured bands and non-coverage:
+  `docs/DELEGATED_ADMISSION.md`.
+- **What was APPLIED is asked of the attempt, never of the OS.** Claudexor records the
+  applied facts — `harness_home_isolated` / `harness_home_dir`, and the boundary as
+  `confinement_mechanism` plus the `confinement_verified_denied_path` it was proven
+  against — on `attempts/<id>/attempt.yaml`, and projects them onto no `/v2` response, so
+  `delegate_wait` reads the artifact (`gateways.claudexor.attempt_containment`). The
+  mechanism is an OPAQUE string, so a boundary shipped for a second OS needs no edit here,
+  and `sys.platform` appears nowhere in the decision: Ouroboros does not know what the
+  engine did, only what it recorded.
+- **A missing boundary is disclosed in three places, not refused.** A run that recorded no
+  mechanism still runs, and the fact reaches the durable event stream
+  (`delegate_run_unconfined`), the child's own instructions (its boundary is stated as a
+  request, so it does not describe itself as sandboxed), and the parent's terminal payload
+  (`containment` carries `os_boundary`, `verified`, `disclosed`/`attempts`). That is
+  AGENTS.md "Disclose instead of forbid": the child already holds a shell in this
+  worktree, and cutting the lane on every host without a mechanism costs more than the
+  marginal step it prevents. A recorded FALSE is still a fault — `harness_home_isolated:
+  false`, or a scoped home that IS the operator's own, is cancelled as a typed containment
+  fault, exactly like a widened access profile. A MISSING home fact is neither: the engine
+  writes two attempt records and only the clean one carries those fields, so "a01 errored,
+  a02 repaired it" legitimately discloses nothing for a01, and faulting on it cancelled
+  healthy, finished, successful runs. Unproven is REPORTED, so silence is never read as
+  success and never enforced as a breach.
+
+**The model cannot widen its own authority.** `delegate_start` exposes exactly two
+parameters, `prompt` and `max_seconds`; there is no access, mode, isolation, root or
+scope argument to set, so the child can ask the host to run something but never choose
+with what powers. Every delegated run also carries host-authored `instructions` stating
+the same prohibitions an ordinary subagent has — no commit or history move, no
+self-review, no runtime controls, skills or memory, no writes outside the root. Those
+are a statement; the enforcement is the access profile plus the patch capture. And
+because Claudexor DERIVES effective access rather than echoing the request,
+`delegate_wait` verifies rather than assumes: every fetched run detail goes through
+`_containment_breach`, the one reader for BOTH halves of containment — the access
+profile and the harness HOME — because they fail identically, and a verification written
+for one half leaves the other trusting an echo. A run enforced WIDER than the task is
+entitled to is cancelled and returned as a typed `access_profile_widened` refusal. A
+narrower effective profile is fine — live probing confirms the engine itself clamps
+`workspace_write` down to `readonly` on an `ask` run.
+
+**Harness-agnostic by construction.** `OUROBOROS_SUBAGENT_HARNESS` holds an OPAQUE
+route (`harness[=model][:effort]`, Claudexor's own reviewer-panel spelling) that is
+passed through as `primaryHarness`. Health comes from the published capability manifest
+(`GET /v2/agent-capabilities`) and quota from `GET /v2/quota`; Ouroboros asks for an
+access PROFILE (`readonly` / `workspace_write`, derived host-side from the calling
+task's own authority — the model cannot widen it) and lets Claudexor choose the
+mechanism. There is no `codex`/`claude`/`cursor` branch anywhere in the core.
+
+Rationale for the narrow setting key: `OUROBOROS_SUBAGENT_HARNESS` is read ONLY by the
+subagent scheduler and is deliberately absent from `provider_models.MODEL_SETTING_KEYS`.
+A session-only route is not an API model identity; letting it into that sweep would
+poison credential planning, pricing, and benchmark provenance.
+
 ### Git and commit review
 
 `tools/git.py` owns repo writes, staging, commit, rollback/revert/restore, auto-tag, auto-push, and CI-status follow-up. `write_file` writes without committing; `edit_text` does exact one-occurrence edits; `commit_reviewed` stages, checks advisory freshness, runs deterministic preflight, runs triad + scope review, revalidates the exact Git binding, commits, verifies, tags, and pushes. The binding is the `git write-tree` SHA, ordered `HEAD`/`MERGE_HEAD` parents, indexed VERSION, expected `v{VERSION}` tag, any existing tag target, and binary staged-diff hash. A changed parent/tag is therefore as invalidating as a changed file; an existing release tag is never silently accepted or retargeted. After `git commit`, tree/parents/VERSION and tag target are re-read before a success attempt or push is recorded.
@@ -1692,7 +2039,7 @@ If neither exists, `cost=None` and `cost_final=false` remain durable. This is no
 budget bypass: an already-exhausted known budget and any known reservation that
 would exceed the remaining limit still block before dispatch.
 
-A raised provider send is terminalized honestly: an OpenRouter router-side 404 ("No endpoints found …" — routing failed BEFORE any upstream generation, nothing billed) settles at a confirmed $0 with `settle_reason="pre_routing_rejection"`, releasing its conservative reservation instead of holding a phantom unresolved bound against the budget forever (the same blind-spot class as the v6.65.4 zero-usage body-error fix); an OpenRouter ToS-policy 403 ("prohibited due to a violation of provider Terms Of Service", HTTP 403, matched structurally-or-textually and raised BEFORE any generation; the audited CLB run showed 0 llm_usage events and 0 billed tokens while accumulating a ~$479 phantom bound) likewise settles at a confirmed $0 with `settle_reason="tos_rejection"`; every other raised failure — including generic 401/403/quota errors without these exact signatures — keeps today's unresolved upper bound. `review_wave_admission` is the read-only pre-flight for task-level review waves (skill review, plan review, task acceptance — never the P3 commit gate): it reuses the exact per-attempt reservation math plus the root-projection remainder, and a wave that cannot fit is declined BEFORE the first reviewer call with a typed `review_wave_budget_insufficient` event — the surface finalizes honestly (skill stays pending, plan returns `PLAN_REVIEW_SKIPPED_BUDGET`, acceptance records a terminal DEGRADED) instead of dying mid-wave with paid partial slots. It is fail-open on unknown pricing/limits, mirroring `reserve_attempt`'s unknown-price stance. Budget check, sequence validation, append, and fsync occur under one short cross-process lock; network I/O never holds it. The projection conservatively counts settled cost + live reservations + unresolved upper bounds before each dispatch, both globally and per root. Reservations use provider-declared piecewise-linear price tiers; for OpenAI-family sends through OpenAI/OpenRouter the chars-based prompt estimate gets a documented 1.10 empirical tokenizer envelope before tier selection, while settlement always uses actual provider usage/cost. Unknown price remains unknown. A corrupt final JSONL row is quarantined with a loud event while the validated prefix stays available; every affected projection becomes integrity-degraded and `cost_final=false` because the lost tail may have been paid. Earlier structural corruption fails closed. If settlement persistence fails after a paid response, the result is preserved and the attempt stays dispatched/unresolved rather than disappearing. New sends stop after the known limit, while already-dispatched work may finish and cause a small honest overrun. A refused root dispatch installs one durable admission marker; it does not scan, mirror, or reclassify the subtree, whose members independently meet the same ledger rail before another dispatch. Resume explicitly clears that marker only after proving the nominated task has not dispatched (or has a typed replay-safe checkpoint); otherwise cancel or start a new task.
+A raised provider send is terminalized honestly: an OpenRouter router-side 404 ("No endpoints found …" — routing failed BEFORE any upstream generation, nothing billed) settles at a confirmed $0 with `settle_reason="pre_routing_rejection"`, releasing its conservative reservation instead of holding a phantom unresolved bound against the budget forever (the same blind-spot class as the v6.65.4 zero-usage body-error fix); an OpenRouter ToS-policy 403 ("prohibited due to a violation of provider Terms Of Service", HTTP 403, matched structurally-or-textually and raised BEFORE any generation; the audited CLB run showed 0 llm_usage events and 0 billed tokens while accumulating a ~$479 phantom bound) likewise settles at a confirmed $0 with `settle_reason="tos_rejection"`; every other raised failure — including generic 401/403/quota errors without these exact signatures — keeps today's unresolved upper bound. `review_wave_admission` is the read-only pre-flight for task-level review waves (skill review, plan review, task acceptance — never the P3 commit gate): it reuses the exact per-attempt reservation math plus the root-projection remainder, and a wave that cannot fit is declined BEFORE the first reviewer call with a typed `review_wave_budget_insufficient` event — the surface finalizes honestly (skill stays pending, plan returns `PLAN_REVIEW_SKIPPED_BUDGET`, acceptance records a terminal DEGRADED) instead of dying mid-wave with paid partial slots. It is fail-open on unknown LIMITS, mirroring `reserve_attempt`'s unknown-price stance, but as of v6.87.7 an unknown PRICE is scoped to its own slot: that slot contributes zero and is counted in `unpriced_slots`, and the remaining priced slots are still summed and still bind. Previously the first unpriceable model returned `fits=True` for the WHOLE wave, so one free slot disabled admission for every paid sibling beside it — the gate stopped binding exactly when a wave mixed known and unknown cost (BIBLE P1: the gap is represented, never filled in). Budget check, sequence validation, append, and fsync occur under one short cross-process lock; network I/O never holds it. The projection conservatively counts settled cost + live reservations + unresolved upper bounds before each dispatch, both globally and per root. Reservations use provider-declared piecewise-linear price tiers; for OpenAI-family sends through OpenAI/OpenRouter the chars-based prompt estimate gets a documented 1.10 empirical tokenizer envelope before tier selection, while settlement always uses actual provider usage/cost. Unknown price remains unknown. A corrupt final JSONL row is quarantined with a loud event while the validated prefix stays available; every affected projection becomes integrity-degraded and `cost_final=false` because the lost tail may have been paid. Earlier structural corruption fails closed. If settlement persistence fails after a paid response, the result is preserved and the attempt stays dispatched/unresolved rather than disappearing. New sends stop after the known limit, while already-dispatched work may finish and cause a small honest overrun. A refused root dispatch installs one durable admission marker; it does not scan, mirror, or reclassify the subtree, whose members independently meet the same ledger rail before another dispatch. Resume explicitly clears that marker only after proving the nominated task has not dispatched (or has a typed replay-safe checkpoint); otherwise cancel or start a new task.
 
 `state.json`, `/api/state`, `/api/cost-breakdown`, task results, and `llm_usage` remain compatibility projections carrying ledger attempt ids; they never become a second charge source. Root totals aggregate the subtree and review/safety/post-task work exactly once. A late cosmetic project-naming settlement refreshes the terminal root projection without reviving a timed-out title/bubble; `task_cost_finalized` refreshes history/cards without creating chat or unread. Owner-visible chat budget lines and startup budget checks replay this ledger instead of trusting a stale state mirror, and fail loudly if replay is unavailable. Split-drive workers receive the canonical `budget_drive_root` before their startup check, so they never report a child-local `$0` projection. Owner surfaces distinguish Accounted/Limit, confirmed/settled, reserved, unresolved upper bound, unknown/unmetered, `cost_final`, and a loud ledger-integrity warning. Quarantine evidence marks the projection integrity-degraded, non-final, and non-replay-safe even when the validated prefix remains readable.
 
@@ -1775,7 +2122,6 @@ Runtime floors:
 | OUROBOROS_VISION_CAPTION_TIMEOUT_SEC | 90 | Provider timeout for send-time image caption sub-calls (`vision_routing.py`); keeps caption fallback from occupying the main loop indefinitely. |
 | OUROBOROS_MODEL_CONSCIOUSNESS | "" | Background Consciousness model slot. Empty means use `OUROBOROS_MODEL`; do not silently downgrade this lane to the light model or a smaller context as a cost optimization |
 | OUROBOROS_MODEL_FALLBACKS | openai/gpt-5.6-luna | Comma-separated cross-model fallback chain tried when the primary returns no usable response (429-aware cooldown, deduped, active model dropped; a benchmark setting all slots to one model dedupes to a no-op). (Renamed from `OUROBOROS_MODEL_FALLBACK`; stored/legacy values migrate.) |
-| OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT | 1 | Capability/cost cap (distinct from the hard nesting cap `OUROBOROS_MAX_SUBAGENT_DEPTH`): the subagent depth at/below which an explicit `main`/`heavy` lane is honored; deeper descendants fall to Light. A capped explicit request surfaces a visible note |
 | OUROBOROS_MODEL_MAX_CONCURRENCY | 3 | (v6.40) Max CONCURRENT provider calls per (model, use_local) route; excess worker threads wait (deadline-bounded) instead of storming one model's rate limit (self-DoS guard, `ouroboros/model_concurrency.py`). <=0 disables. Default-on, fail-soft |
 | OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC | 180 | (v6.40) Hard ceiling (seconds) a provider call waits for a concurrency slot when the task has no deadline; past it the call proceeds without a slot (never blocks forever) |
 | OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC | 60 | (v6.40) Transport timeout for the LIGHT project-naming provider call (`ouroboros/project_naming.py`) |
@@ -1787,10 +2133,13 @@ Runtime floors:
 | OUROBOROS_MODEL_DEEP_SELF_REVIEW | openai/gpt-5.6-sol-pro | Dedicated deep self-review model slot |
 | OUROBOROS_MAX_WORKERS | 10 | Worker process pool size |
 | OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT | 6 | Active subagent cap per root task — readonly or acting (hard max 500 = `config.MAX_ACTIVE_SUBAGENTS_HARD_CAP`, shared with the supervisor reject/reservation gates and the `wait_tasks` id cap; decided trade-off: at ~500 children the `wait_tasks` compact projection can hit the disclosed 15K tool-result truncation — chunked waits + `get_task_result` are the follow-up path, and the O(n²) active-tree scans are accepted with no perf work) |
-| OUROBOROS_MAX_SUBAGENT_DEPTH | 2 | Nested subagent depth cap (hard max 10, min 0; **0 disables delegation entirely**, including plan_task's planning scouts — root tasks still run; descendants deeper than `OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT` use the light lane) |
+| OUROBOROS_MAX_SUBAGENT_DEPTH | 2 | Nested subagent depth cap (hard max 10, min 0; **0 disables delegation entirely**, including plan_task's planning scouts — root tasks still run) |
 | OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS | (empty) | Allow mutative (acting) subagents. Empty = follow runtime mode (ON in advanced/pro, OFF in light); explicit true/false overrides. Owner-controlled. Settings exposes explicit On/Off only; the empty runtime-default state is backend/default behavior, not a third owner-facing mode. |
 | OUROBOROS_SUBAGENT_WORKTREE_ROOT | (empty) | Filesystem root for acting self_worktree checkouts; empty = ~/Ouroboros/subagent_worktrees (kept outside repo/ and data/) |
 | OUROBOROS_SUBAGENT_PROJECTS_ROOT | (empty) | Durable root for genesis ("from scratch") subagent projects; empty = ~/Ouroboros/projects (outside repo/ and data/). Never age-pruned. |
+| OUROBOROS_SUBAGENT_HARNESS | (empty) | (v6.87.8) OPAQUE Claudexor route for delegated subagents, spelled `harness[=model][:effort]`. Empty = delegation off (native children). Read ONLY by the subagent scheduler and deliberately NOT in `provider_models.MODEL_SETTING_KEYS`: a session-only route is not an API model identity, and admitting it there would poison credential planning, pricing, and bench provenance. |
+| OUROBOROS_DELEGATE_WAIT_SEC | 120 | (v6.87.8) Default quiet cutoff for ONE `delegate_wait` call. The call returns earlier on a terminal state or a real journal-cursor advance; this bounds only the silent case, so the nanny keeps reading its mailbox. |
+| OUROBOROS_DELEGATE_WAIT_MAX_SEC | 1800 | (v6.87.8) Ceiling for a caller-supplied `delegate_wait` window. The hard kill stays with the task watchdog; this tunes the passive wait only. |
 | OUROBOROS_DELIVERABLES_ROOT | (empty) | (v6.38.0) Visible container for UNNAMED user deliverables; empty = ~/Ouroboros/Deliverables (sibling of the projects root, outside repo/ and data/, never GC-pruned). A BARE `user_files` filename (no directory) lands here instead of cluttering the home root; an explicit placement (`Desktop/…`, `Downloads/…`, any path WITH a directory) is honored under home as given. `user_files_path_block_reason` allows this container past the workspace-overlap guard only while it stays a genuine sibling of (never overlapping/containing) the hard data/repo/budget drives. |
 | OUROBOROS_GC_RETENTION_DAYS | 7 | Unified age (days) for startup garbage collection of ALL disposable runtime artifacts: acting worktrees, terminal task drives, and leftover service logs (hard max 365; math SSOT in `ouroboros/retention.py`). Deprecated per-subsystem retention keys are migrated into this on settings load. |
 | OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC | 120 | Poll slice for required `plan_task` planning subagents; every started scout remains eligible until terminal state or the shared max-wait cutoff. |
@@ -1867,6 +2216,7 @@ Runtime floors:
 | OUROBOROS_MAX_ROUNDS | 200 | Main-loop LLM round ceiling per task (hot-reloadable) |
 | OUROBOROS_TRANSIENT_RETRY_MAX | 6 | Same-model attempt budget for transient provider failures (finish_reason=null, 429/5xx); floored at the base retry budget |
 | OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC | 1800 | Skill lifecycle lane deadline before a wedged job fails loudly |
+| OUROBOROS_BUNDLE_DIR | (unset) | Packaged bundle root, handed down by `launcher.start_agent` / `packaged_cli` so a child of the embedded interpreter can find bundled payloads (`node-standalone`, `ripgrep-standalone`). Set by the launcher, not by the owner. |
 | OUROBOROS_BG_MAX_ROUNDS | 10 | Max LLM rounds per consciousness cycle |
 | OUROBOROS_BG_WAKEUP_MIN | 30 | Min wakeup interval (seconds) |
 | OUROBOROS_BG_WAKEUP_MAX | 7200 | Max wakeup interval (seconds) |

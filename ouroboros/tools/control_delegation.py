@@ -124,7 +124,19 @@ def effective_delegation_budget(
                     False,
                     budget,
                     reason_code="delegation_constraint_require_lane",
-                    detail=str(payload.get("rationale") or f"Unresolved delegation constraint requires lane {required_lane!r}."),
+                    # Name the v6.87.7 default change in the refusal. A constraint written
+                    # before it reasoned about the OLD `auto`, which resolved a mutating
+                    # child to `heavy`; the same spawn now resolves `light` and is refused
+                    # with no hint that the default moved under it.
+                    detail=str(
+                        payload.get("rationale")
+                        or (
+                            f"Unresolved delegation constraint requires lane {required_lane!r} "
+                            f"(this child resolved {str(effective_lane or '').strip()!r}). Since "
+                            "v6.87.7 an omitted model_lane resolves to light whatever the child "
+                            "may do — ask for the lane explicitly."
+                        )
+                    ),
                 )
         if directive == "cap_children":
             scope = payload.get("scope")

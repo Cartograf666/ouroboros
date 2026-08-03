@@ -14,7 +14,13 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
-from ouroboros.config import apply_settings_to_env, get_max_subagent_depth, load_settings, save_settings
+from ouroboros.config import (
+    EFFORT_SCALE,
+    apply_settings_to_env,
+    get_max_subagent_depth,
+    load_settings,
+    save_settings,
+)
 from ouroboros.headless import prepare_task_drive, task_state_dir
 from ouroboros.contracts.task_contract import (
     build_task_contract,
@@ -39,9 +45,11 @@ from ouroboros.task_results import (
 )
 from ouroboros.task_status import load_effective_task_result, wait_for_effective_tasks
 from ouroboros.subagents import (
+    SUBAGENT_EXECUTORS,
     build_subagent_envelope,
     compact_task_group,
     expand_subagent_lane_slots,
+    normalize_subagent_executor,
     normalize_subagent_model_lane,
 )
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE
@@ -1063,6 +1071,10 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
     expected_output = spec.get("expected_output", "")
     constraints = spec.get("constraints", "")
     delegation_budget = spec.get("child_delegation_budget")
+    narrowed_deadline_at = _earliest_deadline_at(
+        str(spec.get("deadline_at") or ""),
+        str(parent_contract.get("deadline_at") or "") if isinstance(parent_contract, dict) else "",
+    )
     return build_task_contract({
         "id": spec.get("tid"),
         "type": "task",
@@ -1078,10 +1090,7 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
         # parent can only consume the child's handoff inside a narrower window (planning
         # scouts). Never LATER: the earliest of the two wins, so a requested deadline can
         # only tighten the inherited one.
-        "deadline_at": _earliest_deadline_at(
-            str(spec.get("deadline_at") or ""),
-            str(parent_contract.get("deadline_at") or "") if isinstance(parent_contract, dict) else "",
-        ),
+        "deadline_at": narrowed_deadline_at,
         "parent_task_id": spec.get("parent_task_id", ""),
         "root_task_id": spec.get("root_task_id"),
         "session_id": spec.get("session_id", ""),
@@ -1093,6 +1102,12 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
                 "objective": objective,
                 "expected_output": expected_output,
                 "constraints": constraints,
+                # The spread above hands the child EVERY parent field, and this merged
+                # mapping outranks the task-level keys in build_task_contract. Any field we
+                # deliberately narrow must therefore be re-stated after it, or the parent's
+                # value silently wins back — which is exactly what used to happen to a
+                # requested child deadline whenever the parent carried one of its own.
+                "deadline_at": narrowed_deadline_at,
                 "delegation_budget": delegation_budget,
             } if isinstance(parent_contract, dict) else {"delegation_budget": delegation_budget},
         },
@@ -1158,9 +1173,9 @@ def schedule_subagent_properties() -> Dict[str, Any]:
         },
         "model_lane": {
             "type": "string",
-            "enum": ["auto", "main", "heavy", "light", "review", "scope"],
+            "enum": ["auto", "main", "heavy", "light"],
             "default": "auto",
-            "description": "Model lane for the child. auto uses the cheap Light lane for a read-only child but the strong Heavy lane for a MUTATING first-level child — one that writes (a declared write_surface) OR is granted mutative-descendant intent (may_mutate); main/heavy/light use those configured slots (Heavy = strong acting/coding lane, empty Heavy/Light fall back to Main); review/scope fan out across configured reviewer slots and return a task_group. NOTE: an EXPLICIT main/heavy lane is honored only for children at or below the configured capability depth limit (advanced setting OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT, default 1 = direct children); deeper descendants resolve to Light to bound deep-swarm cost (a visible note is surfaced when an explicit request is capped).",
+            "description": "How STRONG this child should be. It says nothing about what the child may DO — authority comes from write_surface. Omit it (auto) for ordinary work: the child runs the cheap Light lane and raises its own power with switch_model if the work turns out to be harder than you expected. Ask for heavy or main when you already know the work needs a strong model — heavy is the strong acting/coding slot, and an empty Heavy/Light slot falls back to Main. Depth does not change the lane.",
         },
         "write_surface": {
             "type": "string",
@@ -1186,6 +1201,21 @@ def schedule_subagent_properties() -> Dict[str, Any]:
             "items": {"type": "string", "enum": list(SUBAGENT_CAPABILITIES)},
             "description": "Closed-enum capabilities this child must have (e.g. shell/vcs/write/service). The scheduler reconciles this with the selected profile before spawning; do not encode these needs in prose.",
         },
+        "executor": {
+            "type": "string",
+            "enum": list(SUBAGENT_EXECUTORS),
+            "default": "auto",
+            "description": "WHO runs this child, a third axis alongside power (model_lane) and authority (write_surface). auto follows the owner's configured policy and is the right answer almost always. native pins the child to Ouroboros' own metered loop. harness pins it to the configured delegation harness and REFUSES if that harness is unavailable, rather than silently spending metered money instead.",
+        },
+        "effort": {
+            "type": "string",
+            "enum": list(EFFORT_SCALE),
+            "description": "Optional reasoning effort for this child. Omit it to inherit the configured effort for the child's task type — that is the normal case. Name one only when you already know this particular child needs to think harder or less hard than its siblings; the child can also raise itself later with switch_model.",
+        },
+        "deadline_at": {
+            "type": "string",
+            "description": "Optional ISO-8601 UTC instant after which this child's work is worthless to you (e.g. a scout whose handoff you can only consume inside a narrow window). NARROWING ONLY: the earlier of this and the parent's deadline wins, so it can tighten your own deadline but never extend it. Omit it to simply inherit the parent's.",
+        },
     }
 
 
@@ -1202,7 +1232,72 @@ def schedule_subagent_param_names() -> frozenset:
 # structurally unreachable from a model tool call: they ride in the POSITIONAL-ONLY `internal`
 # mapping, which no keyword argument produced from tool-call JSON can ever bind to. Keeping
 # them out of the signature is also what holds the handler inside the <8-parameter contract.
-_INTERNAL_SCHEDULE_OPTIONS: frozenset = frozenset({"deadline_at"})
+#
+# The set is EMPTY as of v6.87.7: its only member, `deadline_at`, became a public parameter
+# once the caller judged to be the right one turned out to be the parent LLM itself — it is
+# the parent that knows when a child's handoff stops being useful. The seam stays because it
+# is closed and cheap, and an unknown key here still fails loudly rather than being ignored.
+_INTERNAL_SCHEDULE_OPTIONS: frozenset = frozenset()
+
+
+def _validated_schedule_fields(params: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
+    """Normalize and validate the public schedule_subagent fields.
+
+    Returns ``(fields, "")`` or ``({}, refusal)``. Extracted from ``_schedule_task`` so
+    the handler stays inside the method-size gate — argument validation is a coherent
+    phase with one job, not a slice taken to shed lines.
+    """
+    deadline_at = str(params.get("deadline_at") or "").strip()
+    memory_mode = str(params.get("memory_mode") or "forked").strip().lower()
+    try:
+        model_lane = normalize_subagent_model_lane(params.get("model_lane", "auto"))
+        executor = normalize_subagent_executor(params.get("executor", "auto"))
+    except ValueError as exc:
+        return {}, f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {exc}."
+    effort = str(params.get("effort") or "").strip().lower()
+    if effort and effort not in EFFORT_SCALE:
+        allowed = ", ".join(EFFORT_SCALE)
+        return {}, f"⚠️ TOOL_ARG_ERROR (schedule_subagent): effort must be one of: {allowed}."
+    if deadline_at:
+        # `deadline_at` became MODEL-AUTHORED in v6.87.7; it used to be computed by
+        # plan_review, where neither check could fail. Both failures below are SILENT
+        # without them (BIBLE P1): an unparseable stamp rides into the child contract
+        # verbatim and simply never fires, so the parent believes it bound a child that is
+        # running deadline-blind; and a past stamp makes the child emit its canned
+        # "produce your best answer NOW" on round one, having done no work at all.
+        from ouroboros.deadline_utils import parse_deadline_ts, utc_now
+
+        parsed = parse_deadline_ts(deadline_at)
+        if parsed is None:
+            return {}, (
+                "⚠️ TOOL_ARG_ERROR (schedule_subagent): deadline_at must be an ISO-8601 UTC "
+                f"instant such as 2026-08-02T18:30:00Z (got: {deadline_at!r})."
+            )
+        if parsed <= utc_now():
+            return {}, (
+                "⚠️ TOOL_ARG_ERROR (schedule_subagent): deadline_at is already in the past "
+                f"({deadline_at}); a child bound to it would finalize before doing any work."
+            )
+    objective = str(params.get("objective") or "").strip()
+    if not objective:
+        return {}, "⚠️ TOOL_ARG_ERROR (schedule_subagent): objective is required."
+    expected_output = str(params.get("expected_output") or "").strip()
+    if not expected_output:
+        return {}, "⚠️ TOOL_ARG_ERROR (schedule_subagent): expected_output is required."
+    if memory_mode not in VALID_SUBTASK_MEMORY_MODES:
+        allowed = ", ".join(sorted(VALID_SUBTASK_MEMORY_MODES))
+        return {}, (
+            f"⚠️ TOOL_ARG_ERROR (schedule_subagent): memory_mode must be one of: {allowed}. "
+            "memory_mode=shared is disabled for live local subagents until a sanitized shared-context mode exists."
+        )
+    return {
+        "deadline_at": deadline_at, "objective": objective, "expected_output": expected_output,
+        "role": str(params.get("role") or "researcher").strip() or "researcher",
+        "context": str(params.get("context") or "").strip(),
+        "constraints": str(params.get("constraints") or "").strip(),
+        "memory_mode": memory_mode, "may_mutate": params.get("may_mutate", False),
+        "model_lane": model_lane, "executor": executor, "effort": effort,
+    }, ""
 
 
 def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, **params: Any) -> str:
@@ -1221,28 +1316,20 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     if set(internal) - _INTERNAL_SCHEDULE_OPTIONS:
         raise TypeError(f"_schedule_task: unknown internal scheduling option(s): "
                         f"{sorted(set(internal) - _INTERNAL_SCHEDULE_OPTIONS)}")
-    deadline_at = str(internal.get("deadline_at") or "")
-    objective = str(params.get("objective") or "").strip()
-    expected_output = str(params.get("expected_output") or "").strip()
-    role = str(params.get("role") or "researcher").strip() or "researcher"
-    context = str(params.get("context") or "").strip()
-    constraints = str(params.get("constraints") or "").strip()
-    memory_mode = str(params.get("memory_mode") or "forked").strip().lower()
-    may_mutate = params.get("may_mutate", False)
-    try:
-        requested_model_lane = normalize_subagent_model_lane(params.get("model_lane", "auto"))
-    except ValueError as exc:
-        return f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {exc}."
-    if not objective:
-        return "⚠️ TOOL_ARG_ERROR (schedule_subagent): objective is required."
-    if not expected_output:
-        return "⚠️ TOOL_ARG_ERROR (schedule_subagent): expected_output is required."
-    if memory_mode not in VALID_SUBTASK_MEMORY_MODES:
-        allowed = ", ".join(sorted(VALID_SUBTASK_MEMORY_MODES))
-        return (
-            f"⚠️ TOOL_ARG_ERROR (schedule_subagent): memory_mode must be one of: {allowed}. "
-            "memory_mode=shared is disabled for live local subagents until a sanitized shared-context mode exists."
-        )
+    fields, arg_error = _validated_schedule_fields(params)
+    if arg_error:
+        return arg_error
+    deadline_at = fields["deadline_at"]
+    objective = fields["objective"]
+    expected_output = fields["expected_output"]
+    role = fields["role"]
+    context = fields["context"]
+    constraints = fields["constraints"]
+    memory_mode = fields["memory_mode"]
+    may_mutate = fields["may_mutate"]
+    requested_model_lane = fields["model_lane"]
+    requested_executor = fields["executor"]
+    requested_effort = fields["effort"]
 
     try:
         current_depth = int(getattr(ctx, 'task_depth', 0) or 0)
@@ -1266,12 +1353,13 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
             pass
 
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
-    parent_contract = (
-        getattr(ctx, "task_contract", {})
-        if isinstance(getattr(ctx, "task_contract", {}), dict)
-        else metadata.get("task_contract") if isinstance(metadata.get("task_contract"), dict)
-        else {}
-    )
+    # EMPTINESS decides, not type. `ToolContext.task_contract` defaults to `{}`, so testing
+    # only `isinstance(..., dict)` let that empty default win over a contract that really is
+    # in `task_metadata` — and the parent's `deadline_at` lives in the contract, so the miss
+    # silently un-narrowed every child deadline. Same precedence the registry already uses.
+    parent_contract = metadata.get("task_contract") if isinstance(metadata.get("task_contract"), dict) else {}
+    if not parent_contract and isinstance(getattr(ctx, "task_contract", None), dict):
+        parent_contract = getattr(ctx, "task_contract")
     current_task_id = str(getattr(ctx, "task_id", "") or "")
     parent_task_id = str(current_task_id or metadata.get("parent_task_id") or "").strip()
     root_task_id_seed = str(metadata.get("root_task_id") or current_task_id or "").strip()
@@ -1320,19 +1408,17 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         or {}
     )
     executor_ref = _resolve_executor_ref(ctx)
-    # Auto lane: mutating children use Heavy; read-only children use Light.
-    child_mutating = bool(requested_surface) or normalize_bool(may_mutate)
-    lane_slots = expand_subagent_lane_slots(requested_model_lane, depth=new_depth, mutating=child_mutating)
+    # Power comes from the requested lane alone. The write surface and may_mutate
+    # decide AUTHORITY (which tools the child may call, via task_constraint) and no
+    # longer leak into model choice — see resolve_subagent_lane for why.
+    lane_slots = expand_subagent_lane_slots(requested_model_lane, depth=new_depth)
     if not lane_slots:
         return "⚠️ SUBTASK_STATUS_ERROR: no subagent lane slots resolved; subagent was not scheduled."
-    _lane_downgrade_notes = [s.downgrade_note for s in lane_slots if s.downgrade_note]
     slot_tasks = [(uuid.uuid4().hex[:8], slot) for slot in lane_slots]
     task_ids: List[str] = [task_id for task_id, _slot in slot_tasks]
     emitted_modes: List[str] = []
     task_group_id = (
-        f"subagents-{uuid.uuid4().hex[:8]}"
-        if requested_model_lane in {"review", "scope"} or len(lane_slots) > 1
-        else ""
+        f"subagents-{uuid.uuid4().hex[:8]}" if len(lane_slots) > 1 else ""
     )
     task_group = compact_task_group(
         group_id=task_group_id,
@@ -1382,6 +1468,8 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
             requested_lane=slot.requested_lane,
             effective_lane=slot.effective_lane,
             model=slot.model,
+            reasoning_effort=requested_effort,
+            executor=requested_executor,
             status=STATUS_REQUESTED,
         )
         evt = {
@@ -1411,6 +1499,8 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
             "effective_model_lane": slot.effective_lane,
             "model": slot.model,
             "use_local_model": slot.use_local_model,
+            "requested_executor": requested_executor,
+            "reasoning_effort": requested_effort,
             "task_group_id": task_group_id,
             "task_group": task_group,
             "subagent_envelope": envelope,
@@ -1454,6 +1544,8 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
                 effective_model_lane=slot.effective_lane,
                 model=slot.model,
                 use_local_model=slot.use_local_model,
+                requested_executor=requested_executor,
+                reasoning_effort=requested_effort,
                 task_group_id=task_group_id,
                 task_group=task_group,
                 subagent_envelope=envelope,
@@ -1489,8 +1581,6 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         emitted_modes=emitted_modes,
         write_surface=requested_surface,
     )
-    if _lane_downgrade_notes and isinstance(_schedule_result, str):  # P1: not a silent horizon cut
-        _schedule_result += "\n⚠️ " + "; ".join(dict.fromkeys(_lane_downgrade_notes))
     return _schedule_result
 
 

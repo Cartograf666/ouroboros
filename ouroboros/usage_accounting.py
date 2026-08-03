@@ -12,7 +12,6 @@ for budget check + append + fsync; network I/O always happens outside that lock.
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import contextvars
 import hashlib
@@ -26,14 +25,38 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple
 
 from ouroboros.pricing import estimate_cost_optional
+# One-way seam: the durable ledger substrate (locking, atomic append + fsync, row
+# and transition validation, torn-tail quarantine) lives in ouroboros/usage_ledger.py
+# and knows nothing about reservations, budgets, pricing, or projections. This module
+# is the ACCOUNTING POLICY on top of it and imports FROM it; usage_ledger must never
+# import back. The private names are re-bound here so existing call sites — and the
+# tests that monkeypatch `usage_accounting._locked` — keep working unchanged.
+from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
+    LEDGER_REL,
+    QUARANTINE_REL,
+    UsageAccountingError,
+    UsageLedgerCorrupt,
+    _append_bytes_fsync,
+    _append_rows_locked,
+    _drive_root,
+    _final_rows,
+    _locked,
+    _named_lock,
+    _number,
+    _read_records_locked,
+    # Re-exported although THIS module no longer reads it: the terminal-state set is
+    # part of the substrate's vocabulary, and a policy function that terminalizes an
+    # attempt needs to name those states. Dropping it from the re-export would make the
+    # split look clean here and break a caller that arrives from another branch.
+    _TERMINAL,
+    _validate_records,
+    _write_bytes_atomic_fsync,
+)
 from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso
 
 log = logging.getLogger(__name__)
 
-LEDGER_REL = pathlib.Path("state/usage_attempts.jsonl")
-QUARANTINE_REL = pathlib.Path("state/usage_attempts.quarantine.jsonl")
 IMPORT_REL = pathlib.Path("state/usage_import_watermark.json")
-_TERMINAL = frozenset({"settled", "unresolved", "released"})
 
 __all__ = (
     "AttemptRequest", "AttemptReservation", "BudgetExceeded", "PhysicalAttemptLimitExceeded",
@@ -41,6 +64,7 @@ __all__ = (
     "current_usage_scope",
     "ensure_legacy_imported", "execute_physical_attempt", "execute_physical_attempt_async",
     "mark_dispatched", "mark_unresolved", "physical_attempt_limit",
+    "record_subscription_session",
     "record_unmetered_external_dispatch", "release_attempt", "reserve_attempt", "settle_attempt",
     "usage_breakdown", "usage_from_response", "usage_projection", "usage_scope",
     "review_wave_admission",
@@ -54,14 +78,6 @@ _ATTEMPT_COLLECTOR: contextvars.ContextVar[Optional[list[str]]] = contextvars.Co
 _PHYSICAL_LIMIT: contextvars.ContextVar[Optional["_AttemptLimit"]] = contextvars.ContextVar(
     "ouroboros_physical_attempt_limit", default=None
 )
-
-
-class UsageAccountingError(RuntimeError):
-    """Base error for fail-closed accounting operations."""
-
-
-class UsageLedgerCorrupt(UsageAccountingError):
-    """Raised when durable history is structurally invalid."""
 
 
 class BudgetExceeded(UsageAccountingError):
@@ -122,25 +138,6 @@ class AttemptReservation:
     model: str
     provider: str
     reservation_upper_bound_usd: Optional[float]
-
-
-def _drive_root(value: pathlib.Path | str | None = None) -> pathlib.Path:
-    if value is not None:
-        if not isinstance(value, (str, pathlib.Path)):
-            raise UsageAccountingError(f"invalid usage accounting drive root type: {type(value).__name__}")
-        resolved = pathlib.Path(value)
-        if not resolved.is_absolute():
-            raise UsageAccountingError(f"usage accounting drive root must be absolute: {resolved}")
-        return resolved
-    configured = str(os.environ.get("OUROBOROS_DATA_DIR") or "").strip()
-    if configured:
-        resolved = pathlib.Path(configured)
-        if not resolved.is_absolute():
-            raise UsageAccountingError(f"OUROBOROS_DATA_DIR must be absolute for usage accounting: {resolved}")
-        return resolved
-    from ouroboros.config import DATA_DIR
-
-    return pathlib.Path(DATA_DIR)
 
 
 @contextlib.contextmanager
@@ -211,257 +208,40 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
     return request, scope
 
 
-@contextlib.contextmanager
-def _named_lock(
-    root: pathlib.Path,
-    filename: str,
-    *,
-    timeout_sec: float,
-    stale_sec: float,
-) -> Iterator[None]:
-    from ouroboros.platform_layer import (
-        acquire_exclusive_file_lock,
-        release_exclusive_file_lock,
-    )
-
-    path = root / "state" / filename
-    fd = acquire_exclusive_file_lock(path, timeout_sec=timeout_sec, stale_sec=stale_sec)
-    if fd is None:
-        raise UsageAccountingError(f"usage accounting lock unavailable: {path}")
-    try:
-        yield
-    finally:
-        release_exclusive_file_lock(path, fd)
-
-
-@contextlib.contextmanager
-def _locked(root: pathlib.Path) -> Iterator[None]:
-    # Operator fix 2026-07-23: 4.0s starves under a grown ledger (reserve_attempt
-    # re-reads the whole usage_attempts.jsonl under this lock — ~0.5s hold at 20MB),
-    # failing healthy tasks with UsageAccountingError at >=10 concurrent workers.
-    # Waiting longer is always correct here; the transaction itself stays atomic.
-    with _named_lock(root, "usage_attempts.lock", timeout_sec=45.0, stale_sec=90.0):
-        yield
-
-
-def _append_bytes_fsync(path: pathlib.Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        view = memoryview(payload)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError(f"short append to {path}")
-            view = view[written:]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _write_bytes_atomic_fsync(path: pathlib.Path, payload: bytes) -> None:
-    """Persist the exact snapshotted bytes without reopening the source."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}")
-    fd: Optional[int] = None
-    try:
-        # Windows defaults low-level descriptors to text mode, which would
-        # expand LF bytes and break the archive's immutable source hash.
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        fd = os.open(str(tmp), flags, 0o600)
-        view = memoryview(payload)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError(f"short write to {tmp}")
-            view = view[written:]
-        os.fsync(fd)
-        os.close(fd)
-        fd = None
-        os.replace(tmp, path)
-    except Exception:
-        if fd is not None:
-            os.close(fd)
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
-
-
-def _quarantine_tail(root: pathlib.Path, raw: bytes, offset: int, reason: str) -> None:
-    ledger = root / LEDGER_REL
-    row = {
-        "ts": utc_now_iso(),
-        "reason": reason,
-        "source": str(ledger),
-        "raw_base64": base64.b64encode(raw).decode("ascii"),
-    }
-    _append_bytes_fsync(
-        root / QUARANTINE_REL,
-        (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"),
-    )
-    fd = os.open(str(ledger), os.O_RDWR)
-    try:
-        os.ftruncate(fd, offset)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    log.error("Quarantined corrupt final usage-ledger row: %s", reason)
-    try:
-        append_jsonl(
-            root / "logs" / "events.jsonl",
-            {"type": "usage_ledger_tail_quarantined", "ts": utc_now_iso(), "reason": reason},
-        )
-    except Exception:
-        log.exception("Failed to emit usage-ledger quarantine event")
-
-
-def _validate_records(records: Sequence[Dict[str, Any]]) -> None:
-    states: Dict[str, str] = {}
-    expected = 1
-    for row in records:
-        try:
-            sequence = int(row.get("seq") or 0) if isinstance(row, dict) else 0
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise UsageLedgerCorrupt(f"invalid usage ledger sequence at {expected}") from exc
-        if not isinstance(row, dict) or sequence != expected:
-            raise UsageLedgerCorrupt(f"usage ledger sequence mismatch at {expected}")
-        expected += 1
-        attempt_id = str(row.get("attempt_id") or "")
-        state = str(row.get("state") or "")
-        kind = str(row.get("kind") or "attempt")
-        if not attempt_id or state not in {"reserved", "dispatched", *_TERMINAL}:
-            raise UsageLedgerCorrupt(f"invalid usage ledger row seq={row.get('seq')}")
-        for numeric_field in (
-            "cost_usd", "reservation_upper_bound_usd", "reservation_usd",
-            "max_budget_usd", "global_limit_usd", "root_limit_usd",
-        ):
-            if row.get(numeric_field) is not None and _number(row.get(numeric_field)) is None:
-                raise UsageLedgerCorrupt(f"invalid {numeric_field} in usage row seq={sequence}")
-        for token_field in (
-            "prompt_tokens", "completion_tokens", "cached_tokens",
-            "cache_write_tokens", "ambiguous_call_count",
-        ):
-            if row.get(token_field) is None:
-                continue
-            try:
-                value = int(row.get(token_field))
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise UsageLedgerCorrupt(
-                    f"invalid {token_field} in usage row seq={sequence}"
-                ) from exc
-            if value < 0 or isinstance(row.get(token_field), bool):
-                raise UsageLedgerCorrupt(
-                    f"invalid {token_field} in usage row seq={sequence}"
-                )
-        previous = states.get(attempt_id)
-        if kind.startswith("legacy_") or kind == "external_unmetered":
-            if previous is not None or state not in {"settled", "unresolved"}:
-                raise UsageLedgerCorrupt(f"invalid legacy usage row seq={row.get('seq')}")
-        elif previous is None:
-            if state != "reserved":
-                raise UsageLedgerCorrupt(f"attempt {attempt_id} did not begin reserved")
-        elif previous == "reserved":
-            if state not in {"dispatched", "released"}:
-                raise UsageLedgerCorrupt(f"invalid transition {previous}->{state}")
-        elif previous == "dispatched":
-            if state not in {"settled", "unresolved"}:
-                raise UsageLedgerCorrupt(f"invalid transition {previous}->{state}")
-        else:
-            raise UsageLedgerCorrupt(f"attempt {attempt_id} changed after terminal state")
-        states[attempt_id] = state
-
-
-def _read_records_locked(root: pathlib.Path) -> list[Dict[str, Any]]:
-    path = root / LEDGER_REL
-    try:
-        data = path.read_bytes()
-    except FileNotFoundError:
-        return []
-    except OSError as exc:
-        raise UsageAccountingError(f"cannot read usage ledger: {exc}") from exc
-    records: list[Dict[str, Any]] = []
-    record_locations: list[Tuple[int, bytes]] = []
-    chunks = data.splitlines(keepends=True)
-    nonempty = [index for index, chunk in enumerate(chunks) if chunk.rstrip(b"\r\n")]
-    last_nonempty = nonempty[-1] if nonempty else -1
-    offset = 0
-    for index, chunk in enumerate(chunks):
-        raw = chunk.rstrip(b"\r\n")
-        if not raw:
-            offset += len(chunk)
-            continue
-        try:
-            row = json.loads(raw.decode("utf-8"))
-            if not isinstance(row, dict):
-                raise ValueError("row is not an object")
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            if index == last_nonempty:
-                _quarantine_tail(root, chunk, offset, f"{type(exc).__name__}: {exc}")
-                break
-            raise UsageLedgerCorrupt(f"corrupt usage ledger row before tail: {index + 1}") from exc
-        records.append(row)
-        record_locations.append((offset, chunk))
-        offset += len(chunk)
-    try:
-        _validate_records(records)
-    except UsageLedgerCorrupt:
-        # A final row can be valid JSON yet still be torn structurally (wrong
-        # seq, illegal transition, missing fields). Preserve the validated
-        # history exactly as for a JSON-torn tail; corruption before the final
-        # row remains a hard failure.
-        if not records or not record_locations:
-            raise
-        try:
-            _validate_records(records[:-1])
-        except UsageLedgerCorrupt:
-            raise
-        bad_offset, bad_chunk = record_locations[-1]
-        _quarantine_tail(root, bad_chunk, bad_offset, "structurally invalid final ledger row")
-        records.pop()
-    return records
-
-
-def _append_rows_locked(
-    root: pathlib.Path,
-    records: Sequence[Dict[str, Any]],
-    rows: Sequence[Dict[str, Any]],
-) -> list[Dict[str, Any]]:
-    if not rows:
-        return []
-    sequence = len(records)
-    materialized: list[Dict[str, Any]] = []
-    for raw in rows:
-        sequence += 1
-        materialized.append({**raw, "seq": sequence, "ts": str(raw.get("ts") or utc_now_iso())})
-    _validate_records([*records, *materialized])
-    payload = b"".join(
-        (json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-        for row in materialized
-    )
-    _append_bytes_fsync(root / LEDGER_REL, payload)
-    return materialized
-
-
-def _number(value: Any) -> Optional[float]:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed >= 0 and parsed == parsed else None
-
-
-def _final_rows(records: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    return {str(row["attempt_id"]): row for row in records}
-
-
 def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     settled = confirmed = estimated = reserved = unresolved = 0.0
     unknown = 0
+    # Finality is a COUNT of OPEN ROWS, not a truthiness test on dollar sums. Three of the
+    # four old terms asked a STATE question of a float, so any row that is genuinely open
+    # while holding $0.00 disappeared from the predicate entirely:
+    #   * an ESTIMATED $0.00 — what the engine reports for a delegated subscription run
+    #     whose cash it has not settled (all 8 estimated rows on a live 60-run page); and
+    #   * a DISPATCHED row whose reservation is exactly 0.0, which `_reservation_cost`
+    #     returns for `provider="local"`, so the projection claimed `cost_final: True`
+    #     with a physical send still in flight.
+    # A row is final when it is SETTLED at a known price its writer called final; anything
+    # else is open, however little it costs. `_final_rows` keys by attempt_id, so a settled
+    # row REPLACES its own reserved/dispatched predecessor — a row still open here is
+    # really still open, and a released reservation is in neither branch.
+    #
+    # The count is also the DISCLOSED CAUSE, returned as `non_final_rows`: a projection
+    # reporting `cost_final: false` with every dollar bucket at zero and `unknown` at zero
+    # is a flag no reader can reconstruct.
+    non_final_rows = 0
     counts: Dict[str, int] = {}
+    # Separate "sessions and quota" axis: subscription work is already paid for, so
+    # it contributes exactly $0 to money, and its real scarce resource (sessions and
+    # the window that grants them) is counted here instead of being faked as cash.
+    sessions = 0
+    session_windows: Dict[str, str] = {}
     for row in rows:
         state = str(row.get("state") or "")
+        if str(row.get("kind") or "") == "subscription_session":
+            sessions += 1
+            route = str(row.get("subscription_route") or "")
+            reset_at = str(row.get("subscription_reset_at") or "")
+            if route and reset_at:
+                session_windows[route] = max(session_windows.get(route, ""), reset_at)
         if str(row.get("kind") or "") == "legacy_metadata":
             ambiguous = max(1, int(row.get("ambiguous_call_count") or 1))
             counts["metadata_only"] = counts.get("metadata_only", 0) + ambiguous
@@ -472,6 +252,7 @@ def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             cost = _number(row.get("cost_usd"))
             if cost is None:
                 unknown += 1
+                non_final_rows += 1
                 bound = _number(row.get("reservation_upper_bound_usd"))
                 if bound is not None:
                     unresolved += bound
@@ -481,13 +262,16 @@ def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                     confirmed += cost
                 else:
                     estimated += cost
+                    non_final_rows += 1
         elif state == "reserved":
+            non_final_rows += 1
             bound = _number(row.get("reservation_upper_bound_usd"))
             if bound is None or pricing_unknown:
                 unknown += 1
             if bound is not None:
                 reserved += bound
         elif state in {"dispatched", "unresolved"}:
+            non_final_rows += 1
             bound = _number(row.get("reservation_upper_bound_usd"))
             if bound is None or pricing_unknown:
                 unknown += 1
@@ -504,8 +288,13 @@ def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "unresolved_upper_bound_usd": unresolved,
         "accounted_usd": round(settled + reserved + unresolved, 6),
         "unknown_unmetered": unknown,
-        "cost_final": not unknown and not reserved and not unresolved and not estimated,
+        # Every row that increments `unknown` is open, so the old `not unknown` term is
+        # subsumed here rather than dropped.
+        "non_final_rows": non_final_rows,
+        "cost_final": not non_final_rows,
         "attempt_counts": counts,
+        "subscription_sessions": sessions,
+        "subscription_windows": session_windows,
     }
 
 
@@ -573,6 +362,10 @@ def _physical_call_count(row: Dict[str, Any]) -> int:
     if kind == "legacy_metadata":
         return 0
     if kind == "legacy_delta":
+        return 0
+    # A subscription session is not a core-mediated physical provider send; it is
+    # counted on the sessions axis instead (see record_subscription_session).
+    if kind == "subscription_session":
         return 0
     return 1 if str(row.get("state") or "") in {"dispatched", "settled", "unresolved"} else 0
 
@@ -715,14 +508,17 @@ def review_wave_admission(
     instead. It reuses the exact per-attempt reservation math
     (``_reservation_cost``) and the ledger projection — no second budget
     authority. Fail-open by design: no root scope, no known limit, or unknown
-    pricing for any slot → ``fits=True`` (identical to the admission stance in
-    ``reserve_attempt``, where unknown price never blocks dispatch)."""
+    pricing for a slot contributes zero to the estimate and is counted in
+    ``unpriced_slots`` rather than short-circuiting the whole wave to ``fits=True``
+    (identical to the admission stance in ``reserve_attempt``, where unknown price
+    never blocks dispatch — but there the unknown is per attempt, not per wave)."""
     result: Dict[str, Any] = {
         "fits": True,
         "estimated_wave_usd": None,
         "remaining_usd": None,
         "limit_usd": None,
         "slots": len(list(models or [])),
+        "unpriced_slots": 0,
     }
     root_task_id = str(root_task_id or "").strip()
     if not root_task_id or not models:
@@ -749,7 +545,15 @@ def review_wave_admission(
                 )
             )
             if bound is None:
-                return result
+                # An unpriceable slot contributes an unknown, not a veto and not a
+                # pass for the whole wave. Returning here made ONE such model disable
+                # admission for every priced sibling too — the gate stopped binding
+                # exactly when a wave mixed a known-cost reviewer with an unknown one.
+                # Count it as zero, keep summing the rest, and disclose the unknown so
+                # a reader can tell "fits, all known" from "fits, partly unknown"
+                # (BIBLE P1: a gap is represented, never filled in).
+                result["unpriced_slots"] = int(result.get("unpriced_slots") or 0) + 1
+                continue
             total += float(bound)
         result["estimated_wave_usd"] = round(total, 6)
         result["fits"] = total <= remaining + 1e-9
@@ -918,20 +722,129 @@ def record_unmetered_external_dispatch(
         "source": str(source or bound.source or "external_skill"),
         "external_dispatch_id_sha256": identity,
     }
+    return _append_single_settled_row(root, row, comparable=(
+        "kind", "model", "provider", "task_id", "root_task_id", "parent_task_id",
+        "category", "source", "prompt_tokens", "completion_tokens",
+        "external_dispatch_id_sha256",
+    ))
+
+
+def _append_single_settled_row(
+    root: pathlib.Path, row: Dict[str, Any], *, comparable: Sequence[str],
+) -> str:
+    """Idempotently append a one-shot settled row; a replay under a DIFFERENT identity
+    is a conflict, never a silent overwrite. Shared by every single-row kind."""
+    attempt_id = str(row["attempt_id"])
     with _locked(root):
         records = _read_records_locked(root)
         existing = _final_rows(records).get(attempt_id)
         if existing is not None:
-            comparable = (
-                "kind", "model", "provider", "task_id", "root_task_id", "parent_task_id",
-                "category", "source", "prompt_tokens", "completion_tokens",
-                "external_dispatch_id_sha256",
-            )
             if any(existing.get(key) != row.get(key) for key in comparable):
-                raise UsageAccountingError(f"conflicting external dispatch identity: {attempt_id}")
+                raise UsageAccountingError(f"conflicting settled-row identity: {attempt_id}")
             return attempt_id
         _append_rows_locked(root, records, [row])
     return attempt_id
+
+
+def record_subscription_session(
+    session_id: str,
+    *,
+    drive_root: pathlib.Path | str | None = None,
+    route: str,
+    model: str = "",
+    task_id: str = "",
+    root_task_id: str = "",
+    parent_task_id: str = "",
+    category: str = "subagent",
+    source: str = "delegated_subagent",
+    prompt_tokens: int | None = 0,
+    completion_tokens: int | None = 0,
+    cached_tokens: int | None = None,
+    reset_at: str = "",
+    spend_usd: float | None = None,
+    spend_estimated: bool = False,
+) -> str:
+    """Idempotently record one subscription session on the sessions/quota axis.
+
+    The row has THREE cash states, and only the first is final (rule in
+    docs/DEVELOPMENT.md, LLM Call Rules):
+
+    * DISCLOSED ZERO (``spend_usd=0.0``) — a genuinely free session, the case this row
+      kind was created for: ``cost_usd: 0.0, cost_final: True``, projection stays final.
+    * ESTIMATED (``spend_estimated=True``) — the engine disclosed an amount it has not
+      settled: the number rides as money, the finality does not.
+    * UNDISCLOSED (``spend_usd=None``) — the harness reported nothing: ``cost_usd: None``,
+      counted as unknown/unmetered, never written as a confident ``0.0``.
+
+    Reusing ``record_unmetered_external_dispatch`` for any of them would also drop the
+    separate sessions/quota axis (``subscription_sessions`` / ``subscription_windows``).
+
+    An AMOUNT and its EXACTNESS are two facts, so both are parameters: ``spend_usd``
+    alone cannot say whether the engine settled that cash or estimated it, and a caller
+    that passes only the amount would have the row assert a finality nobody proved.
+    Token counts are ``int | None`` for the same reason on the usage axis — ``None`` is
+    "no harness reported this", which is not the same run as one that used zero.
+    """
+    stable_id, route_id = str(session_id or "").strip(), str(route or "").strip()
+    if not stable_id or not route_id:
+        raise UsageAccountingError("subscription session requires a stable session_id and route")
+    bound = _CURRENT_SCOPE.get() or UsageScope()
+    root = _drive_root(drive_root or bound.drive_root)
+    ensure_legacy_imported(root)
+    identity = hashlib.sha256(stable_id.encode("utf-8")).hexdigest()
+    attempt_id = f"session-{identity[:24]}"
+    row = {
+        "kind": "subscription_session",
+        "attempt_id": attempt_id,
+        "state": "settled",
+        "model": str(model or ""),
+        "provider": route_id,
+        # A subscription session is free ONLY when the harness says it was. `spend_usd`
+        # is the engine's settled cash: a real charge (expired session, a route that
+        # bills, an auth fallback) must ride the ledger as money, and an UNDISCLOSED
+        # spend must not be written as a confident zero — that is the one shape that
+        # would hide delegated cost from every budget fence while claiming finality.
+        # UNKNOWN is None, not 0.0. A `cost_final=False` row whose cost is 0.0 adds zero
+        # to the projection's `estimated` total, and `not 0.0` is True — so the honest
+        # per-row disclosure was invisible in `usage_projection`, which kept reporting
+        # `cost_final: True`. None routes the row through the `unknown` counter instead,
+        # where it correctly drops finality. The DISCLOSED-zero case (a genuinely free
+        # subscription session) still settles at 0.0/final and leaves the projection
+        # final — which is the property this row kind was created for.
+        #
+        # ESTIMATED is the third state, and it is neither of the other two: the engine
+        # discloses an amount it has NOT settled (`spendEstimated` on the wire). It rides
+        # as money — the number is the best fact anyone has — but it may not claim
+        # finality, so it lands in the projection's `estimated` bucket, which is exactly
+        # what that bucket is for. `pricing_known` stays on the amount: a price IS known
+        # here, just not exact; EXACTNESS is `cost_final`'s axis, not this one.
+        "cost_usd": None if spend_usd is None else round(float(spend_usd), 6),
+        "cost_final": spend_usd is not None and not spend_estimated,
+        "reservation_upper_bound_usd": None if spend_usd is None else round(float(spend_usd), 6),
+        "pricing_known": spend_usd is not None,
+        "prompt_tokens": None if prompt_tokens is None else max(0, int(prompt_tokens)),
+        "completion_tokens": None if completion_tokens is None else max(0, int(completion_tokens)),
+        # The schema sentence that governs the two above governs a THIRD field, and the
+        # engine really fills it: 28 of 60 rows on a live `/v2/runs` page carry a non-null
+        # `cachedInputTokens`, 27 of them non-zero. Dropping it left the delegated row with
+        # no `cached_tokens` key at all, which `_breakdown_bucket` renders as 0 beside a
+        # six-figure prompt count — the render-unknown-as-zero shape its two siblings just
+        # stopped doing. It is its own bucket and is never summed into `total_tokens`,
+        # which is required: cached is ⊆ input for some harnesses and disjoint for others.
+        "cached_tokens": None if cached_tokens is None else max(0, int(cached_tokens)),
+        "task_id": str(task_id or bound.task_id or ""),
+        "root_task_id": str(root_task_id or bound.root_task_id or task_id or bound.task_id or ""),
+        "parent_task_id": str(parent_task_id or bound.parent_task_id or ""),
+        "category": str(category or bound.category or "subagent"),
+        "source": str(source or bound.source or "delegated_subagent"),
+        "subscription_route": route_id,
+        "subscription_reset_at": str(reset_at or ""),
+        "session_id_sha256": identity,
+    }
+    return _append_single_settled_row(root, row, comparable=(
+        "kind", "model", "provider", "task_id", "root_task_id", "parent_task_id",
+        "category", "source", "subscription_route", "session_id_sha256",
+    ))
 
 
 def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> Dict[str, Any]:

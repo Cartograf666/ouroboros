@@ -769,15 +769,49 @@ def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconc
             from ouroboros.process_custody import reap_orphaned_processes
             from supervisor.queue import RUNNING as _running_tasks
 
+            live_tasks = set(_running_tasks.keys())
             reap_orphaned_processes(
-                DATA_DIR, running_task_ids=set(_running_tasks.keys()),
+                DATA_DIR, running_task_ids=live_tasks,
                 live_owner_skills=_installed_skill_names(),
             )
+            # A delegated Claudexor run is an orphan under exactly the same predicate:
+            # its owning task is no longer running. It has no pid, so the process
+            # reaper cannot see it — but it is still spending quota and still writing.
+            _reconcile_delegated_runs(live_tasks)
         except Exception:
             log.debug("Periodic custody reap failed", exc_info=True)
     if time.time() - last_review_reconcile[0] > 300:
         last_review_reconcile[0] = time.time()
         _periodic_zombie_reconcile()
+
+
+def _reconcile_delegated_runs(running_task_ids: set) -> None:
+    """Settle or cancel delegated runs whose owning task is gone (startup + tick)."""
+    try:
+        from ouroboros.delegate_custody import reconcile_orphaned_runs
+
+        outcomes = reconcile_orphaned_runs(DATA_DIR, running_task_ids=running_task_ids)
+        if outcomes:
+            log.info("Delegated-run reconciliation handled %d orphan(s): %s", len(outcomes), outcomes)
+    except Exception:
+        log.debug("Delegated-run reconciliation failed", exc_info=True)
+
+
+def _startup_custody_sweep() -> None:
+    """Both custody surfaces, swept once per generation at supervisor startup.
+
+    Nothing is running yet, so every ledgered process and every open delegated run is
+    by definition ownerless: the generation that was watching them did not survive.
+    """
+    try:
+        from ouroboros.process_custody import reap_orphaned_processes
+
+        reaped = reap_orphaned_processes(DATA_DIR, live_owner_skills=_installed_skill_names())
+        if reaped:
+            log.info("Process custody reaper killed %d orphaned process(es): %s", len(reaped), reaped)
+    except Exception:
+        log.debug("Process custody startup reap failed", exc_info=True)
+    _reconcile_delegated_runs(set())
 
 
 def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:
@@ -1577,14 +1611,7 @@ def _run_supervisor(settings: dict) -> None:
                 })
         except Exception:
             log.debug("Headless task drive prune failed", exc_info=True)
-        try:
-            from ouroboros.process_custody import reap_orphaned_processes
-
-            reaped = reap_orphaned_processes(DATA_DIR, live_owner_skills=_installed_skill_names())
-            if reaped:
-                log.info("Process custody reaper killed %d orphaned process(es): %s", len(reaped), reaped)
-        except Exception:
-            log.debug("Process custody startup reap failed", exc_info=True)
+        _startup_custody_sweep()
 
         try:
             from ouroboros import subagent_worktrees

@@ -122,6 +122,10 @@
  * @property {?number=} reserved_usd
  * @property {?number=} unresolved_upper_bound_usd
  * @property {?number=} unknown_unmetered
+ * @property {?number=} non_final_rows
+ *   v6.87.48: the count of OPEN ledger rows — the disclosed cause of `cost_final: false`,
+ *   which can hold with every dollar bucket at zero (an estimated $0.00, or a dispatched
+ *   row whose reservation is exactly zero).
  * @property {string=} result
  * @property {boolean=} result_truncated
  * @property {string=} trace_summary

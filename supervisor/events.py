@@ -388,8 +388,8 @@ def _compose_subagent_text(
             "runtime / skills lifecycle, enable tools, or write cognitive memory. Your "
             "changes are captured as a workspace.patch and returned to the parent, who "
             "integrates and is the sole committer of the live body. Nested delegation is "
-            "allowed within configured depth/cap limits; descendants at depth>=2 are "
-            "resolved onto the configured light lane.",
+            "allowed within configured depth/cap limits; depth bounds how DEEP delegation "
+            "nests and never how strong a descendant is — ask for the lane you need.",
         ])
         if surface == "genesis":
             parts.append(
@@ -406,7 +406,8 @@ def _compose_subagent_text(
             "repo/data/memory state — EXCEPT bounded task-tree coordination via tree_note/"
             "tree_read (raise blocker/question/finding beacons, read the shared frame). "
             "Nested readonly delegation is allowed only through schedule_subagent within "
-            "configured depth/cap limits; deeper descendants are forced onto the light lane."
+            "configured depth/cap limits; depth bounds how DEEP delegation nests and never "
+            "how strong a descendant is — ask for the lane you need."
         )
     budget = delegation_budget if isinstance(delegation_budget, dict) else {}
     if budget:
@@ -463,6 +464,8 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     effective_model_lane = str(fields.get("effective_model_lane") or requested_model_lane)
     model = str(fields.get("model") or "")
     use_local_model = bool(fields.get("use_local_model"))
+    requested_executor = str(fields.get("requested_executor") or "").strip().lower() or "auto"
+    reasoning_effort = str(fields.get("reasoning_effort") or "").strip().lower()
     task_group_id = str(fields.get("task_group_id") or "")
     task_group = fields.get("task_group") if isinstance(fields.get("task_group"), dict) else {}
     subagent_envelope = fields.get("subagent_envelope") if isinstance(fields.get("subagent_envelope"), dict) else {}
@@ -498,6 +501,8 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
         "effective_model_lane": effective_model_lane,
         "model": model,
         "use_local_model": use_local_model,
+        "requested_executor": requested_executor,
+        "reasoning_effort": reasoning_effort,
         "task_group_id": task_group_id,
         "task_group": task_group,
         "subagent_envelope": subagent_envelope,
@@ -521,6 +526,8 @@ def _build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
             "effective_model_lane": effective_model_lane,
             "model": model,
             "use_local_model": use_local_model,
+            "requested_executor": requested_executor,
+            "reasoning_effort": reasoning_effort,
             "task_group_id": task_group_id,
             "task_group": task_group,
             "subagent_envelope": subagent_envelope,
@@ -2689,6 +2696,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
     effective_model_lane = str(evt.get("effective_model_lane") or "").strip() or requested_model_lane
     model = str(evt.get("model") or "").strip()
     use_local_model = bool(evt.get("use_local_model"))
+    requested_executor = str(evt.get("requested_executor") or "").strip().lower() or "auto"
+    reasoning_effort = str(evt.get("reasoning_effort") or "").strip().lower()
     task_group_id = str(evt.get("task_group_id") or "").strip()
     task_group = evt.get("task_group") if isinstance(evt.get("task_group"), dict) else {}
     subagent_envelope = evt.get("subagent_envelope") if isinstance(evt.get("subagent_envelope"), dict) else {}
@@ -2750,6 +2759,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
         "effective_model_lane": effective_model_lane,
         "model": model,
         "use_local_model": use_local_model,
+        "requested_executor": requested_executor,
+        "reasoning_effort": reasoning_effort,
         "task_group_id": task_group_id,
         "task_group": task_group,
         "subagent_envelope": subagent_envelope,
@@ -2975,6 +2986,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "effective_model_lane": effective_model_lane,
             "model": model,
             "use_local_model": use_local_model,
+            "requested_executor": requested_executor,
+            "reasoning_effort": reasoning_effort,
             "task_group_id": task_group_id,
             "task_group": task_group,
             "subagent_envelope": subagent_envelope,

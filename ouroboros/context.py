@@ -1150,6 +1150,42 @@ def build_health_invariants(env: Any) -> str:
         pass
 
     try:
+        from ouroboros.delegate_custody import settled_unread_outputs
+
+        drive_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
+        for run in settled_unread_outputs(drive_root):
+            # Owner doctrine D7, made load-bearing: a delegated result that was paid for
+            # and never read to EOF is the launched-never-collected class. Not CRITICAL —
+            # nothing is live and nothing is mutating — but it stays visible until the
+            # read happens, which is the whole difference between a disclosure and a fact
+            # someone acts on. It clears itself the moment the acknowledgement lands.
+            checks.append(
+                f"WARNING: DELEGATED RESULT NEVER READ — run {run.run_id or '?'} settled "
+                f"with its full output staged at {run.output_artifact} and never read to "
+                f"EOF (owner task {run.task_id or '?'}). Read it with read_file "
+                f"root='task_drive' until the artifact is covered end to end, or say "
+                f"plainly that the result was not collected."
+            )
+    except Exception:
+        pass
+
+    try:
+        from ouroboros.delegate_custody import open_containment_faults
+
+        drive_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
+        for fault in open_containment_faults(drive_root):
+            # An overpowered mutating run we asked to stop and could not verify stopped
+            # is an incident, not a tool-result string. It stays CRITICAL until a
+            # terminal receipt or a settlement clears it.
+            checks.append(
+                f"CRITICAL: DELEGATED RUN MAY STILL BE LIVE — run {fault.get('run_id') or '?'} "
+                f"({fault.get('reason') or 'unverified'}), owner task "
+                f"{fault.get('task_id') or '?'}, since {fault.get('ts') or '?'}"
+            )
+    except Exception:
+        pass
+
+    try:
         stray_note = _stray_server_note(env)
         if stray_note:
             checks.append(stray_note)

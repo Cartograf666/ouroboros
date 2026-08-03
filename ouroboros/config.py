@@ -301,16 +301,51 @@ SETTINGS_DEFAULTS = {
     "USE_LOCAL_CONSCIOUSNESS": False,
     "USE_LOCAL_FALLBACK": False,
     "OUROBOROS_FILE_BROWSER_DEFAULT": "",
-    # Subagent depth at/below which an EXPLICIT main/heavy lane is honored; deeper
-    # descendants (grandchildren) fall to light as a cost guard. Owner-configurable
-    # (advanced); a visible note is surfaced when an explicit request is depth-capped.
-    "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT": 1,
     # 429-aware cross-model fallback: process-local cooldown for transiently failing
     # models (429/5xx/overloaded), passive heal-back. Owner-tunable; default-on, fail-soft.
     "OUROBOROS_FALLBACK_COOLDOWN_ENABLED": True,
     "OUROBOROS_FALLBACK_COOLDOWN_SEC": 120,
     "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL": 1,
+    # Delegated subagents. NARROW key, read ONLY by the subagent scheduler; deliberately
+    # absent from provider_models.MODEL_SETTING_KEYS (see ARCHITECTURE "Delegated
+    # subagents"). Empty = delegation off. Wait keys bound the nanny's QUIET wait only.
+    "OUROBOROS_SUBAGENT_HARNESS": "",
+    "OUROBOROS_DELEGATE_WAIT_SEC": 120,
+    "OUROBOROS_DELEGATE_WAIT_MAX_SEC": 1800,
 }
+
+# Claudexor control-plane contract, checked at handshake so an old daemon is a typed
+# lane refusal rather than a mid-run schema surprise.
+CLAUDEXOR_PROTOCOL_MAJOR: int = 3
+# The TRANSPORT floor: the lowest engine that serves the READ-ONLY lane, which sends no
+# `execution` block at all. 3.2.0 schema-accepts every field that lane does send (verified
+# live: the body comes back with only the fake-root error, never a field error), and a
+# read-only run is already scoped by Claudexor's ordinary envelope, so it needs nothing
+# newer. Keeping this floor AT the oldest serving engine is the point: it is what lets an
+# older daemon keep read-only delegation instead of losing the lane entirely, which is the
+# owner's explicit decision. A floor set to the newest daemon anyone happened to be running
+# is not conservative, it is an outage — 3.2.1 here refused the operator's own 3.2.0 engine
+# and took read-only delegation down with it.
+CLAUDEXOR_MIN_VERSION: str = "3.2.0"
+# The MARKER floor: the oldest engine whose SCHEMA ACCEPTS `execution.delegated`, which is
+# the only delegated-lane question a version can answer honestly. Measured: `RunExecution`
+# is `.strict()` and has no `delegated` key below 3.3.0, so the field is a 400 (live against
+# the running 3.2.0 daemon, which names `/execution/delegated` in `fieldErrors`) and the run
+# never starts. Refusing here turns a certain failure into a typed one before a token is
+# spent — the only work this number does. It cannot be a probe either: the marker is nested
+# under `execution` and the catalog lists TOP-LEVEL keys, and the one behavioural probe is
+# to send it, which on an engine that accepts it STARTS THE RUN.
+#
+# It is NOT the floor for a BOUNDARY existing. It used to be, pinned at 3.3.2 (macOS
+# Seatbelt), and a version standing in for "a boundary was applied" lies in both directions:
+# Claudexor's `docs/DELEGATED_CONFINEMENT.md` §8 says the mechanism is macOS-only ("There is
+# no Linux/Windows implementation"), so a build declares the same number on a host where it
+# applies nothing — and a version describes a BUILD, never what THIS attempt did. That
+# question goes to the attempt record (`gateways.claudexor.attempt_containment`), and a run
+# reporting no mechanism is DISCLOSED, not refused: the child already holds a shell here, so
+# the step to "shell plus token" does not buy a lane-wide refusal (AGENTS.md "Disclose instead
+# of forbid"). Two gates, two questions, no overlap; bands: docs/DELEGATED_ADMISSION.md.
+CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION: str = "3.3.0"
 
 
 def _main_model() -> str:
@@ -691,27 +726,11 @@ def get_per_call_timeout_ceiling_sec() -> int:
 
 
 def get_plan_task_swarm_timeout_sec() -> float:
-    raw = os.environ.get(
-        "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC",
-        SETTINGS_DEFAULTS["OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC"],
-    )
-    try:
-        parsed = float(raw)
-    except (TypeError, ValueError):
-        parsed = float(SETTINGS_DEFAULTS["OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC"])
-    return max(0.0, parsed)
+    return _clamped_number_setting("OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC", low=0.0)
 
 
 def get_plan_task_swarm_max_wait_sec() -> float:
-    raw = os.environ.get(
-        "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC",
-        SETTINGS_DEFAULTS["OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC"],
-    )
-    try:
-        parsed = float(raw)
-    except (TypeError, ValueError):
-        parsed = float(SETTINGS_DEFAULTS["OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC"])
-    return max(0.0, parsed)
+    return _clamped_number_setting("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", low=0.0)
 
 
 def get_restart_drain_max_sec() -> int:
@@ -841,6 +860,17 @@ def get_subagent_worktree_root() -> str:
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "subagent_worktrees"))
 
 
+def get_delegate_wait_max_sec() -> int:
+    """Ceiling for a caller-supplied ``delegate_wait`` window, in seconds."""
+    return _clamped_number_setting("OUROBOROS_DELEGATE_WAIT_MAX_SEC", low=1, high=86_400, cast=int)
+
+
+def get_delegate_wait_sec() -> int:
+    """Default quiet cutoff for ONE ``delegate_wait`` call, in seconds."""
+    return _clamped_number_setting(
+        "OUROBOROS_DELEGATE_WAIT_SEC", low=1, high=get_delegate_wait_max_sec(), cast=int)
+
+
 def get_subagent_projects_root() -> str:
     """Durable root for genesis ("from scratch") subagent projects.
 
@@ -948,78 +978,57 @@ def get_safety_mode() -> str:
     return normalize_safety_mode(os.environ.get("OUROBOROS_SAFETY_MODE", default_val) or default_val)
 
 
+def _clamped_number_setting(key: str, *, low, high=float("inf"), cast=float):
+    """Env-or-default numeric setting clamped to [low, high]; a typo falls back to the
+    shipped default. SSOT for the clamped scalar getters below — the seven of them were
+    byte-identical except for key, caster and bounds (P7 DRY)."""
+    try:
+        value = cast(os.environ.get(key, "") or SETTINGS_DEFAULTS[key])
+    except (TypeError, ValueError):
+        value = cast(SETTINGS_DEFAULTS[key])
+    return max(low, min(value, high))
+
+
 def get_safety_max_tokens() -> int:
     """Output-token budget for safety-supervisor LLM calls (parse-bug fix)."""
-    try:
-        val = int(os.environ.get("OUROBOROS_SAFETY_MAX_TOKENS", "") or SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MAX_TOKENS"])
-    except (TypeError, ValueError):
-        val = int(SETTINGS_DEFAULTS["OUROBOROS_SAFETY_MAX_TOKENS"])
-    return max(256, min(val, 16384))
+    return _clamped_number_setting("OUROBOROS_SAFETY_MAX_TOKENS", low=256, high=16384, cast=int)
 
 
 def get_safety_call_timeout_sec() -> float:
     """Transport timeout for safety-supervisor LLM calls (prevents indefinite hang)."""
-    try:
-        val = float(os.environ.get("OUROBOROS_SAFETY_CALL_TIMEOUT_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_SAFETY_CALL_TIMEOUT_SEC"])
-    except (TypeError, ValueError):
-        val = float(SETTINGS_DEFAULTS["OUROBOROS_SAFETY_CALL_TIMEOUT_SEC"])
-    return max(5.0, min(val, 600.0))
+    return _clamped_number_setting("OUROBOROS_SAFETY_CALL_TIMEOUT_SEC", low=5.0, high=600.0)
 
 
 def get_websearch_timeout_sec() -> float:
     """Transport timeout for the web_search OpenAI streaming call (v6.54.3, D)."""
-    try:
-        val = float(os.environ.get("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_WEBSEARCH_TIMEOUT_SEC"])
-    except (TypeError, ValueError):
-        val = float(SETTINGS_DEFAULTS["OUROBOROS_WEBSEARCH_TIMEOUT_SEC"])
-    return max(30.0, min(val, 3600.0))
+    return _clamped_number_setting("OUROBOROS_WEBSEARCH_TIMEOUT_SEC", low=30.0, high=3600.0)
 
 
 def get_llm_transport_read_timeout_sec() -> float:
     """Default httpx read/write timeout for no_proxy LLM clients (v6.54.3, D).
 
     The DEAD-SOCKET bound, not a latency target; explicit per-call timeouts win."""
-    try:
-        val = float(os.environ.get("OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC"])
-    except (TypeError, ValueError):
-        val = float(SETTINGS_DEFAULTS["OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC"])
-    return max(60.0, min(val, 7200.0))
+    return _clamped_number_setting("OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC", low=60.0, high=7200.0)
 
 
 def get_acceptance_review_est_sec() -> float:
     """Estimated duration of one acceptance review/improvement pass (v6.54.4)."""
-    try:
-        val = float(os.environ.get("OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC"])
-    except (TypeError, ValueError):
-        val = float(SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC"])
-    return max(10.0, min(val, 3600.0))
+    return _clamped_number_setting("OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC", low=10.0, high=3600.0)
 
 
 def get_acceptance_max_improvement_passes() -> int:
     """Default COUNT cap for acceptance-review improvement passes (v6.54.4)."""
-    try:
-        val = int(os.environ.get("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", "") or SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES"])
-    except (TypeError, ValueError):
-        val = int(SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES"])
-    return max(0, min(val, 20))
+    return _clamped_number_setting("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", low=0, high=20, cast=int)
 
 
 def get_acceptance_reserve_pct() -> int:
     """Default finalization-reserve percentage of the total budget (v6.54.4)."""
-    try:
-        val = int(os.environ.get("OUROBOROS_ACCEPTANCE_RESERVE_PCT", "") or SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_RESERVE_PCT"])
-    except (TypeError, ValueError):
-        val = int(SETTINGS_DEFAULTS["OUROBOROS_ACCEPTANCE_RESERVE_PCT"])
-    return max(0, min(val, 50))
+    return _clamped_number_setting("OUROBOROS_ACCEPTANCE_RESERVE_PCT", low=0, high=50, cast=int)
 
 
 def get_plan_task_deadline_min_sec() -> float:
     """Minimum useful deadline-scaled planning-swarm window (v6.54.3, 1.5)."""
-    try:
-        val = float(os.environ.get("OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC", "") or SETTINGS_DEFAULTS["OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC"])
-    except (TypeError, ValueError):
-        val = float(SETTINGS_DEFAULTS["OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC"])
-    return max(30.0, min(val, 3600.0))
+    return _clamped_number_setting("OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC", low=30.0, high=3600.0)
 
 
 def normalize_context_mode(value: Any) -> str:
@@ -1325,6 +1334,18 @@ def _coerce_setting_value(key: str, value):
 
 
 # Load / Save
+# Setting keys a release DELETED. `load_settings` keeps unrecognized keys so an owner
+# customization is never destroyed by a rename, which means a key removed from
+# SETTINGS_DEFAULTS would otherwise live in an existing data/settings.json forever and
+# keep being served by GET /api/settings as something the runtime no longer honors.
+# Retiring a key is a decision; leaving its ghost to answer for it is not.
+RETIRED_SETTING_KEYS: tuple[str, ...] = (
+    # v6.87.7: the capability depth cap conflated how DEEP delegation nests with how
+    # STRONG a descendant may be. Depth never rewrites the lane now.
+    "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT",
+)
+
+
 def load_settings() -> dict:
     fd = _acquire_settings_lock()
     try:
@@ -1350,6 +1371,8 @@ def load_settings() -> dict:
                 loaded["OUROBOROS_GC_RETENTION_DAYS"] = seed
         for _legacy in LEGACY_RETENTION_KEYS:
             loaded.pop(_legacy, None)
+        for _retired in RETIRED_SETTING_KEYS:
+            loaded.pop(_retired, None)
         migrate_legacy_slot_keys(loaded)
         settings = dict(SETTINGS_DEFAULTS)
         settings.update(loaded)
@@ -1514,53 +1537,30 @@ def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int
     return max(0, parsed)
 
 
+# Settings keys deliberately NOT projected into the environment. Everything else in
+# SETTINGS_DEFAULTS IS exported, by derivation rather than by a parallel hand-kept list:
+# a list maintained beside the defaults drifts silently, and the failure it produces is
+# invisible — settings accept the key, the UI shows it saved, and the consuming module
+# goes on reading os.environ and falling back to its hardcoded constant
+# (OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC sat like that behind a hardcoded 1800). Deriving
+# makes export the DEFAULT for a new key and makes an exclusion a decision someone has to
+# write down here.
+SETTINGS_KEYS_NOT_EXPORTED_TO_ENV = frozenset({
+    # Structured list value: `str(value)` is a Python repr no reader parses back, and
+    # every consumer already reads it from the settings dict (mcp_client.parse_servers,
+    # gateway.mcp), never from the environment.
+    "MCP_SERVERS",
+})
+
+
+def settings_env_keys() -> list:
+    """Settings keys projected into os.environ, derived from SETTINGS_DEFAULTS."""
+    return [k for k in SETTINGS_DEFAULTS if k not in SETTINGS_KEYS_NOT_EXPORTED_TO_ENV]
+
+
 def apply_settings_to_env(settings: dict) -> None:
     """Push settings into environment variables for supervisor modules."""
-    env_keys = [
-        "OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_BASE_URL",
-        "CLOUDRU_FOUNDATION_MODELS_API_KEY", "CLOUDRU_FOUNDATION_MODELS_BASE_URL", "GIGACHAT_CREDENTIALS", "GIGACHAT_USER",
-        "GIGACHAT_PASSWORD", "GIGACHAT_SCOPE", "GIGACHAT_BASE_URL", "GIGACHAT_VERIFY_SSL_CERTS", "GIGACHAT_PROFANITY_CHECK",
-        "ANTHROPIC_API_KEY", "OUROBOROS_NETWORK_PASSWORD", "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY",
-        "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS", "OUROBOROS_MODEL_FALLBACKS",
-        "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "CLAUDE_CODE_MODEL", "OUROBOROS_FALLBACK_COOLDOWN_ENABLED",
-        "OUROBOROS_FALLBACK_COOLDOWN_SEC", "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL", "OUROBOROS_MODEL_MAX_CONCURRENCY",
-        "OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC", "OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC",
-        "OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC", "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT", "OUROBOROS_MAX_WORKERS",
-        "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", "OUROBOROS_MAX_SUBAGENT_DEPTH", "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC",
-        "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC", "TOTAL_BUDGET",
-        "OUROBOROS_PER_TASK_COST_USD", "GITHUB_TOKEN", "GITHUB_REPO", "OUROBOROS_RUB_USD_RATE", "OUROBOROS_PRICING_TTL_SEC",
-        "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
-        "OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", "OUROBOROS_TASK_ABS_CEILING_SEC",
-        "OUROBOROS_PACING_INTERVAL_SEC", "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC", "OUROBOROS_MAX_ROUNDS",
-        "OUROBOROS_TRANSIENT_RETRY_MAX", "OUROBOROS_IMAGE_INPUT_MODE", "OUROBOROS_BG_MAX_ROUNDS", "OUROBOROS_BG_WAKEUP_MIN",
-        "OUROBOROS_BG_WAKEUP_MAX", "OUROBOROS_WEBSEARCH_MODEL", "OUROBOROS_WEBSEARCH_BACKEND", "OUROBOROS_MAIN_WEB_SEARCH",
-        "OUROBOROS_MAIN_WEB_SEARCH_ENGINE", "OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS", "OUROBOROS_OR_PROVIDER",
-        "OUROBOROS_SEARCH_CODE_WALL_SEC", "OUROBOROS_GENERATIVE_PROBE", "OUROBOROS_GENERATIVE_PROBE_CHARS",
-        "OUROBOROS_POST_TASK_EVOLUTION", "OUROBOROS_POST_TASK_EVOLUTION_CADENCE", "OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD",
-        "OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE", "OUROBOROS_REVIEW_MODELS", "OUROBOROS_REVIEW_ENFORCEMENT",
-        "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS", "OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS", "OUROBOROS_RESTART_DRAIN_MAX_SEC",
-        "OUROBOROS_SCOPE_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODEL", "OUROBOROS_SCOPE_REVIEW_FLOOR",
-        "OUROBOROS_TASK_REVIEW_MODE", "OUROBOROS_SAFETY_MODE", "OUROBOROS_SAFETY_MAX_TOKENS",
-        "OUROBOROS_SAFETY_CALL_TIMEOUT_SEC", "OUROBOROS_WEBSEARCH_TIMEOUT_SEC", "OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC",
-        "OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC", "OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC",
-        "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", "OUROBOROS_ACCEPTANCE_RESERVE_PCT",
-        # Unified disposable-artifact GC retention (replaces per-subsystem keys).
-        "OUROBOROS_GC_RETENTION_DAYS",
-        # Runtime-mode, context-mode, and skills-repo plumbing.
-        "OUROBOROS_RUNTIME_MODE", "OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SKILLS_REPO_PATH",
-        "OUROBOROS_HOST_SERVICE_PORT",
-        # Acting (mutative) subagents: owner toggle + worktree/projects roots.
-        "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "OUROBOROS_SUBAGENT_WORKTREE_ROOT", "OUROBOROS_SUBAGENT_PROJECTS_ROOT",
-        "OUROBOROS_DELIVERABLES_ROOT",
-        # ClawHub marketplace registry URL.
-        "OUROBOROS_CLAWHUB_REGISTRY_URL", "MCP_ENABLED", "MCP_TOOL_TIMEOUT_SEC", "OUROBOROS_EFFORT_TASK",
-        "OUROBOROS_EFFORT_EVOLUTION", "OUROBOROS_EFFORT_REVIEW", "OUROBOROS_EFFORT_SCOPE_REVIEW",
-        "OUROBOROS_EFFORT_DEEP_SELF_REVIEW", "OUROBOROS_EFFORT_CONSCIOUSNESS", "OUROBOROS_RETURN_REASONING",
-        "OUROBOROS_REASONING_SUMMARY", "LOCAL_MODEL_SOURCE", "LOCAL_MODEL_FILENAME", "LOCAL_MODEL_PORT",
-        "LOCAL_MODEL_N_GPU_LAYERS", "LOCAL_MODEL_CONTEXT_LENGTH", "LOCAL_MODEL_CHAT_FORMAT", "USE_LOCAL_MAIN",
-        "USE_LOCAL_HEAVY", "USE_LOCAL_LIGHT", "USE_LOCAL_CONSCIOUSNESS", "USE_LOCAL_FALLBACK",
-        "OUROBOROS_FILE_BROWSER_DEFAULT",
-    ]
+    env_keys = settings_env_keys()
     # Disk-authored ratchets PROJECT ONLY WHAT THE FILE ACTUALLY SAYS: a default standing in for an absent
     # key is not an owner decision, so overwriting/popping the env entry would clobber a legitimately
     # forwarded value (harbor_installed_agent runs with NO settings.json; server_runner documents the same

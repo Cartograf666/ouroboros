@@ -109,6 +109,7 @@ EXPECTED_TOOLS = [
     "send_user_message", "update_identity", "toggle_evolution",
     "toggle_consciousness", "switch_model", "get_task_result",
     "wait_task", "wait_tasks", "tree_note", "tree_read",
+    "delegate_start", "delegate_wait", "delegate_cancel",
     "read_file", "list_files", "write_file", "edit_text",
     "send_photo", "send_video", "send_file", "search_code", "query_code", "forward_to_worker",
     "generate_evolution_stats",
@@ -595,3 +596,44 @@ class TestPrePushGate:
                 _os.environ["OUROBOROS_PREFLIGHT_TIMEOUT_SEC"] = prev
 
 
+
+
+def test_no_module_defines_the_same_top_level_name_twice():
+    """A redefinition is invisible at import: the later one silently wins.
+
+    This is the shape a clean git merge produces when two branches independently add
+    the same concept — no conflict markers, no import error, no failing test, just one
+    definition quietly shadowing another. It happened in this very series: two branches
+    each added `SUBAGENT_EXECUTORS` and `normalize_subagent_executor` to subagents.py,
+    one a frozenset and one a tuple, and the merge picked a winner by position. That
+    pair happened to be equivalent; the next one will not be.
+    """
+    import ast
+    import collections
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        parts = set(path.parts)
+        if parts & {".git", "node_modules", "venv", ".venv", "build", "dist"}:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        seen = collections.Counter()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                seen[node.name] += 1
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                seen[node.target.id] += 1
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        seen[target.id] += 1
+        for name, count in seen.items():
+            # Dunders and TYPE_CHECKING/try-except import shims legitimately rebind.
+            if count > 1 and not name.startswith("__"):
+                offenders.append(f"{path.relative_to(root)}: {name} defined {count}x")
+    assert not offenders, "Top-level names defined more than once:\n" + "\n".join(offenders)

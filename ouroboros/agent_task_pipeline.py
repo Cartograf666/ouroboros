@@ -1062,8 +1062,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             artifact_axis.update(outcome_axes.get("artifacts") or {})
         artifact_axis["status"] = str(artifact_bundle.get("status") or artifact_axis.get("status") or "not_applicable")
         outcome_axes["artifacts"] = artifact_axis
-        # B1: compact swarm-efficiency rollup, only for a task that actually fanned
-        # out subagents (None for a plain task -> kwarg omitted).
+        # B1: swarm-efficiency rollup, only for a task that fanned out (None -> omitted).
         swarm_efficiency = _build_swarm_efficiency(env, task)
         subagent_envelope = task.get("subagent_envelope") if isinstance(task.get("subagent_envelope"), dict) else {}
         if str(task.get("delegation_role") or "").lower() == "subagent":
@@ -1077,6 +1076,9 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
                 requested_lane=str(task.get("requested_model_lane") or task.get("model_lane") or "auto"),
                 effective_lane=str(task.get("effective_model_lane") or task.get("model_lane") or "light"),
                 model=str(task.get("model") or ""),
+                reasoning_effort=str(task.get("reasoning_effort") or ""),
+                executor=str(task.get("requested_executor") or ""),
+                resolved_executor=str(task.get("resolved_executor") or ""), executor_reason=str(task.get("executor_reason") or ""),  # what RAN, and why
                 status=status,
                 usage={
                     "prompt_tokens": int(usage.get("prompt_tokens") or 0),
@@ -1154,6 +1156,8 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             effective_model_lane=task.get("effective_model_lane"),
             model=task.get("model"),
             use_local_model=task.get("use_local_model"),
+            requested_executor=task.get("requested_executor"),
+            reasoning_effort=task.get("reasoning_effort"),
             task_group_id=task.get("task_group_id"),
             task_group=task.get("task_group"),
             subagent_envelope=subagent_envelope,

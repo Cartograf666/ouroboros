@@ -1124,3 +1124,70 @@ def test_cache_bearing_sends_are_measured_on_every_cache_inclusive_route(tmp_pat
     )
     measured = get_token_density(root, normalize_model_identity("gigachat/some-model"))
     assert abs(measured - 1.5) < 1e-6
+
+
+def test_an_open_row_is_not_final_however_little_it_costs(data_root):
+    """`cost_final` asked a STATE question of a dollar sum on three of its four terms.
+
+    `_reservation_cost` returns exactly `0.0` for `provider="local"` — a first-class
+    supported configuration, not a fixture — so a DISPATCHED row, a physical send still in
+    flight, held a $0.00 bound, added nothing to `unresolved`, and left the projection
+    reporting `cost_final: True`. `not reserved` and `not unresolved` were the two terms
+    the estimated-spend fix did not reach.
+    """
+    reservation = ua.reserve_attempt(_request(
+        data_root, model="local/test", provider="local", reservation_usd=None))
+    assert reservation.reservation_upper_bound_usd == 0.0, \
+        "a local send really does reserve exactly zero — this is the trap, not a mock"
+    ua.mark_dispatched(reservation)
+
+    projection = ua.usage_projection(data_root)
+    assert projection["unresolved_upper_bound_usd"] == 0.0
+    assert projection["unknown_unmetered"] == 0
+    assert projection["cost_final"] is False, \
+        "a send in flight is open however little it is expected to cost"
+
+    # Settling it closes the row — `_final_rows` keys by attempt_id, so the dispatched row
+    # is REPLACED, not accumulated. Without that the count would never reach zero.
+    ua.settle_attempt(reservation, {"prompt_tokens": 1}, cost_usd=0.0, cost_final=True)
+    assert ua.usage_projection(data_root)["cost_final"] is True
+
+    # And a RESERVED row at the same zero bound is open for the same reason.
+    ua.reserve_attempt(_request(
+        data_root, model="local/test", provider="local", reservation_usd=None))
+    assert ua.usage_projection(data_root)["reserved_usd"] == 0.0
+    assert ua.usage_projection(data_root)["cost_final"] is False
+
+
+def test_a_non_final_projection_names_its_cause(data_root):
+    """A flag without its cause is not reconstructible (docs/DEVELOPMENT.md).
+
+    An estimated $0.00 makes every dollar bucket zero and `unknown_unmetered` zero, so
+    `cost_final: false` arrived with nothing anywhere on the projection — or in the
+    dashboard it feeds — that could explain it. The count that DECIDES finality is the
+    same number that discloses it, so the two cannot disagree.
+    """
+    ua.record_subscription_session(
+        "s-est", drive_root=data_root, route="r", task_id="t", root_task_id="root",
+        spend_usd=0.0, spend_estimated=True)
+    projection = ua.usage_projection(data_root)
+    assert projection["cost_final"] is False
+    assert [projection[key] for key in (
+        "settled_usd", "confirmed_usd", "estimated_usd", "reserved_usd",
+        "unresolved_upper_bound_usd", "accounted_usd")] == [0.0] * 6
+    assert projection["unknown_unmetered"] == 0
+    assert projection["non_final_rows"] == 1, \
+        "the ONLY field on the projection that explains the flag"
+
+    # A second open row of a different kind is counted too, so the number is a real cause
+    # and not a boolean wearing an integer's clothes.
+    ua.mark_dispatched(ua.reserve_attempt(_request(data_root, reservation_usd=2.0)))
+    second = ua.usage_projection(data_root)
+    assert second["non_final_rows"] == 2 and second["cost_final"] is False
+
+    # A fully settled ledger says so with the same field.
+    ua.record_subscription_session(
+        "s-free", drive_root=data_root / "free", route="r", task_id="t",
+        root_task_id="root", spend_usd=0.0)
+    free = ua.usage_projection(data_root / "free")
+    assert free["non_final_rows"] == 0 and free["cost_final"] is True

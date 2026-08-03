@@ -198,48 +198,49 @@ def test_attempts_per_model_is_bounded(monkeypatch):
 
 # ------------------------------------------------------------ lane resolver
 
-def test_auto_mutating_child_routes_to_heavy(monkeypatch):
+def test_omitted_lane_routes_to_light_whatever_the_child_may_do(monkeypatch):
+    """Omission is a decision: an unspecified lane is Light, and the child's write
+    authority does not enter the choice. This is the v6.87.7 decoupling — before it,
+    `auto` read `write_surface OR may_mutate` and handed a read-only child the
+    expensive model because of a permission about its grandchildren."""
     monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
     monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "provider::strong")
-    res = subagents.resolve_subagent_lane("auto", depth=1, mutating=True)
-    assert res.effective_lane == "heavy"
-    assert res.model == "provider::strong"
-    assert res.downgrade_note == ""
-
-
-def test_auto_readonly_child_routes_to_light(monkeypatch):
-    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
     monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
-    res = subagents.resolve_subagent_lane("auto", depth=1, mutating=False)
+    res = subagents.resolve_subagent_lane("auto", depth=1)
     assert res.effective_lane == "light"
     assert res.model == "provider::cheap"
 
 
-def test_explicit_main_honored_within_depth_cap(monkeypatch):
-    monkeypatch.delenv("OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT", raising=False)
+def test_resolver_takes_no_authority_argument():
+    """The resolver must not regrow an authority input. If a future change adds one,
+    this fails and the reviewer sees the coupling coming back."""
+    import inspect
+
+    params = set(inspect.signature(subagents.resolve_subagent_lane).parameters)
+    assert "mutating" not in params
+    assert not (params & {"mutating", "may_mutate", "write_surface", "surface"})
+    assert "requested_lane" in params
+    # Deliberately NOT an equality assertion. The remaining slot_index/slot_count/depth
+    # parameters feed a multi-slot fan-out no lane can trigger any more; pinning the exact
+    # signature here would mean a future cleanup has to delete a test in order to delete
+    # dead code. What this test is FOR is the absence of an authority input.
+
+
+def test_explicit_lane_is_honored_at_any_depth(monkeypatch):
+    """Depth bounds how DEEP delegation goes, never how strong a descendant is."""
     monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
-    res = subagents.resolve_subagent_lane("main", depth=1, mutating=False)
+    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "provider::strong")
+    for depth in (1, 2, 5):
+        res = subagents.resolve_subagent_lane("heavy", depth=depth)
+        assert res.effective_lane == "heavy", depth
+        assert res.model == "provider::strong", depth
+        assert res.downgrade_note == "", depth
+
+
+def test_explicit_main_honored(monkeypatch):
+    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
+    res = subagents.resolve_subagent_lane("main", depth=1)
     assert res.effective_lane == "main"
-    assert res.downgrade_note == ""
-
-
-def test_explicit_heavy_beyond_depth_cap_downgrades_with_note(monkeypatch):
-    monkeypatch.delenv("OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT", raising=False)
-    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
-    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
-    res = subagents.resolve_subagent_lane("heavy", depth=2, mutating=True)
-    assert res.effective_lane == "light"
-    assert res.model == "provider::cheap"
-    assert "depth 2" in res.downgrade_note and "light" in res.downgrade_note
-
-
-def test_depth_cap_is_configurable(monkeypatch):
-    monkeypatch.setenv("OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT", "2")
-    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
-    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "provider::strong")
-    # depth 2 is now within the cap -> explicit heavy honored, no note.
-    res = subagents.resolve_subagent_lane("heavy", depth=2, mutating=False)
-    assert res.effective_lane == "heavy"
     assert res.downgrade_note == ""
 
 
@@ -261,17 +262,14 @@ def test_build_envelope_tolerates_legacy_stored_lane():
     assert env["effective_lane"] == "light"
 
 
-def test_string_false_may_mutate_does_not_route_auto_to_heavy(monkeypatch):
+def test_string_false_may_mutate_stays_falsey(monkeypatch):
     # A tool-call payload may carry may_mutate as the STRING "false"; the SSOT
-    # normalize_bool must treat it as falsey, so an `auto` child is NOT promoted to the
-    # Heavy lane on a denied mutation intent (regression: bool("false") was truthy).
+    # normalize_bool must treat it as falsey (regression: bool("false") was truthy).
+    # Since v6.87.7 may_mutate governs AUTHORITY only — it no longer reaches the lane
+    # resolver at all — so this pins the primitive rather than a routing side effect.
     from ouroboros.contracts.task_contract import normalize_bool
     assert normalize_bool("false") is False
     assert normalize_bool("true") is True
-    monkeypatch.setenv("OUROBOROS_MODEL", "provider::main")
-    monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "provider::cheap")
-    res = subagents.resolve_subagent_lane("auto", depth=1, mutating=normalize_bool("false"))
-    assert res.effective_lane == "light"
 
 
 def test_use_local_empty_heavy_follows_main_flag(monkeypatch):
@@ -279,7 +277,7 @@ def test_use_local_empty_heavy_follows_main_flag(monkeypatch):
     monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "")
     monkeypatch.setenv("USE_LOCAL_MAIN", "true")
     monkeypatch.delenv("USE_LOCAL_HEAVY", raising=False)
-    res = subagents.resolve_subagent_lane("heavy", depth=1, mutating=True)
+    res = subagents.resolve_subagent_lane("heavy", depth=1)
     assert res.effective_lane == "heavy"
     assert res.model == "provider::main"
     # Empty Heavy -> Main, so the Main local flag governs (not silently ignored).
@@ -333,3 +331,268 @@ def test_empty_light_slot_inherits_main_routing_even_when_models_match(monkeypat
     # A slot the owner really configured still governs itself.
     monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", shared)
     assert _use_local_for_lane("light", shared) is False
+
+
+def _scheduling_ctx(tmp_path, *, parent_deadline: str = ""):
+    import queue
+
+    from ouroboros.tools.registry import ToolContext
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "parent1"
+    ctx.task_depth = 0
+    ctx.current_chat_id = 1
+    ctx.event_queue = queue.Queue()
+    ctx.task_metadata = {"root_task_id": "root1", "session_id": "sess1"}
+    if parent_deadline:
+        ctx.task_metadata["task_contract"] = {"deadline_at": parent_deadline}
+    return ctx
+
+
+def test_executor_is_a_third_axis_independent_of_lane_and_surface(tmp_path):
+    """WHO runs a child is its own axis. It is a closed enum of intents — never a harness
+    name — so that adding a harness never touches this contract."""
+    from ouroboros.subagents import SUBAGENT_EXECUTORS
+    from ouroboros.tools.control import _schedule_task
+
+    assert SUBAGENT_EXECUTORS == ("auto", "harness", "native")
+
+    for executor in SUBAGENT_EXECUTORS:
+        ctx = _scheduling_ctx(tmp_path / executor)
+        out = _schedule_task(ctx, objective="o", expected_output="e", executor=executor)
+        assert "TOOL_ARG_ERROR" not in out, executor
+        assert ctx.event_queue.get_nowait()["requested_executor"] == executor
+
+    ctx = _scheduling_ctx(tmp_path / "omitted")
+    _schedule_task(ctx, objective="o", expected_output="e")
+    assert ctx.event_queue.get_nowait()["requested_executor"] == "auto"
+
+    ctx = _scheduling_ctx(tmp_path / "bad")
+    out = _schedule_task(ctx, objective="o", expected_output="e", executor="codex")
+    assert "TOOL_ARG_ERROR" in out and "executor must be one of" in out
+    assert ctx.event_queue.empty()
+
+
+def test_effort_is_optional_and_validated_against_the_scale(tmp_path):
+    """A parent may name one child's effort; omission inherits the configured effort for the
+    task type, which stays the normal case. Nothing clamps effort by depth."""
+    from ouroboros.tools.control import _schedule_task
+
+    ctx = _scheduling_ctx(tmp_path / "named")
+    out = _schedule_task(ctx, objective="o", expected_output="e", effort="xhigh")
+    assert "TOOL_ARG_ERROR" not in out
+    assert ctx.event_queue.get_nowait()["reasoning_effort"] == "xhigh"
+
+    ctx = _scheduling_ctx(tmp_path / "omitted")
+    _schedule_task(ctx, objective="o", expected_output="e")
+    assert ctx.event_queue.get_nowait()["reasoning_effort"] == ""
+
+    ctx = _scheduling_ctx(tmp_path / "bad")
+    out = _schedule_task(ctx, objective="o", expected_output="e", effort="ludicrous")
+    assert "TOOL_ARG_ERROR" in out and "effort must be one of" in out
+    assert ctx.event_queue.empty()
+
+
+def _enqueue_through_supervisor(tmp_path, monkeypatch, **schedule_kwargs):
+    """Drive the REAL path: tool call -> event -> supervisor -> the task a worker is handed."""
+    from types import SimpleNamespace
+
+    from supervisor import events as ev_module
+    from ouroboros.tools.control import _schedule_task
+
+    ctx = _scheduling_ctx(tmp_path)
+    out = _schedule_task(ctx, objective="o", expected_output="e", **schedule_kwargs)
+    assert "TOOL_ARG_ERROR" not in out, out
+    event = ctx.event_queue.get_nowait()
+    event["type"] = "schedule_subagent"
+    event["depth"] = 0
+    event["delegation_role"] = ""
+
+    monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *a, **k: None)
+    enqueued = []
+
+    class FakeCtx:
+        DRIVE_ROOT = tmp_path
+        PENDING = []
+        RUNNING = {}
+        WORKERS = {0: SimpleNamespace(busy_task_id=None)}
+
+        def load_state(self):
+            return {"owner_chat_id": 1}
+
+        def send_with_budget(self, chat_id, text, **kwargs):
+            pass
+
+        def enqueue_task(self, task):
+            enqueued.append(task)
+
+        def persist_queue_snapshot(self, reason=""):
+            pass
+
+    ev_module._handle_schedule_task(event, FakeCtx())
+    assert enqueued, "supervisor did not enqueue the task"
+    return enqueued[0]
+
+
+def test_requested_effort_and_executor_survive_the_whole_scheduling_path(tmp_path, monkeypatch):
+    """The parent's `effort` and `executor` must reach the task the WORKER is handed.
+
+    This asserts on the task the supervisor actually enqueues, not on the event and not on
+    a re-implementation of the agent's fallback. An earlier version of this test built the
+    payload itself from the event, which meant it supplied the very keys under test and
+    could not fail — and a version before THAT re-implemented the agent's three lines in
+    the test body. Both passed while the supervisor was silently dropping the keys on the
+    floor. The loss is destructive, not merely inert: the worker writes its own view back
+    over the durable record, so a drop here also erases the evidence of what was asked."""
+    task = _enqueue_through_supervisor(tmp_path, monkeypatch, effort="xhigh", executor="harness")
+    assert task["reasoning_effort"] == "xhigh"
+    assert task["requested_executor"] == "harness"
+    assert task["metadata"]["reasoning_effort"] == "xhigh"
+    assert task["metadata"]["requested_executor"] == "harness"
+
+
+def test_omitted_effort_leaves_the_task_type_default_in_charge(tmp_path, monkeypatch):
+    """Omission stays omission all the way down: an empty stored effort must not be
+    mistaken for a request, or the child would pin an effort nobody asked for."""
+    task = _enqueue_through_supervisor(tmp_path, monkeypatch)
+    assert task["reasoning_effort"] == ""
+    assert task["requested_executor"] == "auto"
+
+
+def test_deadline_at_narrows_but_never_extends(tmp_path):
+    """`deadline_at` is public as of v6.87.7, and narrowing-only: a child may be bound
+    tighter than its parent, never looser."""
+    from ouroboros.tools.control import _INTERNAL_SCHEDULE_OPTIONS, _schedule_task
+
+    assert _INTERNAL_SCHEDULE_OPTIONS == frozenset()
+
+    # Relative to now, not hardcoded: `deadline_at` must be a FUTURE instant, so fixed
+    # calendar dates in this test would silently turn into rejections as time passes.
+    from datetime import timedelta
+
+    from ouroboros.deadline_utils import utc_now
+
+    def stamp(hours):
+        return (utc_now() + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    parent, tighter, looser = stamp(12), stamp(9), stamp(23)
+
+    ctx = _scheduling_ctx(tmp_path / "tighter", parent_deadline=parent)
+    _schedule_task(ctx, objective="o", expected_output="e", deadline_at=tighter)
+    evt = ctx.event_queue.get_nowait()
+    assert evt["task_contract"]["deadline_at"] == tighter
+
+    ctx = _scheduling_ctx(tmp_path / "looser", parent_deadline=parent)
+    _schedule_task(ctx, objective="o", expected_output="e", deadline_at=looser)
+    evt = ctx.event_queue.get_nowait()
+    assert evt["task_contract"]["deadline_at"] == parent
+
+    # A model-authored deadline is validated, because both failures are otherwise silent.
+    ctx = _scheduling_ctx(tmp_path / "garbage")
+    out = _schedule_task(ctx, objective="o", expected_output="e", deadline_at="in 2 hours")
+    assert "TOOL_ARG_ERROR" in out and "ISO-8601" in out
+    assert ctx.event_queue.empty()
+
+    ctx = _scheduling_ctx(tmp_path / "past")
+    out = _schedule_task(ctx, objective="o", expected_output="e", deadline_at=stamp(-1))
+    assert "TOOL_ARG_ERROR" in out and "already in the past" in out
+    assert ctx.event_queue.empty()
+
+
+def test_the_envelope_carries_the_axes_the_child_was_scheduled_on(tmp_path, monkeypatch):
+    """The envelope is the subagent's public description, and the TZ requires effort to
+    reach it. Empty stays empty: substituting the resolved default would report a decision
+    the parent never made, and the envelope is read as evidence of what WAS asked."""
+    from ouroboros.tools.control import _schedule_task
+
+    ctx = _scheduling_ctx(tmp_path / "asked")
+    _schedule_task(ctx, objective="o", expected_output="e", effort="xhigh", executor="harness")
+    envelope = ctx.event_queue.get_nowait()["subagent_envelope"]
+    assert envelope["reasoning_effort"] == "xhigh"
+    assert envelope["executor"] == "harness"
+
+    ctx = _scheduling_ctx(tmp_path / "omitted")
+    _schedule_task(ctx, objective="o", expected_output="e")
+    envelope = ctx.event_queue.get_nowait()["subagent_envelope"]
+    assert envelope["reasoning_effort"] == ""
+    assert envelope["executor"] == "auto"
+
+
+def test_the_envelope_states_what_actually_ran_not_only_what_was_asked(tmp_path, monkeypatch):
+    """P34P1 (D4's p4-owned half): the durable envelope and the parent-facing terminal
+    result were rebuilt from `task["requested_executor"]`, so an `auto` child that
+    actually fell back to metered NATIVE spend reported `auto` in both — the dispatch
+    resolution reached the event log and the child's own prompt and stopped there.
+    The resolution is now persisted onto the task record at dispatch and carried into
+    the envelope, with the divergence stated rather than left for a reader to infer.
+
+    NOTE ON SCOPE: this is NOT D4's `capability_delta` chain, which lives on
+    `cxi/p2-axes` (subagents.capability_delta_notice / agent.capability_delta_prompt_block
+    / control.disclosable_capability_delta) and is deliberately absent here — the
+    branch's own coherence guard in test_convergence_invariants pins that absence. This
+    fixes the p4-owned half in p4's own vocabulary so the two compose at synthesis
+    instead of becoming two implementations of one decision."""
+    from ouroboros.subagents import build_subagent_envelope
+
+    # An `auto` request that resolved to native: both facts, and the divergence.
+    envelope = build_subagent_envelope(
+        task_id="t-child", requested_lane="auto", effective_lane="light",
+        executor="auto", resolved_executor="native",
+        executor_reason="harness_not_configured", status="done")
+    assert envelope["executor"] == "auto", "what was ASKED is preserved"
+    assert envelope["resolved_executor"] == "native", "and what RAN is stated"
+    assert envelope["executor_reason"] == "harness_not_configured"
+    assert envelope["executor_diverged"] is True
+
+    # A request that was honored is not a divergence.
+    honored = build_subagent_envelope(
+        task_id="t2", executor="harness", resolved_executor="harness",
+        executor_reason="harness_ready", status="done")
+    assert honored["executor_diverged"] is False
+
+    # A task that never reached dispatch has no resolved value, and the request is NOT
+    # substituted for one — that would be the same lie one field over.
+    unreached = build_subagent_envelope(task_id="t3", executor="auto", status="queued")
+    assert unreached["resolved_executor"] == "" and unreached["executor_diverged"] is False
+
+    # The real seam: the loop persists the resolution onto the task record, and the
+    # result pipeline reads it from there.
+    import ouroboros.agent as agent
+
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "")     # harness not configured
+    task = {"id": "t-child", "delegation_role": "subagent",
+            "requested_executor": "auto", "model_lane": "light"}
+    decision = agent.resolve_dispatch_executor(task)
+    assert decision is not None and decision.executor == "native"
+    task["resolved_executor"] = decision.executor
+    task["executor_reason"] = decision.reason
+    carried = build_subagent_envelope(
+        task_id=str(task["id"]), executor=str(task.get("requested_executor") or ""),
+        resolved_executor=str(task.get("resolved_executor") or ""),
+        executor_reason=str(task.get("executor_reason") or ""), status="done")
+    assert carried["resolved_executor"] == "native" and carried["executor_diverged"] is True
+
+
+def test_the_scheduling_axes_survive_a_queue_snapshot(tmp_path, monkeypatch):
+    """A pending child that waits through a restart must resume on the effort its parent
+    asked for. The axes live at the task TOP LEVEL because that is where the agent loop
+    reads them — restoring only the copies nested in `metadata` would leave the resumed
+    child running the task-type default while its own record still claimed the request."""
+    import supervisor.queue as q
+
+    task = _enqueue_through_supervisor(tmp_path, monkeypatch, effort="xhigh", executor="harness")
+
+    import json as _json
+
+    captured = {}
+    monkeypatch.setattr(q, "atomic_write_text",
+                        lambda path, text: captured.update(_json.loads(text)))
+    monkeypatch.setattr(q, "PENDING", [task], raising=False)
+    monkeypatch.setattr(q, "RUNNING", {}, raising=False)
+    assert q.persist_queue_snapshot(reason="test") is True
+
+    rows = captured.get("pending") or []
+    assert rows, captured
+    restored = rows[0]["task"]
+    assert restored["reasoning_effort"] == "xhigh"
+    assert restored["requested_executor"] == "harness"

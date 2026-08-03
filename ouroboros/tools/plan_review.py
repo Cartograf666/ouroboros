@@ -462,10 +462,11 @@ def _schedule_planning_scouts(
         before_side = set(_scheduled_side_channel_ids(ctx))
         before_durable = set(_planning_direct_children(ctx))
         try:
-            # The scout deadline rides the POSITIONAL-ONLY internal-options mapping, not a new public
-            # parameter: `deadline_at` is runtime-internal and stays out of the strict schema.
+            # `deadline_at` became a public schedule_subagent parameter in v6.87.7, so the
+            # scout deadline now rides the same channel any parent would use. Narrowing is
+            # enforced downstream: the earlier of this and the parent's deadline wins.
             output = _schedule_task(
-                ctx, {"deadline_at": deadline_at}, objective=objective,
+                ctx, objective=objective, deadline_at=deadline_at,
                 expected_output=("A concise planning handoff with sections: summary, missed_touchpoints, "
                                  "risks, suggested_scope_adjustments, tests_to_run, blockers."),
                 role=role, context=context, constraints=constraints, memory_mode="forked", model_lane="light",

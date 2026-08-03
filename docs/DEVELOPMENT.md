@@ -68,6 +68,24 @@ When a Gateway exists, it should follow these guidelines:
 - `ouroboros/gateways/claude_code.py` — Claude Agent SDK gateway. Two paths: `run_edit`
   (edit mode with PreToolUse safety hooks) and `run_readonly` (advisory review, no
   mutating tools). Structured `ClaudeCodeResult` output.
+- `ouroboros/gateways/claudexor.py` — Claudexor v3 control-plane gateway. Loopback
+  discovery, protocol-major + minimum-version handshake, project registration, run
+  start/poll/cancel. Typed refusals (`ClaudexorUnavailable`,
+  `ClaudexorSubscriptionWindowExhausted`) instead of raw HTTP errors. Also reads the run
+  tree Claudexor writes on disk (`attempt_containment`): the engine records some APPLIED
+  facts — the attempt's harness HOME and the OS boundary it ran under — only as
+  artifacts, so a caller that must verify what was enforced has nowhere else to look, and
+  the path layout is Claudexor's. The boundary mechanism is read as an OPAQUE string: which
+  ones exist, and on which hosts, is the engine's business. `engine_at_least` is the one version-floor
+  predicate, shared by the handshake and by every lane-specific floor. The daemon bearer
+  token grants the whole `/v2` surface and must stay inside this module: never in a
+  `ToolContext`, a child's environment, or a harness sandbox. Policy (which route, when
+  to fall back, when to block) lives in `subagents.resolve_subagent_executor` and
+  `tools/delegate.py`, never here. `start_run` accepts the caller's `idempotency_key`
+  (defaulting to a random one) because only the caller knows what its LOGICAL start is;
+  a random key per POST turns a lost response into a second live run. Run LIFECYCLE —
+  who owns a run, whether a cancel was verified, whether a settlement landed — is
+  `ouroboros/delegate_custody.py`, not transport.
 
 ### Relationship Between Entities
 
@@ -987,8 +1005,8 @@ Before every commit, verify the following:
   local coordination/projection paths; not arbitrary workspace or repo mutation).
   Nested readonly
   `schedule_subagent` recursion is allowed only within configured depth/cap
-  limits; descendants deeper than the configured capability depth
-  (`OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT`) are coerced to the light lane. Enabled/reviewed extension tools and enabled MCP tools may remain
+  limits; depth bounds nesting only and never rewrites a
+  descendant's lane. Enabled/reviewed extension tools and enabled MCP tools may remain
   callable by owner policy, subject to inherited `task_contract.allowed_resources`
   such as no-network/no-web.
 - A NEW `plan_task` scout wave is admitted before launch, and only a NEW one: worker capacity,
@@ -1011,8 +1029,14 @@ Before every commit, verify the following:
   model can see or accepts something it cannot (BIBLE P7). Internal-only options instead travel in
   the POSITIONAL-ONLY `internal` mapping keyed by `_INTERNAL_SCHEDULE_OPTIONS` — structurally
   unreachable from tool-call JSON, which is keyword-only. That is what keeps the handler inside the
-  <8-parameter contract; the scout `deadline_at` is the first such option. Add an internal knob to
-  that closed set, never to the signature and never to the public schema.
+  <8-parameter contract. Add an internal knob to that closed set, never to the signature and never
+  to the public schema. The test of membership is WHO DECIDES, not who currently calls: an option
+  the runtime decides belongs in the closed set, and an option the parent LLM is the right judge of
+  belongs in the public schema. `deadline_at` was the set's only member until v6.87.7, when it moved
+  to the schema on exactly that test — the parent is what knows when a child's handoff stops being
+  useful, and a scout deadline was only ever runtime-internal because `plan_task` happened to be its
+  first caller. The set is empty today; it stays because it is closed and an unknown key in it still
+  fails loudly.
 - `plan_task` planning scouts use the same live-subagent worker pool and one
   shared terminal-or-cutoff wait boundary. Poll in
   `OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC` slices, but wait for every started scout
@@ -1103,6 +1127,31 @@ Before every commit, verify the following:
 - [ ] **Cache-friendliness invariant.** Any change that builds or reorders prompt/context content must not degrade prompt caching: never insert dynamic values (timestamps, hashes, round counters, per-task identity) into a stable cached prefix, never move stable governance content behind dynamic evidence, and never strip or bypass existing `cache_control` markers / cache-affinity keys. Review surfaces mark their stable prefix via `review_helpers.cached_prompt_blocks` (block-level `cache_control` with the review TTL); the boundary each builder reports must contain only byte-stable content. The acceptance substrate (v6.74.0) marks TWO segments — byte-stable governance, then the task-stable contract (goal/scope/checklist/policy) — leaves the per-pass evidence tail unmarked (it changes every pass by design; the exact review binding is useless as a breakpoint because an unchanged binding never makes a second call), keeps slot identity at the TAIL of the mutable part, and asserts `review_substrate.assert_cache_breakpoint_cap` (≤4 declared breakpoints) on the final payload — reuse that assertion in new multi-segment builders. (v6.77.0) A builder no longer places tool markers or orders TTLs itself: `llm.LLMClient._normalize_payload_cache_ttl` finalizes the ASSEMBLED provider payload at every physical-send boundary — it promotes earlier existing breakpoints to `1h` when any later one asks for `1h` (Anthropic requires longer TTLs first; a 5m tools marker before a 1h system marker is a hard 400), marks the last tool schema when the tools segment carries none, and on a >4 payload keeps the four earliest anchors while dropping tail markers with a disclosed `prompt_cache_breakpoints_reduced` usage field. Declare your intended TTL on the blocks you own and let the finalizer order them; the assertion above remains the LOUD builder-side layer (the finalizer is the fail-soft transport guard), and routes that cannot carry markers are left byte-identical, so never re-add a per-builder marking site. This is checklist item `cache_friendliness` in `docs/CHECKLISTS.md`.
 - [ ] OpenRouter reasoning continuity belongs to OpenRouter conversations only. Direct/local payloads strip OpenRouter round-trip metadata; OpenRouter payloads with `reasoning_details` disable provider fallback to avoid endpoint-bound thought-signature corruption.
 - [ ] Claude Agent SDK edit prompts must preserve the full governance prompt. Use the gateway's system-prompt file handoff when the installed SDK exposes one; do not truncate BIBLE/ARCHITECTURE/DEVELOPMENT/CHECKLISTS to avoid argv or transport limits.
+- [ ] Delegated (subscription-harness) work is accounted on its OWN ledger row:
+  `usage_accounting.record_subscription_session`, which feeds the separate sessions/quota
+  axis (`subscription_sessions` / `subscription_windows`). Its cash has THREE states and
+  only the first is final: a DISCLOSED ZERO (`spend_usd=0.0`) settles at `cost_usd=0.0,
+  cost_final=True` and leaves the projection final — the case this row kind exists for;
+  an ESTIMATED amount (`spend_estimated=True`, the engine's `spendEstimated`) rides as
+  money but never as finality; an UNDISCLOSED spend (`spend_usd=None`) is `cost_usd: None`
+  and counted unknown/unmetered, never a confident `0.0`. Token counts are the same rule
+  on the usage axis: `None` means no harness reported it, which is not a run that used
+  zero. Do NOT reuse `record_unmetered_external_dispatch` for any of them — it also drops
+  the sessions/quota axis. The nanny's own model calls remain ordinary metered attempts
+  and keep rolling into the task projection; a subscription session is not counted as a
+  physical provider call.
+- [ ] `cost_final` on a projection is a COUNT of open rows (`non_final_rows`), never a
+  truthiness test on a dollar sum: a reserved/dispatched/unresolved row, a settled row
+  with an unknown price, and a settled row its writer marked non-final are each open
+  however little they cost — `$0.00` is a real reservation for `provider="local"` and a
+  real estimate for a delegated run. `non_final_rows` is returned beside the flag because
+  a projection can be non-final with every dollar bucket at zero, and a flag without its
+  cause is not reconstructible.
+- [ ] A spent SUBSCRIPTION WINDOW is `subscription_window_exhausted`, a TRANSIENT class
+  carrying `reset_at`, scheduled against that instant rather than through the
+  60-second-capped exponential backoff. Do not fold it into `quota_exhausted`, which is
+  classified permanent — correctly so for a billing refusal (402, no credits) and wrong
+  for a window whose only cure is waiting.
 - [ ] Provider failures must be classified before retrying the same request.
   Quota/auth/billing, hard bad-request, and request-too-large/context failures
   are non-retryable as-is: record the exact category and surface a recovery hint

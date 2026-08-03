@@ -33,7 +33,7 @@ from ouroboros.memory import Memory
 from ouroboros.context import build_llm_messages
 from ouroboros.context_budget import CONTEXT_SOFT_CAP_TOKENS
 from ouroboros.loop import run_llm_loop
-from ouroboros.config import resolve_effort
+from ouroboros.config import EFFORT_SCALE, resolve_effort
 from ouroboros.agent_startup_checks import (
     inject_crash_report,
     verify_restart,
@@ -46,10 +46,115 @@ from ouroboros.task_results import STATUS_RUNNING, write_task_result
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.contracts.task_contract import attach_task_contract
 from ouroboros.outcomes import infra_failed_axes
+from ouroboros.subagents import (
+    SUBAGENT_EXECUTORS,
+    SubagentExecutorResolution,
+    delegated_run_shape,
+    probe_subagent_executor,
+    resolve_subagent_executor,
+)
 
 
 _worker_boot_logged = False
 _worker_boot_lock = threading.Lock()
+
+
+def resolve_dispatch_executor(task: Dict[str, Any]) -> Optional[SubagentExecutorResolution]:
+    """Decide WHO RUNS THIS CHILD before a single token is spent (None: not a child).
+
+    The third axis is settled here, at dispatch, because this is the last moment at
+    which refusing still costs nothing. `executor=harness` is a PIN: the parent asked
+    for the already-paid subscription substrate specifically to avoid metered spend, so
+    an unavailable route must become a typed blocker. Falling back to the native worker
+    would bill the owner for exactly the thing the request was meant to prevent — and
+    silently, which is worse than an error.
+    """
+    if str(task.get("delegation_role") or "").lower() != "subagent":
+        return None
+    requested = str(task.get("requested_executor") or "auto").strip().lower() or "auto"
+    if requested not in SUBAGENT_EXECUTORS:
+        # Durable-data tolerance: the schema already refused anything invalid at
+        # schedule time, so an unknown stored value is stale, not an argument error.
+        requested = "auto"
+    if requested == "native":
+        return resolve_subagent_executor("native")  # nothing to ask the daemon
+    from ouroboros.tool_access import predicted_subagent_profile
+
+    constraint = normalize_task_constraint(task.get("task_constraint"))
+    surface = str(getattr(constraint, "surface", "") or "")
+    # The WHOLE shape, from the one owner of it: health is checked against the run this
+    # child would really start, not against a profile string reassembled here. That is
+    # what lets the dispatcher refuse an engine that cannot confine a mutating run,
+    # before a token is spent, instead of leaving the nanny to discover it.
+    shape = delegated_run_shape(predicted_subagent_profile(write_surface=surface) == "acting_subagent")
+    return probe_subagent_executor(requested, shape=shape)
+
+
+def dispatch_executor_note(decision: Optional[SubagentExecutorResolution]) -> str:
+    """The child's VISIBLE marker for a substrate decision it did not make ('' = silent).
+
+    The rule table's `auto` rows are only honest if the child can see which way they
+    went: a nanny must know to delegate, and a child that fell back to metered tokens
+    must know its route was unavailable rather than discovering it by spending.
+    """
+    if decision is None or decision.blocked:
+        return ""
+    if decision.executor == "harness":
+        route = decision.route.route_id if decision.route else ""
+        note = (
+            f"EXECUTOR: your parent scheduled you on the delegated substrate ({route}). "
+            "You are a NANNY: do your work with delegate_start / delegate_wait instead of "
+            "thinking on metered API tokens, and check what comes back rather than "
+            "believing it."
+        )
+        if decision.reset_at:
+            note += (
+                f" The route's plan window is currently spent and resets at "
+                f"{decision.reset_at}. Decide explicitly: wait for the reset, deliver "
+                "partial work, or say you fell back — do not drift into spending."
+            )
+        return note
+    if decision.reason in {"requested_native", "harness_not_configured"}:
+        return ""  # the ordinary case has nothing to announce
+    if decision.reset_at:
+        # D28's fallback, stated as the CAPABILITY DELTA it is: the parent asked for the
+        # already-paid substrate to be used when available, every profile of it is spent,
+        # and the work is proceeding on metered money instead. Destination 2 of 3 (the
+        # child's own prompt); the durable event and the parent's envelope carry the same
+        # two facts. The reset instant is named so the child can weigh waiting against
+        # spending instead of guessing.
+        return (
+            "EXECUTOR CAPABILITY DELTA: every plan window of the configured delegated "
+            f"substrate is spent (resets at {decision.reset_at}), so you FELL BACK to "
+            "METERED API tokens. Your parent asked for 'auto', which permits this "
+            "fallback rather than a wait — but it is real money that the subscription "
+            "would have covered: keep the work proportionate, and say in your result "
+            "that you ran below the substrate you were scheduled for and why."
+        )
+    return (
+        f"EXECUTOR: the configured delegated substrate is unavailable "
+        f"({decision.reason}), so you are running on METERED API tokens. Your parent "
+        "asked for 'auto', which permits this — but say so in your result."
+    )
+
+
+def executor_blocked_outcome(decision: SubagentExecutorResolution) -> Tuple[str, Dict[str, Any]]:
+    """The terminal ``(text, usage)`` of a child that was pinned and could not run.
+
+    Deliberately NOT a fallback: the task ends unrun and typed, having spent nothing.
+    """
+    text = (
+        "⚠️ EXECUTOR_UNAVAILABLE: this subagent was pinned to the delegated substrate "
+        f"(executor='harness') and the route cannot run: {decision.reason}."
+        + (f" It resets at {decision.reset_at}." if decision.reset_at else "")
+        + " The task was NOT run on metered API tokens, because that spend is exactly "
+        "what the pin exists to prevent. Reschedule once the route recovers, or "
+        "schedule it again with executor='auto' to accept metered spend."
+    )
+    return text, {
+        "execution_status": "infra_failed",
+        "reason_code": "subagent_executor_unavailable",
+    }
 
 
 def _persist_early_origin_stub(drive_root: Any, task: Dict[str, Any]) -> None:
@@ -117,6 +222,66 @@ def _queued_budget_exhausted_message() -> str:
         "auto-resumed; cancel it or start a new run unless the recorded checkpoint "
         "is explicitly replay-safe."
     )
+
+
+def _physical_calls_after_budget_rail(budget_root: Any, task_id: str) -> Optional[int]:
+    """How many provider sends this task really made, for an honest budget-rail message.
+
+    ``None`` means UNKNOWN, and an integrity-degraded ledger yields exactly that rather
+    than a count that might be missing a paid tail — "0 calls" and "we cannot tell" must
+    not read the same to the owner.
+    """
+    try:
+        from ouroboros.usage_accounting import usage_breakdown
+
+        evidence = usage_breakdown(pathlib.Path(budget_root), task_id=task_id)
+        if evidence.get("integrity_degraded"):
+            return None
+        return int(evidence.get("physical_calls") or 0)
+    except Exception:
+        log.exception("Could not inspect task attempts after agent budget rail")
+        return None
+
+
+def _announce_dispatch_executor(
+    task: Dict[str, Any], drive_logs: Any, messages: List[Dict[str, Any]],
+) -> Optional[SubagentExecutorResolution]:
+    """Resolve WHO runs this task, record the decision, and tell the child about it.
+
+    The visible marker is not decoration: an `auto` child that fell back to the metered
+    native path because the harness was unavailable would otherwise have no way to know
+    it is spending money, and neither would a reader of the transcript.
+    """
+    # A BLOCKED decision ends the child unrun: the pin was the whole point, and running
+    # the loop here would spend exactly the metered money the parent asked to avoid.
+    # Nothing has been spent at this point, so the refusal is free.
+    decision = resolve_dispatch_executor(task)
+    if decision is None:
+        return None
+    append_jsonl(drive_logs / "events.jsonl", {
+        "ts": utc_now_iso(), "type": "subagent_executor_resolved",
+        "task_id": str(task.get("id") or ""),
+        "requested": decision.requested,
+        "executor": decision.executor,
+        "reason": decision.reason,
+        "reset_at": decision.reset_at,
+        "route": decision.route.route_id if decision.route else "",
+    })
+    note = dispatch_executor_note(decision)
+    if note:
+        messages.append({"role": "user", "content": note})
+    return decision
+
+
+def _initial_effort_for(task: Dict[str, Any], task_type: str) -> str:
+    """The effort a task starts on: the parent's explicit request, else the type default.
+
+    An unrecognized STORED value falls back rather than raising — this is durable data
+    that outlives the schema that wrote it, and `schedule_subagent` already refused
+    anything invalid at the time it was asked for.
+    """
+    requested = str(task.get("reasoning_effort") or "").strip().lower()
+    return requested if requested in EFFORT_SCALE else resolve_effort(task_type)
 
 
 @dataclass(frozen=True)
@@ -347,6 +512,8 @@ class OuroborosAgent:
                     effective_model_lane=task.get("effective_model_lane"),
                     model=task.get("model"),
                     use_local_model=task.get("use_local_model"),
+                    requested_executor=task.get("requested_executor"),
+                    reasoning_effort=task.get("reasoning_effort"),
                     task_group_id=task.get("task_group_id"),
                     task_group=task.get("task_group"),
                     subagent_envelope=task.get("subagent_envelope"),
@@ -413,6 +580,8 @@ class OuroborosAgent:
             "effective_model_lane",
             "model",
             "use_local_model",
+            "requested_executor",
+            "reasoning_effort",
             "task_group_id",
             "task_group",
             "subagent_envelope",
@@ -683,9 +852,18 @@ class OuroborosAgent:
             llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
 
             task_type_str = str(task.get("type") or "").lower()
-            initial_effort = resolve_effort(task_type_str)
+            initial_effort = _initial_effort_for(task, task_type_str)
 
-            if task_type_str == "deep_self_review":
+            executor_decision = _announce_dispatch_executor(task, drive_logs, messages)
+            if executor_decision is not None:
+                # The durable envelope and the parent's result state what actually RAN,
+                # not the request: nothing carried the resolution to them before.
+                task["resolved_executor"] = executor_decision.executor
+                task["executor_reason"] = executor_decision.reason
+
+            if executor_decision is not None and executor_decision.blocked:
+                text, usage = executor_blocked_outcome(executor_decision)
+            elif task_type_str == "deep_self_review":
                 # Deep self-review bypasses the tool loop.
                 try:
                     from ouroboros.deep_self_review import run_deep_self_review, is_review_available
@@ -823,17 +1001,8 @@ class OuroborosAgent:
 
         except BudgetExceeded as exc:
             task_id = str(task.get("id") or "")
-            physical_calls: Optional[int] = None
-            try:
-                from ouroboros.usage_accounting import usage_breakdown
-
-                budget_root = task.get("budget_drive_root") or self.env.drive_root
-                attempt_evidence = usage_breakdown(pathlib.Path(budget_root), task_id=task_id)
-                physical_calls = int(attempt_evidence.get("physical_calls") or 0)
-                if attempt_evidence.get("integrity_degraded"):
-                    physical_calls = None
-            except Exception:
-                log.exception("Could not inspect task attempts after agent budget rail")
+            physical_calls = _physical_calls_after_budget_rail(
+                task.get("budget_drive_root") or self.env.drive_root, task_id)
             # Direct chats cannot honestly advertise the queued-task resume contract.
             replay_safe = physical_calls == 0 and not bool(task.get("_is_direct_chat"))
             resource_limit = {

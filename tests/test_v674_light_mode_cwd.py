@@ -75,6 +75,27 @@ def test_genuine_repo_target_still_blocks(tmp_path):
     ) is True
 
 
+def test_versioned_interpreter_basename_still_classified(tmp_path):
+    """python3.11 / absolute versioned paths must engage the inline-write fence.
+
+    CI's interpreter basename is unversioned ("python"), so the four
+    public-surface light-fence tests cannot catch this class there; this pins
+    the classification host-independently. Regression: exact-set matching of
+    {"python", "python3", ...} let a versioned agent python (the resolver
+    injects OUROBOROS_AGENT_PYTHON or sys.executable into argv[0]) bypass
+    detect_interpreter_inline entirely.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    inline_write = "open('probe.txt', 'w').write('x')"
+    for exe in ("python3.11", "python3.12", "/opt/homebrew/bin/python3.11", "python3.11.exe"):
+        assert light_shell_repo_mutation(
+            [exe, "-c", inline_write],
+            repo_dir=repo, cwd=str(repo), work_dir=repo,
+            detect_interpreter_inline=True,
+        ) is True, exe
+
+
 # ---- registry level: the resolver is hoisted above the light guard ---------
 
 
@@ -91,6 +112,43 @@ def test_light_mode_task_drive_label_cwd_is_not_light_blocked(tmp_path, monkeypa
     assert "LIGHT_MODE_BLOCKED" not in result, result[:300]
     task_drive = pathlib.Path(reg._ctx.task_drive_root())
     assert (task_drive / "out.txt").exists()
+
+
+def test_light_mode_versioned_interpreter_runtime_data_write_is_registry_blocked(tmp_path, monkeypatch):
+    """Registry-level twin of ``test_versioned_interpreter_basename_still_classified``.
+
+    The unit test above pins shell_guards' inline-write fence; this pins the
+    OTHER half of INFRA-1 — ``ToolRegistry._run_shell_safety_check``'s
+    ``runtime_data_scan`` classifier — which that unit test cannot see. The
+    four public-surface light-fence tests run ``sys.executable``, whose
+    basename on CI is unversioned, so reverting the registry classifier to the
+    exact set {"python", "python3", ...} keeps them green there. This test
+    spells the versioned basename explicitly and is host-independent: the
+    guard must refuse BEFORE execution, so ``python3.11`` need not exist on
+    the host — and where it does exist, the write would land and fail the
+    no-file assertion instead.
+    """
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    reg = _registry(tmp_path)
+    # A runtime_data path outside the task's own roots (drive_root/uploads is
+    # neither this task's task_drive nor its artifact_store).
+    target = tmp_path / "drive" / "uploads" / "probe-report.html"
+    result = reg.execute("run_command", {
+        "cmd": [
+            "python3.11",
+            "-c",
+            (
+                "from pathlib import Path\n"
+                f"p = Path({str(target)!r})\n"
+                "p.parent.mkdir(parents=True, exist_ok=True)\n"
+                "p.touch()\n"
+            ),
+        ],
+        "cwd": str(reg._ctx.task_drive_root()),
+    })
+    assert "LIGHT_MODE_BLOCKED" in result, result[:300]
+    assert "runtime_data" in result
+    assert not target.exists()
 
 
 def test_light_mode_repo_write_still_blocked(tmp_path, monkeypatch):
