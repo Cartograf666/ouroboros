@@ -164,9 +164,10 @@ class TestBuildSh:
             "(a silent no-op would otherwise ship a self-resealing bundle)"
         )
 
-    def test_macos_dmg_includes_install_cli_command(self):
+    def test_macos_dmg_includes_finder_install_layout(self):
         src = _read("build.sh")
         assert "dmg-stage" in src
+        assert 'ln -s /Applications "$DMG_STAGE_DIR/Applications"' in src
         assert "Install CLI.command" in src
         assert "install-ouroboros-cli-macos.command" in src
 

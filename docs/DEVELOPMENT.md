@@ -1761,10 +1761,13 @@ record. Each platform shard locates the final DMG, tarball, or ZIP after all
 packaging steps, then performs a smoke test against that final archive. The
 smoke checks require the embedded repository bundle and run the packaged CLI
 with `--help` in an isolated home directory. The macOS check also requires the
-separate `Install CLI.command` payload and an arm64 app executable.
+`Applications -> /Applications` drag target, the separate `Install CLI.command`
+payload, and an arm64 app executable.
 
 Each shard also generates a CycloneDX SBOM from the payload extracted from the
-final archive, including both top-level files in the macOS DMG. The workflow
+final archive. The macOS smoke proves the Applications link, then removes only
+that link from the SBOM staging copy so Syft cannot follow it into the runner's
+host `/Applications`; the app and CLI launcher remain in the scan. The workflow
 downloads a fixed Syft release asset and checks its platform-specific SHA-256
 before execution. GitHub artifact attestations bind both build provenance and
 the SBOM to the final archive digest. The release job downloads the three
