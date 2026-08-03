@@ -178,9 +178,15 @@ def withdraw_finalization_grace(
         _workers_mod.get_event_q().put({
             "type": "send_message",
             "chat_id": chat_id,
+            # Says what was DONE, not what the supervisor cannot know. The revocation
+            # only reaches a reader that has not drained yet; whether this task had
+            # already consumed the control is in-process state (`loop._owner_msg_seen`)
+            # the supervisor cannot see, and claiming a cancelled stop after the task
+            # took the order was a plain lie. Correcting the sentence, not adding an ack.
             "text": (
                 f"▶️ Task {task_id} resumed work before the {reason} grace window closed; "
-                "the stop request was withdrawn."
+                "the stop request was retracted from its mailbox — if the task had "
+                "already read it, it may still finalize."
             ),
             "format": "markdown",
             "is_progress": True,

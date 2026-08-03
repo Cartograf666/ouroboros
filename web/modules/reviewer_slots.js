@@ -91,10 +91,35 @@ export function routeChoiceGroups({ catalogModels = [], harnesses = [], currentA
             disabled: h.status && h.status !== 'ok' && !h.enabled,
         }));
     const groups = [{ label: 'API models', options: apiValues }];
-    if (sessionValues.length) {
-        groups.push({ label: 'Coding agents — subscriptions', options: sessionValues });
-    }
+    // With no daemon the group used to VANISH, while the section copy above still
+    // promised subscription delivery — the owner saw a broken promise and nowhere
+    // to go. Say why it is empty instead of hiding it.
+    groups.push(sessionValues.length
+        ? { label: 'Coding agents — subscriptions', options: sessionValues }
+        : { label: 'Coding agents — subscriptions', options: [{
+            value: '', disabled: true,
+            label: 'None available — sign in under Harness Accounts below',
+        }] });
     return groups;
+}
+
+export function indexProfilesByHarness(payload) {
+    // The REAL ControlCredentialProfilesResponse shape, same reader as
+    // harness_accounts.accountRows: `profiles` is an array of WRAPPERS
+    // `{profile, status, identity}` carrying snake_case fields. Reading flat
+    // camelCase off the wrapper matched nothing, so every session row's
+    // credential-profile picker was silently empty. Exported so the wire test can
+    // hold it against the same golden body the account list consumes.
+    const byHarness = {};
+    const profiles = payload?.profiles?.profiles || [];
+    for (const wrapper of Array.isArray(profiles) ? profiles : []) {
+        const profile = wrapper?.profile || {};
+        const harness = String(profile.harness_id || '');
+        const id = String(profile.profile_id || '');
+        if (!harness || !id) continue;
+        (byHarness[harness] = byHarness[harness] || []).push(id);
+    }
+    return byHarness;
 }
 
 export function buildReviewerSlotsSetting(state) {
@@ -136,7 +161,7 @@ export function describeLastExecution(entry) {
     else if (String(effective.route || '').startsWith('agent_session')) parts.push('model not disclosed');
     if (effective.profile_id) parts.push(`account ${effective.profile_id}`);
     if (effective.access) parts.push(`access ${effective.access}`);
-    if (effective.effort) parts.push(`effort ${effective.effort}`);
+    // No applied effort is rendered: none exists upstream, so the key is not emitted.
     if (effective.verdict_method && effective.verdict_method !== 'structured'
         && effective.verdict_method !== 'strict_parse') {
         parts.push(`verdict via ${effective.verdict_method.replace(/_/g, ' ')}`);
@@ -164,6 +189,7 @@ export function capabilityBadge(row, harnessesById) {
 const state = {
     loaded: false,
     configError: '',
+    loadError: '',
     source: '',
     triad: [],
     scope: [],
@@ -189,7 +215,7 @@ export function renderReviewerSlotsSection() {
                 <em>every</em> commit-review or scope row, those API surfaces fall back to the shipped
                 default models and spend API budget — keep at least one API row to avoid it.
             </div>
-            <div id="reviewer-slots-error" class="settings-inline-note" data-tone="error" hidden></div>
+            <div id="reviewer-slots-error" class="ui-status" data-tone="error" hidden></div>
             <h4 class="reviewer-slots-heading">Triad slots <span class="muted" id="reviewer-triad-limit"></span></h4>
             <div id="reviewer-triad-rows" class="reviewer-slot-rows"></div>
             <button type="button" class="settings-ghost-btn" id="btn-add-triad-slot">Add triad slot</button>
@@ -293,10 +319,14 @@ function advisoryHtml() {
 function renderRows() {
     const errorBox = document.getElementById('reviewer-slots-error');
     if (errorBox) {
-        errorBox.hidden = !state.configError;
+        errorBox.hidden = !(state.configError || state.loadError);
         errorBox.textContent = state.configError
-            ? `Saved reviewer-slot configuration is invalid and blocks reviews: ${state.configError}`
-            : '';
+            ? `Saved reviewer-slot configuration is invalid and blocks reviews: ${state.configError}. `
+              + 'To repair it, add at least one triad slot and one scope slot below, then Save'
+              + (state.triad.length && state.scope.length ? '.' : ' — an incomplete set is not saved.')
+            : (state.loadError
+                ? `Could not reach the reviewer-slot settings — ${state.loadError}. Your saved configuration is unchanged; retry when the connection is back.`
+                : '');
     }
     const triadBox = document.getElementById('reviewer-triad-rows');
     const scopeBox = document.getElementById('reviewer-scope-rows');
@@ -411,6 +441,7 @@ export async function reloadReviewerSlots() {
         const resp = await apiFetch('/api/reviewer-slots', { cache: 'no-store' });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        state.loadError = '';
         state.configError = String(data.config_error || '');
         state.source = String(data.source || '');
         state.limits = data.limits || state.limits;
@@ -420,24 +451,22 @@ export async function reloadReviewerSlots() {
         state.advisory = data.advisory
             ? { ...data.advisory, route: { ...(data.advisory.route || {}) } }
             : state.advisory;
-        state.loaded = !state.configError;
+        // The VIEW loaded even when the saved value is invalid — that is exactly the
+        // state the owner repairs from, and treating it as "not loaded" made the
+        // save drop the repair (see collectReviewerSlots).
+        state.loaded = true;
     } catch (error) {
+        // A transport failure is NOT a verdict on the saved configuration: the
+        // config-error banner accuses the owner's settings of blocking review, and
+        // a network blip must never say that. Separate field, separate sentence.
         state.loaded = false;
-        state.configError = `could not load reviewer slots: ${error.message || error}`;
+        state.loadError = `could not load reviewer slots: ${error.message || error}`;
     }
     try {
         const resp = await apiFetch('/api/claudexor/status?include=models', { cache: 'no-store' });
         const data = await resp.json().catch(() => ({}));
         state.harnesses = Array.isArray(data.harnesses) ? data.harnesses : [];
-        const profiles = data?.profiles?.profiles || data?.profiles || [];
-        const byHarness = {};
-        for (const profile of Array.isArray(profiles) ? profiles : []) {
-            const harness = String(profile.harnessId || profile.harness || '');
-            const id = String(profile.profileId || profile.id || '');
-            if (!harness || !id) continue;
-            (byHarness[harness] = byHarness[harness] || []).push(id);
-        }
-        state.profilesByHarness = byHarness;
+        state.profilesByHarness = indexProfilesByHarness(data);
     } catch (error) {
         state.harnesses = [];
         state.profilesByHarness = {};
@@ -460,9 +489,12 @@ export function initReviewerSlots({ onChange } = {}) {
 }
 
 export function collectReviewerSlots() {
-    // Never author the setting from an unloaded or broken view: an unrelated
-    // save must not overwrite the owner's configuration with an empty page.
-    if (!state.loaded || state.configError) return {};
+    // Never author the setting from an UNLOADED view: an unrelated save must not
+    // overwrite the owner's configuration with an empty page. A config_error is
+    // NOT that case — the stored value is already invalid and blocking review, the
+    // endpoint returns no rows with it, and refusing here made the documented
+    // repair path swallow the owner's replacement rows and still report success.
+    if (state.loadError || !state.loaded) return {};
     if (!state.triad.length || !state.scope.length) return {};
     return { OUROBOROS_REVIEWER_SLOTS: buildReviewerSlotsSetting(state) };
 }

@@ -1194,7 +1194,9 @@ Before every commit, verify the following:
   physical provider call. D29: the APPLIED `credential_profile_id` and `access_profile`
   the engine's `authRoute` receipt / `effectiveAccess` disclosed ride the durable row (and
   the settled event) BY DEFAULT — empty when telemetry predates the receipt, never
-  invented — so "which account paid, under which access" is answerable from the record.
+  invented — so "which account paid, under which access" is answerable from the ledger
+  row, the settled event, and (for reviewer slots) the last-execution file. Those are
+  three separate stores, deliberately not joined into one applied receipt.
 - [ ] `cost_final` on a projection is a COUNT of open rows (`non_final_rows`), never a
   truthiness test on a dollar sum: a reserved/dispatched/unresolved row, a settled row
   with an unknown price, and a settled row its writer marked non-final are each open

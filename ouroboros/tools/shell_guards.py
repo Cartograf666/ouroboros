@@ -53,11 +53,13 @@ INTERPRETER_WRITE_RE = re.compile(
 # includes filesystem-mutating calls the base write regex misses (shutil.copy*/move,
 # touch, symlink/link, chmod/chown, makedirs/removedirs, truncate) — a hit here
 # without AST-resolved targets stays on the conservative full mention scan instead
-# of being treated as a pure read. This list and the AST walker are ONE vocabulary:
-# every spelling here is modelled by some branch of `_python_write_targets_and_unknown`
-# (its own tables, or the receiver/arg-0 branches that already owned a spelling), so a
-# call the regex counts as a write can never reach the walker's "no targets" answer
-# unmodelled and be mistaken for proof of a read (v6.89.0 panel A4). NB: the leading
+# of being treated as a pure read. This list and the AST walker are NOT one
+# vocabulary and no invariant ties them: `<mod>.open(p,"w")` (io/codecs/gzip/bz2/lzma)
+# matches here, while `_python_path_open_target` reads arg 0 as the MODE — right for
+# `Path(p).open("w")`, wrong here — so the walker answers "no targets" and the fence
+# reads that as a proven read. Measured, not hypothetical: it truncates a repo source
+# file. DISCLOSED, not detected (owner direction: weaken, never strengthen; a false
+# invariant is removed rather than made true). NB: the leading
 # (?is) of INTERPRETER_WRITE_RE.pattern already applies globally to the whole
 # concatenated expression — a second mid-pattern global flag is a hard
 # re.error on Python 3.11+ (review round 2).
@@ -376,9 +378,17 @@ def _python_call_is_vocabulary_write(node: ast.Call, callee: str) -> bool:
     if callee in _PYTHON_WRITE_ARG_INDEX:
         return True
     receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
-    return (
+    if not (
         isinstance(receiver, ast.Name)
         and (receiver.id, callee) in _PYTHON_MODULE_WRITE_ARG_INDEX
+    ):
+        return False
+    # `sqlite3.connect(":memory:")` opens no file — the sentinel is not a path, and
+    # resolving it relative to the cwd refused an in-memory scratch DB as a repo write.
+    first = node.args[0] if node.args else None
+    return not (
+        isinstance(first, ast.Constant)
+        and str(first.value or "").removeprefix("file:").startswith(":memory:")
     )
 
 
@@ -789,18 +799,6 @@ def runtime_data_guard_targets(
     if project_store_hits:
         return project_store_hits
     inline = shell_command_string(shell_argv(raw_cmd)) or " ".join(argv[1:])
-    # Read-vs-write is decided by PARSING for python and by fail-closed for every
-    # other interpreter (XG-7B3.1 r2). A write vocabulary can never prove the ABSENCE
-    # of a write in arbitrary code — `php -r "file_put_contents(...)"` and
-    # `node -e "eval(process.env.CODE)"` both read as pure READS to any token list —
-    # so the only honest answer for code this module cannot parse is the conservative
-    # scan. Python keeps its AST proof, which is what preserves the v6.54.3 read
-    # allowance the FP evidence was actually about (python scripts opening the task's
-    # own staged attachment).
-    if interpreter_family(executable) and interpreter_family(executable) != "python":
-        return runtime_data_write_targets(
-            raw_cmd, drive_root=drive_root, work_dir=work_dir, allowed_roots=allowed_roots,
-        )
     if not _INTERPRETER_ANY_WRITE_RE.search(inline):
         return []
     if interpreter_family(executable) == "python":
@@ -1246,19 +1244,16 @@ def light_shell_repo_mutation(
     # `python -c "exec(open(...).read())"`). Only python can answer the proof, by
     # parsing; that is what keeps the v6.54.3 read allowance (whose FP evidence was
     # python scripts opening their own staged attachment). Everything else — other
-    # families, unknown flags, unparseable or computed payloads — is WRITE-CAPABLE and
-    # refused wherever it could reach the repo. Scan side only: advanced/pro is
-    # untouched. A SCRIPT or module invocation (`python -m pytest`) hands nothing
-    # inline and is not judged here.
+    # families, unknown flags, unparseable or computed payloads — is WRITE-CAPABLE.
+    # Scan side only: advanced/pro is untouched. A SCRIPT or module invocation
+    # (`python -m pytest`) hands nothing inline and is not judged here.
     #
-    # The COST, stated at full size rather than at its most flattering: "could reach
-    # the repo" includes `_dynamic_write_could_hit_repo`'s cwd test, and the default
-    # shell cwd IS the system repository. So in an ordinary chat, in light mode, EVERY
-    # non-python inline invocation is refused — not only one naming a repo path, and
-    # even when it provably writes elsewhere or only reads. Only python keeps the
-    # proof, and only a cwd outside the repo (a folder-room chat, an explicit
-    # work_dir) restores the other families. That is the accepted price of the
-    # inversion; it is not a claim that a provable elsewhere-write still runs.
+    # The COST, stated at full size rather than at its most flattering: a non-python
+    # inline invocation that NAMES a repo path is refused even for reading. It is not
+    # refused otherwise — the resolved-cwd half of `_dynamic_write_could_hit_repo`
+    # stays python-only, because the default shell cwd IS the system repository and
+    # applying it to every family refused ordinary `node -e`/`ruby -e` work that
+    # provably writes elsewhere or only reads.
     if detect_interpreter_inline and interpreter_family(executable):
         inline = shell_command_string(argv) or " ".join(argv[1:])
         bodies = interpreter_inline_code(argv)
@@ -1273,8 +1268,15 @@ def light_shell_repo_mutation(
                     return bool(targets) and repo_target_mentioned(
                         [argv[0], *targets], repo_dir=repo_dir, cwd=cwd, work_dir=work_dir,
                     )
-            return _dynamic_write_could_hit_repo(
-                inline, repo_dir=repo_dir, cwd=cwd, work_dir=work_dir,
+                return _dynamic_write_could_hit_repo(
+                    inline, repo_dir=repo_dir, cwd=cwd, work_dir=work_dir,
+                )
+            mentioned = [
+                *embedded_absolute_path_tokens(inline),
+                *EMBEDDED_RELATIVE_PATH_RE.findall(inline),
+            ]
+            return bool(mentioned) and repo_target_mentioned(
+                ["", *mentioned], repo_dir=repo_dir, cwd=cwd, work_dir=work_dir,
             )
 
     if any(ind in cmd_lower for ind in (" > ", " >> ", " | tee ")):

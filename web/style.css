@@ -2916,7 +2916,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     color: var(--text-secondary);
 }
 
-.form-field input, .form-field select {
+.form-field input, .form-field select,
+.reviewer-slot-controls input, .reviewer-slot-controls select {
     padding: 8px 12px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--divider);
@@ -5823,8 +5824,10 @@ textarea.chat-input {
     padding: 8px 10px;
 }
 .reviewer-slot-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+/* Field chrome comes from the shared .form-field rule above (dark-app tokens);
+   only the row's compact sizing is local. */
 .reviewer-slot-controls select,
-.reviewer-slot-controls input { min-width: 140px; max-width: 100%; }
+.reviewer-slot-controls input { min-width: 140px; max-width: 100%; width: auto; }
 .reviewer-slot-meta { font-size: 12px; margin-top: 4px; }
 .reviewer-slot-runs-as { font-size: 12px; margin-top: 2px; font-style: italic; }
 .harness-account-row { align-items: center; }

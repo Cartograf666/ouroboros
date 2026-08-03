@@ -2494,6 +2494,9 @@ export function createChatInstance({
             parent_task_id: msg?.parent_task_id || '',
             delegation_role: msg?.delegation_role || '',
             subagent_role: msg?.subagent_role || '',
+            // The resolved delegated route; without it a LIVE progress bubble drops
+            // the executor chip that the same bubble regains on reload.
+            executor_route: msg?.executor_route || '',
             status: msg?.status || '',
             cost_usd: msg?.cost_usd,
             cost_accounting_status: msg?.cost_accounting_status,

@@ -90,18 +90,12 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
         try:
             # Identity of every scope row comes from the one SSOT that owns it, so
             # the actor record and the substrate call agree on which row spoke.
-            try:
-                scope_slots = list(scope_reviewer_slots() or [])
-            except ValueError:
-                # A malformed reviewer-slot configuration must surface as the
-                # typed infra failure it is — a silent single-row fallback here
-                # would spend API money on a row the owner never configured.
-                raise
-            except Exception:
-                scope_slots = []
-            # Fail-soft as before: a config lookup failure still runs ONE scope row
-            # rather than blocking the commit outright.
-            scope_slots = scope_slots or scope_reviewer_slots([_get_scope_model()])
+            # No except/fallback here BY DESIGN: any failure to read the configured
+            # scope rows must surface. The config validator already guarantees "scope
+            # needs at least one slot" or a ValueError, so a silent single-row
+            # substitute could only ever replace a configured authority with a
+            # different one and spend API money on a row the owner never chose.
+            scope_slots = list(scope_reviewer_slots())
             scope_models = [slot.model for slot in scope_slots]
             ctx._last_scope_model = ",".join(scope_models)
             def _run_one_scope(slot):
@@ -139,8 +133,9 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
             # scope reviewer is honored but recorded as loud durable degraded-trust,
             # and a configured>=2-but-<quorum-responded scope run must never silently
             # pass on "any responded". Only an authoritative `responded` actor counts
-            # toward quorum; budget_exceeded/advisory are a structural context-floor
-            # skip, not an authoritative responder (so we never over-block them).
+            # toward quorum; a context-floor row is not an authoritative responder and
+            # is left out of the count because its OWN authority function already
+            # blocked (it is not counted out in order to let it pass).
             from ouroboros.config import adaptive_quorum
             _scope_statuses = [str(getattr(r, "status", "") or "") for r in results]
             # `responded` is the ONLY authoritative status. A retrieving (session) row
@@ -202,12 +197,13 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
             # advisory FOLLOWS owner enforcement (never hardcode a block). A
             # zero-responded run is NOT decided here: each delivery's own authority
             # function already returns a BLOCKING result when its window cannot
-            # authorise (api `sub_floor`, retrieving `session_advisory`), and the
-            # genuine floor SKIPS (budget_exceeded, low-context) are deliberately not
-            # blocks. Widening this condition to `_responded < _required` would make
-            # this aggregate a SECOND owner of that decision and would turn those
-            # sanctioned skips into blocks — so the fix for a fail-open row belongs in
-            # the row, not here.
+            # authorise (api `sub_floor`, retrieving `session_advisory`). Measured, the
+            # ONLY non-blocking scope status is `skipped_low_context_mode`: a
+            # budget_exceeded PACK arrives here as a BLOCKING `sub_floor` row, and no
+            # ScopeReviewResult carries status "budget_exceeded" at all. Widening this
+            # condition to `_responded < _required` would make this aggregate a SECOND
+            # owner of that decision and would turn the owner-declared low-context skip
+            # into a block — so the fix for a fail-open row belongs in the row, not here.
             partial_quorum_shortfall = (
                 not _single_scope_reviewer and 0 < _responded < _required and not blocked
             )

@@ -476,17 +476,22 @@ def test_one_exhausted_credential_profile_does_not_take_the_harness_offline():
     while its siblings were live — an outage invented out of a healthy substrate, and
     the `harness` executor is a PIN, so the caller was refused rather than re-routed.
 
-    Readiness is per PROFILE now: usable while ANY profile is, and when they are all
-    spent the instant reported is the EARLIEST, because the first profile to heal makes
-    the harness usable again. WHICH profile a run lands on stays Claudexor's business —
-    no rotation moves into Ouroboros (harness-agnostic holds)."""
+    Readiness is per SNAPSHOT now — the engine emits one per credential subject, so in
+    practice one per account: the harness is usable while ANY of its snapshots is, and
+    when they are all spent the instant reported is the EARLIEST, because the first to
+    heal makes the harness usable again. The reader groups by `subject.harness` and
+    deliberately never interprets `subject.subject_id`: WHICH profile a run lands on
+    stays Claudexor's business, so no rotation moves into Ouroboros."""
     from ouroboros.subagents import _exhausted_window_reset_at
 
     def _snap(profile, *, spent, reset="2026-08-03T12:00:00Z", harness="some-route",
               freshness="fresh"):
+        # `subject_id` is the REAL QuotaSubject key for a credential profile
+        # (packages/schema/src/quota.ts; the object is `.strict()`, so the `profile`
+        # this fixture used to invent would be rejected by the engine's own parser).
         constraint = ({"used_ratio": 1.0, "resets_at": reset} if spent
                       else {"used_ratio": 0.4, "resets_at": reset})
-        return {"subject": {"harness": harness, "profile": profile},
+        return {"subject": {"harness": harness, "subject_id": profile},
                 "freshness": freshness, "constraints": [constraint]}
 
     class _Quota:

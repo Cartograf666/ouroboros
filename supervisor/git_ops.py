@@ -950,8 +950,13 @@ def sync_runtime_dependencies(reason: str) -> Tuple[bool, str]:
         log.info("Skipping pip install in frozen (PyInstaller) mode — deps are bundled.")
         return True, "frozen:bundled"
 
+    from ouroboros.platform_layer import pip_install_target_args
+
     req_path = REPO_DIR / "requirements.txt"
-    cmd: List[str] = [sys.executable, "-m", "pip", "install", "-q"]
+    # The sixth and last pip call site. On a packaged install `sys.executable` IS the
+    # bundled interpreter, so an unflagged install wrote into the signed bundle.
+    cmd: List[str] = [sys.executable, "-m", "pip", "install", "-q",
+                      *pip_install_target_args(sys.executable)]
     source = ""
     if req_path.exists():
         cmd += ["-r", str(req_path)]

@@ -110,8 +110,15 @@ def test_pip_install_target_args_only_for_the_embedded_interpreter(tmp_path):
     embedded.parent.mkdir(parents=True)
     embedded.write_text("", encoding="utf-8")
     assert platform_layer.pip_install_target_args(str(embedded)) == ["--user"]
-    # A dev venv refuses --user; a blanket flag would break it.
-    assert platform_layer.pip_install_target_args(sys.executable) == []
+    # A dev venv refuses --user; a blanket flag would break it. Pin the ANSWER to the
+    # interpreter's own location, never to whichever interpreter runs the suite: under
+    # the bundled python `sys.executable` IS embedded, so asserting [] for it failed on
+    # every packaged install — and the tests preflight is fail-closed, so that took the
+    # self-modification commit gate down with it.
+    venv = tmp_path / ".venv" / "bin" / "python3"
+    venv.parent.mkdir(parents=True)
+    venv.write_text("", encoding="utf-8")
+    assert platform_layer.pip_install_target_args(str(venv)) == []
 
 
 def _install_deps_context(tmp_path, interpreter, returncode, sink):

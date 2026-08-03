@@ -95,9 +95,13 @@ def test_versioned_spellings_engage_the_inline_write_fence_like_unversioned(tmp_
     repo = tmp_path / "repo"
     repo.mkdir()
     for unversioned, versioned, flag, code in FENCE_CASES:
+        # The payload NAMES the repo, which is the owner-approved trigger for the
+        # non-python families (a bare relative filename is not a repo-path spelling
+        # and no longer blocks — see the disclosure in CHECKLISTS item 21).
+        named = code.replace("probe.txt", f"{repo}/probe.txt")
         results = {
             spelling: light_shell_repo_mutation(
-                [spelling, flag, code],
+                [spelling, flag, named],
                 repo_dir=repo, cwd=str(repo), work_dir=repo,
                 detect_interpreter_inline=True,
             )
@@ -272,30 +276,62 @@ def test_unparseable_interpreter_code_is_treated_as_write_capable(tmp_path):
     table does not contain, a primitive no table lists, and code whose payload is
     computed at runtime.
 
-    The fence now asks whether it can PROVE the code cannot write into the repo, and
-    refuses when it cannot."""
+    For PYTHON the fence asks whether it can PROVE the code cannot write into the
+    repo and refuses when it cannot. For every other family the owner approved a
+    NARROWER rule — refused only when the code NAMES a repo path, even for reading —
+    so an unprovable non-python payload that names no repo path RUNS. Both halves are
+    pinned here, because the second one is a disclosed hole, not an oversight."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    unprovable = [
-        # Was a HOLE after the vocabulary fix: no known write token appears.
-        ["node18", "-e", "eval(process.env.CODE)"],
+    unprovable_python = [
         ["python3.11", "-c", "exec(open('/dev/stdin').read())"],
         # Execution handed to another process: the AST models nothing past this.
         ["python3.11", "-c", "import subprocess;subprocess.run(['rm','x.py'])"],
         ["python3.11", "-c", "import os;os.system('rm x.py')"],
         ["python3.11", "-c", "eval(__import__('os').environ['C'])"],
-        # An inline flag the table does NOT contain, carrying a write.
-        ["node18", "--experimental-foo", "require('fs').writeFileSync('a.py','x')"],
-        ["ruby3.2", "--some-new-flag", "File.write('a.py','x')"],
-        # A write primitive listed in no vocabulary anywhere.
-        ["ruby3.2", "-e", "IO.binwrite('a.py','x')"],
-        ["php8.3", "-r", "$f=new SplFileObject('a.py','w');"],
-        # Nested quoting the parser cannot resolve.
-        ["node18", "-e", "require('fs')['write'+'FileSync']('a.py','x')"],
-        # Dynamic/computed target.
-        ["perl5.38", "-e", "open(F,'>',$ENV{X});"],
     ]
-    for argv in unprovable:
+    for argv in unprovable_python:
+        assert light_shell_repo_mutation(
+            argv, repo_dir=repo, cwd=str(repo), work_dir=repo,
+        ) is True, argv
+
+    # Non-python, NAMING the repo: refused, whatever the write spelling — this is
+    # the half the vocabulary chase could never cover.
+    unprovable_named = [
+        # An inline flag the table does NOT contain, carrying a write.
+        ["node18", "--experimental-foo", f"require('fs').writeFileSync('{repo}/a.py','x')"],
+        ["ruby3.2", "--some-new-flag", f"File.write('{repo}/a.py','x')"],
+        # A write primitive listed in no vocabulary anywhere.
+        ["ruby3.2", "-e", f"IO.binwrite('{repo}/a.py','x')"],
+        ["php8.3", "-r", f"$f=new SplFileObject('{repo}/a.py','w');"],
+        # Nested quoting the parser cannot resolve.
+        ["node18", "-e", f"require('fs')['write'+'FileSync']('{repo}/a.py','x')"],
+        # Dynamic/computed target that still names the repo.
+        ["perl5.38", "-e", f"open(F,'>',$ENV{{X}}.'{repo}/a.py');"],
+    ]
+    for argv in unprovable_named:
+        assert light_shell_repo_mutation(
+            argv, repo_dir=repo, cwd=str(repo), work_dir=repo,
+        ) is True, argv
+
+    # DISCLOSED HOLE, pinned so it cannot be re-tightened by accident: a non-python
+    # payload the parser cannot read, naming no repo path, RUNS even with the cwd in
+    # the repo. Refusing these refused every ordinary `node -e` in an ordinary chat,
+    # which is more than the owner approved.
+    disclosed_open = [
+        ["node18", "-e", "eval(process.env.CODE)"],
+        ["node18", "-e", "require('fs')['write'+'FileSync']('a.py','x')"],
+        ["php8.3", "-r", "$f=new SplFileObject('a.py','w');"],
+    ]
+    for argv in disclosed_open:
+        assert light_shell_repo_mutation(
+            argv, repo_dir=repo, cwd=str(repo), work_dir=repo,
+        ) is False, argv
+    # ruby/perl are NOT in this list because they are LIGHT_SHELL_WRITER_COMMANDS
+    # members and block on the earlier writer-command branch — public-head behaviour
+    # this range never touched, not the inline fence.
+    for argv in (["ruby3.2", "-e", "IO.binwrite('a.py','x')"],
+                 ["perl5.38", "-e", "open(F,'>',$ENV{X});"]):
         assert light_shell_repo_mutation(
             argv, repo_dir=repo, cwd=str(repo), work_dir=repo,
         ) is True, argv
@@ -452,9 +488,18 @@ def test_legitimate_deliverable_writes_stay_allowed(tmp_path):
         assert light_shell_repo_mutation(
             argv, repo_dir=repo, cwd=str(out_dir), work_dir=out_dir,
         ) is True, argv
-    # Dynamic target with the cwd INSIDE the repo: a relative write lands there.
+    # Dynamic target with the cwd INSIDE the repo: for a NON-python family this now
+    # RUNS. The resolved-cwd test is python-only, because the default shell cwd IS
+    # the repository and applying it to every family refused ordinary node/ruby work
+    # outright — more than the owner approved. Disclosed in CHECKLISTS item 21.
     assert light_shell_repo_mutation(
         ["node", "-e", "require('fs').writeFileSync(process.env.N,'y')"],
+        repo_dir=repo, cwd=str(repo), work_dir=repo,
+    ) is False
+    # Python keeps the cwd test: an unresolvable target with the cwd in the repo is
+    # still refused, which is what keeps run_script at or above the public head.
+    assert light_shell_repo_mutation(
+        ["python3", "-c", "import os;open(os.environ['N'],'w').write('y')"],
         repo_dir=repo, cwd=str(repo), work_dir=repo,
     ) is True
 

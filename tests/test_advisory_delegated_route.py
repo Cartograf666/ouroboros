@@ -66,7 +66,10 @@ def test_delegated_route_runs_without_the_key(tmp_path, monkeypatch, fake_route)
     advisory runs as a delegated session whose checklist comes back parsed."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv(advisory.ADVISORY_REVIEW_ROUTE_ENV, "agent_session")
-    fake_route.catalog_entry["json_schema_output"] = False
+    # No catalog `json_schema_output` is set here: `CatalogHarness` carries NO
+    # transport flags (agent-capabilities.ts), the reader takes the flag off the
+    # /v2/harnesses manifest row, and the invented catalog key was a dead no-op that
+    # modelled a response Claudexor cannot emit.
     fake_route.detail = _terminal_detail(_ADVISORY_ITEMS)
     ctx = _ctx(tmp_path)
     items, raw, model, chars = advisory._run_claude_advisory(

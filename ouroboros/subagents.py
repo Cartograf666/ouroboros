@@ -4,9 +4,11 @@ THE OWNER-FACING AXES ARE THREE, AND EVERYTHING ELSE IS DERIVED.
 
 A parent declares the WORK: ``write_surface`` (what the child may DO),
 ``model_lane`` (how good the answer must be) and ``executor`` (where it runs).
-Model, effort, route and credential profile are consequences of those three plus
-the owner's settings and what is live at the moment the child starts — never a
-second thing the parent can ask for.
+Model, effort, route and TOOL profile are consequences of those three plus the
+owner's settings and what is live at the moment the child starts — never a second
+thing the parent can ask for. The CREDENTIAL profile is NOT derived here at all
+(see the DelegationRoute pin and the rotation note below): it is Claudexor's
+choice, and the applied one comes back on the engine receipt.
 
 ``effort`` used to be a fourth public parameter and broke that twice. It was a
 second knob for the question ``model_lane`` already answers, so ``model_lane:

@@ -33,6 +33,11 @@ _ACCOUNTING_SUMMARY_FIELDS = (
     "accounted_usd",
     "unknown_unmetered",
     "cost_final",
+    # `cost_final`'s DISCLOSED CAUSE travels with the flag it explains — without it
+    # the client's "Pending (N open)" text could never render (costs.js reads
+    # `accounting.non_final_rows`), so the reason for a non-final cost never
+    # reached the owner at all.
+    "non_final_rows",
     "attempt_counts",
 )
 

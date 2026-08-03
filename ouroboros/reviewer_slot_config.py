@@ -624,7 +624,11 @@ def record_reviewer_slot_executions(surface: str, actors: Any, slots_by_id: Dict
             # up as the applied one. An api row's sent model IS its applied one.
             "model": (str(usage.get("resolved_model") or "") if session
                       else str(getattr(slot, "model", "") or "")),
-            "effort": str(getattr(slot, "effort", "") or ""),
+            # No "effort": no APPLIED effort exists anywhere upstream (no
+            # applied/resolved effort in any receipt or telemetry), so the only
+            # value available is the REQUESTED one — already recorded below. Echoing
+            # it here dressed the request up as the applied value, the exact thing
+            # the model rule above forbids.
             "verdict_method": str(usage.get("verdict_method") or ""),
         }
         # D29 applied account/access, verbatim from the engine receipt; absent

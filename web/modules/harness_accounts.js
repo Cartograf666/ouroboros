@@ -408,6 +408,12 @@ function stopJobPolling() {
 }
 
 export async function refreshStatus() {
+    // Poll only while the section is actually on screen. Each tick fans out to four
+    // daemon round-trips, and the interval started at app load and never stopped —
+    // so every page in the app paid for them (`.page` is display:none when inactive,
+    // which is exactly what offsetParent reports).
+    const host = document.getElementById('harness-accounts-rows');
+    if (!host || host.offsetParent === null || document.hidden) return;
     try {
         const resp = await apiFetch('/api/claudexor/status', { cache: 'no-store' });
         const data = await resp.json().catch(() => ({}));

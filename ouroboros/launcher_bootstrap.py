@@ -53,6 +53,16 @@ def embedded_python_env(data_dir: pathlib.Path, base: dict[str, str] | None = No
 
     ``PYTHONNOUSERSITE`` is cleared for the same reason: an inherited value would
     install to the user site and then refuse to import from it.
+
+    DISCLOSED, not fixed: ``site`` puts the user site AHEAD of the bundle's own
+    site-packages, and nothing prunes it. So a package installed here by an older
+    version keeps OUTRANKING the signed bundle's copy for as long as the data dir
+    survives — an upgrade can ship a newer dependency and still import the old one.
+    Making that impossible means either pruning logic or versioning this directory,
+    and versioning it silently abandons every dependency an existing install already
+    paid to download. Both are product decisions with real cost, so the behaviour is
+    stated here rather than changed unilaterally. Recovery is manual and total:
+    delete ``<data>/state/python-userbase`` and relaunch.
     """
     env = dict(os.environ if base is None else base)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
