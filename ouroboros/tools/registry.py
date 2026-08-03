@@ -212,15 +212,35 @@ def _managed_update_code_tool_block(ctx: Any, name: str) -> str:
     try:
         from supervisor.update_merge import managed_assisted_tx_for
 
-        if managed_assisted_tx_for(getattr(ctx, "task_id", ""))[1]:
+        if managed_assisted_tx_for(
+            getattr(ctx, "task_id", ""),
+            getattr(ctx, "task_metadata", None),
+        )[1]:
             return (
                 f"⚠️ MANAGED_UPDATE_IN_PROGRESS: {name!r} is blocked while a managed update merge "
                 "is being resolved (only its authorized resolution task may write the repo). "
                 "Retry after the update lands or is rolled back."
             )
     except Exception:
-        return ""
+        return (
+            f"⚠️ MANAGED_UPDATE_STATE_UNAVAILABLE: {name!r} is blocked because the managed "
+            "update transaction state could not be verified. Retry after the update state is "
+            "available or repaired."
+        )
     return ""
+
+
+def _authorized_managed_update_resolver(ctx: Any) -> bool:
+    """Whether this task is the durable tx-authorized assisted resolver."""
+    try:
+        from supervisor.update_merge import authorized_assisted_task
+
+        return bool(authorized_assisted_task(
+            getattr(ctx, "task_id", ""),
+            getattr(ctx, "task_metadata", None),
+        ))
+    except Exception:
+        return False
 
 
 def _detect_evolution_owner_control_self_change(text_lower: str) -> bool:
@@ -1709,6 +1729,8 @@ class ToolRegistry:
                 "Use marketplace lifecycle flows or edit user-authored "
                 "payload files instead."
             )
+        if _authorized_managed_update_resolver(self._ctx):
+            return None
         if (not workspace_mode or acting_self_worktree) and shell_writer_targets_protected(raw_cmd):
             return (
                 "⚠️ CRITICAL SAFETY_VIOLATION: Shell command would modify "
@@ -2743,6 +2765,7 @@ class ToolRegistry:
             and name in _REPO_MUTATION_TOOLS
             and (not workspace_mode or acting_self_worktree)
             and not light_skill_scoped_str_replace
+            and not _authorized_managed_update_resolver(self._ctx)
         ):
             return light_cognitive_or_root_redirect(name, args) or (
                 "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light blocks Ouroboros "
@@ -2773,7 +2796,10 @@ class ToolRegistry:
             # acting and external workspace tasks get the workspace bypass).
             disable_protected = (workspace_mode and not acting_self_worktree) or not protected_root
             protected_matches = [] if disable_protected else protected_paths_in(protected_write_paths)
-            allow_protected = mode_allows_protected_write(_runtime_mode) and (acting_protected_grant or not acting_subagent)
+            allow_protected = _authorized_managed_update_resolver(self._ctx) or (
+                mode_allows_protected_write(_runtime_mode)
+                and (acting_protected_grant or not acting_subagent)
+            )
             if protected_matches and not allow_protected:
                 first = protected_matches[0]
                 return protected_write_block_message(

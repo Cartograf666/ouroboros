@@ -400,12 +400,12 @@ def test_scope_build_prompt_loads_obligations_from_drive_root(tmp_path, monkeypa
     monkeypatch.setattr(
         scope_review_mod,
         "build_touched_file_pack",
-        lambda _rd, _paths: ("(touched file pack)", []),
+        lambda _rd, _paths, **_kwargs: ("(touched file pack)", []),
     )
     monkeypatch.setattr(
         scope_review_mod,
         "_inline_deleted_file_pack",
-        lambda pack, _deleted, _rd: pack,
+        lambda pack, _deleted, _rd, **_kwargs: pack,
     )
     monkeypatch.setattr(
         scope_review_mod,
@@ -421,7 +421,7 @@ def test_scope_build_prompt_loads_obligations_from_drive_root(tmp_path, monkeypa
     prompt, status = _build_scope_prompt(
         repo_dir,
         commit_message="fix: integration scope test",
-        drive_root=drive_root,
+        context=scope_review_mod._ScopePromptContext(drive_root=drive_root),
     )
 
     assert status is None, f"expected success, got status={status}"

@@ -756,6 +756,54 @@ def test_no_op_cleanup_skips_when_other_tasks_running_or_already_clean(tmp_path)
     assert tx3["cleanup_status"] == "skipped_no_base"
 
 
+def test_evolution_cleanup_never_mutates_checkout_owned_by_update(monkeypatch):
+    from supervisor import git_ops, update_merge, workers
+
+    lock = object()
+    released = []
+    monkeypatch.setattr(update_merge, "acquire_update_lock", lambda: lock)
+    monkeypatch.setattr(update_merge, "release_update_lock", released.append)
+    monkeypatch.setattr(
+        workers, "repo_writer_admission_closed", lambda: "managed_update:smart"
+    )
+    monkeypatch.setattr(
+        git_ops,
+        "git_capture",
+        lambda _cmd: (_ for _ in ()).throw(
+            AssertionError("evolution cleanup must not touch git behind writer fence")
+        ),
+    )
+    tx = {"base_head": "a" * 40, "transaction_id": "evo-update-race"}
+
+    lifecycle._cleanup_worktree_after_cycle(tx, "evolution-task")
+
+    assert tx["cleanup_status"] == "skipped_repo_writer_admission_closed"
+    assert tx["cleanup_deferred_reason"] == "managed_update:smart"
+    assert released == [lock]
+
+
+def test_evolution_cleanup_skips_when_update_lock_is_busy(monkeypatch):
+    from supervisor import git_ops, update_merge
+
+    monkeypatch.setattr(
+        update_merge,
+        "acquire_update_lock",
+        lambda: (_ for _ in ()).throw(RuntimeError("busy")),
+    )
+    monkeypatch.setattr(
+        git_ops,
+        "git_capture",
+        lambda _cmd: (_ for _ in ()).throw(
+            AssertionError("busy update lock must stop cleanup before git")
+        ),
+    )
+    tx = {"base_head": "a" * 40, "transaction_id": "evo-update-lock-race"}
+
+    lifecycle._cleanup_worktree_after_cycle(tx, "evolution-task")
+
+    assert tx["cleanup_status"] == "skipped_managed_update_lock_busy"
+
+
 def test_evolution_restart_uses_local_commit_not_origin_and_blocks_dirty_tree(tmp_path):
     from ouroboros.tools.control import _request_restart
     from ouroboros.tools.registry import ToolContext

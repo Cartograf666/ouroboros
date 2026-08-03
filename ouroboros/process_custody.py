@@ -34,6 +34,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from ouroboros.platform_layer import (
+    kill_process_tree,
     kill_process_group_id,
     pid_is_alive,
     process_command,
@@ -112,13 +113,8 @@ def record_process(
     scope: str,
     owner_task_id: str = "",
     reap_process_group: bool = True,
-    repo_writer: bool = False,
 ) -> Dict[str, Any]:
-    """Append a custody record for an already-spawned process.
-
-    ``repo_writer`` marks a process that runs INSIDE the managed checkout and may therefore write
-    to it. The marker is written only when true, so every other record keeps its exact shape.
-    """
+    """Append a custody record for an already-spawned process."""
     if scope not in _VALID_SCOPES:
         raise ValueError(f"process custody scope must be one of {_VALID_SCOPES}, got {scope!r}")
     try:
@@ -140,24 +136,8 @@ def record_process(
         "owner_task": str(owner_task_id or ""),
         "session_id": _SESSION_ID,
     }
-    if repo_writer:
-        entry["repo_writer"] = True
-    # `append_jsonl` REPORTS its failure instead of raising it (it exhausts its retries and answers
-    # False), so an unchecked call turned "the ledger has no record of this process" into a silent
-    # success. For a repository writer that is the whole custody guarantee: `spawn_supervised` only
-    # handles exceptions, so it would hand back a running repo-rooted service the update fence has
-    # no durable handle on. Raise instead, and let the repudiation path in `spawn_supervised` own it.
-    #
-    # Scoped to `repo_writer` deliberately. For every OTHER scope this ledger is advisory — the
-    # reaper's registry, whose degradation is "an orphan is reaped a generation later" — and the
-    # direct callers (`supervisor.workers`, `workspace_executor`, `local_model`,
-    # `extension_companion`) were written against a `record_process` that could not fail. Raising at
-    # them would convert a filesystem fault into new failure paths in code this fix is not about,
-    # for no custody guarantee that depends on it.
-    if append_jsonl(ledger_path(drive_root), entry) is not True:
-        if repo_writer:
-            raise OSError(f"custody ledger append failed for pid {pid} ({purpose})")
-        log.warning("custody ledger append failed for pid %s (%s); entry not durable", pid, purpose)
+    if not append_jsonl(ledger_path(drive_root), entry):
+        raise OSError("process custody record could not be written")
     return entry
 
 
@@ -169,7 +149,6 @@ def spawn_supervised(
     scope: str,
     owner_task_id: str = "",
     new_process_group: bool = True,
-    repo_writer: bool = False,
     **popen_kwargs: Any,
 ) -> subprocess.Popen:
     """Popen + durable custody record (the single supervised chokepoint).
@@ -177,13 +156,6 @@ def spawn_supervised(
     The record is written immediately after spawn, so even a SIGKILL of the
     spawning worker cannot orphan the child invisibly — the reaper finds it
     in the ledger on the next generation.
-
-    ``repo_writer=True`` additionally marks the child as running inside the
-    managed checkout, which is what lets the supervisor's update fence find it
-    from a DIFFERENT process than the one that spawned it (see
-    ``terminate_repo_writer_processes``) — and makes the record MANDATORY: an
-    unrecordable writer is killed and the start failure propagates, because a
-    running writer the fence cannot see is worse than a failed service.
     """
     if new_process_group:
         merged = dict(subprocess_new_group_kwargs())
@@ -198,22 +170,15 @@ def spawn_supervised(
             purpose=purpose,
             scope=scope,
             owner_task_id=owner_task_id,
-            repo_writer=repo_writer,
         )
-    except Exception as record_exc:
+    except Exception as exc:
         log.warning("process custody record failed for pid %s (%s)", proc.pid, purpose, exc_info=True)
-        if repo_writer:
-            # Mandatory for repository writers: an unrecorded one is invisible to the update fence
-            # that runs in a DIFFERENT process, so we refuse to hand back a running one. This raises
-            # `RepoWriterCustodyError` — deliberately NOT the RuntimeError below — when the writer
-            # is neither proven dead nor latched, so a caller holding its lease can tell "nothing is
-            # running" apart from "something is, and the fence cannot see it".
-            _repudiate_unregistered_repo_writer(
-                drive_root, proc, purpose=purpose, scope=scope, owner_task_id=owner_task_id
-            )
-            raise RuntimeError(
-                f"custody registration failed for repository writer {purpose!r}: {record_exc}"
-            ) from record_exc
+        kill_process_tree(proc)
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        raise RuntimeError("spawned process could not enter durable custody") from exc
     return proc
 
 
@@ -245,10 +210,25 @@ def _fingerprint_matches(entry: Dict[str, Any]) -> bool:
     return True
 
 
-def _read_ledger(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
+def _service_group_survives_leader(entry: Dict[str, Any]) -> bool:
+    """Keep dead-leader service evidence while its recorded group still exists."""
+    purpose = str(entry.get("purpose") or "")
+    scope = str(entry.get("scope") or "")
+    pgid = int(entry.get("pgid") or 0)
+    return bool(
+        purpose.startswith(("service:", "workspace_service:"))
+        and scope in {"task", "session"}
+        and pgid > 0
+        and process_group_is_alive(pgid)
+    )
+
+
+def _read_ledger_records(
+    drive_root: pathlib.Path, *, strict: bool
+) -> tuple[bool, List[Dict[str, Any]]]:
     path = ledger_path(drive_root)
     if not path.exists():
-        return []
+        return True, []
     entries: List[Dict[str, Any]] = []
     try:
         import json
@@ -260,11 +240,16 @@ def _read_ledger(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
             try:
                 obj = json.loads(line)
             except ValueError:
+                if strict:
+                    return False, []
                 continue
-            if isinstance(obj, dict) and obj.get("pid"):
-                entries.append(obj)
+            if not isinstance(obj, dict) or not obj.get("pid"):
+                if strict:
+                    return False, []
+                continue
+            entries.append(obj)
     except OSError:
-        return []
+        return False, []
     # Last record per pid wins (a pid may be re-registered by a newer spawn).
     by_pid: Dict[int, Dict[str, Any]] = {}
     for entry in entries:
@@ -273,7 +258,15 @@ def _read_ledger(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
         except (TypeError, ValueError):
             continue
     by_pid.pop(0, None)
-    return list(by_pid.values())
+    return True, list(by_pid.values())
+
+
+def _read_ledger_strict(drive_root: pathlib.Path) -> tuple[bool, List[Dict[str, Any]]]:
+    return _read_ledger_records(drive_root, strict=True)
+
+
+def _read_ledger(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
+    return _read_ledger_records(drive_root, strict=False)[1]
 
 
 def _rewrite_ledger(drive_root: pathlib.Path, entries: List[Dict[str, Any]]) -> None:
@@ -377,243 +370,61 @@ def live_kept_service_pids(drive_root: pathlib.Path) -> "set[int]":
     return pids
 
 
-# --- repository writers the update fence has to reach across PROCESSES (v6.88.1 r7) -----------
-#
-# `ouroboros.tools.services` keeps its records — and the writer-admission lease they hold — in
-# MODULE GLOBALS. That is enough while the tool call runs in the supervisor, and nothing else,
-# because the fence reads those same globals. It is not enough for a `start_service` executed
-# inside a pooled multiprocessing WORKER: the worker imports its own copy of the module, so the
-# lease lands in the worker's registry and the supervisor's fence never sees it.
-#
-# Killing the worker does not settle the question either. A service is spawned into its own
-# session/process group with an ARBITRARY command, so it is not killed with the worker, and a
-# command free to daemonize or reparent can outlive it and keep writing to the checkout the update
-# is about to hard-reset.
-#
-# The custody ledger is the registry both processes already share, so the marker goes there rather
-# than into a new one. Residual window, named rather than papered over: the record is appended
-# AFTER `Popen` returns (a pid cannot be known before the fork) and `record_process` fingerprints
-# via `ps`, so a service whose spawning worker is SIGKILLed inside that window is ledgered nowhere
-# and this sweep cannot see it. It is the same window the reaper has always had, and the next
-# server generation reaps it; closing it would need a spawn primitive that publishes identity
-# atomically, which POSIX does not offer.
+def quiesce_custodied_services(
+    drive_root: pathlib.Path, *, timeout_sec: float = 5.0
+) -> tuple[bool, List[str]]:
+    """Kill and verify every ledgered task/session service before repo replacement."""
+    drive_root = pathlib.Path(drive_root)
+    readable, entries = _read_ledger_strict(drive_root)
+    if not readable:
+        return False, ["custody_ledger:unreadable"]
+    targets: List[Dict[str, Any]] = []
+    survivors: List[Dict[str, Any]] = []
+    blockers: List[str] = []
+    for entry in entries:
+        purpose = str(entry.get("purpose") or "")
+        is_service = purpose.startswith(("service:", "workspace_service:"))
+        leader_matches = _fingerprint_matches(entry)
+        if (
+            is_service
+            and str(entry.get("scope") or "") in {"task", "session"}
+            and (leader_matches or _service_group_survives_leader(entry))
+        ):
+            targets.append(entry)
+        elif leader_matches:
+            survivors.append(entry)
 
-_REPO_WRITER_KILL_GRACE_SEC = 3.0
-# How many kill/latch rounds `_repudiate_unregistered_repo_writer` runs before it gives up and
-# hands the survivor back to its caller. Three, for the same reason `append_jsonl` retries three
-# times: enough to ride out a transient, short enough that a spawn call is not held indefinitely.
-_REPO_WRITER_REPUDIATION_ROUNDS = 3
+    from ouroboros.platform_layer import kill_pid_tree
 
-
-def _repo_writer_group_outlives_leader(entry: Dict[str, Any]) -> bool:
-    """Whether a repo-writer record's recorded PROCESS GROUP is still alive after its leader exited.
-
-    The leader is only the launcher. A service is spawned into its OWN group with an arbitrary
-    command, so a child that inherited the checkout (and its open file handles) keeps writing after
-    the launcher exits — and the strict pid fingerprint, which is all the fence used to consult,
-    reports that record as gone. The group is the stronger claim, so it decides here.
-
-    Residual, named rather than papered over: nothing re-verifies the IDENTITY of that group. POSIX
-    frees a pgid once the group empties, so an old record can name a group a new unrelated leader
-    has since taken, and ``process_group_is_alive`` fails closed on PermissionError — which is what
-    another user's recycled group produces. ``terminate_repo_writer_processes`` signals such a
-    record anyway (see the reasoning there): an unsignalled one is a blocker nothing can clear, and
-    reaching this branch already requires the recorded leader pid to be dead, which is a much
-    narrower coincidence than plain pid reuse. Windows never reaches here: it has no process groups,
-    so ``process_group_id`` records 0 there and the ``pgid > 0`` guard is false.
-    """
-    if not entry.get("repo_writer"):
-        return False
-    pid = int(entry.get("pid") or 0)
-    if pid > 0 and pid_is_alive(pid):
-        return False  # the leader is still there; the strict fingerprint owns that case
-    pgid = int(entry.get("pgid") or 0)
-    return pgid > 0 and process_group_is_alive(pgid)
-
-
-def live_repo_writer_processes(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
-    """Ledger entries for repository-writing processes that are still the process we recorded — or
-    whose recorded process GROUP outlived that process."""
-    root = pathlib.Path(drive_root)
-    path = ledger_path(root)
-    if path.exists():
-        # Readability probe: `_read_ledger` swallows OSError and answers [], and "no writers" is
-        # exactly the answer a fence must never be handed by a file it could not read. Raising
-        # instead lets the caller refuse the update. Bounded to ONE byte: the ledger is append-only,
-        # so reading it whole here would cost more on every fence and every 60s admission reconcile
-        # for the life of an installation, and a single read proves readability just as well.
-        with path.open("rb") as probe_fh:
-            probe_fh.read(1)
-    return [
-        entry for entry in _read_ledger(root)
-        if entry.get("repo_writer")
-        and (_fingerprint_matches(entry) or _repo_writer_group_outlives_leader(entry))
-    ]
-
-
-def _repo_writer_survives(entry: Dict[str, Any]) -> bool:
-    """Whether anything from this ledgered writer is still running after we killed it.
-
-    Cheap probes only (no `ps`): this is polled. Identity is not re-checked here — a pid recycled
-    within the grace window would be counted as a survivor, which is the fail-closed direction.
-    """
-    pid = int(entry.get("pid") or 0)
-    pgid = int(entry.get("pgid") or 0)
-    if pid > 0 and pid_is_alive(pid):
-        return True
-    # The group is the stronger claim where we have one: the service's own children inherited the
-    # checkout and its file handles, so an empty-leader group is not an empty group.
-    return pgid > 0 and process_group_is_alive(pgid)
-
-
-def _kill_and_prove_dead(pid: int, pgid: int, *, grace_sec: float) -> bool:
-    """Kill ONE repository writer — by GROUP where we have one — and answer whether it is PROVEN
-    gone within ``grace_sec``.
-
-    ``False`` means "still there, OR we could not tell": both are the fail-closed answer, and both
-    callers (the fence sweep and the failed-registration repudiation below) treat them alike.
-    """
-    try:
+    for entry in targets:
+        pid = int(entry.get("pid") or 0)
+        pgid = int(entry.get("pgid") or 0)
         if pgid > 0:
             kill_process_group_id(pgid)
         else:
-            from ouroboros.platform_layer import kill_pid_tree
-
             kill_pid_tree(pid)
-    except Exception:
-        log.warning("Failed to kill repository writer %s", pid, exc_info=True)
-    probe = {"pid": pid, "pgid": pgid}
-    deadline = time.monotonic() + max(0.0, float(grace_sec))
-    while _repo_writer_survives(probe):
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.1)
-    return True
-
-
-class RepoWriterCustodyError(RuntimeError):
-    """A repository writer was left running with neither proof of death nor a fence-visible record.
-
-    Distinct from the ordinary ``RuntimeError`` ``spawn_supervised`` raises for a merely failed
-    registration: that one means "no writer is running", this one means "one is, and nothing can
-    see it". Callers that can still reach the survivor must not treat the two alike.
-
-    ``proc`` CARRIES that survivor. The raise happens inside ``spawn_supervised``, before the
-    ``Popen`` has been returned to anybody, so an error that named the situation without handing
-    over the handle described a process the caller then had no way to reach: ``_start_service`` saw
-    its own ``proc`` still ``None`` and could neither register nor re-tear-down what was running.
-    """
-
-    def __init__(self, message: str, *, proc: Optional[subprocess.Popen] = None):
-        super().__init__(message)
-        self.proc = proc
-
-
-def _repudiate_unregistered_repo_writer(
-    drive_root: pathlib.Path,
-    proc: subprocess.Popen,
-    *,
-    purpose: str,
-    scope: str,
-    owner_task_id: str,
-) -> None:
-    """Undo a repository-writer spawn whose custody record could not be written.
-
-    The ledger is the fence's ONLY registry for a writer started inside a pooled worker, so an
-    unrecorded one would survive the fence invisibly. Returning from this function ASSERTS one of
-    exactly two postconditions, and nothing else:
-
-      1. the process is proven dead, or
-      2. a MINIMAL ledger entry (no ``ps`` fingerprint — the very thing that may have just failed)
-         is durably written, so ``live_repo_writer_processes`` sees a survivor and the next fence
-         refuses the update. A fingerprint-free entry matches on liveness alone: fail-closed.
-
-    Neither is established on a single try. The two postconditions are attempted in ALTERNATION,
-    ``_REPO_WRITER_REPUDIATION_ROUNDS`` times: each kill re-signals and re-proves (a group that was
-    merely slow to be reaped is proven gone on the next round, since the previous signal has had the
-    whole failing-append window to land), and each latch re-attempts the publication (``append_jsonl``
-    has its own retries, but a transient ENOSPC/EROFS outlives them). Bounded, because this runs on
-    a spawn path a caller is waiting on.
-
-    When the rounds are exhausted this RAISES ``RepoWriterCustodyError`` rather than returning.
-    Logging was the terminal outcome before, which let a live, unlatchable writer leave through the
-    ordinary spawn-failure path as though the spawn had simply not happened.
-
-    Residual, named rather than papered over: a ledger this process cannot append to is a ledger no
-    supervisor-visible blocker can reach either, so the raise is the last signal available here.
-    What it buys is that the signal is DISTINGUISHABLE and CARRIES THE HANDLE — the caller gets the
-    live ``Popen`` back and can keep controlling it (and keep its admission lease) instead of
-    discarding both as a start that never happened.
-    """
-    pid = int(getattr(proc, "pid", 0) or 0)
-    try:
-        pgid = process_group_id(pid)
-    except Exception:
-        pgid = 0
-    entry = {
-        "pid": pid,
-        "pgid": int(pgid or 0),
-        "purpose": str(purpose or "")[:200],
-        "scope": scope if scope in _VALID_SCOPES else "session",
-        "owner_task": str(owner_task_id or ""),
-        "session_id": _SESSION_ID,
-        "repo_writer": True,
-    }
-    for _round in range(_REPO_WRITER_REPUDIATION_ROUNDS):
-        if _kill_and_prove_dead(pid, int(pgid or 0), grace_sec=_REPO_WRITER_KILL_GRACE_SEC):
-            return
-        try:
-            # Same reason as in `record_process`: a False here is a failed append, not a written
-            # one, and this is the LAST place the fence could have been told about this process.
-            if append_jsonl(
-                ledger_path(pathlib.Path(drive_root)), {"ts": utc_now_iso(), **entry}
-            ) is True:
-                return
-        except Exception:
-            log.warning(
-                "repository writer latch append raised for pid %s (%s)", pid, purpose, exc_info=True
-            )
-    log.error(
-        "unregisterable repository writer %s (%s) could not be killed OR latched in %d rounds",
-        pid,
-        purpose,
-        _REPO_WRITER_REPUDIATION_ROUNDS,
-    )
-    raise RepoWriterCustodyError(
-        f"repository writer {pid} ({purpose!r}) is running with no proof of death and no "
-        "fence-visible custody record",
-        proc=proc,
-    )
-
-
-def terminate_repo_writer_processes(
-    drive_root: pathlib.Path, *, grace_sec: float = _REPO_WRITER_KILL_GRACE_SEC
-) -> List[str]:
-    """Kill every ledgered repository-writing process; return the ones NOT proven gone.
-
-    An EMPTY list is the only proof the caller may act on. Raises when the ledger cannot be read,
-    because an unreadable registry is not evidence of an empty one.
-    """
-    # A record admitted by `_repo_writer_group_outlives_leader` alone is killed here like any other.
-    # Retaining it UNSIGNALLED was the alternative, on the argument that the pgid probe re-verifies
-    # no identity — but nothing else ever signals such a record either, and nothing prunes it while
-    # its group answers, so the fence would refuse every update and every repo-rooted service start
-    # until the orphan happened to exit on its own. That is an unbounded lockout with no operator
-    # escape, which is a worse failure than the collateral this kill risks, and the collateral is
-    # narrower than it first looks: the branch requires the recorded LEADER PID to be DEAD, so a
-    # misdirected kill needs that pid to have been recycled by a process that then made itself a
-    # group leader AND exited leaving children — not the ordinary pid-reuse case. Killing by group
-    # is also what an operator asked for by starting an update, which is the only caller here.
-    remaining: List[str] = []
-    for entry in live_repo_writer_processes(drive_root):
-        pid = int(entry.get("pid") or 0)
-        if not _kill_and_prove_dead(pid, int(entry.get("pgid") or 0), grace_sec=grace_sec):
-            # Still refused, and now bounded: `_kill_and_prove_dead` returning False for a group we
-            # may not signal at all (another user's recycled pgid → EPERM → `process_group_is_alive`
-            # fails closed) is the one case that stays a standing blocker, and it is one no action
-            # available to this process could clear.
-            remaining.append(f"{str(entry.get('purpose') or 'process')}#{pid}")
-    return remaining
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while targets and time.monotonic() < deadline:
+        if not any(
+            _fingerprint_matches(entry) or _service_group_survives_leader(entry)
+            for entry in targets
+        ):
+            break
+        time.sleep(0.05)
+    for entry in targets:
+        if _fingerprint_matches(entry) or _service_group_survives_leader(entry):
+            survivors.append(entry)
+            blockers.append(f"custody_service:{int(entry.get('pid') or 0)}")
+        else:
+            append_jsonl(drive_root / "logs" / "supervisor.jsonl", {
+                "ts": utc_now_iso(),
+                "type": "process_reaped_for_update",
+                "pid": int(entry.get("pid") or 0),
+                "pgid": int(entry.get("pgid") or 0),
+                "purpose": entry.get("purpose"),
+            })
+    _rewrite_ledger(drive_root, survivors)
+    return not blockers, blockers
 
 
 def reap_orphaned_processes(
@@ -666,13 +477,10 @@ def reap_orphaned_processes(
         pid = int(entry.get("pid") or 0)
         scope = str(entry.get("scope") or "task")
         same_session = str(entry.get("session_id") or "") == _SESSION_ID
-        if not _fingerprint_matches(entry):
-            if _repo_writer_group_outlives_leader(entry):
-                # The launcher exited but its group did not, so this record is still the update
-                # fence's ONLY handle on whatever is left writing the checkout. Pruning it here
-                # would delete that handle; keep it until the group is gone too.
-                survivors.append(entry)
-            continue  # dead or recycled pid: prune silently
+        leader_matches = _fingerprint_matches(entry)
+        group_survives = _service_group_survives_leader(entry)
+        if not leader_matches and not group_survives:
+            continue  # dead/recycled pid with no surviving service group: prune silently
         owner_task = str(entry.get("owner_task") or "")
         purpose = str(entry.get("purpose") or "")
         task_owner_gone = (

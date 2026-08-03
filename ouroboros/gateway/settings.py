@@ -213,6 +213,7 @@ _IMMEDIATE_KEYS = frozenset({
     "OUROBOROS_TOOL_TIMEOUT_SEC",
     "GITHUB_TOKEN",
     "GITHUB_REPO",
+    "OUROBOROS_UPDATE_CHANNEL",
 })
 
 _RESTART_REQUIRED_KEYS = frozenset({
@@ -1108,6 +1109,17 @@ async def api_settings_post(request: Request) -> JSONResponse:
         body = await request.json()
         if not isinstance(body, dict):
             return json_error("JSON body must be an object.", 400)
+        channel_key = "OUROBOROS_UPDATE_CHANNEL"
+        if channel_key in body:
+            from ouroboros.update_channels import UPDATE_CHANNEL_BRANCHES
+
+            raw_channel = str(body.get(channel_key) or "").strip().lower()
+            if raw_channel not in UPDATE_CHANNEL_BRANCHES:
+                return json_error(
+                    f"{channel_key} must be one of: stable, qa, development.", 400
+                )
+            body = dict(body)
+            body[channel_key] = raw_channel
         # Reject a malformed post-task evolution cadence at the API boundary: the
         # read-time getter only normalizes, and the Settings UI validates its own Save,
         # but a direct API client must not be able to persist e.g. every_n:0 or garbage.

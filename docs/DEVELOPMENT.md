@@ -1151,6 +1151,38 @@ Before every commit, verify the following:
 
 ---
 
+## Managed Update Rule
+
+- Keep the local work branch and the official update feed separate. The local
+  branch is `ouroboros`; `OUROBOROS_UPDATE_CHANNEL` maps Stable to `main`, QA to
+  `ouroboros-stable`, and Development to `ouroboros`. QA and Development follow
+  their branch tips. Stable resolves the newest plain `vX.Y.Z` tag whose commit
+  is present in both `main` and `ouroboros-stable`.
+- A preflight chooses one exact official target SHA. Apply must bind to the
+  disclosed base/target, close new writers, drain existing direct/ephemeral
+  turns, stop workers and tracked services, then re-plan before mutation.
+- Clean fast-forwards land the official SHA directly. Git also builds clean
+  merges for dirty or divergent local history. The reviewed assisted resolver
+  runs only when Git reports a real conflict; filenames do not create a second
+  update policy. Hard reset is an explicitly confirmed recovery only.
+- The authorized resolver stages the complete merge, including tracked binary
+  files. Review receives their exact staged mode/blob/size plus the HEAD and
+  official MERGE_HEAD object ids; deletions carry an explicit absent stage and
+  exact parent identities. Missing exact metadata still blocks. This exception
+  does not weaken the ordinary commit pipeline's binary policy.
+- Write the update transaction before mutation. Reopen writers only after a
+  verified abort/rollback or a healthy restart. An unverified rollback keeps
+  its retryable phase plus the full failure evidence; a legacy `gate_blocked`
+  marker retries rollback on boot. Delayed evolution cleanup also acquires the
+  same update lock and honors this admission owner; it must not stash/reset
+  behind the fence. Managed merge tests pass before restart; the ordinary
+  self-modification commit/tag/test/push ordering remains unchanged.
+- Manual Restore reuses the same writer fence and pins the previous HEAD on a
+  local recovery branch before reset. Promotion resolves the development SHA
+  once and uses that exact SHA for both the local QA ref and any remote push.
+
+---
+
 ## Mutation Attribution Rule
 
 - Attribution is evidence, not exclusion. The host captures a `system_repo`
@@ -1761,10 +1793,13 @@ record. Each platform shard locates the final DMG, tarball, or ZIP after all
 packaging steps, then performs a smoke test against that final archive. The
 smoke checks require the embedded repository bundle and run the packaged CLI
 with `--help` in an isolated home directory. The macOS check also requires the
-separate `Install CLI.command` payload and an arm64 app executable.
+`Applications -> /Applications` drag target, the separate `Install CLI.command`
+payload, and an arm64 app executable.
 
 Each shard also generates a CycloneDX SBOM from the payload extracted from the
-final archive, including both top-level files in the macOS DMG. The workflow
+final archive. The macOS smoke proves the Applications link, then removes only
+that link from the SBOM staging copy so Syft cannot follow it into the runner's
+host `/Applications`; the app and CLI launcher remain in the scan. The workflow
 downloads a fixed Syft release asset and checks its platform-specific SHA-256
 before execution. GitHub artifact attestations bind both build provenance and
 the SBOM to the final archive digest. The release job downloads the three

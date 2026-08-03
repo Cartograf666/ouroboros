@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pathlib
 import re
-from typing import Literal, get_args, get_origin, get_type_hints
+from typing import get_args, get_type_hints
 
 from ouroboros.gateway.contracts import (
     HTTP_ENDPOINTS,
@@ -14,15 +14,13 @@ from ouroboros.gateway.contracts import (
     SkillDeleteResponse,
     SkillLifecycleQueueResponse,
     StateResponse,
-    UpdateApplyAssistedStartedResponse,
     UpdateApplyErrorResponse,
-    UpdateApplyManualResponse,
-    UpdateApplyOkResponse,
     UpdateApplyRequest,
-    UpdatePreflightErrorResponse,
-    UpdatePreflightProtectedRoute,
+    UpdateApplySuccessResponse,
+    UpdateMergePlan,
+    UpdatePreflightRequest,
     UpdatePreflightResponse,
-    UpdatePreflightSuccessResponse,
+    UpdateStatusReadyOutbound,
     VideoOutbound,
 )
 from ouroboros.gateway.router import collect_routes
@@ -98,100 +96,37 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "TaskCancelResponse",
         "LogTailResponse",
         "SkillDeleteResponse",
-        "UpdatePreflightProtectedRoute",
-        "UpdatePreflightSuccessResponse",
-        "UpdatePreflightErrorResponse",
+        "UpdateMergePlan",
+        "UpdatePreflightRequest",
+        "UpdatePreflightResponse",
         "UpdateApplyRequest",
-        "UpdateApplyOkResponse",
-        "UpdateApplyAssistedStartedResponse",
-        "UpdateApplyManualResponse",
+        "UpdateApplySuccessResponse",
         "UpdateApplyErrorResponse",
+        "UpdateStatusReadyOutbound",
     ):
         assert re.search(rf"@typedef \{{Object\}} {name}\b", text), f"api_types.js missing {name}"
     api_client = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_client.js").read_text(
         encoding="utf-8"
     )
     assert "openAICompatibleModels" in api_client
-    # v6.88.1: `updateApply` is the one typed helper whose REQUEST body is a declared contract, and
-    # what it carries is a safety override. The typedef parity below only proves api_types.js knows
-    # the fields, and pinning the parameter list alone proves no more: a helper that destructures
-    # all five and then posts `{strategy}` would still satisfy it while degrading an acknowledged
-    # apply into an unacknowledged one, with no test going red. So pin BOTH ends of the helper —
-    # the destructured request it accepts AND the object literal it hands to jsonPost — because it
-    # is the forwarding, not the signature, that carries the override to the wire.
-    apply_helper = re.search(
-        r"updateApply: \((?P<accepts>\{.*?\})\) => jsonPost\('/api/update/apply', (?P<forwards>\{.*?\})\)",
-        api_client,
-        re.S,
-    )
-    assert apply_helper, (
-        "api_client.js updateApply must destructure ONE UpdateApplyRequest object and post ONE "
-        "object literal to /api/update/apply"
-    )
-    for end, verb in (("accepts", "does not accept"), ("forwards", "does not forward")):
-        dropped = sorted(
-            field
-            for field in get_type_hints(UpdateApplyRequest, include_extras=True)
-            if not re.search(rf"\b{field}\b", apply_helper.group(end))
-        )
-        assert not dropped, f"api_client.js updateApply {verb} UpdateApplyRequest fields: {dropped}"
-    # v6.88.1: the RESPONSE is a discriminated union, and the browser previously told the variants
-    # apart by probing keys — including the protected DISCLOSURE, the one frame that carries a
-    # safety decision. The union and the helper's return annotation are pinned so a caller can be
-    # pointed at a declared shape rather than at the endpoint's source.
-    union = re.search(r"@typedef \{(?P<members>[^}]+)\} UpdateApplyResponse\b", text)
-    assert union, "api_types.js missing the UpdateApplyResponse union"
-    assert set(union.group("members").split("|")) == {
-        "UpdateApplyOkResponse",
-        "UpdateApplyAssistedStartedResponse",
-        "UpdateApplyManualResponse",
-        "UpdateApplyErrorResponse",
-    }
-    assert re.search(
-        r"@returns \{Promise<import\('\./api_types\.js'\)\.UpdateApplyResponse>\}\s*\n\s*\*/\s*\n\s*updateApply:",
-        api_client,
-    ), "api_client.js updateApply must declare the typed response it hands to its callers"
-    # v6.88.1 r6: the discriminator must be a LITERAL on both sides. Declared as a plain string it
-    # named a field the variants happen to share instead of the value that tells them apart, so
-    # neither `get_type_hints` nor a JSDoc consumer could narrow the union at all.
-    for variant, literal in (
-        (UpdateApplyOkResponse, "ok"),
-        (UpdateApplyAssistedStartedResponse, "assisted_started"),
-        (UpdateApplyManualResponse, "manual"),
-    ):
-        hint = get_type_hints(variant, include_extras=True)["status"]
-        assert get_origin(hint) is Literal and get_args(hint) == (literal,), (
-            f"{variant.__name__}.status must be Literal[{literal!r}], not {hint!r}"
-        )
-        assert re.search(rf"@property \{{'{literal}'\}} status\b", text), (
-            f"api_types.js must declare the {literal!r} discriminator as a JSDoc literal"
-        )
-    # v6.88.1 r6: preflight is a UNION too — an exception replaces both success keys with `error`,
-    # so a single object declaring them required described a frame the endpoint never emits.
-    preflight_union = re.search(r"@typedef \{(?P<members>[^}]+)\} UpdatePreflightResponse\b", text)
-    assert preflight_union, "api_types.js missing the UpdatePreflightResponse union"
-    assert set(preflight_union.group("members").split("|")) == {
-        "UpdatePreflightSuccessResponse",
-        "UpdatePreflightErrorResponse",
-    }
-    assert get_args(UpdatePreflightResponse) == (
-        UpdatePreflightSuccessResponse, UpdatePreflightErrorResponse
-    ), "UpdatePreflightResponse must stay the success|error union the endpoint actually answers"
     # v6.80.0: the two contracts extended this release join the FIELD-level parity list. The name-level
     # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
     # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
-    # v6.88.1: the managed-update preflight/apply ABI joins the field-level list too — the update
-    # dialog decides what action to OFFER from `protected_route`, so a field that drifts silently
-    # would make the browser offer an action the backend then refuses.
     for cls in (ChatInbound, ChatOutbound, PhotoOutbound, VideoOutbound,
-                StateResponse, OwnerScopeReviewFloorResponse,
-                UpdatePreflightProtectedRoute, UpdatePreflightSuccessResponse,
-                UpdatePreflightErrorResponse, UpdateApplyRequest,
-                UpdateApplyOkResponse, UpdateApplyAssistedStartedResponse,
-                UpdateApplyManualResponse, UpdateApplyErrorResponse):
+                StateResponse, OwnerScopeReviewFloorResponse, UpdateMergePlan,
+                UpdatePreflightRequest, UpdatePreflightResponse, UpdateApplyRequest,
+                UpdateApplySuccessResponse, UpdateApplyErrorResponse,
+                UpdateStatusReadyOutbound):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+    assert UpdatePreflightResponse.__required_keys__ == frozenset({"merge_plan"})
+    assert re.search(r"@property \{'auto_merge'\|'assisted'\|'manual'\|'replace'\} strategy\b", text)
+    assert re.search(r"@property \{string=\} expected_base_sha\b", text)
+    assert re.search(r"@property \{string=\} expected_target_sha\b", text)
+    assert re.search(r"@property \{boolean=\} confirm_recovery\b", text)
+    assert re.search(r"@property \{'ok'\|'restart_required'\|'assisted_started'\|'manual'\} status\b", text)
+    assert re.search(r"@typedef \{Object\} UpdateApplyErrorResponse.*?@property \{string\} error\b", text, re.S)
     assert re.search(r"@property \{boolean\} context_mode_auto_low\b", text), (
         "StateResponse.context_mode_auto_low must be a JSDoc boolean — the owner control branches on it"
     )
@@ -227,6 +162,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     assert re.search(r"@property \{string=\} error\b", text), "SkillDeleteResponse missing optional error"
     assert {"chat", "command", "photo", "video", "typing", "log", "heartbeat", "extension_lifecycle"} <= set(WS_MESSAGE_TYPES)
     assert "message_annotation" in WS_MESSAGE_TYPES
+    assert "update_status_ready" in WS_MESSAGE_TYPES
     assert _js_typedef_fields(text, "MessageAnnotationOutbound") == {
         "type",
         "annotation_type",

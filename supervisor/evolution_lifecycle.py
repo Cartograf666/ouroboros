@@ -290,8 +290,23 @@ def _cleanup_worktree_after_cycle(tx: Dict[str, Any], task_id: str) -> None:
     if not base_head:
         tx["cleanup_status"] = "skipped_no_base"
         return
+    update_lock_fh = None
+    release_update_lock = None
     try:
         from supervisor import git_ops, queue
+        from supervisor.update_merge import acquire_update_lock, release_update_lock
+        from supervisor.workers import repo_writer_admission_closed
+
+        try:
+            update_lock_fh = acquire_update_lock()
+        except RuntimeError:
+            tx["cleanup_status"] = "skipped_managed_update_lock_busy"
+            return
+        admission_reason = repo_writer_admission_closed()
+        if admission_reason:
+            tx["cleanup_status"] = "skipped_repo_writer_admission_closed"
+            tx["cleanup_deferred_reason"] = admission_reason
+            return
 
         # Same protection class as git_ops._guard_live_repo_destructive_git, but
         # covering the stash too: a unit test that never re-pointed
@@ -378,6 +393,9 @@ def _cleanup_worktree_after_cycle(tx: Dict[str, Any], task_id: str) -> None:
     except Exception:
         tx["cleanup_status"] = "error"
         log.debug("Evolution cycle worktree cleanup failed", exc_info=True)
+    finally:
+        if update_lock_fh is not None and release_update_lock is not None:
+            release_update_lock(update_lock_fh)
 
 
 def update_evolution_campaign_after_task(

@@ -746,7 +746,11 @@ def test_scope_prompt_records_stable_boundary(tmp_path, monkeypatch):
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     (tmp_path / "f.py").write_text("x = 1\n")
     subprocess.run(["git", "-C", str(tmp_path), "add", "f.py"], check=True)
-    prompt, status = sr._build_scope_prompt(tmp_path, "test msg", drive_root=tmp_path)
+    prompt, status = sr._build_scope_prompt(
+        tmp_path,
+        "test msg",
+        context=sr._ScopePromptContext(drive_root=tmp_path),
+    )
     assert prompt is not None and status is None
     n = sr._SCOPE_STABLE_PREFIX_LEN.get()
     assert 0 < n < len(prompt)

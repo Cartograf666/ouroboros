@@ -511,109 +511,71 @@
  */
 
 /**
- * @typedef {Object} UpdatePreflightProtectedRoute
- * @property {string} offered_strategy  // auto_merge | assisted
- * @property {boolean} will_route_manual
- * @property {string} reason
- *   v6.88.1: '' | 'protected_paths' | 'protected_delta_unverifiable'. An unverifiable
- *   official delta routes to manual with an EMPTY protected_paths list, so branch on the
- *   reason, never on the list being non-empty.
- * @property {string[]} protected_paths
+ * @typedef {Object} UpdateMergePlan
+ * @property {boolean=} available
+ * @property {boolean=} auto_mergeable
+ * @property {'clean'|'conflicting'|'current'|'unavailable'|'unknown'=} kind
+ * @property {string=} error
+ * @property {string=} remote
+ * @property {string=} remote_branch
+ * @property {string=} target_ref
+ * @property {string=} update_channel
+ * @property {string=} current_branch
+ * @property {string=} base_sha
+ * @property {string=} target_sha
+ * @property {number=} local_dirty_count
+ * @property {string=} local_snapshot
+ * @property {string=} merge_commit
+ * @property {string[]=} code_conflict_paths
+ * @property {string[]=} doc_conflict_paths
+ * @property {string[]=} hot_code_paths
+ * @property {'auto_merge'|'assisted'=} recommended_strategy
  */
 
 /**
- * @typedef {Object} UpdatePreflightSuccessResponse
- * @property {Object} merge_plan
- * @property {UpdatePreflightProtectedRoute} protected_route
+ * @typedef {Object} UpdatePreflightRequest
  */
 
 /**
- * @typedef {Object} UpdatePreflightErrorResponse
- * @property {string} error
- */
-
-/**
- * The preflight endpoint's response. `error` REPLACES the success keys rather than accompanying
- * them — an unhandled exception answers the shared error envelope — so this is a union, not one
- * object with an optional field. Declared the old way, the success keys were required on a frame
- * that never carries them.
- * @typedef {UpdatePreflightSuccessResponse|UpdatePreflightErrorResponse} UpdatePreflightResponse
+ * @typedef {Object} UpdatePreflightResponse
+ * @property {UpdateMergePlan} merge_plan
  */
 
 /**
  * @typedef {Object} UpdateApplyRequest
- * @property {string=} strategy
- *   auto_merge | assisted | doc_reconcile | manual | replace | stash | force
- * @property {boolean=} acknowledge_protected
- *   v6.88.1 BOUND acknowledgement of an official change to a protected tier other than
- *   frozen-contract / release-invariant (safety-critical or unrecognized) on the replace
- *   family: the three echoed fields below must match the disclosure exactly, or the
- *   backend keeps routing the apply to manual.
- * @property {string=} acknowledged_base_sha
- * @property {string=} acknowledged_target_sha
- * @property {string[]=} acknowledged_protected_paths
+ * @property {'auto_merge'|'assisted'|'manual'|'replace'} strategy
+ * @property {string=} expected_base_sha
+ * @property {string=} expected_target_sha
+ * @property {boolean=} confirm_recovery
  */
 
 /**
- * @typedef {Object} UpdateApplyOkResponse
- * @property {'ok'} status
- *   A LITERAL type, not `string`: this field discriminates the union below, and an unconstrained
- *   `string` made every variant structurally interchangeable so nothing could narrow on it.
- * @property {boolean} restarting
- *   v6.88.1: FALSE means the update landed and only the RESTART request failed — the checkout has
- *   already moved, so this is not a failure; `warning` says what is left to do by hand.
- * @property {string=} warning
- * @property {string=} strategy  // staged auto_merge only
- * @property {Object=} merge_plan  // staged auto_merge only
- * @property {Object=} rescue  // replace family only
- * @property {string=} keep_branch  // replace family only; '' when nothing was preserved
- */
-
-/**
- * @typedef {Object} UpdateApplyAssistedStartedResponse
- * @property {'assisted_started'} status  // literal, see UpdateApplyOkResponse
- * @property {string} task_id
- * @property {Object} merge_plan
- */
-
-/**
- * @typedef {Object} UpdateApplyManualResponse
- * @property {'manual'} status  // literal, see UpdateApplyOkResponse
- * @property {string=} reason
- *   '' (the owner asked for manual) | 'protected_paths' | 'protected_delta_unverifiable' |
- *   'release_moved'. Branch on the reason: an unverifiable delta and a fresh disclosure can both
- *   arrive with an empty protected_paths list and they mean opposite things.
- * @property {boolean=} requires_acknowledgement
- *   The protected DISCLOSURE. Re-post with the UpdateApplyRequest acknowledgement fields echoing
- *   base_sha / target_sha / protected_paths exactly, or the apply stays routed to manual.
- * @property {string[]=} protected_paths
- * @property {string=} base_sha
- * @property {string=} target_sha
- * @property {Object=} merge_plan
+ * @typedef {Object} UpdateApplySuccessResponse
+ * @property {'ok'|'restart_required'|'assisted_started'|'manual'} status
+ * @property {boolean=} restarting
+ * @property {'auto_merge'|'assisted'|'manual'|'replace'=} strategy
+ * @property {string=} task_id
+ * @property {UpdateMergePlan=} merge_plan
+ * @property {string=} error
  */
 
 /**
  * @typedef {Object} UpdateApplyErrorResponse
  * @property {string} error
  * @property {string=} reason
- *   'update_lock_held' | 'release_moved' | 'assisted_resolver_unavailable' | ...
- * @property {string=} plan_error
- *   The planner's own low-level message, kept separate from the endpoint's `error`. A
- *   plan-carrying error frame also splats the merge plan's own keys alongside these.
+ * @property {string[]=} blockers
+ * @property {boolean=} rolled_back
  * @property {string=} rollback
- *   What the undo of an already-landed mutation reported. A RESULT, not a status: a frame whose
- *   reason is 'update_recovery_failed' is one whose rollback could NOT be proven, so the presence
- *   of this key must never be read as "recovered".
- * @property {Object=} status
- *   THE reason `error` is checked first: a preparation refusal carries the managed-update status
- *   OBJECT under this key, so `status` on an error frame is a payload, not the discriminator. A
- *   consumer that switched on `status` first would read a truthy object here.
+ * @property {boolean=} restart_required
+ * @property {UpdateMergePlan=} merge_plan
+ * @property {Object=} smoke
  */
 
 /**
- * The apply endpoint's discriminated response. Check `error` FIRST — it replaces `status` rather
- * than accompanying it — then switch on `status`.
- * @typedef {UpdateApplyOkResponse|UpdateApplyAssistedStartedResponse|UpdateApplyManualResponse|UpdateApplyErrorResponse} UpdateApplyResponse
+ * @typedef {Object} UpdateStatusReadyOutbound
+ * @property {'update_status_ready'} type
+ * @property {boolean} available
+ * @property {?boolean} check_ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.88.1';
+export const GATEWAY_CONTRACT_VERSION = '6.87.6';

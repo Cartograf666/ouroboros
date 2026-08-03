@@ -902,6 +902,8 @@ def load_checklist_section(section_name: str) -> str:
 def build_touched_file_pack(
     repo_dir: Path,
     paths: list[str] | None = None,
+    *,
+    represent_binary: bool = False,
 ) -> tuple[str, list[str]]:
     """Read changed files into a prompt code pack plus omission list."""
     if paths is None:
@@ -929,7 +931,19 @@ def build_touched_file_pack(
             omitted.append(rel)
             parts.append(f"### {rel}\n\n*(omitted — path escapes repository root)*\n")
             continue
+        binary_extension = fp.suffix.lower() in BINARY_EXTENSIONS
         if not fp.is_file():
+            from ouroboros.tools import review_binary_context as binary_context
+            deleted_binary = represent_binary and (
+                binary_extension or binary_context.staged_path_is_binary(repo_dir, rel)
+            )
+            if deleted_binary:
+                metadata = binary_context.render_staged_binary_metadata(repo_dir, rel)
+                if metadata is not None:
+                    parts.append(f"### {rel}\n\n{metadata}")
+                    continue
+                omitted.append(rel)
+                parts.append(f"### {rel}\n\n*(omitted — deleted binary has no exact staged Git metadata)*\n")
             continue
         # Never inject credential-shaped files into review prompts.
         fname_lower = fp.name.lower()
@@ -937,7 +951,19 @@ def build_touched_file_pack(
             omitted.append(rel)
             parts.append(f"### {rel}\n\n*(omitted — sensitive file)*\n")
             continue
-        if fp.suffix.lower() in BINARY_EXTENSIONS or _is_probably_binary(fp):
+        if binary_extension or _is_probably_binary(fp):
+            if represent_binary:
+                from ouroboros.tools.review_binary_context import render_staged_binary_metadata
+                metadata = render_staged_binary_metadata(repo_dir, rel)
+                if metadata is None:
+                    omitted.append(rel)
+                    parts.append(
+                        f"### {rel}\n\n"
+                        "*(omitted — binary file has no readable stage-0 Git object metadata)*\n"
+                    )
+                    continue
+                parts.append(f"### {rel}\n\n{metadata}")
+                continue
             omitted.append(rel)
             parts.append(f"### {rel}\n\n*(omitted — binary file)*\n")
             continue

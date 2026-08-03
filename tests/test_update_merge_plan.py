@@ -18,6 +18,7 @@ def _init_repo(tmp_path):
     _git(repo, "config", "user.name", "t")
     _git(repo, "config", "commit.gpgsign", "false")
     (repo / "a.txt").write_text("base\n")
+    (repo / "BIBLE.md").write_text("constitution\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "base")
     head = _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip()
@@ -26,7 +27,18 @@ def _init_repo(tmp_path):
 
 def _point_at(monkeypatch, repo):
     monkeypatch.setattr(git_ops, "REPO_DIR", repo)
-    monkeypatch.setattr(git_ops, "_managed_update_target", lambda branch=None: ("", "", "remote-sim"))
+    current = _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    monkeypatch.setattr(git_ops, "BRANCH_DEV", current)
+    monkeypatch.setattr(git_ops, "_managed_update_target", lambda: ("", "ouroboros", "remote-sim"))
+    monkeypatch.setattr(
+        git_ops,
+        "_resolve_managed_update_target",
+        lambda *_args: (
+            "remote-sim",
+            _git(repo, "rev-parse", "remote-sim").stdout.strip(),
+            "",
+        ),
+    )
 
 
 def test_plan_clean_when_disjoint(tmp_path, monkeypatch):
@@ -43,6 +55,60 @@ def test_plan_clean_when_disjoint(tmp_path, monkeypatch):
     assert plan["kind"] == "clean", plan
     assert plan["auto_mergeable"] is True
     assert plan["recommended_strategy"] == "auto_merge"
+
+
+def test_clean_divergence_preflight_recommends_automatic_git_merge(tmp_path, monkeypatch):
+    repo, head = _init_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "remote-sim")
+    (repo / "remote.txt").write_text("remote\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "remote")
+    _git(repo, "checkout", "-q", head)
+    (repo / "local.txt").write_text("local\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "local")
+    _point_at(monkeypatch, repo)
+
+    plan = update_merge.plan_managed_update_merge(fetch=False, build=False)
+
+    assert plan["kind"] == "clean"
+    assert plan["local_dirty_count"] == 0
+    assert plan["recommended_strategy"] == "auto_merge"
+
+
+def test_clean_fast_forward_lands_exact_official_sha(tmp_path, monkeypatch):
+    repo, head = _init_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "remote-sim")
+    (repo / "b.txt").write_text("remote\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "remote adds b")
+    target = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "checkout", "-q", head)
+    _point_at(monkeypatch, repo)
+
+    plan = update_merge.plan_managed_update_merge(fetch=False, build=True)
+
+    assert plan["kind"] == "clean"
+    assert plan["local_snapshot"] == plan["base_sha"]
+    assert plan["merge_commit"] == target
+    ok, message = update_merge.apply_managed_merge_update(head, plan["merge_commit"])
+    assert ok, message
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == target
+    assert _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip() == head
+
+
+def test_plan_rejects_official_target_that_deletes_constitution(tmp_path, monkeypatch):
+    repo, head = _init_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "remote-sim")
+    _git(repo, "rm", "-q", "BIBLE.md")
+    _git(repo, "commit", "-q", "-m", "delete constitution")
+    _git(repo, "checkout", "-q", head)
+    _point_at(monkeypatch, repo)
+
+    plan = update_merge.plan_managed_update_merge(fetch=False, build=True)
+
+    assert plan["available"] is False
+    assert "does not preserve BIBLE.md" in plan["error"]
 
 
 def test_plan_conflicting_on_code(tmp_path, monkeypatch):
@@ -62,7 +128,7 @@ def test_plan_conflicting_on_code(tmp_path, monkeypatch):
     assert plan["recommended_strategy"] == "assisted"
 
 
-def test_plan_doc_reconcile(tmp_path, monkeypatch):
+def test_plan_document_conflict_uses_assisted_route(tmp_path, monkeypatch):
     repo, head = _init_repo(tmp_path)
     (repo / "README.md").write_text("base readme\n")
     _git(repo, "add", "-A")
@@ -77,7 +143,7 @@ def test_plan_doc_reconcile(tmp_path, monkeypatch):
 
     plan = update_merge.plan_managed_update_merge(fetch=False)
     assert plan["available"] is True, plan
-    assert plan["kind"] == "doc_reconcile", plan
+    assert plan["kind"] == "conflicting", plan
     assert "README.md" in plan["doc_conflict_paths"]
 
 
@@ -123,6 +189,10 @@ def test_rollback_managed_update(tmp_path, monkeypatch):
     monkeypatch.setattr(git_ops, "REPO_DIR", repo)
     monkeypatch.setattr(git_ops, "DRIVE_ROOT", data_dir)
     monkeypatch.setattr(git_ops, "_git_dir", lambda: repo / ".git")
+    import supervisor.workers as workers
+    gate_calls = []
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: gate_calls.append(("close", reason)))
+    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": gate_calls.append(("open", expected_reason)))
     # simulate a bad update landed on top.
     (repo / "bad.txt").write_text("bad\n")
     _git(repo, "add", "-A")
@@ -134,6 +204,10 @@ def test_rollback_managed_update(tmp_path, monkeypatch):
     assert _git(repo, "rev-parse", "HEAD").stdout.strip() == pre
     assert not (repo / "bad.txt").exists()
     assert update_merge.read_update_tx() == {}  # marker cleared
+    assert gate_calls == [
+        ("close", "managed_update:rollback"),
+        ("open", "managed_update:rollback"),
+    ]
 
 
 def _wire_git_ops(monkeypatch, repo, data_dir):
@@ -159,6 +233,10 @@ def test_finalize_rolls_back_after_unhealthy_boot(tmp_path, monkeypatch):
     repo, head = _init_repo(tmp_path)
     pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
     _wire_git_ops(monkeypatch, repo, tmp_path / "data")
+    import supervisor.workers as workers
+    gate_calls = []
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: gate_calls.append(("close", reason)))
+    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": gate_calls.append(("open", expected_reason)))
     (repo / "bad.txt").write_text("bad\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "bad update")
@@ -170,3 +248,4 @@ def test_finalize_rolls_back_after_unhealthy_boot(tmp_path, monkeypatch):
     res = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
     assert res.get("rolled_back") is True, res
     assert _git(repo, "rev-parse", "HEAD").stdout.strip() == pre
+    assert gate_calls == [("close", "managed_update:rollback")]
