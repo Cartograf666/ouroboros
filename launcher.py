@@ -84,6 +84,10 @@ from ouroboros.server_runtime import apply_runtime_provider_defaults, has_startu
 
 MAX_CRASH_RESTARTS = 5
 CRASH_WINDOW_SEC = 120
+# One bounded, visible retry when a restart's dependency install fails (XG-7B.3):
+# long enough to ride out a transient index/network hiccup, short enough not to
+# stall an offline restart whose requirements are already satisfied.
+_DEPS_RETRY_DELAY_SEC = 5
 _CREATE_SUSPENDED = getattr(subprocess, "CREATE_SUSPENDED", 0x4) if IS_WINDOWS else 0
 _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if IS_WINDOWS else 0
 
@@ -288,16 +292,16 @@ def check_git() -> bool:
     return _check_git(IS_WINDOWS)
 
 
-def bootstrap_repo() -> None:
-    _bootstrap_repo(_bootstrap_context())
+def bootstrap_repo() -> bool:
+    return _bootstrap_repo(_bootstrap_context())
 
 
 def _sync_existing_repo_from_bundle() -> None:
     _sync_existing_repo_from_bundle_impl(_bootstrap_context())
 
 
-def _install_deps() -> None:
-    _install_deps_impl(_bootstrap_context())
+def _install_deps() -> bool:
+    return _install_deps_impl(_bootstrap_context())
 
 _agent_proc: Optional[subprocess.Popen] = None
 _agent_job: Optional[object] = None
@@ -434,9 +438,15 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     _apply_settings_to_env(settings)
     env = embedded_python_env(DATA_DIR, os.environ.copy())
     env["PYTHONPATH"] = str(REPO_DIR)
+    # ENV IS THE AUTHORITY for the bind host (config.SETTINGS_KEYS_NOT_EXPORTED_TO_ENV):
+    # `settings` here is the MERGED view, so it usually carries the shipped
+    # 127.0.0.1 default that no owner ever authored. Stamping it over an
+    # operator-provided environment host reintroduced the exact regression the
+    # export exclusion closed — setdefault lets the settings value stand in
+    # only when the environment says nothing.
     saved_host = str(settings.get("OUROBOROS_SERVER_HOST") or "").strip()
     if saved_host:
-        env["OUROBOROS_SERVER_HOST"] = saved_host
+        env.setdefault("OUROBOROS_SERVER_HOST", saved_host)
     env["OUROBOROS_SERVER_PORT"] = str(port)
     env["OUROBOROS_DATA_DIR"] = str(DATA_DIR)
     env["OUROBOROS_REPO_DIR"] = str(REPO_DIR)
@@ -717,7 +727,24 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
         if exit_code == RESTART_EXIT_CODE:
             log.info("Agent requested restart (exit code 42). Restarting...")
             _sync_existing_repo_from_bundle()
-            _install_deps()
+            if not _install_deps():
+                # An evolved checkout may have added requirements its reviewed
+                # commit depends on. Pause visibly and retry once — pip failures
+                # are often transient (index/network) — instead of restarting as
+                # if nothing happened.
+                log.error(
+                    "Dependency install failed after the restart request; "
+                    "retrying once in %ds.", _DEPS_RETRY_DELAY_SEC,
+                )
+                time.sleep(_DEPS_RETRY_DELAY_SEC)
+                if not _install_deps():
+                    log.error(
+                        "Dependency install failed twice; starting the agent anyway "
+                        "under the crash fuse (%d crashes in %ds stops the launcher). "
+                        "If the new commit added packages, the server will fail to "
+                        "import them — see the pip output above for the cause.",
+                        MAX_CRASH_RESTARTS, CRASH_WINDOW_SEC,
+                    )
             _kill_stale_runtime_ports(port)
             continue
 
@@ -1139,7 +1166,14 @@ def main():
         if not check_git():
             sys.exit(1)
 
-    bootstrap_repo()
+    if not bootstrap_repo():
+        # Disclosed, not fatal: an already-provisioned install with satisfied
+        # requirements still runs, and a genuinely broken checkout is stopped
+        # by the startup health check / crash fuse with this line naming why.
+        log.error(
+            "Continuing startup after a failed dependency install; the agent may "
+            "be missing packages (see the pip output above)."
+        )
 
     if not _run_first_run_wizard():
         log.info("Wizard was closed without saving. Launching anyway (Settings page available).")

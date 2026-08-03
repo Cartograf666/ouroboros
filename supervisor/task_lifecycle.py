@@ -722,7 +722,13 @@ def _finish_captured_running(task_id: str, worker: Any, meta: Dict[str, Any]) ->
     # timeout would.
     try:
         from ouroboros.observability import salvaged_output_note
-        salvage_note = salvaged_output_note(q._task_drive_for_task(task, str(task_id)), str(task_id))
+        salvage_note = salvaged_output_note(
+            q._task_drive_for_task(task, str(task_id)), str(task_id),
+            # The full copy must land on the drive that OUTLIVES the child drive
+            # this publication deletes (BIBLE P1): a bounded preview alone is not
+            # a rescue when it is about to become the only copy.
+            preserve_root=pathlib.Path(q.DRIVE_ROOT),
+        )
     except Exception:
         log.debug("Failed to salvage last LLM response for cancelled %s", task_id, exc_info=True)
         salvage_note = ""

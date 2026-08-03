@@ -943,8 +943,14 @@ def bootstrap_native_skills(context: BootstrapContext) -> None:
     )
 
 
-def bootstrap_repo(context: BootstrapContext) -> None:
-    """Ensure the launcher-managed git repo exists and matches the embedded bundle."""
+def bootstrap_repo(context: BootstrapContext) -> bool:
+    """Ensure the launcher-managed git repo exists and matches the embedded bundle.
+
+    Returns whether the dependency install (when one was needed) succeeded —
+    a freshly created/synced checkout that could not land its requirements is
+    a fact the caller must be able to disclose, not a silently swallowed pip
+    exit code that resurfaces later as an unexplained ImportError.
+    """
     context.data_dir.mkdir(parents=True, exist_ok=True)
     outcome = ensure_managed_repo(context)
     context.log.info("Bootstrapping managed repository to %s (outcome=%s)", context.repo_dir, outcome)
@@ -972,7 +978,16 @@ def bootstrap_repo(context: BootstrapContext) -> None:
         context.log.warning("World profile generation failed: %s", exc)
 
     bootstrap_native_skills(context)
+    deps_ok = True
     if outcome != "unchanged":
-        install_deps(context)
+        deps_ok = install_deps(context)
+        if not deps_ok:
+            context.log.error(
+                "Bootstrap finished with a FAILED dependency install (repo outcome=%s): "
+                "the checkout changed but its requirements did not land, so the server "
+                "may be missing packages. See the pip output above for the cause.",
+                outcome,
+            )
     verify_claude_runtime(context)
     context.log.info("Bootstrap complete.")
+    return deps_ok

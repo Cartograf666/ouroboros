@@ -1535,6 +1535,14 @@ SETTINGS_KEYS_NOT_EXPORTED_TO_ENV = frozenset({
     # every consumer already reads it from the settings dict (mcp_client.parse_servers,
     # gateway.mcp), never from the environment.
     "MCP_SERVERS",
+    # ENV IS THE AUTHORITY for the bind host, not settings. `ouroboros server --host
+    # 0.0.0.0` puts the choice in the environment, and both consumers (server.main and
+    # server_control.restart_current_process) deliberately read env BEFORE settings.
+    # Exporting this key stamped the settings value — usually the shipped 127.0.0.1
+    # default, which no owner ever authored — back over that environment, so the operator's
+    # LAN-reachable server silently became loopback at the first self-restart and stayed
+    # there. A default standing in for an absent key is not an owner decision.
+    "OUROBOROS_SERVER_HOST",
 })
 
 

@@ -41,6 +41,16 @@ _PARENT_CONTEXT_END = "[END_PARENT_CONTEXT]"
 VALID_SUBAGENT_MEMORY_MODES = frozenset({"forked", "empty"})
 _GIT_UNBORN_HEAD = "(unborn)"
 
+# A progress frame's ``task_id`` is a ROUTING address — it says which live card the
+# line lands on, NOT who wrote the line. The supervisor narrates a task's terminal
+# path (grace requested, grace withdrawn) onto that task's own card, so those frames
+# carry the task's id while the task itself did nothing. Host-authored frames set
+# this key; ``_handle_send_message`` refuses to count them as the task's work.
+# Without it the supervisor's own voice answers its own question — the grace toast
+# stamped last_progress_at, the next 0.5s tick read the task as resumed, and the
+# episode it had just opened was withdrawn before the worker could ever drain it.
+HOST_NARRATION = "host_narration"
+
 
 def _emit_routing_receipt(
     ctx: Any,
@@ -939,7 +949,9 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
         # Real-progress signal (activity model): a progress narration line is genuine work,
         # so stamp the EMITTING task's last_progress_at. (A productively-waiting parent is
         # kept alive separately by _subtree_progressing detecting fresh DESCENDANT progress,
-        # not by re-stamping its own last_progress_at from child narration.)
+        # not by re-stamping its own last_progress_at from child narration.) HOST_NARRATION
+        # frames are addressed to the task's card but authored by the supervisor, so they
+        # are narration ABOUT the task, never work BY it.
         progress_meta = evt.get("progress_meta") if isinstance(evt.get("progress_meta"), dict) else None
         _running = getattr(ctx, "RUNNING", None)
         if is_progress and task_id and isinstance(_running, dict):
@@ -947,7 +959,8 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             # Mutate in place (see _handle_llm_usage): no write-back, so a cross-thread
             # cancel that popped this task is never resurrected.
             if isinstance(_m, dict):
-                _m["last_progress_at"] = time.time()
+                if not evt.get(HOST_NARRATION):
+                    _m["last_progress_at"] = time.time()
                 # v6.82 (P5): host-attested cancelable marker. RUNNING membership is
                 # the supervisor's own truth that this frame belongs to a queue task
                 # that /api/tasks/{id}/cancel can force-cancel. An in-process

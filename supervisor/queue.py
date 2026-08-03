@@ -155,6 +155,7 @@ from supervisor.task_reaper import (  # noqa: E402,F401 — re-exported for enfo
     reap_queue as _reap_queue,
     reap_timed_out_task as _reap_timed_out_task,
     request_finalization_grace as _request_finalization_grace,
+    resolve_grace_episode_for_spared_task as _resolve_grace_episode_for_spared_task,
 )
 
 
@@ -1228,11 +1229,12 @@ def _enforce_task_timeouts_locked(
         last_progress_at = float(meta.get("last_progress_at") or started_at)
         idle_sec = max(0.0, now - last_progress_at)
         subtree_progressing = _subtree_progressing(task_id, now, idle_timeout)
+        own_progress = idle_sec < idle_timeout
         # Keep an orchestrator alive while it (a) makes own progress, (b) has a freshly
         # progressing RUNNING descendant, OR (c) has a QUEUED descendant still waiting for a
         # worker — killing it then would orphan the queued subtree. Only the abs ceiling /
         # explicit deadline / budget are unconditional.
-        progressing = idle_sec < idle_timeout or subtree_progressing or _has_pending_descendant(task_id)
+        progressing = own_progress or subtree_progressing or _has_pending_descendant(task_id)
         ceiling_reached = runtime_sec >= abs_ceiling
 
         # Hard axes (deadline_at, abs ceiling) stop the task regardless of activity; the
@@ -1240,14 +1242,16 @@ def _enforce_task_timeouts_locked(
         # progressing. This honors an explicit/caller deadline promptly while never letting
         # the removed blanket wall-clock kill a productively-waiting orchestrator.
         if not ceiling_reached and not deadline_reached and progressing:
-            # The grace latch belongs to ONE finalization episode, not to the task.
-            # A task that answered finalize_now and went back to work has no
-            # outstanding request; leaving the latch set would make the NEXT
-            # terminal condition skip its own grace window entirely (now - the
-            # stale timestamp already exceeds it) and kill the task instantly,
-            # unwarned, under the earlier episode's reason.
-            if meta.pop("finalization_requested_at", None) is not None:
-                meta.pop("finalization_reason", None)
+            # An outstanding episode outlives this reprieve or is withdrawn by it; the
+            # rule (own progress answers the request, sparing only suspends its clock)
+            # lives with the rest of the episode mechanics in task_reaper. The latch is
+            # checked here so the drive resolution (which may read the result record)
+            # stays off the no-episode path.
+            if meta.get("finalization_requested_at") and _resolve_grace_episode_for_spared_task(
+                _task_drive_for_task(task, str(task_id)), str(task_id), meta,
+                chat_id=int(task.get("chat_id") or owner_chat_id or 0),
+                own_progress=own_progress, now=now,
+            ):
                 RUNNING[task_id] = meta
             continue
 
@@ -1261,12 +1265,15 @@ def _enforce_task_timeouts_locked(
         if finalization_requested_at <= 0 and FINALIZATION_GRACE_SEC > 0:
             meta["finalization_requested_at"] = now
             meta["finalization_reason"] = terminal_reason
-            RUNNING[task_id] = meta
-            _request_finalization_grace(
+            # The control's msg_id IS the episode's identity: it is what the
+            # symmetric withdraw revokes, so the latch and the mailbox control
+            # can never name different episodes.
+            meta["finalization_control_msg_id"] = _request_finalization_grace(
                 _task_drive_for_task(task, str(task_id)), str(task_id), terminal_reason,
                 chat_id=int(task.get("chat_id") or owner_chat_id or 0),
-                stamp=int(finalization_requested_at or now),
+                stamp=int(now),
             )
+            RUNNING[task_id] = meta
             continue
         if finalization_requested_at > 0 and now - finalization_requested_at < FINALIZATION_GRACE_SEC:
             continue

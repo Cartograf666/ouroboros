@@ -14,10 +14,12 @@ import logging
 import pathlib
 import queue as _stdqueue
 import threading
+import uuid
 from typing import Any, Dict, Optional
 
 from ouroboros.outcomes import EXECUTION_INFRA_FAILED, terminal_outcome_axes
 from ouroboros.utils import append_jsonl, utc_now_iso
+from supervisor.events import HOST_NARRATION
 from supervisor.message_bus import send_with_budget
 
 log = logging.getLogger(__name__)
@@ -80,7 +82,7 @@ def ensure_reaper_started() -> None:
 
 def request_finalization_grace(
     task_drive: pathlib.Path, task_id: str, terminal_reason: str, *, chat_id: int, stamp: int,
-) -> None:
+) -> str:
     """Ask a task to finalize cooperatively before the supervisor stops it.
 
     Both side effects of opening a grace window: the typed ``finalize_now``
@@ -89,11 +91,21 @@ def request_finalization_grace(
     the owner-visible progress toast. Lives here with the rest of the
     supervisor's terminal-path mechanics so ``queue.py``'s enforce loop keeps
     only the DECISION.
+
+    Returns the control's msg_id — the grace EPISODE's identity. The caller
+    stores it next to the latch so ``withdraw_finalization_grace`` can retract
+    exactly this episode; "" means no control is outstanding.
     """
+    control_msg_id = uuid.uuid4().hex
     try:
         from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
-        write_owner_message(task_drive, terminal_reason, task_id, kind=KIND_FINALIZE_NOW)
+        if not write_owner_message(
+            task_drive, terminal_reason, task_id,
+            msg_id=control_msg_id, kind=KIND_FINALIZE_NOW,
+        ):
+            control_msg_id = ""
     except Exception:
+        control_msg_id = ""
         log.debug("Failed to write finalize_now control for %s", task_id, exc_info=True)
     try:
         from supervisor import workers as _workers_mod
@@ -107,6 +119,10 @@ def request_finalization_grace(
             "format": "markdown",
             "is_progress": True,
             "task_id": task_id,
+            # Addressed to the task's card, authored by the supervisor: see
+            # events.HOST_NARRATION. Without it this toast stamped the task's
+            # last_progress_at and the next tick withdrew the episode it announced.
+            HOST_NARRATION: True,
             "progress_meta": {
                 "task_incident": terminal_reason,
                 "toast_once": f"{task_id}:{terminal_reason}:{stamp}",
@@ -115,6 +131,99 @@ def request_finalization_grace(
         })
     except Exception:
         log.debug("Failed to emit finalization grace warning for %s", task_id, exc_info=True)
+    return control_msg_id
+
+
+def withdraw_finalization_grace(
+    task_drive: pathlib.Path, task_id: str, meta: Dict[str, Any], *, chat_id: int,
+) -> bool:
+    """Retract a grace window the supervisor no longer wants — the symmetric twin
+    of ``request_finalization_grace``, and the ONLY correct way to end an episode.
+
+    An episode is two things written together: the durable ``finalize_now``
+    control in the task's mailbox and the ``finalization_requested_at`` latch in
+    its RUNNING metadata. Retiring only the latch left the task holding a live
+    kill order it would obey on its next drain — with no terminal condition
+    pending and no kill coming — so this owns BOTH halves (plus the owner toast
+    that promised a stop) and refuses to split them: if the control cannot be
+    revoked, the latch stays and the caller retries on the next tick.
+
+    Returns True when a whole episode was withdrawn.
+    """
+    if not float(meta.get("finalization_requested_at") or 0.0):
+        return False
+    control_msg_id = str(meta.get("finalization_control_msg_id") or "")
+    if control_msg_id:
+        revoked = False
+        try:
+            from ouroboros.owner_mailbox import revoke_owner_control
+            revoked = revoke_owner_control(task_drive, task_id, control_msg_id)
+        except Exception:
+            log.debug("Failed to revoke finalize_now control for %s", task_id, exc_info=True)
+        if not revoked:
+            log.warning(
+                "Could not revoke the finalize_now control for %s; keeping the grace latch "
+                "so the episode stays whole (retried next tick).", task_id,
+            )
+            return False
+    reason = str(meta.get("finalization_reason") or "the terminal condition")
+    meta.pop("finalization_requested_at", None)
+    meta.pop("finalization_reason", None)
+    meta.pop("finalization_control_msg_id", None)
+    try:
+        # Plain progress, NOT a task_incident: the request's toast is styled as an
+        # error in the UI, and its retraction is good news. It is emitted at most
+        # once per episode, because the latch is already gone by here.
+        from supervisor import workers as _workers_mod
+        _workers_mod.get_event_q().put({
+            "type": "send_message",
+            "chat_id": chat_id,
+            "text": (
+                f"▶️ Task {task_id} resumed work before the {reason} grace window closed; "
+                "the stop request was withdrawn."
+            ),
+            "format": "markdown",
+            "is_progress": True,
+            "task_id": task_id,
+            HOST_NARRATION: True,
+            "ts": utc_now_iso(),
+        })
+    except Exception:
+        log.debug("Failed to emit finalization withdrawal for %s", task_id, exc_info=True)
+    return True
+
+
+def resolve_grace_episode_for_spared_task(
+    task_drive: pathlib.Path, task_id: str, meta: Dict[str, Any], *,
+    chat_id: int, own_progress: bool, now: float,
+) -> bool:
+    """What happens to an outstanding grace episode on a tick the task is NOT stopped.
+
+    Two different reprieves reach this point and they are not the same answer:
+
+    * The task made its OWN progress — that is the task answering the request, so the
+      episode is withdrawn whole. A DESCENDANT's progress must not withdraw it: that
+      spares the task deliberately but is not the task answering, and treating it as
+      an answer re-armed the episode on every subtree flicker (one finalize_now and
+      one owner toast per flicker, window never elapsing).
+    * The task is merely SPARED. Sparing suspends the stop, so it suspends the window:
+      the latch is the base of a clock measuring time the supervisor ACTUALLY intended
+      to stop this task, not wall clock. A parent blocked in ``wait_tasks`` makes no
+      own progress and drains no mailbox (drains happen at round boundaries), so a
+      window that ran down while the subtree deliberately kept it alive killed it
+      0.5s after its last child finished — zero usable grace, the finalize_now still
+      unread, and a blind plan replay. The ask is NOT re-sent: one episode, one
+      control, one toast. A withdrawal that could not be made durable lands here too
+      and simply retries on the next tick.
+
+    Returns True when the episode was withdrawn (the caller re-publishes the row).
+    """
+    if own_progress and withdraw_finalization_grace(
+        task_drive, task_id, meta, chat_id=chat_id,
+    ):
+        return True
+    meta["finalization_requested_at"] = now
+    return False
 
 
 def _kill_and_confirm_worker_dead(proc: Any, worker_id: int, task_id: str) -> bool:
@@ -414,7 +523,12 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
         salvage_note = ""
         try:
             from ouroboros.observability import salvaged_output_note
-            salvage_note = salvaged_output_note(_q._task_drive_for_task(task, task_id), task_id)
+            salvage_note = salvaged_output_note(
+                _q._task_drive_for_task(task, task_id), task_id,
+                # Symmetric with the cancel path: the child drive holding the
+                # blobs does not outlive the task, the canonical drive does.
+                preserve_root=pathlib.Path(_q.DRIVE_ROOT),
+            )
         except Exception:
             log.debug("Reaper: failed to salvage last LLM response for %s", task_id, exc_info=True)
 
