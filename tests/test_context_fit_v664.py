@@ -522,7 +522,7 @@ def test_route_switch_rebinds_same_core_to_new_exact_route(tmp_path, monkeypatch
     assert rebound.core_sha256 == core_sha
     assert rebound.model == "new-model"
     assert rebound.route_fp == "route-new"
-    assert rebound.evidence_status == "unprobeable"
+    assert rebound.status == "unprobeable"
     assert mode == "max"
     assert messages[0] == rebound.max_projection.system_message()
     assert registry._ctx.context_fit_plan is rebound

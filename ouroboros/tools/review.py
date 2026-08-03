@@ -85,6 +85,8 @@ def _format_timeout_seconds(timeout_sec: float) -> str:
     return f"{timeout_sec:g}"
 
 
+from ouroboros.reviewer_window import reviewer_context_window, window_scaled_reserves
+from ouroboros.tools.review_synthesis import quorum_input_token_limit as _quorum_input_token_limit
 from ouroboros.tools.review_helpers import (
     REPO_ROOT as _REPO_ROOT,
     load_checklist_section as _load_checklist_section_precise,
@@ -1217,20 +1219,34 @@ def _build_preflight_staged(target_repo: str, fallback: str = "") -> str:
 
 def _fit_triad_prompt(api_models: list, assemble, current_files_section: str,
                       diff_text: str, changed: str, target_repo) -> tuple:
-    """The api pack's guaranteed-fit ladder, unchanged in behavior (P3 one-pass):
-    drop only evidence duplicated by the complete staged diff — full snapshots
-    first, then unchanged diff context — sized to the strictest configured API
-    family. Returns ``(prompt, stable_prefix_len, block_message_or_empty)``."""
-    input_limit = min(
-        calibrated_input_token_limit(
-            model,
-            context_window=1_000_000,
+    """The api pack's guaranteed-fit ladder (P3 one-pass): drop only evidence
+    duplicated by the complete staged diff — full snapshots first, then unchanged
+    diff context. Each api slot's limit uses its REAL window from Capability
+    Evidence (a hardcoded 1M treated a 200K reviewer as 1M-capable and lost its
+    whole review to a deterministic prompt-too-long 400), with sub-1M windows
+    scaling their reserves so a small-window slot gets a fit-sized pack, not a
+    zero limit; the shared prompt is sized to the review QUORUM — the same SSOT
+    plan review uses — so one small slot degrades its OWN seat rather than
+    blocking the gate for the whole panel. Session rows are not constrained by
+    this pack at all (5.2/5.7): they retrieve with their own tools. Returns
+    ``(prompt, stable_prefix_len, block_message_or_empty)``."""
+    def _slot_input_limit(slot_model: str) -> int:
+        window = reviewer_context_window(slot_model)
+        output_reserve, tokenizer_margin = window_scaled_reserves(
+            window,
             output_reserve=_review_output_budget(),
             tokenizer_margin=50_000,
-            budget_cap=REVIEW_PROMPT_TOKEN_BUDGET,
         )
-        for model in api_models
-    )
+        return max(0, calibrated_input_token_limit(
+            slot_model,
+            context_window=window,
+            output_reserve=output_reserve,
+            tokenizer_margin=tokenizer_margin,
+            budget_cap=REVIEW_PROMPT_TOKEN_BUDGET,
+        ))
+
+    input_limit = _quorum_input_token_limit(
+        api_models, {m: _slot_input_limit(m) for m in api_models})
     prompt, stable_prefix_len = assemble(current_files_section, diff_text)
     if input_limit and estimate_tokens(prompt) > input_limit:
         touched_paths = [line.strip() for line in changed.splitlines() if line.strip()]

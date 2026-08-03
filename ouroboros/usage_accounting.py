@@ -891,6 +891,49 @@ def mark_unresolved(reservation: AttemptReservation, reason: str) -> None:
     _transition(reservation, "unresolved", reason=str(reason or "provider_outcome_unknown")[:500])
 
 
+def terminalize_abandoned_attempt(
+    reservation: AttemptReservation,
+    *,
+    reason: str,
+    usage: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Close an attempt whose owning process died before it could settle.
+
+    A non-terminal attempt keeps its full reservation upper bound counted
+    against the global/root limit forever, so a killed out-of-process dispatch
+    (timeout, native abort) permanently burns whatever it reserved — for the
+    advisory gateway that reservation IS the remaining budget. The supervising
+    process settles it with whatever usage the dead child managed to report
+    (measured tokens, estimated cost, never a fabricated final number) and falls
+    back to the honest ``unresolved`` state when nothing was reported.
+
+    Already-terminal attempts are returned untouched: appending after a terminal
+    state would corrupt the ledger for every later reader."""
+    with _locked(reservation.drive_root):
+        current = _final_rows(_read_records_locked(reservation.drive_root)).get(
+            reservation.attempt_id
+        )
+    if current is None:
+        return "unknown"
+    state = str(current.get("state") or "")
+    if state in _TERMINAL:
+        return state
+    if state == "reserved":
+        release_attempt(reservation, reason)
+        return "released"
+    normalized = dict(usage or {})
+    measured = int(
+        _number(normalized.get("prompt_tokens") or normalized.get("input_tokens")) or 0
+    ) + int(
+        _number(normalized.get("completion_tokens") or normalized.get("output_tokens")) or 0
+    )
+    if measured > 0:
+        settle_attempt(reservation, normalized, cost_usd=None, cost_final=False)
+        return "settled"
+    mark_unresolved(reservation, reason)
+    return "unresolved"
+
+
 def _plain(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool, dict, list)):
         return value

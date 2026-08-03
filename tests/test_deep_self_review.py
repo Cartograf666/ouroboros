@@ -689,15 +689,29 @@ class TestReviewPackOverflow:
         # v6.80.0: the deep reviewer's cap is DENSITY-calibrated per model at call
         # time (the module constant is only the uncalibrated window arithmetic), so
         # the message must quote the calibrated number actually enforced.
+        # v6.87.9: the window itself is resolved from Capability Evidence per
+        # reviewer (an unknown route keeps the full-window assumption; a KNOWN
+        # sub-1M one shrinks) and the reserves scale to it, so the quoted number
+        # follows the same resolution instead of a hardcoded 1M.
+        from ouroboros.reviewer_window import (
+            reviewer_context_window,
+            window_scaled_reserves,
+        )
         from ouroboros.tools.review_helpers import calibrated_input_token_limit
         from ouroboros.deep_self_review import (
-            _DEEP_MAX_OUTPUT_TOKENS, _DEEP_MODEL_CONTEXT_WINDOW, _DEEP_OUTPUT_MARGIN_TOKENS,
+            _DEEP_MAX_OUTPUT_TOKENS, _DEEP_OUTPUT_MARGIN_TOKENS,
+        )
+        window = reviewer_context_window("test-model")
+        output_reserve, margin = window_scaled_reserves(
+            window,
+            output_reserve=_DEEP_MAX_OUTPUT_TOKENS,
+            tokenizer_margin=_DEEP_OUTPUT_MARGIN_TOKENS,
         )
         enforced = calibrated_input_token_limit(
             "test-model",
-            context_window=_DEEP_MODEL_CONTEXT_WINDOW,
-            output_reserve=_DEEP_MAX_OUTPUT_TOKENS,
-            tokenizer_margin=_DEEP_OUTPUT_MARGIN_TOKENS,
+            context_window=window,
+            output_reserve=output_reserve,
+            tokenizer_margin=margin,
         )
         assert f"{enforced:,}" in result
         assert usage == {}

@@ -52,8 +52,12 @@ class ContextFitPlan:
     model: str
     provider: str
     route_fp: str
-    evidence_status: str
-    evidence_stale: bool
+    # Named for ``capability_evidence.CapabilityEvidence``, not paraphrased: the plan
+    # is an evidence-shaped record, so ``is_known`` applies to it DIRECTLY instead of
+    # each reader restating the three-clause freshness boolean (the wire keys stay
+    # ``evidence_status`` / ``evidence_stale``).
+    status: str
+    stale: bool
     window_tokens: int
     output_reserve_tokens: int
     user_content_json: str
@@ -100,12 +104,9 @@ class ContextFitPlan:
         return int((projection.estimated_tokens + tool_tokens) * projection.calibration_ratio)
 
     def initial_mode_with_tools(self, tools: Optional[List[Dict[str, Any]]]) -> str:
-        known_window = (
-            self.evidence_status in {"confirmed", "asserted"}
-            and not self.evidence_stale
-            and self.window_tokens > 0
-        )
-        if self.preferred_mode != "max" or not known_window:
+        from ouroboros.capability_evidence import is_known
+
+        if self.preferred_mode != "max" or not is_known(self, require_fresh=True):
             return self.initial_mode
         projected = self.projected_tokens_with_tools("max", tools)
         return (
@@ -341,6 +342,7 @@ def build_context_fit_plan(
     # Keep the fit projection tied to the physical dispatch contract instead of
     # duplicating its output reservation.  The lazy import avoids coupling the
     # data-only fit representation to the high-level model loop.
+    from ouroboros.capability_evidence import is_known
     from ouroboros.loop_llm_call import MAIN_LOOP_MAX_TOKENS
 
     output_reserve = MAIN_LOOP_MAX_TOKENS
@@ -349,11 +351,7 @@ def build_context_fit_plan(
         str(evidence.route_fp or ""),
         str(route["model"] or ""),
     )
-    known_window = (
-        str(evidence.status or "") in {"confirmed", "asserted"}
-        and not bool(evidence.stale)
-        and int(evidence.window_tokens or 0) > 0
-    )
+    known_window = is_known(evidence, require_fresh=True)
 
     def _projection(mode: str) -> ContextFitProjection:
         system_content = _render_context_system_content(env, core, mode=mode)
@@ -411,8 +409,8 @@ def build_context_fit_plan(
         model=str(route["model"] or ""),
         provider=str(route["provider"] or ""),
         route_fp=str(evidence.route_fp or ""),
-        evidence_status=str(evidence.status or ""),
-        evidence_stale=bool(evidence.stale),
+        status=str(evidence.status or ""),
+        stale=bool(evidence.stale),
         window_tokens=int(evidence.window_tokens or 0),
         output_reserve_tokens=output_reserve,
         user_content_json=core.user_content_json,

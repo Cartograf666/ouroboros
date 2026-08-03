@@ -4772,19 +4772,14 @@ def _maybe_downgrade_max_unconfirmed(mode: str, use_local: bool, model: str = ""
     if mode != "max":
         return mode
     try:
-        from ouroboros.capability_evidence import ONE_MILLION
+        from ouroboros.capability_evidence import ONE_MILLION, is_known
         from ouroboros.context import _context_fit_route
 
         _route, evidence = _context_fit_route(
             {"model": model, "use_local_model": use_local},
             allow_fetch=allow_fetch,
         )
-        known = (
-            str(getattr(evidence, "status", "")) in {"confirmed", "asserted"}
-            and not bool(getattr(evidence, "stale", False))
-            and int(getattr(evidence, "window_tokens", 0) or 0) > 0
-        )
-        if known and int(evidence.window_tokens or 0) < ONE_MILLION:
+        if is_known(evidence, require_fresh=True) and int(evidence.window_tokens or 0) < ONE_MILLION:
             log.info(
                 "Exact route evidence reports a sub-1M context window "
                 "(%s tokens, use_local=%s); using the task-local Low projection.",
@@ -4834,6 +4829,7 @@ def _rebind_context_fit_plan(
         raise RuntimeError(
             "CONTEXT_FIT_REBUILD_FAILED: immutable context core is unavailable for route switch"
         )
+    from ouroboros.capability_evidence import is_known
     from ouroboros.context import _context_fit_route
     from ouroboros.context_fit import _failed_route_evidence, _route_calibration_ratio
 
@@ -4856,11 +4852,7 @@ def _rebind_context_fit_plan(
         str(getattr(evidence, "route_fp", "") or ""),
         str(route.get("model") or model),
     )
-    known_window = (
-        str(getattr(evidence, "status", "") or "") in {"confirmed", "asserted"}
-        and not bool(getattr(evidence, "stale", False))
-        and int(getattr(evidence, "window_tokens", 0) or 0) > 0
-    )
+    known_window = is_known(evidence, require_fresh=True)
     window_tokens = int(getattr(evidence, "window_tokens", 0) or 0)
 
     def project(projection: Any) -> Any:
@@ -4887,8 +4879,8 @@ def _rebind_context_fit_plan(
         model=str(route.get("model") or model),
         provider=str(route.get("provider") or ""),
         route_fp=str(getattr(evidence, "route_fp", "") or ""),
-        evidence_status=str(getattr(evidence, "status", "") or ""),
-        evidence_stale=bool(getattr(evidence, "stale", False)),
+        status=str(getattr(evidence, "status", "") or ""),
+        stale=bool(getattr(evidence, "stale", False)),
         window_tokens=window_tokens,
         max_projection=max_projection,
         low_projection=low_projection,
@@ -4918,7 +4910,7 @@ def _rebind_context_fit_plan(
                 "core_sha256": rebound.core_sha256,
                 "preferred_mode": preferred,
                 "effective_mode": mode,
-                "evidence_status": rebound.evidence_status,
+                "evidence_status": rebound.status,
                 "window_tokens": rebound.window_tokens,
                 "projected_prompt_tokens": projected_prompt_tokens,
             },

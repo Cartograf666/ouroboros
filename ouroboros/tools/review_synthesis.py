@@ -617,22 +617,36 @@ def plan_slot_fit_with_identity(models: Any, slot_limits: Any, estimated_tokens:
 def per_slot_input_token_limits(
     models: Any,
     *,
-    context_window: int,
+    context_window: Optional[int] = None,
     output_reserve: int,
     tokenizer_margin: int,
 ) -> Dict[str, int]:
-    """Per-slot calibrated input caps for a prompt fanned across mixed families."""
+    """Per-slot calibrated input caps for a prompt fanned across mixed families.
+
+    ``context_window=None`` (the default) resolves each slot's REAL window from
+    Capability Evidence and scales the reserves to it, so a sub-1M slot gets a
+    fit-sized pack instead of a prompt sized for a window it does not have.
+    An explicit window stays honoured for callers that pin one deliberately."""
+    from ouroboros.reviewer_window import reviewer_context_window, window_scaled_reserves
     from ouroboros.tools.review_helpers import calibrated_input_token_limit
 
-    return {
-        str(model): calibrated_input_token_limit(
-            str(model),
-            context_window=context_window,
-            output_reserve=output_reserve,
-            tokenizer_margin=tokenizer_margin,
+    limits: Dict[str, int] = {}
+    for model in (models or []):
+        window = (
+            int(context_window)
+            if context_window is not None
+            else reviewer_context_window(str(model))
         )
-        for model in (models or [])
-    }
+        slot_output_reserve, slot_margin = window_scaled_reserves(
+            window, output_reserve=output_reserve, tokenizer_margin=tokenizer_margin,
+        )
+        limits[str(model)] = max(0, calibrated_input_token_limit(
+            str(model),
+            context_window=window,
+            output_reserve=slot_output_reserve,
+            tokenizer_margin=slot_margin,
+        ))
+    return limits
 
 
 def parse_plan_review_signal(text: str) -> str:

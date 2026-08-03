@@ -165,6 +165,51 @@ class TestPathGuard:
         ))
         assert "deny" in str(result)
 
+    def test_the_write_fence_returns_a_decision_for_every_shape_of_tool_call(self, tmp_path):
+        """A guard that RAISES delivers no permission decision at all.
+
+        The SDK hands the callback ``request_data.get("input")`` — the CLI's JSON, with
+        no default and no type check — and turns an exception out of the callback into a
+        control-protocol ERROR response, which is not a deny. The write then runs
+        unfenced, so every shape a payload can arrive in must come back as a decision.
+
+        v6.87.43 made ``_resolved()`` strict for exactly this reason and shipped with NO
+        test for it: reverting its source hunk leaves this whole file green while
+        ``Write(file_path=42)`` raises ``TypeError`` out of the callback. Strictness also
+        has to stay strict rather than becoming ``str()`` coercion, which fails OPEN by
+        turning ``42`` or ``[]`` into a relative name inside the working directory.
+        """
+        guard = make_path_guard(str(tmp_path))
+
+        # The VALUE is not a string.
+        for value in (42, True, 3.5, b"/etc/passwd", ["/etc/passwd"], {"a": 1}):
+            result = self._run(guard(
+                {"tool_name": "Write", "tool_input": {"file_path": value}}, "tid-v", None,
+            ))
+            assert "deny" in str(result), f"non-str file_path {value!r} must deny, not raise"
+
+        # The INPUTS are not a mapping — the same defect one level out, and the one the
+        # read twin had already normalised away on its own line while this fence kept
+        # calling `.get` on whatever arrived. Unreadable inputs cannot be confined, and
+        # this fence's contract is that no write leaves cwd, so they deny.
+        for payload in (None, [], "x", 42, ["/etc/passwd"]):
+            result = self._run(guard(
+                {"tool_name": "Write", "tool_input": payload}, "tid-i", None,
+            ))
+            assert "deny" in str(result), f"unreadable tool_input {payload!r} must deny, not raise"
+        assert "deny" in str(self._run(guard({"tool_name": "Write"}, "tid-missing", None)))
+
+        # The PAYLOAD itself is not a mapping: no tool name, so this fence has nothing to
+        # say — but it still has to say it rather than raise.
+        assert self._run(guard(None, "tid-p", None)) == {}
+        assert self._run(guard(["Write"], "tid-p2", None)) == {}
+
+        # An ordinary in-cwd write is still allowed, so none of the above is a blanket deny.
+        assert self._run(guard(
+            {"tool_name": "Write", "tool_input": {"file_path": str(tmp_path / "ok.py")}},
+            "tid-ok", None,
+        )) == {}
+
     def test_applies_external_write_path_blocker(self, tmp_path):
         guard = make_path_guard(
             str(tmp_path),
@@ -360,9 +405,10 @@ class TestSDKAPISurface:
 
     def test_edit_mode_allows_write_tool_for_new_files(self):
         """Edit mode must allow SDK Write for new-file deliverables."""
-        src = self._gateway_source()
-        assert 'allowed_tools=["Read", "Edit", "Write", "Grep", "Glob"]' in src
-        assert 'matcher="Edit|Write|MultiEdit"' in src
+        from ouroboros.gateways.claude_code import EDIT_TOOLS
+
+        assert set(EDIT_TOOLS) == {"Read", "Edit", "Write", "Grep", "Glob"}
+        assert 'matcher="Edit|Write|MultiEdit"' in self._gateway_source()
 
     def test_edit_path_uses_system_prompt_file_when_sdk_supports_it(self, tmp_path):
         """Large governance prompt should be handed to supported SDKs by private temp file."""
@@ -1114,3 +1160,558 @@ class TestVersionTuple:
         from ouroboros.launcher_bootstrap import _version_tuple
         assert _version_tuple("") == (0,)
         assert _version_tuple("garbage") == (0,)
+
+
+# ---------------------------------------------------------------------------
+# Delegated trust surface (v6.87.9): foreign settings/MCP, tool allowlist,
+# read confinement, and accounting for a child that never came back.
+# ---------------------------------------------------------------------------
+
+def _fake_sdk(captured):
+    """Return (FakeOptions, FakeSDKClient) capturing constructed SDK options."""
+
+    class FakeOptions:
+        # Explicit params so the gateway's signature probe sees this SDK's support.
+        def __init__(self, effort=None, tools=None, strict_mcp_config=None, **kwargs):
+            if effort is not None:
+                kwargs["effort"] = effort
+            if tools is not None:
+                kwargs["tools"] = tools
+            if strict_mcp_config is not None:
+                kwargs["strict_mcp_config"] = strict_mcp_config
+            captured.update(kwargs)
+
+    class FakeSDKClient:
+        def __init__(self, options=None):
+            self.options = options
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            return None
+
+        async def receive_response(self):
+            if False:
+                yield None
+
+    return FakeOptions, FakeSDKClient
+
+
+def _run_with_fake_sdk(monkeypatch, coro_factory):
+    """Run a gateway coroutine against a fake SDK and return the SDK options."""
+    import ouroboros.gateways.claude_code as gw
+
+    captured: dict = {}
+    fake_options, fake_client = _fake_sdk(captured)
+    monkeypatch.setattr(gw, "ClaudeAgentOptions", fake_options)
+    monkeypatch.setattr(gw, "ClaudeSDKClient", fake_client)
+    monkeypatch.setattr(gw, "_reserve_sdk_attempt", lambda *a, **k: object())
+    monkeypatch.setattr(gw, "mark_unresolved", lambda *a, **k: None)
+    asyncio.get_event_loop().run_until_complete(coro_factory(gw))
+    return captured
+
+
+class TestDelegatedTrustSurface:
+    """A delegated run must not inherit configuration from the target directory."""
+
+    def _readonly_options(self, monkeypatch, cwd="/tmp"):
+        return _run_with_fake_sdk(monkeypatch, lambda gw: gw._run_readonly_async(
+            "review", cwd=cwd, effort="high", max_budget_usd=1.0,
+        ))
+
+    def _edit_options(self, monkeypatch, cwd="/tmp"):
+        return _run_with_fake_sdk(monkeypatch, lambda gw: gw._run_edit_async(
+            "edit", cwd=cwd, budget=1.0,
+        ))
+
+    @pytest.mark.parametrize("path", ["readonly", "edit"])
+    def test_foreign_settings_and_mcp_config_are_not_loaded(self, monkeypatch, path):
+        options = (
+            self._readonly_options(monkeypatch) if path == "readonly"
+            else self._edit_options(monkeypatch)
+        )
+        # A `.claude/settings.json` / `.mcp.json` in the target directory would
+        # otherwise be loaded and executed (--print skips the trust prompt).
+        assert options["setting_sources"] == []
+        assert options["strict_mcp_config"] is True
+        assert options["mcp_servers"] == {}
+
+    def test_the_floor_sdk_without_strict_mcp_config_still_constructs_options(self, monkeypatch):
+        """claude-agent-sdk 0.1.60 — the requirements floor — has setting_sources,
+        mcp_servers, tools and effort but NO strict_mcp_config field anywhere
+        (verified against the published wheel). Passing it unconditionally made
+        ``ClaudeAgentOptions(**kwargs)`` raise TypeError, killing BOTH delegated
+        paths on a supported install; the param is probed like ``tools`` and
+        ``effort``. Omission is fail-closed: ``setting_sources=[]`` already keeps
+        the project ``.mcp.json`` out, and the allowlist hook denies ``mcp__*``."""
+        import ouroboros.gateways.claude_code as gw
+
+        class FloorOptions:
+            # 0.1.60's relevant signature: explicit fields, no **kwargs escape.
+            def __init__(self, tools=None, allowed_tools=None, disallowed_tools=None,
+                         setting_sources=None, mcp_servers=None, effort=None):
+                self.tools = tools
+
+        monkeypatch.setattr(gw, "ClaudeAgentOptions", FloorOptions)
+        for surface in (gw.READONLY_TOOLS, gw.EDIT_TOOLS):
+            kwargs = gw._tool_surface_kwargs(surface)
+            assert "strict_mcp_config" not in kwargs
+            constructed = FloorOptions(**kwargs)  # unconditional kwarg -> TypeError
+            assert constructed.tools == list(surface)
+
+    def test_readonly_tool_surface_is_closed_and_read_only(self, monkeypatch):
+        from ouroboros.gateways.claude_code import READONLY_TOOLS
+
+        options = self._readonly_options(monkeypatch)
+        assert options["tools"] == list(READONLY_TOOLS)
+        assert options["allowed_tools"] == list(READONLY_TOOLS)
+        for forbidden in ("Agent", "Task", "Bash", "Edit", "Write", "WebFetch"):
+            assert forbidden in options["disallowed_tools"]
+
+    def test_edit_tool_surface_keeps_edits_and_forbids_subagents(self, monkeypatch):
+        from ouroboros.gateways.claude_code import EDIT_TOOLS
+
+        options = self._edit_options(monkeypatch)
+        assert options["tools"] == list(EDIT_TOOLS)
+        for forbidden in ("Agent", "Task", "Bash", "NotebookEdit", "WebFetch"):
+            assert forbidden in options["disallowed_tools"]
+        assert "Edit" not in options["disallowed_tools"]
+        assert "Write" not in options["disallowed_tools"]
+
+    @pytest.mark.parametrize("path", ["readonly", "edit"])
+    def test_both_paths_install_pretooluse_guards(self, monkeypatch, path):
+        options = (
+            self._readonly_options(monkeypatch) if path == "readonly"
+            else self._edit_options(monkeypatch)
+        )
+        assert len(options["hooks"]["PreToolUse"]) >= 2
+
+
+class TestToolAllowlistGuard:
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    @pytest.mark.parametrize("tool", ["Agent", "Task", "WebFetch", "mcp__foreign__exfiltrate"])
+    def test_denies_everything_outside_the_allowlist(self, tool):
+        guard = make_readonly_guard()
+        result = self._run(guard({"tool_name": tool, "tool_input": {}}, "tid", None))
+        assert "deny" in str(result)
+
+    def test_edit_surface_allows_its_own_tools_only(self):
+        from ouroboros.gateways.claude_code import EDIT_TOOLS, make_tool_allowlist_guard
+
+        guard = make_tool_allowlist_guard(EDIT_TOOLS)
+        assert self._run(guard({"tool_name": "Write", "tool_input": {}}, "t", None)) == {}
+        assert "deny" in str(self._run(guard({"tool_name": "Agent", "tool_input": {}}, "t", None)))
+
+
+class TestReadGuard:
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def _guard(self, tmp_path):
+        from ouroboros.gateways.claude_code import make_read_guard
+        return make_read_guard(str(tmp_path))
+
+    def test_allows_read_inside_workspace(self, tmp_path):
+        guard = self._guard(tmp_path)
+        inside = tmp_path / "notes.md"
+        inside.write_text("x", encoding="utf-8")
+        assert self._run(guard(
+            {"tool_name": "Read", "tool_input": {"file_path": str(inside)}}, "t", None,
+        )) == {}
+        assert self._run(guard(
+            {"tool_name": "Grep", "tool_input": {"pattern": "x"}}, "t", None,
+        )) == {}
+
+    def test_blocks_absolute_read_outside_workspace(self, tmp_path):
+        guard = self._guard(tmp_path)
+        result = self._run(guard(
+            {"tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}}, "t", None,
+        ))
+        assert "deny" in str(result)
+
+    def test_blocks_relative_escape_and_symlink_escape(self, tmp_path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        secret = tmp_path / "secret.txt"
+        secret.write_text("s", encoding="utf-8")
+        (workspace / "link").symlink_to(secret)
+        guard = self._guard(workspace)
+        assert "deny" in str(self._run(guard(
+            {"tool_name": "Read", "tool_input": {"file_path": "../secret.txt"}}, "t", None,
+        )))
+        assert "deny" in str(self._run(guard(
+            {"tool_name": "Read", "tool_input": {"file_path": "link"}}, "t", None,
+        )))
+
+    def test_blocks_grep_and_glob_roots_outside_workspace(self, tmp_path):
+        guard = self._guard(tmp_path)
+        for tool in ("Grep", "Glob"):
+            result = self._run(guard(
+                {"tool_name": tool, "tool_input": {"path": "/"}}, "t", None,
+            ))
+            assert "deny" in str(result), tool
+
+    def test_edit_mode_keeps_the_enclosing_repo_readable(self, tmp_path):
+        """Writes stay in the work dir; the surrounding project stays readable."""
+        from ouroboros.gateways.claude_code import make_read_guard
+
+        repo = tmp_path / "repo"
+        work = repo / "sub"
+        work.mkdir(parents=True)
+        (repo / "BIBLE.md").write_text("b", encoding="utf-8")
+        guard = make_read_guard(str(work), extra_roots=(str(repo),))
+        assert self._run(guard(
+            {"tool_name": "Read", "tool_input": {"file_path": str(repo / "BIBLE.md")}}, "t", None,
+        )) == {}
+        assert "deny" in str(self._run(guard(
+            {"tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "elsewhere.txt")}}, "t", None,
+        )))
+
+    def test_confines_by_value_not_by_an_enumerated_field_name(self, tmp_path):
+        """An enumerated field allowlist is the same structurally-incomplete shape this
+        module already rejects for tool NAMES: a call whose only path rides a field
+        nobody listed never entered the loop and was allowed by default.
+
+        `Glob` carries its path in `pattern` and can omit `path` entirely, so
+        `Glob(pattern="/Users/x/.ssh/*")` read outside the workspace unchallenged.
+        """
+        from ouroboros.gateways.claude_code import make_read_guard
+
+        guard = make_read_guard(str(tmp_path))
+        # `~` is expanded before the absolute test — in `_resolved`, which owns every
+        # step of turning a value into a path. Untreated it reads as relative, gets
+        # joined onto the workspace root, and is allowed — this was the fix's own
+        # docstring example, asserted in prose and passing in practice.
+        for tilde in ("~/.ssh/id_rsa", "~/.aws/credentials"):
+            assert self._run(guard({"tool_name": "Read",
+                                    "tool_input": {"file_path": tilde}}, "t", None)), tilde
+
+        # Containers are walked recursively: a path one level down is still a path.
+        for nested in ({"opts": {"path": "/etc/passwd"}}, {"paths": [["/etc/passwd"]]}):
+            assert self._run(guard({"tool_name": "Glob", "tool_input": nested}, "t", None)), nested
+
+        # `pattern` is a glob for Glob but a REGEX for Grep. Path-checking the regex
+        # denied an ordinary search for a string literal.
+        assert self._run(guard({"tool_name": "Grep",
+                                "tool_input": {"pattern": "/api/v1/users"}}, "t", None)) == {}
+
+        for field in ("pattern", "glob", "a_field_a_future_cli_adds"):
+            out = self._run(guard({"tool_name": "Glob",
+                                   "tool_input": {field: "/etc/ssh/ssh_config"}}, "t", None))
+            assert out, f"{field} escaped the read fence"
+            assert "blocked" in str(out).lower()
+
+        # A list-valued field is checked element by element.
+        out = self._run(guard({"tool_name": "Grep",
+                               "tool_input": {"paths": [str(tmp_path), "/etc/hosts"]}}, "t", None))
+        assert out, "a path inside a list escaped the read fence"
+
+        # An unresolvable path denies, whatever makes it unresolvable, and on BOTH
+        # fences. Each earlier widening stopped one exception short of the case the
+        # guard advertised: `OSError` alone missed an embedded null (`ValueError`, legal
+        # in a JSON string), and adding `ValueError` still missed a symlink loop
+        # (`RuntimeError`). A guard that raises out of the PreToolUse callback delivers
+        # no decision at all, which is the one outcome a fence must never produce.
+        import os as _os
+
+        from ouroboros.gateways.claude_code import make_path_guard
+
+        _os.symlink(tmp_path / "loop_b", tmp_path / "loop_a")
+        _os.symlink(tmp_path / "loop_a", tmp_path / "loop_b")
+        write_fence = make_path_guard(str(tmp_path))
+        for bad in ("/etc/passwd\x00", str(tmp_path / "loop_a" / "x")):
+            assert self._run(guard({"tool_name": "Read",
+                                    "tool_input": {"file_path": bad}}, "t", None)), bad
+            assert self._run(write_fence({"tool_name": "Write",
+                                          "tool_input": {"file_path": bad}}, "t", None)), bad
+
+        # In-workspace values still pass, whatever they are called.
+        inside = tmp_path / "a.txt"
+        inside.write_text("x")
+        assert self._run(guard({"tool_name": "Glob",
+                                "tool_input": {"pattern": str(inside)}}, "t", None)) == {}
+
+    def test_both_fences_judge_the_path_the_cli_will_actually_open(self, tmp_path):
+        """A fence must resolve a value the way its CONSUMER resolves it.
+
+        The CLI funnels every tool path through one helper that TRIMS the value and then
+        expands a leading ``~``. `_resolved` did neither, and both omissions fail OPEN
+        the same way: `pathlib` calls anything not starting with a separator relative and
+        joins it onto the workspace, so `" /etc/passwd"` was confined to
+        `<cwd>/ /etc/passwd` and `"~/.ssh/x"` to `<cwd>/~/.ssh/x` while the tool opened
+        `/etc/passwd` and `$HOME/.ssh/x`.
+
+        The trim gap is reachable END TO END, verified against the real CLI: `Grep`/`Glob`
+        hand the hook their `path` verbatim (only `Read`/`Write`/`Edit` pre-normalise
+        `file_path` before hooks run), and `Grep(path=" /outside")` returned a file from
+        outside the read root. The `~` gap is the sprint's twin shape — the read fence had
+        bought it back one layer up in `_path_like_values`, so only the WRITE fence was
+        still exposed, and nothing asked whether the twin needed the same.
+
+        Both are one predicate's question, so both are asserted on BOTH fences.
+        """
+        from ouroboros.gateways.claude_code import make_path_guard
+
+        read_fence = self._guard(tmp_path)
+        write_fence = make_path_guard(str(tmp_path))
+
+        escapes = (
+            "~/.ssh/authorized_keys",   # `~` expansion, the write twin's live gap
+            "~",                        # bare `~` is $HOME, and has no separator in it
+            " /etc/passwd",             # leading space, reproduced end to end via Grep
+            "\t/etc/passwd",            # `trim()` is not just the space character
+            "　/etc/passwd",        # ...nor just the ASCII ones
+            "﻿/etc/passwd",        # ...and JS trims the BOM where `str.strip` does not
+        )
+        for value in escapes:
+            assert self._run(read_fence(
+                {"tool_name": "Read", "tool_input": {"file_path": value}}, "t", None,
+            )), f"read fence allowed {value!r}"
+            assert self._run(read_fence(
+                {"tool_name": "Grep", "tool_input": {"pattern": "x", "path": value}}, "t", None,
+            )), f"read fence allowed Grep(path={value!r})"
+            assert self._run(write_fence(
+                {"tool_name": "Write", "tool_input": {"file_path": value}}, "t", None,
+            )), f"write fence allowed {value!r}"
+
+        # A `~` value has the shape of a path with no separator in it, so the walker has
+        # to catch it by NAME now that it no longer expands on the way past.
+        assert self._run(read_fence(
+            {"tool_name": "Glob", "tool_input": {"a_field_a_future_cli_adds": "~"}}, "t", None,
+        )), "a bare ~ in an unlisted field escaped the read fence"
+
+        # ...and the walker yields the value VERBATIM, which is the half of this change
+        # nothing else would catch: moving the expansion into `_resolved` while leaving
+        # `_path_like_values` expanding on the way past denies every case above just the
+        # same, so only the WORDS of the deny separate the two. They are worth pinning
+        # on their own terms — the reason is what the delegated agent reads, and quoting
+        # a rewritten path both hides which value was rejected and hands the child the
+        # operator's real home directory, which it was never shown and cannot resolve.
+        reason = str(self._run(read_fence(
+            {"tool_name": "Read", "tool_input": {"file_path": "~/.ssh/authorized_keys"}},
+            "t", None,
+        )))
+        assert "'~/.ssh/authorized_keys'" in reason, reason
+        assert f"{pathlib.Path.home()}/.ssh/authorized_keys" not in reason, reason
+
+        # The expansion joins by TEXT for a reason: `Path.home() / "/etc/passwd"` throws
+        # the home prefix away and answers `/etc/passwd`, so a `~/` value with an
+        # absolute tail would stop meaning what the consumer's own substitution means.
+        # Both spellings deny here, so only the resolved path itself shows the difference.
+        from ouroboros.gateways.claude_code import _resolved
+
+        under_home = _resolved("~//etc/passwd", tmp_path)
+        assert under_home != pathlib.Path("/etc/passwd")
+        assert str(under_home).startswith(str(pathlib.Path.home())), under_home
+
+        # Not a blanket deny, and not stricter than the consumer either: the CLI expands
+        # only `~` and `~/`, so `~notauser/x` stays RELATIVE for the tool and the fence
+        # has to agree rather than guess at a home directory the tool will never use.
+        (tmp_path / "sub").mkdir(exist_ok=True)
+        for ok in ("ok.py", "sub/ok.py", " ok.py", "./ok.py", "~notauser/x"):
+            assert self._run(read_fence(
+                {"tool_name": "Read", "tool_input": {"file_path": ok}}, "t", None,
+            )) == {}, f"read fence denied in-workspace {ok!r}"
+            assert self._run(write_fence(
+                {"tool_name": "Write", "tool_input": {"file_path": ok}}, "t", None,
+            )) == {}, f"write fence denied in-workspace {ok!r}"
+
+    def test_read_fence_and_allowlist_decide_on_a_payload_that_is_not_a_dict(self, tmp_path):
+        """The payload is a dict by CONVENTION: the SDK forwards the CLI's JSON with no
+        default and no type check, and an exception out of a PreToolUse callback is an
+        error response, not a deny. Every guard must answer, never raise."""
+        from ouroboros.gateways.claude_code import make_tool_allowlist_guard
+
+        guard = self._guard(tmp_path)
+        allowlist = make_tool_allowlist_guard(("Read",))
+        for payload in (None, [], "x", 42):
+            assert isinstance(self._run(guard(payload, "t", None)), dict)
+            assert "deny" in str(self._run(allowlist(payload, "t", None))), payload
+
+        # And the inputs are still path-checked AS THEY ARRIVE. Normalising a non-dict to
+        # `{}` would drop a bare-string payload out of the fence entirely.
+        assert "deny" in str(self._run(guard(
+            {"tool_name": "Read", "tool_input": "/etc/passwd"}, "t", None,
+        )))
+
+class TestAbandonedChildAccounting:
+    """A killed advisory child must not keep its reservation open forever."""
+
+    def test_control_lines_are_split_from_child_output(self):
+        import ouroboros.gateways.claude_code as gw
+
+        stdout = (
+            f'{gw._CHILD_ATTEMPT_LINE}{{"attempt_id": "a1", "drive_root": "/d"}}\n'
+            f'{gw._CHILD_USAGE_LINE}{{"prompt_tokens": 10}}\n'
+            f'{gw._CHILD_USAGE_LINE}{{"prompt_tokens": 30}}\n'
+            '{"success": true}\n'
+        )
+        attempt, usage, plain = gw._parse_child_stdout(stdout)
+        assert attempt["attempt_id"] == "a1"
+        assert usage == {"prompt_tokens": 30}  # the LAST checkpoint wins
+        assert plain.strip() == '{"success": true}'
+
+    def test_timeout_settles_the_reservation_the_child_could_not_close(self, monkeypatch, tmp_path):
+        import subprocess as sp
+        import ouroboros.gateways.claude_code as gw
+        import ouroboros.platform_layer as platform
+        import ouroboros.usage_accounting as ua
+
+        settled: dict = {}
+
+        class FakeProc:
+            returncode = -9
+            pid = 4242
+
+            def __init__(self):
+                self.calls = 0
+
+            def communicate(self, input=None, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise sp.TimeoutExpired(cmd="claude", timeout=timeout or 1)
+                return (
+                    f'{gw._CHILD_ATTEMPT_LINE}{{"attempt_id": "a1", "drive_root": "{tmp_path}",'
+                    ' "model": "claude", "provider": "anthropic",'
+                    ' "reservation_upper_bound_usd": 7.5}\n'
+                    f'{gw._CHILD_USAGE_LINE}{{"prompt_tokens": 900, "completion_tokens": 10}}\n',
+                    "killed",
+                )
+
+        def fake_terminalize(reservation, *, reason, usage=None):
+            settled["attempt_id"] = reservation.attempt_id
+            settled["bound"] = reservation.reservation_upper_bound_usd
+            settled["usage"] = usage
+            settled["reason"] = reason
+            return "settled"
+
+        popen_kwargs: dict = {}
+
+        def fake_popen(*args, **kwargs):
+            popen_kwargs.update(kwargs)
+            return FakeProc()
+
+        monkeypatch.delenv("OUROBOROS_CLAUDE_READONLY_CHILD", raising=False)
+        monkeypatch.setattr(gw.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(platform, "kill_process_tree", lambda proc: None)
+        monkeypatch.setattr(ua, "terminalize_abandoned_attempt", fake_terminalize)
+
+        result = gw.run_readonly("review this", cwd=str(tmp_path))
+
+        assert result.success is False
+        assert "timed out" in result.error
+        assert settled["attempt_id"] == "a1"
+        assert settled["bound"] == 7.5
+        assert settled["usage"] == {"prompt_tokens": 900, "completion_tokens": 10}
+        # Control lines are accounting transport, never review output.
+        assert gw._CHILD_ATTEMPT_LINE not in result.stderr_tail
+        # The spawn env must carry the child-mode marker: it is the only thing
+        # that makes the child emit the attempt/usage lines this settlement
+        # consumed. Both halves were tested separately; this pins the LINK.
+        assert popen_kwargs["env"]["OUROBOROS_CLAUDE_READONLY_CHILD"] == "1"
+
+    def test_child_emits_attempt_and_usage_lines_only_in_child_mode(self, monkeypatch, capsys):
+        import ouroboros.gateways.claude_code as gw
+
+        monkeypatch.delenv("OUROBOROS_CLAUDE_READONLY_CHILD", raising=False)
+        gw._emit_child_control(gw._CHILD_USAGE_LINE, {"prompt_tokens": 1})
+        assert capsys.readouterr().out == ""
+
+        monkeypatch.setenv("OUROBOROS_CLAUDE_READONLY_CHILD", "1")
+        gw._emit_child_control(gw._CHILD_USAGE_LINE, {"prompt_tokens": 1})
+        assert capsys.readouterr().out.startswith(gw._CHILD_USAGE_LINE)
+
+    def test_running_usage_totals_accumulate_across_turns(self):
+        import ouroboros.gateways.claude_code as gw
+
+        totals: dict = {}
+        gw._accumulate_usage(totals, {"input_tokens": 100, "output_tokens": 10})
+        gw._accumulate_usage(totals, {"input_tokens": 50, "output_tokens": 5})
+        assert totals["prompt_tokens"] == 150
+        assert totals["completion_tokens"] == 15
+
+
+
+class TestResultMessageIsErrorHonored:
+    """The CLI reports hard API failures (a disabled org key, connection death)
+    as ``subtype="success"`` with ``is_error=True`` and the error text in
+    ``result``. Ignoring ``is_error`` made the advisory layer parse the error
+    text as a checklist, pay a fallback-extraction call on it, and record
+    ``parse_failure`` — hiding the real cause (observed live: attempts 5/6 of
+    the external-review gate against a disabled Anthropic organization)."""
+
+    def _fake_client(self, fake_result):
+        class FakeSDKClient:
+            def __init__(self, options=None):
+                self.options = options
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def query(self, prompt):
+                return None
+
+            async def receive_response(self):
+                yield fake_result
+
+        return FakeSDKClient
+
+    def _run(self, runner, fake_result, tmp_path, **kwargs):
+        import asyncio
+        from unittest.mock import patch
+
+        import ouroboros.gateways.claude_code as gw
+
+        with patch("ouroboros.gateways.claude_code.ClaudeAgentOptions", lambda **kw: None), \
+             patch("ouroboros.gateways.claude_code.ClaudeSDKClient", self._fake_client(fake_result)), \
+             patch("ouroboros.gateways.claude_code.ResultMessage", type(fake_result)):
+            return asyncio.get_event_loop().run_until_complete(
+                runner("prompt", cwd=str(tmp_path), **kwargs)
+            )
+
+    def test_is_error_fails_both_paths_and_carries_the_cli_text(self, tmp_path):
+        import ouroboros.gateways.claude_code as gw
+
+        class FakeErrorResult:
+            subtype = "success"
+            is_error = True
+            result = "API Error: 400 The socket connection was closed unexpectedly."
+            session_id = "sid"
+            total_cost_usd = 0
+            usage = {}
+
+        for runner, kwargs in (
+            (gw._run_edit_async, {"budget": 1.0}),
+            (gw._run_readonly_async, {"max_budget_usd": 1.0}),
+        ):
+            out = self._run(runner, FakeErrorResult(), tmp_path, **kwargs)
+            assert out.success is False, runner.__name__
+            assert "is_error=true" in out.error, runner.__name__
+            assert "socket connection was closed" in out.error, runner.__name__
+
+    def test_a_clean_success_still_passes_both_paths(self, tmp_path):
+        import ouroboros.gateways.claude_code as gw
+
+        class FakeCleanResult:
+            subtype = "success"
+            is_error = False
+            result = "done"
+            session_id = "sid"
+            total_cost_usd = 0
+            usage = {}
+
+        for runner, kwargs in (
+            (gw._run_edit_async, {"budget": 1.0}),
+            (gw._run_readonly_async, {"max_budget_usd": 1.0}),
+        ):
+            out = self._run(runner, FakeCleanResult(), tmp_path, **kwargs)
+            assert out.success is True, runner.__name__

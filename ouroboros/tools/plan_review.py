@@ -1222,7 +1222,7 @@ async def _run_plan_review_async(
             return "ERROR: No review models configured. Set OUROBOROS_REVIEW_MODELS in settings."
         models = _get_review_models()
         slot_limits = _per_slot_input_token_limits(
-            models, context_window=1_000_000, output_reserve=_PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000)
+            models, output_reserve=_PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000)
         plan_budget_limit = _quorum_input_token_limit(models, slot_limits)  # quorum, not the smallest window
 
     if deadline_blocked:

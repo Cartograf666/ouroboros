@@ -531,6 +531,11 @@ def _max_context_block(settings: Dict[str, Any], *, allow_generative: bool = Fal
         ev = probe(DATA_DIR, provider=route["provider"], model=route["model"],
                    base_url=route["base_url"], use_local=route["use_local"], allow_fetch=True,
                    allow_generative=allow_generative, api_key=compatible_api_key)
+        # Deliberately NOT require_fresh: this gate would DOWNGRADE the owner's own
+        # cognitive horizon, and this module's standing invariant is that a provider
+        # blip must never erase a prior confirmed record (P4/P1). The opposite policy
+        # applies where evidence AUTHORIZES rather than restricts — see
+        # `_review_capability_notices` and the scope-review blocking floor.
         if confirms_at_least(ev, ONE_MILLION):
             return None
         win = int(ev.window_tokens or 0)
@@ -675,7 +680,12 @@ def _review_capability_notices(settings: Dict[str, Any]) -> list:
                 base_url=route["base_url"], use_local=route["use_local"],
                 allow_fetch=True, allow_generative=False,
             )
-            if not confirms_at_least(ev, ONE_MILLION):
+            # SAME freshness policy the scope gate applies at review time
+            # (`reviewer_window.ReviewerWindow.blocking_authority_allowed`): an expired
+            # or outage-carried record will NOT authorise a blocking verdict, so the
+            # owner must be offered the ack now rather than told the slot is fine and
+            # then blocked at commit time by the twin check.
+            if not confirms_at_least(ev, ONE_MILLION, require_fresh=True):
                 notices.append({
                     "surface": "scope_review",
                     "needs_ack": {**route, "route_fp": ev.route_fp, "evidence": ev.to_json()},
@@ -713,7 +723,7 @@ def _active_route_confirms_max(
     stampeding. Unknown is deliberately distinct from confirmed sub-1M so the
     ordinary task path may attempt Max once and react only to real overflow."""
     try:
-        from ouroboros.capability_evidence import ONE_MILLION, probe
+        from ouroboros.capability_evidence import ONE_MILLION, is_known, probe
         from ouroboros.config import DATA_DIR
 
         s = settings if isinstance(settings, dict) else _owner_read_settings_raw()
@@ -722,12 +732,9 @@ def _active_route_confirms_max(
             DATA_DIR, provider=route["provider"], model=route["model"],
             base_url=route["base_url"], use_local=route["use_local"], allow_fetch=allow_fetch,
         )
-        known = (
-            str(getattr(ev, "status", "") or "") in {"confirmed", "asserted"}
-            and not bool(getattr(ev, "stale", False))
-            and int(getattr(ev, "window_tokens", 0) or 0) > 0
-        )
-        if not known:
+        # The known-ness predicate is OWNED by capability_evidence; restating it here
+        # is how the freshness half of it drifted away from the other call sites.
+        if not is_known(ev, require_fresh=True):
             return None
         return int(ev.window_tokens or 0) >= ONE_MILLION
     except Exception:

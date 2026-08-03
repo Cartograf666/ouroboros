@@ -109,6 +109,11 @@ _SCOPE_INPUT_TOKEN_LIMIT = min(
 # whole process and no observation could ever reach it. The calibration shrinks the
 # PROMPT for the same pinned reviewer — never the reviewer model or the >=1M window
 # floor (BIBLE P3).
+from ouroboros.reviewer_window import (
+    ReviewerWindow,
+    resolve_reviewer_window as _resolve_reviewer_window,
+    window_scaled_reserves as _shared_window_scaled_reserves,
+)
 from ouroboros.tools.review_helpers import (
     calibrated_input_token_limit as _calibrated_input_token_limit,
 )
@@ -116,23 +121,19 @@ from ouroboros.tools.review_helpers import (
 # Window provenance vocabulary shared with the diagnostics wording (RS5).
 _WINDOW_CONFIRMED = "confirmed"
 _WINDOW_ASSERTED = "asserted"
+_WINDOW_STALE = "stale_unverifiable"
 _WINDOW_UNKNOWN = "unknown_conservative"
 _WINDOW_SENTINEL = "designated_default_sentinel"
 
-# ROUTE FINGERPRINTS whose metadata window was already lazily probed in this process.
-# The lazy probe exists for an OFF-DEFAULT env-only pin, whose route otherwise never
-# reaches a fetching probe call site (the Max-context gate only probes the MAIN route),
-# so the pin was structurally condemned to the conservative sub-floor window.
-#
-# Keyed by the full ROUTE fingerprint, not the model name: capability is a property of
-# provider+base_url+model, and evidence is stored under that same fingerprint. Keyed by
-# model alone, a hot `OPENAI_BASE_URL` / `OPENAI_COMPATIBLE_BASE_URL` /
-# `CLOUDRU_FOUNDATION_MODELS_BASE_URL` / `GIGACHAT_BASE_URL` change produced a route with
-# no evidence and NO second probe, so the next scope review silently fell to the
-# conservative sub-floor and the advertised owner-ack path was unreachable.
-_LAZY_WINDOW_PROBED: set = set()
-# (model, resolved_window) -> provenance label, memoised by the window resolver.
-_WINDOW_PROVENANCE: dict = {}
+# The metadata probe lives with the shared window resolver (`reviewer_window`) and is
+# rate-limited by the TTL on the evidence record, keyed by the full ROUTE fingerprint
+# rather than the model name: capability is a property of provider+base_url+model, and
+# a hot base-URL change must get its own probe rather than silently reusing the old
+# verdict. EVERY scope route gets that probe, the shipped default included: the probe is
+# now the only path to blocking authority, so exempting the default (as the sentinel-era
+# code did) left the one route that gates commits structurally unable to source its
+# window — and rate-limiting it per PROCESS instead of per TTL left an install that
+# outlived the TTL unable to RE-source it (v6.87.45).
 
 
 def _scope_review_skipped_in_low_context() -> bool:
@@ -154,7 +155,12 @@ def _scope_review_skipped_in_low_context() -> bool:
 
 def _is_designated_default_reviewer(model: str) -> bool:
     """True iff ``model`` is the shipped default reviewer (``openai/gpt-5.6-terra``),
-    across provider spellings (``openai::gpt-5.6-terra``, ``openrouter::openai/...``)."""
+    across provider spellings (``openai::gpt-5.6-terra``, ``openrouter::openai/...``).
+
+    SIZING only. This answers "how big a pack may I assemble for an unevidenced
+    route", never "may this reviewer block a commit": authority is computed from
+    Capability Evidence (``ReviewerWindow.blocking_authority_allowed``) and a model
+    acquires none of it from its name."""
     def _normalized(m: str) -> str:
         text = str(m or "").strip()
         if text.startswith("openrouter::"):
@@ -167,98 +173,77 @@ def _is_designated_default_reviewer(model: str) -> bool:
     return bool(model) and _normalized(model) == _normalized(_SCOPE_MODEL_DEFAULT)
 
 
-def _scope_reviewer_window(model: str) -> int:
-    """Reviewer context window (tokens) from Capability Evidence, FAIL-CLOSED on
-    absent evidence. Replaces the deleted static per-model window table: a
-    confirmed/asserted probe (provider metadata or owner-ack) for the reviewer's REAL
-    active route gives the real window. With NO evidence, the 1M blocking-floor
-    sentinel is granted ONLY to the SHIPPED designated reviewer (gpt-5.6-terra, a real
-    >=1M-window model — 1.05M per OpenRouter /models metadata, checked 2026-07-29);
-    any other no-evidence reviewer returns a conservative sub-floor
-    window so the P3 authority check downgrades it (visibly) instead of silently
-    treating a 200K model as 1M and overflowing its real window into a provider 400
-    (the v6.46.0 scope-discard bug). A non-default >=1M reviewer must be owner-acked
-    to regain 1M — the fact of a PIN is routing intent, never evidence.
+def _scope_window(model: str) -> ReviewerWindow:
+    """The scope reviewer's window AND its blocking authority, as ONE typed result.
 
-    An off-default pin gets ONE lazy metadata-only probe per process (never
-    generative, never a paid call): without it the pin's route reached no fetching
-    probe call site at all, so the owner's pin could not become "known" through any
-    path. Afterwards the cache answers and the path stays hot-path safe. Provenance
-    for the resolved number is memoised for the diagnostics wording."""
+    Replaces the deleted static per-model window table: a confirmed/asserted probe
+    (provider metadata or owner-ack) for the reviewer's REAL active route gives the
+    real window, and only such SOURCED, non-stale, >=1M evidence carries blocking
+    authority (BIBLE P3 — "a reviewer whose window cannot be established by sourced
+    Capability Evidence is treated as too small rather than assumed adequate").
+
+    With NO evidence the result still carries a SIZING number so the review is
+    dispatched rather than declined before it starts — the 1M figure for the shipped
+    designated reviewer, a conservative sub-floor for anything else, matching what
+    each can plausibly hold. Neither carries a KNOWN status, so neither can authorise:
+    the sentinel sizes a prompt, it does not sign a verdict. That split is why this
+    returns the whole record instead of a bare int — a number alone cannot say where
+    it came from, and the caller that needs to know then guesses.
+
+    Every route gets one lazy metadata-only fetch per evidence-TTL period (never
+    generative, never a paid call), concurrent resolutions of the same route
+    serialized by the per-route lock; inside the TTL the cache answers and the path
+    stays hot-path safe. How often the network is re-asked is owned by
+    ``capability_evidence.probe``'s record TTL, deliberately NOT by the process
+    lifetime (v6.87.45: a per-process memo outlived the 24h record and wedged
+    every commit once an install stayed up past the TTL)."""
     model = str(model or "")
     try:
-        from ouroboros.capability_evidence import probe, route_fingerprint
-        from ouroboros.config import DATA_DIR, load_settings
-        from ouroboros.provider_models import provider_for_model
-        settings = load_settings()
-        provider = provider_for_model(model)
-        base_url = ""
-        if provider == "openai":
-            base_url = str(settings.get("OPENAI_BASE_URL") or "")
-        elif provider == "openai-compatible":
-            base_url = str(settings.get("OPENAI_COMPATIBLE_BASE_URL") or "")
-        elif provider == "cloudru":
-            base_url = str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "")
-        elif provider == "gigachat":
-            base_url = str(settings.get("GIGACHAT_BASE_URL") or "")
         # Probe the scope slot, not the active main route (which honors USE_LOCAL_MAIN).
-        use_local = review_model_uses_local(model)
-        route_fp = route_fingerprint(
-            provider="local" if use_local else provider, base_url=base_url, model=model,
-        )
-        lazy = route_fp not in _LAZY_WINDOW_PROBED and not _is_designated_default_reviewer(model)
-        if lazy:
-            _LAZY_WINDOW_PROBED.add(route_fp)
-        ev = probe(
-            DATA_DIR,
-            provider="local" if use_local else provider,
-            model=model,
-            base_url=base_url,
-            use_local=use_local,
-            allow_fetch=bool(lazy),
-        )
-        if int(ev.window_tokens or 0) > 0:
-            window = int(ev.window_tokens)
-            _WINDOW_PROVENANCE[(model, window)] = (
-                _WINDOW_ASSERTED
-                if str(getattr(ev, "status", "") or "") == "asserted"
-                else _WINDOW_CONFIRMED
-            )
-            return window
+        resolved = _resolve_reviewer_window(model, use_local=review_model_uses_local(model))
+        if int(resolved.window_tokens) > 0:
+            return resolved
     except Exception:
         pass
-    if _is_designated_default_reviewer(model):
-        _WINDOW_PROVENANCE[(model, _SCOPE_MODEL_CONTEXT_WINDOW)] = _WINDOW_SENTINEL
-        return _SCOPE_MODEL_CONTEXT_WINDOW
-    _WINDOW_PROVENANCE[(model, _SCOPE_FAILCLOSED_WINDOW)] = _WINDOW_UNKNOWN
-    return _SCOPE_FAILCLOSED_WINDOW
-
-
-def _scope_reviewer_window_evidence(model: str) -> tuple:
-    """``(window_tokens, provenance)``.
-
-    Deliberately LAYERED over ``_scope_reviewer_window`` rather than replacing it: that
-    function is the single window seam every caller already uses, and a number supplied
-    by a substituted seam must still get an honest — if coarser — provenance label
-    instead of a fabricated "confirmed"."""
-    window = _scope_reviewer_window(model)
-    memoised = _WINDOW_PROVENANCE.get((str(model or ""), int(window)))
-    if memoised:
-        return window, memoised
-    return window, (
-        _WINDOW_SENTINEL if int(window) >= _SCOPE_MODEL_CONTEXT_WINDOW else _WINDOW_UNKNOWN
+    return ReviewerWindow(
+        window_tokens=(
+            _SCOPE_MODEL_CONTEXT_WINDOW if _is_designated_default_reviewer(model)
+            else _SCOPE_FAILCLOSED_WINDOW
+        ),
+        model=model,
     )
 
 
-def _window_provenance_phrase(window: int, provenance: str) -> str:
-    """Honest four-way wording for a reviewer window (RS5).
+def _scope_window_provenance(window: ReviewerWindow) -> str:
+    """Provenance label for the diagnostics wording (RS5)."""
+    if window.stale:
+        return _WINDOW_STALE
+    if window.status == "asserted":
+        return _WINDOW_ASSERTED
+    if window.status == "confirmed":
+        return _WINDOW_CONFIRMED
+    if int(window.window_tokens) >= _SCOPE_MODEL_CONTEXT_WINDOW:
+        return _WINDOW_SENTINEL
+    return _WINDOW_UNKNOWN
+
+
+def _window_provenance_phrase(window: int, provenance: str, observed_at: str = "") -> str:
+    """Honest five-way wording for a reviewer window (RS5).
 
     The old single phrasing called every sub-1M window "known", which read as a
-    measured fact even when it was the conservative fallback for an unprobed route."""
+    measured fact even when it was the conservative fallback for an unprobed route;
+    the stale wording exists because an expired record used to be indistinguishable
+    from a live reading in every message the owner ever saw. ``observed_at`` dates the
+    expired reading, which is the difference between "the provider blipped an hour ago"
+    and "this route has been dead for a week" — the only two situations that produce
+    identical wording otherwise (BIBLE P1, provenance)."""
     if provenance == _WINDOW_CONFIRMED:
         return f"confirmed {window}-token window"
     if provenance == _WINDOW_ASSERTED:
         return f"owner-asserted {window}-token window"
+    if provenance == _WINDOW_STALE:
+        dated = f", last confirmed {observed_at}" if observed_at else ""
+        return f"EXPIRED, unverifiable {window}-token window{dated}"
     if provenance == _WINDOW_SENTINEL:
         return f"designated-default {window}-token sentinel window"
     return f"unknown window, conservatively treated as {window} tokens"
@@ -294,18 +279,21 @@ def _low_context_skip_result(scope_model: str) -> "ScopeReviewResult":
     )
 
 
-def _scope_sub_floor_finding(scope_model: str, window: int, provenance: str = _WINDOW_UNKNOWN) -> dict:
+def _scope_sub_floor_finding(
+    scope_model: str, window: int, provenance: str = _WINDOW_UNKNOWN, observed_at: str = "",
+) -> dict:
     return {
         "verdict": "FAIL",
         "severity": "advisory",
         "item": "scope_review_sub_floor",
         "reason": (
             f"⚠️ SCOPE_REVIEW_SUB_FLOOR: scope reviewer {scope_model} resolves to a "
-            f"{_window_provenance_phrase(window, provenance)} for authority purposes, "
-            "below the >=1M blocking scope floor (BIBLE P3). Its findings are "
-            "ADVISORY-ONLY and cannot satisfy the blocking scope gate; configure a "
-            ">=1M-window scope model, or owner-ack this route's window, to restore "
-            "an authoritative verdict."
+            f"{_window_provenance_phrase(window, provenance, observed_at)} for authority purposes, "
+            "which does not establish the >=1M blocking scope floor with sourced, "
+            "current Capability Evidence (BIBLE P3). Its findings are ADVISORY-ONLY "
+            "and cannot satisfy the blocking scope gate; connect the provider so the "
+            "route can be probed, owner-ack this route's window, or configure a "
+            ">=1M-window scope model, to restore an authoritative verdict."
         ),
         "model": scope_model,
     }
@@ -321,11 +309,11 @@ def _window_scaled_reserves(window: int) -> tuple:
     still produce the full checklist JSON) and an eighth for tokenizer margin.
     >=1M windows keep the absolute reserves unchanged.
     """
-    if window >= _SCOPE_MODEL_CONTEXT_WINDOW:
-        return _SCOPE_MAX_TOKENS, _SCOPE_OUTPUT_MARGIN_TOKENS
-    output_reserve = min(_SCOPE_MAX_TOKENS, max(8_192, window // 4))
-    tokenizer_margin = min(_SCOPE_OUTPUT_MARGIN_TOKENS, window // 8)
-    return output_reserve, tokenizer_margin
+    return _shared_window_scaled_reserves(
+        window,
+        output_reserve=_SCOPE_MAX_TOKENS,
+        tokenizer_margin=_SCOPE_OUTPUT_MARGIN_TOKENS,
+    )
 
 
 def _effective_scope_input_limit(*, scope_model: str = "") -> int:
@@ -337,7 +325,7 @@ def _effective_scope_input_limit(*, scope_model: str = "") -> int:
     of a deterministic provider 400. Its blocking authority is checked separately and
     stays fail-closed."""
     model = scope_model or _get_scope_model()
-    window = _scope_reviewer_window(model)
+    window = _scope_window(model).sizing_window(_SCOPE_FAILCLOSED_WINDOW)
     output_reserve, tokenizer_margin = _window_scaled_reserves(window)
     return max(0, _calibrated_input_token_limit(
         model,
@@ -617,8 +605,9 @@ def _ladder_terminal_status(
     status picks the AUTHORITY branch (sub-floor vs >=1M) while the CAUSE rides
     separately, because the ladder terminates on two different failures — which
     can coincide — and both authority branches must report every one that
-    happened."""
-    known = _scope_reviewer_window(scope_model)
+    happened. The window is the evidence-resolved sizing window (never a
+    hardcoded table): a sub-1M resolved window reports `budget_exceeded`."""
+    known = _scope_window(scope_model).sizing_window(_SCOPE_FAILCLOSED_WINDOW)
     return _TouchedContextStatus(
         status="budget_exceeded" if known and known < _SCOPE_MODEL_CONTEXT_WINDOW else "fixed_overflow",
         token_count=token_count,
@@ -1047,7 +1036,9 @@ def _call_scope_llm(
     delegated = str(getattr(route, "value", route) or "") == "agent_session"
     # Output budget scales with the reviewer window: requesting the absolute
     # 100K reserve on a small-window model would 400 on input+max_tokens.
-    _scope_output_tokens, _ = _window_scaled_reserves(_scope_reviewer_window(scope_model))
+    _scope_output_tokens, _ = _window_scaled_reserves(
+        _scope_window(scope_model).sizing_window(_SCOPE_FAILCLOSED_WINDOW)
+    )
     if delegated:
         messages: Any = []
     else:
@@ -1246,13 +1237,14 @@ def _handle_prompt_signals(
     if context_status.status == "budget_exceeded":
         token_count = context_status.token_count
         # Report the REAL window-scaled reserves, not the 1M constants.
-        _window, _provenance = (
-            _scope_reviewer_window_evidence(scope_model) if scope_model
-            else (_SCOPE_MODEL_CONTEXT_WINDOW, _WINDOW_SENTINEL)
+        _resolved = _scope_window(scope_model) if scope_model else ReviewerWindow(
+            window_tokens=_SCOPE_MODEL_CONTEXT_WINDOW,
         )
+        _window = _resolved.sizing_window(_SCOPE_FAILCLOSED_WINDOW)
+        _provenance = _scope_window_provenance(_resolved)
         _output_reserve, _ = _window_scaled_reserves(_window)
         _budget = (f"input budget ({input_limit} tokens, reserving {_output_reserve} for "
-                   f"output within its {_window_provenance_phrase(_window, _provenance)})")
+                   f"output within its {_window_provenance_phrase(_window, _provenance, _resolved.observed_at)})")
         _cause, _remedy = _ladder_terminal_cause(context_status, input_limit, budget_phrase=_budget)
         log.warning(
             "Scope review pack did not assemble: %s; window=%d provenance=%s (fail-closed).",
@@ -1341,10 +1333,12 @@ def _handle_prompt_signals(
 
 
 def _apply_scope_authority(
+    ctx: Any,
     critical_findings: List[dict],
     advisory_findings: List[dict],
     *,
     scope_model_id: str,
+    prompt_tokens_est: int = 0,
     result_kwargs: dict,
     delegated: bool = False,
 ) -> tuple[List[dict], List[dict], Optional[ScopeReviewResult]]:
@@ -1352,31 +1346,49 @@ def _apply_scope_authority(
     enough for its verdict to gate a commit? ``api_chat`` must fit the whole assembled pack
     (constitutional >=1M; sub-floor BLOCKS); ``agent_session`` assembles none and needs
     SOURCED window evidence instead (scope_review_session owns that decision). NEITHER is
-    waved through — skipping this for sessions let one gate with no window test at all."""
-    window, provenance = _scope_reviewer_window_evidence(scope_model_id)
+    waved through — skipping this for sessions let one gate with no window test at all.
+    Authority is read from the EVIDENCE, not from the number: a window that is merely
+    large enough is not a window that was established — an expired record, an outage-
+    carried record, and the unevidenced designated-default sentinel all size a prompt
+    at >=1M and all fail here (the BIBLE P3 rule stated in code)."""
+    resolved = _scope_window(scope_model_id)
     if delegated:
         from ouroboros.tools.scope_review_session import session_scope_authority
 
+        # EVIDENCE, never the sizing fallback: the session floor is gated on SOURCED
+        # provenance, and a fail-closed sizing number handed over as a window would
+        # read as evidence for exactly the number the session floor sits at. A STALE
+        # record sizes a prompt but authorises nothing (same rule as the api row), so
+        # its provenance is blanked before the session predicate reads it.
         return session_scope_authority(
             critical_findings, advisory_findings, scope_model=scope_model_id,
-            window=window, provenance=provenance, result_kwargs=result_kwargs,
-            phrase=_window_provenance_phrase(window, provenance),
+            window=int(resolved.window_tokens or 0),
+            provenance="" if resolved.stale else str(resolved.status or ""),
+            result_kwargs=result_kwargs,
+            phrase=_window_provenance_phrase(
+                resolved.sizing_window(_SCOPE_FAILCLOSED_WINDOW),
+                _scope_window_provenance(resolved), resolved.observed_at),
         )
-    if not (window and window < _SCOPE_MODEL_CONTEXT_WINDOW):
+    if resolved.blocking_authority_allowed:
         return critical_findings, advisory_findings, None
+    window = resolved.sizing_window(_SCOPE_FAILCLOSED_WINDOW)
+    provenance = _scope_window_provenance(resolved)
     for finding in critical_findings:
         finding["severity"] = "advisory"
         finding["reason"] = "[sub-floor scope reviewer] " + str(finding.get("reason", ""))
     advisory_findings = list(critical_findings) + list(advisory_findings)
     critical_findings = []
-    advisory_findings.append(_scope_sub_floor_finding(scope_model_id, window, provenance))
+    advisory_findings.append(
+        _scope_sub_floor_finding(scope_model_id, window, provenance, resolved.observed_at)
+    )
     return critical_findings, advisory_findings, ScopeReviewResult(
         blocked=True,
         block_message=(
             f"⚠️ SCOPE_REVIEW_BLOCKED: scope reviewer {scope_model_id} has a "
-            f"{_window_provenance_phrase(window, provenance)}, below the required "
-            ">=1M floor. Its advisory findings were preserved, but it cannot supply "
-            "the authoritative scope verdict required to commit."
+            f"{_window_provenance_phrase(window, provenance, resolved.observed_at)}, which does not "
+            "establish the required >=1M floor with sourced Capability Evidence. Its "
+            "advisory findings were preserved, but it cannot supply the authoritative "
+            "scope verdict required to commit."
         ),
         critical_findings=critical_findings,
         advisory_findings=advisory_findings,
@@ -1618,7 +1630,7 @@ def run_scope_review(
         "response_ref": _response_ref,
     }
     critical_findings, advisory_findings, authority_block = _apply_scope_authority(
-        critical_findings, advisory_findings, scope_model_id=scope_model_id,
+        ctx, critical_findings, advisory_findings, scope_model_id=scope_model_id,
         result_kwargs=result_kwargs, delegated=delegated,
     )
     if authority_block is not None:

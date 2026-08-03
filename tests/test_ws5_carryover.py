@@ -98,7 +98,7 @@ def test_owner_floor_write_changes_no_scope_review_behaviour(monkeypatch, tmp_pa
 
     import ouroboros.config as cfg
     from ouroboros.gateway import settings as smod
-    from ouroboros.tools import scope_review as sr
+    from ouroboros.tools import review_helpers, scope_review as sr
 
     monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
     monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "blocking_1m")
@@ -692,6 +692,7 @@ def test_capability_evidence_is_route_aware_not_model_aware(monkeypatch, tmp_pat
     from types import SimpleNamespace
 
     import ouroboros.config as cfg
+    from ouroboros import capability_evidence as ce
     from ouroboros.gateway import settings as smod
     from ouroboros.tools import scope_review as sr
 
@@ -699,27 +700,25 @@ def test_capability_evidence_is_route_aware_not_model_aware(monkeypatch, tmp_pat
     base_urls = {"OPENAI_BASE_URL": "https://route-a.example/v1"}
     monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
     monkeypatch.setattr(cfg, "load_settings", lambda: dict(base_urls))
-    monkeypatch.setattr(sr, "_LAZY_WINDOW_PROBED", set())
 
     fetched: list = []
 
-    def fake_probe(drive_root, **kwargs):
-        if kwargs.get("allow_fetch"):
-            fetched.append(str(kwargs.get("base_url") or ""))
-        return SimpleNamespace(
-            window_tokens=200_000, status="confirmed", route_fp="fp-" + str(kwargs.get("base_url")),
-            to_json=lambda: {"window_tokens": 200_000, "status": "confirmed"},
-        )
+    # The REAL probe, so what is counted is real network work: a route whose stored
+    # record is current is served from the cache, which is the rate limit — not a
+    # process memo that outlives the record and can never re-source it.
+    def fake_metadata(_provider, _model, base_url, allow_fetch, **_kw):
+        fetched.append(str(base_url or ""))
+        return 200_000
 
-    monkeypatch.setattr("ouroboros.capability_evidence.probe", fake_probe)
+    monkeypatch.setattr(ce, "_provider_metadata_window", fake_metadata)
 
-    sr._scope_reviewer_window(model)
-    sr._scope_reviewer_window(model)
-    assert fetched == ["https://route-a.example/v1"], "one lazy probe per route, not per call"
+    sr._scope_window(model)
+    sr._scope_window(model)
+    assert fetched == ["https://route-a.example/v1"], "one probe per route, not per call"
 
     # Same model, DIFFERENT base URL: a new route, so the lazy probe must run again.
     base_urls["OPENAI_BASE_URL"] = "https://route-b.example/v1"
-    sr._scope_reviewer_window(model)
+    sr._scope_window(model)
     assert fetched == [
         "https://route-a.example/v1", "https://route-b.example/v1",
     ], "a base-URL change is a new route fingerprint and must be probed"
@@ -734,6 +733,64 @@ def test_capability_evidence_is_route_aware_not_model_aware(monkeypatch, tmp_pat
     assert len(notices) == 1
     assert notices[0]["needs_ack"]["model"] == model
     assert notices[0]["needs_ack"]["base_url"] == "https://route-b.example/v1"
+
+
+def test_scope_capability_notice_is_offered_on_a_route_whose_record_expired(
+    monkeypatch, tmp_path,
+):
+    """The `require_fresh=True` on the save-time notice is REACHABLE, and it is what
+    puts the owner-ack in front of the owner.
+
+    Route fingerprints are content-addressed, so re-selecting a slot the install has
+    used before finds that route's PRIOR record — which may have expired meanwhile.
+    With the provider unreachable `probe` keeps that record (module invariant) and
+    marks it stale, and a stale 1M record is exactly the shape that reads as `confirmed
+    1M` yet cannot authorize the commit-time gate. Without the freshness argument the
+    save reports the slot as fine and the next commit blocks with SCOPE_REVIEW_SUB_FLOOR
+    pointing at an ack the UI never offered."""
+    import datetime
+    import json
+    import pathlib
+
+    import ouroboros.config as cfg
+    from ouroboros import capability_evidence as ce
+    from ouroboros.gateway import settings as smod
+
+    model = "openai/gpt-5.6-terra"
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "get_scope_review_models", lambda: [model])
+
+    route = smod._review_slot_route({}, model)
+    fp = ce.route_fingerprint(provider=route["provider"], base_url=route["base_url"], model=model)
+    expired = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=5)
+    ).isoformat()
+    store = tmp_path / "state" / "capability_evidence.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(json.dumps({"probes": {fp: {
+        "window_tokens": 1_000_000, "status": "confirmed", "source": "provider_metadata",
+        "route_fp": fp, "model": model, "provider": route["provider"], "ts": expired,
+    }}}), encoding="utf-8")
+
+    # The provider cannot re-confirm it right now.
+    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 0)
+    monkeypatch.setattr(ce, "_metadata_fetch_transport_failed", lambda *a, **k: True)
+
+    notices = smod._review_capability_notices({"OUROBOROS_SCOPE_REVIEW_MODELS": model})
+    assert len(notices) == 1, "an expired, unverifiable record must still offer the ack"
+    assert notices[0]["needs_ack"]["model"] == model
+    assert notices[0]["needs_ack"]["evidence"]["stale"] is True
+    assert notices[0]["window_tokens"] == 1_000_000, (
+        "the number clears the floor — freshness, not size, is what withholds authority"
+    )
+
+    # And the owner-facing prompt says WHY a 1M reading is being questioned, instead of
+    # asking them to confirm 1000000 tokens because the route reports 1000000 tokens.
+    settings_js = (
+        pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "settings.js"
+    ).read_text(encoding="utf-8")
+    assert "evidence?.stale" in settings_js
+    assert "EXPIRED reading the provider could not re-confirm" in settings_js
 
 
 def test_unrecognised_review_model_ids_are_reported_loudly(monkeypatch):
@@ -814,3 +871,66 @@ def test_read_exemption_fails_closed_on_nested_execution_constructs():
     assert verdict("/usr/bin/grep ouroboros_scope_review_floor data/settings.json") is False
     assert pure("grep ouroboros_scope_review_floor data/settings.json") is True
     assert pure("cat data/settings.json | grep floor") is True
+
+
+def test_scope_capability_notice_fires_on_stale_evidence(monkeypatch, tmp_path):
+    """The save-time notice and the review-time authority check are twins: both ask
+    "can this slot supply a BLOCKING scope verdict". The notice used to accept an
+    expired 1M record, so the owner was told the slot was fine and then blocked at
+    commit time by the check that reads the same evidence with the freshness applied."""
+    from types import SimpleNamespace
+
+    import ouroboros.config as cfg
+    from ouroboros.gateway import settings as smod
+    from ouroboros.reviewer_window import ReviewerWindow
+
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "get_scope_review_models", lambda: ["anthropic/claude-fable-5"])
+
+    evidence = {"stale": False}
+
+    def fake_probe(drive_root, **kwargs):
+        return SimpleNamespace(
+            window_tokens=1_000_000, status="confirmed", route_fp="fp",
+            stale=evidence["stale"], ts="",
+            to_json=lambda: {"window_tokens": 1_000_000, "status": "confirmed"},
+        )
+
+    monkeypatch.setattr("ouroboros.capability_evidence.probe", fake_probe)
+
+    assert smod._review_capability_notices({}) == [], "current 1M evidence needs no ack"
+
+    evidence["stale"] = True
+    notices = smod._review_capability_notices({})
+    assert len(notices) == 1 and notices[0]["surface"] == "scope_review"
+    # ...and the review-time twin agrees, which is the point of the shared predicate.
+    assert ReviewerWindow(1_000_000, "confirmed", stale=True).blocking_authority_allowed is False
+
+
+def test_active_route_max_gate_still_rides_out_a_provider_blip(monkeypatch, tmp_path):
+    """Counterpart guard for the freshness sweep: the gate that would DOWNGRADE the
+    owner's own context mode must NOT start denying on stale evidence. An outage may
+    cost a blocking scope verdict; it may not silently narrow the cognitive horizon."""
+    from types import SimpleNamespace
+
+    import ouroboros.config as cfg
+    from ouroboros.gateway import settings as smod
+
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(smod, "_owner_read_settings_raw", lambda: {})
+    monkeypatch.setattr(
+        smod, "_active_main_route",
+        lambda *a, **k: {"provider": "openrouter", "model": "x/y",
+                         "base_url": "", "use_local": False},
+    )
+    monkeypatch.setattr(
+        "ouroboros.capability_evidence.probe",
+        lambda *a, **k: SimpleNamespace(
+            window_tokens=1_000_000, status="confirmed", route_fp="fp", stale=True, ts="",
+            to_json=lambda: {}),
+    )
+    # _active_route_confirms_max asks "is it CURRENTLY known" (hot path, per task) and
+    # answers unknown, which the caller treats as "attempt Max, react to real overflow"
+    # — never as a confirmed sub-1M downgrade.
+    assert smod._active_route_confirms_max() is None
+    assert smod._max_context_block({}) is None, "an outage must not revoke Max mode"

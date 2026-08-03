@@ -813,9 +813,17 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         for (const notice of pending) {
             const ack = notice.needs_ack;
             const seen = Number(notice.window_tokens || 0);
+            // A STALE record can report a full 1M and still not authorize, so say WHY
+            // the ack is being asked for — otherwise the prompt reads "this route
+            // reports 1000000 tokens, please confirm 1000000 tokens".
+            const reading = !(seen > 0)
+                ? 'no window metadata'
+                : (notice?.needs_ack?.evidence?.stale
+                    ? `${seen} tokens from an EXPIRED reading the provider could not re-confirm`
+                    : `${seen} tokens`);
             const confirmed = window.confirm(
                 'Scope review is fail-closed unless its reviewer\'s 1,000,000-token context '
-                + `window is known, and this route reports ${seen > 0 ? `${seen} tokens` : 'no window metadata'}.\n\n`
+                + `window is currently known, and this route reports ${reading}.\n\n`
                 + 'Confirm that this model supports a 1,000,000-token context window?\n'
                 + `  provider: ${ack.provider || '(default)'}\n  model: ${ack.model}\n`
                 + `  base_url: ${ack.base_url || '(default)'}\n\n`

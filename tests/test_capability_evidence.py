@@ -580,3 +580,118 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
         extractor=lambda resp: (dict(resp.usage), 0.0, True),
     )
     assert abs(get_token_density(tmp_path, "direct-anthropic-model") - 1.6) < 1e-6
+
+
+def test_freshness_is_an_explicit_axis_of_the_owned_predicate(tmp_path, monkeypatch):
+    """The >=1M question and the "is this still current" question are ONE predicate
+    with an explicit knob, not one predicate plus a re-derivation at each call site.
+
+    `probe` already documents that a stale record "reads as unknown for >=1M gates",
+    but `confirms_at_least` never checked `stale` — so the gate that AUTHORIZES a
+    blocking review accepted an outage-carried record, while the gate beside it
+    hand-rolled the freshness test in a local boolean."""
+    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 1_000_000)
+    fresh = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True)
+    assert fresh.stale is False
+    assert ce.is_known(fresh, require_fresh=True) is True
+    assert ce.confirms_at_least(fresh, ce.ONE_MILLION, require_fresh=True) is True
+
+    # Provider now unreachable: the prior record is KEPT (module invariant) but stale.
+    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 0)
+    monkeypatch.setattr(ce, "_metadata_fetch_transport_failed", lambda *a, **k: True)
+    stale = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True, force=True)
+    assert stale.stale is True and stale.window_tokens == 1_000_000
+
+    # Restricting gates keep it (never downgrade the owner's horizon on a blip)...
+    assert ce.confirms_at_least(stale, ce.ONE_MILLION) is True
+    # ...authorizing gates do not.
+    assert ce.confirms_at_least(stale, ce.ONE_MILLION, require_fresh=True) is False
+    assert ce.is_known(stale, require_fresh=True) is False
+    assert ce.is_known(stale) is True
+
+    # A window of 0 is never "known", whatever the status claims.
+    assert ce.is_known(ce.CapabilityEvidence(0, ce.STATUS_CONFIRMED, "", "")) is False
+    assert ce.is_known(None) is False
+
+
+def test_no_surface_restates_the_freshness_predicate_it_does_not_own():
+    """Class guard (v6.87.45): `is_known` is the ONE place that says what counts as
+    current, sourced evidence.
+
+    Making freshness an argument of the owned predicate is only worth anything if the
+    restatements it replaced are gone. Four survived the change that claimed them —
+    `context_fit` twice (once on a real `CapabilityEvidence`, once on the plan built
+    from it) and `loop` twice — each spelling out the same
+    `status in {confirmed, asserted} and not stale and window > 0`. They agree today;
+    a fifth caller that drops the `not stale` clause is exactly how the >=1M gate lost
+    it in the first place."""
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "ouroboros"
+    pattern = re.compile(r"""in\s*\{\s*["'](?:confirmed|asserted)["']\s*,\s*["'](?:confirmed|asserted)["']\s*\}""")
+    offenders = [
+        f"{path.relative_to(root)}:{i}"
+        for path in sorted(root.rglob("*.py"))
+        if path.name != "capability_evidence.py"
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if pattern.search(line)
+    ]
+    assert offenders == [], (
+        "these re-derive capability_evidence.is_known(...) instead of calling it: "
+        + ", ".join(offenders)
+    )
+
+
+def test_a_failed_probe_is_retried_once_its_throttle_expires_and_not_before(tmp_path, monkeypatch):
+    """The FAILED cache is a short throttle, and both of its edges are load-bearing.
+
+    `probe` serves a cached record without touching the network while it is inside its
+    TTL, and the TTL a FAILED record gets is a tenth of an hour against a confirmed
+    record's day. Nothing measured either number: both could move to any value with a
+    green suite, and each direction breaks something this branch has already had to fix
+    once. Too LONG and one transport blip reads as a dead route for the whole window —
+    every resolution past it takes the no-fetch answer, `blocking_authority_allowed`
+    goes False, and scope blocks every commit until it expires, which is v6.87.45's
+    wedge arriving through the record instead of through a process-lifetime memo. Too
+    SHORT and the throttle stops existing: a provider that is genuinely down is re-asked
+    on every resolution, on the hot path of every review.
+
+    So the behaviour is driven from both sides of the edge rather than named."""
+    import datetime
+
+    fetches = []
+
+    def fake_metadata(*_a, **_k):
+        fetches.append(1)
+        return 1_000_000
+
+    monkeypatch.setattr(ce, "_provider_metadata_window", fake_metadata)
+    monkeypatch.setattr(ce, "_metadata_fetch_transport_failed", lambda *a, **k: True)
+
+    def seed_failure(age_seconds):
+        fp = ce.route_fingerprint(provider="openrouter", base_url="", model="x/y")
+        ts = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(seconds=age_seconds)).isoformat()
+        store = tmp_path / "state" / "capability_evidence.json"
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps({"probes": {fp: {
+            "window_tokens": 0, "status": ce.STATUS_FAILED, "source": ce.SOURCE_NONE,
+            "route_fp": fp, "model": "x/y", "provider": "openrouter", "ts": ts,
+            "detail": "provider unreachable during probe",
+        }}}), encoding="utf-8")
+
+    # Inside the throttle: the failure is served from the cache, untouched, and the
+    # provider is not asked again.
+    seed_failure(5 * 60)
+    throttled = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True)
+    assert throttled.status == ce.STATUS_FAILED
+    assert fetches == [], "a fresh failure record must not re-ask the provider"
+
+    # Past it: the route is retried, and a provider that has come back replaces the
+    # failure with confirmed evidence instead of staying poisoned.
+    seed_failure(20 * 60)
+    retried = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True)
+    assert fetches, "an expired failure record must be retried"
+    assert retried.status == ce.STATUS_CONFIRMED and retried.window_tokens == 1_000_000
+    assert ce.confirms_at_least(retried, ce.ONE_MILLION, require_fresh=True) is True

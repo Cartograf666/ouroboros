@@ -133,6 +133,46 @@ def test_provider_failure_remains_unresolved(data_root):
     assert _ledger(data_root)[-1]["state"] == "unresolved"
 
 
+def test_abandoned_attempt_settles_with_the_usage_the_dead_child_reported(data_root, monkeypatch):
+    """A killed out-of-process dispatch must not hold its bound forever."""
+    monkeypatch.setattr(ua, "estimate_cost_optional", lambda *a, **k: 0.42)
+    reservation = ua.reserve_attempt(_request(data_root, reservation_usd=None, max_budget_usd=5.0))
+    ua.mark_dispatched(reservation)
+    assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 5.0
+
+    state = ua.terminalize_abandoned_attempt(
+        reservation,
+        reason="child timed out",
+        usage={"prompt_tokens": 1200, "completion_tokens": 300},
+    )
+
+    assert state == "settled"
+    projection = ua.usage_projection(data_root)
+    assert projection["unresolved_upper_bound_usd"] == 0.0
+    assert projection["accounted_usd"] < 5.0
+    # Idempotent: a terminal attempt is never transitioned again (a post-terminal
+    # row would make the whole ledger unreadable for every later reader).
+    assert ua.terminalize_abandoned_attempt(reservation, reason="again") == "settled"
+    assert [row["state"] for row in _ledger(data_root)] == ["reserved", "dispatched", "settled"]
+
+
+def test_abandoned_attempt_without_reported_usage_stays_honestly_unresolved(data_root):
+    reservation = ua.reserve_attempt(_request(data_root))
+    ua.mark_dispatched(reservation)
+
+    assert ua.terminalize_abandoned_attempt(reservation, reason="child aborted") == "unresolved"
+    assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 1.0
+
+
+def test_abandoned_attempt_before_dispatch_is_released(data_root):
+    reservation = ua.reserve_attempt(_request(data_root))
+
+    assert ua.terminalize_abandoned_attempt(reservation, reason="never started") == "released"
+    projection = ua.usage_projection(data_root)
+    assert projection["reserved_usd"] == 0.0
+    assert projection["unresolved_upper_bound_usd"] == 0.0
+
+
 def test_lock_failure_is_fail_closed_before_send(data_root, monkeypatch):
     import ouroboros.platform_layer as platform
 

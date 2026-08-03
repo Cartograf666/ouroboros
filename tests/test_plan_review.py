@@ -1686,7 +1686,7 @@ def test_oversized_planned_required_artifact_refuses_typed(tmp_path, monkeypatch
 
     dispatched = {"called": False}
 
-    async def _fake_slots(_ctx, models, _system, _user, user_stable_len=0):
+    async def _fake_slots(_ctx, models, _system, _user, user_stable_len=0, slot_ids=None):
         dispatched["called"] = True
         return [
             {"model": str(m), "text": _review_text("GREEN"), "error": None}

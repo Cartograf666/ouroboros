@@ -66,8 +66,10 @@ When a Gateway exists, it should follow these guidelines:
 
 **Existing Gateways:**
 - `ouroboros/gateways/claude_code.py` — Claude Agent SDK gateway. Two paths: `run_edit`
-  (edit mode with PreToolUse safety hooks) and `run_readonly` (advisory review, no
-  mutating tools). Structured `ClaudeCodeResult` output.
+  (edit mode) and `run_readonly` (advisory review, no mutating tools). Both pin the
+  delegated trust surface — no settings/MCP config loaded from the target directory —
+  and enforce one derived tool allowlist plus read/write path confinement through
+  PreToolUse hooks. Structured `ClaudeCodeResult` output.
 - `ouroboros/gateways/claudexor.py` — Claudexor v3 control-plane gateway. Loopback
   discovery, protocol-major + minimum-version handshake, project registration, run
   start/poll/cancel. Typed refusals (`ClaudexorUnavailable`,
@@ -413,7 +415,14 @@ per-feature nicety:
   reviewer runs in the visible sub-floor window until Capability Evidence lands
   (generative probe or `/api/owner/capability-ack`); an OpenAI-only install's
   designated scope reviewer is now the same terra model (direct spelling), so it keeps
-  the sentinel; the blocking triad is unaffected. That ack is
+  the sentinel; the blocking triad is unaffected. Since v6.87.44 that sentinel is
+  SIZING-only for EVERY route, the shipped default included: the designated default
+  acquires no blocking authority from its name — its route is probed like any pin
+  (metadata-only, rate-limited by the evidence TTL, v6.87.45) and it may BLOCK only
+  on sourced, non-stale ≥1M evidence (`ReviewerWindow.blocking_authority_allowed`).
+  The sentinel sizes the prompt; the evidence signs the verdict. On a connected
+  install the automatic first-use metadata probe sources that evidence immediately,
+  so the distinction is visible mainly when the provider cannot be reached. That ack is
   REACHABLE from the UI: a scope-slot change makes the settings save probe the slot's
   own route and return `review_capability_notices` carrying the same
   `needs_ack:{route, route_fp, evidence}` payload the Max gate uses, which
@@ -754,12 +763,31 @@ measuring ~1.1 cannot hand the next code-heavy scope pack a LOOSER cap than toda
 the historical absolute-margin form bounds every cap regardless. `_effective_scope_input_limit` computes it PER CALL — the former
 import-time `_ANTHROPIC_SCOPE_INPUT_TOKEN_LIMIT` (≈545K) froze the pre-measurement
 value for the whole process. (2) WINDOW: a known reviewer window from Capability
-Evidence (`_scope_reviewer_window_evidence` -> `ouroboros.capability_evidence`; no
+Evidence (`_scope_window` -> `ouroboros.capability_evidence`; no
 static per-model table, v6.33.0) replaces the assumed 1M with reserves scaled to the
 window (`_window_scaled_reserves`) so a small-window slot keeps a positive input
-limit, and it now returns PROVENANCE (`confirmed` | `asserted` |
+limit, and it returns PROVENANCE (`confirmed` | `asserted` | `stale_unverifiable` |
 `unknown_conservative` | `designated_default_sentinel`) so diagnostics stop calling a
-conservative fallback "known".
+conservative fallback — or an expired record — "known". (v6.87.44) SIZING and
+AUTHORITY are separate answers about one route and travel in one typed
+`ReviewerWindow`: `sizing_window()` may be optimistic (a declined review is a certain
+loss), while `blocking_authority_allowed` demands SOURCED, CURRENT, ≥1M evidence via
+`capability_evidence.confirms_at_least(..., require_fresh=True)`. Freshness is an
+explicit argument of that one owned predicate — `is_known(ev, require_fresh=...)` —
+and (v6.87.45) NO surface restates it: the scope floor, the save-time
+`review_capability_notices` twin, the Max-context gate, both context-fit route
+decisions and `ContextFitPlan` (an evidence-shaped record, so the predicate applies
+to it directly) all call it. Gates that AUTHORIZE pass `require_fresh=True`; the
+Max-context gate, which would DOWNGRADE the owner's own horizon, deliberately does
+not — a provider blip must never erase a prior confirmed record. The save-time notice
+is offered on a route-affecting SETTINGS CHANGE; it is not a scheduled staleness
+watch, so it precedes the commit-time twin only when the owner passes through
+settings. The designated-default sentinel is a SIZING number and carries no
+authority; a model acquires none from its name. How often a route may be re-probed
+belongs to `probe`'s TTL alone (confirmed 24h / failed 10 min): a process-lifetime
+"already probed" memo in `reviewer_window` outlived the record it produced, so an
+install that stayed up past the TTL could never RE-source its reviewer and blocked
+every commit for the rest of the process's life (v6.87.45).
 Whether scope review applies at all is decided by the owner-only
 `OUROBOROS_CONTEXT_MODE`, read as the OWNER-SELECTED value (`get_owner_context_mode`).
 There is no floor CONFIG any more: `OUROBOROS_SCOPE_REVIEW_FLOOR` is deprecated and
