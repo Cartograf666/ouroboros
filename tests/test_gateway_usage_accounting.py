@@ -104,6 +104,11 @@ def test_cost_breakdown_uses_ledger_not_later_compatibility_events(tmp_path, mon
         "accounted_usd": 1.75,
         "unknown_unmetered": 1,
         "cost_final": False,
+        # The disclosed cause of `cost_final: False`, and broader than
+        # `unknown_unmetered`: three of the four seeded rows are still open --
+        # the reserved attempt, the unresolved one, and the external unmetered
+        # dispatch whose price is unknown. Only the settled $0.25 row is final.
+        "non_final_rows": 3,
         "attempt_counts": {"reserved": 1, "settled": 2, "unresolved": 1},
         "authority": "physical_attempt_ledger",
         "limit_usd": 7.5,
