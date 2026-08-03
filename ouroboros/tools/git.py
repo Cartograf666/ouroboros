@@ -1488,6 +1488,7 @@ def _task_attributed_commit_paths(
 
 def _evolution_commit_authority(
     ctx: ToolContext, *, commit_sha: str = "", require_receipt: bool = True,
+    require_uncommitted: bool = False,
 ) -> tuple[Dict[str, str], Dict[str, Any]]:
     metadata = getattr(ctx, "task_metadata", {})
     metadata = metadata if isinstance(metadata, dict) else {}
@@ -1503,6 +1504,7 @@ def _evolution_commit_authority(
     authority = check_evolution_authority(
         **claim,
         commit_sha=str(commit_sha or "") if require_receipt else "",
+        require_uncommitted=bool(require_uncommitted),
     )
     expected_sha = str(commit_sha or "").strip()
     if authority.get("ok") and expected_sha:
@@ -1529,6 +1531,7 @@ def _check_evolution_commit_stage(
         ctx,
         commit_sha=commit_sha,
         require_receipt=phase != "pre_tag_authority",
+        require_uncommitted=phase in {"pre_review_authority", "pre_commit_authority"},
     )
     if authority.get("ok"):
         return claim, ""
@@ -1569,7 +1572,12 @@ def _check_evolution_commit_stage(
 def _preserve_evolution_orphan(
     ctx: ToolContext, commit_sha: str, *, created_tag: str = "",
 ) -> str:
-    """Keep an unauthorized local commit inspectable but outside normal push refs."""
+    """Keep an unauthorized local commit inspectable but outside normal push refs.
+
+    Ref containment deliberately never touches the index or worktree: another task may
+    have edited tracked bytes after the commit was created. Leaving those bytes visibly
+    dirty is safer than aligning them to the rewound branch and losing concurrent work.
+    """
     sha = str(commit_sha or "").strip()
     ref_name = f"refs/ouroboros/evolution-orphans/{sha}"
     try:
@@ -1592,6 +1600,7 @@ def _preserve_evolution_orphan(
         ]
         tag_note = ""
         tag_name = str(created_tag or "").strip()
+        target_oid = ""
         if tag_name:
             try:
                 target_commit = run_cmd(
@@ -1606,26 +1615,101 @@ def _preserve_evolution_orphan(
                 commands.append(f"delete refs/tags/{tag_name} {target_oid}")
                 tag_note = f"; deleted local tag {tag_name}"
         commands.extend(("prepare", "commit"))
-        proc = subprocess.run(
-            ["git", "update-ref", "--stdin"],
-            cwd=ctx.repo_dir,
-            input="\n".join(commands) + "\n",
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.strip() or "git update-ref transaction failed")
-        # Align tracked files without moving the branch ref again. A concurrent
-        # Git writer may legitimately advance it after the CAS transaction.
-        run_cmd(["git", "read-tree", "--reset", "-u", "HEAD"], cwd=ctx.repo_dir)
+        transaction_error = ""
+        for _attempt in range(2):
+            proc = subprocess.run(
+                ["git", "update-ref", "--stdin"],
+                cwd=ctx.repo_dir,
+                input="\n".join(commands) + "\n",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if proc.returncode == 0:
+                transaction_error = ""
+                break
+            transaction_error = proc.stderr.strip() or "git update-ref transaction failed"
+
+        # A ref transaction is atomic, so a failed transaction can be decomposed into
+        # individually verified CAS operations without risking a partial worktree reset.
+        if transaction_error:
+            zero_oid = "0" * 40
+            try:
+                current_orphan = run_cmd(
+                    ["git", "rev-parse", "--verify", ref_name], cwd=ctx.repo_dir,
+                ).strip()
+            except Exception:
+                current_orphan = ""
+            if current_orphan != sha:
+                fallback = subprocess.run(
+                    ["git", "update-ref", ref_name, sha, zero_oid],
+                    cwd=ctx.repo_dir, text=True, capture_output=True, check=False,
+                )
+                if fallback.returncode != 0:
+                    raise RuntimeError(
+                        fallback.stderr.strip() or f"could not create {ref_name}"
+                    )
+
+            current_branch = run_cmd(
+                ["git", "rev-parse", branch_ref], cwd=ctx.repo_dir,
+            ).strip()
+            if current_branch == sha:
+                fallback = subprocess.run(
+                    ["git", "update-ref", branch_ref, parent, sha],
+                    cwd=ctx.repo_dir, text=True, capture_output=True, check=False,
+                )
+                if fallback.returncode != 0:
+                    raise RuntimeError(
+                        fallback.stderr.strip() or f"could not reset {branch_ref}"
+                    )
+
+            if tag_name and target_oid:
+                try:
+                    current_tag_oid = run_cmd(
+                        ["git", "rev-parse", f"refs/tags/{tag_name}"], cwd=ctx.repo_dir,
+                    ).strip()
+                except Exception:
+                    current_tag_oid = ""
+                if current_tag_oid == target_oid:
+                    fallback = subprocess.run(
+                        ["git", "update-ref", "-d", f"refs/tags/{tag_name}", target_oid],
+                        cwd=ctx.repo_dir, text=True, capture_output=True, check=False,
+                    )
+                    if fallback.returncode != 0:
+                        raise RuntimeError(
+                            fallback.stderr.strip() or f"could not delete tag {tag_name}"
+                        )
+
+        final_orphan = run_cmd(
+            ["git", "rev-parse", "--verify", ref_name], cwd=ctx.repo_dir,
+        ).strip()
+        if final_orphan != sha:
+            raise RuntimeError("private orphan ref does not resolve to the unauthorized commit")
         final_head = run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir).strip()
+        reachable = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", sha, branch_ref],
+            cwd=ctx.repo_dir, text=True, capture_output=True, check=False,
+        ).returncode == 0
+        if reachable:
+            raise RuntimeError("the unauthorized commit remains reachable from the active branch")
+        if tag_name:
+            try:
+                final_tag_target = run_cmd(
+                    ["git", "rev-parse", f"refs/tags/{tag_name}^{{commit}}"], cwd=ctx.repo_dir,
+                ).strip()
+            except Exception:
+                final_tag_target = ""
+            if final_tag_target == sha:
+                raise RuntimeError(f"tag {tag_name} still reaches the unauthorized commit")
         branch_note = (
             f"the active branch was reset to {parent[:12]}"
             if final_head == parent
             else f"a concurrent branch update to {final_head[:12]} was preserved"
         )
-        return f"The commit remains at private local ref {ref_name}; {branch_note}{tag_note}."
+        return (
+            f"The commit remains at private local ref {ref_name}; {branch_note}{tag_note}. "
+            "The index and worktree were left untouched for lossless recovery."
+        )
     except Exception as exc:
         return (
             "⚠️ EVOLUTION_ORPHAN_CONTAINMENT_FAILED: normal publication remains blocked, "
@@ -1672,7 +1756,8 @@ def _record_evolution_commit_receipt(
 
 def _evolution_publication_stopped_result(
     ctx: ToolContext, commit_message: str, commit_sha: str, test_warning: str,
-    created_tag: str = "",
+    created_tag: str = "", started_at: float = 0.0,
+    fingerprints: Optional[tuple[Dict[str, Any], Dict[str, Any]]] = None,
 ) -> str:
     """Format a local-only result when the SHA receipt loses authority."""
     if str(ctx.current_task_type or "") != "evolution":
@@ -1684,11 +1769,26 @@ def _evolution_publication_stopped_result(
     containment = _preserve_evolution_orphan(
         ctx, commit_sha, created_tag=created_tag,
     )
-    return (
+    pre_fingerprint, post_fingerprint = fingerprints or ({}, {})
+    message = (
         "⚠️ EVOLUTION_PUBLICATION_STOPPED: campaign authority changed after "
         f"the local SHA receipt ({authority.get('reason') or 'unknown'}). Nothing "
         f"was pushed and restart remains blocked. {containment}{test_warning}"
     )
+    _record_commit_attempt(
+        ctx, commit_message, "failed",
+        block_reason="evolution_authority", block_details=message,
+        duration_sec=time.time() - started_at if started_at else 0.0,
+        phase="publication_authority", fingerprint_status="matched",
+        pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
+        post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
+        triad_models=getattr(ctx, "_last_triad_models", []),
+        scope_model=getattr(ctx, "_last_scope_model", ""),
+        triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+        scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
+        degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
+    )
+    return message
 
 
 def _publish_reviewed_commit(
@@ -1814,9 +1914,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             return _fail(preparation_error)
         evolution_claim: Dict[str, str] = {}
         if str(ctx.current_task_type or "") == "evolution":
-            evolution_claim, authority_error = _check_evolution_commit_stage(
-                ctx, commit_message, _commit_start, phase="pre_review_authority",
-            )
+            evolution_claim, authority_error = _check_evolution_commit_stage(ctx, commit_message, _commit_start, phase="pre_review_authority")
             if authority_error:
                 return authority_error
         outcome = _run_reviewed_stage_cycle(
@@ -1848,9 +1946,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
         post_fingerprint = outcome.get("post_fingerprint", {}) or {}
 
         if evolution_claim:
-            _, authority_error = _check_evolution_commit_stage(
-                ctx, commit_message, _commit_start, phase="pre_commit_authority",
-            )
+            _, authority_error = _check_evolution_commit_stage(ctx, commit_message, _commit_start, phase="pre_commit_authority")
             if authority_error:
                 return authority_error
 
@@ -1895,6 +1991,8 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                 "was NOT tagged or pushed; inspect the repository and re-run review on a "
                 f"new exact tree. Detail: {binding_detail}"
             )
+            if evolution_claim:
+                binding_msg += " " + _preserve_evolution_orphan(ctx, commit_sha)
             _record_commit_attempt(
                 ctx,
                 commit_message,
@@ -1921,10 +2019,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
         created_tag = ""
         if not _managed_tx:
             if evolution_claim:
-                _, authority_error = _check_evolution_commit_stage(
-                    ctx, commit_message, _commit_start,
-                    phase="pre_tag_authority", commit_sha=commit_sha,
-                )
+                _, authority_error = _check_evolution_commit_stage(ctx, commit_message, _commit_start, phase="pre_tag_authority", commit_sha=commit_sha)
                 if authority_error:
                     containment = _preserve_evolution_orphan(ctx, commit_sha)
                     return f"{authority_error}\n\n{containment}"
@@ -1948,6 +2043,10 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                 "release-tag verification failed. Nothing was pushed; immutable tags are "
                 f"never retargeted. Detail: {binding_detail}"
             )
+            if evolution_claim:
+                binding_msg += " " + _preserve_evolution_orphan(
+                    ctx, commit_sha, created_tag=created_tag,
+                )
             _record_commit_attempt(
                 ctx,
                 commit_message,
@@ -1974,6 +2073,15 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             if receipt_error:
                 return receipt_error
         _post_commit_result(ctx, commit_message, skip_tests, test_warning_ref)
+        push_status = ""
+        if not _managed_tx and evolution_claim:
+            publication_error = _evolution_publication_stopped_result(
+                ctx, commit_message, commit_sha, test_warning_ref[0],
+                created_tag=created_tag, started_at=_commit_start, fingerprints=(pre_fingerprint, post_fingerprint),
+            )
+            if publication_error:
+                return publication_error
+            push_status = _auto_push(ctx.repo_dir)
         ctx.last_reviewed_commit_sha = commit_sha
         if attribution_binding is not None:
             # The task's own commit moved HEAD: open the next attributed-staging
@@ -2000,17 +2108,6 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                                scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
                                degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
         ctx._scope_review_history = {}  # Clear on success — next commit starts fresh
-        if not _managed_tx:
-            publication_error = _evolution_publication_stopped_result(
-                ctx, commit_message, commit_sha, test_warning_ref[0],
-                created_tag=created_tag,
-            )
-            if publication_error:
-                return publication_error
-            push_status = _auto_push(ctx.repo_dir)
-            return _publish_reviewed_commit(
-                ctx, commit_message, commit_sha, tag_info, test_warning_ref[0], paths, push_status,
-            )
     finally:
         _release_git_lock(lock)
     if _managed_tx:
@@ -2028,7 +2125,11 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                                    duration_sec=time.time() - _commit_start)
             return _msg_pc
         return _format_commit_result(ctx, commit_message, "", test_warning_ref[0]) + "\n\n" + _msg_pc
-    raise RuntimeError("unreachable non-managed commit path")
+    if not evolution_claim:
+        push_status = _auto_push(ctx.repo_dir)
+    return _publish_reviewed_commit(
+        ctx, commit_message, commit_sha, tag_info, test_warning_ref[0], paths, push_status,
+    )
 
 
 def _limit_git_output(text: str, max_chars: int = 0) -> str:

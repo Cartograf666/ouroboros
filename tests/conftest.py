@@ -4,9 +4,11 @@
 # Cross-module helpers that are not pytest fixtures (e.g. SDK mock, extension
 # runtime cleanup) live in ``tests/_shared.py`` instead.
 import asyncio
+import functools
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -15,8 +17,10 @@ import pytest
 
 _PYTEST_DATA_DIR = None
 if os.environ.get("OUROBOROS_ALLOW_LIVE_DATA_TESTS") != "1":
-    _LIVE_DATA_ROOT = os.environ.get(
-        "OUROBOROS_DATA_DIR", str(pathlib.Path.home() / "Ouroboros" / "data")
+    _LIVE_DATA_ROOT = (
+        os.environ.get("OUROBOROS_TEST_LIVE_DATA_ROOT")
+        or os.environ.get("OUROBOROS_DATA_DIR")
+        or str(pathlib.Path.home() / "Ouroboros" / "data")
     )
     _PYTEST_DATA_DIR = pathlib.Path(tempfile.mkdtemp(prefix="ouroboros-pytest-data-"))
     os.environ["OUROBOROS_PYTEST_ACTIVE"] = "1"
@@ -30,6 +34,54 @@ if os.environ.get("OUROBOROS_ALLOW_LIVE_DATA_TESTS") != "1":
     # programbench/swe_bench_pro pollution). A file-local autouse fixture only
     # covered one module; pinning it here covers every test.
     os.environ["OUROBOROS_BENCH_RUNS_ROOT"] = str(_PYTEST_DATA_DIR / "bench_runs")
+
+
+_ORIGINAL_POPEN_INIT = subprocess.Popen.__init__
+_PYTEST_CHILD_DATA_DIR = os.environ.get("OUROBOROS_DATA_DIR", "")
+_PYTEST_CHILD_LIVE_ROOT = os.environ.get("OUROBOROS_TEST_LIVE_DATA_ROOT", "")
+_PYTEST_CHILD_BENCH_ROOT = os.environ.get("OUROBOROS_BENCH_RUNS_ROOT", "")
+_PYTEST_POPEN_PATCHED = False
+
+
+def _isolated_child_env(value) -> dict:
+    child_env = dict(value)
+    if not child_env.get("OUROBOROS_DATA_DIR"):
+        child_env["OUROBOROS_DATA_DIR"] = _PYTEST_CHILD_DATA_DIR
+    if not child_env.get("OUROBOROS_SETTINGS_PATH"):
+        child_env["OUROBOROS_SETTINGS_PATH"] = str(
+            pathlib.Path(child_env["OUROBOROS_DATA_DIR"]) / "settings.json"
+        )
+    if _PYTEST_CHILD_BENCH_ROOT and not child_env.get("OUROBOROS_BENCH_RUNS_ROOT"):
+        child_env["OUROBOROS_BENCH_RUNS_ROOT"] = _PYTEST_CHILD_BENCH_ROOT
+    child_env["OUROBOROS_PYTEST_ACTIVE"] = "1"
+    child_env["OUROBOROS_TEST_LIVE_DATA_ROOT"] = _PYTEST_CHILD_LIVE_ROOT
+    return child_env
+
+
+def _install_pytest_child_isolation() -> None:
+    """Keep the disposable data root when a test scrubs a child env."""
+    global _PYTEST_POPEN_PATCHED
+    if _PYTEST_DATA_DIR is None or _PYTEST_POPEN_PATCHED:
+        return
+
+    @functools.wraps(_ORIGINAL_POPEN_INIT)
+    def isolated_init(self, *args, **kwargs):
+        positional = list(args)
+        if len(positional) > 10 and positional[10] is not None:
+            positional[10] = _isolated_child_env(positional[10])
+        elif kwargs.get("env") is not None:
+            kwargs["env"] = _isolated_child_env(kwargs["env"])
+        return _ORIGINAL_POPEN_INIT(self, *positional, **kwargs)
+
+    subprocess.Popen.__init__ = isolated_init
+    _PYTEST_POPEN_PATCHED = True
+
+
+def _restore_pytest_child_isolation() -> None:
+    global _PYTEST_POPEN_PATCHED
+    if _PYTEST_POPEN_PATCHED:
+        subprocess.Popen.__init__ = _ORIGINAL_POPEN_INIT
+        _PYTEST_POPEN_PATCHED = False
 
 
 def _bind_pytest_runtime_roots() -> None:
@@ -112,6 +164,7 @@ def pytest_collection_modifyitems(config, items):  # noqa: ARG001
 
 def pytest_sessionstart(session):  # noqa: ARG001
     _bind_pytest_runtime_roots()
+    _install_pytest_child_isolation()
     repo_root = pathlib.Path(__file__).resolve().parents[1]
     session.config._ouroboros_initial_mock_pollution = _mock_pollution_files(repo_root)
 
@@ -150,6 +203,12 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     # Per-process temp data dir (unique mkdtemp per controller/worker) — clean on EVERY process.
     if _PYTEST_DATA_DIR is not None:
         shutil.rmtree(_PYTEST_DATA_DIR, ignore_errors=True)
+
+
+def pytest_unconfigure(config):  # noqa: ARG001
+    # Keep child isolation active through every session-finish hook; some tests
+    # exercise that hook directly before the real pytest session has ended.
+    _restore_pytest_child_isolation()
 
 
 @pytest.hookimpl(hookwrapper=True)

@@ -1502,10 +1502,51 @@ def _handle_deep_self_review_request(evt: Dict[str, Any], ctx: Any) -> None:
 
 def _handle_promote_to_stable(evt: Dict[str, Any], ctx: Any) -> None:
     import subprocess as sp
+    target = ctx.BRANCH_DEV
+    evolution_claim = evt.get("evolution_claim")
+    if isinstance(evolution_claim, dict):
+        commit_sha = str(evolution_claim.get("commit_sha") or "").strip()
+        if not commit_sha:
+            authority = {"ok": False, "reason": "commit_receipt_missing"}
+        else:
+            from supervisor.evolution_lifecycle import check_evolution_authority
+
+            authority = check_evolution_authority(
+                campaign_id=str(evolution_claim.get("campaign_id") or ""),
+                transaction_id=str(evolution_claim.get("transaction_id") or ""),
+                task_id=str(evolution_claim.get("task_id") or ""),
+                commit_sha=commit_sha,
+            )
+        if not authority.get("ok"):
+            st = ctx.load_state()
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "❌ Evolution promotion refused: the exact reviewed campaign claim "
+                    f"is no longer valid ({authority.get('reason') or 'unknown'}).",
+                )
+            return
+        try:
+            dev_sha = sp.run(
+                ["git", "rev-parse", ctx.BRANCH_DEV],
+                cwd=str(ctx.REPO_DIR), capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        except Exception:
+            dev_sha = ""
+        if dev_sha != commit_sha:
+            st = ctx.load_state()
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "❌ Evolution promotion refused: the development branch no longer "
+                    "matches the reviewed commit receipt.",
+                )
+            return
+        target = commit_sha
     # Local branch promotion always works without a remote.
     try:
         sp.run(
-            ["git", "branch", "-f", ctx.BRANCH_STABLE, ctx.BRANCH_DEV],
+            ["git", "branch", "-f", ctx.BRANCH_STABLE, target],
             cwd=str(ctx.REPO_DIR), check=True,
         )
         new_sha = sp.run(
@@ -1524,7 +1565,7 @@ def _handle_promote_to_stable(evt: Dict[str, Any], ctx: Any) -> None:
         sp.run(["git", "remote", "get-url", "origin"], cwd=str(ctx.REPO_DIR),
                capture_output=True, check=True)
         sp.run(
-            ["git", "push", "origin", f"{ctx.BRANCH_DEV}:{ctx.BRANCH_STABLE}"],
+            ["git", "push", "origin", f"{target}:{ctx.BRANCH_STABLE}"],
             cwd=str(ctx.REPO_DIR), check=True,
         )
         remote_status = " (pushed to origin)"

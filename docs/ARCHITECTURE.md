@@ -1326,9 +1326,11 @@ at assignment. A reviewed
 commit is recorded back to that claim by exact SHA after final local commit/tag
 binding and before push. If authority changes after commit, the commit moves to a
 private local inspection ref, a tag created by that attempt is removed, and the
-active branch returns to the exact parent before any later ordinary push; no restart
-occurs. Runtime
-lifecycle authority mutations use short exact state/campaign CAS operations and
+normal branch/tag namespace no longer reaches it before any later ordinary push;
+the index and worktree remain untouched so concurrent edits cannot be lost. No restart
+occurs. Runtime terminal transitions run under the shared state lock, and an exact
+terminal replay resumes pending cleanup/restart/report effects without counting the
+cycle twice. Lifecycle authority mutations use short exact state/campaign operations and
 reject stale campaign ids or terminal resurrection. Transaction schema v2 carries
 the same typed receipt through marker and markerless boot verification; legacy v1
 transactions retain their existing restart recovery. Boot reconciliation shares

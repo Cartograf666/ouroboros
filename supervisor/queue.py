@@ -1295,6 +1295,11 @@ def _enforce_task_timeouts_locked(
         # no longer race a concurrently-assigned retry; for a subagent the retry reuses the
         # same id/drive). Decisions that need live RUNNING state (orchestrator -> no blind
         # retry; the retry id) are frozen HERE under the lock and passed in the job.
+        if task_type == "evolution":
+            from supervisor.evolution_lifecycle import update_evolution_transaction
+            if not update_evolution_transaction(task_id, dispatch_status="reaping"):
+                log.warning("Evolution timeout teardown deferred: reaping state was not durable for %s", task_id)
+                continue
         RUNNING.pop(task_id, None)
         proc_handle = None
         if worker_id in workers.WORKERS:
@@ -1325,7 +1330,8 @@ def _enforce_task_timeouts_locked(
             will_retry = False
         retry_task_id = ""
         if will_retry:
-            retry_task_id = task_id if str(task.get("delegation_role") or "") == "subagent" else uuid.uuid4().hex[:8]
+            same_id = task_type == "evolution" or str(task.get("delegation_role") or "") == "subagent"
+            retry_task_id = task_id if same_id else uuid.uuid4().hex[:8]
 
         _ensure_reaper_started()
         _reap_queue.put({
@@ -1491,21 +1497,19 @@ def enqueue_evolution_task_if_needed() -> None:
         return
     campaign = _read_evolution_campaign()
     from supervisor.state import update_state
-
-    if campaign.get("status") != "active" or not all(
-        str(campaign.get(key) or "").strip() for key in ("id", "source")
-    ):
-        disable_evolution_authority(
-            "bare_flag_disabled", campaign_id=str(campaign.get("id") or ""),
-        )
+    has_authority = all(str(campaign.get(key) or "").strip() for key in ("id", "source"))
+    if campaign.get("status") != "active" or not has_authority:
+        disable_evolution_authority("bare_flag_disabled", campaign_id=str(campaign.get("id") or ""))
         send_with_budget(
             int(owner_chat_id),
-            "🧬 Evolution stayed off: the enable flag had no active campaign authority. "
-            "Use /evolve start to begin a fresh campaign.",
+            "🧬 Evolution stayed off: the enable flag had no active campaign authority. Use /evolve start to begin a fresh campaign.",
         )
         return
     active_tx = campaign.get("active_transaction") if isinstance(campaign.get("active_transaction"), dict) else {}
-    if active_tx and str(active_tx.get("commit_sha") or "").strip():
+    if active_tx and (
+        str(active_tx.get("commit_sha") or "").strip()
+        or str(active_tx.get("dispatch_status") or "") == "reaping"
+    ):
         return
 
     # Defensive net: light mode must never run evolution even if the flag was
@@ -1571,15 +1575,10 @@ def enqueue_evolution_task_if_needed() -> None:
     tid = uuid.uuid4().hex[:8]
     transaction = begin_evolution_transaction(tid, cycle=cycle, campaign=campaign)
     if not transaction:
-        disable_evolution_authority(
-            "transaction_attach_failed",
-            campaign_id=str(campaign.get("id") or ""),
-            task_id=tid,
-        )
+        disable_evolution_authority("transaction_attach_failed", campaign_id=str(campaign.get("id") or ""), task_id=tid)
         send_with_budget(
             int(owner_chat_id),
-            "🧬 Evolution stayed off: the campaign changed before its next task "
-            "could be attached. Start it again when ready.",
+            "🧬 Evolution stayed off: the campaign changed before its next task could be attached. Start it again when ready.",
         )
         return
     from ouroboros.contracts.task_contract import attach_task_contract

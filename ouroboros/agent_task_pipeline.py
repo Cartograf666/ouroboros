@@ -847,13 +847,13 @@ def emit_task_results(
     # This ensures causal ordering: send_message reaches the UI before task_done,
     # preventing the live card from collapsing before the assistant reply arrives.
     restart_reason = str(getattr(ctx, "pending_restart_reason", "") or "").strip()
+    evolution_restart = bool(getattr(ctx, "pending_restart_is_evolution", False))
     if restart_reason:
-        pending_events.append({
-            "type": "restart_request",
-            "reason": restart_reason,
-            "evolution_restart": bool(getattr(ctx, "pending_restart_is_evolution", False)),
-            "ts": utc_now_iso(),
-        })
+        if not evolution_restart:
+            pending_events.append({
+                "type": "restart_request", "reason": restart_reason,
+                "evolution_restart": False, "ts": utc_now_iso(),
+            })
         ctx.pending_restart_reason = None
         ctx.pending_restart_is_evolution = False
 

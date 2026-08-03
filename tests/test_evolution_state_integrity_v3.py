@@ -136,6 +136,105 @@ print(json.dumps({'root': str(state.DRIVE_ROOT), 'state': state.load_state()}))
     assert payload["state"]["probe"] == "isolated"
 
 
+@pytest.mark.serial
+def test_pytest_scrubbed_child_keeps_disposable_state_root(tmp_path):
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    fake_home = tmp_path / "home"
+    fake_live = fake_home / "Ouroboros" / "data" / "state"
+    fake_live.mkdir(parents=True)
+    sentinels = {
+        fake_live / "state.json": b'{"sentinel":"state"}\n',
+        fake_live / "evolution_campaign.json": b'{"sentinel":"campaign"}\n',
+    }
+    for path, content in sentinels.items():
+        path.write_bytes(content)
+    disposable_state = pathlib.Path(os.environ["OUROBOROS_DATA_DIR"]) / "state"
+    disposable_paths = tuple(
+        disposable_state / name
+        for name in ("state.json", "state.last_good.json", "evolution_campaign.json")
+    )
+    disposable_before = {
+        path: path.read_bytes() if path.exists() else None for path in disposable_paths
+    }
+    code = """
+import json
+from supervisor import evolution_lifecycle, state
+state.update_state(lambda live: live.update({'scrubbed_child_probe': True}))
+campaign = evolution_lifecycle.start_evolution_campaign('Probe', source='test')
+print(json.dumps({
+    'campaign_id': campaign.get('id', ''),
+    'drive_root': str(state.DRIVE_ROOT),
+    'pytest_loaded': 'pytest' in __import__('sys').modules,
+}))
+"""
+
+    child_env = {"HOME": str(fake_home), "USERPROFILE": str(fake_home)}
+    if os.name == "nt" and os.environ.get("SystemRoot"):
+        child_env["SystemRoot"] = os.environ["SystemRoot"]
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=repo,
+            env=child_env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert payload["pytest_loaded"] is False
+        assert pathlib.Path(payload["drive_root"]).resolve(strict=False) == pathlib.Path(
+            os.environ["OUROBOROS_DATA_DIR"]
+        ).resolve(strict=False)
+        assert payload["campaign_id"]
+        for path, content in sentinels.items():
+            assert path.read_bytes() == content
+    finally:
+        for path, content in disposable_before.items():
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+
+
+@pytest.mark.serial
+def test_nested_pytest_keeps_the_original_live_root_marker(tmp_path):
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    inherited_disposable = tmp_path / "parent-pytest-data"
+    env = {
+        "OUROBOROS_DATA_DIR": str(inherited_disposable),
+        "OUROBOROS_SETTINGS_PATH": str(inherited_disposable / "settings.json"),
+    }
+    code = """
+import importlib.util, json, os, pathlib
+spec = importlib.util.spec_from_file_location('nested_conftest', pathlib.Path('tests/conftest.py'))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(json.dumps({
+    'live_root': os.environ['OUROBOROS_TEST_LIVE_DATA_ROOT'],
+    'data_root': os.environ['OUROBOROS_DATA_DIR'],
+}))
+"""
+
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=repo,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert pathlib.Path(payload["live_root"]).resolve(strict=False) == pathlib.Path(
+        os.environ["OUROBOROS_TEST_LIVE_DATA_ROOT"]
+    ).resolve(strict=False)
+    assert pathlib.Path(payload["data_root"]).resolve(strict=False) != inherited_disposable.resolve(
+        strict=False
+    )
+
+
 def test_scheduler_disables_a_bare_flag_without_campaign(tmp_path, monkeypatch):
     from supervisor import queue, state
 
@@ -262,6 +361,75 @@ def test_scheduler_replaces_uncommitted_transaction_lost_before_enqueue(tmp_path
     assert stored["transaction_history"][-1]["abandoned_reason"] == "dispatch_not_persisted"
 
 
+def test_scheduler_does_not_replace_transaction_while_worker_is_reaping(tmp_path, monkeypatch):
+    from supervisor import evolution_lifecycle, queue
+
+    _campaign, tx = _active_transaction(tmp_path, task_id="reaping-evolution")
+    pending = []
+    queue.init_queue_refs(pending, {}, {"value": 0})
+    assert evolution_lifecycle.update_evolution_transaction(
+        tx["task_id"], dispatch_status="reaping",
+    )
+    monkeypatch.setattr(queue, "send_with_budget", lambda *args, **kwargs: None)
+
+    queue.enqueue_evolution_task_if_needed()
+
+    assert pending == []
+    stored = evolution_lifecycle._read_evolution_campaign()["active_transaction"]
+    assert stored["transaction_id"] == tx["transaction_id"]
+    assert stored["dispatch_status"] == "reaping"
+
+
+def test_timeout_marks_evolution_reaping_before_scheduler_can_replace_it(tmp_path, monkeypatch):
+    from supervisor import evolution_lifecycle, queue
+
+    _campaign, tx = _active_transaction(tmp_path, task_id="timeout-evolution")
+    pending = []
+    running = {
+        tx["task_id"]: {
+            "task": {
+                "id": tx["task_id"],
+                "type": "evolution",
+                "chat_id": 1,
+                "metadata": {"evolution_transaction": dict(tx)},
+            },
+            "started_at": 1.0,
+            "last_heartbeat_at": 1.0,
+            "worker_id": 7,
+            "attempt": 1,
+        }
+    }
+    queue.init_queue_refs(pending, running, {"value": 0})
+    worker = SimpleNamespace(busy_task_id=tx["task_id"], proc=None, reaping=False)
+    workers_view = SimpleNamespace(WORKERS={7: worker})
+    reaper_jobs = _CaptureQueue()
+    monkeypatch.setattr(queue, "FINALIZATION_GRACE_SEC", 0)
+    monkeypatch.setattr(queue, "get_task_idle_timeout_sec", lambda: 1)
+    monkeypatch.setattr(queue, "get_per_call_timeout_ceiling_sec", lambda: 1)
+    monkeypatch.setattr(queue, "get_task_abs_ceiling_sec", lambda: 10)
+    monkeypatch.setattr(queue, "_ensure_reaper_started", lambda: None)
+    monkeypatch.setattr(queue, "_reap_queue", reaper_jobs)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
+    monkeypatch.setattr(queue, "send_with_budget", lambda *args, **kwargs: None)
+
+    queue._enforce_task_timeouts_locked(
+        workers_view, now=1000.0, owner_chat_id=1,
+        st={"evolution_mode_enabled": True},
+    )
+
+    assert running == {}
+    assert worker.reaping is True
+    assert len(reaper_jobs.items) == 1
+    stored = evolution_lifecycle._read_evolution_campaign()["active_transaction"]
+    assert stored["dispatch_status"] == "reaping"
+
+    queue.enqueue_evolution_task_if_needed()
+    assert pending == []
+    assert evolution_lifecycle._read_evolution_campaign()["active_transaction"][
+        "transaction_id"
+    ] == tx["transaction_id"]
+
+
 def test_terminal_event_cannot_write_into_a_different_campaign(tmp_path):
     from supervisor import evolution_lifecycle
 
@@ -293,32 +461,111 @@ def test_terminal_event_cannot_write_into_a_different_campaign(tmp_path):
     assert stored.get("history", []) == []
 
 
-def test_terminal_write_cas_preserves_concurrent_transaction_state(tmp_path, monkeypatch):
+def test_metadata_less_terminal_cannot_mutate_active_campaign(tmp_path):
+    from supervisor import evolution_lifecycle, queue, state
+
+    state.init(tmp_path)
+    queue.init(tmp_path, 600, 1800)
+    campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
+
+    result = evolution_lifecycle.update_evolution_campaign_after_task(
+        "stale-task",
+        cost_usd=1.25,
+        outcome_axes={"execution": {"status": "failed"}},
+        rounds=1,
+    )
+
+    assert result == {
+        "accepted": False,
+        "persisted": False,
+        "replay": False,
+        "reason": "transaction_missing",
+        "transaction": {},
+    }
+    stored = evolution_lifecycle._read_evolution_campaign()
+    assert stored["id"] == campaign["id"]
+    assert stored["cycles_done"] == 0
+    assert stored["budget_spent_usd"] == 0.0
+    assert stored.get("history", []) == []
+
+
+def test_duplicate_terminal_resumes_pending_cleanup_and_owner_report(tmp_path, monkeypatch):
     from supervisor import evolution_lifecycle
 
     _campaign, tx = _active_transaction(tmp_path)
-    real_write = evolution_lifecycle._write_evolution_campaign
-    side_effects = []
-
-    def _interleave(data, **kwargs):
-        current = evolution_lifecycle._read_evolution_campaign()
-        current["active_transaction"]["concurrent_evidence"] = "kept"
-        assert real_write(current) is True
-        return real_write(data, **kwargs)
-
-    monkeypatch.setattr(evolution_lifecycle, "_write_evolution_campaign", _interleave)
+    assert evolution_lifecycle.update_evolution_transaction(
+        tx["task_id"], rescue_ref="refs/ouroboros/rescue/test",
+    )
+    real_resume = evolution_lifecycle._resume_evolution_terminal_effects
     monkeypatch.setattr(
         evolution_lifecycle,
-        "_cleanup_worktree_after_cycle",
-        lambda *_a, **_k: side_effects.append("cleanup"),
+        "_resume_evolution_terminal_effects",
+        lambda _campaign_id, _task_id, value: dict(value),
     )
+
+    first = evolution_lifecycle.update_evolution_campaign_after_task(
+        tx["task_id"],
+        cost_usd=1.0,
+        outcome_axes={"execution": {"status": "failed"}},
+        rounds=1,
+        transaction=tx,
+    )
+
+    assert first["persisted"] is True
+    stored = evolution_lifecycle._read_evolution_campaign()
+    assert stored["history"][0]["transaction"]["cleanup_status"] == "pending"
+    assert stored["pending_owner_report"]["cycle_outcome"] == "abandoned"
+
+    cleanup_calls = []
+    reports = []
+
+    def _cleanup(value, *_args, **_kwargs):
+        cleanup_calls.append(value["transaction_id"])
+        value["cleanup_status"] = "already_clean"
+
+    monkeypatch.setattr(evolution_lifecycle, "_resume_evolution_terminal_effects", real_resume)
+    monkeypatch.setattr(evolution_lifecycle, "_cleanup_worktree_after_cycle", _cleanup)
     monkeypatch.setattr(
         evolution_lifecycle,
         "notify_owner_cycle_outcome",
-        lambda *_a, **_k: side_effects.append("notify"),
+        lambda campaign, value: reports.append((campaign["id"], value["cycle_outcome"])),
     )
 
-    result = evolution_lifecycle.update_evolution_campaign_after_task(
+    replay = evolution_lifecycle.update_evolution_campaign_after_task(
+        tx["task_id"],
+        cost_usd=1.0,
+        outcome_axes={"execution": {"status": "failed"}},
+        rounds=1,
+        transaction=tx,
+    )
+
+    assert replay["replay"] is True
+    assert cleanup_calls == [tx["transaction_id"]]
+    assert reports == [(_campaign["id"], "abandoned")]
+    stored = evolution_lifecycle._read_evolution_campaign()
+    assert stored["history"][0]["transaction"]["cleanup_status"] == "already_clean"
+    assert "pending_owner_report" not in stored
+
+
+def test_duplicate_terminal_resumes_missing_restart_request(tmp_path, monkeypatch):
+    from supervisor import evolution_lifecycle
+
+    _campaign, tx = _active_transaction(tmp_path)
+    receipt = evolution_lifecycle.record_evolution_commit(
+        campaign_id=tx["campaign_id"],
+        transaction_id=tx["transaction_id"],
+        task_id=tx["task_id"],
+        commit_sha="a" * 40,
+    )
+    assert receipt["ok"] is True
+    real_resume = evolution_lifecycle._resume_evolution_terminal_effects
+    monkeypatch.setattr(
+        evolution_lifecycle,
+        "_resume_evolution_terminal_effects",
+        lambda _campaign_id, _task_id, value: dict(value),
+    )
+
+    first = evolution_lifecycle.update_evolution_campaign_after_task(
         tx["task_id"],
         cost_usd=1.0,
         outcome_axes={"execution": {"status": "ok"}},
@@ -326,13 +573,114 @@ def test_terminal_write_cas_preserves_concurrent_transaction_state(tmp_path, mon
         transaction=tx,
     )
 
-    assert result["accepted"] is True
-    assert result["persisted"] is False
-    assert result["reason"] == "campaign_write_refused"
+    assert first["transaction"]["cycle_outcome"] == "waiting_for_restart"
+    restart_calls = []
+    monkeypatch.setattr(evolution_lifecycle, "_resume_evolution_terminal_effects", real_resume)
+    monkeypatch.setattr(
+        evolution_lifecycle,
+        "request_evolution_restart",
+        lambda drive_root, value, log=None: restart_calls.append(
+            (pathlib.Path(drive_root), value["commit_sha"])
+        ),
+    )
+
+    replay = evolution_lifecycle.update_evolution_campaign_after_task(
+        tx["task_id"],
+        cost_usd=1.0,
+        outcome_axes={"execution": {"status": "ok"}},
+        rounds=1,
+        transaction=tx,
+    )
+
+    assert replay["replay"] is True
+    assert restart_calls == [(tmp_path, "a" * 40)]
+
+
+def test_terminal_restart_preserves_exact_model_reason(tmp_path, monkeypatch):
+    from supervisor import evolution_lifecycle, workers
+
+    campaign, tx = _active_transaction(tmp_path)
+    sha = "c" * 40
+    assert evolution_lifecycle.record_evolution_commit(
+        campaign["id"], tx["transaction_id"], tx["task_id"], sha,
+    )["ok"] is True
+    current_tx = evolution_lifecycle._read_evolution_campaign()["active_transaction"]
+    claim = {
+        "campaign_id": campaign["id"],
+        "transaction_id": tx["transaction_id"],
+        "task_id": tx["task_id"],
+        "commit_sha": sha,
+    }
+    marker = tmp_path / "state" / "pending_restart_verify.json"
+    marker.write_text(json.dumps({
+        "expected_sha": sha,
+        "reason": "apply reviewed evolution",
+        "evolution_claim": claim,
+    }))
+    events = _CaptureQueue()
+    monkeypatch.setenv("OUROBOROS_EVOLUTION_AUTO_RESTART", "true")
+    monkeypatch.setattr(workers, "get_event_q", lambda: events)
+
+    evolution_lifecycle.request_evolution_restart(tmp_path, current_tx)
+
+    assert json.loads(marker.read_text())["reason"] == "apply reviewed evolution"
+    assert len(events.items) == 1
+    assert events.items[0]["reason"] == "apply reviewed evolution"
+    assert events.items[0]["evolution_restart"] is True
+
+
+def test_terminal_write_serializes_concurrent_campaign_pause(tmp_path, monkeypatch):
+    from supervisor import evolution_lifecycle
+
+    _campaign, tx = _active_transaction(tmp_path)
+    real_write = evolution_lifecycle._write_evolution_campaign
+    entered = threading.Event()
+    release = threading.Event()
+    terminal_result = {}
+    pause_result = {}
+
+    def _hold_terminal_write(data, **kwargs):
+        entered.set()
+        assert release.wait(timeout=2)
+        return real_write(data, **kwargs)
+
+    monkeypatch.setattr(evolution_lifecycle, "_write_evolution_campaign", _hold_terminal_write)
+    monkeypatch.setattr(
+        evolution_lifecycle,
+        "_cleanup_worktree_after_cycle",
+        lambda tx, *_a, **_k: tx.update(cleanup_status="already_clean"),
+    )
+
+    def _terminal():
+        terminal_result.update(evolution_lifecycle.update_evolution_campaign_after_task(
+            tx["task_id"],
+            cost_usd=1.0,
+            outcome_axes={"execution": {"status": "ok"}},
+            rounds=1,
+            transaction=tx,
+        ))
+
+    terminal_thread = threading.Thread(target=_terminal)
+    terminal_thread.start()
+    assert entered.wait(timeout=2)
+
+    def _pause():
+        pause_result.update(evolution_lifecycle.pause_evolution_campaign("concurrent pause"))
+
+    pause_thread = threading.Thread(target=_pause)
+    pause_thread.start()
+    pause_thread.join(timeout=0.05)
+    assert pause_thread.is_alive()
+    release.set()
+    terminal_thread.join(timeout=2)
+    pause_thread.join(timeout=2)
+
+    assert terminal_result["persisted"] is True
+    assert pause_result["status"] == "paused"
     stored = evolution_lifecycle._read_evolution_campaign()
-    assert stored["active_transaction"]["concurrent_evidence"] == "kept"
-    assert stored.get("history", []) == []
-    assert side_effects == []
+    assert stored["status"] == "paused"
+    assert stored["pause_reason"] == "concurrent pause"
+    assert stored["history"][0]["task_id"] == tx["task_id"]
 
 
 def test_terminal_write_exception_has_no_lifecycle_side_effects(tmp_path, monkeypatch):
@@ -500,6 +848,7 @@ def test_evolution_orphan_ref_cannot_be_published_by_later_normal_push(
     _git("config", "user.email", "test@example.com")
     _git("remote", "add", "origin", str(remote))
     (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    (repo / "peer.txt").write_text("peer-base\n", encoding="utf-8")
     _git("add", ".")
     _git("commit", "-m", "base")
     base_sha = _git("rev-parse", "HEAD").stdout.strip()
@@ -511,6 +860,7 @@ def test_evolution_orphan_ref_cannot_be_published_by_later_normal_push(
     _git("commit", "-m", "orphan")
     orphan_sha = _git("rev-parse", "HEAD").stdout.strip()
     _git("tag", "-a", "v-orphan", "-m", "orphan")
+    (repo / "peer.txt").write_text("peer-concurrent-edit\n", encoding="utf-8")
 
     note = git_tools._preserve_evolution_orphan(
         SimpleNamespace(repo_dir=repo), orphan_sha, created_tag="v-orphan",
@@ -522,6 +872,8 @@ def test_evolution_orphan_ref_cannot_be_published_by_later_normal_push(
     assert _git("rev-parse", private_ref).stdout.strip() == orphan_sha
     assert _git("show-ref", "--verify", "refs/tags/v-orphan", check=False).returncode != 0
     assert _git("rev-parse", "refs/tags/v-base^{commit}").stdout.strip() == base_sha
+    assert (repo / "peer.txt").read_text(encoding="utf-8") == "peer-concurrent-edit\n"
+    assert _git("status", "--porcelain").stdout.strip()
 
     monkeypatch.setattr(git_ops, "REPO_DIR", repo)
     pushed, _message = git_ops.push_to_remote("ouroboros", push_tags=True)
@@ -547,16 +899,20 @@ def test_evolution_orphan_ref_cannot_be_published_by_later_normal_push(
         check=True,
         capture_output=True,
     ).stdout.strip()
-    real_run_cmd = git_tools.run_cmd
+    real_subprocess_run = subprocess.run
     interleaved = {"done": False}
 
-    def _interleave_before_worktree_sync(cmd, cwd=None):
-        if cmd[:4] == ["git", "read-tree", "--reset", "-u"] and not interleaved["done"]:
-            _git("update-ref", "refs/heads/ouroboros", concurrent, base_sha)
+    def _interleave_after_ref_transaction(cmd, *args, **kwargs):
+        proc = real_subprocess_run(cmd, *args, **kwargs)
+        if cmd[:3] == ["git", "update-ref", "--stdin"] and proc.returncode == 0 and not interleaved["done"]:
+            real_subprocess_run(
+                ["git", "update-ref", "refs/heads/ouroboros", concurrent, base_sha],
+                cwd=repo, check=True, capture_output=True, text=True,
+            )
             interleaved["done"] = True
-        return real_run_cmd(cmd, cwd=cwd)
+        return proc
 
-    monkeypatch.setattr(git_tools, "run_cmd", _interleave_before_worktree_sync)
+    monkeypatch.setattr(git_tools.subprocess, "run", _interleave_after_ref_transaction)
     note = git_tools._preserve_evolution_orphan(
         SimpleNamespace(repo_dir=repo), second_orphan,
     )
@@ -567,6 +923,61 @@ def test_evolution_orphan_ref_cannot_be_published_by_later_normal_push(
     assert _git(
         "rev-parse", f"refs/ouroboros/evolution-orphans/{second_orphan}",
     ).stdout.strip() == second_orphan
+
+
+def test_orphan_ref_transaction_failure_falls_back_to_safe_ref_cas(tmp_path, monkeypatch):
+    from ouroboros.tools import git as git_tools
+    from supervisor import git_ops
+
+    repo, remote = tmp_path / "repo", tmp_path / "remote.git"
+    real_run = subprocess.run
+
+    def _git(*args, cwd=repo, check=True):
+        return real_run(
+            ["git", *args], cwd=cwd, check=check, capture_output=True, text=True,
+        )
+
+    real_run(["git", "init", "--bare", str(remote)], check=True, capture_output=True, text=True)
+    repo.mkdir()
+    _git("init", "-b", "ouroboros")
+    _git("config", "user.name", "Test")
+    _git("config", "user.email", "test@example.com")
+    _git("remote", "add", "origin", str(remote))
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-m", "base")
+    base_sha = _git("rev-parse", "HEAD").stdout.strip()
+    _git("push", "-u", "origin", "ouroboros")
+    (repo / "file.txt").write_text("orphan\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-m", "orphan")
+    orphan_sha = _git("rev-parse", "HEAD").stdout.strip()
+    _git("tag", "-a", "v-orphan", "-m", "orphan")
+
+    def _fail_transactions(cmd, *args, **kwargs):
+        if cmd[:3] == ["git", "update-ref", "--stdin"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "injected transaction failure")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(git_tools.subprocess, "run", _fail_transactions)
+
+    note = git_tools._preserve_evolution_orphan(
+        SimpleNamespace(repo_dir=repo), orphan_sha, created_tag="v-orphan",
+    )
+
+    assert "CONTAINMENT_FAILED" not in note
+    assert _git("rev-parse", "HEAD").stdout.strip() == base_sha
+    assert _git(
+        "rev-parse", f"refs/ouroboros/evolution-orphans/{orphan_sha}",
+    ).stdout.strip() == orphan_sha
+    assert _git("show-ref", "--verify", "refs/tags/v-orphan", check=False).returncode != 0
+
+    monkeypatch.setattr(git_ops, "REPO_DIR", repo)
+    pushed, _message = git_ops.push_to_remote("ouroboros", push_tags=True)
+
+    assert pushed is True
+    assert _git("rev-parse", "refs/heads/ouroboros", cwd=remote).stdout.strip() == base_sha
+    assert _git("cat-file", "-e", orphan_sha, cwd=remote, check=False).returncode != 0
 
 
 def test_exact_commit_receipt_is_bound_to_campaign_transaction_and_task(tmp_path):
@@ -596,6 +1007,69 @@ def test_exact_commit_receipt_is_bound_to_campaign_transaction_and_task(tmp_path
     assert evolution_lifecycle.check_evolution_authority(
         **claim, commit_sha="a" * 40,
     )["reason"] == "commit_receipt_missing"
+
+
+def test_second_evolution_commit_is_blocked_before_review(tmp_path, monkeypatch):
+    from ouroboros.tools import git as git_tools
+    from supervisor import evolution_lifecycle
+
+    campaign, tx = _active_transaction(tmp_path)
+    assert evolution_lifecycle.record_evolution_commit(
+        campaign["id"], tx["transaction_id"], tx["task_id"], "a" * 40,
+    )["ok"] is True
+    review_calls = []
+    monkeypatch.setattr(git_tools, "_task_attributed_commit_paths", lambda *a, **k: (None, None, "", None))
+    monkeypatch.setattr(git_tools, "_check_overlapping_review_attempt", lambda *a, **k: "")
+    monkeypatch.setattr(git_tools, "_record_commit_attempt", lambda *a, **k: None)
+    monkeypatch.setattr(git_tools, "_acquire_git_lock", lambda *a, **k: pathlib.Path("lock"))
+    monkeypatch.setattr(git_tools, "_release_git_lock", lambda *a, **k: None)
+    monkeypatch.setattr(git_tools, "_prepare_review_commit_worktree", lambda *a, **k: (False, ""))
+    monkeypatch.setattr(
+        git_tools,
+        "_run_reviewed_stage_cycle",
+        lambda *a, **k: review_calls.append(True) or {"status": "passed"},
+    )
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path,
+        drive_root=tmp_path,
+        current_task_type="evolution",
+        task_id=tx["task_id"],
+        task_metadata={"evolution_transaction": tx},
+    )
+
+    result = git_tools._repo_commit_push(ctx, "second commit")
+
+    assert "transaction_already_committed" in result
+    assert "No reviewer was called" in result
+    assert review_calls == []
+
+
+def test_receipt_race_blocks_evolution_before_git_commit(tmp_path, monkeypatch):
+    from ouroboros.tools import git as git_tools
+    from supervisor import evolution_lifecycle
+
+    campaign, tx = _active_transaction(tmp_path)
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path,
+        current_task_type="evolution",
+        task_id=tx["task_id"],
+        task_metadata={"evolution_transaction": tx},
+    )
+    monkeypatch.setattr(git_tools, "_record_commit_attempt", lambda *a, **k: None)
+    claim, error = git_tools._check_evolution_commit_stage(
+        ctx, "commit", 0.0, phase="pre_review_authority",
+    )
+    assert error == ""
+    assert evolution_lifecycle.record_evolution_commit(
+        **claim, commit_sha="b" * 40,
+    )["ok"] is True
+
+    _claim, error = git_tools._check_evolution_commit_stage(
+        ctx, "commit", 0.0, phase="pre_commit_authority",
+    )
+
+    assert "transaction_already_committed" in error
+    assert "Nothing was committed" in error
 
 
 def test_revoked_authority_leaves_commit_unrecorded(tmp_path):
@@ -915,7 +1389,16 @@ def test_postcommit_cas_failure_returns_local_orphan_after_binding(tmp_path, mon
     assert len(contained) == 1
 
 
-def test_final_evolution_authority_check_and_push_stay_under_git_lock(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("task_type", "expected_order"),
+    [
+        ("evolution", ["authority", "push", "release", "publish"]),
+        ("task", ["release", "push", "publish"]),
+    ],
+)
+def test_only_evolution_push_stays_under_git_lock(
+    tmp_path, monkeypatch, task_type, expected_order,
+):
     from ouroboros.tools import git as git_tools
 
     claim = {"campaign_id": "camp", "transaction_id": "tx", "task_id": "evo"}
@@ -950,18 +1433,137 @@ def test_final_evolution_authority_check_and_push_stay_under_git_lock(tmp_path, 
         lambda *a, **k: order.append("authority") or "",
     )
     monkeypatch.setattr(git_tools, "_auto_push", lambda *a, **k: order.append("push") or "")
-    monkeypatch.setattr(git_tools, "_publish_reviewed_commit", lambda *a, **k: "ok")
+    monkeypatch.setattr(
+        git_tools,
+        "_publish_reviewed_commit",
+        lambda *a, **k: order.append("publish") or "ok",
+    )
     ctx = SimpleNamespace(
         repo_dir=tmp_path,
         drive_root=tmp_path,
         branch_dev="ouroboros",
-        current_task_type="evolution",
+        current_task_type=task_type,
         task_id="evo",
         task_metadata={"evolution_transaction": claim},
     )
 
     assert git_tools._repo_commit_push(ctx, "test commit", skip_tests=True) == "ok"
-    assert order == ["authority", "push", "release"]
+    assert order == expected_order
+
+
+def test_revoked_publication_does_not_record_or_anchor_success(tmp_path, monkeypatch):
+    from ouroboros import mutation_attribution
+    from ouroboros.tools import git as git_tools
+
+    claim = {"campaign_id": "camp", "transaction_id": "tx", "task_id": "evo"}
+    sha = "d" * 40
+    attempts, baselines, contained, pushed = [], [], [], []
+    authority = iter([
+        (claim, {"ok": True}),
+        (claim, {"ok": True}),
+        (claim, {"ok": True}),
+        (claim, {"ok": False, "reason": "owner_stopped"}),
+    ])
+    monkeypatch.setattr(git_tools, "_task_attributed_commit_paths", lambda *a, **k: (None, None, "", ("root", "task")))
+    monkeypatch.setattr(git_tools, "_check_overlapping_review_attempt", lambda *a, **k: "")
+    monkeypatch.setattr(git_tools, "_record_commit_attempt", lambda *a, **k: attempts.append((k.get("status") or a[2], k)))
+    monkeypatch.setattr(git_tools, "_acquire_git_lock", lambda *a, **k: pathlib.Path("lock"))
+    monkeypatch.setattr(git_tools, "_release_git_lock", lambda *a, **k: None)
+    monkeypatch.setattr(git_tools, "_prepare_review_commit_worktree", lambda *a, **k: (False, ""))
+    monkeypatch.setattr(git_tools, "_evolution_commit_authority", lambda *a, **k: next(authority))
+    monkeypatch.setattr(git_tools, "_verify_reviewed_commit_binding", lambda *a, **k: (True, ""))
+    def reviewed(review_ctx, *args, **kwargs):
+        review_ctx._last_triad_raw_results = [{"raw": "triad"}]
+        review_ctx._last_scope_raw_result = {"raw": "scope"}
+        review_ctx._review_degraded_reasons = ["recorded"]
+        return {
+            "status": "passed",
+            "pre_fingerprint": {"fingerprint": "pre"},
+            "post_fingerprint": {"fingerprint": "post", "binding": {}},
+        }
+    monkeypatch.setattr(git_tools, "_run_reviewed_stage_cycle", reviewed)
+    monkeypatch.setattr(git_tools, "run_cmd", lambda cmd, cwd=None: sha if cmd[:3] == ["git", "rev-parse", "HEAD"] else "")
+    monkeypatch.setattr(git_tools, "_auto_tag_on_version_bump", lambda *a, **k: "")
+    monkeypatch.setattr(git_tools, "_record_evolution_commit_receipt", lambda *a, **k: "")
+    monkeypatch.setattr(git_tools, "_preserve_evolution_orphan", lambda *a, **k: contained.append(True) or "contained")
+    monkeypatch.setattr(git_tools, "_auto_push", lambda *a, **k: pushed.append(True) or "")
+    monkeypatch.setattr(mutation_attribution, "advance_mutation_baseline", lambda *a, **k: baselines.append(a))
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path, drive_root=tmp_path, branch_dev="ouroboros",
+        current_task_type="evolution", task_id="evo",
+        task_metadata={"evolution_transaction": claim},
+        _scope_review_history={"keep": True},
+    )
+
+    result = git_tools._repo_commit_push(ctx, "test commit", skip_tests=True)
+
+    assert "EVOLUTION_PUBLICATION_STOPPED" in result
+    assert contained == [True]
+    assert pushed == []
+    assert baselines == []
+    statuses = [status for status, _details in attempts]
+    assert "succeeded" not in statuses and statuses[-1] == "failed"
+    failed = attempts[-1][1]
+    assert failed["fingerprint_status"] == "matched"
+    assert failed["pre_review_fingerprint"] == "pre"
+    assert failed["post_review_fingerprint"] == "post"
+    assert failed["triad_raw_results"] == [{"raw": "triad"}]
+    assert failed["scope_raw_result"] == {"raw": "scope"}
+    assert failed["degraded_reasons"] == ["recorded"]
+    assert not getattr(ctx, "last_reviewed_commit_sha", "")
+    assert ctx._scope_review_history == {"keep": True}
+
+
+def test_postcommit_binding_failure_contains_evolution_commit(tmp_path, monkeypatch):
+    from ouroboros.tools import git as git_tools
+
+    claim = {"campaign_id": "camp", "transaction_id": "tx", "task_id": "evo"}
+    contained = []
+    monkeypatch.setattr(git_tools, "_task_attributed_commit_paths", lambda *a, **k: (None, None, "", None))
+    monkeypatch.setattr(git_tools, "_check_overlapping_review_attempt", lambda *a, **k: "")
+    monkeypatch.setattr(git_tools, "_record_commit_attempt", lambda *a, **k: None)
+    monkeypatch.setattr(git_tools, "_acquire_git_lock", lambda *a, **k: pathlib.Path("lock"))
+    monkeypatch.setattr(git_tools, "_release_git_lock", lambda *a, **k: None)
+    monkeypatch.setattr(git_tools, "_prepare_review_commit_worktree", lambda *a, **k: (False, ""))
+    monkeypatch.setattr(git_tools, "_evolution_commit_authority", lambda *a, **k: (claim, {"ok": True}))
+    monkeypatch.setattr(
+        git_tools,
+        "_run_reviewed_stage_cycle",
+        lambda *a, **k: {
+            "status": "passed",
+            "pre_fingerprint": {"fingerprint": "pre"},
+            "post_fingerprint": {"fingerprint": "post", "binding": {}},
+        },
+    )
+    monkeypatch.setattr(
+        git_tools,
+        "run_cmd",
+        lambda cmd, cwd=None: "2" * 40 if cmd[:3] == ["git", "rev-parse", "HEAD"] else "",
+    )
+    monkeypatch.setattr(
+        git_tools,
+        "_verify_reviewed_commit_binding",
+        lambda *a, **k: (False, "tree mismatch"),
+    )
+    monkeypatch.setattr(
+        git_tools,
+        "_preserve_evolution_orphan",
+        lambda *a, **k: contained.append((a, k)) or "contained",
+    )
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path,
+        drive_root=tmp_path,
+        current_task_type="evolution",
+        task_id="evo",
+        task_metadata={"evolution_transaction": claim},
+    )
+
+    result = git_tools._repo_commit_push(ctx, "test commit")
+
+    assert "REVIEW_BINDING_FAILED" in result
+    assert "contained" in result
+    assert len(contained) == 1
+    assert contained[0][1] == {}
 
 
 def test_final_tag_binding_failure_cannot_record_restart_receipt(tmp_path, monkeypatch):
@@ -969,6 +1571,7 @@ def test_final_tag_binding_failure_cannot_record_restart_receipt(tmp_path, monke
 
     claim = {"campaign_id": "camp", "transaction_id": "tx", "task_id": "evo"}
     recorded = []
+    contained = []
     binding_results = iter([(True, ""), (False, "tag target mismatch")])
     monkeypatch.setattr(git_tools, "_task_attributed_commit_paths", lambda *a, **k: (None, None, "", None))
     monkeypatch.setattr(git_tools, "_check_overlapping_review_attempt", lambda *a, **k: "")
@@ -985,14 +1588,26 @@ def test_final_tag_binding_failure_cannot_record_restart_receipt(tmp_path, monke
         lambda *a, **k: {
             "status": "passed",
             "pre_fingerprint": {"fingerprint": "pre"},
-            "post_fingerprint": {"fingerprint": "post", "binding": {}},
+            "post_fingerprint": {
+                "fingerprint": "post",
+                "binding": {"expected_tag": "v-test"},
+            },
         },
     )
     monkeypatch.setattr(
         git_tools, "run_cmd",
         lambda cmd, cwd=None: "1" * 40 if cmd[:3] == ["git", "rev-parse", "HEAD"] else "",
     )
-    monkeypatch.setattr(git_tools, "_auto_tag_on_version_bump", lambda *a, **k: "")
+    monkeypatch.setattr(
+        git_tools,
+        "_auto_tag_on_version_bump",
+        lambda *a, **k: " [tagged: v-test]",
+    )
+    monkeypatch.setattr(
+        git_tools,
+        "_preserve_evolution_orphan",
+        lambda *a, **k: contained.append((a, k)) or "contained",
+    )
     monkeypatch.setattr(
         git_tools,
         "_record_evolution_commit_receipt",
@@ -1011,6 +1626,8 @@ def test_final_tag_binding_failure_cannot_record_restart_receipt(tmp_path, monke
 
     assert "REVIEW_BINDING_FAILED" in result
     assert recorded == []
+    assert len(contained) == 1
+    assert contained[0][1]["created_tag"] == "v-test"
 
 
 def test_evolution_publication_authority_requires_exact_head(tmp_path, monkeypatch):
@@ -1039,6 +1656,117 @@ def test_evolution_publication_authority_requires_exact_head(tmp_path, monkeypat
 
     assert authority["ok"] is False
     assert authority["reason"] == "head_mismatch"
+
+
+def test_evolution_promote_event_carries_exact_claim():
+    from ouroboros.tools import control
+
+    ctx = SimpleNamespace(
+        current_task_type="evolution",
+        task_id="evo-task",
+        task_metadata={"evolution_transaction": {
+            "campaign_id": "campaign",
+            "transaction_id": "transaction",
+            "task_id": "evo-task",
+            "commit_sha": "",
+        }},
+        last_reviewed_commit_sha="a" * 40,
+        pending_events=[],
+    )
+
+    control._promote_to_stable(ctx, "reviewed")
+
+    event = ctx.pending_events[0]
+    assert event["type"] == "promote_to_stable"
+    assert event["reason"] == "reviewed"
+    assert event["evolution_claim"] == {
+        "campaign_id": "campaign",
+        "transaction_id": "transaction",
+        "task_id": "evo-task",
+        "commit_sha": "a" * 40,
+    }
+
+
+def test_promote_to_stable_rechecks_evolution_claim_without_changing_normal_flow(
+    tmp_path, monkeypatch,
+):
+    from supervisor import events, evolution_lifecycle
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def _git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    _git("init", "-b", "ouroboros")
+    _git("config", "user.name", "Test")
+    _git("config", "user.email", "test@example.com")
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-m", "base")
+    base_sha = _git("rev-parse", "HEAD")
+    _git("branch", "ouroboros-stable", base_sha)
+    (repo / "file.txt").write_text("reviewed\n", encoding="utf-8")
+    _git("add", ".")
+    _git("commit", "-m", "reviewed")
+    reviewed_sha = _git("rev-parse", "HEAD")
+    sent = []
+    ctx = SimpleNamespace(
+        REPO_DIR=repo,
+        BRANCH_DEV="ouroboros",
+        BRANCH_STABLE="ouroboros-stable",
+        load_state=lambda: {"owner_chat_id": 1},
+        send_with_budget=lambda chat_id, message: sent.append(message),
+    )
+    monkeypatch.setattr(
+        evolution_lifecycle,
+        "check_evolution_authority",
+        lambda **claim: {
+            "ok": claim.get("campaign_id") == "valid",
+            "reason": "owner_stopped" if claim.get("campaign_id") != "valid" else "",
+        },
+    )
+
+    events._handle_promote_to_stable({
+        "type": "promote_to_stable",
+        "evolution_claim": {
+            "campaign_id": "revoked",
+            "transaction_id": "tx",
+            "task_id": "evo",
+            "commit_sha": reviewed_sha,
+        },
+    }, ctx)
+    assert _git("rev-parse", "ouroboros-stable") == base_sha
+    assert "owner_stopped" in sent[-1]
+
+    events._handle_promote_to_stable({
+        "type": "promote_to_stable",
+        "evolution_claim": {
+            "campaign_id": "",
+            "transaction_id": "",
+            "task_id": "",
+            "commit_sha": "",
+        },
+    }, ctx)
+    assert _git("rev-parse", "ouroboros-stable") == base_sha
+    assert "commit_receipt_missing" in sent[-1]
+
+    events._handle_promote_to_stable({
+        "type": "promote_to_stable",
+        "evolution_claim": {
+            "campaign_id": "valid",
+            "transaction_id": "tx",
+            "task_id": "evo",
+            "commit_sha": reviewed_sha,
+        },
+    }, ctx)
+    assert _git("rev-parse", "ouroboros-stable") == reviewed_sha
+
+    _git("branch", "-f", "ouroboros-stable", base_sha)
+    events._handle_promote_to_stable({"type": "promote_to_stable"}, ctx)
+    assert _git("rev-parse", "ouroboros-stable") == reviewed_sha
 
 
 def test_restart_requires_the_exact_active_commit_receipt(tmp_path, monkeypatch):

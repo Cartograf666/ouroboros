@@ -634,26 +634,26 @@ def _clear_objective_repeat_count(campaign: Dict[str, Any], tx: Dict[str, Any]) 
         dropped.remove(fp)
 
 
-def update_evolution_transaction(task_id: str, **updates: Any) -> None:
+def update_evolution_transaction(task_id: str, **updates: Any) -> bool:
     """Best-effort update of the active/lightweight evolution transaction."""
     from supervisor import state
 
     state.assert_test_data_path(state.STATE_PATH)
     lock_fd = state.acquire_file_lock(state.STATE_LOCK_PATH)
     if lock_fd is None:
-        return
+        return False
     try:
         campaign = _read_evolution_campaign()
         tx = campaign.get("active_transaction")
         if not isinstance(tx, dict) or str(tx.get("task_id") or "") != str(task_id or ""):
-            return
+            return False
         for key, value in updates.items():
             if value is not None:
                 tx[key] = value
         tx["updated_at"] = utc_now_iso()
         campaign["active_transaction"] = tx
         campaign["updated_at"] = utc_now_iso()
-        _write_evolution_campaign(campaign, _state_lock_held=True)
+        return _write_evolution_campaign(campaign, _state_lock_held=True)
     finally:
         state.release_file_lock(state.STATE_LOCK_PATH, lock_fd)
 
@@ -807,6 +807,35 @@ def _persist_evolution_cleanup(campaign_id: str, tx: Dict[str, Any]) -> bool:
         state.release_file_lock(state.STATE_LOCK_PATH, lock_fd)
 
 
+def _resume_evolution_terminal_effects(
+    campaign_id: str, task_id: str, tx: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Finish idempotent effects that follow the durable terminal transition."""
+    from supervisor import queue
+
+    resumed = dict(tx or {})
+    if resumed.get("cleanup_status") == "pending":
+        _cleanup_worktree_after_cycle(resumed, str(task_id or ""))
+        try:
+            if not _persist_evolution_cleanup(campaign_id, resumed):
+                log.warning("Failed to persist evolution cleanup evidence for %s", task_id)
+        except Exception:
+            log.warning("Failed to persist evolution cleanup evidence for %s", task_id, exc_info=True)
+    if (
+        resumed.get("cycle_outcome") == "waiting_for_restart"
+        and resumed.get("restart_required")
+        and not resumed.get("restart_verified")
+    ):
+        try:
+            request_evolution_restart(queue.DRIVE_ROOT, resumed, log=log)
+        except Exception:
+            log.warning("Failed to resume evolution restart request for %s", task_id, exc_info=True)
+    # Abandon/absorb reports are staged in the same campaign write as the
+    # transition. Delivery clears only the exact report after a successful send.
+    deliver_pending_owner_report()
+    return resumed
+
+
 def update_evolution_campaign_after_task(
     task_id: str,
     *,
@@ -817,116 +846,136 @@ def update_evolution_campaign_after_task(
     transaction: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Record an evolution cycle outcome in the active campaign file."""
-    from supervisor import queue
+    from supervisor import state
 
-    campaign = _read_evolution_campaign()
-    if campaign.get("status") not in {"active", "paused"}:
+    state.assert_test_data_path(state.STATE_PATH)
+    lock_fd = state.acquire_file_lock(state.STATE_LOCK_PATH)
+    if lock_fd is None:
         return {
-            "accepted": False, "persisted": False, "replay": False,
-            "reason": "campaign_not_active", "transaction": {},
+            "accepted": True, "persisted": False, "replay": False,
+            "reason": "state_lock_unavailable", "transaction": {},
         }
-    metadata_tx = transaction if isinstance(transaction, dict) else {}
-    active_tx = campaign.get("active_transaction") if isinstance(campaign.get("active_transaction"), dict) else {}
-    expected_active_tx = dict(active_tx)
-    campaign_id = str(campaign.get("id") or "")
-
-    def _matches(candidate: Dict[str, Any]) -> bool:
-        return bool(
-            campaign_id
-            and str(candidate.get("campaign_id") or "") == campaign_id
-            and str(candidate.get("transaction_id") or "")
-            and str(candidate.get("task_id") or "") == str(task_id or "")
-        )
-
-    metadata_tx_id = str(metadata_tx.get("transaction_id") or "") if _matches(metadata_tx) else ""
-    if metadata_tx_id:
-        for existing in list(campaign.get("history") or []):
-            if not isinstance(existing, dict) or str(existing.get("task_id") or "") != str(task_id or ""):
-                continue
-            existing_tx = existing.get("transaction")
-            if (
-                isinstance(existing_tx, dict)
-                and str(existing_tx.get("campaign_id") or "") == campaign_id
-                and str(existing_tx.get("transaction_id") or "") == metadata_tx_id
-            ):
-                return {
-                    "accepted": True, "persisted": True, "replay": True,
-                    "reason": "duplicate_terminal", "transaction": dict(existing_tx),
-                }
-
-    if active_tx or metadata_tx:
-        if (
-            not _matches(active_tx)
-            or not _matches(metadata_tx)
-            or str(active_tx.get("transaction_id") or "")
-            != str(metadata_tx.get("transaction_id") or "")
-        ):
+    replay_found = False
+    replay_tx: Dict[str, Any] = {}
+    campaign_id = ""
+    tx: Dict[str, Any] = {}
+    try:
+        # The complete read/check/mutate/write is protected by the same state lock
+        # used by pause, owner stop, boot reconciliation, and transaction updates.
+        campaign = _read_evolution_campaign()
+        if campaign.get("status") not in {"active", "paused"}:
             return {
                 "accepted": False, "persisted": False, "replay": False,
-                "reason": "transaction_mismatch", "transaction": {},
+                "reason": "campaign_not_active", "transaction": {},
             }
-        tx = {**metadata_tx, **active_tx}
-    else:
-        tx = {}
-    axes = normalize_outcome_axes({"outcome_axes": outcome_axes or {}})
-    tx_id = str(tx.get("transaction_id") or "") if tx else ""
-    if not tx_id:
-        for existing in list(campaign.get("history") or []):
-            if isinstance(existing, dict) and str(existing.get("task_id") or "") == str(task_id or ""):
+        metadata_tx = transaction if isinstance(transaction, dict) else {}
+        active_tx = (
+            campaign.get("active_transaction")
+            if isinstance(campaign.get("active_transaction"), dict) else {}
+        )
+        campaign_id = str(campaign.get("id") or "")
+
+        def _matches(candidate: Dict[str, Any]) -> bool:
+            return bool(
+                campaign_id
+                and str(candidate.get("campaign_id") or "") == campaign_id
+                and str(candidate.get("transaction_id") or "")
+                and str(candidate.get("task_id") or "") == str(task_id or "")
+            )
+
+        metadata_tx_id = (
+            str(metadata_tx.get("transaction_id") or "") if _matches(metadata_tx) else ""
+        )
+        if metadata_tx_id:
+            for existing in list(campaign.get("history") or []):
+                if (
+                    not isinstance(existing, dict)
+                    or str(existing.get("task_id") or "") != str(task_id or "")
+                ):
+                    continue
+                existing_tx = existing.get("transaction")
+                if (
+                    isinstance(existing_tx, dict)
+                    and str(existing_tx.get("campaign_id") or "") == campaign_id
+                    and str(existing_tx.get("transaction_id") or "") == metadata_tx_id
+                ):
+                    replay_found = True
+                    replay_tx = dict(existing_tx)
+                    break
+
+        if not replay_found and not active_tx and not metadata_tx:
+            # Preserve idempotency for old history-only records, but never let a
+            # new metadata-less terminal mutate whichever campaign happens to be active.
+            for existing in list(campaign.get("history") or []):
+                if (
+                    isinstance(existing, dict)
+                    and str(existing.get("task_id") or "") == str(task_id or "")
+                ):
+                    replay_found = True
+                    replay_tx = dict(existing.get("transaction") or {})
+                    break
+            if not replay_found:
                 return {
-                    "accepted": True, "persisted": True, "replay": True,
-                    "reason": "duplicate_terminal",
-                    "transaction": dict(existing.get("transaction") or {}),
+                    "accepted": False, "persisted": False, "replay": False,
+                    "reason": "transaction_missing", "transaction": {},
                 }
-    if tx:
-        tx["outcome_axes"] = axes
-        tx["updated_at"] = utc_now_iso()
-    history = list(campaign.get("history") or [])
-    cost_available = cost_accounting_status == "available" and cost_usd is not None
-    row = {
-        "task_id": str(task_id or ""),
-        "ts": utc_now_iso(),
-        "cost_usd": float(cost_usd) if cost_available else None,
-        "cost_accounting_status": "available" if cost_available else "unavailable",
-        "outcome_axes": axes,
-        "rounds": int(rounds or 0),
-    }
-    if tx:
-        row["transaction"] = tx
-    history.append(row)
-    campaign["history"] = history[-50:]
-    cleanup_required = False
-    restart_requested = False
-    if tx:
-        has_commit = bool(str(tx.get("commit_sha") or "").strip())
-        restart_verified = bool(tx.get("restart_verified"))
-        has_rescue = bool(str(tx.get("rescue_ref") or "").strip())
-        if str((campaign.get("active_transaction") or {}).get("task_id") or "") == str(task_id or ""):
+
+        if not replay_found:
+            if (
+                not _matches(active_tx)
+                or not _matches(metadata_tx)
+                or str(active_tx.get("transaction_id") or "")
+                != str(metadata_tx.get("transaction_id") or "")
+            ):
+                return {
+                    "accepted": False, "persisted": False, "replay": False,
+                    "reason": "transaction_mismatch", "transaction": {},
+                }
+            tx = {**metadata_tx, **active_tx}
+            axes = normalize_outcome_axes({"outcome_axes": outcome_axes or {}})
+            tx["outcome_axes"] = axes
+            tx["updated_at"] = utc_now_iso()
+            history = list(campaign.get("history") or [])
+            cost_available = cost_accounting_status == "available" and cost_usd is not None
+            row = {
+                "task_id": str(task_id or ""),
+                "ts": utc_now_iso(),
+                "cost_usd": float(cost_usd) if cost_available else None,
+                "cost_accounting_status": "available" if cost_available else "unavailable",
+                "outcome_axes": axes,
+                "rounds": int(rounds or 0),
+                "transaction": tx,
+            }
+            history.append(row)
+            campaign["history"] = history[-50:]
+            has_commit = bool(str(tx.get("commit_sha") or "").strip())
+            restart_verified = bool(tx.get("restart_verified"))
+            has_rescue = bool(str(tx.get("rescue_ref") or "").strip())
             if has_commit and restart_verified:
                 tx["cycle_outcome"] = "absorbed"
-                campaign["absorbed_cycles_done"] = int(campaign.get("absorbed_cycles_done") or 0) + 1
+                campaign["absorbed_cycles_done"] = int(
+                    campaign.get("absorbed_cycles_done") or 0
+                ) + 1
                 append_unique_transaction(campaign, tx)
                 campaign.pop("active_transaction", None)
-                _clear_objective_repeat_count(campaign, tx)  # BUG3: genuine progress clears this fp
+                _clear_objective_repeat_count(campaign, tx)
             elif has_rescue:
                 tx["cycle_outcome"] = "abandoned"
                 tx["abandoned_reason"] = "rescue_ref_present"
                 tx["cleanup_status"] = "pending"
-                cleanup_required = True
                 append_unique_transaction(campaign, tx)
                 campaign.pop("active_transaction", None)
-                campaign.pop("post_task_backlog_id", None)  # BUG3 Layer B: detach (was missing on abandoned)
-                _bump_objective_repeat_count(campaign, tx)  # BUG3: non-absorbing cycle counts
+                campaign.pop("post_task_backlog_id", None)
+                _bump_objective_repeat_count(campaign, tx)
             elif not has_commit:
                 tx["cycle_outcome"] = "no_op"
                 tx["restart_required"] = False
                 tx["recovery_hint"] = ""
                 tx["cleanup_status"] = "pending"
-                cleanup_required = True
                 append_unique_transaction(campaign, tx)
                 campaign.pop("active_transaction", None)
                 campaign.pop("post_task_backlog_id", None)
-                _bump_objective_repeat_count(campaign, tx)  # BUG3: non-absorbing cycle counts
+                _bump_objective_repeat_count(campaign, tx)
             else:
                 tx["cycle_outcome"] = "waiting_for_restart"
                 tx["recovery_hint"] = tx.get("recovery_hint") or (
@@ -937,55 +986,51 @@ def update_evolution_campaign_after_task(
                 if not tx.get("restart_decision"):
                     tx["restart_decision"] = "supervisor_auto_requested"
                 campaign["active_transaction"] = tx
-                restart_requested = True
-    campaign["last_task_id"] = str(task_id or "")
-    campaign["cycles_done"] = int(campaign.get("cycles_done") or 0) + 1
-    execution_status = str((axes.get("execution") or {}).get("status") or "unknown")
-    objective_status = str((axes.get("objective") or {}).get("status") or "not_evaluated")
-    cost_note = f"${float(cost_usd):.4f}" if cost_available else "unavailable"
-    campaign["progress_notes"] = (
-        f"Last cycle {task_id}: execution={execution_status}, objective={objective_status}, "
-        f"rounds={int(rounds or 0)}, cost={cost_note}."
-    )
-    if cost_available:
-        campaign["budget_spent_usd"] = round(
-            float(campaign.get("budget_spent_usd") or 0.0) + float(cost_usd), 6,
-        )
-    else:
-        campaign["cost_accounting_status"] = "unavailable"
-    campaign["updated_at"] = utc_now_iso()
-    try:
-        persisted = _write_evolution_campaign(
-            campaign,
-            expected_campaign_id=campaign_id,
-            expected_active_transaction=expected_active_tx,
-        )
-    except Exception:
-        log.warning("Failed to persist evolution terminal for %s", task_id, exc_info=True)
+            if tx.get("cycle_outcome") in {"absorbed", "abandoned"}:
+                campaign["pending_owner_report"] = dict(tx)
+            campaign["last_task_id"] = str(task_id or "")
+            campaign["cycles_done"] = int(campaign.get("cycles_done") or 0) + 1
+            execution_status = str((axes.get("execution") or {}).get("status") or "unknown")
+            objective_status = str((axes.get("objective") or {}).get("status") or "not_evaluated")
+            cost_note = f"${float(cost_usd):.4f}" if cost_available else "unavailable"
+            campaign["progress_notes"] = (
+                f"Last cycle {task_id}: execution={execution_status}, objective={objective_status}, "
+                f"rounds={int(rounds or 0)}, cost={cost_note}."
+            )
+            if cost_available:
+                campaign["budget_spent_usd"] = round(
+                    float(campaign.get("budget_spent_usd") or 0.0) + float(cost_usd), 6,
+                )
+            else:
+                campaign["cost_accounting_status"] = "unavailable"
+            campaign["updated_at"] = utc_now_iso()
+            try:
+                persisted = _write_evolution_campaign(
+                    campaign,
+                    expected_campaign_id=campaign_id,
+                    _state_lock_held=True,
+                )
+            except Exception:
+                log.warning("Failed to persist evolution terminal for %s", task_id, exc_info=True)
+                return {
+                    "accepted": True, "persisted": False, "replay": False,
+                    "reason": "campaign_write_failed", "transaction": {},
+                }
+            if not persisted:
+                return {
+                    "accepted": True, "persisted": False, "replay": False,
+                    "reason": "campaign_write_refused", "transaction": {},
+                }
+    finally:
+        state.release_file_lock(state.STATE_LOCK_PATH, lock_fd)
+
+    if replay_found:
+        replay_tx = _resume_evolution_terminal_effects(campaign_id, str(task_id or ""), replay_tx)
         return {
-            "accepted": True, "persisted": False, "replay": False,
-            "reason": "campaign_write_failed", "transaction": {},
+            "accepted": True, "persisted": True, "replay": True,
+            "reason": "duplicate_terminal", "transaction": replay_tx,
         }
-    if not persisted:
-        return {
-            "accepted": True, "persisted": False, "replay": False,
-            "reason": "campaign_write_refused", "transaction": {},
-        }
-    if cleanup_required:
-        _cleanup_worktree_after_cycle(tx, str(task_id or ""))
-        try:
-            if not _persist_evolution_cleanup(campaign_id, tx):
-                log.warning("Failed to persist evolution cleanup evidence for %s", task_id)
-        except Exception:
-            log.warning("Failed to persist evolution cleanup evidence for %s", task_id, exc_info=True)
-    if restart_requested:
-        request_evolution_restart(queue.DRIVE_ROOT, tx, log=log)
-    if tx:
-        # Tell the owner only after the campaign transition is durable.
-        try:
-            notify_owner_cycle_outcome(campaign, tx)
-        except Exception:
-            log.debug("Failed to send evolution cycle owner report", exc_info=True)
+    tx = _resume_evolution_terminal_effects(campaign_id, str(task_id or ""), tx)
     return {
         "accepted": True, "persisted": True, "replay": False,
         "reason": "", "transaction": tx,
@@ -1170,13 +1215,21 @@ def request_evolution_restart(drive_root: pathlib.Path, tx: Dict[str, Any], log:
             )
         return
     try:
+        marker_path = pathlib.Path(drive_root) / "state" / "pending_restart_verify.json"
+        existing = read_json_dict(marker_path) or {}
+        existing_claim = existing.get("evolution_claim")
+        restart_reason = (
+            str(existing.get("reason") or "").strip()
+            if isinstance(existing_claim, dict) and existing_claim == claim
+            else ""
+        ) or "supervisor_auto_evolution_restart"
         atomic_write_json(
-            pathlib.Path(drive_root) / "state" / "pending_restart_verify.json",
+            marker_path,
             {
                 "ts": utc_now_iso(),
                 "expected_sha": commit_sha,
                 "expected_branch": str(tx.get("base_branch") or ""),
-                "reason": "supervisor_auto_evolution_restart",
+                "reason": restart_reason,
                 "evolution_claim": claim,
             },
             trailing_newline=True,
@@ -1185,7 +1238,7 @@ def request_evolution_restart(drive_root: pathlib.Path, tx: Dict[str, Any], log:
 
         workers.get_event_q().put({
             "type": "restart_request",
-            "reason": "supervisor_auto_evolution_restart",
+            "reason": restart_reason,
             "evolution_restart": True,
             "ts": utc_now_iso(),
         })

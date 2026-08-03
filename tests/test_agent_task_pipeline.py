@@ -193,6 +193,28 @@ def test_emit_task_results_queues_restart_after_final_events(tmp_path, monkeypat
     assert memory_calls == ["post_task"]
 
     pending_events.clear()
+    evolution_ctx = SimpleNamespace(
+        pending_restart_reason="apply reviewed evolution",
+        pending_restart_is_evolution=True,
+    )
+    pipeline.emit_task_results(
+        env=env,
+        memory=object(),
+        llm=object(),
+        pending_events=pending_events,
+        task={"id": "evo-1", "type": "evolution", "chat_id": 1, "text": "improve"},
+        text="All done",
+        usage={"rounds": 2, "cost": 0.2},
+        llm_trace={"tool_calls": [], "reasoning_notes": []},
+        start_time=0.0,
+        drive_logs=drive_logs,
+        ctx=evolution_ctx,
+    )
+    assert [evt["type"] for evt in pending_events] == ["send_message", "task_metrics", "task_done"]
+    assert evolution_ctx.pending_restart_reason is None
+    assert evolution_ctx.pending_restart_is_evolution is False
+
+    pending_events.clear()
     memory_calls.clear()
     pipeline.emit_task_results(
         env=env,

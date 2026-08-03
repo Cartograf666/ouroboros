@@ -582,7 +582,21 @@ def _set_tool_timeout(ctx: ToolContext, seconds: int) -> str:
 
 
 def _promote_to_stable(ctx: ToolContext, reason: str) -> str:
-    ctx.pending_events.append({"type": "promote_to_stable", "reason": reason, "ts": utc_now_iso()})
+    event = {"type": "promote_to_stable", "reason": reason, "ts": utc_now_iso()}
+    if str(ctx.current_task_type or "") == "evolution":
+        metadata = getattr(ctx, "task_metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        tx = metadata.get("evolution_transaction")
+        tx = tx if isinstance(tx, dict) else {}
+        event["evolution_claim"] = {
+            "campaign_id": str(tx.get("campaign_id") or ""),
+            "transaction_id": str(tx.get("transaction_id") or ""),
+            "task_id": str(getattr(ctx, "task_id", "") or tx.get("task_id") or ""),
+            "commit_sha": str(
+                getattr(ctx, "last_reviewed_commit_sha", "") or tx.get("commit_sha") or ""
+            ),
+        }
+    ctx.pending_events.append(event)
     return f"Promote to stable requested: {reason}"
 
 

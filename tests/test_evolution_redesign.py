@@ -36,15 +36,21 @@ def test_evolution_campaign_text_includes_objective(tmp_path, monkeypatch):
 
 
 def test_evolution_campaign_pause_resume_preserves_history(tmp_path):
-    from supervisor import queue
+    from supervisor import queue, state
 
+    state.init(tmp_path)
     queue.init(tmp_path, 600, 1800)
     first = queue.start_evolution_campaign("Improve scheduler observability", source="test")
+    live = state.load_state()
+    live["evolution_mode_enabled"] = True
+    state.save_state(live)
+    transaction = lifecycle.begin_evolution_transaction("task1", cycle=1, campaign=first)
     lifecycle.update_evolution_campaign_after_task(
         "task1",
         cost_usd=0.5,
         outcome_axes={"execution": {"status": "ok"}, "objective": {"status": "not_evaluated"}},
         rounds=3,
+        transaction=transaction,
     )
     queue.pause_evolution_campaign("pause")
     resumed = queue.start_evolution_campaign("", source="test")

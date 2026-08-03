@@ -150,7 +150,11 @@ def test_self_finalized_reaper_preserves_evolution_transaction_metadata(
         "id": "evo-reaped",
         "type": "evolution",
         "chat_id": 0,
-        "metadata": {"evolution_transaction": tx},
+        "metadata": {
+            "evolution_transaction": tx,
+            "secret_sentinel": "must-not-reach-terminal-event",
+            "workspace_root": "/private/workspace",
+        },
     }
     write_task_result(tmp_path, task["id"], STATUS_CANCELLED, result="cancelled")
 
@@ -169,7 +173,7 @@ def test_self_finalized_reaper_preserves_evolution_transaction_metadata(
     terminal = [event for event in events if event.get("type") == "task_done"]
     assert enqueued == []
     assert len(terminal) == 1
-    assert terminal[0]["metadata"]["evolution_transaction"] == tx
+    assert terminal[0]["metadata"] == {"evolution_transaction": tx}
 
 
 def test_top_level_retry_preserves_logical_root_and_typed_attempt_lineage(
