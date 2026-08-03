@@ -149,7 +149,7 @@ def test_login_endpoint_validates_before_any_daemon_work():
 # ---------------------------------------------------------------------------
 
 
-def _agent_with_metadata(decision, task_id="child-1"):
+def _agent_with_metadata(task, task_id="child-1"):
     import types
 
     from ouroboros.agent import OuroborosAgent
@@ -160,7 +160,12 @@ def _agent_with_metadata(decision, task_id="child-1"):
         "parent_task_id": "p", "model": "m", "task_group_id": "g",
     }
     agent._current_task_id = task_id
-    agent._record_executor_facts(decision)
+    # Since synthesis the fact is read from the ONE record the dispatch
+    # resolution stamped onto the task (`resolve_subagent_dispatch` ->
+    # record_fields) — the same principle this file always asserted ("a
+    # projection of the decision, never a second derivation"), one level
+    # stronger: the projection reads the durable record, not a live object.
+    agent._record_executor_facts(task if isinstance(task, dict) else {})
     return agent, types
 
 
@@ -170,12 +175,8 @@ def test_resolved_harness_route_reaches_the_frame_assembler():
     frame assembler already projects — never re-derived per surface."""
     import types
 
-    class _Harness:
-        blocked = False
-        executor = "harness"
-        route = types.SimpleNamespace(route_id="codex")
-
-    agent, _ = _agent_with_metadata(_Harness())
+    agent, _ = _agent_with_metadata(
+        {"effective_executor": "harness", "executor_route": "codex"})
     frame = agent._subagent_progress_meta("running")
     assert frame["executor_route"] == "codex"
     # The frame keeps carrying the execution facts it always did.
@@ -188,22 +189,14 @@ def test_no_executor_fact_when_the_run_is_native_blocked_or_undecided():
     API path is the ordinary case and must not print 'api' on every bubble."""
     import types
 
-    class _Native:
-        blocked = False
-        executor = "native"
-        route = None
-
-    class _Blocked:
-        blocked = True
-        executor = "blocked"
-        route = types.SimpleNamespace(route_id="codex")
-
-    native, _ = _agent_with_metadata(_Native(), "child-2")
+    native, _ = _agent_with_metadata(
+        {"effective_executor": "native", "executor_route": ""}, "child-2")
     assert native._subagent_progress_meta("running")["executor_route"] == ""
-    # A blocked or absent decision records nothing at all.
-    blocked, _ = _agent_with_metadata(_Blocked(), "child-3")
+    # A blocked or unresolved dispatch records nothing at all.
+    blocked, _ = _agent_with_metadata(
+        {"effective_executor": "blocked", "executor_route": "codex"}, "child-3")
     assert "executor_route" not in blocked._current_task_metadata
-    undecided, _ = _agent_with_metadata(None, "child-4")
+    undecided, _ = _agent_with_metadata({}, "child-4")
     assert "executor_route" not in undecided._current_task_metadata
 
 

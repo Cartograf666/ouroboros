@@ -1041,6 +1041,16 @@ def _parse_args():
         default="HEAD",
         help="Committed proposal ref for --contributor (default: HEAD).",
     )
+    parser.add_argument(
+        "--scope-only",
+        action="store_true",
+        help=(
+            "Run ONLY the scope lane (no advisory, no triad). The raw-diff cap governs "
+            "the lanes that put the staged diff into a model prompt; scope assembles its "
+            "own atlas pack under its own budget, so a scope-only run is exempt from that "
+            "cap and discloses that it carries no advisory and no triad coverage."
+        ),
+    )
     args = parser.parse_args()
 
     if args.contributor and args.no_isolated_checkout:
@@ -1133,6 +1143,58 @@ def _prepare_review_configuration(args) -> tuple[dict | None, str, dict]:
     return contributor_snapshot, review_base_commit, resolved_config
 
 
+_RAW_DIFF_CAP_LANES = ("advisory", "triad")
+
+
+def _raw_diff_cap_decision(reviewable_chars: int, *, scope_only: bool) -> dict:
+    """Decide the raw-diff cap for THIS invocation, and say what it governed.
+
+    The cap exists because the advisory pre-review and the triad put the staged
+    diff itself into a model prompt: an oversized diff there is a commit-shape
+    problem, and «split the phase» is the honest answer. Scope review does not
+    read the raw diff — it assembles its own pack through the review-context
+    atlas under its own budget and its own typed refusals — so measuring a
+    scope-only run against the raw-diff size refuses the one lane built for a
+    large subject, using a number that does not describe what it sends.
+
+    The cap constant, its policy sentence and its behaviour for every ordinary
+    invocation are unchanged. A scope-only run is exempt and MUST disclose that
+    it carries no advisory and no triad coverage; the returned record is written
+    into the packet on both paths so an exempt run can never be mistaken for a
+    run that fit.
+    """
+    from ouroboros.tools.claude_advisory_review import _MAX_DIFF_CHARS_ERROR
+
+    over = int(reviewable_chars) > _MAX_DIFF_CHARS_ERROR
+    record = {
+        "limit_chars": _MAX_DIFF_CHARS_ERROR,
+        "measured_chars": int(reviewable_chars),
+        "governs_lanes": list(_RAW_DIFF_CAP_LANES),
+        "over_limit": over,
+        "scope_only": bool(scope_only),
+        "exempt": bool(over and scope_only),
+        "refuses": bool(over and not scope_only),
+    }
+    if record["refuses"]:
+        record["message"] = (
+            f"ERROR: staged diff is {reviewable_chars:,} chars — over the advisory hard cap "
+            f"({_MAX_DIFF_CHARS_ERROR:,}). Policy: split the phase into smaller "
+            "single-intent commits instead of relaxing the gate."
+        )
+    elif record["exempt"]:
+        record["message"] = (
+            f"DISCLOSED: staged diff is {reviewable_chars:,} chars, over the "
+            f"{_MAX_DIFF_CHARS_ERROR:,}-char raw-diff cap. This run is --scope-only: the "
+            "advisory and triad lanes, which put the raw diff into a model prompt, are NOT "
+            "running. Scope assembles its own atlas pack under its own budget and typed "
+            "refusals. This packet therefore carries NO advisory and NO triad coverage of "
+            "this subject — that coverage must come from separate packets."
+        )
+    else:
+        record["message"] = ""
+    return record
+
+
 def _operator_reviewable_diff_chars(fallback_chars: int) -> int:
     """Size of the TEXTUAL staged diff — what the production gates review.
 
@@ -1192,20 +1254,18 @@ def main() -> int:
         print(message, file=sys.stderr)
         return 2
 
-    from ouroboros.tools.claude_advisory_review import _MAX_DIFF_CHARS_ERROR
-
     reviewable_chars = (
         len(staged) if contributor_snapshot is not None
         else _operator_reviewable_diff_chars(len(staged))
     )
-    if reviewable_chars > _MAX_DIFF_CHARS_ERROR:
-        print(
-            f"ERROR: staged diff is {reviewable_chars:,} chars — over the advisory hard cap "
-            f"({_MAX_DIFF_CHARS_ERROR:,}). Policy: split the phase into smaller "
-            "single-intent commits instead of relaxing the gate.",
-            file=sys.stderr,
-        )
+    raw_diff_cap = _raw_diff_cap_decision(
+        reviewable_chars, scope_only=bool(getattr(args, "scope_only", False))
+    )
+    if raw_diff_cap["refuses"]:
+        print(raw_diff_cap["message"], file=sys.stderr)
         return 3
+    if raw_diff_cap["exempt"]:
+        print(raw_diff_cap["message"], file=sys.stderr)
 
     sha8 = (
         str(contributor_snapshot["head_sha"])[:8]

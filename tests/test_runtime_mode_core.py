@@ -948,7 +948,13 @@ def test_light_mode_allows_shell_wrapper_non_repo_writer(tmp_path, monkeypatch):
     assert "LIGHT_MODE_BLOCKED" not in result, result[:200]
 
 
-def test_light_mode_tripwire_catches_python_repo_writer(tmp_path, monkeypatch):
+def test_light_mode_inline_writer_is_refused_upfront(tmp_path, monkeypatch):
+    """H2 (owner decision 2026-08-03): the INVERTED interpreter write fence refuses
+    an inline payload it cannot prove repo-safe BEFORE execution — python gets a
+    real AST proof, and a proven write is refused with nothing executed. The old
+    enumerate-and-detect fence ADMITTED this exact vector and left the post-hoc
+    tripwire to report the already-done write; that contract deliberately no
+    longer exists, and the file staying untouched is the point."""
     import ouroboros.safety as safety_mod
 
     repo = _git_repo(tmp_path)
@@ -960,6 +966,29 @@ def test_light_mode_tripwire_catches_python_repo_writer(tmp_path, monkeypatch):
         "run_command",
         {"cmd": [sys.executable, "-c", "from pathlib import Path; Path('README.md').write_text('hacked\\n')"]},
     )
+
+    assert "LIGHT_MODE_BLOCKED" in result, result[:300]
+    assert "LIGHT_MODE_REPO_WRITE_BLOCKED" not in result  # refused upfront, not detected after
+    assert (repo / "README.md").read_text(encoding="utf-8") != "hacked\n"
+
+
+def test_light_mode_tripwire_catches_python_repo_writer(tmp_path, monkeypatch):
+    """The tripwire is the DETECTION layer BEHIND the fence: a SCRIPT-file
+    invocation hands the fence nothing inline (by design — the fence judges only
+    payloads it can read), executes, and the post-hoc snapshot catches the repo
+    mutation. Vector updated at the H2 synthesis: the old inline vector is now
+    refused upfront (see test_light_mode_inline_writer_is_refused_upfront), so
+    it can no longer reach the layer this test exists to cover."""
+    import ouroboros.safety as safety_mod
+
+    repo = _git_repo(tmp_path)
+    payload = tmp_path / "writer.py"
+    payload.write_text("from pathlib import Path\nPath('README.md').write_text('hacked\\n')\n")
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **k: (True, ""))
+    reg = ToolRegistry(repo_dir=repo, drive_root=tmp_path / "drive")
+
+    result = reg.execute("run_command", {"cmd": [sys.executable, str(payload)]})
 
     assert "LIGHT_MODE_REPO_WRITE_BLOCKED" in result, result[:300]
     assert "README.md" in result
@@ -974,10 +1003,9 @@ def test_light_mode_tripwire_catches_untracked_repo_file(tmp_path, monkeypatch):
     monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **k: (True, ""))
     reg = ToolRegistry(repo_dir=repo, drive_root=tmp_path / "drive")
 
-    result = reg.execute(
-        "run_command",
-        {"cmd": [sys.executable, "-c", "from pathlib import Path; Path('new_tool.py').write_text('x\\n')"]},
-    )
+    payload = tmp_path / "creator.py"
+    payload.write_text("from pathlib import Path\nPath('new_tool.py').write_text('x\\n')\n")
+    result = reg.execute("run_command", {"cmd": [sys.executable, str(payload)]})
 
     assert "LIGHT_MODE_REPO_WRITE_BLOCKED" in result, result[:300]
     assert "new_tool.py" in result
@@ -1020,10 +1048,10 @@ def test_light_mode_tripwire_runs_after_failed_command(tmp_path, monkeypatch):
     monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **k: (True, ""))
     reg = ToolRegistry(repo_dir=repo, drive_root=tmp_path / "drive")
 
-    result = reg.execute(
-        "run_command",
-        {"cmd": [sys.executable, "-c", "from pathlib import Path; Path('README.md').write_text('bad\\n'); raise SystemExit(2)"]},
-    )
+    payload = tmp_path / "failing_writer.py"
+    payload.write_text(
+        "from pathlib import Path\nPath('README.md').write_text('bad\\n')\nraise SystemExit(2)\n")
+    result = reg.execute("run_command", {"cmd": [sys.executable, str(payload)]})
 
     assert "LIGHT_MODE_REPO_WRITE_BLOCKED" in result, result[:300]
     assert "SHELL_EXIT_ERROR" in result

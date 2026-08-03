@@ -66,11 +66,17 @@ def test_settings_secrets_are_generic_and_integrations_tab_removed():
 
 
 def test_settings_scope_review_effort_round_trips():
-    ui = _read("web/modules/settings_ui.js")
+    """6.3 moved the Review/Scope efforts off the Behavior tab onto the Models
+    page as PER-SLOT dropdowns (red on cxi/p6-ui-v2's own head — the branch
+    moved the carrier and left this pin behind): the owner-facing carrier is now
+    reviewer_slots.js, where an EMPTY slot effort inherits the surface default
+    (OUROBOROS_EFFORT_SCOPE_REVIEW backend-side) and the advisory row defaults
+    low (D14). The mode-guard filter in settings.js is unchanged."""
+    slots_ui = _read("web/modules/reviewer_slots.js")
     settings = _read("web/modules/settings.js")
-    assert "s-effort-scope-review" in ui
-    assert "OUROBOROS_EFFORT_SCOPE_REVIEW" in settings
-    assert "['s-effort-scope-review', 'OUROBOROS_EFFORT_SCOPE_REVIEW', 'high']" in settings
+    assert "scope review effort" in slots_ui   # per-slot surface-default wording
+    assert "review effort" in slots_ui
+    assert "effort: 'low'" in slots_ui          # the advisory default (D14)
     assert "key !== 'OUROBOROS_RUNTIME_MODE' && key !== 'OUROBOROS_CONTEXT_MODE'" in settings
 
 

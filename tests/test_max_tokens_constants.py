@@ -634,6 +634,23 @@ def test_the_triad_sizes_its_shared_prompt_by_quorum_not_by_the_strictest_slot(m
     assert review._quorum_input_token_limit(list(two_slot), two_slot) == 90_000
 
 
+
+def _triad_assemble(review, stable_fields, dynamic_fields):
+    """The production caller's assemble closure, rebuilt from the (monkeypatched)
+    templates — the fused `_fit_triad_prompt` takes assembly from its caller
+    (the 5.2/5.3 api/session split), so the test drives the same seam."""
+    def _assemble(files_section, staged_diff):
+        stable = review._REVIEW_PROMPT_TEMPLATE_STABLE.format(**stable_fields)
+        dynamic = review._REVIEW_PROMPT_TEMPLATE_DYNAMIC.format(**{
+            **dynamic_fields,
+            "current_files_section": files_section,
+            "diff_text": staged_diff,
+        })
+        return stable + "\n" + dynamic, len(stable) + 1
+    return _assemble
+
+
+
 def test_a_sub_quorum_window_degrades_its_own_slot_instead_of_blocking_the_commit_gate(
     monkeypatch, tmp_path,
 ):
@@ -674,12 +691,12 @@ def test_a_sub_quorum_window_degrades_its_own_slot_instead_of_blocking_the_commi
         "current_files_section": "full snapshot of a.py",
     }
 
+    _assemble = _triad_assemble(review, stable_fields, dynamic_fields)
+
     def fit(models):
-        return review._fit_shared_review_prompt(
-            stable_fields=stable_fields,
-            dynamic_fields=dynamic_fields,
-            models=models,
-            target_repo=tmp_path,
+        return review._fit_triad_prompt(
+            models, _assemble, dynamic_fields["current_files_section"],
+            dynamic_fields["diff_text"], dynamic_fields["changed_files"], tmp_path,
         )
 
     _, _, overflow = fit(["big/one", "big/two", "small/one"])
@@ -808,11 +825,11 @@ def test_triad_fit_sizes_against_the_local_route(monkeypatch, tmp_path):
         "current_files_section": "full snapshot of a.py",
     }
 
-    _, _, overflow = review._fit_shared_review_prompt(
-        stable_fields=stable_fields,
-        dynamic_fields=dynamic_fields,
-        models=["openai/gpt-5.6-terra"],
-        target_repo=tmp_path,
+    _assemble = _triad_assemble(review, stable_fields, dynamic_fields)
+    _, _, overflow = review._fit_triad_prompt(
+        ["openai/gpt-5.6-terra"], _assemble,
+        dynamic_fields["current_files_section"], dynamic_fields["diff_text"],
+        dynamic_fields["changed_files"], tmp_path,
     )
     assert "REVIEW_BLOCKED" in overflow, (
         "a local-only install must size the triad prompt against the local "

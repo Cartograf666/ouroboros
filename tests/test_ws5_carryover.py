@@ -673,8 +673,12 @@ def test_settings_save_probes_review_slots_with_the_needs_ack_contract(monkeypat
     ):
         assert needle in settings_js, needle
     gateway_src = (repo / "ouroboros" / "gateway" / "settings.py").read_text(encoding="utf-8")
+    # The gate grew the 6.1 slots SSOT key (a slot change IS a route change) and
+    # wrapped; the pinned semantics is unchanged — probe only on ROUTE-affecting
+    # keys, never on every save.
     assert (
-        'k.startswith("OUROBOROS_SCOPE_REVIEW_MODEL") or k in _REVIEW_ROUTE_BASE_URL_KEYS'
+        'k.startswith("OUROBOROS_SCOPE_REVIEW_MODEL") or k == "OUROBOROS_REVIEWER_SLOTS"\n'
+        '            or k in _REVIEW_ROUTE_BASE_URL_KEYS'
         in gateway_src
     ), "the probe must be gated on a ROUTE-affecting change, not run on every save"
 
