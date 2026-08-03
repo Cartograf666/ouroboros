@@ -562,9 +562,13 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
     instead of spawning a duplicate) and the originating message id (for idempotent
     steer delivery). P5-clean: surfaces state only; the agent picks the target by
     judgment among answer / steer_task / promote_chat_to_task / route_to_project."""
+    md = dict(task_metadata) if isinstance(task_metadata, dict) else {}
+    swarm_intent = bool(md.get("force_plan"))
     addressable_here = _addressable_root_tasks(ctx, chat_id)
     running_here = [row for row in addressable_here if row.get("status") == "running"]
-    project_id = _project_id_for_registered_chat(ctx, chat_id)
+    project_id = str(md.get("project_id") or "").strip() or _project_id_for_registered_chat(
+        ctx, chat_id,
+    )
     is_main_lane = not bool(project_id)
     try:
         # Every non-Project owner transport is the Main lane.  External transports
@@ -579,9 +583,8 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
     except Exception:
         log.warning("Unable to build Main routing manifest", exc_info=True)
         main_manifest = {"error": "routing_manifest_unavailable"} if is_main_lane else {}
-    if not addressable_here and not client_message_id and not main_manifest:
+    if not swarm_intent and not addressable_here and not client_message_id and not main_manifest:
         return task_metadata
-    md = dict(task_metadata) if isinstance(task_metadata, dict) else {}
     if addressable_here:
         md["current_chat"] = {
             "chat_id": int(chat_id or 0),
@@ -597,7 +600,7 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         if is_main_lane and isinstance(main_manifest, dict)
         else addressable_here
     )
-    manual_options = [
+    manual_options = [] if swarm_intent else [
         {
             "action": "steer_task",
             "task_id": row["task_id"],
@@ -608,30 +611,38 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         for row in option_roots
         if isinstance(row, dict) and row.get("task_id")
     ]
-    if is_main_lane and isinstance(main_manifest, dict):
+    if not swarm_intent and is_main_lane and isinstance(main_manifest, dict):
         manual_options.extend({
             "action": "new_task_in_project",
             "project_id": str(row.get("project_id") or ""),
             "project_name": str(row.get("name") or row.get("project_id") or "Project"),
             "label": f"New task in {str(row.get('name') or 'Project')}",
         } for row in list(main_manifest.get("projects") or []) if isinstance(row, dict))
-    elif project_id:
+    elif project_id and not swarm_intent:
         manual_options.append({
             "action": "new_task_in_project",
             "project_id": project_id,
             "label": "New task in Project",
         })
-    md["routing_contract"] = {
+    routing_contract = {
         "llm_first": True,
         "source_lane": "main" if is_main_lane else "project",
-        "valid_actions": [
-            "answer_inline", "steer_task", "promote_chat_to_task", "route_to_project",
-            "needs_manual_target",
-        ],
-        "on_uncertain_or_invalid_target": "needs_manual_target",
-        "manual_target_tool": {"name": "route_to_project", "project_id": ""},
+        "valid_actions": (
+            (["promote_chat_to_task", "route_to_project"] if is_main_lane else ["promote_chat_to_task"])
+            if swarm_intent else
+            [
+                "answer_inline", "steer_task", "promote_chat_to_task", "route_to_project",
+                "needs_manual_target",
+            ]
+        ),
+        "on_uncertain_or_invalid_target": (
+            "promote_chat_to_task" if swarm_intent else "needs_manual_target"
+        ),
         "manual_options": manual_options,
     }
+    if not swarm_intent:
+        routing_contract["manual_target_tool"] = {"name": "route_to_project", "project_id": ""}
+    md["routing_contract"] = routing_contract
     return md
 
 
@@ -996,6 +1007,9 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         return
     ctx.consciousness.inject_observation(f"Message from my human: {incoming.get('log_text') or ''}")
     task_metadata = _scoped_task_metadata(project_id, task_metadata)
+    swarm_intent = bool(
+        isinstance(task_metadata, dict) and task_metadata.get("force_plan")
+    )
     # The turn's origin identity rides UNCONDITIONALLY (not only when the
     # decision lane runs): a bare direct turn with no projects/roots yet — the
     # first-ever project creation — must still carry it so promote/route/bind
@@ -1011,7 +1025,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         # A suppressed (never-logged) message has a DESIGNED absence of origin;
         # downstream binders must not classify it as a producer bug.
         task_metadata = {**(task_metadata or {}), "origin_suppressed": True}
-    if project_id:
+    if project_id and not swarm_intent:
         routed_to_task = _route_project_chat_to_running_task(
             ctx,
             chat_id,
@@ -1040,7 +1054,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
     except Exception:
         log.warning("Unable to inspect Projects for owner routing", exc_info=True)
         has_projects = True
-    needs_decision_lane = bool(project_id) or has_projects or bool(global_roots)
+    needs_decision_lane = swarm_intent or bool(project_id) or has_projects or bool(global_roots)
     if needs_decision_lane:
         task_metadata = _decision_turn_metadata(ctx, chat_id, client_message_id, task_metadata)
     agent = ctx.get_chat_agent()

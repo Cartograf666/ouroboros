@@ -361,9 +361,15 @@ def _promote_duplicate_reason(task_id: str, ctx: Any) -> str:
     return "duplicate_task_id" if live_duplicate or stored_duplicate else ""
 
 
+def _promoted_force_plan_metadata(evt: dict) -> dict:
+    if evt.get("force_plan") is not True:
+        return {}
+    source = str(evt.get("force_plan_source") or "operator").strip() or "operator"
+    return {"metadata": {"force_plan": True, "force_plan_source": source}}
+
+
 def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     """Enqueue a first-class pooled owner task from a conversation-lane promote.
-
     The task carries the originating ``chat_id`` (its live card and replies
     land in that thread) and the optional ``project_id`` scope; it competes for
     the project writer lease like any other top-level project task.
@@ -426,6 +432,7 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         "_require_worker_pool": True,
         "_admission_token": admission_token,
         "promotion_admission_token": admission_token,
+        **_promoted_force_plan_metadata(evt),
     }
     if repair_constraint is not None:
         # Must be present before attach_task_contract so the managed root task
