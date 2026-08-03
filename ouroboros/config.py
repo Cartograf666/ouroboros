@@ -850,9 +850,15 @@ def get_subagent_worktree_root() -> str:
     return raw or os.path.expanduser(os.path.join("~", "Ouroboros", "subagent_worktrees"))
 
 
+# The delegate_wait ToolEntry's own per-call timeout: a configured ceiling above it
+# buys a KILLED tool call, not a longer wait. Pinned to that ToolEntry by test.
+DELEGATE_WAIT_CEILING_SEC = 2100
+
+
 def get_delegate_wait_max_sec() -> int:
     """Ceiling for a caller-supplied ``delegate_wait`` window, in seconds."""
-    return _clamped_number_setting("OUROBOROS_DELEGATE_WAIT_MAX_SEC", low=1, high=86_400, cast=int)
+    return _clamped_number_setting(
+        "OUROBOROS_DELEGATE_WAIT_MAX_SEC", low=1, high=DELEGATE_WAIT_CEILING_SEC, cast=int)
 
 
 def get_delegate_wait_sec() -> int:

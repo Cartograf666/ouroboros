@@ -173,8 +173,6 @@ def test_resolved_harness_route_reaches_the_frame_assembler():
     """The chip's fact comes from the ONE place the executor was decided: the
     dispatch resolution is stamped onto the live metadata that the canonical
     frame assembler already projects — never re-derived per surface."""
-    import types
-
     agent, _ = _agent_with_metadata(
         {"effective_executor": "harness", "executor_route": "codex"})
     frame = agent._subagent_progress_meta("running")
@@ -187,8 +185,6 @@ def test_resolved_harness_route_reaches_the_frame_assembler():
 def test_no_executor_fact_when_the_run_is_native_blocked_or_undecided():
     """Absent fact -> empty/absent, so the renderer draws NO chip: the native
     API path is the ordinary case and must not print 'api' on every bubble."""
-    import types
-
     native, _ = _agent_with_metadata(
         {"effective_executor": "native", "executor_route": ""}, "child-2")
     assert native._subagent_progress_meta("running")["executor_route"] == ""

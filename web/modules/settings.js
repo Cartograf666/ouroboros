@@ -830,6 +830,12 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         for (const notice of pending) {
             const ack = notice.needs_ack;
             const seen = Number(notice.window_tokens || 0);
+            // Each delivery is judged by ITS OWN floor: the api row by the
+            // constitutional 1M, a RETRIEVING row by the 200K session floor. Asking
+            // about 1M for a retrieving row would demand a confirmation its own gate
+            // never wanted, so the floor rides with the notice.
+            const floor = Number(notice.floor_tokens || 0) || 1000000;
+            const floorText = floor.toLocaleString('en-US');
             // A STALE record can report a full 1M and still not authorize, so say WHY
             // the ack is being asked for — otherwise the prompt reads "this route
             // reports 1000000 tokens, please confirm 1000000 tokens".
@@ -839,9 +845,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                     ? `${seen} tokens from an EXPIRED reading the provider could not re-confirm`
                     : `${seen} tokens`);
             const confirmed = window.confirm(
-                'Scope review is fail-closed unless its reviewer\'s 1,000,000-token context '
+                `Scope review is fail-closed unless its reviewer's ${floorText}-token context `
                 + `window is currently known, and this route reports ${reading}.\n\n`
-                + 'Confirm that this model supports a 1,000,000-token context window?\n'
+                + `Confirm that this reviewer supports a ${floorText}-token context window?\n`
                 + `  provider: ${ack.provider || '(default)'}\n  model: ${ack.model}\n`
                 + `  base_url: ${ack.base_url || '(default)'}\n\n`
                 + 'This applies only to this exact model/provider. Answering No leaves scope '
@@ -850,7 +856,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             if (!confirmed) continue;
             await apiClient.ownerCapabilityAck({
                 provider: ack.provider, model: ack.model, base_url: ack.base_url,
-                window_tokens: 1000000, note: 'owner-confirmed scope reviewer window',
+                window_tokens: floor, note: 'owner-confirmed scope reviewer window',
             });
             acked += 1;
         }

@@ -28,13 +28,18 @@ STATUS_CANCELLED = "cancelled"
 # STATUS_CANCELLED write still lands.
 STATUS_CANCEL_REQUESTED = "cancel_requested"
 
-# The nine flat task-scope cost fields shared by live task events, progress-row
+# The ten flat task-scope cost fields shared by live task events, progress-row
 # replay, task_summary chat rows, and the persisted result written here (v6.82
 # P1) — one home, so no consumer grows a divergent literal list.
+# ``non_final_rows`` rides with ``cost_final`` because it is that flag's DISCLOSED
+# CAUSE: `cost_final: false` can hold with every dollar bucket at zero, and a
+# surface that shows the flag without the count shows an unexplained "not final".
+# Both contract mirrors already declared the field; only this list did not carry
+# it, so it never reached the surface that declares it (v6.89.0 panel D2).
 TASK_COST_META_FIELDS = (
     "cost_usd", "cost_accounting_status", "cost_accounting_error", "cost_final",
     "cost_usd_with_children", "cost_with_children_partial", "reserved_usd",
-    "unresolved_upper_bound_usd", "unknown_unmetered",
+    "unresolved_upper_bound_usd", "unknown_unmetered", "non_final_rows",
 )
 
 # Monotonic lifecycle ordering. A write that would move a task *backwards* past

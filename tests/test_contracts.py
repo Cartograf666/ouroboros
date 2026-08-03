@@ -1107,7 +1107,7 @@ def test_advisory_enforcement_not_self_overridable_scope(crit_item, tmp_path, mo
     # Isolate advisory finding enforcement from the independent blocking_1m
     # authority floor: this synthetic route is explicitly 1M-capable.
     monkeypatch.setattr(scope, "_scope_window",
-                        lambda _model: scope.ReviewerWindow(1_000_000, "confirmed"))
+                        lambda _model, **_k: scope.ReviewerWindow(1_000_000, "confirmed"))
     monkeypatch.setattr(scope, "_call_scope_llm",
                         lambda *a, **k: (_json.dumps(raw), {"prompt_tokens": 1, "completion_tokens": 1}, None))
     result = scope.run_scope_review(_Ctx(), "test commit", scope_model="test")

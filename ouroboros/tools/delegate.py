@@ -1273,28 +1273,35 @@ def _halt_breached_run(ctx: ToolContext, gateway: Any, entry: _RunCustody,
                        breach: _Breach) -> str:
     """Stop a run the engine did not contain as asked, and say exactly what failed.
 
-    The incident goes through ``custody.record_containment_fault``, the same writer an
-    unverified cancel uses, so a breached run also surfaces as the CRITICAL health
-    invariant that stays open until a terminal receipt resolves it. Emitting a
+    The BREACH incident goes through ``custody.record_containment_fault``, the same
+    writer an unverified cancel uses, so a breached run also surfaces as the CRITICAL
+    health invariant that stays open until a terminal receipt resolves it. Emitting a
     look-alike event here instead left the breach out of the open-fault sweep.
+
+    The stop itself goes through ``custody.cancel_and_verify`` — the ONE cancel path,
+    with its four typed outcomes — and the sentence handed back to the agent is built
+    from the outcome it returns. The ad-hoc cancel this replaced swallowed every
+    exception into a log line and then said "The run was cancelled" unconditionally,
+    which is precisely what ``record_containment_fault``'s own contract forbids: an
+    incident must never surface "as a reassuring string in a tool result". An
+    overpowered run that refused to stop was reported to the agent as stopped.
     """
     run_id = entry.run_id
     drive = custody.custody_root(ctx)
     try:
-        gateway.cancel_run(run_id, reason=breach.code)
-        detail = gateway.get_run(run_id)
-        if custody.is_terminal(detail):
-            custody.settle_run(drive, gateway, entry, detail)
+        cancelled = custody.cancel_and_verify(drive, gateway, entry, breach.code)
     except Exception:
         log.warning("Failed to cancel an uncontained delegated run %s", run_id, exc_info=True)
+        cancelled = {"outcome": custody.CANCEL_CONTAINMENT_FAULT}
     custody.record_containment_fault(drive, entry, breach.code, breach.detail,
                                      fault=breach.code, **breach.facts)
+    outcome = str(cancelled.get("outcome") or custody.CANCEL_CONTAINMENT_FAULT)
     return _fail(
         "delegate_wait", breach.code,
-        f"{breach.detail} The run was cancelled. Do not retry it: this is a containment "
-        "fault in the transport or the engine, not a task failure — report it and "
-        "continue within your own authority.",
-        run_id=run_id, **breach.facts,
+        f"{breach.detail} {_CANCEL_NOTES.get(outcome, '')} Do not retry it: this is a "
+        "containment fault in the transport or the engine, not a task failure — report "
+        "it and continue within your own authority.",
+        run_id=run_id, cancel_outcome=outcome, **breach.facts,
     )
 
 

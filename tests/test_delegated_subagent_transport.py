@@ -453,8 +453,8 @@ class _HealthStub:
 
 def _dispatch(requested, *, route="some-route=weak:low", stub=None, monkeypatch=None,
               raises=None, acting=False):
-    from ouroboros.agent import resolve_dispatch_executor
     from ouroboros.gateways import claudexor as gw
+    from ouroboros.subagents import dispatch_executor_resolution
 
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", route)
 
@@ -467,7 +467,7 @@ def _dispatch(requested, *, route="some-route=weak:low", stub=None, monkeypatch=
     task = {"delegation_role": "subagent", "requested_executor": requested}
     if acting:
         task["task_constraint"] = {"mode": "acting_subagent", "surface": "self_worktree"}
-    return resolve_dispatch_executor(task)
+    return dispatch_executor_resolution(task)
 
 
 def test_one_exhausted_credential_profile_does_not_take_the_harness_offline():
@@ -596,8 +596,8 @@ def test_dispatch_row_explicit_harness_blocks_and_never_reaches_the_native_path(
 
 
 def test_dispatch_row_native_is_native_and_asks_the_daemon_nothing(monkeypatch):
-    from ouroboros.agent import resolve_dispatch_executor
     from ouroboros.gateways import claudexor as gw
+    from ouroboros.subagents import dispatch_executor_resolution
 
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route")
 
@@ -605,7 +605,7 @@ def test_dispatch_row_native_is_native_and_asks_the_daemon_nothing(monkeypatch):
         raise AssertionError("a native request must not touch the daemon")
 
     monkeypatch.setattr(gw, "ClaudexorGateway", _boom)
-    res = resolve_dispatch_executor({"delegation_role": "subagent", "requested_executor": "native"})
+    res = dispatch_executor_resolution({"delegation_role": "subagent", "requested_executor": "native"})
     assert (res.executor, res.reason) == ("native", "requested_native")
 
 
@@ -623,10 +623,22 @@ def test_a_blocked_pin_ends_the_task_unrun_instead_of_spending(monkeypatch):
     assert dispatch_executor_note(res) == ""
 
 
-def test_a_plain_task_is_not_subject_to_the_executor_axis():
-    from ouroboros.agent import resolve_dispatch_executor
+def test_a_plain_task_is_not_subject_to_the_executor_axis(monkeypatch):
+    """The guard lives at the PRODUCTION entry point, `agent.resolve_dispatch_axes`:
+    a task with no `delegation_role: subagent` resolves no axes at all and never
+    reaches the daemon. (There used to be a second, test-only wrapper in `agent.py`
+    carrying its own copy of this guard while production went through
+    `resolve_subagent_dispatch`; the guard is pinned where it actually runs.)"""
+    from ouroboros.agent import resolve_dispatch_axes
+    from ouroboros.gateways import claudexor as gw
 
-    assert resolve_dispatch_executor({"type": "improvement"}) is None
+    def _boom(*a, **k):
+        raise AssertionError("a plain task must not touch the daemon")
+
+    monkeypatch.setattr(gw, "ClaudexorGateway", _boom)
+    task = {"type": "improvement"}
+    assert resolve_dispatch_axes(task) is None
+    assert "effective_executor" not in task
 
 
 def test_an_acting_child_is_health_checked_against_the_profile_it_will_ask_for(monkeypatch):
@@ -4055,3 +4067,86 @@ def test_both_custody_surfaces_see_the_same_live_task_set(monkeypatch):
     monkeypatch.setitem(queue.RUNNING, "t-live", {})
     server._periodic_supervisor_maintenance([0.0], [time.time()])
     assert seen["processes"] == seen["delegated"] == {"t-live"}, seen
+
+
+def test_a_breach_whose_cancel_was_never_verified_is_not_reported_as_cancelled(
+    tmp_path, monkeypatch
+):
+    """A containment BREACH stops the run through the one verified cancel path, and the
+    sentence the agent reads comes from that cancel's typed outcome.
+
+    The ad-hoc cancel this replaced swallowed every exception into a log line and then
+    said "The run was cancelled. Do not retry it" unconditionally — so a daemon that
+    REFUSED the cancel, or that could not be reached to confirm it, left an overpowered
+    run mutating a workspace while the agent was told it had stopped. That is exactly
+    what `record_containment_fault`'s own contract forbids: an incident must surface as
+    a critical health invariant, "never as a reassuring string in a tool result".
+    """
+    from ouroboros.gateways import claudexor as gw
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    import ouroboros.delegate_custody as dc
+
+    run_dir = tmp_path / "run-1"
+    home = tmp_path / "operator-home"
+    home.mkdir()
+    monkeypatch.setattr(cx, "operator_home", lambda: home)
+
+    class _RefusingStub:
+        engine_version = CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
+
+        def handshake(self): return {}
+
+        def get_run(self, rid):
+            # Still RUNNING: the cancel changed nothing the daemon will confirm.
+            return {"lastSeq": 7, "summary": {
+                "state": "running", "effectiveAccess": "workspace_write",
+                "runDir": str(run_dir),
+            }}
+
+        def cancel_run(self, rid, reason=""):
+            raise ClaudexorUnavailable("control_refused", "daemon refused the cancel")
+
+        def remove_project(self, pid): pass
+        def close(self): pass
+
+    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _RefusingStub())
+    _write_attempt(run_dir, isolated=False, home_dir=str(home))
+
+    out = _waiting(tmp_path, monkeypatch)
+
+    assert out["status"] == "refused" and out["reason"] == "home_isolation_not_applied", out
+    # The typed outcome rides out with the refusal instead of a comforting sentence.
+    assert out["cancel_outcome"] == dc.CANCEL_CONTAINMENT_FAULT, out
+    assert "CONTAINMENT FAULT" in out["detail"], out["detail"]
+    assert "MAY STILL BE LIVE" in out["detail"], out["detail"]
+    assert "The run was cancelled." not in out["detail"], out["detail"]
+
+
+def test_the_configured_wait_ceiling_cannot_promise_more_than_the_tool_can_serve():
+    """`OUROBOROS_DELEGATE_WAIT_MAX_SEC` accepted up to 86,400 while `delegate_wait`'s
+    own per-call executor timeout is 2100 and the tool is neither per-call-timeout
+    configurable nor deadline-clamped — so everything above 2100 bought a KILLED tool
+    call instead of the graceful typed no-progress return the wait exists to give.
+    The two numbers are pinned together here so they cannot drift apart again."""
+    import os
+
+    from ouroboros.config import DELEGATE_WAIT_CEILING_SEC, get_delegate_wait_max_sec
+    from ouroboros.loop_tool_execution import _DEADLINE_CLAMPED_TOOLS, _PER_CALL_TIMEOUT_TOOLS
+    from ouroboros.tools.delegate import get_tools
+
+    entry = next(e for e in get_tools() if e.schema["name"] == "delegate_wait")
+    assert DELEGATE_WAIT_CEILING_SEC == entry.timeout_sec
+    # ...and neither escape hatch applies to this tool, which is why the ToolEntry
+    # value really is the bound.
+    assert "delegate_wait" not in _PER_CALL_TIMEOUT_TOOLS
+    assert "delegate_wait" not in _DEADLINE_CLAMPED_TOOLS
+
+    previous = os.environ.get("OUROBOROS_DELEGATE_WAIT_MAX_SEC")
+    os.environ["OUROBOROS_DELEGATE_WAIT_MAX_SEC"] = "7200"
+    try:
+        assert get_delegate_wait_max_sec() == DELEGATE_WAIT_CEILING_SEC
+    finally:
+        if previous is None:
+            os.environ.pop("OUROBOROS_DELEGATE_WAIT_MAX_SEC", None)
+        else:
+            os.environ["OUROBOROS_DELEGATE_WAIT_MAX_SEC"] = previous

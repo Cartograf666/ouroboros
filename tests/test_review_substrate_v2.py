@@ -1621,7 +1621,7 @@ def test_p3_scope_actor_retries_empty_same_slot_model_once_then_blocks(tmp_path,
     monkeypatch.setattr(scope_review, "LLMClient", lambda: recovered_llm)
     monkeypatch.setattr(scope_review, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
     monkeypatch.setattr(scope_review, "_scope_window",
-                        lambda _model: scope_review.ReviewerWindow(1_000_000, "confirmed"))
+                        lambda _model, **_k: scope_review.ReviewerWindow(1_000_000, "confirmed"))
     ctx = SimpleNamespace(
         repo_dir=tmp_path, drive_root=tmp_path,
         task_id="scope-recovered", pending_events=[],
@@ -1735,7 +1735,7 @@ def test_scope_review_result_preserves_substrate_refs(tmp_path, monkeypatch):
     # This test isolates durable substrate refs, not the separate P3 authority
     # floor; give its synthetic reviewer explicit >=1M capability evidence.
     monkeypatch.setattr(scope_review, "_scope_window",
-                        lambda _model: scope_review.ReviewerWindow(1_000_000, "confirmed"))
+                        lambda _model, **_k: scope_review.ReviewerWindow(1_000_000, "confirmed"))
 
     result = scope_review.run_scope_review(ctx, "commit message")
     record = build_scope_actor_record(result, fallback_model_id="test-scope-model", slot_id="scope_slot_1")

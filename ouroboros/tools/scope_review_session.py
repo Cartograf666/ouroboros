@@ -176,6 +176,28 @@ def session_window_is_authoritative(window: Any, provenance: str) -> bool:
     return str(provenance or "") in SOURCED_PROVENANCE and int(window or 0) >= SESSION_WINDOW_FLOOR
 
 
+def _unproven_window_sentence(scope_model: str, phrase: str) -> str:
+    """The ONE sentence naming why this row's window authorises nothing.
+
+    Both the advisory finding and the block message are built from it, so the
+    disclosure the owner reads and the reason the commit stopped cannot drift."""
+    return (
+        f"retrieving scope reviewer {scope_model} has a {phrase}, which does not meet "
+        f"the >={SESSION_WINDOW_FLOOR} SOURCED-evidence floor this lower-assurance "
+        "delivery needs to carry a blocking verdict (BIBLE P3: a window that cannot be "
+        "established by evidence is treated as too small, never assumed adequate)."
+    )
+
+
+def _restoration_sentence() -> str:
+    """What the owner can do to get an authoritative verdict back."""
+    return (
+        "Owner-ack this route's window (the scope-slot save offers the ack), configure "
+        "a reviewer with confirmed window evidence, or deliver this row over the api "
+        "route to restore an authoritative verdict."
+    )
+
+
 def session_window_unproven_finding(scope_model: str, phrase: str) -> Dict[str, Any]:
     """Disclosure for a retrieving row whose window is not SOURCED >= the floor.
 
@@ -186,18 +208,22 @@ def session_window_unproven_finding(scope_model: str, phrase: str) -> Dict[str, 
         "severity": "advisory",
         "item": "scope_review_session_window_unproven",
         "reason": (
-            f"⚠️ SCOPE_SESSION_ADVISORY_ONLY: retrieving scope reviewer {scope_model} has a "
-            f"{phrase}, which does not meet the >={SESSION_WINDOW_FLOOR} SOURCED-evidence "
-            "floor this lower-assurance delivery needs to carry a blocking verdict (BIBLE "
-            "P3: a window that cannot be established by evidence is treated as too small, "
-            "never assumed adequate). Its findings are ADVISORY-ONLY, do not satisfy the "
-            "blocking scope gate, and are not counted toward the authoritative scope "
-            "quorum. Owner-ack this route's window, configure a reviewer with confirmed "
-            "window evidence, or deliver this row over the api route to restore an "
-            "authoritative verdict."
+            f"⚠️ SCOPE_SESSION_ADVISORY_ONLY: {_unproven_window_sentence(scope_model, phrase)} "
+            "Its findings are ADVISORY-ONLY and are not counted toward the authoritative "
+            "scope quorum; the row therefore cannot supply the authoritative scope verdict "
+            f"required to commit. {_restoration_sentence()}"
         ),
         "model": scope_model,
     }
+
+
+def session_window_unproven_block_message(scope_model: str, phrase: str) -> str:
+    """The retrieving row's BLOCK message — the twin of the api row's sub-floor one."""
+    return (
+        f"⚠️ SCOPE_REVIEW_BLOCKED: {_unproven_window_sentence(scope_model, phrase)} Its "
+        "findings were preserved as advisory evidence, but it cannot supply the "
+        f"authoritative scope verdict required to commit. {_restoration_sentence()}"
+    )
 
 
 def session_scope_authority(
@@ -218,8 +244,19 @@ def session_scope_authority(
     criticals are PRESERVED as advisory evidence (never discarded — a real finding
     stays readable), tagged so their origin is unmistakable, the disclosure names
     what would restore an authoritative verdict, and the typed
-    ``session_advisory`` result is returned: it does not gate the commit and the
-    scope quorum does not count it as authoritative."""
+    ``session_advisory`` result is returned.
+
+    That result BLOCKS, exactly as the api row's ``sub_floor`` twin does. The two
+    halves of the same sentence are easy to confuse, so both are stated: the row's
+    FINDINGS are advisory (an unestablished window cannot certify a verdict) and
+    the PANEL is short one authoritative verdict (which is what stops the commit).
+    Returning ``blocked=False`` here made the blocking scope gate of BIBLE P3 fail
+    OPEN: a panel of retrieving rows produced zero authoritative verdicts, the
+    aggregate's partial-quorum shortfall only fires above zero responders, and the
+    commit sailed through a gate the owner had every reason to believe was armed —
+    while the identical api panel blocked. Authority is decided in ONE place per
+    delivery (here for retrieving rows, ``_apply_scope_authority`` for api rows);
+    the quorum aggregate stays a discloser, never a second decider."""
     if session_window_is_authoritative(window, provenance):
         return critical_findings, advisory_findings, None
     for finding in critical_findings:
@@ -230,6 +267,8 @@ def session_scope_authority(
     from ouroboros.tools.scope_review import ScopeReviewResult
 
     return [], advisory, ScopeReviewResult(
-        blocked=False, critical_findings=[], advisory_findings=advisory,
+        blocked=True,
+        block_message=session_window_unproven_block_message(scope_model, phrase),
+        critical_findings=[], advisory_findings=advisory,
         status="session_advisory", **result_kwargs,
     )

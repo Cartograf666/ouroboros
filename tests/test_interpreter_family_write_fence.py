@@ -37,6 +37,8 @@ import sys
 import pytest
 
 from ouroboros.tools.shell_guards import (
+    _INTERPRETER_ANY_WRITE_RE,
+    _python_write_targets_and_unknown,
     interpreter_family,
     interpreter_inline_code,
     light_shell_repo_mutation,
@@ -486,3 +488,104 @@ def test_the_price_of_the_inversion_is_named(tmp_path):
         ["python3.11", "-c", f"print(open('{repo}/x.py').read())"],
         repo_dir=repo, cwd=str(outside), work_dir=outside,
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# ONE write vocabulary: the AST walker knows everything the regex calls a write.
+# ---------------------------------------------------------------------------
+
+_ORDINARY_STDLIB_WRITES = [
+    ("shutil.copy", "import shutil; shutil.copy('/tmp/src', {t})"),
+    ("shutil.move", "import shutil; shutil.move('/tmp/src', {t})"),
+    ("shutil.copytree", "import shutil; shutil.copytree('/tmp/src', {t})"),
+    ("Path.touch", "import pathlib; pathlib.Path({t}).touch()"),
+    ("os.symlink", "import os; os.symlink('/tmp/src', {t})"),
+    ("os.truncate", "import os; os.truncate({t}, 0)"),
+    ("os.chmod", "import os; os.chmod({t}, 0o600)"),
+    ("zipfile.extractall", "import zipfile; zipfile.ZipFile('/tmp/a.zip').extractall({t})"),
+    ("shutil.unpack_archive", "import shutil; shutil.unpack_archive('/tmp/a.zip', {t})"),
+]
+
+
+@pytest.mark.parametrize("label, template", _ORDINARY_STDLIB_WRITES,
+                         ids=[label for label, _ in _ORDINARY_STDLIB_WRITES])
+def test_an_ordinary_stdlib_write_is_never_read_as_a_proven_read(tmp_path, label, template):
+    """Nine ordinary stdlib write APIs parsed to a fully-resolved AST with ZERO write
+    targets, so `targets == [] and not unknown` — the callers' PROOF of read-only —
+    was handed out for a payload that writes. `_INTERPRETER_ANY_WRITE_RE`, in the
+    SAME module, recognised all nine: two write vocabularies, and the weaker one
+    signed the proof. The fence's claim marked this failure class closed, so the
+    next reviewer would not have come back to it (BIBLE P2).
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    code = template.format(t=repr(str(repo / "victim.txt")))
+
+    # The regex half of the vocabulary has always seen these as writes...
+    assert _INTERPRETER_ANY_WRITE_RE.search(code), label
+    # ...and now the AST half agrees: it either resolves the target or says UNKNOWN.
+    targets, unknown = _python_write_targets_and_unknown(code)
+    assert targets or unknown, f"{label} parsed as a proven read"
+    # End to end, with the cwd OUTSIDE the repo so only the target can block it.
+    assert light_shell_repo_mutation(
+        ["python3.11", "-c", code],
+        repo_dir=repo, cwd=str(tmp_path), work_dir=tmp_path,
+    ) is True, label
+
+
+def test_the_same_stdlib_writes_still_run_when_they_target_elsewhere(tmp_path):
+    """The vocabulary repair must not become a blanket refusal: a resolved
+    destination OUTSIDE the repo is a proven-elsewhere write and still runs."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "elsewhere"
+    for label, template in _ORDINARY_STDLIB_WRITES:
+        code = template.format(t=repr(str(outside / "file.txt")))
+        assert light_shell_repo_mutation(
+            ["python3.11", "-c", code],
+            repo_dir=repo, cwd=str(tmp_path), work_dir=tmp_path,
+        ) is False, label
+
+
+def test_a_write_through_an_untraceable_handle_is_unknown_not_a_proven_read(tmp_path):
+    """The same defect one spelling over: `.write` on a receiver the walker cannot
+    trace to a path contributed no target AND no unknown, so an unlocatable write
+    read as proof of a read. Locatable handles must keep resolving, or the repair
+    would just turn every deliverable write into a refusal."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for code in (
+        'f = get_handle(); f.write("x")',
+        'import tempfile; f = tempfile.NamedTemporaryFile(); f.write(b"x")',
+    ):
+        targets, unknown = _python_write_targets_and_unknown(code)
+        assert unknown and not targets, code
+
+    # ...while the shapes it CAN trace still resolve, so an ordinary out-of-repo
+    # deliverable keeps running even with the cwd inside the repo.
+    out = repr(str(tmp_path / "out.txt"))
+    for code in (
+        f'open({out}, "w").write("x")',
+        f'import pathlib; pathlib.Path({out}).open("w").write("x")',
+        f'f = open({out}, "w"); f.write("x")',
+        f'import json; f = open({out}, "w"); json.dump({{}}, f)',
+    ):
+        targets, unknown = _python_write_targets_and_unknown(code)
+        assert targets and not unknown, code
+        assert light_shell_repo_mutation(
+            ["python3.11", "-c", code], repo_dir=repo, cwd=str(repo), work_dir=repo,
+        ) is False, code
+
+
+def test_the_vocabulary_repair_does_not_widen_past_the_regex(tmp_path):
+    """`.copy()` on a dict and `dump()` on an arbitrary object are NOT writes to the
+    module's regex, so the walker must not call them write-capable either — a wider
+    walker would refuse ordinary read-only payloads for a name collision."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for code in ("d = {}; e = d.copy()", "import yaml; print(yaml.dump({}))", "logger.dump()"):
+        assert not _INTERPRETER_ANY_WRITE_RE.search(code), code
+        assert _python_write_targets_and_unknown(code) == ([], False), code
+        assert light_shell_repo_mutation(
+            ["python3.11", "-c", code], repo_dir=repo, cwd=str(repo), work_dir=repo,
+        ) is False, code

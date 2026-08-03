@@ -594,7 +594,7 @@ class TestRunScopeReviewFailClosed:
         # Capability Evidence: gigachat KNOWN sub-floor (131K), fable-5 >=1M.
         monkeypatch.setattr(
             mod, "_scope_window",
-            lambda m: mod.ReviewerWindow(
+            lambda m, **_k: mod.ReviewerWindow(
                 131_072 if "gigachat" in str(m).lower() else 1_000_000, "confirmed",
             ),
         )
@@ -776,7 +776,7 @@ class TestRunScopeReviewFailClosed:
         # model with no Capability Evidence now fail-closes to the sub-floor (v6.46.0 fix),
         # which would empty critical_findings via the sub-floor path instead.
         monkeypatch.setattr(mod, "_scope_window",
-                            lambda m: mod.ReviewerWindow(1_000_000, "confirmed"))
+                            lambda m, **_k: mod.ReviewerWindow(1_000_000, "confirmed"))
 
         result = mod.run_scope_review(MockCtx(), "test commit", scope_model="test-scope")
 
@@ -807,7 +807,7 @@ class TestRunScopeReviewFailClosed:
         monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
         monkeypatch.setattr(mod, "_call_scope_llm", lambda *a, **k: ("", None, oversize_error))
         monkeypatch.setattr(mod, "_scope_window",
-                            lambda _m: mod.ReviewerWindow(1_000_000, "confirmed"))
+                            lambda _m, **_k: mod.ReviewerWindow(1_000_000, "confirmed"))
 
         result = mod.run_scope_review(MockCtx(), "test commit", scope_model="anthropic/claude-fable-5")
 
@@ -860,7 +860,7 @@ class TestRunScopeReviewFailClosed:
         # treat opus-4.8 / gigachat as KNOWN sub-floor (<1M), fable-5 as >=1M.
         monkeypatch.setattr(
             mod, "_scope_window",
-            lambda m: mod.ReviewerWindow(
+            lambda m, **_k: mod.ReviewerWindow(
                 200_000 if ("opus" in str(m) or "gigachat" in str(m).lower()) else 1_000_000,
                 "confirmed",
             ),
@@ -913,7 +913,7 @@ class TestRunScopeReviewFailClosed:
             for item_id in sorted(mod._SCOPE_REQUIRED_ITEMS)
         ]
         monkeypatch.setattr(mod, "_scope_window",
-                            lambda _m: mod.ReviewerWindow(200_000, "confirmed"))
+                            lambda _m, **_k: mod.ReviewerWindow(200_000, "confirmed"))
         monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
         monkeypatch.setattr(
             mod,
@@ -948,7 +948,7 @@ class TestRunScopeReviewFailClosed:
 
         error = "Error code: 400 - prompt is too long: 300000 tokens > 200000 maximum"
         monkeypatch.setattr(mod, "_scope_window",
-                            lambda _m: mod.ReviewerWindow(200_000, "confirmed"))
+                            lambda _m, **_k: mod.ReviewerWindow(200_000, "confirmed"))
         monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
         monkeypatch.setattr(mod, "_call_scope_llm", lambda *a, **k: ("", None, error))
 
@@ -962,7 +962,7 @@ class TestRunScopeReviewFailClosed:
         """A pre-dispatch sub-floor fit failure cannot silently satisfy P3."""
         mod = _get_module("ouroboros.tools.scope_review")
         monkeypatch.setattr(mod, "_scope_window",
-                            lambda _m: mod.ReviewerWindow(200_000, "confirmed"))
+                            lambda _m, **_k: mod.ReviewerWindow(200_000, "confirmed"))
 
         result = mod._handle_prompt_signals(
             None,
@@ -1027,7 +1027,7 @@ class TestRunScopeReviewFailClosed:
         monkeypatch.setattr(mod, "_effective_scope_input_limit", lambda *a, **k: 10)
 
         monkeypatch.setattr(mod, "_scope_window",
-                            lambda _m: mod.ReviewerWindow(1_000_000, "confirmed"))
+                            lambda _m, **_k: mod.ReviewerWindow(1_000_000, "confirmed"))
         result = mod.run_scope_review(MockCtx(), "test commit", scope_model="anthropic/claude-fable-5")
 
         assert result.blocked is True
@@ -1075,7 +1075,7 @@ class TestRunScopeReviewFailClosed:
         # opus-4.8 KNOWN sub-floor (200K) via evidence; everything else >=1M.
         monkeypatch.setattr(
             mod, "_scope_window",
-            lambda m: mod.ReviewerWindow(
+            lambda m, **_k: mod.ReviewerWindow(
                 200_000 if "opus" in str(m) else 1_000_000, "confirmed",
             ),
         )
@@ -1122,7 +1122,7 @@ class TestRunScopeReviewFailClosed:
             lambda *a, **k: (json.dumps(raw_items), {"prompt_tokens": 10, "completion_tokens": 5}, None),
         )
         monkeypatch.setattr(mod, "_scope_window",
-                            lambda _m: mod.ReviewerWindow(1_000_000, "confirmed"))
+                            lambda _m, **_k: mod.ReviewerWindow(1_000_000, "confirmed"))
 
         result = mod.run_scope_review(MockCtx(), "test commit", scope_model="test-scope")
         record = helpers.build_scope_actor_record(result, fallback_model_id="fallback-scope")
@@ -2426,7 +2426,7 @@ def test_unassembled_required_terminal_names_the_artifact_not_a_phantom_overflow
     _repo_with_oversized_required_prompt(tmp_path)
     monkeypatch.setattr(sr, "_effective_scope_input_limit", lambda **_kw: 200_000)
     monkeypatch.setattr(sr, "_scope_window",
-                        lambda _m: sr.ReviewerWindow(window_tokens=1_000_000, status="confirmed"))
+                        lambda _m, **_k: sr.ReviewerWindow(window_tokens=1_000_000, status="confirmed"))
 
     prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
 
@@ -2454,7 +2454,7 @@ def test_sub_floor_terminal_reports_the_same_cause_as_the_1m_terminal(monkeypatc
     from ouroboros.tools import scope_review as sr
 
     monkeypatch.setattr(
-        sr, "_scope_window", lambda _m: sr.ReviewerWindow(window_tokens=200_000, status="confirmed"),
+        sr, "_scope_window", lambda _m, **_k: sr.ReviewerWindow(window_tokens=200_000, status="confirmed"),
     )
     missing = sr._TouchedContextStatus(
         status="budget_exceeded", token_count=3_672,
@@ -2488,7 +2488,7 @@ def test_mixed_terminal_reports_both_causes_and_the_mixed_remedy(tmp_path, monke
     # manifest overflows, while required prompts/huge.md was already dropped.
     monkeypatch.setattr(sr, "_effective_scope_input_limit", lambda **_kw: 6_000)
     monkeypatch.setattr(sr, "_scope_window",
-                        lambda _m: sr.ReviewerWindow(window_tokens=1_000_000, status="confirmed"))
+                        lambda _m, **_k: sr.ReviewerWindow(window_tokens=1_000_000, status="confirmed"))
 
     prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
 
@@ -2518,7 +2518,7 @@ def test_mixed_sub_floor_terminal_reports_the_same_two_causes(monkeypatch):
     from ouroboros.tools.review_context_atlas import ATLAS_MIXED_ASSEMBLY_REMEDY
 
     monkeypatch.setattr(
-        sr, "_scope_window", lambda _m: sr.ReviewerWindow(window_tokens=200_000, status="confirmed"),
+        sr, "_scope_window", lambda _m, **_k: sr.ReviewerWindow(window_tokens=200_000, status="confirmed"),
     )
     mixed = sr._TouchedContextStatus(
         status="budget_exceeded", token_count=3_672,
@@ -2675,7 +2675,7 @@ def test_ladder_cannot_degrade_a_required_beyond_diff_artifact_to_diff_only(
 
     monkeypatch.setattr(sr, "_effective_scope_input_limit", lambda **_kw: 120_000)
     monkeypatch.setattr(sr, "_scope_window",
-                        lambda _m: sr.ReviewerWindow(window_tokens=1_000_000, status="confirmed"))
+                        lambda _m, **_k: sr.ReviewerWindow(window_tokens=1_000_000, status="confirmed"))
 
     prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
 
@@ -2706,7 +2706,7 @@ def test_cold_start_sizes_down_and_passes_instead_of_400ing(tmp_path, monkeypatc
     _DENSITY_MEMO.clear()
     monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(sr, "_scope_window",
-                        lambda _m: sr.ReviewerWindow(1_000_000, "confirmed"))
+                        lambda _m, **_k: sr.ReviewerWindow(1_000_000, "confirmed"))
 
     cold = sr._effective_scope_input_limit(scope_model="unknown/brand-new-model")
     assert 0 < cold <= sr._SCOPE_INPUT_TOKEN_LIMIT, (
@@ -2772,7 +2772,7 @@ def _run_scope_fanout(monkeypatch, tmp_path, models):
     monkeypatch.setattr(review_substrate, "run_review_request", fake_run_review_request)
     monkeypatch.setattr(sr, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
     monkeypatch.setattr(sr, "_scope_window",
-                        lambda _model: sr.ReviewerWindow(window_tokens=1_000_000, status="confirmed"))
+                        lambda _model, **_k: sr.ReviewerWindow(window_tokens=1_000_000, status="confirmed"))
     monkeypatch.setattr(parallel_review, "run_cmd", lambda *_a, **_k: "staged diff")
     monkeypatch.setattr(review, "_run_unified_review", lambda *_a, **_k: None)
 
@@ -2912,7 +2912,7 @@ def test_stale_evidence_cannot_authorize_a_blocking_scope_verdict(monkeypatch, t
     critical = [{"item": "architecture_fit", "verdict": "FAIL",
                  "severity": "critical", "reason": "r"}]
     crit_out, adv_out, result = sr._apply_scope_authority(
-        None, critical, [], scope_model_id=model, prompt_tokens_est=0, result_kwargs={},
+        critical, [], scope_model_id=model, result_kwargs={},
     )
     assert crit_out == [] and result is not None and result.blocked is True
     assert result.status == "sub_floor"
@@ -2962,8 +2962,7 @@ def test_designated_default_gets_no_authority_from_its_name(monkeypatch, tmp_pat
     critical = [{"item": "architecture_fit", "verdict": "FAIL",
                  "severity": "critical", "reason": "r"}]
     crit_out, _adv, result = sr._apply_scope_authority(
-        None, critical, [], scope_model_id=sr._SCOPE_MODEL_DEFAULT,
-        prompt_tokens_est=0, result_kwargs={},
+        critical, [], scope_model_id=sr._SCOPE_MODEL_DEFAULT, result_kwargs={},
     )
     assert crit_out == [] and result is not None and result.blocked is True
 
@@ -3068,8 +3067,8 @@ def test_expired_evidence_is_re_sourced_instead_of_wedging_the_process(monkeypat
     assert resolved.stale is False, "an expired record must be RE-SOURCED, not read as expired"
     assert resolved.blocking_authority_allowed is True
     _crit, _adv, result = sr._apply_scope_authority(
-        None, [{"item": "architecture_fit", "verdict": "FAIL",
-                "severity": "critical", "reason": "r"}],
-        [], scope_model_id=model, prompt_tokens_est=0, result_kwargs={},
+        [{"item": "architecture_fit", "verdict": "FAIL",
+          "severity": "critical", "reason": "r"}],
+        [], scope_model_id=model, result_kwargs={},
     )
     assert result is None, "a healthy install must not block its own commits after 24h"

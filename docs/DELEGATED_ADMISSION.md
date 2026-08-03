@@ -154,6 +154,16 @@ Stated plainly, because a floor described as total is worse than a narrow one.
   boundary", so such a run is disclosed as unconfined when it was in fact confined. That is
   the honest limit of an applied-fact reader, and it is the safe direction: the consequence is
   a disclosure, never a refusal.
+- **Not free of every harness NAME.** One named residual, disclosed rather than removed:
+  `gateway/claudexor_accounts.py::_build_login_request` branches on `harness == "codex"` in
+  three places (login setup only — never admission, routing or confinement). The branch is
+  load-bearing: `loginFlow` exists only for codex and is a 400 elsewhere, and a non-codex
+  login with no explicit transport would default daemon-side to `transport=daemon`, the
+  macOS Terminal.app handoff D30 forbids — so `client_pty` is forced instead. It mirrors
+  Claudexor's own setup-transport rule, not Ouroboros policy, and deleting it breaks D30.
+  It is the ONLY harness-name branch in the core (`ouroboros/`, `supervisor/`, `server.py`,
+  `launcher.py`). Removal condition: when the engine makes non-codex logins daemon-hosted,
+  the branch goes and this bullet with it.
 
 ## 8. Evidence, not intention — and the disclosure it feeds
 

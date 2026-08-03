@@ -48,7 +48,6 @@ from ouroboros.contracts.task_contract import attach_task_contract
 from ouroboros.outcomes import infra_failed_axes
 from ouroboros.subagents import (
     SubagentExecutorResolution,
-    dispatch_executor_resolution,
     SUBAGENT_RESOLUTION_FIELDS,
     SubagentDispatch,
     capability_delta_disclosures,
@@ -59,25 +58,6 @@ from ouroboros.subagents import (
 
 _worker_boot_logged = False
 _worker_boot_lock = threading.Lock()
-
-
-def resolve_dispatch_executor(task: Dict[str, Any]) -> Optional[SubagentExecutorResolution]:
-    """Decide WHO RUNS THIS CHILD before a single token is spent (None: not a child).
-
-    The third axis is settled here, at dispatch, because this is the last moment at
-    which refusing still costs nothing. `executor=harness` is a PIN: the parent asked
-    for the already-paid subscription substrate specifically to avoid metered spend, so
-    an unavailable route must become a typed blocker. Falling back to the native worker
-    would bill the owner for exactly the thing the request was meant to prevent — and
-    silently, which is worse than an error.
-    """
-    if str(task.get("delegation_role") or "").lower() != "subagent":
-        return None
-    # ONE resolver: `subagents.dispatch_executor_resolution` owns the shape
-    # derivation and the probe, and `resolve_subagent_dispatch` calls the same
-    # body — so the answer this dispatcher acts on and the one the record states
-    # cannot come from two implementations that drift apart.
-    return dispatch_executor_resolution(task)
 
 
 def dispatch_executor_note(decision: Optional[SubagentExecutorResolution]) -> str:

@@ -286,21 +286,31 @@ following bounds are constitutional:
   cannot establish from outside what a vendor session actually held in
   context. This mode is therefore admitted on the same honest footing as
   the `low` coupling below — as a DECLARED reduction in assurance, never
-  as a substitute claim. The mode is ADMITTED here and PENDING
-  IMPLEMENTATION: no per-slot selector exists yet, so until one ships this
-  paragraph binds the future control rather than describing an available
-  one. It is bounded by four conditions:
+  as a substitute claim. It is bounded by four conditions:
 
-  - the owner selects it explicitly per scope slot; the agent cannot
-    select it for its own commits;
+  - the owner selects it explicitly per scope slot. This is an OWNER
+    INTENT, not an enforced control: the reviewer-slot setting travels the
+    ordinary settings path, so an agent that can write settings can reach
+    it — as it already could reach the legacy reviewer-model keys. What is
+    enforced is the condition below: a slot the agent switched to this
+    mode acquires no authority from the switch, and blocks for want of an
+    authoritative verdict exactly as any unestablished reviewer does;
   - the reviewer's context window is established by sourced Capability
     Evidence at 200K tokens or more — the same evidence discipline as the
-    1M floor, only a different number;
+    1M floor, only a different number. A row that does not meet it keeps
+    its findings as advisory evidence and cannot supply the authoritative
+    scope verdict a commit requires;
   - every review taken this way records a typed, durable row naming the
     mode and the reviewer, so a retrieved verdict is never mistaken for a
     pushed one in any later audit;
-  - the artifacts the session opened are recorded as FORENSIC evidence.
-    They inform a reader; they do not certify coverage and never gate.
+  - the artifacts the session opened are NOT recorded, and this bound says
+    so rather than promising forensics nobody produces. The host does not
+    see what a vendor session read; recording it awaits an upstream
+    Claudexor capability to report a session's read events. Until that
+    exists, the coverage manifest states plainly that coverage is the
+    session's own retrieval and is not host-attested — which is the honest
+    form of the same disclosure, and is what the condition above already
+    makes non-certifying.
 
   The cost is stated as plainly as the `low` cost: a retrieving reviewer
   may reach a verdict having consulted less of the repository than a
@@ -329,9 +339,8 @@ following bounds are constitutional:
   and, since the retrieving mode above, no longer the only one admitted:
   the owner may instead declare a retrieving scope slot under its four
   bounds, whose assurance is DECLARED lower rather than claimed equal.
-  Until that control ships (see its pending-implementation note above),
-  `low` is the only one an owner can actually select today. What stays
-  forbidden either way is an undeclared partial-coverage reviewer that
+  Both are selectable today. What stays forbidden either way is an
+  undeclared partial-coverage reviewer that
   looks like the pushed gate. In EVERY mode the staged diff is still
   blocking-reviewed by the diff-reviewer triad, and lowering the mode is
   owner-only — the agent cannot switch scope review off for its own

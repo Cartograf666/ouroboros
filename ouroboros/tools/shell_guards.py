@@ -50,10 +50,14 @@ INTERPRETER_WRITE_RE = re.compile(
     r"""open\s*\([^)]*,\s*['"][^'"]*[wax+])"""
 )
 # Wider write-indicator net for the read-vs-write runtime_data scan (v6.54.3):
-# includes filesystem-mutating calls the python AST analysis does NOT model
-# (shutil.copy*/move, touch, symlink/link, chmod/chown, makedirs/removedirs,
-# truncate) — a hit here without AST-resolved targets stays on the conservative
-# full mention scan instead of being treated as a pure read. NB: the leading
+# includes filesystem-mutating calls the base write regex misses (shutil.copy*/move,
+# touch, symlink/link, chmod/chown, makedirs/removedirs, truncate) — a hit here
+# without AST-resolved targets stays on the conservative full mention scan instead
+# of being treated as a pure read. This list and the AST walker are ONE vocabulary:
+# every spelling here is modelled by some branch of `_python_write_targets_and_unknown`
+# (its own tables, or the receiver/arg-0 branches that already owned a spelling), so a
+# call the regex counts as a write can never reach the walker's "no targets" answer
+# unmodelled and be mistaken for proof of a read (v6.89.0 panel A4). NB: the leading
 # (?is) of INTERPRETER_WRITE_RE.pattern already applies globally to the whole
 # concatenated expression — a second mid-pattern global flag is a hard
 # re.error on Python 3.11+ (review round 2).
@@ -319,6 +323,64 @@ _PYTHON_OPAQUE_EXEC_ATTRS = frozenset({
 })
 _PYTHON_OPAQUE_SUBPROCESS_ATTRS = frozenset({"run", "call"})
 
+# The rest of the module's ONE write vocabulary, in the form the AST walker needs.
+# `_INTERPRETER_ANY_WRITE_RE` above already enumerates these spellings as writes;
+# the walker used to model only `open`/`Path`/`os.remove`-family calls, so a
+# `shutil.copy` or `Path.touch` payload parsed cleanly, produced ZERO targets, and
+# both callers read that as PROOF the payload cannot write. Two write vocabularies
+# in one module meant the weaker one signed the proof (v6.89.0 panel A4). Anything
+# the regex calls a write is modelled here or is UNKNOWN — never silently absent.
+#
+# The value is the index of the positional argument naming what gets WRITTEN, or
+# None where no argument does (a cwd-relative extract, a hardlink whose direction
+# depends on the pathlib spelling). None — and a missing/unresolvable argument —
+# means UNKNOWN, the same answer the opaque-exec branch gives.
+_PYTHON_WRITE_ARG_INDEX: dict = {
+    "copyfile": 1, "copy2": 1, "copytree": 1, "symlink": 1,
+    "chmod": 0, "chown": 0, "truncate": 0,
+    "extractall": 0, "make_archive": 0, "unpack_archive": 1,
+    "save": 0, "savefig": 0, "imwrite": 0,
+    "to_csv": 0, "to_excel": 0, "to_parquet": 0, "to_json": 0, "to_pickle": 0,
+    "link_to": None, "hardlink_to": None,
+}
+# Spellings the regex only treats as writes behind their module (`shutil.copy` is
+# a write; `some_dict.copy()` is not). Mirroring that discrimination is what keeps
+# the walker from calling every ordinary `.copy()`/`.move()` write-capable.
+_PYTHON_MODULE_WRITE_ARG_INDEX: dict = {
+    ("shutil", "copy"): 1, ("shutil", "move"): 1, ("os", "link"): 1,
+    ("sqlite3", "connect"): 0, ("json", "dump"): 1, ("pickle", "dump"): 1,
+}
+
+
+def _python_vocabulary_write_target(
+    node: ast.Call, callee: str, names: dict, write_handles: dict,
+) -> "str | None":
+    """Where a vocabulary write call writes, or None when that is not derivable."""
+    index = _PYTHON_WRITE_ARG_INDEX.get(callee)
+    if index is None and isinstance(node.func, ast.Attribute):
+        receiver = node.func.value
+        if isinstance(receiver, ast.Name):
+            index = _PYTHON_MODULE_WRITE_ARG_INDEX.get((receiver.id, callee))
+    if index is None or index >= len(node.args):
+        return None
+    argument = node.args[index]
+    # `json.dump(obj, fh)` / `pickle.dump(obj, fh)` write through an already-open
+    # handle, so the handle's own target is the answer the walker already knows.
+    if isinstance(argument, ast.Name) and argument.id in write_handles:
+        return write_handles[argument.id]
+    return _python_literal_path(argument, names)
+
+
+def _python_call_is_vocabulary_write(node: ast.Call, callee: str) -> bool:
+    """Whether this call is a write by the module's shared vocabulary."""
+    if callee in _PYTHON_WRITE_ARG_INDEX:
+        return True
+    receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
+    return (
+        isinstance(receiver, ast.Name)
+        and (receiver.id, callee) in _PYTHON_MODULE_WRITE_ARG_INDEX
+    )
+
 
 def _python_call_is_opaque(node: ast.Call) -> bool:
     func = node.func
@@ -406,6 +468,7 @@ def _python_write_targets_and_unknown(inline_code: str) -> tuple[list[str], bool
                     targets.append(target)
         elif isinstance(func, ast.Attribute) and func.attr in {
             "write_text", "write_bytes", "unlink", "rename", "replace", "mkdir", "rmdir",
+            "touch",
         }:
             target = _python_literal_path(func.value, names)
             if target is None:
@@ -417,8 +480,24 @@ def _python_write_targets_and_unknown(inline_code: str) -> tuple[list[str], bool
                 targets.append(write_handles[func.value.id])
                 continue
             target, is_write_open = _python_path_open_target(func.value, names)
+            if not is_write_open and isinstance(func.value, ast.Call):
+                # The CHAINED builtin form `open(p, "w").write(x)`: the receiver is the
+                # open call itself, which `_python_path_open_target` only reads in its
+                # `Path(p).open("w")` spelling.
+                inner = func.value
+                if isinstance(inner.func, ast.Name) and inner.func.id == "open" and any(
+                    flag in _python_write_mode_from_open_call(inner) for flag in ("w", "a", "x", "+")
+                ):
+                    target = _python_literal_path(inner.args[0], names) if inner.args else None
+                    is_write_open = True
             if is_write_open and target is not None:
                 targets.append(target)
+            else:
+                # A `.write` whose receiver this walker cannot trace to a path (a
+                # handle returned by a helper, `tempfile.NamedTemporaryFile()`, an
+                # object held in a container) is a write it cannot LOCATE — which is
+                # UNKNOWN, not proof of a read. `sys.stdout/stderr` are excluded above.
+                unknown = True
         elif isinstance(func, ast.Attribute) and func.attr == "open":
             target, is_write_open = _python_path_open_target(node, names)
             if is_write_open and target is None:
@@ -433,6 +512,19 @@ def _python_write_targets_and_unknown(inline_code: str) -> tuple[list[str], bool
                 unknown = True
             else:
                 targets.append(target)
+        else:
+            # The rest of the module's shared write vocabulary. Reached last so the
+            # branches above keep owning the spellings they already model.
+            callee = (
+                func.attr if isinstance(func, ast.Attribute)
+                else func.id if isinstance(func, ast.Name) else ""
+            )
+            if callee and _python_call_is_vocabulary_write(node, callee):
+                target = _python_vocabulary_write_target(node, callee, names, write_handles)
+                if target is None:
+                    unknown = True
+                else:
+                    targets.append(target)
     resolved = list(dict.fromkeys(targets))
     # A derivation that collapsed to a degenerate cwd-shape ('.'/'') was NOT
     # really grounded (e.g. .parent of a literal whose separators the resolver
@@ -656,9 +748,10 @@ def runtime_data_guard_targets(
     - no write indicators at all → no block (pure read);
     - python with LITERAL write targets the AST fully resolved → block only those
       write targets that land under the drive outside the task roots;
-    - anything else with write indicators (dynamic python write paths, write calls
-      the AST does not model such as shutil.copy*/touch/chmod, non-python
-      interpreters) → fail closed on the full mention scan.
+    - anything else with write indicators (dynamic python write paths, a write call
+      whose destination is not a resolvable argument such as a cwd-relative
+      `extractall()`, non-python interpreters) → fail closed on the full mention
+      scan.
     """
     argv = [str(t) for t in shell_argv_with_inline(raw_cmd)]
     executable = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe") if argv else ""
@@ -1155,8 +1248,17 @@ def light_shell_repo_mutation(
     # python scripts opening their own staged attachment). Everything else — other
     # families, unknown flags, unparseable or computed payloads — is WRITE-CAPABLE and
     # refused wherever it could reach the repo. Scan side only: advanced/pro is
-    # untouched, and a provable write elsewhere still runs. A SCRIPT or module
-    # invocation (`python -m pytest`) hands nothing inline and is not judged here.
+    # untouched. A SCRIPT or module invocation (`python -m pytest`) hands nothing
+    # inline and is not judged here.
+    #
+    # The COST, stated at full size rather than at its most flattering: "could reach
+    # the repo" includes `_dynamic_write_could_hit_repo`'s cwd test, and the default
+    # shell cwd IS the system repository. So in an ordinary chat, in light mode, EVERY
+    # non-python inline invocation is refused — not only one naming a repo path, and
+    # even when it provably writes elsewhere or only reads. Only python keeps the
+    # proof, and only a cwd outside the repo (a folder-room chat, an explicit
+    # work_dir) restores the other families. That is the accepted price of the
+    # inversion; it is not a claim that a provable elsewhere-write still runs.
     if detect_interpreter_inline and interpreter_family(executable):
         inline = shell_command_string(argv) or " ".join(argv[1:])
         bodies = interpreter_inline_code(argv)

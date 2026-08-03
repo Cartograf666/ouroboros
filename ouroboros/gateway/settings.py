@@ -584,13 +584,24 @@ _REVIEW_ROUTE_BASE_URL_KEYS = frozenset({
 })
 
 
-def _review_slot_route(settings: Dict[str, Any], model: str) -> Dict[str, Any]:
+def _review_slot_route(settings: Dict[str, Any], model: str, *, session: bool = False) -> Dict[str, Any]:
     """(provider, model, base_url, use_local) for a REVIEW slot's own route.
 
     Deliberately NOT ``_active_main_route``: a review slot is pinned by its own model
-    id and must never inherit the main lane's USE_LOCAL_MAIN routing."""
-    from ouroboros.provider_models import provider_for_model
+    id and must never inherit the main lane's USE_LOCAL_MAIN routing.
 
+    ``session=True`` is a RETRIEVING row, whose target is a harness route spec rather
+    than a provider model id; it fingerprints under the session provider that
+    ``reviewer_window.reviewer_route`` owns, so the ack recorded from this notice and
+    the evidence the scope gate reads back are the same route. Resolving it through
+    ``provider_for_model`` instead would file a harness under ``openrouter`` and the
+    ack would never match."""
+    from ouroboros.provider_models import provider_for_model
+    from ouroboros.reviewer_window import SESSION_ROUTE_PROVIDER
+
+    if session:
+        return {"provider": SESSION_ROUTE_PROVIDER, "model": str(model or ""),
+                "base_url": "", "use_local": False}
     provider = provider_for_model(str(model or ""))
     base_url = ""
     if provider == "openai":
@@ -636,12 +647,14 @@ def _unrecognised_review_models(models: Any) -> list:
 
 
 def _candidate_scope_models(settings: Dict[str, Any]) -> list:
-    """Scope-review model candidates from CANDIDATE settings (6.1-aware).
+    """Scope-review API model candidates from CANDIDATE settings (6.1-aware).
 
     The structured reviewer-slot value wins when present and parseable: its
-    api_chat scope rows are the routes the >=1M gate applies to (a delegated
-    session row is the declared lower-guarantee mode, D16 — never probed
-    here). Otherwise the legacy comma keys, then the live config."""
+    api_chat scope rows are the routes the >=1M gate applies to. A retrieving
+    (session) row is NOT a provider model id, so it is not a candidate here —
+    its own >=200K floor and its own ack route are handled by
+    ``_candidate_scope_session_targets``. Otherwise the legacy comma keys, then
+    the live config."""
     from ouroboros.config import get_scope_review_models
 
     raw_structured = str(settings.get("OUROBOROS_REVIEWER_SLOTS") or "").strip()
@@ -660,6 +673,27 @@ def _candidate_scope_models(settings: Dict[str, Any]) -> list:
             or ""
         ).replace(",", " ").split() if m
     ] or list(get_scope_review_models() or [])
+
+
+def _candidate_scope_session_targets(settings: Dict[str, Any]) -> list:
+    """Scope-review RETRIEVING row targets from CANDIDATE settings.
+
+    A retrieving row's blocking authority rests on SOURCED window evidence at the
+    session floor (``scope_review_session.SESSION_WINDOW_FLOOR``), and a harness
+    route publishes no model metadata — so owner-ack is the ONLY path that floor
+    can ever be reached by. Leaving these rows out of the notice made the floor
+    decorative: the mode could not reach `asserted` through any product path, so
+    every retrieving row stayed advisory-only forever by construction."""
+    raw_structured = str(settings.get("OUROBOROS_REVIEWER_SLOTS") or "").strip()
+    if not raw_structured:
+        return []  # legacy rows share ONE session route with no per-row target
+    try:
+        from ouroboros.reviewer_slot_config import parse_reviewer_slots
+
+        return [r.target_id for r in parse_reviewer_slots(raw_structured).scope
+                if r.is_session and r.target_id]
+    except ValueError:
+        return []
 
 
 def _candidate_triad_models(settings: Dict[str, Any]) -> list:
@@ -689,12 +723,17 @@ def _review_capability_notices(settings: Dict[str, Any]) -> list:
     Advisory only: a slot without evidence stays fail-closed at review time (the pin is
     routing intent, never evidence) — this just makes "known" reachable.
 
-    ONLY the scope-review surface is probed: it is the one surface whose >=1M evidence
+    ONLY the scope-review surface is probed: it is the one surface whose window evidence
     gates anything, so probing the triad slots was network work whose result was
     discarded. The caller gates this on a ROUTE-AFFECTING change (the scope slot itself
     or any base URL that route resolves through), not every settings save: capability is
     a property of provider+base_url+model, so a hot base-URL change produces a route with
     no evidence exactly as a model change does.
+
+    BOTH scope deliveries are offered their ack, each against ITS OWN floor: an api row
+    against the constitutional >=1M, a RETRIEVING row against the >=200K session floor
+    (BIBLE P3's retrieving amendment). The floor travels with the notice as
+    ``floor_tokens`` so the UI asks about the number that route is actually judged by.
 
     The slot is read from the CANDIDATE settings, not from ``get_scope_review_models()``:
     that reads process env, which is not necessarily the value being saved, so the notice
@@ -703,14 +742,17 @@ def _review_capability_notices(settings: Dict[str, Any]) -> list:
     try:
         from ouroboros.capability_evidence import ONE_MILLION, confirms_at_least, probe
         from ouroboros.config import DATA_DIR
+        from ouroboros.tools.scope_review_session import SESSION_WINDOW_FLOOR
 
-        candidates = _candidate_scope_models(settings)
+        candidates = [(str(m), False, ONE_MILLION) for m in _candidate_scope_models(settings)]
+        candidates += [(str(t), True, SESSION_WINDOW_FLOOR)
+                       for t in _candidate_scope_session_targets(settings)]
         seen: set = set()
-        for model in candidates:
-            if str(model) in seen:
+        for model, session, floor in candidates:
+            if (model, session) in seen:
                 continue
-            seen.add(str(model))
-            route = _review_slot_route(settings, str(model))
+            seen.add((model, session))
+            route = _review_slot_route(settings, model, session=session)
             ev = probe(
                 DATA_DIR, provider=route["provider"], model=route["model"],
                 base_url=route["base_url"], use_local=route["use_local"],
@@ -721,11 +763,12 @@ def _review_capability_notices(settings: Dict[str, Any]) -> list:
             # or outage-carried record will NOT authorise a blocking verdict, so the
             # owner must be offered the ack now rather than told the slot is fine and
             # then blocked at commit time by the twin check.
-            if not confirms_at_least(ev, ONE_MILLION, require_fresh=True):
+            if not confirms_at_least(ev, floor, require_fresh=True):
                 notices.append({
-                    "surface": "scope_review",
+                    "surface": "scope_review_session" if session else "scope_review",
                     "needs_ack": {**route, "route_fp": ev.route_fp, "evidence": ev.to_json()},
                     "window_tokens": int(ev.window_tokens or 0),
+                    "floor_tokens": int(floor),
                     "verified": int(ev.window_tokens or 0) > 0,
                 })
     except Exception:

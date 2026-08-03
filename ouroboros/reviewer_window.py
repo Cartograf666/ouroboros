@@ -36,6 +36,13 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 REVIEWER_FULL_WINDOW = 1_000_000
+# The provider a RETRIEVING (agent_session) reviewer row fingerprints under. Its
+# target is a harness route spec, never a provider model id, so it gets its own
+# provider name rather than being filed under whatever `provider_for_model`
+# guesses for an unrecognised string. Spelled the same as
+# `reviewer_slot_config.ROUTE_KIND_SESSION`, imported here so this module keeps
+# importing nothing from the tools package.
+SESSION_ROUTE_PROVIDER = "agent_session"
 # Per-route locks that serialise concurrent resolutions of the SAME route —
 # parallel_review runs the triad and the scope slots at once — so they share ONE
 # metadata fetch: the second thread enters after the first has written the evidence
@@ -100,11 +107,23 @@ class ReviewerWindow:
         return int(self.window_tokens) if int(self.window_tokens) > 0 else int(unknown_window)
 
 
-def reviewer_route(model_id: str) -> tuple:
-    """``(provider, base_url)`` for a reviewer slot's real route."""
+def reviewer_route(model_id: str, *, session: bool = False) -> tuple:
+    """``(provider, base_url)`` for a reviewer slot's real route.
+
+    ``session=True`` marks a RETRIEVING row, whose ``model_id`` is an opaque
+    Claudexor ``harness[=model]`` spec and not a provider model id at all.
+    ``provider_for_model`` cannot resolve such a spec — it answers ``openrouter``
+    for anything unrecognised — so a session row fingerprinted through the api
+    path would be filed under a provider it never travels, and the owner-ack the
+    scope gate reads back would be recorded against that same falsehood. The
+    harness IS the provider here, exactly as the reviewer-slot SSOT spells it,
+    which is what makes the ack reachable and the record honest. The caller
+    passes the ROW's configured kind; nothing sniffs the string."""
     from ouroboros.config import load_settings
     from ouroboros.provider_models import provider_for_model
 
+    if session:
+        return SESSION_ROUTE_PROVIDER, ""
     provider = provider_for_model(str(model_id or ""))
     settings_key = {
         "openai": "OPENAI_BASE_URL",
@@ -120,6 +139,7 @@ def resolve_reviewer_window(
     model_id: str,
     *,
     use_local: Optional[bool] = None,
+    session: bool = False,
 ) -> ReviewerWindow:
     """The reviewer's :class:`ReviewerWindow` from Capability Evidence.
 
@@ -151,9 +171,11 @@ def resolve_reviewer_window(
         from ouroboros.config import DATA_DIR
         from ouroboros.provider_models import review_model_uses_local
 
+        # A retrieving row never travels the local lane: its target is a harness
+        # route, so the local-model predicate has nothing to say about it.
         if use_local is None:
-            use_local = review_model_uses_local(model)
-        provider, base_url = reviewer_route(model)
+            use_local = False if session else review_model_uses_local(model)
+        provider, base_url = reviewer_route(model, session=session)
         effective_provider = "local" if use_local else provider
         route_fp = route_fingerprint(
             provider=effective_provider, base_url=base_url, model=model,

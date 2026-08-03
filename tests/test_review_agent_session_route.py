@@ -978,15 +978,18 @@ def _scope_matrix_with_critical():
 def test_session_scope_without_sourced_window_evidence_is_advisory_only(
     tmp_path, fake_route, monkeypatch, window, provenance
 ):
-    """A retrieving scope row carries a BLOCKING verdict only on SOURCED window
-    evidence >= the session floor.
+    """A retrieving scope row's FINDINGS certify nothing without SOURCED window
+    evidence >= the session floor — and the row BLOCKS, as its api twin does.
 
     The previous shape skipped `_apply_scope_authority` for `agent_session`
     entirely — a session verdict gated commits with NO window test at all, while
-    its own manifest recorded coverage_incomplete/host_enforced=False. On this
-    branch BIBLE.md is unamended, so blocking authority here would contradict the
-    constitution's own >=1M text; degrading to advisory-with-disclosure is
-    simultaneously non-violating there and correct under the amended reading.
+    its own manifest recorded coverage_incomplete/host_enforced=False.
+
+    Two facts live in one result and are easy to conflate: the findings are
+    demoted to ADVISORY (an unestablished window cannot certify a verdict), and
+    the commit is BLOCKED (the panel is short an authoritative verdict). Returning
+    `blocked=False` here is what made the P3 gate fail open — the api row's
+    `sub_floor` twin blocked on the identical panel shape.
     """
     result = _run_session_scope(
         tmp_path, fake_route, monkeypatch, window=window, provenance=provenance,
@@ -994,7 +997,8 @@ def test_session_scope_without_sourced_window_evidence_is_advisory_only(
     )
 
     assert result.status == "session_advisory", result.status
-    assert result.blocked is False
+    assert result.blocked is True
+    assert "authoritative scope verdict required to commit" in result.block_message
     # The critical was preserved as advisory evidence, not discarded...
     assert result.critical_findings == []
     reasons = " ".join(str(f.get("reason") or "") for f in result.advisory_findings)
@@ -1180,3 +1184,157 @@ def test_triad_session_task_carries_criteria_and_nav_maps_not_evidence():
     assert "DEVELOPMENT.md (navigation map)" in task
     assert "ARCHITECTURE.md (navigation map)" in task
     assert "Read BIBLE.md in full" in task
+
+
+# ---------------------------------------------------------------------------
+# The blocking scope gate must not fail OPEN on an all-retrieving panel.
+# ---------------------------------------------------------------------------
+
+
+def _all_session_scope_panel(tmp_path, monkeypatch, *, window, provenance):
+    """The REAL fan-out + aggregate over a panel of two retrieving rows.
+
+    Only the two genuinely external things are faked: the reviewer's window
+    evidence and the model call. Everything the gate actually decides with —
+    `run_scope_review`, `_apply_scope_authority`, `session_scope_authority`,
+    `run_parallel_review`'s quorum, `aggregate_review_verdict` — runs for real.
+    """
+    from ouroboros import config as cfg
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewSlot
+    from ouroboros.tools import parallel_review, review
+    import ouroboros.tools.scope_review as scope_mod
+
+    if provenance:
+        resolved = scope_mod.ReviewerWindow(window_tokens=int(window), status=provenance)
+    else:
+        resolved = scope_mod.ReviewerWindow(window_tokens=0, status="")
+    monkeypatch.setattr(cfg, "get_review_enforcement", lambda: "blocking")
+    monkeypatch.setattr(scope_mod, "_scope_window", lambda *_a, **_k: resolved)
+    monkeypatch.setattr(
+        scope_mod, "_call_scope_llm",
+        lambda *_a, **_k: (json.dumps(_scope_matrix_rows()), {}, ""),
+    )
+    monkeypatch.setattr(parallel_review, "scope_reviewer_slots", lambda *_a, **_k: [
+        ReviewSlot(slot_id="scope_slot_1", model="codex=gpt-5.6-sol",
+                   route=ReviewRouteKind.AGENT_SESSION, session_target="codex=gpt-5.6-sol"),
+        ReviewSlot(slot_id="scope_slot_2", model="claude=fable-5",
+                   route=ReviewRouteKind.AGENT_SESSION, session_target="claude=fable-5"),
+    ])
+    monkeypatch.setattr(parallel_review, "run_cmd", lambda *_a, **_k: "staged diff")
+    monkeypatch.setattr(review, "_run_unified_review", lambda *_a, **_k: None)
+
+    ctx = _scope_ctx(tmp_path)
+    ctx._review_history = []
+    ctx._review_advisory = []
+    ctx._scope_review_history = {}
+    ctx.task_id = "scope-fail-open"
+    ctx.pending_events = []
+    args = parallel_review.run_parallel_review(ctx, "all-retrieving scope panel")
+    blocked, message, reason, _findings, _advisory = parallel_review.aggregate_review_verdict(
+        *args, ctx, "all-retrieving scope panel", 0.0, tmp_path,
+    )
+    manifest = (ctx._last_scope_raw_result or {}).get("context_manifest") or {}
+    return blocked, message or "", reason, manifest
+
+
+def test_all_retrieving_scope_panel_blocks_instead_of_failing_open(tmp_path, monkeypatch):
+    """A scope panel of retrieving rows with no sourced window evidence yields ZERO
+    authoritative verdicts — and must BLOCK, exactly as the api panel does.
+
+    This is the fail-open the adversarial panel measured on a6a3c1f: the same panel
+    shape gave `api_chat status=sub_floor -> BLOCKED=True` and
+    `agent_session status=session_advisory -> BLOCKED=False`. Nothing downstream
+    could recover it — `partial_quorum_shortfall` only fires above zero responders,
+    so a zero-authoritative run walked straight through the blocking scope gate of
+    BIBLE P3 while looking armed.
+    """
+    blocked, message, reason, manifest = _all_session_scope_panel(
+        tmp_path, monkeypatch, window=0, provenance="",
+    )
+
+    assert blocked is True, "the blocking scope gate must not pass a zero-authoritative panel"
+    assert reason == "scope_blocked", reason
+    assert "SCOPE_REVIEW_BLOCKED" in message
+    assert "authoritative scope verdict required to commit" in message
+    # The shortfall is still disclosed, not merely converted into a block.
+    assert manifest["scope_responded_count"] == 0, manifest
+    assert manifest["scope_session_advisory_only_count"] == 2, manifest
+    assert any("scope_session_advisory_only" in str(r)
+               for r in manifest["scope_degraded_reasons"]), manifest
+
+
+def test_retrieving_and_api_panels_agree_on_an_unestablished_window(tmp_path, monkeypatch):
+    """The asymmetry itself is the defect: an unestablished window blocks on BOTH
+    deliveries, and SOURCED evidence at the row's own floor authorises on both."""
+    import ouroboros.tools.scope_review as scope_mod
+
+    # Retrieving row, SOURCED at the session floor -> authoritative, no block.
+    blocked, _msg, _reason, manifest = _all_session_scope_panel(
+        tmp_path, monkeypatch, window=200_000, provenance="confirmed",
+    )
+    assert blocked is False, "sourced >=200K evidence must restore an authoritative verdict"
+    assert manifest["scope_responded_count"] == 2, manifest
+
+    # api row, window below its own floor -> blocks (the twin, unchanged).
+    monkeypatch.setattr(scope_mod, "_build_scope_prompt",
+                        lambda *_a, **_k: ("assembled api pack", None))
+    monkeypatch.setattr(scope_mod, "_scope_window",
+                        lambda *_a, **_k: scope_mod.ReviewerWindow(
+                            window_tokens=200_000, status="confirmed"))
+    monkeypatch.setattr(
+        scope_mod, "_call_scope_llm",
+        lambda *_a, **_k: (json.dumps(_scope_matrix_rows()), {}, ""),
+    )
+    api_result = scope_mod.run_scope_review(
+        _scope_ctx(tmp_path), "api row, sub-floor window", scope_model="api/small",
+        slot_id="scope_slot_1",
+    )
+    assert api_result.blocked is True and api_result.status == "sub_floor"
+
+
+def test_a_retrieving_row_can_actually_reach_sourced_evidence(tmp_path, monkeypatch):
+    """The >=200K floor must be REACHABLE, not decorative.
+
+    Retrieving rows were excluded from Capability-Evidence probing and their opaque
+    `harness[=model]` target does not resolve through `provider_for_model`, so no
+    product path could ever take such a row to `confirmed`/`asserted`: advisory-only
+    was the mode's ONLY possible outcome. The settings save now offers the row its
+    ack against its own floor, and acking that exact route restores authority.
+    """
+    from ouroboros import capability_evidence as ce
+    from ouroboros.gateway import settings as smod
+    from ouroboros.reviewer_window import SESSION_ROUTE_PROVIDER
+    from ouroboros.tools.scope_review_session import (
+        SESSION_WINDOW_FLOOR,
+        session_window_is_authoritative,
+    )
+    from ouroboros.tools.scope_window import scope_window
+
+    monkeypatch.setattr(ce, "DATA_DIR", tmp_path, raising=False)
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    monkeypatch.setattr(smod, "_candidate_scope_models", lambda _s: [])
+    slots = json.dumps({
+        "triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "api/m"}}],
+        "scope": [{"slot_id": "s1", "route": {"kind": "agent_session",
+                                              "target_id": "codex=gpt-5.6-sol"}}],
+    })
+
+    notices = smod._review_capability_notices({"OUROBOROS_REVIEWER_SLOTS": slots})
+    assert len(notices) == 1, notices
+    notice = notices[0]
+    assert notice["surface"] == "scope_review_session"
+    assert notice["floor_tokens"] == SESSION_WINDOW_FLOOR
+    ack_route = notice["needs_ack"]
+    assert ack_route["provider"] == SESSION_ROUTE_PROVIDER, ack_route
+    assert ack_route["model"] == "codex=gpt-5.6-sol"
+
+    # Before the ack the row cannot authorise...
+    before = scope_window("codex=gpt-5.6-sol", session=True)
+    assert session_window_is_authoritative(before.window_tokens, before.status) is False
+
+    # ...and the ack the UI records against that exact route is what restores it.
+    ce.record_owner_ack(tmp_path, provider=ack_route["provider"], model=ack_route["model"],
+                        base_url=ack_route["base_url"], window_tokens=SESSION_WINDOW_FLOOR)
+    after = scope_window("codex=gpt-5.6-sol", session=True)
+    assert session_window_is_authoritative(after.window_tokens, after.status) is True

@@ -59,7 +59,7 @@ def is_designated_default_reviewer(model: str) -> bool:
     return bool(model) and _normalized(model) == _normalized(SCOPE_MODEL_DEFAULT)
 
 
-def scope_window(model: str) -> ReviewerWindow:
+def scope_window(model: str, *, session: bool = False) -> ReviewerWindow:
     """The scope reviewer's window AND its blocking authority, as ONE typed result.
 
     Replaces the deleted static per-model window table: a confirmed/asserted probe
@@ -86,7 +86,14 @@ def scope_window(model: str) -> ReviewerWindow:
     model = str(model or "")
     try:
         # Probe the scope slot, not the active main route (which honors USE_LOCAL_MAIN).
-        resolved = _resolve_reviewer_window(model, use_local=review_model_uses_local(model))
+        # ``session`` is the ROW's configured delivery: a retrieving row's target is a
+        # harness route spec, so it fingerprints under its own provider and the local
+        # predicate does not apply to it (see `reviewer_window.reviewer_route`).
+        resolved = _resolve_reviewer_window(
+            model,
+            use_local=None if session else review_model_uses_local(model),
+            session=session,
+        )
         if int(resolved.window_tokens) > 0:
             return resolved
     except Exception:

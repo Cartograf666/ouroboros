@@ -147,7 +147,10 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
             # whose window is not sourced-proven arrives as `session_advisory`: its
             # coverage is declaredly not host-attested, so it must never be counted as
             # the authoritative verdict that satisfies the blocking scope quorum — it is
-            # advisory evidence, and the shortfall it leaves is disclosed below.
+            # advisory evidence, and the shortfall it leaves is disclosed below. Such a
+            # row also arrives BLOCKED (its own authority function decides that, exactly
+            # as the api row's `sub_floor` twin does), so counting it out of the quorum
+            # here can no longer let the gate fail open.
             _responded = sum(1 for s in _scope_statuses if s == "responded")
             _session_advisory = sum(1 for s in _scope_statuses if s == "session_advisory")
             _required = adaptive_quorum(len(scope_models))
@@ -197,8 +200,14 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
             # Bible P3 negative control: configured>=2 but a PARTIAL authoritative
             # quorum (0 < responded < required) is a loud quorum FAILURE — block vs
             # advisory FOLLOWS owner enforcement (never hardcode a block). A
-            # zero-responded run is a structural floor/skip handled by the
-            # per-result status, so it stays advisory-only here.
+            # zero-responded run is NOT decided here: each delivery's own authority
+            # function already returns a BLOCKING result when its window cannot
+            # authorise (api `sub_floor`, retrieving `session_advisory`), and the
+            # genuine floor SKIPS (budget_exceeded, low-context) are deliberately not
+            # blocks. Widening this condition to `_responded < _required` would make
+            # this aggregate a SECOND owner of that decision and would turn those
+            # sanctioned skips into blocks — so the fix for a fail-open row belongs in
+            # the row, not here.
             partial_quorum_shortfall = (
                 not _single_scope_reviewer and 0 < _responded < _required and not blocked
             )

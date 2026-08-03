@@ -1230,12 +1230,10 @@ def _handle_prompt_signals(
 
 
 def _apply_scope_authority(
-    ctx: Any,
     critical_findings: List[dict],
     advisory_findings: List[dict],
     *,
     scope_model_id: str,
-    prompt_tokens_est: int = 0,
     result_kwargs: dict,
     delegated: bool = False,
 ) -> tuple[List[dict], List[dict], Optional[ScopeReviewResult]]:
@@ -1248,7 +1246,7 @@ def _apply_scope_authority(
     large enough is not a window that was established — an expired record, an outage-
     carried record, and the unevidenced designated-default sentinel all size a prompt
     at >=1M and all fail here (the BIBLE P3 rule stated in code)."""
-    resolved = _scope_window(scope_model_id)
+    resolved = _scope_window(scope_model_id, session=delegated)
     if delegated:
         from ouroboros.tools.scope_review_session import session_scope_authority
 
@@ -1532,7 +1530,7 @@ def run_scope_review(
         "response_ref": _response_ref,
     }
     critical_findings, advisory_findings, authority_block = _apply_scope_authority(
-        ctx, critical_findings, advisory_findings, scope_model_id=scope_model_id,
+        critical_findings, advisory_findings, scope_model_id=scope_model_id,
         result_kwargs=result_kwargs, delegated=delegated,
     )
     if authority_block is not None:
