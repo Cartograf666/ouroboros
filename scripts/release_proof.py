@@ -30,7 +30,9 @@ RELEASE_GATES = (
 COMMON_SMOKE_CHECKS = frozenset({"embedded_repo_bundle", "packaged_cli_help"})
 REQUIRED_SMOKE_CHECKS = {
     "macos-arm64": COMMON_SMOKE_CHECKS
-    | frozenset({"install_cli_command", "arm64_main_executable"}),
+    | frozenset(
+        {"applications_shortcut", "install_cli_command", "arm64_main_executable"}
+    ),
     "linux-x86_64": COMMON_SMOKE_CHECKS,
     "windows-x64": COMMON_SMOKE_CHECKS,
 }

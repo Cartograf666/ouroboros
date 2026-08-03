@@ -1,4 +1,4 @@
-# Ouroboros v6.87.5 — Architecture & Reference
+# Ouroboros v6.87.6 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -1923,6 +1923,7 @@ Rationale: normal self-modification needs fast feedback, but release tags must p
 ### Build scripts
 
 `build.sh`, `build_linux.sh`, `build_windows.ps1`, and `scripts/build_repo_bundle.py` are release-invariant surfaces. Changes to them must update README install/build notes and architecture rationale in the same commit.
+The macOS DMG has one explicit Finder installation layout: `Ouroboros.app`, an `Applications -> /Applications` symlink as the drag target, and the optional `Install CLI.command`. The release workflow mounts the final read-only DMG and verifies both the symlink type and its exact target before publication; a staging-directory string check alone is not release evidence.
 Release tag prerequisite: platform build scripts delegate repo-bundle creation to `scripts/build_repo_bundle.py`; that Python bundler is the release-tag SSOT and verifies the annotated `v$(cat VERSION)` tag points at `HEAD` before packaged artifacts are produced. This catches untagged release builds locally instead of publishing artifacts whose version carriers disagree with git history.
 Packaged Python bytecode policy (v6.36.0): platform build scripts PRECOMPILE the bundled `python-standalone` + `ouroboros` payload (`compileall -f --invalidation-mode unchecked-hash`, using the in-bundle interpreter) and SEAL the resulting `.pyc` inside the signature, replacing the old "delete all `.pyc` before signing" step — with the `.pyc` present and valid (and `unchecked-hash` skipping the source-mtime check on a read-only bundle), the runtime never writes new bytecode into the bundle, so the macOS codesign seal stays valid (a runtime `__pycache__` write previously broke the seal → AppTranslocation). `xattr -cr` + FinderInfo/detritus hygiene and `codesign --verify --strict` are preserved; hardened runtime/notarization untouched. As defense-in-depth the runtime launcher + packaged CLI set `PYTHONDONTWRITEBYTECODE=1` GLOBALLY at the earliest point and add the bytecode vars to the curated-env whitelists (`isolated_deps._SAFE_ENV_KEYS`, `extension_process_runner._child_env`) so embedded-python `pip`/`venv`/extension spawns also route caches to the external `data/state/pycache` prefix. Linux/Windows mirror the precompile for start-speed parity (they do not seal resources).
 

@@ -245,6 +245,11 @@ def test_release_workflow_orders_smoke_sbom_attestation_and_draft_verification()
     assert "matrix.sbom_path" not in workflow
     assert "steps.smoke_macos.outputs.sbom_path" in workflow
     assert 'test -x "$MOUNT/Install CLI.command"' in workflow
+    assert 'test -L "$MOUNT/Applications"' in workflow
+    assert 'test "$(readlink "$MOUNT/Applications")" = "/Applications"' in workflow
+    assert 'test -L "$SBOM_ROOT/Applications"' in workflow
+    assert 'unlink "$SBOM_ROOT/Applications"' in workflow
+    assert "--check applications_shortcut" in workflow
     assert "lipo -archs" in workflow
     assert "Refusing to modify the published release" in workflow
     assert "group: release-${{ github.ref }}" in workflow

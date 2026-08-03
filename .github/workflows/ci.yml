@@ -632,6 +632,8 @@ jobs:
           test "$(uname -m)" = "arm64"
           test -f "$MOUNT/Ouroboros.app/Contents/Resources/repo.bundle"
           test -f "$MOUNT/Ouroboros.app/Contents/Resources/repo_bundle_manifest.json"
+          test -L "$MOUNT/Applications"
+          test "$(readlink "$MOUNT/Applications")" = "/Applications"
           test -x "$MOUNT/Install CLI.command"
           APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$MOUNT/Ouroboros.app/Contents/Info.plist")"
           lipo -archs "$MOUNT/Ouroboros.app/Contents/MacOS/$APP_EXECUTABLE" | tr ' ' '\n' | grep -qx arm64
@@ -644,6 +646,8 @@ jobs:
           rm -rf "$SBOM_ROOT"
           mkdir -p "$SBOM_ROOT"
           ditto "$MOUNT" "$SBOM_ROOT"
+          test -L "$SBOM_ROOT/Applications"
+          unlink "$SBOM_ROOT/Applications"
           echo "sbom_path=$SBOM_ROOT" >> "$GITHUB_OUTPUT"
 
       - name: Smoke final Linux archive
@@ -690,7 +694,7 @@ jobs:
         run: |
           EXTRA_CHECKS=()
           if [ "${{ matrix.proof_id }}" = "macos-arm64" ]; then
-            EXTRA_CHECKS+=(--check install_cli_command --check arm64_main_executable)
+            EXTRA_CHECKS+=(--check applications_shortcut --check install_cli_command --check arm64_main_executable)
           fi
           python scripts/release_proof.py record-smoke \
             --proof-id "${{ matrix.proof_id }}" \

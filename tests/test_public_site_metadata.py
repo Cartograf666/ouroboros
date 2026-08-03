@@ -184,6 +184,21 @@ def test_generated_public_files_match_source():
         assert (SITE / "public" / name).read_bytes() == (DOCS / name).read_bytes()
 
 
+def test_install_visual_is_synced_valid_and_cache_busted():
+    source = REPO / "assets" / "install-macos.png"
+    data = source.read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    width, height = struct.unpack(">II", data[16:24])
+    assert (width, height) == (1536, 1024)
+    assert '"install-macos.png"' in (SITE / "scripts" / "sync-assets.mjs").read_text(
+        encoding="utf-8"
+    )
+    install_page = (SITE / "install" / "index.html").read_text(encoding="utf-8")
+    assert f"/assets/install-macos.png?v={_sha256(source)[:10]}" in install_page
+    assert 'width="1536" height="1024"' in install_page
+    assert source.read_bytes() == (DOCS / "assets" / "install-macos.png").read_bytes()
+
+
 def test_navigation_keeps_accessible_home_and_contributor_links():
     for path in INDEXABLE.values():
         html = path.read_text(encoding="utf-8")

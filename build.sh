@@ -208,6 +208,7 @@ DMG_STAGE_DIR="dist/dmg-stage"
 rm -rf "$DMG_STAGE_DIR"
 mkdir -p "$DMG_STAGE_DIR"
 cp -R "$APP_PATH" "$DMG_STAGE_DIR/Ouroboros.app"
+ln -s /Applications "$DMG_STAGE_DIR/Applications"
 cp packaging/cli/install-ouroboros-cli-macos.command "$DMG_STAGE_DIR/Install CLI.command"
 chmod +x "$DMG_STAGE_DIR/Install CLI.command"
 for attempt in 1 2 3; do
