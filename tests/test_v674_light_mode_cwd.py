@@ -164,3 +164,31 @@ def test_light_mode_cwd_resolution_failure_fails_closed(tmp_path, monkeypatch):
     reg = _registry(tmp_path)
     result = reg.execute("run_command", {"cmd": "touch out.txt", "cwd": "/etc"})
     assert "SHELL_CWD_BLOCKED" in result, result[:300]
+
+
+def test_light_mode_versioned_interpreter_triggers_runtime_data_scan(tmp_path, monkeypatch):
+    """The registry half of the versioned-basename fix: `python3.11` must engage
+    ToolRegistry's light-mode runtime_data scan exactly like `python`.
+
+    The command is deliberately a PURE READ (no coarse write indicator — pathlib
+    ``read_text``, no ``open(``), so `writeish` is False and the ONLY thing that
+    can start the scan is the interpreter classification itself: with the
+    exact-set match ({"python", "python3", ...}) a versioned agent python walked
+    straight past the scan and read secret-named runtime_data (settings.json at
+    the drive root) that the same command spelled `python -c` is blocked from.
+    `runtime_data_guard_targets` always handled startswith("python") internally —
+    the invocation trigger was the untested bypass."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    reg = _registry(tmp_path)
+    secret = pathlib.Path(reg._ctx.drive_root) / "settings.json"
+    read_cmd = f"import pathlib; print(pathlib.Path({str(secret)!r}).read_text())"
+
+    result = reg.execute("run_command", {"cmd": ["python3.11", "-c", read_cmd]})
+    assert "LIGHT_MODE_BLOCKED" in result, result[:300]
+    assert "runtime_data paths outside this task's own roots" in result, result[:300]
+    assert "settings.json" in result, result[:300]
+
+    # Parity pin: the unversioned spelling of the same command is blocked the
+    # same way — the versioned basename must not be the weaker path.
+    unversioned = reg.execute("run_command", {"cmd": ["python", "-c", read_cmd]})
+    assert "LIGHT_MODE_BLOCKED" in unversioned, unversioned[:300]

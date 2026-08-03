@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from ouroboros.tools.review_context_atlas import (
+    ATLAS_ASSEMBLY_FAILURE_STATUSES,
     ReviewContextAtlasRequest,
+    atlas_assembly_failed,
+    atlas_assembly_failure_reason,
+    atlas_hard_budget_overflowed,
+    atlas_unassembled_required,
     compile_review_context_atlas,
 )
 
@@ -245,13 +253,15 @@ def test_atlas_respects_total_prompt_target_and_reports_budget_manifest_only(tmp
     # Even the content-free manifest exceeds this micro budget (hard context
     # allowance is 0 after fixed+headroom) — only then budget_exceeded survives.
     assert overflow.status == "budget_exceeded"
+    assert atlas_assembly_failed(overflow)
     assert _coverage(overflow)["BIBLE.md"]["disposition"] == "budget_omitted"
 
 
-def test_atlas_required_overflow_degrades_to_manifest_not_exceeded(tmp_path):
-    """Guaranteed-fit: a required file that cannot fit the hard budget degrades
-    to an explicit budget_omitted manifest entry; the atlas stays usable
-    (budget_constrained), it does NOT give up with budget_exceeded."""
+def test_atlas_required_overflow_is_an_assembly_failure_not_a_smaller_pack(tmp_path):
+    """BIBLE P3 scope floor: a REQUIRED artifact that does not fit fails the
+    ASSEMBLY. The pack must not come back reviewable (`budget_constrained`) with
+    the artifact quietly downgraded to a manifest row — the row is disclosure
+    that ACCOMPANIES the refusal, never a substitute for it."""
     _write(tmp_path / "BIBLE.md", "constitution\n" * 3000)  # ~9K tokens > hard allowance
     _write(tmp_path / "small.py", "def f():\n    return 'x'\n" * 30)
 
@@ -266,11 +276,223 @@ def test_atlas_required_overflow_degrades_to_manifest_not_exceeded(tmp_path):
     )
 
     coverage = _coverage(pack)
-    assert pack.status == "budget_constrained"
+    # The refusal.
+    assert pack.status == "required_artifact_omitted"
+    assert atlas_assembly_failed(pack)
+    assert pack.status in ATLAS_ASSEMBLY_FAILURE_STATUSES
+    # The disclosure that accompanies it: typed, naming artifact AND reason,
+    # carried by the ONE reader every consumer uses. The durable manifest is that
+    # carrier — a parallel typed attribute would be a second copy of one fact,
+    # and every production reader already goes through the manifest.
+    assert [row["path"] for row in atlas_unassembled_required(pack.manifest)] == ["BIBLE.md"]
+    assert [row["path"] for row in pack.manifest["unassembled_required"]] == ["BIBLE.md"]
+    assert not hasattr(pack, "unassembled_required")
+    assert "exceeded the atlas hard budget" in pack.manifest["unassembled_required"][0]["reason"]
+    assert "BIBLE.md" in atlas_assembly_failure_reason(pack)
     assert coverage["BIBLE.md"]["disposition"] == "budget_omitted"
-    assert "degraded to manifest entry" in coverage["BIBLE.md"]["reason"]
     assert coverage["small.py"]["disposition"] == "full"
     assert pack.manifest["estimated_total_tokens"] <= 10_000
+
+
+def test_atlas_required_removed_by_shrink_wave_is_the_same_assembly_failure(tmp_path):
+    """The twin branch: a required artifact that PASSED selection and was then
+    dropped by the hard-budget shrink wave is the identical failure — one
+    branch fixed while its sibling degrades silently is the whole defect."""
+    for idx in range(6):
+        _write(tmp_path / "prompts" / f"p_{idx}.md", "prompt line\n" * 260)
+
+    pack = compile_review_context_atlas(
+        ReviewContextAtlasRequest(
+            repo_dir=tmp_path,
+            tracked_paths=tuple(f"prompts/p_{idx}.md" for idx in range(6)),
+            fixed_prompt_tokens=100,
+            target_total_tokens=4_000,
+            hard_total_tokens=8_000,
+        )
+    )
+
+    omitted_reasons = {row["path"]: row["reason"] for row in pack.manifest["unassembled_required"]}
+    assert omitted_reasons, "shrink wave must have dropped at least one required prompt file"
+    assert any("removed to keep atlas below hard budget" in reason for reason in omitted_reasons.values()), (
+        f"expected the shrink-wave branch, got: {omitted_reasons}"
+    )
+    assert pack.status == "required_artifact_omitted"
+    assert atlas_assembly_failed(pack)
+
+
+def test_atlas_mixed_failure_reports_both_causes_without_losing_disclosure(tmp_path):
+    """The MIXED assembly failure: required candidates are marked budget_omitted
+    BEFORE the rendered content-free atlas is tested against the hard budget, so
+    one pack can carry status="budget_exceeded" AND non-empty
+    manifest["unassembled_required"] simultaneously. The reason must then render
+    BOTH causes — treating the required rows as an exclusive discriminator
+    suppresses the overflow and prescribes a remedy that cannot resolve it."""
+    # Identical shape to the micro-budget case in
+    # test_atlas_respects_total_prompt_target_and_reports_budget_manifest_only:
+    # the hard context allowance is 0 after fixed+headroom, so even the
+    # manifest-only pack overflows — while required BIBLE.md was already dropped.
+    _write(tmp_path / "BIBLE.md", "constitution\n" * 500)
+    pack = compile_review_context_atlas(
+        ReviewContextAtlasRequest(
+            repo_dir=tmp_path,
+            tracked_paths=("BIBLE.md",),
+            fixed_prompt_tokens=100,
+            target_total_tokens=300,
+            hard_total_tokens=350,
+        )
+    )
+
+    # The mixed state itself: both facts, one pack.
+    assert pack.status == "budget_exceeded"
+    assert atlas_assembly_failed(pack)
+    assert atlas_hard_budget_overflowed(pack.manifest)
+    rows = atlas_unassembled_required(pack.manifest)
+    # The required-artifact disclosure is NOT lost to the overflow…
+    assert [row["path"] for row in rows] == ["BIBLE.md"]
+    # …and the overflow is NOT suppressed behind the required rows: the shared
+    # reason renders BOTH causes for every consumer (scope, plan, deep review).
+    reason = atlas_assembly_failure_reason(pack)
+    assert "BIBLE.md" in reason
+    assert "required artifact could not be assembled" in reason
+    assert "exceeded hard budget" in reason
+
+    # The halves that must NOT change: each single-cause failure still reports
+    # exactly its own cause, nothing extra.
+    pure_missing = SimpleNamespace(
+        status="required_artifact_omitted",
+        manifest={
+            "status": "required_artifact_omitted",
+            "estimated_total_tokens": 900,
+            "unassembled_required": [{"path": "BIBLE.md", "reason": "required file exceeded the atlas hard budget"}],
+        },
+    )
+    missing_reason = atlas_assembly_failure_reason(pure_missing)
+    assert "BIBLE.md" in missing_reason
+    assert "exceeded hard budget (~" not in missing_reason
+    assert not atlas_hard_budget_overflowed(pure_missing.manifest)
+    pure_overflow = SimpleNamespace(
+        status="budget_exceeded",
+        manifest={"status": "budget_exceeded", "estimated_total_tokens": 950_000, "unassembled_required": []},
+    )
+    overflow_reason = atlas_assembly_failure_reason(pure_overflow)
+    assert "required artifact" not in overflow_reason
+    assert "exceeded hard budget" in overflow_reason
+    assert atlas_hard_budget_overflowed(pure_overflow.manifest)
+
+
+def test_atlas_navigational_omission_stays_legal(tmp_path):
+    """The counterpart the owner preserved: manifest-only NAVIGATION entries for
+    non-required files are a lossless map, not an assembly failure."""
+    for idx in range(8):
+        _write(tmp_path / f"pkg/mod_{idx}.py", "def f():\n    return 'x'\n" * 120)
+
+    pack = compile_review_context_atlas(
+        ReviewContextAtlasRequest(
+            repo_dir=tmp_path,
+            tracked_paths=tuple(f"pkg/mod_{idx}.py" for idx in range(8)),
+            fixed_prompt_tokens=100,
+            target_total_tokens=5_000,
+            hard_total_tokens=8_000,
+        )
+    )
+
+    assert any(row["disposition"] == "manifest_only" for row in pack.manifest["coverage"])
+    assert pack.manifest["unassembled_required"] == []
+    assert not atlas_assembly_failed(pack)
+    assert pack.status == "budget_constrained"
+
+
+def test_atlas_oversized_required_artifact_is_a_typed_assembly_failure(tmp_path):
+    """XR-1: `_build_file_facts` used to classify a file over the per-file 1MB
+    cap as `oversized` and return BEFORE requiredness was computed, so a
+    REQUIRED artifact (here a force-included `prompts/` file) was silently
+    dropped while the pack assembled and review proceeded — bypassing the
+    BIBLE P3 typed-failure guarantee. Requiredness is now decided before any
+    disposition can drop an artifact, and the drop lands on the ONE existing
+    predicate (`budget_omitted` + `required_artifact_omitted`)."""
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "huge.md").write_bytes(b"x" * (1_048_576 + 1))
+    _write(tmp_path / "ok.py", "print(1)\n")
+
+    pack = compile_review_context_atlas(
+        ReviewContextAtlasRequest(
+            repo_dir=tmp_path,
+            tracked_paths=("prompts/huge.md", "ok.py"),
+        )
+    )
+
+    assert pack.status == "required_artifact_omitted"
+    assert atlas_assembly_failed(pack)
+    coverage = _coverage(pack)
+    assert coverage["prompts/huge.md"]["disposition"] == "budget_omitted"
+    assert "per-file atlas cap" in coverage["prompts/huge.md"]["reason"]
+    assert [row["path"] for row in atlas_unassembled_required(pack.manifest)] == [
+        "prompts/huge.md"
+    ]
+    # The legal half is untouched: a NON-required oversized file stays a plain
+    # coverage row (pinned by
+    # test_atlas_marks_sensitive_binary_oversized_and_vendored_files).
+
+
+def test_atlas_diff_only_required_artifact_is_a_typed_assembly_failure(tmp_path):
+    """XR-4: the `diff_only_included` classification returned before
+    requiredness was computed, so an artifact owed IN FULL regardless of the
+    change (prompts/, contracts/, protected + review stack, canonical docs)
+    whose full snapshot the ladder dropped to diff-only left NO typed failure:
+    the full text was in neither the fixed prompt nor the atlas, and review
+    proceeded. A merely-touched file on the same path keeps the sanctioned
+    disclosed degradation (guaranteed-fit ladder step 4) — its complete
+    change-evidence is the staged diff itself."""
+    _write(tmp_path / "prompts" / "touched.md", "p\n" * 200)
+    _write(tmp_path / "module.py", "q = 1\n" * 200)
+
+    pack = compile_review_context_atlas(
+        ReviewContextAtlasRequest(
+            repo_dir=tmp_path,
+            tracked_paths=("prompts/touched.md", "module.py"),
+            anchors=("prompts/touched.md", "module.py"),
+            already_included=frozenset({"prompts/touched.md", "module.py"}),
+            diff_only_included=frozenset({"prompts/touched.md", "module.py"}),
+        )
+    )
+
+    assert pack.status == "required_artifact_omitted"
+    assert atlas_assembly_failed(pack)
+    coverage = _coverage(pack)
+    assert coverage["prompts/touched.md"]["disposition"] == "budget_omitted"
+    assert "diff-only" in coverage["prompts/touched.md"]["reason"]
+    # The merely-touched module keeps the legal disclosed diff-only row.
+    assert coverage["module.py"]["disposition"] == "already_included"
+    assert "full snapshot omitted" in coverage["module.py"]["reason"]
+    assert [row["path"] for row in atlas_unassembled_required(pack.manifest)] == [
+        "prompts/touched.md"
+    ]
+
+
+def test_atlas_includes_anchored_test_file_instead_of_silently_excluding_it(tmp_path):
+    """Sibling-path sweep of XR-1/XR-4: `excluded_test` exempted force-include
+    but NOT anchors (while `excluded_dir` exempts both), so a REQUIRED-by-anchor
+    test file was silently droppable with `include_tests=False`. Tests are
+    excludable only when UNRELATED to the change (BIBLE P3); an anchor is
+    related by definition."""
+    _write(tmp_path / "tests" / "test_mod.py", "def test_ok():\n    assert True\n")
+    _write(tmp_path / "tests" / "test_other.py", "def test_other():\n    assert True\n")
+    _write(tmp_path / "mod.py", "x = 1\n")
+
+    pack = compile_review_context_atlas(
+        ReviewContextAtlasRequest(
+            repo_dir=tmp_path,
+            tracked_paths=("tests/test_mod.py", "tests/test_other.py", "mod.py"),
+            anchors=("tests/test_mod.py",),
+            include_tests=False,
+        )
+    )
+
+    coverage = _coverage(pack)
+    assert coverage["tests/test_mod.py"]["disposition"] == "full"
+    # Unrelated wider tests stay excluded by policy, exactly as before.
+    assert coverage["tests/test_other.py"]["disposition"] == "excluded_test"
+    assert not atlas_assembly_failed(pack)
 
 
 def test_atlas_centrality_scores_default_off_is_identical(tmp_path):
@@ -324,3 +546,52 @@ def test_atlas_centrality_scores_boost_selection_order(tmp_path):
     assert "mod_2.py" not in selected, "the boost must displace an unboosted peer"
     cov = _coverage(boosted)
     assert "graph_centrality" in cov["mod_5.py"]["reason"]
+
+
+def _not_assembled_pack():
+    """A pack whose REQUIRED artifact could not be assembled (BIBLE P3 refusal)."""
+    return SimpleNamespace(
+        text="## Generated Scope Atlas\n(remainder without ouroboros/llm.py)\n",
+        manifest={
+            "estimated_total_tokens": 500_000,
+            "unassembled_required": [
+                {"path": "ouroboros/llm.py", "reason": "required file exceeded the atlas hard budget"}
+            ],
+        },
+        status="required_artifact_omitted",
+        selected=(),
+        omitted=(),
+        token_count=500_000,
+    )
+
+
+def test_scope_review_refuses_a_pack_that_did_not_assemble(monkeypatch, tmp_path):
+    """Consumer 1 of 3. Scope review must not review the remainder: the atlas
+    section is refused, and the manifest disclosure is recorded BEFORE the
+    refusal so it accompanies it rather than replacing it."""
+    from ouroboros.tools import scope_review as sr
+
+    monkeypatch.setattr(sr, "compile_review_context_atlas", lambda req: _not_assembled_pack())
+    sr._SCOPE_CONTEXT_MANIFEST.set({})
+
+    with pytest.raises(sr._ScopeAtlasNotAssembled) as excinfo:
+        sr._gather_scope_packs(tmp_path, ["ouroboros/llm.py"])
+
+    assert "ouroboros/llm.py" in str(excinfo.value)
+    manifest = sr._current_scope_context_manifest()
+    assert manifest["unassembled_required"][0]["path"] == "ouroboros/llm.py"
+
+
+def test_deep_self_review_refuses_a_pack_that_did_not_assemble(monkeypatch, tmp_path):
+    """Consumer 2 of 3. Same predicate, same refusal — no pack text is returned
+    for a review that could not assemble a required artifact."""
+    from ouroboros import deep_self_review as dsr
+
+    monkeypatch.setattr(dsr, "_dulwich_tracked_paths", lambda repo_dir: (["main.py"], []))
+    monkeypatch.setattr(dsr, "compile_review_context_atlas", lambda req: _not_assembled_pack())
+
+    pack_text, stats = dsr.build_review_pack(tmp_path, tmp_path / "drive")
+
+    assert pack_text == ""
+    assert "ouroboros/llm.py" in stats["skipped"][0]
+    assert stats["context_manifest"]["unassembled_required"][0]["path"] == "ouroboros/llm.py"

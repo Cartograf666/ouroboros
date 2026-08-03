@@ -427,7 +427,7 @@ class TestRunScopeReviewFailClosed:
         def fake_gather(_repo_dir, _paths, **kwargs):
             calls.append(bool(kwargs.get("compact")))
             if not kwargs.get("compact"):
-                raise mod._ScopeAtlasBudgetExceeded({"estimated_total_tokens": 900_000})
+                raise mod._ScopeAtlasNotAssembled({"estimated_total_tokens": 900_000})
             return "COMPACT ATLAS"
 
         monkeypatch.setattr(mod, "_gather_scope_packs", fake_gather)
@@ -466,7 +466,7 @@ class TestRunScopeReviewFailClosed:
         def fake_gather(_repo_dir, _paths, fixed_prompt_tokens=0, compact=False, **_kw):
             calls.append(compact)
             if compact:
-                raise mod._ScopeAtlasBudgetExceeded({"estimated_total_tokens": 900_001})
+                raise mod._ScopeAtlasNotAssembled({"estimated_total_tokens": 900_001})
             return "OVERSIZED ATLAS"
 
         monkeypatch.setattr(mod, "_gather_scope_packs", fake_gather)
@@ -579,7 +579,7 @@ class TestRunScopeReviewFailClosed:
         monkeypatch.setattr(
             mod, "_gather_scope_packs",
             lambda *_a, **_k: (_ for _ in ()).throw(
-                mod._ScopeAtlasBudgetExceeded({"estimated_total_tokens": 999_999})
+                mod._ScopeAtlasNotAssembled({"estimated_total_tokens": 999_999})
             ),
         )
         monkeypatch.setattr(mod, "estimate_tokens", lambda _text: 800_000)
@@ -1654,9 +1654,10 @@ class TestHeadSnapshotSection:
         (tmp_path / "newfile.py").write_text("print('new')", encoding="utf-8")
 
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, ["newfile.py"])
+        result, included = mod.build_head_snapshot_section(tmp_path, ["newfile.py"])
         assert "File is new" in result
         assert "no HEAD snapshot" in result
+        assert "newfile.py" not in included  # no snapshot text -> not claimable
 
     def test_existing_file_shows_old_content(self, tmp_path):
         """Modified files should show the HEAD (old) content in the snapshot."""
@@ -1668,8 +1669,9 @@ class TestHeadSnapshotSection:
         (tmp_path / "existing.py").write_text("NEW_CONTENT_V2", encoding="utf-8")
 
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, ["existing.py"])
+        result, included = mod.build_head_snapshot_section(tmp_path, ["existing.py"])
         assert "OLD_CONTENT_V1" in result
+        assert "existing.py" in included  # full snapshot present -> claimable
         assert "NEW_CONTENT_V2" not in result  # HEAD snapshot, not current
 
     def test_deleted_file_shows_old_content(self, tmp_path):
@@ -1681,8 +1683,9 @@ class TestHeadSnapshotSection:
         (tmp_path / "deleted.py").unlink()
 
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, ["deleted.py"])
+        result, included = mod.build_head_snapshot_section(tmp_path, ["deleted.py"])
         assert "CONTENT_BEFORE_DELETE" in result
+        assert "deleted.py" in included
 
     def test_new_file_not_confused_with_git_error(self, tmp_path, monkeypatch):
         """git show non-zero for a new file must say 'File is new', not 'error'."""
@@ -1702,11 +1705,12 @@ class TestHeadSnapshotSection:
         monkeypatch.setattr(sp_module, "run", mock_run)
 
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, ["newfile.py"])
+        result, included = mod.build_head_snapshot_section(tmp_path, ["newfile.py"])
         assert "File is new" in result
         assert "no HEAD snapshot" in result
         # Must NOT render as a git error
         assert "HEAD snapshot error" not in result
+        assert "newfile.py" not in included
 
     def test_real_git_error_not_mislabeled_as_new_file(self, tmp_path, monkeypatch):
         """Real git failures (bad object, corrupt repo) must render as 'HEAD snapshot error',
@@ -1728,10 +1732,11 @@ class TestHeadSnapshotSection:
         monkeypatch.setattr(sp_module, "run", mock_run)
 
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, ["existing.py"])
+        result, included = mod.build_head_snapshot_section(tmp_path, ["existing.py"])
         # Must render as an error, not as a new file
         assert "HEAD snapshot error" in result
         assert "File is new" not in result
+        assert "existing.py" not in included
 
     def test_binary_file_omitted_cleanly(self, tmp_path):
         """Binary files (e.g. .png) must produce an omission note, not garbage bytes."""
@@ -1742,18 +1747,20 @@ class TestHeadSnapshotSection:
         (tmp_path / "logo.png").unlink()
 
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, ["logo.png"])
+        result, included = mod.build_head_snapshot_section(tmp_path, ["logo.png"])
         # Must produce an omission note, not binary garbage
         assert "omitted" in result.lower() or "binary" in result.lower()
         # Must not contain raw binary bytes
         assert "\x00" not in result
         assert "\xff" not in result
+        assert "logo.png" not in included
 
     def test_empty_paths_returns_placeholder(self, tmp_path):
         """Empty paths list returns a placeholder."""
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, [])
+        result, included = mod.build_head_snapshot_section(tmp_path, [])
         assert "no touched files" in result
+        assert included == frozenset()
 
     def test_scope_prompt_omits_head_snapshots_section(self, tmp_path):
         """v4.33.0: _build_scope_prompt MUST NOT include a separate 'Pre-change snapshots' section.
@@ -2345,6 +2352,311 @@ def test_ladder_steps_are_recorded_once_aggregated(tmp_path, monkeypatch):
     assert isinstance(steps, list) and len(steps) == 1
     assert steps[0]["step"] == "full_atlas"
     assert set(steps[0]) >= {"tokens_before", "tokens_after", "diff_only_files", "deficit"}
+
+
+def _repo_with_oversized_required_prompt(tmp_path, required_bytes=935_000):
+    """A repo whose UNCHANGED `prompts/` artifact cannot fit any atlas budget."""
+    import subprocess
+
+    (tmp_path / "docs").mkdir(exist_ok=True)
+    (tmp_path / "docs" / "CHECKLISTS.md").write_text(
+        "## Intent / Scope Review Checklist\n\nplaceholder\n", encoding="utf-8",
+    )
+    (tmp_path / "docs" / "DEVELOPMENT.md").write_text("dev guide\n", encoding="utf-8")
+    (tmp_path / "BIBLE.md").write_text("constitution\n", encoding="utf-8")
+    (tmp_path / "prompts").mkdir(exist_ok=True)
+    # Force-included by prefix => `required`, and never touched by this commit.
+    (tmp_path / "prompts" / "huge.md").write_text("x" * required_bytes, encoding="utf-8")
+    (tmp_path / "ok.py").write_text("print(1)\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-m", "init"],
+        cwd=str(tmp_path), capture_output=True,
+    )
+    (tmp_path / "ok.py").write_text("print(2)\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+
+
+def test_unassembled_required_terminal_names_the_artifact_not_a_phantom_overflow(
+    tmp_path, monkeypatch,
+):
+    """BIBLE P1/P3. The ladder terminates on TWO different failures. When it ends
+    because a REQUIRED artifact never assembled, the owner-facing block must say
+    so — not reuse the irreducible-prompt story, whose own quoted token count
+    contradicts the budget it claims to exceed, and whose remedy ("split the
+    staged diff") cannot shrink an UNCHANGED artifact. The refusal is also a
+    ladder STEP: a terminal with an empty trace explains nothing after the fact."""
+    from ouroboros.tools import scope_review as sr
+
+    _repo_with_oversized_required_prompt(tmp_path)
+    monkeypatch.setattr(sr, "_effective_scope_input_limit", lambda **_kw: 200_000)
+    monkeypatch.setattr(sr, "_scope_reviewer_window", lambda _m: 1_000_000)
+
+    prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
+
+    assert prompt is None
+    assert status.status == "fixed_overflow"          # authority branch unchanged
+    assert status.unassembled_required == ["prompts/huge.md"]  # cause carried
+    # The trace records the refusal steps, naming what did not assemble.
+    steps = sr._current_scope_context_manifest().get("ladder_steps") or []
+    assert [s for s in steps if s["step"] == "atlas_refused"], steps
+    assert steps[0]["unassembled_required"] == ["prompts/huge.md"]
+
+    result = sr._handle_prompt_signals(prompt, status, input_limit=200_000, scope_model="")
+    assert "prompts/huge.md" in result.block_message
+    # The false cause and its self-contradicting comparison are gone.
+    assert "irreducible scope prompt" not in result.block_message
+    assert f"({200_000})" not in result.block_message
+    assert "Split the commit into smaller staged diffs" not in result.block_message
+
+
+def test_sub_floor_terminal_reports_the_same_cause_as_the_1m_terminal(monkeypatch):
+    """The twin: `budget_exceeded` (sub-floor reviewer) is the other authority
+    branch of the same terminal and made the identical false claim. Fixing one
+    branch and leaving its sibling is the defect, not the fix. The genuine
+    overflow wording must survive on both."""
+    from ouroboros.tools import scope_review as sr
+
+    monkeypatch.setattr(
+        sr, "_scope_reviewer_window_evidence", lambda _m: (200_000, sr._WINDOW_UNKNOWN),
+    )
+    missing = sr._TouchedContextStatus(
+        status="budget_exceeded", token_count=3_672,
+        unassembled_required=["prompts/huge.md"],
+    )
+    result = sr._handle_prompt_signals(None, missing, input_limit=200_000, scope_model="m/x")
+    assert "prompts/huge.md" in result.block_message
+    assert "prompts/huge.md" in result.advisory_findings[0]["reason"]
+    assert "cannot fit the irreducible scope prompt" not in result.block_message
+    assert "Full scope-review prompt" not in result.advisory_findings[0]["reason"]
+
+    # The half that must NOT change: a real overflow still reports an overflow.
+    overflow = sr._TouchedContextStatus(status="budget_exceeded", token_count=990_000)
+    plain = sr._handle_prompt_signals(None, overflow, input_limit=200_000, scope_model="m/x")
+    assert "irreducible scope prompt" in plain.block_message
+    assert "~990000 estimated tokens" in plain.advisory_findings[0]["reason"]
+
+
+def test_mixed_terminal_reports_both_causes_and_the_mixed_remedy(tmp_path, monkeypatch):
+    """The MIXED terminal: the refusal that dropped a required artifact was itself
+    a hard-budget overflow (even the content-free manifest did not fit beside the
+    fixed prompt). Reporting only the missing artifact prescribes
+    ATLAS_MISSING_ARTIFACT_REMEDY — "narrowing the reviewed change cannot help" —
+    which is false for, and cannot resolve, the overflow half. Both causes ride
+    the terminal, the trace, and the owner-facing block."""
+    from ouroboros.tools import scope_review as sr
+    from ouroboros.tools.review_context_atlas import ATLAS_MIXED_ASSEMBLY_REMEDY
+
+    _repo_with_oversized_required_prompt(tmp_path)
+    # An input budget so small the atlas hard allowance is zero: ANY rendered
+    # manifest overflows, while required prompts/huge.md was already dropped.
+    monkeypatch.setattr(sr, "_effective_scope_input_limit", lambda **_kw: 6_000)
+    monkeypatch.setattr(sr, "_scope_reviewer_window", lambda _m: 1_000_000)
+
+    prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
+
+    assert prompt is None
+    assert status.status == "fixed_overflow"          # authority branch unchanged
+    assert status.unassembled_required == ["prompts/huge.md"]  # cause 1 carried
+    assert status.atlas_overflowed is True                     # cause 2 carried
+    steps = sr._current_scope_context_manifest().get("ladder_steps") or []
+    refused = [s for s in steps if s["step"] == "atlas_refused"]
+    assert refused, steps
+    assert refused[0]["atlas_overflowed"] is True
+
+    result = sr._handle_prompt_signals(prompt, status, input_limit=6_000, scope_model="")
+    # Both causes are rendered — neither shadows the other…
+    assert "prompts/huge.md" in result.block_message
+    assert "content-free atlas manifest" in result.block_message
+    # …and the remedy is the mixed one, not the single-cause half-truth that
+    # cannot resolve the overflow.
+    assert ATLAS_MIXED_ASSEMBLY_REMEDY in result.block_message
+    assert "narrowing the reviewed change cannot help" not in result.block_message
+
+
+def test_mixed_sub_floor_terminal_reports_the_same_two_causes(monkeypatch):
+    """The sub-floor authority branch is the twin surface of the same terminal:
+    it must render the identical mixed cause and remedy."""
+    from ouroboros.tools import scope_review as sr
+    from ouroboros.tools.review_context_atlas import ATLAS_MIXED_ASSEMBLY_REMEDY
+
+    monkeypatch.setattr(
+        sr, "_scope_reviewer_window_evidence", lambda _m: (200_000, sr._WINDOW_UNKNOWN),
+    )
+    mixed = sr._TouchedContextStatus(
+        status="budget_exceeded", token_count=3_672,
+        unassembled_required=["prompts/huge.md"], atlas_overflowed=True,
+    )
+    result = sr._handle_prompt_signals(None, mixed, input_limit=200_000, scope_model="m/x")
+    for text in (result.block_message, result.advisory_findings[0]["reason"]):
+        assert "prompts/huge.md" in text
+        assert "content-free atlas manifest" in text
+    assert ATLAS_MIXED_ASSEMBLY_REMEDY in result.advisory_findings[0]["reason"]
+    assert "narrowing the reviewed change cannot help" not in result.advisory_findings[0]["reason"]
+
+
+def test_diff_only_degradation_is_not_reported_as_fully_included(tmp_path, monkeypatch):
+    """P1. When the ladder drops a touched file's full snapshot, the durable
+    coverage manifest must say so. `already_included` was re-derived from ALL
+    touched paths instead of the surviving `kept` set that `_render_touched_section`
+    owns, so a file whose snapshot had just been removed was still recorded as
+    "included in fixed prompt context" — a claim the prompt itself contradicts."""
+    import subprocess
+
+    from ouroboros.tools import scope_review as sr
+
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "CHECKLISTS.md").write_text(
+        "## Intent / Scope Review Checklist\n\nplaceholder\n", encoding="utf-8",
+    )
+    # Two equal-sized big files: the ladder degrades only the first.
+    (tmp_path / "big_a.py").write_text("x = 1\n" * 40_000, encoding="utf-8")
+    (tmp_path / "big_b.py").write_text("y = 1\n" * 40_000, encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-m", "init"],
+        cwd=str(tmp_path), capture_output=True,
+    )
+    # Tiny change inside huge files: the diff fits, the snapshots do not.
+    (tmp_path / "big_a.py").write_text("z = 0\n" + "x = 1\n" * 39_999, encoding="utf-8")
+    (tmp_path / "big_b.py").write_text("z = 0\n" + "y = 1\n" * 39_999, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+
+    monkeypatch.setattr(sr, "_effective_scope_input_limit", lambda **_kw: 120_000)
+
+    prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
+
+    assert status is None and prompt is not None
+    assert "TOUCHED FILE BUDGET DEGRADATION NOTE" in prompt and "- big_a.py" in prompt
+    assert "### big_b.py" in prompt  # this one kept its snapshot
+    rows = {r["path"]: r for r in sr._current_scope_context_manifest()["coverage"]}
+    # The degraded file is disclosed as diff-only, the intact one is not.
+    assert "full snapshot omitted" in rows["big_a.py"]["reason"]
+    assert rows["big_b.py"]["reason"] == "included in fixed prompt context"
+
+
+def test_design_skipped_touched_test_is_not_claimed_as_fully_included(tmp_path):
+    """XG-1R4.1 / P1. `_gather_scope_packs` used to derive `already_included` from
+    the touched LIST (`all_touched_paths`), while `_build_scope_prompt` omits the
+    full snapshots of touched TESTS by design (`current_skipped_by_design`). The
+    durable row for a touched test therefore read "included in fixed prompt
+    context" while NO full snapshot of it existed anywhere in the pack — the same
+    false-coverage-claim class as XR-4/XG-1R.4, on the last surface still
+    deriving the claim instead of being told it.
+
+    `already_included` is now the CONSERVATIVE set the fixed part really carries,
+    so the touched test falls through to the atlas, where (being an anchor, hence
+    related to the change and not excludable under BIBLE P3) it is supplied in
+    FULL exactly once. The invariant under test is the general one: a coverage row
+    may never claim content the pack does not contain."""
+    import subprocess
+
+    from ouroboros.tools import scope_review as sr
+
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "CHECKLISTS.md").write_text(
+        "## Intent / Scope Review Checklist\n\nplaceholder\n", encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    # An INDENTED marker far from the change: unreachable through the staged diff
+    # (outside any -U3 hunk, and never picked as git's hunk-header funcname), so
+    # finding it in the prompt proves a real full snapshot.
+    body = ["def test_a():", "    UNCHANGED_TEST_BODY_MARKER_ZZZ = 1"]
+    body += [f"    filler_{idx} = {idx}" for idx in range(40)]
+    body += ["    assert True"]
+    (tmp_path / "tests" / "test_thing.py").write_text(
+        "\n".join(body) + "\n", encoding="utf-8",
+    )
+    (tmp_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-m", "init"],
+        cwd=str(tmp_path), capture_output=True,
+    )
+    (tmp_path / "tests" / "test_thing.py").write_text(
+        "\n".join(body) + "\n\n\ndef test_b():\n    assert True\n", encoding="utf-8",
+    )
+    (tmp_path / "mod.py").write_text("x = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+
+    prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
+
+    assert status is None and prompt
+    rows = {r["path"]: r for r in sr._current_scope_context_manifest()["coverage"]}
+    row = rows["tests/test_thing.py"]
+    # The false claim is gone…
+    assert row["reason"] != "included in fixed prompt context"
+    assert row["disposition"] != "already_included"
+    # …and the pack really carries what the row now says: the atlas supplied the
+    # touched test in full, so the unchanged body reached the reviewer.
+    assert row["disposition"] == "full"
+    assert "UNCHANGED_TEST_BODY_MARKER_ZZZ" in prompt
+    # The dedup note still explains the non-duplication in the fixed part.
+    assert "DEDUPLICATION NOTE" in prompt and "- tests/test_thing.py" in prompt
+    # The touched non-test keeps its true `already_included` claim.
+    assert rows["mod.py"]["reason"] == "included in fixed prompt context"
+
+
+def test_ladder_cannot_degrade_a_required_beyond_diff_artifact_to_diff_only(
+    tmp_path, monkeypatch,
+):
+    """XR-4 end-to-end. The guaranteed-fit ladder degrades the LARGEST touched
+    files to diff-only; when that file is an artifact owed in full regardless of
+    the change (here a `prompts/` file), the atlas used to accept the declared
+    drop without a typed failure and scope review PROCEEDED with the prompt's
+    full snapshot in neither the fixed prompt nor the atlas. Now the atlas
+    refuses (BIBLE P3), the refusal is a recorded ladder step, and the terminal
+    names the artifact — review does not proceed on the remainder."""
+    import subprocess
+
+    from ouroboros.tools import scope_review as sr
+
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "CHECKLISTS.md").write_text(
+        "## Intent / Scope Review Checklist\n\nplaceholder\n", encoding="utf-8",
+    )
+    (tmp_path / "prompts").mkdir()
+    # The prompts/ artifact is the LARGEST touched file: degraded first.
+    (tmp_path / "prompts" / "big_prompt.md").write_text(
+        "word here\n" * 45_000, encoding="utf-8",
+    )
+    (tmp_path / "big_b.py").write_text("y = 1\n" * 40_000, encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-m", "init"],
+        cwd=str(tmp_path), capture_output=True,
+    )
+    # Tiny changes inside huge files: the diff fits, the snapshots do not.
+    (tmp_path / "prompts" / "big_prompt.md").write_text(
+        "CHANGED\n" + "word here\n" * 44_999, encoding="utf-8",
+    )
+    (tmp_path / "big_b.py").write_text("z = 0\n" + "y = 1\n" * 39_999, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+
+    monkeypatch.setattr(sr, "_effective_scope_input_limit", lambda **_kw: 120_000)
+    monkeypatch.setattr(sr, "_scope_reviewer_window", lambda _m: 1_000_000)
+
+    prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
+
+    assert prompt is None
+    assert status.status == "fixed_overflow"          # authority branch unchanged
+    assert status.unassembled_required == ["prompts/big_prompt.md"]
+    steps = sr._current_scope_context_manifest().get("ladder_steps") or []
+    refused = [s for s in steps if s["step"] == "atlas_refused"]
+    assert refused, steps
+    # The refusal naming the artifact is a recorded ladder step (the FIRST
+    # refusal may be the pre-degradation hard-budget one with no named rows).
+    assert any(
+        s["unassembled_required"] == ["prompts/big_prompt.md"] for s in refused
+    ), refused
+    rows = {r["path"]: r for r in sr._current_scope_context_manifest()["coverage"]}
+    assert rows["prompts/big_prompt.md"]["disposition"] == "budget_omitted"
+    # An ORDINARY touched file may still ride the disclosed diff-only step
+    # (pinned by test_diff_only_degradation_is_not_reported_as_fully_included).
 
 
 def test_cold_start_sizes_down_and_passes_instead_of_400ing(tmp_path, monkeypatch):

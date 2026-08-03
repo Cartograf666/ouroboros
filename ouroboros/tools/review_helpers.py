@@ -1286,12 +1286,22 @@ def build_goal_section(
 def build_head_snapshot_section(
     repo_dir: Path,
     paths: list[str],
-) -> str:
-    """Build prompt text with HEAD snapshots of touched files."""
+) -> tuple[str, frozenset[str]]:
+    """Build prompt text with HEAD snapshots of touched files.
+
+    Returns ``(section_text, included_paths)`` where ``included_paths`` holds
+    exactly the paths whose FULL snapshot text made it into the section. Every
+    other path got an omission marker (sensitive/binary/oversized/new/error),
+    and the caller must NOT report it to the atlas as ``already_included`` —
+    that claim is what the atlas trusts, so a false one bypasses the BIBLE P3
+    required-artifact refusal (XG-1R.4). Same shape as
+    ``build_touched_file_pack``'s ``(section, omitted)`` contract.
+    """
     if not paths:
-        return "(no touched files)"
+        return "(no touched files)", frozenset()
 
     parts: list[str] = []
+    included: set[str] = set()
     for rel in paths:
         fp_rel = Path(rel)
         suffix = fp_rel.suffix.lower()
@@ -1331,6 +1341,7 @@ def build_head_snapshot_section(
                 # Decode only after binary/size checks.
                 content = raw_bytes.decode("utf-8", errors="replace")
                 parts.append(f"### {rel}\n\n```{lang}\n{content}\n```\n")
+                included.add(rel)
                 continue
             if result.returncode != 0:
                 # Distinguish a new file from a real git failure.
@@ -1360,7 +1371,7 @@ def build_head_snapshot_section(
         except Exception as exc:
             parts.append(f"### {rel}\n\n*(HEAD snapshot error: {exc})*\n")
 
-    return "\n".join(parts)
+    return "\n".join(parts), frozenset(included)
 
 
 def build_scope_section(scope: str = "") -> str:

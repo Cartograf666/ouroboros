@@ -66,12 +66,124 @@ _FORCE_INCLUDE_PREFIXES = (
 
 _ROUTE_RE = re.compile(r"""['"](/(?:api|ws|owner|static|assets)/[^'"\s{}]+)['"]""")
 
+# BIBLE P3 scope floor: a pack in one of these statuses did NOT assemble. Review
+# does not proceed on the remainder — disclosure accompanies the refusal, it does
+# not replace it. Every atlas consumer asks `atlas_assembly_failed`; nobody
+# re-derives the condition from a status string of its own.
+ATLAS_ASSEMBLY_FAILURE_STATUSES = frozenset({"budget_exceeded", "required_artifact_omitted"})
+
+AtlasStatus = Literal[
+    "ok", "under_target", "budget_constrained", "budget_exceeded", "required_artifact_omitted"
+]
+
+
+def atlas_assembly_failed(pack: Any) -> bool:
+    """True when this pack must NOT be reviewed (see ATLAS_ASSEMBLY_FAILURE_STATUSES)."""
+    return str(getattr(pack, "status", "") or "") in ATLAS_ASSEMBLY_FAILURE_STATUSES
+
+
+# The remedy that matches a missing-REQUIRED-artifact refusal, shared by every
+# consumer's refusal wording. Budget knobs do NOT move it: narrowing the reviewed
+# change (a smaller diff, a smaller plan, a lower context level) leaves the
+# artifact just as required, so either it shrinks or the reviewer window grows.
+ATLAS_MISSING_ARTIFACT_REMEDY = (
+    "Shrink or split the named artifact(s), or configure a larger-window reviewer — "
+    "narrowing the reviewed change cannot help, the artifact is required regardless "
+    "of what this change touches."
+)
+
+# The remedy for the MIXED assembly failure — required artifact(s) missing AND the
+# pack itself (even content-free) overflowing the hard budget. Neither single-cause
+# remedy is honest alone: the missing-artifact remedy says narrowing cannot help
+# (true for the artifact, false for the overflow), the overflow remedy says split
+# the change (inert for the artifact). Shared by every consumer that renders both.
+ATLAS_MIXED_ASSEMBLY_REMEDY = (
+    "Two causes must BOTH clear: shrink or split the named required artifact(s), AND "
+    "free hard-budget room for the pack itself (a smaller change or plan shrinks the "
+    "fixed prompt; the atlas manifest scales with the repository, not with this "
+    "change). Configuring a larger-window reviewer is the one remedy that resolves both."
+)
+
+
+def atlas_unassembled_required(manifest: Mapping[str, Any] | None) -> tuple[dict, ...]:
+    """The required artifacts an assembly failure could not fit, from the manifest SSOT.
+
+    A non-empty result means a REQUIRED artifact is missing. This is NOT an
+    exclusive discriminator against the hard-budget overflow: required candidates
+    are marked ``budget_omitted`` before the rendered pack is tested against the
+    hard budget, so the same pack can ALSO carry ``status="budget_exceeded"`` —
+    read that second cause with ``atlas_hard_budget_overflowed``. Consumers word
+    their refusal from BOTH facts and render every cause that applies, instead of
+    re-deriving the distinction from a status string or asserting the wrong cause.
+    """
+    rows = dict(manifest or {}).get("unassembled_required") or ()
+    return tuple(row for row in rows if isinstance(row, dict))
+
+
+def atlas_hard_budget_overflowed(manifest: Mapping[str, Any] | None) -> bool:
+    """True when the pack itself overflowed the hard budget (``budget_exceeded``).
+
+    Manifest-based so contexts holding only the durable manifest (the scope
+    ladder's refusal, plan review's remedy pick) read the same fact as pack
+    holders. Can be True TOGETHER with non-empty ``atlas_unassembled_required``:
+    that mixed state is two simultaneous assembly causes, not either/or.
+    """
+    return str(dict(manifest or {}).get("status") or "") == "budget_exceeded"
+
+
+def atlas_assembly_failure_reason(pack: Any) -> str:
+    """Typed sentence(s) naming why the pack did not assemble, for every caller's refusal.
+
+    Renders EVERY cause that applies: a missing required artifact and a hard-budget
+    overflow are not mutually exclusive, and suppressing the overflow behind the
+    artifact rows would prescribe a remedy that cannot resolve it (P1).
+    """
+    manifest = dict(getattr(pack, "manifest", None) or {})
+    rows = atlas_unassembled_required(manifest)
+    tokens = int(manifest.get("estimated_total_tokens") or 0)
+    overflow_cause = "generated repository atlas exceeded hard budget" + (
+        f" (~{tokens:,} estimated tokens)" if tokens else ""
+    )
+    if not rows:
+        return overflow_cause
+    named = "; ".join(
+        f"{row.get('path') or '?'} ({row.get('reason') or 'did not fit'})" for row in rows[:5]
+    )
+    more = f" (+{len(rows) - 5} more)" if len(rows) > 5 else ""
+    required_cause = (
+        "required artifact could not be assembled into the review pack: "
+        f"{named}{more}"
+    )
+    if atlas_hard_budget_overflowed(manifest):
+        # Mixed failure: both causes are real; neither may shadow the other.
+        return required_cause + "; AND even the content-free " + overflow_cause
+    return required_cause
+
+
+def atlas_assembly_remedy(manifest: Mapping[str, Any] | None, overflow_remedy: str) -> str:
+    """The remedy matching the manifest's cause set — ONE pick for every consumer.
+
+    ``overflow_remedy`` is the caller's surface-specific overflow wording; the
+    missing-artifact and mixed remedies are shared, because each single-cause
+    remedy states something false for the other cause of the mixed failure.
+    """
+    missing = bool(atlas_unassembled_required(manifest))
+    if missing and atlas_hard_budget_overflowed(manifest):
+        return ATLAS_MIXED_ASSEMBLY_REMEDY
+    return ATLAS_MISSING_ARTIFACT_REMEDY if missing else overflow_remedy
+
 
 @dataclass(frozen=True)
 class ReviewContextAtlasRequest:
     repo_dir: pathlib.Path
     anchors: tuple[str, ...] = ()
     already_included: frozenset[str] = field(default_factory=frozenset)
+    # The subset of ``already_included`` whose CHANGES are in the fixed prompt but
+    # whose full snapshot was dropped to fit the budget. Excluded from selection
+    # exactly the same way — only the coverage row differs, because a durable
+    # manifest that calls a dropped snapshot "included in fixed prompt context" is
+    # a false disclosure (P1), not a smaller one.
+    diff_only_included: frozenset[str] = field(default_factory=frozenset)
     tracked_paths: tuple[str, ...] = ()
     fixed_prompt_tokens: int = 0
     target_total_tokens: int = DEFAULT_ATLAS_TARGET_TOTAL_TOKENS
@@ -113,7 +225,12 @@ class ReviewContextAtlasPack:
     selected: tuple[AtlasFileRecord, ...]
     omitted: tuple[AtlasFileRecord, ...]
     token_count: int
-    status: Literal["ok", "under_target", "budget_constrained", "budget_exceeded"]
+    status: AtlasStatus
+    # NOTE: the required artifacts the assembler could not fit live in
+    # ``manifest["unassembled_required"]`` — read them with
+    # ``atlas_unassembled_required``. That dict is the durable, persisted record
+    # every consumer already reads; a parallel typed tuple here was a second
+    # carrier for one fact, and only a test ever read it.
 
 
 @dataclass
@@ -146,6 +263,9 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
     anchors = frozenset(_normalize_path(path) for path in req.anchors if _normalize_path(path))
     already_included = frozenset(
         _normalize_path(path) for path in req.already_included if _normalize_path(path)
+    )
+    diff_only_included = frozenset(
+        _normalize_path(path) for path in req.diff_only_included if _normalize_path(path)
     )
     manifest_reserve_tokens = min(
         _ATLAS_MANIFEST_RESERVE_TOKENS,
@@ -196,6 +316,7 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
             anchors,
             already_included,
             req.include_tests,
+            diff_only_included=diff_only_included,
             inventory_fact=inventory_by_path.get(rel),
         )
         for rel in tracked_paths
@@ -237,11 +358,11 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
             used_tokens += facts.token_count
             continue
         if facts.required:
-            # Guaranteed-fit: a required file that cannot fit degrades to an
-            # explicit manifest entry instead of failing the whole atlas.
-            # The omission stays visible (P1) via disposition + reason.
+            # BIBLE P3 scope floor: a REQUIRED artifact that does not fit is a
+            # failure to ASSEMBLE, not a smaller pack. The row records artifact +
+            # reason (disclosure, P1); the pack status refuses the review.
             facts.disposition = "budget_omitted"
-            facts.reason = "required file exceeded the atlas hard budget; degraded to manifest entry"
+            facts.reason = "required file exceeded the atlas hard budget"
         else:
             facts.disposition = "manifest_only"
             facts.reason = "not selected within atlas target budget"
@@ -252,7 +373,9 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
     if token_count > hard_context_tokens:
         # Shrink waves: non-required content first, then required content
         # (largest first) — the atlas always converges to at worst a
-        # manifest-only pack instead of giving up with budget_exceeded.
+        # manifest-only pack instead of giving up with budget_exceeded. Dropping
+        # a REQUIRED artifact here is the same assembly failure as above, not a
+        # legal degradation: identical disposition, identical refusal.
         removable = [path for path in reversed(selected_paths) if not facts_by_path[path].required]
         removable += sorted(
             (path for path in selected_paths if facts_by_path[path].required),
@@ -262,7 +385,7 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
             facts = facts_by_path[path]
             if facts.required:
                 facts.disposition = "budget_omitted"
-                facts.reason = "required file removed to keep atlas below hard budget; degraded to manifest entry"
+                facts.reason = "required file removed to keep atlas below hard budget"
             else:
                 facts.disposition = "manifest_only"
                 facts.reason = "removed to keep atlas below hard budget"
@@ -286,12 +409,21 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
                 break
 
     # budget_exceeded survives ONLY when even the content-free atlas (manifest
-    # alone) cannot fit the hard budget; degraded required files are a
-    # budget_constrained pack, not a failure.
+    # alone) cannot fit the hard budget. An omitted REQUIRED artifact is the
+    # other assembly failure: the pack is disclosed but never reviewable. The two
+    # causes are NOT exclusive — required candidates were marked budget_omitted
+    # above, before this overflow test — so a budget_exceeded pack keeps its
+    # `unassembled_required` rows (the disclosure survives) and consumers read
+    # BOTH facts: rows via atlas_unassembled_required, overflow via
+    # atlas_hard_budget_overflowed. The status ranks the overflow first only
+    # because a pack that cannot even render is the harder failure.
+    unassembled = _unassembled_required(facts_by_path)
     if token_count > hard_context_tokens:
-        status: Literal["ok", "under_target", "budget_constrained", "budget_exceeded"] = "budget_exceeded"
+        status: AtlasStatus = "budget_exceeded"
+    elif unassembled:
+        status = "required_artifact_omitted"
     elif any(
-        facts.disposition in ("manifest_only", "budget_omitted") and facts.content
+        facts.disposition == "manifest_only" and facts.content
         for facts in facts_by_path.values()
     ):
         status = "budget_constrained"
@@ -302,7 +434,7 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
 
     text = _render_atlas_text(req, facts_by_path, selected_paths, status_hint=status)
     token_count = estimate_tokens(text)
-    manifest = _build_manifest(req, facts_by_path, selected_paths, token_count, status)
+    manifest = _build_manifest(req, facts_by_path, selected_paths, token_count, status, unassembled)
     manifest["code_inventory"] = inventory_summary
     selected = tuple(_record_for(facts_by_path[path]) for path in selected_paths)
     omitted = tuple(
@@ -320,12 +452,22 @@ def compile_review_context_atlas(req: ReviewContextAtlasRequest) -> ReviewContex
     )
 
 
+def _unassembled_required(facts_by_path: dict[str, _FileFacts]) -> list[_FileFacts]:
+    """Required artifacts the assembler could not fit — the assembly-failure SSOT."""
+    return [
+        facts
+        for facts in facts_by_path.values()
+        if facts.required and facts.disposition == "budget_omitted"
+    ]
+
+
 def _build_file_facts(
     repo_dir: pathlib.Path,
     rel: str,
     anchors: frozenset[str],
     already_included: frozenset[str],
     include_tests: bool,
+    diff_only_included: frozenset[str] = frozenset(),
     inventory_fact: Any = None,
 ) -> _FileFacts:
     facts = _FileFacts(rel_path=rel, language=pathlib.PurePosixPath(rel).suffix.lstrip("."))
@@ -335,10 +477,29 @@ def _build_file_facts(
         facts.sha256 = digest[:16]
         facts.language = str(getattr(inventory_fact, "language", "") or facts.language)
     path = repo_dir / rel
-    if rel in already_included:
-        facts.disposition = "already_included"
-        facts.reason = "included in fixed prompt context"
+    # BIBLE P3 / D17: requiredness is a property of the path and the request,
+    # decided HERE — before any classification below can drop the artifact.
+    # Every early return sees the same answer; no branch re-derives it.
     force_include = _is_force_include(rel)
+    is_anchor = rel in anchors
+    is_canonical = rel in _CANONICAL_CONTEXT_DOCS
+    facts.required = force_include or is_anchor or is_canonical
+    # The classes owed IN FULL regardless of the change: for these the staged
+    # diff is never a substitute for the artifact. An anchor is required
+    # BECAUSE it is touched, and its complete change-evidence is the staged
+    # diff itself — so merely-touched files may legally degrade to diff-only
+    # (the ladder's disclosed step), while these classes may not.
+    required_beyond_diff = force_include or is_canonical
+    if rel in already_included or rel in diff_only_included:
+        facts.disposition = "already_included"
+        # The caller owns which snapshots actually survived in the fixed prompt;
+        # the row must not claim more than it was told (P1).
+        facts.reason = (
+            "changes included in the fixed staged diff; full snapshot omitted "
+            "to fit the reviewer input budget"
+            if rel in diff_only_included
+            else "included in fixed prompt context"
+        )
 
     try:
         resolved = path.resolve()
@@ -364,15 +525,28 @@ def _build_file_facts(
         return facts
 
     if facts.disposition == "already_included":
+        if rel in diff_only_included and required_beyond_diff:
+            # BIBLE P3 scope floor: dropping the full snapshot of an artifact
+            # the reviewer is owed in full is a failure to ASSEMBLE, not a
+            # disclosed degradation — same typed disposition, same single
+            # predicate (`_unassembled_required`) as every other required drop.
+            facts.disposition = "budget_omitted"
+            facts.reason = (
+                "required artifact degraded to diff-only: full snapshot "
+                "dropped to fit the reviewer input budget"
+            )
         return facts
 
     suffix = pathlib.PurePosixPath(rel).suffix.lower()
     fname = pathlib.PurePosixPath(rel).name.lower()
-    if rel.startswith("tests/") and not include_tests and not force_include:
+    if rel.startswith("tests/") and not include_tests and not force_include and not is_anchor:
+        # Anchors are exempt exactly like in the directory exclusion below:
+        # tests are excludable only when UNRELATED to the change (BIBLE P3),
+        # and an anchor is related by definition.
         facts.disposition = "excluded_test"
         facts.reason = "wider tests excluded by atlas policy"
         return facts
-    if _skip_by_dir(rel) and rel not in anchors and not force_include and not (include_tests and rel.startswith("tests/")):
+    if _skip_by_dir(rel) and not is_anchor and not force_include and not (include_tests and rel.startswith("tests/")):
         facts.disposition = "excluded_dir"
         facts.reason = "excluded non-agent-logic directory"
         return facts
@@ -391,8 +565,17 @@ def _build_file_facts(
         facts.reason = "vendored or minified file"
         return facts
     if facts.size_bytes > _MAX_FULL_REPO_FILE_BYTES:
-        facts.disposition = "oversized"
-        facts.reason = f">{_MAX_FULL_REPO_FILE_BYTES // 1024}KB"
+        if facts.required:
+            # BIBLE P3: a required artifact over the per-file cap cannot be
+            # assembled — a typed failure, never a silent coverage row.
+            facts.disposition = "budget_omitted"
+            facts.reason = (
+                "required file exceeds the per-file atlas cap "
+                f"(>{_MAX_FULL_REPO_FILE_BYTES // 1024}KB)"
+            )
+        else:
+            facts.disposition = "oversized"
+            facts.reason = f">{_MAX_FULL_REPO_FILE_BYTES // 1024}KB"
         return facts
     if _is_probably_binary(path):
         facts.disposition = "binary_media"
@@ -425,16 +608,15 @@ def _build_file_facts(
     facts.route_count = len(routes)
     facts.token_count = estimate_tokens(_render_file_content(facts))
 
+    # Scoring reads the SAME hoisted flags that own `facts.required` above —
+    # requiredness has exactly one computation in this function.
     if force_include:
-        facts.required = True
         facts.score += 10_000
         facts.reasons.append("protected_or_review_surface")
-    if rel in anchors:
-        facts.required = True
+    if is_anchor:
         facts.score += 9_000
         facts.reasons.append("anchor")
-    if rel in _CANONICAL_CONTEXT_DOCS:
-        facts.required = True
+    if is_canonical:
         facts.score += 8_000
         facts.reasons.append("canonical_context_doc")
     if rel.startswith("ouroboros/"):
@@ -721,6 +903,7 @@ def _build_manifest(
     selected_paths: list[str],
     token_count: int,
     status: str,
+    unassembled: list[_FileFacts],
 ) -> dict:
     counts = Counter(facts.disposition for facts in facts_by_path.values())
     return {
@@ -738,6 +921,10 @@ def _build_manifest(
         "selected": [_manifest_row(facts_by_path[path]) for path in selected_paths],
         "coverage": [_manifest_row(facts) for facts in facts_by_path.values()],
         "compact_manifest_in_prompt": bool(req.compact_manifest),
+        # Typed assembly-failure record (BIBLE P3): named here rather than left
+        # for a reader to rediscover among ~900 coverage rows. This dict is the
+        # ONE carrier — read it with ``atlas_unassembled_required``.
+        "unassembled_required": [_manifest_row(facts) for facts in unassembled],
     }
 
 

@@ -700,19 +700,34 @@ only when `OUROBOROS_REVIEW_ENFORCEMENT=blocking`; advisory mode downgrades them
 to warnings by operator policy. Scope review ALWAYS actually runs for the ≥1M
 blocking reviewer (v6.30.0 guaranteed-fit): the assembler walks a deterministic
 degradation ladder — full atlas → compact atlas (durable `context_manifest`
-keeps full per-file coverage) → atlas `required` files degrade to explicit
-`budget_omitted` manifest entries → the largest touched files degrade to
+keeps full per-file coverage) → a `required` artifact the atlas cannot fit is a
+FAILURE TO ASSEMBLE (typed `budget_omitted` row naming artifact and reason,
+`required_artifact_omitted` pack status, no review of the remainder), which the
+ladder answers by shrinking the fixed part and retrying → the largest touched files degrade to
 diff-only with an explicit `TOUCHED FILE BUDGET DEGRADATION NOTE` (their full
-changes stay visible in the staged diff). If the remaining staged diff is the
+changes stay visible in the staged diff, and those paths are DECLARED to the
+atlas via `diff_only_included`, so the durable coverage row records the dropped
+snapshot rather than claiming the file is fully in the prompt; legal only for
+merely-touched files — a `prompts/`-class or canonical artifact declared
+diff-only, or any required artifact over the per-file 1MB cap, is the same
+typed `budget_omitted` assembly failure). If the remaining staged diff is the
 only oversized part, its unchanged hunk context may be removed with `-U0` while
 every file/hunk identity and every added/deleted line remains. Triad uses the
 same one-pass principle: before dispatch it may replace duplicated full touched
 snapshots with a disclosed path manifest, then remove unchanged diff context.
 Every step is a disclosed omission
 (P1). If even the irreducible prompt (checklist + canonical docs + staged diff)
-cannot fit the blocking reviewer's window, the commit fails CLOSED with
-`fixed_overflow` — split the diff; there is no silent skip on the blocking
-path. The shared `REVIEW_PROMPT_TOKEN_BUDGET` / `_SCOPE_BUDGET_TOKEN_LIMIT`
+cannot fit the blocking reviewer's window — or the ladder exhausts every step
+and a required artifact still cannot be assembled — the commit fails CLOSED with
+`fixed_overflow` (a sub-floor reviewer records `budget_exceeded`) — split the
+diff or shrink the required surface; there is no silent skip on the blocking
+path, and no review of a pack a required artifact is missing from. Which of the
+two it was is carried on the status and worded by ONE derivation
+(`_ladder_terminal_cause`), so neither authority branch tells the owner to split
+a diff that cannot shrink an unchanged required artifact — and when both causes
+hold at once (the refusal that dropped the artifact was itself a hard-budget
+overflow) both are reported with the mixed remedy, since either single-cause
+remedy is false about the other half. The shared `REVIEW_PROMPT_TOKEN_BUDGET` / `_SCOPE_BUDGET_TOKEN_LIMIT`
 (920K estimated tokens) is the INPUT-size SSOT, but scope review also reserves
 `_SCOPE_MAX_TOKENS` for OUTPUT inside the reviewer's 1M context window plus
 substantial tokenizer headroom (currently 155K tokens):

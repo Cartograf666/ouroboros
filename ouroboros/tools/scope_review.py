@@ -24,12 +24,19 @@ from ouroboros.review_substrate import review_repo_dirs_for
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.review_context_atlas import (
     ReviewContextAtlasRequest,
+    atlas_assembly_failed,
+    atlas_assembly_failure_reason,
+    atlas_hard_budget_overflowed,
+    atlas_unassembled_required,
     compile_review_context_atlas,
 )
 from ouroboros.tools.scope_review_contract import (
     SCOPE_REQUIRED_ITEMS,
+    TouchedContextStatus as _TouchedContextStatus,
     build_scope_block_message as _build_block_message,
     classify_scope_findings as _classify_scope_findings,
+    compute_touched_context_status as _compute_touched_status,
+    ladder_terminal_cause as _ladder_terminal_cause,
     normalize_scope_items as _normalize_scope_items,
 )
 from ouroboros.tools.review_synthesis import build_scope_review_prompt
@@ -351,13 +358,23 @@ _SCOPE_CONTEXT_MANIFEST = contextvars.ContextVar("scope_context_manifest", defau
 _SCOPE_STABLE_PREFIX_LEN = contextvars.ContextVar("scope_stable_prefix_len", default=0)
 
 
-class _ScopeAtlasBudgetExceeded(RuntimeError):
-    def __init__(self, manifest: dict):
+class _ScopeAtlasNotAssembled(RuntimeError):
+    """The atlas did not assemble — an oversized pack, or an omitted REQUIRED artifact.
+
+    Both are refusals under the BIBLE P3 scope floor: the ladder degrades the
+    fixed part and retries, and scope review never runs on the remainder.
+    """
+
+    def __init__(self, manifest: dict, reason: str = ""):
         self.manifest = dict(manifest or {})
         token_count = int(self.manifest.get("estimated_total_tokens") or 0)
         super().__init__(
-            "Generated Scope Atlas exceeded hard budget"
-            + (f" (~{token_count:,} estimated tokens)" if token_count else "")
+            "Generated Scope Atlas did not assemble: "
+            + (
+                reason
+                or "exceeded hard budget"
+                + (f" (~{token_count:,} estimated tokens)" if token_count else "")
+            )
         )
 
 
@@ -388,14 +405,6 @@ class ScopeReviewResult:
     context_manifest: dict = field(default_factory=dict)
     prompt_ref: dict = field(default_factory=dict)
     response_ref: dict = field(default_factory=dict)
-
-
-@dataclass
-class _TouchedContextStatus:
-    """Touched-context sentinel; ``None`` means context OK."""
-    status: str  # "empty" | "omitted" | "budget_exceeded" | "fixed_overflow"
-    omitted_paths: List[str] = field(default_factory=list)
-    token_count: int = 0  # estimated full prompt tokens when budget is exceeded
 
 
 def _get_scope_model() -> str:
@@ -536,20 +545,6 @@ def _inline_deleted_file_pack(
     return joint
 
 
-def _compute_touched_status(
-    current_files_section: str,
-    deleted_paths: list,
-    omitted: list,
-    current_paths: list,
-) -> Optional["_TouchedContextStatus"]:
-    """Return touched-context failure status, or None when context is complete."""
-    if not current_files_section.strip() and not deleted_paths:
-        return _TouchedContextStatus(status="empty")
-    if omitted and current_paths:
-        return _TouchedContextStatus(status="omitted", omitted_paths=list(omitted))
-    return None
-
-
 def _gather_scope_packs(
     repo_dir: pathlib.Path,
     all_touched_paths: list,
@@ -557,10 +552,21 @@ def _gather_scope_packs(
     drive_root: Optional[pathlib.Path] = None,
     compact: bool = False,
     scope_model: str = "",
+    diff_only_paths: Optional[list] = None,
+    snapshot_included_paths: Optional[frozenset] = None,
 ) -> str:
     """Collect the bounded wider repository atlas, failing closed on git errors."""
-    # Canonical docs and touched files are injected explicitly; avoid duplicating them.
-    already_included = frozenset(set(all_touched_paths) | set(_CANONICAL_CONTEXT_DOCS))
+    # WHICH snapshots the fixed part actually holds is the assembler's fact,
+    # never re-derived from the touched LIST: `all_touched_paths` also names
+    # files the fixed part omits by design (touched tests) or suppresses (a
+    # sensitive/oversized deletion), and claiming those as "included in fixed
+    # prompt context" is a false coverage claim (BIBLE P1) that also hides them
+    # from the atlas's own requiredness classification. Unclaimed paths are
+    # classified by the atlas; a canonical doc is claimed only if it exists.
+    already_included = frozenset(
+        set(snapshot_included_paths or frozenset())
+        | {doc for doc in _CANONICAL_CONTEXT_DOCS if (repo_dir / doc).is_file()}
+    )
     _input_limit = _effective_scope_input_limit(scope_model=scope_model)
     try:
         atlas = compile_review_context_atlas(
@@ -568,6 +574,7 @@ def _gather_scope_packs(
                 repo_dir=repo_dir,
                 anchors=tuple(all_touched_paths),
                 already_included=already_included,
+                diff_only_included=frozenset(diff_only_paths or ()),
                 fixed_prompt_tokens=fixed_prompt_tokens,
                 target_total_tokens=min(850_000, _input_limit),
                 hard_total_tokens=_input_limit,
@@ -577,11 +584,13 @@ def _gather_scope_packs(
                 compact_manifest=compact,
             )
         )
+        # Set the manifest FIRST: disclosure accompanies the refusal below, it
+        # never replaces it (BIBLE P3).
         _SCOPE_CONTEXT_MANIFEST.set(atlas.manifest)
-        if atlas.status == "budget_exceeded":
-            raise _ScopeAtlasBudgetExceeded(atlas.manifest)
+        if atlas_assembly_failed(atlas):
+            raise _ScopeAtlasNotAssembled(atlas.manifest, atlas_assembly_failure_reason(atlas))
         repo_pack_section = atlas.text or "(no additional repo files)"
-    except _ScopeAtlasBudgetExceeded:
+    except _ScopeAtlasNotAssembled:
         raise
     except RuntimeError:
         raise
@@ -600,12 +609,22 @@ def _record_ladder_steps(steps: list) -> None:
     _SCOPE_CONTEXT_MANIFEST.set(manifest)
 
 
-def _ladder_terminal_status(scope_model: str, token_count: int) -> "_TouchedContextStatus":
-    """Terminal status when the guaranteed-fit ladder exhausts every step."""
-    known_window = _scope_reviewer_window(scope_model)
-    if known_window and known_window < _SCOPE_MODEL_CONTEXT_WINDOW:
-        return _TouchedContextStatus(status="budget_exceeded", token_count=token_count)
-    return _TouchedContextStatus(status="fixed_overflow", token_count=token_count)
+def _ladder_terminal_status(
+    scope_model: str, token_count: int, unassembled_required: Optional[list] = None,
+    atlas_overflowed: bool = False,
+) -> "_TouchedContextStatus":
+    """Terminal status when the guaranteed-fit ladder exhausts every step: the
+    status picks the AUTHORITY branch (sub-floor vs >=1M) while the CAUSE rides
+    separately, because the ladder terminates on two different failures — which
+    can coincide — and both authority branches must report every one that
+    happened."""
+    known = _scope_reviewer_window(scope_model)
+    return _TouchedContextStatus(
+        status="budget_exceeded" if known and known < _SCOPE_MODEL_CONTEXT_WINDOW else "fixed_overflow",
+        token_count=token_count,
+        unassembled_required=list(unassembled_required or []),
+        atlas_overflowed=bool(atlas_overflowed),
+    )
 
 
 def _render_touched_section(
@@ -620,6 +639,11 @@ def _render_touched_section(
     ``diff_only_paths`` are degraded to an explicit disclosed note (their
     changes stay fully visible in the staged diff) — the guaranteed-fit
     ladder's step for oversized fixed parts.
+
+    Returns ``(section, pack_omitted, snapshot_included)``. ``snapshot_included``
+    is the CONSERVATIVE set of paths whose full snapshot this section really
+    carries — the atlas is told that and nothing more, so no coverage row can
+    claim content the pack does not hold (BIBLE P1).
     """
     kept = [path for path in current_context_paths if path not in diff_only_paths]
     section, pack_omitted = build_touched_file_pack(repo_dir, kept)
@@ -628,8 +652,10 @@ def _render_touched_section(
         skip_note = (
             "## CURRENT FILE CONTEXT DEDUPLICATION NOTE\n"
             "The following touched files are not duplicated as full current-file "
-            "snapshots because they are either canonical docs injected above or "
-            "tests whose exact changes are visible in the staged diff below:\n"
+            "snapshots HERE because they are either canonical docs injected above "
+            "or tests whose exact changes are visible in the staged diff below. "
+            "A touched test is an atlas anchor, so its full snapshot appears once "
+            "in the generated atlas when the atlas selects it:\n"
             + "\n".join(f"- {path}" for path in skipped_by_design)
             + "\n"
         )
@@ -646,7 +672,14 @@ def _render_touched_section(
             + "\n"
         )
         section = section + "\n\n" + degrade_note if section.strip() else degrade_note
-    return section, pack_omitted
+    # Only paths that CANNOT be absent: kept, not omitted by the pack builder,
+    # and a real file on disk (the builder can emit nothing else). Deleted paths
+    # are never claimed — they leave the index, so the atlas has no row for them.
+    snapshot_included = frozenset(
+        path for path in kept
+        if path not in set(pack_omitted) and (repo_dir / path).is_file()
+    )
+    return section, pack_omitted, snapshot_included
 
 
 def _build_scope_history_section(scope_review_history: Optional[list]) -> str:
@@ -779,7 +812,7 @@ def _build_scope_prompt(
             diff_only_paths,
         )
 
-    current_files_section, omitted = _render_current_section([])
+    current_files_section, omitted, snapshot_included = _render_current_section([])
     touched_status = _compute_touched_status(
         current_files_section, deleted_paths, omitted, current_context_paths
     )
@@ -817,6 +850,9 @@ def _build_scope_prompt(
             "drive_root": drive_root,
             "scope_model": scope_model,
             "compact": compact,
+            # The ladder owns which snapshots survived; the atlas is TOLD.
+            "diff_only_paths": list(diff_only_paths),
+            "snapshot_included_paths": snapshot_included,
         }
         return _gather_scope_packs(
             repo_dir,
@@ -849,6 +885,8 @@ def _build_scope_prompt(
     compact = False
     compact_diff_attempted = False
     last_known_tokens = 0
+    unassembled_required: list = []
+    atlas_overflowed = False
     # One AGGREGATED record of the guaranteed-fit ladder (RS5): a per-step event
     # stream would be noise, but a silent ladder makes an oversized pack
     # unexplainable after the fact (BIBLE P1).
@@ -859,15 +897,33 @@ def _build_scope_prompt(
         atlas_text = None
         try:
             atlas_text = _atlas_section(fixed_prompt_tokens, compact)
-        except _ScopeAtlasBudgetExceeded as exc:
+        except _ScopeAtlasNotAssembled as exc:
+            refusal = exc
             if not compact:
                 compact = True
                 try:
                     atlas_text = _atlas_section(fixed_prompt_tokens, True)
-                except _ScopeAtlasBudgetExceeded as compact_exc:
-                    last_known_tokens = int(compact_exc.manifest.get("estimated_total_tokens") or 0)
-            else:
-                last_known_tokens = int(exc.manifest.get("estimated_total_tokens") or 0)
+                except _ScopeAtlasNotAssembled as compact_exc:
+                    refusal = compact_exc
+            if atlas_text is None:
+                last_known_tokens = int(refusal.manifest.get("estimated_total_tokens") or 0)
+                # The atlas manifest stays the ONE carrier of what did not assemble,
+                # and a refusal is a ladder STEP with a trace row exactly like the
+                # assembly branch below (an empty trace explains nothing — P1).
+                unassembled_required = [
+                    str(row.get("path") or "?") for row in atlas_unassembled_required(refusal.manifest)
+                ]
+                # The refusal can carry TWO causes at once (missing required
+                # artifact AND hard-budget overflow) — capture both facts.
+                atlas_overflowed = atlas_hard_budget_overflowed(refusal.manifest)
+                ladder_steps.append({
+                    "step": "atlas_refused", "compact": compact, "reason": str(refusal),
+                    "unassembled_required": list(unassembled_required),
+                    "atlas_overflowed": atlas_overflowed,
+                    "tokens_after": last_known_tokens,
+                    "diff_only_files": len(diff_only_paths),
+                    "zero_context_diff": compact_diff_attempted,
+                })
 
         deficit = 0
         if atlas_text is not None:
@@ -876,6 +932,8 @@ def _build_scope_prompt(
                 raise RuntimeError("scope review atlas placeholder missing")
             prompt = head + atlas_text + tail
             prompt_tokens = estimate_tokens(prompt)
+            unassembled_required = []  # assembled: no earlier refusal is the cause now
+            atlas_overflowed = False
             ladder_steps.append({
                 "step": "compact_atlas" if compact else "full_atlas",
                 "tokens_before": last_known_tokens,
@@ -907,18 +965,24 @@ def _build_scope_prompt(
                     continue
             # Terminal pack status: >=1M authority is fixed_overflow; a sub-floor
             # pack is budget_exceeded here and the authority policy turns it into
-            # a block unless the owner explicitly selected advisory scope.
+            # a block unless the owner explicitly selected advisory scope. The
+            # CAUSE travels separately — both branches report the real one.
             _record_ladder_steps(ladder_steps)
             return None, _ladder_terminal_status(
                 scope_model or _get_scope_model(),
                 last_known_tokens or fixed_prompt_tokens,
+                unassembled_required=unassembled_required,
+                atlas_overflowed=atlas_overflowed,
             )
         freed = 0
         while degradable and freed < deficit + 2_000:
             path = degradable.pop(0)
             diff_only_paths.append(path)
             freed += _touched_token_estimate(path)
-        current_files_section, _ = _render_current_section(diff_only_paths)
+        # Re-render AND re-read what the shrunken section now holds: a path just
+        # degraded to diff-only has stopped being a survivor, so the next atlas
+        # build must not be told otherwise.
+        current_files_section, _, snapshot_included = _render_current_section(diff_only_paths)
 
 
 def _log_scope_result(
@@ -1149,21 +1213,18 @@ def _handle_prompt_signals(
             else (_SCOPE_MODEL_CONTEXT_WINDOW, _WINDOW_SENTINEL)
         )
         _output_reserve, _ = _window_scaled_reserves(_window)
+        _budget = (f"input budget ({input_limit} tokens, reserving {_output_reserve} for "
+                   f"output within its {_window_provenance_phrase(_window, _provenance)})")
+        _cause, _remedy = _ladder_terminal_cause(context_status, input_limit, budget_phrase=_budget)
         log.warning(
-            "Scope review prompt (~%d tokens) exceeds reviewer input limit (%d); "
-            "window=%d provenance=%s (fail-closed).",
-            token_count,
-            input_limit,
-            _window,
-            _provenance,
+            "Scope review pack did not assemble: %s; window=%d provenance=%s (fail-closed).",
+            _cause, _window, _provenance,
         )
         return ScopeReviewResult(
             blocked=True,
             block_message=(
-                "⚠️ SCOPE_REVIEW_BLOCKED: the configured reviewer cannot fit the "
-                "irreducible scope prompt within its "
-                f"{_window_provenance_phrase(_window, _provenance)}, so the "
-                "required >=1M blocking scope gate has no authoritative verdict."
+                f"⚠️ SCOPE_REVIEW_BLOCKED: {_cause}, so the required >=1M blocking "
+                "scope gate has no authoritative verdict."
             ),
             status="sub_floor",
             # No prompt string exists on this path (the fit ladder returned a
@@ -1176,35 +1237,28 @@ def _handle_prompt_signals(
                 "severity": "advisory",
                 "item": "scope_review_skipped",
                 "reason": (
-                    f"⚠️ SCOPE_REVIEW_SKIPPED: Full scope-review prompt (~{token_count} tokens) "
-                    f"exceeds the scope input budget ({input_limit} tokens, "
-                    f"reserving {_output_reserve} for output within its "
-                    f"{_window_provenance_phrase(_window, _provenance)}). "
-                    "The blocking scope gate has no authoritative verdict. "
-                    "Consider reducing codebase size or configuring a >=1M reviewer."
+                    f"⚠️ SCOPE_REVIEW_SKIPPED: {_cause}. The blocking scope gate has "
+                    f"no authoritative verdict. {_remedy}"
                 ),
                 "model": scope_model or "scope_reviewer",
             }],
         )
 
     if context_status.status == "fixed_overflow":
-        # The guaranteed-fit ladder exhausted every degradation step: even with
-        # all touched files reduced to diff-only and the atlas reduced to its
-        # manifest, the irreducible prompt (checklist + canonical docs + staged
-        # diff) exceeds the reviewer input budget. This is a structural
-        # condition the owner must see — fail CLOSED, never a silent skip.
+        # The guaranteed-fit ladder exhausted every degradation step. TWO failures
+        # land here — an irreducible prompt that overflows, and a REQUIRED artifact
+        # that never assembled — and they can COINCIDE, so the cause(s) are READ
+        # from the status, not assumed, and every one that applies is rendered.
+        # Either way: a structural condition the owner must see, failing CLOSED.
         token_count = context_status.token_count
+        cause, remedy = _ladder_terminal_cause(context_status, input_limit)
         return ScopeReviewResult(
             blocked=True,
             status="fixed_overflow",
             prompt_chars=token_count * 4,
             prompt_chars_source="estimated_from_tokens",
             block_message=(
-                f"⚠️ SCOPE_REVIEW_BLOCKED: the irreducible scope prompt (checklist + canonical "
-                f"docs + staged diff) is ~{token_count} estimated tokens and exceeds the scope "
-                f"reviewer input budget ({input_limit}). Every touched file was already degraded "
-                "to diff-only and the atlas to its manifest. Split the commit into smaller "
-                "staged diffs, or configure a larger-window scope reviewer. "
+                f"⚠️ SCOPE_REVIEW_BLOCKED: {cause}. {remedy} "
                 "Fail-closed stop — not a skippable budget condition."
             ),
         )

@@ -31,7 +31,13 @@ from ouroboros.task_results import (
 )
 from ouroboros.task_status import FINAL_STATUSES, find_child_tasks, wait_for_effective_tasks
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tools.review_context_atlas import ReviewContextAtlasRequest, compile_review_context_atlas
+from ouroboros.tools.review_context_atlas import (
+    ReviewContextAtlasRequest,
+    atlas_assembly_failed,
+    atlas_assembly_failure_reason,
+    atlas_assembly_remedy,
+    compile_review_context_atlas,
+)
 from ouroboros.tools.review_helpers import (
     build_head_snapshot_section,
     load_governance_doc,
@@ -59,8 +65,10 @@ from ouroboros.tools.review_synthesis import (
     plan_envelope_mismatch_note as _envelope_note,
     plan_review_component_hashes as _plan_component_hashes,
     plan_review_fingerprint as _plan_request_fingerprint,
+    plan_context_target_tokens as _plan_context_target_tokens,
     plan_slot_fit as _plan_slot_fit,
     plan_text_fingerprint,
+    resolve_plan_context_level as _resolve_plan_context_level,
     quorum_input_token_limit as _quorum_input_token_limit,
     unbindable_disposition_error as _unbindable_disposition_error,
     planning_handoff_selection as _planning_handoff_selection,
@@ -1264,8 +1272,17 @@ async def _run_plan_review_async(
         "docs/CHECKLISTS.md",
     }
     head_snapshots = ""
+    # Only paths whose FULL snapshot text actually made it into the prompt may
+    # be declared `already_included` to the atlas below: the atlas trusts that
+    # claim, so an omission marker (oversized/sensitive/binary/error) reported
+    # as "included" would bypass the BIBLE P3 required-artifact refusal
+    # (XG-1R.4). Omitted paths flow into the normal atlas classification
+    # instead, where the hoisted requiredness predicate decides.
+    snapshot_included: frozenset[str] = frozenset()
     if files_to_touch:
-        head_snapshots = build_head_snapshot_section(subject_repo, files_to_touch)
+        head_snapshots, snapshot_included = build_head_snapshot_section(
+            subject_repo, files_to_touch
+        )
 
     system_prompt = _build_system_prompt(
         checklist,
@@ -1304,8 +1321,10 @@ async def _run_plan_review_async(
                 ReviewContextAtlasRequest(
                     repo_dir=subject_repo,
                     anchors=tuple(files_to_touch),
+                    # NOT files_to_touch: only the snapshots that SURVIVED into
+                    # the prompt (see snapshot_included above, XG-1R.4).
                     already_included=frozenset(
-                        set(files_to_touch)
+                        set(snapshot_included)
                         | (canonical_docs if subject_repo == governance_repo else set())
                     ),
                     fixed_prompt_tokens=fixed_prompt_tokens,
@@ -1319,12 +1338,16 @@ async def _run_plan_review_async(
         except Exception as e:
             return f"ERROR: Failed to build review context atlas: {e}"
 
-        if atlas.status == "budget_exceeded":
-            estimated = int((atlas.manifest or {}).get("estimated_total_tokens") or 0)
+        if atlas_assembly_failed(atlas):
+            # Review does not proceed on the remainder; the typed reason renders
+            # EVERY cause and the shared remedy pick follows the cause set —
+            # `context_level` moves only `target_total_tokens` (inert here).
             return (
-                "⚠️ PLAN_REVIEW_SKIPPED: generated repository atlas exceeded hard budget"
-                + (f" ({estimated:,} estimated tokens)" if estimated else "")
-                + ". Split the plan into a smaller scope or choose a smaller context_level."
+                "⚠️ PLAN_REVIEW_SKIPPED: " + atlas_assembly_failure_reason(atlas) + ". "
+                + atlas_assembly_remedy(
+                    atlas.manifest,
+                    "Split the plan into a smaller scope or choose a smaller context_level.",
+                )
             )
 
         # The Atlas slot is the LAST section of the stable evidence prefix by construction, so
@@ -1502,30 +1525,6 @@ def _resolve_plan_class(ctx: ToolContext, plan_class: str, files_to_touch: list)
     # Undeclared: preserve today's behavior for self-repo work; a task planning in
     # an external workspace defaults to the external class.
     return ("external" if active != system_repo else "self_mod"), ""
-
-
-def _resolve_plan_context_level(raw_level: str, *, plan_class: str = "self_mod") -> str:
-    level = str(raw_level or "").strip().lower()
-    valid = {"minimal", "localized", "broad", "constitutional"}
-    if level not in valid:
-        # v6.61.0 (5.2): non-self_mod classes default to `minimal` — the generated Atlas is repo
-        # archaeology, needed only on request. self_mod keeps the explicit-choice contract.
-        if not level and plan_class in ("external", "creative", "research"):
-            return "minimal"
-        allowed = ", ".join(sorted(valid))
-        raise ValueError(
-            "plan_task requires an explicit context_level chosen by the agent "
-            f"({allowed}); do not rely on host-side auto selection."
-        )
-    return level
-
-
-def _plan_context_target_tokens(level: str) -> int:
-    return {
-        "localized": 80_000,
-        "broad": 350_000,
-        "constitutional": 850_000,
-    }.get(str(level or ""), 80_000)
 
 
 def _classify_reviewer_error(exc: BaseException, model: str) -> str:

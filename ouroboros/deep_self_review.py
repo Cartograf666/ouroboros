@@ -12,6 +12,8 @@ log = logging.getLogger(__name__)
 # Pack filtering is shared with scope review.
 from ouroboros.tools.review_context_atlas import (  # noqa: E402
     ReviewContextAtlasRequest,
+    atlas_assembly_failed,
+    atlas_assembly_failure_reason,
     compile_review_context_atlas,
 )
 from ouroboros.tools.review_helpers import (  # noqa: E402
@@ -149,8 +151,9 @@ def _append_omission_section(parts: list[str], skipped: list[str]) -> None:
         "## OMITTED FILES (not included in review pack)",
         "Reasons: sensitive=secrets/keys, vendored/minified=third-party bundled asset, "
         "binary/media=images/fonts/compiled blobs, excluded_dir=non-agent-logic directory, "
-        "excluded_test=wider tests excluded, oversized=>1MB, read_error=unreadable, "
-        "budget_omitted=required atlas file did not fit.",
+        "excluded_test=wider tests excluded, oversized=>1MB, read_error=unreadable. "
+        "(A required atlas file that does not fit never reaches this list: it fails "
+        "the pack instead of shrinking it.)",
         "Full per-file coverage for every tracked path is in the atlas coverage "
         "manifest (persisted to state/deep_self_review_context.json).",
         "",
@@ -294,16 +297,22 @@ def build_review_pack(
         )
 
     atlas = _compile(False)
-    if atlas.status == "budget_exceeded":
+    if atlas_assembly_failed(atlas):
         # Graceful compact retry (mirrors scope review): the durable manifest
         # keeps full per-file coverage while the visible prompt switches to the
         # compact coverage index, freeing manifest tokens for required files.
         atlas = _compile(True)
-    if atlas.status == "budget_exceeded":
+    if atlas_assembly_failed(atlas):
+        # No pack: a review that could not assemble a required artifact does not
+        # run on the remainder (BIBLE P3). The manifest carries the disclosure.
         return "", {
             "file_count": 0,
             "total_chars": 0,
-            "skipped": ["FATAL: generated repository atlas exceeded hard budget even with the compact manifest"],
+            "skipped": [
+                "FATAL: "
+                + atlas_assembly_failure_reason(atlas)
+                + " (even with the compact manifest)"
+            ],
             "context_manifest": atlas.manifest,
         }
     skipped.extend(

@@ -306,6 +306,32 @@ def normalize_plan_scope(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return result
 
 
+def resolve_plan_context_level(raw_level: str, *, plan_class: str = "self_mod") -> str:
+    """Normalize the agent-declared context level (pure, same family as the scope above)."""
+    level = str(raw_level or "").strip().lower()
+    valid = {"minimal", "localized", "broad", "constitutional"}
+    if level not in valid:
+        # v6.61.0 (5.2): non-self_mod classes default to `minimal` — the generated Atlas is repo
+        # archaeology, needed only on request. self_mod keeps the explicit-choice contract.
+        if not level and plan_class in ("external", "creative", "research"):
+            return "minimal"
+        allowed = ", ".join(sorted(valid))
+        raise ValueError(
+            "plan_task requires an explicit context_level chosen by the agent "
+            f"({allowed}); do not rely on host-side auto selection."
+        )
+    return level
+
+
+def plan_context_target_tokens(level: str) -> int:
+    """The atlas TARGET the resolved level buys (the hard budget is the reviewer's window)."""
+    return {
+        "localized": 80_000,
+        "broad": 350_000,
+        "constitutional": 850_000,
+    }.get(str(level or ""), 80_000)
+
+
 def plan_review_fingerprint(
     *,
     plan: str,
