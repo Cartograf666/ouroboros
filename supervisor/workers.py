@@ -17,12 +17,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from supervisor.state import load_state, append_jsonl, reconstruct_task_cost
 from supervisor.message_bus import coerce_chat_identity, send_with_budget
+from ouroboros.config import DATA_DIR, REPO_DIR as CONFIG_REPO_DIR
 from ouroboros.outcomes import EXECUTION_FAILED, EXECUTION_INFRA_FAILED, terminal_outcome_axes
 from ouroboros.utils import utc_now_iso
 
 
-REPO_DIR: pathlib.Path = pathlib.Path.home() / "Ouroboros" / "repo"
-DRIVE_ROOT: pathlib.Path = pathlib.Path.home() / "Ouroboros" / "data"
+REPO_DIR: pathlib.Path = pathlib.Path(CONFIG_REPO_DIR)
+DRIVE_ROOT: pathlib.Path = pathlib.Path(DATA_DIR)
 MAX_WORKERS: int = 10
 SOFT_TIMEOUT_SEC: int = 600
 HARD_TIMEOUT_SEC: int = 1800
@@ -1302,6 +1303,9 @@ def _emit_task_done_terminal(
     status = status or "failed"
     # Caller reason_code wins; budget_exhausted -> EXECUTION_FAILED below, not infra-failure.
     reason_code = reason_code or ("worker_terminal_failure" if status == "failed" else status)
+    task_metadata = (task or {}).get("metadata")
+    task_metadata = task_metadata if isinstance(task_metadata, dict) else {}
+    evolution_tx = task_metadata.get("evolution_transaction")
     try:
         cost_fields: Dict[str, Any] = {
             "cost_accounting_status": cost_accounting_status,
@@ -1332,6 +1336,8 @@ def _emit_task_done_terminal(
                 review_trigger="worker_terminal",
             ),
             "reason_code": reason_code,
+            **({"metadata": {"evolution_transaction": dict(evolution_tx)}}
+               if isinstance(evolution_tx, dict) else {}),
             **cost_fields,
         })
         return True
@@ -1812,6 +1818,62 @@ def _drop_cancelled_pending() -> None:
         )
 
 
+def _evolution_assignment_error(task: Dict[str, Any]) -> str:
+    """Return the exact authority error for an evolution task about to run."""
+    if str(task.get("type") or "") != "evolution":
+        return ""
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    tx = metadata.get("evolution_transaction")
+    tx = tx if isinstance(tx, dict) else {}
+    task_id = str(task.get("id") or "")
+    if str(tx.get("task_id") or "") != task_id:
+        return "task_mismatch"
+    from supervisor.evolution_lifecycle import check_evolution_authority
+
+    try:
+        authority = check_evolution_authority(
+            campaign_id=str(tx.get("campaign_id") or ""),
+            transaction_id=str(tx.get("transaction_id") or ""),
+            task_id=task_id,
+            require_uncommitted=True,
+        )
+    except Exception:
+        log.warning("Evolution assignment authority check failed", exc_info=True)
+        return "authority_check_failed"
+    return "" if authority.get("ok") else str(authority.get("reason") or "unknown")
+
+
+def _cancel_unauthorized_evolution(task: Dict[str, Any], reason: str) -> bool:
+    """Terminally cancel a stale restored/retried evolution task."""
+    task_id = str(task.get("id") or "")
+    from ouroboros.task_results import STATUS_CANCELLED, write_task_result
+
+    try:
+        write_task_result(
+            DRIVE_ROOT,
+            task_id,
+            STATUS_CANCELLED,
+            reason_code="evolution_authority_missing",
+            authority_reason=str(reason or "unknown"),
+            metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
+            result=f"Evolution authority is no longer active ({reason or 'unknown'}).",
+        )
+    except Exception:
+        log.debug("Failed to cancel unauthorized evolution task %s", task_id, exc_info=True)
+        return False
+    _emit_task_done_terminal(
+        task, task_id, "cancelled", reason_code="evolution_authority_missing",
+    )
+    append_jsonl(
+        DRIVE_ROOT / "logs" / "events.jsonl",
+        {
+            "ts": utc_now_iso(), "type": "evolution_assignment_rejected",
+            "task_id": task_id, "reason": str(reason or "unknown"),
+        },
+    )
+    return True
+
+
 def assign_tasks() -> None:
     from supervisor import queue
     from supervisor.state import budget_remaining, EVOLUTION_BUDGET_RESERVE
@@ -2007,6 +2069,13 @@ def assign_tasks() -> None:
                         queue.persist_queue_snapshot(reason="evolution_dropped_budget")
                     continue
                 task = PENDING.pop(chosen_idx)
+                evolution_error = _evolution_assignment_error(task)
+                if evolution_error:
+                    if _cancel_unauthorized_evolution(task, evolution_error):
+                        queue.persist_queue_snapshot(reason="evolution_authority_rejected")
+                    else:
+                        PENDING.insert(chosen_idx, task)
+                    continue
                 if str(task.get("delegation_role") or "") == "subagent" and str(task.get("drive_root") or ""):
                     try:
                         from ouroboros.task_results import STATUS_RUNNING, write_task_result
@@ -2268,19 +2337,10 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                             )
                         except Exception:
                             log.debug("Failed to send failure message for %s", w.busy_task_id, exc_info=True)
-                        try:
-                            get_event_q().put({
-                                "type": "task_done",
-                                "task_id": str(w.busy_task_id),
-                                "task_type": task_type,
-                                "chat_id": chat_id,
-                                "status": "failed",
-                                "reason_code": reason_code,
-                                "outcome_axes": terminal_outcome_axes(lifecycle="failed", execution=EXECUTION_INFRA_FAILED, reason_code=reason_code, review_trigger="worker_terminal"),
-                                **r_cost_fields,
-                            })
-                        except Exception:
-                            log.debug("Failed to emit terminal event for %s", w.busy_task_id, exc_info=True)
+                        _emit_task_done_terminal(
+                            task, str(w.busy_task_id), "failed",
+                            reason_code=reason_code, **r_cost_fields,
+                        )
                     elif task_type == "evolution" and not bool(load_state().get("evolution_mode_enabled")):
                         # Evolution was stopped: do not resurrect a dead evolution
                         # worker into another cycle (mirrors the hard-timeout gate

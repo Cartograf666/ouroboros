@@ -486,9 +486,24 @@ def _evolution_restart_block_reason(ctx: ToolContext) -> str:
         return f"could not verify local git durability: {exc}"
     reviewed_sha = str(getattr(ctx, "last_reviewed_commit_sha", "") or "").strip()
     if reviewed_sha and reviewed_sha == head and not status:
-        return ""
-    if not reviewed_sha and not status:
-        return ""
+        metadata = getattr(ctx, "task_metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        tx = metadata.get("evolution_transaction")
+        tx = tx if isinstance(tx, dict) else {}
+        from supervisor.evolution_lifecycle import check_evolution_authority
+
+        authority = check_evolution_authority(
+            str(tx.get("campaign_id") or ""),
+            str(tx.get("transaction_id") or ""),
+            str(getattr(ctx, "task_id", "") or tx.get("task_id") or ""),
+            commit_sha=head,
+        )
+        return "" if authority.get("ok") else (
+            "the exact evolution commit receipt is no longer active "
+            f"({authority.get('reason') or 'unknown'})"
+        )
+    if not reviewed_sha:
+        return "commit_reviewed has not recorded an exact local commit receipt"
     if reviewed_sha and reviewed_sha != head:
         return "HEAD changed after the last reviewed local commit"
     return "commit_reviewed must create a local reviewed commit before evolution restart"
@@ -498,16 +513,32 @@ def _request_restart(ctx: ToolContext, reason: str) -> str:
     block_reason = _evolution_restart_block_reason(ctx)
     if block_reason:
         return f"⚠️ RESTART_BLOCKED: in evolution mode, {block_reason}."
+    is_evolution = str(ctx.current_task_type or "") == "evolution"
+    restart_reason = str(reason or "").strip() or "agent_requested_restart"
     # Persist expected ref for post-restart verification.
     try:
         sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir)
         branch = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=ctx.repo_dir)
         verify_path = ctx.drive_path("state") / "pending_restart_verify.json"
+        evolution_claim = {}
+        if is_evolution:
+            metadata = getattr(ctx, "task_metadata", {})
+            metadata = metadata if isinstance(metadata, dict) else {}
+            tx = metadata.get("evolution_transaction")
+            tx = tx if isinstance(tx, dict) else {}
+            evolution_claim = {
+                "campaign_id": str(tx.get("campaign_id") or ""),
+                "transaction_id": str(tx.get("transaction_id") or ""),
+                "task_id": str(ctx.task_id or tx.get("task_id") or ""),
+                "commit_sha": str(sha or "").strip(),
+            }
         atomic_write_json(verify_path, {
             "ts": utc_now_iso(), "expected_sha": sha,
-            "expected_branch": branch, "reason": reason,
+            "expected_branch": branch, "reason": restart_reason,
+            **({"evolution_claim": evolution_claim} if evolution_claim else {}),
         })
-        if str(ctx.current_task_type or "") == "evolution":
+        if evolution_claim:
+            ctx.pending_restart_is_evolution = True
             try:
                 from supervisor.evolution_lifecycle import update_evolution_transaction
 
@@ -520,13 +551,17 @@ def _request_restart(ctx: ToolContext, reason: str) -> str:
                 )
             except Exception:
                 log.debug("Failed to record evolution restart request", exc_info=True)
-    except Exception:
+    except Exception as exc:
         log.debug("Failed to read VERSION file or git ref for restart verification", exc_info=True)
-        pass
-    ctx.pending_restart_reason = str(reason or "").strip() or "agent_requested_restart"
+        if is_evolution:
+            return (
+                "⚠️ RESTART_BLOCKED: the exact evolution restart receipt could not "
+                f"be persisted ({exc})."
+            )
+    ctx.pending_restart_reason = restart_reason
     ctx.last_push_succeeded = False
     ctx.last_reviewed_commit_sha = ""
-    return f"Restart requested: {reason}"
+    return f"Restart requested: {restart_reason}"
 
 
 def _set_tool_timeout(ctx: ToolContext, seconds: int) -> str:
@@ -547,7 +582,21 @@ def _set_tool_timeout(ctx: ToolContext, seconds: int) -> str:
 
 
 def _promote_to_stable(ctx: ToolContext, reason: str) -> str:
-    ctx.pending_events.append({"type": "promote_to_stable", "reason": reason, "ts": utc_now_iso()})
+    event = {"type": "promote_to_stable", "reason": reason, "ts": utc_now_iso()}
+    if str(ctx.current_task_type or "") == "evolution":
+        metadata = getattr(ctx, "task_metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        tx = metadata.get("evolution_transaction")
+        tx = tx if isinstance(tx, dict) else {}
+        event["evolution_claim"] = {
+            "campaign_id": str(tx.get("campaign_id") or ""),
+            "transaction_id": str(tx.get("transaction_id") or ""),
+            "task_id": str(getattr(ctx, "task_id", "") or tx.get("task_id") or ""),
+            "commit_sha": str(
+                getattr(ctx, "last_reviewed_commit_sha", "") or tx.get("commit_sha") or ""
+            ),
+        }
+    ctx.pending_events.append(event)
     return f"Promote to stable requested: {reason}"
 
 
@@ -1967,7 +2016,7 @@ def get_tools() -> List[ToolEntry]:
         }, _set_tool_timeout),
         ToolEntry("request_restart", {
             "name": "request_restart",
-            "description": "Ask supervisor to restart runtime (after a reviewed local commit or clean no-op state).",
+            "description": "Ask supervisor to restart runtime after a reviewed local commit or a non-evolution clean no-op; evolution requires its exact active commit receipt.",
             "parameters": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]},
         }, _request_restart),
         ToolEntry("promote_to_stable", {

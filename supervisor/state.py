@@ -10,13 +10,14 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from ouroboros.config import DATA_DIR
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
 
 
-DRIVE_ROOT: pathlib.Path = pathlib.Path.home() / "Ouroboros" / "data"
+DRIVE_ROOT: pathlib.Path = pathlib.Path(DATA_DIR)
 STATE_PATH: pathlib.Path = DRIVE_ROOT / "state" / "state.json"
 STATE_LAST_GOOD_PATH: pathlib.Path = DRIVE_ROOT / "state" / "state.last_good.json"
 STATE_LOCK_PATH: pathlib.Path = DRIVE_ROOT / "locks" / "state.lock"
@@ -27,6 +28,25 @@ QUEUE_SNAPSHOT_PATH: pathlib.Path = DRIVE_ROOT / "state" / "queue_snapshot.json"
 # has it, so reset_per_task_budget can refuse on it regardless of how the path resolves —
 # closing the budget-reset guard for custom-data-root installs (BIBLE P8).
 ISOLATED_BENCHMARK_SENTINEL = ".ouroboros_isolated_benchmark"
+
+
+def assert_test_data_path(path: pathlib.Path) -> None:
+    """Fail closed when pytest resolves a writer into the live data tree."""
+    if os.environ.get("OUROBOROS_PYTEST_ACTIVE") != "1":
+        return
+    if os.environ.get("OUROBOROS_ALLOW_LIVE_DATA_TESTS") == "1":
+        return
+    roots = {pathlib.Path.home() / "Ouroboros" / "data"}
+    configured = str(os.environ.get("OUROBOROS_TEST_LIVE_DATA_ROOT") or "").strip()
+    if configured:
+        roots.add(pathlib.Path(configured))
+    target = pathlib.Path(path).resolve(strict=False)
+    for root in roots:
+        try:
+            target.relative_to(root.resolve(strict=False))
+        except ValueError:
+            continue
+        raise RuntimeError(f"PYTEST_LIVE_DATA_WRITE_BLOCKED: {target}")
 
 
 def init(drive_root: pathlib.Path, total_budget_limit: float = 0.0) -> None:
@@ -40,6 +60,7 @@ def init(drive_root: pathlib.Path, total_budget_limit: float = 0.0) -> None:
 
 
 def atomic_write_text(path: pathlib.Path, content: str) -> None:
+    assert_test_data_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp.{uuid.uuid4().hex}")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -165,6 +186,7 @@ def _warn_state_unlocked(op: str, lock_fd: Optional[int]) -> None:
 
 
 def load_state() -> Dict[str, Any]:
+    assert_test_data_path(STATE_PATH)
     lock_fd = acquire_file_lock(STATE_LOCK_PATH)
     _warn_state_unlocked("load", lock_fd)
     try:
@@ -174,6 +196,7 @@ def load_state() -> Dict[str, Any]:
 
 
 def save_state(st: Dict[str, Any]) -> None:
+    assert_test_data_path(STATE_PATH)
     lock_fd = acquire_file_lock(STATE_LOCK_PATH)
     _warn_state_unlocked("save", lock_fd)
     try:
@@ -199,6 +222,7 @@ def update_state(mutator) -> Dict[str, Any]:
     ``mutator`` must NOT call ``load_state``/``save_state``/``update_state`` itself:
     STATE_LOCK is not re-entrant within a process, so re-entering would block.
     """
+    assert_test_data_path(STATE_PATH)
     lock_fd = acquire_file_lock(STATE_LOCK_PATH)
     _warn_state_unlocked("update", lock_fd)
     try:
@@ -212,6 +236,7 @@ def update_state(mutator) -> Dict[str, Any]:
 
 def init_state() -> Dict[str, Any]:
     """Initialize session snapshots for budget drift detection."""
+    assert_test_data_path(STATE_PATH)
     lock_fd = acquire_file_lock(STATE_LOCK_PATH)
     try:
         st = _load_state_unlocked()

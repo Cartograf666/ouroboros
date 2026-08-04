@@ -820,8 +820,8 @@ to `managed`.
 Self-modification success is local-first: `commit_reviewed` creating a reviewed
 local commit is the durable boundary. `origin` push and CI are best-effort
 follow-ups; missing `origin` is a local-only mode, not a broken evolution run.
-Autonomous restart uses the local commit SHA or a clean no-op state as its
-eligibility signal, never remote push success.
+Autonomous evolution restart requires the exact reviewed local commit receipt,
+never remote push success.
 
 Reviewed-change pytest preflight is hermetic. `ouroboros/preflight_runner.py`
 creates a disposable detached worktree, replays the candidate staged/unstaged
@@ -830,7 +830,9 @@ diff plus untracked candidate files, runs the default pytest suite serially with
 scrubs inherited `OUROBOROS_*` behavior plus secret-class environment values.
 This prevents tests launched by advisory/commit review from writing live
 `data/settings.json`, inheriting owner runtime modes, or triggering
-launcher-managed reset behavior against the live repo. CI alone owns its
+launcher-managed reset behavior against the live repo. Pytest also rebinds the
+already-imported state, queue, and worker roots for each test process and refuses
+state/campaign writes that resolve to the captured live data root. CI alone owns its
 parallel non-serial plus serial split.
 
 Safety-critical protection is no longer implemented as "copy these files from the
@@ -1316,6 +1318,25 @@ with git/memory hashes, `outcome_axes`, and per-cycle cost/rounds for future
 eval curves. Task attempts/campaign tasks are counted separately from absorbed
 evolution cycles: an absorbed cycle requires a reviewed self-mod commit plus
 successful startup restart verification of that commit.
+`evolution_mode_enabled` is only the scheduling projection of an active campaign,
+not authority by itself. Before dispatch, review, commit, publication, and restart,
+the runtime verifies the exact campaign, transaction, and task claim; restored or
+retried queue rows without that still-uncommitted authority are terminally cancelled
+at assignment. A reviewed
+commit is recorded back to that claim by exact SHA after final local commit/tag
+binding and before push. If authority changes after commit, the commit moves to a
+private local inspection ref, a tag created by that attempt is removed, and the
+normal branch/tag namespace no longer reaches it before any later ordinary push;
+the index and worktree remain untouched so concurrent edits cannot be lost. No restart
+occurs. Runtime terminal transitions run under the shared state lock, and an exact
+terminal replay resumes pending cleanup/restart/report effects without counting the
+cycle twice. Lifecycle authority mutations use short exact state/campaign operations and
+reject stale campaign ids or terminal resurrection. Transaction schema v2 carries
+the same typed receipt through marker and markerless boot verification; legacy v1
+transactions retain their existing restart recovery. Boot reconciliation shares
+the state lock with campaign closure, stamps the current custody generation on
+campaign start, requires a new server generation before consuming an explicit
+restart claim, and atomically reclaims claims left by dead worker PIDs.
 The evolution redesign (v6.30.0) closes the structural feedback and hygiene
 gaps. Campaign state and the transaction lifecycle live in
 `supervisor/evolution_lifecycle.py` (queue.py keeps queueing only).
