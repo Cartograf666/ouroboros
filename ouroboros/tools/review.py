@@ -59,31 +59,19 @@ err on the side of NOT recommending it and explain the tension.
 
 def _review_model_timeout_sec() -> float:
     raw = os.environ.get("OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC", "")
-    if not raw:
-        return DEFAULT_REVIEW_MODEL_TIMEOUT_SEC
     try:
         value = float(raw)
     except (TypeError, ValueError):
+        value = 0.0
+    if value > 0:
+        return value
+    if raw:
         log.warning(
-            "Invalid OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC=%r; using %.0fs",
+            "Invalid or non-positive OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC=%r; using %.0fs",
             raw,
             DEFAULT_REVIEW_MODEL_TIMEOUT_SEC,
         )
-        return DEFAULT_REVIEW_MODEL_TIMEOUT_SEC
-    if value <= 0:
-        log.warning(
-            "Non-positive OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC=%r; using %.0fs",
-            raw,
-            DEFAULT_REVIEW_MODEL_TIMEOUT_SEC,
-        )
-        return DEFAULT_REVIEW_MODEL_TIMEOUT_SEC
-    return value
-
-
-def _format_timeout_seconds(timeout_sec: float) -> str:
-    if float(timeout_sec).is_integer():
-        return str(int(timeout_sec))
-    return f"{timeout_sec:g}"
+    return DEFAULT_REVIEW_MODEL_TIMEOUT_SEC
 
 
 from ouroboros.reviewer_window import reviewer_context_window, window_scaled_reserves
@@ -114,8 +102,6 @@ from ouroboros.tools.review_helpers import (
 # Derived alias; ``review_helpers.REPO_ROOT`` remains the repo-root SSOT.
 _CHECKLISTS_PATH = _REPO_ROOT / "docs" / "CHECKLISTS.md"
 
-
-# Tool: task_acceptance_review.
 
 def get_tools():
     return [
@@ -332,8 +318,6 @@ def _handle_task_acceptance_review(
         subject=claim,
         evidence=evidence,
         checklist=checklist,
-        # v6.60.0: dead `verdict_is_advisory` removed — enforcement is the single
-        # OUROBOROS_REVIEW_ENFORCEMENT setting (advisory|blocking) via obligations.
         policy={
             "raw_output_must_be_preserved": True,
             # min_successful_slots is set below from adaptive_quorum(len(slots)) —
@@ -355,9 +339,8 @@ def _handle_task_acceptance_review(
     # agent that explicitly asked for detail.
     capsule = build_improvement_capsule(result)
     payload_dict = dict(result.__dict__)
-    # v6.54.4: DISSENT is recorded on EVERY path — the agent-called flow marks it
-    # in the payload so the tool-result capture lands acceptance_decision.dissent_noted
-    # (review round 2: previously only the host-forced path recorded it).
+    # Dissent is recorded on the agent-called path too, so the tool-result
+    # capture lands acceptance_decision.dissent_noted on EVERY path.
     payload_dict["dissent_noted"] = bool(dissent_findings(result))
     if agent_decision:
         payload_dict["agent_decision"] = agent_decision
@@ -492,7 +475,7 @@ async def _query_model(
             }
             return model, payload, None
         except asyncio.TimeoutError:
-            error = f"Error: Timeout after {_format_timeout_seconds(timeout_sec)}s"
+            error = f"Error: Timeout after {timeout_sec:g}s"
             return model, _review_query_error_payload(ctx=ctx, model=model, messages=messages, slot_id=slot_id, error=error), None
         except Exception as e:
             # Preserve full review errors; helper adds an omission note if needed.
@@ -611,21 +594,15 @@ def _parse_model_response(model: str, result, headers_dict) -> dict:
     # Row identity travels with the envelope on EVERY branch — success, transport
     # error, malformed body — so no consumer has to guess it back from position.
     slot_id = str(result.get("slot_id") or "") if isinstance(result, dict) else ""
-    if isinstance(result, dict) and result.get("error"):
+    if isinstance(result, str) or (isinstance(result, dict) and result.get("error")):
         return {
             "model": resolved_model, "request_model": model,
-            "provider": provider, "verdict": "ERROR", "text": str(result.get("error") or ""),
+            "provider": provider, "verdict": "ERROR",
+            "text": result if isinstance(result, str) else str(result.get("error") or ""),
             "tokens_in": 0, "tokens_out": 0, "cost_estimate": None,
             "slot_id": slot_id,
-            "prompt_ref": result.get("prompt_ref", {}),
-            "response_ref": result.get("response_ref", {}),
-        }
-    if isinstance(result, str):
-        return {
-            "model": resolved_model, "request_model": model,
-            "provider": provider, "verdict": "ERROR", "text": result,
-            "tokens_in": 0, "tokens_out": 0, "cost_estimate": None,
-            "slot_id": slot_id,
+            "prompt_ref": result.get("prompt_ref", {}) if isinstance(result, dict) else {},
+            "response_ref": result.get("response_ref", {}) if isinstance(result, dict) else {},
         }
     try:
         choices = result.get("choices", [])
@@ -651,7 +628,6 @@ def _parse_model_response(model: str, result, headers_dict) -> dict:
                     verdict = "FAIL"
                     break
     except (KeyError, IndexError, TypeError):
-        # Preserve full response body; no bare hardcoded truncation.
         text = (
             "(unexpected response format: "
             f"{truncate_review_artifact(json.dumps(result), limit=4000)})"
@@ -697,9 +673,7 @@ def _load_checklist_section() -> str:
     """Load Repo Commit Checklist, fail-closed if missing/malformed."""
     try:
         return _load_checklist_section_precise("Repo Commit Checklist")
-    except FileNotFoundError:
-        raise
-    except ValueError:
+    except (FileNotFoundError, ValueError):
         raise
     except Exception as e:
         raise FileNotFoundError(
@@ -794,9 +768,9 @@ def _preflight_check(commit_message: str, staged_files: str,
                      repo_dir) -> Optional[str]:
     """Fast deterministic review preflight for common incomplete staged diffs."""
     import re
+    import string as _string
 
     # Accept either name-status lines ("A  path") or plain filenames.
-    import string as _string
     raw_lines = staged_files.strip().splitlines()
     file_status: list[tuple[str, str]] = []  # (status_char, filepath)
     for raw in raw_lines:
@@ -822,9 +796,7 @@ def _preflight_check(commit_message: str, staged_files: str,
     active_staged = {path for status, path in file_status if status != "D"}
     # Added/Copied count as new modules; renames do not.
     new_files = {path for status, path in file_status if status in ("A", "C")}
-    msg_lower = commit_message.lower()
-
-    has_version_ref = bool(re.search(r'v?\d+\.\d+\.\d+', commit_message)) or "version" in msg_lower
+    has_version_ref = bool(re.search(r'v?\d+\.\d+\.\d+', commit_message)) or "version" in commit_message.lower()
     version_staged = "VERSION" in active_staged
 
     missing = []
@@ -913,7 +885,8 @@ def _preflight_check(commit_message: str, staged_files: str,
         except Exception:
             pass  # Non-fatal: LLM reviewers handle version sync
 
-    # VERSION changes need a staged README changelog row.
+    # VERSION changes need a staged README changelog row, and the staged README
+    # must respect P9 history limits.
     if version_staged:
         try:
             from ouroboros.tools.release_sync import is_release_version
@@ -929,9 +902,6 @@ def _preflight_check(commit_message: str, staged_files: str,
                     )
         except Exception:
             pass  # Non-fatal
-
-    # VERSION changes must respect P9 README history limits in staged content.
-    if version_staged:
         try:
             readme_staged = _git_show_staged(repo_dir, "README.md")
             if readme_staged:
@@ -1162,9 +1132,8 @@ def _build_critical_block_message(
 
     iteration_note = f" (attempt {ctx._review_iteration_count})"
 
-    self_verify_findings = list(getattr(ctx, '_last_review_critical_findings', []) or []) or list(critical_fails)
     retry_coaching = build_self_verification_template(
-        self_verify_findings,
+        critical_entries,
         attempt_idx=ctx._review_iteration_count,
         tool_name="commit_reviewed",
         context_noun="diff",
@@ -1593,9 +1562,7 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
         ctx._review_iteration_count = 0
         ctx._review_history = []
 
-    if errored_note:
-        advisory_warns.append(errored_note.strip())
-    if advisory_warns or getattr(ctx, "_last_review_advisory_findings", None):
+    if errored_note or advisory_warns or getattr(ctx, "_last_review_advisory_findings", None):
         ctx._review_advisory = list(getattr(ctx, "_last_review_advisory_findings", []) or [])
         if errored_note:
             ctx._review_advisory.append(errored_note.strip())

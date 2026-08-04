@@ -669,51 +669,27 @@ def get_deep_self_review_model() -> str:
 
 
 def get_max_workers() -> int:
-    raw = os.environ.get("OUROBOROS_MAX_WORKERS", SETTINGS_DEFAULTS["OUROBOROS_MAX_WORKERS"])
-    try:
-        parsed = int(raw)
-    except (TypeError, ValueError):
-        parsed = int(SETTINGS_DEFAULTS["OUROBOROS_MAX_WORKERS"])
-    return max(1, parsed)
+    return _clamped_number_setting("OUROBOROS_MAX_WORKERS", low=1, cast=int)
 
 
 def get_task_idle_timeout_sec() -> int:
     """Idle window before a task is eligible for an activity-based stop: it has made
     no REAL progress (its own last_progress_at) AND has no progressing subtree for
     this long. The periodic 30s process heartbeat is liveness, NOT progress."""
-    raw = os.environ.get(
-        "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", SETTINGS_DEFAULTS["OUROBOROS_TASK_IDLE_TIMEOUT_SEC"]
-    )
-    try:
-        return max(60, int(raw))
-    except (TypeError, ValueError):
-        return int(SETTINGS_DEFAULTS["OUROBOROS_TASK_IDLE_TIMEOUT_SEC"])
+    return _clamped_number_setting("OUROBOROS_TASK_IDLE_TIMEOUT_SEC", low=60, cast=int)
 
 
 def get_task_abs_ceiling_sec() -> int:
     """Absolute wall-clock backstop per task, independent of activity — the only hard
     time axis (budget/cost is the other, separate hard axis). A productively-waiting
     orchestrator survives to this ceiling instead of a flat 1800s wall-clock kill."""
-    raw = os.environ.get(
-        "OUROBOROS_TASK_ABS_CEILING_SEC", SETTINGS_DEFAULTS["OUROBOROS_TASK_ABS_CEILING_SEC"]
-    )
-    try:
-        return max(300, int(raw))
-    except (TypeError, ValueError):
-        return int(SETTINGS_DEFAULTS["OUROBOROS_TASK_ABS_CEILING_SEC"])
+    return _clamped_number_setting("OUROBOROS_TASK_ABS_CEILING_SEC", low=300, cast=int)
 
 
 def get_per_call_timeout_ceiling_sec() -> int:
     """SSOT ceiling for an explicit per-call run_command/run_script timeout_sec
     (and the outer tool-execution cap that accommodates it)."""
-    raw = os.environ.get(
-        "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC",
-        SETTINGS_DEFAULTS["OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC"],
-    )
-    try:
-        return max(1, int(raw))
-    except (TypeError, ValueError):
-        return int(SETTINGS_DEFAULTS["OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC"])
+    return _clamped_number_setting("OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", low=1, cast=int)
 
 
 def get_plan_task_swarm_timeout_sec() -> float:
@@ -725,15 +701,8 @@ def get_plan_task_swarm_max_wait_sec() -> float:
 
 
 def get_restart_drain_max_sec() -> int:
-    raw = os.environ.get(
-        "OUROBOROS_RESTART_DRAIN_MAX_SEC",
-        SETTINGS_DEFAULTS["OUROBOROS_RESTART_DRAIN_MAX_SEC"],
-    )
-    try:
-        parsed = int(float(raw))
-    except (TypeError, ValueError):
-        parsed = int(SETTINGS_DEFAULTS["OUROBOROS_RESTART_DRAIN_MAX_SEC"])
-    return max(0, parsed)
+    return _clamped_number_setting(
+        "OUROBOROS_RESTART_DRAIN_MAX_SEC", low=0, cast=lambda v: int(float(v)))
 
 
 def get_post_task_evolution_enabled() -> bool:
@@ -780,14 +749,7 @@ def get_evolution_persistent_objective() -> str:
 def get_post_task_evolution_budget_usd() -> float:
     """Optional per-window USD budget for post-task evolution (0 = use the
     existing EVOLUTION_BUDGET_RESERVE / TOTAL_BUDGET gating only)."""
-    raw = os.environ.get(
-        "OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD",
-        SETTINGS_DEFAULTS["OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD"],
-    )
-    try:
-        return max(0.0, float(raw))
-    except (TypeError, ValueError):
-        return 0.0
+    return _clamped_number_setting("OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD", low=0.0)
 
 
 def _bounded_positive_int_setting(key: str, *, default: int, hard_max: int, min_value: int = 1) -> int:
@@ -1211,13 +1173,9 @@ def get_ouroboroshub_catalog_url() -> str:
 
 
 def get_ouroboroshub_skills_dir() -> pathlib.Path:
-    """Return ``<DATA_DIR>/skills/ouroboroshub/`` (created on demand)."""
-    target = ensure_data_skills_dir(DATA_DIR) / SKILL_SOURCE_OUROBOROSHUB
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-    return target
+    """Return ``<DATA_DIR>/skills/ouroboroshub/`` (created on demand by
+    ``ensure_data_skills_dir``, which makes every source subdir)."""
+    return ensure_data_skills_dir(DATA_DIR) / SKILL_SOURCE_OUROBOROSHUB
 
 
 def get_clawhub_registry_url() -> str:
@@ -1483,11 +1441,7 @@ def get_mcp_tool_timeout_sec() -> int:
 
 
 def get_vision_caption_timeout_sec() -> int:
-    raw = os.environ.get("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", SETTINGS_DEFAULTS["OUROBOROS_VISION_CAPTION_TIMEOUT_SEC"])
-    try:
-        return max(1, int(raw))
-    except (TypeError, ValueError):
-        return int(SETTINGS_DEFAULTS["OUROBOROS_VISION_CAPTION_TIMEOUT_SEC"])
+    return _clamped_number_setting("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", low=1, cast=int)
 
 
 def get_finalization_grace_sec(settings: Optional[dict] = None) -> int:

@@ -300,9 +300,7 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
         if isinstance(result, str) and vacuous_disposition:
             result += _VACUOUS_DISPOSITION_NOTE
         return result
-    except concurrent.futures.TimeoutError:
-        return f"ERROR: Plan review timed out after {_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC}s."
-    except asyncio.TimeoutError:
+    except (concurrent.futures.TimeoutError, asyncio.TimeoutError):
         return f"ERROR: Plan review timed out after {_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC}s."
     except Exception as e:
         log.error("plan_task failed: %s", e, exc_info=True)
@@ -397,8 +395,7 @@ def _collect_planning_handoffs(
         "omissions": omissions,
         "consumed_task_ids": [],
     }
-    artifact = _persist_planning_handoffs(ctx, handoffs)
-    handoffs["artifact"] = artifact
+    handoffs["artifact"] = _persist_planning_handoffs(ctx, handoffs)
     return handoffs
 
 
@@ -733,8 +730,7 @@ def _mark_planning_handoffs_consumed(ctx: ToolContext, handoffs: dict) -> dict:
     handoffs.pop("reviewed_result_hashes", None)
     handoffs.pop("review_evidence_status", None)
     handoffs.setdefault("wait", {})
-    artifact = _persist_planning_handoffs(ctx, handoffs)
-    handoffs["artifact"] = artifact
+    handoffs["artifact"] = _persist_planning_handoffs(ctx, handoffs)
     return wave
 
 
@@ -770,8 +766,7 @@ def _capture_late_planning_audit(ctx: ToolContext, handoffs: dict) -> None:
         "affects_review": False,
         "tasks": late_tasks,
     }
-    artifact = _persist_planning_handoffs(ctx, handoffs)
-    handoffs["artifact"] = artifact
+    handoffs["artifact"] = _persist_planning_handoffs(ctx, handoffs)
 
 
 def _resolve_plan_roots(
@@ -1055,17 +1050,15 @@ def _plan_deadline_skip(ctx: ToolContext, *, emit: bool = False) -> str:
                 })
         except Exception:
             pass
-    if remaining <= 0:
-        return (
-            "PLAN_TASK_SKIPPED_DEADLINE: the task deadline has expired; no new planning "
-            "scout or reviewer work was started. Proceed with your own best plan directly; "
-            "do not re-call plan_task under this deadline."
-        )
+    cause = (
+        "the task deadline has expired; no new planning scout or reviewer work was started."
+        if remaining <= 0 else
+        f"insufficient time for useful planning — remaining {int(remaining)}s gives a "
+        f"swarm window of {int(scaled)}s (< {int(minimum)}s useful floor)."
+    )
     return (
-        "PLAN_TASK_SKIPPED_DEADLINE: insufficient time for useful planning — "
-        f"remaining {int(remaining)}s gives a swarm window of {int(scaled)}s "
-        f"(< {int(minimum)}s useful floor). Proceed with your own best plan directly; "
-        "do not re-call plan_task under this deadline."
+        f"PLAN_TASK_SKIPPED_DEADLINE: {cause} Proceed with your own best plan "
+        "directly; do not re-call plan_task under this deadline."
     )
 
 
@@ -1074,28 +1067,19 @@ def _finalize_plan_review_output(
     finalization: _PlanReviewFinalization,
 ) -> str:
     """Persist the authoritative review result and render its public projection."""
-    request = finalization.request
     raw_results = finalization.raw_results
-    models = finalization.models
-    estimated_tokens = finalization.estimated_tokens
-    subject_repo = finalization.subject_repo
-    governance_repo = finalization.governance_repo
     planning_handoffs = finalization.planning_handoffs
-    state_root = finalization.state_root
-    state_task_id = finalization.state_task_id
     request_fingerprint = finalization.request_fingerprint
-    degraded_scout_note = finalization.degraded_scout_note
-    reviewed_result_hashes = finalization.reviewed_result_hashes
     ctx._last_plan_review_raw_results = raw_results
-    ctx._last_plan_review_estimated_tokens = estimated_tokens
-    ctx._last_plan_review_subject_root = str(subject_repo)
-    ctx._last_plan_review_governance_root = str(governance_repo)
+    ctx._last_plan_review_estimated_tokens = finalization.estimated_tokens
+    ctx._last_plan_review_subject_root = str(finalization.subject_repo)
+    ctx._last_plan_review_governance_root = str(finalization.governance_repo)
     summary = _summarize_plan_review_results(raw_results)
     aggregate_signal = str(summary["aggregate_signal"])
     review_record = {
         "schema_version": 1,
         "request_fingerprint": request_fingerprint,
-        "plan_text_hash": plan_text_fingerprint(request.plan),
+        "plan_text_hash": plan_text_fingerprint(finalization.request.plan),
         "aggregate_signal": aggregate_signal,
         "findings": list(summary["findings"]),
         "reviewed_at": utc_now_iso(),
@@ -1110,8 +1094,9 @@ def _finalize_plan_review_output(
     if planning_handoffs:
         try:
             wave = record_plan_review_result(
-                state_root, state_task_id, fingerprint=request_fingerprint, review=review_record,
-                reviewed_result_hashes=reviewed_result_hashes,
+                finalization.state_root, finalization.state_task_id,
+                fingerprint=request_fingerprint, review=review_record,
+                reviewed_result_hashes=finalization.reviewed_result_hashes,
             )
         except (OSError, TimeoutError, ValueError) as exc:
             return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
@@ -1151,9 +1136,10 @@ def _finalize_plan_review_output(
         f"PLAN_REVIEW_OUTCOME: {aggregate_signal}", f"AGGREGATE: {aggregate_signal}",
     ])
     return (
-        degraded_scout_note
+        finalization.degraded_scout_note
         + _planning_disposition_warning_note(planning_handoffs)
-        + _format_output(raw_results, models, request.goal, estimated_tokens)
+        + _format_output(raw_results, finalization.models, finalization.request.goal,
+                         finalization.estimated_tokens)
         + "\n\n"
         + footer
     )
@@ -1481,8 +1467,6 @@ def _plan_raw_result_from_actor(actor: dict, request_model: str) -> dict:
     }
 
 
-
-
 _PLAN_CLASSES = ("self_mod", "external", "creative", "research")
 
 
@@ -1538,8 +1522,6 @@ def _resolve_plan_class(ctx: ToolContext, plan_class: str, files_to_touch: list)
 
 def _classify_reviewer_error(exc: BaseException, model: str) -> str:
     """Return actionable reviewer failure text without swallowing details."""
-    import json
-
     exc_type = type(exc).__name__
     exc_str = str(exc)
 
@@ -1584,9 +1566,7 @@ def _get_review_models() -> list[str]:
 
     models = list(_cfg.get_review_models() or [])
     if not models:
-        main = os.environ.get("OUROBOROS_MODEL", _cfg.SETTINGS_DEFAULTS["OUROBOROS_MODEL"])
-        models = [main]
-
+        models = [os.environ.get("OUROBOROS_MODEL", _cfg.SETTINGS_DEFAULTS["OUROBOROS_MODEL"])]
     return models  # honor the configured reviewer count
 
 
