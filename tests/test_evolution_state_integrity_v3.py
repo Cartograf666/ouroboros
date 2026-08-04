@@ -206,6 +206,15 @@ def test_nested_pytest_keeps_the_original_live_root_marker(tmp_path):
         "OUROBOROS_DATA_DIR": str(inherited_disposable),
         "OUROBOROS_SETTINGS_PATH": str(inherited_disposable / "settings.json"),
     }
+    # A Windows child python cannot even boot without SystemRoot, and the nested
+    # conftest's fresh mkdtemp needs a real TEMP (the ntpath fallback chain would
+    # otherwise land in the repo cwd). POSIX children boot fine with a bare env —
+    # same passthrough precedent as the scrubbed-child test above. The conftest
+    # Popen patch injects the OUROBOROS_* markers this test is actually about.
+    if os.name == "nt":
+        for key in ("SystemRoot", "TEMP", "TMP"):
+            if os.environ.get(key):
+                env[key] = os.environ[key]
     code = """
 import importlib.util, json, os, pathlib
 spec = importlib.util.spec_from_file_location('nested_conftest', pathlib.Path('tests/conftest.py'))

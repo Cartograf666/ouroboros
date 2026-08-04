@@ -388,6 +388,38 @@ def pid_is_alive(pid: int) -> bool:
 
     if pid <= 0:
         return False
+    if IS_WINDOWS:
+        # os.kill(pid, 0) is WRONG on Windows: signal 0 is CTRL_C_EVENT, so
+        # os.kill sends Ctrl+C to the target pid's CONSOLE PROCESS GROUP instead
+        # of probing liveness — when the pid shares this process's console (e.g.
+        # our own pid, or a sibling under the same runner console) it delivers a
+        # KeyboardInterrupt to the whole group. Probe with OpenProcess +
+        # GetExitCodeProcess, which never signals anything.
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        _STILL_ACTIVE = 259
+        _ERROR_ACCESS_DENIED = 5
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            # A live but access-protected process reads as alive; anything else
+            # (invalid parameter -> no such pid) reads as dead.
+            return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True  # opened but unreadable -> fail SAFE toward alive
+            return int(code.value) == _STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
