@@ -123,7 +123,7 @@ def _mock_pollution_files(root: pathlib.Path) -> set[pathlib.Path]:
 # Files whose tests spawn REAL OS processes / bind REAL ports / mutate process-global state.
 # Under `pytest -n` (xdist) they flake — or crash a worker, which (with --max-worker-restart=0)
 # fails that worker's WHOLE co-located batch, surfacing as spurious failures in unrelated files.
-# So CI **and the hermetic commit gate** (ouroboros/preflight_runner.py, v6.89.0) run them in a
+# So CI **and the hermetic commit gate** (ouroboros/preflight_runner.py, v6.88.0) run them in a
 # SERIAL pass (`-m serial`) and exclude them from the parallel pass (`-m "not serial" -n auto`);
 # in the gate a crashed worker is a named hard block, not a retry. A NEW real-process/port/
 # global-state test should mark itself `@pytest.mark.serial` (preferred) or be added here.

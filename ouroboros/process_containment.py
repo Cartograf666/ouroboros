@@ -1,4 +1,4 @@
-"""Process containment for the hermetic commit gate (v6.89 two-pass work).
+"""Process containment for the hermetic commit gate (v6.88 two-pass work).
 
 `ProcessContainer` is DETECTION for a spawned tree that outlives its root — an
 honest membership answer at teardown, not a kill guarantee. Env-token membership

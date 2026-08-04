@@ -260,14 +260,23 @@ def _preflight_pass_specs(
     ]
 
 
-def _run_git(repo_dir: pathlib.Path, args: Sequence[str], *, input_text: str = "", timeout: int = 30) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+def _run_git(repo_dir: pathlib.Path, args: Sequence[str], *, input_text: str = "", timeout: int = 30) -> subprocess.CompletedProcess:
+    # BINARY pipes, decoded here so callers keep the str contract: text-mode pipes
+    # translate \n to os.linesep, and on Windows a CRLF-mangled stdin corrupts a
+    # multi-line git payload (a replayed diff's context lines stop matching the
+    # LF worktree, so `git apply` rejects the candidate diff wholesale).
+    proc = subprocess.run(
         ["git", *args],
         cwd=str(repo_dir),
-        input=input_text if input_text else None,
+        input=input_text.encode("utf-8") if input_text else None,
         capture_output=True,
-        text=True,
         timeout=timeout,
+    )
+    return subprocess.CompletedProcess(
+        proc.args,
+        proc.returncode,
+        (proc.stdout or b"").decode("utf-8", "replace"),
+        (proc.stderr or b"").decode("utf-8", "replace"),
     )
 
 

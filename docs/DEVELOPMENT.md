@@ -1760,7 +1760,7 @@ that:
   order; and if you must mutate a module global, reset it around the test (pattern:
   `tests/conftest.py::_isolate_workspace_executor_globals`).
 
-### The commit gate mirrors the CI split (v6.89.0)
+### The commit gate mirrors the CI split (v6.88.0)
 
 `ouroboros/preflight_runner.py::run_hermetic_pytest` no longer runs one serial pass. It runs
 **the same two passes CI runs**, in the SAME disposable worktree and the same scrubbed env:
@@ -1770,9 +1770,9 @@ that:
 | 1 `parallel` | `not serial and <LANE_EXCLUSION_EXPR>` | `-n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread` |
 | 2 `serial`   | `serial and <LANE_EXCLUSION_EXPR>`     | none (flag-free, exactly like CI) |
 
-> **Provisioning prerequisite — read this before pulling v6.89.0.** Until v6.88.0 the gate ran a
+> **Provisioning prerequisite — read this before pulling v6.88.0.** Before v6.88.0 the gate ran a
 > plain serial pytest, so `pytest-xdist` was a CI-only dependency and a machine without it worked
-> fine. From v6.89.0 the gate spawns pytest under the interpreter at `OUROBOROS_AGENT_PYTHON` (or
+> fine. From v6.88.0 the gate spawns pytest under the interpreter at `OUROBOROS_AGENT_PYTHON` (or
 > `sys.executable`), and that interpreter MUST carry `pytest-xdist>=3.5` and `pytest-timeout>=2.1`.
 > If it does not, the gate fails closed: **every** commit returns `PREFLIGHT_PLUGIN_MISSING` instead
 > of running the suite. That is the designed behaviour — a degraded gate is indistinguishable from a
@@ -2061,7 +2061,7 @@ Wall-clock shape: the serial lane is roughly 20% of the total, with a ~72–80s 
 by `tests/test_osworld_cu_bridge.py` (moving to `--dist load` is out of scope — it would break the
 per-file fixture locality the serial split assumes).
 
-**Pre-switch audit (v6.89.0):** four consecutive full-suite runs under the two-pass split were
+**Pre-switch audit (v6.88.0):** four consecutive full-suite runs under the two-pass split were
 byte-identical to the serial baseline with zero worker crashes. Ongoing protection is (a) the static
 serial-candidate checklist below and (b) the in-gate crash=hard-block canary, which self-reports
 drift at the first offending commit rather than silently flaking.

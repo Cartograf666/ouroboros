@@ -672,13 +672,17 @@ def _create_isolated_checkout(
     if add.returncode != 0:
         raise RuntimeError(f"worktree add failed: {add.stderr.strip()}")
     if staged_patch.strip():
+        # Bytes stdin: a text-mode pipe CRLF-mangles the patch on Windows and
+        # git apply then rejects every hunk against the LF checkout.
         apply = subprocess.run(
             ["git", "apply", "--index", "--whitespace=nowarn", "--binary"],
-            cwd=str(checkout), input=staged_patch, capture_output=True, text=True, timeout=120,
+            cwd=str(checkout), input=staged_patch.encode("utf-8"),
+            capture_output=True, timeout=120,
         )
         if apply.returncode != 0:
             raise RuntimeError(
-                f"staged diff did not apply to the isolated checkout: {apply.stderr.strip()}"
+                "staged diff did not apply to the isolated checkout: "
+                f"{(apply.stderr or b'').decode('utf-8', 'replace').strip()}"
             )
     return checkout_root, checkout
 

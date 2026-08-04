@@ -1754,18 +1754,24 @@ def _preserve_evolution_orphan(
         commands.extend(("prepare", "commit"))
         transaction_error = ""
         for _attempt in range(2):
+            # BYTES stdin, deliberately not text mode: Python's text pipes translate
+            # \n to os.linesep, and on Windows git's --stdin parser rejects the
+            # resulting "start\r" as an unknown command — every transaction then
+            # silently degraded to the decomposed CAS fallback.
             proc = subprocess.run(
                 ["git", "update-ref", "--stdin"],
                 cwd=ctx.repo_dir,
-                input="\n".join(commands) + "\n",
-                text=True,
+                input=("\n".join(commands) + "\n").encode("utf-8"),
                 capture_output=True,
                 check=False,
             )
             if proc.returncode == 0:
                 transaction_error = ""
                 break
-            transaction_error = proc.stderr.strip() or "git update-ref transaction failed"
+            transaction_error = (
+                proc.stderr.decode("utf-8", "replace").strip()
+                or "git update-ref transaction failed"
+            )
 
         # A ref transaction is atomic, so a failed transaction can be decomposed into
         # individually verified CAS operations without risking a partial worktree reset.

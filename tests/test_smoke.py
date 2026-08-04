@@ -566,7 +566,7 @@ class TestPrePushGate:
     def test_pre_push_tests_timeout_is_sufficient(self):
         """The pre-push/post-commit pytest budget must be >= 180s.
 
-        Since v6.89.0 this is the TOTAL budget across BOTH preflight passes
+        Since v6.88.0 this is the TOTAL budget across BOTH preflight passes
         (parallel ``not serial``, then ``serial``, which gets the remainder).
         The full suite measures ~180s two-pass against ~470-510s for the old
         single serial pass, so a shorter cap produces false TESTS_FAILED on

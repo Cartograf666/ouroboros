@@ -956,7 +956,9 @@ def test_orphan_ref_transaction_failure_falls_back_to_safe_ref_cas(tmp_path, mon
 
     def _fail_transactions(cmd, *args, **kwargs):
         if cmd[:3] == ["git", "update-ref", "--stdin"]:
-            return subprocess.CompletedProcess(cmd, 1, "", "injected transaction failure")
+            # BYTES streams: the transaction call deliberately runs in binary mode
+            # (text-mode pipes CRLF-mangle --stdin commands on Windows).
+            return subprocess.CompletedProcess(cmd, 1, b"", b"injected transaction failure")
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(git_tools.subprocess, "run", _fail_transactions)
