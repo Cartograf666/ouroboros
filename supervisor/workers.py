@@ -1283,6 +1283,7 @@ def _emit_task_done_terminal(
     reserved_usd: float = 0.0,
     unresolved_upper_bound_usd: float = 0.0,
     unknown_unmetered: int = 0,
+    non_final_rows: int = 0,
     cost_accounting_error: str = "",
     ledger_integrity_degraded: bool = False,
 ) -> bool:
@@ -1292,7 +1293,11 @@ def _emit_task_done_terminal(
 
     Cost fields carry reconstructed totals so an evolution campaign tally fed
     from this terminal event records real spend instead of zeros; callers that
-    have no reconstructed cost leave them at 0."""
+    have no reconstructed cost leave them at 0.
+
+    The keyword list must accept every key of ``reconstruct_task_cost(fields=True)``:
+    three call sites below splat that projection whole, so a key this signature
+    cannot bind is a TypeError on a real teardown path, not a dropped field."""
     if not task_id:
         return False
     try:
@@ -1318,6 +1323,9 @@ def _emit_task_done_terminal(
                 "reserved_usd": reserved_usd,
                 "unresolved_upper_bound_usd": unresolved_upper_bound_usd,
                 "unknown_unmetered": unknown_unmetered,
+                # cost_final's DISCLOSED CAUSE travels with the flag, exactly as
+                # the normal task_done producer emits it (events.py **terminal_cost).
+                "non_final_rows": non_final_rows,
             })
         get_event_q().put({
             "type": "task_done",

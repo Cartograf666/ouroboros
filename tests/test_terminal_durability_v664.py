@@ -2,24 +2,31 @@
 
 from __future__ import annotations
 
+import inspect
+import pathlib
+import tempfile
 from types import SimpleNamespace
 
 import pytest
 
 
 def _available_cost_fields(*, calls: int = 0, degraded: bool = False) -> dict:
-    return {
-        "cost_accounting_status": "available",
-        "cost_usd": 0.0,
-        "total_rounds": calls,
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "cost_final": True,
-        "reserved_usd": 0.0,
-        "unresolved_upper_bound_usd": 0.0,
-        "unknown_unmetered": 0,
-        "ledger_integrity_degraded": degraded,
-    }
+    """The REAL projection over an empty ledger, not a hand-copied mirror of it.
+
+    This used to be a ten-key dict literal. It was the reason a projection key
+    the terminal emitter could not bind stayed invisible in a green suite: every
+    test that reached the emitter substituted this stale copy for the real
+    `reconstruct_task_cost`, so the shape under test was the one the test author
+    remembered rather than the one production builds."""
+    from supervisor.state import reconstruct_task_cost
+
+    fields = reconstruct_task_cost(
+        "no-such-task", fields=True, drive_root=pathlib.Path(tempfile.mkdtemp()),
+    )
+    assert fields["cost_accounting_status"] == "available"
+    fields["total_rounds"] = calls
+    fields["ledger_integrity_degraded"] = degraded
+    return fields
 
 
 def test_headless_worker_crash_emits_task_done_without_main_chat_reroute(tmp_path, monkeypatch):
@@ -425,3 +432,154 @@ def test_reaper_suppresses_retry_when_terminal_result_write_fails(tmp_path, monk
     assert len(terminal) == 1
     assert terminal[0]["task_id"] == "retry-needs-terminal"
     assert terminal[0]["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# The projection/consumer seam.
+#
+# Three times in this range a key was added to a cost projection and a consumer
+# that could not carry it was missed. The suite stayed green each time because
+# every test that reached a consumer handed it a HAND-WRITTEN dict, so no test
+# ever asked whether the object the consumer receives in production is an object
+# the consumer can accept. These drive the real functions with the real
+# projection instead.
+# ---------------------------------------------------------------------------
+
+
+def _real_projection(tmp_path):
+    from supervisor.state import reconstruct_task_cost
+
+    projection = reconstruct_task_cost("no-such-task", fields=True, drive_root=tmp_path)
+    assert projection["cost_accounting_status"] == "available"
+    return projection
+
+
+def test_every_splat_consumer_binds_the_real_cost_projection(tmp_path):
+    """`reconstruct_task_cost(fields=True)` is splatted whole into these callables.
+
+    A key the callee's signature cannot bind is a TypeError on a live teardown
+    path, not a dropped field -- and on the budget-stop path it is a SILENT one,
+    swallowed by a try/except that then never removes the task from PENDING."""
+    from ouroboros.task_results import write_task_result
+    from supervisor.workers import _emit_task_done_terminal
+
+    projection = _real_projection(tmp_path)
+    unbindable = {}
+    for name, fn, leading in (
+        ("_emit_task_done_terminal", _emit_task_done_terminal, (None, "t1", "failed")),
+        ("write_task_result", write_task_result, (tmp_path, "t1", "failed")),
+    ):
+        try:
+            inspect.signature(fn).bind(*leading, **projection)
+        except TypeError as exc:
+            unbindable[name] = str(exc)
+    assert unbindable == {}, (
+        "a consumer cannot bind the projection its call site splats into it: "
+        f"{unbindable}"
+    )
+
+
+def _install_supervisor(tmp_path, monkeypatch):
+    from supervisor import queue, state, workers
+
+    state.init(tmp_path, total_budget_limit=10.0)
+    queue.init(tmp_path, 600, 1800)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
+    workers.PENDING[:] = []
+    workers.RUNNING.clear()
+    workers.WORKERS.clear()
+    queue.BUDGET_ROOT_FENCES.clear()
+    queue.init_queue_refs(workers.PENDING, workers.RUNNING, workers.QUEUE_SEQ_COUNTER_REF)
+    events = []
+    monkeypatch.setattr(workers, "get_event_q", lambda: SimpleNamespace(put=events.append))
+    monkeypatch.setattr(workers, "send_with_budget", lambda *_a, **_k: None)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    return queue, state, workers, events
+
+
+def test_budget_stop_terminalizes_instead_of_stranding_the_task(tmp_path, monkeypatch):
+    """The silent one: the emitter call sits immediately before
+    `terminal_ids.append`, inside a try/except that only logs. A raise there
+    leaves the durable row `failed` while the task stays in PENDING forever --
+    the card spins, every later tick re-plans it, and a budget top-up dispatches
+    a task whose result already says failed."""
+    from supervisor import state as state_mod
+
+    _queue, _state, workers, events = _install_supervisor(tmp_path, monkeypatch)
+    monkeypatch.setattr(workers, "load_state", lambda: {"owner_chat_id": 0})
+    monkeypatch.setattr(state_mod, "budget_remaining", lambda _st, **_kw: 0.0)
+    # A retry lineage is not replay-safe, which is what selects the terminal branch.
+    workers.PENDING.append({"id": "stopped-task", "type": "task", "chat_id": 0, "_attempt": 2})
+
+    workers.assign_tasks()
+
+    assert workers.PENDING == [], "task stranded in PENDING: the terminal projection raised"
+    terminal = [event for event in events if event.get("type") == "task_done"]
+    assert len(terminal) == 1
+    assert terminal[0]["task_id"] == "stopped-task"
+    assert terminal[0]["reason_code"] == "budget_exhausted"
+    assert "non_final_rows" in terminal[0]
+
+
+class _DeadProc:
+    exitcode = 0
+
+    @staticmethod
+    def is_alive():
+        return False
+
+    @staticmethod
+    def join(timeout=None):
+        del timeout
+
+
+def _crashed_worker(monkeypatch, workers, task):
+    workers.WORKERS[0] = SimpleNamespace(
+        wid=0, busy_task_id=task["id"], proc=_DeadProc(), reaping=False,
+    )
+    workers.RUNNING[task["id"]] = {
+        "task": task, "started_at": 1.0, "last_heartbeat_at": 1.0, "attempt": 1,
+    }
+    monkeypatch.setattr(workers, "QUEUE_MAX_RETRIES", 3)
+    monkeypatch.setattr(workers, "_LAST_SPAWN_TIME", 0)
+    monkeypatch.setattr(workers, "CRASH_TS", [])
+    monkeypatch.setattr(workers, "respawn_worker", lambda _wid: None)
+    monkeypatch.setattr("ouroboros.tools.services.archive_task_service_logs", lambda *_a, **_k: None)
+
+
+def test_evolution_stop_cleanup_finishes_the_health_sweep(tmp_path, monkeypatch):
+    """Uncaught: a raise propagates out of `_ensure_workers_healthy_locked`
+    mid-sweep, so this tick's respawns and the crash-storm bookkeeping below it
+    are lost and the cancelled task never gets its terminal event."""
+    _queue, _state, workers, events = _install_supervisor(tmp_path, monkeypatch)
+    task = {"id": "evo-task", "type": "evolution", "chat_id": 0, "_attempt": 1}
+    _crashed_worker(monkeypatch, workers, task)
+    monkeypatch.setattr(workers, "load_state", lambda: {"evolution_mode_enabled": False})
+
+    workers.ensure_workers_healthy()
+
+    terminal = [event for event in events if event.get("type") == "task_done"]
+    assert len(terminal) == 1, f"health sweep aborted before emitting: {events}"
+    assert terminal[0]["task_id"] == "evo-task"
+    assert terminal[0]["status"] == "cancelled"
+    assert "non_final_rows" in terminal[0]
+
+
+def test_admission_blocked_crash_retry_finishes_the_health_sweep(tmp_path, monkeypatch):
+    """Same uncaught propagation on the crash-retry admission fence."""
+    queue, _state, workers, events = _install_supervisor(tmp_path, monkeypatch)
+    task = {"id": "blocked-task", "type": "task", "chat_id": 0, "_attempt": 1}
+    _crashed_worker(monkeypatch, workers, task)
+    monkeypatch.setattr(workers, "load_state", lambda: {})
+    monkeypatch.setattr(
+        queue, "enqueue_task", lambda *_a, **_k: {"_admission_blocked": "root_budget_fence"},
+    )
+
+    workers.ensure_workers_healthy()
+
+    terminal = [event for event in events if event.get("type") == "task_done"]
+    assert len(terminal) == 1, f"health sweep aborted before emitting: {events}"
+    assert terminal[0]["task_id"] == "blocked-task"
+    assert terminal[0]["reason_code"] == "worker_crash_retry_admission_blocked"
+    assert "non_final_rows" in terminal[0]
