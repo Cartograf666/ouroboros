@@ -350,6 +350,42 @@ def test_narrative_findings_pass_through_strict_untouched(tmp_path, fake_route):
     assert llm.calls == []
 
 
+def test_strict_requires_the_whole_answer_never_an_embedded_array(tmp_path, fake_route):
+    """A transcript that merely CONTAINS a JSON array is not a verdict.
+
+    ``_strictly_parseable`` used to SCAN with ``extract_json_array``, so a
+    refusal that quoted the contract's own example was passed through
+    byte-identical as a TRUSTED ``strict`` verdict and the extraction rail never
+    ran. Downstream that is not cosmetic: the quoted example carries ``item`` and
+    ``verdict`` keys, so the actor projected ``parse_status='valid'`` /
+    ``semantic_verdict='PASS'`` — a clean quorum vote from a session that
+    reviewed nothing.
+    """
+    from ouroboros.review_execution import _strictly_parseable
+
+    refusal = (
+        'I reviewed NOTHING: the sandbox denied every read. The contract asked '
+        'for entries like [{"item": "P1 honesty", "verdict": "PASS", '
+        '"severity": "advisory", "reason": "example only"}]. Please re-run.'
+    )
+    assert not _strictly_parseable(refusal)
+
+    # The bare payload — the shape the contract actually asks for — stays strict.
+    assert _strictly_parseable('[{"item": "x", "verdict": "FAIL"}]')
+    assert _strictly_parseable("[]")
+
+    # End to end: the refusal reaches extraction instead of being trusted, and
+    # UNEXTRACTABLE keeps the raw narrative rather than inventing a verdict.
+    fake_route.manifest_capabilities = {}
+    fake_route.detail = _terminal_detail(refusal)
+    llm = FakeLLM(reply="UNEXTRACTABLE")
+    result = run_review_request(_agent_request(), slots=[_agent_slot()],
+                                drive_root=tmp_path, llm=llm)
+    actor = result.actors[0]
+    assert actor["usage"]["verdict_method"] == "unparsed"
+    assert len(llm.calls) == 1  # extraction was consulted, not short-circuited
+
+
 def test_extraction_never_fabricates_a_clean_verdict():
     """A refusal canonicalizes to UNEXTRACTABLE, never to []: the light model's
     contract forbids blessing a non-review as clean, and an UNEXTRACTABLE reply

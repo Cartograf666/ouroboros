@@ -480,6 +480,17 @@ def _python_write_targets_and_unknown(inline_code: str) -> tuple[list[str], bool
             "write_text", "write_bytes", "unlink", "rename", "replace", "mkdir", "rmdir",
             "touch",
         }:
+            if isinstance(func.value, ast.Constant):
+                # `'a,b'.replace(',', ';')` is str.replace, not Path.replace. A bare
+                # literal receiver has no filesystem method at all, so there is no
+                # such thing as a repo write via `'a,b'.replace` — crediting one
+                # refused ordinary text one-liners (`.replace` is the most common
+                # string method in Python) with a security message whose advice
+                # ("move your cwd") the agent could not connect to the cause. The
+                # module already draws exactly this receiver line for the other
+                # ambiguous spellings (`shutil.copy` is a write, `some_dict.copy()`
+                # is not); `replace`/`rename` had simply never been held to it.
+                continue
             target = _python_literal_path(func.value, names)
             if target is None:
                 unknown = True
@@ -517,6 +528,12 @@ def _python_write_targets_and_unknown(inline_code: str) -> tuple[list[str], bool
         elif isinstance(func, ast.Attribute) and func.attr in {
             "remove", "unlink", "makedirs", "mkdir", "rmdir", "removedirs", "rmtree",
         }:
+            first = node.args[0] if node.args else None
+            if isinstance(first, ast.Constant) and not isinstance(first.value, (str, bytes)):
+                # `d.remove(1)` is list.remove. A non-string literal is not an
+                # UNRESOLVABLE path (which would rightly be UNKNOWN) — it is not a
+                # path at all, so the conservative fallback never should have fired.
+                continue
             target = _python_literal_path(node.args[0], names) if node.args else None
             if target is None:
                 unknown = True
@@ -1240,20 +1257,31 @@ def light_shell_repo_mutation(
     # (XG-7B3.1 r2): the fence asks "can I prove this cannot write into the repo?"
     # and blocks when it cannot. Chasing write spellings was whack-a-mole by
     # construction — no token list can prove the ABSENCE of a write in arbitrary
-    # code, and two holes outlived that enumeration (`node -e "eval(process.env.C)"`,
-    # `python -c "exec(open(...).read())"`). Only python can answer the proof, by
-    # parsing; that is what keeps the v6.54.3 read allowance (whose FP evidence was
-    # python scripts opening their own staged attachment). Everything else — other
-    # families, unknown flags, unparseable or computed payloads — is WRITE-CAPABLE.
+    # code, and two holes outlived that enumeration. The inversion closes ONE of them:
+    # `python -c "exec(open(...).read())"` is unprovable and therefore refused. Only
+    # python can answer the proof, by parsing; that is what keeps the v6.54.3 read
+    # allowance (whose FP evidence was python scripts opening their own staged
+    # attachment). Everything else — other families, unknown flags, unparseable or
+    # computed payloads — is WRITE-CAPABLE.
     # Scan side only: advanced/pro is untouched. A SCRIPT or module invocation
     # (`python -m pytest`) hands nothing inline and is not judged here.
     #
-    # The COST, stated at full size rather than at its most flattering: a non-python
-    # inline invocation that NAMES a repo path is refused even for reading. It is not
-    # refused otherwise — the resolved-cwd half of `_dynamic_write_could_hit_repo`
-    # stays python-only, because the default shell cwd IS the system repository and
-    # applying it to every family refused ordinary `node -e`/`ruby -e` work that
-    # provably writes elsewhere or only reads.
+    # The COST, stated at full size rather than at its most flattering:
+    #  * A non-python inline invocation that names the repo by an ABSOLUTE path, or by
+    #    a `./`- or `../`-prefixed relative one, is refused even for reading. It is not
+    #    refused otherwise — the resolved-cwd half of `_dynamic_write_could_hit_repo`
+    #    stays python-only, because the default shell cwd IS the system repository and
+    #    applying it to every family refused ordinary `node -e`/`ruby -e` work that
+    #    provably writes elsewhere or only reads.
+    #  * A PLAIN relative spelling is INVISIBLE to this branch. The mention scan is
+    #    `embedded_absolute_path_tokens` + `EMBEDDED_RELATIVE_PATH_RE`, and that regex
+    #    anchors on `./`/`../`, so `node -e "…('ouroboros/safety.py')"` names the repo
+    #    to a reader but not to the scan and RUNS — for a write as much as for a read.
+    #    Disclosed, not closed: widening the regex would be a strengthening.
+    #  * The OTHER hole named above, `node -e "eval(process.env.C)"`, stays OPEN — a
+    #    non-python payload the parser cannot read, naming no repo path, runs even
+    #    with the cwd in the repo. `test_unparseable_interpreter_code_is_treated_as_
+    #    write_capable` pins it as `is False` so it cannot be re-tightened by accident.
     if detect_interpreter_inline and interpreter_family(executable):
         inline = shell_command_string(argv) or " ".join(argv[1:])
         bodies = interpreter_inline_code(argv)

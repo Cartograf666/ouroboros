@@ -278,8 +278,11 @@ def test_unparseable_interpreter_code_is_treated_as_write_capable(tmp_path):
 
     For PYTHON the fence asks whether it can PROVE the code cannot write into the
     repo and refuses when it cannot. For every other family the owner approved a
-    NARROWER rule — refused only when the code NAMES a repo path, even for reading —
-    so an unprovable non-python payload that names no repo path RUNS. Both halves are
+    NARROWER rule — refused only when the code names the repo by an ABSOLUTE path or
+    a `./`/`../`-prefixed relative one, even for reading — so an unprovable non-python
+    payload that does not name the repo in one of those spellings RUNS. A PLAIN
+    relative spelling (`ouroboros/safety.py`) is not one of them: `EMBEDDED_RELATIVE_
+    PATH_RE` anchors on `./`/`../`, so it is invisible to the scan. Both halves are
     pinned here, because the second one is a disclosed hole, not an oversight."""
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -506,11 +509,17 @@ def test_legitimate_deliverable_writes_stay_allowed(tmp_path):
 
 def test_the_price_of_the_inversion_is_named(tmp_path):
     """The narrowing the inverted default costs, pinned so it is a DECISION and not a
-    surprise: a NON-python inline invocation that names a repo path is refused in light
-    mode even when it only reads, because nothing here can prove a regex-described
-    read is a read. Python is unaffected (it is really parsed), the drive/user_files
-    roots are unaffected, `read_file` remains the gated read path for every family,
-    and advanced/pro mode is untouched — this fence only exists in light mode.
+    surprise: a NON-python inline invocation that names the repo by an ABSOLUTE path
+    (or a `./`/`../`-prefixed relative one) is refused in light mode even when it only
+    reads, because nothing here can prove a regex-described read is a read. Python is
+    unaffected (it is really parsed), the drive/user_files roots are unaffected,
+    `read_file` remains the gated read path for every family, and advanced/pro mode is
+    untouched — this fence only exists in light mode.
+
+    The cost does NOT extend to a plain relative spelling: `EMBEDDED_RELATIVE_PATH_RE`
+    anchors on `./`/`../`, so `node -e "…('pkg/mod.py')"` is invisible to the scan and
+    runs. That is pinned below as a disclosed hole, not corrected — widening the regex
+    would be a strengthening.
 
     If this assertion ever needs to flip, the honest fix is a real parser for that
     family, not another write-token list."""
@@ -533,6 +542,25 @@ def test_the_price_of_the_inversion_is_named(tmp_path):
         ["python3.11", "-c", f"print(open('{repo}/x.py').read())"],
         repo_dir=repo, cwd=str(outside), work_dir=outside,
     ) is False
+
+    # DISCLOSED HOLE, pinned so the claim above stays honest: "names a repo path"
+    # means ABSOLUTE or `./`/`../`-prefixed. `EMBEDDED_RELATIVE_PATH_RE` anchors on
+    # those prefixes, so a PLAIN relative spelling is invisible to the scan and runs
+    # even with the cwd in the repo — for a write as much as for a read. Every other
+    # pin in this file happens to use an absolute path, which is why the generalized
+    # wording went unmeasured. Widening the regex would be a strengthening; the text
+    # was corrected instead.
+    for code in ("require('fs').writeFileSync('pkg/mod.py','x')",
+                 "require('fs').readFileSync('pkg/mod.py')"):
+        assert light_shell_repo_mutation(
+            ["node", "-e", code], repo_dir=repo, cwd=str(repo), work_dir=repo,
+        ) is False, code
+    # ...while the `./`-prefixed spelling of the SAME path is seen and refused.
+    for code in ("require('fs').writeFileSync('./pkg/mod.py','x')",
+                 "require('fs').readFileSync('./pkg/mod.py')"):
+        assert light_shell_repo_mutation(
+            ["node", "-e", code], repo_dir=repo, cwd=str(repo), work_dir=repo,
+        ) is True, code
 
 
 # ---------------------------------------------------------------------------
@@ -634,3 +662,44 @@ def test_the_vocabulary_repair_does_not_widen_past_the_regex(tmp_path):
         assert light_shell_repo_mutation(
             ["python3.11", "-c", code], repo_dir=repo, cwd=str(repo), work_dir=repo,
         ) is False, code
+
+
+def test_builtin_replace_and_remove_are_not_filesystem_writes(tmp_path):
+    """`.replace`/`.rename`/`.remove` were credited as writes on ANY receiver.
+
+    `.replace` is the most common string method in Python, so in light mode an
+    ordinary text one-liner was refused with a security message telling the agent
+    to move its cwd — advice it cannot connect to the cause. There is no such
+    thing as a repo write via `'a,b'.replace`, so this was a pure over-block with
+    no security gain. Same receiver discrimination the module already applies to
+    `shutil.copy` vs `some_dict.copy()`.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for code in (
+        "print('a,b'.replace(',', ';'))",
+        "d = [1, 2]; d.remove(1); print(d)",
+        "print('a-b'.replace('-', '_').upper())",
+    ):
+        assert _python_write_targets_and_unknown(code) == ([], False), code
+        assert light_shell_repo_mutation(
+            ["python3.11", "-c", code], repo_dir=repo, cwd=str(repo), work_dir=repo,
+        ) is False, code
+
+    # ...and the GENUINE path writes those same spellings also name are still refused.
+    # The walker resolves the receiver-is-a-path forms to a literal target; the
+    # `os.replace`/`os.rename` forms read their receiver (`os`) and answer UNKNOWN,
+    # which the fence resolves through `_dynamic_write_could_hit_repo`. Either way the
+    # one invariant that matters is that NEITHER is ever a proven read.
+    for code in (
+        "import pathlib; pathlib.Path('pkg/mod.py').replace('other.py')",
+        "import pathlib; pathlib.Path('pkg/mod.py').rename('other.py')",
+        "import os; os.replace('pkg/mod.py', 'other.py')",
+        "import os; os.rename('pkg/mod.py', 'other.py')",
+        "import os; os.remove('pkg/mod.py')",
+    ):
+        targets, unknown = _python_write_targets_and_unknown(code)
+        assert targets or unknown, code  # never `([], False)` — a proven read
+        assert light_shell_repo_mutation(
+            ["python3.11", "-c", code], repo_dir=repo, cwd=str(repo), work_dir=repo,
+        ) is True, code

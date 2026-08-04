@@ -473,12 +473,26 @@ def _strictly_parseable(text: str) -> bool:
     contract is passed through byte-identical, and the constitutional
     ``empty_array_is_verified_clean`` predicate stays untouched — its strictness
     is the reason extraction exists, not a defect extraction papers over.
+
+    The WHOLE answer must BE the payload. This used to SCAN with
+    ``extract_json_array``, so any JSON array of objects appearing anywhere in a
+    transcript made it "strict" — a refusal that quoted the contract's own
+    example ("I reviewed NOTHING. The contract asked for entries like
+    [{"item": ..., "verdict": "PASS", ...}]") was passed through byte-identical
+    as a TRUSTED verdict, and the extraction rail that exists precisely to
+    canonicalize a non-verdict never ran. Requiring the whole text removes that
+    leniency; it matches the discipline ``empty_array_is_verified_clean``
+    already applies, and a narrative falls through to extraction, which is what
+    extraction is for.
     """
     body = str(text or "")
     if empty_array_is_verified_clean(body):
         return True
-    parsed = extract_json_array(body)
-    return bool(parsed) and all(isinstance(item, dict) for item in parsed)
+    try:
+        parsed = json.loads(body.strip())
+    except (TypeError, ValueError):
+        return False
+    return bool(parsed) and isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed)
 
 
 def canonicalize_session_verdict(
