@@ -23,9 +23,12 @@ const JOB_POLL_MS = 3000;
 // ---------------------------------------------------------------------------
 
 export function verificationBadge(profile) {
-    // Q2-а (recommendation A, pending owner confirmation): both statuses are
-    // shown honestly — vendor-verified is trusted, local-store presence is
-    // labeled "not verified", because the local status has lied before.
+    // Q2-а: both statuses are shown honestly — vendor-verified is trusted,
+    // local-store presence stays labeled "not verified live" in WORDS, but in
+    // a NEUTRAL tone (owner finding #2): the engine has no vendor probe for
+    // some harnesses (cursor), so a warning-toned "not verified" there is a
+    // permanent alarm nothing can clear — noise, not honesty. "local session"
+    // is the daemon's own name for the route (next_up.route).
     const status = profile?.status || profile || {};
     const source = String(status.verification_source || '');
     const verification = String(status.verification || '');
@@ -34,7 +37,7 @@ export function verificationBadge(profile) {
         return { tone: 'ok', label: `verified live${at ? ` ${at}` : ''}` };
     }
     if (verification === 'passed') {
-        return { tone: 'warn', label: 'logged in locally — not verified' };
+        return { tone: 'muted', label: 'local session — not verified live' };
     }
     if (verification) {
         return { tone: 'error', label: `verification ${verification}` };
@@ -177,8 +180,9 @@ export function accountRows(payload) {
             profile_id: '',
             kind: 'native',
             identity: native?.identity || {},
-            // The native/CLI login is local-store evidence at best: presence is
-            // detected, liveness is not (verification_source stays local_store).
+            // Both engine schema versions declare this row
+            // additionalProperties:false with NO status field, so presence
+            // projects as local-store evidence — detected, liveness unproven.
             status: {
                 verification: native?.native_login_detected ? 'passed' : '',
                 verification_source: 'local_store',
@@ -259,7 +263,7 @@ function rowHtml(row, payload) {
         ? `${row.harness} — default account`
         : `${row.harness} — ${row.profile_id}`;
     return `
-        <div class="settings-custom-secret-row harness-account-row${quota.exhausted ? ' harness-exhausted' : ''}" data-harness="${escapeHtml(row.harness)}" data-profile="${escapeHtml(row.profile_id)}">
+        <div class="harness-account-row${quota.exhausted ? ' harness-exhausted' : ''}" data-harness="${escapeHtml(row.harness)}" data-profile="${escapeHtml(row.profile_id)}">
             <div class="harness-account-main">
                 <span class="harness-chip" data-harness-chip="${escapeHtml(row.harness)}">${escapeHtml(row.harness)}</span>
                 <strong>${escapeHtml(name)}</strong>
@@ -309,7 +313,7 @@ function renderRows() {
     const parts = rows.map((row) => rowHtml(row, payload));
     for (const harness of bare) {
         parts.push(`
-            <div class="settings-custom-secret-row harness-account-row" data-harness="${escapeHtml(harness)}" data-profile="">
+            <div class="harness-account-row" data-harness="${escapeHtml(harness)}" data-profile="">
                 <div class="harness-account-main">
                     <span class="harness-chip" data-harness-chip="${escapeHtml(harness)}">${escapeHtml(harness)}</span>
                     <strong>${escapeHtml(harness)}</strong>
@@ -355,7 +359,9 @@ function renderLoginCard() {
     const summary = jobStateSummary(active.job || {});
     const disclosure = deviceCodeDisclosure(active.job || {});
     const face = loginCardFace(active);
-    const bits = [`<div class="panel-card harness-login-card" data-login-card>`,
+    // NOT .panel-card: that class lives in onboarding.css, which the settings
+    // pages never load — the card rendered with no frame at all (finding #4).
+    const bits = [`<div class="harness-login-card" data-login-card>`,
         `<h4>Connect ${escapeHtml(active.harness)}${active.profile ? ` (${escapeHtml(active.profile)})` : ''}</h4>`];
     if (face === 'error') {
         bits.push(`<div class="settings-inline-note" data-tone="error">${escapeHtml(active.error)}</div>`);

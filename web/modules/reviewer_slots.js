@@ -1,16 +1,17 @@
-// Reviewer slots UI (phase 6.2/6.3) — the Models-page rows over the ONE
-// structured setting (OUROBOROS_REVIEWER_SLOTS).
+// Reviewer slots UI (phase 6.2/6.3, revised per owner finding #6) — the
+// Models-page rows over the ONE structured setting (OUROBOROS_REVIEWER_SLOTS).
 //
-// Shape rules are the owner's, verbatim:
-//  * ONE GROUPED combobox per slot encodes both the route kind and the target
-//    — an API model, or a coding-agent harness. No separate "API or harness"
-//    switch, no second target picker, no invalid combinations.
+// Shape rules are the owner's:
+//  * The ROUTE select carries routes only: "API model" plus one entry per
+//    login-capable harness — never the full flat model catalog (hundreds of
+//    options made the list unusable, finding #6).
+//  * On the API route the model id is a FREE-TEXT input with a datalist of
+//    catalog suggestions — the same catalog-assisted entry the model cards
+//    use. On a harness route the MODEL is a dropdown fed by Claudexor
+//    discovery. No invalid combinations can be composed.
 //  * The provider shown for a delegated row is the HARNESS NAME (codex,
 //    claude, cursor, …) — never "Claudexor", and never a `provider::model`
 //    string syntax.
-//  * When a harness is selected the MODEL is a dropdown fed by Claudexor
-//    discovery, not free input. API model ids keep the existing free entry
-//    (catalog-assisted) the model cards already use.
 //  * Effort is the EXISTING per-model effort mechanism, one dropdown per row.
 // Capability badges DISPLAY facts; they configure nothing.
 //
@@ -21,7 +22,10 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
 export const ROUTE_KIND_API = 'api_chat';
 export const ROUTE_KIND_SESSION = 'agent_session';
-export const CUSTOM_API_CHOICE = 'api:__custom__';
+// The route select's single API entry. The target model id never lives in
+// the select — display always matches the stored target (finding #6c: a
+// fresh row used to DISPLAY the first catalog model while storing '').
+export const API_ROUTE_CHOICE = 'api';
 
 export const EFFORT_CHOICES = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -44,7 +48,7 @@ export function encodeRouteChoice(row) {
     if (kind === ROUTE_KIND_SESSION) {
         return `session:${splitSessionTarget(target).harness}`;
     }
-    return `api:${target}`;
+    return API_ROUTE_CHOICE;
 }
 
 export function decodeRouteChoice(value) {
@@ -52,9 +56,9 @@ export function decodeRouteChoice(value) {
     if (raw.startsWith('session:')) {
         return { kind: ROUTE_KIND_SESSION, harness: raw.slice('session:'.length) };
     }
-    if (raw === CUSTOM_API_CHOICE) return { kind: ROUTE_KIND_API, custom: true };
-    if (raw.startsWith('api:')) return { kind: ROUTE_KIND_API, target: raw.slice('api:'.length) };
-    return { kind: ROUTE_KIND_API, target: raw };
+    // Every non-session choice is the API route; the target comes from the
+    // free-text input beside the select, never from the choice value.
+    return { kind: ROUTE_KIND_API };
 }
 
 // Claudexor's own reviewer-panel spelling: harness[=model]. Never '::'.
@@ -71,16 +75,7 @@ export function splitSessionTarget(target) {
     return { harness: raw.slice(0, eq), model: raw.slice(eq + 1) };
 }
 
-export function routeChoiceGroups({ catalogModels = [], harnesses = [], currentApiTargets = [] } = {}) {
-    const apiValues = [];
-    const seen = new Set();
-    for (const model of [...currentApiTargets, ...catalogModels]) {
-        const id = String(model || '').trim();
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
-        apiValues.push({ value: `api:${id}`, label: id });
-    }
-    apiValues.push({ value: CUSTOM_API_CHOICE, label: 'API model — enter id…' });
+export function routeChoiceGroups({ harnesses = [], currentChoice = '' } = {}) {
     const sessionValues = (harnesses || [])
         .filter((h) => h && h.id)
         .map((h) => ({
@@ -90,7 +85,17 @@ export function routeChoiceGroups({ catalogModels = [], harnesses = [], currentA
             label: `${h.display_name || h.id} (coding agent)`,
             disabled: h.status && h.status !== 'ok' && !h.enabled,
         }));
-    const groups = [{ label: 'API models', options: apiValues }];
+    // A SAVED session route whose harness discovery no longer lists (daemon
+    // down, signed out) must keep an option, or the browser silently redraws
+    // the row as the first choice — same rule as profileOptionsFor.
+    const savedChoice = String(currentChoice || '');
+    if (savedChoice.startsWith('session:') && !sessionValues.some((o) => o.value === savedChoice)) {
+        sessionValues.push({
+            value: savedChoice,
+            label: `${savedChoice.slice('session:'.length)} (not in discovery)`,
+        });
+    }
+    const groups = [{ label: 'API', options: [{ value: API_ROUTE_CHOICE, label: 'API model' }] }];
     // With no daemon the group used to VANISH, while the section copy above still
     // promised subscription delivery — the owner saw a broken promise and nowhere
     // to go. Say why it is empty instead of hiding it. Name the DESTINATION by
@@ -198,6 +203,36 @@ export function capabilityBadge(row, harnessesById) {
     return 'api pack delivery';
 }
 
+export function advisoryRouteTransition(prev, decoded, memory = {}) {
+    // Route-kind switching must not WIPE a stored target (finding #7c): the
+    // old handler wrote target_id:'' on every change, so flipping to a
+    // session and back — or just touching the select — silently discarded the
+    // saved advisory target on the next Save. Each kind remembers the last
+    // route it held; a kind the user returns to is restored, and the stored
+    // route only changes when the user actually picks something else.
+    const current = (prev && typeof prev === 'object' && prev.kind)
+        ? prev : { kind: 'api', target_id: '' };
+    const next = { ...memory };
+    if (decoded.kind === ROUTE_KIND_SESSION) {
+        const prevHarness = current.kind === ROUTE_KIND_SESSION
+            ? splitSessionTarget(current.target_id).harness : '';
+        if (prevHarness === decoded.harness) return { route: current, memory: next };
+        if (current.kind === ROUTE_KIND_SESSION) next.session = { ...current };
+        else next.api = { ...current };
+        const stash = next.session;
+        const route = (stash && splitSessionTarget(stash.target_id).harness === decoded.harness)
+            ? { ...stash }
+            : { kind: ROUTE_KIND_SESSION, target_id: decoded.harness };
+        return { route, memory: next };
+    }
+    if (current.kind !== ROUTE_KIND_SESSION) return { route: current, memory: next };
+    next.session = { ...current };
+    return {
+        route: next.api ? { ...next.api } : { kind: 'api', target_id: '' },
+        memory: next,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // DOM section (Models page). State is module-local; collect is synchronous.
 // ---------------------------------------------------------------------------
@@ -218,6 +253,10 @@ const state = {
     onChange: () => {},
 };
 
+// Per-kind memory for the advisory route select (see advisoryRouteTransition):
+// seeded from the LOADED setting so a kind round-trip restores the saved target.
+const advisoryRouteMemory = { api: null, session: null };
+
 export function renderReviewerSlotsSection() {
     return `
         <div class="form-section" id="reviewer-slots-section">
@@ -232,12 +271,17 @@ export function renderReviewerSlotsSection() {
                 default models and spend API budget — keep at least one API row to avoid it.
             </div>
             <div id="reviewer-slots-error" class="ui-status" data-tone="error" hidden></div>
+            <datalist id="reviewer-api-model-catalog"></datalist>
             <h4 class="reviewer-slots-heading">Triad slots <span class="muted" id="reviewer-triad-limit"></span></h4>
             <div id="reviewer-triad-rows" class="reviewer-slot-rows"></div>
-            <button type="button" class="settings-ghost-btn" id="btn-add-triad-slot">Add triad slot</button>
+            <div class="settings-toolbar">
+                <button type="button" class="settings-ghost-btn" id="btn-add-triad-slot">Add triad slot</button>
+            </div>
             <h4 class="reviewer-slots-heading">Scope slots <span class="muted" id="reviewer-scope-limit"></span></h4>
             <div id="reviewer-scope-rows" class="reviewer-slot-rows"></div>
-            <button type="button" class="settings-ghost-btn" id="btn-add-scope-slot">Add scope slot</button>
+            <div class="settings-toolbar">
+                <button type="button" class="settings-ghost-btn" id="btn-add-scope-slot">Add scope slot</button>
+            </div>
             <h4 class="reviewer-slots-heading">Advisory pre-reviewer</h4>
             <div id="reviewer-advisory-row" class="reviewer-slot-rows"></div>
             <div class="settings-inline-note">
@@ -277,11 +321,7 @@ function effortSelectHtml(attrs, selected, surfaceDefault) {
 
 function rowHtml(row, group) {
     const choice = encodeRouteChoice(row);
-    const groups = routeChoiceGroups({
-        catalogModels: state.catalogModels,
-        harnesses: state.harnesses,
-        currentApiTargets: row.route.kind === ROUTE_KIND_API ? [row.route.target_id] : [],
-    });
+    const groups = routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice });
     const session = row.route.kind === ROUTE_KIND_SESSION;
     const split = session ? splitSessionTarget(row.route.target_id) : { harness: '', model: '' };
     const harness = session ? harnessesById()[split.harness] : null;
@@ -299,7 +339,7 @@ function rowHtml(row, group) {
         <div class="reviewer-slot-row" data-slot-group="${group}" data-slot-id="${escapeHtml(row.slot_id)}">
             <div class="reviewer-slot-controls">
                 ${selectHtml(`data-slot-route aria-label="Reviewer route"`, groups, choice)}
-                ${row._customApi ? `<input data-slot-custom-api placeholder="provider/model-id" value="${escapeHtml(row.route.target_id || '')}" spellcheck="false">` : ''}
+                ${session ? '' : `<input data-slot-custom-api list="reviewer-api-model-catalog" placeholder="provider/model-id" value="${escapeHtml(row.route.target_id || '')}" spellcheck="false" aria-label="API model id">`}
                 ${session ? selectHtml('data-slot-model aria-label="Harness model"', [{ label: '', options: modelOptions }], split.model) : ''}
                 ${session && profileOptions.length > 1 ? selectHtml('data-slot-profile aria-label="Credential account"', [{ label: '', options: profileOptions }], row.route.profile_id || '') : ''}
                 ${effortSelectHtml('data-slot-effort aria-label="Reasoning effort"', row.effort, surfaceDefault)}
@@ -314,11 +354,15 @@ function rowHtml(row, group) {
 function advisoryHtml() {
     const advisory = state.advisory;
     const session = advisory.route?.kind === ROUTE_KIND_SESSION;
+    const choice = session
+        ? `session:${splitSessionTarget(advisory.route.target_id).harness}`
+        : API_ROUTE_CHOICE;
+    // Both optgroups are labeled (finding #7): an unlabeled first group made
+    // the API entry read as stray next to the labeled subscriptions group.
     const groups = [
-        { label: '', options: [{ value: 'api:', label: 'Claude (Anthropic API key)' }] },
-        ...routeChoiceGroups({ catalogModels: [], harnesses: state.harnesses }).slice(1),
+        { label: 'API', options: [{ value: API_ROUTE_CHOICE, label: 'Claude (Anthropic API key)' }] },
+        ...routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice }).slice(1),
     ];
-    const choice = session ? `session:${splitSessionTarget(advisory.route.target_id).harness}` : 'api:';
     return `
         <div class="reviewer-slot-row" data-advisory-row>
             <div class="reviewer-slot-controls">
@@ -326,6 +370,7 @@ function advisoryHtml() {
                 ${selectHtml('data-advisory-route aria-label="Advisory route"', groups, choice)}
                 ${effortSelectHtml('data-advisory-effort aria-label="Advisory effort"', advisory.effort === 'low' ? '' : advisory.effort, 'low')}
             </div>
+            <div class="reviewer-slot-meta muted">${escapeHtml(capabilityBadge({ route: advisory.route || {} }, harnessesById()))}</div>
             ${state.lastExecutions.advisory_slot_1 ? `<div class="reviewer-slot-runs-as muted" title="UI projection of capability_delta (D22)">Last run: ${escapeHtml(describeLastExecution(state.lastExecutions.advisory_slot_1))}</div>` : ''}
         </div>
     `;
@@ -352,6 +397,11 @@ function renderRows() {
     scopeBox.innerHTML = state.scope.map((row) => rowHtml(row, 'scope')).join('')
         || '<div class="muted">No scope slots configured.</div>';
     advisoryBox.innerHTML = advisoryHtml();
+    const datalist = document.getElementById('reviewer-api-model-catalog');
+    if (datalist) {
+        datalist.innerHTML = state.catalogModels
+            .map((id) => `<option value="${escapeHtml(id)}"></option>`).join('');
+    }
     const triadLimit = document.getElementById('reviewer-triad-limit');
     if (triadLimit) triadLimit.textContent = `(${state.triad.length}/${state.limits.triad} — the commit gate's real ceiling)`;
     const scopeLimit = document.getElementById('reviewer-scope-limit');
@@ -378,14 +428,15 @@ function bindRowEvents() {
         rowEl.querySelector('[data-slot-route]')?.addEventListener('change', (event) => {
             const decoded = decodeRouteChoice(event.target.value);
             if (decoded.kind === ROUTE_KIND_SESSION) {
-                row.route = { kind: ROUTE_KIND_SESSION, target_id: decoded.harness, profile_id: '' };
-                row._customApi = false;
-            } else if (decoded.custom) {
+                const prevHarness = row.route.kind === ROUTE_KIND_SESSION
+                    ? splitSessionTarget(row.route.target_id).harness : '';
+                if (prevHarness !== decoded.harness) {
+                    row.route = { kind: ROUTE_KIND_SESSION, target_id: decoded.harness, profile_id: '' };
+                }
+            } else if (row.route.kind !== ROUTE_KIND_API) {
+                // A session spec is not an API model id: the input starts
+                // empty (placeholder visible), display matching state.
                 row.route = { kind: ROUTE_KIND_API, target_id: '' };
-                row._customApi = true;
-            } else {
-                row.route = { kind: ROUTE_KIND_API, target_id: decoded.target };
-                row._customApi = false;
             }
             renderRows();
             state.onChange();
@@ -422,10 +473,10 @@ function bindRowEvents() {
             state.onChange();
         });
         advisoryEl.querySelector('[data-advisory-route]')?.addEventListener('change', (event) => {
-            const decoded = decodeRouteChoice(event.target.value);
-            state.advisory.route = decoded.kind === ROUTE_KIND_SESSION
-                ? { kind: ROUTE_KIND_SESSION, target_id: decoded.harness }
-                : { kind: 'api', target_id: '' };
+            const result = advisoryRouteTransition(
+                state.advisory.route, decodeRouteChoice(event.target.value), advisoryRouteMemory);
+            state.advisory.route = result.route;
+            Object.assign(advisoryRouteMemory, result.memory);
             renderRows();
             state.onChange();
         });
@@ -445,7 +496,6 @@ function addRow(group) {
         slot_id: mintSlotId(group === 'scope' ? 'scope' : 'triad', taken),
         route: { kind: ROUTE_KIND_API, target_id: '' },
         effort: '',
-        _customApi: true,
     });
     renderRows();
     state.onChange();
@@ -466,6 +516,10 @@ export async function reloadReviewerSlots() {
         state.advisory = data.advisory
             ? { ...data.advisory, route: { ...(data.advisory.route || {}) } }
             : state.advisory;
+        // Seed the per-kind route memory with the SAVED route, so switching
+        // the advisory select away and back restores it (finding #7c).
+        advisoryRouteMemory[state.advisory.route?.kind === ROUTE_KIND_SESSION ? 'session' : 'api']
+            = { ...(state.advisory.route || {}) };
         // The VIEW loaded even when the saved value is invalid — that is exactly the
         // state the owner repairs from, and treating it as "not loaded" made the
         // save drop the repair (see collectReviewerSlots).

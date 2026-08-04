@@ -38,6 +38,50 @@ log = logging.getLogger(__name__)
 _LOGIN_TRANSPORTS = ("", "client_pty")
 
 
+def _login_capable_harness_ids(rows: List[Dict[str, Any]]) -> "set | None":
+    """Harnesses whose manifest declares a ``native_session`` auth source.
+
+    That is the engine's own discriminator for "an account you LOG INTO"
+    (codex, claude, cursor). The raw-api/openrouter adapters authenticate with
+    an API key only — projecting them into the accounts panel gave them
+    "Log in" buttons no flow can honor, and leaked them into the reviewer
+    slots' subscriptions group. Read from ``/v2/harnesses`` because the
+    agent-capability catalog is a derived projection that drops the
+    manifest's auth block.
+
+    Returns ``None`` when the response carried ZERO readable manifests overall
+    — the answer succeeded but says nothing about auth, so callers must fail
+    open exactly like an unreachable read (a blip must not blank the panel).
+    Pure for unit tests."""
+    capable = set()
+    readable = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        manifest = row.get("manifest")
+        if not isinstance(manifest, dict):
+            continue
+        readable += 1
+        profile = manifest.get("capability_profile")
+        auth = profile.get("auth") if isinstance(profile, dict) else None
+        sources = auth.get("supported_sources") if isinstance(auth, dict) else None
+        if any(str(s) == "native_session" for s in sources or []):
+            capable.add(str(row.get("id") or ""))
+    return capable if readable else None
+
+
+def _account_row_visible(harness_id: str, row: Dict[str, Any], capable) -> bool:
+    """Account-surface row predicate: manifest-declared login capability OR the
+    daemon vouching an actual login on the row itself (``native_login_detected``)
+    — a harness with a null/unreadable manifest must not lose the account the
+    owner is really logged into. Deliberately NOT "keep all unknown-manifest
+    rows": that would resurrect raw-api (manifest-null on the live engine),
+    which is the exact leak this filter closes."""
+    if capable is None:
+        return True
+    return harness_id in capable or bool(row.get("native_login_detected"))
+
+
 def _status_payload(include_models: bool) -> Dict[str, Any]:
     from ouroboros.claudexor_daemon import get_owned_daemon, owned_config_dir
     from ouroboros.gateways.claudexor import (
@@ -62,9 +106,19 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
             gateway.handshake()
             payload["daemon"]["engine_version"] = gateway.engine_version
             catalog = gateway.agent_capabilities()
+            # Account surfaces show only harnesses with a login concept. On a
+            # transient manifest-read failure — or a successful read with zero
+            # readable manifests (the helper answers None) — fail OPEN
+            # (no filter): a blip must not blank the panel.
+            try:
+                capable = _login_capable_harness_ids(gateway.harnesses())
+            except ClaudexorUnavailable:
+                capable = None
             rows: List[Dict[str, Any]] = []
             for row in catalog.get("harnesses") or []:
                 if not isinstance(row, dict):
+                    continue
+                if not _account_row_visible(str(row.get("id") or ""), row, capable):
                     continue
                 projected = {
                     "id": str(row.get("id") or ""),
@@ -84,7 +138,37 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                         projected["models_error"] = exc.code
                 rows.append(projected)
             payload["harnesses"] = rows
-            payload["profiles"] = gateway.credential_profiles()
+            profiles = gateway.credential_profiles()
+            accounts = profiles.get("harnessAccounts") if isinstance(profiles, dict) else None
+            if capable is not None and isinstance(accounts, list):
+                # The daemon emits a native pseudo-row for EVERY adapter,
+                # including the API-key-only ones; same filter, same reason —
+                # but a vouched login (native_login_detected) keeps its row
+                # even when the manifest is unreadable.
+                profiles["harnessAccounts"] = [
+                    r for r in accounts
+                    if isinstance(r, dict)
+                    and _account_row_visible(str(r.get("harness_id") or ""), r, capable)
+                ]
+            wrappers = profiles.get("profiles") if isinstance(profiles, dict) else None
+            if capable is not None and isinstance(wrappers, list):
+                # Named credential-profile wrappers leak the same way: an
+                # api_key-kind profile registered for a non-loginable harness
+                # would render a fake-loginable account row. Keep a wrapper
+                # only for a login-capable harness OR one the daemon vouches a
+                # native login for among the pseudo-rows above.
+                vouched = {
+                    str(r.get("harness_id") or "")
+                    for r in (accounts if isinstance(accounts, list) else [])
+                    if isinstance(r, dict) and r.get("native_login_detected")
+                }
+                profiles["profiles"] = [
+                    w for w in wrappers
+                    if isinstance(w, dict)
+                    and isinstance(w.get("profile"), dict)
+                    and str(w["profile"].get("harness_id") or "") in (capable | vouched)
+                ]
+            payload["profiles"] = profiles
             payload["quota"] = gateway.quota_snapshots()
     except ClaudexorUnavailable as exc:
         payload["daemon"]["state"] = "unreachable"

@@ -5831,9 +5831,34 @@ textarea.chat-input {
    only the row's compact sizing is local. */
 .reviewer-slot-controls select,
 .reviewer-slot-controls input { min-width: 140px; max-width: 100%; width: auto; }
+/* API model ids are long (provider/model); give the free-entry room. */
+.reviewer-slot-controls input[data-slot-custom-api] { min-width: 240px; }
+/* The base .local-toggle carries padding-bottom:8px for form layouts; inside a
+   center-aligned control row that padding shoves the checkbox off-axis. The
+   row's generic input sizing above also hits the toggle's CHECKBOX (an input),
+   stretching an empty 140px box between the glyph and its label. */
+.reviewer-slot-controls .local-toggle { padding-bottom: 0; }
+.reviewer-slot-controls .local-toggle input[type="checkbox"] {
+    min-width: 0;
+    width: 14px;
+    padding: 0;
+}
 .reviewer-slot-meta { font-size: 12px; margin-top: 4px; }
 .reviewer-slot-runs-as { font-size: 12px; margin-top: 2px; font-style: italic; }
-.harness-account-row { align-items: center; }
+/* Account rows are purpose-built (identity left, actions right), not the
+   settings key/value grid — .settings-custom-secret-row's 0.65fr/1.35fr
+   columns inverted the proportions and its align-items:end sank the text. */
+.harness-account-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid var(--ui-card-border);
+    border-radius: var(--radius);
+    background: var(--ui-card-bg-soft);
+}
 .harness-account-main { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; flex: 1; }
 .harness-account-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .harness-chip {
@@ -5846,7 +5871,22 @@ textarea.chat-input {
     letter-spacing: 0.04em;
 }
 .harness-exhausted { opacity: 0.62; }
-.harness-login-card { margin-top: 8px; }
+/* The login card frames itself: .panel-card is an onboarding.css class the
+   settings pages never load, so leaning on it rendered a bare, frameless
+   card (finding #4). Same ui-card tokens as every other panel surface. */
+.harness-login-card {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 16px 18px;
+    border: 1px solid var(--ui-card-border);
+    border-radius: var(--radius);
+    background: var(--ui-card-bg);
+}
+.harness-login-card h4 { margin: 0; font-size: 14px; }
+.harness-login-card p { margin: 0; color: var(--text-secondary); font-size: 13px; line-height: 1.5; }
 .harness-device-code p { margin: 4px 0; }
 .harness-code {
     font-family: var(--mono, ui-monospace, monospace);
@@ -5863,7 +5903,7 @@ textarea.chat-input {
     font-size: 12px;
     padding: 8px 10px;
     border-radius: 8px;
-    background: rgba(127, 127, 127, 0.12);
+    background: var(--surface-control);
     overflow-x: auto;
     user-select: all;
     white-space: pre-wrap;

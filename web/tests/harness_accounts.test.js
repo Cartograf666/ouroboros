@@ -22,9 +22,12 @@ const CREDENTIAL_PROFILES_RESPONSE = JSON.parse(readFileSync(
     'utf-8',
 ));
 
-test('both verification statuses are honest: vendor is trusted, local is labeled unverified', () => {
+test('both verification statuses are honest: vendor is trusted, local is neutral, never a permanent alarm', () => {
     // Q2-а: the local status has lied before (verification: passed a minute
-    // before a 401), so it must never render as trusted.
+    // before a 401), so it must never render as trusted. Finding #2: some
+    // harnesses (cursor) have NO vendor probe in the engine, so a warn-toned
+    // "not verified" there is an alarm nothing can ever clear — the local
+    // state stays labeled unverified in WORDS, in a neutral tone.
     const vendor = verificationBadge({ status: {
         verification: 'passed', verification_source: 'vendor', last_verified_at: '2026-08-03T10:00:00Z',
     } });
@@ -32,8 +35,8 @@ test('both verification statuses are honest: vendor is trusted, local is labeled
     assert.ok(vendor.label.startsWith('verified live'));
 
     const local = verificationBadge({ status: { verification: 'passed', verification_source: 'local_store' } });
-    assert.equal(local.tone, 'warn');
-    assert.equal(local.label, 'logged in locally — not verified');
+    assert.equal(local.tone, 'muted');
+    assert.equal(local.label, 'local session — not verified live');
 
     assert.equal(verificationBadge({ status: {} }).label, 'not logged in');
     assert.equal(verificationBadge({ status: { verification: 'failed', verification_source: 'vendor' } }).tone, 'error');
@@ -184,7 +187,7 @@ test('account rows consume the REAL schema shape: array of {profile,status,ident
     const native = rows.find((row) => row.kind === 'native');
     assert.equal(native.harness, 'codex');  // read from harness_id (snake_case), not harnessId
     // A native login detected locally is still only local_store evidence.
-    assert.equal(verificationBadge(native).label, 'logged in locally — not verified');
+    assert.equal(verificationBadge(native).label, 'local session — not verified live');
 
     const profile = rows.find((row) => row.kind === 'profile');
     // Read from the NESTED wrapper.profile.* snake_case fields, not a flat map.
@@ -228,7 +231,7 @@ test('DTO end-to-end: EMPTY and MULTI-ACCOUNT schema-parsed bodies', () => {
     const byId = Object.fromEntries(rows.filter((r) => r.kind === 'profile')
         .map((r) => [r.profile_id, verificationBadge(r)]));
     assert.equal(byId.koshak.tone, 'ok');                       // vendor-verified
-    assert.equal(byId.backup.label, 'logged in locally — not verified');
+    assert.equal(byId.backup.label, 'local session — not verified live');
     assert.equal(byId.main.tone, 'error');                      // vendor said failed
     // A claude native row with no login shows "not logged in", not a lie.
     const claudeNative = rows.find((r) => r.kind === 'native' && r.harness === 'claude');

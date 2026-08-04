@@ -118,6 +118,199 @@ def test_status_payload_not_provisioned_never_spawns(monkeypatch, tmp_path):
     assert not (tmp_path / "cfg").exists()  # read-only: nothing provisioned
 
 
+def test_login_capable_harness_ids_reads_the_manifest_auth_block():
+    """Finding #3: only harnesses whose manifest declares a native_session auth
+    source have a login concept. API-key-only adapters (raw-api, openrouter)
+    must not surface as fake-loginable accounts."""
+    from ouroboros.gateway.claudexor_accounts import _login_capable_harness_ids
+
+    rows = [
+        {"id": "codex", "manifest": {"capability_profile": {"auth": {
+            "supported_sources": ["native_session", "provider_auth_file"]}}}},
+        {"id": "cursor", "manifest": {"capability_profile": {"auth": {
+            "supported_sources": ["native_session", "api_key_env"]}}}},
+        {"id": "openrouter", "manifest": {"capability_profile": {"auth": {
+            "supported_sources": ["api_key_env"]}}}},
+        {"id": "raw-api", "manifest": None},  # unavailable: no manifest at all
+        "not-a-dict",
+    ]
+    assert _login_capable_harness_ids(rows) == {"codex", "cursor"}
+
+
+def test_zero_readable_manifests_is_a_read_failure_not_an_empty_filter():
+    """Review delta 1 edge: a /v2/harnesses answer that SUCCEEDED but carried
+    zero readable manifests says nothing about auth — the helper answers None
+    so the caller fails open exactly like the ClaudexorUnavailable path,
+    instead of filtering every row out of the panel."""
+    from ouroboros.gateway.claudexor_accounts import _login_capable_harness_ids
+
+    assert _login_capable_harness_ids([]) is None
+    assert _login_capable_harness_ids([
+        {"id": "codex", "manifest": None},
+        {"id": "raw-api"},
+        "not-a-dict",
+    ]) is None
+    # ONE readable manifest is enough to trust the read (even when it grants
+    # nobody a login): the filter then applies, it does not fail open.
+    assert _login_capable_harness_ids([
+        {"id": "codex", "manifest": None},
+        {"id": "openrouter", "manifest": {"capability_profile": {"auth": {
+            "supported_sources": ["api_key_env"]}}}},
+    ]) == set()
+
+
+def test_status_payload_filters_api_key_only_adapters(monkeypatch, tmp_path):
+    """The catalog projection AND the daemon's native pseudo-rows are filtered
+    to login-capable harnesses; a transient manifest-read failure fails OPEN."""
+    from ouroboros.gateway.claudexor_accounts import _status_payload
+    from ouroboros.gateways import claudexor as gw
+
+    class FakeDaemon:
+        def status_dict(self):
+            return {"state": "running"}
+
+    class FakeGateway:
+        engine_version = "9.9.9"
+
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self):
+            return {}
+
+        def agent_capabilities(self):
+            return {"harnesses": [
+                {"id": "codex", "displayName": "Codex CLI", "status": "ok", "enabled": True},
+                {"id": "openrouter", "displayName": "Raw API (openai)", "status": "degraded", "enabled": True},
+            ]}
+
+        def harnesses(self):
+            return [
+                {"id": "codex", "manifest": {"capability_profile": {"auth": {
+                    "supported_sources": ["native_session"]}}}},
+                {"id": "openrouter", "manifest": {"capability_profile": {"auth": {
+                    "supported_sources": ["api_key_env"]}}}},
+            ]
+
+        def credential_profiles(self):
+            return {"profiles": [
+                # Review delta 2: named wrappers pass the same predicate. An
+                # api_key-kind profile registered for a non-loginable harness
+                # must not render a fake-loginable account row…
+                {"profile": {"harness_id": "openrouter", "profile_id": "or-key",
+                             "kind": "api_key"}, "status": {}, "identity": {}},
+                # …while a capable-harness profile survives untouched.
+                {"profile": {"harness_id": "codex", "profile_id": "koshak",
+                             "kind": "native_session"}, "status": {}, "identity": {}},
+            ], "harnessAccounts": [
+                {"harness_id": "codex", "native_login_detected": True},
+                {"harness_id": "openrouter", "native_login_detected": False},
+            ]}
+
+        def quota_snapshots(self):
+            return []
+
+    monkeypatch.setattr(owned, "get_owned_daemon", lambda: FakeDaemon())
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
+
+    payload = _status_payload(include_models=False)
+    assert [h["id"] for h in payload["harnesses"]] == ["codex"]
+    assert [r["harness_id"] for r in payload["profiles"]["harnessAccounts"]] == ["codex"]
+    assert [w["profile"]["profile_id"] for w in payload["profiles"]["profiles"]] == ["koshak"]
+
+    class FlakyGateway(FakeGateway):
+        def harnesses(self):
+            raise gw.ClaudexorUnavailable("daemon_unreachable", "transient")
+
+    monkeypatch.setattr(gw, "ClaudexorGateway", FlakyGateway)
+    payload = _status_payload(include_models=False)
+    # Fail-open: a blip in the manifest read must not blank the panel.
+    assert [h["id"] for h in payload["harnesses"]] == ["codex", "openrouter"]
+    assert len(payload["profiles"]["harnessAccounts"]) == 2
+    assert len(payload["profiles"]["profiles"]) == 2
+
+
+def test_a_vouched_login_survives_an_unreadable_manifest(monkeypatch, tmp_path):
+    """Review delta 1: a harness whose manifest is null/unreadable must not
+    lose the account the owner is really logged into — the daemon's own
+    ``native_login_detected`` vouches the row. The un-vouched, non-capable
+    adapter stays filtered (raw-api must NOT come back)."""
+    from ouroboros.gateway.claudexor_accounts import _status_payload
+    from ouroboros.gateways import claudexor as gw
+
+    class FakeDaemon:
+        def status_dict(self):
+            return {"state": "running"}
+
+    class FakeGateway:
+        engine_version = "9.9.9"
+
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self):
+            return {}
+
+        def agent_capabilities(self):
+            return {"harnesses": [
+                # Manifest-less codex: the daemon vouches the login on the row.
+                {"id": "codex", "displayName": "Codex CLI", "enabled": True,
+                 "native_login_detected": True},
+                {"id": "cursor", "displayName": "Cursor", "enabled": True},
+                {"id": "raw-api", "displayName": "Raw API", "enabled": True},
+            ]}
+
+        def harnesses(self):
+            return [
+                {"id": "codex", "manifest": None},  # unreadable, NOT un-capable
+                {"id": "cursor", "manifest": {"capability_profile": {"auth": {
+                    "supported_sources": ["native_session"]}}}},
+                {"id": "raw-api", "manifest": None},
+            ]
+
+        def credential_profiles(self):
+            return {"profiles": [
+                # A wrapper for the vouched-but-unreadable harness survives too.
+                {"profile": {"harness_id": "codex", "profile_id": "backup",
+                             "kind": "native_session"}, "status": {}, "identity": {}},
+            ], "harnessAccounts": [
+                {"harness_id": "codex", "native_login_detected": True,
+                 "identity": {"email": "owner@example.com"}},
+                {"harness_id": "cursor", "native_login_detected": False},
+                {"harness_id": "raw-api", "native_login_detected": False},
+            ]}
+
+        def quota_snapshots(self):
+            return []
+
+    monkeypatch.setattr(owned, "get_owned_daemon", lambda: FakeDaemon())
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
+
+    payload = _status_payload(include_models=False)
+    assert [h["id"] for h in payload["harnesses"]] == ["codex", "cursor"]
+    accounts = payload["profiles"]["harnessAccounts"]
+    # The logged-into row keeps its identity; raw-api stays out.
+    assert [r["harness_id"] for r in accounts] == ["codex", "cursor"]
+    assert accounts[0]["identity"] == {"email": "owner@example.com"}
+    assert [w["profile"]["profile_id"] for w in payload["profiles"]["profiles"]] == ["backup"]
+
+
 def test_login_endpoint_validates_before_any_daemon_work():
     import asyncio
 

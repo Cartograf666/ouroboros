@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-    CUSTOM_API_CHOICE,
+    API_ROUTE_CHOICE,
     ROUTE_KIND_API,
     ROUTE_KIND_SESSION,
+    advisoryRouteTransition,
     buildReviewerSlotsSetting,
     capabilityBadge,
     composeSessionTarget,
@@ -38,20 +39,32 @@ test('a saved account pin survives a discovery list that no longer contains it',
 
 test('the provider shown for a delegated row is the harness name, never Claudexor', () => {
     const groups = routeChoiceGroups({
-        catalogModels: ['openai/gpt-5.6-luna'],
         harnesses: [{ id: 'codex', display_name: 'Codex CLI', status: 'ok', enabled: true }],
     });
     const flat = JSON.stringify(groups);
     assert.ok(flat.includes('Codex CLI'));
     assert.ok(!/claudexor/i.test(flat), 'the aggregator brand must not appear as a provider');
-    // One grouped combobox encodes both kind and target.
-    assert.equal(groups[0].label, 'API models');
+    // The route select carries ROUTES only (finding #6): one API entry, one
+    // entry per harness — never the flat model catalog. Both groups labeled.
+    assert.equal(groups[0].label, 'API');
+    assert.deepEqual(groups[0].options, [{ value: API_ROUTE_CHOICE, label: 'API model' }]);
     assert.equal(groups[1].options[0].value, 'session:codex');
+});
+
+test('a saved session route survives a discovery list that no longer contains its harness', () => {
+    // Same rule as profileOptionsFor: the select's value must EXIST as an
+    // option or the browser silently redraws the row as the first choice.
+    const groups = routeChoiceGroups({ harnesses: [{ id: 'codex' }], currentChoice: 'session:claude' });
+    const session = groups[1].options;
+    assert.deepEqual(session.map((o) => o.value), ['session:codex', 'session:claude']);
+    assert.match(session[1].label, /not in discovery/);
+    // A choice discovery DOES list gains no duplicate.
+    const listed = routeChoiceGroups({ harnesses: [{ id: 'codex' }], currentChoice: 'session:codex' });
+    assert.deepEqual(listed[1].options.map((o) => o.value), ['session:codex']);
 });
 
 test('no :: syntax anywhere in encoded choices or composed targets', () => {
     const groups = routeChoiceGroups({
-        catalogModels: ['openai/gpt-5.6-luna', 'anthropic/claude-sonnet-5'],
         harnesses: [{ id: 'codex' }, { id: 'claude' }],
     });
     for (const group of groups) {
@@ -64,15 +77,43 @@ test('no :: syntax anywhere in encoded choices or composed targets', () => {
 });
 
 test('route choice round-trips through encode/decode', () => {
+    // The API choice no longer carries the model id — the free-text input
+    // does — so encode collapses every api row to the ONE api option, and a
+    // fresh row (target '') displays exactly that option, not the first
+    // catalog model (finding #6c).
     const apiRow = { route: { kind: ROUTE_KIND_API, target_id: 'openai/gpt-5.6-luna' } };
-    assert.deepEqual(decodeRouteChoice(encodeRouteChoice(apiRow)),
-        { kind: ROUTE_KIND_API, target: 'openai/gpt-5.6-luna' });
+    assert.equal(encodeRouteChoice(apiRow), API_ROUTE_CHOICE);
+    assert.equal(encodeRouteChoice({ route: { kind: ROUTE_KIND_API, target_id: '' } }), API_ROUTE_CHOICE);
+    assert.deepEqual(decodeRouteChoice(encodeRouteChoice(apiRow)), { kind: ROUTE_KIND_API });
     const sessionRow = { route: { kind: ROUTE_KIND_SESSION, target_id: 'codex=gpt-5.6-sol' } };
     assert.deepEqual(decodeRouteChoice(encodeRouteChoice(sessionRow)),
         { kind: ROUTE_KIND_SESSION, harness: 'codex' });
-    assert.deepEqual(decodeRouteChoice(CUSTOM_API_CHOICE), { kind: ROUTE_KIND_API, custom: true });
     assert.deepEqual(splitSessionTarget('codex=gpt-5.6-sol'),
         { harness: 'codex', model: 'gpt-5.6-sol' });
+});
+
+test('advisory route switching never wipes a stored target (finding #7c)', () => {
+    // Saved: api with an explicit target. Flip to a session and back: the
+    // saved api target is restored, not written to ''.
+    const savedApi = { kind: 'api', target_id: 'anthropic/claude-opus-5' };
+    let memory = { api: { ...savedApi }, session: null };
+    const toSession = advisoryRouteTransition(savedApi, { kind: ROUTE_KIND_SESSION, harness: 'codex' }, memory);
+    assert.deepEqual(toSession.route, { kind: ROUTE_KIND_SESSION, target_id: 'codex' });
+    const back = advisoryRouteTransition(toSession.route, { kind: ROUTE_KIND_API }, toSession.memory);
+    assert.deepEqual(back.route, savedApi);
+
+    // Saved: session with a model spec. Kind round-trip restores the FULL
+    // spec (harness=model), not the bare harness.
+    const savedSession = { kind: ROUTE_KIND_SESSION, target_id: 'claude=claude-opus-5' };
+    memory = { api: null, session: { ...savedSession } };
+    const toApi = advisoryRouteTransition(savedSession, { kind: ROUTE_KIND_API }, memory);
+    assert.deepEqual(toApi.route, { kind: 'api', target_id: '' });
+    const restored = advisoryRouteTransition(toApi.route, { kind: ROUTE_KIND_SESSION, harness: 'claude' }, toApi.memory);
+    assert.deepEqual(restored.route, savedSession);
+
+    // Re-selecting the CURRENT kind/harness is a no-op, never a reset.
+    const noop = advisoryRouteTransition(savedSession, { kind: ROUTE_KIND_SESSION, harness: 'claude' }, memory);
+    assert.deepEqual(noop.route, savedSession);
 });
 
 test('the composed setting carries stable ids, per-row routes/efforts and the optional pin', () => {
