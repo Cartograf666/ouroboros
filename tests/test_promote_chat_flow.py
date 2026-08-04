@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import queue
 import types
 
 
-def test_promote_tool_emits_event_with_chat_and_project(tmp_path):
+def _confirm_promote(monkeypatch):
+    monkeypatch.setattr(
+        "ouroboros.tools.control._wait_for_promotion_admission",
+        lambda *_args, **_kwargs: {"status": "scheduled"},
+    )
+
+
+def test_promote_tool_emits_event_with_chat_and_project(tmp_path, monkeypatch):
     from ouroboros.tools.control import _promote_chat_to_task
 
+    _confirm_promote(monkeypatch)
     events = []
     ctx = types.SimpleNamespace(
         pending_events=events,
@@ -16,7 +25,8 @@ def test_promote_tool_emits_event_with_chat_and_project(tmp_path):
         drive_root=tmp_path,
     )
     out = _promote_chat_to_task(ctx, "Build the racer prototype", project_id="racer")
-    assert out.startswith("OK: promoted to supervised task")
+    assert out.startswith("OK: task")
+    assert "accepted and durably scheduled" in out
     assert len(events) == 1
     evt = events[0]
     assert evt["type"] == "promote_chat_to_task"
@@ -25,6 +35,124 @@ def test_promote_tool_emits_event_with_chat_and_project(tmp_path):
     assert evt["chat_id"] == 1
     assert evt["task_id"]
     assert ctx._typed_routing_action_emitted == "promote_chat_to_task"
+
+
+def _swarm_ctx(tmp_path, **overrides):
+    values = {
+        "pending_events": [],
+        "event_queue": None,
+        "current_chat_id": 1,
+        "drive_root": tmp_path,
+        "project_id": "",
+        "is_ephemeral_turn": True,
+        "task_metadata": {"force_plan": True, "force_plan_source": "swarm"},
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
+def test_ephemeral_swarm_promotion_carries_intent_and_pins_host_scope(tmp_path, monkeypatch):
+    from ouroboros.tools.control import _promote_chat_to_task
+
+    _confirm_promote(monkeypatch)
+    ctx = _swarm_ctx(tmp_path, project_id="alpha")
+
+    out = _promote_chat_to_task(
+        ctx,
+        "Audit and fix the issue",
+        project_id="beta",
+        project_name="Injected Project",
+        workspace_root="/tmp/foreign",
+        workspace="none",
+        source="https://example.invalid/repo.git",
+    )
+
+    assert out.startswith("OK: task")
+    evt = ctx.pending_events[0]
+    assert evt["force_plan"] is True
+    assert evt["force_plan_source"] == "swarm"
+    assert evt["project_id"] == "alpha"
+    assert evt["project_name"] == evt["workspace_root"] == evt["workspace"] == evt["source"] == ""
+    assert ctx._swarm_handoff_attempt["status"] == "scheduled"
+
+
+def test_ephemeral_swarm_unconfirmed_promotion_reuses_one_task_id(tmp_path, monkeypatch):
+    from ouroboros.tools.control import _promote_chat_to_task
+
+    monkeypatch.setattr(
+        "ouroboros.tools.control._wait_for_promotion_admission",
+        lambda *_args, **_kwargs: {"status": "unconfirmed", "reason": "confirmation_timeout"},
+    )
+    ctx = _swarm_ctx(tmp_path)
+
+    first = _promote_chat_to_task(ctx, "Audit and fix the issue")
+    second = _promote_chat_to_task(ctx, "Audit and fix the issue")
+
+    assert first == second
+    assert first.startswith("PROMOTE_UNCONFIRMED")
+    assert len(ctx.pending_events) == 1
+    assert ctx._swarm_handoff_attempt["task_id"] == ctx.pending_events[0]["task_id"]
+
+
+def test_ephemeral_swarm_receipt_error_after_emit_keeps_one_attempt(tmp_path, monkeypatch):
+    from ouroboros.tools.control import _promote_chat_to_task
+
+    monkeypatch.setattr(
+        "ouroboros.tools.control._wait_for_promotion_admission",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("receipt unavailable")),
+    )
+    event_queue = queue.Queue()
+    ctx = _swarm_ctx(tmp_path, event_queue=event_queue)
+
+    first = _promote_chat_to_task(ctx, "Audit and fix the issue")
+    second = _promote_chat_to_task(ctx, "Audit and fix the issue")
+
+    assert first == second
+    assert first.startswith("PROMOTE_UNCONFIRMED")
+    assert event_queue.qsize() == 1
+    event = event_queue.get_nowait()
+    assert ctx._swarm_handoff_attempt["task_id"] == event["task_id"]
+    assert ctx._swarm_handoff_attempt["reason"] == "admission_confirmation_failed"
+
+
+def test_ephemeral_swarm_rejected_promotion_is_latched_without_event(tmp_path, monkeypatch):
+    from ouroboros.tools.control import _promote_chat_to_task
+
+    monkeypatch.setattr(
+        "ouroboros.tools.control._promotion_pool_disabled_from_snapshot",
+        lambda _ctx: "crash_storm",
+    )
+    ctx = _swarm_ctx(tmp_path)
+
+    first = _promote_chat_to_task(ctx, "Audit and fix the issue")
+    second = _promote_chat_to_task(ctx, "Audit and fix the issue")
+
+    assert first == second
+    assert first.startswith("PROMOTE_REJECTED")
+    assert ctx.pending_events == []
+    assert ctx._swarm_handoff_attempt["status"] == "rejected"
+
+
+def test_managed_swarm_does_not_recursively_propagate_routing_intent(tmp_path, monkeypatch):
+    from ouroboros.tools.control import _promote_chat_to_task
+
+    _confirm_promote(monkeypatch)
+    ctx = _swarm_ctx(tmp_path, is_ephemeral_turn=False)
+
+    _promote_chat_to_task(ctx, "A later task chosen during execution")
+
+    assert "force_plan" not in ctx.pending_events[0]
+    assert not hasattr(ctx, "_swarm_handoff_attempt")
+
+
+def test_ephemeral_swarm_rejects_steer_without_emitting_event(tmp_path):
+    from ouroboros.tools.control import _steer_task
+
+    ctx = _swarm_ctx(tmp_path)
+    out = _steer_task(ctx, "existing-root", "do this there")
+
+    assert "cannot steer an existing task" in out
+    assert ctx.pending_events == []
 
 
 def test_promote_tool_rejects_dirty_project_id(tmp_path):
@@ -38,11 +166,12 @@ def test_promote_tool_rejects_dirty_project_id(tmp_path):
     assert not ctx.pending_events
 
 
-def test_promote_tool_project_name_creates_named_project_event(tmp_path):
+def test_promote_tool_project_name_creates_named_project_event(tmp_path, monkeypatch):
     """LLM-first 'create a named project and work there' (v6.33.0): project_name
     derives a clean id, carries the human display name, and rides title."""
     from ouroboros.tools.control import _promote_chat_to_task
 
+    _confirm_promote(monkeypatch)
     events = []
     ctx = types.SimpleNamespace(
         pending_events=events, event_queue=None, current_chat_id=1, drive_root=tmp_path,
@@ -51,7 +180,7 @@ def test_promote_tool_project_name_creates_named_project_event(tmp_path):
         ctx, "research everything about the airi institute",
         project_name="Airi Research", title="Airi Research",
     )
-    assert out.startswith("OK: promoted to supervised task")
+    assert out.startswith("OK: task")
     assert "new project 'Airi Research'" in out
     evt = events[0]
     assert evt["project_name"] == "Airi Research"
@@ -71,19 +200,20 @@ def test_project_id_from_display_name_handles_non_ascii():
     assert project_id_from_display_name("") == ""
 
 
-def test_promote_tool_cyrillic_project_name_still_creates(tmp_path):
+def test_promote_tool_cyrillic_project_name_still_creates(tmp_path, monkeypatch):
     """promote_chat_to_task(project_name=<cyrillic>) must NOT fail — it derives a
     hash id while keeping the Cyrillic display name (Workflow-caught regression)."""
     from ouroboros.project_facts import project_id_from_display_name
     from ouroboros.tools.control import _promote_chat_to_task
 
+    _confirm_promote(monkeypatch)
     events = []
     ctx = types.SimpleNamespace(
         pending_events=events, event_queue=None, current_chat_id=1, drive_root=tmp_path,
     )
     out = _promote_chat_to_task(ctx, "исследуй динозавров", project_name="динозавры", title="динозавры")
     assert "TOOL_ARG_ERROR" not in out
-    assert out.startswith("OK: promoted")
+    assert out.startswith("OK: task")
     evt = events[0]
     assert evt["project_name"] == "динозавры"
     assert evt["project_id"] == project_id_from_display_name("динозавры")
@@ -100,6 +230,7 @@ def test_promote_event_names_project_from_display_name(tmp_path, monkeypatch):
     enqueued = []
     ctx = types.SimpleNamespace(
         enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
     )
     workers.promote_chat_to_task({
@@ -141,6 +272,7 @@ def test_promote_event_enqueues_first_class_task(tmp_path, monkeypatch):
     enqueued = []
     ctx = types.SimpleNamespace(
         enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
     )
     evt = {
@@ -177,6 +309,31 @@ def test_promote_event_enqueues_first_class_task(tmp_path, monkeypatch):
     assert all_task_bindings(tmp_path).get("abc12345") == project["chat_id"]
 
 
+def test_promote_worker_persists_swarm_intent_on_managed_root(tmp_path, monkeypatch):
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    enqueued = []
+    ctx = types.SimpleNamespace(
+        enqueue_task=enqueued.append,
+        persist_queue_snapshot=lambda **_kwargs: True,
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+
+    outcome = workers.promote_chat_to_task({
+        "type": "promote_chat_to_task",
+        "task_id": "swarmroot1",
+        "objective": "Audit and fix the issue",
+        "chat_id": 1,
+        "force_plan": True,
+        "force_plan_source": "swarm",
+    }, ctx)
+
+    assert outcome["status"] == "scheduled"
+    assert enqueued[0]["metadata"]["force_plan"] is True
+    assert enqueued[0]["metadata"]["force_plan_source"] == "swarm"
+
+
 def test_route_to_project_event_emits_route_receipt_action(tmp_path, monkeypatch):
     """route_to_project reuses promote admission but must retain its distinct
     host receipt action instead of rendering the task as a fresh promotion."""
@@ -201,6 +358,7 @@ def test_route_to_project_event_emits_route_receipt_action(tmp_path, monkeypatch
         WORKERS={0: types.SimpleNamespace()},
         bridge=Bridge(),
         enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
         append_jsonl=lambda *args, **kwargs: None,
     )
@@ -208,6 +366,7 @@ def test_route_to_project_event_emits_route_receipt_action(tmp_path, monkeypatch
     _handle_promote_chat_to_task({
         "type": "promote_chat_to_task",
         "task_id": "route01",
+        "routing_token": "route-token-01",
         "objective": "Continue the racer",
         "project_id": "racer",
         "chat_id": 1,
@@ -229,6 +388,7 @@ def test_promoted_skill_repair_is_canonical_confined_managed_task(tmp_path, monk
     enqueued = []
     ctx = types.SimpleNamespace(
         enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
     )
 
@@ -268,6 +428,7 @@ def test_promoted_skill_repair_rejects_missing_payload(tmp_path, monkeypatch):
     enqueued = []
     ctx = types.SimpleNamespace(
         enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
     )
 
@@ -314,6 +475,7 @@ def test_promote_route_persists_source_ref_and_fails_closed_on_binding_error(tmp
     enqueued = []
     ctx = types.SimpleNamespace(
         enqueue_task=lambda task: enqueued.append(task),
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
     )
     from ouroboros.project_dialogue import _text_sha256
@@ -379,6 +541,7 @@ def test_promote_chat_to_task_broadcasts_projects_changed(tmp_path, monkeypatch)
     monkeypatch.setattr(mbus, "get_bridge", lambda: fake_bridge)
     ctx = types.SimpleNamespace(
         enqueue_task=lambda task: None,
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
     )
     workers.promote_chat_to_task({
@@ -492,7 +655,7 @@ def test_restart_drain_defers_then_completes_without_sleeping(tmp_path, monkeypa
 
     monkeypatch.setenv("OUROBOROS_RESTART_DRAIN_MAX_SEC", "120")
     performed = []
-    monkeypatch.setattr(server, "_perform_supervisor_restart", lambda ctx: performed.append(True))
+    monkeypatch.setattr(server, "_perform_supervisor_restart", lambda ctx, **kw: performed.append(True))
     server._pending_restart.clear()
 
     now = __import__("time").time()
@@ -526,7 +689,7 @@ def test_restart_drain_no_live_tasks_restarts_immediately(tmp_path, monkeypatch)
 
     monkeypatch.setenv("OUROBOROS_RESTART_DRAIN_MAX_SEC", "120")
     performed = []
-    monkeypatch.setattr(server, "_perform_supervisor_restart", lambda ctx: performed.append(True))
+    monkeypatch.setattr(server, "_perform_supervisor_restart", lambda ctx, **kw: performed.append(True))
     server._pending_restart.clear()
 
     ctx = types.SimpleNamespace(
@@ -554,7 +717,7 @@ def test_restart_drain_uses_generic_queue_heartbeat_not_retired_planning_knob(
     monkeypatch.setenv("OUROBOROS_RESTART_DRAIN_MAX_SEC", "120")
     monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC", "999999")
     performed = []
-    monkeypatch.setattr(server, "_perform_supervisor_restart", lambda ctx: performed.append(True))
+    monkeypatch.setattr(server, "_perform_supervisor_restart", lambda ctx, **kw: performed.append(True))
     server._pending_restart.clear()
 
     ctx = types.SimpleNamespace(
@@ -631,7 +794,9 @@ def test_route_project_chat_defers_when_multiple_running_tasks(tmp_path, monkeyp
     project_chat = int(proj["chat_id"])
 
     delivered = []
-    monkeypatch.setattr(omb, "write_owner_message", lambda *a, **k: delivered.append(a))
+    monkeypatch.setattr(
+        omb, "write_owner_message", lambda *a, **k: delivered.append(a) or True
+    )
 
     ctx = types.SimpleNamespace(
         DRIVE_ROOT=tmp_path,
@@ -659,7 +824,7 @@ def test_route_project_chat_1to1_delivery_is_idempotent(tmp_path, monkeypatch):
 
     msg_ids = []
     monkeypatch.setattr(omb, "write_owner_message",
-                        lambda drive, text, tid, msg_id=None, **k: msg_ids.append(msg_id))
+                        lambda drive, text, tid, msg_id=None, **k: msg_ids.append(msg_id) or True)
 
     ctx = types.SimpleNamespace(
         DRIVE_ROOT=tmp_path,
@@ -669,6 +834,33 @@ def test_route_project_chat_1to1_delivery_is_idempotent(tmp_path, monkeypatch):
     server._route_project_chat_to_running_task(ctx, project_chat, "go", "cmid-7")
     server._route_project_chat_to_running_task(ctx, project_chat, "go", "cmid-7")
     assert msg_ids == ["cmid-7:pr", "cmid-7:pr"]
+
+
+def test_route_project_chat_does_not_confirm_failed_mailbox_write(tmp_path, monkeypatch):
+    import types
+
+    import ouroboros.owner_mailbox as omb
+    import server
+    from ouroboros.projects_registry import create_project
+
+    project_chat = int(create_project(tmp_path, "racer")["chat_id"])
+    monkeypatch.setattr(omb, "write_owner_message", lambda *_a, **_k: False)
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path,
+        RUNNING={
+            "pr": {
+                "task": {"id": "pr", "chat_id": project_chat},
+                "last_heartbeat_at": 1.0,
+            }
+        },
+    )
+
+    assert (
+        server._route_project_chat_to_running_task(
+            ctx, project_chat, "must be durable", "owner-msg"
+        )
+        == ""
+    )
 
 
 def test_busy_project_chat_routes_to_ephemeral_decision_turn(tmp_path, monkeypatch):
@@ -1127,10 +1319,11 @@ def test_steer_task_tool_emits_event_with_target_and_client_id(tmp_path):
     events = []
     ctx = types.SimpleNamespace(
         pending_events=events, event_queue=None, current_chat_id=1,
+        drive_root=tmp_path,
         task_metadata={"client_message_id": "cm-42"},
     )
     out = _steer_task(ctx, "abc12345", "also add the benchmarks slide")
-    assert out.startswith("✉️ Steering task abc12345")
+    assert out.startswith("⚠️ STEER_UNCONFIRMED")
     assert len(events) == 1
     evt = events[0]
     assert evt["type"] == "steer_task"
@@ -1154,6 +1347,7 @@ def test_main_steer_can_address_project_bound_root_from_host_manifest(tmp_path, 
         pending_events=emitted,
         event_queue=None,
         current_chat_id=1,
+        drive_root=tmp_path,
         task_metadata={
             "client_message_id": "main-42",
             "routing_contract": {"source_lane": "main"},
@@ -1210,6 +1404,7 @@ def test_busy_direct_main_root_is_manifested_and_steerable_without_promotion(tmp
         pending_events=emitted,
         event_queue=None,
         current_chat_id=1,
+        drive_root=tmp_path,
         task_metadata={
             "client_message_id": "followup-1",
             "routing_contract": metadata["routing_contract"],

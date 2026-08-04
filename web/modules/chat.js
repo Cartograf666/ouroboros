@@ -5,7 +5,6 @@ import { showToast } from './toast.js';
 import { downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
 import { apiClient, apiFetch, cancelTask } from './api_client.js';
 import {
-    compactModel,
     formatReviewProjection,
     getLogTaskGroupId,
     isGroupedTaskEvent,
@@ -226,9 +225,9 @@ export function clearStickyCardState(record) {
     if (!record) return record;
     record.collapsedActivity = '';
     record.costMeta = null;
-    // The activity CLOCK and the full-text reference are cycle state too: a
+    // The activity clock is cycle state too: a
     // recycled slot ('bg-consciousness', 'active') would otherwise open showing
-    // the previous cycle's "Latest" time and its tooltip.
+    // the previous cycle's "Latest" time.
     record.latestActivityTs = '';
     if (record.activityEl) {
         record.activityEl.textContent = '';
@@ -244,24 +243,24 @@ export function clearStickyCardState(record) {
  * activity, so the line is suppressed to avoid duplication. Subagent titles
  * keep the role·model·id identity, so their routed progress body always feeds
  * the line. A frame without new activity keeps `previous`, so finishing a card
- * never blanks its last activity.
+ * never blanks its last activity. Geometry is owned by the two-line CSS clamp;
+ * this character ceiling is only a defensive DOM/accessibility bound.
  */
-export const COLLAPSED_ACTIVITY_MAX = 400;
+export const COLLAPSED_ACTIVITY_MAX = 240;
+
+export function boundActivityPreview(value = '') {
+    const candidate = String(value || '').replace(/\s+/g, ' ').trim();
+    if (candidate.length <= COLLAPSED_ACTIVITY_MAX) return candidate;
+    return candidate.slice(0, COLLAPSED_ACTIVITY_MAX - 1).trimEnd() + '…';
+}
 
 export function projectCollapsedActivity({
     isSubagent = false, suggestedName = '', headline = '', body = '', previous = '',
 } = {}) {
-    const candidate = String((isSubagent ? body : headline) || '').trim()
-        || String(previous || '').trim();
+    const current = boundActivityPreview(isSubagent ? body : headline);
+    const candidate = current || boundActivityPreview(previous);
     if (!isSubagent && !String(suggestedName || '').trim()) return '';
-    // BOUNDED, and the bound is DISCLOSED. The line is fed the uncut text (never a
-    // timeline preview), but a single card line is not a place to render an
-    // unbounded narration: it is clipped at a generous ceiling with an explicit
-    // ellipsis, and applyLiveCardState keeps the complete text on the element's
-    // title so the full value stays reachable rather than destroyed (BIBLE P1 —
-    // truncation is allowed when it is visible and the whole text survives).
-    if (candidate.length <= COLLAPSED_ACTIVITY_MAX) return candidate;
-    return candidate.slice(0, COLLAPSED_ACTIVITY_MAX - 1).trimEnd() + '…';
+    return candidate;
 }
 
 // Logical slots that may host multiple independent cycles (v6.82: hoisted to
@@ -435,7 +434,7 @@ export function createChatInstance({
             <div class="chat-input-wrap">
                 <div class="chat-toolbar-row">
                     <div class="chat-composer-pills" id="chat-composer-pills">
-                        <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: arm a one-shot deep plan + multi-subagent fan-out (plan_task + web search, then delegate) for your next message. Auto-disarms after sending.">Swarm</button>
+                        <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: route your next message into a new managed task, run a deep plan review with plan_task, then delegate when parallel work helps. Auto-disarms after sending.">Swarm</button>
                         <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Context size mode" title="Context mode (owner setting). Low fits ~200K / local models; Max is full. Saves immediately; lowering to Low requires Ouroboros to be idle.">
                             <button class="chat-seg" type="button" data-mode="low">Low</button>
                             <button class="chat-seg" type="button" data-mode="max">Max</button>
@@ -668,6 +667,15 @@ export function createChatInstance({
     let lastHistorySyncSucceeded = false;
     let historyPaintGeneration = 0;
     let welcomeShown = false;
+    // Per-instance viewport intent. Content growth does not emit a user scroll,
+    // so `_savedStick` survives a large live-card mutation that would make a
+    // post-mutation `isNearBottom()` check lose the owner's prior intent.
+    let _savedScrollTop = 0;
+    let _savedStick = true;
+    let _restoring = false;
+    let _viewportMutationDepth = 0;
+    const isInstanceVisible = () =>
+        Boolean(messagesDiv) && messagesDiv.offsetParent !== null && !document.hidden;
     const liveCardRecords = new Map();
     // Reusable slots (bg-consciousness, active) destroy+recreate their card on every
     // new cycle and auto-collapse on each cycle finish. Remember the owner's explicit
@@ -694,6 +702,10 @@ export function createChatInstance({
     let pendingReconnectBannerText = readPendingReconnectBanner();
 
     function registerEphemeralDecisionFrame(frame) {
+        return withStableViewport(() => registerEphemeralDecisionFrameMutation(frame));
+    }
+
+    function registerEphemeralDecisionFrameMutation(frame) {
         const taskId = String(frame?.task_id || '').trim();
         if (!taskId) return false;
         if (frame?.ephemeral_decision) {
@@ -926,31 +938,135 @@ export function createChatInstance({
 
     function captureVisibleTimelineAnchor(excludeNode = null) {
         const nodes = Array.from(messagesDiv.children).filter(
-            (node) => node !== excludeNode && !node.classList.contains('typing-bubble')
+            (node) => node !== excludeNode
+                && !excludeNode?.contains?.(node)
+                && !node.classList.contains('typing-bubble')
         );
-        const messagesTop = messagesDiv.getBoundingClientRect().top;
-        const node = nodes.find((item) => item.getBoundingClientRect().bottom > messagesTop) || null;
-        if (!node) return null;
-        const ts = node.dataset?.ts || '';
+        const messagesRect = messagesDiv.getBoundingClientRect();
+        const topNode = nodes.find((item) => {
+            const rect = item.getBoundingClientRect();
+            return rect.bottom > messagesRect.top && rect.top < messagesRect.bottom;
+        }) || null;
+        if (!topNode) return null;
+
+        // A live-card can span several screens while the reader is inside a
+        // child summary or timeline line. Preserve that visible boundary, not
+        // merely the root card whose own top may be far above the viewport.
+        let node = topNode;
+        if (topNode.classList.contains('chat-live-card')) {
+            const selector = [
+                '.chat-live-card',
+                '[data-live-summary-button]',
+                '[data-live-title]',
+                '[data-live-activity]',
+                '[data-live-meta]',
+                '.chat-live-actions',
+                '.chat-live-line',
+                '.chat-live-project-card-btn',
+            ].join(',');
+            const candidates = [topNode, ...topNode.querySelectorAll(selector)]
+                .map((candidate) => {
+                    let depth = 0;
+                    let parent = candidate === topNode ? null : candidate.parentElement;
+                    while (parent && topNode.contains(parent) && parent !== topNode) {
+                        depth += 1;
+                        parent = parent.parentElement;
+                    }
+                    return { node: candidate, rect: candidate.getBoundingClientRect(), depth };
+                })
+                .filter(({ node: candidate, rect }) => candidate.getClientRects().length
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > messagesRect.top
+                    && rect.top < messagesRect.bottom);
+            const belowTop = candidates
+                .filter(({ rect }) => rect.top >= messagesRect.top)
+                .sort((a, b) => (a.rect.top - b.rect.top) || (b.depth - a.depth));
+            const crossing = candidates
+                .filter(({ rect }) => rect.top <= messagesRect.top && rect.bottom > messagesRect.top)
+                .sort((a, b) => b.depth - a.depth);
+            node = belowTop[0]?.node || crossing[0]?.node || topNode;
+        }
+
+        const cardChain = [];
+        let card = node.classList.contains('chat-live-card')
+            ? node
+            : node.closest?.('.chat-live-card');
+        while (card && messagesDiv.contains(card)) {
+            cardChain.push({
+                node: card,
+                taskId: card.dataset?.taskId || '',
+                offset: card.getBoundingClientRect().top - messagesRect.top,
+            });
+            card = card.parentElement?.closest?.('.chat-live-card') || null;
+        }
+
+        const ts = topNode.dataset?.ts || '';
+        const anchorRole = [
+            '[data-live-summary-button]',
+            '[data-live-title]',
+            '[data-live-activity]',
+            '[data-live-meta]',
+            '.chat-live-actions',
+            '.chat-live-project-card-btn',
+        ].find((candidate) => node.matches?.(candidate)) || '';
         return {
             node,
-            taskId: node.classList.contains('chat-live-card') ? (node.dataset?.taskId || '') : '',
-            clientMessageId: node.dataset?.clientMessageId || '',
+            cardChain,
+            lineKey: node.matches?.('.chat-live-line') ? (node.dataset?.liveLineKey || '') : '',
+            anchorRole,
+            topNode,
+            clientMessageId: topNode.dataset?.clientMessageId || '',
             ts,
-            ordinal: ts ? nodes.filter((item) => item.dataset?.ts === ts).indexOf(node) : -1,
-            offset: node.getBoundingClientRect().top - messagesTop,
+            ordinal: ts ? nodes.filter((item) => item.dataset?.ts === ts).indexOf(topNode) : -1,
+            offset: node.getBoundingClientRect().top - messagesRect.top,
+            topOffset: topNode.getBoundingClientRect().top - messagesRect.top,
         };
     }
 
     function restoreVisibleTimelineAnchor(anchor) {
         if (!anchor) return false;
-        let node = anchor.node?.isConnected ? anchor.node : null;
-        if (!node && anchor.taskId) {
-            node = Array.from(messagesDiv.children).find(
-                (item) => item.classList.contains('chat-live-card')
-                    && item.dataset?.taskId === anchor.taskId
-            ) || null;
+        const isRendered = (node) => {
+            if (!node?.isConnected || !messagesDiv.contains(node)) return false;
+            const rect = node.getBoundingClientRect();
+            return node.getClientRects().length > 0 && rect.width > 0 && rect.height > 0;
+        };
+        const restoreNode = (node, offset) => {
+            if (!isRendered(node)) return false;
+            const currentOffset = node.getBoundingClientRect().top
+                - messagesDiv.getBoundingClientRect().top;
+            messagesDiv.scrollTop += currentOffset - offset;
+            return true;
+        };
+
+        if (restoreNode(anchor.node, anchor.offset)) return true;
+
+        const cardChain = Array.isArray(anchor.cardChain) && anchor.cardChain.length
+            ? anchor.cardChain
+            : [];
+        const resolveCard = (entry) => {
+            if (isRendered(entry?.node)) return entry.node;
+            if (!entry?.taskId) return null;
+            const record = liveCardRecords.get(entry.taskId);
+            return isRendered(record?.root) ? record.root : null;
+        };
+        const ownerCard = resolveCard(cardChain[0]);
+        if (ownerCard && anchor.lineKey) {
+            const line = Array.from(ownerCard.querySelectorAll('.chat-live-line'))
+                .find((candidate) => candidate.dataset?.liveLineKey === anchor.lineKey
+                    && candidate.closest('.chat-live-card') === ownerCard);
+            if (restoreNode(line, anchor.offset)) return true;
         }
+        if (ownerCard && anchor.anchorRole) {
+            const roleNode = Array.from(ownerCard.querySelectorAll(anchor.anchorRole))
+                .find((candidate) => candidate.closest('.chat-live-card') === ownerCard);
+            if (restoreNode(roleNode, anchor.offset)) return true;
+        }
+        for (const entry of cardChain) {
+            if (restoreNode(resolveCard(entry), entry.offset)) return true;
+        }
+
+        let node = isRendered(anchor.topNode) ? anchor.topNode : null;
         if (!node && anchor.clientMessageId) {
             node = Array.from(messagesDiv.children).find(
                 (item) => item.dataset?.clientMessageId === anchor.clientMessageId
@@ -962,11 +1078,28 @@ export function createChatInstance({
             );
             node = matches[anchor.ordinal] || matches[0] || null;
         }
-        if (!node) return false;
-        const currentOffset = node.getBoundingClientRect().top
-            - messagesDiv.getBoundingClientRect().top;
-        messagesDiv.scrollTop += currentOffset - anchor.offset;
-        return true;
+        return restoreNode(node, anchor.topOffset ?? anchor.offset);
+    }
+
+    function withStableViewport(mutate) {
+        if (typeof mutate !== 'function') return undefined;
+        if (_viewportMutationDepth > 0 || _restoring || !isInstanceVisible()) return mutate();
+
+        const followBottom = _savedStick || isNearBottom();
+        const anchor = followBottom ? null : captureVisibleTimelineAnchor();
+        _viewportMutationDepth = 1;
+        try {
+            return mutate();
+        } finally {
+            _viewportMutationDepth = 0;
+            if (isInstanceVisible()) {
+                if (followBottom) messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                else restoreVisibleTimelineAnchor(anchor);
+                _savedScrollTop = messagesDiv.scrollTop;
+                _savedStick = followBottom || isNearBottom();
+                updateScrollButton();
+            }
+        }
     }
 
     function insertMessageNode(node, options = {}) {
@@ -1081,6 +1214,12 @@ export function createChatInstance({
     }
 
     function revealBufferedCardIfNeeded(taskState, { suppressDomInsert = false, rawTs = '' } = {}) {
+        return withStableViewport(() => revealBufferedCardMutation(
+            taskState, { suppressDomInsert, rawTs },
+        ));
+    }
+
+    function revealBufferedCardMutation(taskState, { suppressDomInsert = false, rawTs = '' } = {}) {
         if (!taskState) return;
         if (taskState.cardVisible) {
             reanchorVisibleTaskCard(taskState, rawTs, { suppressDomInsert });
@@ -1171,6 +1310,12 @@ export function createChatInstance({
     const cancelableTaskIds = new Set();
 
     function queueTaskLiveUpdate(summary, taskId, ts, dedupeKey = '', rawTs = '') {
+        return withStableViewport(() => queueTaskLiveUpdateMutation(
+            summary, taskId, ts, dedupeKey, rawTs,
+        ));
+    }
+
+    function queueTaskLiveUpdateMutation(summary, taskId, ts, dedupeKey = '', rawTs = '') {
         const resolvedTaskId = taskId || activeLiveGroupId || '';
         if (!resolvedTaskId) return;
         const taskState = getTaskUiState(resolvedTaskId, true);
@@ -1217,8 +1362,10 @@ export function createChatInstance({
         record.root.dataset.projectCreating = '1';
         const actions = record.turnProjectBtn?.parentElement || record.root.querySelector('.chat-live-actions');
         if (actions) {
-            actions.innerHTML = '<button type="button" class="chat-live-project-btn" disabled>Creating project…</button>';
-            record.cancelRunBtn = null;
+            withStableViewport(() => {
+                actions.innerHTML = '<button type="button" class="chat-live-project-btn" disabled>Creating project…</button>';
+                record.cancelRunBtn = null;
+            });
         }
         try {
             // One-click convert (owner P1): no name prompt, no extra LLM call.
@@ -1236,18 +1383,20 @@ export function createChatInstance({
             showToast(`Project creation failed: ${exc.message || exc}`, 'error');
             delete record.root.dataset.projectCreating;
             if (actions) {
-                actions.innerHTML = '<button type="button" class="chat-live-project-btn" data-turn-into-project>Turn into project</button>';
-                record.turnProjectBtn = actions.querySelector('[data-turn-into-project]');
-                // Re-wire the click handler — innerHTML replaced the original node,
-                // so without this the restored button would be dead after a
-                // transient failure (T5).
-                record.turnProjectBtn?.addEventListener('click', (event) => {
-                    event.stopPropagation();
-                    turnTaskIntoProject(record);
+                withStableViewport(() => {
+                    actions.innerHTML = '<button type="button" class="chat-live-project-btn" data-turn-into-project>Turn into project</button>';
+                    record.turnProjectBtn = actions.querySelector('[data-turn-into-project]');
+                    // Re-wire the click handler — innerHTML replaced the original node,
+                    // so without this the restored button would be dead after a
+                    // transient failure (T5).
+                    record.turnProjectBtn?.addEventListener('click', (event) => {
+                        event.stopPropagation();
+                        turnTaskIntoProject(record);
+                    });
+                    // P5: innerHTML also dropped a rendered "Cancel run" — restore it.
+                    record.cancelRunBtn = null;
+                    syncCancelRunButton(record);
                 });
-                // P5: innerHTML also dropped a rendered "Cancel run" — restore it.
-                record.cancelRunBtn = null;
-                syncCancelRunButton(record);
             }
         }
     }
@@ -1274,6 +1423,10 @@ export function createChatInstance({
     }
 
     function syncCancelRunButton(record) {
+        return withStableViewport(() => syncCancelRunButtonMutation(record));
+    }
+
+    function syncCancelRunButtonMutation(record) {
         if (!record?.root) return;
         const eligible = cancelRunEligibility({
             groupId: record.groupId,
@@ -1394,6 +1547,10 @@ export function createChatInstance({
     // so the main chat is freed — the card stops being a busy red task and
     // recolors to the project fuchsia. Plain wording (no "ack"); click opens the panel.
     function markCardConverted(record, project) {
+        return withStableViewport(() => markCardConvertedMutation(record, project));
+    }
+
+    function markCardConvertedMutation(record, project) {
         delete record.root.dataset.projectCreating;
         record.root.dataset.projectCreated = '1';
         record.root.dataset.projectId = project.id || '';
@@ -1416,24 +1573,12 @@ export function createChatInstance({
             window.dispatchEvent(new CustomEvent('ouro:open-project', { detail: { project } }));
         });
         // Atomic detach-and-reparent (C4.5): replaceChildren swaps the whole live
-        // timeline (subagent cards, working bubble) for the chip in one paint — no
-        // innerHTML reparse, no torn intermediate state. The task tree re-homes to
-        // the project thread on the backend (lineage classification + the owner
-        // request mirrored into the project chat), so the main chat keeps only this
-        // calm pointer; the project panel re-renders the full tree from history.
+        // timeline (subagent cards, working bubble) for the chip in one paint.
         record.root.replaceChildren(chip);
         record.turnProjectBtn = null;
         record.cancelRunBtn = null;
-        // The task now lives in the project panel, so this card must stop counting
-        // as a foreground ACTIVE task in the main chat — otherwise isForegroundLiveCard
-        // keeps suppressing the typing indicator / status-badge clear until the
-        // background task ends. Mark it finished; the converted-card guards in
-        // applyLiveCardState/finishLiveCard then ignore any late terminal frame.
-        // (The detached element refs are LEFT intact — nulling them made other
-        // terminal paths like finishLiveCard throw on a post-conversion frame.)
         record.finished = true;
-        // Recolor on the next frame so the 250ms fuchsia fade actually animates
-        // (the class can't be added in the same paint as the content swap).
+        // Recolor on the next frame so the 250ms fuchsia fade actually animates.
         requestAnimationFrame(() => record.root.classList.add('is-project'));
         signalChatFreed();  // subtle "this chat is free again" composer cue
     }
@@ -1534,8 +1679,8 @@ export function createChatInstance({
             // Cluster B: the proactively-coined LLM project name; when set it becomes
             // the card title (the activity headline keeps rendering in the lines below).
             suggestedName: '',
-            // P1 (v6.82): last raw activity candidate (remembered even while the
-            // collapsed line is suppressed on unnamed root cards) + sticky cost.
+            // P1 (v6.82): last bounded activity projection (remembered even while
+            // the collapsed line is suppressed on unnamed root cards) + sticky cost.
             collapsedActivity: '',
             costMeta: null,
         };
@@ -1604,6 +1749,10 @@ export function createChatInstance({
     // screen (live `task_named` event or history replay). A main card's groupId IS its
     // task_id, so the lookup is direct. No-op until the card exists / without a name.
     function applySuggestedName(taskId, name) {
+        return withStableViewport(() => applySuggestedNameMutation(taskId, name));
+    }
+
+    function applySuggestedNameMutation(taskId, name) {
         const tid = String(taskId || '').trim();
         const nm = String(name || '').trim();
         if (!tid || !nm) return;
@@ -1619,27 +1768,20 @@ export function createChatInstance({
         if (record.titleEl) record.titleEl.textContent = nm;
         // P1 (v6.82): the collapsed activity line was suppressed while the card
         // was unnamed; populate it now from the remembered candidate so the live
-        // task_named direct-DOM path does not depend on the next
-        // applyLiveCardState frame. (The pendingSuggestedNames drain path in
-        // createLiveCardRecord relies on the creating frame that immediately
-        // follows record creation — a fresh record has no remembered activity
-        // yet, so there is nothing for the drain itself to populate.)
+        // task_named direct-DOM path does not depend on the next frame.
         renderCollapsedActivity(record, projectCollapsedActivity({
             suggestedName: nm,
+            headline: record.collapsedActivity,
             previous: record.collapsedActivity,
         }));
     }
 
-    // ONE renderer for the collapsed activity line: text plus the complete-text
-    // reference. Two call sites (frame updates and the late task_named path) drifted
-    // apart before, so a late-named card showed clipped text with no way back to the
-    // full narration; a suppressed line must not leak through a tooltip either.
+    // One renderer for the bounded collapsed projection. Full narration is
+    // owned by timeline disclosure, never by a mouse-only title attribute.
     function renderCollapsedActivity(record, text) {
         if (!record?.activityEl) return;
         record.activityEl.textContent = text;
-        const full = String(record.collapsedActivity || '');
-        if (text && full && full !== text) record.activityEl.title = full;
-        else record.activityEl.removeAttribute('title');
+        record.activityEl.removeAttribute('title');
     }
 
     function ensureSubagentContainer(parentId = '') {
@@ -1659,6 +1801,12 @@ export function createChatInstance({
     }
 
     function getSubagentCardRecord(childId = '', parentId = '', role = '') {
+        return withStableViewport(() => getSubagentCardRecordMutation(
+            childId, parentId, role,
+        ));
+    }
+
+    function getSubagentCardRecordMutation(childId = '', parentId = '', role = '') {
         if (!childId || !parentId) return null;
         const existing = liveCardRecords.get(childId);
         const wasSubagent = existing?.isSubagent === true || existing?.root?.classList.contains('subagent');
@@ -1747,12 +1895,15 @@ export function createChatInstance({
     }
 
     function setLiveCardExpanded(record, expanded) {
-        if (!record?.root) return;
-        record.root.dataset.expanded = expanded ? '1' : '0';
-        syncLiveCardToggle(record);
-        if (record.root.isConnected) {
-            requestAnimationFrame(() => syncLiveCardLayout(record));
-        }
+        const mutate = () => {
+            if (!record?.root) return;
+            record.root.dataset.expanded = expanded ? '1' : '0';
+            syncLiveCardToggle(record);
+            if (record.root.isConnected) {
+                requestAnimationFrame(() => syncLiveCardLayout(record));
+            }
+        };
+        return record?.root?.isConnected ? withStableViewport(mutate) : mutate();
     }
 
     function isLiveLineExpandable(item) {
@@ -1876,11 +2027,13 @@ export function createChatInstance({
 
     // Full rebuild for initial render and expand/collapse toggles.
     function renderLiveCardTimeline(record) {
-        const el = record.timelineEl;
-        const pinned = isTimelinePinnedToBottom(record);
-        const prevTop = el.scrollTop;
-        el.innerHTML = record.items.map((item) => buildTimelineItemHtml(item, record)).join('');
-        el.scrollTop = pinned ? el.scrollHeight : prevTop;
+        return withStableViewport(() => {
+            const el = record.timelineEl;
+            const pinned = isTimelinePinnedToBottom(record);
+            const prevTop = el.scrollTop;
+            el.innerHTML = record.items.map((item) => buildTimelineItemHtml(item, record)).join('');
+            el.scrollTop = pinned ? el.scrollHeight : prevTop;
+        });
     }
 
     // P3: fetch the genuinely-full output for a server-truncated timeline line (the WS
@@ -1963,7 +2116,13 @@ export function createChatInstance({
         }, 700);
     }
 
-    function applyLiveCardState(summary, groupId, ts, dedupeKey = '', { suppressDomInsert = false, rawTs = '' } = {}) {
+    function applyLiveCardState(summary, groupId, ts, dedupeKey = '', options = {}) {
+        return withStableViewport(() => applyLiveCardStateMutation(
+            summary, groupId, ts, dedupeKey, options,
+        ));
+    }
+
+    function applyLiveCardStateMutation(summary, groupId, ts, dedupeKey = '', { suppressDomInsert = false, rawTs = '' } = {}) {
         const nextGroupId = groupId || activeLiveGroupId || 'active';
         const record = getLiveCardRecord(nextGroupId);
         // A converted card is now a terminal project chip — its task is owned by the
@@ -2018,32 +2177,22 @@ export function createChatInstance({
         // headline still renders in the timeline lines below. Falls back to the
         // activity headline until the proactive namer has produced a name.
         record.titleEl.textContent = record.suggestedName || activeHeadline;
-        // P1 (v6.82): collapsed activity line. The raw candidate is remembered
-        // even while the line is suppressed (unnamed root card) so a late coined
-        // name can populate it without waiting for the next frame. Root cards
-        // take candidates from HUMAN frames only — terminal/lifecycle fallbacks
-        // ("Done") are phase chips, not activity, and must not overwrite or
-        // duplicate the last meaningful action.
-        // The line takes the FULL companion (fullHeadline/fullBody) whenever the
-        // summarizer carried one: `headline`/`body` are timeline PREVIEWS capped
-        // for the bounded row, and the wrapping activity line has no such bound,
-        // so reusing the preview here would be an undisclosed cut of owner-facing
-        // cognitive text (BIBLE P1 / DEVELOPMENT no-silent-truncation).
-        const rootActivityHeadline = (!record.isSubagent && summary.human)
-            ? String(summary.fullHeadline || activeHeadline || '') : '';
-        const childActivityBody = record.isSubagent
-            ? String(summary.fullBody || summary.body || '') : '';
-        const activityCandidate = String(
-            (record.isSubagent ? childActivityBody : rootActivityHeadline) || '',
-        ).trim();
+        // The collapsed line is a compact presentation projection, while the
+        // complete latest activity remains independently reachable through the
+        // expanded timeline. Root cards accept activity only from human frames;
+        // terminal "Done" markers must not overwrite the last real action.
+        const previewSource = record.isSubagent
+            ? String(summary.activityPreview ?? summary.body ?? '')
+            : (summary.human ? String(summary.activityPreview ?? activeHeadline ?? '') : '');
+        const activityCandidate = previewSource.trim();
+        if (activityCandidate) record.collapsedActivity = boundActivityPreview(activityCandidate);
         const activityText = projectCollapsedActivity({
             isSubagent: record.isSubagent,
             suggestedName: record.suggestedName,
-            headline: record.isSubagent ? '' : rootActivityHeadline,
-            body: childActivityBody,
+            headline: record.isSubagent ? '' : record.collapsedActivity,
+            body: record.isSubagent ? record.collapsedActivity : '',
             previous: record.collapsedActivity,
         });
-        if (activityCandidate) record.collapsedActivity = activityCandidate;
         renderCollapsedActivity(record, activityText);
 
         const shouldRenderLine = summary.visible !== false && Boolean(headline || summary.body);
@@ -2167,6 +2316,10 @@ export function createChatInstance({
     }
 
     function finishLiveCard(groupId = '', phase = '') {
+        return withStableViewport(() => finishLiveCardMutation(groupId, phase));
+    }
+
+    function finishLiveCardMutation(groupId = '', phase = '') {
         const record = groupId
             ? liveCardRecords.get(groupId)
             : (activeLiveGroupId ? liveCardRecords.get(activeLiveGroupId) : null);
@@ -2264,17 +2417,6 @@ export function createChatInstance({
     // progress for these must NOT revive it back to "working".
     const subagentTerminalChildren = new Set();
 
-    const SUBAGENT_EVENT_PHASE = {
-        scheduled: 'start', running: 'working', completed: 'done', completed_warn: 'warn',
-        // 'cancelled' is a first-class terminal phase (v6.82 P5) — a cancelled
-        // child must read as Cancelled, not as a generic amber "Notice".
-        failed: 'error', rejected: 'warn', cancelled: 'cancelled', interrupted: 'warn',
-    };
-    const SUBAGENT_EVENT_LABEL = {
-        scheduled: 'scheduled', running: 'running', completed: 'done', completed_warn: 'done with warnings',
-        failed: 'failed', rejected: 'rejected', cancelled: 'cancelled', interrupted: 'interrupted',
-    };
-
     // E2 (v6.39 UI): merge a subagent's parent/role/model, PRESERVING a previously-seen model
     // when a later (model-less) event — e.g. a synthesized terminal — updates the entry, so the
     // "role · model" headline survives the child's lifecycle.
@@ -2287,16 +2429,15 @@ export function createChatInstance({
         });
     }
 
-    function formatSubagentHeadline(childId = '', role = '', label = '', model = '') {
-        const shortChild = String(childId || '').slice(0, 8);
-        const cleanRole = String(role || '').trim();
-        const suffix = label ? ` — ${label}` : '';
-        // Show the resolved model compactly NEXT TO the role (e.g. "planning-scout · gemini-3.5-flash").
-        const modelPart = compactModel(model) ? ` · ${compactModel(model)}` : '';
-        if (cleanRole) {
-            return `${cleanRole}${modelPart}${shortChild ? ` (${shortChild})` : ''}${suffix}`;
-        }
-        return `Subagent ${shortChild || 'child'}${modelPart}${suffix}`;
+    function summarizeSubagentCardFrame(evt, overrides = {}, rawTs = '') {
+        const summary = summarizeChatLiveEvent({
+            ...evt,
+            type: 'send_message',
+            is_progress: true,
+            delegation_role: 'subagent',
+            ...overrides,
+        });
+        return summary ? withTaskCostMeta(summary, evt, { rawTs }) : null;
     }
 
     function updateLiveCardFromProgressMessage(msg) {
@@ -2316,8 +2457,11 @@ export function createChatInstance({
         // Subagent lifecycle pings render as child cards linked to the parent;
         // they must not update the parent card's terminal state.
         const lifecycleParent = String(msg?.parent_task_id || '').trim();
-        if (msg?.subagent_event && lifecycleParent && lifecycleParent !== taskId) {
-            updateSubagentCardFromEvent(msg, rawTs);
+        if (
+            msg?.subagent_event
+            && lifecycleParent
+            && updateSubagentCardFromEvent(msg, rawTs)
+        ) {
             return;
         }
         // A known subagent child's own (non-lifecycle) progress stays on the child
@@ -2381,107 +2525,81 @@ export function createChatInstance({
         const parentId = String(evt.parent_task_id || '').trim();
         const childId = String(evt.subagent_task_id || evt.task_id || '').trim();
         if (!parentId || !childId || parentId === childId) return false;
-        const rawEvent = String(evt.subagent_event || 'update').toLowerCase();
-        const completionSeverity = rawEvent === 'completed' ? taskOutcomeSeverity(evt) : 'done';
-        const event = rawEvent === 'completed'
-            ? (completionSeverity === 'error' ? 'failed' : (completionSeverity === 'warn' ? 'completed_warn' : 'completed'))
-            : rawEvent;
+        const event = String(evt.subagent_event || '').toLowerCase();
         const role = String(evt.subagent_role || '').trim();
         setSubagentParent(childId, { parentId, role, model: evt.model });
-        const { model } = subagentChildParents.get(childId) || {};
-        // NOTE: 'interrupted' is intentionally excluded — it is retryable
-        // (written before requeue), so the child resumes and its later progress
-        // must still flow to its card. Only true terminals lock it.
-        if (['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(event)) {
-            subagentTerminalChildren.add(childId);  // lock the child card terminal
+        // Worker narration carries subagent_event="progress" too. It is activity,
+        // not a lifecycle row: route it through the progress key so the later
+        // terminal frame cannot overwrite the only full narration disclosure.
+        if (![
+            'scheduled', 'running', 'completed', 'completed_warn',
+            'failed', 'cancelled', 'rejected', 'interrupted',
+        ].includes(event)) {
+            routeSubagentProgressToCard(childId, evt);
+            return true;
         }
-        const phase = SUBAGENT_EVENT_PHASE[event] || 'working';
-        const label = SUBAGENT_EVENT_LABEL[event] || event;
-        const shortChild = childId.slice(0, 8);
-        const headline = formatSubagentHeadline(childId, role, label, model);
-        // Surface the child's handoff (result/trace/error) as expandable detail
-        // on the child card.
-        const detailParts = [];
-        const reviewDetails = formatReviewProjection(evt.review_projection);
-        if (reviewDetails) detailParts.push(`[REVIEW]\n${reviewDetails}`);
-        if (evt.result) detailParts.push(`[RESULT]\n${String(evt.result)}`);
-        if (evt.trace_summary) detailParts.push(`[TRACE]\n${String(evt.trace_summary)}`);
-        if (evt.error) detailParts.push(`[ERROR]\n${String(evt.error)}`);
-        const metaBits = [`child=${shortChild}`];
-        if (role) metaBits.push(`role=${role}`);
+        const { model } = subagentChildParents.get(childId) || {};
+        const rawTs = tsValue || new Date().toISOString();
+        const summary = summarizeSubagentCardFrame(evt, {
+            subagent_task_id: childId,
+            parent_task_id: parentId,
+            subagent_role: role,
+            model,
+        }, rawTs);
+        if (!summary) return false;
+        summary.dedupeKey = `subagent-lifecycle:${childId}`;
+        // Interrupted is retryable and therefore non-terminal; the canonical
+        // projector owns that distinction for both live and replay paths.
+        if (summary.terminal) subagentTerminalChildren.add(childId);
         forceTaskCard(parentId, tsValue);
         const childState = getTaskUiState(childId, true);
         if (childState && !childState.completed) childState.forceCard = true;
         getSubagentCardRecord(childId, parentId, role);
-        queueTaskLiveUpdate({
-            phase,
-            headline,
-            body: reviewDetails,
-            fullBody: detailParts.join('\n\n'),
-            visible: true,
-            promote: true,
-            expandByDefault: Boolean(reviewDetails),
-            meta: metaBits,
-            costProjection: taskCostProjection(evt, tsValue),
-            dedupeKey: `subagent-lifecycle:${childId}`,
-            terminal: ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(event),
-        }, childId, normalizeLogTs(tsValue || new Date().toISOString()), `subagent-lifecycle:${childId}`, tsValue);
+        queueTaskLiveUpdate(
+            summary,
+            childId,
+            normalizeLogTs(rawTs),
+            summary.dedupeKey,
+            rawTs,
+        );
         return true;
-    }
-
-    // Record a terminal child's latest narration as its collapsed activity
-    // without touching phase, timeline or finished state (P1, v6.82).
-    function rememberSubagentActivity(childId, msg) {
-        const record = liveCardRecords.get(childId);
-        if (!record || !record.activityEl) return;
-        const line = String(msg?.content || msg?.text || '').trim().split('\n').filter(Boolean).pop() || '';
-        if (!line) return;
-        // The complete line is kept: this is owner-facing cognitive text, and the
-        // CSS wraps it (`overflow-wrap:anywhere`), so a hardcoded slice here would
-        // be an undisclosed cut (BIBLE P1 / DEVELOPMENT no-silent-truncation).
-        record.collapsedActivity = line;
-        renderCollapsedActivity(record, projectCollapsedActivity({
-            isSubagent: true,
-            body: record.collapsedActivity,
-            previous: record.collapsedActivity,
-        }));
     }
 
     // A known child's own (non-lifecycle) progress updates the linked child card.
     function routeSubagentProgressToCard(childId, msg) {
         const info = subagentChildParents.get(childId);
         if (!info) return;
-        if (subagentTerminalChildren.has(childId)) {
-            // Never revive a finished child's phase/timeline — but its last
-            // narration is still its collapsed activity (P1, v6.82): on replay
-            // terminal children are pre-marked before pass 1, so without this a
-            // finished child card would show an empty activity line.
-            rememberSubagentActivity(childId, msg);
-            return;
-        }
         const { parentId, role, model } = info;
-        const shortChild = String(childId).slice(0, 8);
-        const line = String(msg?.content || msg?.text || '').trim().split('\n').filter(Boolean).pop() || '';
-        const headline = formatSubagentHeadline(childId, role, 'running', model);
+        const content = String(msg?.content || msg?.text || '').trim();
+        if (!content) return;
         const rawTs = msg?.ts || new Date().toISOString();
         forceTaskCard(parentId, rawTs);
         const childState = getTaskUiState(childId, true);
         if (childState && !childState.completed) childState.forceCard = true;
-        getSubagentCardRecord(childId, parentId, role);
-        const meta = [`child=${shortChild}`];
-        if (role) meta.push(`role=${role}`);
-        queueTaskLiveUpdate({
-            phase: 'working',
-            headline,
-            body: line.slice(0, 200),
-            // The timeline row stays a bounded preview; the collapsed activity
-            // line reads this uncut companion instead (P1: no silent cut).
-            fullBody: line,
-            visible: true,
-            promote: true,
-            meta,
-            dedupeKey: `subagent-progress:${childId}`,
-        }, childId, normalizeLogTs(rawTs), `subagent-progress:${childId}`, rawTs);
+        const record = getSubagentCardRecord(childId, parentId, role);
+        const preserveTerminal = Boolean(record?.finished && subagentTerminalChildren.has(childId));
+        const summary = summarizeSubagentCardFrame(msg, {
+            content,
+            text: content,
+            subagent_event: 'running',
+            subagent_task_id: childId,
+            parent_task_id: parentId,
+            subagent_role: role,
+            model,
+            // A replayed progress row may follow a terminal record because the
+            // history pre-pass already knows the child's final state. Do not add
+            // contradictory `status=running` metadata in that case.
+            status: preserveTerminal ? '' : (msg?.status || ''),
+        }, rawTs);
+        if (!summary) return;
+        summary.dedupeKey = `subagent-progress:${childId}`;
+        if (preserveTerminal) {
+            summary.phase = String(record.phaseEl?.dataset?.phase || 'done');
+            summary.headline = String(record.titleEl?.textContent || summary.headline);
+            summary.fullHeadline = summary.headline;
+            summary.terminal = true;
+        }
+        queueTaskLiveUpdate(summary, childId, normalizeLogTs(rawTs), summary.dedupeKey, rawTs);
     }
 
     function routeSubagentFinalMessageToCard(taskId, msg) {
@@ -2489,26 +2607,30 @@ export function createChatInstance({
         const info = subagentChildParents.get(childId);
         if (!childId || !info) return false;
         const { parentId, role, model } = info;
-        const shortChild = childId.slice(0, 8);
         const text = String(msg?.content || msg?.text || '').trim();
         const rawTs = msg?.ts || new Date().toISOString();
         forceTaskCard(parentId, rawTs);
         const record = getSubagentCardRecord(childId, parentId, role);
         const priorTerminalPhase = record?.finished ? String(record.phaseEl?.dataset?.phase || '') : '';
-        const resultPhase = ['warn', 'error', 'cancelled'].includes(priorTerminalPhase) ? priorTerminalPhase : 'done';
-        const meta = [`child=${shortChild}`];
-        if (role) meta.push(`role=${role}`);
-        queueTaskLiveUpdate({
-            phase: resultPhase,
-            headline: formatSubagentHeadline(childId, role, 'result', model),
-            body: text.slice(0, 200),
-            fullBody: text,
-            visible: true,
-            promote: true,
-            meta,
-            dedupeKey: `subagent-result:${childId}`,
-            terminal: true,
-        }, childId, normalizeLogTs(rawTs), `subagent-result:${childId}`, rawTs);
+        const summary = summarizeSubagentCardFrame(msg, {
+            content: '',
+            text: '',
+            result: text,
+            subagent_event: 'completed',
+            subagent_task_id: childId,
+            parent_task_id: parentId,
+            subagent_role: role,
+            model,
+        }, rawTs);
+        if (!summary) return false;
+        summary.dedupeKey = `subagent-result:${childId}`;
+        if (priorTerminalPhase) {
+            summary.phase = priorTerminalPhase;
+            summary.headline = String(record.titleEl?.textContent || summary.headline);
+            summary.fullHeadline = summary.headline;
+            summary.terminal = true;
+        }
+        queueTaskLiveUpdate(summary, childId, normalizeLogTs(rawTs), summary.dedupeKey, rawTs);
         return true;
     }
 
@@ -3379,11 +3501,6 @@ export function createChatInstance({
     // column's scrollTop, and toggling .page display can reset it too). We
     // remember where the user was and restore it on show: pinned to the latest
     // message in the common case, or the exact spot they'd scrolled back to.
-    let _savedScrollTop = 0;
-    let _savedStick = true;  // a fresh thread starts pinned to the newest message
-    let _restoring = false;  // suppress saved-state writes during a restore pass
-    const isInstanceVisible = () =>
-        Boolean(messagesDiv) && messagesDiv.offsetParent !== null && !document.hidden;
     messagesDiv?.addEventListener('scroll', () => {
         // Ignore the spurious scrollTop=0 a browser emits while the column is
         // hidden — that would erase the real position we want to restore.

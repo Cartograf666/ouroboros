@@ -152,6 +152,16 @@ def latest_chat_annotations(drive_root: Any) -> Dict[str, Dict[str, Any]]:
     return _latest_annotations(path)
 
 
+def chat_annotation_receipt(
+    drive_root: Any, client_message_id: str, routing_token: str,
+) -> Dict[str, Any]:
+    """Return the exact token-bound annotation for one routing attempt."""
+    row = latest_chat_annotations(drive_root).get(str(client_message_id or ""), {})
+    if str(row.get("routing_token") or "") != str(routing_token or ""):
+        return {}
+    return dict(row)
+
+
 def _compact_annotations_locked(drive_root: Any, path: pathlib.Path) -> None:
     if not path.is_file() or path.stat().st_size < _COMPACT_AT_BYTES:
         return
@@ -186,6 +196,10 @@ def append_chat_annotation(
     action: str,
     target: str = "",
     status: str,
+    routing_token: str = "",
+    reason: str = "",
+    detail: str = "",
+    options: Any = None,
 ) -> bool:
     """Append one compact UI annotation; no semantic routing state is stored."""
     message_id = str(client_message_id or "").strip()
@@ -199,6 +213,14 @@ def append_chat_annotation(
         "target": str(target or "")[:200],
         "status": str(status or "")[:80],
     }
+    if str(routing_token or ""):
+        row["routing_token"] = str(routing_token)[:128]
+    if str(reason or ""):
+        row["reason"] = str(reason)[:200]
+    if str(detail or ""):
+        row["detail"] = str(detail)[:1000]
+    if isinstance(options, list):
+        row["options"] = [dict(item) for item in options[:100] if isinstance(item, dict)]
     path = pathlib.Path(drive_root) / "logs" / _ANNOTATIONS_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = jsonl_append_lock_path(path)
@@ -224,6 +246,7 @@ def append_chat_annotation(
 __all__ = [
     "append_chat_annotation",
     "build_owner_message_ref",
+    "chat_annotation_receipt",
     "entry_matches_source_ref",
     "latest_chat_annotations",
     "project_origin_rows",

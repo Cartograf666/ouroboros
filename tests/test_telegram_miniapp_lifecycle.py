@@ -23,11 +23,13 @@ class _Status:
         self.state = "starting"
         self.reason_code = "initializing"
         self.transitions: list[tuple[str, str]] = []
+        self.messages: list[str] = []
 
     def transition(self, state: str, _message: str, *, reason_code: str, **_kwargs: Any) -> None:
         self.state = state
         self.reason_code = reason_code
         self.transitions.append((state, reason_code))
+        self.messages.append(_message)
 
 
 def test_owner_change_revokes_sidecar_before_monitor_tick(tmp_path: Path) -> None:
@@ -575,6 +577,62 @@ def test_generation_loop_survives_more_than_five_tunnel_failures(
         await asyncio.gather(server_task, return_exceptions=True)
         assert attempts == 7
         assert stopped == 7
+
+    asyncio.run(scenario())
+
+
+def test_generation_backoff_preserves_tunnel_failure_detail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        class Tunnel:
+            returncode = 17
+
+            def __init__(self, *_args: Any) -> None:
+                pass
+
+            async def start(self) -> None:
+                raise companion.CloudflaredError(
+                    "Cloudflared exited before publishing a URL (exit 17). Last output: allocation refused"
+                )
+
+            async def stop(self) -> None:
+                return None
+
+        status = _Status()
+
+        async def inspect_backoff(*_args: Any, **_kwargs: Any) -> None:
+            assert status.reason_code == "tunnel_generation_failed"
+            assert status.messages[-1].endswith("allocation refused")
+            raise companion.ShutdownRequested("test complete")
+
+        monkeypatch.setattr(companion, "QuickTunnel", Tunnel)
+        monkeypatch.setattr(companion, "_wait_or_stop", inspect_backoff)
+        monkeypatch.setattr(companion, "_retry_delay", lambda _count: 1.0)
+        server_task = asyncio.create_task(asyncio.Event().wait())
+        context = companion._GenerationContext(
+            menu=object(),  # type: ignore[arg-type]
+            settings_observer=type("Settings", (), {"state_dir": tmp_path})(),  # type: ignore[arg-type]
+            owner=12345,
+            button_text="Ouroboros",
+            core_port=9012,
+            status=status,  # type: ignore[arg-type]
+            stop_event=asyncio.Event(),
+            server_task=server_task,
+        )
+        sidecar = type("Sidecar", (), {"clear_public_url": lambda self: None})()
+        with pytest.raises(companion.ShutdownRequested, match="test complete"):
+            await companion._run_tunnel_generations(
+                tmp_path / "cloudflared",
+                tmp_path,
+                45678,
+                sidecar,  # type: ignore[arg-type]
+                context,
+            )
+        assert status.transitions[-1] == ("reconnecting", "tunnel_generation_failed")
+        server_task.cancel()
+        await asyncio.gather(server_task, return_exceptions=True)
 
     asyncio.run(scenario())
 

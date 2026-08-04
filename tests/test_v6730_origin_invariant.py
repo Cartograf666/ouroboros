@@ -143,9 +143,13 @@ def _tool_ctx(tmp_path, events, metadata):
     )
 
 
-def test_promote_tool_passes_origin_by_value_despite_rewritten_objective(tmp_path):
+def test_promote_tool_passes_origin_by_value_despite_rewritten_objective(tmp_path, monkeypatch):
     from ouroboros.tools.control import _promote_chat_to_task
 
+    monkeypatch.setattr(
+        "ouroboros.tools.control._wait_for_promotion_admission",
+        lambda *_args, **_kwargs: {"status": "scheduled"},
+    )
     events = []
     ctx = _tool_ctx(tmp_path, events, {
         "client_message_id": "owner-msg-1",
@@ -157,7 +161,7 @@ def test_promote_tool_passes_origin_by_value_despite_rewritten_objective(tmp_pat
         objective="Create a standalone 3D browser game about a robot (LLM-rewritten)",
         project_name="Robot City Adventure",
     )
-    assert out.startswith("OK: promoted")
+    assert out.startswith("OK: task")
     evt = events[0]
     assert evt["source_ref"] == _ref()
     assert evt["source_text"] == OWNER_TEXT
@@ -191,6 +195,7 @@ def test_promote_worker_absence_reason_follows_provenance(tmp_path, monkeypatch)
     create_project(tmp_path, "racer")
     ctx = SimpleNamespace(
         enqueue_task=lambda task: None,
+        persist_queue_snapshot=lambda **_kwargs: True,
         load_state=lambda: {"owner_chat_id": 1},
     )
     result = workers.promote_chat_to_task({
@@ -568,7 +573,11 @@ def test_suppressed_message_promote_is_designed_absence(tmp_path, monkeypatch):
         "type": "promote_chat_to_task", "task_id": "sup-1",
         "objective": "Continue", "project_id": "supproj", "chat_id": 1,
         "client_message_id": "owner-sup-1", "origin_suppressed": True,
-    }, SimpleNamespace(enqueue_task=lambda t: None, load_state=lambda: {"owner_chat_id": 1}))
+    }, SimpleNamespace(
+        enqueue_task=lambda t: None,
+        persist_queue_snapshot=lambda **_kwargs: True,
+        load_state=lambda: {"owner_chat_id": 1},
+    ))
     assert project_binding_for_task(tmp_path, "sup-1")["origin_absent"] == "mid_task_no_origin"
 
 

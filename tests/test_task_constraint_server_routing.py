@@ -37,7 +37,7 @@ def test_constrained_repair_promotes_managed_task_before_busy_ephemeral_lane(mon
         handle_chat_ephemeral=lambda cid, txt, img, task_constraint=None, task_metadata=None: calls["ephemeral"].append(task_constraint),
     )
     monkeypatch.setattr(
-        "supervisor.workers.promote_chat_to_task",
+        "supervisor.events._handle_promote_chat_to_task",
         lambda event, _ctx: (
             calls["promote"].append(event)
             or {"status": "scheduled", "task_id": event["task_id"]}
@@ -71,7 +71,9 @@ def test_constrained_repair_promotes_managed_task_before_busy_ephemeral_lane(mon
         "payload_root": "skills/external/alpha",
     }
     assert event["origin_suppressed"] is True
-    assert calls["sent"] == []
+    assert len(calls["sent"]) == 1
+    assert calls["sent"][0][0] == 1
+    assert "accepted and durably scheduled" in calls["sent"][0][1]
 
 
 def test_constrained_repair_refusal_is_reported_to_owner(monkeypatch):
@@ -81,7 +83,7 @@ def test_constrained_repair_refusal_is_reported_to_owner(monkeypatch):
         send_with_budget=lambda chat_id, text: sent.append((chat_id, text)),
     )
     monkeypatch.setattr(
-        "supervisor.workers.promote_chat_to_task",
+        "supervisor.events._handle_promote_chat_to_task",
         lambda event, _ctx: {
             "status": "needs_manual_target",
             "reason": "skill_repair_payload_missing",

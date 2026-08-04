@@ -259,6 +259,9 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
     proc = job.get("proc")
     task_id = str(job.get("task_id") or "")
     task = job.get("task") if isinstance(job.get("task"), dict) else {}
+    task_metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    evolution_tx = task_metadata.get("evolution_transaction")
+    terminal_metadata = {"evolution_transaction": dict(evolution_tx)} if isinstance(evolution_tx, dict) else {}
     task_type = str(job.get("task_type") or "")
     terminal_reason = str(job.get("terminal_reason") or "idle_timeout")
     attempt = int(job.get("attempt") or 1)
@@ -355,6 +358,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                     "type": "task_done", "task_id": task_id, "task_type": task_type,
                     "chat_id": done_chat_id, "status": self_status,
                     "reason_code": str((_existing or {}).get("reason_code") or ""),
+                    "metadata": terminal_metadata,
             })
         except Exception:
             log.debug("Reaper: failed to emit task_done for self-finalized %s", task_id, exc_info=True)
@@ -507,23 +511,17 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                         "chat_id": done_chat_id, "status": "failed", "reason_code": terminal_reason,
                         "outcome_axes": terminal_outcome_axes(lifecycle="failed", execution=EXECUTION_INFRA_FAILED, reason_code=terminal_reason, review_trigger="supervisor_terminal"),
                         **recon_fields,
-                        "metadata": task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
+                        "metadata": terminal_metadata,
                 })
             except Exception:
                 log.debug("Reaper: failed to emit task_done for %s", task_id, exc_info=True)
 
     # 5. Respawn a fresh worker for the slot; on failure, CLEAR reaping so the crash detector
     #    can recover the slot on a later tick instead of stranding it permanently.
-    #    Hold _queue_lock across the membership check AND the respawn so it is mutually
-    #    exclusive with kill_workers (which clears WORKERS under the same lock at shutdown).
-    #    Otherwise the reaper could pass the check, start a replacement process, and insert it
-    #    into WORKERS only AFTER shutdown cleanup already cleared the pool — an orphan worker
-    #    surviving shutdown. _queue_lock is an RLock and respawn_worker re-acquires it
-    #    internally, so taking it here is safe (and a cleared pool makes the check fail closed).
+    #    respawn_worker owns the lifecycle race with shutdown and starts the child
+    #    outside _queue_lock, so a fork can never inherit the RLock from this thread.
     try:
-        with _q._queue_lock:
-            if worker_id in workers_mod.WORKERS:
-                workers_mod.respawn_worker(worker_id)
+        workers_mod.respawn_worker(worker_id)
     except Exception:
         log.warning("Reaper: respawn failed for worker %d; clearing reaping for recovery", worker_id, exc_info=True)
         try:

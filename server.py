@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import socket
+import subprocess
 
 import os
 import pathlib
@@ -12,7 +13,7 @@ import sys
 import threading
 import time
 import uuid
-from ouroboros.utils import utc_now_iso
+from ouroboros.utils import read_json_dict, utc_now_iso
 from typing import Any, Dict, Optional
 
 from starlette.applications import Starlette
@@ -444,7 +445,10 @@ def _route_project_chat_to_running_task(
                 active_fence = ACCEPTANCE_FENCES.get(fence_root)
                 if isinstance(active_fence, dict) and str(active_fence.get("status") or "") == "sealed":
                     return ""
-            write_owner_message(task_drive, f"{message}{attachment_note}", tid, msg_id=msg_id)
+            if not write_owner_message(
+                task_drive, f"{message}{attachment_note}", tid, msg_id=msg_id
+            ):
+                return ""
             if direct_lock_held:
                 direct_agent._owner_message_generation = int(
                     getattr(direct_agent, "_owner_message_generation", 0) or 0
@@ -559,9 +563,13 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
     instead of spawning a duplicate) and the originating message id (for idempotent
     steer delivery). P5-clean: surfaces state only; the agent picks the target by
     judgment among answer / steer_task / promote_chat_to_task / route_to_project."""
+    md = dict(task_metadata) if isinstance(task_metadata, dict) else {}
+    swarm_intent = bool(md.get("force_plan"))
     addressable_here = _addressable_root_tasks(ctx, chat_id)
     running_here = [row for row in addressable_here if row.get("status") == "running"]
-    project_id = _project_id_for_registered_chat(ctx, chat_id)
+    project_id = str(md.get("project_id") or "").strip() or _project_id_for_registered_chat(
+        ctx, chat_id,
+    )
     is_main_lane = not bool(project_id)
     try:
         # Every non-Project owner transport is the Main lane.  External transports
@@ -576,9 +584,8 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
     except Exception:
         log.warning("Unable to build Main routing manifest", exc_info=True)
         main_manifest = {"error": "routing_manifest_unavailable"} if is_main_lane else {}
-    if not addressable_here and not client_message_id and not main_manifest:
+    if not swarm_intent and not addressable_here and not client_message_id and not main_manifest:
         return task_metadata
-    md = dict(task_metadata) if isinstance(task_metadata, dict) else {}
     if addressable_here:
         md["current_chat"] = {
             "chat_id": int(chat_id or 0),
@@ -594,7 +601,7 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         if is_main_lane and isinstance(main_manifest, dict)
         else addressable_here
     )
-    manual_options = [
+    manual_options = [] if swarm_intent else [
         {
             "action": "steer_task",
             "task_id": row["task_id"],
@@ -605,30 +612,38 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         for row in option_roots
         if isinstance(row, dict) and row.get("task_id")
     ]
-    if is_main_lane and isinstance(main_manifest, dict):
+    if not swarm_intent and is_main_lane and isinstance(main_manifest, dict):
         manual_options.extend({
             "action": "new_task_in_project",
             "project_id": str(row.get("project_id") or ""),
             "project_name": str(row.get("name") or row.get("project_id") or "Project"),
             "label": f"New task in {str(row.get('name') or 'Project')}",
         } for row in list(main_manifest.get("projects") or []) if isinstance(row, dict))
-    elif project_id:
+    elif project_id and not swarm_intent:
         manual_options.append({
             "action": "new_task_in_project",
             "project_id": project_id,
             "label": "New task in Project",
         })
-    md["routing_contract"] = {
+    routing_contract = {
         "llm_first": True,
         "source_lane": "main" if is_main_lane else "project",
-        "valid_actions": [
-            "answer_inline", "steer_task", "promote_chat_to_task", "route_to_project",
-            "needs_manual_target",
-        ],
-        "on_uncertain_or_invalid_target": "needs_manual_target",
-        "manual_target_tool": {"name": "route_to_project", "project_id": ""},
+        "valid_actions": (
+            (["promote_chat_to_task", "route_to_project"] if is_main_lane else ["promote_chat_to_task"])
+            if swarm_intent else
+            [
+                "answer_inline", "steer_task", "promote_chat_to_task", "route_to_project",
+                "needs_manual_target",
+            ]
+        ),
+        "on_uncertain_or_invalid_target": (
+            "promote_chat_to_task" if swarm_intent else "needs_manual_target"
+        ),
         "manual_options": manual_options,
     }
+    if not swarm_intent:
+        routing_contract["manual_target_tool"] = {"name": "route_to_project", "project_id": ""}
+    md["routing_contract"] = routing_contract
     return md
 
 
@@ -923,15 +938,16 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         # through the conversation decision lane would combine skill_repair with
         # _ephemeral_turn: ephemeral hides the repair mutators while heal mode
         # blocks promotion. Promote it directly without weakening either policy.
-        from supervisor.workers import promote_chat_to_task
+        from supervisor.events import _handle_promote_chat_to_task
 
         ctx.consciousness.inject_observation(
             f"Message from my human: {incoming.get('log_text') or ''}"
         )
-        task_id = uuid.uuid4().hex[:8]
+        task_id = uuid.uuid4().hex[:16]
         event = {
             "type": "promote_chat_to_task",
             "task_id": task_id,
+            "routing_token": uuid.uuid4().hex,
             "objective": text or image_caption,
             "chat_id": chat_id,
             "client_message_id": client_message_id,
@@ -945,7 +961,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         else:
             event["origin_suppressed"] = True
         try:
-            outcome = promote_chat_to_task(event, ctx)
+            outcome = _handle_promote_chat_to_task(event, ctx)
         except Exception:
             log.warning("Direct skill-repair promotion failed", exc_info=True)
             outcome = {
@@ -955,7 +971,15 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
             }
         outcome = outcome if isinstance(outcome, dict) else {"status": "scheduled", "task_id": task_id}
         outcome_status = str(outcome.get("status") or "needs_manual_target")
-        if outcome_status != "scheduled":
+        if outcome_status == "scheduled":
+            try:
+                ctx.send_with_budget(
+                    chat_id,
+                    f"✅ Repair task {task_id} was accepted and durably scheduled.",
+                )
+            except Exception:
+                log.debug("Repair promotion success notification failed", exc_info=True)
+        else:
             reason = str(outcome.get("reason") or outcome_status)
             try:
                 ctx.send_with_budget(
@@ -964,15 +988,6 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
                 )
             except Exception:
                 log.debug("Repair promotion refusal notification failed", exc_info=True)
-        _record_routing_receipt(
-            bridge,
-            ctx,
-            chat_id=chat_id,
-            client_message_id=client_message_id,
-            action="promote_chat_to_task",
-            target=str(outcome.get("task_id") or task_id),
-            status=outcome_status,
-        )
         return
     reserved_project = _reserved_project_for_chat(ctx, chat_id)
     project_id = (
@@ -993,6 +1008,9 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         return
     ctx.consciousness.inject_observation(f"Message from my human: {incoming.get('log_text') or ''}")
     task_metadata = _scoped_task_metadata(project_id, task_metadata)
+    swarm_intent = bool(
+        isinstance(task_metadata, dict) and task_metadata.get("force_plan")
+    )
     # The turn's origin identity rides UNCONDITIONALLY (not only when the
     # decision lane runs): a bare direct turn with no projects/roots yet — the
     # first-ever project creation — must still carry it so promote/route/bind
@@ -1008,7 +1026,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         # A suppressed (never-logged) message has a DESIGNED absence of origin;
         # downstream binders must not classify it as a producer bug.
         task_metadata = {**(task_metadata or {}), "origin_suppressed": True}
-    if project_id:
+    if project_id and not swarm_intent:
         routed_to_task = _route_project_chat_to_running_task(
             ctx,
             chat_id,
@@ -1037,7 +1055,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
     except Exception:
         log.warning("Unable to inspect Projects for owner routing", exc_info=True)
         has_projects = True
-    needs_decision_lane = bool(project_id) or has_projects or bool(global_roots)
+    needs_decision_lane = swarm_intent or bool(project_id) or has_projects or bool(global_roots)
     if needs_decision_lane:
         task_metadata = _decision_turn_metadata(ctx, chat_id, client_message_id, task_metadata)
     agent = ctx.get_chat_agent()
@@ -1266,11 +1284,18 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             if turn_on and len(parts) > 2:
                 objective = text.split(None, 2)[2].strip()
             if turn_on:
-                from supervisor.evolution_lifecycle import evolution_block_reason
+                from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
 
                 block = evolution_block_reason()
                 if block:
                     ctx.send_with_budget(chat_id, block)
+                    continue
+                try:
+                    if not start_evolution_campaign(objective, source="owner_chat"):
+                        raise RuntimeError("campaign write was refused")
+                except Exception:
+                    log.warning("Failed to start evolution campaign", exc_info=True)
+                    ctx.send_with_budget(chat_id, "⚠️ Evolution stayed OFF: campaign state could not be created.")
                     continue
             st2 = ctx.load_state()
             st2["evolution_mode_enabled"] = bool(turn_on)
@@ -1306,11 +1331,9 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                         f"🛑 Cancelled running evolution task(s): {', '.join(cancelled)}",
                     )
             try:
-                from supervisor.evolution_lifecycle import complete_evolution_campaign, start_evolution_campaign
+                from supervisor.evolution_lifecycle import complete_evolution_campaign
 
-                if turn_on:
-                    start_evolution_campaign(objective, source="owner_chat")
-                else:
+                if not turn_on:
                     # Terminal close (not a resumable pause): /evolve start mints a FRESH
                     # campaign rather than resurrecting this one.
                     complete_evolution_campaign("disabled via owner chat", status="stopped")
@@ -1819,6 +1842,7 @@ def _handle_restart_in_supervisor(evt: Dict[str, Any], ctx: Any) -> None:
         _pending_restart.update({
             "reason": str(evt.get("reason") or "agent_restart_request"),
             "deadline": time.time() + min(max_wait, 1800),
+            "evolution_restart": bool(evt.get("evolution_restart")),
         })
         if st.get("owner_chat_id"):
             ctx.send_with_budget(
@@ -1827,7 +1851,10 @@ def _handle_restart_in_supervisor(evt: Dict[str, Any], ctx: Any) -> None:
                 f"{', '.join(sorted(live))} to finish.",
             )
         return
-    _perform_supervisor_restart(ctx)
+    _perform_supervisor_restart(
+        ctx, restart_reason=str(evt.get("reason") or "agent_restart_request"),
+        evolution_restart=bool(evt.get("evolution_restart")),
+    )
 
 
 def _check_pending_restart_drain(ctx: Any) -> bool:
@@ -1839,8 +1866,12 @@ def _check_pending_restart_drain(ctx: Any) -> bool:
     live = _live_running_task_ids(ctx)
     if live and time.time() < float(_pending_restart.get("deadline") or 0.0):
         return True  # keep draining — events still flow each tick
+    pending = dict(_pending_restart)
     _pending_restart.clear()
-    _perform_supervisor_restart(ctx)
+    _perform_supervisor_restart(
+        ctx, restart_reason=str(pending.get("reason") or "agent_restart_request"),
+        evolution_restart=bool(pending.get("evolution_restart")),
+    )
     # Still "quiescing" this tick: _perform_supervisor_restart sets up the exit
     # (or fail-closed pauses) and returns to the loop — the process exits on the
     # next `while not _restart_requested` check. Returning True keeps the caller
@@ -1848,9 +1879,74 @@ def _check_pending_restart_drain(ctx: Any) -> bool:
     return True
 
 
-def _perform_supervisor_restart(ctx: Any) -> None:
+def _perform_supervisor_restart(
+    ctx: Any, *, restart_reason: str = "agent_restart_request",
+    evolution_restart: bool = False,
+) -> None:
     """Graceful shutdown + exit(42) (the post-drain tail; never sleeps)."""
     st = ctx.load_state()
+    marker = read_json_dict(
+        pathlib.Path(ctx.DRIVE_ROOT) / "state" / "pending_restart_verify.json"
+    ) or {}
+    claim = (
+        marker.get("evolution_claim")
+        if evolution_restart and marker.get("reason") == restart_reason
+        else {}
+    )
+    claim = claim if isinstance(claim, dict) else {}
+    if evolution_restart and not claim:
+        if st.get("owner_chat_id"):
+            ctx.send_with_budget(
+                int(st["owner_chat_id"]),
+                "🧬 Restart cancelled: the exact evolution restart receipt is missing.",
+            )
+        return
+    if claim:
+        from supervisor.evolution_lifecycle import check_evolution_authority
+
+        authority = check_evolution_authority(
+            str(claim.get("campaign_id") or ""),
+            str(claim.get("transaction_id") or ""),
+            str(claim.get("task_id") or ""),
+            commit_sha=str(claim.get("commit_sha") or ""),
+        )
+        if not authority.get("ok"):
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "🧬 Restart cancelled: evolution authority changed "
+                    f"({authority.get('reason') or 'unknown'}).",
+                )
+            return
+        expected_sha = str(claim.get("commit_sha") or "")
+        try:
+            head_proc = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(ctx.REPO_DIR),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            status_proc = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(ctx.REPO_DIR),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            head = head_proc.stdout.strip() if head_proc.returncode == 0 else ""
+            clean = status_proc.returncode == 0 and not status_proc.stdout.strip()
+        except Exception:
+            head = ""
+            clean = False
+        if not expected_sha or head != expected_sha or not clean:
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "🧬 Restart cancelled: the live checkout no longer matches "
+                    "the exact reviewed evolution commit.",
+                )
+            return
     ok, msg = ctx.safe_restart(
         reason="agent_restart_request", unsynced_policy="rescue_and_block",
     )
@@ -1901,6 +1997,15 @@ def _shutdown_task_cleanup_args(restart_requested: bool) -> tuple[str, str]:
             "finished; the task was interrupted, not a worker crash."
         )
     return "cancelled", reason
+
+
+def _shutdown_supervisor_event_bus() -> None:
+    try:
+        from supervisor.workers import shutdown_event_q
+
+        shutdown_event_q()
+    except Exception:
+        pass
 
 
 def _execute_panic_stop(consciousness, kill_workers_fn) -> None:
@@ -2276,6 +2381,7 @@ async def lifespan(app):
             get_bridge().shutdown()
         except Exception:
             pass
+        _shutdown_supervisor_event_bus()
 
 
 app = NetworkAuthGate(Starlette(routes=routes, lifespan=lifespan))

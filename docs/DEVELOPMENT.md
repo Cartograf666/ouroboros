@@ -546,6 +546,25 @@ dispositions fail closed. Reviewers remain generative, but a finding must name
 a concrete defect or a concrete smaller existing extension seam; never require
 a fixed number of findings.
 
+Force-plan is an LLM-first pre-implementation obligation on the admitted managed
+root, not a mechanical permission check around implementation tools. The existing
+`plan_review_state` owns durable review authority and
+`config.get_review_enforcement()` owns blocking/advisory policy. Every submitted
+envelope that reaches `plan_task` supersedes prior authority: invalid plan/goal/scope
+input stores a domain-separated open attempt, while a valid envelope stores its
+canonical fingerprint before repository/path validation. A newer attempt therefore
+cannot fall back to an older GREEN. Immediately before first panel dispatch, the exact planning-scout
+handoff component is frozen in a fingerprint-keyed host write-once continuity artifact;
+the remaining live reviewer context is rebuilt. An unavailable reviewer
+never becomes a disposition-able verdict; a repeat call reuses that handoff snapshot and
+retries the panel, including after A→B→A. Blocking stays in
+analysis and non-mutating preparation until closure or a real task-wide rail;
+advisory may proceed by agent judgment with a host-owned disclosure. A planning
+deadline skip records a typed rail attempt before returning so the reducer cannot
+misread it as an absent `plan_task` call.
+The short-lived Swarm router admits one new root and transfers the intent; it
+never runs `plan_task`, steers an existing task, or publishes the work inline.
+
 **Context mode (low / max).** The owner-selected `OUROBOROS_CONTEXT_MODE`
 (layout SSOT: `ouroboros/context_layout.py`) tiers the *reference-doc* layer of
 the agent's own context (main task context, background consciousness, deep
@@ -794,7 +813,13 @@ Review preflight tests are hermetic. Any pytest run launched by
 with a temporary `OUROBOROS_DATA_DIR` / `OUROBOROS_SETTINGS_PATH`, a temp
 `PYTHONPYCACHEPREFIX`, and no inherited `OUROBOROS_MANAGED_BY_LAUNCHER`. Tests
 may read the live source checkout as the candidate snapshot, but they must not
-write the live repo or live `data/`.
+write the live repo or live `data/`. `tests/conftest.py` must also rebind
+already-imported state/queue/worker roots inside each pytest process and fail
+closed if a state or evolution-campaign write resolves to the captured live data
+root. Explicit subprocess environments preserve their own isolated data root or
+receive the parent's disposable root and pytest markers; scrubbing unrelated
+variables must not reopen the live default. Setting only `OUROBOROS_DATA_DIR` is
+insufficient for process-global roots.
 
 Self-modification durability is local-first. A successful reviewed local commit
 is the persistence boundary; `origin` push and CI are optional follow-up signals.
@@ -1705,26 +1730,27 @@ non-deterministic `TESTS_FAILED` indistinguishable from a real immune rejection)
 ### GitHub Actions: secrets in step-level `if:` conditions
 
 GitHub Actions rejects `secrets.*` inside step-level `if:` expressions, and a
-step's own `env:` block is not visible to that same step's `if:`. Map secrets at
-the job-level `env:` block, then gate steps with `env.*`.
+step's own `env:` block is not visible to that same step's `if:`. Derive a
+non-secret boolean in the job-level `env:` block, gate steps with that boolean,
+and map the actual credentials only inside the first-party steps that need them.
 
 ```yaml
 jobs:
   build:
     runs-on: macos-latest
     env:
-      # job-level: visible to step-level `if:` via env.*
-      BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
-      P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+      HAS_APPLE_SIGNING: ${{ secrets.BUILD_CERTIFICATE_BASE64 != '' && secrets.P12_PASSWORD != '' && 'true' || 'false' }}
     steps:
       - name: Import Apple signing certificate
-        # ✅ env.* — visible inside step-level if
-        if: env.BUILD_CERTIFICATE_BASE64 != '' && env.P12_PASSWORD != ''
+        if: env.HAS_APPLE_SIGNING == 'true'
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
         run: |
           echo "${BUILD_CERTIFICATE_BASE64}" | base64 -d > cert.p12
           security import cert.p12 -P "${P12_PASSWORD}" ...
       - name: Cleanup keychain
-        if: always() && env.BUILD_CERTIFICATE_BASE64 != ''
+        if: always() && env.HAS_APPLE_SIGNING == 'true'
         run: security delete-keychain ...
 ```
 
@@ -1743,10 +1769,50 @@ enforces this across every workflow `if:` block.
 
 When Apple signing secrets are configured, the macOS shard imports the Developer
 ID certificate into a temporary keychain and `build.sh` signs the `.app` and
-`.dmg` via `SIGN_IDENTITY`. Apple secrets are job-level env values guarded by
-`matrix.os == 'macos-latest'`, so Linux/Windows shards receive empty strings.
-If `APPLE_ID` and `APPLE_APP_SPECIFIC_PASSWORD` are present, notarization runs;
-otherwise the DMG ships signed but not notarized. Notary/stapler failures are
-soft warnings, recorded through `NOTARIZE_OUTCOME`, so transient Apple issues do
-not silently drop the macOS artifact. Cleanup uses `always()` plus macOS/env
-guards, and signing material never persists across runs.
+`.dmg` via `SIGN_IDENTITY`. Only a non-secret `HAS_APPLE_SIGNING` gate is
+job-wide. Certificate and keychain values exist only in the import step, while
+Apple ID notarization values exist only in the first-party build step. Later
+SBOM and attestation steps inherit none of them. If `APPLE_ID` and
+`APPLE_APP_SPECIFIC_PASSWORD` are present, notarization runs; otherwise the DMG
+ships signed but not notarized. Notary/stapler failures are soft warnings,
+recorded through `NOTARIZE_OUTCOME`, so transient Apple issues do not silently
+drop the macOS artifact. Cleanup uses `always()` plus macOS/env guards, and
+signing material never persists across runs.
+
+### Release proof capsule
+
+The tagged build binds public release assets to their source and verification
+record. Each platform shard locates the final DMG, tarball, or ZIP after all
+packaging steps, then performs a smoke test against that final archive. The
+smoke checks require the embedded repository bundle and run the packaged CLI
+with `--help` in an isolated home directory. The macOS check also requires the
+`Applications -> /Applications` drag target, the separate `Install CLI.command`
+payload, and an arm64 app executable.
+
+Each shard also generates a CycloneDX SBOM from the payload extracted from the
+final archive. The macOS smoke proves the Applications link, then removes only
+that link from the SBOM staging copy so Syft cannot follow it into the runner's
+host `/Applications`; the app and CLI launcher remain in the scan. The workflow
+downloads a fixed Syft release asset and checks its platform-specific SHA-256
+before execution. GitHub artifact attestations bind both build provenance and
+the SBOM to the final archive digest. The release job downloads the three
+archives and their proof files, checks the exact platform allowlist,
+recalculates every digest, and verifies both predicates against the exact source
+SHA, tag ref, repository, and signer workflow before it writes:
+
+- `SHA256SUMS` for archives, SBOMs, and smoke receipts;
+- `release-evidence.json` with tag, commit, workflow, checks, and artifact
+  bindings;
+- release notes from the matching README Version History row.
+
+Publication uses a draft release. A per-tag concurrency group serializes release
+jobs, and a fail-closed preflight allows only an absent release or an existing
+draft; a published release is never overwritten by a rerun. The workflow
+uploads only the explicit allowlist and compares GitHub's stored sizes and
+SHA-256 digests with the local files. Immediately before draft creation and
+again before publication, it requires the remote tag to exist as an annotated
+tag whose peeled commit is the workflow event SHA. It publishes only after all
+of those checks pass. A release from an
+older workflow may receive a clearly labelled post-publication checksum
+inventory, but it must never claim build-time provenance, an SBOM, or packaged
+smoke evidence that the original build did not create.

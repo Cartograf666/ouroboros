@@ -109,6 +109,7 @@ def record_process(
     purpose: str,
     scope: str,
     owner_task_id: str = "",
+    reap_process_group: bool = True,
 ) -> Dict[str, Any]:
     """Append a custody record for an already-spawned process."""
     if scope not in _VALID_SCOPES:
@@ -120,7 +121,7 @@ def record_process(
     entry = {
         "ts": utc_now_iso(),
         "pid": int(pid),
-        "pgid": int(pgid or 0),
+        "pgid": int(pgid or 0) if reap_process_group else 0,
         "fingerprint": {
             "start_time": process_start_time(pid),
             # The LIVE command line (what the OS reports) is the reap-time

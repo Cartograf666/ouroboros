@@ -15,7 +15,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from supervisor.state import (
-    load_state, save_state, append_jsonl, atomic_write_text,
+    append_jsonl, atomic_write_text, load_state, save_state,
 )
 from ouroboros.utils import utc_now_iso
 
@@ -565,38 +565,21 @@ def _create_rescue_snapshot(branch: str, reason: str,
 def _link_rescue_to_evolution_transaction(rescue_info: Dict[str, Any], reason: str) -> None:
     """Attach rescue recovery pointers to the active evolution transaction."""
     try:
-        path = pathlib.Path(DRIVE_ROOT) / "state" / "evolution_campaign.json"
-        if not path.is_file():
+        from supervisor.evolution_lifecycle import link_evolution_rescue
+
+        linked = link_evolution_rescue(pathlib.Path(DRIVE_ROOT), rescue_info)
+        if not linked:
             return
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict) or raw.get("status") not in {"active", "paused"}:
-            return
-        tx = raw.get("active_transaction")
-        if not isinstance(tx, dict):
-            return
-        tx["rescue_ref"] = str(rescue_info.get("rescue_ref") or "")
-        tx["dirty_snapshot_ref"] = str(rescue_info.get("rescue_ref") or "")
-        tx["rescue_path"] = str(rescue_info.get("path") or "")
-        tx["restart_decision"] = "rescue_snapshot_created"
-        tx["recovery_hint"] = (
-            f"Recover with {tx['rescue_ref']} or inspect {tx['rescue_path']}"
-            if tx.get("rescue_ref") or tx.get("rescue_path")
-            else "Rescue attempted; inspect supervisor logs."
-        )
-        tx["updated_at"] = utc_now_iso()
-        raw["active_transaction"] = tx
-        raw["updated_at"] = utc_now_iso()
-        atomic_write_text(path, json.dumps(raw, ensure_ascii=False, indent=2) + "\n")
         append_jsonl(
             pathlib.Path(DRIVE_ROOT) / "logs" / "supervisor.jsonl",
             {
                 "ts": utc_now_iso(),
                 "type": "evolution_transaction_rescue_linked",
                 "reason": reason,
-                "transaction_id": tx.get("transaction_id"),
-                "task_id": tx.get("task_id"),
-                "rescue_ref": tx.get("rescue_ref"),
-                "rescue_path": tx.get("rescue_path"),
+                "transaction_id": linked.get("transaction_id"),
+                "task_id": linked.get("task_id"),
+                "rescue_ref": linked.get("rescue_ref"),
+                "rescue_path": linked.get("rescue_path"),
             },
         )
     except Exception:

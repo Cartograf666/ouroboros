@@ -18,7 +18,7 @@ from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
 from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_call_id, persist_call
-from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools
+from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context import build_user_content, estimate_context_prompt_tokens
 from ouroboros.context_budget import EMERGENCY_COMPACTION_CHARS, LOW_EMERGENCY_COMPACTION_CHARS
@@ -222,32 +222,115 @@ def _skill_finalization_message(drive_root: pathlib.Path, llm_trace: Dict[str, A
     )
 
 
-def _force_plan_completed(llm_trace: Dict[str, Any]) -> bool:
-    """True when the latest plan_task control closes the force-plan gate.
+def _force_plan_decision(
+    ctx: Any,
+    _llm_trace: Dict[str, Any],
+    *,
+    hard_rail: str = "",
+) -> Dict[str, Any]:
+    """Project force-plan finalization from existing review + policy SSOTs."""
 
-    Reads the exact typed outcome/control captured from the FULL tool result at
-    execution time.  GREEN closes directly; REVIEW_REQUIRED closes only after
-    an exact-fingerprint disposition.  REVISE_PLAN and malformed/open controls
-    keep the force-plan gate closed.
-    """
-    for call in reversed(llm_trace.get("tool_calls") or []):
-        if not isinstance(call, dict):
-            continue
-        if str(call.get("tool") or "") != "plan_task":
-            continue
-        if bool(call.get("is_error")):
-            return False
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if not metadata.get("force_plan") or bool(getattr(ctx, "is_ephemeral_turn", False)):
+        return {"required": False, "allow": True, "status": "not_required"}
+    from ouroboros.task_results import load_plan_review_state, plan_review_gate_projection
+
+    try:
+        root = pathlib.Path(str(getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
+        task_id = str(getattr(ctx, "task_id", "") or "").strip()
+        state = load_plan_review_state(root, task_id) if task_id else None
+    except (OSError, TimeoutError, ValueError):
+        log.warning("Unable to read durable force-plan review state", exc_info=True)
+        state = None
+    return {
+        "required": True,
+        **plan_review_gate_projection(
+            state,
+            get_review_enforcement(),
+            hard_rail=hard_rail,
+        ),
+    }
+
+
+def _force_plan_reminder(decision: Dict[str, Any]) -> str:
+    outcome = str(decision.get("outcome") or "")
+    if decision.get("reviewer_slots_degraded"):
         return (
-            call.get("plan_review_closed") is True
-            and str(call.get("plan_review_outcome") or "")
-            in {"GREEN", "REVIEW_REQUIRED"}
+            "[SWARM_INITIATIVE] Blocking plan review still has an unavailable reviewer slot. "
+            "Re-call plan_task with the exact unchanged plan and no review_disposition; the "
+            "existing scout wave will be reused while the reviewer panel retries. Continue "
+            "analysis and non-mutating preparation, but do not begin implementation before "
+            "review closes or a real task-wide rail fires."
         )
-    return False
+    if outcome == "REVIEW_REQUIRED":
+        return (
+            "[SWARM_INITIATIVE] Blocking plan review remains REVIEW_REQUIRED. Re-call "
+            "plan_task with the exact fingerprint and a complete review_disposition, then "
+            "continue; do not rerun the reviewer wave."
+        )
+    if outcome == "REVISE_PLAN":
+        return (
+            "[SWARM_INITIATIVE] Blocking plan review requires a revised plan. Change the "
+            "plan text and call plan_task for the new fingerprint. Continue analysis and "
+            "non-mutating preparation, but do not begin implementation before review closes "
+            "or a real task-wide rail fires."
+        )
+    return (
+        "[SWARM_INITIATIVE] Call plan_task with a concrete plan, goal, and appropriate "
+        "context_level. If review infrastructure is unavailable, continue analysis and "
+        "non-mutating preparation, but do not begin implementation before review closes "
+        "or a real task-wide rail fires."
+    )
 
 
-def _force_plan_required(ctx: Any, llm_trace: Dict[str, Any]) -> bool:
-    metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
-    return bool(metadata.get("force_plan")) and not _force_plan_completed(llm_trace)
+def _force_plan_disclosure(
+    ctx: Any,
+    llm_trace: Dict[str, Any],
+    *,
+    forced_reason: str = "",
+) -> str:
+    # Normal finalization reuses the reducer projection that already decided
+    # this exact candidate. The trace copy is presentation-only and cannot grant
+    # permission; forced rails recompute with their explicit rail input.
+    projected = llm_trace.get("force_plan_decision")
+    decision = (
+        projected
+        if not forced_reason and isinstance(projected, dict)
+        else _force_plan_decision(ctx, llm_trace, hard_rail=forced_reason)
+    )
+    if not decision.get("required") or decision.get("status") == "closed":
+        return ""
+    outcome = str(decision.get("outcome") or "")
+    if decision.get("status") == "rail_degraded":
+        rail_reason = str(forced_reason or decision.get("reason") or "task_rail")
+        detail_value = outcome
+        if decision.get("reviewer_slots_degraded"):
+            detail_value = f"{detail_value or 'open'}; reviewer availability incomplete"
+        detail = f" ({detail_value})" if detail_value else ""
+        subject = (
+            "Blocking plan review"
+            if decision.get("enforcement") == "blocking"
+            else "Plan review"
+        )
+        return (
+            f"\n\n⚠️ {subject} remained open{detail} when the task-wide "
+            f"rail `{rail_reason}` required best-effort finalization."
+        )
+    if decision.get("allow"):
+        detail = outcome or "unavailable"
+        if decision.get("reviewer_slots_degraded"):
+            detail += " with a reviewer availability gap"
+        return (
+            f"\n\n⚠️ Plan review remained {detail}; work proceeded under the "
+            "owner-selected advisory enforcement."
+        )
+    return ""
+
+
+def _swarm_handoff_attempt(ctx: Any) -> Dict[str, Any]:
+    attempt = getattr(ctx, "_swarm_handoff_attempt", None)
+    return dict(attempt) if isinstance(attempt, dict) else {}
 
 
 def _check_budget_limits(
@@ -275,7 +358,17 @@ def _check_budget_limits(
         accumulated_usage["reason_code"] = "budget_exhausted"
         if ctx.round_idx <= 1:
             trace = ctx.llm_trace if isinstance(ctx.llm_trace, dict) else {}
-            return finish_reason, accumulated_usage, trace
+            router_result = _forced_swarm_router_result(ctx, trace, "budget_exhausted")
+            if router_result is not None:
+                return router_result
+            tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+            suffix = (
+                _force_plan_disclosure(
+                    tool_ctx, trace, forced_reason="budget_exhausted",
+                )
+                if tool_ctx is not None else ""
+            )
+            return _compose_delivery_suffix(finish_reason, suffix), accumulated_usage, trace
         return _forced_final_answer(
             ctx,
             prompt=(
@@ -2554,10 +2647,10 @@ def _load_direct_child_results(
     try:
         from ouroboros.task_results import (
             load_plan_review_state,
-            plan_review_audit_only_task_ids,
+            plan_review_recorded_panel_task_ids,
         )
 
-        audit_only = set(plan_review_audit_only_task_ids(
+        audit_only = set(plan_review_recorded_panel_task_ids(
             load_plan_review_state(pathlib.Path(status_root), task_id)
         ))
     except Exception:
@@ -4074,6 +4167,42 @@ def _maybe_enforce_child_absorption_gate(
     return text, usage, llm_trace
 
 
+def _enforce_swarm_actions(
+    content: str,
+    messages: List[Dict[str, Any]],
+    tools: ToolRegistry,
+    llm_trace: Dict[str, Any],
+    emit_progress: Callable[[str], None],
+) -> bool:
+    """Hold normal finalization while routing or blocking plan work is open."""
+
+    if swarm_router_turn(tools._ctx) and not _swarm_handoff_attempt(tools._ctx):
+        if content.strip():
+            messages.append({"role": "assistant", "content": content})
+        reminder = (
+            "[SWARM_ROUTING_INTENT] Admit exactly one new managed root now with "
+            "promote_chat_to_task, or from Main route_to_project for a clearly matching "
+            "existing Project. Do not answer inline or steer an existing task."
+        )
+        _append_or_merge_user_message(messages, reminder)
+        llm_trace["reasoning_notes"].append(reminder)
+        emit_progress("Swarm routing action required before final response.")
+        return True
+
+    decision = _force_plan_decision(tools._ctx, llm_trace)
+    if decision.get("required"):
+        llm_trace["force_plan_decision"] = decision
+    if decision.get("allow"):
+        return False
+    if content.strip():
+        messages.append({"role": "assistant", "content": content})
+    reminder = _force_plan_reminder(decision)
+    _append_or_merge_user_message(messages, reminder)
+    llm_trace["reasoning_notes"].append(reminder)
+    emit_progress("Swarm plan-review action required before final response.")
+    return True
+
+
 def _no_tool_final_answer(
     content: Any,
     limit_ctx: _RoundLimitContext,
@@ -4102,28 +4231,9 @@ def _no_tool_final_answer(
         if isinstance(candidate, DeliveryCandidate):
             content = candidate.full_text
 
-    if _force_plan_required(tools._ctx, llm_trace):
-        attempts = int(getattr(tools._ctx, "_force_plan_reminder_count", 0) or 0)
-        if attempts >= 2:
-            limit_ctx.accumulated_usage.update(
-                execution_status="failed", reason_code="swarm_force_plan_not_called",
-            )
-            return (
-                "⚠️ SWARM_INITIATIVE_BLOCKED: plan_task was required for this swarm task but was not called.",
-                limit_ctx.accumulated_usage,
-                llm_trace,
-            )
-        tools._ctx._force_plan_reminder_count = attempts + 1
-        if content and content.strip():
-            messages.append({"role": "assistant", "content": content})
-        _append_or_merge_user_message(
-            messages,
-            "[SWARM_INITIATIVE] plan_task is required before finalizing this task. "
-            "Call plan_task now with an appropriate context_level, then continue.",
-        )
-        emit_progress("Swarm force-plan reminder injected before final response.")
-        llm_trace["reasoning_notes"].append("Swarm force-plan reminder injected before final response.")
-        _arm_delivery_control(tools, limit_ctx, llm_trace)
+    if _enforce_swarm_actions(
+        str(content or ""), messages, tools, llm_trace, emit_progress,
+    ):
         return None
     handoff_msg = _compute_subagent_handoff(tools, limit_ctx.drive_root, limit_ctx.task_id, content)
     if handoff_msg:
@@ -4197,7 +4307,9 @@ def _no_tool_final_answer(
             return None
 
     _project_child_result_dispositions(limit_ctx, llm_trace)
-    normal_suffix = _forced_orphan_note(limit_ctx, include_terminal=False)
+    plan_suffix = _force_plan_disclosure(tools._ctx, llm_trace)
+    orphan_suffix = _forced_orphan_note(limit_ctx, include_terminal=False)
+    normal_suffix = plan_suffix + orphan_suffix
     composed_content = _compose_delivery_suffix(str(content or ""), normal_suffix)
     candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if composed_content and (
@@ -4212,9 +4324,13 @@ def _no_tool_final_answer(
             control="host_suffix" if normal_suffix else "candidate",
         )
     if isinstance(candidate, DeliveryCandidate):
-        if normal_suffix:
+        if orphan_suffix:
             candidate.degraded = True
             candidate.degraded_reason = "host_child_status_suffix"
+            _publish_delivery_candidate(tools, candidate, llm_trace)
+        elif plan_suffix:
+            candidate.degraded = True
+            candidate.degraded_reason = "plan_review_advisory"
             _publish_delivery_candidate(tools, candidate, llm_trace)
         content = candidate.full_text
 
@@ -4581,7 +4697,15 @@ def _forced_fallback_result(
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Return one exact candidate; reuse only current unchanged full text."""
 
-    suffix = _forced_orphan_note(ctx)
+    router_result = _forced_swarm_router_result(ctx, llm_trace, reason_code)
+    if router_result is not None:
+        return router_result
+    tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+    plan_suffix = (
+        _force_plan_disclosure(tool_ctx, llm_trace, forced_reason=reason_code)
+        if tool_ctx is not None else ""
+    )
+    suffix = plan_suffix + _forced_orphan_note(ctx)
     live_candidate = _live_delivery_candidate(ctx)
     fallback_is_retained_model_text = (
         isinstance(live_candidate, DeliveryCandidate)
@@ -4659,6 +4783,59 @@ def _forced_fallback_result(
     return composed, ctx.accumulated_usage, llm_trace
 
 
+def _forced_swarm_router_result(
+    ctx: _RoundLimitContext,
+    llm_trace: Dict[str, Any],
+    reason_code: str,
+) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """Use deterministic routing text only when a real rail ends the router."""
+
+    tools = getattr(ctx, "tools", None)
+    if tools is None or not swarm_router_turn(tools._ctx):
+        return None
+    attempt = _swarm_handoff_attempt(tools._ctx)
+    status = str(attempt.get("status") or "not_attempted")
+    task_id = str(attempt.get("task_id") or "")
+    if status == "scheduled":
+        text = f"✅ Swarm admitted managed task {task_id}. Work continues in that task."
+    elif status == "unconfirmed":
+        text = (
+            f"⚠️ Swarm attempted managed task {task_id}, but admission was not confirmed. "
+            "No second routing event was emitted; keep the task id for reconciliation."
+        )
+    elif status == "rejected":
+        detail = str(attempt.get("reason") or "admission rejected")
+        text = f"⚠️ Swarm could not admit a new managed task ({detail}). No retry was emitted."
+    else:
+        text = (
+            f"⚠️ Swarm reached the task-wide rail `{reason_code}` before a managed-root "
+            "admission attempt completed. No inline work was published."
+        )
+    full_text = _compose_delivery_suffix(text, _forced_orphan_note(ctx))
+    candidate = _replace_delivery_candidate(
+        tools, ctx, llm_trace, full_text, control=f"forced_swarm_router:{reason_code}",
+    )
+    if status != "scheduled":
+        candidate.degraded = True
+        candidate.degraded_reason = reason_code
+    _publish_delivery_candidate(tools, candidate, llm_trace)
+    if status == "scheduled":
+        # The short acknowledgement hit a rail, but the requested managed work
+        # was already durably admitted. Keep that successful handoff truthful.
+        ctx.accumulated_usage.pop("execution_status", None)
+        ctx.accumulated_usage.pop("reason_code", None)
+    else:
+        ctx.accumulated_usage.update(execution_status="failed", reason_code=reason_code)
+    _record_forced_finalization(
+        ctx,
+        llm_trace,
+        reason_code=reason_code,
+        source="host_swarm_routing_fallback",
+        candidate=candidate,
+    )
+    return candidate.full_text, ctx.accumulated_usage, llm_trace
+
+
 def _forced_final_answer(
     ctx: _RoundLimitContext,
     *,
@@ -4671,6 +4848,9 @@ def _forced_final_answer(
     live_trace = getattr(ctx, "llm_trace", None)
     llm_trace = live_trace if isinstance(live_trace, dict) else {}
     _finalize_forced_services(ctx, llm_trace)
+    router_result = _forced_swarm_router_result(ctx, llm_trace, reason_code)
+    if router_result is not None:
+        return router_result
     _append_or_merge_user_message(ctx.messages, prompt)
     extracted = ""
     for attempt in range(2):
@@ -4710,7 +4890,14 @@ def _forced_final_answer(
         # Typed fact for the best_effort outcome gate: a REAL model answer
         # was extracted (host fallback strings never set this).
         ctx.accumulated_usage["_best_effort_extracted"] = True
-        full_text = _compose_delivery_suffix(extracted, _forced_orphan_note(ctx))
+        tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+        plan_suffix = (
+            _force_plan_disclosure(tool_ctx, llm_trace, forced_reason=reason_code)
+            if tool_ctx is not None else ""
+        )
+        full_text = _compose_delivery_suffix(
+            extracted, plan_suffix + _forced_orphan_note(ctx),
+        )
         candidate = _publish_model_forced_candidate(
             ctx, llm_trace, full_text, reason_code,
         )

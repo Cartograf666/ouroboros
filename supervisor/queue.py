@@ -21,6 +21,7 @@ from supervisor.state import (
 )
 from supervisor.message_bus import send_with_budget
 from ouroboros.config import (
+    DATA_DIR,
     FINALIZATION_GRACE_DEFAULT_SEC,
     get_finalization_grace_sec,
     get_per_call_timeout_ceiling_sec,
@@ -33,13 +34,15 @@ from ouroboros.outcomes import normalize_outcome_axes, terminal_outcome_axes
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
 from supervisor.evolution_lifecycle import (
     _read_evolution_campaign,
-    _write_evolution_campaign,
     begin_evolution_transaction,
     build_evolution_task_text,
+    disable_evolution_authority,
+    disable_evolution_projection,
+    deliver_pending_owner_report,
     evolution_block_reason,
     notify_owner_cycle_outcome,
     pause_evolution_campaign,
-    start_evolution_campaign,
+    start_evolution_campaign,  # noqa: F401 -- historical queue API re-export
 )
 from supervisor.task_lifecycle import (  # noqa: F401 -- public queue API re-exports
     BUDGET_ROOT_FENCES, apply_budget_root_admission_fence, cancel_task_by_id,
@@ -50,7 +53,7 @@ from supervisor.task_lifecycle import (  # noqa: F401 -- public queue API re-exp
 log = logging.getLogger(__name__)
 
 
-DRIVE_ROOT: pathlib.Path = pathlib.Path.home() / "Ouroboros" / "data"
+DRIVE_ROOT: pathlib.Path = pathlib.Path(DATA_DIR)
 SOFT_TIMEOUT_SEC: int = 600
 HARD_TIMEOUT_SEC: int = 1800
 HEARTBEAT_STALE_SEC: int = 120
@@ -135,11 +138,17 @@ PENDING: List[Dict[str, Any]] = []
 RUNNING: Dict[str, Dict[str, Any]] = {}
 QUEUE_SEQ_COUNTER_REF: Dict[str, int] = {"value": 0}
 ACCEPTANCE_FENCES: Dict[str, Dict[str, Any]] = {}
+ADMISSION_RESERVATIONS: Dict[str, str] = {}
 
 # Guards PENDING/RUNNING mutations across main loop, direct chat, watchdog.
 _queue_lock = threading.RLock()
 _last_skill_schedule_sync: float = 0.0
 _SKILL_SCHEDULE_SYNC_INTERVAL_SEC: float = 60.0
+
+from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
+    release_task_admission,
+    reserve_task_admission,
+)
 
 # Variant A off-loop worker reaper lives in supervisor/task_reaper.py (extracted for
 # module size). Re-export the thin names the enforce path and tests use; monkeypatching
@@ -158,6 +167,7 @@ def init_queue_refs(pending: List[Dict[str, Any]], running: Dict[str, Dict[str, 
     PENDING = pending
     RUNNING = running
     QUEUE_SEQ_COUNTER_REF = seq_counter_ref
+    ADMISSION_RESERVATIONS.clear()
 
 
 def _task_priority(task_type: str) -> int:
@@ -198,6 +208,59 @@ def enqueue_task(
     t = dict(task)
     attach_task_contract(t)
     with _queue_lock:
+        require_unique_id = bool(t.pop("_require_unique_task_id", False))
+        require_worker_pool = bool(t.pop("_require_worker_pool", False))
+        admission_token = str(t.pop("_admission_token", "") or "")
+        task_id = str(t.get("id") or "").strip()
+        reserved_token = str(ADMISSION_RESERVATIONS.get(task_id) or "")
+        if reserved_token and admission_token != reserved_token:
+            # A reservation owns this id until its request either enqueues or
+            # releases it.  Tokenless internal callers and competing ingress
+            # requests must not be able to consume/collide with that id.
+            t["_admission_blocked"] = "admission_reservation_owned"
+            return t
+        if require_worker_pool:
+            try:
+                from supervisor import workers
+
+                disabled_reason = str(workers._WORKER_POOL_DISABLED_REASON or "")
+                worker_count = len(workers.WORKERS)
+            except Exception:
+                disabled_reason = "state_unavailable"
+                worker_count = 0
+            if disabled_reason or worker_count <= 0:
+                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                    ADMISSION_RESERVATIONS.pop(task_id, None)
+                t["_admission_blocked"] = "worker_pool_unavailable"
+                t["_worker_pool_disabled_reason"] = disabled_reason or "no_workers"
+                return t
+        if admission_token and reserved_token != admission_token:
+            t["_admission_blocked"] = "admission_reservation_lost"
+            return t
+        if require_unique_id and task_id:
+            live_duplicate = task_id in RUNNING or any(
+                isinstance(row, dict) and str(row.get("id") or "") == task_id
+                for row in PENDING
+            )
+            if live_duplicate:
+                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                    ADMISSION_RESERVATIONS.pop(task_id, None)
+                t["_admission_blocked"] = "duplicate_task_id"
+                return t
+            try:
+                from ouroboros.task_results import load_task_result
+
+                if load_task_result(DRIVE_ROOT, task_id):
+                    if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                        ADMISSION_RESERVATIONS.pop(task_id, None)
+                    t["_admission_blocked"] = "duplicate_task_id"
+                    return t
+            except Exception:
+                log.warning("Fresh task-id lookup failed for %s", task_id, exc_info=True)
+                t["_admission_blocked"] = "task_id_lookup_failed"
+                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                    ADMISSION_RESERVATIONS.pop(task_id, None)
+                return t
         project_id = str(t.get("project_id") or "").strip()
         if project_id:
             try:
@@ -209,20 +272,28 @@ def enqueue_task(
                     t["_admission_blocked"] = "project_routing_fence"
                     t["_project_lifecycle"] = lifecycle
                     t["_project_id"] = project_id
+                    if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                        ADMISSION_RESERVATIONS.pop(task_id, None)
                     return t
             except Exception:
                 log.warning("Project admission check failed for %s", project_id, exc_info=True)
                 t["_admission_blocked"] = "project_routing_fence_lookup_failed"
                 t["_project_id"] = project_id
+                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                    ADMISSION_RESERVATIONS.pop(task_id, None)
                 return t
         root_id = str(t.get("root_task_id") or "").strip()
         if root_id and not restoring_snapshot and apply_budget_root_admission_fence(t, root_id):
+            if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                ADMISSION_RESERVATIONS.pop(task_id, None)
             return t
         fence = ACCEPTANCE_FENCES.get(root_id) if root_id else None
         if isinstance(fence, dict) and str(fence.get("status") or "") in {"active", "sealed"}:
             t["_admission_blocked"] = "task_acceptance_fence"
             t["_acceptance_fence_token"] = str(fence.get("token") or "")
             t["_acceptance_fence_status"] = str(fence.get("status") or "active")
+            if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                ADMISSION_RESERVATIONS.pop(task_id, None)
             return t
         QUEUE_SEQ_COUNTER_REF["value"] += 1
         seq = QUEUE_SEQ_COUNTER_REF["value"]
@@ -231,8 +302,12 @@ def enqueue_task(
         t.setdefault("_attempt", int(_att) if _att is not None else 1)
         t["_queue_seq"] = -seq if front else seq
         t["queued_at"] = utc_now_iso()
+        if admission_token:
+            t["_admission_owner_token"] = admission_token
         PENDING.append(t)
         sort_pending()
+        if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+            ADMISSION_RESERVATIONS.pop(task_id, None)
     return t
 
 
@@ -596,7 +671,7 @@ def _kept_service_pids() -> "set[int]":
         return set()
 
 
-def persist_queue_snapshot(reason: str = "") -> None:
+def persist_queue_snapshot(reason: str = "") -> bool:
     """Persist queue snapshot for restart/recovery diagnostics.
 
     Snapshots PENDING/RUNNING under the queue lock: iterating the live dicts
@@ -620,6 +695,9 @@ def persist_queue_snapshot(reason: str = "") -> None:
 
             _ws = list(_workers_mod.WORKERS.values())
             worker_total = len(_ws)
+            worker_pool_disabled_reason = str(
+                getattr(_workers_mod, "_WORKER_POOL_DISABLED_REASON", "") or ""
+            )
             reaping_count = sum(1 for _w in _ws if getattr(_w, "reaping", False))
             assignable_idle_workers = sum(
                 1 for _w in _ws
@@ -627,6 +705,7 @@ def persist_queue_snapshot(reason: str = "") -> None:
             )
         except Exception:
             worker_total = 0
+            worker_pool_disabled_reason = "unknown"
             reaping_count = 0
             assignable_idle_workers = 0
     pending_rows = []
@@ -687,6 +766,7 @@ def persist_queue_snapshot(reason: str = "") -> None:
         "pending_count": len(pending_items), "running_count": len(running_items),
         "reaping_count": reaping_count,
         "worker_total": worker_total,
+        "worker_pool_disabled_reason": worker_pool_disabled_reason,
         "assignable_idle_workers": assignable_idle_workers,
         "acceptance_fences": acceptance_fences,
         "budget_root_fences": budget_root_fences,
@@ -694,9 +774,10 @@ def persist_queue_snapshot(reason: str = "") -> None:
     }
     try:
         atomic_write_text(QUEUE_SNAPSHOT_PATH, json.dumps(payload, ensure_ascii=False, indent=2))
+        return True
     except Exception:
         log.warning("Failed to persist queue snapshot (reason=%s)", reason, exc_info=True)
-        pass
+        return False
 
 
 def parse_iso_to_ts(iso_ts: str) -> Optional[float]:
@@ -1214,6 +1295,11 @@ def _enforce_task_timeouts_locked(
         # no longer race a concurrently-assigned retry; for a subagent the retry reuses the
         # same id/drive). Decisions that need live RUNNING state (orchestrator -> no blind
         # retry; the retry id) are frozen HERE under the lock and passed in the job.
+        if task_type == "evolution":
+            from supervisor.evolution_lifecycle import update_evolution_transaction
+            if not update_evolution_transaction(task_id, dispatch_status="reaping"):
+                log.warning("Evolution timeout teardown deferred: reaping state was not durable for %s", task_id)
+                continue
         RUNNING.pop(task_id, None)
         proc_handle = None
         if worker_id in workers.WORKERS:
@@ -1244,7 +1330,8 @@ def _enforce_task_timeouts_locked(
             will_retry = False
         retry_task_id = ""
         if will_retry:
-            retry_task_id = task_id if str(task.get("delegation_role") or "") == "subagent" else uuid.uuid4().hex[:8]
+            same_id = task_type == "evolution" or str(task.get("delegation_role") or "") == "subagent"
+            retry_task_id = task_id if same_id else uuid.uuid4().hex[:8]
 
         _ensure_reaper_started()
         _reap_queue.put({
@@ -1394,23 +1481,7 @@ def get_evolution_status_snapshot() -> Dict[str, Any]:
 
 
 def _deliver_pending_owner_report() -> None:
-    """Deliver a WS-13.5 owner report staged by a worker-side absorb/abandon.
-
-    verify_restart runs in the worker (no live message bus), so it stages
-    ``pending_owner_report`` on the campaign; we deliver it here in the SERVER
-    process (where the bus is initialized) and clear it. Runs every supervisor
-    tick. Best-effort; never raises into the tick.
-    """
-    try:
-        campaign = _read_evolution_campaign()
-        report = campaign.get("pending_owner_report")
-        if not isinstance(report, dict):
-            return
-        notify_owner_cycle_outcome(campaign, report)  # reuses the message builder
-        campaign.pop("pending_owner_report", None)
-        _write_evolution_campaign(campaign)
-    except Exception:
-        log.debug("failed to deliver pending owner report", exc_info=True)
+    deliver_pending_owner_report(notify_owner_cycle_outcome)
 
 
 def enqueue_evolution_task_if_needed() -> None:
@@ -1425,33 +1496,36 @@ def enqueue_evolution_task_if_needed() -> None:
     if not owner_chat_id:
         return
     campaign = _read_evolution_campaign()
+    from supervisor.state import update_state
+    has_authority = all(str(campaign.get(key) or "").strip() for key in ("id", "source"))
+    if campaign.get("status") != "active" or not has_authority:
+        disable_evolution_authority("bare_flag_disabled", campaign_id=str(campaign.get("id") or ""))
+        send_with_budget(
+            int(owner_chat_id),
+            "🧬 Evolution stayed off: the enable flag had no active campaign authority. Use /evolve start to begin a fresh campaign.",
+        )
+        return
     active_tx = campaign.get("active_transaction") if isinstance(campaign.get("active_transaction"), dict) else {}
-    if (
-        active_tx
-        and str(active_tx.get("commit_sha") or "").strip()
-        and (bool(active_tx.get("restart_required")) or not bool(active_tx.get("restart_verified")))
+    if active_tx and (
+        str(active_tx.get("commit_sha") or "").strip()
+        or str(active_tx.get("dispatch_status") or "") == "reaping"
     ):
         return
 
     # Defensive net: light mode must never run evolution even if the flag was
     # left enabled (e.g. carried across a restart into light mode). Disable and
     # pause once; entry points already refuse new starts up front.
-    from supervisor.state import update_state
-
-    def _disable_evolution(live: Dict[str, Any]) -> None:
-        live["evolution_mode_enabled"] = False
-
     block = evolution_block_reason()
     if block:
         pause_evolution_campaign("blocked in light runtime mode")
-        update_state(_disable_evolution)
+        disable_evolution_projection()
         send_with_budget(int(owner_chat_id), block)
         return
 
     consecutive_failures = int(st.get("evolution_consecutive_failures") or 0)
     if consecutive_failures >= 3:
         pause_evolution_campaign("paused after consecutive failures")
-        update_state(_disable_evolution)
+        disable_evolution_projection()
         send_with_budget(
             int(owner_chat_id),
             f"🧬⚠️ Evolution paused: {consecutive_failures} consecutive failures. "
@@ -1473,7 +1547,7 @@ def enqueue_evolution_task_if_needed() -> None:
     _objective_repeats = int(_objective_repeat_counts.get(_active_objective_fp, 0)) if _active_objective_fp else 0
     if _objective_repeats >= OBJECTIVE_REPEAT_CAP:
         pause_evolution_campaign("paused: objective re-proposed without ever absorbing")
-        update_state(_disable_evolution)
+        disable_evolution_projection()
         send_with_budget(
             int(owner_chat_id),
             f"🧬⚠️ Evolution paused: the current objective ran {_objective_repeats} reviewed "
@@ -1494,13 +1568,19 @@ def enqueue_evolution_task_if_needed() -> None:
         return
     if remaining < EVOLUTION_BUDGET_RESERVE:
         pause_evolution_campaign("budget reserve reached")
-        update_state(_disable_evolution)
+        disable_evolution_projection()
         send_with_budget(int(owner_chat_id), f"💸 Evolution stopped: ${remaining:.2f} remaining (reserve ${EVOLUTION_BUDGET_RESERVE:.0f} for conversations).")
         return
     cycle = int(st.get("evolution_cycle") or 0) + 1
-    campaign = start_evolution_campaign(source="idle_evolution")
     tid = uuid.uuid4().hex[:8]
     transaction = begin_evolution_transaction(tid, cycle=cycle, campaign=campaign)
+    if not transaction:
+        disable_evolution_authority("transaction_attach_failed", campaign_id=str(campaign.get("id") or ""), task_id=tid)
+        send_with_budget(
+            int(owner_chat_id),
+            "🧬 Evolution stayed off: the campaign changed before its next task could be attached. Start it again when ready.",
+        )
+        return
     from ouroboros.contracts.task_contract import attach_task_contract
 
     task = {
@@ -1517,5 +1597,3 @@ def enqueue_evolution_task_if_needed() -> None:
         live["last_evolution_task_at"] = utc_now_iso()
 
     update_state(_record_cycle)
-    # The generic "Evolution task <id> started." lifecycle message (workers.py)
-    # already announces the cycle start, so no extra enqueue bubble here.

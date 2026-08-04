@@ -442,6 +442,23 @@ def test_bounded_log_keeps_only_tail() -> None:
     assert log.text() == "a" * 12
 
 
+def test_safe_log_detail_redacts_urls_and_credential_shapes() -> None:
+    detail = cloudflare._safe_log_detail(
+        'ERR url=http://api.trycloudflare.com/tunnel '
+        '{"token":"json-secret"}, tunnelSecret=field-secret, '
+        'authorization: Bearer header-secret'
+    )
+    assert detail.count("[url]") == 1
+    assert detail.count("[redacted]") == 3
+    for hidden in (
+        "api.trycloudflare.com",
+        "json-secret",
+        "field-secret",
+        "header-secret",
+    ):
+        assert hidden not in detail
+
+
 class _FakeStream:
     def __init__(self, chunks: list[bytes]) -> None:
         self.chunks = list(chunks)
@@ -554,7 +571,12 @@ def test_quick_tunnel_reports_death_before_url(
         root = cloudflare._safe_state_root(tmp_path / "state")
         binary = cloudflare._installed_path(root, spec)
         binary.write_bytes(b"binary")
-        process = _FakeProcess([b"failed safely\n"])
+        process = _FakeProcess(
+            [
+                b"ERR allocation failed url=https://api.trycloudflare.com/tunnel "
+                b"token=secret-value\n"
+            ]
+        )
         process.returncode = 17
         process._done.set()
         windows_job = _FakeWindowsJob()
@@ -572,8 +594,14 @@ def test_quick_tunnel_reports_death_before_url(
         await tunnel.start()
         isolated_home = tunnel._home
         assert isolated_home is not None and isolated_home.is_dir()
-        with pytest.raises(cloudflare.CloudflaredError, match="exit 17"):
+        with pytest.raises(cloudflare.CloudflaredError, match="exit 17") as captured:
             await tunnel.wait_url(1)
+        message = str(captured.value)
+        assert "allocation failed" in message
+        assert "[url]" in message
+        assert "[redacted]" in message
+        assert "api.trycloudflare.com" not in message
+        assert "secret-value" not in message
         assert await tunnel.wait() == 17
         assert not isolated_home.exists()
         if cloudflare.IS_WINDOWS:

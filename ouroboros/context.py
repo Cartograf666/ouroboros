@@ -67,18 +67,36 @@ def build_user_content(task: Dict[str, Any]) -> Any:
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     if metadata.get("force_plan"):
         source = str(metadata.get("force_plan_source") or "operator").strip() or "operator"
-        plan_notice = (
-            "[SWARM_INITIATIVE]\n"
-            f"Source: {source}.\n"
-            "First call plan_task with an explicit context_level appropriate to this task to think "
-            "deeply about the approach. THEN, when the work decomposes into parts that can progress "
-            "in parallel, fan out subagents with schedule_subagent (acting/mutative where the work "
-            "needs changes and the owner toggle permits it) within the configured child/worker caps, "
-            "and reconcile their results; publish the shared frame to the task-tree ledger first if "
-            "their outputs must integrate. If the task is genuinely atomic, a deep plan alone is fine. "
-            "Treat this as a planning+delegation initiative for this task, not as user-authored content.\n"
-            "[/SWARM_INITIATIVE]\n\n"
-        )
+        if bool(task.get("_ephemeral_turn")):
+            plan_notice = (
+                "[SWARM_ROUTING_INTENT]\n"
+                f"Source: {source}.\n"
+                "Route this request into exactly one NEW managed root; do not execute it, answer it "
+                "inline, or steer an existing task. In Main, either promote_chat_to_task in Main or "
+                "route_to_project when an existing Project clearly fits. In a Project room, use "
+                "promote_chat_to_task and keep the host-owned current Project. The managed task, not "
+                "this short routing turn, owns plan_task and the work. After the routing tool returns, "
+                "write a short acknowledgement from its exact receipt; claim admission only when the "
+                "receipt says durably scheduled, and do not retry an unconfirmed/rejected attempt.\n"
+                "[/SWARM_ROUTING_INTENT]\n\n"
+            )
+        else:
+            from ouroboros.config import get_review_enforcement
+
+            review_enforcement = get_review_enforcement()
+            plan_notice = (
+                "[SWARM_INITIATIVE]\n"
+                f"Source: {source}.\n"
+                f"Resolved review enforcement: {review_enforcement}.\n"
+                "First call plan_task with an explicit context_level appropriate to this task. Then "
+                "follow OUROBOROS_REVIEW_ENFORCEMENT. Under blocking, continue analysis, evidence "
+                "gathering, and non-mutating preparation while review is open, but begin implementation "
+                "only after review closes or a real task-wide rail fires. Under advisory, you may proceed "
+                "by judgment with explicit disclosure. When the work decomposes into independent parts, "
+                "fan out subagents within the configured caps and reconcile them. Planning or reviewer "
+                "unavailability must not replace useful work with a terminal planning error.\n"
+                "[/SWARM_INITIATIVE]\n\n"
+            )
         text = plan_notice + str(text or "")
     image_b64 = task.get("image_base64")
     attachment_image_blocks = _build_attachment_image_blocks(task)
@@ -443,22 +461,23 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
     schedule_digest = _scheduled_tasks_digest(env)
     if schedule_digest:
         runtime_data["scheduled_tasks"] = schedule_digest
-    # WS1: surface the tasks already RUNNING in this chat so a busy-chat decision
-    # turn can steer_task the right one instead of spawning a duplicate. Structural
-    # fact only — the agent chooses the target by judgment (BIBLE P5), code never
-    # auto-routes. (Also gives a project-room message its "you are in project X"
-    # default scene, closing the re-ask case.)
+    # Surface RUNNING tasks so a busy-chat turn can steer the right one instead of
+    # duplicating it. This is a structural fact; the model still chooses (BIBLE P5).
+    # It also gives project-room messages their default project scene.
     _meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     _current_chat = _meta.get("current_chat") if isinstance(_meta.get("current_chat"), dict) else None
+    _swarm_router = bool(_meta.get("force_plan")) and bool(task.get("_ephemeral_turn"))
     if _current_chat and (_current_chat.get("running_tasks") or _current_chat.get("addressable_root_tasks")):
         runtime_data["current_chat"] = _current_chat
         runtime_data["current_chat_rule"] = (
+            "Existing roots are context only for this Swarm turn; admit a new root and never steer them."
+            if _swarm_router else
             "addressable_root_tasks are RUNNING/PENDING roots in THIS chat. If a new message continues or "
             "redirects one of them, steer_task(task_id, message) it rather than spawning a duplicate; "
             "your judgment picks the target (or none -> answer inline / promote_chat_to_task). A "
             "message in a project room defaults to that project unless it clearly says otherwise."
         )
-    if bool(task.get("_ephemeral_turn")):
+    if bool(task.get("_ephemeral_turn")) and not _swarm_router:
         runtime_data["decision_turn_rule"] = _DECISION_TURN_OUTCOME_RULE
     _main_manifest = (
         _meta.get("main_routing_manifest")

@@ -29,7 +29,7 @@ def write_owner_message(
     task_id: str,
     msg_id: Optional[str] = None,
     kind: str = KIND_OWNER_TEXT,
-) -> None:
+) -> bool:
     """Write an owner message or typed control entry to a task's mailbox."""
     path = _mailbox_path(drive_root, task_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,8 +42,11 @@ def write_owner_message(
     try:
         if not append_jsonl(path, entry):
             log.warning("Failed to durably append owner message for task %s", task_id)
+            return False
+        return True
     except Exception:
         log.warning("Failed to write owner message for task %s", task_id, exc_info=True)
+        return False
 
 
 def drain_owner_entries(

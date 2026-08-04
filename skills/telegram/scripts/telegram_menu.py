@@ -301,11 +301,17 @@ class TelegramMenuManager:
 
     async def _reconcile(self, snapshot: dict[str, Any], observed: dict[str, Any]) -> dict[str, Any] | None:
         if snapshot["phase"] == "installed":
-            if observed != snapshot["owned"]:
-                raise TelegramMenuConflictError(
-                    "Telegram menu changed outside this skill; refusing to overwrite it."
-                )
-            return snapshot
+            if observed == snapshot["owned"]:
+                return snapshot
+            if observed == snapshot["original"]:
+                # Telegram already has the exact pre-Mini-App button.  Treat a
+                # surviving installed snapshot as a completed rollback rather
+                # than blocking the next enabled generation forever.
+                self._delete()
+                return None
+            raise TelegramMenuConflictError(
+                "Telegram menu changed outside this skill; refusing to overwrite it."
+            )
 
         before = snapshot["from"]
         after = snapshot["to"]

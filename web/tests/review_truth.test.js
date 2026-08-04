@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
     formatReviewProjection,
+    summarizeChatLiveEvent,
     taskOutcomeSeverity,
 } from '../modules/log_events.js';
 
@@ -111,10 +111,76 @@ test('mixed panel renders quorum participation separately from pass support and 
     assert.match(text, /slot_3.*verdict=FAIL.*quorum=contributes.*enforcement=veto/);
 });
 
-test('subagent terminal routing preserves the compact review projection', () => {
-    const source = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    assert.match(source, /review_projection:\s*evt\.review_projection/);
-    assert.match(source, /const reviewDetails = formatReviewProjection\(evt\.review_projection\)/);
-    assert.match(source, /body:\s*reviewDetails/);
-    assert.match(source, /expandByDefault:\s*Boolean\(reviewDetails\)/);
+test('subagent terminal projection keeps review complete without using it as activity', () => {
+    const summary = summarizeChatLiveEvent({
+        type: 'send_message',
+        is_progress: true,
+        delegation_role: 'subagent',
+        parent_task_id: 'parent',
+        subagent_task_id: 'child',
+        subagent_role: 'reviewer',
+        subagent_event: 'completed',
+        result: 'Concrete child result',
+        write_surface: 'none',
+        status: 'completed',
+        outcome_axes: {
+            lifecycle: { status: 'completed' },
+            execution: { status: 'ok' },
+            objective: { status: 'best_effort' },
+            review: { status: 'degraded' },
+            artifacts: { status: 'ready' },
+        },
+        review_projection: { panels: [{
+            panel_id: 'panel_child', surface: 'task_acceptance', authority: 'host_root',
+            aggregate_signal: 'DEGRADED', transport_status: 'success', parse_status: 'valid',
+            quorum: { required: 1, contributed: 1, configured: 1 },
+            enforcement_impact: 'degrades_completion', reason: 'needs owner context',
+            actors: [],
+        }] },
+    });
+    assert.equal(summary.terminal, true);
+    assert.equal(summary.phase, 'warn');
+    assert.equal(summary.expandByDefault, true);
+    assert.equal(summary.activityPreview, 'Concrete child result');
+    assert.match(summary.body, /panel_child/);
+    assert.match(summary.fullBody, /^\[REVIEW\][\s\S]*panel_child/);
+    assert.match(summary.fullBody, /\[RESULT\]\nConcrete child result/);
+    assert.deepEqual(summary.meta, ['write=none', 'status=completed']);
+});
+
+test('terminal subagent activity prefers the authoritative result over emitter boilerplate', () => {
+    const summary = summarizeChatLiveEvent({
+        type: 'send_message',
+        is_progress: true,
+        delegation_role: 'subagent',
+        parent_task_id: 'parent',
+        subagent_task_id: 'child',
+        subagent_event: 'completed',
+        content: 'Subagent child completed (researcher).',
+        result: 'The evidence-backed conclusion and its concrete next step.',
+        status: 'completed',
+    });
+    assert.equal(summary.activityPreview, 'The evidence-backed conclusion and its concrete next step.');
+    assert.match(summary.fullBody, /Subagent child completed/);
+    assert.match(summary.fullBody, /\[RESULT\]\nThe evidence-backed conclusion/);
+});
+
+test('review-only subagent projection explicitly has no collapsed activity', () => {
+    const summary = summarizeChatLiveEvent({
+        type: 'send_message',
+        is_progress: true,
+        delegation_role: 'subagent',
+        parent_task_id: 'parent',
+        subagent_task_id: 'child',
+        subagent_event: 'completed',
+        review_projection: { panels: [{
+            panel_id: 'panel_review_only', surface: 'task_acceptance', authority: 'host_root',
+            aggregate_signal: 'PASS', transport_status: 'success', parse_status: 'valid',
+            quorum: { required: 1, contributed: 1, configured: 1 },
+            enforcement_impact: 'supports_pass', reason: 'review only', actors: [],
+        }] },
+    });
+    assert.equal(summary.activityPreview, '');
+    assert.match(summary.body, /panel_review_only/);
+    assert.equal(summary.expandByDefault, true);
 });

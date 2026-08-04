@@ -357,7 +357,7 @@ def test_chat_remote_no_proxy_retries_openrouter_parameter_rejection():
 
 def test_plan_review_slots_use_no_proxy(tmp_path):
     """plan_review's shared ReviewCoordinator path must pass no_proxy=True."""
-    from ouroboros.tools import plan_review
+    from ouroboros.tools import plan_review, plan_review_runtime
 
     captured_kwargs = []
 
@@ -378,7 +378,9 @@ def test_plan_review_slots_use_no_proxy(tmp_path):
         "event_queue": None,
     })()
 
-    with patch.object(plan_review, "LLMClient", return_value=FakeLLMClient()):
+    # The slot runner (and its LLMClient construction site) moved to
+    # plan_review_runtime; patch the owning module, not the re-exporting one.
+    with patch.object(plan_review_runtime, "LLMClient", return_value=FakeLLMClient()):
         result = _asyncio.run(
             plan_review._run_plan_review_slots(
                 fake_ctx,

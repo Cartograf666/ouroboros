@@ -13,6 +13,20 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_worker_crash_state():
+    """Crash history is process-global and must not leak between serial tests."""
+    import supervisor.workers as workers
+
+    workers.CRASH_TS.clear()
+    workers._WORKER_POOL_DISABLED_REASON = ""
+    yield
+    workers.CRASH_TS.clear()
+    workers._WORKER_POOL_DISABLED_REASON = ""
+
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +494,8 @@ def test_signal_crash_is_terminal_no_retry(tmp_path):
     import queue as _queue
 
     task = _make_task(task_id="sig01", attempt=1, chat_id=7)  # ordinary task type
+    evolution_tx = {"campaign_id": "camp", "transaction_id": "tx", "task_id": "sig01"}
+    task["metadata"] = {"evolution_transaction": evolution_tx}
     worker = _make_worker(busy_task_id="sig01", exitcode=-11)
 
     W.DRIVE_ROOT = tmp_path
@@ -524,7 +540,8 @@ def test_signal_crash_is_terminal_no_retry(tmp_path):
     drained = []
     while not event_q.empty():
         drained.append(event_q.get_nowait())
-    assert any(e.get("type") == "task_done" and e.get("task_id") == "sig01" for e in drained)
+    terminal = next(e for e in drained if e.get("type") == "task_done" and e.get("task_id") == "sig01")
+    assert terminal["metadata"]["evolution_transaction"] == evolution_tx
     incident_notice.assert_called_once()
     notice_args, notice_kwargs = incident_notice.call_args
     assert notice_args[0] == 7

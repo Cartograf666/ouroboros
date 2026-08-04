@@ -6,6 +6,7 @@ import logging
 import os
 import pathlib
 import subprocess
+import threading
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -47,25 +48,78 @@ def _emit_routing_receipt(
     action: str,
     target: str = "",
     status: str,
+    reason: str = "",
+    detail: str = "",
     options: Optional[list] = None,
-) -> None:
-    """Latest-only UI annotation plus typed non-bubble transport receipt."""
+    publish: bool = True,
+) -> Dict[str, Any]:
+    """Persist and publish one token-bound routing annotation receipt."""
     client_message_id = str(evt.get("client_message_id") or "").strip()
-    if not client_message_id:
-        return
-    try:
-        from ouroboros.project_dialogue import append_chat_annotation
+    routing_token = str(evt.get("routing_token") or "").strip()
+    annotation_status = "not_applicable"
+    if client_message_id:
+        try:
+            from ouroboros.project_dialogue import append_chat_annotation
 
-        append_chat_annotation(
-            ctx.DRIVE_ROOT,
-            client_message_id,
+            annotation_status = (
+                "persisted"
+                if append_chat_annotation(
+                    ctx.DRIVE_ROOT,
+                    client_message_id,
+                    action=action,
+                    target=target,
+                    status=status,
+                    routing_token=routing_token,
+                    reason=reason,
+                    detail=detail,
+                    options=options,
+                )
+                else "failed"
+            )
+        except Exception:
+            annotation_status = "failed"
+            log.debug("Routing annotation append failed", exc_info=True)
+
+    effective_status = str(status or "needs_manual_target")
+    effective_reason = str(reason or "")
+    if annotation_status == "failed" and effective_status in {"scheduled", "delivered"}:
+        effective_status = "unconfirmed"
+        effective_reason = "routing_annotation_persist_failed"
+
+    receipt: Dict[str, Any] = {
+        "persisted": annotation_status in {"persisted", "not_applicable"},
+        "status": effective_status,
+        "reason": effective_reason,
+        "detail": str(detail or ""),
+        "annotation_status": annotation_status,
+        "routing_token": routing_token,
+    }
+    if not receipt["persisted"]:
+        return receipt
+    if publish:
+        _publish_routing_ack(
+            ctx,
+            evt,
             action=action,
             target=target,
-            status=status,
+            status=effective_status,
+            options=options,
         )
-    except Exception:
-        log.debug("Routing annotation append failed", exc_info=True)
+    return receipt
+
+
+def _publish_routing_ack(
+    ctx: Any,
+    evt: Dict[str, Any],
+    *,
+    action: str,
+    target: str,
+    status: str,
+    options: Optional[list] = None,
+) -> None:
+    """Publish a live non-bubble acknowledgement after durable authority exists."""
     try:
+        client_message_id = str(evt.get("client_message_id") or "").strip()
         try:
             chat_id = int(evt.get("chat_id") or 0)
         except (TypeError, ValueError):
@@ -1043,7 +1097,7 @@ def _handle_evolution_task_done(
             if isinstance(metadata.get("evolution_transaction"), dict)
             else {}
         )
-        recorded_transaction = update_evolution_campaign_after_task(
+        lifecycle_result = update_evolution_campaign_after_task(
             str(task_id or ""),
             cost_usd=cost,
             cost_accounting_status=str(
@@ -1053,32 +1107,40 @@ def _handle_evolution_task_done(
             rounds=rounds,
             transaction=transaction,
         )
-        replayed_terminal = bool(
-            isinstance(recorded_transaction, dict)
-            and recorded_transaction.get("_replay")
-        )
+        if not isinstance(lifecycle_result, dict):
+            log.warning("Evolution terminal rejected: invalid lifecycle result for %s", task_id)
+            return
+        if not lifecycle_result.get("accepted") or not lifecycle_result.get("persisted"):
+            log.warning(
+                "Evolution terminal rejected for %s: %s",
+                task_id, lifecycle_result.get("reason") or "not_persisted",
+            )
+            return
+        if lifecycle_result.get("replay"):
+            return
+        recorded_transaction = lifecycle_result.get("transaction")
+        recorded_transaction = recorded_transaction if isinstance(recorded_transaction, dict) else {}
         try:
             from ouroboros.evolution_checkpoints import append_evolution_checkpoint
 
-            if not replayed_terminal:
-                append_evolution_checkpoint(
-                    ctx.DRIVE_ROOT,
-                    ctx.REPO_DIR,
-                    task_id=str(task_id or ""),
-                    campaign=_read_evolution_campaign(),
-                    outcome_axes=outcome_axes,
-                    cost_usd=cost,
-                    cost_accounting_status=str(
-                        task_done_event.get("cost_accounting_status") or "available"
-                    ),
-                    rounds=rounds,
-                    transaction=recorded_transaction or transaction,
-                )
+            append_evolution_checkpoint(
+                ctx.DRIVE_ROOT,
+                ctx.REPO_DIR,
+                task_id=str(task_id or ""),
+                campaign=_read_evolution_campaign(),
+                outcome_axes=outcome_axes,
+                cost_usd=cost,
+                cost_accounting_status=str(
+                    task_done_event.get("cost_accounting_status") or "available"
+                ),
+                rounds=rounds,
+                transaction=recorded_transaction or transaction,
+            )
         except Exception:
             log.debug("Failed to append evolution checkpoint", exc_info=True)
     except Exception:
         log.debug("Failed to update evolution campaign state", exc_info=True)
-        replayed_terminal = False
+        return
 
     axes = normalize_outcome_axes({
         "status": task_done_event.get("status"),
@@ -1098,9 +1160,7 @@ def _handle_evolution_task_done(
         or objective_status in {"fail", "degraded"}
         or artifact_status in {"failed", "missing"}
     )
-    if replayed_terminal:
-        pass
-    elif not failed_by_axes and (rounds or 0) >= 1:
+    if not failed_by_axes and (rounds or 0) >= 1:
         from supervisor.state import update_state
 
         update_state(lambda live: live.update(evolution_consecutive_failures=0))
@@ -1442,10 +1502,51 @@ def _handle_deep_self_review_request(evt: Dict[str, Any], ctx: Any) -> None:
 
 def _handle_promote_to_stable(evt: Dict[str, Any], ctx: Any) -> None:
     import subprocess as sp
+    target = ctx.BRANCH_DEV
+    evolution_claim = evt.get("evolution_claim")
+    if isinstance(evolution_claim, dict):
+        commit_sha = str(evolution_claim.get("commit_sha") or "").strip()
+        if not commit_sha:
+            authority = {"ok": False, "reason": "commit_receipt_missing"}
+        else:
+            from supervisor.evolution_lifecycle import check_evolution_authority
+
+            authority = check_evolution_authority(
+                campaign_id=str(evolution_claim.get("campaign_id") or ""),
+                transaction_id=str(evolution_claim.get("transaction_id") or ""),
+                task_id=str(evolution_claim.get("task_id") or ""),
+                commit_sha=commit_sha,
+            )
+        if not authority.get("ok"):
+            st = ctx.load_state()
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "❌ Evolution promotion refused: the exact reviewed campaign claim "
+                    f"is no longer valid ({authority.get('reason') or 'unknown'}).",
+                )
+            return
+        try:
+            dev_sha = sp.run(
+                ["git", "rev-parse", ctx.BRANCH_DEV],
+                cwd=str(ctx.REPO_DIR), capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        except Exception:
+            dev_sha = ""
+        if dev_sha != commit_sha:
+            st = ctx.load_state()
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "❌ Evolution promotion refused: the development branch no longer "
+                    "matches the reviewed commit receipt.",
+                )
+            return
+        target = commit_sha
     # Local branch promotion always works without a remote.
     try:
         sp.run(
-            ["git", "branch", "-f", ctx.BRANCH_STABLE, ctx.BRANCH_DEV],
+            ["git", "branch", "-f", ctx.BRANCH_STABLE, target],
             cwd=str(ctx.REPO_DIR), check=True,
         )
         new_sha = sp.run(
@@ -1464,7 +1565,7 @@ def _handle_promote_to_stable(evt: Dict[str, Any], ctx: Any) -> None:
         sp.run(["git", "remote", "get-url", "origin"], cwd=str(ctx.REPO_DIR),
                capture_output=True, check=True)
         sp.run(
-            ["git", "push", "origin", f"{ctx.BRANCH_DEV}:{ctx.BRANCH_STABLE}"],
+            ["git", "push", "origin", f"{target}:{ctx.BRANCH_STABLE}"],
             cwd=str(ctx.REPO_DIR), check=True,
         )
         remote_status = " (pushed to origin)"
@@ -1984,57 +2085,383 @@ def _handle_project_digest(evt: Dict[str, Any], ctx: Any) -> None:
         log.debug("project_digest consciousness injection failed", exc_info=True)
 
 
-def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> None:
+def _rollback_promoted_pending(
+    ctx: Any, task_id: str, admission_token: str, *, reason: str,
+) -> bool:
+    """Remove an unconfirmed promote before the supervisor can assign it."""
+    from supervisor import queue as supervisor_queue
+
+    removed = False
+    with supervisor_queue._queue_lock:
+        pending = getattr(ctx, "PENDING", supervisor_queue.PENDING)
+        survivors = [
+            task for task in pending
+            if not (
+                str(task.get("id") or "") == task_id
+                and str(
+                    task.get("_admission_owner_token")
+                    or task.get("promotion_admission_token")
+                    or ""
+                ) == admission_token
+            )
+        ]
+        removed = len(survivors) != len(pending)
+        if removed:
+            pending[:] = survivors
+    if removed:
+        persist = getattr(ctx, "persist_queue_snapshot", None)
+        if callable(persist):
+            try:
+                persist(reason=reason)
+            except Exception:
+                log.warning("Failed to persist promote rollback for %s", task_id, exc_info=True)
+    return removed
+
+
+def _persist_promote_rejection(
+    ctx: Any,
+    evt: Dict[str, Any],
+    outcome: Dict[str, Any],
+    *,
+    status: str = "rejected",
+) -> None:
+    task_id = str(outcome.get("task_id") or evt.get("task_id") or "")
+    reason = str(outcome.get("reason") or "admission_rejected")
+    write_task_result(
+        ctx.DRIVE_ROOT,
+        task_id,
+        STATUS_FAILED,
+        reason_code=reason,
+        project_id=str(evt.get("project_id") or ""),
+        description=str(evt.get("objective") or ""),
+        expected_output=str(evt.get("expected_output") or ""),
+        promotion_admission={
+            "status": status,
+            "routing_token": str(evt.get("routing_token") or ""),
+            "reason": reason,
+            "detail": str(outcome.get("detail") or ""),
+            "worker_pool_disabled_reason": str(
+                outcome.get("worker_pool_disabled_reason") or ""
+            ),
+            "confirmed_at": utc_now_iso(),
+        },
+        result=(
+            f"Promotion was not scheduled: {reason}. "
+            f"{str(outcome.get('detail') or '')}"
+        ).strip(),
+    )
+
+
+def _prepare_promote_source_off_loop(evt: Dict[str, Any], ctx: Any) -> None:
+    """Resolve a potentially 900s clone away from the supervisor drain loop."""
+    continuation = dict(evt)
+    continuation["_source_prepared"] = True
+    try:
+        from ouroboros.promotion_source import resolve_promote_source
+
+        folder, note, error, project_id = resolve_promote_source(
+            ctx,
+            str(evt.get("source") or ""),
+            str(evt.get("project_id") or ""),
+        )
+        continuation["project_id"] = project_id
+        continuation["_source_note"] = note
+        continuation["_source_error"] = error
+        if folder and not str(continuation.get("workspace_root") or "").strip():
+            continuation["workspace_root"] = folder
+    except Exception as exc:
+        continuation["_source_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        from supervisor.workers import get_event_q
+
+        get_event_q().put(continuation)
+    except Exception as exc:
+        log.exception("Failed to publish promote source continuation")
+        from supervisor import queue as supervisor_queue
+
+        task_id = str(evt.get("task_id") or "")
+        routing_token = str(evt.get("routing_token") or "")
+        supervisor_queue.release_task_admission(task_id, routing_token)
+        failed = {
+            "status": "unconfirmed",
+            "reason": "source_continuation_publish_failed",
+            "detail": f"{type(exc).__name__}: {exc}",
+            "task_id": task_id,
+        }
+        try:
+            _persist_promote_rejection(ctx, evt, failed, status="unconfirmed")
+            _emit_routing_receipt(
+                ctx,
+                evt,
+                action=(
+                    "route_to_project"
+                    if bool(evt.get("routed_from_main"))
+                    else "promote_chat_to_task"
+                ),
+                target=task_id,
+                status="unconfirmed",
+                reason=failed["reason"],
+                detail=failed["detail"],
+            )
+        except Exception:
+            log.exception("Failed to persist promote source continuation failure")
+
+
+def _handle_promote_chat_to_task(evt: Dict[str, Any], ctx: Any) -> Dict[str, Any]:
     """Spawn a first-class pooled owner task from a conversation-lane promote.
 
     Unlike ``schedule_subagent`` the child is NOT a subagent: it is a normal
     owner task (live card, canonical drive, project lease participation). The
     conversation lane that emitted the event stays free.
     """
-    from supervisor.workers import promote_chat_to_task
+    from supervisor.workers import (
+        _broadcast_task_named,
+        promote_chat_to_task,
+        worker_pool_admission_state,
+    )
     receipt_action = (
         "route_to_project" if bool(evt.get("routed_from_main"))
         else "promote_chat_to_task"
     )
 
+    task_id = str(evt.get("task_id") or "")
+    routing_token = str(evt.get("routing_token") or "")
     try:
-        outcome = promote_chat_to_task(evt, ctx)
-        outcome = outcome if isinstance(outcome, dict) else {"status": "scheduled"}
-        _emit_routing_receipt(
-            ctx,
-            evt,
-            action=receipt_action,
-            target=str(outcome.get("task_id") or evt.get("task_id") or ""),
-            status=str(outcome.get("status") or "needs_manual_target"),
+        from supervisor import queue as supervisor_queue
+
+        reservation = supervisor_queue.reserve_task_admission(
+            task_id,
+            routing_token,
+            require_worker_pool=True,
+            drive_root=ctx.DRIVE_ROOT,
+            worker_pool=getattr(ctx, "WORKERS", None),
         )
-        if str(outcome.get("status") or "") != "scheduled":
+        reservation_status = str(reservation.get("status") or "")
+        if reservation_status == "already_reserved" and evt.get("_admission_reserved"):
+            reservation_status = "reserved"
+        if reservation_status != "reserved":
+            if reservation_status == "existing_same_token":
+                admission = reservation.get("promotion_admission")
+                return {
+                    "status": str((admission or {}).get("status") or "unconfirmed"),
+                    "task_id": task_id,
+                    "reason": str((admission or {}).get("reason") or ""),
+                }
+            if reservation_status == "already_reserved":
+                return {"status": "preparing", "task_id": task_id}
+            blocked = {
+                "status": "needs_manual_target",
+                "reason": str(reservation.get("reason") or "admission_reservation_failed"),
+                "worker_pool_disabled_reason": str(
+                    reservation.get("worker_pool_disabled_reason") or ""
+                ),
+                "task_id": task_id,
+                "reservation_owned": False,
+            }
+            if blocked["reason"] != "duplicate_task_id":
+                _persist_promote_rejection(ctx, evt, blocked)
+            _emit_routing_receipt(
+                ctx,
+                evt,
+                action=receipt_action,
+                target=task_id,
+                status="needs_manual_target",
+                reason=blocked["reason"],
+            )
             ctx.append_jsonl(
                 ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
                 {
                     "ts": utc_now_iso(),
                     "type": "promote_chat_to_task_rejected",
-                    "task_id": str(outcome.get("task_id") or evt.get("task_id") or ""),
-                    "reason": str(outcome.get("reason") or "admission_rejected"),
-                    "project_lifecycle": str(outcome.get("project_lifecycle") or ""),
+                    "task_id": task_id,
+                    "reason": blocked["reason"],
+                    "worker_pool_disabled_reason": blocked[
+                        "worker_pool_disabled_reason"
+                    ],
                 },
             )
-    except Exception:
+            return blocked
+        evt = {**evt, "_admission_reserved": True}
+        if str(evt.get("source") or "").strip() and not evt.get("_source_prepared"):
+            threading.Thread(
+                target=_prepare_promote_source_off_loop,
+                args=(dict(evt), ctx),
+                daemon=True,
+                name=f"promote-source-{task_id[:12]}",
+            ).start()
+            return {"status": "preparing", "task_id": task_id}
+        source_error = str(evt.get("_source_error") or "")
+        if source_error:
+            outcome = {
+                "status": "needs_manual_target",
+                "reason": "project_source_error",
+                "detail": source_error,
+                "task_id": task_id,
+                "reservation_owned": True,
+            }
+        else:
+            outcome = None
+        pool_state = worker_pool_admission_state(ctx)
+        if outcome is None and not pool_state["available"]:
+            outcome = {
+                "status": "needs_manual_target",
+                "reason": "worker_pool_unavailable",
+                "worker_pool_disabled_reason": str(pool_state.get("disabled_reason") or ""),
+                "task_id": task_id,
+            }
+        elif outcome is None:
+            outcome = promote_chat_to_task(evt, ctx)
+        outcome = outcome if isinstance(outcome, dict) else {"status": "scheduled"}
+        if str(outcome.get("status") or "") == "scheduled":
+            title = str(evt.get("title") or "").strip()[:80]
+            receipt = _emit_routing_receipt(
+                ctx,
+                evt,
+                action=receipt_action,
+                target=str(outcome.get("task_id") or task_id),
+                status="scheduled",
+                detail=str(outcome.get("source_note") or ""),
+                publish=False,
+            )
+            admission_status = (
+                "scheduled"
+                if receipt.get("persisted") and str(receipt.get("status") or "") == "scheduled"
+                else "unconfirmed"
+            )
+            stored = write_task_result(
+                ctx.DRIVE_ROOT,
+                str(outcome.get("task_id") or task_id),
+                STATUS_SCHEDULED,
+                project_id=str(outcome.get("project_id") or evt.get("project_id") or ""),
+                description=str(evt.get("objective") or ""),
+                expected_output=str(evt.get("expected_output") or ""),
+                suggested_name=title,
+                promotion_admission={
+                    "status": admission_status,
+                    "routing_token": str(evt.get("routing_token") or ""),
+                    "reason": str(receipt.get("reason") or ""),
+                    "confirmed_at": utc_now_iso(),
+                    "queue_snapshot_persisted": True,
+                    "routing_receipt_required": bool(str(evt.get("client_message_id") or "")),
+                    "routing_receipt_status": str(receipt.get("annotation_status") or ""),
+                    "source_note": str(outcome.get("source_note") or ""),
+                },
+                result=(
+                    "Task accepted and durably scheduled."
+                    if admission_status == "scheduled"
+                    else "Task is scheduled, but its owner-facing routing receipt was not confirmed."
+                ),
+            )
+            admission = stored.get("promotion_admission") if isinstance(stored, dict) else {}
+            if (
+                str((admission or {}).get("status") or "") != admission_status
+                or str((admission or {}).get("routing_token") or "")
+                != str(evt.get("routing_token") or "")
+            ):
+                raise RuntimeError("scheduled promotion result was not persisted")
+            supervisor_queue.release_task_admission(task_id, routing_token)
+            if admission_status != "scheduled":
+                return {
+                    **outcome,
+                    "status": "unconfirmed",
+                    "reason": str(receipt.get("reason") or "routing_receipt_persist_failed"),
+                }
+            _publish_routing_ack(
+                ctx,
+                evt,
+                action=receipt_action,
+                target=str(outcome.get("task_id") or task_id),
+                status="scheduled",
+            )
+            if title:
+                _broadcast_task_named(
+                    {"type": "task_named", "task_id": str(outcome.get("task_id") or task_id),
+                     "suggested_name": title}
+                )
+            try:
+                ctx.append_jsonl(
+                    ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                    {
+                        "ts": utc_now_iso(),
+                        "type": "promote_chat_to_task_admitted",
+                        "task_id": str(outcome.get("task_id") or task_id),
+                    },
+                )
+            except Exception:
+                log.warning("Failed to record admitted promote %s", task_id, exc_info=True)
+            return outcome
+
+        _rollback_promoted_pending(
+            ctx,
+            str(outcome.get("task_id") or task_id),
+            routing_token,
+            reason="promote_chat_to_task_rejected",
+        )
+        supervisor_queue.release_task_admission(task_id, routing_token)
+        _persist_promote_rejection(ctx, evt, outcome)
+        _emit_routing_receipt(
+            ctx,
+            evt,
+            action=receipt_action,
+            target=str(outcome.get("task_id") or task_id),
+            status="needs_manual_target",
+            reason=str(outcome.get("reason") or "admission_rejected"),
+            detail=str(outcome.get("detail") or ""),
+        )
+        ctx.append_jsonl(
+            ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "promote_chat_to_task_rejected",
+                "task_id": str(outcome.get("task_id") or evt.get("task_id") or ""),
+                "reason": str(outcome.get("reason") or "admission_rejected"),
+                "project_lifecycle": str(outcome.get("project_lifecycle") or ""),
+                "worker_pool_disabled_reason": str(
+                    outcome.get("worker_pool_disabled_reason") or ""
+                ),
+            },
+        )
+        return outcome
+    except Exception as exc:
         log.warning("promote_chat_to_task event failed", exc_info=True)
+        _rollback_promoted_pending(
+            ctx, task_id, routing_token, reason="promote_chat_to_task_failed",
+        )
+        try:
+            from supervisor import queue as supervisor_queue
+
+            supervisor_queue.release_task_admission(task_id, routing_token)
+        except Exception:
+            pass
+        failed_outcome = {
+            "status": "unconfirmed",
+            "reason": "promotion_persistence_failed",
+            "task_id": task_id,
+            "detail": f"{type(exc).__name__}: {exc}",
+        }
+        try:
+            _persist_promote_rejection(ctx, evt, failed_outcome, status="unconfirmed")
+        except Exception:
+            log.warning("Failed to persist promote failure for %s", task_id, exc_info=True)
         _emit_routing_receipt(
             ctx,
             evt,
             action=receipt_action,
             target=str(evt.get("task_id") or ""),
-            status="needs_manual_target",
+            status="unconfirmed",
+            reason="promotion_persistence_failed",
+            detail=f"{type(exc).__name__}: {exc}",
         )
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
             {
                 "ts": utc_now_iso(),
                 "type": "promote_chat_to_task_failed",
-                "event_repr": repr(evt)[:500],
+                "task_id": task_id,
+                "error": f"{type(exc).__name__}: {exc}",
             },
         )
+        return failed_outcome
 
 
 def _handle_ensure_project_scope(evt: Dict[str, Any], ctx: Any) -> None:
@@ -2060,6 +2487,7 @@ def _handle_routing_manual_target(evt: Dict[str, Any], ctx: Any) -> None:
         action="route_decision",
         target=str(evt.get("requested_target") or evt.get("reason") or "")[:200],
         status="needs_manual_target",
+        reason=str(evt.get("reason") or "target_unspecified"),
         options=options,
     )
 
@@ -2143,11 +2571,11 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
         # Fail visibly: the chosen task is no longer a steerable running task in
         # this chat. Tell the owner so the agent/owner can answer or spawn instead.
         client_message_id = str(evt.get("client_message_id") or "").strip()
-        if client_message_id:
-            _emit_routing_receipt(
-                ctx, evt, action="steer_task", target=target, status="needs_manual_target",
-            )
-        elif chat_id:
+        _emit_routing_receipt(
+            ctx, evt, action="steer_task", target=target, status="needs_manual_target",
+            reason="target_not_steerable",
+        )
+        if not client_message_id and chat_id:
             try:
                 ctx.send_with_budget(
                     chat_id,
@@ -2180,6 +2608,7 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             ):
                 _emit_routing_receipt(
                     ctx, evt, action="steer_task", target=target, status="needs_manual_target",
+                    reason="target_closed",
                 )
                 return
         drive = pathlib.Path(ctx.DRIVE_ROOT) if direct_active else _task_drive_for_task(task, target)
@@ -2203,6 +2632,7 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             if live_meta is None and not still_pending:
                 _emit_routing_receipt(
                     ctx, evt, action="steer_task", target=target, status="needs_manual_target",
+                    reason="target_finished",
                 )
                 return
             fence_root = str(task.get("root_task_id") or target)
@@ -2210,15 +2640,17 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
             if isinstance(active_fence, dict) and str(active_fence.get("status") or "") == "sealed":
                 _emit_routing_receipt(
                     ctx, evt, action="steer_task", target=target, status="needs_manual_target",
+                    reason="acceptance_fence_sealed",
                 )
                 return
-        write_owner_message(
+        if not write_owner_message(
             drive,
             f"{message}{attachment_note}",
             target,
             msg_id=msg_id,
             kind=KIND_OWNER_TEXT,
-        )
+        ):
+            raise OSError("owner mailbox append was not durable")
         if direct_active:
             direct_agent._owner_message_generation = int(
                 getattr(direct_agent, "_owner_message_generation", 0) or 0
@@ -2234,6 +2666,7 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
         log.warning("steer_task delivery failed for task %s", target, exc_info=True)
         _emit_routing_receipt(
             ctx, evt, action="steer_task", target=target, status="needs_manual_target",
+            reason="mailbox_write_failed",
         )
     finally:
         if queue_lock_held:
@@ -2740,13 +3173,25 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
     """Toggle evolution mode from LLM tool call."""
     enabled = bool(evt.get("enabled"))
     if enabled:
-        from supervisor.evolution_lifecycle import evolution_block_reason
+        from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
 
         block = evolution_block_reason()
         if block:
             st = ctx.load_state()
             if st.get("owner_chat_id"):
                 ctx.send_with_budget(int(st["owner_chat_id"]), block)
+            return
+        try:
+            if not start_evolution_campaign(str(evt.get("objective") or ""), source="agent_tool"):
+                raise RuntimeError("campaign write was refused")
+        except Exception:
+            log.warning("Failed to start evolution campaign from agent tool", exc_info=True)
+            st = ctx.load_state()
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "🧬 Evolution stayed OFF: campaign state could not be created.",
+                )
             return
     from supervisor.state import update_state
 
@@ -2779,11 +3224,9 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
         ctx.sort_pending()
         ctx.persist_queue_snapshot(reason="evolve_off_via_tool")
     try:
-        from supervisor.evolution_lifecycle import complete_evolution_campaign, start_evolution_campaign
+        from supervisor.evolution_lifecycle import complete_evolution_campaign
 
-        if enabled:
-            start_evolution_campaign(str(evt.get("objective") or ""), source="agent_tool")
-        else:
+        if not enabled:
             # Terminal close (not a resumable pause), so a later /evolve start mints fresh.
             complete_evolution_campaign("disabled via agent tool", status="stopped")
     except Exception:

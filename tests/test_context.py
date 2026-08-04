@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from ouroboros.context import build_health_invariants, build_runtime_section, build_user_content
 
 
-def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text():
+@pytest.mark.parametrize("enforcement", ["blocking", "advisory"])
+def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
+    monkeypatch, enforcement,
+):
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
     content = build_user_content(
         {
             "text": "Fix the marketplace retry flow.",
@@ -17,6 +23,23 @@ def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
 
     assert content.startswith("[SWARM_INITIATIVE]")
     assert "Source: swarm." in content
+    assert f"Resolved review enforcement: {enforcement}." in content
+    assert "Under blocking" in content
+    assert "non-mutating preparation" in content
+    assert "begin implementation only after review closes" in content
+    assert content.rstrip().endswith("Fix the marketplace retry flow.")
+
+
+def test_ephemeral_force_plan_is_routing_only_and_transfers_work():
+    content = build_user_content({
+        "text": "Fix the marketplace retry flow.",
+        "_ephemeral_turn": True,
+        "metadata": {"force_plan": True, "force_plan_source": "swarm"},
+    })
+
+    assert content.startswith("[SWARM_ROUTING_INTENT]")
+    assert "exactly one NEW managed root" in content
+    assert "do not execute it" in content
     assert content.rstrip().endswith("Fix the marketplace retry flow.")
 
 
