@@ -39,6 +39,10 @@ _POPEN_ALLOWLIST = {
     "launcher.py",                        # custody host process (pre-runtime)
     "ouroboros/process_custody.py",       # the chokepoint itself
     "ouroboros/platform_layer.py",        # primitives (hidden_run helpers)
+    # ProcessContainer.spawn IS the custody for the hermetic gate's short-lived
+    # pytest root: membership is env-token/Job-Object-held and reaped at teardown,
+    # so routing it through spawn_supervised would double-custody a bounded child.
+    "ouroboros/process_containment.py",
     "ouroboros/packaged_cli.py",          # user-facing CLI wrapper (foreground)
     "ouroboros/cli.py",                   # dev CLI (foreground)
     "ouroboros/server_control.py",        # restart exec path
