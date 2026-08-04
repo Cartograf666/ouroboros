@@ -435,7 +435,8 @@ def apply_pending_request(drive_root: Any) -> bool:
                 return False
         if bool(req.get("requires_plan_review", True)):
             objective += _PLAN_REVIEW_SUFFIX
-        start_evolution_campaign(objective, source="post_task")
+        if not start_evolution_campaign(objective, source="post_task"):
+            return False
         # Link the promoted backlog id to the campaign so close-on-commit (Phase 2 C)
         # can mark it done when the cycle is absorbed. Validate it against the OPEN
         # backlog first: never link (and later close) a hallucinated or stale id.

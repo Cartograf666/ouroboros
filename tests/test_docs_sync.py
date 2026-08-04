@@ -22,15 +22,15 @@ def test_architecture_mentions_shared_log_grouping_and_direct_provider_review_fa
     assert "log_events.js" in arch
     assert "live task card" in arch
     assert "grouped task cards" in arch
-    # Direct-provider fallback covers official OpenAI, Anthropic, Cloud.ru, and GigaChat,
-    # while still excluding OpenRouter/OpenAI-compatible/mixed-provider configs.
+    # Direct-provider fallback covers official OpenAI, Anthropic, MiniMax, Cloud.ru,
+    # and GigaChat, while still excluding OpenRouter/OpenAI-compatible/mixed-provider configs.
     # Keep the generalized name ("Direct-provider review fallback") and a
     # reference to the legacy "OpenAI-only review fallback" phrase for
     # discoverability, and pin the honest scope language so the doc cannot
     # silently re-expand to claim symmetric coverage it does not have yet.
     assert "Direct-provider review fallback" in arch
     assert "OpenAI-only review fallback" in arch  # legacy name still referenced for discoverability
-    assert "official OpenAI, Anthropic, Cloud.ru, and GigaChat" in arch
+    assert "official OpenAI, Anthropic, MiniMax, Cloud.ru, and GigaChat" in arch
     assert "_exclusive_direct_remote_provider_env" in arch
     # v4.34.0: direct-provider fallback now documents the
     # `main_model.startswith(provider_prefix)` guard in get_review_models —

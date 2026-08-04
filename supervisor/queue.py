@@ -21,6 +21,7 @@ from supervisor.state import (
 )
 from supervisor.message_bus import send_with_budget
 from ouroboros.config import (
+    DATA_DIR,
     FINALIZATION_GRACE_DEFAULT_SEC,
     get_finalization_grace_sec,
     get_per_call_timeout_ceiling_sec,
@@ -33,13 +34,15 @@ from ouroboros.outcomes import normalize_outcome_axes, terminal_outcome_axes
 from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
 from supervisor.evolution_lifecycle import (
     _read_evolution_campaign,
-    _write_evolution_campaign,
     begin_evolution_transaction,
     build_evolution_task_text,
+    disable_evolution_authority,
+    disable_evolution_projection,
+    deliver_pending_owner_report,
     evolution_block_reason,
     notify_owner_cycle_outcome,
     pause_evolution_campaign,
-    start_evolution_campaign,
+    start_evolution_campaign,  # noqa: F401 -- historical queue API re-export
 )
 from supervisor.task_lifecycle import (  # noqa: F401 -- public queue API re-exports
     BUDGET_ROOT_FENCES, apply_budget_root_admission_fence, cancel_task_by_id,
@@ -50,7 +53,7 @@ from supervisor.task_lifecycle import (  # noqa: F401 -- public queue API re-exp
 log = logging.getLogger(__name__)
 
 
-DRIVE_ROOT: pathlib.Path = pathlib.Path.home() / "Ouroboros" / "data"
+DRIVE_ROOT: pathlib.Path = pathlib.Path(DATA_DIR)
 SOFT_TIMEOUT_SEC: int = 600
 HARD_TIMEOUT_SEC: int = 1800
 HEARTBEAT_STALE_SEC: int = 120
@@ -1292,6 +1295,11 @@ def _enforce_task_timeouts_locked(
         # no longer race a concurrently-assigned retry; for a subagent the retry reuses the
         # same id/drive). Decisions that need live RUNNING state (orchestrator -> no blind
         # retry; the retry id) are frozen HERE under the lock and passed in the job.
+        if task_type == "evolution":
+            from supervisor.evolution_lifecycle import update_evolution_transaction
+            if not update_evolution_transaction(task_id, dispatch_status="reaping"):
+                log.warning("Evolution timeout teardown deferred: reaping state was not durable for %s", task_id)
+                continue
         RUNNING.pop(task_id, None)
         proc_handle = None
         if worker_id in workers.WORKERS:
@@ -1322,7 +1330,8 @@ def _enforce_task_timeouts_locked(
             will_retry = False
         retry_task_id = ""
         if will_retry:
-            retry_task_id = task_id if str(task.get("delegation_role") or "") == "subagent" else uuid.uuid4().hex[:8]
+            same_id = task_type == "evolution" or str(task.get("delegation_role") or "") == "subagent"
+            retry_task_id = task_id if same_id else uuid.uuid4().hex[:8]
 
         _ensure_reaper_started()
         _reap_queue.put({
@@ -1472,23 +1481,7 @@ def get_evolution_status_snapshot() -> Dict[str, Any]:
 
 
 def _deliver_pending_owner_report() -> None:
-    """Deliver a WS-13.5 owner report staged by a worker-side absorb/abandon.
-
-    verify_restart runs in the worker (no live message bus), so it stages
-    ``pending_owner_report`` on the campaign; we deliver it here in the SERVER
-    process (where the bus is initialized) and clear it. Runs every supervisor
-    tick. Best-effort; never raises into the tick.
-    """
-    try:
-        campaign = _read_evolution_campaign()
-        report = campaign.get("pending_owner_report")
-        if not isinstance(report, dict):
-            return
-        notify_owner_cycle_outcome(campaign, report)  # reuses the message builder
-        campaign.pop("pending_owner_report", None)
-        _write_evolution_campaign(campaign)
-    except Exception:
-        log.debug("failed to deliver pending owner report", exc_info=True)
+    deliver_pending_owner_report(notify_owner_cycle_outcome)
 
 
 def enqueue_evolution_task_if_needed() -> None:
@@ -1503,33 +1496,36 @@ def enqueue_evolution_task_if_needed() -> None:
     if not owner_chat_id:
         return
     campaign = _read_evolution_campaign()
+    from supervisor.state import update_state
+    has_authority = all(str(campaign.get(key) or "").strip() for key in ("id", "source"))
+    if campaign.get("status") != "active" or not has_authority:
+        disable_evolution_authority("bare_flag_disabled", campaign_id=str(campaign.get("id") or ""))
+        send_with_budget(
+            int(owner_chat_id),
+            "🧬 Evolution stayed off: the enable flag had no active campaign authority. Use /evolve start to begin a fresh campaign.",
+        )
+        return
     active_tx = campaign.get("active_transaction") if isinstance(campaign.get("active_transaction"), dict) else {}
-    if (
-        active_tx
-        and str(active_tx.get("commit_sha") or "").strip()
-        and (bool(active_tx.get("restart_required")) or not bool(active_tx.get("restart_verified")))
+    if active_tx and (
+        str(active_tx.get("commit_sha") or "").strip()
+        or str(active_tx.get("dispatch_status") or "") == "reaping"
     ):
         return
 
     # Defensive net: light mode must never run evolution even if the flag was
     # left enabled (e.g. carried across a restart into light mode). Disable and
     # pause once; entry points already refuse new starts up front.
-    from supervisor.state import update_state
-
-    def _disable_evolution(live: Dict[str, Any]) -> None:
-        live["evolution_mode_enabled"] = False
-
     block = evolution_block_reason()
     if block:
         pause_evolution_campaign("blocked in light runtime mode")
-        update_state(_disable_evolution)
+        disable_evolution_projection()
         send_with_budget(int(owner_chat_id), block)
         return
 
     consecutive_failures = int(st.get("evolution_consecutive_failures") or 0)
     if consecutive_failures >= 3:
         pause_evolution_campaign("paused after consecutive failures")
-        update_state(_disable_evolution)
+        disable_evolution_projection()
         send_with_budget(
             int(owner_chat_id),
             f"🧬⚠️ Evolution paused: {consecutive_failures} consecutive failures. "
@@ -1551,7 +1547,7 @@ def enqueue_evolution_task_if_needed() -> None:
     _objective_repeats = int(_objective_repeat_counts.get(_active_objective_fp, 0)) if _active_objective_fp else 0
     if _objective_repeats >= OBJECTIVE_REPEAT_CAP:
         pause_evolution_campaign("paused: objective re-proposed without ever absorbing")
-        update_state(_disable_evolution)
+        disable_evolution_projection()
         send_with_budget(
             int(owner_chat_id),
             f"🧬⚠️ Evolution paused: the current objective ran {_objective_repeats} reviewed "
@@ -1572,13 +1568,19 @@ def enqueue_evolution_task_if_needed() -> None:
         return
     if remaining < EVOLUTION_BUDGET_RESERVE:
         pause_evolution_campaign("budget reserve reached")
-        update_state(_disable_evolution)
+        disable_evolution_projection()
         send_with_budget(int(owner_chat_id), f"💸 Evolution stopped: ${remaining:.2f} remaining (reserve ${EVOLUTION_BUDGET_RESERVE:.0f} for conversations).")
         return
     cycle = int(st.get("evolution_cycle") or 0) + 1
-    campaign = start_evolution_campaign(source="idle_evolution")
     tid = uuid.uuid4().hex[:8]
     transaction = begin_evolution_transaction(tid, cycle=cycle, campaign=campaign)
+    if not transaction:
+        disable_evolution_authority("transaction_attach_failed", campaign_id=str(campaign.get("id") or ""), task_id=tid)
+        send_with_budget(
+            int(owner_chat_id),
+            "🧬 Evolution stayed off: the campaign changed before its next task could be attached. Start it again when ready.",
+        )
+        return
     from ouroboros.contracts.task_contract import attach_task_contract
 
     task = {
@@ -1595,5 +1597,3 @@ def enqueue_evolution_task_if_needed() -> None:
         live["last_evolution_task_at"] = utc_now_iso()
 
     update_state(_record_cycle)
-    # The generic "Evolution task <id> started." lifecycle message (workers.py)
-    # already announces the cycle start, so no extra enqueue bubble here.

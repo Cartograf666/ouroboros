@@ -45,6 +45,7 @@ from ouroboros.subagents import (
     normalize_subagent_model_lane,
 )
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE
+from ouroboros.tool_policy import swarm_router_turn
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso, run_cmd
 
@@ -461,13 +462,23 @@ def _emit_and_wait_for_routing(
         }
     timeout = _PROMOTE_CONFIRM_TIMEOUT_SEC if mode == "live" else 0.0
     if str(evt.get("type") or "") == "promote_chat_to_task":
-        return mode, _wait_for_promotion_admission(
-            ctx,
-            str(evt.get("task_id") or ""),
-            str(evt.get("routing_token") or ""),
-            client_message_id=str(evt.get("client_message_id") or ""),
-            timeout_sec=timeout,
-        )
+        try:
+            return mode, _wait_for_promotion_admission(
+                ctx,
+                str(evt.get("task_id") or ""),
+                str(evt.get("routing_token") or ""),
+                client_message_id=str(evt.get("client_message_id") or ""),
+                timeout_sec=timeout,
+            )
+        except Exception as exc:
+            if not swarm_router_turn(ctx):
+                raise
+            log.warning("Routing admission receipt failed after event emission", exc_info=True)
+            return mode, {
+                "status": "unconfirmed",
+                "reason": "admission_confirmation_failed",
+                "detail": type(exc).__name__,
+            }
     return mode, _wait_for_routing_annotation(
         ctx,
         str(evt.get("client_message_id") or ""),
@@ -486,9 +497,24 @@ def _evolution_restart_block_reason(ctx: ToolContext) -> str:
         return f"could not verify local git durability: {exc}"
     reviewed_sha = str(getattr(ctx, "last_reviewed_commit_sha", "") or "").strip()
     if reviewed_sha and reviewed_sha == head and not status:
-        return ""
-    if not reviewed_sha and not status:
-        return ""
+        metadata = getattr(ctx, "task_metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        tx = metadata.get("evolution_transaction")
+        tx = tx if isinstance(tx, dict) else {}
+        from supervisor.evolution_lifecycle import check_evolution_authority
+
+        authority = check_evolution_authority(
+            str(tx.get("campaign_id") or ""),
+            str(tx.get("transaction_id") or ""),
+            str(getattr(ctx, "task_id", "") or tx.get("task_id") or ""),
+            commit_sha=head,
+        )
+        return "" if authority.get("ok") else (
+            "the exact evolution commit receipt is no longer active "
+            f"({authority.get('reason') or 'unknown'})"
+        )
+    if not reviewed_sha:
+        return "commit_reviewed has not recorded an exact local commit receipt"
     if reviewed_sha and reviewed_sha != head:
         return "HEAD changed after the last reviewed local commit"
     return "commit_reviewed must create a local reviewed commit before evolution restart"
@@ -498,16 +524,32 @@ def _request_restart(ctx: ToolContext, reason: str) -> str:
     block_reason = _evolution_restart_block_reason(ctx)
     if block_reason:
         return f"⚠️ RESTART_BLOCKED: in evolution mode, {block_reason}."
+    is_evolution = str(ctx.current_task_type or "") == "evolution"
+    restart_reason = str(reason or "").strip() or "agent_requested_restart"
     # Persist expected ref for post-restart verification.
     try:
         sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir)
         branch = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=ctx.repo_dir)
         verify_path = ctx.drive_path("state") / "pending_restart_verify.json"
+        evolution_claim = {}
+        if is_evolution:
+            metadata = getattr(ctx, "task_metadata", {})
+            metadata = metadata if isinstance(metadata, dict) else {}
+            tx = metadata.get("evolution_transaction")
+            tx = tx if isinstance(tx, dict) else {}
+            evolution_claim = {
+                "campaign_id": str(tx.get("campaign_id") or ""),
+                "transaction_id": str(tx.get("transaction_id") or ""),
+                "task_id": str(ctx.task_id or tx.get("task_id") or ""),
+                "commit_sha": str(sha or "").strip(),
+            }
         atomic_write_json(verify_path, {
             "ts": utc_now_iso(), "expected_sha": sha,
-            "expected_branch": branch, "reason": reason,
+            "expected_branch": branch, "reason": restart_reason,
+            **({"evolution_claim": evolution_claim} if evolution_claim else {}),
         })
-        if str(ctx.current_task_type or "") == "evolution":
+        if evolution_claim:
+            ctx.pending_restart_is_evolution = True
             try:
                 from supervisor.evolution_lifecycle import update_evolution_transaction
 
@@ -520,13 +562,17 @@ def _request_restart(ctx: ToolContext, reason: str) -> str:
                 )
             except Exception:
                 log.debug("Failed to record evolution restart request", exc_info=True)
-    except Exception:
+    except Exception as exc:
         log.debug("Failed to read VERSION file or git ref for restart verification", exc_info=True)
-        pass
-    ctx.pending_restart_reason = str(reason or "").strip() or "agent_requested_restart"
+        if is_evolution:
+            return (
+                "⚠️ RESTART_BLOCKED: the exact evolution restart receipt could not "
+                f"be persisted ({exc})."
+            )
+    ctx.pending_restart_reason = restart_reason
     ctx.last_push_succeeded = False
     ctx.last_reviewed_commit_sha = ""
-    return f"Restart requested: {reason}"
+    return f"Restart requested: {restart_reason}"
 
 
 def _set_tool_timeout(ctx: ToolContext, seconds: int) -> str:
@@ -547,7 +593,21 @@ def _set_tool_timeout(ctx: ToolContext, seconds: int) -> str:
 
 
 def _promote_to_stable(ctx: ToolContext, reason: str) -> str:
-    ctx.pending_events.append({"type": "promote_to_stable", "reason": reason, "ts": utc_now_iso()})
+    event = {"type": "promote_to_stable", "reason": reason, "ts": utc_now_iso()}
+    if str(ctx.current_task_type or "") == "evolution":
+        metadata = getattr(ctx, "task_metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        tx = metadata.get("evolution_transaction")
+        tx = tx if isinstance(tx, dict) else {}
+        event["evolution_claim"] = {
+            "campaign_id": str(tx.get("campaign_id") or ""),
+            "transaction_id": str(tx.get("transaction_id") or ""),
+            "task_id": str(getattr(ctx, "task_id", "") or tx.get("task_id") or ""),
+            "commit_sha": str(
+                getattr(ctx, "last_reviewed_commit_sha", "") or tx.get("commit_sha") or ""
+            ),
+        }
+    ctx.pending_events.append(event)
     return f"Promote to stable requested: {reason}"
 
 
@@ -567,6 +627,44 @@ def _attach_origin_from_metadata(ctx: ToolContext, evt: Dict[str, Any]) -> None:
             evt["source_text"] = text
     elif metadata.get("origin_suppressed"):
         evt["origin_suppressed"] = True
+
+
+def _attach_swarm_intent(ctx: ToolContext, evt: Dict[str, Any]) -> None:
+    """Carry host-attested Swarm intent into the admitted managed root."""
+
+    if not swarm_router_turn(ctx):
+        return
+    metadata = getattr(ctx, "task_metadata", {})
+    evt["force_plan"] = True
+    evt["force_plan_source"] = str(
+        metadata.get("force_plan_source") or "operator"
+    ).strip() or "operator"
+
+
+def _cached_swarm_handoff(ctx: ToolContext) -> str:
+    attempt = getattr(ctx, "_swarm_handoff_attempt", None)
+    return str(attempt.get("response") or "") if swarm_router_turn(ctx) and isinstance(attempt, dict) else ""
+
+
+def _finish_swarm_handoff(
+    ctx: ToolContext,
+    evt: Dict[str, Any],
+    response: str,
+    *,
+    status: str,
+    reason: str = "",
+) -> str:
+    """Latch one immutable admission attempt; repeated calls emit nothing."""
+
+    if swarm_router_turn(ctx) and not isinstance(getattr(ctx, "_swarm_handoff_attempt", None), dict):
+        ctx._swarm_handoff_attempt = {
+            "task_id": str(evt.get("task_id") or ""),
+            "routing_token": str(evt.get("routing_token") or ""),
+            "status": status,
+            "reason": reason,
+            "response": response,
+        }
+    return response
 
 
 def _promote_chat_to_task(
@@ -597,6 +695,13 @@ def _promote_chat_to_task(
     goal = str(objective or "").strip()
     if not goal:
         return "⚠️ TOOL_ARG_ERROR (promote_chat_to_task): objective is required"
+    cached = _cached_swarm_handoff(ctx)
+    if cached:
+        return cached
+    if swarm_router_turn(ctx):
+        # The model chooses admission; the host-owned room chooses scope.
+        project_id = str(getattr(ctx, "project_id", "") or "")
+        project_name = workspace_root = workspace = source = ""
     from ouroboros.project_facts import (
         explicit_project_id_ok,
         project_id_from_display_name,
@@ -631,10 +736,17 @@ def _promote_chat_to_task(
     routing_token = uuid.uuid4().hex
     disabled_reason = _promotion_pool_disabled_from_snapshot(ctx)
     if disabled_reason:
-        return (
+        response = (
             f"PROMOTE_REJECTED: task {tid} was not scheduled "
             f"(worker_pool_unavailable: {disabled_reason}). No project/workspace "
             "admission side effects were started."
+        )
+        return _finish_swarm_handoff(
+            ctx,
+            {"task_id": tid, "routing_token": routing_token},
+            response,
+            status="rejected",
+            reason=f"worker_pool_unavailable:{disabled_reason}",
         )
     evt: Dict[str, Any] = {
         "type": "promote_chat_to_task",
@@ -664,6 +776,7 @@ def _promote_chat_to_task(
         "ts": utc_now_iso(),
     }
     _attach_origin_from_metadata(ctx, evt)
+    _attach_swarm_intent(ctx, evt)
     mode, confirmation = _emit_and_wait_for_routing(ctx, evt)
     if display_name:
         scope_note = f" in new project '{display_name}'"
@@ -677,22 +790,26 @@ def _promote_chat_to_task(
     disabled_reason = str(confirmation.get("worker_pool_disabled_reason") or "")
     if confirmation_status == "scheduled":
         source_confirmation = f" [{detail}]" if detail else ""
-        return (
+        response = (
             f"OK: task {tid}{scope_note} accepted and durably scheduled ({mode}).{source_confirmation} "
             "The conversation lane stays free; the owner sees a live task card and can "
             "steer the running task from chat. Use wait_task/get_task_result if its result "
             "is needed in this conversation."
         )
+        return _finish_swarm_handoff(ctx, evt, response, status="scheduled")
     if confirmation_status in {"rejected", "needs_manual_target"}:
         shown_reason = (
             f"{reason}: {disabled_reason}" if disabled_reason else reason
         )
         if detail:
             shown_reason = f"{shown_reason}: {detail}" if shown_reason else detail
-        return (
+        response = (
             f"PROMOTE_REJECTED: task {tid} was not scheduled"
             f"{f' ({shown_reason})' if shown_reason else ''}. "
             "Do not report this task as created."
+        )
+        return _finish_swarm_handoff(
+            ctx, evt, response, status="rejected", reason=shown_reason or "admission_rejected",
         )
     try:
         root = Path(str(getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
@@ -714,10 +831,13 @@ def _promote_chat_to_task(
         if mode == "live"
         else f"because the event transport returned {mode}"
     )
-    return (
+    response = (
         f"PROMOTE_UNCONFIRMED: task {tid} admission was not confirmed {confirmation_window}. "
         "Do not report this task as "
         "created and do not retry automatically; keep this task id for reconciliation."
+    )
+    return _finish_swarm_handoff(
+        ctx, evt, response, status="unconfirmed", reason=reason or "confirmation_timeout",
     )
 
 
@@ -758,6 +878,14 @@ def _route_to_project(
     msg = str(message or "").strip()
     if not msg:
         return "⚠️ TOOL_ARG_ERROR (route_to_project): message is required"
+    cached = _cached_swarm_handoff(ctx)
+    if cached:
+        return cached
+    if swarm_router_turn(ctx) and str(getattr(ctx, "project_id", "") or "").strip():
+        return (
+            "⚠️ SWARM_PROJECT_SCOPE_OWNED: this Project-room Swarm must create its new "
+            "root with promote_chat_to_task in the current Project."
+        )
     try:
         current_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
     except (TypeError, ValueError):
@@ -829,24 +957,32 @@ def _route_to_project(
         "ts": utc_now_iso(),
     }
     _attach_origin_from_metadata(ctx, evt)
+    _attach_swarm_intent(ctx, evt)
     mode, receipt = _emit_and_wait_for_routing(ctx, evt)
     name = str(proj.get("name") or pid)
     status = str(receipt.get("status") or "unconfirmed")
     if status == "scheduled":
-        return (
+        response = (
             f"✉️ Routed to project '{name}' ({pid}) as task {tid}; admission is durably "
             f"scheduled ({mode}). I'll continue there; this chat stays free for you."
         )
+        return _finish_swarm_handoff(ctx, evt, response, status="scheduled")
     reason_text = str(receipt.get("reason") or "confirmation_timeout")
     detail = str(receipt.get("detail") or "")
     if status in {"rejected", "needs_manual_target"}:
-        return (
+        response = (
             f"⚠️ ROUTE_REJECTED: task {tid} was not routed to project '{name}' "
             f"({reason_text}{(': ' + detail) if detail else ''})."
         )
-    return (
+        return _finish_swarm_handoff(
+            ctx, evt, response, status="rejected", reason=reason_text,
+        )
+    response = (
         f"⚠️ ROUTE_UNCONFIRMED: task {tid} routing to project '{name}' was not durably "
         "confirmed. Do not report it as routed and do not retry automatically."
+    )
+    return _finish_swarm_handoff(
+        ctx, evt, response, status="unconfirmed", reason=reason_text,
     )
 
 
@@ -865,6 +1001,11 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
     performs the mailbox write on the task's active drive. When unsure which task
     (or none) fits, spawn a fresh task with ``promote_chat_to_task`` instead.
     """
+    if swarm_router_turn(ctx):
+        return (
+            "⚠️ SWARM_NEW_ROOT_REQUIRED: explicit Swarm cannot steer an existing task; "
+            "use promote_chat_to_task or, from Main, route_to_project."
+        )
     target = str(task_id or "").strip()
     msg = str(message or "").strip()
     if not target:
@@ -1967,7 +2108,7 @@ def get_tools() -> List[ToolEntry]:
         }, _set_tool_timeout),
         ToolEntry("request_restart", {
             "name": "request_restart",
-            "description": "Ask supervisor to restart runtime (after a reviewed local commit or clean no-op state).",
+            "description": "Ask supervisor to restart runtime after a reviewed local commit or a non-evolution clean no-op; evolution requires its exact active commit receipt.",
             "parameters": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]},
         }, _request_restart),
         ToolEntry("promote_to_stable", {

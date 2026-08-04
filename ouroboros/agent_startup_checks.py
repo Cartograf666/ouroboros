@@ -542,6 +542,11 @@ def _append_cycle_outcome_tag(env: Any, *, campaign: Any, transaction: Any, sour
 
 def verify_restart(env: Any, git_sha: str) -> None:
     """Best-effort restart verification."""
+    from supervisor import state as supervisor_state
+
+    campaign_path = env.drive_path("state") / "evolution_campaign.json"
+    supervisor_state.assert_test_data_path(campaign_path)
+
     def _append_unique_transaction(campaign: Dict[str, Any], tx: Dict[str, Any]) -> None:
         tx_history = list(campaign.get("transaction_history") or [])
         tx_id = str(tx.get("transaction_id") or "")
@@ -584,9 +589,54 @@ def verify_restart(env: Any, git_sha: str) -> None:
         except Exception:
             return False
 
+    def _restart_authority_error(
+        campaign: Dict[str, Any], tx: Dict[str, Any], *,
+        claim: Any = None, require_claim: bool = False,
+    ) -> str:
+        """Validate v2 restart authority while preserving legacy v1 recovery."""
+        try:
+            schema_version = int(tx.get("schema_version") or 1)
+        except (TypeError, ValueError):
+            schema_version = 1
+        strict = (
+            schema_version >= 2
+            or "commit_receipt" in tx
+            or claim is not None
+        )
+        if not strict:
+            return ""
+        if require_claim and not isinstance(claim, dict):
+            return "restart_claim_missing" if claim is None else "restart_claim_invalid"
+        expected = {
+            "campaign_id": str(campaign.get("id") or ""),
+            "transaction_id": str(tx.get("transaction_id") or ""),
+            "task_id": str(tx.get("task_id") or ""),
+            "commit_sha": str(tx.get("commit_sha") or ""),
+        }
+        if isinstance(claim, dict) and any(
+            str(claim.get(key) or "") != value for key, value in expected.items()
+        ):
+            return "restart_claim_mismatch"
+        from supervisor.evolution_lifecycle import evolution_commit_receipt_error
+
+        return evolution_commit_receipt_error(tx, **expected)
+
+    def _boot_reconcile_generation() -> str:
+        from supervisor.evolution_lifecycle import current_evolution_boot_generation
+
+        return current_evolution_boot_generation()
+
     def _reconcile_dangling_campaign_transaction(observed_sha: str) -> None:
         try:
-            campaign_path = env.drive_path("state") / "evolution_campaign.json"
+            snapshot = read_json_dict(campaign_path) or {}
+            snapshot_tx = (
+                snapshot.get("active_transaction")
+                if isinstance(snapshot.get("active_transaction"), dict) else {}
+            )
+            snapshot_sha = str(snapshot_tx.get("commit_sha") or "").strip()
+            snapshot_reachable = bool(
+                snapshot_sha and _commit_reachable(snapshot_sha, observed_sha)
+            )
             # Reconcile AT MOST ONCE per server generation. A genuine restart
             # begins a new custody generation (NW-10 session id, which workers
             # inherit from the server); a routine worker RESPAWN keeps the same
@@ -597,11 +647,7 @@ def verify_restart(env: Any, git_sha: str) -> None:
             # nothing was actually restarted. Honors the owner's reconcile_yes
             # choice: it still reconciles on the next genuine new-generation boot.
             # The gen value depends only on the custody session, not the campaign.
-            try:
-                from ouroboros.process_custody import current_custody_session_id
-                gen = str(current_custody_session_id() or "")
-            except Exception:
-                gen = ""
+            gen = _boot_reconcile_generation()
             # The whole read-check-write runs under update_json_locked so the
             # gen-gate is ATOMIC: at boot ~10 workers whose os.rename of the pending
             # file lost all call this; the lock + in-lock re-read make exactly one
@@ -614,9 +660,17 @@ def verify_restart(env: Any, git_sha: str) -> None:
             event: Dict[str, Any] = {}  # captured in-lock for post-lock event logging
 
             outcome_snapshot: Dict[str, Any] = {}
+            state_path = env.drive_path("state") / "state.json"
+            state_lock_path = env.drive_path("locks") / "state.lock"
 
             def _mutate(campaign: Dict[str, Any]):
                 if not isinstance(campaign, dict):
+                    return None
+                live_state = read_json_dict(state_path) or {}
+                if (
+                    bool(live_state.get("evolution_owner_stopped"))
+                    or campaign.get("status") not in {"active", "paused"}
+                ):
                     return None
                 if gen and str(campaign.get("last_boot_reconcile_gen") or "") == gen:
                     return None  # already reconciled this generation — abort, no write
@@ -633,12 +687,44 @@ def verify_restart(env: Any, git_sha: str) -> None:
                         campaign["updated_at"] = utc_now_iso()
                         return campaign
                     return None
+                if commit_sha != snapshot_sha:
+                    if gen:
+                        campaign["last_boot_reconcile_gen"] = gen
+                        campaign["updated_at"] = utc_now_iso()
+                        return campaign
+                    return None
                 now = utc_now_iso()
+                authority_error = _restart_authority_error(campaign, tx)
+                if authority_error:
+                    campaign["last_boot_reconcile_gen"] = gen
+                    tx["restart_required"] = True
+                    tx["restart_verified"] = False
+                    tx["restart_authority_error"] = authority_error
+                    tx["restart_observed_sha"] = observed_sha
+                    tx["updated_at"] = now
+                    campaign["active_transaction"] = tx
+                    campaign["progress_notes"] = (
+                        "Restart reconciliation kept the evolution transaction open: "
+                        f"exact commit authority failed ({authority_error})."
+                    )
+                    campaign["updated_at"] = now
+                    event.update({
+                        "ts": now,
+                        "type": "evolution_tx_reconcile_blocked",
+                        "ok": False,
+                        "reason": authority_error,
+                        "campaign_id": str(campaign.get("id") or ""),
+                        "transaction_id": str(tx.get("transaction_id") or ""),
+                        "task_id": str(tx.get("task_id") or ""),
+                        "commit_sha": commit_sha,
+                        "observed_sha": observed_sha,
+                    })
+                    return campaign
                 campaign["last_boot_reconcile_gen"] = gen
                 tx["restart_verified_at"] = now
                 tx["restart_observed_sha"] = observed_sha
                 tx["updated_at"] = now
-                if _commit_reachable(commit_sha, observed_sha):
+                if snapshot_reachable:
                     tx["restart_required"] = False
                     tx["restart_verified"] = True
                     tx["verified_by"] = "boot_reconciliation"
@@ -685,7 +771,13 @@ def verify_restart(env: Any, git_sha: str) -> None:
                 })
                 return campaign
 
-            update_json_locked(campaign_path, _mutate)
+            lock_fd = supervisor_state.acquire_file_lock(state_lock_path)
+            if lock_fd is None:
+                return
+            try:
+                update_json_locked(campaign_path, _mutate)
+            finally:
+                supervisor_state.release_file_lock(state_lock_path, lock_fd)
             if event:
                 append_jsonl(env.drive_path("logs") / "events.jsonl", event)
             if outcome_snapshot.get("transaction"):
@@ -699,27 +791,77 @@ def verify_restart(env: Any, git_sha: str) -> None:
         except Exception:
             log.debug("Failed to reconcile dangling evolution transaction", exc_info=True)
 
-    def _mark_campaign_restart_verified(expected_sha: str, observed_sha: str, ok: bool) -> bool:
-        # Runs only on the single worker that won the os.rename of the pending claim,
-        # so there is no marker-vs-marker race. It stays unlocked (its strict
-        # expected==observed check and the active_transaction-popped guard make the
-        # outcome consistent with a concurrent boot reconcile in the common case where
-        # the reviewed commit IS HEAD). KNOWN LIMITATION: if the reviewed commit is an
-        # ANCESTOR of HEAD but not HEAD itself, this marker blocks (mismatch) while a
-        # boot reconciler would absorb (commit reachable) — a narrow, idempotency-
-        # mitigated ordering edge. Fully resolving it needs both writers to share the
-        # campaign lock; deferred as a focused follow-up (advisory, restart-critical).
+    mark_error: Dict[str, str] = {}
+
+    def _mark_campaign_restart_verified(
+        expected_sha: str, observed_sha: str, ok: bool, claim: Any = None,
+    ) -> bool:
+        # Only the os.rename winner reaches this transition. It stamps the custody
+        # generation before removing the claim; losers either see the claimed file or
+        # the generation stamp, so markerless reconciliation cannot bypass the claim.
+        state_lock_path = env.drive_path("locks") / "state.lock"
+        lock_fd = None
         try:
-            campaign_path = env.drive_path("state") / "evolution_campaign.json"
+            lock_fd = supervisor_state.acquire_file_lock(state_lock_path)
+            if lock_fd is None:
+                mark_error["reason"] = "state_lock_unavailable"
+                return False
             campaign = read_json_dict(campaign_path) or {}
             if not isinstance(campaign, dict):
                 return bool(ok)
             tx = campaign.get("active_transaction") if isinstance(campaign.get("active_transaction"), dict) else {}
             if not tx:
+                if claim is not None:
+                    mark_error["reason"] = "transaction_missing"
+                    mark_error["durable"] = "1"
+                    return False
+                mark_error["durable"] = "1"
                 return bool(ok)
+            live_state = read_json_dict(env.drive_path("state") / "state.json") or {}
+            if bool(live_state.get("evolution_owner_stopped")):
+                mark_error["reason"] = "owner_stopped"
+                mark_error["durable"] = "1"
+                return False
+            if campaign.get("status") not in {"active", "paused"}:
+                mark_error["reason"] = "campaign_not_active"
+                mark_error["durable"] = "1"
+                return False
+            prior_gen = str(campaign.get("last_boot_reconcile_gen") or "")
+            gen = _boot_reconcile_generation()
             # Captured before the absorbed branch pops it via _close_post_task_backlog.
             backlog_id_before_close = str(campaign.get("post_task_backlog_id") or "")
             commit_sha = str(tx.get("commit_sha") or "").strip()
+            authority_error = _restart_authority_error(
+                campaign, tx, claim=claim, require_claim=True,
+            )
+            if authority_error:
+                now = utc_now_iso()
+                mark_error["reason"] = authority_error
+                if gen:
+                    campaign["last_boot_reconcile_gen"] = gen
+                tx["restart_required"] = True
+                tx["restart_verified"] = False
+                tx["restart_verified_at"] = now
+                tx["restart_expected_sha"] = expected_sha
+                tx["restart_observed_sha"] = observed_sha
+                tx["restart_authority_error"] = authority_error
+                tx["updated_at"] = now
+                campaign["active_transaction"] = tx
+                campaign["progress_notes"] = (
+                    "Restart verification kept the evolution transaction open: "
+                    f"exact commit authority failed ({authority_error})."
+                )
+                campaign["updated_at"] = now
+                atomic_write_json(campaign_path, campaign, trailing_newline=True)
+                mark_error["durable"] = "1"
+                return False
+            if isinstance(claim, dict) and gen and prior_gen == gen:
+                # A replacement worker inherits the server's custody generation.
+                # Keep the marker pending until the server itself has restarted.
+                mark_error["reason"] = "restart_generation_unchanged"
+                return False
+            if gen:
+                campaign["last_boot_reconcile_gen"] = gen
             if commit_sha and commit_sha != expected_sha:
                 tx["restart_required"] = True
                 tx["restart_verified"] = False
@@ -740,6 +882,7 @@ def verify_restart(env: Any, git_sha: str) -> None:
                 )
                 campaign["updated_at"] = utc_now_iso()
                 atomic_write_json(campaign_path, campaign, trailing_newline=True)
+                mark_error["durable"] = "1"
                 return False
             tx["restart_required"] = bool(not ok)
             tx["restart_verified"] = bool(ok)
@@ -796,6 +939,7 @@ def verify_restart(env: Any, git_sha: str) -> None:
                 _record_pending_owner_report(campaign, tx)
             campaign["updated_at"] = utc_now_iso()
             atomic_write_json(campaign_path, campaign, trailing_newline=True)
+            mark_error["durable"] = "1"
             if tx.get("cycle_outcome") == "absorbed":
                 _append_cycle_outcome_tag(
                     env,
@@ -806,8 +950,12 @@ def verify_restart(env: Any, git_sha: str) -> None:
                 )
             return bool(ok)
         except Exception:
+            mark_error["reason"] = "restart_campaign_write_failed"
             log.debug("Failed to update evolution campaign restart verification", exc_info=True)
-            return bool(ok)
+            return False
+        finally:
+            if lock_fd is not None:
+                supervisor_state.release_file_lock(state_lock_path, lock_fd)
 
     try:
         pending_path = env.drive_path('state') / 'pending_restart_verify.json'
@@ -815,35 +963,71 @@ def verify_restart(env: Any, git_sha: str) -> None:
         try:
             os.rename(str(pending_path), str(claim_path))
         except (FileNotFoundError, Exception):
-            _reconcile_dangling_campaign_transaction(git_sha)
-            return
+            claimed_paths = list(pending_path.parent.glob(
+                f"{pending_path.stem}.claimed.*{pending_path.suffix}"
+            ))
+            if not claimed_paths:
+                _reconcile_dangling_campaign_transaction(git_sha)
+                return
+            from ouroboros.platform_layer import pid_is_alive
+
+            prefix = f"{pending_path.stem}.claimed."
+            reclaimed = False
+            for stale_path in claimed_paths:
+                raw_pid = stale_path.name[len(prefix):-len(pending_path.suffix)]
+                if not raw_pid.isdecimal() or pid_is_alive(int(raw_pid)):
+                    return
+                try:
+                    os.rename(str(stale_path), str(claim_path))
+                    reclaimed = True
+                    break
+                except Exception:
+                    continue
+            if not reclaimed:
+                return
         try:
             claim_data = read_json_dict(claim_path)
             if claim_data is None:
+                _mark_campaign_restart_verified("", git_sha, False, None)
                 append_jsonl(env.drive_path('logs') / 'events.jsonl', {
                     'ts': utc_now_iso(), 'type': 'restart_verify',
                     'pid': os.getpid(), 'ok': False,
                     'error': 'pending_restart_verify_invalid',
+                    'authority_error': mark_error.get("reason", ""),
                     'observed_sha': git_sha,
                 })
-                return
-            expected_sha = str(claim_data.get("expected_sha", "")).strip()
-            sha_ok = bool(expected_sha and expected_sha == git_sha)
-            campaign_ok = _mark_campaign_restart_verified(expected_sha, git_sha, sha_ok)
-            ok = bool(sha_ok and campaign_ok)
-            append_jsonl(env.drive_path('logs') / 'events.jsonl', {
-                'ts': utc_now_iso(), 'type': 'restart_verify',
-                'pid': os.getpid(), 'ok': ok,
-                'expected_sha': expected_sha, 'observed_sha': git_sha,
-            })
+            else:
+                expected_sha = str(claim_data.get("expected_sha", "")).strip()
+                sha_ok = bool(expected_sha and expected_sha == git_sha)
+                evolution_claim = claim_data.get("evolution_claim")
+                campaign_ok = _mark_campaign_restart_verified(
+                    expected_sha, git_sha, sha_ok, evolution_claim,
+                )
+                ok = bool(sha_ok and campaign_ok)
+                event = {
+                    'ts': utc_now_iso(), 'type': 'restart_verify',
+                    'pid': os.getpid(), 'ok': ok,
+                    'expected_sha': expected_sha, 'observed_sha': git_sha,
+                }
+                if mark_error.get("reason"):
+                    event["error"] = mark_error["reason"]
+                append_jsonl(env.drive_path('logs') / 'events.jsonl', event)
         except Exception:
             log.debug("Failed to log restart verify event", exc_info=True)
             pass
-        try:
-            claim_path.unlink()
-        except Exception:
-            log.debug("Failed to delete restart verify claim file", exc_info=True)
-            pass
+        if mark_error.get("durable") == "1":
+            try:
+                claim_path.unlink()
+            except Exception:
+                log.debug("Failed to delete restart verify claim file", exc_info=True)
+                pass
+        else:
+            try:
+                if claim_path.is_file() and not pending_path.exists():
+                    os.rename(str(claim_path), str(pending_path))
+            except Exception:
+                log.debug("Failed to restore unresolved restart verify claim", exc_info=True)
+                pass
     except Exception:
         log.debug("Restart verification failed", exc_info=True)
         pass

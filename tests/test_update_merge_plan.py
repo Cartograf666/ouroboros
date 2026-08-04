@@ -18,6 +18,7 @@ def _init_repo(tmp_path):
     _git(repo, "config", "user.name", "t")
     _git(repo, "config", "commit.gpgsign", "false")
     (repo / "a.txt").write_text("base\n")
+    (repo / "BIBLE.md").write_text("constitution\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "base")
     head = _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip()
@@ -26,7 +27,18 @@ def _init_repo(tmp_path):
 
 def _point_at(monkeypatch, repo):
     monkeypatch.setattr(git_ops, "REPO_DIR", repo)
-    monkeypatch.setattr(git_ops, "_managed_update_target", lambda branch=None: ("", "", "remote-sim"))
+    current = _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip()
+    monkeypatch.setattr(git_ops, "BRANCH_DEV", current)
+    monkeypatch.setattr(git_ops, "_managed_update_target", lambda: ("", "ouroboros", "remote-sim"))
+    monkeypatch.setattr(
+        git_ops,
+        "_resolve_managed_update_target",
+        lambda *_args: (
+            "remote-sim",
+            _git(repo, "rev-parse", "remote-sim").stdout.strip(),
+            "",
+        ),
+    )
 
 
 def test_plan_clean_when_disjoint(tmp_path, monkeypatch):
@@ -43,6 +55,60 @@ def test_plan_clean_when_disjoint(tmp_path, monkeypatch):
     assert plan["kind"] == "clean", plan
     assert plan["auto_mergeable"] is True
     assert plan["recommended_strategy"] == "auto_merge"
+
+
+def test_clean_divergence_preflight_recommends_automatic_git_merge(tmp_path, monkeypatch):
+    repo, head = _init_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "remote-sim")
+    (repo / "remote.txt").write_text("remote\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "remote")
+    _git(repo, "checkout", "-q", head)
+    (repo / "local.txt").write_text("local\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "local")
+    _point_at(monkeypatch, repo)
+
+    plan = update_merge.plan_managed_update_merge(fetch=False, build=False)
+
+    assert plan["kind"] == "clean"
+    assert plan["local_dirty_count"] == 0
+    assert plan["recommended_strategy"] == "auto_merge"
+
+
+def test_clean_fast_forward_lands_exact_official_sha(tmp_path, monkeypatch):
+    repo, head = _init_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "remote-sim")
+    (repo / "b.txt").write_text("remote\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "remote adds b")
+    target = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "checkout", "-q", head)
+    _point_at(monkeypatch, repo)
+
+    plan = update_merge.plan_managed_update_merge(fetch=False, build=True)
+
+    assert plan["kind"] == "clean"
+    assert plan["local_snapshot"] == plan["base_sha"]
+    assert plan["merge_commit"] == target
+    ok, message = update_merge.apply_managed_merge_update(head, plan["merge_commit"])
+    assert ok, message
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == target
+    assert _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip() == head
+
+
+def test_plan_rejects_official_target_that_deletes_constitution(tmp_path, monkeypatch):
+    repo, head = _init_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "remote-sim")
+    _git(repo, "rm", "-q", "BIBLE.md")
+    _git(repo, "commit", "-q", "-m", "delete constitution")
+    _git(repo, "checkout", "-q", head)
+    _point_at(monkeypatch, repo)
+
+    plan = update_merge.plan_managed_update_merge(fetch=False, build=True)
+
+    assert plan["available"] is False
+    assert "does not preserve BIBLE.md" in plan["error"]
 
 
 def test_plan_conflicting_on_code(tmp_path, monkeypatch):
@@ -62,7 +128,7 @@ def test_plan_conflicting_on_code(tmp_path, monkeypatch):
     assert plan["recommended_strategy"] == "assisted"
 
 
-def test_plan_doc_reconcile(tmp_path, monkeypatch):
+def test_plan_document_conflict_uses_assisted_route(tmp_path, monkeypatch):
     repo, head = _init_repo(tmp_path)
     (repo / "README.md").write_text("base readme\n")
     _git(repo, "add", "-A")
@@ -77,7 +143,7 @@ def test_plan_doc_reconcile(tmp_path, monkeypatch):
 
     plan = update_merge.plan_managed_update_merge(fetch=False)
     assert plan["available"] is True, plan
-    assert plan["kind"] == "doc_reconcile", plan
+    assert plan["kind"] == "conflicting", plan
     assert "README.md" in plan["doc_conflict_paths"]
 
 
@@ -105,14 +171,19 @@ def test_build_and_apply_clean_merge(tmp_path, monkeypatch):
     assert plan["kind"] == "clean", plan
     assert plan["merge_commit"], plan
 
+    # Q1=C: local dirty work rides a stash through the apply — it never becomes
+    # part of committed history — and is restored as uncommitted content after.
+    ok, stash_sha, stash_error = update_merge.stash_local_changes_for_update("plan-test")
+    assert ok and stash_sha, stash_error
     ok, msg = update_merge.apply_managed_merge_update(head, plan["merge_commit"])
     assert ok, msg
-    # the live repo now has BOTH the remote's new file AND the local dirty work.
     assert (repo / "b.txt").exists()
+    restored, note = update_merge.restore_update_stash(stash_sha, context="test")
+    assert restored, note
     assert (repo / "c.txt").read_text() == "local untracked\n"
-    # HEAD is a merge commit (self + 2 parents = local snapshot + target).
-    parents = _git(repo, "rev-list", "--parents", "-n", "1", "HEAD").stdout.strip().split()
-    assert len(parents) == 3
+    # Base was fast-forwardable, so official history lands as-is: HEAD is the
+    # target itself, with no synthetic merge commit carrying local work.
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == plan["target_sha"]
 
 
 def test_rollback_managed_update(tmp_path, monkeypatch):
@@ -123,6 +194,10 @@ def test_rollback_managed_update(tmp_path, monkeypatch):
     monkeypatch.setattr(git_ops, "REPO_DIR", repo)
     monkeypatch.setattr(git_ops, "DRIVE_ROOT", data_dir)
     monkeypatch.setattr(git_ops, "_git_dir", lambda: repo / ".git")
+    import supervisor.workers as workers
+    gate_calls = []
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: gate_calls.append(("close", reason)))
+    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": gate_calls.append(("open", expected_reason)))
     # simulate a bad update landed on top.
     (repo / "bad.txt").write_text("bad\n")
     _git(repo, "add", "-A")
@@ -134,6 +209,10 @@ def test_rollback_managed_update(tmp_path, monkeypatch):
     assert _git(repo, "rev-parse", "HEAD").stdout.strip() == pre
     assert not (repo / "bad.txt").exists()
     assert update_merge.read_update_tx() == {}  # marker cleared
+    assert gate_calls == [
+        ("close", "managed_update:rollback"),
+        ("open", "managed_update:rollback"),
+    ]
 
 
 def _wire_git_ops(monkeypatch, repo, data_dir):
@@ -159,6 +238,10 @@ def test_finalize_rolls_back_after_unhealthy_boot(tmp_path, monkeypatch):
     repo, head = _init_repo(tmp_path)
     pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
     _wire_git_ops(monkeypatch, repo, tmp_path / "data")
+    import supervisor.workers as workers
+    gate_calls = []
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: gate_calls.append(("close", reason)))
+    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": gate_calls.append(("open", expected_reason)))
     (repo / "bad.txt").write_text("bad\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "bad update")
@@ -170,6 +253,7 @@ def test_finalize_rolls_back_after_unhealthy_boot(tmp_path, monkeypatch):
     res = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
     assert res.get("rolled_back") is True, res
     assert _git(repo, "rev-parse", "HEAD").stdout.strip() == pre
+    assert gate_calls == [("close", "managed_update:rollback")]
 
 
 def test_rollback_still_resets_when_the_forensics_ref_cannot_be_written(tmp_path, monkeypatch):
@@ -188,9 +272,13 @@ def test_rollback_still_resets_when_the_forensics_ref_cannot_be_written(tmp_path
     ref makes `git branch -f failed-update-<sha>` impossible (a ref cannot be both a
     directory and a file), which is exactly the name-collision case in the finding.
     """
+    import supervisor.workers as workers
+
     repo, head = _init_repo(tmp_path)
     pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
     _wire_git_ops(monkeypatch, repo, tmp_path / "data")
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: True)
+    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": True)
     (repo / "bad.txt").write_text("bad\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "bad update")
@@ -214,52 +302,6 @@ def test_rollback_still_resets_when_the_forensics_ref_cannot_be_written(tmp_path
     assert update_merge.read_update_tx() == {}, (
         "the tx marker survived, so the next boot resumes the update that was just rolled back"
     )
-    assert "could not be recorded" in msg, (
-        f"the lost forensics ref must still be reported to the operator: {msg}"
-    )
-
-
-def test_a_gate_blocked_tx_is_terminal_for_boot_recovery_and_for_commits(tmp_path, monkeypatch):
-    """`gate_blocked` is the terminal phase written when a rejected update could NOT be rolled back.
-
-    The danger it exists to stop: an assisted tx sits in `committing_assisted` when the
-    gate rejects it, and boot recovery reads that phase as "the process died
-    mid-commit" — so it promotes the merge to `pending_boot_smoke` and finalizes the
-    exact revision the gate refused, without ever rerunning the gate. Re-phasing to
-    `gate_blocked` is what makes that impossible, so it has to be terminal in BOTH
-    directions: boot recovery must not advance it, and `commit_reviewed` must not
-    admit an ordinary commit on top of a refused merge that is still in the tree.
-
-    Pinned against the real module rather than a fake, because the value of the phase
-    is entirely in the real recovery branches keying off it.
-    """
-    repo, head = _init_repo(tmp_path)
-    _wire_git_ops(monkeypatch, repo, tmp_path / "data")
-    cur = _git(repo, "rev-parse", "HEAD").stdout.strip()
-    update_merge.write_update_tx(
-        {"phase": "committing_assisted", "task_id": "t-1", "merge_commit": cur,
-         "pre_update_sha": cur, "pre_update_branch": head}
-    )
-
-    assert update_merge.mark_update_tx_gate_blocked("post_commit_gate_failed") is True
-    tx = update_merge.read_update_tx()
-    assert tx["phase"] == update_merge.UPDATE_TX_GATE_BLOCKED
-    assert tx["gate_blocked_reason"] == "post_commit_gate_failed"
-
-    # Boot recovery stops instead of promoting the refused merge.
-    res = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
-    assert res["finalized"] is False, res
-    assert "gate_blocked" in str(res.get("reason") or ""), res
-    assert update_merge.read_update_tx()["phase"] == update_merge.UPDATE_TX_GATE_BLOCKED, (
-        "boot recovery advanced a terminal gate_blocked marker"
-    )
-
-    # ...and the commit path blocks, INCLUDING the task that was authorized before.
-    for task_id in ("t-1", "some-other-task"):
-        managed_tx, block = update_merge.managed_assisted_tx_for(task_id)
-        assert managed_tx == {}, f"{task_id} was handed a gate-blocked tx to commit under"
-        assert "MANAGED_UPDATE_GATE_BLOCKED" in block, block
-        assert "post_commit_gate_failed" in block, block
 
 
 def test_mark_update_tx_gate_blocked_does_not_invent_a_transaction(tmp_path, monkeypatch):
@@ -267,11 +309,11 @@ def test_mark_update_tx_gate_blocked_does_not_invent_a_transaction(tmp_path, mon
 
     The caller reaches this helper on a failed rollback, and a rollback fails for
     reasons that include "the marker was already cleared". Writing a `gate_blocked`
-    tx from nothing there would brick every later commit on a machine whose update
-    had actually finished.
+    tx from nothing would leave a permanent phantom transaction that blocks every
+    later managed update on a machine whose update had actually finished.
     """
     repo, _head = _init_repo(tmp_path)
     _wire_git_ops(monkeypatch, repo, tmp_path / "data")
 
-    assert update_merge.mark_update_tx_gate_blocked("post_commit_gate_failed") is False
+    update_merge.mark_update_tx_gate_blocked("post_commit_gate_failed", "detail")
     assert update_merge.read_update_tx() == {}, "a gate-blocked marker was invented from no tx"

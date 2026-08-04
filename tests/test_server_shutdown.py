@@ -30,6 +30,157 @@ def test_shutdown_task_cleanup_args_never_reports_crash_storm():
     assert "interrupted" in reason_signal.lower()
 
 
+def test_managed_update_restart_preserves_pending_queue(monkeypatch, tmp_path):
+    import server
+
+    worker_calls = []
+    state = {"owner_chat_id": 0}
+    ctx = SimpleNamespace(
+        load_state=lambda: dict(state),
+        save_state=lambda updated: state.update(updated),
+        safe_restart=lambda **_kwargs: (True, "ok"),
+        kill_workers=lambda **kwargs: worker_calls.append(kwargs),
+        persist_queue_snapshot=lambda **_kwargs: None,
+        # The evolution restart-receipt check reads pending_restart_verify.json
+        # from ctx.DRIVE_ROOT before any restart proceeds.
+        DRIVE_ROOT=tmp_path,
+        REPO_DIR=tmp_path,
+    )
+    monkeypatch.setattr(
+        server,
+        "_managed_update_pending_kwargs",
+        lambda: {"preserve_pending": True},
+    )
+    monkeypatch.setattr(server, "_request_restart_exit", lambda: None)
+
+    server._perform_supervisor_restart(ctx)
+
+    assert worker_calls[0]["preserve_pending"] is True
+    assert worker_calls[0]["terminal_status"] == "cancelled"
+
+
+def test_pre_transaction_update_quiesce_also_preserves_pending(monkeypatch):
+    import server
+    import supervisor.update_merge as update_merge
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(update_merge, "active_update_tx", lambda: {})
+    monkeypatch.setattr(workers, "repo_writer_admission_closed", lambda: "managed_update:smart")
+    monkeypatch.setattr(
+        workers,
+        "worker_pool_admission_state",
+        lambda: {"disabled_reason": "managed_update"},
+    )
+
+    assert server._managed_update_pending_kwargs() == {"preserve_pending": True}
+
+
+def test_ordinary_restart_disarms_orphan_update_intent(monkeypatch):
+    import server
+    import supervisor.git_ops as git_ops
+    import supervisor.update_merge as update_merge
+
+    calls = []
+    monkeypatch.setattr(update_merge, "acquire_update_lock", lambda: object())
+    monkeypatch.setattr(update_merge, "release_update_lock", lambda _lock: None)
+    monkeypatch.setattr(update_merge, "read_update_tx_strict", lambda: ("absent", {}))
+    monkeypatch.setattr(git_ops, "_clear_update_intent", lambda: calls.append("clear") or True)
+
+    ok, message = server._safe_restart_serialized(
+        lambda **_kwargs: (calls.append("restart") or True, "ok"),
+        reason="owner_restart",
+        unsynced_policy="rescue_and_reset",
+    )
+
+    assert (ok, message) == (True, "ok")
+    assert calls == ["clear", "restart"]
+
+
+def test_supervisor_startup_restores_queue_before_worker_reset():
+    """A fresh process must not overwrite the durable queue with its empty memory."""
+    import inspect
+    import server
+
+    source = inspect.getsource(server._run_supervisor)
+    restore = source.index("restored_pending = restore_pending_from_snapshot()")
+    reset = source.index("kill_workers(preserve_pending=True)")
+    spawn = source.index("spawn_workers(max_workers)")
+    assert restore < reset < spawn
+
+
+def test_update_finalizer_waits_for_real_supervisor_outcome(monkeypatch):
+    import server
+
+    calls = []
+    ready = SimpleNamespace(wait=lambda: calls.append("wait"))
+    monkeypatch.setattr(server, "_supervisor_ready", ready)
+    monkeypatch.setattr(server, "_supervisor_error", None)
+
+    assert server._wait_for_supervisor_update_finalize() is True
+    assert calls == ["wait"]
+
+
+def test_boot_update_check_notifies_the_live_ui():
+    import inspect
+    import server
+
+    source = inspect.getsource(server._boot_managed_update_tasks)
+    assert '"type": "update_status_ready"' in source
+    assert source.index("compute_managed_update_status(fetch=True)") < source.index(
+        '"type": "update_status_ready"'
+    )
+
+
+def test_successful_boot_rollback_requests_restart_and_preserves_queue(monkeypatch):
+    import server
+    import supervisor.git_ops as git_ops
+    import supervisor.update_merge as update_merge
+    import supervisor.workers as workers
+
+    calls = []
+    monkeypatch.setattr(server, "_wait_for_supervisor_update_finalize", lambda: False)
+    monkeypatch.setattr(
+        update_merge, "finalize_managed_update_on_boot",
+        lambda supervisor_ready: {"finalized": False, "rolled_back": True},
+    )
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: calls.append(("gate", reason)))
+    monkeypatch.setattr(server, "_request_restart_exit", lambda: calls.append(("restart", "")))
+    monkeypatch.setattr(
+        git_ops, "compute_managed_update_status",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("restarting generation must not check feed")),
+    )
+
+    server._boot_managed_update_tasks()
+
+    assert calls == [
+        ("gate", "managed_update:rollback_restart"),
+        ("restart", ""),
+    ]
+
+
+def test_failed_boot_rollback_does_not_restart(monkeypatch):
+    import server
+    import supervisor.git_ops as git_ops
+    import supervisor.update_merge as update_merge
+
+    calls = []
+    monkeypatch.setattr(server, "_wait_for_supervisor_update_finalize", lambda: False)
+    monkeypatch.setattr(
+        update_merge, "finalize_managed_update_on_boot",
+        lambda supervisor_ready: {"finalized": False, "rolled_back": False},
+    )
+    monkeypatch.setattr(
+        git_ops, "compute_managed_update_status",
+        lambda fetch: {"available": False, "check_ok": True},
+    )
+    monkeypatch.setattr(server, "_request_restart_exit", lambda: calls.append("restart"))
+    monkeypatch.setattr(server, "broadcast_ws_sync", lambda payload: calls.append(payload["type"]))
+
+    server._boot_managed_update_tasks()
+
+    assert calls == ["update_status_ready"]
+
+
 def test_main_normal_exit_does_not_run_emergency_cleanup(monkeypatch):
     import server
 
@@ -166,6 +317,8 @@ def test_panic_stop_kills_services_without_log_finalization(monkeypatch, tmp_pat
     monkeypatch.setattr("ouroboros.local_model.get_manager", lambda: SimpleNamespace(stop_server=lambda: None))
     monkeypatch.setattr("supervisor.state.load_state", lambda: {})
     monkeypatch.setattr("supervisor.state.save_state", lambda _state: None)
+    monkeypatch.setattr("supervisor.evolution_lifecycle.complete_evolution_campaign", lambda *a, **k: {})
+    monkeypatch.setattr("ouroboros.post_task_evolution.drop_pending_request", lambda *a, **k: None)
     monkeypatch.setattr("ouroboros.extension_companion.panic_kill_all", lambda: None)
     monkeypatch.setattr("multiprocessing.active_children", lambda: [])
     monkeypatch.setattr("ouroboros.platform_layer.kill_process_on_port", lambda _port: None)

@@ -1,8 +1,7 @@
 """
 Ouroboros — Shared configuration (single source of truth).
 
-Paths, settings defaults, load/save with file locking.
-Only imports ouroboros.platform_layer (platform abstraction, no circular deps).
+Paths, settings defaults, load/save with file locking and cycle-free setting metadata.
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ from typing import Any, Optional, Sequence
 from ouroboros.platform_layer import pid_lock_acquire as _compat_pid_lock_acquire
 from ouroboros.platform_layer import pid_lock_release as _compat_pid_lock_release
 from ouroboros.provider_models import compute_direct_review_models_fallback, local_only_review_route_env, migrate_model_value, review_model_uses_local as review_model_uses_local
+from ouroboros.update_channels import UPDATE_SETTINGS_DEFAULTS, normalize_update_channel
 
 
 # Paths
@@ -61,7 +61,7 @@ def _guard_live_settings_write() -> None:
 
 
 # Settings defaults
-SETTINGS_DEFAULTS = {
+SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OPENROUTER_API_KEY": "",
     "OPENAI_API_KEY": "",
     "OPENAI_BASE_URL": "",
@@ -77,6 +77,8 @@ SETTINGS_DEFAULTS = {
     "GIGACHAT_VERIFY_SSL_CERTS": "true",
     "GIGACHAT_PROFANITY_CHECK": "",
     "ANTHROPIC_API_KEY": "",
+    "MINIMAX_API_KEY": "",
+    "MINIMAX_REGION": "",
 
     "OUROBOROS_NETWORK_PASSWORD": "",
     "OUROBOROS_SERVER_HOST": "127.0.0.1",
@@ -496,6 +498,7 @@ def _exclusive_direct_remote_provider_env() -> str:
     has_openrouter = bool(str(os.environ.get("OPENROUTER_API_KEY", "") or "").strip())
     has_openai = bool(str(os.environ.get("OPENAI_API_KEY", "") or "").strip())
     has_anthropic = bool(str(os.environ.get("ANTHROPIC_API_KEY", "") or "").strip())
+    has_minimax = bool(str(os.environ.get("MINIMAX_API_KEY", "") or "").strip())
     has_legacy_base = bool(str(os.environ.get("OPENAI_BASE_URL", "") or "").strip())
     has_compatible = bool(str(os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip())
     has_cloudru = bool(str(os.environ.get("CLOUDRU_FOUNDATION_MODELS_API_KEY", "") or "").strip())
@@ -505,18 +508,14 @@ def _exclusive_direct_remote_provider_env() -> str:
     )
     # OpenRouter / legacy OpenAI base / OpenAI-compatible all route through the
     # OpenRouter-style stack, so their presence means "not an exclusive direct
-    # provider". Among the real direct providers (official OpenAI, Anthropic,
-    # Cloud.ru, GigaChat), return one only when exactly one is configured.
+    # provider". Among the registered direct providers, return one only when
+    # exactly one is configured.
     if has_openrouter or has_legacy_base or has_compatible:
         return ""
-    direct = [
-        name for name, present in (
-            ("openai", has_openai),
-            ("anthropic", has_anthropic),
-            ("cloudru", has_cloudru),
-            ("gigachat", has_gigachat),
-        ) if present
-    ]
+    direct = [name for name, present in (
+        ("openai", has_openai), ("anthropic", has_anthropic), ("minimax", has_minimax),
+        ("cloudru", has_cloudru), ("gigachat", has_gigachat),
+    ) if present]
     return direct[0] if len(direct) == 1 else ""
 
 
@@ -550,7 +549,7 @@ def resolve_effort(task_type: str) -> str:
 
 def direct_provider_review_models_fallback(provider: str) -> list[str]:
     """Return the exact review-models list a direct-provider fallback emits."""
-    if provider not in ("openai", "anthropic", "cloudru", "gigachat"):
+    if provider not in ("openai", "anthropic", "minimax", "cloudru", "gigachat"):
         return []
     main_model = str(
         os.environ.get("OUROBOROS_MODEL", SETTINGS_DEFAULTS["OUROBOROS_MODEL"]) or ""
@@ -715,10 +714,7 @@ def get_plan_task_swarm_max_wait_sec() -> float:
 
 
 def get_restart_drain_max_sec() -> int:
-    raw = os.environ.get(
-        "OUROBOROS_RESTART_DRAIN_MAX_SEC",
-        SETTINGS_DEFAULTS["OUROBOROS_RESTART_DRAIN_MAX_SEC"],
-    )
+    raw = os.environ.get("OUROBOROS_RESTART_DRAIN_MAX_SEC", SETTINGS_DEFAULTS["OUROBOROS_RESTART_DRAIN_MAX_SEC"])
     try:
         parsed = int(float(raw))
     except (TypeError, ValueError):
@@ -1288,6 +1284,8 @@ def _coerce_setting_value(key: str, value):
     # Normalize runtime mode on read so all consumers see the closed enum.
     if key == "OUROBOROS_RUNTIME_MODE":
         return normalize_runtime_mode(value)
+    if key == "OUROBOROS_UPDATE_CHANNEL":
+        return normalize_update_channel(value)
     if key == "OUROBOROS_CONTEXT_MODE":
         return normalize_context_mode(value)
     # Trim so whitespace-only config is not treated as a configured skills repo.
@@ -1520,7 +1518,7 @@ def apply_settings_to_env(settings: dict) -> None:
         "OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_BASE_URL",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY", "CLOUDRU_FOUNDATION_MODELS_BASE_URL", "GIGACHAT_CREDENTIALS", "GIGACHAT_USER",
         "GIGACHAT_PASSWORD", "GIGACHAT_SCOPE", "GIGACHAT_BASE_URL", "GIGACHAT_VERIFY_SSL_CERTS", "GIGACHAT_PROFANITY_CHECK",
-        "ANTHROPIC_API_KEY", "OUROBOROS_NETWORK_PASSWORD", "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY",
+        "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "MINIMAX_REGION", "OUROBOROS_NETWORK_PASSWORD", "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY",
         "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS", "OUROBOROS_MODEL_FALLBACKS",
         "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "CLAUDE_CODE_MODEL", "OUROBOROS_FALLBACK_COOLDOWN_ENABLED",
         "OUROBOROS_FALLBACK_COOLDOWN_SEC", "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL", "OUROBOROS_MODEL_MAX_CONCURRENCY",
@@ -1529,7 +1527,7 @@ def apply_settings_to_env(settings: dict) -> None:
         "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", "OUROBOROS_MAX_SUBAGENT_DEPTH", "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC",
         "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC", "TOTAL_BUDGET",
         "OUROBOROS_PER_TASK_COST_USD", "GITHUB_TOKEN", "GITHUB_REPO", "OUROBOROS_RUB_USD_RATE", "OUROBOROS_PRICING_TTL_SEC",
-        "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
+        "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_MANAGED_UPDATE_FETCH_TIMEOUT_SEC", "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
         "OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", "OUROBOROS_TASK_ABS_CEILING_SEC",
         "OUROBOROS_PACING_INTERVAL_SEC", "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC", "OUROBOROS_MAX_ROUNDS",
         "OUROBOROS_TRANSIENT_RETRY_MAX", "OUROBOROS_IMAGE_INPUT_MODE", "OUROBOROS_BG_MAX_ROUNDS", "OUROBOROS_BG_WAKEUP_MIN",
@@ -1547,7 +1545,7 @@ def apply_settings_to_env(settings: dict) -> None:
         # Unified disposable-artifact GC retention (replaces per-subsystem keys).
         "OUROBOROS_GC_RETENTION_DAYS",
         # Runtime-mode, context-mode, and skills-repo plumbing.
-        "OUROBOROS_RUNTIME_MODE", "OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SKILLS_REPO_PATH",
+        "OUROBOROS_RUNTIME_MODE", "OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SKILLS_REPO_PATH", "OUROBOROS_UPDATE_CHANNEL",
         "OUROBOROS_HOST_SERVICE_PORT",
         # Acting (mutative) subagents: owner toggle + worktree/projects roots.
         "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "OUROBOROS_SUBAGENT_WORKTREE_ROOT", "OUROBOROS_SUBAGENT_PROJECTS_ROOT",

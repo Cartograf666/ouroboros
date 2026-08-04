@@ -729,7 +729,7 @@ def _execute_pytest_pass(
     the return rather than in the `finally` below, which cannot alter an
     already-computed tuple; only the handle release stays unconditional.
     """
-    from ouroboros.platform_layer import ProcessContainer
+    from ouroboros.process_containment import ProcessContainer
 
     container = ProcessContainer()
     # `container.spawn`, not `Popen` + `adopt`: it applies the process-group/session

@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import socket
+import subprocess
 
 import os
 import pathlib
@@ -12,7 +13,7 @@ import sys
 import threading
 import time
 import uuid
-from ouroboros.utils import utc_now_iso
+from ouroboros.utils import read_json_dict, utc_now_iso
 from typing import Any, Dict, Optional
 
 from starlette.applications import Starlette
@@ -562,9 +563,13 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
     instead of spawning a duplicate) and the originating message id (for idempotent
     steer delivery). P5-clean: surfaces state only; the agent picks the target by
     judgment among answer / steer_task / promote_chat_to_task / route_to_project."""
+    md = dict(task_metadata) if isinstance(task_metadata, dict) else {}
+    swarm_intent = bool(md.get("force_plan"))
     addressable_here = _addressable_root_tasks(ctx, chat_id)
     running_here = [row for row in addressable_here if row.get("status") == "running"]
-    project_id = _project_id_for_registered_chat(ctx, chat_id)
+    project_id = str(md.get("project_id") or "").strip() or _project_id_for_registered_chat(
+        ctx, chat_id,
+    )
     is_main_lane = not bool(project_id)
     try:
         # Every non-Project owner transport is the Main lane.  External transports
@@ -579,9 +584,8 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
     except Exception:
         log.warning("Unable to build Main routing manifest", exc_info=True)
         main_manifest = {"error": "routing_manifest_unavailable"} if is_main_lane else {}
-    if not addressable_here and not client_message_id and not main_manifest:
+    if not swarm_intent and not addressable_here and not client_message_id and not main_manifest:
         return task_metadata
-    md = dict(task_metadata) if isinstance(task_metadata, dict) else {}
     if addressable_here:
         md["current_chat"] = {
             "chat_id": int(chat_id or 0),
@@ -597,7 +601,7 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         if is_main_lane and isinstance(main_manifest, dict)
         else addressable_here
     )
-    manual_options = [
+    manual_options = [] if swarm_intent else [
         {
             "action": "steer_task",
             "task_id": row["task_id"],
@@ -608,30 +612,38 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         for row in option_roots
         if isinstance(row, dict) and row.get("task_id")
     ]
-    if is_main_lane and isinstance(main_manifest, dict):
+    if not swarm_intent and is_main_lane and isinstance(main_manifest, dict):
         manual_options.extend({
             "action": "new_task_in_project",
             "project_id": str(row.get("project_id") or ""),
             "project_name": str(row.get("name") or row.get("project_id") or "Project"),
             "label": f"New task in {str(row.get('name') or 'Project')}",
         } for row in list(main_manifest.get("projects") or []) if isinstance(row, dict))
-    elif project_id:
+    elif project_id and not swarm_intent:
         manual_options.append({
             "action": "new_task_in_project",
             "project_id": project_id,
             "label": "New task in Project",
         })
-    md["routing_contract"] = {
+    routing_contract = {
         "llm_first": True,
         "source_lane": "main" if is_main_lane else "project",
-        "valid_actions": [
-            "answer_inline", "steer_task", "promote_chat_to_task", "route_to_project",
-            "needs_manual_target",
-        ],
-        "on_uncertain_or_invalid_target": "needs_manual_target",
-        "manual_target_tool": {"name": "route_to_project", "project_id": ""},
+        "valid_actions": (
+            (["promote_chat_to_task", "route_to_project"] if is_main_lane else ["promote_chat_to_task"])
+            if swarm_intent else
+            [
+                "answer_inline", "steer_task", "promote_chat_to_task", "route_to_project",
+                "needs_manual_target",
+            ]
+        ),
+        "on_uncertain_or_invalid_target": (
+            "promote_chat_to_task" if swarm_intent else "needs_manual_target"
+        ),
         "manual_options": manual_options,
     }
+    if not swarm_intent:
+        routing_contract["manual_target_tool"] = {"name": "route_to_project", "project_id": ""}
+    md["routing_contract"] = routing_contract
     return md
 
 
@@ -759,36 +771,10 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
     threading.Thread(target=_watch, name="supervisor-liveness-watchdog", daemon=True).start()
 
 
-def _reconcile_stranded_writer_admission() -> None:
-    """Give the managed-update writer-admission fence an owner that outlives a single watchdog call.
-
-    The fence closes in-process writer admission (direct + ephemeral chat) process-wide, and the
-    events that give it back are all single-shot: a restart, an apply's abort path, or the
-    orphaned-resolution watchdog on `task_done`. A resolver worker that dies WITHOUT emitting
-    `task_done` reaches none of them, so chat would stay refused for the rest of the process' life
-    with no restart pending to clear it. The reconcile is fail-closed (it re-opens only when no
-    update transaction is live AND the checkout is provably recovered), so running it on a timer
-    cannot re-admit a writer behind a live fence."""
-    try:
-        from supervisor.update_merge import reconcile_repo_writer_admission
-
-        reconcile_repo_writer_admission()
-    except Exception:
-        log.debug("Periodic writer-admission reconcile failed", exc_info=True)
-
-
-# Cadence marker for the writer-admission reconcile below. Module-level (like `_pending_restart`)
-# rather than a supervisor-loop local: the lockout it heals is PROCESS-wide, so it outlives any one
-# loop generation, and keeping it out of `_run_supervisor` keeps that function under the size gate.
-_last_admission_reconcile: list = [0.0]
-
-
 def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconcile: list) -> None:
     """Throttled periodic upkeep extracted from the supervisor loop: custody reap
     of orphaned task-scoped processes (every 600s) + review-job zombie reconcile
-    (every 300s) + stranded update writer-admission reconcile (every 60s — it is a
-    chat-availability lockout, so it wants a much tighter cadence than the other
-    two). Each cadence gates itself via its own last-run marker."""
+    (every 300s). Each cadence gates itself via its own last-run marker."""
     if time.time() - last_custody_reap[0] > 600:
         last_custody_reap[0] = time.time()
         try:
@@ -804,9 +790,6 @@ def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconc
     if time.time() - last_review_reconcile[0] > 300:
         last_review_reconcile[0] = time.time()
         _periodic_zombie_reconcile()
-    if time.time() - _last_admission_reconcile[0] > 60:
-        _last_admission_reconcile[0] = time.time()
-        _reconcile_stranded_writer_admission()
 
 
 def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:
@@ -1025,6 +1008,9 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         return
     ctx.consciousness.inject_observation(f"Message from my human: {incoming.get('log_text') or ''}")
     task_metadata = _scoped_task_metadata(project_id, task_metadata)
+    swarm_intent = bool(
+        isinstance(task_metadata, dict) and task_metadata.get("force_plan")
+    )
     # The turn's origin identity rides UNCONDITIONALLY (not only when the
     # decision lane runs): a bare direct turn with no projects/roots yet — the
     # first-ever project creation — must still carry it so promote/route/bind
@@ -1040,7 +1026,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         # A suppressed (never-logged) message has a DESIGNED absence of origin;
         # downstream binders must not classify it as a producer bug.
         task_metadata = {**(task_metadata or {}), "origin_suppressed": True}
-    if project_id:
+    if project_id and not swarm_intent:
         routed_to_task = _route_project_chat_to_running_task(
             ctx,
             chat_id,
@@ -1069,7 +1055,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
     except Exception:
         log.warning("Unable to inspect Projects for owner routing", exc_info=True)
         has_projects = True
-    needs_decision_lane = bool(project_id) or has_projects or bool(global_roots)
+    needs_decision_lane = swarm_intent or bool(project_id) or has_projects or bool(global_roots)
     if needs_decision_lane:
         task_metadata = _decision_turn_metadata(ctx, chat_id, client_message_id, task_metadata)
     agent = ctx.get_chat_agent()
@@ -1122,11 +1108,7 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
         suppress_chat_log = bool(msg.get("suppress_chat_log"))
         task_constraint = msg.get("task_constraint") if isinstance(msg.get("task_constraint"), dict) else None
         task_metadata = msg.get("task_metadata") if isinstance(msg.get("task_metadata"), dict) else None
-        image_data = (
-            (image_base64, image_mime, image_caption)
-            if image_base64
-            else None
-        )
+        image_data = (image_base64, image_mime, image_caption) if image_base64 else None
         log_text = text or image_caption or ("(image attached)" if image_base64 else "")
         now_iso = utc_now_iso()
         if not client_message_id:
@@ -1248,7 +1230,11 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             _execute_panic_stop(ctx.consciousness, ctx.kill_workers)
         elif lowered.startswith("/restart"):
             ctx.send_with_budget(chat_id, "♻️ Restarting.")
-            ok, restart_msg = ctx.safe_restart(reason="owner_restart", unsynced_policy="rescue_and_reset")
+            ok, restart_msg = _safe_restart_serialized(
+                ctx.safe_restart,
+                reason="owner_restart",
+                unsynced_policy="rescue_and_reset",
+            )
             if not ok:
                 ctx.send_with_budget(chat_id, f"⚠️ Restart cancelled: {restart_msg}")
                 continue
@@ -1271,6 +1257,7 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                     force=True,
                     terminal_status="cancelled",
                     result_reason="Owner restart stopped this task before process restart.",
+                    **_managed_update_pending_kwargs(),
                 )
             except Exception:
                 owner_restart_flag.unlink(missing_ok=True)
@@ -1298,11 +1285,18 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             if turn_on and len(parts) > 2:
                 objective = text.split(None, 2)[2].strip()
             if turn_on:
-                from supervisor.evolution_lifecycle import evolution_block_reason
+                from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
 
                 block = evolution_block_reason()
                 if block:
                     ctx.send_with_budget(chat_id, block)
+                    continue
+                try:
+                    if not start_evolution_campaign(objective, source="owner_chat"):
+                        raise RuntimeError("campaign write was refused")
+                except Exception:
+                    log.warning("Failed to start evolution campaign", exc_info=True)
+                    ctx.send_with_budget(chat_id, "⚠️ Evolution stayed OFF: campaign state could not be created.")
                     continue
             st2 = ctx.load_state()
             st2["evolution_mode_enabled"] = bool(turn_on)
@@ -1338,11 +1332,9 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                         f"🛑 Cancelled running evolution task(s): {', '.join(cancelled)}",
                     )
             try:
-                from supervisor.evolution_lifecycle import complete_evolution_campaign, start_evolution_campaign
+                from supervisor.evolution_lifecycle import complete_evolution_campaign
 
-                if turn_on:
-                    start_evolution_campaign(objective, source="owner_chat")
-                else:
+                if not turn_on:
                     # Terminal close (not a resumable pause): /evolve start mints a FRESH
                     # campaign rather than resurrecting this one.
                     complete_evolution_campaign("disabled via owner chat", status="stopped")
@@ -1436,25 +1428,11 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
             _managed_update_active = False
         block = _has_active_evolution_transaction() or _managed_update_active
         policy = "rescue_and_block" if block else "rescue_and_reset"
-        if not _managed_update_active:
-            # No transaction, so the restart below is about to run ORDINARY reset recovery — which
-            # `checkout_and_reset` performs by CONSUMING any update intent marker it finds. An
-            # intent that outlived its transaction (a crash between the two writes, or a cleanup
-            # that could only clear one of them) would therefore be applied here as an unsupervised
-            # hard reset onto an update target, with no rollback point recorded anywhere. Remove it
-            # first; if it cannot be PROVEN gone, do not restart at all — an unbootstrapped
-            # supervisor is recoverable, a silently applied update is not.
-            try:
-                cleared = git_ops_module._clear_update_intent()
-            except Exception:
-                log.warning("Failed to clear orphaned update intent at bootstrap", exc_info=True)
-                cleared = False
-            if not cleared:
-                return False, (
-                    "an update intent marker with no update transaction could not be removed; "
-                    "refusing to bootstrap rather than apply it as an ordinary reset"
-                )
-        ok, msg = git_ops_module.safe_restart(reason="bootstrap", unsynced_policy=policy)
+        ok, msg = _safe_restart_serialized(
+            git_ops_module.safe_restart,
+            reason="bootstrap",
+            unsynced_policy=policy,
+        )
         if not ok and policy == "rescue_and_block":
             try:
                 from supervisor.evolution_lifecycle import pause_evolution_campaign
@@ -1595,9 +1573,9 @@ def _run_supervisor(settings: dict) -> None:
         import types
         import queue as _queue_mod
 
-        kill_workers()
-        spawn_workers(max_workers)
         restored_pending = restore_pending_from_snapshot()
+        kill_workers(preserve_pending=True)
+        spawn_workers(max_workers)
         persist_queue_snapshot(reason="startup")
         _resume_interrupted_project_deletions()
         try:
@@ -1869,6 +1847,7 @@ def _handle_restart_in_supervisor(evt: Dict[str, Any], ctx: Any) -> None:
         _pending_restart.update({
             "reason": str(evt.get("reason") or "agent_restart_request"),
             "deadline": time.time() + min(max_wait, 1800),
+            "evolution_restart": bool(evt.get("evolution_restart")),
         })
         if st.get("owner_chat_id"):
             ctx.send_with_budget(
@@ -1877,7 +1856,10 @@ def _handle_restart_in_supervisor(evt: Dict[str, Any], ctx: Any) -> None:
                 f"{', '.join(sorted(live))} to finish.",
             )
         return
-    _perform_supervisor_restart(ctx)
+    _perform_supervisor_restart(
+        ctx, restart_reason=str(evt.get("reason") or "agent_restart_request"),
+        evolution_restart=bool(evt.get("evolution_restart")),
+    )
 
 
 def _check_pending_restart_drain(ctx: Any) -> bool:
@@ -1889,8 +1871,12 @@ def _check_pending_restart_drain(ctx: Any) -> bool:
     live = _live_running_task_ids(ctx)
     if live and time.time() < float(_pending_restart.get("deadline") or 0.0):
         return True  # keep draining — events still flow each tick
+    pending = dict(_pending_restart)
     _pending_restart.clear()
-    _perform_supervisor_restart(ctx)
+    _perform_supervisor_restart(
+        ctx, restart_reason=str(pending.get("reason") or "agent_restart_request"),
+        evolution_restart=bool(pending.get("evolution_restart")),
+    )
     # Still "quiescing" this tick: _perform_supervisor_restart sets up the exit
     # (or fail-closed pauses) and returns to the loop — the process exits on the
     # next `while not _restart_requested` check. Returning True keeps the caller
@@ -1898,11 +1884,78 @@ def _check_pending_restart_drain(ctx: Any) -> bool:
     return True
 
 
-def _perform_supervisor_restart(ctx: Any) -> None:
+def _perform_supervisor_restart(
+    ctx: Any, *, restart_reason: str = "agent_restart_request",
+    evolution_restart: bool = False,
+) -> None:
     """Graceful shutdown + exit(42) (the post-drain tail; never sleeps)."""
     st = ctx.load_state()
-    ok, msg = ctx.safe_restart(
-        reason="agent_restart_request", unsynced_policy="rescue_and_block",
+    marker = read_json_dict(
+        pathlib.Path(ctx.DRIVE_ROOT) / "state" / "pending_restart_verify.json"
+    ) or {}
+    claim = (
+        marker.get("evolution_claim")
+        if evolution_restart and marker.get("reason") == restart_reason
+        else {}
+    )
+    claim = claim if isinstance(claim, dict) else {}
+    if evolution_restart and not claim:
+        if st.get("owner_chat_id"):
+            ctx.send_with_budget(
+                int(st["owner_chat_id"]),
+                "🧬 Restart cancelled: the exact evolution restart receipt is missing.",
+            )
+        return
+    if claim:
+        from supervisor.evolution_lifecycle import check_evolution_authority
+
+        authority = check_evolution_authority(
+            str(claim.get("campaign_id") or ""),
+            str(claim.get("transaction_id") or ""),
+            str(claim.get("task_id") or ""),
+            commit_sha=str(claim.get("commit_sha") or ""),
+        )
+        if not authority.get("ok"):
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "🧬 Restart cancelled: evolution authority changed "
+                    f"({authority.get('reason') or 'unknown'}).",
+                )
+            return
+        expected_sha = str(claim.get("commit_sha") or "")
+        try:
+            head_proc = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(ctx.REPO_DIR),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            status_proc = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(ctx.REPO_DIR),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            head = head_proc.stdout.strip() if head_proc.returncode == 0 else ""
+            clean = status_proc.returncode == 0 and not status_proc.stdout.strip()
+        except Exception:
+            head = ""
+            clean = False
+        if not expected_sha or head != expected_sha or not clean:
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "🧬 Restart cancelled: the live checkout no longer matches "
+                    "the exact reviewed evolution commit.",
+                )
+            return
+    ok, msg = _safe_restart_serialized(
+        ctx.safe_restart,
+        reason="agent_restart_request",
+        unsynced_policy="rescue_and_block",
     )
     if not ok:
         try:
@@ -1917,7 +1970,12 @@ def _perform_supervisor_restart(ctx: Any) -> None:
             ctx.send_with_budget(int(st["owner_chat_id"]), f"⚠️ Restart skipped: {msg}")
         return
     cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested=True)
-    ctx.kill_workers(force=True, terminal_status=cleanup_status, result_reason=cleanup_reason)
+    ctx.kill_workers(
+        force=True,
+        terminal_status=cleanup_status,
+        result_reason=cleanup_reason,
+        **_managed_update_pending_kwargs(),
+    )
     st2 = ctx.load_state()
     st2["session_id"] = uuid.uuid4().hex
     ctx.save_state(st2)
@@ -1928,6 +1986,101 @@ def _perform_supervisor_restart(ctx: Any) -> None:
 def _request_restart_exit() -> None:
     """Signal server shutdown with restart exit code."""
     _restart_requested.set()
+
+
+def _managed_update_pending_kwargs() -> dict:
+    """Preserve queued work while a durable tx or its pre-tx quiesce owns restart."""
+    try:
+        from supervisor.update_merge import active_update_tx
+
+        if active_update_tx():
+            return {"preserve_pending": True}
+        from supervisor.workers import repo_writer_admission_closed, worker_pool_admission_state
+
+        gate = repo_writer_admission_closed()
+        disabled = str(worker_pool_admission_state().get("disabled_reason") or "")
+        if gate.startswith("managed_update:") or disabled == "managed_update":
+            return {"preserve_pending": True}
+        return {}
+    except Exception:
+        return {"preserve_pending": True}
+
+
+def _safe_restart_serialized(safe_restart_fn, *, reason: str, unsynced_policy: str):
+    """Serialize checkout/reset with update apply; only a landed update may restart."""
+    from supervisor import git_ops
+    from supervisor.update_merge import (
+        acquire_update_lock,
+        read_update_tx_strict,
+        release_update_lock,
+    )
+
+    try:
+        lock_fh = acquire_update_lock()
+    except RuntimeError:
+        return False, "Managed update is changing the checkout; restart was deferred."
+    try:
+        status, tx = read_update_tx_strict()
+        if status == "corrupt":
+            return False, "Managed update state is unreadable; restart was deferred."
+        if status == "absent" and not git_ops._clear_update_intent():
+            return False, (
+                "An update intent marker with no update transaction could not be removed; "
+                "restart was deferred rather than applying an orphaned update."
+            )
+        allowed_phases = {"pending_boot_smoke", "applying_replace"}
+        if status == "valid" and str(tx.get("phase") or "") not in allowed_phases:
+            return False, "Managed update merge is still being resolved; restart was deferred."
+        return safe_restart_fn(reason=reason, unsynced_policy=unsynced_policy)
+    finally:
+        release_update_lock(lock_fh)
+
+
+def _wait_for_supervisor_update_finalize() -> bool:
+    """Wait for a real init outcome; slow dependency sync is not a failed boot."""
+    _supervisor_ready.wait()
+    return not bool(_supervisor_error)
+
+
+def _boot_managed_update_tasks() -> None:
+    """Finalize a pending update, restart after rollback, then refresh its feed."""
+    try:
+        from supervisor.git_ops import compute_managed_update_status
+        from supervisor.update_merge import finalize_managed_update_on_boot
+
+        result = finalize_managed_update_on_boot(
+            supervisor_ready=_wait_for_supervisor_update_finalize()
+        )
+        stash_note = str(result.get("stash_note") or "")
+        if stash_note:
+            # Q1=C disclosure contract: a stash restore that conflicted keeps the
+            # entry and the OWNER must see the exact recovery command, not only
+            # the supervisor log.
+            try:
+                from supervisor.message_bus import send_with_budget
+                from supervisor.state import load_state as _load_state
+
+                owner_chat = int((_load_state() or {}).get("owner_chat_id") or 0)
+                if owner_chat:
+                    send_with_budget(owner_chat, f"📦 Managed update: {stash_note}")
+            except Exception:
+                log.debug("stash note owner notification failed", exc_info=True)
+        if result.get("rolled_back") is True:
+            # This generation imported the rejected candidate. Preserve queued roots
+            # through shutdown, then exec the restored code instead of limping on.
+            from supervisor.workers import close_repo_writer_admission
+
+            close_repo_writer_admission("managed_update:rollback_restart")
+            _request_restart_exit()
+            return
+        update_status = compute_managed_update_status(fetch=True)
+        broadcast_ws_sync({
+            "type": "update_status_ready",
+            "available": bool(update_status.get("available")),
+            "check_ok": update_status.get("check_ok"),
+        })
+    except Exception:
+        log.debug("boot managed-update tasks failed", exc_info=True)
 
 
 def _shutdown_task_cleanup_args(restart_requested: bool) -> tuple[str, str]:
@@ -2036,70 +2189,6 @@ def _run_startup_task_recovery(
         log.warning("Root post-task synthesis recovery at startup failed", exc_info=True)
 
 
-# P2: finalize a pending managed merge update (post-boot smoke / boot-loop rollback) and run a
-# one-shot boot-time update check (check-on-restart) so the main-screen Update badge reflects
-# availability. Both run OFF the startup critical path and fail-soft — a missing managed remote /
-# offline boot simply yields no badge. Module-level rather than nested in `lifespan`: a nested def
-# counts toward its enclosing function's line span, and `lifespan` is already close to the repo's
-# 300-line function cap. It closes over nothing but the `_supervisor_ready` / `_supervisor_error`
-# module globals, so lifting it out is behaviour-preserving.
-def _boot_managed_update_tasks():
-    try:
-        _supervisor_ready.wait(timeout=60)
-        from supervisor.git_ops import compute_managed_update_status
-        from supervisor.update_merge import finalize_managed_update_on_boot
-
-        # A HEALTHY boot only — _supervisor_ready is also set on supervisor INIT FAILURE
-        # (alongside _supervisor_error), so gate on the error too or finalize would clear a
-        # pending update as "finalized" on a failed boot, defeating the boot-loop rollback.
-        finalize_managed_update_on_boot(
-            supervisor_ready=_supervisor_ready.is_set() and not _supervisor_error
-        )
-        # The boot check FETCHES the managed remote, which moves the tracking ref an
-        # in-flight apply has already gated and disclosed. Take the same update lock the
-        # apply holds so this thread can never swap the target underneath it; if an apply
-        # holds it, skip the check entirely (the pill keeps its previous cache). The fetch
-        # itself is bounded (see `compute_managed_update_status`), so a hung remote cannot
-        # keep owner-initiated updates locked out indefinitely.
-        from supervisor.update_merge import acquire_update_lock, release_update_lock
-
-        try:
-            update_lock_fh = acquire_update_lock()
-        except RuntimeError:
-            log.debug("boot managed-update check skipped: an update holds the lock")
-            return
-        try:
-            status = compute_managed_update_status(fetch=True)
-        finally:
-            release_update_lock(update_lock_fh)
-        # Persist the boot check-on-restart result so the passive Update pill can show
-        # availability without a network fetch on every poll (P2 2F: boot fetches once,
-        # the badge reads this cache; no periodic polling). A passive
-        # compute_managed_update_status(fetch=False) bails before resolving the official
-        # ref, so without this cache the pill stays hidden after a restart.
-        try:
-            from supervisor.state import update_state
-            from ouroboros.utils import utc_now_iso
-
-            def _cache_update_status(s):
-                s["managed_update_cache"] = {
-                    "available": bool(status.get("available")),
-                    "safe_to_apply": bool(status.get("safe_to_apply")),
-                    "latest_sha": status.get("latest_sha") or "",
-                    "latest_short_sha": status.get("latest_short_sha") or "",
-                    "latest_message": status.get("latest_message") or "",
-                    "behind": int(status.get("behind") or 0),
-                    "ahead": int(status.get("ahead") or 0),
-                    "checked_at": utc_now_iso(),
-                }
-
-            update_state(_cache_update_status)
-        except Exception:
-            log.debug("boot managed-update cache failed", exc_info=True)
-    except Exception:
-        log.debug("boot managed-update tasks failed", exc_info=True)
-
-
 @asynccontextmanager
 async def lifespan(app):
     global _event_loop
@@ -2158,6 +2247,10 @@ async def lifespan(app):
         _supervisor_ready.set()
         log.info("No supported provider or local routing configured. Supervisor not started.")
 
+    # P2: finalize a pending managed merge update (post-boot smoke / boot-loop rollback)
+    # and run a one-shot boot-time update check (check-on-restart) so the main-screen
+    # Update badge reflects availability. Both run OFF the startup critical path and
+    # fail-soft — a missing managed remote / offline boot simply yields no badge.
     threading.Thread(
         target=_boot_managed_update_tasks, daemon=True, name="boot-managed-update",
     ).start()
@@ -2347,7 +2440,12 @@ async def lifespan(app):
                 log.debug("Failed to record server_shutdown event", exc_info=True)
             from supervisor.workers import kill_workers
             cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested)
-            kill_workers(force=True, terminal_status=cleanup_status, result_reason=cleanup_reason)
+            kill_workers(
+                force=True,
+                terminal_status=cleanup_status,
+                result_reason=cleanup_reason,
+                **_managed_update_pending_kwargs(),
+            )
         except Exception:
             pass
         try:
@@ -2411,9 +2509,14 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
                 archive_service_logs=False,
                 terminal_status=cleanup_status,
                 result_reason=cleanup_reason,
+                **_managed_update_pending_kwargs(),
             )
         else:
-            kill_workers(force=True, archive_service_logs=False)
+            kill_workers(
+                force=True,
+                archive_service_logs=False,
+                **_managed_update_pending_kwargs(),
+            )
     except Exception:
         pass
     import multiprocessing

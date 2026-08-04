@@ -10,6 +10,7 @@ def test_has_startup_ready_provider_accepts_any_remote_key_or_local_routing():
     assert has_startup_ready_provider({"OPENROUTER_API_KEY": "sk-or-test"})
     assert has_startup_ready_provider({"OPENAI_API_KEY": "sk-openai"})
     assert has_startup_ready_provider({"ANTHROPIC_API_KEY": "sk-ant"})
+    assert has_startup_ready_provider({"MINIMAX_API_KEY": "minimax-key"})
     assert has_startup_ready_provider({"OPENAI_COMPATIBLE_BASE_URL": "https://compat.example/v1"})
     assert not has_startup_ready_provider({"OPENAI_COMPATIBLE_API_KEY": "compat-key"})
     assert has_startup_ready_provider({"CLOUDRU_FOUNDATION_MODELS_API_KEY": "cloudru-key"})
@@ -492,6 +493,27 @@ def test_apply_runtime_provider_defaults_cloudru_only_elevates_to_direct():
     assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"].startswith("cloudru::")
 
 
+def test_apply_runtime_provider_defaults_minimax_only_uses_current_models():
+    normalized, changed, changed_keys = apply_runtime_provider_defaults({
+        "MINIMAX_API_KEY": "minimax-key",
+    })
+
+    assert changed
+    assert "OUROBOROS_MODEL" in changed_keys
+    assert normalized["OUROBOROS_MODEL"] == "minimax::MiniMax-M3"
+    assert normalized["OUROBOROS_MODEL_HEAVY"] == "minimax::MiniMax-M3"
+    assert normalized["OUROBOROS_MODEL_LIGHT"] == "minimax::MiniMax-M2.7"
+    assert normalized["OUROBOROS_MODEL_FALLBACKS"] == "minimax::MiniMax-M2.7"
+    # Deep self-review stays empty: MiniMax guarantees only a 512K window floor,
+    # below the 1M target deep review sizes against (clear-instead-of-fill).
+    assert not normalized.get("OUROBOROS_MODEL_DEEP_SELF_REVIEW")
+    assert normalized["OUROBOROS_REVIEW_MODELS"] == (
+        "minimax::MiniMax-M3,minimax::MiniMax-M2.7,minimax::MiniMax-M2.7"
+    )
+    assert normalized["OUROBOROS_SCOPE_REVIEW_MODEL"] == "minimax::MiniMax-M3"
+    assert normalized["OUROBOROS_SCOPE_REVIEW_MODELS"] == "minimax::MiniMax-M3"
+
+
 def test_apply_runtime_provider_defaults_cloudru_migrates_populated_shipped_defaults():
     """The realistic save path: a Cloud.ru-only user whose settings already carry
     the shipped (non-cloudru) defaults. main/code AND every review/scope reviewer
@@ -663,8 +685,9 @@ def test_direct_only_install_gets_a_reachable_deep_review_model():
         assert "/" not in expected.split("::", 1)[1]
 
     # A sub-floor provider gets NO auto-filled deep slot: deep review sizes against
-    # a fixed 1M window, and Cloud.ru/GigaChat are documented below that floor, so
-    # filling the slot would advertise a review doomed to overflow its route.
+    # a fixed 1M window; Cloud.ru/GigaChat are documented below that floor, and
+    # MiniMax guarantees only a 512K minimum ("up to 1M"), so filling the slot
+    # would advertise a review doomed to overflow its route.
     # A sub-floor provider must end up with NO deep slot at all: the shipped
     # OpenRouter-form default is unreachable for it, and auto-filling its own model
     # would advertise a review doomed to overflow the 1M window deep review sizes
@@ -673,7 +696,8 @@ def test_direct_only_install_gets_a_reachable_deep_review_model():
     # not an API-key spelling — a wrong key silently skips the direct path
     # entirely and makes this assertion vacuous).
     for creds in ({"CLOUDRU_FOUNDATION_MODELS_API_KEY": "sk-test"},
-                  {"GIGACHAT_CREDENTIALS": "Z2ln-test"}):
+                  {"GIGACHAT_CREDENTIALS": "Z2ln-test"},
+                  {"MINIMAX_API_KEY": "minimax-test"}):
         populated = dict(SETTINGS_DEFAULTS)
         populated.update(creds)
         normalized, _changed, changed_keys = apply_runtime_provider_defaults(populated)

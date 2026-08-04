@@ -53,6 +53,7 @@ _REVIEW_STACK_PATHS = frozenset({
     "ouroboros/tools/triad_review.py",
     "ouroboros/tools/claude_advisory_review.py",
     "ouroboros/tools/plan_review.py",
+    "ouroboros/tools/plan_review_runtime.py",
     "ouroboros/triad_review.py",
     "ouroboros/review_state.py",
     "ouroboros/review_evidence.py",

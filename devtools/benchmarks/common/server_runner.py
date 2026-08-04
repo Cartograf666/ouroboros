@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
@@ -93,7 +94,7 @@ _ISO_SETTINGS_ALLOW_EXACT = frozenset({
 # server env via shell tools) cannot read owner/skill secrets like TELEGRAM_BOT_TOKEN.
 _PROVIDER_ENV_KEYS = frozenset({
     "OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_COMPATIBLE_API_KEY",
-    "CLOUDRU_FOUNDATION_MODELS_API_KEY", "ANTHROPIC_API_KEY",
+    "CLOUDRU_FOUNDATION_MODELS_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY",
     "GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD",
 })
 
@@ -173,6 +174,19 @@ def seed_owner_state(data_root: pathlib.Path, *, evolution_enabled: bool = False
             st = {}
     st["owner_chat_id"] = 1
     if evolution_enabled:
+        campaign_path = pathlib.Path(data_root) / "state" / "evolution_campaign.json"
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        campaign_path.write_text(json.dumps({
+            "schema_version": 1,
+            "id": uuid.uuid4().hex[:8],
+            "status": "active",
+            "objective": "Autonomously improve Ouroboros from benchmark evidence.",
+            "source": "benchmark",
+            "started_at": now,
+            "updated_at": now,
+            "cycles_done": 0,
+            "absorbed_cycles_done": 0,
+        }), encoding="utf-8")
         st["evolution_mode_enabled"] = True
     state_path.write_text(json.dumps(st), encoding="utf-8")
 

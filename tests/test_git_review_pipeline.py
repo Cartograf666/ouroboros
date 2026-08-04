@@ -106,6 +106,35 @@ def review_ctx(tmp_path):
     return _get_review_module(), _make_ctx(tmp_path)
 
 
+def test_managed_resolver_stages_tracked_binary_from_official_merge(tmp_path, monkeypatch):
+    git_mod = _get_git_module()
+    ctx = _make_ctx(tmp_path)
+    binary = pathlib.Path(ctx.repo_dir) / "native.so"
+    binary.write_bytes(b"old\x00payload")
+    subprocess.run(["git", "add", "-f", "native.so"], cwd=ctx.repo_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "track binary"], cwd=ctx.repo_dir, check=True)
+    binary.write_bytes(b"official\x00payload")
+    monkeypatch.setattr(git_mod, "_authorized_managed_update_resolver", lambda _ctx: True)
+
+    _paths, _advisory_paths, error = git_mod._stage_candidate_for_review(
+        ctx,
+        "review assisted update",
+        0.0,
+        paths=None,
+        came_from_detached_checkout=False,
+    )
+
+    staged = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        cwd=ctx.repo_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert error is None
+    assert "native.so" in staged
+
+
 # --- repo_write tool registration ---
 
 class TestRepoWriteRegistration:
@@ -811,6 +840,40 @@ class TestAutoPushBehavior:
         source = inspect.getsource(git_mod._auto_push)
         assert "except Exception" in source
         assert "non-fatal" in source.lower() or "non_fatal" in source.lower()
+
+    def test_managed_tests_gate_before_tag_and_ordinary_tests_keep_prior_order(self):
+        git_mod = _get_git_module()
+        source = inspect.getsource(git_mod._repo_commit_push)
+        # The managed BLOCKING gate (extracted helper) runs before tagging;
+        # ordinary warning-only tests run after the tag and before the push.
+        managed_tests_pos = source.index("_managed_post_commit_tests_gate(")
+        tag_pos = source.index("tag_info =")
+        ordinary_tests_pos = source.index("_post_commit_result(ctx, commit_message")
+        push_pos = source.rindex("push_status = _auto_push")
+        assert managed_tests_pos < tag_pos < ordinary_tests_pos < push_pos
+
+    def test_failed_managed_post_commit_gate_rolls_back_or_stays_blocked(
+        self, monkeypatch
+    ):
+        git_mod = _get_git_module()
+        from supervisor import update_merge
+
+        marked = []
+        monkeypatch.setattr(
+            update_merge,
+            "rollback_managed_update",
+            lambda reason: (False, f"rollback failed for {reason}"),
+        )
+        monkeypatch.setattr(
+            update_merge,
+            "mark_update_tx_gate_blocked",
+            lambda reason, detail: marked.append((reason, detail)),
+        )
+
+        result = git_mod._managed_commit_gate_failure("post_tests", "tests failed")
+
+        assert "MANAGED_UPDATE_GATE_BLOCKED" in result
+        assert marked == [("post_tests", "rollback failed for post_tests")]
 
 
 # --- configure_remote failure surfacing ---

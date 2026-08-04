@@ -1266,6 +1266,51 @@ def test_run_llm_loop_enforces_swarm_force_plan_before_final(tmp_path, monkeypat
         }, 0.0
 
     def fake_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, trace, _progress):
+        from ouroboros.task_results import (
+            STATUS_RUNNING,
+            record_plan_review_collection,
+            record_plan_review_attempt,
+            record_plan_review_result,
+            reserve_plan_review_wave,
+            write_task_result,
+        )
+
+        fingerprint = "a" * 64
+        write_task_result(tmp_path, "task1", STATUS_RUNNING, result="running")
+        record_plan_review_attempt(tmp_path, "task1", fingerprint=fingerprint)
+        reserve_plan_review_wave(
+            tmp_path,
+            "task1",
+            fingerprint=fingerprint,
+            plan_text_hash="b" * 64,
+            scout_roles=[],
+            cutoff_at="2026-08-03T00:00:00+00:00",
+        )
+        record_plan_review_collection(
+            tmp_path,
+            "task1",
+            fingerprint=fingerprint,
+            included_task_ids=[],
+            omissions=[],
+            stop_reason="complete",
+        )
+        record_plan_review_result(
+            tmp_path,
+            "task1",
+            fingerprint=fingerprint,
+            review={
+                "schema_version": 1,
+                "request_fingerprint": fingerprint,
+                "plan_text_hash": "b" * 64,
+                "aggregate_signal": "GREEN",
+                "findings": [],
+                "reviewed_at": "2026-08-03T00:00:00+00:00",
+                "closed": True,
+                "included_task_ids": [],
+                "omitted_task_ids": [],
+            },
+            reviewed_result_hashes={},
+        )
         trace["tool_calls"].append({
             "tool": tool_calls[0]["function"]["name"],
             "args": {},
@@ -1295,39 +1340,31 @@ def test_run_llm_loop_enforces_swarm_force_plan_before_final(tmp_path, monkeypat
 
     assert result == "done after plan"
     assert calls["count"] == 3
-    assert any("plan_task is required" in str(item.get("content") or "") for item in seen_second_request["messages"])
+    assert any("Call plan_task" in str(item.get("content") or "") for item in seen_second_request["messages"])
     assert trace["tool_calls"][0]["tool"] == "plan_task"
 
 
-def test_force_plan_closes_only_on_green_or_disposed_review_required():
-    def trace(outcome, closed, *, is_error=False):
-        return {"tool_calls": [{
-            "tool": "plan_task",
-            "is_error": is_error,
-            "plan_review_outcome": outcome,
-            "plan_review_closed": closed,
-        }]}
+def test_force_plan_decision_does_not_treat_trace_marker_as_authority(tmp_path, monkeypatch):
+    ctx = SimpleNamespace(
+        task_metadata={"force_plan": True},
+        is_ephemeral_turn=False,
+        task_id="root1",
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+    )
+    monkeypatch.setattr(loop_mod, "get_review_enforcement", lambda: "blocking")
 
-    assert loop_mod._force_plan_completed(trace("GREEN", True))
-    assert loop_mod._force_plan_completed(trace("REVIEW_REQUIRED", True))
-    assert not loop_mod._force_plan_completed(trace("REVIEW_REQUIRED", False))
-    assert not loop_mod._force_plan_completed(trace("REVISE_PLAN", False))
-    assert not loop_mod._force_plan_completed(trace("GREEN", True, is_error=True))
-    assert not loop_mod._force_plan_completed({"tool_calls": [{
-        "tool": "plan_task", "is_error": False, "plan_review_aggregate": True,
-    }]})
-    assert not loop_mod._force_plan_completed({"tool_calls": [
-        trace("GREEN", True)["tool_calls"][0],
-        trace("REVISE_PLAN", False)["tool_calls"][0],
-    ]})
-    assert not loop_mod._force_plan_completed({"tool_calls": [
-        trace("GREEN", True)["tool_calls"][0],
-        trace("REVIEW_REQUIRED", False)["tool_calls"][0],
-    ]})
-    assert loop_mod._force_plan_completed({"tool_calls": [
-        trace("REVISE_PLAN", False)["tool_calls"][0],
-        trace("GREEN", True)["tool_calls"][0],
-    ]})
+    decision = loop_mod._force_plan_decision(ctx, {
+        "tool_calls": [{
+            "tool": "plan_task",
+            "is_error": False,
+            "plan_review_outcome": "GREEN",
+            "plan_review_closed": True,
+        }],
+    })
+
+    assert decision["allow"] is False
+    assert decision["status"] == "absent"
 
 
 def test_run_llm_loop_does_not_accept_failed_plan_task_for_swarm_force_plan(tmp_path, monkeypatch):
@@ -1354,9 +1391,13 @@ def test_run_llm_loop_does_not_accept_failed_plan_task_for_swarm_force_plan(tmp_
                     "function": {"name": "plan_task", "arguments": "{}"},
                 }],
             }, 0.0
-        return {"role": "assistant", "content": '{"delivery_control":"keep"}'}, 0.0
+        return {"role": "assistant", "content": "done despite unavailable plan"}, 0.0
 
     def fake_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, trace, _progress):
+        from ouroboros.task_results import STATUS_RUNNING, record_plan_review_attempt, write_task_result
+
+        write_task_result(tmp_path, "task1", STATUS_RUNNING, result="running")
+        record_plan_review_attempt(tmp_path, "task1", fingerprint="d" * 64)
         trace["tool_calls"].append({
             "tool": tool_calls[0]["function"]["name"],
             "args": {},
@@ -1382,9 +1423,10 @@ def test_run_llm_loop_does_not_accept_failed_plan_task_for_swarm_force_plan(tmp_
         drive_root=tmp_path,
     )
 
-    assert result.startswith("⚠️ SWARM_INITIATIVE_BLOCKED")
-    assert calls["count"] == 4
-    assert usage["reason_code"] == "swarm_force_plan_not_called"
+    assert result.startswith("done despite unavailable plan")
+    assert "advisory enforcement" in result
+    assert calls["count"] == 3
+    assert usage.get("reason_code") != "swarm_force_plan_not_called"
     assert trace["tool_calls"][0]["tool"] == "plan_task"
 
 

@@ -356,8 +356,8 @@ not migrate their runtime representations.
 ### Provider Independence
 
 Ouroboros must remain fully operational when configured with a SINGLE isolated
-provider — a local model, or only one of OpenAI / Anthropic / Cloud.ru / GigaChat —
-with no second provider and no OpenRouter. This is a standing invariant, not a
+provider — a local model, or only one of OpenAI / Anthropic / MiniMax / Cloud.ru /
+GigaChat — with no second provider and no OpenRouter. This is a standing invariant, not a
 per-feature nicety:
 
 - **Core capability floor.** The agent loop, the multi-model commit (triad)
@@ -377,9 +377,10 @@ per-feature nicety:
   an unconfigured provider.
   EXCEPTION (v6.82.0): the deep-self-review slot is filled only for providers whose
   model carries the >=1M window that review sizes against — OpenAI and Anthropic.
-  Cloud.ru and GigaChat are documented below that floor, so their shipped deep value
-  is CLEARED instead (an explicit owner value is never touched) and deep review is
-  honestly unavailable rather than advertised and doomed to overflow its route.
+  Cloud.ru and GigaChat are documented below that floor, and MiniMax guarantees only
+  a 512K minimum ("up to 1M"), so their shipped deep value is CLEARED instead (an
+  explicit owner value is never touched) and deep review is honestly unavailable
+  rather than advertised and doomed to overflow its route.
 - **Scope-review ≥1M floor (BIBLE P3).** A direct-provider-only setup fills the
   scope-reviewer slot with its own model (mirroring the Cloud.ru pattern). Where the
   single provider has no 1M-context model, the disclosed fallback (v6.80.0) is the
@@ -545,6 +546,25 @@ plan revision. `REVISE_PLAN` requires changed plan text/fingerprint and another
 dispositions fail closed. Reviewers remain generative, but a finding must name
 a concrete defect or a concrete smaller existing extension seam; never require
 a fixed number of findings.
+
+Force-plan is an LLM-first pre-implementation obligation on the admitted managed
+root, not a mechanical permission check around implementation tools. The existing
+`plan_review_state` owns durable review authority and
+`config.get_review_enforcement()` owns blocking/advisory policy. Every submitted
+envelope that reaches `plan_task` supersedes prior authority: invalid plan/goal/scope
+input stores a domain-separated open attempt, while a valid envelope stores its
+canonical fingerprint before repository/path validation. A newer attempt therefore
+cannot fall back to an older GREEN. Immediately before first panel dispatch, the exact planning-scout
+handoff component is frozen in a fingerprint-keyed host write-once continuity artifact;
+the remaining live reviewer context is rebuilt. An unavailable reviewer
+never becomes a disposition-able verdict; a repeat call reuses that handoff snapshot and
+retries the panel, including after A→B→A. Blocking stays in
+analysis and non-mutating preparation until closure or a real task-wide rail;
+advisory may proceed by agent judgment with a host-owned disclosure. A planning
+deadline skip records a typed rail attempt before returning so the reducer cannot
+misread it as an absent `plan_task` call.
+The short-lived Swarm router admits one new root and transfers the intent; it
+never runs `plan_task`, steers an existing task, or publishes the work inline.
 
 **Context mode (low / max).** The owner-selected `OUROBOROS_CONTEXT_MODE`
 (layout SSOT: `ouroboros/context_layout.py`) tiers the *reference-doc* layer of
@@ -794,7 +814,13 @@ Review preflight tests are hermetic. Any pytest run launched by
 with a temporary `OUROBOROS_DATA_DIR` / `OUROBOROS_SETTINGS_PATH`, a temp
 `PYTHONPYCACHEPREFIX`, and no inherited `OUROBOROS_MANAGED_BY_LAUNCHER`. Tests
 may read the live source checkout as the candidate snapshot, but they must not
-write the live repo or live `data/`.
+write the live repo or live `data/`. `tests/conftest.py` must also rebind
+already-imported state/queue/worker roots inside each pytest process and fail
+closed if a state or evolution-campaign write resolves to the captured live data
+root. Explicit subprocess environments preserve their own isolated data root or
+receive the parent's disposable root and pytest markers; scrubbing unrelated
+variables must not reopen the live default. Setting only `OUROBOROS_DATA_DIR` is
+insufficient for process-global roots.
 
 Self-modification durability is local-first. A successful reviewed local commit
 is the persistence boundary; `origin` push and CI are optional follow-up signals.
@@ -1148,6 +1174,42 @@ Before every commit, verify the following:
 ---
 
 *This section is the authoritative definition of "DEVELOPMENT.md compliance" referenced in the `development_compliance` item in `docs/CHECKLISTS.md`.*
+
+---
+
+## Managed Update Rule
+
+- Keep the local work branch and the official update feed separate. The local
+  branch is `ouroboros`; `OUROBOROS_UPDATE_CHANNEL` maps Stable to `main`, QA to
+  `ouroboros-stable`, and Development to `ouroboros`. QA and Development follow
+  their branch tips. Stable resolves the newest plain `vX.Y.Z` tag whose commit
+  is present in both `main` and `ouroboros-stable`.
+- A preflight chooses one exact official target SHA. Apply must bind to the
+  disclosed base/target, close new writers, drain existing direct/ephemeral
+  turns, stop workers and tracked services, then re-plan before mutation.
+- Clean fast-forwards land the official SHA directly. Git also builds clean
+  merges for divergent local history, with parents = reviewed HEAD + official
+  target. Dirty local work never enters that history: the apply stashes it and
+  restores it as uncommitted content (boot finalize on success, the pre-update
+  tree on rollback; a conflicting restore keeps the stash and discloses the
+  recovery command). The reviewed assisted resolver runs only when Git reports
+  a real conflict; filenames do not create a second update policy. Hard reset
+  is an explicitly confirmed recovery only.
+- The authorized resolver stages the complete merge, including tracked binary
+  files. Review receives their exact staged mode/blob/size plus the HEAD and
+  official MERGE_HEAD object ids; deletions carry an explicit absent stage and
+  exact parent identities. Missing exact metadata still blocks. This exception
+  does not weaken the ordinary commit pipeline's binary policy.
+- Write the update transaction before mutation. Reopen writers only after a
+  verified abort/rollback or a healthy restart. An unverified rollback keeps
+  its retryable phase plus the full failure evidence; a legacy `gate_blocked`
+  marker retries rollback on boot. Delayed evolution cleanup also acquires the
+  same update lock and honors this admission owner; it must not stash/reset
+  behind the fence. Managed merge tests pass before restart; the ordinary
+  self-modification commit/tag/test/push ordering remains unchanged.
+- Manual Restore reuses the same writer fence and pins the previous HEAD on a
+  local recovery branch before reset. Promotion resolves the development SHA
+  once and uses that exact SHA for both the local QA ref and any remote push.
 
 ---
 
@@ -2066,10 +2128,13 @@ record. Each platform shard locates the final DMG, tarball, or ZIP after all
 packaging steps, then performs a smoke test against that final archive. The
 smoke checks require the embedded repository bundle and run the packaged CLI
 with `--help` in an isolated home directory. The macOS check also requires the
-separate `Install CLI.command` payload and an arm64 app executable.
+`Applications -> /Applications` drag target, the separate `Install CLI.command`
+payload, and an arm64 app executable.
 
 Each shard also generates a CycloneDX SBOM from the payload extracted from the
-final archive, including both top-level files in the macOS DMG. The workflow
+final archive. The macOS smoke proves the Applications link, then removes only
+that link from the SBOM staging copy so Syft cannot follow it into the runner's
+host `/Applications`; the app and CLI launcher remain in the scan. The workflow
 downloads a fixed Syft release asset and checks its platform-specific SHA-256
 before execution. GitHub artifact attestations bind both build provenance and
 the SBOM to the final archive digest. The release job downloads the three

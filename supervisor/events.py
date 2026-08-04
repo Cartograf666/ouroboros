@@ -1097,7 +1097,7 @@ def _handle_evolution_task_done(
             if isinstance(metadata.get("evolution_transaction"), dict)
             else {}
         )
-        recorded_transaction = update_evolution_campaign_after_task(
+        lifecycle_result = update_evolution_campaign_after_task(
             str(task_id or ""),
             cost_usd=cost,
             cost_accounting_status=str(
@@ -1107,32 +1107,40 @@ def _handle_evolution_task_done(
             rounds=rounds,
             transaction=transaction,
         )
-        replayed_terminal = bool(
-            isinstance(recorded_transaction, dict)
-            and recorded_transaction.get("_replay")
-        )
+        if not isinstance(lifecycle_result, dict):
+            log.warning("Evolution terminal rejected: invalid lifecycle result for %s", task_id)
+            return
+        if not lifecycle_result.get("accepted") or not lifecycle_result.get("persisted"):
+            log.warning(
+                "Evolution terminal rejected for %s: %s",
+                task_id, lifecycle_result.get("reason") or "not_persisted",
+            )
+            return
+        if lifecycle_result.get("replay"):
+            return
+        recorded_transaction = lifecycle_result.get("transaction")
+        recorded_transaction = recorded_transaction if isinstance(recorded_transaction, dict) else {}
         try:
             from ouroboros.evolution_checkpoints import append_evolution_checkpoint
 
-            if not replayed_terminal:
-                append_evolution_checkpoint(
-                    ctx.DRIVE_ROOT,
-                    ctx.REPO_DIR,
-                    task_id=str(task_id or ""),
-                    campaign=_read_evolution_campaign(),
-                    outcome_axes=outcome_axes,
-                    cost_usd=cost,
-                    cost_accounting_status=str(
-                        task_done_event.get("cost_accounting_status") or "available"
-                    ),
-                    rounds=rounds,
-                    transaction=recorded_transaction or transaction,
-                )
+            append_evolution_checkpoint(
+                ctx.DRIVE_ROOT,
+                ctx.REPO_DIR,
+                task_id=str(task_id or ""),
+                campaign=_read_evolution_campaign(),
+                outcome_axes=outcome_axes,
+                cost_usd=cost,
+                cost_accounting_status=str(
+                    task_done_event.get("cost_accounting_status") or "available"
+                ),
+                rounds=rounds,
+                transaction=recorded_transaction or transaction,
+            )
         except Exception:
             log.debug("Failed to append evolution checkpoint", exc_info=True)
     except Exception:
         log.debug("Failed to update evolution campaign state", exc_info=True)
-        replayed_terminal = False
+        return
 
     axes = normalize_outcome_axes({
         "status": task_done_event.get("status"),
@@ -1152,9 +1160,7 @@ def _handle_evolution_task_done(
         or objective_status in {"fail", "degraded"}
         or artifact_status in {"failed", "missing"}
     )
-    if replayed_terminal:
-        pass
-    elif not failed_by_axes and (rounds or 0) >= 1:
+    if not failed_by_axes and (rounds or 0) >= 1:
         from supervisor.state import update_state
 
         update_state(lambda live: live.update(evolution_consecutive_failures=0))
@@ -1338,15 +1344,25 @@ def _finish_task_done_dispatch(
 def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
     task_id = evt.get("task_id")
     wid = evt.get("worker_id")
-    if task_id:
-        try:
-            from supervisor.update_merge import abort_orphaned_assisted_tx
-
-            abort_orphaned_assisted_tx(str(task_id))
-        except Exception:
-            log.debug("assisted-merge orphan watchdog failed", exc_info=True)
     meta = ctx.RUNNING.get(str(task_id or ""), {}) if task_id else {}
     task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
+    event_metadata = evt.get("metadata")
+    task_metadata = (
+        task.get("metadata")
+        if isinstance(task.get("metadata"), dict)
+        else event_metadata if isinstance(event_metadata, dict) else None
+    )
+    if task_id:
+        try:
+            from supervisor.update_merge import (
+                abort_orphaned_assisted_tx,
+                release_assisted_writer_gate_after_task,
+            )
+
+            abort_orphaned_assisted_tx(str(task_id), task_metadata)
+            release_assisted_writer_gate_after_task(task_metadata)
+        except Exception:
+            log.debug("assisted-merge orphan watchdog failed", exc_info=True)
     task_type = str(evt.get("task_type") or task.get("type") or "")
 
     final_task_result: Dict[str, Any] = {}
@@ -1496,37 +1512,91 @@ def _handle_deep_self_review_request(evt: Dict[str, Any], ctx: Any) -> None:
 
 def _handle_promote_to_stable(evt: Dict[str, Any], ctx: Any) -> None:
     import subprocess as sp
-    # Local branch promotion always works without a remote.
+
+    from supervisor.git_ops import promote_branch_exact
+    from supervisor.update_merge import (
+        acquire_update_lock,
+        active_update_tx,
+        release_update_lock,
+    )
+
+    target = ctx.BRANCH_DEV
+    evolution_claim = evt.get("evolution_claim")
+    if isinstance(evolution_claim, dict):
+        commit_sha = str(evolution_claim.get("commit_sha") or "").strip()
+        if not commit_sha:
+            authority = {"ok": False, "reason": "commit_receipt_missing"}
+        else:
+            from supervisor.evolution_lifecycle import check_evolution_authority
+
+            authority = check_evolution_authority(
+                campaign_id=str(evolution_claim.get("campaign_id") or ""),
+                transaction_id=str(evolution_claim.get("transaction_id") or ""),
+                task_id=str(evolution_claim.get("task_id") or ""),
+                commit_sha=commit_sha,
+            )
+        if not authority.get("ok"):
+            st = ctx.load_state()
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "❌ Evolution promotion refused: the exact reviewed campaign claim "
+                    f"is no longer valid ({authority.get('reason') or 'unknown'}).",
+                )
+            return
+        try:
+            dev_sha = sp.run(
+                ["git", "rev-parse", ctx.BRANCH_DEV],
+                cwd=str(ctx.REPO_DIR), capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        except Exception:
+            dev_sha = ""
+        if dev_sha != commit_sha:
+            st = ctx.load_state()
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "❌ Evolution promotion refused: the development branch no longer "
+                    "matches the reviewed commit receipt.",
+                )
+            return
+        # Promote the exact reviewed SHA (TOCTOU-safe: the dev branch may move
+        # between the check above and the ref update inside promote_branch_exact).
+        target = commit_sha
+
+    lock_fh = None
     try:
-        sp.run(
-            ["git", "branch", "-f", ctx.BRANCH_STABLE, ctx.BRANCH_DEV],
-            cwd=str(ctx.REPO_DIR), check=True,
-        )
-        new_sha = sp.run(
-            ["git", "rev-parse", ctx.BRANCH_STABLE],
-            cwd=str(ctx.REPO_DIR), capture_output=True, text=True, check=True,
-        ).stdout.strip()
-    except Exception as e:
+        lock_fh = acquire_update_lock()
+        if active_update_tx():
+            ok, result = False, {"error": "a managed update transaction is still active"}
+        else:
+            ok, result = promote_branch_exact(
+                target, ctx.BRANCH_STABLE, push_remote=True,
+                repo_dir=str(ctx.REPO_DIR),
+            )
+    except RuntimeError as exc:
+        ok, result = False, {"error": str(exc)}
+    finally:
+        if lock_fh is not None:
+            release_update_lock(lock_fh)
+    if not ok:
         st = ctx.load_state()
         if st.get("owner_chat_id"):
-            ctx.send_with_budget(int(st["owner_chat_id"]), f"❌ Failed to promote to stable: {e}")
+            ctx.send_with_budget(
+                int(st["owner_chat_id"]),
+                f"❌ Failed to promote to stable: {result.get('error') or 'unknown error'}",
+            )
         return
-
-    # Optional remote push; local promotion remains authoritative.
-    remote_status = ""
-    try:
-        sp.run(["git", "remote", "get-url", "origin"], cwd=str(ctx.REPO_DIR),
-               capture_output=True, check=True)
-        sp.run(
-            ["git", "push", "origin", f"{ctx.BRANCH_DEV}:{ctx.BRANCH_STABLE}"],
-            cwd=str(ctx.REPO_DIR), check=True,
-        )
-        remote_status = " (pushed to origin)"
-    except Exception:
-        log.debug("No remote or push failed — local-only promote")
 
     st = ctx.load_state()
     if st.get("owner_chat_id"):
+        new_sha = str(result["sha"])
+        if result.get("remote_pushed"):
+            remote_status = " (pushed to origin)"
+        elif result.get("remote_error"):
+            remote_status = f" (local only; remote push failed: {result['remote_error']})"
+        else:
+            remote_status = ""
         ctx.send_with_budget(
             int(st["owner_chat_id"]),
             f"✅ Promoted: {ctx.BRANCH_DEV} → {ctx.BRANCH_STABLE} ({new_sha[:8]}){remote_status}",
@@ -3126,13 +3196,25 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
     """Toggle evolution mode from LLM tool call."""
     enabled = bool(evt.get("enabled"))
     if enabled:
-        from supervisor.evolution_lifecycle import evolution_block_reason
+        from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
 
         block = evolution_block_reason()
         if block:
             st = ctx.load_state()
             if st.get("owner_chat_id"):
                 ctx.send_with_budget(int(st["owner_chat_id"]), block)
+            return
+        try:
+            if not start_evolution_campaign(str(evt.get("objective") or ""), source="agent_tool"):
+                raise RuntimeError("campaign write was refused")
+        except Exception:
+            log.warning("Failed to start evolution campaign from agent tool", exc_info=True)
+            st = ctx.load_state()
+            if st.get("owner_chat_id"):
+                ctx.send_with_budget(
+                    int(st["owner_chat_id"]),
+                    "🧬 Evolution stayed OFF: campaign state could not be created.",
+                )
             return
     from supervisor.state import update_state
 
@@ -3165,11 +3247,9 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
         ctx.sort_pending()
         ctx.persist_queue_snapshot(reason="evolve_off_via_tool")
     try:
-        from supervisor.evolution_lifecycle import complete_evolution_campaign, start_evolution_campaign
+        from supervisor.evolution_lifecycle import complete_evolution_campaign
 
-        if enabled:
-            start_evolution_campaign(str(evt.get("objective") or ""), source="agent_tool")
-        else:
+        if not enabled:
             # Terminal close (not a resumable pause), so a later /evolve start mints fresh.
             complete_evolution_campaign("disabled via agent tool", status="stopped")
     except Exception:

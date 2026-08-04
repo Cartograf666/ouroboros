@@ -1238,11 +1238,11 @@ def test_an_unreadable_process_table_is_a_containment_failure_not_an_empty_conta
     for "could not read the table". Conflating them makes the container answer
     "reaped" for a tree it never looked at, which is no container at all.
     """
-    from ouroboros import platform_layer
+    from ouroboros import process_containment
 
-    monkeypatch.setattr(platform_layer, "pids_with_env_marker",
+    monkeypatch.setattr(process_containment, "pids_with_env_marker",
                         lambda marker, pgid=0, since_ticks=0: None)
-    container = platform_layer.ProcessContainer()
+    container = process_containment.ProcessContainer()
     # A token exists from construction; no process is adopted, so nothing is
     # signalled either way — the subject is purely the enumeration verdict.
     reason = container.reap()
@@ -1250,9 +1250,9 @@ def test_an_unreadable_process_table_is_a_containment_failure_not_an_empty_conta
     assert reason, "an unreadable process table was reported as a clean reap"
     assert "enumerated" in reason, reason
 
-    monkeypatch.setattr(platform_layer, "pids_with_env_marker",
+    monkeypatch.setattr(process_containment, "pids_with_env_marker",
                         lambda marker, pgid=0, since_ticks=0: [])
-    assert platform_layer.ProcessContainer().reap() == "", (
+    assert process_containment.ProcessContainer().reap() == "", (
         "an empty container must still be a SUCCESSFUL reap"
     )
 
@@ -1364,17 +1364,14 @@ def test_the_production_entry_points_do_not_short_circuit_a_deleted_suite(
 
 
 def test_a_failing_post_commit_gate_stops_publication(monkeypatch):
-    """A hard block the commit path converts to a warning is not a block.
+    """A hard block the MANAGED commit path converts to a warning is not a block.
 
-    `_post_commit_result` used to store the failure in the warning ref and return
-    None, after which `_repo_commit_push` fell through to `_auto_push` and
-    formatted the outcome as `OK`. Every verdict this gate can reach — a missing
-    plugin, a lost parallel lane, a crashed worker, a deleted suite, a tree that
-    could not be proven gone — was therefore still pushed to origin, tags and all.
-
-    The commit itself stays preserved (that is deliberate: it is the artifact the
-    author has to inspect). PUBLICATION is what a red gate stops, so the failure
-    has to travel back as a return value and reach the caller ahead of the push.
+    `_post_commit_result` must return the failure (not just store it in the
+    warning ref) so the managed gate can act on it. For a managed-update merge
+    the gate's verdict is read BEFORE the tag and the push — an auto-created
+    version tag on an unverified merge is immutable and would strand the
+    corrected commit. Ordinary commits deliberately keep the warning-only
+    contract (their own commit stays preserved for inspection).
     """
     from ouroboros.tools import git as git_module
 
@@ -1384,7 +1381,7 @@ def test_a_failing_post_commit_gate_stops_publication(monkeypatch):
     monkeypatch.setattr(git_module, "_consecutive_test_failures", 0)
     monkeypatch.setattr(
         git_module, "_git_commit_with_tests",
-        lambda ctx: "⚠️ TESTS_FAILED: Post-commit verification failed.\nPREFLIGHT_PLUGIN_MISSING",
+        lambda ctx, force=False: "⚠️ TESTS_FAILED: Post-commit verification failed.\nPREFLIGHT_PLUGIN_MISSING",
     )
 
     warning_ref = [""]
@@ -1396,22 +1393,20 @@ def test_a_failing_post_commit_gate_stops_publication(monkeypatch):
     assert "TESTS_FAILED" in warning_ref[0], "the operator-visible warning was dropped"
 
     # The control: a green gate returns None, so the ordinary path still pushes.
-    monkeypatch.setattr(git_module, "_git_commit_with_tests", lambda ctx: None)
+    monkeypatch.setattr(git_module, "_git_commit_with_tests", lambda ctx, force=False: None)
     assert git_module._post_commit_result(object(), "msg", False, [""]) is None
-    # ...and a skipped gate is not a failed one.
+    # ...and a skipped gate is not a failed one — EXCEPT under force, which the
+    # managed gate uses so neither skip_tests nor the env toggle can wave a
+    # managed merge through untested.
     assert git_module._post_commit_result(object(), "msg", True, [""]) is None
 
-    # The caller must act on it BEFORE it publishes anything, and "publishes"
-    # starts at the TAG, not at the push: `_auto_tag_on_version_bump` used to run
-    # first, so a red gate left an auto-created version tag on an unverified
-    # commit. Tags are immutable to release verification — it never retargets one
-    # — so that leftover then blocked the corrected commit reusing the version,
-    # and any later tag push shipped a tag made for a revision whose tests failed.
-    # Pinned in source because driving the whole commit path here would assert on
-    # the mock scaffolding rather than on the ordering that matters.
+    # The managed gate must act BEFORE anything publishes, and "publishes"
+    # starts at the TAG, not at the push. Pinned in source because driving the
+    # whole commit path here would assert on mock scaffolding instead of the
+    # ordering that matters.
     src = inspect.getsource(git_module._repo_commit_push)
-    assert "gate_block = _post_commit_gate_block(" in src
-    guard = src.index("if gate_block:")
+    assert "gate_failure = _managed_post_commit_tests_gate(" in src
+    guard = src.index("if gate_failure:")
     assert guard < src.index("_auto_tag_on_version_bump("), (
         "the version tag is created before the gate's verdict is read"
     )
@@ -1420,7 +1415,7 @@ def test_a_failing_post_commit_gate_stops_publication(monkeypatch):
         "the managed-update path runs before the gate's verdict is read"
     )
     # ...and the helper records the terminal failed attempt rather than dropping it.
-    helper = inspect.getsource(git_module._post_commit_gate_block)
+    helper = inspect.getsource(git_module._managed_post_commit_tests_gate)
     assert 'block_reason="post_commit_tests_failed"' in helper
 
 
@@ -1439,6 +1434,9 @@ def test_the_post_commit_gate_record_carries_the_same_review_metadata_as_its_sib
     recorded = {}
     monkeypatch.setattr(git_module, "_post_commit_result", lambda *a, **k: "⚠️ TESTS_FAILED: red")
     monkeypatch.setattr(
+        git_module, "_managed_commit_gate_failure", lambda reason, message: message,
+    )
+    monkeypatch.setattr(
         git_module, "_record_commit_attempt",
         lambda ctx, message, status, **kwargs: recorded.update(status=status, **kwargs),
     )
@@ -1450,9 +1448,11 @@ def test_the_post_commit_gate_record_carries_the_same_review_metadata_as_its_sib
         _last_scope_raw_result = {"in_scope": True}
         _review_degraded_reasons = ["one model timed out"]
 
-    assert git_module._post_commit_gate_block(_Ctx(), "msg", False, [""], time.time(),
-                                              {"fingerprint": "pre-abc"},
-                                              {"fingerprint": "post-def"})
+    assert git_module._managed_post_commit_tests_gate(
+        _Ctx(), "msg", time.time(), False, ["⚠️ TESTS_FAILED: red"],
+        {"phase": "committing_assisted"},
+        fingerprints=({"fingerprint": "pre-abc"}, {"fingerprint": "post-def"}),
+    )
 
     assert recorded.get("status") == "failed"
     assert recorded.get("triad_models") == ["m1", "m2"]
@@ -1470,7 +1470,9 @@ def test_the_post_commit_gate_record_carries_the_same_review_metadata_as_its_sib
     # ...and a ctx that carries none of it still records, rather than raising on a
     # missing attribute and losing the whole entry.
     recorded.clear()
-    assert git_module._post_commit_gate_block(object(), "msg", False, [""], time.time(), {}, {})
+    assert git_module._managed_post_commit_tests_gate(
+        object(), "msg", time.time(), False, [""], {"phase": "committing_assisted"},
+    )
     assert recorded.get("status") == "failed"
     assert recorded.get("pre_review_fingerprint") == ""
 
@@ -1514,16 +1516,20 @@ def test_a_red_gate_on_a_managed_update_rolls_the_merge_back(monkeypatch):
 
     fake = types.ModuleType("supervisor.update_merge")
     fake.rollback_managed_update = _rollback
-    fake.mark_update_tx_gate_blocked = lambda reason: blocked.append(reason) or True
+    fake.mark_update_tx_gate_blocked = (
+        lambda reason, detail="": blocked.append(reason) or True
+    )
     monkeypatch.setitem(sys.modules, "supervisor.update_merge", fake)
 
-    annotated = git_module._managed_update_gate_rollback("⚠️ TESTS_FAILED: red")
+    annotated = git_module._managed_commit_gate_failure(
+        "assisted_post_commit_tests_failed", "⚠️ TESTS_FAILED: red",
+    )
 
-    assert calls == ["assisted_post_commit_gate_failed"], (
+    assert calls == ["assisted_post_commit_tests_failed"], (
         "the update transaction was abandoned in committing_assisted"
     )
     assert "TESTS_FAILED" in annotated, "the rollback swallowed the gate's own verdict"
-    assert "MANAGED_UPDATE_ROLLED_BACK" in annotated, annotated
+    assert "rolled back" in annotated, annotated
     assert not blocked, (
         "a SUCCESSFUL rollback already cleared the marker; rewriting one back is how "
         "a finished transaction reappears on the next boot"
@@ -1531,104 +1537,111 @@ def test_a_red_gate_on_a_managed_update_rolls_the_merge_back(monkeypatch):
 
     # A rollback that returns False never got as far as clearing the marker, so the
     # phase it was called to escape is still on disk. Re-phase it, or the next boot
-    # promotes and finalizes the merge this gate just refused.
+    # resumes the merge this gate just refused.
     calls.clear()
     fake.rollback_managed_update = lambda reason: (False, "no pre_update_sha in tx marker")
-    annotated = git_module._managed_update_gate_rollback("⚠️ TESTS_FAILED: red")
-    assert blocked == ["assisted_post_commit_gate_failed"], (
-        "a failed rollback left the tx in committing_assisted, which boot recovery "
-        "reads as an interrupted commit and promotes"
+    annotated = git_module._managed_commit_gate_failure(
+        "assisted_post_commit_tests_failed", "⚠️ TESTS_FAILED: red",
     )
-    assert "MANAGED_UPDATE_ROLLBACK_FAILED" in annotated, annotated
+    assert blocked == ["assisted_post_commit_tests_failed"], (
+        "a failed rollback left the tx in its pre-gate phase, which boot recovery "
+        "reads as an interrupted commit"
+    )
+    assert "MANAGED_UPDATE_GATE_BLOCKED" in annotated, annotated
     assert "marked gate_blocked" in annotated, (
         f"the operator is not told the tx was pinned shut: {annotated}"
     )
 
-    # A rollback that RAISES is not different from one that returns False, and the
+    # A rollback that RAISES is no different from one that returns False, and the
     # PERSISTED state is the assertion that matters: `rollback_managed_update` runs
     # several git commands before it clears the marker, so a raise halfway through
-    # leaves the same `committing_assisted` on disk. An earlier revision called the
-    # re-phase only from inside the rollback's own `try`, so this path skipped it
-    # entirely while still telling the operator the tx was pinned.
+    # leaves the same pre-gate phase on disk. The re-phase must run independently
+    # of the rollback's own error handling.
     def _explode(reason):
         raise RuntimeError("no pre_update_sha recorded")
 
     blocked.clear()
     fake.rollback_managed_update = _explode
-    annotated = git_module._managed_update_gate_rollback("⚠️ TESTS_FAILED: red")
-    assert blocked == ["assisted_post_commit_gate_failed"], (
-        "a RAISED rollback left the tx in committing_assisted; the exception path "
+    annotated = git_module._managed_commit_gate_failure(
+        "assisted_post_commit_tests_failed", "⚠️ TESTS_FAILED: red",
+    )
+    assert blocked == ["assisted_post_commit_tests_failed"], (
+        "a RAISED rollback left the tx in its pre-gate phase; the exception path "
         "must attempt the terminal re-phase independently of the rollback"
     )
-    assert "MANAGED_UPDATE_ROLLBACK_FAILED" in annotated, annotated
+    assert "MANAGED_UPDATE_GATE_BLOCKED" in annotated, annotated
     assert "TESTS_FAILED" in annotated
 
     # And when the re-phase ITSELF cannot be written, the message must stop claiming
     # the transaction is pinned. Telling an operator a dangerous marker is terminal
     # when it is not is worse than the failure it is reporting: it is the one line
     # that would have sent them to clear it before the next boot.
-    def _explode_mark(reason):
+    def _explode_mark(reason, detail=""):
         raise OSError("update tx marker is not writable")
 
     fake.mark_update_tx_gate_blocked = _explode_mark
-    annotated = git_module._managed_update_gate_rollback("⚠️ TESTS_FAILED: red")
+    annotated = git_module._managed_commit_gate_failure(
+        "assisted_post_commit_tests_failed", "⚠️ TESTS_FAILED: red",
+    )
     assert "MANAGED_UPDATE_ROLLBACK_FAILED" in annotated, annotated
     assert "could NOT be re-phased" in annotated, (
         f"an unpinned tx is still reported as pinned shut: {annotated}"
     )
-    assert "committing_assisted" in annotated, (
-        "the operator is not told which phase is still on disk, so they cannot "
-        f"clear it before restarting: {annotated}"
-    )
 
-    # And the seams that reach it. Pinned in source because driving a whole managed
-    # update here would assert on the mock scaffolding instead of on the routing.
-    # Only for a managed transaction — an ordinary commit's red gate still just blocks
-    # publication with its own commit left intact for inspection.
+    # And the seams that reach it: the managed test gate and BOTH review-binding
+    # mismatches route through the shared managed-failure helpers rather than
+    # returning bare and abandoning the commit mid-transaction.
     src = inspect.getsource(git_module._repo_commit_push)
     for call in (
-        '_managed_update_gate_rollback(gate_block, "post_commit_gate")',
-        '_managed_update_gate_rollback(binding_msg, "commit_binding")',
-        '_managed_update_gate_rollback(binding_msg, "tag_binding")',
+        'binding_kind="commit"',
+        'binding_kind="tag"',
     ):
         assert call in src, (
-            f"{call} is not routed through the managed rollback; that return abandons "
-            "the commit in committing_assisted just as the red gate did"
+            f"{call} is not routed through _review_binding_failure; that return "
+            "abandons the commit in its pre-gate phase just as the red gate did"
         )
     assert src.count("return binding_msg\n") == 0, (
         "a binding mismatch still returns bare, leaving a managed tx parked in "
-        "committing_assisted for boot recovery to promote"
+        "its pre-gate phase for boot recovery to resume"
     )
+    gate_src = inspect.getsource(git_module._managed_post_commit_tests_gate)
+    assert "_managed_commit_gate_failure(" in gate_src
+    binding_src = inspect.getsource(git_module._review_binding_failure)
+    assert "_managed_commit_gate_failure(" in binding_src
 
 
 def test_a_gate_blocked_update_tx_is_never_promoted_by_boot_recovery():
-    """`gate_blocked` is terminal: recovery may log it, never advance it.
+    """A gate_blocked tx must never be finalized or resumed by boot recovery.
 
     It exists only for the path where a check rejected the update AND the rollback
-    that should have erased the transaction failed. What is on disk at that point is
-    a merge the gate refused, sitting in the tree, with the marker still naming it.
-    Every other phase in the finalizer moves the update FORWARD — `pending_boot_smoke`
-    finalizes, `committing_assisted` promotes to `pending_boot_smoke` — so falling
-    through to any of them relands the rejected revision without rerunning anything.
+    that should have erased the transaction failed. What is on disk at that point
+    is a merge the gate refused, with the marker still naming it. Boot recovery's
+    contract for that phase is a fresh ROLLBACK attempt (restoring pre_update_sha)
+    — never `pending_boot_smoke` promotion, never assisted resumption, never a
+    `finalized: True` report on the refused revision.
     """
     from supervisor import update_merge
 
-    assert update_merge.UPDATE_TX_GATE_BLOCKED not in update_merge._ASSISTED_PHASES, (
+    assert update_merge.GATE_BLOCKED_PHASE not in update_merge._ASSISTED_PHASES, (
         "gate_blocked is an assisted phase again, so `_recover_assisted_on_boot` "
         "resumes or promotes the merge a gate refused"
     )
     src = inspect.getsource(update_merge.finalize_managed_update_on_boot)
-    gate_branch = src.split("if phase == UPDATE_TX_GATE_BLOCKED:", 1)
+    gate_branch = src.split("if phase == GATE_BLOCKED_PHASE:", 1)
     assert len(gate_branch) == 2, (
         "the finalizer has no explicit gate_blocked branch; an unhandled phase is "
         "only safe until someone widens the fallthrough"
     )
-    assert "if phase in _ASSISTED_PHASES" in gate_branch[1], (
-        "the assisted dispatch runs before the gate_blocked branch, so a tx pinned "
-        "shut is promoted by whichever phase it still carries"
+    branch_body = gate_branch[1].split("return", 1)
+    assert "rollback_managed_update(" in branch_body[0], (
+        "the gate_blocked branch no longer retries the rollback that restores "
+        "pre_update_sha"
     )
-    assert '"finalized": False' in gate_branch[1].split("return", 1)[1].split("\n", 1)[0], (
+    assert '"finalized": False' in branch_body[1].split("\n", 1)[0], (
         "the gate_blocked branch reports the update as finalized"
+    )
+    assert "_finalize_pending_boot_smoke" not in gate_branch[1].split("if phase", 1)[0], (
+        "the gate_blocked branch promotes the refused merge to pending_boot_smoke"
     )
 
 
@@ -1742,7 +1755,7 @@ def test_a_second_timeout_keeps_the_excerpt_the_first_one_already_carried(tmp_pa
     The container is also reaped BEFORE the retry, not only after: the descendant
     that would make the retry hang is precisely the one the container can kill.
     """
-    from ouroboros import platform_layer, preflight_runner as pr
+    from ouroboros import preflight_runner as pr, process_containment
 
     order: list = []
 
@@ -1777,7 +1790,7 @@ def test_a_second_timeout_keeps_the_excerpt_the_first_one_already_carried(tmp_pa
         def close(self):
             order.append("close")
 
-    monkeypatch.setattr(platform_layer, "ProcessContainer", _FakeContainer)
+    monkeypatch.setattr(process_containment, "ProcessContainer", _FakeContainer)
     monkeypatch.setattr(pr, "_terminate_preflight_tree", lambda proc, temp_root: None)
 
     returncode, output, reap_error = pr._execute_pytest_pass(
@@ -2357,7 +2370,7 @@ def test_windows_containment_uses_the_shared_job_seam_and_closes_the_spawn_race(
     helpers are all stubbed; the assertion is on the call sequence, not on the
     Win32 API.
     """
-    from ouroboros import platform_layer
+    from ouroboros import platform_layer, process_containment
 
     calls: list = []
 
@@ -2379,7 +2392,7 @@ def test_windows_containment_uses_the_shared_job_seam_and_closes_the_spawn_race(
     monkeypatch.setattr(platform_layer, "terminate_job", lambda job, *rest: calls.append(("terminate", job)) or "")
     monkeypatch.setattr(platform_layer, "close_job", lambda job: calls.append(("close", job)) or "")
 
-    container = platform_layer.ProcessContainer()
+    container = process_containment.ProcessContainer()
     proc = container.spawn(["pytest"], cwd=".")
     # `reap` performs BOTH halves of the teardown, because only its return value can
     # reach the pass verdict; `close` afterwards is inert (the handle is consumed).
@@ -2414,7 +2427,7 @@ def test_a_windows_root_that_cannot_be_job_held_is_killed_and_reported(monkeypat
     (it is never left suspended either, which would deadlock a caller waiting on
     it), and `reap()` returns a non-empty reason the pass loop hard-blocks on.
     """
-    from ouroboros import platform_layer
+    from ouroboros import platform_layer, process_containment
 
     calls: list = []
 
@@ -2431,7 +2444,7 @@ def test_a_windows_root_that_cannot_be_job_held_is_killed_and_reported(monkeypat
     monkeypatch.setattr(platform_layer, "terminate_job", lambda job, *rest: calls.append(("terminate", job)) or "")
     monkeypatch.setattr(platform_layer, "close_job", lambda job: "")
 
-    container = platform_layer.ProcessContainer()
+    container = process_containment.ProcessContainer()
     container.spawn(["pytest"])
 
     assert ("kill", 99) in calls, "the unheld root was left running outside any container"
@@ -2465,7 +2478,7 @@ def test_the_process_group_is_a_detection_input_and_is_never_signalled():
     import inspect
 
     from ouroboros import platform_layer
-    from ouroboros.platform_layer import ProcessContainer
+    from ouroboros.process_containment import ProcessContainer
 
     container = ProcessContainer()
     assert container._pgid == 0, (
@@ -2479,7 +2492,7 @@ def test_the_process_group_is_a_detection_input_and_is_never_signalled():
             f"{method.__name__} signals a process group again: {source}"
         )
     scan_src = inspect.getsource(ProcessContainer._scan)
-    group_branch = scan_src.split("elif pgid and process_group_id(pid) == pgid:", 1)
+    group_branch = scan_src.split("elif pgid and _pl.process_group_id(pid) == pgid:", 1)
     assert len(group_branch) == 2, (
         "the group-membership branch is gone from `_scan`; a contained child that "
         "replaces its whole environment is then invisible to every membership signal"
@@ -2504,8 +2517,8 @@ def test_a_member_that_replaced_its_environment_is_still_detected_by_its_group()
     token, so the environment signal reports the child as a non-member and the reap
     comes back clean while it is still running. The kernel still places it in the
     root's process group, and that fact needs no cooperation from the child."""
-    from ouroboros.platform_layer import (MARKER_MEMBER, ProcessContainer,
-                                          pid_marker_state, pids_with_env_marker)
+    from ouroboros.process_containment import (MARKER_MEMBER, ProcessContainer,
+                                               pid_marker_state, pids_with_env_marker)
 
     container = ProcessContainer()
     token = container._token
@@ -2566,7 +2579,8 @@ def test_a_detached_child_is_still_found_after_its_root_exits():
     names it — `adopt` on a bare `Popen` cannot plant one, which is why the gate
     always uses `spawn`. The container both kills it (best effort) and, if it were
     still there, would say so; here it is genuinely gone, so `reap` returns clean."""
-    from ouroboros.platform_layer import ProcessContainer, pid_is_alive
+    from ouroboros.platform_layer import pid_is_alive
+    from ouroboros.process_containment import ProcessContainer
 
     container = ProcessContainer()
     root = container.spawn(
@@ -2620,11 +2634,8 @@ def test_process_container_kills_a_descendant_that_left_the_group():
     poll interval — the fastest and most ordinary shape — escaped entirely.
     Membership is now read from the kernel AT REAP TIME, so there is no window
     to be born inside."""
-    from ouroboros.platform_layer import (
-        ProcessContainer,
-        pid_is_alive,
-        process_group_id,
-    )
+    from ouroboros.platform_layer import pid_is_alive, process_group_id
+    from ouroboros.process_containment import ProcessContainer
 
     container = ProcessContainer()
     root = container.spawn(
@@ -2676,7 +2687,7 @@ def test_spawn_plants_the_membership_token_in_a_caller_supplied_env():
     token has to be MERGED into it. Dropped, the container has no POSIX membership
     at all: every scan comes back empty and `reap` honestly — and uselessly —
     reports a clean teardown for a tree it was never able to see."""
-    from ouroboros.platform_layer import ProcessContainer, pids_with_env_marker
+    from ouroboros.process_containment import ProcessContainer, pids_with_env_marker
 
     container = ProcessContainer()
     token = container._token
@@ -2709,7 +2720,7 @@ def test_the_membership_token_survives_the_preflight_env_scrub(tmp_path, monkeyp
     a nested `_preflight_env` that stripped the outer container's token would
     hide the entire inner tree from the outer reap — each container matches only
     its own uuid, so the tokens are meant to compose, not to overwrite."""
-    from ouroboros.platform_layer import CONTAINMENT_ENV_PREFIX
+    from ouroboros.process_containment import CONTAINMENT_ENV_PREFIX
     from ouroboros.preflight_runner import _preflight_env
 
     assert not CONTAINMENT_ENV_PREFIX.startswith("OUROBOROS_"), (
@@ -2748,8 +2759,9 @@ def test_a_stranger_that_took_a_recycled_pid_or_pgid_is_never_signalled(monkeypa
     that never carried the token, which the non-`/proc` branch deliberately calls
     `unreadable` and blocks on. Reading the host would therefore pin whichever
     contract the gate runner happens to have."""
-    from ouroboros import platform_layer
-    from ouroboros.platform_layer import ProcessContainer, pid_is_alive
+    from ouroboros import process_containment
+    from ouroboros.platform_layer import pid_is_alive
+    from ouroboros.process_containment import ProcessContainer
 
     stranger = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],
@@ -2758,12 +2770,12 @@ def test_a_stranger_that_took_a_recycled_pid_or_pgid_is_never_signalled(monkeypa
         stderr=subprocess.DEVNULL,
         start_new_session=True,  # its own leader, so pgid == pid, as a root's is
     )
-    answer = [platform_layer.MARKER_ABSENT]
-    monkeypatch.setattr(platform_layer, "_REAP_DEADLINE_SEC", 0.5)
+    answer = [process_containment.MARKER_ABSENT]
+    monkeypatch.setattr(process_containment, "_REAP_DEADLINE_SEC", 0.5)
     monkeypatch.setattr(
-        platform_layer, "pid_marker_state",
+        process_containment, "pid_marker_state",
         lambda pid, marker: (answer[0] if pid == stranger.pid
-                             else platform_layer.MARKER_ABSENT),
+                             else process_containment.MARKER_ABSENT),
     )
     container = ProcessContainer()
     try:
@@ -2781,7 +2793,7 @@ def test_a_stranger_that_took_a_recycled_pid_or_pgid_is_never_signalled(monkeypa
         # The same recycled root pid, now UNREADABLE. Nothing was disproved, so the
         # seeded root is a leak — and still nothing is signalled, which is what keeps
         # fail-closed from becoming a licence to kill whatever it cannot identify.
-        answer[0] = platform_layer.MARKER_UNREADABLE
+        answer[0] = process_containment.MARKER_UNREADABLE
         unreadable = ProcessContainer()
         unreadable._root = stranger.pid
         reason = unreadable.reap()
@@ -2830,21 +2842,21 @@ def test_reap_fails_when_a_member_stays_alive_across_scans(monkeypatch):
     The kill seam here leaves the same marker-bearing pid visible on every scan,
     which is what a failed signal looks like from inside the loop.
     """
-    from ouroboros import platform_layer
+    from ouroboros import platform_layer, process_containment
 
     survivor = os.getpid() + 1_000_000  # never a live pid; every probe is stubbed
     killed: list[int] = []
 
-    monkeypatch.setattr(platform_layer, "_REAP_DEADLINE_SEC", 0.3)
-    monkeypatch.setattr(platform_layer, "pids_with_env_marker",
+    monkeypatch.setattr(process_containment, "_REAP_DEADLINE_SEC", 0.3)
+    monkeypatch.setattr(process_containment, "pids_with_env_marker",
                         lambda marker, pgid=0, since_ticks=0: [survivor])
     monkeypatch.setattr(
-        platform_layer, "pid_marker_state", lambda pid, marker: platform_layer.MARKER_MEMBER
+        process_containment, "pid_marker_state", lambda pid, marker: process_containment.MARKER_MEMBER
     )
-    monkeypatch.setattr(platform_layer, "pid_is_zombie", lambda pid: False)
+    monkeypatch.setattr(process_containment, "pid_is_zombie", lambda pid: False)
     monkeypatch.setattr(platform_layer, "force_kill_pid", lambda pid: killed.append(pid))
 
-    container = platform_layer.ProcessContainer()
+    container = process_containment.ProcessContainer()
     error = container.reap()
 
     assert error, "reap reported success while a marker-bearing member was still alive"
@@ -2854,9 +2866,9 @@ def test_reap_fails_when_a_member_stays_alive_across_scans(monkeypatch):
     # The control: once the seam actually clears the member, the SAME loop returns
     # success — the failure above is about liveness, not about the loop refusing
     # to terminate.
-    monkeypatch.setattr(platform_layer, "pids_with_env_marker",
+    monkeypatch.setattr(process_containment, "pids_with_env_marker",
                         lambda marker, pgid=0, since_ticks=0: [])
-    assert platform_layer.ProcessContainer().reap() == ""
+    assert process_containment.ProcessContainer().reap() == ""
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX marker-membership reaping")
@@ -2867,19 +2879,19 @@ def test_reap_does_not_mistake_an_unwaited_corpse_for_a_live_member(monkeypatch)
     pid and its pgid in `ps`, executing nothing. Counting it live would spin the
     whole cleanup deadline and then hard-block the run on containment for what was
     really a timeout."""
-    from ouroboros import platform_layer
+    from ouroboros import process_containment
 
     corpse = os.getpid() + 1_000_000
 
-    monkeypatch.setattr(platform_layer, "_REAP_DEADLINE_SEC", 0.3)
-    monkeypatch.setattr(platform_layer, "pids_with_env_marker",
+    monkeypatch.setattr(process_containment, "_REAP_DEADLINE_SEC", 0.3)
+    monkeypatch.setattr(process_containment, "pids_with_env_marker",
                         lambda marker, pgid=0, since_ticks=0: [corpse])
     monkeypatch.setattr(
-        platform_layer, "pid_marker_state", lambda pid, marker: platform_layer.MARKER_MEMBER
+        process_containment, "pid_marker_state", lambda pid, marker: process_containment.MARKER_MEMBER
     )
-    monkeypatch.setattr(platform_layer, "pid_is_zombie", lambda pid: True)
+    monkeypatch.setattr(process_containment, "pid_is_zombie", lambda pid: True)
 
-    assert platform_layer.ProcessContainer().reap() == "", (
+    assert process_containment.ProcessContainer().reap() == "", (
         "an already-exited member was counted as live, so containment blocked a timeout"
     )
 
@@ -2899,7 +2911,7 @@ def test_a_member_that_becomes_unreadable_is_a_leak_not_a_clean_reap(monkeypatch
     So `reap` keeps its own set of pids it has already seen as members, and a
     member whose recheck comes back UNREADABLE is reported as a leak by pid.
     """
-    from ouroboros import platform_layer
+    from ouroboros import platform_layer, process_containment
 
     ghost = os.getpid() + 1_000_000  # never a live pid; every probe below is stubbed
     scans = []
@@ -2909,17 +2921,17 @@ def test_a_member_that_becomes_unreadable_is_a_leak_not_a_clean_reap(monkeypatch
         # Seen once, then unreadable — so no longer enumerable as a member.
         return [ghost] if len(scans) == 1 else []
 
-    monkeypatch.setattr(platform_layer, "_REAP_DEADLINE_SEC", 0.3)
-    monkeypatch.setattr(platform_layer, "pids_with_env_marker", _enumerate)
+    monkeypatch.setattr(process_containment, "_REAP_DEADLINE_SEC", 0.3)
+    monkeypatch.setattr(process_containment, "pids_with_env_marker", _enumerate)
     monkeypatch.setattr(
-        platform_layer, "pid_marker_state",
-        lambda pid, marker: platform_layer.MARKER_UNREADABLE,
+        process_containment, "pid_marker_state",
+        lambda pid, marker: process_containment.MARKER_UNREADABLE,
     )
-    monkeypatch.setattr(platform_layer, "pid_is_zombie", lambda pid: False)
+    monkeypatch.setattr(process_containment, "pid_is_zombie", lambda pid: False)
     monkeypatch.setattr(platform_layer, "force_kill_pid",
                         lambda pid: pytest.fail(f"pid {pid} was signalled without revalidation"))
 
-    error = platform_layer.ProcessContainer().reap()
+    error = process_containment.ProcessContainer().reap()
 
     assert error, "a member that vanished into unreadability was reported as reaped"
     assert "could not be determined" in error, error
@@ -2943,25 +2955,25 @@ def test_a_root_unreadable_from_the_very_first_scan_is_still_a_leak(monkeypatch)
     NEVER returns it and its membership probe is never answerable, which is the
     exact shape of that escape; the container must still block, by pid.
     """
-    from ouroboros import platform_layer
+    from ouroboros import platform_layer, process_containment
 
     class _FakeProc:
         pid = os.getpid() + 1_000_000  # never a live pid; every probe below is stubbed
 
     monkeypatch.setattr(subprocess, "Popen", lambda argv, **kwargs: _FakeProc())
-    monkeypatch.setattr(platform_layer, "_REAP_DEADLINE_SEC", 0.3)
+    monkeypatch.setattr(process_containment, "_REAP_DEADLINE_SEC", 0.3)
     # The root is invisible to enumeration for the whole reap, from the first scan on.
-    monkeypatch.setattr(platform_layer, "pids_with_env_marker",
+    monkeypatch.setattr(process_containment, "pids_with_env_marker",
                         lambda marker, pgid=0, since_ticks=0: [])
     monkeypatch.setattr(
-        platform_layer, "pid_marker_state",
-        lambda pid, marker: platform_layer.MARKER_UNREADABLE,
+        process_containment, "pid_marker_state",
+        lambda pid, marker: process_containment.MARKER_UNREADABLE,
     )
-    monkeypatch.setattr(platform_layer, "pid_is_zombie", lambda pid: False)
+    monkeypatch.setattr(process_containment, "pid_is_zombie", lambda pid: False)
     monkeypatch.setattr(platform_layer, "force_kill_pid",
                         lambda pid: pytest.fail(f"pid {pid} was signalled without revalidation"))
 
-    container = platform_layer.ProcessContainer()
+    container = process_containment.ProcessContainer()
     container.spawn(["pytest"])
     error = container.reap()
 
@@ -2972,9 +2984,9 @@ def test_a_root_unreadable_from_the_very_first_scan_is_still_a_leak(monkeypatch)
     # The control: the same unenumerable root, ANSWERED as gone, is not a leak —
     # otherwise every ordinary pass would block on its own exited pytest.
     monkeypatch.setattr(
-        platform_layer, "pid_marker_state", lambda pid, marker: platform_layer.MARKER_ABSENT
+        process_containment, "pid_marker_state", lambda pid, marker: process_containment.MARKER_ABSENT
     )
-    replacement = platform_layer.ProcessContainer()
+    replacement = process_containment.ProcessContainer()
     replacement.spawn(["pytest"])
     assert replacement.reap() == "", "an exited root was mistaken for an unreadable one"
 
@@ -2995,7 +3007,7 @@ def test_a_descendant_unreadable_before_it_was_ever_seen_is_still_a_leak(monkeyp
     own environment or credentials. Enumeration therefore takes the group as a second
     input, and once the pid is in `known` the unreadable probe makes it undetermined —
     which fails closed."""
-    from ouroboros import platform_layer
+    from ouroboros import platform_layer, process_containment
 
     class _FakeProc:
         pid = os.getpid() + 1_000_000  # never a live pid; every probe below is stubbed
@@ -3010,18 +3022,18 @@ def test_a_descendant_unreadable_before_it_was_ever_seen_is_still_a_leak(monkeyp
     monkeypatch.setattr(subprocess, "Popen", lambda argv, **kwargs: _FakeProc())
     monkeypatch.setattr(platform_layer, "process_group_id",
                         lambda pid: _FakeProc.pid if pid in (_FakeProc.pid, hidden) else 0)
-    monkeypatch.setattr(platform_layer, "_REAP_DEADLINE_SEC", 0.3)
-    monkeypatch.setattr(platform_layer, "pids_with_env_marker", _enumerate)
+    monkeypatch.setattr(process_containment, "_REAP_DEADLINE_SEC", 0.3)
+    monkeypatch.setattr(process_containment, "pids_with_env_marker", _enumerate)
     monkeypatch.setattr(
-        platform_layer, "pid_marker_state",
-        lambda pid, marker: (platform_layer.MARKER_ABSENT if pid == _FakeProc.pid
-                             else platform_layer.MARKER_UNREADABLE),
+        process_containment, "pid_marker_state",
+        lambda pid, marker: (process_containment.MARKER_ABSENT if pid == _FakeProc.pid
+                             else process_containment.MARKER_UNREADABLE),
     )
-    monkeypatch.setattr(platform_layer, "pid_is_zombie", lambda pid: False)
+    monkeypatch.setattr(process_containment, "pid_is_zombie", lambda pid: False)
     monkeypatch.setattr(platform_layer, "force_kill_pid",
                         lambda pid: pytest.fail(f"pid {pid} was signalled without revalidation"))
 
-    container = platform_layer.ProcessContainer()
+    container = process_containment.ProcessContainer()
     container.spawn(["pytest"])
     assert container._pgid == _FakeProc.pid, (
         "spawn did not record the root's own group, so enumeration has only the token "
@@ -3048,7 +3060,7 @@ def test_the_deadline_report_names_the_last_scan_that_actually_saw_something(mon
     deadline lands on is empty while the run has already named a pid. One quiet scan
     is not two, so this is a BLOCK either way; the question is whether it is an
     actionable one."""
-    from ouroboros import platform_layer
+    from ouroboros import platform_layer, process_containment
 
     flicker = os.getpid() + 1_000_000  # never a live pid; every probe is stubbed
     scans: list[str] = []
@@ -3059,17 +3071,17 @@ def test_the_deadline_report_names_the_last_scan_that_actually_saw_something(mon
 
     # Shorter than one settle interval, so it expires during the sleep after scan 1
     # and the loop exits on scan 2 — before quiet could ever reach two.
-    monkeypatch.setattr(platform_layer, "_REAP_DEADLINE_SEC", 0.03)
-    monkeypatch.setattr(platform_layer, "pids_with_env_marker", _enumerate)
+    monkeypatch.setattr(process_containment, "_REAP_DEADLINE_SEC", 0.03)
+    monkeypatch.setattr(process_containment, "pids_with_env_marker", _enumerate)
     monkeypatch.setattr(
-        platform_layer, "pid_marker_state",
-        lambda pid, marker: (platform_layer.MARKER_MEMBER if len(scans) == 1
-                             else platform_layer.MARKER_ABSENT),
+        process_containment, "pid_marker_state",
+        lambda pid, marker: (process_containment.MARKER_MEMBER if len(scans) == 1
+                             else process_containment.MARKER_ABSENT),
     )
-    monkeypatch.setattr(platform_layer, "pid_is_zombie", lambda pid: False)
+    monkeypatch.setattr(process_containment, "pid_is_zombie", lambda pid: False)
     monkeypatch.setattr(platform_layer, "force_kill_pid", lambda pid: None)
 
-    error = platform_layer.ProcessContainer().reap()
+    error = process_containment.ProcessContainer().reap()
 
     assert len(scans) >= 2, (
         f"the reap exited on its first scan ({len(scans)}), so 'the LAST non-empty "
@@ -3100,7 +3112,7 @@ def test_a_member_is_signalled_at_most_once_however_long_the_scans_run(monkeypat
     looks like from inside the loop; it must be signalled exactly once, and the
     verdict must still be a block.
     """
-    from ouroboros import platform_layer
+    from ouroboros import platform_layer, process_containment
 
     survivor = os.getpid() + 1_000_000  # never a live pid; every probe is stubbed
     killed: list[int] = []
@@ -3110,15 +3122,15 @@ def test_a_member_is_signalled_at_most_once_however_long_the_scans_run(monkeypat
         scans.append(marker)
         return [survivor]
 
-    monkeypatch.setattr(platform_layer, "_REAP_DEADLINE_SEC", 0.5)
-    monkeypatch.setattr(platform_layer, "pids_with_env_marker", _enumerate)
+    monkeypatch.setattr(process_containment, "_REAP_DEADLINE_SEC", 0.5)
+    monkeypatch.setattr(process_containment, "pids_with_env_marker", _enumerate)
     monkeypatch.setattr(
-        platform_layer, "pid_marker_state", lambda pid, marker: platform_layer.MARKER_MEMBER
+        process_containment, "pid_marker_state", lambda pid, marker: process_containment.MARKER_MEMBER
     )
-    monkeypatch.setattr(platform_layer, "pid_is_zombie", lambda pid: False)
+    monkeypatch.setattr(process_containment, "pid_is_zombie", lambda pid: False)
     monkeypatch.setattr(platform_layer, "force_kill_pid", lambda pid: killed.append(pid))
 
-    error = platform_layer.ProcessContainer().reap()
+    error = process_containment.ProcessContainer().reap()
 
     assert len(scans) > 2, (
         f"the reap only scanned {len(scans)} time(s), so 'at most once' is vacuous here"
@@ -3148,7 +3160,7 @@ def test_the_ps_membership_branch_answers_unreadable_for_a_live_pid(monkeypatch)
     """
     import types
 
-    from ouroboros import platform_layer
+    from ouroboros import platform_layer, process_containment
 
     if platform_layer.IS_WINDOWS:
         pytest.skip("POSIX environment-token membership")
@@ -3170,16 +3182,16 @@ def test_the_ps_membership_branch_answers_unreadable_for_a_live_pid(monkeypatch)
 
     monkeypatch.setattr(platform_layer.subprocess, "run", _run)
 
-    assert platform_layer.pid_marker_state(1234, "TOKEN") == platform_layer.MARKER_UNREADABLE, (
+    assert process_containment.pid_marker_state(1234, "TOKEN") == process_containment.MARKER_UNREADABLE, (
         "a live pid whose environment `ps` declined to print was reported as proof "
         "of non-membership, so an uninspectable member leaves containment silently"
     )
 
     # The two answers that ARE answers: the token is there, or the pid is not.
     result["out"] = "/usr/bin/python3 -c pass TOKEN=1\n"
-    assert platform_layer.pid_marker_state(1234, "TOKEN") == platform_layer.MARKER_MEMBER
+    assert process_containment.pid_marker_state(1234, "TOKEN") == process_containment.MARKER_MEMBER
     result["rc"], result["out"] = 1, ""
-    assert platform_layer.pid_marker_state(1234, "TOKEN") == platform_layer.MARKER_ABSENT, (
+    assert process_containment.pid_marker_state(1234, "TOKEN") == process_containment.MARKER_ABSENT, (
         "a pid `ps` cannot find must be ABSENT, or every ordinary exit blocks the gate"
     )
 
@@ -3193,7 +3205,7 @@ def test_an_unanswerable_membership_probe_is_unreadable_not_absent(monkeypatch):
     """
     import builtins
 
-    from ouroboros import platform_layer
+    from ouroboros import platform_layer, process_containment
 
     if platform_layer.IS_WINDOWS:
         pytest.skip("POSIX environment-token membership")
@@ -3215,16 +3227,16 @@ def test_an_unanswerable_membership_probe_is_unreadable_not_absent(monkeypatch):
         return _open
 
     monkeypatch.setattr(builtins, "open", _open_raising(errno.EACCES))
-    assert platform_layer.pid_marker_state(1234, "TOKEN") == platform_layer.MARKER_UNREADABLE, (
+    assert process_containment.pid_marker_state(1234, "TOKEN") == process_containment.MARKER_UNREADABLE, (
         "an unreadable environment was reported as proof of non-membership"
     )
 
     # The control: a pid that is genuinely gone is ANSWERED, not undetermined, or
     # every ordinary exit would block the run.
     monkeypatch.setattr(builtins, "open", _open_raising(errno.ESRCH))
-    assert platform_layer.pid_marker_state(1234, "TOKEN") == platform_layer.MARKER_ABSENT
+    assert process_containment.pid_marker_state(1234, "TOKEN") == process_containment.MARKER_ABSENT
     monkeypatch.setattr(builtins, "open", _open_raising(errno.ENOENT))
-    assert platform_layer.pid_marker_state(1234, "TOKEN") == platform_layer.MARKER_ABSENT
+    assert process_containment.pid_marker_state(1234, "TOKEN") == process_containment.MARKER_ABSENT
 
 
 def test_a_windows_job_teardown_that_does_not_confirm_itself_is_a_containment_failure(monkeypatch):
@@ -3247,7 +3259,7 @@ def test_a_windows_job_teardown_that_does_not_confirm_itself_is_a_containment_fa
     import inspect
     import types
 
-    from ouroboros import platform_layer
+    from ouroboros import platform_layer, process_containment
 
     win_src = inspect.getsource(platform_layer.terminate_job) + inspect.getsource(
         platform_layer.close_job)
@@ -3270,7 +3282,7 @@ def test_a_windows_job_teardown_that_does_not_confirm_itself_is_a_containment_fa
         raising=False,
     )
 
-    container = platform_layer.ProcessContainer()
+    container = process_containment.ProcessContainer()
     container._job = object()
     error = container.reap()
     assert "TerminateJobObject" in error and "5" in error, error
@@ -3278,7 +3290,7 @@ def test_a_windows_job_teardown_that_does_not_confirm_itself_is_a_containment_fa
     # A close that fails is equally a leak, and a raised call is not different from
     # a false return — both leave the job unaccounted for.
     results["terminate"], results["close"] = 1, 0
-    container = platform_layer.ProcessContainer()
+    container = process_containment.ProcessContainer()
     container._job = object()
     assert "kill-on-close never fired" in container.reap()
 
@@ -3290,7 +3302,7 @@ def test_a_windows_job_teardown_that_does_not_confirm_itself_is_a_containment_fa
         types.SimpleNamespace(TerminateJobObject=_raise, CloseHandle=_raise),
         raising=False,
     )
-    container = platform_layer.ProcessContainer()
+    container = process_containment.ProcessContainer()
     container._job = object()
     error = container.reap()
     assert "the handle is invalid" in error, error
@@ -3301,7 +3313,7 @@ def test_a_windows_job_teardown_that_does_not_confirm_itself_is_a_containment_fa
         types.SimpleNamespace(TerminateJobObject=lambda job, code: 1, CloseHandle=lambda job: 1),
         raising=False,
     )
-    container = platform_layer.ProcessContainer()
+    container = process_containment.ProcessContainer()
     container._job = object()
     assert container.reap() == ""
 

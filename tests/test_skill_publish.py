@@ -7,6 +7,7 @@ surfaced in the generated PR body while the secret scan stays enforced.
 """
 from __future__ import annotations
 
+import json
 import types
 
 import pytest
@@ -59,6 +60,34 @@ def _patch_validate(monkeypatch, loaded: LoadedSkill, computed_hash: str = "h") 
     monkeypatch.setattr(skill_publish, "github_token_from_env_or_settings", lambda: "tok")
     monkeypatch.setattr(skill_publish, "find_skill", lambda root, name: loaded)
     monkeypatch.setattr(skill_publish, "compute_content_hash", lambda *a, **k: computed_hash)
+
+
+# --- _commit_payload attribution ------------------------------------------
+
+def test_commit_payload_hardcodes_ouroboros_coauthor(monkeypatch):
+    captured = {}
+
+    def fake_gh_json(_ctx, _args, *, timeout, input_data):
+        captured.update(json.loads(input_data))
+        return {"data": {"createCommitOnBranch": {"commit": {"oid": "commit-sha"}}}}
+
+    monkeypatch.setattr(skill_publish, "_gh_json", fake_gh_json)
+
+    result = skill_publish._commit_payload(
+        types.SimpleNamespace(),
+        "razzant",
+        "OuroborosHub",
+        "submit/demo-v1.0.0",
+        "base-sha",
+        "Add skill: demo v1.0.0",
+        [],
+    )
+
+    assert result == "commit-sha"
+    assert captured["variables"]["input"]["message"] == {
+        "headline": "Add skill: demo v1.0.0",
+        "body": "Co-authored-by: Ouroboros <311266734+ouroboros-agent@users.noreply.github.com>",
+    }
 
 
 # --- _advisory_findings_section (pure) ------------------------------------

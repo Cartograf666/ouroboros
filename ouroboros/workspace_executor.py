@@ -749,39 +749,24 @@ def start_service(
         log_path = pathlib.Path(getattr(ctx, "drive_root")) / "services" / record.task_id / f"{name}.executor.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fh = log_path.open("ab")
-        proc = subprocess.Popen(
+        from ouroboros.process_custody import spawn_supervised
+
+        proc = spawn_supervised(
             record.cmd,
+            drive_root=pathlib.Path(getattr(ctx, "drive_root")),
+            purpose=f"workspace_service:{name}",
+            scope="session" if record.keep_alive else "task",
+            owner_task_id=record.task_id,
             cwd=str(host_cwd),
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             env=_executor_service_env(),
-            **subprocess_new_group_kwargs(),
         )
         log_fh.close()
         record.local_proc = proc
         record.backend_pid = str(proc.pid)
         record.backend_log_path = str(log_path)
-        # Write-through into the custody ledger: workspace records keep their
-        # own validation semantics, but the generation reaper now sees these
-        # too (previously swept only on clean shutdown).
-        try:
-            from ouroboros.process_custody import record_process
-
-            record_process(
-                pathlib.Path(getattr(ctx, "drive_root")),
-                pid=proc.pid,
-                cmd=record.cmd,
-                purpose=f"workspace_service:{name}",
-                scope="session" if record.keep_alive else "task",
-                owner_task_id=record.task_id,
-            )
-        except Exception:
-            import logging as _logging
-
-            _logging.getLogger(__name__).debug(
-                "workspace service custody record failed", exc_info=True
-            )
     else:
         if executor.network == "none":
             _assert_docker_network_none(executor.container_name)

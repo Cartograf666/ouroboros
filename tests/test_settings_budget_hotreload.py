@@ -101,6 +101,27 @@ def test_settings_post_rejects_malformed_evolution_cadence(monkeypatch, tmp_path
         assert current[key] == "llm", bad  # not persisted
 
 
+def test_settings_post_validates_and_applies_update_channel(monkeypatch, tmp_path):
+    from ouroboros.config import SETTINGS_DEFAULTS as _defaults
+
+    key = "OUROBOROS_UPDATE_CHANNEL"
+    current = dict(_defaults)
+    client = _settings_client(monkeypatch, tmp_path, current)
+
+    for value in ("stable", "qa", "development"):
+        resp = client.post("/api/settings", json={key: value.upper()})
+        assert resp.status_code == 200, (value, resp.text)
+        assert bool(resp.json().get("immediate_changed")) is (value != "stable")
+        assert current[key] == value
+
+    previous = current[key]
+    for value in ("", "nightly", None):
+        resp = client.post("/api/settings", json={key: value})
+        assert resp.status_code == 400, (value, resp.text)
+        assert "stable, qa, development" in resp.json()["error"]
+        assert current[key] == previous
+
+
 def test_settings_post_auto_downgrades_max_on_sub1m_route_change(monkeypatch, tmp_path):
     """v6.33.0 WS11 (owner decision): changing the model while Max is on stays
     FRICTION-FREE — the model change SUCCEEDS and, if the new route can't be

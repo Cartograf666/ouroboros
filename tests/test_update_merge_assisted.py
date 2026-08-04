@@ -3,6 +3,7 @@ in a real temp repo, the tx authorization gate, the conflict-marker gate, merge-
 classification, and non-destructive boot recovery."""
 
 import subprocess
+from types import SimpleNamespace
 
 import supervisor.git_ops as git_ops
 import supervisor.update_merge as update_merge
@@ -20,6 +21,7 @@ def _init_repo(tmp_path):
     _git(repo, "config", "user.name", "t")
     _git(repo, "config", "commit.gpgsign", "false")
     (repo / "a.txt").write_text("base\n")
+    (repo / "BIBLE.md").write_text("constitution\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "base")
     head = _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip()
@@ -31,7 +33,24 @@ def _point_at(monkeypatch, tmp_path, repo, head):
     monkeypatch.setattr(git_ops, "BRANCH_DEV", head)
     monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
     monkeypatch.setattr(git_ops, "_managed_update_target", lambda branch=None: ("", "", "remote-sim"))
+    monkeypatch.setattr(
+        git_ops,
+        "_resolve_managed_update_target",
+        lambda *_args: (
+            "remote-sim",
+            _git(repo, "rev-parse", "remote-sim").stdout.strip(),
+            "",
+        ),
+    )
     (tmp_path / "data" / "logs").mkdir(parents=True, exist_ok=True)
+
+
+def _authority_metadata(tx):
+    return {
+        "managed_update": {
+            "authority_fingerprint": update_merge.assisted_authority_fingerprint(tx),
+        }
+    }
 
 
 def _conflict_repo(tmp_path, monkeypatch):
@@ -72,6 +91,18 @@ def test_materialize_sets_merge_head_and_markers(tmp_path, monkeypatch):
     assert ok3
 
 
+def test_marker_gate_accepts_staged_deletion_and_binary_blob(tmp_path, monkeypatch):
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    (repo / "binary.bin").write_bytes(b"\x00<<<<<<< ours\n>>>>>>> theirs\n")
+    _git(repo, "add", "binary.bin")
+    _git(repo, "rm", "a.txt")
+
+    ok, message = update_merge.managed_assisted_marker_check()
+
+    assert ok, message
+
+
 def test_assisted_head_state_in_progress_then_committed(tmp_path, monkeypatch):
     repo, head, plan = _conflict_repo(tmp_path, monkeypatch)
     update_merge.materialize_assisted_merge_live(
@@ -92,15 +123,229 @@ def test_assisted_head_state_in_progress_then_committed(tmp_path, monkeypatch):
 def test_managed_assisted_tx_for_authorizes_only_owner(tmp_path, monkeypatch):
     repo, head = _init_repo(tmp_path)
     _point_at(monkeypatch, tmp_path, repo, head)
-    update_merge.write_update_tx({"phase": "assisted_resolution", "task_id": "owner-task"})
+    tx_data = {"phase": "assisted_resolution", "task_id": "owner-task"}
+    metadata = _authority_metadata(tx_data)
+    update_merge.write_update_tx(tx_data)
     # The authorized task is allowed (no block); any other task is blocked.
-    tx, block = update_merge.managed_assisted_tx_for("owner-task")
+    tx, block = update_merge.managed_assisted_tx_for("owner-task", metadata)
     assert tx and not block
-    _tx2, block2 = update_merge.managed_assisted_tx_for("some-other-task")
+    _tx2, block2 = update_merge.managed_assisted_tx_for("some-other-task", metadata)
     assert not _tx2 and "MANAGED_UPDATE_IN_PROGRESS" in block2
+    for phase in ("pending_boot_smoke", "rolling_back"):
+        update_merge.write_update_tx({"phase": phase, "task_id": "owner-task"})
+        _tx3, block3 = update_merge.managed_assisted_tx_for("owner-task", metadata)
+        assert not _tx3 and "MANAGED_UPDATE_IN_PROGRESS" in block3
     # No managed tx → never blocks.
     update_merge.clear_update_tx()
     assert update_merge.managed_assisted_tx_for("any") == ({}, "")
+
+
+def test_managed_update_tool_gate_fails_closed_when_state_is_unavailable(monkeypatch):
+    from ouroboros.tools.registry import _managed_update_code_tool_block
+
+    monkeypatch.setattr(
+        update_merge,
+        "managed_assisted_tx_for",
+        lambda *_args: (_ for _ in ()).throw(OSError("state unavailable")),
+    )
+    ctx = type("Context", (), {"task_id": "task", "task_metadata": {}})()
+
+    block = _managed_update_code_tool_block(ctx, "write_file")
+
+    assert "MANAGED_UPDATE_STATE_UNAVAILABLE" in block
+    assert "write_file" in block
+
+
+def test_authorized_resolver_can_edit_any_conflicting_official_file(tmp_path, monkeypatch):
+    from ouroboros.tools import git as git_tool
+    from ouroboros.tools.registry import ToolContext
+
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    (repo / "BIBLE.md").write_text("local\n", encoding="utf-8")
+    tx_data = {
+        "phase": "assisted_resolution",
+        "task_id": "update-resolver",
+    }
+    metadata = _authority_metadata(tx_data)
+    update_merge.write_update_tx(tx_data)
+    monkeypatch.setattr(git_tool, "_current_runtime_mode", lambda: "advanced")
+
+    authorized = ToolContext(
+        repo_dir=repo,
+        drive_root=tmp_path / "data",
+        task_id="update-resolver",
+        task_metadata=metadata,
+    )
+    other = ToolContext(
+        repo_dir=repo,
+        drive_root=tmp_path / "data",
+        task_id="unrelated-task",
+    )
+
+    result = git_tool._repo_write(authorized, path="BIBLE.md", content="reconciled\n")
+    blocked = git_tool._repo_write(other, path="BIBLE.md", content="unrelated\n")
+
+    assert "Written 1 file" in result
+    assert (repo / "BIBLE.md").read_text(encoding="utf-8") == "reconciled\n"
+    assert "CORE_PROTECTION_BLOCKED" in blocked
+
+
+def test_forged_marker_without_host_metadata_cannot_authorize_or_rollback(
+    tmp_path, monkeypatch
+):
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "keep.txt").write_text("keep\n", encoding="utf-8")
+    update_merge.write_update_tx({
+        "phase": "assisted_resolution",
+        "task_id": "ordinary-task",
+        "pre_update_sha": pre,
+        "pre_update_branch": head,
+        "target_sha": "b" * 40,
+    })
+
+    assert not update_merge.authorized_assisted_task("ordinary-task", {})
+    managed, block = update_merge.managed_assisted_tx_for("ordinary-task", {})
+    assert not managed and "MANAGED_UPDATE_IN_PROGRESS" in block
+    result = update_merge.abort_orphaned_assisted_tx("ordinary-task", {})
+
+    assert result == {"acted": False, "reason": "resolver authority mismatch"}
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == pre
+    assert (repo / "keep.txt").read_text(encoding="utf-8") == "keep\n"
+
+
+def test_cancelled_resolver_task_done_keeps_event_authority(tmp_path, monkeypatch):
+    from supervisor.events import _handle_task_done
+
+    metadata = {"managed_update": {"authority_fingerprint": "host-bound"}}
+    calls = {}
+    monkeypatch.setattr(
+        update_merge,
+        "abort_orphaned_assisted_tx",
+        lambda task_id, task_metadata: calls.setdefault(
+            "abort", (task_id, task_metadata)
+        ),
+    )
+    monkeypatch.setattr(
+        update_merge,
+        "release_assisted_writer_gate_after_task",
+        lambda task_metadata: calls.setdefault("release", task_metadata),
+    )
+    ctx = SimpleNamespace(
+        RUNNING={},
+        WORKERS={},
+        DRIVE_ROOT=tmp_path,
+        REPO_DIR=tmp_path,
+        persist_queue_snapshot=lambda reason="": None,
+        bridge=SimpleNamespace(push_log=lambda event: None),
+    )
+
+    _handle_task_done(
+        {
+            "type": "task_done",
+            "task_id": "update-resolver",
+            "task_type": "task",
+            "status": "cancelled",
+            "metadata": metadata,
+        },
+        ctx,
+    )
+
+    assert calls == {
+        "abort": ("update-resolver", metadata),
+        "release": metadata,
+    }
+
+
+def test_assisted_objective_is_truthful_for_any_conflict_free_reviewed_merge():
+    objective = update_merge._assisted_objective({
+        "target_sha": "b" * 40,
+        "conflict_paths": [],
+    })
+
+    assert "merge itself is clean" in objective
+    assert "combines local and official history" in objective
+    assert "conflicts are marked" not in objective
+    assert "see `git status` for unmerged paths" not in objective
+
+
+def test_boot_resume_does_not_enqueue_a_duplicate_assisted_resolver(monkeypatch):
+    import supervisor.queue as queue
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(workers, "ensure_worker_pool_started", lambda **_kwargs: True)
+    pending = [{"id": "resolver-task", "type": "task", "legacy_field": "preserved"}]
+    monkeypatch.setattr(workers, "PENDING", pending)
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(
+        queue,
+        "enqueue_task",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("existing resolver must not be enqueued again")
+        ),
+    )
+
+    tx = {
+        "task_id": "resolver-task",
+        "target_sha": "b" * 40,
+        "owner_chat_id": 0,
+    }
+    task_id = update_merge.enqueue_assisted_resolution_task(tx)
+
+    assert task_id == "resolver-task"
+    assert pending[0]["legacy_field"] == "preserved"
+    assert update_merge.assisted_task_metadata_authorizes(tx, pending[0]["metadata"])
+
+
+def test_assisted_resolver_readiness_waits_for_clean_tree_boot(tmp_path, monkeypatch):
+    import supervisor.workers as workers
+
+    proc = SimpleNamespace(pid=1234, is_alive=lambda: True)
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
+    monkeypatch.setattr(workers, "WORKERS", {})
+
+    def start_pool(**_kwargs):
+        workers.WORKERS[0] = SimpleNamespace(proc=proc)
+        return True
+
+    monkeypatch.setattr(workers, "ensure_worker_pool_started", start_pool)
+    monkeypatch.setattr(
+        workers,
+        "_first_worker_event_since",
+        lambda *_args: {"pid": 1234, "git_sha": "base-sha"},
+    )
+
+    assert update_merge.ensure_assisted_resolver_ready("base-sha", timeout_sec=0.1) is True
+
+
+def test_assisted_resolver_readiness_rejects_wrong_sha(tmp_path, monkeypatch):
+    import supervisor.workers as workers
+
+    proc = SimpleNamespace(pid=1234, is_alive=lambda: True)
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(
+        workers,
+        "ensure_worker_pool_started",
+        lambda **_kwargs: workers.WORKERS.setdefault(0, SimpleNamespace(proc=proc)) is not None,
+    )
+    monkeypatch.setattr(
+        workers,
+        "_first_worker_event_since",
+        lambda *_args: {"pid": 1234, "git_sha": "stale-sha"},
+    )
+
+    assert update_merge.ensure_assisted_resolver_ready("base-sha", timeout_sec=0.1) is False
+
+
+def test_worker_ready_follows_update_authority_preload():
+    import inspect
+    import supervisor.workers as workers
+
+    source = inspect.getsource(workers.worker_main)
+    assert source.index("_prepare_worker_task_runtime()") < source.index('"worker_ready"')
 
 
 def test_read_update_tx_strict_distinguishes_corrupt(tmp_path, monkeypatch):
@@ -127,7 +372,237 @@ def test_pending_boot_smoke_not_finalized_on_failed_supervisor(tmp_path, monkeyp
     })
     res = update_merge.finalize_managed_update_on_boot(supervisor_ready=False)
     assert res.get("finalized") is not True, res
-    assert update_merge.read_update_tx_strict()[0] == "valid"  # survives for the next boot
+    assert update_merge.read_update_tx()["boot_attempts"] == 1
+    res2 = update_merge.finalize_managed_update_on_boot(supervisor_ready=False)
+    assert res2.get("rolled_back") is True, res2
+    assert update_merge.read_update_tx_strict()[0] == "absent"
+
+
+def test_healthy_boot_clears_replace_intent_before_finalizing(tmp_path, monkeypatch):
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    cur = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    git_ops._write_update_intent({"target_sha": cur})
+    update_merge.write_update_tx({
+        "phase": "pending_boot_smoke", "merge_commit": cur,
+        "pre_update_sha": cur, "pre_update_branch": head,
+    })
+
+    result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+
+    assert result["finalized"] is True
+    assert not git_ops._update_intent_marker_path().exists()
+    assert update_merge.read_update_tx_strict()[0] == "absent"
+
+
+def test_boot_replays_unproven_pre_restart_smoke_before_finalizing(
+    tmp_path, monkeypatch
+):
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    cur = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    calls = []
+    monkeypatch.setattr(
+        update_merge,
+        "update_restart_smoke",
+        lambda: calls.append("smoke") or {"ok": True},
+    )
+    update_merge.write_update_tx({
+        "phase": "pending_boot_smoke",
+        "pre_restart_smoke": "pending",
+        "merge_commit": cur,
+        "pre_update_sha": cur,
+        "pre_update_branch": head,
+    })
+
+    result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+
+    assert result["finalized"] is True
+    assert calls == ["smoke"]
+    assert update_merge.read_update_tx_strict()[0] == "absent"
+
+
+def test_boot_rolls_back_when_recovered_pre_restart_smoke_fails(
+    tmp_path, monkeypatch
+):
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    cur = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    monkeypatch.setattr(
+        update_merge,
+        "update_restart_smoke",
+        lambda: {"ok": False, "stderr": "broken", "returncode": 1},
+    )
+    update_merge.write_update_tx({
+        "phase": "pending_boot_smoke",
+        "pre_restart_smoke": "pending",
+        "merge_commit": cur,
+        "pre_update_sha": cur,
+        "pre_update_branch": head,
+    })
+
+    result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+
+    assert result["rolled_back"] is True
+    assert update_merge.read_update_tx_strict()[0] == "absent"
+
+
+def test_assisted_commit_publishes_smoke_proof_only_after_pass(monkeypatch):
+    writes = []
+    monkeypatch.setattr(update_merge, "write_update_tx", lambda tx: writes.append(dict(tx)))
+    monkeypatch.setattr(update_merge, "update_restart_smoke", lambda: {"ok": True})
+
+    ok, _message = update_merge.managed_assisted_postcommit(
+        {"phase": "committing_assisted", "task_id": "resolver"},
+        "c" * 40,
+    )
+
+    assert ok is True
+    assert [tx["pre_restart_smoke"] for tx in writes] == ["pending", "passed"]
+
+
+def test_assisted_commit_crash_before_gates_rolls_back(tmp_path, monkeypatch):
+    repo, head, plan = _conflict_repo(tmp_path, monkeypatch)
+    update_merge.materialize_assisted_merge_live(
+        head, plan["local_snapshot"], plan["target_sha"], plan["base_sha"]
+    )
+    (repo / "a.txt").write_text("resolved but unproven\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "unproven merge")
+    update_merge.write_update_tx({
+        "phase": "committing_assisted", "task_id": "resolver",
+        "pre_update_sha": plan["base_sha"], "pre_update_branch": head,
+        "target_sha": plan["target_sha"],
+    })
+
+    result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+
+    assert result.get("rolled_back") is True, result
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == plan["base_sha"]
+    assert update_merge.read_update_tx_strict()[0] == "absent"
+
+
+def test_replace_crash_before_checkout_preserves_dirty_tree(tmp_path, monkeypatch):
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "a.txt").write_text("owner dirty work\n")
+    git_ops._write_update_intent({"target_sha": "b" * 40})
+    update_merge.write_update_tx({
+        "phase": "applying_replace", "pre_update_sha": pre,
+        "pre_update_branch": head, "target_sha": "b" * 40,
+        "merge_commit": "b" * 40, "pre_update_dirty_count": 1,
+    })
+
+    result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+
+    assert result.get("abandoned") is True, result
+    assert (repo / "a.txt").read_text() == "owner dirty work\n"
+    assert update_merge.read_update_tx_strict()[0] == "absent"
+    assert not git_ops._update_intent_marker_path().exists()
+
+
+def test_replace_target_with_dirty_tree_is_rolled_back(tmp_path, monkeypatch):
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "a.txt").write_text("target\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "target")
+    target = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "a.txt").write_text("partial checkout dirt\n")
+    git_ops._write_update_intent({"target_sha": target})
+    update_merge.write_update_tx({
+        "phase": "applying_replace", "pre_update_sha": pre,
+        "pre_update_branch": head, "target_sha": target,
+        "merge_commit": target, "pre_update_dirty_count": 0,
+    })
+
+    result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+
+    assert result.get("rolled_back") is True, result
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == pre
+    assert not _git(repo, "status", "--porcelain").stdout.strip()
+
+
+def test_rollback_disarms_replay_before_touching_dirty_tree(tmp_path, monkeypatch):
+    repo, head = _init_repo(tmp_path)
+    _point_at(monkeypatch, tmp_path, repo, head)
+    pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "a.txt").write_text("keep me\n")
+    update_merge.write_update_tx({
+        "phase": "pending_boot_smoke", "pre_update_sha": pre,
+        "pre_update_branch": head, "target_sha": "b" * 40,
+    })
+    monkeypatch.setattr(git_ops, "_clear_update_intent", lambda: False)
+
+    ok, _message = update_merge.rollback_managed_update("test")
+
+    assert ok is False
+    assert (repo / "a.txt").read_text() == "keep me\n"
+    assert update_merge.read_update_tx()["phase"] == "rolling_back"
+    detail = "rollback evidence " * 200
+    update_merge.mark_update_tx_gate_blocked("test", detail)
+    blocked = update_merge.read_update_tx()
+    assert blocked["phase"] == "rolling_back"
+    assert blocked["gate_blocked_detail"] == detail
+
+    monkeypatch.setattr(git_ops, "_clear_update_intent", lambda: True)
+    recovered = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+    assert recovered["rolled_back"] is True
+    assert update_merge.read_update_tx_strict()[0] == "absent"
+
+
+def test_restart_smoke_syncs_dependencies_before_code_checks(monkeypatch):
+    calls = []
+    monkeypatch.setattr(update_merge, "managed_update_constitution_present", lambda _ref: True)
+    monkeypatch.setattr(git_ops, "git_capture", lambda _cmd: (0, "", ""))
+    monkeypatch.setattr(
+        git_ops, "sync_runtime_dependencies",
+        lambda reason: (calls.append(("deps", reason)) or (True, "ok")),
+    )
+    monkeypatch.setattr(
+        update_merge, "_run_update_smoke",
+        lambda cmd, timeout_sec=120.0: (calls.append(("smoke", cmd)) or {
+            "ok": True, "stdout": "", "stderr": "", "returncode": 0,
+        }),
+    )
+
+    result = update_merge.update_restart_smoke()
+
+    assert result["ok"] is True
+    assert calls[0] == ("deps", "managed_update_pre_restart")
+    assert [kind for kind, _payload in calls] == ["deps", "smoke", "smoke"]
+
+
+def test_restart_smoke_timeout_kills_process_tree(monkeypatch):
+    import ouroboros.platform_layer as platform_layer
+    from ouroboros.tools import shell
+
+    killed = []
+
+    class HungProcess:
+        returncode = 1
+
+        def __init__(self):
+            self.calls = 0
+
+        def communicate(self, timeout=None):
+            assert self in shell._active_subprocesses
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired(["python"], timeout)
+            return "", ""
+
+    proc = HungProcess()
+    monkeypatch.setattr(update_merge.subprocess, "Popen", lambda *_a, **_k: proc)
+    monkeypatch.setattr(platform_layer, "kill_process_tree", lambda value: killed.append(value))
+
+    result = update_merge._run_update_smoke(["python"], timeout_sec=0.01)
+
+    assert result["returncode"] == 124
+    assert killed == [proc]
+    assert proc not in shell._active_subprocesses
 
 
 def test_boot_recovery_diverged_keeps_worker_commit(tmp_path, monkeypatch):
@@ -149,6 +624,41 @@ def test_boot_recovery_diverged_keeps_worker_commit(tmp_path, monkeypatch):
     # The worker's commit survives; the tx is cleared (no destructive rollback).
     assert _git(repo, "rev-parse", "HEAD").stdout.strip() == worker_head
     assert update_merge.read_update_tx_strict()[0] == "absent"
+
+
+def test_boot_recovery_rolls_back_interrupted_materialization(tmp_path, monkeypatch):
+    repo, head, plan = _conflict_repo(tmp_path, monkeypatch)
+    import supervisor.workers as workers
+
+    gate_calls = []
+    monkeypatch.setattr(
+        workers,
+        "close_repo_writer_admission",
+        lambda reason: gate_calls.append(("close", reason)),
+    )
+    monkeypatch.setattr(
+        workers,
+        "open_repo_writer_admission",
+        lambda expected_reason="": gate_calls.append(("open", expected_reason)),
+    )
+    _git(repo, "reset", "--hard", "HEAD")
+    _git(repo, "clean", "-fd")
+    _git(repo, "checkout", "-B", head, plan["local_snapshot"])
+    _git(repo, "merge", "--no-commit", "--no-ff", plan["target_sha"])
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == plan["local_snapshot"]
+    update_merge.write_update_tx({
+        "phase": "materializing_assisted", "task_id": "t",
+        "pre_update_sha": plan["base_sha"], "pre_update_branch": head,
+        "local_snapshot": plan["local_snapshot"], "target_sha": plan["target_sha"],
+    })
+
+    result = update_merge.finalize_managed_update_on_boot(supervisor_ready=True)
+
+    assert result.get("rolled_back") is True, result
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == plan["base_sha"]
+    assert update_merge._merge_head_sha() == ""
+    assert update_merge.read_update_tx_strict()[0] == "absent"
+    assert gate_calls == [("close", "managed_update:rollback")]
 
 
 def test_dirty_local_work_is_in_the_reviewed_diff(tmp_path, monkeypatch):

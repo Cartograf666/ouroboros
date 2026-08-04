@@ -902,6 +902,8 @@ def load_checklist_section(section_name: str) -> str:
 def build_touched_file_pack(
     repo_dir: Path,
     paths: list[str] | None = None,
+    *,
+    represent_binary: bool = False,
 ) -> tuple[str, list[str]]:
     """Read changed files into a prompt code pack plus omission list."""
     if paths is None:
@@ -929,7 +931,19 @@ def build_touched_file_pack(
             omitted.append(rel)
             parts.append(f"### {rel}\n\n*(omitted — path escapes repository root)*\n")
             continue
+        binary_extension = fp.suffix.lower() in BINARY_EXTENSIONS
         if not fp.is_file():
+            from ouroboros.tools import review_binary_context as binary_context
+            deleted_binary = represent_binary and (
+                binary_extension or binary_context.staged_path_is_binary(repo_dir, rel)
+            )
+            if deleted_binary:
+                metadata = binary_context.render_staged_binary_metadata(repo_dir, rel)
+                if metadata is not None:
+                    parts.append(f"### {rel}\n\n{metadata}")
+                    continue
+                omitted.append(rel)
+                parts.append(f"### {rel}\n\n*(omitted — deleted binary has no exact staged Git metadata)*\n")
             continue
         # Never inject credential-shaped files into review prompts.
         fname_lower = fp.name.lower()
@@ -937,7 +951,19 @@ def build_touched_file_pack(
             omitted.append(rel)
             parts.append(f"### {rel}\n\n*(omitted — sensitive file)*\n")
             continue
-        if fp.suffix.lower() in BINARY_EXTENSIONS or _is_probably_binary(fp):
+        if binary_extension or _is_probably_binary(fp):
+            if represent_binary:
+                from ouroboros.tools.review_binary_context import render_staged_binary_metadata
+                metadata = render_staged_binary_metadata(repo_dir, rel)
+                if metadata is None:
+                    omitted.append(rel)
+                    parts.append(
+                        f"### {rel}\n\n"
+                        "*(omitted — binary file has no readable stage-0 Git object metadata)*\n"
+                    )
+                    continue
+                parts.append(f"### {rel}\n\n{metadata}")
+                continue
             omitted.append(rel)
             parts.append(f"### {rel}\n\n*(omitted — binary file)*\n")
             continue
@@ -1533,19 +1559,13 @@ def _run_review_preflight_tests(
     repo_dir = getattr(ctx, "repo_dir", None)
     if repo_dir is None:
         return None
-    # NO `tests/` existence check here: whether the repository is in scope is
-    # run_hermetic_pytest's decision. A missing tests/ means either "never had a
-    # suite" (out of scope) or "this candidate deleted the suite" (a hard block),
-    # and only the runner can tell them apart by consulting HEAD. Short-circuiting
-    # here skipped the gate for exactly the change that deletes the gate.
+    # NO `tests/` existence check: run_hermetic_pytest owns the scope call (a
+    # deleted suite is a hard block; a shortcut here skipped the gate for it).
     MAX_OUTPUT = 8000
     try:
         from ouroboros.preflight_runner import PRE_COMMIT_PHASE, run_hermetic_pytest
 
-        # This entry point runs BEFORE the commit exists, so the deleted-suite
-        # baseline is HEAD alone. Consulting HEAD~1 here rejected the first
-        # unrelated staged change after a deliberate test-removal commit, whose
-        # HEAD legitimately carries no suite while HEAD~1 still does.
+        # Pre-commit entry point: the deleted-suite baseline is HEAD alone.
         run_kwargs = {"max_output": MAX_OUTPUT, "phase": PRE_COMMIT_PHASE}
         if timeout is not None:
             run_kwargs["timeout"] = timeout

@@ -157,7 +157,11 @@ def test_v5_apply_pending_request_activates_gated_campaign(tmp_path, monkeypatch
     import supervisor.evolution_lifecycle as lifecycle
     import supervisor.state as st
     monkeypatch.setattr(lifecycle, "evolution_block_reason", lambda: "")
-    monkeypatch.setattr(lifecycle, "start_evolution_campaign", lambda objective, source="": started.update(objective=objective, source=source))
+    monkeypatch.setattr(
+        lifecycle,
+        "start_evolution_campaign",
+        lambda objective, source="": started.update(objective=objective, source=source) or {"id": "test"},
+    )
     monkeypatch.setattr(st, "load_state", lambda: {"owner_chat_id": 7})
     monkeypatch.setattr(st, "save_state", lambda s: saved.update(s))
 
@@ -340,7 +344,7 @@ def test_toggle_evolution_on_clears_owner_stop(tmp_path, monkeypatch):
     monkeypatch.setattr(lifecycle, "complete_evolution_campaign",
                         lambda reason="", *, status="stopped": calls["complete"].append((reason, status)))
     monkeypatch.setattr(lifecycle, "start_evolution_campaign",
-                        lambda objective="", *, source="": calls["start"].append((objective, source)))
+                        lambda objective="", *, source="": calls["start"].append((objective, source)) or {"id": "test"})
 
     ctx = types.SimpleNamespace(
         load_state=lambda: {"owner_chat_id": 7},
@@ -352,6 +356,22 @@ def test_toggle_evolution_on_clears_owner_stop(tmp_path, monkeypatch):
     assert captured["evolution_owner_stopped"] is False  # cleared on owner start
     assert calls["start"] == [("improve X", "agent_tool")]
     assert calls["complete"] == []
+
+
+def test_toggle_evolution_start_failure_sends_owner_correction(monkeypatch):
+    from supervisor import evolution_lifecycle, events
+
+    monkeypatch.setattr(evolution_lifecycle, "evolution_block_reason", lambda: "")
+    monkeypatch.setattr(evolution_lifecycle, "start_evolution_campaign", lambda *a, **k: {})
+    sent = []
+    ctx = types.SimpleNamespace(
+        load_state=lambda: {"owner_chat_id": 7, "evolution_mode_enabled": False},
+        send_with_budget=lambda chat_id, text: sent.append((chat_id, text)),
+    )
+
+    events._handle_toggle_evolution({"enabled": True}, ctx)
+
+    assert sent == [(7, "🧬 Evolution stayed OFF: campaign state could not be created.")]
 
 
 def test_apply_pending_request_atomic_recheck_aborts_on_raced_owner_stop(tmp_path, monkeypatch):
@@ -371,7 +391,7 @@ def test_apply_pending_request_atomic_recheck_aborts_on_raced_owner_stop(tmp_pat
     calls = {"start": [], "complete": []}
     monkeypatch.setattr(lifecycle, "evolution_block_reason", lambda: "")
     monkeypatch.setattr(lifecycle, "start_evolution_campaign",
-                        lambda objective, source="": calls["start"].append((objective, source)))
+                        lambda objective, source="": calls["start"].append((objective, source)) or {"id": "test"})
     monkeypatch.setattr(lifecycle, "complete_evolution_campaign",
                         lambda reason="", *, status="stopped": calls["complete"].append((reason, status)))
     # Snapshot passes the chokepoint (flag False, not yet enabled)...
@@ -473,6 +493,7 @@ def test_complete_evolution_campaign_cleans_worktree_before_popping_tx(tmp_path,
 
     # Emergency Stop Invariant: cleanup_worktree=False (panic path) still pops the tx but
     # runs NO git worktree cleanup, so nothing can delay the panic hard-exit.
+    (tmp_path / "state" / "evolution_campaign.json").unlink()
     lifecycle._write_evolution_campaign({
         "id": "OLD2", "status": "active",
         "active_transaction": {"task_id": "t10", "commit_sha": "", "base_head": "def456"},
@@ -576,7 +597,11 @@ def _apply_with_request(tmp_path, monkeypatch, backlog_id):
     import supervisor.state as stt
     camp: dict = {}
     monkeypatch.setattr(lifecycle, "evolution_block_reason", lambda: "")
-    monkeypatch.setattr(lifecycle, "start_evolution_campaign", lambda *a, **k: None)
+    monkeypatch.setattr(
+        lifecycle,
+        "start_evolution_campaign",
+        lambda *a, **k: {"id": "C", "status": "active"},
+    )
     monkeypatch.setattr(lifecycle, "_read_evolution_campaign", lambda: camp)
     monkeypatch.setattr(lifecycle, "_write_evolution_campaign", lambda c: camp.update(c))
     monkeypatch.setattr(stt, "load_state", lambda: {"owner_chat_id": 7})

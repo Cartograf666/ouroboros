@@ -126,6 +126,31 @@ def test_readme_documents_packaged_cli_installer_and_source_venv():
     assert "ouroboros run --start \"2+2?\"" in readme
 
 
+def test_readme_prioritizes_macos_dmg_install_and_model_access():
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+
+    install_pos = readme.index("## Install")
+    origin_pos = readme.index("Ouroboros first booted")
+    evolution_image_pos = readme.index('src="assets/evolution.png"')
+    assert install_pos < origin_pos < evolution_image_pos
+    assert "Ouroboros-<version>.dmg" in readme
+    assert "drag `Ouroboros.app` onto the **Applications** shortcut" in readme
+    assert 'src="assets/install-macos.png"' in readme
+    assert "at least one supported remote provider API key or a local GGUF model" in readme
+    assert "https://ouroboros-agent.ai/install/" in readme
+
+
+def test_install_page_matches_macos_quick_start_and_model_prerequisite():
+    install_page = (REPO / "site" / "install" / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="macos-quick-start"' in install_page
+    assert install_page.count('<li>') == 3
+    assert "Ouroboros-&lt;version&gt;.dmg" in install_page
+    assert "Applications</strong> shortcut" in install_page
+    assert 'src="/assets/install-macos.png?v=' in install_page
+    assert "at least one supported remote provider API key or a local GGUF model" in install_page
+
+
 def test_architecture_doc_describes_build_script_release_tag_check():
     architecture = (REPO / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
 

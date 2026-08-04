@@ -207,5 +207,10 @@ def test_provider_reported_zero_cost_remains_known_zero():
 def test_inference_helpers_keep_route_identity(monkeypatch):
     assert infer_api_key_type("openai::gpt-x") == "openai"
     assert infer_api_key_type("mistralai/model") == "openrouter"
+    # Direct MiniMax uses the :: spelling; the slash form is a REAL OpenRouter
+    # vendor namespace and must keep routing (and safety-key inference) through
+    # the OpenRouter key, unlike cloudru/gigachat which exist nowhere on OpenRouter.
+    assert infer_api_key_type("minimax::MiniMax-M3") == "minimax"
+    assert infer_api_key_type("minimax/minimax-m2") == "openrouter"
     monkeypatch.setenv("OUROBOROS_MODEL", "mistralai/model")
     assert infer_model_category("mistralai/model") == "main"

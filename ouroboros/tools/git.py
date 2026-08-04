@@ -10,7 +10,7 @@ import pathlib
 import re
 import subprocess
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.config import get_runtime_mode
 from ouroboros.runtime_mode_policy import (
@@ -23,7 +23,12 @@ from ouroboros.runtime_mode_policy import (
     protected_write_block_message,
 )
 from ouroboros.platform_layer import acquire_exclusive_file_lock, unlink_lockfile
-from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
+from ouroboros.tools.registry import (
+    ToolContext,
+    ToolEntry,
+    _authorized_managed_update_resolver,
+    active_repo_dir_for,
+)
 from ouroboros.tools.commit_gate import (
     _check_advisory_freshness,
     _check_overlapping_review_attempt,
@@ -420,7 +425,7 @@ def _stage_candidate_for_review(
             f"⚠️ GIT_ERROR (add): {_sanitize_git_error(str(exc))}",
         )
         return [], None, error
-    if not paths:
+    if not paths and not _authorized_managed_update_resolver(ctx):
         removed = _unstage_binaries(ctx.repo_dir)
         if removed:
             log.warning("Unstaged %d binary files: %s", len(removed), removed)
@@ -516,7 +521,11 @@ def _run_reviewed_stage_cycle(
         return stage_error
     protected_staged_paths = protected_paths_in(classification_paths)
     runtime_mode = _current_runtime_mode()
-    if protected_staged_paths and not mode_allows_protected_write(runtime_mode):
+    if (
+        protected_staged_paths
+        and not mode_allows_protected_write(runtime_mode)
+        and not _authorized_managed_update_resolver(ctx)
+    ):
         msg = _protected_paths_block_message(
             protected_staged_paths,
             runtime_mode=runtime_mode,
@@ -978,19 +987,16 @@ def _log_test_failure(ctx: ToolContext, commit_message: str, test_output: str) -
         pass
 
 
-def _run_pre_push_tests(ctx: ToolContext) -> Optional[str]:
+def _run_pre_push_tests(ctx: ToolContext, force: bool = False) -> Optional[str]:
     if ctx is None:
         log.warning("_run_pre_push_tests called with ctx=None, skipping tests")
         return None
-    if os.environ.get("OUROBOROS_PRE_PUSH_TESTS", "1") != "1":
+    if not force and os.environ.get("OUROBOROS_PRE_PUSH_TESTS", "1") != "1":
         return None
-    # NO `tests/` existence check here. Whether this repository is in scope is
-    # run_hermetic_pytest's decision, because a MISSING tests/ has two meanings
-    # and only it can tell them apart: a repository that never had a suite (out
-    # of scope, returns None) versus a candidate that staged the removal of every
-    # test file, which removes the directory with them since git does not track
-    # empty directories (a hard block). Short-circuiting here skipped the gate for
-    # exactly the change that deletes the gate.
+    # NO `tests/` existence check here: whether the repository is in scope is
+    # run_hermetic_pytest's decision. This entry point runs POST-commit, so it
+    # compares HEAD and HEAD~1 (the default phase) — a candidate that deleted the
+    # suite is a hard block, while a repo that never had one is out of scope.
     try:
         from ouroboros.preflight_runner import run_hermetic_pytest
 
@@ -1004,8 +1010,8 @@ def _run_pre_push_tests(ctx: ToolContext) -> Optional[str]:
         return f"⚠️ PRE_PUSH_TEST_ERROR: Unexpected error running tests: {e}"
 
 
-def _git_commit_with_tests(ctx: ToolContext) -> Optional[str]:
-    test_error = _run_pre_push_tests(ctx)
+def _git_commit_with_tests(ctx: ToolContext, force: bool = False) -> Optional[str]:
+    test_error = _run_pre_push_tests(ctx, force=force)
     if test_error:
         log.error("Post-commit verification failed")
         ctx.last_push_succeeded = False
@@ -1017,82 +1023,119 @@ def _git_commit_with_tests(ctx: ToolContext) -> Optional[str]:
     return None
 
 
-def _post_commit_result(ctx, commit_message, skip_tests, tw_ref):
-    """Run the post-commit gate; return its BLOCKING error text, or None.
-
-    The return value is not decoration. A failing gate used to become warning
-    text in ``tw_ref`` and nothing else, after which the caller went straight on
-    to ``_auto_push`` — so every hard block the preflight can raise (a missing
-    plugin, a lost parallel lane, a crashed worker, a deleted suite) was still
-    pushed to origin, tags included, behind an ``OK:`` result. The commit stays
-    preserved either way; PUBLICATION is what a red gate has to stop.
-    """
+def _post_commit_result(ctx, commit_message, skip_tests, tw_ref, force: bool = False) -> Optional[str]:
     global _consecutive_test_failures
-    if skip_tests:
+    if skip_tests and not force:
         return None
-    push_error = _git_commit_with_tests(ctx)
+    push_error = _git_commit_with_tests(ctx, force=force)
     if push_error:
         _consecutive_test_failures += 1
         _log_test_failure(ctx, commit_message, push_error)
         tw_ref[0] = (f"\n\n⚠️ TESTS_FAILED (commit preserved, "
                      f"consecutive failures: {_consecutive_test_failures}):\n{push_error}")
         return push_error
-    _consecutive_test_failures = 0
+    else:
+        _consecutive_test_failures = 0
     return None
 
 
-def _post_commit_gate_block(ctx, commit_message, skip_tests, tw_ref, started_at,
-                            pre_fingerprint, post_fingerprint) -> Optional[str]:
-    """Run the post-commit gate BEFORE anything publishes; blocking text, or None.
+def _managed_commit_gate_failure(reason: str, message: str) -> str:
+    """Rollback a landed assisted commit, or keep the failed gate durable.
 
-    Ordering is the substance here, not the extraction. This used to run after
-    `_auto_tag_on_version_bump`, so a red gate still left an auto-created version
-    tag sitting on an unverified commit. Release-tag verification treats tags as
-    immutable and never retargets them, so that leftover blocked the corrected
-    commit that reused the version, and a later `git push --tags` published a tag
-    created for a revision whose tests had failed. Running first means a failing
-    gate creates no tag, pushes nothing, and never returns the leading `OK:`
-    callers key on — while the commit itself stays preserved for inspection.
-    """
-    error = _post_commit_result(ctx, commit_message, skip_tests, tw_ref)
-    if not error:
+    A rollback that RAISES is no different from one that returns False: it runs
+    several git commands before clearing the marker, so a raise halfway leaves
+    the same pre-gate phase on disk — the re-phase to gate_blocked must run
+    independently of the rollback's own error handling. When even that re-phase
+    cannot be written, the message must stop claiming the tx is pinned."""
+    from supervisor.update_merge import (
+        mark_update_tx_gate_blocked,
+        rollback_managed_update,
+    )
+
+    try:
+        ok, detail = rollback_managed_update(reason)
+    except Exception as exc:
+        log.warning("managed update rollback after a red gate raised", exc_info=True)
+        ok, detail = False, f"rollback raised {type(exc).__name__}: {exc}"
+    if ok:
+        return f"{message}\n\nThe managed update was rolled back: {detail}"
+    try:
+        mark_update_tx_gate_blocked(reason, detail)
+    except Exception as exc:
+        log.warning("pinning the update tx gate_blocked failed", exc_info=True)
+        return (
+            f"{message}\n\n⚠️ MANAGED_UPDATE_ROLLBACK_FAILED ({detail}); the update tx "
+            f"marker could NOT be re-phased to gate_blocked ({type(exc).__name__}: {exc}) — "
+            "if a tx marker remains, clear or roll it back before the next boot."
+        )
+    return (
+        f"{message}\n\n⚠️ MANAGED_UPDATE_GATE_BLOCKED: rollback could not be verified "
+        f"({detail}). The tx is marked gate_blocked; restart/recovery is required."
+    )
+
+
+def _managed_post_commit_tests_gate(
+    ctx, commit_message: str, commit_start: float, skip_tests: bool,
+    test_warning_ref, managed_tx: Dict[str, Any],
+    fingerprints: Tuple[Dict[str, Any], Dict[str, Any]] = ({}, {}),
+) -> Optional[str]:
+    """BLOCKING post-commit test gate for managed-update merges only: a failed
+    suite rolls the assisted merge back instead of shipping a warning (ordinary
+    commits keep the warning-only contract later in the flow). The gate is
+    MANDATORY: neither the caller's skip_tests nor OUROBOROS_PRE_PUSH_TESTS=0
+    can wave a managed merge through untested. The terminal record carries the
+    same review metadata/fingerprints as every sibling failure record, so an
+    operator can reconstruct WHICH reviewed revision the gate rejected."""
+    if not managed_tx:
         return None
-    # The same review metadata every sibling failure record carries. This is the newest
-    # terminal outcome in the ledger, so a thinner record here is missing forensics on
-    # exactly the failure class least is known about. The fingerprints are `matched`, not
-    # pending: the caller only reaches this gate once `_verify_reviewed_commit_binding` has
-    # tied the created commit to `post_fingerprint`, so the ledger can say which reviewed
-    # revision the gate rejected instead of leaving that column empty for this class alone.
-    _record_commit_attempt(ctx, commit_message, "failed",
-                           block_reason="post_commit_tests_failed",
-                           block_details=error,
-                           duration_sec=time.time() - started_at,
-                           phase="post_commit_gate",
-                           pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
-                           post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
-                           fingerprint_status="matched",
-                           triad_models=getattr(ctx, "_last_triad_models", []),
-                           scope_model=getattr(ctx, "_last_scope_model", ""),
-                           triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
-                           scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
-                           degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
-    return error
+    del skip_tests  # deliberately ignored for managed merges
+    post_test_error = _post_commit_result(
+        ctx, commit_message, False, test_warning_ref, force=True,
+    )
+    if not post_test_error:
+        return None
+    failure = test_warning_ref[0].strip() or post_test_error
+    failure = _managed_commit_gate_failure("assisted_post_commit_tests_failed", failure)
+    pre_fingerprint, post_fingerprint = fingerprints
+    _record_commit_attempt(
+        ctx, commit_message, "failed",
+        block_reason="post_commit_tests_failed", block_details=failure,
+        duration_sec=time.time() - commit_start, phase="post_commit_tests",
+        pre_review_fingerprint=(pre_fingerprint or {}).get("fingerprint", ""),
+        post_review_fingerprint=(post_fingerprint or {}).get("fingerprint", ""),
+        fingerprint_status="matched",
+        triad_models=getattr(ctx, "_last_triad_models", []),
+        scope_model=getattr(ctx, "_last_scope_model", ""),
+        triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+        scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
+        degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
+    )
+    return failure
 
 
-def _record_binding_mismatch(ctx, commit_message, binding_msg, *, reason, phase,
-                             pre_fingerprint, post_fingerprint, started_at) -> None:
-    """Record the terminal `failed` attempt for a reviewed-binding mismatch.
-
-    The commit-binding and tag-binding sites write the SAME ledger entry and differ only in
-    `block_reason`/`phase`, so the two inline copies were duplication that also cost the caller
-    the 300-line function cap the smoke gate enforces."""
+def _review_binding_failure(
+    ctx: ToolContext,
+    commit_message: str,
+    commit_start: float,
+    message: str,
+    *,
+    binding_kind: str,
+    fingerprints: Tuple[Dict[str, Any], Dict[str, Any]],
+    managed_tx: Dict[str, Any],
+) -> str:
+    """Record either exact-tree binding failure through one shared path."""
+    block_reason, phase, managed_reason = {
+        "commit": ("review_binding_mismatch", "commit_binding", "assisted_commit_binding_mismatch"),
+        "tag": ("review_tag_binding_mismatch", "tag_binding", "assisted_tag_binding_mismatch"),
+    }[binding_kind]
+    pre_fingerprint, post_fingerprint = fingerprints
     _record_commit_attempt(
         ctx,
         commit_message,
         "failed",
-        block_reason=reason,
-        block_details=binding_msg,
-        duration_sec=time.time() - started_at,
+        block_reason=block_reason,
+        block_details=message,
+        duration_sec=time.time() - commit_start,
         phase=phase,
         pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
         post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
@@ -1103,77 +1146,7 @@ def _record_binding_mismatch(ctx, commit_message, binding_msg, *, reason, phase,
         scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
         degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
     )
-
-
-def _managed_update_gate_rollback(gate_block: str, reason: str = "post_commit_gate") -> str:
-    """Undo a managed-update merge that a post-commit check rejected; annotated block text.
-
-    A managed assisted update writes its transaction as ``committing_assisted`` BEFORE the
-    2-parent merge commit, and that phase means "the process died mid-commit" — boot recovery
-    reads it as an interrupted commit, promotes it to ``pending_boot_smoke`` and can finalize the
-    merge without ever rerunning the check that rejected it. Returning the block on its own would
-    leave exactly that state behind, with HEAD advanced and MERGE_HEAD gone, so an immediate
-    retry fails managed precommit verification too. The existing failed-update path is the right
-    terminal state: the rejected merge is preserved on a ``failed-update-*`` branch, the tree is
-    reset to ``pre_update_sha``, and the tx marker is CLEARED so nothing can promote it later.
-
-    ``reason`` names the rejecting check, and EVERY return that abandons the commit after the
-    ``committing_assisted`` write has to route through here — a red gate and a binding mismatch
-    park the transaction in the identical dangerous phase, so exempting one of them reopens the
-    window for that one."""
-    try:
-        from supervisor.update_merge import rollback_managed_update
-
-        ok, msg = rollback_managed_update(f"assisted_{reason}_failed")
-    except Exception as exc:  # rollback is itself infrastructure; never mask the check's verdict
-        log.warning("managed update rollback after a red post-commit check failed", exc_info=True)
-        ok, msg = False, str(exc)
-    if ok:
-        return gate_block + (
-            "\n\n⚠️ MANAGED_UPDATE_ROLLED_BACK: the update's merge commit failed this check, so it "
-            f"was rolled back ({msg}). The rejected merge is normally preserved on a "
-            "failed-update-* branch — that ref is best-effort, so if the detail above says it "
-            "could not be recorded, the merge is now unreferenced. Fix the tests and re-run the "
-            "update."
-        )
-    # EVERY unsuccessful rollback lands here, returned-False and raised alike: clearing the tx is
-    # the LAST thing a rollback does, and it runs several git commands first, so a raise halfway
-    # through leaves exactly the `committing_assisted` marker this call existed to escape. The
-    # re-phase therefore gets its OWN attempt — sharing the rollback's `try` meant a raise skipped
-    # it entirely while the text below still told the operator the tx was pinned.
-    try:
-        from supervisor.update_merge import mark_update_tx_gate_blocked
-
-        pinned = bool(mark_update_tx_gate_blocked(f"assisted_{reason}_failed"))
-    except Exception:
-        log.warning("pinning the update tx shut after a failed rollback failed", exc_info=True)
-        pinned = False
-    tail = ("The update tx is marked gate_blocked so no boot can finalize it, and the working "
-            "tree still carries the rejected merge — inspect it before restarting."
-            if pinned else
-            "The update tx marker could NOT be re-phased to gate_blocked: if a tx marker remains "
-            "it still reads committing_assisted, which the next boot treats as an interrupted "
-            "commit and can FINALIZE — clear it before restarting.")
-    return gate_block + (
-        "\n\n⚠️ MANAGED_UPDATE_ROLLBACK_FAILED: the update's merge commit failed this check and "
-        f"could NOT be rolled back ({msg}). " + tail
-    )
-
-
-def _record_commit_success(ctx, commit_message, started_at, pre_fingerprint, post_fingerprint):
-    """Record the terminal `succeeded` attempt and clear the per-commit review state."""
-    _record_commit_attempt(ctx, commit_message, "succeeded",
-                           duration_sec=time.time() - started_at,
-                           phase="commit",
-                           pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
-                           post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
-                           fingerprint_status="matched",
-                           triad_models=getattr(ctx, "_last_triad_models", []),
-                           scope_model=getattr(ctx, "_last_scope_model", ""),
-                           triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
-                           scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
-                           degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
-    ctx._scope_review_history = {}  # Clear on success — next commit starts fresh
+    return _managed_commit_gate_failure(managed_reason, message) if managed_tx else message
 
 
 def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
@@ -1313,7 +1286,12 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
 
     for e in write_list:
         norm = normalize_repo_path(e["path"])
-        if not ctx.is_workspace_mode() and is_protected_runtime_path(norm) and not mode_allows_protected_write(_current_runtime_mode()):
+        if (
+            not ctx.is_workspace_mode()
+            and is_protected_runtime_path(norm)
+            and not mode_allows_protected_write(_current_runtime_mode())
+            and not _authorized_managed_update_resolver(ctx)
+        ):
             return protected_write_block_message(
                 path=norm,
                 runtime_mode=_current_runtime_mode(),
@@ -1398,7 +1376,12 @@ def _str_replace_editor(
         return "⚠️ STR_REPLACE_ERROR: old_str is required (cannot be empty)."
 
     norm = normalize_repo_path(path)
-    if not ctx.is_workspace_mode() and is_protected_runtime_path(norm) and not mode_allows_protected_write(_current_runtime_mode()):
+    if (
+        not ctx.is_workspace_mode()
+        and is_protected_runtime_path(norm)
+        and not mode_allows_protected_write(_current_runtime_mode())
+        and not _authorized_managed_update_resolver(ctx)
+    ):
         return protected_write_block_message(
             path=norm,
             runtime_mode=_current_runtime_mode(),
@@ -1635,6 +1618,351 @@ def _task_attributed_commit_paths(
     return selected, attribution, error, (results_root, evidence_task_id)
 
 
+def _evolution_commit_authority(
+    ctx: ToolContext, *, commit_sha: str = "", require_receipt: bool = True,
+    require_uncommitted: bool = False,
+) -> tuple[Dict[str, str], Dict[str, Any]]:
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    tx = metadata.get("evolution_transaction")
+    tx = tx if isinstance(tx, dict) else {}
+    claim = {
+        "campaign_id": str(tx.get("campaign_id") or ""),
+        "transaction_id": str(tx.get("transaction_id") or ""),
+        "task_id": str(getattr(ctx, "task_id", "") or tx.get("task_id") or ""),
+    }
+    from supervisor.evolution_lifecycle import check_evolution_authority
+
+    authority = check_evolution_authority(
+        **claim,
+        commit_sha=str(commit_sha or "") if require_receipt else "",
+        require_uncommitted=bool(require_uncommitted),
+    )
+    expected_sha = str(commit_sha or "").strip()
+    if authority.get("ok") and expected_sha:
+        try:
+            head = run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir).strip()
+        except Exception as exc:
+            authority = {**authority, "ok": False, "reason": f"git_state_unavailable:{exc}"}
+        else:
+            if head != expected_sha:
+                authority = {**authority, "ok": False, "reason": "head_mismatch"}
+    return claim, authority
+
+
+def _check_evolution_commit_stage(
+    ctx: ToolContext,
+    commit_message: str,
+    started_at: float,
+    *,
+    phase: str,
+    commit_sha: str = "",
+) -> tuple[Dict[str, str], str]:
+    """Recheck the exact evolution claim at a commit/publication boundary."""
+    claim, authority = _evolution_commit_authority(
+        ctx,
+        commit_sha=commit_sha,
+        require_receipt=phase != "pre_tag_authority",
+        require_uncommitted=phase in {"pre_review_authority", "pre_commit_authority"},
+    )
+    if authority.get("ok"):
+        return claim, ""
+    reason = authority.get("reason") or "unknown"
+    if phase == "pre_review_authority":
+        message = (
+            "⚠️ EVOLUTION_AUTHORITY_REVOKED: the exact campaign/transaction/task "
+            f"claim is no longer active ({reason}). No reviewer was called and no "
+            "commit was created."
+        )
+    elif phase == "pre_commit_authority":
+        message = (
+            "⚠️ EVOLUTION_AUTHORITY_REVOKED: review completed, but the exact "
+            f"campaign claim disappeared before commit ({reason}). Nothing was committed."
+        )
+    else:
+        message = (
+            "⚠️ EVOLUTION_PUBLICATION_STOPPED: Git created reviewed local commit "
+            f"{commit_sha}, but campaign authority changed before local tag creation "
+            f"({reason}). Nothing was tagged, pushed, or scheduled for restart."
+        )
+    _record_commit_attempt(
+        ctx,
+        commit_message,
+        "failed" if phase == "pre_tag_authority" else "blocked",
+        block_reason="evolution_authority",
+        block_details=message,
+        duration_sec=time.time() - started_at,
+        phase=phase,
+        **({
+            "triad_models": getattr(ctx, "_last_triad_models", []),
+            "scope_model": getattr(ctx, "_last_scope_model", ""),
+        } if phase == "pre_tag_authority" else {}),
+    )
+    return claim, message
+
+
+def _preserve_evolution_orphan(
+    ctx: ToolContext, commit_sha: str, *, created_tag: str = "",
+) -> str:
+    """Keep an unauthorized local commit inspectable but outside normal push refs.
+
+    Ref containment deliberately never touches the index or worktree: another task may
+    have edited tracked bytes after the commit was created. Leaving those bytes visibly
+    dirty is safer than aligning them to the rewound branch and losing concurrent work.
+    """
+    sha = str(commit_sha or "").strip()
+    ref_name = f"refs/ouroboros/evolution-orphans/{sha}"
+    try:
+        resolved = run_cmd(
+            ["git", "rev-parse", "--verify", f"{sha}^{{commit}}"], cwd=ctx.repo_dir,
+        ).strip()
+        head = run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir).strip()
+        parent = run_cmd(["git", "rev-parse", f"{sha}^"], cwd=ctx.repo_dir).strip()
+        if resolved != sha or head != sha or not parent:
+            raise RuntimeError("the unauthorized commit is no longer the exact HEAD")
+        branch_ref = run_cmd(
+            ["git", "symbolic-ref", "-q", "HEAD"], cwd=ctx.repo_dir,
+        ).strip()
+        if not branch_ref.startswith("refs/heads/"):
+            raise RuntimeError("HEAD is not attached to a local branch")
+        commands = [
+            "start",
+            f"update {ref_name} {sha}",
+            f"update {branch_ref} {parent} {sha}",
+        ]
+        tag_note = ""
+        tag_name = str(created_tag or "").strip()
+        target_oid = ""
+        if tag_name:
+            try:
+                target_commit = run_cmd(
+                    ["git", "rev-parse", f"refs/tags/{tag_name}^{{commit}}"], cwd=ctx.repo_dir,
+                ).strip()
+                target_oid = run_cmd(
+                    ["git", "rev-parse", f"refs/tags/{tag_name}"], cwd=ctx.repo_dir,
+                ).strip()
+            except Exception:
+                target_commit = target_oid = ""
+            if target_commit == sha and target_oid:
+                commands.append(f"delete refs/tags/{tag_name} {target_oid}")
+                tag_note = f"; deleted local tag {tag_name}"
+        commands.extend(("prepare", "commit"))
+        transaction_error = ""
+        for _attempt in range(2):
+            proc = subprocess.run(
+                ["git", "update-ref", "--stdin"],
+                cwd=ctx.repo_dir,
+                input="\n".join(commands) + "\n",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if proc.returncode == 0:
+                transaction_error = ""
+                break
+            transaction_error = proc.stderr.strip() or "git update-ref transaction failed"
+
+        # A ref transaction is atomic, so a failed transaction can be decomposed into
+        # individually verified CAS operations without risking a partial worktree reset.
+        if transaction_error:
+            zero_oid = "0" * 40
+            try:
+                current_orphan = run_cmd(
+                    ["git", "rev-parse", "--verify", ref_name], cwd=ctx.repo_dir,
+                ).strip()
+            except Exception:
+                current_orphan = ""
+            if current_orphan != sha:
+                fallback = subprocess.run(
+                    ["git", "update-ref", ref_name, sha, zero_oid],
+                    cwd=ctx.repo_dir, text=True, capture_output=True, check=False,
+                )
+                if fallback.returncode != 0:
+                    raise RuntimeError(
+                        fallback.stderr.strip() or f"could not create {ref_name}"
+                    )
+
+            current_branch = run_cmd(
+                ["git", "rev-parse", branch_ref], cwd=ctx.repo_dir,
+            ).strip()
+            if current_branch == sha:
+                fallback = subprocess.run(
+                    ["git", "update-ref", branch_ref, parent, sha],
+                    cwd=ctx.repo_dir, text=True, capture_output=True, check=False,
+                )
+                if fallback.returncode != 0:
+                    raise RuntimeError(
+                        fallback.stderr.strip() or f"could not reset {branch_ref}"
+                    )
+
+            if tag_name and target_oid:
+                try:
+                    current_tag_oid = run_cmd(
+                        ["git", "rev-parse", f"refs/tags/{tag_name}"], cwd=ctx.repo_dir,
+                    ).strip()
+                except Exception:
+                    current_tag_oid = ""
+                if current_tag_oid == target_oid:
+                    fallback = subprocess.run(
+                        ["git", "update-ref", "-d", f"refs/tags/{tag_name}", target_oid],
+                        cwd=ctx.repo_dir, text=True, capture_output=True, check=False,
+                    )
+                    if fallback.returncode != 0:
+                        raise RuntimeError(
+                            fallback.stderr.strip() or f"could not delete tag {tag_name}"
+                        )
+
+        final_orphan = run_cmd(
+            ["git", "rev-parse", "--verify", ref_name], cwd=ctx.repo_dir,
+        ).strip()
+        if final_orphan != sha:
+            raise RuntimeError("private orphan ref does not resolve to the unauthorized commit")
+        final_head = run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir).strip()
+        reachable = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", sha, branch_ref],
+            cwd=ctx.repo_dir, text=True, capture_output=True, check=False,
+        ).returncode == 0
+        if reachable:
+            raise RuntimeError("the unauthorized commit remains reachable from the active branch")
+        if tag_name:
+            try:
+                final_tag_target = run_cmd(
+                    ["git", "rev-parse", f"refs/tags/{tag_name}^{{commit}}"], cwd=ctx.repo_dir,
+                ).strip()
+            except Exception:
+                final_tag_target = ""
+            if final_tag_target == sha:
+                raise RuntimeError(f"tag {tag_name} still reaches the unauthorized commit")
+        branch_note = (
+            f"the active branch was reset to {parent[:12]}"
+            if final_head == parent
+            else f"a concurrent branch update to {final_head[:12]} was preserved"
+        )
+        return (
+            f"The commit remains at private local ref {ref_name}; {branch_note}{tag_note}. "
+            "The index and worktree were left untouched for lossless recovery."
+        )
+    except Exception as exc:
+        return (
+            "⚠️ EVOLUTION_ORPHAN_CONTAINMENT_FAILED: normal publication remains blocked, "
+            f"but the active ref could not be reset safely ({_sanitize_git_error(str(exc))})."
+        )
+
+
+def _record_evolution_commit_receipt(
+    ctx: ToolContext,
+    commit_message: str,
+    started_at: float,
+    claim: Dict[str, str],
+    commit_sha: str,
+    created_tag: str = "",
+) -> str:
+    """Record the exact reviewed SHA or leave it as an inspectable local orphan."""
+    from supervisor.evolution_lifecycle import record_evolution_commit
+
+    receipt = record_evolution_commit(**claim, commit_sha=commit_sha)
+    if receipt.get("ok"):
+        return ""
+    containment = _preserve_evolution_orphan(
+        ctx, commit_sha, created_tag=created_tag,
+    )
+    message = (
+        "⚠️ EVOLUTION_COMMIT_ORPHANED: Git created reviewed local commit "
+        f"{commit_sha}, but its exact campaign authority disappeared before the "
+        f"SHA receipt was recorded ({receipt.get('reason') or 'unknown'}). "
+        f"Nothing was pushed or scheduled for restart. {containment}"
+    )
+    _record_commit_attempt(
+        ctx,
+        commit_message,
+        "failed",
+        block_reason="evolution_authority",
+        block_details=message,
+        duration_sec=time.time() - started_at,
+        phase="post_commit_authority",
+        triad_models=getattr(ctx, "_last_triad_models", []),
+        scope_model=getattr(ctx, "_last_scope_model", ""),
+    )
+    return message
+
+
+def _evolution_publication_stopped_result(
+    ctx: ToolContext, commit_message: str, commit_sha: str, test_warning: str,
+    created_tag: str = "", started_at: float = 0.0,
+    fingerprints: Optional[tuple[Dict[str, Any], Dict[str, Any]]] = None,
+) -> str:
+    """Format a local-only result when the SHA receipt loses authority."""
+    if str(ctx.current_task_type or "") != "evolution":
+        return ""
+    _, authority = _evolution_commit_authority(ctx, commit_sha=commit_sha)
+    if authority.get("ok"):
+        return ""
+    ctx.last_push_succeeded = False
+    containment = _preserve_evolution_orphan(
+        ctx, commit_sha, created_tag=created_tag,
+    )
+    pre_fingerprint, post_fingerprint = fingerprints or ({}, {})
+    message = (
+        "⚠️ EVOLUTION_PUBLICATION_STOPPED: campaign authority changed after "
+        f"the local SHA receipt ({authority.get('reason') or 'unknown'}). Nothing "
+        f"was pushed and restart remains blocked. {containment}{test_warning}"
+    )
+    _record_commit_attempt(
+        ctx, commit_message, "failed",
+        block_reason="evolution_authority", block_details=message,
+        duration_sec=time.time() - started_at if started_at else 0.0,
+        phase="publication_authority", fingerprint_status="matched",
+        pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
+        post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
+        triad_models=getattr(ctx, "_last_triad_models", []),
+        scope_model=getattr(ctx, "_last_scope_model", ""),
+        triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+        scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
+        degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
+    )
+    return message
+
+
+def _publish_reviewed_commit(
+    ctx: ToolContext,
+    commit_message: str,
+    commit_sha: str,
+    tag_info: str,
+    test_warning: str,
+    paths: Optional[List[str]],
+    push_status: str,
+) -> str:
+    """Record push state and format the successful reviewed commit result."""
+    is_evolution = str(ctx.current_task_type or "") == "evolution"
+    ctx.last_push_succeeded = "[pushed:" in push_status
+    if is_evolution:
+        try:
+            from supervisor.evolution_lifecycle import update_evolution_transaction
+
+            update_evolution_transaction(
+                str(ctx.task_id or ""),
+                push_status="pushed" if ctx.last_push_succeeded else "skipped_or_failed",
+            )
+        except Exception:
+            log.debug("Failed to record evolution transaction push status", exc_info=True)
+    ci_note = _check_ci_status_after_push(ctx.repo_dir) if ctx.last_push_succeeded else ""
+    result = _format_commit_result(ctx, commit_message, push_status + tag_info, test_warning)
+    if is_evolution:
+        result += (
+            "\n\nEvolution transaction open: this cycle should contain at most one reviewed commit. "
+            "If this commit is the intended change, call request_restart once now and then stop."
+        )
+    if paths is not None:
+        try:
+            untracked = run_cmd(["git", "ls-files", "--others", "--exclude-standard"], cwd=ctx.repo_dir)
+            if untracked.strip():
+                files = ", ".join(untracked.strip().split("\n"))
+                result += f"\n⚠️ WARNING: untracked files remain: {files}"
+        except Exception:
+            pass
+    return result + ci_note
+
+
 def _repo_commit_push(ctx: ToolContext, commit_message: str,
                        paths: Optional[List[str]] = None,
                        skip_tests: bool = False,
@@ -1662,8 +1990,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
     # reviewed 2-parent merge (native MERGE_HEAD), with push/tag suppressed + an inline
     # pre-restart smoke. Any OTHER task is blocked from committing while the tx is active.
     from supervisor.update_merge import managed_assisted_tx_for
-
-    _managed_tx, _managed_block = managed_assisted_tx_for(getattr(ctx, "task_id", ""))
+    _managed_tx, _managed_block = managed_assisted_tx_for(getattr(ctx, "task_id", ""), getattr(ctx, "task_metadata", None))
     if _managed_block:
         _record_commit_attempt(ctx, commit_message, "blocked",
                                block_reason="managed_update_in_progress", block_details=_managed_block,
@@ -1716,6 +2043,11 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
         )
         if preparation_error:
             return _fail(preparation_error)
+        evolution_claim: Dict[str, str] = {}
+        if str(ctx.current_task_type or "") == "evolution":
+            evolution_claim, authority_error = _check_evolution_commit_stage(ctx, commit_message, _commit_start, phase="pre_review_authority")
+            if authority_error:
+                return authority_error
         outcome = _run_reviewed_stage_cycle(
             ctx,
             commit_message,
@@ -1744,11 +2076,16 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
         pre_fingerprint = outcome.get("pre_fingerprint", {}) or {}
         post_fingerprint = outcome.get("post_fingerprint", {}) or {}
 
+        if evolution_claim:
+            _, authority_error = _check_evolution_commit_stage(ctx, commit_message, _commit_start, phase="pre_commit_authority")
+            if authority_error:
+                return authority_error
+
         if _managed_tx:
             # PRIMARY conflict-marker leakage gate (a `git add`-ed marker file is a resolved
             # entry that --diff-filter=U misses), then mark the crash-window phase before the
             # native 2-parent commit (MERGE_HEAD is still set, so `git commit` records both
-            # parents — local_snapshot + target).
+            # parents — reviewed pre_update_sha + target).
             from supervisor.update_merge import managed_assisted_marker_check, write_update_tx
 
             _mok, _merr = managed_assisted_marker_check()
@@ -1763,6 +2100,9 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             commit_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir).strip()
         except Exception as e:
             err_msg = f"⚠️ GIT_ERROR (commit): {_sanitize_git_error(str(e))}"
+            if _managed_tx:
+                from supervisor.update_merge import restore_assisted_resolution_after_commit_error
+                restore_assisted_resolution_after_commit_error(_managed_tx)
             _record_commit_attempt(ctx, commit_message, "failed",
                                    block_reason="infra_failure", block_details=err_msg,
                                    duration_sec=time.time() - _commit_start,
@@ -1785,36 +2125,40 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                 "was NOT tagged or pushed; inspect the repository and re-run review on a "
                 f"new exact tree. Detail: {binding_detail}"
             )
-            _record_binding_mismatch(ctx, commit_message, binding_msg,
-                                     reason="review_binding_mismatch", phase="commit_binding",
-                                     pre_fingerprint=pre_fingerprint,
-                                     post_fingerprint=post_fingerprint, started_at=_commit_start)
-            return (_managed_update_gate_rollback(binding_msg, "commit_binding")
-                    if _managed_tx else binding_msg)
-        # BEFORE the tag: a tag is immutable, so one created for a revision the gate then
-        # rejects cannot be moved onto the corrected commit that reuses the version.
-        gate_block = _post_commit_gate_block(ctx, commit_message, skip_tests,
-                                             test_warning_ref, _commit_start,
-                                             pre_fingerprint, post_fingerprint)
-        if gate_block:
-            # A managed update is mid-transaction here (`committing_assisted`, written above),
-            # and this return skips the postcommit step that would otherwise finalize or roll it
-            # back. Route the red gate into the same failure cleanup instead of leaving the tx
-            # parked in a phase boot recovery reads as an interrupted commit.
-            return (_managed_update_gate_rollback(gate_block, "post_commit_gate")
-                    if _managed_tx else gate_block)
+            if evolution_claim:
+                binding_msg += " " + _preserve_evolution_orphan(ctx, commit_sha)
+            return _review_binding_failure(
+                ctx, commit_message, _commit_start, binding_msg,
+                binding_kind="commit",
+                fingerprints=(pre_fingerprint, post_fingerprint),
+                managed_tx=_managed_tx,
+            )
         reviewed_binding = post_fingerprint.get("binding", {}) or {}
+        gate_failure = _managed_post_commit_tests_gate(
+            ctx, commit_message, _commit_start, skip_tests, test_warning_ref, _managed_tx,
+            fingerprints=(pre_fingerprint, post_fingerprint),
+        )
+        if gate_failure:
+            return gate_failure
         # A managed-update merge commit must NOT auto-tag/auto-push pre-restart (an un-smoked
         # update would otherwise reach origin / create a version tag, and a later rollback would
         # diverge from origin). The official version tag is handled on the owner's terms.
         tag_info = ""
+        created_tag = ""
         if not _managed_tx:
+            if evolution_claim:
+                _, authority_error = _check_evolution_commit_stage(ctx, commit_message, _commit_start, phase="pre_tag_authority", commit_sha=commit_sha)
+                if authority_error:
+                    containment = _preserve_evolution_orphan(ctx, commit_sha)
+                    return f"{authority_error}\n\n{containment}"
+            reviewed_tag = str(reviewed_binding.get("expected_tag") or "")
             tag_info = _auto_tag_on_version_bump(
                 pathlib.Path(ctx.repo_dir),
                 commit_message,
                 expected_commit_sha=commit_sha,
-                expected_tag=str(reviewed_binding.get("expected_tag") or ""),
+                expected_tag=reviewed_tag,
             )
+            created_tag = reviewed_tag if tag_info == f" [tagged: {reviewed_tag}]" else ""
         binding_ok, binding_detail = _verify_reviewed_commit_binding(
             pathlib.Path(ctx.repo_dir),
             commit_sha,
@@ -1827,12 +2171,37 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                 "release-tag verification failed. Nothing was pushed; immutable tags are "
                 f"never retargeted. Detail: {binding_detail}"
             )
-            _record_binding_mismatch(ctx, commit_message, binding_msg,
-                                     reason="review_tag_binding_mismatch", phase="tag_binding",
-                                     pre_fingerprint=pre_fingerprint,
-                                     post_fingerprint=post_fingerprint, started_at=_commit_start)
-            return (_managed_update_gate_rollback(binding_msg, "tag_binding")
-                    if _managed_tx else binding_msg)
+            if evolution_claim:
+                binding_msg += " " + _preserve_evolution_orphan(
+                    ctx, commit_sha, created_tag=created_tag,
+                )
+            return _review_binding_failure(
+                ctx, commit_message, _commit_start, binding_msg,
+                binding_kind="tag",
+                fingerprints=(pre_fingerprint, post_fingerprint),
+                managed_tx=_managed_tx,
+            )
+        if evolution_claim:
+            receipt_error = _record_evolution_commit_receipt(
+                ctx, commit_message, _commit_start, evolution_claim, commit_sha,
+                created_tag=created_tag,
+            )
+            if receipt_error:
+                return receipt_error
+        if not _managed_tx:
+            # Ordinary self-modification contract: post-commit tests are reported
+            # as a warning. Managed-update merges already ran them as the BLOCKING
+            # assisted_post_commit_tests gate right after the commit above.
+            _post_commit_result(ctx, commit_message, skip_tests, test_warning_ref)
+        push_status = ""
+        if not _managed_tx and evolution_claim:
+            publication_error = _evolution_publication_stopped_result(
+                ctx, commit_message, commit_sha, test_warning_ref[0],
+                created_tag=created_tag, started_at=_commit_start, fingerprints=(pre_fingerprint, post_fingerprint),
+            )
+            if publication_error:
+                return publication_error
+            push_status = _auto_push(ctx.repo_dir)
         ctx.last_reviewed_commit_sha = commit_sha
         if attribution_binding is not None:
             # The task's own commit moved HEAD: open the next attributed-staging
@@ -1847,23 +2216,18 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                 )
             except Exception:
                 log.warning("mutation baseline advance failed after commit", exc_info=True)
-        if str(ctx.current_task_type or "") == "evolution":
-            try:
-                from supervisor.evolution_lifecycle import update_evolution_transaction
-
-                update_evolution_transaction(
-                    str(ctx.task_id or ""),
-                    preflight_status="passed",
-                    advisory_status="fresh_or_bypassed",
-                    triad_scope_status="passed",
-                    commit_sha=commit_sha,
-                    restart_required=True,
-                    restart_verified=False,
-                )
-            except Exception:
-                log.debug("Failed to record evolution transaction commit", exc_info=True)
-        _record_commit_success(ctx, commit_message, _commit_start,
-                               pre_fingerprint, post_fingerprint)
+        _record_commit_attempt(ctx, commit_message, "succeeded",
+                               duration_sec=time.time() - _commit_start,
+                               phase="commit",
+                               pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
+                               post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
+                               fingerprint_status="matched",
+                               triad_models=getattr(ctx, "_last_triad_models", []),
+                               scope_model=getattr(ctx, "_last_scope_model", ""),
+                               triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+                               scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
+                               degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
+        ctx._scope_review_history = {}  # Clear on success — next commit starts fresh
     finally:
         _release_git_lock(lock)
     if _managed_tx:
@@ -1881,36 +2245,11 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                                    duration_sec=time.time() - _commit_start)
             return _msg_pc
         return _format_commit_result(ctx, commit_message, "", test_warning_ref[0]) + "\n\n" + _msg_pc
-    push_status = _auto_push(ctx.repo_dir)
-    ctx.last_push_succeeded = "[pushed:" in push_status
-    if str(ctx.current_task_type or "") == "evolution":
-        try:
-            from supervisor.evolution_lifecycle import update_evolution_transaction
-
-            update_evolution_transaction(
-                str(ctx.task_id or ""),
-                push_status="pushed" if ctx.last_push_succeeded else "skipped_or_failed",
-            )
-        except Exception:
-            log.debug("Failed to record evolution transaction push status", exc_info=True)
-    ci_note = ""
-    if ctx.last_push_succeeded:
-        ci_note = _check_ci_status_after_push(ctx.repo_dir)
-    result = _format_commit_result(ctx, commit_message, push_status + tag_info, test_warning_ref[0])
-    if str(ctx.current_task_type or "") == "evolution":
-        result += (
-            "\n\nEvolution transaction open: this cycle should contain at most one reviewed commit. "
-            "If this commit is the intended change, call request_restart once now and then stop."
-        )
-    if paths is not None:
-        try:
-            untracked = run_cmd(["git", "ls-files", "--others", "--exclude-standard"], cwd=ctx.repo_dir)
-            if untracked.strip():
-                files = ", ".join(untracked.strip().split("\n"))
-                result += f"\n⚠️ WARNING: untracked files remain: {files}"
-        except Exception:
-            pass
-    return result + ci_note
+    if not evolution_claim:
+        push_status = _auto_push(ctx.repo_dir)
+    return _publish_reviewed_commit(
+        ctx, commit_message, commit_sha, tag_info, test_warning_ref[0], paths, push_status,
+    )
 
 
 def _limit_git_output(text: str, max_chars: int = 0) -> str:
