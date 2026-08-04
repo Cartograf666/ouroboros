@@ -542,9 +542,13 @@ def test_rollback_disarms_replay_before_touching_dirty_tree(tmp_path, monkeypatc
     assert (repo / "a.txt").read_text() == "keep me\n"
     assert update_merge.read_update_tx()["phase"] == "rolling_back"
     detail = "rollback evidence " * 200
-    update_merge.mark_update_tx_gate_blocked("test", detail)
+    assert update_merge.mark_update_tx_gate_blocked("test", detail) is True
     blocked = update_merge.read_update_tx()
-    assert blocked["phase"] == "rolling_back"
+    # The pre-gate phase is taken OFF the marker (a refused merge left in its
+    # original phase reads as an interrupted step and gets resumed/promoted);
+    # boot's gate_blocked branch retries the rollback, so recovery is preserved.
+    assert blocked["phase"] == update_merge.GATE_BLOCKED_PHASE
+    assert blocked["gate_blocked_from_phase"] == "rolling_back"
     assert blocked["gate_blocked_detail"] == detail
 
     monkeypatch.setattr(git_ops, "_clear_update_intent", lambda: True)

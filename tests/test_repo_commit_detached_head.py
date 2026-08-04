@@ -51,7 +51,7 @@ def _drive_commit(tmp_path: pathlib.Path, head_branch: str):
          patch.object(git_module, "_acquire_git_lock", return_value=None), \
          patch.object(git_module, "_release_git_lock"), \
          patch.object(git_module, "_record_commit_attempt"), \
-         patch.object(git_module, "_post_commit_result"), \
+         patch.object(git_module, "_post_commit_result", return_value=None), \
          patch.object(git_module, "_auto_tag_on_version_bump", return_value=""), \
          patch.object(git_module, "_auto_push", return_value="ok"):
         try:

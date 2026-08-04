@@ -1636,7 +1636,7 @@ def get_tools() -> list:
                         "goal": _schema_param("string", "High-level goal of this change. Used to judge completeness."),
                         "scope": _schema_param("string", "Declared scope boundary. Issues outside scope are advisory-only."),
                         "paths": _schema_param("array", "Explicit list of changed file paths. Auto-detected from git status if omitted.", items={"type": "string"}),
-                        "skip_tests": _schema_param("boolean", "Skip the pre-advisory pytest run. Default: False (tests run by default). Use True only for intentionally incomplete WIP code where test failures are expected. Tests are run via 'pytest tests/ -q' before the SDK call to catch broken code early and avoid wasting advisory budget.", default=False),
+                        "skip_tests": _schema_param("boolean", "Skip the pre-advisory pytest run. Default: False (tests run by default). Use True only for intentionally incomplete WIP code where test failures are expected. Tests are run before the SDK call — in a hermetic worktree, as the same two passes CI runs (parallel 'not serial' then serial) — to catch broken code early and avoid wasting advisory budget.", default=False),
                     },
                     "required": ["commit_message"],
                 },

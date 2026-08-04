@@ -1760,9 +1760,316 @@ that:
   order; and if you must mutate a module global, reset it around the test (pattern:
   `tests/conftest.py::_isolate_workspace_executor_globals`).
 
-The per-commit preflight GATE stays **serial** regardless — never add `-n` to `pyproject.toml`
-`addopts` or to `ouroboros/preflight_runner.py` (a flaky parallel fail-closed gate manufactures
-non-deterministic `TESTS_FAILED` indistinguishable from a real immune rejection).
+### The commit gate mirrors the CI split (v6.89.0)
+
+`ouroboros/preflight_runner.py::run_hermetic_pytest` no longer runs one serial pass. It runs
+**the same two passes CI runs**, in the SAME disposable worktree and the same scrubbed env:
+
+| Pass | markexpr | extra flags |
+|------|----------|-------------|
+| 1 `parallel` | `not serial and <LANE_EXCLUSION_EXPR>` | `-n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread` |
+| 2 `serial`   | `serial and <LANE_EXCLUSION_EXPR>`     | none (flag-free, exactly like CI) |
+
+> **Provisioning prerequisite — read this before pulling v6.89.0.** Until v6.88.0 the gate ran a
+> plain serial pytest, so `pytest-xdist` was a CI-only dependency and a machine without it worked
+> fine. From v6.89.0 the gate spawns pytest under the interpreter at `OUROBOROS_AGENT_PYTHON` (or
+> `sys.executable`), and that interpreter MUST carry `pytest-xdist>=3.5` and `pytest-timeout>=2.1`.
+> If it does not, the gate fails closed: **every** commit returns `PREFLIGHT_PLUGIN_MISSING` instead
+> of running the suite. That is the designed behaviour — a degraded gate is indistinguishable from a
+> passing one — but it means provisioning is a hard prerequisite, not a nicety. Install with
+> `"$OUROBOROS_AGENT_PYTHON" -m pip install -r requirements.txt`, or set
+> `OUROBOROS_PREFLIGHT_SERIAL=1` to fall back to the legacy single serial pass while you do.
+>
+> The same prerequisite reaches `tests/test_preflight_runner.py`, whose real-spawn tests run a
+> NESTED pytest under `sys.executable`. It probes the interpreter once at import through the gate's
+> own `_verify_preflight_plugins` and, if the plugins are absent, **skips only those tests** with a
+> reason naming what to install — the fail-closed behaviour itself is pinned by hermetic and stubbed
+> tests that never skip. Skips there mean "this interpreter cannot host a real pass", not "the
+> property is unpinned"; CI installs both plugins, so that lane executes on every push.
+>
+> **Set `OUROBOROS_PREFLIGHT_REQUIRE_PLUGINS=1` whenever you are treating a run as evidence.**
+> The skip is otherwise able to conceal itself: `requires_preflight_plugins` is keyed on the probe
+> result, so a control test carrying that same marker skipped in exactly the case its assertion was
+> written to catch, and an unprovisioned interpreter produced a fast, clean-looking run in which the
+> only behavioural proofs of the forced-plugin and worker-probe machinery
+> (`test_the_parallel_pass_really_starts_more_than_one_worker`,
+> `test_a_candidate_cannot_switch_the_parallel_plugins_off`,
+> `test_a_candidate_faking_the_parallel_flags_cannot_earn_a_green_pass`,
+> `test_a_green_pass_cannot_leak_a_child_into_the_next_pass`) never executed. With the flag set,
+> `test_plugin_verification_passes_on_the_interpreter_running_this_suite` hard-fails and names the
+> missing distributions. `quick-test` and `full-test` set it at job level, and a review/repair gate
+> command that is meant to prove this file should export it too.
+
+Rules that keep this a fail-closed gate rather than a flake generator:
+
+- **`LANE_EXCLUSION_EXPR` is the SSOT** for the costly marker lanes. A command-line `-m`
+  **replaces** the `pyproject.toml` `addopts` `-m` entirely, so every pass restates the full
+  conjunction. `test_lane_expr_matches_pyproject` pins it against `pyproject.toml`, and
+  `test_each_ci_job_runs_the_same_split_the_gate_runs` pins BOTH markexprs and the exact
+  `PARALLEL_PASS_FLAGS` vector against `quick-test` and `full-test` **separately** — a search of the
+  whole workflow file stays green while either job alone drifts, and drift there silently re-admits
+  an excluded lane into the gate.
+- **The parallel lane must really be parallel.** `-n auto` resolves through
+  `PYTEST_XDIST_AUTO_NUM_WORKERS`, so an inherited `1` runs the whole pass on one worker while the
+  argv still reads `-n`, `PreflightPass.parallel` stays True, and the green return proves nothing
+  about the parallel-only defects the pass exists to catch. `_preflight_env` therefore scrubs the
+  **entire `PYTEST_*` namespace** — wholesale, not by name, because `PYTEST_ADDOPTS` (`-p no:xdist`,
+  its own `-m`), `PYTEST_PLUGINS`, `PYTEST_DISABLE_PLUGIN_AUTOLOAD` and the leaked
+  `PYTEST_XDIST_WORKER`/`PYTEST_CURRENT_TEST` identities all weaken the pass the same way — and
+  re-injects a worker count clamped to at least two. `OUROBOROS_PREFLIGHT_TEST_WORKERS` is a private
+  test-only seam that can only lower the count TO that floor, and it is itself scrubbed before the
+  candidate runs.
+- **Plugin presence is verified independently of the candidate.** A candidate `conftest.py` can
+  declare `-n`/`--dist`/`--timeout` with `pytest_addoption` and ignore them, so with xdist absent the
+  nominal parallel lane runs serially, exits 0, and returns GREEN — "pytest did not reject the flags"
+  is not evidence. `_verify_preflight_plugins` imports and version-checks xdist and pytest-timeout
+  with the selected interpreter, from the disposable temp root **before the worktree is created**, so
+  no candidate conftest, `sitecustomize`, or plugin can run before the answer is known. The strict
+  probe uses `-I`; because `-I` also drops `PYTHONPATH` and the user site directory (neither of which
+  is candidate-controlled), a strict miss is re-confirmed without them rather than hard-blocking a
+  legitimate `pip install --user`.
+- **A candidate that deletes the whole suite is a hard block.** Git does not track empty directories,
+  so staging the removal of every test file removes `tests/` with them; the live-path check then
+  returned success before the worktree existed, and the all-passes-empty invariant — reachable only
+  *through* the passes — never ran. `_head_tracks_tests` separates "this repository has no suite"
+  (out of scope) from "this change deleted the gate" (blocked) against the caller's **phase
+  baseline**, because the two entry points see different repository states and neither baseline is
+  right for both. The review preflight runs pre-commit (deletion merely staged, `HEAD` still carries
+  the suite) and passes `phase=PRE_COMMIT_PHASE`, so it compares **`HEAD` only** — an `any()` over
+  `HEAD~1` too rejected the first unrelated staged change after a deliberate removal commit, and that
+  horizon expires only once the next commit exists, i.e. after the pre-commit gate has already
+  refused to let it be made. The commit gate runs POST-commit — `_post_commit_result` is reached only
+  once `commit_sha` exists, which is why its failure text says the commit "was already created and
+  preserved" — so by then the deletion is *in* `HEAD`, a HEAD-only baseline answered "this repository
+  has no test suite", and the block was unreachable from the entry point that most needed it; that
+  phase therefore compares **`HEAD` and `HEAD~1`**. Exactly one commit back, so a project that
+  genuinely dropped its tests is back out of scope on its next commit rather than blocked forever.
+- **A red post-commit gate stops publication, not just the result text.** `_post_commit_result`
+  returns the blocking error instead of only stashing a warning, and `_repo_commit_push` returns it
+  before `_auto_push` — otherwise every hard block above (missing plugin, lost parallelism, crashed
+  worker, deleted suite, failed containment) was pushed to origin behind an `OK:` result. The commit
+  itself stays preserved; an auto-created version tag stays local. **A managed update is the one
+  case where returning the block alone is not enough**: its transaction is written as
+  `committing_assisted` *before* the 2-parent merge commit, and that phase means "died mid-commit",
+  so boot recovery would promote the rejected merge to `pending_boot_smoke` and finalize it without
+  ever rerunning the gate. `_repo_commit_push` therefore routes a red gate inside a managed tx into
+  `rollback_managed_update` — the rejected merge is preserved on a `failed-update-*` branch, the
+  tree is reset to `pre_update_sha`, and the tx marker is cleared so nothing can promote it. That
+  forensics ref is written first but is deliberately BEST-EFFORT: getting the machine back onto a
+  working revision is this function's actual job, and every caller except this gate (the post-boot
+  smoke rollback, the gateway control paths) ignores the returned boolean and relies on the reset
+  having happened. Aborting because a branch name could not be written — a ref/directory collision,
+  a read-only refs dir — left the box running the bad update *and* returned before
+  `_finalize_pending_boot_smoke` persisted `boot_attempts`, so the next boot repeated the same
+  failing attempt forever. The lost ref is logged and named in the returned message instead.
+  The gate is not the only return that reaches that state: BOTH `_verify_reviewed_commit_binding`
+  mismatches (`review_binding_mismatch`, `review_tag_binding_mismatch`) abandon the commit after
+  the same `committing_assisted` write, so all three route through the shared managed-failure
+  helpers (`_review_binding_failure` / `_managed_post_commit_tests_gate` →
+  `_managed_commit_gate_failure`). And because *clearing the marker is the last thing the rollback
+  does*, a rollback that FAILS leaves the exact phase it was called to escape — so every
+  unsuccessful rollback re-phases the tx to `gate_blocked` (`mark_update_tx_gate_blocked`), whose
+  boot branch in `finalize_managed_update_on_boot` RETRIES the rollback rather than resuming or
+  promoting the refused merge. "Unsuccessful" includes RAISED, and the re-phase runs in its own
+  `try` for exactly that reason: the rollback executes several git commands before it clears the
+  marker, so an exception halfway through is the case that most needs pinning, and an attempt
+  nested inside the rollback's own `try` would be the one case that skipped it. The returned text
+  reports what actually happened — it claims the tx is pinned only when that write returned true,
+  and otherwise says the marker could not be re-phased and must be cleared before the next boot.
+- **A detected leak is itself a hard block.** `_execute_pytest_pass` returns
+  `(returncode, output, containment_error)` and reaps *before* returning, because a `finally:` block
+  cannot alter an already-computed tuple — a scan whose verdict no caller can see is exactly the
+  fail-open the container exists to close. A non-empty reason (a member still alive after the
+  best-effort sweep, a member whose environment could not be read, a process table that would not
+  enumerate, a Windows Job Object that could not be created or whose termination could not be
+  confirmed) blocks the pass ahead of its exit code, green included, as
+  `PREFLIGHT_CONTAINMENT_FAILED` naming the leaked pids and the mark-it-`@pytest.mark.serial`
+  remediation.
+- **A crashed xdist worker is an explicit hard block, never a retry.** `_classify_pass_result`
+  recognises xdist's own controller phrasing (`crashed while running`, `node down:`,
+  `worker gwN crashed …`, `replacing crashed worker`, `maximum crashed workers reached`) and returns
+  `PARALLEL_WORKER_CRASH` naming the mark-it-`@pytest.mark.serial` remediation. This is
+  what removes the old objection that a parallel gate manufactures `TESTS_FAILED`
+  indistinguishable from a real rejection: a crash now has its own name. Both error directions
+  are bounded, and they are not symmetric: a **miss** degrades only the label (the nonzero exit
+  still blocks), while a **false positive** would be lossy — so the matched lines are only ever a
+  highlighted PREFIX in front of the full pytest output, never a replacement for it. Each pattern
+  matches a COMPLETE controller line shape (the phrase together with the `gwN` id or the numeric
+  operand xdist always prints) after terminal decoration is stripped, never a free substring: bare
+  `node down:`, `crashed while running`, `replacing crashed worker` and `maximum crashed workers
+  reached` all occur in ordinary assertion text and captured logs of tests that reason about worker
+  pools. Every pattern IS `^`-anchored to the stripped line; the `-q` short-summary re-emission
+  (`handle_crashitem` reports the crash as a TestReport longrepr) is matched by its own anchored
+  `FAILED/ERROR`-prefixed pattern rather than by unanchoring the phrase.
+- **A worker killed by the per-test timeout gets the OPPOSITE remediation.** `--timeout-method=thread`
+  does not fail the slow test; it dumps stacks and `os._exit`s the worker, which reaches the
+  controller wearing exactly the crash phrasing above. So `_crash_remediation` first looks for
+  pytest-timeout's own banner (`+++ Timeout +++`, or — for the signal method — `Timeout >300.0s`
+  only as pytest's own `Failed:` exception line, because the bare phrase is ordinary text a test can
+  print or assert on and matching it against the whole pass output would INVERT the remediation for a
+  genuine crash running alongside such a test) and, when it is present, says *make the test faster or
+  split it* and explicitly says **not** to mark it
+  `@pytest.mark.serial`. That matters because pass 2 is flag-free: it carries no per-test timeout,
+  so obeying the generic instruction would relocate the hang into the only pass that cannot bound
+  it, where it eats the whole remaining total budget and returns as a pass-2 timeout — the exact
+  failure `--timeout=300` was added to prevent. The label and the hard block are identical either
+  way; only the instruction line changes.
+- **A missing plugin fails closed, never degrades to serial.** Either the pre-run interpreter
+  verification above, or pytest exit 4 whose `unrecognized arguments:` list contains a WHOLE token
+  from `PARALLEL_PASS_FLAGS`, becomes `PREFLIGHT_PLUGIN_MISSING` naming the interpreter.
+  `requirements.txt` declares `pytest-xdist>=3.5` and `pytest-timeout>=2.1` — declaring them is not
+  installing them, so a provisioning miss surfaces here rather than as a quietly weaker gate.
+- **Installed is not loaded, so the parallel pass forces the plugins ON and then PROVES it ran
+  parallel.** Ini `addopts` are PREPENDED to the gate's argv, so a candidate `pytest.ini` with
+  `-p no:xdist -p no:timeout` (plus a `conftest.py` that declares and ignores `-n`/`--dist`/
+  `--timeout`) yields a lane labelled parallel that runs strictly serially and exits 0. The pass
+  appends `-p xdist -p timeout`; `consider_preparse` walks `-p` entries in order, so the later
+  unblock wins. Use the ENTRY-POINT names, never module paths: pytest skips an entry point whose
+  name is already registered, whereas `-p xdist.plugin` registers the same module under a second
+  name and pluggy raises `Plugin already registered`, failing runs that were green. The proof is
+  independent of anything the candidate can print — the gate writes its own tiny plugin onto the
+  run's `PYTHONPATH`, loads it with `-p`, and each xdist worker drops a file named for its
+  `PYTEST_XDIST_WORKER` id; a GREEN pass reporting fewer than `_MIN_PREFLIGHT_WORKERS` distinct
+  workers is `PREFLIGHT_PARALLELISM_LOST`, a hard block whose remediation is
+  `OUROBOROS_PREFLIGHT_SERIAL=1` if a serial run is what you actually want. This closes the silent
+  downgrade, not active forgery of the worker files. The check keys on the probe being present in
+  the argv (NOT on `PreflightPass.parallel`), because an explicit caller `pytest_args` carrying its
+  own `-n` is forwarded verbatim, never gets the probe, and must not be blocked for evidence the
+  gate never asked for.
+- **Both hard-block labels are gated on `PreflightPass.parallel`**, read off the argv rather than
+  the label. A pass that never handed the run to xdist has no worker to crash and no xdist plugin
+  to miss, so firing either label there attaches a remediation that is wrong by construction:
+  telling a test already in the serial lane to mark itself `serial`, or blaming pytest-xdist for an
+  unrelated usage error. Matching is whole-token for the same reason — `-n` is a substring of
+  `--no-header`, which `DEFAULT_PYTEST_ARGS` passes on EVERY invocation. This is a message-quality
+  rule, not a verdict rule: a nonzero exit blocks either way.
+- **A diagnosis puts its remediation ahead of the pytest body.** `review_helpers` re-truncates the
+  returned string from the TAIL at the same 8000-char limit, so a remediation printed after a
+  full-budget body is the first thing lost — exactly when the output is long enough to need it.
+  `_diagnosis` also reserves the header/remediation length out of the body budget, so the result
+  stays inside the caller's declared limit instead of overrunning it — unconditionally, including
+  when the limit is too small to hold the prefix itself. `_with_timeout_excerpt` obeys the same
+  invariant without exception: when the message alone already fills the budget it is cut rather than
+  returned whole, because a declared limit that holds on some branches and not others is not a limit.
+- **The exit code decides the verdict; the rendered text only decides how it reads.** Because
+  `_diagnosis` renders *inside* the caller's budget, a non-positive `max_output` produced an empty
+  string for a real failure — and an empty diagnosis read as "no failure", turning a red pass into a
+  green gate. A non-positive budget is now rejected before anything runs, and the pass loop blocks on
+  the nonzero exit itself with a plain header as the fallback text.
+- **Process containment is unconditional, not a timeout path.** `communicate()` returning proves only
+  that the pytest CONTROLLER exited; a child a test spawned and never waited on survives it, and once
+  the controller is gone that child is invisible to both the `pgrep -P` parent→child walk (the ppid
+  links died with the parent) and the temp-root command-line sweep (its argv names no sweepable
+  path). `process_containment.ProcessContainer` *spawns* pytest (`container.spawn`, not `Popen` + `adopt`)
+  and is reaped in `finally` after EVERY pass, green included, which is what actually keeps pass 1
+  out of pass 2 and off the machine. Spawning through the container is what closes the Windows
+  assignment race: a Job Object holds only what has been assigned to it, so anything the process
+  starts between `Popen` returning and the assignment is not a member and survives terminate/close —
+  the process is therefore created `CREATE_SUSPENDED` and resumed only once it is in the job, the
+  same sequence `launcher.py` uses for the agent server, through the same
+  `create_kill_on_close_job`/`assign_pid_to_job`/`terminate_job`/`close_job` helpers.
+  **The POSIX contract is DETECTION, not guaranteed teardown**, and that distinction is the design
+  rather than a caveat. Guaranteed teardown of a detached foreign process is not something POSIX
+  offers: a pid is a reusable name, membership is not kernel-held, and a signal can be refused
+  (`EPERM`) or land on a recycled stranger — so every earlier attempt to promise reaping produced
+  another PID-reuse edge instead of a guarantee. What `reap` can do honestly is LOOK. Membership is
+  a unique **token planted in the root's environment**: the kernel copies the environment into every
+  child at `fork` and preserves it across `exec`, and neither `setsid()`, nor closing every
+  inherited descriptor, nor being reparented to init removes it, so `reap` resolves members from
+  live kernel state (`pids_with_env_marker`, reading `/proc/<pid>/environ` on Linux and `ps -E`
+  elsewhere) at the moment it runs — seeded with the pid `spawn` started, which is a member by
+  construction and therefore the one member that does not have to be readable to be known.
+  The token is claimed by READING the process, though, which leaves it two blind spots: a member
+  that turns nondumpable or changes credentials before the FIRST scan is in no list at all (the
+  seed only names the root, and "once seen, always watched" only holds pids it managed to see
+  once), and a child spawned with a wholly REPLACED environment — an ordinary `Popen(env={...})`
+  in a test — never carried the token to begin with. The root's **process group** covers both,
+  because it is kernel-held and readable from outside no matter what the process did to its own
+  environment or credentials. It is an ENUMERATION and CLASSIFICATION input **only**: a pid found
+  by group alone is reported as alive and is never signalled. That asymmetry is the whole licence
+  for reintroducing the group after PID-reuse bugs got it removed — reading a stale pgid can only
+  ever ADD a pid to the leak report, costing a false BLOCK an operator can clear, whereas
+  signalling one kills a bystander and no rescan undoes that. `spawn` also takes the group only
+  when `start_new_session` made the root its own LEADER (`pgid == pid`); any other pgid is a group
+  we did not create, and enumerating it would report the caller's own neighbours as leaks. It then
+  attempts **ONE** bounded best-effort kill sweep — each signal aimed at a pid revalidated as a
+  member microseconds earlier, with no lookup in between, so a recycled pid is never the target —
+  and everything after the sweep is scan-only. A member is thus signalled at most once instead of
+  re-signalled every 50ms for ten seconds: the revalidate-then-signal race cannot be closed, only
+  entered as few times as possible, and a member that survived the first `SIGKILL` is one we cannot
+  kill, so the block is already earned. Any member still alive, or any member whose liveness could
+  not be DETERMINED, is returned as a failure naming the pids, and the gate hard-
+  blocks. Cannot-determine is treated exactly as leaked: `pid_marker_state` is tri-state
+  (`member` / `absent` / `unreadable`), because folding a `PermissionError` on a member's `environ`
+  into "not a member" is how a live descendant leaves containment without exiting. Correctness
+  therefore rests on the scan being honest and never on the kill having worked, which is why there
+  is no `killpg` in the reap path at all — an emptied pgid is free for reuse, and signalling one
+  from a snapshot is how a bystander gets SIGKILLed. When the deadline expires the report is built
+  from the last NON-EMPTY scan rather than the current one, because the remediation tells the
+  operator to kill the pids listed and a scan that happens to come back empty as the clock runs out
+  would list none. Note the environmental prerequisite this
+  places on POSIX systems **without** `/proc` (macOS, the BSDs): membership is read with `ps -E
+  -ww`, and `ps` reports a process whose environment it may not print by simply *omitting* the
+  environment — output identical to a process that never carried the token. That branch therefore
+  fails closed on BOTH readings: only a non-zero `ps -p` exit (no such process) answers `absent`,
+  while a pid that is alive and shows no token answers `unreadable` and blocks. The cost is that a
+  pid recycled during a reap blocks the gate; the benefit is that a member turning nondumpable
+  cannot leave quietly where there is no `/proc`. An image whose `ps` cannot run at all is the same
+  block. Linux needs no `ps` for containment; the kernel exposes everything through `/proc`.
+  This **replaced** a background `(pid, start_time)` poller, and the difference is a real leak, not
+  a tuning question. The poller could only fingerprint a descendant while its ppid link still
+  existed, so a child born AND orphaned between two 0.5s samples escaped both mechanisms — the
+  fastest and most ordinary daemonising shape — and no sampling rate closes that. Resolving
+  membership at reap time means there is no window to be born inside; the regression
+  (`test_process_container_kills_a_descendant_that_left_the_group`) therefore spawns and exits with
+  no sleep at all, where it previously had to sleep two seconds to accommodate the sampler.
+  The remaining limit is narrower than either signal alone: a descendant escapes only by scrubbing
+  its environment **and** calling `setsid()` to leave the group — two deliberate acts by code
+  running with our own privileges, not an ordinary leak. The token lives OUTSIDE the
+  `OUROBOROS_*` namespace `_preflight_env` scrubs, so a nested preflight's env keeps the outer
+  container's token and the tokens compose instead of overwriting.
+  Windows keeps its `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job Object, which is kernel-held membership
+  outright — the one platform where teardown really is enforced, but only when the API says so:
+  `terminate_job`/`close_job` return a reason instead of `None`, a FALSE Win32 BOOL counts as a
+  failure exactly like a raised call, and `reap` performs both (terminate, then close for the
+  kill-on-close backstop) so either failure reaches the verdict rather than the discarded handle.
+- **A timed-out pass reports what it had already flushed.** The post-kill `communicate` collects the
+  child's output; discarding it left the operator with "the serial pass timed out" and nothing naming
+  the test that hung — and pass 2 is exactly the pass with no per-test timeout to name it otherwise.
+  The excerpt keeps the TAIL and shares the same `max_output` budget.
+- **An explicitly EMPTY `pytest_args` maps to `DEFAULT_PYTEST_ARGS`, not to a literally empty argv.**
+  The two-pass default is reserved for `pytest_args is None` (silently upgrading an explicit argv
+  would run tests the caller never asked for under xdist requirements they never opted into), but an
+  empty sequence must keep the pre-two-pass runner's truthiness behaviour: forwarding no argv at all
+  changes the discovery target and drops the output flags.
+- **Exit 5 is green PER PASS, blocking only when EVERY pass is empty.** A tiny candidate repo with
+  zero `serial` tests must not be false-blocked; a `tests/` tree with no runnable test anywhere still is.
+- **One TOTAL budget** (900s, `OUROBOROS_PREFLIGHT_TIMEOUT_SEC`). Pass 2 gets exactly `total −
+  elapsed` as a float — never clamped up to a whole second and never rounded, or the gate would
+  outlive the total it advertises; an already-exhausted budget returns a pass-named error WITHOUT
+  spawning pass 2 at all. The header and the timeout message report each pass's OWN duration, so a
+  fast serial pass is never blamed for the wall-clock a slow parallel pass burned. CI's two-pass split completes the same
+  suite in ~178s against the ~466–510s of a single serial run, so the budget gains headroom rather
+  than losing it. That figure is CI-measured; reproduce it locally with a real
+  `run_hermetic_pytest` call before quoting it as a local number.
+- **Fail-fast**: the first red pass returns immediately with that single pass's output, so the
+  failing section can never be truncated away by merging a second pass into the same 8000-char budget.
+- **`OUROBOROS_PREFLIGHT_SERIAL=1`** forces the legacy single serial pass — an instant operator
+  rollback lever. The variable is scrubbed by `_preflight_env`, so the candidate suite cannot see it.
+
+Wall-clock shape: the serial lane is roughly 20% of the total, with a ~72–80s `loadscope` floor set
+by `tests/test_osworld_cu_bridge.py` (moving to `--dist load` is out of scope — it would break the
+per-file fixture locality the serial split assumes).
+
+**Pre-switch audit (v6.89.0):** four consecutive full-suite runs under the two-pass split were
+byte-identical to the serial baseline with zero worker crashes. Ongoing protection is (a) the static
+serial-candidate checklist below and (b) the in-gate crash=hard-block canary, which self-reports
+drift at the first offending commit rather than silently flaking.
+
+**Static checklist when adding a test** (syntax cannot prove mocking, so the semantic call in
+`docs/CHECKLISTS.md` item 18 stays mandatory) — grep the new test for:
+`subprocess.Popen` / `subprocess.run`, socket or fixed-port binding, `start_new_session=True`,
+and un-monkeypatched module globals. Any hit means `@pytest.mark.serial`.
 
 ### GitHub Actions: secrets in step-level `if:` conditions
 

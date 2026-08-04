@@ -993,9 +993,10 @@ def _run_pre_push_tests(ctx: ToolContext, force: bool = False) -> Optional[str]:
         return None
     if not force and os.environ.get("OUROBOROS_PRE_PUSH_TESTS", "1") != "1":
         return None
-    tests_dir = pathlib.Path(ctx.repo_dir) / "tests"
-    if not tests_dir.exists():
-        return None
+    # NO `tests/` existence check here: whether the repository is in scope is
+    # run_hermetic_pytest's decision. This entry point runs POST-commit, so it
+    # compares HEAD and HEAD~1 (the default phase) — a candidate that deleted the
+    # suite is a hard block, while a repo that never had one is out of scope.
     try:
         from ouroboros.preflight_runner import run_hermetic_pytest
 
@@ -1039,31 +1040,57 @@ def _post_commit_result(ctx, commit_message, skip_tests, tw_ref, force: bool = F
 
 
 def _managed_commit_gate_failure(reason: str, message: str) -> str:
-    """Rollback a landed assisted commit, or keep the failed gate durable."""
+    """Rollback a landed assisted commit, or keep the failed gate durable.
+
+    A rollback that RAISES is no different from one that returns False: it runs
+    several git commands before clearing the marker, so a raise halfway leaves
+    the same pre-gate phase on disk — the re-phase to gate_blocked must run
+    independently of the rollback's own error handling. When even that re-phase
+    cannot be written, the message must stop claiming the tx is pinned."""
     from supervisor.update_merge import (
         mark_update_tx_gate_blocked,
         rollback_managed_update,
     )
 
-    ok, detail = rollback_managed_update(reason)
+    try:
+        ok, detail = rollback_managed_update(reason)
+    except Exception as exc:
+        log.warning("managed update rollback after a red gate raised", exc_info=True)
+        ok, detail = False, f"rollback raised {type(exc).__name__}: {exc}"
     if ok:
         return f"{message}\n\nThe managed update was rolled back: {detail}"
-    mark_update_tx_gate_blocked(reason, detail)
+    try:
+        pinned = bool(mark_update_tx_gate_blocked(reason, detail))
+    except Exception as exc:
+        log.warning("pinning the update tx gate_blocked failed", exc_info=True)
+        pinned = False
+        detail = f"{detail}; re-phase raised {type(exc).__name__}: {exc}"
+    if not pinned:
+        # The message must not claim the tx is pinned when nothing was written
+        # (absent/corrupt marker, or the write itself failed).
+        return (
+            f"{message}\n\n⚠️ MANAGED_UPDATE_ROLLBACK_FAILED ({detail}); the update tx "
+            "marker could NOT be re-phased to gate_blocked — if a tx marker remains, "
+            "clear or roll it back before the next boot."
+        )
     return (
         f"{message}\n\n⚠️ MANAGED_UPDATE_GATE_BLOCKED: rollback could not be verified "
-        f"({detail}). Restart/recovery is required."
+        f"({detail}). The tx is marked gate_blocked; restart/recovery is required."
     )
 
 
 def _managed_post_commit_tests_gate(
     ctx, commit_message: str, commit_start: float, skip_tests: bool,
     test_warning_ref, managed_tx: Dict[str, Any],
+    fingerprints: Tuple[Dict[str, Any], Dict[str, Any]] = ({}, {}),
 ) -> Optional[str]:
     """BLOCKING post-commit test gate for managed-update merges only: a failed
     suite rolls the assisted merge back instead of shipping a warning (ordinary
     commits keep the warning-only contract later in the flow). The gate is
     MANDATORY: neither the caller's skip_tests nor OUROBOROS_PRE_PUSH_TESTS=0
-    can wave a managed merge through untested."""
+    can wave a managed merge through untested. The terminal record carries the
+    same review metadata/fingerprints as every sibling failure record, so an
+    operator can reconstruct WHICH reviewed revision the gate rejected."""
     if not managed_tx:
         return None
     del skip_tests  # deliberately ignored for managed merges
@@ -1074,10 +1101,19 @@ def _managed_post_commit_tests_gate(
         return None
     failure = test_warning_ref[0].strip() or post_test_error
     failure = _managed_commit_gate_failure("assisted_post_commit_tests_failed", failure)
+    pre_fingerprint, post_fingerprint = fingerprints
     _record_commit_attempt(
         ctx, commit_message, "failed",
         block_reason="post_commit_tests_failed", block_details=failure,
         duration_sec=time.time() - commit_start, phase="post_commit_tests",
+        pre_review_fingerprint=(pre_fingerprint or {}).get("fingerprint", ""),
+        post_review_fingerprint=(post_fingerprint or {}).get("fingerprint", ""),
+        fingerprint_status="matched",
+        triad_models=getattr(ctx, "_last_triad_models", []),
+        scope_model=getattr(ctx, "_last_scope_model", ""),
+        triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+        scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
+        degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
     )
     return failure
 
@@ -2105,6 +2141,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
         reviewed_binding = post_fingerprint.get("binding", {}) or {}
         gate_failure = _managed_post_commit_tests_gate(
             ctx, commit_message, _commit_start, skip_tests, test_warning_ref, _managed_tx,
+            fingerprints=(pre_fingerprint, post_fingerprint),
         )
         if gate_failure:
             return gate_failure

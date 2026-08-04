@@ -1559,14 +1559,14 @@ def _run_review_preflight_tests(
     repo_dir = getattr(ctx, "repo_dir", None)
     if repo_dir is None:
         return None
-    tests_dir = pathlib.Path(repo_dir) / "tests"
-    if not tests_dir.exists():
-        return None
+    # NO `tests/` existence check: run_hermetic_pytest owns the scope call (a
+    # deleted suite is a hard block; a shortcut here skipped the gate for it).
     MAX_OUTPUT = 8000
     try:
-        from ouroboros.preflight_runner import run_hermetic_pytest
+        from ouroboros.preflight_runner import PRE_COMMIT_PHASE, run_hermetic_pytest
 
-        run_kwargs = {"max_output": MAX_OUTPUT}
+        # Pre-commit entry point: the deleted-suite baseline is HEAD alone.
+        run_kwargs = {"max_output": MAX_OUTPUT, "phase": PRE_COMMIT_PHASE}
         if timeout is not None:
             run_kwargs["timeout"] = timeout
         output = run_hermetic_pytest(pathlib.Path(repo_dir), **run_kwargs)

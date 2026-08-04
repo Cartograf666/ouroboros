@@ -254,3 +254,66 @@ def test_finalize_rolls_back_after_unhealthy_boot(tmp_path, monkeypatch):
     assert res.get("rolled_back") is True, res
     assert _git(repo, "rev-parse", "HEAD").stdout.strip() == pre
     assert gate_calls == [("close", "managed_update:rollback")]
+
+
+def test_rollback_still_resets_when_the_forensics_ref_cannot_be_written(tmp_path, monkeypatch):
+    """Recovery must not be traded away for a forensics branch name.
+
+    `rollback_managed_update` writes `failed-update-<sha>` before it resets, so the
+    rejected candidate keeps a name. That write is BEST-EFFORT on purpose: this
+    function's job is to get the machine back onto a working revision, and every
+    caller but the commit gate is a recovery path that ignores the boolean and
+    relies on the reset having happened. An earlier revision returned early when the
+    ref could not be written, which left the box still running the bad update — and
+    `_finalize_pending_boot_smoke` returned before persisting `boot_attempts`, so the
+    next boot repeated the same failing attempt forever.
+
+    The failure is made real rather than stubbed: an existing `failed-update-<sha>/child`
+    ref makes `git branch -f failed-update-<sha>` impossible (a ref cannot be both a
+    directory and a file), which is exactly the name-collision case in the finding.
+    """
+    import supervisor.workers as workers
+
+    repo, head = _init_repo(tmp_path)
+    pre = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _wire_git_ops(monkeypatch, repo, tmp_path / "data")
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: True)
+    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": True)
+    (repo / "bad.txt").write_text("bad\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "bad update")
+
+    short = _git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
+    blocked = _git(repo, "branch", f"failed-update-{short}/child", "HEAD")
+    assert blocked.returncode == 0, blocked.stderr
+    assert _git(repo, "branch", "-f", f"failed-update-{short}", "HEAD").returncode != 0, (
+        "the collision did not actually make the forensics ref unwritable, so this "
+        "test would pass without exercising the failure at all"
+    )
+
+    update_merge.write_update_tx({"pre_update_sha": pre, "pre_update_branch": head})
+    ok, msg = update_merge.rollback_managed_update("test")
+
+    assert ok, f"a forensics-ref failure aborted the recovery: {msg}"
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == pre, (
+        "the machine was left on the bad update because a branch name could not be written"
+    )
+    assert not (repo / "bad.txt").exists()
+    assert update_merge.read_update_tx() == {}, (
+        "the tx marker survived, so the next boot resumes the update that was just rolled back"
+    )
+
+
+def test_mark_update_tx_gate_blocked_does_not_invent_a_transaction(tmp_path, monkeypatch):
+    """No live tx means nothing to re-phase — writing one would CREATE a blocking marker.
+
+    The caller reaches this helper on a failed rollback, and a rollback fails for
+    reasons that include "the marker was already cleared". Writing a `gate_blocked`
+    tx from nothing would leave a permanent phantom transaction that blocks every
+    later managed update on a machine whose update had actually finished.
+    """
+    repo, _head = _init_repo(tmp_path)
+    _wire_git_ops(monkeypatch, repo, tmp_path / "data")
+
+    update_merge.mark_update_tx_gate_blocked("post_commit_gate_failed", "detail")
+    assert update_merge.read_update_tx() == {}, "a gate-blocked marker was invented from no tx"
