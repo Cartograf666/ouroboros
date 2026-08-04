@@ -14,6 +14,8 @@ def _base_payload() -> dict:
         "OPENROUTER_API_KEY": "",
         "OPENAI_API_KEY": "",
         "ANTHROPIC_API_KEY": "",
+        "MINIMAX_API_KEY": "",
+        "MINIMAX_REGION": "",
         "TOTAL_BUDGET": 10,
         "OUROBOROS_PER_TASK_COST_USD": 20,
         "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
@@ -34,7 +36,7 @@ def test_prepare_onboarding_settings_requires_runnable_config():
     prepared, error = prepare_onboarding_settings(_base_payload(), {})
 
     assert prepared == {}
-    assert "Configure OpenRouter, OpenAI, OpenAI-compatible, Cloud.ru, Anthropic, or a local model" in error
+    assert "Configure OpenRouter, OpenAI, OpenAI-compatible, Cloud.ru, MiniMax, Anthropic, or a local model" in error
 
 
 def test_prepare_onboarding_settings_accepts_openai_only_setup():
@@ -111,6 +113,37 @@ def test_prepare_onboarding_settings_accepts_cloudru_only_setup():
     assert error is None
     assert prepared["CLOUDRU_FOUNDATION_MODELS_API_KEY"] == "cloudru-key-1234567890"
     assert prepared["OUROBOROS_MODEL"] == "cloudru::zai-org/GLM-4.7"
+
+
+def test_prepare_onboarding_settings_accepts_minimax_only_setup():
+    payload = _base_payload()
+    payload.update({
+        "MINIMAX_API_KEY": "minimax-key-1234567890",
+        "MINIMAX_REGION": "CN_ZH",
+        "OUROBOROS_MODEL": "minimax::MiniMax-M3",
+        "OUROBOROS_MODEL_HEAVY": "minimax::MiniMax-M3",
+        "OUROBOROS_MODEL_LIGHT": "minimax::MiniMax-M2.7",
+        "OUROBOROS_MODEL_FALLBACKS": "minimax::MiniMax-M2.7",
+    })
+
+    prepared, error = prepare_onboarding_settings(payload, {})
+
+    assert error is None
+    assert prepared["MINIMAX_API_KEY"] == "minimax-key-1234567890"
+    assert prepared["MINIMAX_REGION"] == "cn_zh"
+    assert prepared["OUROBOROS_MODEL"] == "minimax::MiniMax-M3"
+    assert prepared["OUROBOROS_MODEL_LIGHT"] == "minimax::MiniMax-M2.7"
+
+
+def test_prepare_onboarding_settings_rejects_unknown_minimax_region():
+    payload = _base_payload()
+    payload["MINIMAX_API_KEY"] = "minimax-key-1234567890"
+    payload["MINIMAX_REGION"] = "unknown"
+
+    prepared, error = prepare_onboarding_settings(payload, {})
+
+    assert prepared == {}
+    assert error == "MiniMax Region must be global_en or cn_zh."
 
 
 def test_prepare_onboarding_settings_accepts_anthropic_only_setup():
@@ -244,13 +277,13 @@ def test_prepare_onboarding_settings_rejects_openai_compatible_key_without_base_
     prepared, error = prepare_onboarding_settings(payload, {})
 
     assert prepared == {}
-    assert "Configure OpenRouter, OpenAI, OpenAI-compatible, Cloud.ru, Anthropic, or a local model" in error
+    assert "Configure OpenRouter, OpenAI, OpenAI-compatible, Cloud.ru, MiniMax, Anthropic, or a local model" in error
 
 
 def test_onboarding_frontend_uses_base_url_first_compatible_validation():
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
 
-    assert "field.settingKey !== 'OPENAI_COMPATIBLE_API_KEY'" in source
+    assert "!['OPENAI_COMPATIBLE_API_KEY', 'MINIMAX_REGION'].includes(field.settingKey)" in source
     assert "const hasRemote = keyValues.some(([, value]) => value);" not in source
 
 
@@ -270,6 +303,8 @@ def test_build_onboarding_html_contains_multistep_markers():
     assert "openai::gpt-5.6-terra" in html
     assert "openai::gpt-5.6-luna" in html
     assert "anthropic::claude-sonnet-5" in html
+    assert "minimax::MiniMax-M3" in html
+    assert "minimax::MiniMax-M2.7" in html
     assert "OPENAI_BASE_URL: ''" not in html
     assert "OPENAI_COMPATIBLE_API_KEY: ''" not in html
     assert "OPENAI_COMPATIBLE_BASE_URL: ''" not in html
@@ -311,6 +346,8 @@ def test_setup_contract_groups_rarely_used_providers():
         "OPENROUTER_API_KEY": "primary",
         "OPENAI_API_KEY": "primary",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY": "more",
+        "MINIMAX_API_KEY": "more",
+        "MINIMAX_REGION": "more",
         "ANTHROPIC_API_KEY": "primary",
         "OPENAI_COMPATIBLE_BASE_URL": "more",
         "OPENAI_COMPATIBLE_API_KEY": "more",
@@ -349,6 +386,15 @@ def test_setup_contract_has_no_secret_values():
     suggestions = build_setup_bootstrap({}, "web")["modelSuggestions"]
     assert "anthropic/claude-sonnet-5" in suggestions
     assert "anthropic::claude-sonnet-5" in suggestions
+    assert "minimax::MiniMax-M3" in suggestions
+    assert "minimax::MiniMax-M2.7" in suggestions
+
+    configured_value = "minimax-hidden-value"
+    bootstrap = build_setup_bootstrap({"MINIMAX_API_KEY": configured_value}, "web")
+    initial = bootstrap["initialState"]
+    assert initial["providerProfile"] == "minimax"
+    assert initial["mainModel"] == "minimax::MiniMax-M3"
+    assert initial["lightModel"] == "minimax::MiniMax-M2.7"
 
 
 def test_api_settings_exposes_setup_contract_without_secrets(tmp_path):
