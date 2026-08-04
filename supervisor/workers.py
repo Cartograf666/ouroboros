@@ -1274,30 +1274,18 @@ def _emit_task_done_terminal(
     status: str = "failed",
     *,
     reason_code: str = "",
-    cost_usd: float = 0.0,
-    total_rounds: int = 0,
-    prompt_tokens: int = 0,
-    completion_tokens: int = 0,
-    cost_accounting_status: str = "unavailable",
-    cost_final: bool = False,
-    reserved_usd: float = 0.0,
-    unresolved_upper_bound_usd: float = 0.0,
-    unknown_unmetered: int = 0,
-    non_final_rows: int = 0,
-    cost_accounting_error: str = "",
-    ledger_integrity_degraded: bool = False,
+    cost_fields: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Emit a task_done event so the UI resolves the live card when a task is
     torn down outside the normal completion path (crash storm, kill, hard
     timeout). Without this the spinner spins forever on these paths.
 
-    Cost fields carry reconstructed totals so an evolution campaign tally fed
-    from this terminal event records real spend instead of zeros; callers that
-    have no reconstructed cost leave them at 0.
-
-    The keyword list must accept every key of ``reconstruct_task_cost(fields=True)``:
-    three call sites below splat that projection whole, so a key this signature
-    cannot bind is a TypeError on a real teardown path, not a dropped field."""
+    ``cost_fields`` is one whole ``reconstruct_task_cost(fields=True)`` projection,
+    taken opaquely (as ``queue._emit_cancel_task_done`` already takes it) rather
+    than re-declared field by field. Three times a key was added to that
+    projection and a hand-maintained mirror here was missed; a signature that
+    names no cost field cannot be missed again. Callers with no reconstructed
+    cost pass nothing and the event says so instead of reporting zeros as fact."""
     if not task_id:
         return False
     try:
@@ -1308,25 +1296,25 @@ def _emit_task_done_terminal(
     # Caller reason_code wins; budget_exhausted -> EXECUTION_FAILED below, not infra-failure.
     reason_code = reason_code or ("worker_terminal_failure" if status == "failed" else status)
     try:
-        cost_fields: Dict[str, Any] = {
-            "cost_accounting_status": cost_accounting_status,
-            "cost_final": bool(cost_final),
+        # Only the four keys whose EMISSION RULE differs are read by name: the
+        # accounting verdict always rides, the two disclosure flags ride only
+        # when they have something to disclose, and everything else rides only
+        # when the accounting is available -- so an unavailable projection never
+        # publishes its `None` placeholders as if they were measurements.
+        projection: Dict[str, Any] = dict(cost_fields or {})
+        emitted: Dict[str, Any] = {
+            "cost_accounting_status": str(projection.pop("cost_accounting_status", "") or "unavailable"),
+            "cost_final": bool(projection.pop("cost_final", False)),
         }
-        if cost_accounting_error:
-            cost_fields["cost_accounting_error"] = cost_accounting_error
-        if ledger_integrity_degraded:
-            cost_fields["ledger_integrity_degraded"] = True
-        if cost_accounting_status == "available":
-            cost_fields.update({
-                "cost_usd": cost_usd, "total_rounds": total_rounds,
-                "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                "reserved_usd": reserved_usd,
-                "unresolved_upper_bound_usd": unresolved_upper_bound_usd,
-                "unknown_unmetered": unknown_unmetered,
-                # cost_final's DISCLOSED CAUSE travels with the flag, exactly as
-                # the normal task_done producer emits it (events.py **terminal_cost).
-                "non_final_rows": non_final_rows,
-            })
+        accounting_error = projection.pop("cost_accounting_error", "")
+        if accounting_error:
+            emitted["cost_accounting_error"] = accounting_error
+        if projection.pop("ledger_integrity_degraded", False):
+            emitted["ledger_integrity_degraded"] = True
+        if emitted["cost_accounting_status"] == "available":
+            # Verbatim, unenumerated: cost_final's disclosed cause (non_final_rows)
+            # rides here today for free, and so will the next field added upstream.
+            emitted.update(projection)
         get_event_q().put({
             "type": "task_done",
             "task_id": str(task_id),
@@ -1340,7 +1328,7 @@ def _emit_task_done_terminal(
                 review_trigger="worker_terminal",
             ),
             "reason_code": reason_code,
-            **cost_fields,
+            **emitted,
         })
         return True
     except Exception:
@@ -1884,7 +1872,8 @@ def assign_tasks() -> None:
                             **cost_fields,
                         )
                         _emit_task_done_terminal(
-                            task, task_id, "failed", reason_code="budget_exhausted", **cost_fields,
+                            task, task_id, "failed", reason_code="budget_exhausted",
+                            cost_fields=cost_fields,
                         )
                         terminal_ids.append(task_id)
                 except Exception:
@@ -2311,7 +2300,7 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                             log.debug("Failed to write cancelled status for %s", w.busy_task_id, exc_info=True)
                         _emit_task_done_terminal(
                             task, str(w.busy_task_id), "cancelled",
-                            **r_cost_fields,
+                            cost_fields=r_cost_fields,
                         )
                     else:
                         task = dict(task)
@@ -2362,7 +2351,7 @@ def _ensure_workers_healthy_locked(queue: Any) -> tuple[List[int], bool]:
                                 str(w.busy_task_id),
                                 "failed",
                                 reason_code=reason_code,
-                                **r_cost_fields,
+                                cost_fields=r_cost_fields,
                             )
             respawn_ids.append(wid)
 

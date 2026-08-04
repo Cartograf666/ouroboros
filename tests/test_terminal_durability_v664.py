@@ -461,12 +461,10 @@ def test_every_splat_consumer_binds_the_real_cost_projection(tmp_path):
     path, not a dropped field -- and on the budget-stop path it is a SILENT one,
     swallowed by a try/except that then never removes the task from PENDING."""
     from ouroboros.task_results import write_task_result
-    from supervisor.workers import _emit_task_done_terminal
 
     projection = _real_projection(tmp_path)
     unbindable = {}
     for name, fn, leading in (
-        ("_emit_task_done_terminal", _emit_task_done_terminal, (None, "t1", "failed")),
         ("write_task_result", write_task_result, (tmp_path, "t1", "failed")),
     ):
         try:
@@ -477,6 +475,70 @@ def test_every_splat_consumer_binds_the_real_cost_projection(tmp_path):
         "a consumer cannot bind the projection its call site splats into it: "
         f"{unbindable}"
     )
+
+
+def test_terminal_emitter_names_no_cost_field_and_forwards_an_unknown_one(tmp_path):
+    """The emitter left the splat-consumer list above by taking the projection
+    whole, the way `queue._emit_cancel_task_done` already does. That is what
+    retires the defect class here: a field added upstream tomorrow reaches the
+    card without an edit, so there is no mirror left to forget to update."""
+    from types import SimpleNamespace
+
+    from supervisor import workers
+
+    signature = inspect.signature(workers._emit_task_done_terminal)
+    named_cost_fields = sorted(
+        name for name in signature.parameters
+        if name in _real_projection(tmp_path)
+    )
+    assert named_cost_fields == [], (
+        "the emitter re-declares projection fields by name again: "
+        f"{named_cost_fields} -- that is the mirror that drifted three times"
+    )
+
+    events = []
+    workers.get_event_q = lambda: SimpleNamespace(put=events.append)
+    future = dict(_real_projection(tmp_path), a_field_invented_after_this_commit=7)
+    assert workers._emit_task_done_terminal(None, "t1", "failed", cost_fields=future) is True
+    assert events[-1]["a_field_invented_after_this_commit"] == 7
+    assert events[-1]["non_final_rows"] == 0
+    # The projection carries `ledger_integrity_degraded: False` on a healthy
+    # task; forwarding it would put a "degraded" key on every clean terminal
+    # event. The flag is a disclosure, so it appears only when it discloses.
+    assert "ledger_integrity_degraded" not in events[-1]
+
+
+def test_terminal_emitter_still_withholds_an_unavailable_projection(tmp_path, monkeypatch):
+    """The opaque hand-off must not turn `cost_accounting_status: unavailable`
+    into published numbers: the projection's `None` placeholders are absence,
+    and a card that shows them as $0.00 is a false accounting claim (P1).
+
+    The unavailable projection is produced by breaking the real ledger rather
+    than hand-written here -- a fixture is one more copy of the field set, and
+    copies of this field set are what the pass above went in to delete."""
+    from types import SimpleNamespace
+
+    import ouroboros.usage_accounting as usage_accounting
+    from supervisor import workers
+    from supervisor.state import reconstruct_task_cost
+
+    def _ledger_down(*_a, **_k):
+        raise RuntimeError("ledger down")
+
+    monkeypatch.setattr(usage_accounting, "usage_breakdown", _ledger_down)
+    unavailable = reconstruct_task_cost("t1", fields=True, drive_root=tmp_path)
+    assert unavailable["cost_accounting_status"] == "unavailable"
+    assert unavailable["cost_usd"] is None
+
+    events = []
+    workers.get_event_q = lambda: SimpleNamespace(put=events.append)
+    assert workers._emit_task_done_terminal(None, "t1", "failed", cost_fields=unavailable) is True
+    emitted = events[-1]
+    assert emitted["cost_accounting_status"] == "unavailable"
+    assert emitted["cost_accounting_error"] == "ledger_unavailable"
+    assert emitted["ledger_integrity_degraded"] is True
+    assert [k for k, v in emitted.items() if v is None] == []
+    assert "cost_usd" not in emitted and "non_final_rows" not in emitted
 
 
 def _install_supervisor(tmp_path, monkeypatch):
