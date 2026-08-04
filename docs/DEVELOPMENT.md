@@ -575,6 +575,25 @@ dispositions fail closed. Reviewers remain generative, but a finding must name
 a concrete defect or a concrete smaller existing extension seam; never require
 a fixed number of findings.
 
+Force-plan is an LLM-first pre-implementation obligation on the admitted managed
+root, not a mechanical permission check around implementation tools. The existing
+`plan_review_state` owns durable review authority and
+`config.get_review_enforcement()` owns blocking/advisory policy. Every submitted
+envelope that reaches `plan_task` supersedes prior authority: invalid plan/goal/scope
+input stores a domain-separated open attempt, while a valid envelope stores its
+canonical fingerprint before repository/path validation. A newer attempt therefore
+cannot fall back to an older GREEN. Immediately before first panel dispatch, the exact planning-scout
+handoff component is frozen in a fingerprint-keyed host write-once continuity artifact;
+the remaining live reviewer context is rebuilt. An unavailable reviewer
+never becomes a disposition-able verdict; a repeat call reuses that handoff snapshot and
+retries the panel, including after A→B→A. Blocking stays in
+analysis and non-mutating preparation until closure or a real task-wide rail;
+advisory may proceed by agent judgment with a host-owned disclosure. A planning
+deadline skip records a typed rail attempt before returning so the reducer cannot
+misread it as an absent `plan_task` call.
+The short-lived Swarm router admits one new root and transfers the intent; it
+never runs `plan_task`, steers an existing task, or publishes the work inline.
+
 **Context mode (low / max).** The owner-selected `OUROBOROS_CONTEXT_MODE`
 (layout SSOT: `ouroboros/context_layout.py`) tiers the *reference-doc* layer of
 the agent's own context (main task context, background consciousness, deep
@@ -864,7 +883,13 @@ Review preflight tests are hermetic. Any pytest run launched by
 with a temporary `OUROBOROS_DATA_DIR` / `OUROBOROS_SETTINGS_PATH`, a temp
 `PYTHONPYCACHEPREFIX`, and no inherited `OUROBOROS_MANAGED_BY_LAUNCHER`. Tests
 may read the live source checkout as the candidate snapshot, but they must not
-write the live repo or live `data/`.
+write the live repo or live `data/`. `tests/conftest.py` must also rebind
+already-imported state/queue/worker roots inside each pytest process and fail
+closed if a state or evolution-campaign write resolves to the captured live data
+root. Explicit subprocess environments preserve their own isolated data root or
+receive the parent's disposable root and pytest markers; scrubbing unrelated
+variables must not reopen the live default. Setting only `OUROBOROS_DATA_DIR` is
+insufficient for process-global roots.
 
 Self-modification durability is local-first. A successful reviewed local commit
 is the persistence boundary; `origin` push and CI are optional follow-up signals.

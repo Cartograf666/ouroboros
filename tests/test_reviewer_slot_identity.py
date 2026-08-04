@@ -141,11 +141,11 @@ def test_plan_row_ids_come_from_the_one_mint(tmp_path, monkeypatch):
     """Plan review is the third configured-reviewer surface; it minted its own
     ``plan_slot_{idx+1}`` beside the SSOT that owns exactly that shape."""
     from ouroboros import review_substrate
-    from ouroboros.tools import plan_review
+    from ouroboros.tools import plan_review, plan_review_runtime
 
     ran_as: list = []
     monkeypatch.setattr(review_substrate, "run_review_request", _substrate_stub(ran_as))
-    monkeypatch.setattr(plan_review, "LLMClient", lambda *a, **k: object())
+    monkeypatch.setattr(plan_review_runtime, "LLMClient", lambda *a, **k: object())
     _repoint_the_mint(monkeypatch)
 
     ctx = _fake_ctx(tmp_path)
@@ -166,11 +166,11 @@ def test_duplicate_model_plan_rows_stay_distinct_through_finalization(tmp_path, 
     indistinguishable downstream, against the carried-not-re-derived contract.
     """
     from ouroboros import review_substrate
-    from ouroboros.tools import plan_review
+    from ouroboros.tools import plan_review, plan_review_runtime
 
     ran_as: list = []
     monkeypatch.setattr(review_substrate, "run_review_request", _substrate_stub(ran_as))
-    monkeypatch.setattr(plan_review, "LLMClient", lambda *a, **k: object())
+    monkeypatch.setattr(plan_review_runtime, "LLMClient", lambda *a, **k: object())
 
     ctx = _fake_ctx(tmp_path)
     raw = asyncio.run(plan_review._run_plan_review_slots(
@@ -221,10 +221,10 @@ def _per_model_substrate(recorder, texts):
 def _drive_plan_review_async(tmp_path, monkeypatch, *, models, limits, substrate):
     """Run the REAL _run_plan_review_async with the world around it stubbed."""
     from ouroboros import review_substrate
-    from ouroboros.tools import plan_review
+    from ouroboros.tools import plan_review, plan_review_runtime
 
     monkeypatch.setattr(review_substrate, "run_review_request", substrate)
-    monkeypatch.setattr(plan_review, "LLMClient", lambda *a, **k: object())
+    monkeypatch.setattr(plan_review_runtime, "LLMClient", lambda *a, **k: object())
     monkeypatch.setattr(
         plan_review, "_start_planning_swarm",
         lambda *a, **k: {"started": True, "handoffs": {}},
@@ -297,7 +297,7 @@ def test_oversize_middle_row_keeps_its_id_through_the_carry(tmp_path, monkeypatc
     dropping out leaves plan_slot_1/plan_slot_3 untouched — and the slots
     surface honors CARRIED ids instead of re-minting from its argument list."""
     from ouroboros import review_substrate
-    from ouroboros.tools import plan_review
+    from ouroboros.tools import plan_review, plan_review_runtime
     from ouroboros.tools.review_synthesis import plan_slot_fit_with_identity
 
     models = ["m/a", "m/mid-small", "m/c"]
@@ -317,7 +317,7 @@ def test_oversize_middle_row_keeps_its_id_through_the_carry(tmp_path, monkeypatc
 
     ran_as: list = []
     monkeypatch.setattr(review_substrate, "run_review_request", _substrate_stub(ran_as))
-    monkeypatch.setattr(plan_review, "LLMClient", lambda *a, **k: object())
+    monkeypatch.setattr(plan_review_runtime, "LLMClient", lambda *a, **k: object())
     ctx = _fake_ctx(tmp_path)
     raw = asyncio.run(plan_review._run_plan_review_slots(
         ctx, fit_models, "system prompt", "user content", slot_ids=callable_ids,
@@ -376,12 +376,10 @@ def test_middle_slot_oversize_binds_findings_to_their_configured_rows(tmp_path, 
     bound = {f["finding_id"]: (f["reviewer_slot"], f["model"]) for f in findings}
     assert bound["plan_slot_1:a-risk"] == ("plan_slot_1", "m/big-a"), bound
     assert bound["plan_slot_3:b-risk"] == ("plan_slot_3", "m/big-b"), bound
-    # The oversize row is its own fail-closed finding under its OWN id.
-    assert bound["plan_slot_2:reviewer-unavailable"][0] == "plan_slot_2", bound
-    assert bound["plan_slot_2:reviewer-unavailable"][1] == "m/mid-small", bound
-    assert set(bound) == {
-        "plan_slot_1:a-risk", "plan_slot_2:reviewer-unavailable", "plan_slot_3:b-risk",
-    }, bound
+    # The oversize row is preflight_excluded (swarm-plan-liveness): a slot that
+    # was never called is an availability fact, not a dispositionable finding —
+    # it must not appear in the disposition ledger under any id.
+    assert set(bound) == {"plan_slot_1:a-risk", "plan_slot_3:b-risk"}, bound
     assert "PLAN_REVIEW_OUTCOME: REVIEW_REQUIRED" in out, out
 
 

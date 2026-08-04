@@ -18,12 +18,692 @@ import os
 import pathlib
 import queue
 import unittest
+import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _force_plan_gate_state(kind: str) -> dict:
+    fingerprint = "a" * 64
+    state = {
+        "schema_version": 1,
+        "current_attempt": {},
+        "latest_review_fingerprint": "",
+        "waves": [],
+    }
+    if kind == "absent":
+        return state
+    state["current_attempt"] = {
+        "fingerprint": fingerprint,
+        "status": (
+            "unavailable" if kind == "unavailable" else
+            "rail_degraded" if kind == "rail_degraded" else
+            "open"
+        ),
+        "reason": (
+            "reviewer unavailable" if kind == "unavailable" else
+            "plan_task_deadline" if kind == "rail_degraded" else
+            ""
+        ),
+    }
+    if kind in {"open", "closed"}:
+        outcome = "GREEN" if kind == "closed" else "REVIEW_REQUIRED"
+        state["latest_review_fingerprint"] = fingerprint
+        state["waves"] = [{
+            "request_fingerprint": fingerprint,
+            "phase": "reviewed",
+            "review_evidence_status": "integrated",
+            "review": {
+                "aggregate_signal": outcome,
+                "closed": kind == "closed",
+            },
+        }]
+    return state
+
+
+@pytest.mark.parametrize(
+    ("kind", "enforcement", "allowed", "status"),
+    [
+        ("absent", "advisory", False, "absent"),
+        ("absent", "blocking", False, "absent"),
+        ("open", "advisory", True, "advisory_open"),
+        ("open", "blocking", False, "reviewed"),
+        ("unavailable", "advisory", True, "advisory_open"),
+        ("unavailable", "blocking", False, "unavailable"),
+        ("rail_degraded", "advisory", True, "rail_degraded"),
+        ("rail_degraded", "blocking", True, "rail_degraded"),
+        ("closed", "advisory", True, "closed"),
+        ("closed", "blocking", True, "closed"),
+    ],
+)
+def test_force_plan_gate_projection_matrix(kind, enforcement, allowed, status):
+    from ouroboros.task_results import plan_review_gate_projection
+
+    decision = plan_review_gate_projection(_force_plan_gate_state(kind), enforcement)
+
+    assert decision["allow"] is allowed
+    assert decision["status"] == status
+
+
+@pytest.mark.parametrize("state", [
+    None,
+    _force_plan_gate_state("absent"),
+    _force_plan_gate_state("open"),
+    _force_plan_gate_state("unavailable"),
+])
+def test_force_plan_gate_real_hard_rail_always_releases(state):
+    from ouroboros.task_results import plan_review_gate_projection
+
+    decision = plan_review_gate_projection(state, "blocking", hard_rail="round_limit")
+
+    assert decision["allow"] is True
+    assert decision["status"] == "rail_degraded"
+    assert decision["reason"] == "round_limit"
+
+
+def test_new_canonical_attempt_does_not_fall_back_to_old_closed_review():
+    from ouroboros.task_results import plan_review_gate_projection
+
+    state = _force_plan_gate_state("closed")
+    state["current_attempt"] = {
+        "fingerprint": "b" * 64,
+        "status": "open",
+        "reason": "",
+    }
+
+    decision = plan_review_gate_projection(state, "blocking")
+
+    assert decision["allow"] is False
+    assert decision["status"] == "open"
+
+
+def test_invalid_new_plan_attempts_do_not_reuse_old_green(tmp_path):
+    import ouroboros.tools.plan_review as pr
+    from ouroboros.task_results import (
+        STATUS_RUNNING,
+        load_plan_review_state,
+        plan_review_gate_projection,
+        record_plan_review_attempt,
+        record_plan_review_collection,
+        record_plan_review_result,
+        reserve_plan_review_wave,
+        write_task_result,
+    )
+    from ouroboros.tools.registry import ToolContext
+
+    write_task_result(tmp_path, "root1", STATUS_RUNNING, result="running")
+    old_fingerprint = "a" * 64
+    record_plan_review_attempt(tmp_path, "root1", fingerprint=old_fingerprint)
+    reserve_plan_review_wave(
+        tmp_path,
+        "root1",
+        fingerprint=old_fingerprint,
+        plan_text_hash=pr.plan_text_fingerprint("old plan"),
+        scout_roles=[],
+        cutoff_at="2026-08-03T00:00:00+00:00",
+    )
+    record_plan_review_collection(
+        tmp_path,
+        "root1",
+        fingerprint=old_fingerprint,
+        included_task_ids=[],
+        omissions=[],
+        stop_reason="complete",
+    )
+    record_plan_review_result(
+        tmp_path,
+        "root1",
+        fingerprint=old_fingerprint,
+        review={
+            "schema_version": 1,
+            "request_fingerprint": old_fingerprint,
+            "plan_text_hash": pr.plan_text_fingerprint("old plan"),
+            "aggregate_signal": "GREEN",
+            "findings": [],
+            "closed": True,
+            "reviewer_slots_degraded": False,
+        },
+        reviewed_result_hashes={},
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "root1"
+    ctx.system_repo_dir = tmp_path
+    ctx.emit_progress_fn = lambda _message: None
+    cases = [
+        (_plan_request("new invalid plan", "G", files_to_touch=["../escape.py"], context_level="minimal"),
+         "ERROR: PLAN_SUBJECT_ROOT_INVALID:"),
+        (_plan_request("", "G", context_level="minimal"), "ERROR: plan parameter is required"),
+        (_plan_request("P", "G", context_level="minimal", scope="not-an-object"),
+         "ERROR: PLAN_SCOPE_INVALID:"),
+    ]
+    for new_request, error_prefix in cases:
+        record_plan_review_attempt(tmp_path, "root1", fingerprint=old_fingerprint)
+        output = pr._handle_plan_task(ctx, **vars(new_request))
+        assert output.startswith(error_prefix)
+        state = load_plan_review_state(tmp_path, "root1")
+        assert state["current_attempt"]["fingerprint"] != old_fingerprint
+        decision = plan_review_gate_projection(state, "blocking")
+        assert decision["allow"] is False
+        assert decision["status"] == "open"
+
+    record_plan_review_attempt(tmp_path, "root1", fingerprint=old_fingerprint)
+    with pytest.raises(TypeError):
+        pr._handle_plan_task(ctx, plan="P", goal="G", files_to_touch=123)
+    state = load_plan_review_state(tmp_path, "root1")
+    assert state["current_attempt"]["fingerprint"] != old_fingerprint
+    assert plan_review_gate_projection(state, "blocking")["allow"] is False
+
+
+def test_rail_degraded_attempt_overrides_same_fingerprint_open_review():
+    from ouroboros.task_results import plan_review_gate_projection
+
+    state = _force_plan_gate_state("open")
+    state["current_attempt"].update({
+        "status": "rail_degraded",
+        "reason": "plan_task_deadline",
+    })
+
+    decision = plan_review_gate_projection(state, "blocking")
+
+    assert decision["allow"] is True
+    assert decision["status"] == "rail_degraded"
+    assert decision["outcome"] == "REVIEW_REQUIRED"
+    assert decision["reason"] == "plan_task_deadline"
+
+
+def test_current_plan_attempt_survives_reload(tmp_path):
+    from ouroboros.task_results import (
+        STATUS_RUNNING,
+        load_plan_review_state,
+        record_plan_review_attempt,
+        write_task_result,
+    )
+
+    write_task_result(tmp_path, "root1", STATUS_RUNNING, result="running")
+    record_plan_review_attempt(tmp_path, "root1", fingerprint="c" * 64)
+
+    state = load_plan_review_state(tmp_path, "root1")
+    assert state["current_attempt"] == {
+        "fingerprint": "c" * 64,
+        "status": "open",
+        "reason": "",
+    }
+
+
+def test_reviewer_unavailability_stays_retryable_not_durable_verdict(tmp_path):
+    import ouroboros.tools.plan_review as pr
+    from ouroboros.task_results import (
+        STATUS_RUNNING,
+        load_plan_review_state,
+        plan_review_wave_handoffs,
+        record_plan_review_collection,
+        record_plan_review_attempt,
+        record_plan_review_scout,
+        reserve_plan_review_wave,
+        write_task_result,
+    )
+    from ouroboros.tools.registry import ToolContext
+
+    request = _plan_request("P", "G", context_level="minimal")
+    fingerprint = pr._plan_request_fingerprint(
+        plan=request.plan,
+        goal=request.goal,
+        files_to_touch=request.files_to_touch,
+        context_level=request.context_level,
+        context_notes=request.context_notes,
+        plan_class=request.plan_class,
+        scope=request.scope,
+        include_tests=request.include_tests,
+    )
+    write_task_result(tmp_path, "root1", STATUS_RUNNING, result="running")
+    record_plan_review_attempt(tmp_path, "root1", fingerprint=fingerprint)
+    wave, _ = reserve_plan_review_wave(
+        tmp_path,
+        "root1",
+        fingerprint=fingerprint,
+        plan_text_hash=pr.plan_text_fingerprint(request.plan),
+        scout_roles=["planning-scout-1"],
+        cutoff_at="2026-08-03T00:00:00+00:00",
+    )
+    wave = record_plan_review_scout(
+        tmp_path,
+        "root1",
+        fingerprint=fingerprint,
+        role="planning-scout-1",
+        schedule_status="started",
+        task_ids=["scout1"],
+        reason="scheduled scout1",
+    )
+    write_task_result(
+        tmp_path,
+        "scout1",
+        "completed",
+        parent_task_id="root1",
+        root_task_id="root1",
+        delegation_role="subagent",
+        role="planning-scout-1",
+        result="summary: original reviewer input",
+    )
+    wave = record_plan_review_collection(
+        tmp_path,
+        "root1",
+        fingerprint=fingerprint,
+        included_task_ids=["scout1"],
+        omissions=[],
+        stop_reason="complete",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "root1"
+
+    planning_handoffs = plan_review_wave_handoffs(wave)
+    planning_handoffs["wait"] = {
+        "tasks": {
+            "scout1": {
+                "status": "completed",
+                "role": "planning-scout-1",
+                "result": "summary: original reviewer input",
+            },
+        },
+        "all_terminal": True,
+    }
+    pr._persist_planning_handoffs(ctx, planning_handoffs)
+    reviewed_result_hashes = pr._reviewed_handoff_hashes(planning_handoffs)
+    assert "error" not in pr._persist_planning_snapshot(ctx, planning_handoffs)
+    output = pr._finalize_plan_review_output(ctx, pr._PlanReviewFinalization(
+        request=request,
+        raw_results=[{"model": "m", "text": "", "error": "timeout"}],
+        models=["m"],
+        estimated_tokens=1,
+        subject_repo=tmp_path,
+        governance_repo=tmp_path,
+        planning_handoffs=planning_handoffs,
+        state_root=tmp_path,
+        state_task_id="root1",
+        request_fingerprint=fingerprint,
+        degraded_scout_note="",
+        reviewed_result_hashes=reviewed_result_hashes,
+    ))
+
+    state = load_plan_review_state(tmp_path, "root1")
+    assert state["current_attempt"]["status"] == "unavailable"
+    assert state["waves"][0]["review"]["closed"] is False
+    assert state["waves"][0]["review"]["reviewer_slots_degraded"] is True
+    assert state["waves"][0]["reviewed_result_hashes"] == reviewed_result_hashes
+    assert "not a durable review verdict" in output
+    assert pr._reuse_or_disposition_plan_review(
+        ctx,
+        fingerprint,
+        None,
+        pr.plan_text_fingerprint(request.plan),
+        request,
+    ) is None
+    other_handoffs = {
+        "schema_version": 1,
+        "request_fingerprint": "b" * 64,
+        "task_ids": [],
+        "included_task_ids": [],
+        "wait": {"tasks": {}, "all_terminal": True},
+    }
+    pr._persist_planning_handoffs(ctx, other_handoffs)
+    assert "error" not in pr._persist_planning_snapshot(ctx, other_handoffs)
+    assert json.loads(pr._planning_handoff_path(ctx).read_text(encoding="utf-8"))[
+        "request_fingerprint"
+    ] == "b" * 64
+    write_task_result(
+        tmp_path,
+        "scout1",
+        "completed",
+        parent_task_id="root1",
+        root_task_id="root1",
+        delegation_role="subagent",
+        role="planning-scout-1",
+        result="summary: rewritten after reviewer outage",
+    )
+    retry = pr._start_planning_swarm(ctx, request, fingerprint)
+    assert retry["started"] is True and retry["resumed"] is True
+    assert (
+        retry["handoffs"]["wait"]["tasks"]["scout1"]["result"]
+        == "summary: original reviewer input"
+    )
+    resumed = pr._start_planning_swarm(ctx, request, fingerprint)
+    assert resumed["started"] is True
+    assert resumed["resumed"] is True
+    assert len(load_plan_review_state(tmp_path, "root1")["waves"]) == 1
+
+
+def test_reviewer_unavailability_retries_zero_included_snapshot(tmp_path):
+    import ouroboros.tools.plan_review as pr
+    from ouroboros.task_results import (
+        STATUS_RUNNING,
+        load_plan_review_state,
+        plan_review_wave_handoffs,
+        record_plan_review_collection,
+        record_plan_review_attempt,
+        reserve_plan_review_wave,
+        write_task_result,
+    )
+    from ouroboros.tools.registry import ToolContext
+
+    request = _plan_request("P", "G", context_level="minimal")
+    fingerprint = pr._plan_request_fingerprint(
+        plan=request.plan,
+        goal=request.goal,
+        files_to_touch=request.files_to_touch,
+        context_level=request.context_level,
+        context_notes=request.context_notes,
+        plan_class=request.plan_class,
+        scope=request.scope,
+        include_tests=request.include_tests,
+    )
+    write_task_result(tmp_path, "root-zero", STATUS_RUNNING, result="running")
+    record_plan_review_attempt(tmp_path, "root-zero", fingerprint=fingerprint)
+    reserve_plan_review_wave(
+        tmp_path,
+        "root-zero",
+        fingerprint=fingerprint,
+        plan_text_hash=pr.plan_text_fingerprint(request.plan),
+        scout_roles=[],
+        cutoff_at="2026-08-03T00:00:00+00:00",
+    )
+    wave = record_plan_review_collection(
+        tmp_path,
+        "root-zero",
+        fingerprint=fingerprint,
+        included_task_ids=[],
+        omissions=[],
+        stop_reason="complete",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "root-zero"
+    handoffs = plan_review_wave_handoffs(wave)
+    handoffs["wait"] = {"tasks": {}, "all_terminal": True}
+    pr._persist_planning_handoffs(ctx, handoffs)
+    assert "error" not in pr._persist_planning_snapshot(ctx, handoffs)
+
+    pr._finalize_plan_review_output(ctx, pr._PlanReviewFinalization(
+        request=request,
+        raw_results=[{"model": "m", "text": "", "error": "timeout"}],
+        models=["m"],
+        estimated_tokens=1,
+        subject_repo=tmp_path,
+        governance_repo=tmp_path,
+        planning_handoffs=handoffs,
+        state_root=tmp_path,
+        state_task_id="root-zero",
+        request_fingerprint=fingerprint,
+        degraded_scout_note="",
+        reviewed_result_hashes={},
+    ))
+
+    state = load_plan_review_state(tmp_path, "root-zero")
+    assert state["current_attempt"]["status"] == "unavailable"
+    retry = pr._start_planning_swarm(ctx, request, fingerprint)
+    assert retry["started"] is True
+    assert retry["resumed"] is True
+    assert retry["handoffs"]["included_task_ids"] == []
+    assert retry["handoffs"]["wait"] == {"tasks": {}, "all_terminal": True}
+    assert "error" not in retry["handoffs"]["artifact"]
+
+
+def test_exception_after_snapshot_retries_exact_frozen_evidence(monkeypatch, tmp_path):
+    import asyncio
+
+    import ouroboros.tools.plan_review as pr
+    from ouroboros.task_results import write_task_result
+
+    ctx = _make_ctx(tmp_path)
+    ctx.task_id = "root-post-freeze-exception"
+    request = _plan_request("P", "G", context_level="minimal")
+    real_start = pr._start_planning_swarm
+    starts = 0
+
+    def first_then_real(ctx_arg, request_arg, fingerprint):
+        nonlocal starts
+        starts += 1
+        if starts == 1:
+            return _completed_planning_swarm(ctx_arg, request_arg, fingerprint)
+        return real_start(ctx_arg, request_arg, fingerprint)
+
+    panel_inputs = []
+
+    async def fail_then_pass(_ctx, models, _system_prompt, user_content, user_stable_len=0, slot_ids=None):
+        panel_inputs.append(user_content)
+        if len(panel_inputs) == 1:
+            raise RuntimeError("injected post-freeze reviewer failure")
+        return [{
+            "model": model,
+            "text": _review_text("GREEN"),
+            "error": None,
+        } for model in models]
+
+    monkeypatch.setattr(pr, "_start_planning_swarm", first_then_real)
+    monkeypatch.setattr(pr, "_run_plan_review_slots", fail_then_pass)
+    monkeypatch.setattr(pr, "_load_plan_checklist", lambda: "checklist")
+    monkeypatch.setattr(pr, "load_governance_doc", lambda *_a, **_k: "doc")
+    monkeypatch.setattr(pr, "build_head_snapshot_section", lambda *_a, **_k: "")
+    monkeypatch.setattr(pr, "_get_review_models", lambda: ["m1", "m2"])
+    monkeypatch.setattr("ouroboros.config.get_review_models", lambda: ["m1", "m2"])
+
+    with pytest.raises(RuntimeError, match="post-freeze reviewer failure"):
+        asyncio.run(pr._run_plan_review_async(ctx, request))
+    assert "error" not in pr._plan_unavailable(ctx, "review failed", "review_failed").lower()
+    write_task_result(
+        tmp_path,
+        "scout1",
+        "completed",
+        parent_task_id=ctx.task_id,
+        root_task_id=ctx.task_id,
+        delegation_role="subagent",
+        role="planning-scout-1",
+        result="summary: changed after exception",
+    )
+
+    output = asyncio.run(pr._run_plan_review_async(ctx, request))
+
+    assert "PLAN_REVIEW_OUTCOME: GREEN" in output
+    assert "summary: ok" in panel_inputs[1]
+    assert "summary: changed after exception" not in panel_inputs[1]
+
+
+def test_green_with_addressable_findings_is_substantive_review_required():
+    import ouroboros.tools.plan_review as pr
+
+    summary = pr._summarize_plan_review_results([{
+        "model": "m",
+        "text": _review_text("GREEN", [{
+            "id": "real-risk",
+            "level": "RISK",
+            "summary": "The plan misses a real seam.",
+            "recommendation": "Use the existing reducer.",
+        }]),
+        "error": None,
+    }])
+
+    assert summary["signals"] == ["REVIEW_REQUIRED"]
+    assert summary["aggregate_signal"] == "REVIEW_REQUIRED"
+    assert summary["degraded_count"] == 0
+
+
+def test_substantive_finding_survives_peer_outage_and_retries_same_wave(tmp_path):
+    import ouroboros.tools.plan_review as pr
+    from ouroboros.task_results import (
+        STATUS_RUNNING,
+        load_plan_review_state,
+        plan_review_wave_handoffs,
+        record_plan_review_attempt,
+        record_plan_review_collection,
+        record_plan_review_scout,
+        reserve_plan_review_wave,
+        write_task_result,
+    )
+    from ouroboros.tools.registry import ToolContext
+
+    request = _plan_request("P", "G", context_level="minimal")
+    fingerprint = pr._plan_request_fingerprint(
+        plan=request.plan,
+        goal=request.goal,
+        files_to_touch=request.files_to_touch,
+        context_level=request.context_level,
+        context_notes=request.context_notes,
+        plan_class=request.plan_class,
+        scope=request.scope,
+        include_tests=request.include_tests,
+    )
+    write_task_result(tmp_path, "root1", STATUS_RUNNING, result="running")
+    record_plan_review_attempt(tmp_path, "root1", fingerprint=fingerprint)
+    wave, _ = reserve_plan_review_wave(
+        tmp_path,
+        "root1",
+        fingerprint=fingerprint,
+        plan_text_hash=pr.plan_text_fingerprint(request.plan),
+        scout_roles=["planning-scout-1"],
+        cutoff_at="2026-08-03T00:00:00+00:00",
+    )
+    wave = record_plan_review_scout(
+        tmp_path,
+        "root1",
+        fingerprint=fingerprint,
+        role="planning-scout-1",
+        schedule_status="started",
+        task_ids=["scout1"],
+        reason="scheduled scout1",
+    )
+    write_task_result(
+        tmp_path,
+        "scout1",
+        "completed",
+        parent_task_id="root1",
+        root_task_id="root1",
+        delegation_role="subagent",
+        role="planning-scout-1",
+        result="summary: use the existing reducer",
+    )
+    wave = record_plan_review_collection(
+        tmp_path,
+        "root1",
+        fingerprint=fingerprint,
+        included_task_ids=["scout1"],
+        omissions=[],
+        stop_reason="complete",
+    )
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "root1"
+    planning_handoffs = plan_review_wave_handoffs(wave)
+    planning_handoffs["wait"] = {
+        "tasks": {
+            "scout1": {
+                "status": "completed",
+                "role": "planning-scout-1",
+                "result": "summary: use the existing reducer",
+            },
+        },
+        "all_terminal": True,
+    }
+    reviewed_result_hashes = pr._reviewed_handoff_hashes(planning_handoffs)
+    assert "error" not in pr._persist_planning_snapshot(ctx, planning_handoffs)
+
+    output = pr._finalize_plan_review_output(ctx, pr._PlanReviewFinalization(
+        request=request,
+        raw_results=[
+            {
+                "model": "m1",
+                "text": _review_text("REVIEW_REQUIRED", [{
+                    "id": "real-risk",
+                    "level": "RISK",
+                    "summary": "The plan misses a real seam.",
+                    "recommendation": "Use the existing reducer.",
+                }]),
+                "error": None,
+            },
+            {"model": "m2", "text": "", "error": "timeout"},
+        ],
+        models=["m1", "m2"],
+        estimated_tokens=1,
+        subject_repo=tmp_path,
+        governance_repo=tmp_path,
+        planning_handoffs=planning_handoffs,
+        state_root=tmp_path,
+        state_task_id="root1",
+        request_fingerprint=fingerprint,
+        degraded_scout_note="",
+        reviewed_result_hashes=reviewed_result_hashes,
+    ))
+
+    state = load_plan_review_state(tmp_path, "root1")
+    review = state["waves"][0]["review"]
+    assert review["reviewer_slots_degraded"] is True
+    assert any(item["finding_id"].endswith(":real-risk") for item in review["findings"])
+    assert "substantive findings were stored" in output
+    assert "not a durable review verdict" not in output
+    from ouroboros.task_results import plan_review_gate_projection
+    from ouroboros.loop import _force_plan_reminder
+
+    decision = plan_review_gate_projection(state, "blocking")
+    assert decision["reviewer_slots_degraded"] is True
+    assert "no review_disposition" in _force_plan_reminder(decision)
+    assert pr._reuse_or_disposition_plan_review(
+        ctx,
+        fingerprint,
+        None,
+        pr.plan_text_fingerprint(request.plan),
+        request,
+    ) is None
+    write_task_result(
+        tmp_path,
+        "scout1",
+        "completed",
+        parent_task_id="root1",
+        root_task_id="root1",
+        delegation_role="subagent",
+        role="planning-scout-1",
+        result="summary: a later process rewrote this completed result",
+    )
+    retry = pr._start_planning_swarm(ctx, request, fingerprint)
+    assert retry["started"] is True and retry["resumed"] is True
+    assert (
+        retry["handoffs"]["wait"]["tasks"]["scout1"]["result"]
+        == "summary: use the existing reducer"
+    )
+    assert pr._reviewed_handoff_hashes(retry["handoffs"]) == reviewed_result_hashes
+    assert len(load_plan_review_state(tmp_path, "root1")["waves"]) == 1
+    rejected = pr._reuse_or_disposition_plan_review(
+        ctx,
+        fingerprint,
+        {"review_fingerprint": fingerprint, "items": []},
+        pr.plan_text_fingerprint(request.plan),
+        request,
+    )
+    assert rejected.startswith("ERROR: PLAN_REVIEW_RETRY_REQUIRED")
+
+    recovered = pr._finalize_plan_review_output(ctx, pr._PlanReviewFinalization(
+        request=request,
+        raw_results=[
+            {"model": "m1", "text": _review_text("GREEN", []), "error": None},
+            {"model": "m2", "text": _review_text("GREEN", []), "error": None},
+        ],
+        models=["m1", "m2"],
+        estimated_tokens=1,
+        subject_repo=tmp_path,
+        governance_repo=tmp_path,
+        planning_handoffs=retry["handoffs"],
+        state_root=tmp_path,
+        state_task_id="root1",
+        request_fingerprint=fingerprint,
+        degraded_scout_note="",
+        reviewed_result_hashes=pr._reviewed_handoff_hashes(retry["handoffs"]),
+    ))
+
+    state = load_plan_review_state(tmp_path, "root1")
+    wave = state["waves"][0]
+    assert "PLAN_REVIEW_OUTCOME: GREEN" in recovered
+    assert wave["review"]["closed"] is True
+    assert wave["review_evidence_status"] == "integrated"
+    assert wave["consumed_task_ids"] == ["scout1"]
+
 
 def _make_ctx(tmp_path: pathlib.Path | None = None) -> MagicMock:
     import tempfile
@@ -371,11 +1051,15 @@ def test_expired_explicit_deadline_skips_before_scout_or_reviewer(monkeypatch, t
     from datetime import datetime, timedelta, timezone
 
     import ouroboros.tools.plan_review as pr
+    import ouroboros.loop as loop_mod
+    from ouroboros.task_results import load_plan_review_state
 
     ctx = _make_ctx(tmp_path)
     ctx.task_metadata = {
-        "deadline_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        "deadline_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        "force_plan": True,
     }
+    ctx.is_ephemeral_turn = False
     monkeypatch.setattr(
         pr,
         "_start_planning_swarm",
@@ -395,6 +1079,124 @@ def test_expired_explicit_deadline_skips_before_scout_or_reviewer(monkeypatch, t
 
     assert out.startswith("PLAN_TASK_SKIPPED_DEADLINE: the task deadline has expired")
     assert pr._planning_swarm_timing(ctx)[1] == 0.0
+    attempt = load_plan_review_state(tmp_path, ctx.task_id)["current_attempt"]
+    assert attempt["status"] == "rail_degraded"
+    assert attempt["reason"] == "plan_task_deadline"
+
+    monkeypatch.setattr(loop_mod, "get_review_enforcement", lambda: "blocking")
+    decision = loop_mod._force_plan_decision(ctx, {})
+    assert decision["allow"] is True
+    assert decision["status"] == "rail_degraded"
+    assert "plan_task_deadline" in loop_mod._force_plan_disclosure(ctx, {}, forced_reason="")
+
+
+def test_expired_deadline_releases_existing_open_wave(monkeypatch, tmp_path):
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    import ouroboros.tools.plan_review as pr
+    from ouroboros.task_results import (
+        load_plan_review_state,
+        record_plan_review_attempt,
+        reserve_plan_review_wave,
+    )
+
+    request = _plan_request(
+        plan="P",
+        goal="G",
+        files_to_touch=[],
+        context_level="minimal",
+        plan_class="external",
+    )
+    fingerprint = pr._plan_request_fingerprint(
+        plan=request.plan,
+        goal=request.goal,
+        files_to_touch=request.files_to_touch,
+        context_level=request.context_level,
+        context_notes=request.context_notes,
+        plan_class=request.plan_class,
+        scope=request.scope,
+        include_tests=request.include_tests,
+    )
+    ctx = _make_ctx(tmp_path)
+    ctx.task_metadata = {
+        "deadline_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        "force_plan": True,
+    }
+    record_plan_review_attempt(tmp_path, ctx.task_id, fingerprint=fingerprint)
+    reserve_plan_review_wave(
+        tmp_path,
+        ctx.task_id,
+        fingerprint=fingerprint,
+        plan_text_hash=pr.plan_text_fingerprint(request.plan),
+        scout_roles=[],
+        cutoff_at="2099-01-01T00:00:00+00:00",
+    )
+    monkeypatch.setattr(pr, "_resolve_plan_roots", lambda *_a, **_k: (tmp_path, tmp_path))
+
+    out = asyncio.run(pr._run_plan_review_async(ctx, request))
+
+    assert out.startswith("PLAN_TASK_SKIPPED_DEADLINE:")
+    attempt = load_plan_review_state(tmp_path, ctx.task_id)["current_attempt"]
+    assert attempt["status"] == "rail_degraded"
+    assert attempt["reason"] == "plan_task_deadline"
+
+
+def test_rail_degraded_prepanel_scouts_only_stop_quiescence():
+    from ouroboros.task_results import (
+        plan_review_audit_only_task_ids,
+        plan_review_recorded_panel_task_ids,
+    )
+
+    fingerprint = "f" * 64
+    state = {
+        "current_attempt": {
+            "fingerprint": fingerprint,
+            "status": "rail_degraded",
+            "reason": "plan_task_deadline",
+        },
+        "waves": [{
+            "request_fingerprint": fingerprint,
+            "intended_scouts": [{"task_ids": ["scout-rail"]}],
+        }],
+    }
+
+    assert plan_review_audit_only_task_ids(state) == ["scout-rail"]
+    assert plan_review_recorded_panel_task_ids(state) == []
+
+    state["waves"][0]["review"] = {"aggregate_signal": "REVIEW_REQUIRED"}
+    assert plan_review_recorded_panel_task_ids(state) == ["scout-rail"]
+
+
+def test_prepanel_unavailable_scout_remains_visible_to_absorption(monkeypatch, tmp_path):
+    import ouroboros.task_results as task_results
+    import ouroboros.task_status as task_status
+    from ouroboros.loop import _load_direct_child_results
+
+    fingerprint = "e" * 64
+    state = {
+        "current_attempt": {
+            "fingerprint": fingerprint,
+            "status": "unavailable",
+            "reason": "review_budget_unavailable",
+        },
+        "waves": [{
+            "request_fingerprint": fingerprint,
+            "intended_scouts": [{"task_ids": ["scout-paid"]}],
+        }],
+    }
+    monkeypatch.setattr(task_results, "load_plan_review_state", lambda *_args: state)
+    monkeypatch.setattr(task_status, "find_child_tasks", lambda *_args, **_kwargs: [{
+        "task_id": "scout-paid",
+        "parent_task_id": "root",
+        "root_task_id": "root",
+        "status": "completed",
+        "result": "paid planning evidence",
+    }])
+
+    rows = _load_direct_child_results(tmp_path, "root", "root")
+
+    assert [row["task_id"] for row in rows] == ["scout-paid"]
 
 
 def test_missing_deadline_is_not_treated_as_expired(tmp_path):
@@ -1744,6 +2546,36 @@ def test_oversized_planned_required_artifact_refuses_typed(tmp_path, monkeypatch
 
 
 class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
+    async def test_declined_wave_does_not_freeze_pre_dispatch_snapshot(self):
+        import tempfile
+
+        from ouroboros.tools import plan_review as pr
+
+        with tempfile.TemporaryDirectory() as raw:
+            ctx = _make_ctx(pathlib.Path(raw))
+            freeze = MagicMock(return_value={"path": "unused"})
+            with (
+                patch.object(pr, "build_head_snapshot_section", return_value=""),
+                patch.object(pr, "_load_plan_checklist", return_value="checklist"),
+                patch.object(pr, "load_governance_doc", return_value="doc"),
+                patch.object(pr, "_start_planning_swarm", side_effect=_completed_planning_swarm),
+                patch("ouroboros.config.get_review_models", return_value=["model-a", "model-b"]),
+                patch.object(pr, "_get_review_models", return_value=["model-a", "model-b"]),
+                patch.object(pr, "_persist_planning_snapshot", freeze),
+                patch.object(pr, "review_wave_budget_gate", return_value={
+                    "estimated_wave_usd": 2.0,
+                    "remaining_usd": 1.0,
+                    "limit_usd": 1.0,
+                }),
+            ):
+                result = await pr._run_plan_review_async(
+                    ctx,
+                    _plan_request("my plan", "my goal", [], context_level="minimal"),
+                )
+
+        self.assertIn("PLAN_REVIEW_SKIPPED_BUDGET", result)
+        freeze.assert_not_called()
+
     async def test_budget_gate_skips_when_oversized(self):
         """An assembled prompt no slot can fit is a loud typed preflight degradation.
 
@@ -3034,7 +3866,10 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
             )
 
         ctx = ToolContext(repo_dir=pathlib.Path("."), drive_root=pathlib.Path("."))
-        with patch.object(pr, "_run_plan_review_async", _stub):
+        ctx.task_id = "parent"
+        with patch.object(pr, "_record_raw_plan_request_attempt"), patch.object(
+            pr, "_run_plan_review_async", _stub,
+        ):
             out = pr._handle_plan_task(
                 ctx,
                 plan="P",
@@ -3056,7 +3891,10 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
             return "PLAN_REVIEW_OUTCOME: GREEN"
 
         ctx = ToolContext(repo_dir=pathlib.Path("."), drive_root=pathlib.Path("."))
-        with patch.object(pr, "_run_plan_review_async", _stub):
+        ctx.task_id = "parent"
+        with patch.object(pr, "_record_raw_plan_request_attempt"), patch.object(
+            pr, "_run_plan_review_async", _stub,
+        ):
             out = pr._handle_plan_task(
                 ctx,
                 plan="P",
@@ -3225,6 +4063,20 @@ class TestPlanBudgetFollowsQuorum(unittest.TestCase):
         self.assertEqual([rec["model"] for rec in oversize], ["small/545"])
         self.assertIn("preflight_oversize", oversize[0]["error"])
         self.assertEqual(oversize[0]["tokens_in"], 0)
+
+    def test_quorum_preserving_exclusion_is_not_retryable_degradation(self):
+        from ouroboros.tools.review_synthesis import summarize_plan_review_results
+
+        _callable, oversize, _error = self.fit(self.models, self.limits, 600_000)
+        raw = oversize + [
+            {"model": model, "text": _review_text("GREEN"), "error": None}
+            for model in ("big/a", "big/b")
+        ]
+        summary = summarize_plan_review_results(raw)
+
+        self.assertEqual(summary["aggregate_signal"], "GREEN")
+        self.assertEqual(summary["degraded_count"], 0)
+        self.assertEqual(summary["preflight_excluded_count"], 1)
 
     def test_prompt_above_the_quorum_budget_still_fails_loudly(self):
         _callable, _oversize, error = self.fit(self.models, self.limits, 800_000)

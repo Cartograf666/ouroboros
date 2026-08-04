@@ -271,7 +271,6 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     # describe a code that cannot appear in it.
     "subagent_executor_unavailable": (False, "agent.py executor_blocked_outcome; a subagent terminal, never a trial's"),
     "task_exception": (False, "agent.py:777 the attempt ran and crashed; an honest failure"),
-    "swarm_force_plan_not_called": (False, "loop.py:4109 policy terminal, agent had its shot"),
     "capability_profile_mismatch": (False, "control_delegation.py:81 rejected delegate call"),
     "delegation_constraint_block_surface": (False, "control_delegation.py:116 rejected call"),
     "delegation_constraint_child_cap": (False, "control_delegation.py:149 rejected call"),

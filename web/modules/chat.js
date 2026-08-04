@@ -434,7 +434,7 @@ export function createChatInstance({
             <div class="chat-input-wrap">
                 <div class="chat-toolbar-row">
                     <div class="chat-composer-pills" id="chat-composer-pills">
-                        <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: arm a one-shot deep plan + multi-subagent fan-out (plan_task + web search, then delegate) for your next message. Auto-disarms after sending.">Swarm</button>
+                        <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: route your next message into a new managed task, run a deep plan review with plan_task, then delegate when parallel work helps. Auto-disarms after sending.">Swarm</button>
                         <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Context size mode" title="Context mode (owner setting). Low fits ~200K / local models; Max is full. Saves immediately; lowering to Low requires Ouroboros to be idle.">
                             <button class="chat-seg" type="button" data-mode="low">Low</button>
                             <button class="chat-seg" type="button" data-mode="max">Max</button>

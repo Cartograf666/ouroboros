@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
@@ -173,6 +174,19 @@ def seed_owner_state(data_root: pathlib.Path, *, evolution_enabled: bool = False
             st = {}
     st["owner_chat_id"] = 1
     if evolution_enabled:
+        campaign_path = pathlib.Path(data_root) / "state" / "evolution_campaign.json"
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        campaign_path.write_text(json.dumps({
+            "schema_version": 1,
+            "id": uuid.uuid4().hex[:8],
+            "status": "active",
+            "objective": "Autonomously improve Ouroboros from benchmark evidence.",
+            "source": "benchmark",
+            "started_at": now,
+            "updated_at": now,
+            "cycles_done": 0,
+            "absorbed_cycles_done": 0,
+        }), encoding="utf-8")
         st["evolution_mode_enabled"] = True
     state_path.write_text(json.dumps(st), encoding="utf-8")
 

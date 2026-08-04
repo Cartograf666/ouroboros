@@ -399,9 +399,74 @@ def persist_plan_review_handoffs(
         }
 
 
+def plan_review_handoff_snapshot_path(
+    results_drive_root: Any,
+    task_id: str,
+    fingerprint: str,
+    *,
+    create: bool = False,
+) -> pathlib.Path:
+    """Canonical immutable handoff snapshot path for one reviewed fingerprint."""
+    if not _PLAN_REVIEW_HASH_RE.fullmatch(str(fingerprint or "")):
+        raise ValueError("PLAN_REVIEW_STATE_INVALID: snapshot fingerprint is invalid")
+    artifact_dir = (
+        task_results_dir(results_drive_root, create=create)
+        / "artifacts"
+        / validate_task_id(task_id or "plan_review")
+    )
+    if create:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+    return artifact_dir / f"plan_task_handoffs.{fingerprint}.json"
+
+
+def persist_plan_review_handoff_snapshot(
+    results_drive_root: Any,
+    task_id: str,
+    handoffs: Dict[str, Any],
+) -> Dict[str, str]:
+    """Freeze the first reviewer-input snapshot for one exact plan fingerprint."""
+    try:
+        fingerprint = str(handoffs.get("request_fingerprint") or "")
+        path = plan_review_handoff_snapshot_path(
+            results_drive_root, task_id, fingerprint, create=True,
+        )
+        incoming = {
+            **copy.deepcopy(handoffs),
+            "audit_only": True,
+            "authoritative": False,
+            "immutable_reviewer_input": True,
+        }
+
+        def _freeze(existing: Dict[str, Any]) -> Dict[str, Any]:
+            if not existing:
+                return incoming
+            if (
+                existing.get("request_fingerprint") != fingerprint
+                or existing.get("audit_only") is not True
+                or existing.get("authoritative") is not False
+                or existing.get("immutable_reviewer_input") is not True
+            ):
+                raise ValueError("PLAN_REVIEW_STATE_INVALID: immutable snapshot is invalid")
+            return existing
+
+        update_json_locked(path, _freeze, strict_existing_dict=True)
+        return {
+            "kind": "plan_task_handoff_snapshot",
+            "name": path.name,
+            "path": str(path),
+        }
+    except Exception as exc:
+        log.debug("Failed to persist immutable plan_task handoff snapshot", exc_info=True)
+        return {
+            "kind": "plan_task_handoff_snapshot",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def _empty_plan_review_state() -> Dict[str, Any]:
     return {
         "schema_version": _PLAN_REVIEW_STATE_VERSION,
+        "current_attempt": {},
         "latest_review_fingerprint": "",
         "waves": [],
     }
@@ -552,6 +617,8 @@ def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
                 raise ValueError("PLAN_REVIEW_STATE_INVALID: invalid review aggregate")
             if not isinstance(review.get("closed"), bool):
                 raise ValueError("PLAN_REVIEW_STATE_INVALID: review closed must be boolean")
+            if not isinstance(review.get("reviewer_slots_degraded", False), bool):
+                raise ValueError("PLAN_REVIEW_STATE_INVALID: review degradation flag must be boolean")
             if aggregate == "GREEN" and not review["closed"]:
                 raise ValueError("PLAN_REVIEW_STATE_INVALID: GREEN review must be closed")
             if aggregate == "REVISE_PLAN" and review["closed"]:
@@ -587,6 +654,22 @@ def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
     if latest and latest not in reviewed:
         raise ValueError("PLAN_REVIEW_STATE_INVALID: latest review fingerprint is unknown")
     copied = copy.deepcopy(value)
+    attempt = copied.get("current_attempt", {})
+    if not isinstance(attempt, dict):
+        raise ValueError("PLAN_REVIEW_STATE_INVALID: current_attempt must be an object")
+    if attempt:
+        fingerprint = str(attempt.get("fingerprint") or "")
+        status = str(attempt.get("status") or "")
+        reason = str(attempt.get("reason") or "")
+        if set(attempt) != {"fingerprint", "status", "reason"}:
+            raise ValueError("PLAN_REVIEW_STATE_INVALID: current_attempt shape is invalid")
+        if not _PLAN_REVIEW_HASH_RE.fullmatch(fingerprint):
+            raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt fingerprint is invalid")
+        if status not in {"open", "unavailable", "rail_degraded"}:
+            raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt status is invalid")
+        if len(reason) > _PLAN_REVIEW_REASON_MAX_CHARS:
+            raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt reason is too large")
+    copied.setdefault("current_attempt", {})
     if len(json.dumps(copied, ensure_ascii=False, default=str).encode("utf-8")) > _PLAN_REVIEW_STATE_MAX_BYTES:
         raise ValueError("PLAN_REVIEW_STATE_INVALID: state exceeds the bounded size limit")
     return copied
@@ -600,6 +683,145 @@ def load_plan_review_state(results_drive_root: Any, task_id: str) -> Dict[str, A
     if result is None:
         raise ValueError("PLAN_REVIEW_STATE_INVALID: parent task result JSON is malformed")
     return _validated_plan_review_state(result.get(PLAN_REVIEW_STATE_KEY))
+
+
+def plan_review_gate_projection(
+    state: Any,
+    enforcement: str,
+    *,
+    hard_rail: str = "",
+) -> Dict[str, Any]:
+    """Project one force-plan finalization decision from existing authority.
+
+    ``plan_review_state`` remains the durable review SSOT. Its tiny
+    ``current_attempt`` pointer prevents a newer validated fingerprint from
+    falling back to an older durable GREEN. A hard rail is supplied only by an
+    existing task-wide finalization branch.
+    """
+
+    policy = "blocking" if str(enforcement or "").lower() == "blocking" else "advisory"
+    control: Dict[str, Any] = {}
+    attempted = False
+    if isinstance(state, dict):
+        attempt = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
+        fingerprint = str(attempt.get("fingerprint") or "")
+        attempted = bool(fingerprint)
+        if not fingerprint:
+            fingerprint = str(state.get("latest_review_fingerprint") or "")
+        wave = plan_review_wave(state, fingerprint) if fingerprint else None
+        review = wave.get("review") if isinstance((wave or {}).get("review"), dict) else {}
+        integrated = bool(
+            review
+            and str((wave or {}).get("phase") or "") == "reviewed"
+            and str((wave or {}).get("review_evidence_status") or "integrated") != "pending"
+        )
+        review_outcome = str(review.get("aggregate_signal") or "")
+        review_closed = bool(review.get("closed")) and review_outcome in {
+            "GREEN", "REVIEW_REQUIRED",
+        }
+        if integrated and review_closed:
+            control = {
+                "status": "reviewed",
+                "outcome": review_outcome,
+                "closed": True,
+                "reviewer_slots_degraded": bool(review.get("reviewer_slots_degraded")),
+                "fingerprint": fingerprint,
+            }
+        elif str(attempt.get("status") or "") == "rail_degraded":
+            control = {
+                "status": "rail_degraded",
+                "reason": str(attempt.get("reason") or ""),
+                "outcome": review_outcome,
+                "reviewer_slots_degraded": bool(review.get("reviewer_slots_degraded")),
+            }
+        elif integrated:
+            control = {
+                "status": "reviewed",
+                "outcome": review_outcome,
+                "closed": False,
+                "reviewer_slots_degraded": bool(review.get("reviewer_slots_degraded")),
+                "fingerprint": fingerprint,
+            }
+        elif attempted:
+            control = {
+                "status": str(attempt.get("status") or "open"),
+                "reason": str(attempt.get("reason") or ""),
+            }
+        elif state.get("waves"):
+            control = {"status": "pending"}
+        else:
+            control = {"status": "absent"}
+    else:
+        control = {"status": "invalid"}
+
+    status = str(control.get("status") or "unavailable")
+    outcome = str(control.get("outcome") or "")
+    closed = bool(control.get("closed")) and outcome in {"GREEN", "REVIEW_REQUIRED"}
+    if status == "reviewed" and closed:
+        gate_status, allow = "closed", True
+    elif hard_rail:
+        gate_status, allow = "rail_degraded", True
+    elif status == "rail_degraded":
+        gate_status, allow = "rail_degraded", True
+    elif policy == "advisory" and status in {"reviewed", "open", "unavailable"}:
+        gate_status, allow = "advisory_open", True
+    else:
+        gate_status, allow = status, False
+    return {
+        "enforcement": policy,
+        "status": gate_status,
+        "allow": allow,
+        "attempted": attempted,
+        "outcome": outcome,
+        "closed": closed,
+        "reviewer_slots_degraded": bool(control.get("reviewer_slots_degraded")),
+        "reason": str(hard_rail or control.get("reason") or ""),
+        "source": "durable_state",
+    }
+
+
+def record_plan_review_attempt(
+    results_drive_root: Any,
+    task_id: str,
+    *,
+    fingerprint: str,
+    status: str = "open",
+    reason: str = "",
+) -> Dict[str, Any]:
+    """Select one already-validated canonical plan fingerprint as current."""
+
+    if not _PLAN_REVIEW_HASH_RE.fullmatch(str(fingerprint or "")):
+        raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt fingerprint is invalid")
+    if status not in {"open", "unavailable", "rail_degraded"}:
+        raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt status is invalid")
+
+    def _record(state: Dict[str, Any]) -> Dict[str, Any]:
+        state["current_attempt"] = {
+            "fingerprint": fingerprint,
+            "status": status,
+            "reason": str(reason or "")[:_PLAN_REVIEW_REASON_MAX_CHARS],
+        }
+        return state
+
+    return _update_plan_review_state(results_drive_root, task_id, _record)
+
+
+def mark_current_plan_review_unavailable(
+    results_drive_root: Any,
+    task_id: str,
+    *,
+    reason: str,
+) -> Dict[str, Any]:
+    """Mark the already-validated current fingerprint retryable-unavailable."""
+
+    def _mark(state: Dict[str, Any]) -> Dict[str, Any]:
+        current = state.get("current_attempt")
+        if isinstance(current, dict) and current.get("fingerprint"):
+            current["status"] = "unavailable"
+            current["reason"] = str(reason or "review_unavailable")[:_PLAN_REVIEW_REASON_MAX_CHARS]
+        return state
+
+    return _update_plan_review_state(results_drive_root, task_id, _mark)
 
 
 def _update_plan_review_state(
@@ -832,6 +1054,18 @@ def record_plan_review_result(
                 raise ValueError(
                     "PLAN_REVIEW_STATE_INVALID: paid review hashes must exactly match included evidence"
                 )
+            consumed = {str(item) for item in wave.get("consumed_task_ids") or []}
+            prior_hashes = dict(wave.get("reviewed_result_hashes") or {})
+            if consumed == included and included:
+                if prior_hashes and prior_hashes != normalized_hashes:
+                    raise ValueError(
+                        "PLAN_REVIEW_STATE_INVALID: reviewer retry changed consumed evidence hashes"
+                    )
+                wave["reviewed_result_hashes"] = normalized_hashes
+                wave["review_evidence_status"] = "integrated"
+                wave["phase"] = "reviewed"
+                state["latest_review_fingerprint"] = fingerprint
+                return state
             wave["reviewed_result_hashes"] = normalized_hashes
             if included:
                 wave["review_evidence_status"] = "pending"
@@ -888,7 +1122,27 @@ def plan_review_wave_task_ids(wave: Dict[str, Any]) -> List[str]:
 
 
 def plan_review_audit_only_task_ids(state: Dict[str, Any]) -> List[str]:
-    """Return every scout id whose exact plan review is already authoritative."""
+    """Return scout ids that must not hold acceptance quiescence open."""
+    task_ids: List[str] = []
+    current = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
+    audit_only_fingerprint = (
+        str(current.get("fingerprint") or "")
+        if str(current.get("status") or "") in {"unavailable", "rail_degraded"} else ""
+    )
+    for wave in state.get("waves") or []:
+        if (
+            not isinstance(wave.get("review"), dict)
+            and str(wave.get("request_fingerprint") or "") != audit_only_fingerprint
+        ):
+            continue
+        for task_id in plan_review_wave_task_ids(wave):
+            if task_id not in task_ids:
+                task_ids.append(task_id)
+    return task_ids
+
+
+def plan_review_recorded_panel_task_ids(state: Dict[str, Any]) -> List[str]:
+    """Return scout ids whose wave has a durable panel-attempt record."""
     task_ids: List[str] = []
     for wave in state.get("waves") or []:
         if not isinstance(wave.get("review"), dict):

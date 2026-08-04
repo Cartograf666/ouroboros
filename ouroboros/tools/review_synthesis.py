@@ -538,6 +538,7 @@ def plan_slot_fit(models: Any, slot_limits: Any, estimated_tokens: int) -> tuple
     oversize = [
         {
             "model": m, "request_model": m, "text": "",
+            "review_participation": "preflight_excluded",
             "error": (
                 f"preflight_oversize: assembled prompt {int(estimated_tokens or 0):,} estimated "
                 f"tokens exceeds this slot's calibrated input cap {int(limits.get(m, 0) or 0):,}"
@@ -786,6 +787,9 @@ def summarize_plan_review_results(raw_results: List[Dict[str, Any]]) -> Dict[str
     # Keyed by plan_row_key: the CARRIED slot_id (position only for legacy rows).
     projection_errors: Dict[Any, str] = {}
     for index, result in enumerate(raw_results, start=1):
+        if result.get("review_participation") == "preflight_excluded":
+            signals.append("PREFLIGHT_EXCLUDED")
+            continue
         text = str(result.get("text") or "")
         signal = "DEGRADED" if result.get("error") or not text.strip() else (
             parse_plan_review_signal(text) or "DEGRADED"
@@ -796,18 +800,23 @@ def summarize_plan_review_results(raw_results: List[Dict[str, Any]]) -> Dict[str
         if error:
             projection_errors[plan_row_key(result, index)] = error
             if signal == "GREEN":
-                signal = "DEGRADED"
+                # Contradictory GREEN with valid addressable findings is
+                # substantive REVIEW_REQUIRED, not reviewer unavailability.
+                signal = "REVIEW_REQUIRED" if error == "green_with_findings" else "DEGRADED"
         findings.extend(projected)
         signals.append(signal)
     counts = {name: signals.count(name) for name in (
-        "REVISE_PLAN", "REVIEW_REQUIRED", "DEGRADED", "GREEN"
+        "REVISE_PLAN", "REVIEW_REQUIRED", "DEGRADED", "GREEN", "PREFLIGHT_EXCLUDED"
     )}
     from ouroboros.config import adaptive_quorum
     if signals and counts["REVISE_PLAN"] >= adaptive_quorum(len(signals)):
         aggregate = "REVISE_PLAN"
     elif counts["REVISE_PLAN"] == 1 or counts["REVIEW_REQUIRED"] or counts["DEGRADED"]:
         aggregate = "REVIEW_REQUIRED"
-    elif signals and counts["GREEN"] == len(signals):
+    elif (
+        counts["GREEN"] >= adaptive_quorum(len(signals))
+        and counts["GREEN"] + counts["PREFLIGHT_EXCLUDED"] == len(signals)
+    ):
         aggregate = "GREEN"
     else:
         aggregate = "REVIEW_REQUIRED"
@@ -820,6 +829,7 @@ def summarize_plan_review_results(raw_results: List[Dict[str, Any]]) -> Dict[str
         "review_required_count": counts["REVIEW_REQUIRED"],
         "degraded_count": counts["DEGRADED"],
         "green_count": counts["GREEN"],
+        "preflight_excluded_count": counts["PREFLIGHT_EXCLUDED"],
     }
 
 
@@ -832,7 +842,10 @@ def _quote_public_plan_review_control_lines(text: str) -> str:
 
 
 def format_plan_review_output(
-    raw_results: List[Dict[str, Any]], models: List[str], goal: str, estimated_tokens: int
+    raw_results: List[Dict[str, Any]], models: List[str], goal: str, estimated_tokens: int,
+    *,
+    availability_only: bool = False,
+    reviewer_retry_required: bool = False,
 ) -> str:
     summary = summarize_plan_review_results(raw_results)
     # The configured row count is the raw list itself (one row per configured slot,
@@ -903,14 +916,25 @@ def format_plan_review_output(
             reasons.append(f"{summary['degraded_count']} reviewer(s) returned no parseable verdict")
         if reasons:
             lines.append("Reason: " + "; ".join(reasons) + ".")
-        lines.append("Read every full response and disposition the addressable findings before coding.")
+        lines.append(
+            "Read every full response, then retry the same fingerprint without a disposition; "
+            "the existing scout wave is reused."
+            if reviewer_retry_required else
+            "Read every full response and disposition the addressable findings before coding."
+        )
     else:
         lines.append(
             f"{summary['revise_count']} reviewer(s) independently flagged REVISE_PLAN; "
             "change the plan before writing code."
         )
+    if availability_only:
+        findings_heading = "## Reviewer Availability Evidence (audit only)"
+    elif reviewer_retry_required:
+        findings_heading = "## Findings Preserved Pending Reviewer Retry"
+    else:
+        findings_heading = "## Findings Requiring Disposition"
     lines.extend([
-        "", "## Findings Requiring Disposition", "", "```json",
+        "", findings_heading, "", "```json",
         json.dumps(summary["findings"], ensure_ascii=False, indent=2, default=str), "```",
     ])
     return _quote_public_plan_review_control_lines("\n".join(lines))

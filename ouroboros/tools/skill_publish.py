@@ -324,7 +324,10 @@ mutation($input: CreateCommitOnBranchInput!) {
         "variables": {
             "input": {
                 "branch": {"repositoryNameWithOwner": f"{login}/{repo}", "branchName": branch},
-                "message": {"headline": headline},
+                "message": {
+                    "headline": headline,
+                    "body": "Co-authored-by: Ouroboros <311266734+ouroboros-agent@users.noreply.github.com>",
+                },
                 "fileChanges": {"additions": additions},
                 "expectedHeadOid": base_sha,
             }

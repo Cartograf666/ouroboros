@@ -58,6 +58,7 @@ _REVIEW_STACK_PATHS = frozenset({
     # part of the immune system's review surface and must never be reduced to an
     # ordinary budget-selected dependency in a broad review pack.
     "ouroboros/review_execution.py",
+    "ouroboros/tools/plan_review_runtime.py",
     "ouroboros/triad_review.py",
     "ouroboros/review_state.py",
     "ouroboros/review_evidence.py",

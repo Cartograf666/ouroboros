@@ -6,30 +6,44 @@ import asyncio
 import concurrent.futures
 import json
 import logging
-import os
 import pathlib
 import time
 from dataclasses import dataclass, replace
 from datetime import timedelta
 
-from ouroboros.config import SETTINGS_DEFAULTS, review_model_uses_local
+from ouroboros.config import SETTINGS_DEFAULTS
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now as _planning_now
-from ouroboros.llm import LLMClient
 from ouroboros.review_substrate import review_repo_dirs_for
 from ouroboros.task_results import (
     load_plan_review_state,
+    mark_current_plan_review_unavailable,
+    plan_review_gate_projection,
     plan_review_wave,
     plan_review_wave_handoffs,
     plan_review_wave_task_ids,
+    plan_review_handoff_snapshot_path,
+    persist_plan_review_handoff_snapshot,
     persist_plan_review_handoffs,
     record_plan_review_collection,
     record_plan_review_consumed,
+    record_plan_review_attempt,
     record_plan_review_result,
     record_plan_review_scout,
     represent_plan_review,
     reserve_plan_review_wave,
 )
 from ouroboros.task_status import FINAL_STATUSES, find_child_tasks, wait_for_effective_tasks
+from ouroboros.tools.plan_review_runtime import (
+    PLAN_REVIEW_MAX_TOKENS as _PLAN_REVIEW_MAX_TOKENS,
+    PLAN_REVIEW_SLOT_TIMEOUT_SEC as _PLAN_REVIEW_SLOT_TIMEOUT_SEC,
+    classify_reviewer_error as _classify_reviewer_error,  # noqa: F401 — test-compat re-export
+    get_review_models as _get_review_models,
+    load_plan_checklist as _load_plan_checklist,
+    record_raw_plan_request_attempt as _record_raw_plan_request_attempt,
+    resolve_plan_class as _resolve_plan_class,
+    run_plan_review_slots as _run_plan_review_slots,
+    validate_plan_request_envelope as _validate_plan_request_envelope,
+)
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.tools.review_context_atlas import (
     ReviewContextAtlasRequest,
@@ -41,12 +55,10 @@ from ouroboros.tools.review_context_atlas import (
 from ouroboros.tools.review_helpers import (
     build_head_snapshot_section,
     load_governance_doc,
-    load_checklist_section,
     review_wave_budget_gate,
 )
 from ouroboros.tools.review_synthesis import (
     emit_plan_review_usage as _emit_plan_review_usage,  # noqa: F401 — test-compat re-export
-    build_plan_review_messages,
     PLAN_REVIEW_CONTROL_PREFIX,
     VACUOUS_DISPOSITION_NOTE as _VACUOUS_DISPOSITION_NOTE,
     addressable_plan_findings,
@@ -62,7 +74,7 @@ from ouroboros.tools.review_synthesis import (
     normalize_plan_scope as _normalize_plan_scope,
     parse_plan_review_signal,
     bindable_claimed_wave as _bindable_claimed_wave,
-    minted_plan_slot_ids as _minted_plan_slot_ids,
+    minted_plan_slot_ids as _minted_plan_slot_ids,  # noqa: F401 — test-compat re-export
     per_slot_input_token_limits as _per_slot_input_token_limits,
     plan_envelope_mismatch_note as _envelope_note,
     plan_review_component_hashes as _plan_component_hashes,
@@ -81,7 +93,7 @@ from ouroboros.tools.review_synthesis import (
     summarize_plan_review_results as _summarize_plan_review_results,
     validate_plan_review_disposition,
 )
-from ouroboros.utils import estimate_tokens, utc_now_iso
+from ouroboros.utils import estimate_tokens, read_json_dict, utc_now_iso
 
 _addressable_plan_findings = addressable_plan_findings
 _parse_aggregate_signal = parse_plan_review_signal
@@ -90,12 +102,9 @@ _build_user_content = build_plan_review_user_content
 
 log = logging.getLogger(__name__)
 
-_PLAN_REVIEW_MAX_TOKENS = 65536
 # Scout-wave admission prices ONE opening round per scout (a deliberate lower bound: a wave
 # that cannot fund even that must not start; the per-attempt reservation rail covers the rest).
 _PLAN_SCOUT_MAX_TOKENS = 8192
-_PLAN_REVIEW_EFFORT = "high"
-_PLAN_REVIEW_SLOT_TIMEOUT_SEC = 560
 # Wrapper covers the shared scout cutoff plus one reviewer slot below the hard timeout.
 _PLAN_SWARM_MAX_WAIT_DEFAULT_SEC = int(SETTINGS_DEFAULTS["OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC"])  # config SSOT (no DRY mirror)
 _PLAN_REVIEW_WRAPPER_TIMEOUT_SEC = _PLAN_SWARM_MAX_WAIT_DEFAULT_SEC + _PLAN_REVIEW_SLOT_TIMEOUT_SEC + 60
@@ -262,6 +271,11 @@ def get_tools():
 
 
 def _handle_plan_task(ctx: ToolContext, **params) -> str:
+    try:
+        state_root, state_task_id = _planning_state_location(ctx)
+        _record_raw_plan_request_attempt(params, state_root, state_task_id, reason="plan_envelope_pending")
+    except (OSError, TimeoutError, ValueError) as exc:
+        return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
     review_disposition = params.get("review_disposition")
     vacuous_disposition = _vacuous_review_disposition(review_disposition)
     review_disposition = None if vacuous_disposition else review_disposition
@@ -276,11 +290,6 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
         scope=params.get("scope"),
         review_disposition=review_disposition,
     )
-    if not request.plan.strip():
-        return "ERROR: plan parameter is required and must not be empty."
-    if not request.goal.strip():
-        return "ERROR: goal parameter is required and must not be empty."
-
     try:
         try:
             asyncio.get_running_loop()
@@ -301,26 +310,32 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
             result += _VACUOUS_DISPOSITION_NOTE
         return result
     except (concurrent.futures.TimeoutError, asyncio.TimeoutError):
-        return f"ERROR: Plan review timed out after {_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC}s."
+        return _plan_unavailable(
+            ctx, f"ERROR: Plan review timed out after {_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC}s.", "review_timeout")
     except Exception as e:
         log.error("plan_task failed: %s", e, exc_info=True)
-        return f"ERROR: Plan review failed: {e}"
+        return _plan_unavailable(ctx, f"ERROR: Plan review failed: {e}", "review_failed")
 
 
-def _planning_swarm_count(context_level: str, files_to_touch: list) -> int:
+def _plan_unavailable(ctx: ToolContext, message: str, reason: str) -> str:
+    """Persist a retryable availability outcome after canonical validation."""
     try:
-        from ouroboros.config import get_max_active_subagents_per_root
-
-        cap = get_max_active_subagents_per_root()
-    except Exception:
-        cap = 3
-    desired = 2 if context_level in {"broad", "constitutional"} or len(files_to_touch or []) > 3 else 1
-    return max(1, min(int(cap or 1), desired))
+        root, task_id = _planning_state_location(ctx)
+        mark_current_plan_review_unavailable(root, task_id, reason=reason)
+    except (OSError, TimeoutError, ValueError) as exc:
+        return f"{message}\nERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
+    return message
 
 
 def _persist_planning_handoffs(ctx: ToolContext, handoffs: dict) -> dict:
     task_id = str(getattr(ctx, "task_id", "") or "plan_review")
     return persist_plan_review_handoffs(ctx.drive_root, task_id, handoffs)
+
+
+def _persist_planning_snapshot(ctx: ToolContext, handoffs: dict) -> dict:
+    """Freeze the scout-handoff input once, immediately before panel dispatch."""
+    task_id = str(getattr(ctx, "task_id", "") or "plan_review")
+    return persist_plan_review_handoff_snapshot(ctx.drive_root, task_id, handoffs)
 
 
 def _planning_handoff_path(ctx: ToolContext) -> pathlib.Path:
@@ -454,7 +469,6 @@ def _scheduled_side_channel_ids(ctx: ToolContext) -> list[str]:
         if str(task_id)
     ))
 
-
 def _schedule_planning_scouts(
     ctx: ToolContext, wave: dict, *, fingerprint: str, objective: str, constraints: str, context: str,
     deadline_at: str = "",
@@ -580,6 +594,44 @@ def _collect_host_planning_wave(
     return handoffs, wave
 
 
+def _retry_reviewed_wave_handoffs(ctx: ToolContext, wave: dict) -> dict:
+    """Reuse the exact scout snapshot seen by the first reviewer attempt."""
+    handoffs = plan_review_wave_handoffs(wave)
+    path = plan_review_handoff_snapshot_path(
+        ctx.drive_root, str(getattr(ctx, "task_id", "") or "plan_review"),
+        str(wave.get("request_fingerprint") or ""),
+    )
+    stored = read_json_dict(path)
+    error = ""
+    if not isinstance(stored, dict):
+        error = "reviewed planning handoff snapshot is missing or invalid"
+    elif stored.get("request_fingerprint") != handoffs.get("request_fingerprint"):
+        error = "reviewed planning handoff snapshot belongs to another plan"
+    elif stored.get("audit_only") is not True or stored.get("authoritative") is not False:
+        error = "reviewed planning handoff snapshot has invalid provenance"
+    else:
+        handoffs["wait"] = stored.get("wait") if isinstance(stored.get("wait"), dict) else {}
+        try:
+            actual_hashes = _reviewed_handoff_hashes(handoffs)
+        except ValueError as exc:
+            error = str(exc)
+        else:
+            expected_hashes = dict(wave.get("reviewed_result_hashes") or {})
+            if expected_hashes and actual_hashes != expected_hashes:
+                error = "reviewed planning handoff snapshot hash does not match durable review state"
+            elif (
+                isinstance(wave.get("review"), dict)
+                and wave.get("included_task_ids")
+                and not expected_hashes
+            ):
+                error = "reviewed planning handoff snapshot has no durable evidence hashes"
+    handoffs["artifact"] = {
+        "kind": "plan_task_handoffs",
+        **({"error": error} if error else {"name": path.name, "path": str(path)}),
+    }
+    return handoffs
+
+
 def _start_planning_swarm(
     ctx: ToolContext,
     request: _PlanReviewRequest,
@@ -602,8 +654,34 @@ def _start_planning_swarm(
         wave = plan_review_wave(state, fingerprint)
         resumed = wave is not None
         created = False
+        review = wave.get("review") if isinstance((wave or {}).get("review"), dict) else {}
+        orphan_snapshot = not review and plan_review_handoff_snapshot_path(
+            ctx.drive_root, str(getattr(ctx, "task_id", "") or "plan_review"), fingerprint,
+        ).is_file()
+        snapshot_retry = bool(wave and (review.get("reviewer_slots_degraded") is True or orphan_snapshot))
+        if snapshot_retry:
+            handoffs = _retry_reviewed_wave_handoffs(ctx, wave)
+            tasks = (
+                handoffs.get("wait", {}).get("tasks", {})
+                if isinstance(handoffs.get("wait"), dict) else {}
+            )
+            return {
+                "started": not bool((handoffs.get("artifact") or {}).get("error")),
+                "task_ids": plan_review_wave_task_ids(wave),
+                "handoffs": handoffs,
+                "resumed": True,
+                "degraded_evidence": not bool(_completed_planning_handoffs(tasks or {})),
+                **({"error": handoffs["artifact"]["error"]}
+                   if (handoffs.get("artifact") or {}).get("error") else {}),
+            }
         if wave is None:
-            roles = [f"planning-scout-{idx + 1}" for idx in range(_planning_swarm_count(context_level, files_to_touch))]
+            try:
+                from ouroboros.config import get_max_active_subagents_per_root
+                _cap = get_max_active_subagents_per_root()
+            except Exception:
+                _cap = 3
+            _desired = 2 if context_level in {"broad", "constitutional"} or len(files_to_touch or []) > 3 else 1
+            roles = [f"planning-scout-{idx + 1}" for idx in range(max(1, min(int(_cap or 1), _desired)))]
             wave, created = reserve_plan_review_wave(
                 root, parent_id, fingerprint=fingerprint, plan_text_hash=plan_text_fingerprint(plan),
                 scout_roles=roles, cutoff_at=(_planning_now() + timedelta(seconds=max_wait)).isoformat(),
@@ -974,6 +1052,14 @@ def _reuse_or_disposition_plan_review(
     audit["artifact"] = _persist_planning_handoffs(ctx, audit)
     if audit["artifact"].get("error"):
         return "ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: " + str(audit["artifact"]["error"])
+    if review.get("reviewer_slots_degraded") is True:
+        if review_disposition is not None:
+            return (
+                "ERROR: PLAN_REVIEW_RETRY_REQUIRED: reviewer availability cannot be "
+                "closed by disposition. Re-call plan_task with the same unchanged plan "
+                "and omit review_disposition; the existing scout wave will be reused."
+            )
+        return None
     aggregate = str(review.get("aggregate_signal") or "")
     if aggregate == "REVISE_PLAN":
         return (
@@ -1076,6 +1162,11 @@ def _finalize_plan_review_output(
     ctx._last_plan_review_governance_root = str(finalization.governance_repo)
     summary = _summarize_plan_review_results(raw_results)
     aggregate_signal = str(summary["aggregate_signal"])
+    reviewer_slots_degraded = bool(summary.get("degraded_count"))
+    availability_only = bool(
+        reviewer_slots_degraded
+        and not (summary.get("review_required_count") or summary.get("revise_count"))
+    )
     review_record = {
         "schema_version": 1,
         "request_fingerprint": request_fingerprint,
@@ -1084,6 +1175,7 @@ def _finalize_plan_review_output(
         "findings": list(summary["findings"]),
         "reviewed_at": utc_now_iso(),
         "closed": aggregate_signal == "GREEN",
+        "reviewer_slots_degraded": reviewer_slots_degraded,
         "included_task_ids": list(planning_handoffs.get("included_task_ids") or []),
         "omitted_task_ids": [
             str(item.get("task_id") or "")
@@ -1100,7 +1192,7 @@ def _finalize_plan_review_output(
             )
         except (OSError, TimeoutError, ValueError) as exc:
             return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
-        if str(wave.get("review_evidence_status") or "") == "pending":
+        if not availability_only and str(wave.get("review_evidence_status") or "") == "pending":
             try:
                 wave = _mark_planning_handoffs_consumed(ctx, dict(wave))
             except (OSError, TimeoutError, ValueError) as exc:
@@ -1113,8 +1205,25 @@ def _finalize_plan_review_output(
             return "ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: " + str(artifact["error"])
         planning_handoffs["artifact"] = artifact
         _capture_late_planning_audit(ctx, planning_handoffs)
+    if availability_only:
+        try:
+            record_plan_review_attempt(
+                finalization.state_root,
+                finalization.state_task_id,
+                fingerprint=request_fingerprint,
+                status="unavailable",
+                reason="reviewer_unavailable",
+            )
+        except (OSError, TimeoutError, ValueError) as exc:
+            return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
 
-    if aggregate_signal == "GREEN":
+    if reviewer_slots_degraded:
+        next_step = (
+            "Reviewer availability prevented an authoritative verdict. Re-call plan_task "
+            "with the same unchanged plan and no review_disposition; the existing scout "
+            "wave is reused while the reviewer panel retries."
+        )
+    elif aggregate_signal == "GREEN":
         next_step = "Proceed with the reviewed plan."
     elif aggregate_signal == "REVIEW_REQUIRED":
         next_step = (
@@ -1135,11 +1244,30 @@ def _finalize_plan_review_output(
         ),
         f"PLAN_REVIEW_OUTCOME: {aggregate_signal}", f"AGGREGATE: {aggregate_signal}",
     ])
+    if availability_only:
+        availability_note = (
+            "⚠️ REVIEWER AVAILABILITY: this output is audit evidence, not a durable "
+            "review verdict; retry the same plan fingerprint.\n\n"
+        )
+    elif reviewer_slots_degraded:
+        availability_note = (
+            "⚠️ REVIEWER AVAILABILITY: substantive findings were stored, but the "
+            "review remains open until the same reviewer panel retries.\n\n"
+        )
+    else:
+        availability_note = ""
     return (
         finalization.degraded_scout_note
+        + availability_note
         + _planning_disposition_warning_note(planning_handoffs)
-        + _format_output(raw_results, finalization.models, finalization.request.goal,
-                         finalization.estimated_tokens)
+        + _format_output(
+            raw_results,
+            finalization.models,
+            finalization.request.goal,
+            finalization.estimated_tokens,
+            availability_only=availability_only,
+            reviewer_retry_required=reviewer_slots_degraded,
+        )
         + "\n\n"
         + footer
     )
@@ -1161,20 +1289,27 @@ async def _run_plan_review_async(
     plan_class = request.plan_class
     review_disposition = request.review_disposition
     try:
-        scope = _normalize_plan_scope(request.scope)
+        state_root, state_task_id = _planning_state_location(ctx)
     except ValueError as exc:
-        return f"ERROR: PLAN_SCOPE_INVALID: {exc}"
+        return f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}"
+    scope, validation_error = _validate_plan_request_envelope(request, state_root, state_task_id)
+    if validation_error:
+        return validation_error
     from ouroboros import config as _cfg
     deadline_skip = _plan_deadline_skip(ctx)
     deadline_blocked = bool(deadline_skip)
     try:
-        state_root, state_task_id = _planning_state_location(ctx)
-    except ValueError as exc:
-        return f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}"
-    try:
         has_prior_state = bool(load_plan_review_state(state_root, state_task_id).get("waves"))
     except (OSError, TimeoutError, ValueError) as exc:
         return f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}"
+    request_fingerprint = _plan_request_fingerprint(
+        plan=plan, goal=goal, files_to_touch=files_to_touch, context_level=context_level,
+        context_notes=context_notes, plan_class=plan_class, scope=scope, include_tests=include_tests,
+    )
+    try:
+        record_plan_review_attempt(state_root, state_task_id, fingerprint=request_fingerprint)
+    except (OSError, TimeoutError, ValueError) as exc:
+        return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
     if not deadline_blocked or has_prior_state:
         try:
             governance_repo, subject_repo = _resolve_plan_roots(ctx, files_to_touch)
@@ -1193,26 +1328,54 @@ async def _run_plan_review_async(
             plan_class=resolved_class,
             scope=scope,
         )
-        # BINDING identity = a pure function of the AGENT's envelope (resolved values
-        # live in the wave's component hashes, for diagnostics only).
-        request_fingerprint = _plan_request_fingerprint(
-            plan=plan, goal=goal, files_to_touch=files_to_touch, context_level=context_level,
-            context_notes=context_notes, plan_class=plan_class, scope=scope, include_tests=include_tests,
-        )
-        existing = _reuse_or_disposition_plan_review(
-            ctx, request_fingerprint, review_disposition, plan_text_fingerprint(plan), resolved_request,
-        )
-        if existing is not None:
-            return existing
-        if not list(_cfg.get_review_models() or []):
-            return "ERROR: No review models configured. Set OUROBOROS_REVIEW_MODELS in settings."
-        models = _get_review_models()
-        slot_limits = _per_slot_input_token_limits(
-            models, output_reserve=_PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000)
-        plan_budget_limit = _quorum_input_token_limit(models, slot_limits)  # quorum, not the smallest window
-
+        if deadline_blocked:
+            try:
+                decision = plan_review_gate_projection(
+                    load_plan_review_state(state_root, state_task_id),
+                    "blocking",
+                )
+            except (OSError, TimeoutError, ValueError) as exc:
+                return f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}"
+            if str(decision.get("status") or "") == "closed" or review_disposition is not None:
+                existing = _reuse_or_disposition_plan_review(
+                    ctx,
+                    request_fingerprint,
+                    review_disposition,
+                    plan_text_fingerprint(plan),
+                    resolved_request,
+                )
+                if existing is not None:
+                    return existing
+            if str(decision.get("status") or "") != "closed":
+                try:
+                    record_plan_review_attempt(
+                        state_root, state_task_id, fingerprint=request_fingerprint,
+                        status="rail_degraded", reason="plan_task_deadline")
+                except (OSError, TimeoutError, ValueError) as exc:
+                    return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
+                return _plan_deadline_skip(ctx, emit=True) or deadline_skip
+        else:
+            existing = _reuse_or_disposition_plan_review(
+                ctx, request_fingerprint, review_disposition, plan_text_fingerprint(plan), resolved_request,
+            )
+            if existing is not None:
+                return existing
     if deadline_blocked:
+        try:
+            record_plan_review_attempt(
+                state_root, state_task_id, fingerprint=request_fingerprint,
+                status="rail_degraded", reason="plan_task_deadline")
+        except (OSError, TimeoutError, ValueError) as exc:
+            return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
         return _plan_deadline_skip(ctx, emit=True) or deadline_skip
+    if not list(_cfg.get_review_models() or []):
+        return _plan_unavailable(
+            ctx, "ERROR: No review models configured. Set OUROBOROS_REVIEW_MODELS in settings.",
+            "review_models_unconfigured")
+    models = _get_review_models()
+    slot_limits = _per_slot_input_token_limits(
+        models, output_reserve=_PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000)
+    plan_budget_limit = _quorum_input_token_limit(models, slot_limits)  # quorum, not the smallest window
     degraded_scout_note = ""
     planning_handoffs: dict = {}
     reviewed_result_hashes: dict[str, str] = {}
@@ -1221,12 +1384,15 @@ async def _run_plan_review_async(
     else:
         swarm = _start_planning_swarm(ctx, resolved_request, request_fingerprint)
         if not swarm.get("started"):
-            return str(swarm.get("error") or "ERROR: plan_task planning swarm failed closed.")
+            return _plan_unavailable(
+                ctx, str(swarm.get("error") or "ERROR: plan_task planning swarm failed closed."),
+                "planning_scout_unavailable")
         planning_handoffs = dict(swarm.get("handoffs") or {})
         try:
             reviewed_result_hashes = _reviewed_handoff_hashes(planning_handoffs)
         except ValueError as exc:
-            return f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}"
+            return _plan_unavailable(
+                ctx, f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}", "planning_evidence_invalid")
         planning_handoff_raw = _format_planning_handoffs(planning_handoffs, raw=True)
         planning_handoff_compact = _format_planning_handoffs(planning_handoffs, raw=False)
         degraded_scout_note = (
@@ -1235,23 +1401,18 @@ async def _run_plan_review_async(
             "omissions manifest.\n\n"
             if swarm.get("degraded_evidence") else ""
         )
-
     checklist = _load_plan_checklist()
     bible_text = load_governance_doc(governance_repo, "BIBLE.md", on_missing="explicit")
     dev_md = load_governance_doc(governance_repo, "docs/DEVELOPMENT.md", on_missing="explicit")
     arch_md = load_governance_doc(governance_repo, "docs/ARCHITECTURE.md", on_missing="explicit")
     checklists_md = load_governance_doc(governance_repo, "docs/CHECKLISTS.md", on_missing="explicit")
-    # v6.61.0 (5.2) doc tiering (GOVERNANCE-contract change, owner quiz 19): reviewers of a
-    # NON-self_mod plan keep BIBLE + DEVELOPMENT in full but get ARCHITECTURE as the LOSSLESS
-    # navigation map (every section + line range, full sections on demand). self_mod keeps
-    # today's full pack untouched.
+    # Non-self-mod plans use the lossless ARCHITECTURE navigation map; self-mod keeps it whole.
     if resolved_class != "self_mod" and arch_md.strip():
         from ouroboros.context_layout import generate_doc_nav_map
 
         arch_md = generate_doc_nav_map(
             arch_md, title="ARCHITECTURE.md", rel_path="docs/ARCHITECTURE.md"
         )
-
     ctx.emit_progress_fn("📐 plan_task: reading planned-touch file snapshots…")
     canonical_docs = {
         "BIBLE.md",
@@ -1271,7 +1432,6 @@ async def _run_plan_review_async(
         head_snapshots, snapshot_included = build_head_snapshot_section(
             subject_repo, files_to_touch
         )
-
     system_prompt = _build_system_prompt(
         checklist,
         bible_text,
@@ -1324,29 +1484,31 @@ async def _run_plan_review_async(
                 )
             )
         except Exception as e:
-            return f"ERROR: Failed to build review context atlas: {e}"
+            return _plan_unavailable(
+                ctx, f"ERROR: Failed to build review context atlas: {e}", "review_atlas_failed")
 
         if atlas_assembly_failed(atlas):
             # Review does not proceed on the remainder; the typed reason renders
             # EVERY cause and the shared remedy pick follows the cause set —
             # `context_level` moves only `target_total_tokens` (inert here).
-            return (
+            return _plan_unavailable(
+                ctx,
                 "⚠️ PLAN_REVIEW_SKIPPED: " + atlas_assembly_failure_reason(atlas) + ". "
                 + atlas_assembly_remedy(
                     atlas.manifest,
                     "Split the plan into a smaller scope or choose a smaller context_level.",
-                )
+                ),
+                "review_atlas_assembly_failed",
             )
 
-        # The Atlas slot is the LAST section of the stable evidence prefix by construction, so
-        # substitute the LAST occurrence within that boundary: a wider search would match the
-        # placeholder literal quoted by the plan text or by a HEAD snapshot.
+        # Replace only the stable-prefix slot, not a copy quoted by plan text or a snapshot.
         slot = user_content.rfind(placeholder, 0, user_stable_len)
         if slot < 0:
-            return "ERROR: Failed to build review context atlas: placeholder missing."
+            return _plan_unavailable(
+                ctx, "ERROR: Failed to build review context atlas: placeholder missing.",
+                "review_atlas_invalid")
         user_content = user_content[:slot] + atlas.text + user_content[slot + len(placeholder):]
         user_stable_len += len(atlas.text) - len(placeholder)
-
     estimated_tokens = estimate_tokens(system_prompt + user_content)
     if estimated_tokens > plan_budget_limit and planning_handoff_raw:
         user_content = user_content.replace(planning_handoff_raw, planning_handoff_compact)
@@ -1354,24 +1516,30 @@ async def _run_plan_review_async(
     models, callable_slot_ids, oversize_results, fit_error = _plan_slot_fit_with_identity(
         models, slot_limits, estimated_tokens)
     if fit_error:
-        return fit_error
+        return _plan_unavailable(ctx, fit_error, "review_context_unavailable")
 
-    # Budget admission for the whole reviewer wave (v6.69.0): declining up front
-    # beats dying mid-wave with paid partial slots. Fail-open on unknowns.
+    # Decline an unaffordable whole wave before paying for partial slots; fail open on unknowns.
     _admission = review_wave_budget_gate(
         ctx, surface="plan_review", models=models,
         prompt_chars=len(system_prompt) + len(user_content),
         max_completion_tokens=_PLAN_REVIEW_MAX_TOKENS,
     )
     if _admission is not None:
-        return (
+        return _plan_unavailable(
+            ctx,
             "⚠️ PLAN_REVIEW_SKIPPED_BUDGET: the reviewer wave was declined before "
             f"dispatch — estimated cost ~${_admission.get('estimated_wave_usd')} exceeds "
             f"the remaining root budget ${_admission.get('remaining_usd')} "
             f"(limit ${_admission.get('limit_usd')}). No reviewer was called. "
-            "Shrink the plan context, split the plan, or raise the per-task budget."
+            "Shrink the plan context, split the plan, or raise the per-task budget.",
+            "review_budget_unavailable",
         )
-
+    if planning_handoffs:
+        snapshot = _persist_planning_snapshot(ctx, planning_handoffs)
+        if snapshot.get("error"):
+            return _plan_unavailable(
+                ctx, "ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: " + str(snapshot["error"]),
+                "planning_evidence_snapshot_failed")
     ctx.emit_progress_fn(
         f"📐 plan_task: running {len(models)} parallel reviewers "
         f"(context={resolved_context_level}, ~{estimated_tokens:,} tokens each)…"
@@ -1395,185 +1563,3 @@ async def _run_plan_review_async(
         degraded_scout_note=degraded_scout_note,
         reviewed_result_hashes=reviewed_result_hashes,
     ))
-
-
-async def _run_plan_review_slots(
-    ctx: ToolContext,
-    models: list[str],
-    system_prompt: str,
-    user_content: str,
-    user_stable_len: int = 0, slot_ids: list[str] | None = None,
-) -> list[dict]:
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
-
-    # Owner decision D15: plan review stays api_chat — no route list is consulted here.
-    row_ids = list(slot_ids) if slot_ids is not None else _minted_plan_slot_ids(models)
-    slots = [
-        ReviewSlot(
-            slot_id=row_id,
-            model=str(model),
-            effort=_PLAN_REVIEW_EFFORT,
-            timeout_sec=_PLAN_REVIEW_SLOT_TIMEOUT_SEC,
-            max_tokens=_PLAN_REVIEW_MAX_TOKENS,
-            temperature=0.2,
-            role_hint="plan reviewer",
-            use_local=review_model_uses_local(str(model)),
-        )
-        for row_id, model in zip(row_ids, models, strict=True)
-    ]
-    request = ReviewRequest(
-        surface="plan_review",
-        goal="Review the proposed implementation plan before code is written.",
-        messages=build_plan_review_messages(system_prompt, user_content, user_stable_len),
-        task_id=str(getattr(ctx, "task_id", "") or "plan_review"),
-        call_type="plan_review",
-        max_tokens=_PLAN_REVIEW_MAX_TOKENS,
-        temperature=0.2,
-        no_proxy=True,
-    )
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
-        None,
-        lambda: run_review_request(
-            request,
-            slots=slots,
-            drive_root=pathlib.Path(ctx.drive_root),
-            llm=LLMClient(),
-            usage_ctx=ctx,
-        ),
-    )
-    return [_plan_raw_result_from_actor(actor, models[idx] if idx < len(models) else "") for idx, actor in enumerate(result.actors)]
-
-
-def _plan_raw_result_from_actor(actor: dict, request_model: str) -> dict:
-    usage = actor.get("usage") or {}
-    text = actor.get("raw_text") or ""
-    error = actor.get("error") or ""
-    if actor.get("status") not in {"ok", "empty"} and not error:
-        error = str(actor.get("status") or "review failed")
-    return {
-        # Identity is CARRIED, never re-derived: the row keeps the slot_id the
-        # substrate ran, so duplicate-model plan rows stay distinguishable.
-        "slot_id": str(actor.get("slot_id") or ""),
-        "model": str(usage.get("resolved_model") or actor.get("model") or request_model),
-        "request_model": request_model or actor.get("model") or "",
-        "text": text,
-        "error": error or None,
-        "prompt_ref": actor.get("prompt_ref") or {},
-        "response_ref": actor.get("response_ref") or {},
-        "tokens_in": usage.get("prompt_tokens", 0),
-        "tokens_out": usage.get("completion_tokens", 0),
-        "cost": float(usage["cost"]) if usage.get("cost") is not None else None,
-    }
-
-
-_PLAN_CLASSES = ("self_mod", "external", "creative", "research")
-
-
-def _resolve_plan_class(ctx: ToolContext, plan_class: str, files_to_touch: list) -> tuple[str, str]:
-    """v6.61.0 (5.1): resolve the plan's CLASS — the agent declares it LLM-first (self_mod |
-    external | creative | research), and the host STRUCTURALLY escalates to self_mod when the
-    planned files resolve under the SYSTEM repo (a path fact, never keyword matching — P5).
-    Returns (resolved_class, escalation_note)."""
-    from ouroboros.tool_access import path_is_relative_to
-    from ouroboros.tools.registry import active_repo_dir_for
-
-    declared = str(plan_class or "").strip().lower()
-    if declared not in _PLAN_CLASSES:
-        declared = ""
-    _sys_raw = getattr(ctx, "system_repo_dir", None)
-    if _sys_raw is not None and _sys_raw.__class__.__module__.startswith("unittest.mock"):
-        _sys_raw = None  # same mock guard active_repo_dir_for uses
-    try:
-        system_repo = pathlib.Path(_sys_raw or ctx.repo_dir).resolve(strict=False)
-    except (TypeError, OSError, ValueError):
-        # Unresolvable ctx: fail toward the historically STRICTER class —
-        # self_mod keeps the full pack + the explicit context_level contract.
-        return "self_mod", ""
-    try:
-        active = pathlib.Path(active_repo_dir_for(ctx)).resolve(strict=False)
-    except Exception:
-        active = system_repo
-    touches_system = False
-    if files_to_touch:
-        if active == system_repo:
-            # Relative files_to_touch resolve against the active workspace — here
-            # that IS the system repo, so the plan touches the self-body.
-            touches_system = True
-        else:
-            for raw in files_to_touch:
-                candidate = pathlib.Path(str(raw or ""))
-                resolved = (candidate if candidate.is_absolute() else active / candidate).resolve(strict=False)
-                if resolved == system_repo or path_is_relative_to(resolved, system_repo):
-                    touches_system = True
-                    break
-    if touches_system:
-        note = "" if (declared in ("", "self_mod")) else (
-            f"plan_class escalated {declared!r} -> 'self_mod': files_to_touch resolve "
-            "under the Ouroboros system repo (structural fact)."
-        )
-        return "self_mod", note
-    if declared:
-        return declared, ""
-    # Undeclared: preserve today's behavior for self-repo work; a task planning in
-    # an external workspace defaults to the external class.
-    return ("external" if active != system_repo else "self_mod"), ""
-
-
-def _classify_reviewer_error(exc: BaseException, model: str) -> str:
-    """Return actionable reviewer failure text without swallowing details."""
-    exc_type = type(exc).__name__
-    exc_str = str(exc)
-
-    # JSONDecodeError usually means provider returned a non-JSON error body.
-    if isinstance(exc, json.JSONDecodeError):
-        return (
-            f"API error (provider returned non-JSON response body — likely oversized prompt "
-            f"or HTTP error from {model}): {exc_str}"
-        )
-
-    # Import lazily so the module loads without openai installed.
-    try:
-        from openai import (
-            APIConnectionError,
-            APIStatusError,
-            BadRequestError,
-            RateLimitError,
-        )
-        if isinstance(exc, RateLimitError):
-            return f"Rate limit / quota exceeded for {model} (HTTP 429): {exc_str}"
-        if isinstance(exc, BadRequestError):
-            return (
-                f"Bad request for {model} (HTTP 400 — prompt may be too large "
-                f"for this model's context window): {exc_str}"
-            )
-        if isinstance(exc, APIConnectionError):
-            return f"API connection error for {model} (network failure): {exc_str}"
-        if isinstance(exc, APIStatusError):
-            status = getattr(exc, "status_code", "?")
-            return f"API status error {status} for {model}: {exc_str}"
-    except ImportError:
-        pass
-
-    # Catch-all: preserve the full unknown exception text.
-    return f"{exc_type}: {exc_str}"
-
-
-def _get_review_models() -> list[str]:
-    """Return the configured review-model slots (arbitrary N), preserving
-    explicit duplicates; fall back to the main model only when nothing is set."""
-    from ouroboros import config as _cfg
-
-    models = list(_cfg.get_review_models() or [])
-    if not models:
-        models = [os.environ.get("OUROBOROS_MODEL", _cfg.SETTINGS_DEFAULTS["OUROBOROS_MODEL"])]
-    return models  # honor the configured reviewer count
-
-
-def _load_plan_checklist() -> str:
-    """Load the Plan Review Checklist section from CHECKLISTS.md."""
-    try:
-        return load_checklist_section("Plan Review Checklist")
-    except Exception as e:
-        log.warning("Could not load Plan Review Checklist: %s", e)
-        return ""

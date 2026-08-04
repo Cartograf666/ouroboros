@@ -121,6 +121,7 @@ def test_atlas_compact_manifest_keeps_full_coverage_out_of_prompt(tmp_path):
 def test_atlas_force_includes_protected_workflow_even_under_skipped_github_dir(tmp_path):
     _write(tmp_path / ".github" / "workflows" / "ci.yml", "name: CI\n")
     _write(tmp_path / "ouroboros" / "tools" / "review_context_atlas.py", "ATLAS = True\n")
+    _write(tmp_path / "ouroboros" / "tools" / "plan_review_runtime.py", "RUNTIME = True\n")
     _write(tmp_path / "assets" / "logo.txt", "asset text\n")
     _write(tmp_path / "main.py", "print('main')\n")
 
@@ -130,6 +131,7 @@ def test_atlas_force_includes_protected_workflow_even_under_skipped_github_dir(t
             tracked_paths=(
                 ".github/workflows/ci.yml",
                 "ouroboros/tools/review_context_atlas.py",
+                "ouroboros/tools/plan_review_runtime.py",
                 "assets/logo.txt",
                 "main.py",
             ),
@@ -142,6 +144,7 @@ def test_atlas_force_includes_protected_workflow_even_under_skipped_github_dir(t
     coverage = _coverage(pack)
     assert coverage[".github/workflows/ci.yml"]["disposition"] == "full"
     assert coverage["ouroboros/tools/review_context_atlas.py"]["disposition"] == "full"
+    assert coverage["ouroboros/tools/plan_review_runtime.py"]["disposition"] == "full"
     assert "name: CI" in pack.text
     assert coverage["assets/logo.txt"]["disposition"] == "excluded_dir"
     assert "asset text" not in pack.text

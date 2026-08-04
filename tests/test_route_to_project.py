@@ -8,14 +8,16 @@ from ouroboros.projects_registry import create_project
 from ouroboros.tools.control import _list_projects, _route_to_project, get_tools
 
 
-def _ctx(tmp_path, events=None, *, task_metadata=None):
-    return types.SimpleNamespace(
+def _ctx(tmp_path, events=None, *, task_metadata=None, **overrides):
+    values = dict(
         pending_events=events if events is not None else [],
         event_queue=None,
         current_chat_id=1,
         drive_root=tmp_path,
         task_metadata=task_metadata or {},
     )
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
 
 
 def test_route_to_existing_project_emits_event_and_receipt(tmp_path):
@@ -51,6 +53,52 @@ def test_route_to_existing_project_emits_event_and_receipt(tmp_path):
     assert evt["source_ref"] == origin_ref
     assert evt["source_text"] == "continue the engine tuning"
     assert ctx._typed_routing_action_emitted == "route_to_project"
+
+
+def test_main_swarm_route_carries_intent_and_emits_only_once(tmp_path, monkeypatch):
+    create_project(tmp_path, "racer", name="Racer")
+    monkeypatch.setattr(
+        "ouroboros.tools.control._wait_for_promotion_admission",
+        lambda *_args, **_kwargs: {"status": "unconfirmed", "reason": "confirmation_timeout"},
+    )
+    events = []
+    ctx = _ctx(
+        tmp_path,
+        events,
+        task_metadata={
+            "client_message_id": "swarm-route-1",
+            "force_plan": True,
+            "force_plan_source": "swarm",
+        },
+        is_ephemeral_turn=True,
+        project_id="",
+    )
+
+    first = _route_to_project(ctx, "racer", "Audit and fix this in Racer")
+    second = _route_to_project(ctx, "racer", "Audit and fix this in Racer")
+
+    assert first == second
+    assert len(events) == 1
+    assert events[0]["force_plan"] is True
+    assert events[0]["force_plan_source"] == "swarm"
+    assert ctx._swarm_handoff_attempt["task_id"] == events[0]["task_id"]
+
+
+def test_project_swarm_route_to_other_project_is_rejected_without_event(tmp_path):
+    create_project(tmp_path, "beta", name="Beta")
+    events = []
+    ctx = _ctx(
+        tmp_path,
+        events,
+        task_metadata={"force_plan": True, "force_plan_source": "swarm"},
+        is_ephemeral_turn=True,
+        project_id="alpha",
+    )
+
+    out = _route_to_project(ctx, "beta", "Audit and fix this in Beta")
+
+    assert "SWARM_PROJECT_SCOPE_OWNED" in out
+    assert events == []
 
 
 def test_route_to_missing_project_emits_typed_manual_target(tmp_path):
