@@ -1108,11 +1108,7 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
         suppress_chat_log = bool(msg.get("suppress_chat_log"))
         task_constraint = msg.get("task_constraint") if isinstance(msg.get("task_constraint"), dict) else None
         task_metadata = msg.get("task_metadata") if isinstance(msg.get("task_metadata"), dict) else None
-        image_data = (
-            (image_base64, image_mime, image_caption)
-            if image_base64
-            else None
-        )
+        image_data = (image_base64, image_mime, image_caption) if image_base64 else None
         log_text = text or image_caption or ("(image attached)" if image_base64 else "")
         now_iso = utc_now_iso()
         if not client_message_id:

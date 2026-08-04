@@ -844,9 +844,11 @@ class TestAutoPushBehavior:
     def test_managed_tests_gate_before_tag_and_ordinary_tests_keep_prior_order(self):
         git_mod = _get_git_module()
         source = inspect.getsource(git_mod._repo_commit_push)
-        managed_tests_pos = source.index("_post_commit_result(ctx, commit_message")
+        # The managed BLOCKING gate (extracted helper) runs before tagging;
+        # ordinary warning-only tests run after the tag and before the push.
+        managed_tests_pos = source.index("_managed_post_commit_tests_gate(")
         tag_pos = source.index("tag_info =")
-        ordinary_tests_pos = source.rindex("_post_commit_result(ctx, commit_message")
+        ordinary_tests_pos = source.index("_post_commit_result(ctx, commit_message")
         push_pos = source.rindex("push_status = _auto_push")
         assert managed_tests_pos < tag_pos < ordinary_tests_pos < push_pos
 

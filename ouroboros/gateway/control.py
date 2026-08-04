@@ -570,6 +570,22 @@ def _apply_clean_merge_fenced(request: Request, plan: dict) -> JSONResponse:
         "dirty_lines": [ln for ln in status_txt.splitlines() if ln.strip()] if rc_s == 0 else [],
         "unpushed_lines": [], "warnings": [],
     })
+    attempt_id = uuid.uuid4().hex[:12]
+    # Owner decision (Q1=C): dirty local work never enters committed history on a
+    # clean auto-update. Stash it (tracked + untracked) before the apply; boot
+    # finalization restores it as uncommitted content, and a rollback restores it
+    # onto the exact pre-update tree it was taken from.
+    stash_sha = ""
+    if int(plan.get("local_dirty_count") or 0) > 0:
+        from supervisor.update_merge import stash_local_changes_for_update
+
+        stash_ok, stash_sha, stash_error = stash_local_changes_for_update(attempt_id)
+        if not stash_ok:
+            _respawn_workers_after_failed_update()
+            return JSONResponse(
+                {"error": f"could not preserve local changes before the update: {stash_error}"},
+                status_code=409,
+            )
     tx = {
         "pre_update_sha": str(plan.get("base_sha") or ""),
         "pre_update_branch": branch,
@@ -580,7 +596,8 @@ def _apply_clean_merge_fenced(request: Request, plan: dict) -> JSONResponse:
         "phase": "pending_boot_smoke",
         "pre_restart_smoke": "pending",
         "rollback_attempted": False,
-        "attempt_id": uuid.uuid4().hex[:12],
+        "attempt_id": attempt_id,
+        "stash_sha": stash_sha,
     }
     write_update_tx(tx)
     ok, msg = apply_managed_merge_update(branch, merge_commit)

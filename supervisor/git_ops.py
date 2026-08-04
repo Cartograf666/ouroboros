@@ -677,6 +677,31 @@ def _preserve_branch_for_official_reset(
         return False, branch_or_error
     return True, branch_or_error
 
+def _run_git_resilient(cmd, **kwargs):
+    """Run a destructive-checkout git command with index-repair retries."""
+    import time
+    check = bool(kwargs.pop("check", False))
+    _guard_live_repo_destructive_git(list(cmd))
+    for attempt in range(5):
+        run_kwargs = dict(kwargs)
+        run_kwargs.setdefault("capture_output", True)
+        run_kwargs.setdefault("text", True)
+        result = subprocess.run(cmd, **run_kwargs)
+        if result.returncode == 0:
+            return result
+        if _maybe_repair_git_index(result.stderr):
+            time.sleep(0.2)
+            continue
+        if not check:
+            return result
+        if attempt == 4:
+            raise subprocess.CalledProcessError(
+                result.returncode, cmd, output=result.stdout, stderr=result.stderr,
+            )
+        time.sleep(1)
+    return subprocess.run(cmd, check=check, **kwargs)
+
+
 def checkout_and_reset(branch: str, reason: str = "unspecified",
                        unsynced_policy: str = "ignore") -> Tuple[bool, str]:
     managed_meta = _read_managed_repo_meta()
@@ -888,32 +913,6 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
                     "rescue": rescue_info,
                 },
             )
-
-    def _run_git_resilient(cmd, **kwargs):
-        import time
-        check = bool(kwargs.pop("check", False))
-        _guard_live_repo_destructive_git(list(cmd))
-        for attempt in range(5):
-            run_kwargs = dict(kwargs)
-            run_kwargs.setdefault("capture_output", True)
-            run_kwargs.setdefault("text", True)
-            result = subprocess.run(cmd, **run_kwargs)
-            if result.returncode == 0:
-                return result
-            if _maybe_repair_git_index(result.stderr):
-                time.sleep(0.2)
-                continue
-            if not check:
-                return result
-            if attempt == 4:
-                raise subprocess.CalledProcessError(
-                    result.returncode,
-                    cmd,
-                    output=result.stdout,
-                    stderr=result.stderr,
-                )
-            time.sleep(1)
-        return subprocess.run(cmd, check=check, **kwargs)
 
     remote_ref_exists = False
     if target_ref:
@@ -1490,29 +1489,10 @@ def prepare_managed_update(
     }
 
 
-def rollback_to_version(tag_or_sha: str, reason: str = "manual_rollback") -> Tuple[bool, str]:
-    from supervisor.update_recovery import rollback_to_version as _rollback
-
-    return _rollback(tag_or_sha, reason)
-
-
-def promote_branch_exact(
-    source_branch: str,
-    stable_branch: str,
-    *,
-    push_remote: bool = False,
-    remote_name: str = "origin",
-    repo_dir: Optional[str] = None,
-) -> Tuple[bool, Dict[str, Any]]:
-    from supervisor.update_recovery import promote_branch_exact as _promote
-
-    return _promote(
-        source_branch,
-        stable_branch,
-        push_remote=push_remote,
-        remote_name=remote_name,
-        repo_dir=repo_dir,
-    )
+# Owner recovery surface lives in supervisor/update_recovery.py; re-exported because
+# callers/tests address it through the git_ops facade (cycle-free: update_recovery
+# imports git_ops only inside functions).
+from supervisor.update_recovery import promote_branch_exact, rollback_to_version  # noqa: E402,F401
 
 
 def configure_remote(repo_slug: str, token: str) -> Tuple[bool, str]:

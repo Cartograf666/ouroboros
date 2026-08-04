@@ -171,14 +171,19 @@ def test_build_and_apply_clean_merge(tmp_path, monkeypatch):
     assert plan["kind"] == "clean", plan
     assert plan["merge_commit"], plan
 
+    # Q1=C: local dirty work rides a stash through the apply — it never becomes
+    # part of committed history — and is restored as uncommitted content after.
+    ok, stash_sha, stash_error = update_merge.stash_local_changes_for_update("plan-test")
+    assert ok and stash_sha, stash_error
     ok, msg = update_merge.apply_managed_merge_update(head, plan["merge_commit"])
     assert ok, msg
-    # the live repo now has BOTH the remote's new file AND the local dirty work.
     assert (repo / "b.txt").exists()
+    restored, note = update_merge.restore_update_stash(stash_sha, context="test")
+    assert restored, note
     assert (repo / "c.txt").read_text() == "local untracked\n"
-    # HEAD is a merge commit (self + 2 parents = local snapshot + target).
-    parents = _git(repo, "rev-list", "--parents", "-n", "1", "HEAD").stdout.strip().split()
-    assert len(parents) == 3
+    # Base was fast-forwardable, so official history lands as-is: HEAD is the
+    # target itself, with no synthetic merge commit carrying local work.
+    assert _git(repo, "rev-parse", "HEAD").stdout.strip() == plan["target_sha"]
 
 
 def test_rollback_managed_update(tmp_path, monkeypatch):

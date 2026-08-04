@@ -30,7 +30,7 @@ def test_shutdown_task_cleanup_args_never_reports_crash_storm():
     assert "interrupted" in reason_signal.lower()
 
 
-def test_managed_update_restart_preserves_pending_queue(monkeypatch):
+def test_managed_update_restart_preserves_pending_queue(monkeypatch, tmp_path):
     import server
 
     worker_calls = []
@@ -41,6 +41,10 @@ def test_managed_update_restart_preserves_pending_queue(monkeypatch):
         safe_restart=lambda **_kwargs: (True, "ok"),
         kill_workers=lambda **kwargs: worker_calls.append(kwargs),
         persist_queue_snapshot=lambda **_kwargs: None,
+        # The evolution restart-receipt check reads pending_restart_verify.json
+        # from ctx.DRIVE_ROOT before any restart proceeds.
+        DRIVE_ROOT=tmp_path,
+        REPO_DIR=tmp_path,
     )
     monkeypatch.setattr(
         server,

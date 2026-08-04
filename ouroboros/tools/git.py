@@ -1055,6 +1055,28 @@ def _managed_commit_gate_failure(reason: str, message: str) -> str:
     )
 
 
+def _managed_post_commit_tests_gate(
+    ctx, commit_message: str, commit_start: float, skip_tests: bool,
+    test_warning_ref, managed_tx: Dict[str, Any],
+) -> Optional[str]:
+    """BLOCKING post-commit test gate for managed-update merges only: a failed
+    suite rolls the assisted merge back instead of shipping a warning (ordinary
+    commits keep the warning-only contract later in the flow)."""
+    if not managed_tx:
+        return None
+    post_test_error = _post_commit_result(ctx, commit_message, skip_tests, test_warning_ref)
+    if not post_test_error:
+        return None
+    failure = test_warning_ref[0].strip() or post_test_error
+    failure = _managed_commit_gate_failure("assisted_post_commit_tests_failed", failure)
+    _record_commit_attempt(
+        ctx, commit_message, "failed",
+        block_reason="post_commit_tests_failed", block_details=failure,
+        duration_sec=time.time() - commit_start, phase="post_commit_tests",
+    )
+    return failure
+
+
 def _review_binding_failure(
     ctx: ToolContext,
     commit_message: str,
@@ -2076,26 +2098,11 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                 managed_tx=_managed_tx,
             )
         reviewed_binding = post_fingerprint.get("binding", {}) or {}
-        post_test_error = (
-            _post_commit_result(ctx, commit_message, skip_tests, test_warning_ref)
-            if _managed_tx
-            else None
+        gate_failure = _managed_post_commit_tests_gate(
+            ctx, commit_message, _commit_start, skip_tests, test_warning_ref, _managed_tx,
         )
-        if post_test_error:
-            failure = test_warning_ref[0].strip() or post_test_error
-            failure = _managed_commit_gate_failure(
-                "assisted_post_commit_tests_failed", failure
-            )
-            _record_commit_attempt(
-                ctx,
-                commit_message,
-                "failed",
-                block_reason="post_commit_tests_failed",
-                block_details=failure,
-                duration_sec=time.time() - _commit_start,
-                phase="post_commit_tests",
-            )
-            return failure
+        if gate_failure:
+            return gate_failure
         # A managed-update merge commit must NOT auto-tag/auto-push pre-restart (an un-smoked
         # update would otherwise reach origin / create a version tag, and a later rollback would
         # diverge from origin). The official version tag is handled on the owner's terms.
