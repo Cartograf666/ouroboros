@@ -96,6 +96,91 @@ def test_project_single_pending_root_gets_zero_call_mailbox_delivery(tmp_path, m
     assert annotation["status"] == "delivered"
 
 
+def test_project_swarm_bypasses_single_root_mailbox_for_new_managed_root(tmp_path, monkeypatch):
+    import server
+    from ouroboros.owner_mailbox import drain_owner_messages
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(tmp_path, "racer")
+    chat_id = int(project["chat_id"])
+    pending = {
+        "id": "pending-root",
+        "chat_id": chat_id,
+        "root_task_id": "pending-root",
+        "delegation_role": "root",
+        "drive_root": str(tmp_path),
+    }
+    calls = []
+    ctx = _ctx(
+        tmp_path,
+        pending=[pending],
+        ephemeral=lambda cid, text, image, **kwargs: calls.append((cid, text, kwargs)),
+        direct=lambda *_a, **_k: calls.append("direct"),
+    )
+
+    class Bridge:
+        def get_updates(self, offset=0, timeout=1):
+            return [{
+                "update_id": 2,
+                "message": {
+                    "chat": {"id": chat_id}, "from": {"id": 1}, "source": "web",
+                    "text": "deeply fix the new issue", "client_message_id": "swarm-project-1",
+                    "task_metadata": {"force_plan": True, "force_plan_source": "swarm"},
+                },
+            }]
+
+        def broadcast(self, _payload):
+            return None
+
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr("supervisor.message_bus.log_chat", lambda *_a, **_k: None)
+    server._process_bridge_updates(Bridge(), 0, ctx)
+
+    assert drain_owner_messages(tmp_path, "pending-root") == []
+    assert len(calls) == 1 and calls[0] != "direct"
+    metadata = calls[0][2]["task_metadata"]
+    assert metadata["force_plan"] is True
+    assert metadata["routing_contract"]["valid_actions"] == ["promote_chat_to_task"]
+    assert metadata["routing_contract"]["on_uncertain_or_invalid_target"] == "promote_chat_to_task"
+    assert metadata["routing_contract"]["manual_options"] == []
+
+
+def test_empty_main_swarm_uses_ephemeral_router_not_direct_lane(tmp_path, monkeypatch):
+    import server
+    from ouroboros.projects_registry import create_project
+
+    calls = []
+    create_project(tmp_path, "racer", name="Racer")
+    ctx = _ctx(
+        tmp_path,
+        ephemeral=lambda cid, text, image, **kwargs: calls.append(("ephemeral", kwargs)),
+        direct=lambda *_a, **_k: calls.append(("direct", {})),
+    )
+
+    class Bridge:
+        def get_updates(self, offset=0, timeout=1):
+            return [{
+                "update_id": 3,
+                "message": {
+                    "chat": {"id": 1}, "from": {"id": 1}, "source": "web",
+                    "text": "audit and fix it", "client_message_id": "swarm-main-1",
+                    "task_metadata": {"force_plan": True, "force_plan_source": "swarm"},
+                },
+            }]
+
+        def broadcast(self, _payload):
+            return None
+
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr("supervisor.message_bus.log_chat", lambda *_a, **_k: None)
+    server._process_bridge_updates(Bridge(), 0, ctx)
+
+    assert [kind for kind, _kwargs in calls] == ["ephemeral"]
+    contract = calls[0][1]["task_metadata"]["routing_contract"]
+    assert contract["valid_actions"] == ["promote_chat_to_task", "route_to_project"]
+    assert contract["manual_options"] == []
+
+
 def test_project_zero_call_followup_advances_active_fence_then_falls_through_when_sealed(
     tmp_path, monkeypatch,
 ):
@@ -333,6 +418,26 @@ def test_project_room_manual_options_are_room_scoped(tmp_path):
         "project_id": "racer",
         "label": "New task in Project",
     }]
+
+
+def test_project_swarm_keeps_host_scope_when_registry_recheck_is_unavailable(
+    tmp_path, monkeypatch,
+):
+    import server
+
+    ctx = _ctx(tmp_path)
+    monkeypatch.setattr(server, "_project_id_for_registered_chat", lambda *_args: "")
+
+    metadata = server._decision_turn_metadata(
+        ctx,
+        987654,
+        "project-swarm-1",
+        {"project_id": "racer", "force_plan": True, "force_plan_source": "swarm"},
+    )
+
+    assert metadata["routing_contract"]["source_lane"] == "project"
+    assert metadata["routing_contract"]["valid_actions"] == ["promote_chat_to_task"]
+    assert "main_routing_manifest" not in metadata
 
 
 def test_transport_without_client_id_gets_stable_host_owned_routing_id(tmp_path, monkeypatch):

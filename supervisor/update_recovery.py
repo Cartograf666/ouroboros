@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+import os
+import subprocess
+from typing import Any, Dict, Optional, Tuple
 
 
 def rollback_to_version(tag_or_sha: str, reason: str = "manual_rollback") -> Tuple[bool, str]:
@@ -94,21 +96,37 @@ def promote_branch_exact(
     *,
     push_remote: bool = False,
     remote_name: str = "origin",
+    repo_dir: Optional[str] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Move local/optional remote stable refs to one captured source SHA."""
+    """Move local/optional remote stable refs to one captured source SHA.
+
+    ``repo_dir`` scopes the ref operations to the caller's repository (the
+    events handler passes its ctx.REPO_DIR); by default the supervisor's own
+    checkout is used. The remote push always targets the supervisor checkout's
+    remotes, so it is honestly skipped for a non-default ``repo_dir``."""
     from supervisor import git_ops as _g
 
-    rc, source_sha, error = _g.git_capture(
+    cwd = str(repo_dir) if repo_dir else str(_g.REPO_DIR)
+
+    def _capture(cmd: list) -> Tuple[int, str, str]:
+        env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
+        return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+
+    rc, source_sha, error = _capture(
         ["git", "rev-parse", "--verify", f"{source_branch}^{{commit}}"]
     )
     if rc != 0 or not source_sha:
         return False, {"error": error or f"cannot resolve {source_branch}"}
-    rc, _out, error = _g.git_capture(
+    rc, _out, error = _capture(
         ["git", "branch", "-f", stable_branch, source_sha]
     )
     if rc != 0:
         return False, {"error": error or f"cannot update {stable_branch}"}
-    if not _g._ref_points_at_ref(stable_branch, source_sha):
+    rc, landed_sha, error = _capture(
+        ["git", "rev-parse", "--verify", f"{stable_branch}^{{commit}}"]
+    )
+    if rc != 0 or landed_sha != source_sha:
         return False, {"error": f"{stable_branch} did not land on captured SHA {source_sha}"}
 
     result: Dict[str, Any] = {
@@ -117,7 +135,8 @@ def promote_branch_exact(
         "stable_branch": stable_branch,
         "remote_pushed": False,
     }
-    if push_remote and _g._has_remote(remote_name):
+    scoped_elsewhere = bool(repo_dir) and os.path.realpath(cwd) != os.path.realpath(str(_g.REPO_DIR))
+    if push_remote and not scoped_elsewhere and _g._has_remote(remote_name):
         rc, _out, error = _g._git_network_bounded(
             ["push", remote_name, f"{source_sha}:refs/heads/{stable_branch}"]
         )

@@ -436,13 +436,15 @@ def test_auto_push_is_best_effort():
     assert "non-fatal" in source.lower() or "non_fatal" in source.lower()
 
 
-def test_auto_push_outside_git_lock():
-    """Auto-push call must happen AFTER _release_git_lock, not inside the try/finally."""
+def test_only_evolution_authority_recheck_and_auto_push_hold_git_lock():
+    """Evolution push stays inside the lock; ordinary push returns outside it."""
     git_mod = _get_git_module()
     source = inspect.getsource(git_mod._repo_commit_push)
-    lock_release_pos = source.rfind("_release_git_lock")
-    push_pos = source.rfind("_auto_push")
-    assert lock_release_pos < push_pos, "_repo_commit_push: _auto_push must come after _release_git_lock"
+    authority_pos = source.find("_evolution_publication_stopped_result")
+    evolution_push_pos = source.find("_auto_push", authority_pos)
+    lock_release_pos = source.find("_release_git_lock", evolution_push_pos)
+    ordinary_push_pos = source.find("_auto_push", lock_release_pos)
+    assert authority_pos < evolution_push_pos < lock_release_pos < ordinary_push_pos
 
 
 # --- Credential configuration (legacy token-in-URL migration retired) ---

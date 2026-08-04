@@ -259,6 +259,8 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
     proc = job.get("proc")
     task_id = str(job.get("task_id") or "")
     task = job.get("task") if isinstance(job.get("task"), dict) else {}
+    task_metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    terminal_metadata = workers_mod.terminal_task_metadata(task_metadata)
     task_type = str(job.get("task_type") or "")
     terminal_reason = str(job.get("terminal_reason") or "idle_timeout")
     attempt = int(job.get("attempt") or 1)
@@ -355,9 +357,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                     "type": "task_done", "task_id": task_id, "task_type": task_type,
                     "chat_id": done_chat_id, "status": self_status,
                     "reason_code": str((_existing or {}).get("reason_code") or ""),
-                    "metadata": task.get("metadata")
-                    if isinstance(task.get("metadata"), dict)
-                    else {},
+                    "metadata": terminal_metadata,
             })
         except Exception:
             log.debug("Reaper: failed to emit task_done for self-finalized %s", task_id, exc_info=True)
@@ -510,7 +510,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                         "chat_id": done_chat_id, "status": "failed", "reason_code": terminal_reason,
                         "outcome_axes": terminal_outcome_axes(lifecycle="failed", execution=EXECUTION_INFRA_FAILED, reason_code=terminal_reason, review_trigger="supervisor_terminal"),
                         **recon_fields,
-                        "metadata": task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
+                        "metadata": terminal_metadata,
                 })
             except Exception:
                 log.debug("Reaper: failed to emit task_done for %s", task_id, exc_info=True)

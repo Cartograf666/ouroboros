@@ -10,6 +10,17 @@ from __future__ import annotations
 from typing import Any, Dict, List, Protocol
 
 
+def swarm_router_turn(ctx: Any) -> bool:
+    """Return whether *ctx* is the host-attested short-lived Swarm router."""
+
+    metadata = getattr(ctx, "task_metadata", {})
+    return bool(
+        isinstance(metadata, dict)
+        and metadata.get("force_plan")
+        and getattr(ctx, "is_ephemeral_turn", False)
+    )
+
+
 class ToolSchemaProvider(Protocol):
     """Minimal registry contract needed by the loop/discovery helpers."""
 

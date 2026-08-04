@@ -156,19 +156,69 @@ def test_headless_reaper_still_emits_task_done(tmp_path, monkeypatch):
     assert terminal[0]["chat_id"] == 0
 
 
-def test_self_finalized_reaper_event_preserves_task_metadata(tmp_path, monkeypatch):
+def test_self_finalized_reaper_preserves_evolution_transaction_metadata(
+    tmp_path, monkeypatch,
+):
+    from ouroboros.task_results import STATUS_CANCELLED, write_task_result
+    from supervisor.task_reaper import reap_timed_out_task
+
+    events, enqueued = _patch_reaper(tmp_path, monkeypatch)
+    tx = {"campaign_id": "camp", "transaction_id": "tx", "task_id": "evo-reaped"}
+    task = {
+        "id": "evo-reaped",
+        "type": "evolution",
+        "chat_id": 0,
+        "metadata": {
+            "evolution_transaction": tx,
+            "secret_sentinel": "must-not-reach-terminal-event",
+            "workspace_root": "/private/workspace",
+        },
+    }
+    write_task_result(tmp_path, task["id"], STATUS_CANCELLED, result="cancelled")
+
+    reap_timed_out_task({
+        "worker_id": 4,
+        "proc": None,
+        "task_id": task["id"],
+        "task": task,
+        "task_type": "evolution",
+        "terminal_reason": "idle_timeout",
+        "attempt": 1,
+        "owner_chat_id": 0,
+        "will_retry": False,
+    })
+
+    terminal = [event for event in events if event.get("type") == "task_done"]
+    assert enqueued == []
+    assert len(terminal) == 1
+    assert terminal[0]["metadata"] == {"evolution_transaction": tx}
+
+
+def test_self_finalized_reaper_event_preserves_managed_update_metadata(
+    tmp_path, monkeypatch,
+):
+    """The assisted-merge watchdog in _handle_task_done releases the writer gate
+    from the terminal event's metadata when the task already left RUNNING, so a
+    reaped resolver task must forward managed_update — and nothing else."""
     from ouroboros.task_results import write_task_result
     from supervisor.task_reaper import reap_timed_out_task
 
     events, enqueued = _patch_reaper(tmp_path, monkeypatch)
-    metadata = {"managed_update": {"authority_fingerprint": "host-bound"}}
+    managed = {"authority_fingerprint": "host-bound"}
     write_task_result(tmp_path, "self-finalized", "completed", result="done")
 
     reap_timed_out_task({
         "worker_id": 4,
         "proc": None,
         "task_id": "self-finalized",
-        "task": {"id": "self-finalized", "type": "task", "metadata": metadata},
+        "task": {
+            "id": "self-finalized",
+            "type": "task",
+            "metadata": {
+                "managed_update": managed,
+                "secret_sentinel": "must-not-reach-terminal-event",
+            },
+        },
         "task_type": "task",
         "terminal_reason": "idle_timeout",
         "attempt": 1,
@@ -178,7 +228,7 @@ def test_self_finalized_reaper_event_preserves_task_metadata(tmp_path, monkeypat
 
     terminal = [event for event in events if event.get("type") == "task_done"]
     assert enqueued == []
-    assert terminal[-1]["metadata"] == metadata
+    assert terminal[-1]["metadata"] == {"managed_update": managed}
 
 
 def test_top_level_retry_preserves_logical_root_and_typed_attempt_lineage(

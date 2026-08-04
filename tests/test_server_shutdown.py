@@ -313,6 +313,8 @@ def test_panic_stop_kills_services_without_log_finalization(monkeypatch, tmp_pat
     monkeypatch.setattr("ouroboros.local_model.get_manager", lambda: SimpleNamespace(stop_server=lambda: None))
     monkeypatch.setattr("supervisor.state.load_state", lambda: {})
     monkeypatch.setattr("supervisor.state.save_state", lambda _state: None)
+    monkeypatch.setattr("supervisor.evolution_lifecycle.complete_evolution_campaign", lambda *a, **k: {})
+    monkeypatch.setattr("ouroboros.post_task_evolution.drop_pending_request", lambda *a, **k: None)
     monkeypatch.setattr("ouroboros.extension_companion.panic_kill_all", lambda: None)
     monkeypatch.setattr("multiprocessing.active_children", lambda: [])
     monkeypatch.setattr("ouroboros.platform_layer.kill_process_on_port", lambda _port: None)

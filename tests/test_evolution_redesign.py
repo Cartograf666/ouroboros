@@ -36,15 +36,21 @@ def test_evolution_campaign_text_includes_objective(tmp_path, monkeypatch):
 
 
 def test_evolution_campaign_pause_resume_preserves_history(tmp_path):
-    from supervisor import queue
+    from supervisor import queue, state
 
+    state.init(tmp_path)
     queue.init(tmp_path, 600, 1800)
     first = queue.start_evolution_campaign("Improve scheduler observability", source="test")
+    live = state.load_state()
+    live["evolution_mode_enabled"] = True
+    state.save_state(live)
+    transaction = lifecycle.begin_evolution_transaction("task1", cycle=1, campaign=first)
     lifecycle.update_evolution_campaign_after_task(
         "task1",
         cost_usd=0.5,
         outcome_axes={"execution": {"status": "ok"}, "objective": {"status": "not_evaluated"}},
         rounds=3,
+        transaction=transaction,
     )
     queue.pause_evolution_campaign("pause")
     resumed = queue.start_evolution_campaign("", source="test")
@@ -83,6 +89,7 @@ def test_evolution_enqueue_attaches_lightweight_transaction(tmp_path, monkeypatc
     queue.init(tmp_path, 600, 1800)
     pending = []
     queue.init_queue_refs(pending, {}, {"value": 0})
+    queue.start_evolution_campaign("Improve", source="test")
     st = supervisor_state.load_state()
     st["evolution_mode_enabled"] = True
     st["owner_chat_id"] = 1
@@ -101,15 +108,22 @@ def test_evolution_enqueue_attaches_lightweight_transaction(tmp_path, monkeypatc
 
 def test_evolution_task_completion_preserves_live_transaction_updates(tmp_path):
     from supervisor import queue
+    from supervisor import state as supervisor_state
 
+    supervisor_state.init(tmp_path)
     queue.init(tmp_path, 600, 1800)
     campaign = queue.start_evolution_campaign("Improve", source="test")
+    st = supervisor_state.load_state()
+    st["evolution_mode_enabled"] = True
+    supervisor_state.save_state(st)
     stale = queue.begin_evolution_transaction("task1", cycle=1, campaign=campaign)
+    assert lifecycle.record_evolution_commit(
+        campaign["id"], stale["transaction_id"], "task1", "abc123",
+    )["ok"] is True
     lifecycle.update_evolution_transaction(
         "task1",
         preflight_status="passed",
         triad_scope_status="passed",
-        commit_sha="abc123",
         push_status="skipped_or_failed",
     )
 
@@ -122,7 +136,9 @@ def test_evolution_task_completion_preserves_live_transaction_updates(tmp_path):
     )
     campaign = queue.get_evolution_status_snapshot()["campaign"]
 
-    assert recorded["commit_sha"] == "abc123"
+    assert recorded["accepted"] is True
+    assert recorded["persisted"] is True
+    assert recorded["transaction"]["commit_sha"] == "abc123"
     assert campaign["history"][0]["transaction"]["commit_sha"] == "abc123"
     assert campaign.get("transaction_history", []) == []
     assert campaign["active_transaction"]["commit_sha"] == "abc123"
@@ -138,10 +154,12 @@ def test_evolution_task_completion_preserves_live_transaction_updates(tmp_path):
         transaction=stale,
     )
     campaign = queue.get_evolution_status_snapshot()["campaign"]
-    assert replay_recorded["commit_sha"] == "abc123"
+    assert replay_recorded["replay"] is True
+    assert replay_recorded["transaction"]["commit_sha"] == "abc123"
     assert len(campaign["history"]) == 1
     assert campaign["cycles_done"] == 1
 
+    lifecycle.complete_evolution_campaign("previous scenario complete", cleanup_worktree=False)
     campaign = queue.start_evolution_campaign("Improve", source="test")
     no_durability = queue.begin_evolution_transaction("task2", cycle=2, campaign=campaign)
     lifecycle.update_evolution_campaign_after_task(
@@ -168,6 +186,9 @@ def test_terminal_evolution_event_without_running_metadata_updates_transaction(t
     supervisor_state.init(tmp_path)
     queue.init(tmp_path, 600, 1800)
     campaign = queue.start_evolution_campaign("Improve", source="test")
+    st = supervisor_state.load_state()
+    st["evolution_mode_enabled"] = True
+    supervisor_state.save_state(st)
     tx = queue.begin_evolution_transaction("task-cancel", cycle=1, campaign=campaign)
     write_task_result(tmp_path, "task-cancel", STATUS_CANCELLED, cost_usd=1.0, total_rounds=1)
 
@@ -215,6 +236,9 @@ def test_degraded_evolution_axes_count_as_failure(tmp_path):
     supervisor_state.init(tmp_path)
     queue.init(tmp_path, 600, 1800)
     campaign = queue.start_evolution_campaign("Improve", source="test")
+    st = supervisor_state.load_state()
+    st["evolution_mode_enabled"] = True
+    supervisor_state.save_state(st)
     tx = queue.begin_evolution_transaction("task-degraded", cycle=1, campaign=campaign)
     write_task_result(
         tmp_path,
@@ -684,6 +708,7 @@ def test_no_op_cycle_resets_dirty_worktree_to_base_with_recovery_refs(tmp_path, 
     import subprocess
 
     from supervisor import git_ops, queue
+    from supervisor import state as supervisor_state
 
     repo = tmp_path / "repo"
     _git = _make_git_repo(repo)
@@ -700,6 +725,9 @@ def test_no_op_cycle_resets_dirty_worktree_to_base_with_recovery_refs(tmp_path, 
     queue.RUNNING.clear()
 
     campaign = queue.start_evolution_campaign("Improve", source="test")
+    st = supervisor_state.load_state()
+    st["evolution_mode_enabled"] = True
+    supervisor_state.save_state(st)
     tx = queue.begin_evolution_transaction("task-noop", cycle=1, campaign=campaign)
     assert tx["base_head"]  # begin records the CURRENT head (after leftover commit)
     # Rewrite base to the true cycle base for the scenario.
@@ -708,12 +736,14 @@ def test_no_op_cycle_resets_dirty_worktree_to_base_with_recovery_refs(tmp_path, 
     recorded = lifecycle.update_evolution_campaign_after_task(
         "task-noop", cost_usd=0.1,
         outcome_axes={"execution": {"status": "ok"}}, rounds=2,
+        transaction=tx,
     )
 
-    assert recorded["cycle_outcome"] == "no_op"
-    assert recorded["cleanup_status"] == "reset_to_base"
-    assert recorded["cleanup_stash"].startswith("evolution-cycle-cleanup-")
-    assert recorded["cleanup_preserved_ref"].startswith("evolution-leftover-")
+    recorded_tx = recorded["transaction"]
+    assert recorded_tx["cycle_outcome"] == "no_op"
+    assert recorded_tx["cleanup_status"] == "reset_to_base"
+    assert recorded_tx["cleanup_stash"].startswith("evolution-cycle-cleanup-")
+    assert recorded_tx["cleanup_preserved_ref"].startswith("evolution-leftover-")
     # Worktree is back at base and clean.
     head_now = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo), capture_output=True, text=True).stdout.strip()
     status_now = subprocess.run(["git", "status", "--porcelain"], cwd=str(repo), capture_output=True, text=True).stdout.strip()
@@ -807,6 +837,8 @@ def test_evolution_cleanup_skips_when_update_lock_is_busy(monkeypatch):
 def test_evolution_restart_uses_local_commit_not_origin_and_blocks_dirty_tree(tmp_path):
     from ouroboros.tools.control import _request_restart
     from ouroboros.tools.registry import ToolContext
+    from supervisor import evolution_lifecycle, queue
+    from supervisor import state as supervisor_state
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -825,19 +857,38 @@ def test_evolution_restart_uses_local_commit_not_origin_and_blocks_dirty_tree(tm
     head = __import__("subprocess").run(
         ["git", "rev-parse", "HEAD"], cwd=str(repo), check=True, capture_output=True, text=True
     ).stdout.strip()
-    ctx = ToolContext(repo_dir=repo, drive_root=tmp_path, current_task_type="evolution")
+    supervisor_state.init(tmp_path)
+    queue.init(tmp_path, 600, 1800)
+    campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
+    st = supervisor_state.load_state()
+    st["evolution_mode_enabled"] = True
+    supervisor_state.save_state(st)
+    tx = evolution_lifecycle.begin_evolution_transaction("evo", cycle=1, campaign=campaign)
+    assert evolution_lifecycle.record_evolution_commit(
+        campaign["id"], tx["transaction_id"], "evo", head,
+    )["ok"] is True
+    ctx = ToolContext(
+        repo_dir=repo,
+        drive_root=tmp_path,
+        current_task_type="evolution",
+        task_id="evo",
+        task_metadata={"evolution_transaction": tx},
+    )
     ctx.last_reviewed_commit_sha = head
 
-    result = _request_restart(ctx, "after local commit")
+    result = _request_restart(ctx, "   ")
 
     assert "Restart requested" in result
+    marker = json.loads((tmp_path / "state" / "pending_restart_verify.json").read_text())
+    assert marker["reason"] == "agent_requested_restart"
+    assert ctx.pending_restart_is_evolution is True
     (repo / "file.txt").write_text("dirty\n", encoding="utf-8")
     ctx = ToolContext(repo_dir=repo, drive_root=tmp_path, current_task_type="evolution")
 
     result = _request_restart(ctx, "dirty")
 
     assert "RESTART_BLOCKED" in result
-    assert "local reviewed commit" in result
+    assert "exact local commit receipt" in result
 
 
 def test_toggle_evolution_tool_accepts_objective(tmp_path, monkeypatch):
@@ -939,6 +990,7 @@ def test_enqueue_evolution_omits_duplicate_cycle_message(tmp_path, monkeypatch):
     queue.init(tmp_path, 600, 1800)
     pending = []
     queue.init_queue_refs(pending, {}, {"value": 0})
+    queue.start_evolution_campaign("Improve", source="test")
     st = supervisor_state.load_state()
     st["evolution_mode_enabled"] = True
     st["owner_chat_id"] = 1

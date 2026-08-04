@@ -90,11 +90,23 @@ def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
 
     import supervisor.queue as q
     import supervisor.state as state
+    from supervisor import evolution_lifecycle
     from supervisor import workers as workers_mod
     import ouroboros.tools.services as services_mod
 
-    monkeypatch.setattr(q, "DRIVE_ROOT", tmp_path)
-    monkeypatch.setattr(state, "DRIVE_ROOT", tmp_path)
+    state.init(tmp_path)
+    q.init(tmp_path, 600, 1800)
+    campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
+    state.update_state(lambda live: live.update(
+        owner_chat_id=7,
+        evolution_mode_enabled=True,
+        evolution_owner_stopped=False,
+    ))
+    transaction = evolution_lifecycle.begin_evolution_transaction(
+        "evo1", cycle=1, campaign=campaign,
+    )
+    if not evolution_enabled:
+        state.update_state(lambda live: live.update(evolution_mode_enabled=False))
     monkeypatch.setattr(q, "FINALIZATION_GRACE_SEC", 0)
     # Activity model: drive an IDLE kill (no progress for the idle window), not a flat
     # wall-clock/ceiling kill — small idle/ceiling getters + a recent started_at keep
@@ -115,7 +127,13 @@ def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
         for index in range(3)
     ])
 
-    task = {"id": "evo1", "type": "evolution", "chat_id": 7, "_attempt": 1, "metadata": {}}
+    task = {
+        "id": "evo1",
+        "type": "evolution",
+        "chat_id": 7,
+        "_attempt": 1,
+        "metadata": {"evolution_transaction": transaction},
+    }
     monkeypatch.setattr(q, "RUNNING", {
         "evo1": {"task": task, "started_at": time.time() - 1000, "worker_id": 0, "attempt": 1},
     })
@@ -184,14 +202,22 @@ def test_hard_timeout_evolution_stopped_no_requeue_records_cost(tmp_path, monkey
 def test_handle_task_done_reconstructs_cost_from_physical_ledger(tmp_path):
     """A zeroed terminal event and stale result cannot override the ledger."""
     from ouroboros import usage_accounting as accounting
-    from supervisor import queue
+    from supervisor import evolution_lifecycle as lifecycle, queue
     from supervisor import state as supervisor_state
     from supervisor.events import _handle_task_done
     from ouroboros.task_results import STATUS_CANCELLED, write_task_result
 
     supervisor_state.init(tmp_path)
     queue.init(tmp_path, 600, 1800)
-    queue.start_evolution_campaign("Improve", source="test")
+    campaign = queue.start_evolution_campaign("Improve", source="test")
+    supervisor_state.update_state(lambda live: live.update(
+        owner_chat_id=1,
+        evolution_mode_enabled=True,
+        evolution_owner_stopped=False,
+    ))
+    transaction = lifecycle.begin_evolution_transaction(
+        "evo-zero", cycle=1, campaign=campaign,
+    )
 
     reservation = accounting.reserve_attempt(accounting.AttemptRequest(
         model="openai/gpt-5.2", provider="openai", reservation_usd=2.5,
@@ -221,6 +247,7 @@ def test_handle_task_done_reconstructs_cost_from_physical_ledger(tmp_path):
         {
             "type": "task_done", "task_id": "evo-zero", "task_type": "evolution",
             "result_status": "cancelled", "cost_usd": 0, "total_rounds": 0,
+            "metadata": {"evolution_transaction": transaction},
         },
         ctx,
     )
