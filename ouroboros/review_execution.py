@@ -599,8 +599,11 @@ def _extract_verdict_via_light_model(
 # access profile the engine derives).
 _REVIEW_SESSION_INSTRUCTIONS = (
     "You are a delegated read-only REVIEWER session. Retrieve the evidence "
-    "yourself with your own tools inside this repository root: read files, run "
-    "read-only git commands (git diff --cached, git log, git show), search. Do "
+    "yourself with the tools your read-only mode actually gives you inside this "
+    "repository root: read files and search, and — only if command execution is "
+    "among them, which read-only frequently withholds — read-only git commands "
+    "(git diff --cached, git log, git show). Reading the tree directly is a "
+    "complete substitute; a review is not incomplete for lacking a shell. Do "
     "not modify anything and do not run history-moving git commands. Your final "
     "answer must follow the output contract in the task EXACTLY; your host "
     "parses it structurally, and prose around the verdict is a non-response."
@@ -715,7 +718,9 @@ def run_delegated_review_session(
     ``TimeoutError`` or ``RuntimeError``.
     """
     from ouroboros import delegate_custody as custody
-    from ouroboros.gateways.claudexor import ClaudexorGateway, ClaudexorUnavailable
+    from ouroboros.gateways.claudexor import (
+        ClaudexorGateway, ClaudexorSubscriptionWindowExhausted, ClaudexorUnavailable,
+    )
     from ouroboros.subagents import DelegationRoute, delegated_run_shape, route_health
 
     task_id, surface, slot_id = invocation.task_id, invocation.surface, invocation.slot_id
@@ -915,11 +920,20 @@ def run_delegated_review_session(
         summary = custody.summary_of(detail)
         run_state = str(summary.get("state") or "")
         if run_state != "succeeded":
-            failure = summary.get("failure")
-            raise RuntimeError(
-                f"delegated review session {run_id} ended {run_state or 'unknown'}"
-                + (f": {json.dumps(failure, ensure_ascii=False)[:500]}" if failure else "")
-            )
+            # The engine states WHY in a typed RunFailure — `code` and, for a spent
+            # subscription window, the `resetsAt` a caller is meant to schedule against.
+            # Flattening it into prose and truncating that prose at 500 chars destroyed
+            # both, so every terminal refusal arrived as an indistinguishable
+            # RuntimeError and the retry rail above launched a second, identically
+            # doomed, billable session. Raise the class the seam already has.
+            failure = summary.get("failure") if isinstance(summary.get("failure"), dict) else {}
+            message = (f"delegated review session {run_id} ended {run_state or 'unknown'}"
+                       + (f": {json.dumps(failure, ensure_ascii=False)}" if failure else ""))
+            code = str(failure.get("code") or "")
+            if code == "subscription_window_exhausted":
+                raise ClaudexorSubscriptionWindowExhausted(
+                    message, reset_at=str(failure.get("resetsAt") or ""))
+            raise ClaudexorUnavailable(code or f"run_{run_state or 'unknown'}", message)
         text = _full_session_text(gateway, run_id, detail)
         spend, estimated = custody.disclosed_spend(summary)
         return {
@@ -943,7 +957,10 @@ def run_delegated_review_session(
             # D22/D29 APPLIED facts, verbatim from the run's own telemetry
             # receipt — empty when the engine predates it, never invented.
             "applied_profile": str((summary.get("authRoute") or {}).get("profileId") or ""),
-            "applied_access": str(summary.get("effectiveAccess") or summary.get("access") or ""),
+            # `access` is the client's own request echoed back, not a witness —
+            # `_widened_access` already refuses to read it for exactly that reason.
+            # Falling back to it published a REQUEST as an APPLIED fact.
+            "applied_access": str(summary.get("effectiveAccess") or ""),
         }
     finally:
         gateway.close()
@@ -1060,6 +1077,9 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         # permitted second physical attempt replays THAT invocation instead of
         # minting a second live run. It never crosses slot instances.
         self._retry_state: Dict[str, Any] = {}
+        # The failure of a session that already RAN, remembered so the permitted
+        # resend re-raises it instead of buying a second billed run (see execute).
+        self._settled_failure: Optional[BaseException] = None
 
     # -- prompt (route-owned; never the api pack) ------------------------------
 
@@ -1110,7 +1130,23 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             # Plan 5.5: the permitted resend repairs FORMAT locally over the
             # collected transcript; it never launches a second session.
             return self._verdict_result(force_extraction=True)
-        self._run_session()
+        if self._settled_failure is not None:
+            # The same rule, one step earlier: the session ALREADY RAN. Whether it
+            # terminated on a typed refusal or succeeded and then refused to hand
+            # its transcript back, the money is spent and the second physical send
+            # would mint a NEW run — a fresh idempotency key, a fresh bill — for a
+            # cause that is deterministic and will refuse identically. The rail's
+            # second send exists for a transport transient BEFORE the run exists
+            # (the pending invocation replays the same key onto the same run), and
+            # that path is untouched: it leaves `_retry_state` pending and never
+            # reaches here.
+            raise self._settled_failure
+        try:
+            self._run_session()
+        except BaseException as exc:
+            if not self._retry_state.get("pending_invocation_id"):
+                self._settled_failure = exc
+            raise
         return self._verdict_result()
 
     def _session_route(self) -> Any:

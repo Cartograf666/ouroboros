@@ -239,10 +239,13 @@ def _home_isolation_breach(detail: Dict[str, Any]) -> Optional[_Breach]:
     attempt (``harness_home_isolated`` / ``harness_home_dir``) and projects it onto no
     ``/v2`` response, so the artifact is the only witness there is.
 
-    A FAULT NEEDS A FACT. Claudexor writes two attempt records: the clean one carries
-    the HOME fields, and ``attemptFailureRecord`` — the one an errored attempt gets —
-    carries none. "a01 errored, a02 repaired it" is the ordinary path of the converge
-    loop an ``agent`` run takes, so reading a missing fact as a fault cancels a
+    A FAULT NEEDS A FACT, and the fact can legitimately be absent. Current Claudexor
+    spreads the applied facts into ``attemptFailureRecord`` too, so an errored attempt
+    usually carries them — but ``harness_home_isolated`` is the one optional member, left
+    out when the attempt died before its home was decided, and an older engine wrote no
+    HOME fields on a failure record at all. "a01 errored, a02 repaired it" is the ordinary
+    path of the converge loop an ``agent`` run takes, so reading a missing fact as a fault
+    cancels a
     correctly confined, finished, successful run and tells the nanny an ordinary harness
     failure was a containment fault it must not retry. That is the same line
     ``_widened_access`` draws for an undisclosed access profile: absence of evidence is

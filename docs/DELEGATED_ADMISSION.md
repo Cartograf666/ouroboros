@@ -18,8 +18,11 @@ reads it can start runs at any access level on any registered project. Every aut
 derivation Ouroboros performs — the access profile, the run shape, the write-surface
 predicate — is decoration downstream of a child that holds it.
 
-The daemon runs as the operator, so the token sits in the operator's home at a fixed absolute
-path. Nothing Ouroboros does can move it.
+The daemon runs as the operator, so a daemon Ouroboros did not start keeps its token in the
+operator's own home, at an absolute path a scoped `HOME` does not redirect. Ouroboros's OWN
+daemon (D30) is the exception: it is spawned under `CLAUDEXOR_CONFIG_DIR`, and that override IS
+the complete relocatable root — its token lives under `data/claudexor/`, not in the operator's
+home. Either way the token is an absolute path the child does not have to guess.
 
 ## 2. The actor
 
@@ -55,7 +58,13 @@ Probed live against the operator's running daemon, and read out of the Claudexor
 | ≤ 3.2.x | **400** `invalid_request`, `fieldErrors: {"/execution/delegated": ["Unexpected field; not part of this request."]}` | run never starts | below the marker floor — refused, because it cannot run |
 | 3.3.0 – 3.3.1 | accepted | a scoped `HOME` — a CONVENTION. `~`-relative lookups redirect; `/Users/<op>/.claudexor/v3/daemon/token` is read with an absolute path and is READABLE. No confinement fields exist on the attempt record at all | admitted, and reported as UNCONFINED |
 | ≥ 3.3.2, macOS | accepted | Seatbelt profile denying the Claudexor runtime tree and the operator credential stores, PROVEN against a denied path before the harness spawns; recorded as `confinement_mechanism` + `confinement_verified_denied_path` | admitted, and reported as CONFINED |
-| ≥ 3.3.2, elsewhere | accepted | nothing. `confinementMechanism()` returns null off darwin — `docs/DELEGATED_CONFINEMENT.md` §8: "There is no Linux/Windows implementation" | admitted, and reported as UNCONFINED |
+| 3.3.2, elsewhere | accepted | nothing, and the run does not proceed: `applyConfinement` threw `ConfinementUnavailableError` off darwin and the evidence gate refused to terminalize | REFUSED by the engine (`delegated_confinement_unavailable`) |
+| ≥ 3.3.3, elsewhere | accepted | nothing enforced. `confinementMechanism()` returns null off darwin and the engine works anyway, disclosing the absence — `docs/DELEGATED_CONFINEMENT.md` §7: "There is no second policy. On every other platform `confinement_mechanism` is null, `confinement_verified_denied_path` is null, and `confinement_unavailable_reason` says why." | admitted, and reported as UNCONFINED |
+
+3.3.3 is where proceed-and-disclose replaced the refusal, not 3.3.6. Between them, 3.3.3–3.3.5
+did ship a real Linux bubblewrap boundary; 3.3.6 removed it as an owner decision, leaving the
+scoped `HOME` plus a disclosed absence as the whole non-macOS design. None of 3.3.3–3.3.5 was
+ever tagged or published, so the band above is what any reachable engine does.
 
 The live 3.2.0 daemon answers the read-only body with nothing but the fake-root error
 (`project root does not exist`), i.e. it schema-accepts every field that lane sends. The
@@ -87,7 +96,8 @@ For the SCHEMA question a version is the only answer available. Verified rather 
   3.3.2 source, where the handshake responder is unchanged.
 - `GET /v2/agent-capabilities` publishes `runControlKeys` derived from **top-level** request
   keys only. `execution` appears; `execution.delegated` is nested and therefore invisible.
-  The catalog SCHEMA is byte-identical between 3.2.0 and 3.3.2 — it gained no field at all.
+  The catalog SCHEMA is field-identical between 3.2.0 and 3.3.2 — the only diff is one
+  `.describe()` string, so it gained nothing a probe could read.
 - The per-harness `delegation` object in that catalog is about **Claudexor MCP injection** —
   whether the harness can be handed sub-agent tools. It is `available: true` on the live 3.2.0
   daemon, which rejects the marker outright, so reading it as a delegation signal would admit
@@ -168,9 +178,11 @@ Stated plainly, because a floor described as total is worse than a narrow one.
 ## 8. Evidence, not intention — and the disclosure it feeds
 
 What the run actually got is read back from the run's own artifacts
-(`<runDir>/attempts/<id>/attempt.yaml`), which is the only place the engine records it — it is
-projected onto no `/v2` response. Two facts, one reader
-(`gateways.claudexor.attempt_containment`):
+(`<runDir>/attempts/<id>/attempt.yaml`). The HOME pair is artifact-only — the engine projects it
+onto no `/v2` response — while the boundary is also on the run detail, as
+`candidates[].confinement` (`proven` / `mechanism` / `verifiedDeniedPath` / `unavailableReason`,
+since 3.3.6); the artifact stays the one reader here because it answers both halves at once.
+Two facts, one reader (`gateways.claudexor.attempt_containment`):
 
 - the HOME pair, `harness_home_isolated` / `harness_home_dir`;
 - the boundary, `confinement_mechanism` together with `confinement_verified_denied_path` —
@@ -187,10 +199,12 @@ am I on". A boundary shipped for a second OS is therefore already handled, and a
 branch would have gone on reporting "no boundary" forever after that day.
 
 **The two halves take different rules about silence, on purpose.** A missing HOME fact stays
-UNPROVEN rather than false, because the consequence of "false" there is a CANCELLATION and
-`attemptFailureRecord` legitimately carries no HOME fields. A missing mechanism collapses to
-"no boundary", because the consequence there is a DISCLOSURE. Each silence is read in the
-direction whose failure mode is recoverable.
+UNPROVEN rather than false, because the consequence of "false" there is a CANCELLATION, and an
+attempt can legitimately record no `harness_home_isolated` — it is the one optional member of
+the applied facts, omitted when the attempt died before its home was decided (and an engine
+older than 3.3.2 put no applied facts on `attemptFailureRecord` at all). A missing mechanism
+collapses to "no boundary", because the consequence there is a DISCLOSURE. Each silence is read
+in the direction whose failure mode is recoverable.
 
 **A recorded home INSIDE the operator's own home is still a breach** — that is a recorded
 false, not a silence, and it is cancelled as a containment fault.

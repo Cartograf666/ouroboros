@@ -57,6 +57,25 @@ test('an exhausted window is shown with its reset time, never hidden', () => {
     assert.deepEqual(quotaSummary([], 'codex'), { label: '', exhausted: false, resetsAt: '' });
 });
 
+test('a named profile\'s exhausted window is never reported as the default account\'s', () => {
+    // The daemon stamps the DEFAULT subject with subject_id null and scopes every
+    // cooldown to its own subject ("a profiled limit must never cool the default
+    // subject down"). The row that names ONE account has to honour that: the old
+    // `!subjectId ||` wildcard made the default row match every subject on the
+    // harness and paint itself red off someone else's spent window.
+    const snapshots = [
+        { subject: { harness: 'codex', subject_id: null }, constraints: [{ used_ratio: 0.05 }] },
+        { subject: { harness: 'codex', subject_id: 'koshak' },
+          constraints: [{ used_ratio: 1.0, resets_at: '2026-08-04T00:00:00Z' }] },
+    ];
+    const defaultRow = quotaSummary(snapshots, 'codex', '');
+    assert.equal(defaultRow.exhausted, false);
+    assert.equal(defaultRow.label, '5% of window used');
+    const namedRow = quotaSummary(snapshots, 'codex', 'koshak');
+    assert.equal(namedRow.exhausted, true);
+    assert.equal(namedRow.resetsAt, '2026-08-04T00:00:00Z');
+});
+
 test('the device-code disclosure is found wherever the snapshot nests it', () => {
     const job = { snapshot: { disclosures: { deviceCode: {
         flow: 'chatgptDeviceCode', verificationUrl: 'https://auth.example/device', userCode: 'ABCD-1234',
@@ -94,6 +113,24 @@ test('job terminal states are the typed set, success is exactly succeeded', () =
         assert.equal(summary.succeeded, false, bad);
     }
     assert.equal(jobStateSummary({ state: 'waiting_for_input', phase: 'awaiting_user' }).terminal, false);
+});
+
+test('the POLLED snapshot ENVELOPE is read, so the login poll can actually terminate', () => {
+    // GET /v2/setup/jobs/:id/snapshot answers ControlSetupJobSnapshot —
+    // {job, cursor, sequence, deviceCode?} — while POST /v2/setup/jobs answers a
+    // bare ControlSetupJob. Reading only the top level saw a state on the create
+    // response and NEVER on a poll, so the card's terminal banner never rendered
+    // and the 3-second poll ran forever.
+    const envelope = {
+        job: { jobId: 'j1', state: 'succeeded', phase: 'completed' },
+        cursor: 'c1', sequence: 7,
+    };
+    assert.deepEqual(jobStateSummary(envelope),
+        { state: 'succeeded', phase: 'completed', terminal: true, succeeded: true });
+    assert.equal(jobStateSummary({ job: { state: 'failed', phase: 'login' } }).terminal, true);
+    assert.equal(jobStateSummary({ job: { state: 'waiting_for_input' } }).terminal, false);
+    // The bare create-response job keeps working through the same reader.
+    assert.equal(jobStateSummary({ state: 'cancelled' }).terminal, true);
 });
 
 test('account rows consume the REAL schema shape: array of {profile,status,identity} wrappers + harnessAccounts array', () => {
@@ -168,4 +205,17 @@ test('the login card prefers a STRUCTURED disclosure over the copy-paste fallbac
     assert.equal(loginCardFace({ error: 'nope', mode: 'attach', attachCommand: 'cmd', job: {} }), 'error');
     assert.equal(loginCardFace({ mode: 'device', job: { state: 'running' } }), 'progress');
     assert.equal(loginCardFace(null), 'none');
+});
+
+test('a device-BUTTON login that the server forced to client_pty still shows its command', () => {
+    // _build_login_request forces transport=client_pty for every non-codex
+    // harness, so "Connect claude" (mode 'device') comes back with a copy-paste
+    // command and nothing structured. Keying the attach face on the CLICKED mode
+    // left that card on "Login running…" forever with no way to finish the login.
+    assert.equal(loginCardFace({
+        mode: 'device', attachCommand: 'CLAUDEXOR_CONFIG_DIR=/d claudexor setup attach j1',
+        job: { state: 'waiting_for_input' },
+    }), 'attach');
+    // And a job the server issued NO command for stays on progress.
+    assert.equal(loginCardFace({ mode: 'device', attachCommand: '', job: { state: 'running' } }), 'progress');
 });

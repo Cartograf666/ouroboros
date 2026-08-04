@@ -627,7 +627,10 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
     # durable row by default. Null on runs whose engine telemetry predates the
     # receipt — empty string, never invented.
     applied_profile = str((summary.get("authRoute") or {}).get("profileId") or "")
-    applied_access = str(summary.get("effectiveAccess") or summary.get("access") or "")
+    # Only `effectiveAccess` testifies. The daemon computes `access` as
+    # `effectiveAccess ?? the client's own parsed request`, so falling back to it wrote
+    # our own ASK into the durable row under a column that promises applied facts.
+    applied_access = str(summary.get("effectiveAccess") or "")
     if not custody.ledger_recorded:
         try:
             from ouroboros.usage_accounting import record_subscription_session

@@ -75,10 +75,11 @@ When a Gateway exists, it should follow these guidelines:
   discovery, protocol-major + minimum-version handshake, project registration, run
   start/poll/cancel. Typed refusals (`ClaudexorUnavailable`,
   `ClaudexorSubscriptionWindowExhausted`) instead of raw HTTP errors. Also reads the run
-  tree Claudexor writes on disk (`attempt_containment`): the engine records some APPLIED
-  facts — the attempt's harness HOME and the OS boundary it ran under — only as
-  artifacts, so a caller that must verify what was enforced has nowhere else to look, and
-  the path layout is Claudexor's. The boundary mechanism is read as an OPAQUE string: which
+  tree Claudexor writes on disk (`attempt_containment`): the attempt's harness HOME is
+  recorded only as an artifact, so a caller that must verify it has nowhere else to look
+  (the OS boundary is also on the run detail as `candidates[].confinement`, but the
+  artifact answers both halves per attempt), and the path layout is Claudexor's. The
+  boundary mechanism is read as an OPAQUE string: which
   ones exist, and on which hosts, is the engine's business. `engine_at_least` is the one version-floor
   predicate, shared by the handshake and by every lane-specific floor. The daemon bearer
   token grants the whole `/v2` surface and must stay inside this module: never in a

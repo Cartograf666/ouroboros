@@ -295,7 +295,17 @@ def route_health(gateway: Any, route_id: str, shape: DelegatedRunShape) -> tuple
     if not entry.get("enabled") or str(entry.get("status") or "") != "ok":
         return f"route_status_{entry.get('status') or 'disabled'}", ""
     supported = [str(v) for v in entry.get("accessProfilesSupported") or []]
-    if shape.access not in supported:
+    # A DELEGATED run is externally confined, and the engine rewrites its access to
+    # `external_sandbox_full` before admitting it (`RequestRequirementsResolver.adapterAccess`)
+    # — so the profile the route must declare is that one, not the literal the request
+    # carries. Comparing the literal refused every route whose adapter stands its own
+    # sandbox down in favour of the engine's boundary and therefore declares only the
+    # confined profile: today opencode, which was given `external_sandbox_full` for
+    # exactly this run. Refusing what the engine would admit turned `executor="harness"`
+    # into a typed blocker and `auto` into a silent, metered drop to a native child.
+    if shape.access not in supported and not (
+        shape.delegated and "external_sandbox_full" in supported
+    ):
         return f"access_profile_unsupported:{shape.access}", ""
     # An engine below the marker floor REJECTS `execution.delegated` outright — the field
     # is absent from a `.strict()` schema, so the start is a 400 and no run exists. That

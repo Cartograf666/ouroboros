@@ -122,14 +122,16 @@ def build_scope_session_task(
         pathlib.Path(governance_repo_dir or repo_dir), _CANONICAL_CONTEXT_DOCS,
     )
     task_text, _stable_len = build_scope_review_prompt(
-        "(not inlined — session delivery: list the touched files with "
-        "`git diff --cached --name-status` and read them yourself)",
+        "(not inlined — session delivery: find the touched files yourself, with "
+        "`git diff --cached --name-status` if your read-only mode lets you run "
+        "commands and by reading the tree if it does not)",
         scope_checklist=scope_checklist,
         canonical_docs=nav_docs,
         intent_context=f"{scope_section}\n\n{goal_section}",
         history_block=f"{rebuttal_section}{history_section}{scope_history_section}",
-        diff_text="(not inlined — session delivery: run `git diff --cached` in "
-                  "this repository root yourself)",
+        diff_text="(not inlined — session delivery: retrieve the staged change in this "
+                  "repository root yourself, with `git diff --cached` when your read-only "
+                  "mode permits commands and by reading the files when it does not)",
         repo_pack_placeholder=(
             "(no assembled repository pack in session delivery — the navigation "
             "maps above index the governance docs; retrieve everything else with "

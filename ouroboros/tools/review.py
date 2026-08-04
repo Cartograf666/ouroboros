@@ -1289,8 +1289,11 @@ def _triad_session_task(ctx: ToolContext, *, goal_section: str, scope_section: s
         review_history_section,
         "## Subject (session delivery)\n"
         "The review subject is the STAGED diff of the repository you are running "
-        "in. Retrieve it yourself: `git diff --cached` (list files with "
-        "`git diff --cached --name-only`) and read the touched files as needed.",
+        "in. Retrieve it yourself with whatever your read-only tools allow: if you "
+        "can run commands, `git diff --cached` (and `git diff --cached --name-only` "
+        "for the file list); if your read-only mode withholds command execution — it "
+        "commonly does — read the touched files directly and compare them against "
+        "`.git`. Read the touched files as needed either way.",
         "## Governance context (navigation maps)\n"
         "Read BIBLE.md in full from the repository root. The maps below index "
         "the other governance docs by line range; the paths are relative to the "

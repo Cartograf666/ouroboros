@@ -72,9 +72,6 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                     "status": str(row.get("status") or ""),
                     "enabled": bool(row.get("enabled")),
                     "provider_family": str(row.get("providerFamily") or ""),
-                    "json_schema_output": bool(
-                        row.get("json_schema_output") or row.get("jsonSchemaOutput")
-                    ),
                     "access_profiles_supported": [
                         str(v) for v in row.get("accessProfilesSupported") or []
                     ],

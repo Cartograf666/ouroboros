@@ -274,10 +274,14 @@ def test_project_registration_is_a_required_first_step():
     assert ("POST", "/v2/projects") in calls
 
 
-def test_a_control_problem_with_a_reset_becomes_the_transient_window_class():
+def test_the_window_class_is_chosen_by_the_code_not_by_sniffing_the_context():
+    """`quota` was never a Claudexor code. The classifier keys on the real one —
+    `subscription_window_exhausted`, the RunFailureCode the engine actually emits — so
+    an unrelated refusal carrying a stray reset-shaped key is not announced as a spent
+    subscription window and put on a retry timer."""
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(429, json={
-            "code": "quota", "message": "window spent", "retryable": True,
+            "code": "subscription_window_exhausted", "message": "window spent", "retryable": True,
             "context": {"resetsAt": "2030-01-01T00:00:00Z"},
         })
 
@@ -285,6 +289,18 @@ def test_a_control_problem_with_a_reset_becomes_the_transient_window_class():
         with pytest.raises(cx.ClaudexorSubscriptionWindowExhausted) as excinfo:
             gateway.get_run("run-1")
     assert excinfo.value.reset_at == "2030-01-01T00:00:00Z"
+
+    def conflict(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={
+            "code": "idempotency_conflict", "message": "same key, different body",
+            "retryable": False, "context": {"cooldownUntil": "2030-01-01T00:00:00Z"},
+        })
+
+    with _gateway(conflict) as gateway:
+        with pytest.raises(cx.ClaudexorUnavailable) as excinfo:
+            gateway.get_run("run-1")
+    assert excinfo.value.code == "idempotency_conflict"
+    assert not isinstance(excinfo.value, cx.ClaudexorSubscriptionWindowExhausted)
 
 
 def test_an_unreachable_daemon_is_a_typed_refusal_not_a_crash():
@@ -653,6 +669,31 @@ def test_an_acting_child_is_health_checked_against_the_profile_it_will_ask_for(m
     assert res.blocked and res.reason == "access_profile_unsupported:workspace_write"
     res = _dispatch("harness", stub=_HealthStub(profiles=("readonly",)), monkeypatch=monkeypatch)
     assert res.executor == "harness"
+
+
+def test_a_route_that_declares_only_the_confined_profile_is_admitted_not_refused(monkeypatch):
+    """Ouroboros must not refuse the run Claudexor would admit.
+
+    A delegated run is externally confined, so the engine rewrites `workspace_write` to
+    `external_sandbox_full` before it checks the manifest — and a route whose adapter
+    stands its own sandbox down in favour of that boundary declares only the confined
+    profile. `opencode` is exactly that route (`["full", "external_sandbox_full",
+    "inherit_native"]`, given the profile so a delegated mutating run on macOS could
+    exist at all). Comparing the literal blocked a pinned `harness` executor outright
+    and dropped `auto` to a metered native child for no reason on either side.
+    """
+    opencode = ("full", "external_sandbox_full", "inherit_native")
+    res = _dispatch("harness", stub=_HealthStub(profiles=opencode),
+                    monkeypatch=monkeypatch, acting=True)
+    assert res.executor == "harness" and not res.blocked
+    # The fallback is the DELEGATED run's alone: a read-only child asks for `readonly`,
+    # the engine leaves it `readonly`, and opencode really cannot serve it.
+    res = _dispatch("harness", stub=_HealthStub(profiles=opencode), monkeypatch=monkeypatch)
+    assert res.blocked and res.reason == "access_profile_unsupported:readonly"
+    # And a route with neither profile still refuses the acting child.
+    res = _dispatch("harness", stub=_HealthStub(profiles=("readonly", "inherit_native")),
+                    monkeypatch=monkeypatch, acting=True)
+    assert res.blocked and res.reason == "access_profile_unsupported:workspace_write"
 
 
 def test_a_stale_unknown_executor_value_degrades_to_auto_not_to_a_crash(monkeypatch):
@@ -1249,6 +1290,16 @@ def test_d29_absent_authroute_records_empty_never_invented(tmp_path, monkeypatch
     assert event["credential_profile_id"] == ""
 
 
+def test_the_durable_access_profile_is_the_receipt_never_our_own_request(tmp_path, monkeypatch):
+    """The daemon computes `access` as `effectiveAccess ?? the client's own parsed
+    request`, so it is our ask reflected back, not a witness. Reading it as a fallback
+    wrote the REQUEST into a durable column that promises applied facts."""
+    _payload, row, event = _settled_run(tmp_path, monkeypatch, {
+        "state": "succeeded", "spendUsd": 0.0, "access": "workspace_write"})
+    assert row["access_profile"] == ""
+    assert event["access_profile"] == ""
+
+
 def _settled_run(tmp_path, monkeypatch, summary):
     """Drive a real `_settle` for `summary`; return (agent payload, ledger row, envelope).
 
@@ -1649,8 +1700,10 @@ def _write_attempt(run_dir, *, isolated, home_dir, attempt="a01", mechanism="sea
 
 
 def _write_failed_attempt(run_dir, *, attempt="a01"):
-    """Claudexor's OTHER attempt.yaml, verbatim: `AC.attemptFailureRecord` — written at
-    orchestrator.ts:3347 and :4952 — carries no harness-HOME fields at all."""
+    """An errored attempt.yaml with NO harness-HOME fields. `AC.attemptFailureRecord`
+    (orchestrator.ts:3512 and :5088) spreads the applied facts in today, but
+    `harness_home_isolated` is the one optional member — absent when the attempt died
+    before its home was decided — and an engine older than 3.3.2 wrote none of them."""
     attempt_dir = run_dir / "attempts" / attempt
     attempt_dir.mkdir(parents=True, exist_ok=True)
     (attempt_dir / "attempt.yaml").write_text(
@@ -1803,8 +1856,8 @@ def test_the_two_floors_sit_at_the_measured_bands(engine, serves_read_only, admi
 def test_asking_for_a_scoped_home_is_not_evidence_that_one_was_applied(tmp_path, monkeypatch):
     """The whole point: the request is a request. An engine that accepted the marker and
     then ran the harness in the operator's own home has produced a CONTAINMENT FAULT, and
-    the only witness is the attempt's own artifact — Claudexor projects the applied fact
-    onto no `/v2` response."""
+    the only witness is the attempt's own artifact — Claudexor projects the applied HOME
+    fact onto no `/v2` response (only the boundary half reaches `candidates[].confinement`)."""
     run_dir = tmp_path / "run-1"
     home = tmp_path / "operator-home"
     home.mkdir()
@@ -1886,8 +1939,10 @@ def test_absence_of_the_artifact_is_no_evidence_and_a_read_only_run_is_never_fau
 
 
 def test_an_attempt_that_recorded_no_home_fact_is_not_a_containment_fault(tmp_path, monkeypatch):
-    """Claudexor has TWO attempt.yaml shapes and only the clean one carries the HOME
-    fields: `AC.attemptFailureRecord` (orchestrator.ts:3347 and :4952) writes
+    """An attempt record can legitimately state no HOME fact. `AC.attemptFailureRecord`
+    (orchestrator.ts:3512 and :5088) spreads the applied facts into an errored record
+    today, but `harness_home_isolated` is the one OPTIONAL member — omitted when the
+    attempt died before its home was decided — and an engine older than 3.3.2 wrote
     attempt_id/harness_id/cost/errored/phase/errors and nothing else. "a01 errored, a02
     repaired it" is the ORDINARY path of the converge loop that Ouroboros's own
     `mode: agent` run takes, so a missing fact must be no evidence — exactly the line

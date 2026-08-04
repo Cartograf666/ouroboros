@@ -289,10 +289,17 @@ class ClaudexorGateway:
             message = str(body.get("message") or message)
             raw_context = body.get("context")
             context = raw_context if isinstance(raw_context, dict) else {}
-        reset_at = str(context.get("resetsAt") or context.get("resets_at") or context.get("cooldownUntil") or "")
-        if reset_at:
+        # The CODE decides, exactly as every other classification on this seam does.
+        # Sniffing `context` for a reset key instead had it both ways: no producer puts
+        # `resetsAt`/`resets_at`/`cooldownUntil` in a ControlProblem context (a spent
+        # window is reported as a run-detail RunFailure, and `cooldown_until` lives in a
+        # quota snapshot), so the transient class was unreachable — while any unrelated
+        # refusal that happened to carry one, an `idempotency_conflict` say, would have
+        # been announced as a spent subscription window and retried on a timer.
+        if code == "subscription_window_exhausted":
             return ClaudexorSubscriptionWindowExhausted(
-                message, reset_at=reset_at, status_code=response.status_code,
+                message, reset_at=str(context.get("resetsAt") or ""),
+                status_code=response.status_code,
             )
         return ClaudexorUnavailable(code, message, status_code=response.status_code)
 
@@ -527,9 +534,11 @@ def attempt_containment(run_dir: str) -> List[AttemptContainment]:
 
     Claudexor writes ``harness_home_isolated`` / ``harness_home_dir`` and the applied
     boundary (``confinement_mechanism``, with ``confinement_verified_denied_path`` as
-    its proof) onto ``<runDir>/attempts/<id>/attempt.yaml``, and projects none of them
-    onto any ``/v2`` response, so this file is the only evidence a caller has that the
-    confinement it asked for was applied rather than merely requested.
+    its proof) onto ``<runDir>/attempts/<id>/attempt.yaml``. The HOME pair is projected
+    onto no ``/v2`` response, so for that half this file is the only evidence a caller
+    has that the confinement it asked for was applied rather than merely requested; the
+    BOUNDARY half is also served on the run detail as ``candidates[].confinement`` (since
+    3.3.6). The artifact is read for both, because it is where the two meet per attempt.
 
     The mechanism is read as an OPAQUE string. Which mechanisms exist, and on which
     hosts, is the engine's business — Ouroboros asks what was applied and never which

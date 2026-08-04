@@ -482,6 +482,76 @@ def test_failed_session_state_is_an_error_actor_not_a_verdict(tmp_path, fake_rou
     assert "ended failed" in actor["error"]
 
 
+def test_applied_access_is_the_receipt_alone_never_the_request_echoed_back(tmp_path, fake_route):
+    """`applied_access` promises APPLIED facts, verbatim from the run's own telemetry
+    receipt. The daemon computes `access` as `effectiveAccess ?? the client's own parsed
+    request`, so falling back to it published our ASK as if the engine had confirmed it —
+    the same non-witness `_widened_access` already refuses to read."""
+    detail = _terminal_detail("[]", conformance="passed")
+    detail["summary"]["access"] = "workspace_write"   # the request, echoed
+    fake_route.detail = detail
+    result = run_review_request(_agent_request(), slots=[_agent_slot()],
+                                drive_root=tmp_path, llm=FakeLLM())
+    assert result.actors[0]["usage"]["applied_access"] == ""
+
+    detail = _terminal_detail("[]", conformance="passed")
+    detail["summary"]["effectiveAccess"] = "readonly"  # the derived witness
+    detail["summary"]["access"] = "workspace_write"
+    fake_route.detail = detail
+    custody._CUSTODY.clear()
+    result = run_review_request(_agent_request(), slots=[_agent_slot()],
+                                drive_root=tmp_path / "b", llm=FakeLLM())
+    assert result.actors[0]["usage"]["applied_access"] == "readonly"
+
+
+def _exhausted_window_detail():
+    """A terminal whose RunFailure states a spent subscription window, verbatim in the
+    engine's own shape (`RunFailureCode` + the STRUCTURAL `resetsAt`)."""
+    detail = _terminal_detail("", state="failed")
+    detail["summary"]["failure"] = {
+        "phase": "routing", "category": "harness_unavailable",
+        "code": "subscription_window_exhausted",
+        "safeMessage": "every credential profile for this route is spent",
+        "resetsAt": "2030-01-01T00:00:00Z",
+        "nextActions": ["wait for the window to reopen"],
+    }
+    return detail
+
+
+def test_a_typed_terminal_refusal_keeps_its_code_and_its_reset_time(tmp_path, fake_route):
+    """The engine says WHY in a typed RunFailure. Flattening it into prose — and
+    truncating that prose at 500 chars — threw away both the `code` a caller
+    classifies on and the `resetsAt` it is meant to schedule against."""
+    from ouroboros.gateways.claudexor import ClaudexorSubscriptionWindowExhausted
+    from ouroboros.review_execution import AgentSessionReviewExecutor, ReviewAssignment
+
+    fake_route.detail = _exhausted_window_detail()
+    executor = AgentSessionReviewExecutor(
+        ReviewAssignment(request=_agent_request(), slot=_agent_slot(),
+                         call_id="c-window", call_type="scope_review",
+                         custody_root=tmp_path),
+        llm=FakeLLM(),
+    )
+    with pytest.raises(ClaudexorSubscriptionWindowExhausted) as excinfo:
+        executor.execute()
+    assert excinfo.value.code == "subscription_window_exhausted"
+    assert excinfo.value.reset_at == "2030-01-01T00:00:00Z"
+
+
+def test_a_typed_refusal_is_not_relaunched_into_a_second_billed_session(tmp_path, fake_route):
+    """The P3 slot rail is allowed two physical sends, for a transport transient or a
+    format repair. A typed Claudexor refusal is neither: it says "this transport is not
+    usable", so the second send is a deterministic re-refusal that spends vendor money
+    for zero extra verdicts."""
+    fake_route.detail = _exhausted_window_detail()
+    result = run_review_request(_agent_request(), slots=[_agent_slot()],
+                                drive_root=tmp_path, llm=FakeLLM())
+    assert sum(len(inst.start_requests) for inst in fake_route.instances) == 1
+    actor = result.actors[0]
+    assert actor["status"] == "error"
+    assert "subscription_window_exhausted" in actor["error"]
+
+
 def test_timeout_cancels_the_run_and_fails_typed(tmp_path, fake_route):
     """The nanny owns the time cap: a run that never terminates is cancelled
     through the verified-cancel path and the slot fails as an ordinary timeout.
@@ -528,6 +598,11 @@ def test_unresolvable_truncated_output_refuses_instead_of_judging_a_preview(tmp_
     actor = result.actors[0]
     assert actor["status"] == "error"
     assert "never read from a preview" in actor["error"]
+    # And it is refused ONCE. The session SUCCEEDED and was fully billed; only
+    # reading its transcript back failed, deterministically (the artifact is
+    # reclaimed — a second identical fetch cannot find it). Relaunching bought a
+    # second billed session and no second verdict.
+    assert sum(len(inst.start_requests) for inst in fake_route.instances) == 1
 
 
 def test_transport_retry_reuses_the_pending_invocation_id(tmp_path, fake_route):

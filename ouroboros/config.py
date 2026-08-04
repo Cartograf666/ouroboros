@@ -339,8 +339,9 @@ CLAUDEXOR_MIN_VERSION: str = "3.2.0"
 #
 # It is NOT the floor for a BOUNDARY existing. It used to be, pinned at 3.3.2 (macOS
 # Seatbelt), and a version standing in for "a boundary was applied" lies in both directions:
-# Claudexor's `docs/DELEGATED_CONFINEMENT.md` §8 says the mechanism is macOS-only ("There is
-# no Linux/Windows implementation"), so a build declares the same number on a host where it
+# Claudexor's `docs/DELEGATED_CONFINEMENT.md` says the mechanism is macOS-only ("On every
+# other platform `confinement_mechanism` is null, `confinement_verified_denied_path` is null,
+# and `confinement_unavailable_reason` says why"), so a build declares the same number on a host where it
 # applies nothing — and a version describes a BUILD, never what THIS attempt did. That
 # question goes to the attempt record (`gateways.claudexor.attempt_containment`), and a run
 # reporting no mechanism is DISCLOSED, not refused: the child already holds a shell here, so

@@ -111,7 +111,7 @@ env:
   # means the engine this seam requires is not published yet.
   #
   # Why `next` and not `^3.3.2`: no stable 3.3.x has ever been published — the
-  # registry jumps 3.2.0 → 3.3.7-rc.0 — so the caret spec was unresolvable from
+  # registry goes 3.2.0 → 3.2.1 → 3.3.7-rc.0 — so the caret spec was unresolvable from
   # birth, and npm's prerelease-exclusion rule means it would STAY unresolvable
   # for every -rc even after one exists. The engine ≥3.3.0 lives on the `next`
   # dist-tag until a stable 3.3.x lands; flip this back to a caret spec then.

@@ -48,7 +48,11 @@ export function quotaSummary(snapshots, harnessId, subjectId = '') {
     const rows = (snapshots || []).filter((snap) => {
         const subject = snap?.subject || {};
         if (String(subject.harness || '') !== String(harnessId)) return false;
-        return !subjectId || String(subject.subject_id || '') === String(subjectId);
+        // EXACT subject, including the default account's empty id. The old
+        // `!subjectId ||` wildcard made the native row match EVERY subject on the
+        // harness, so the default account reported a named profile's exhausted
+        // window — red styling and all — as its own.
+        return String(subject.subject_id || '') === String(subjectId);
     });
     let worst = null;
     for (const snap of rows) {
@@ -106,17 +110,30 @@ export function deviceCodeDisclosure(job) {
 // sealed client_pty job once the upstream extension discloses claude/cursor
 // links structurally — the card renders it, and the copy-paste command is only
 // the fallback for a job with nothing structured yet. Pure for node tests.
+//
+// The ATTACH face is keyed on HAVING the command, not on the button that was
+// clicked: the server forces client_pty for every non-codex login, so a
+// `device`-mode click on claude/cursor comes back with a copy-paste command and
+// nothing else — and demanding mode==='attach' left that card stuck on
+// "Login running…" with the one thing the user needed never rendered. The
+// command is only ever issued for a job that really is client_pty.
 export function loginCardFace(active) {
     if (!active) return 'none';
     if (active.error) return 'error';
     if (deviceCodeDisclosure(active.job || {})) return 'device';
-    if (active.mode === 'attach' && active.attachCommand) return 'attach';
+    if (active.attachCommand) return 'attach';
     return 'progress';
 }
 
 export function jobStateSummary(job) {
-    const state = String(job?.state || job?.status || '');
-    const phase = String(job?.phase || '');
+    // The POLL returns ControlSetupJobSnapshot — the ENVELOPE {job, cursor,
+    // sequence, deviceCode?} — while the CREATE returns a bare ControlSetupJob.
+    // Reading only the top level found the state on the create response and
+    // never on any poll, so `terminal` stayed false forever: no "Connected." /
+    // "Login failed." banner, and the 3-second poll never stopped. `status` is
+    // a field ControlSetupJob does not have and never had.
+    const state = String(job?.state || job?.job?.state || '');
+    const phase = String(job?.phase || job?.job?.phase || '');
     const terminal = ['succeeded', 'failed', 'cancelled', 'timed_out',
         'interrupted_unknown', 'not_supported'].includes(state);
     return { state, phase, terminal, succeeded: state === 'succeeded' };
@@ -405,10 +422,11 @@ function startJobPolling() {
         try {
             const resp = await apiFetch(`/api/claudexor/login/${encodeURIComponent(active.jobId)}`, { cache: 'no-store' });
             const data = await resp.json().catch(() => ({}));
-            if (resp.ok) {
-                active.job = data.job || active.job;
-                if (!active.attachCommand) active.attachCommand = String(data.attach_command || '');
-            }
+            // The CREATE answer is the only authority on whether this job has a
+            // copy-paste command: it issues one exactly for a client_pty job,
+            // while the poll route hands one back for every job including the
+            // daemon-transport codex device flow, which must never show it.
+            if (resp.ok) active.job = data.job || active.job;
         } catch (err) { /* transient poll failure; the next tick retries */ }
         renderLoginCard();
         if (jobStateSummary(state.activeJob?.job || {}).terminal) {
