@@ -104,9 +104,12 @@ class ChatOutbound(TypedDict):
     model_lane: NotRequired[str]
     requested_model_lane: NotRequired[str]
     effective_model_lane: NotRequired[str]
-    # Phase 6: OPAQUE harness id this bubble/subagent really ran on (a
-    # delegated route only); absent/empty means the ordinary native path and
-    # the UI draws no chip.
+    # Phase 6: the OPAQUE harness route RESOLVED AT DISPATCH for this
+    # bubble/subagent (`resolve_subagent_dispatch`, stamped once) — a delegated
+    # route only; absent/empty means the ordinary native path and the UI draws
+    # no chip. It is the route the run was sent to, not a receipt from the
+    # engine saying where it landed: a landing below the ask is disclosed on
+    # `capability_delta`, not by rewriting this field.
     executor_route: NotRequired[str]
     model: NotRequired[str]
     task_group_id: NotRequired[str]

@@ -39,9 +39,12 @@ test('both verification statuses are honest: vendor is trusted, local is labeled
     assert.equal(verificationBadge({ status: { verification: 'failed', verification_source: 'vendor' } }).tone, 'error');
 });
 
+// `freshness` is a REQUIRED member of the daemon's quota snapshot
+// (@claudexor/schema quota.ts, `z.enum(['fresh','stale','unknown'])`), so every
+// fixture here carries it exactly as the wire does.
 test('an exhausted window is shown with its reset time, never hidden', () => {
     const snapshots = [{
-        subject: { harness: 'codex', subject_id: 'koshak' },
+        subject: { harness: 'codex', subject_id: 'koshak' }, freshness: 'fresh',
         constraints: [{ used_ratio: 1.0, resets_at: '2026-08-04T00:00:00Z' }],
     }];
     const summary = quotaSummary(snapshots, 'codex', 'koshak');
@@ -50,11 +53,50 @@ test('an exhausted window is shown with its reset time, never hidden', () => {
     assert.ok(summary.label.includes('resets 2026-08-04T00:00:00Z'));
 
     const healthy = quotaSummary([{
-        subject: { harness: 'codex' }, constraints: [{ used_ratio: 0.42 }],
+        subject: { harness: 'codex' }, freshness: 'fresh', constraints: [{ used_ratio: 0.42 }],
     }], 'codex');
     assert.equal(healthy.exhausted, false);
     assert.equal(healthy.label, '42% of window used');
     assert.deepEqual(quotaSummary([], 'codex'), { label: '', exhausted: false, resetsAt: '' });
+});
+
+test('the card reads a window on the same bar the runtime dispatches on', () => {
+    // Two ways the card and the runtime disagreed about the SAME snapshot.
+    //
+    // 1. STALENESS. `harness_window_wait_hint` skips any snapshot that is not
+    //    `fresh` ("an old reading must not block a lane"), so a stale spent window
+    //    still dispatches — while the card painted it red and named a reset time,
+    //    telling the owner a lane was down that was in fact serving.
+    const stale = [{
+        subject: { harness: 'codex', subject_id: 'koshak' }, freshness: 'stale',
+        constraints: [{ used_ratio: 1.0, resets_at: '2026-08-04T00:00:00Z' }],
+    }];
+    assert.deepEqual(quotaSummary(stale, 'codex', 'koshak'),
+        { label: '', exhausted: false, resetsAt: '' });
+    assert.equal(quotaSummary([{ ...stale[0], freshness: 'unknown' }], 'codex', 'koshak').exhausted, false);
+    assert.equal(quotaSummary([{ ...stale[0], freshness: 'fresh' }], 'codex', 'koshak').exhausted, true);
+
+    // 2. WHICH CONSTRAINT. The runtime spends a profile when ANY of its constraints
+    //    is cooling down or full; the card read exhaustion off the single highest
+    //    used_ratio, so a cooling 5-hour window hid behind a busier weekly one...
+    const cooling = [{
+        subject: { harness: 'codex', subject_id: 'koshak' }, freshness: 'fresh',
+        constraints: [
+            { used_ratio: 0.20, cooldown_until: '2026-08-04T00:00:00Z' },
+            { used_ratio: 0.80 },
+        ],
+    }];
+    const summary = quotaSummary(cooling, 'codex', 'koshak');
+    assert.equal(summary.exhausted, true);
+    assert.equal(summary.resetsAt, '2026-08-04T00:00:00Z');
+
+    // ...and vanished entirely when the cooling constraint reported no ratio at all,
+    // because a non-finite used_ratio was skipped before it could be read.
+    const ratioless = [{
+        subject: { harness: 'codex', subject_id: 'koshak' }, freshness: 'fresh',
+        constraints: [{ cooldown_until: '2026-08-04T00:00:00Z' }],
+    }];
+    assert.equal(quotaSummary(ratioless, 'codex', 'koshak').exhausted, true);
 });
 
 test('a named profile\'s exhausted window is never reported as the default account\'s', () => {
@@ -64,8 +106,9 @@ test('a named profile\'s exhausted window is never reported as the default accou
     // `!subjectId ||` wildcard made the default row match every subject on the
     // harness and paint itself red off someone else's spent window.
     const snapshots = [
-        { subject: { harness: 'codex', subject_id: null }, constraints: [{ used_ratio: 0.05 }] },
-        { subject: { harness: 'codex', subject_id: 'koshak' },
+        { subject: { harness: 'codex', subject_id: null }, freshness: 'fresh',
+          constraints: [{ used_ratio: 0.05 }] },
+        { subject: { harness: 'codex', subject_id: 'koshak' }, freshness: 'fresh',
           constraints: [{ used_ratio: 1.0, resets_at: '2026-08-04T00:00:00Z' }] },
     ];
     const defaultRow = quotaSummary(snapshots, 'codex', '');

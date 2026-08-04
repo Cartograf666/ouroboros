@@ -428,14 +428,14 @@ def install_deps(context: BootstrapContext) -> bool:
             capture_output=True,
         )
     except Exception as exc:
-        context.log.error("Dependency install/update failed: %s", exc)
+        context.log.warning("Dependency install/update failed: %s", exc)
         return False
     # A non-zero pip exit is a real, actionable failure (unreachable index, an
     # unbuildable wheel, a read-only target): silently discarding it leaves the
     # app to fail much later with an unexplained ImportError.
     returncode = int(getattr(result, "returncode", 0) or 0)
     if returncode != 0:
-        context.log.error(
+        context.log.warning(
             "Dependency install/update pip exited %d; the runtime may be missing packages:\n%s",
             returncode, _pip_output_tail(result),
         )
@@ -992,7 +992,7 @@ def bootstrap_repo(context: BootstrapContext) -> bool:
     if outcome != "unchanged":
         deps_ok = install_deps(context)
         if not deps_ok:
-            context.log.error(
+            context.log.warning(
                 "Bootstrap finished with a FAILED dependency install (repo outcome=%s): "
                 "the checkout changed but its requirements did not land, so the server "
                 "may be missing packages. See the pip output above for the cause.",

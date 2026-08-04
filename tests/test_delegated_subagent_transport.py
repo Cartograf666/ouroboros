@@ -4197,7 +4197,9 @@ def test_the_configured_wait_ceiling_cannot_promise_more_than_the_tool_can_serve
     entry = next(e for e in get_tools() if e.schema["name"] == "delegate_wait")
     assert DELEGATE_WAIT_CEILING_SEC == entry.timeout_sec
     # ...and neither escape hatch applies to this tool, which is why the ToolEntry
-    # value really is the bound.
+    # value really is the bound. The task deadline is a separate concern and is
+    # honoured INSIDE the tool (see the wait-window test below), which is why the
+    # outer clamp still must not apply: it would thread-kill the graceful return.
     assert "delegate_wait" not in _PER_CALL_TIMEOUT_TOOLS
     assert "delegate_wait" not in _DEADLINE_CLAMPED_TOOLS
 
@@ -4210,3 +4212,83 @@ def test_the_configured_wait_ceiling_cannot_promise_more_than_the_tool_can_serve
             os.environ.pop("OUROBOROS_DELEGATE_WAIT_MAX_SEC", None)
         else:
             os.environ["OUROBOROS_DELEGATE_WAIT_MAX_SEC"] = previous
+
+
+def _wait_against_a_live_run(ctx, tmp_path, monkeypatch, *, wait_sec):
+    """Drive `_delegate_wait` against a run that stays RUNNING and never advances its
+    cursor, so the WINDOW itself is the only thing that can end the wait. Returns
+    (payload, elapsed_sec)."""
+    import time
+
+    import ouroboros.gateways.claudexor as gw
+    import ouroboros.tools.delegate as delegate
+
+    run_dir = tmp_path / "rundir"
+    run_dir.mkdir(exist_ok=True)
+
+    class _AliveStub:
+        def handshake(self): return {"compatible": True, "protocolMajor": 3}
+
+        def get_run(self, rid):
+            return {"lastSeq": 0, "summary": {
+                "state": "running", "effectiveAccess": "workspace_write",
+                "runDir": str(run_dir),
+            }}
+
+        def close(self): pass
+
+    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _AliveStub())
+    delegate._CUSTODY.clear()
+    delegate._CUSTODY["run-1"] = delegate._RunCustody(
+        task_id="t-nanny", route_id="some-route", model="m",
+        project_id="prj", project_owned=False,
+    )
+    try:
+        started = time.monotonic()
+        out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=wait_sec, since_seq=0))
+        return out, time.monotonic() - started
+    finally:
+        delegate._CUSTODY.clear()
+
+
+def test_the_wait_window_never_outlives_the_nannys_own_deadline(tmp_path, monkeypatch):
+    """`delegate_wait` is deliberately NOT in `_DEADLINE_CLAMPED_TOOLS`, so nothing
+    upstream cuts it: measured, a 2100s window with ten seconds of task deadline left
+    kept the full 2100s outer timeout while `web_search` was clamped to 1s, and a real
+    call with an 8s window against a 2s deadline returned after 8.0s — the task slid
+    six seconds past its own deadline mid-tool, the exact defect that clamp exists for.
+
+    The bound belongs HERE rather than in that set: the outer clamp is a thread-kill,
+    while the wait's whole contract is the graceful typed `no_progress` return. So the
+    window narrows to the remaining deadline and the caller still gets its answer, in
+    time to finalize."""
+    from ouroboros.deadline_utils import deadline_remaining_sec
+
+    ctx = _delegating_ctx(tmp_path, acting=True)
+    ctx.task_metadata = dict(ctx.task_metadata or {})
+    ctx.task_metadata["deadline_at"] = (
+        datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(seconds=3)).isoformat()
+
+    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=8)
+
+    # It waited the DEADLINE, not the asked-for window, and came back BEFORE the
+    # deadline rather than being killed after it.
+    assert elapsed < 5.0, elapsed
+    assert out["status"] == "no_progress", out
+    assert out["waited_sec"] <= 3, out
+    assert deadline_remaining_sec(ctx) > 0, "the wait ate the whole remaining deadline"
+
+
+def test_a_wait_with_no_deadline_keeps_the_full_window_it_asked_for(tmp_path, monkeypatch):
+    """The clamp is NARROW-ONLY, and `deadline_remaining_sec` answers 0.0 both for "no
+    deadline" and for "the deadline is behind us" — so a clamp that skipped the
+    positive-remaining guard would shrink EVERY ordinary deadline-less wait to one
+    second. This is the control that keeps that path byte-identical."""
+    from ouroboros.deadline_utils import deadline_remaining_sec
+
+    ctx = _delegating_ctx(tmp_path, acting=True)
+    assert deadline_remaining_sec(ctx) == 0.0, ctx.task_metadata
+
+    out, _ = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=2)
+    assert out["status"] == "no_progress" and out["waited_sec"] == 2, out

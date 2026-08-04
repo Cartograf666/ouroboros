@@ -77,9 +77,11 @@ export function compactModel(model = '') {
 }
 
 // Phase 6, owner directive #1: «бейдж точно нужен, но не рекламный … что ТУТ
-// бабл \ субагент на codex». A small chip carrying the harness this bubble or
-// subagent REALLY ran on — icon plus the short harness name, in the style of
-// the Harness Accounts rows, never a promotional badge.
+// бабл \ субагент на codex». A small chip carrying the harness route this bubble
+// or subagent was DISPATCHED to — icon plus the short harness name, in the style
+// of the Harness Accounts rows, never a promotional badge. Dispatch, not receipt:
+// `executor_route` is resolved once when the work is sent, so the chip says where
+// it was sent, and a landing below that ask is disclosed on `capability_delta`.
 //
 // Only a DELEGATED route is a fact worth a chip: the native API path is the
 // ordinary case and prints nothing, so the lane never fills with "api" noise on
@@ -101,7 +103,14 @@ export function executorChip(evt) {
         harness,
         icon: HARNESS_CHIP_ICON[harness] || '◆',
         label: harness,
-        title: `This work ran on your ${harness} subscription (delegated session)`,
+        // "This work" restated the bubble the tooltip is attached to, and
+        // "subscription" asserted the billing shape — a harness account can be a
+        // metered one, and the chip cannot see the run's spend at all. The ledger's
+        // own rule is that a session is free ONLY when the harness says it was
+        // (usage_accounting: "legacy zero may mean unknown pricing, never free"), so
+        // the chip states WHERE the work ran and leaves what it cost to the row that
+        // measured it.
+        title: `Ran on your ${harness} account (delegated session)`,
     };
 }
 

@@ -248,6 +248,59 @@ def _point_owned_home(monkeypatch, config_dir: pathlib.Path, data_dir: pathlib.P
     monkeypatch.setattr(config_mod, "DATA_DIR", data_dir)
 
 
+def test_a_spawn_that_never_publishes_a_descriptor_does_not_leave_the_child_running(
+        monkeypatch, tmp_path):
+    """The timeout branch raised its typed refusal and walked away from the process it
+    had just started. That child is OURS and it is alive — holding the config dir, its
+    log, and whatever port it eventually binds — and `self._proc` still pointed at it,
+    so the NEXT `ensure_running` spawned a SECOND daemon beside the first. Every retry
+    added one. `stop()` could not clean up either: by contract it only ever terminates
+    a daemon we successfully started, and this one never became reachable."""
+    import sys
+
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    data_dir = tmp_path / "data"
+    config_dir = data_dir / "claudexor"
+    _point_owned_home(monkeypatch, config_dir, data_dir)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(owned, "resolve_claudexord", lambda: sys.executable)
+    monkeypatch.setattr(owned, "_SPAWN_WAIT_SEC", 0.3)
+    monkeypatch.setattr(owned, "_SPAWN_POLL_SEC", 0.05)
+
+    class _NeverReadyChild:
+        """Alive, but it never writes a descriptor — so discovery never succeeds."""
+
+        pid = 424242
+
+        def __init__(self):
+            self.terminated = 0
+
+        def poll(self):
+            return None                      # still running
+
+        def terminate(self):
+            self.terminated += 1
+
+    child = _NeverReadyChild()
+    import ouroboros.platform_layer as platform_layer
+    monkeypatch.setattr(platform_layer, "process_group_id", lambda _pid: 0)
+    monkeypatch.setattr(owned, "spawn_supervised", lambda *a, **k: child, raising=False)
+    import ouroboros.process_custody as custody_mod
+    monkeypatch.setattr(custody_mod, "spawn_supervised", lambda *a, **k: child)
+
+    manager = owned.OwnedClaudexorDaemon()
+    with pytest.raises(ClaudexorUnavailable) as err:
+        manager.ensure_running()
+    assert err.value.code == "daemon_spawn_failed"
+
+    # The child we started is stopped, and the handle is forgotten so the next
+    # attempt starts ONE daemon rather than a second one beside a live orphan.
+    assert child.terminated == 1, "the spawned child was left running"
+    assert manager._proc is None
+    assert manager.stop() is False
+
+
 def test_dead_owned_daemon_is_restarted_and_reconciled(monkeypatch, tmp_path):
     """The stale case end-to-end: descriptor exists, daemon dead, ownership
     marker OURS -> ensure_running restarts under the same supervision

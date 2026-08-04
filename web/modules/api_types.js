@@ -107,8 +107,10 @@
  * @property {string=} requested_model_lane
  * @property {string=} effective_model_lane
  * @property {string=} executor_route
- *   Phase 6: OPAQUE harness id this bubble/subagent really ran on (delegated
- *   routes only). Absent/empty = the ordinary native path; no chip is drawn.
+ *   Phase 6: the OPAQUE harness route RESOLVED AT DISPATCH for this bubble /
+ *   subagent (delegated routes only) — the route it was sent to, not a receipt
+ *   from the engine saying where it landed. Absent/empty = the ordinary native
+ *   path; no chip is drawn.
  * @property {string=} model
  * @property {string=} task_group_id
  * @property {string=} task_event

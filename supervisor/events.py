@@ -1092,6 +1092,13 @@ def _authoritative_terminal_cost(
                 "cost_usd_with_children": round(float(subtree.get("accounted_usd") or 0.0), 6),
                 "cost_with_children_partial": not subtree_final,
                 "cost_final": bool(projection.get("cost_final") and subtree_final),
+                # THIRD site of the same class: `non_final_rows` is `cost_final`'s
+                # DISCLOSED CAUSE and rides with it by contract (task_results.py), but
+                # the root branch narrowed `cost_final` against the SUBTREE and then
+                # left the row count describing this task alone — so a root turned
+                # non-final purely by a child's open row reported a cause of 0, a flag
+                # no reader could reconstruct.
+                "non_final_rows": int(subtree.get("non_final_rows") or 0),
             })
         except Exception:
             log.error("Root subtree cost authority unavailable for %s", task_id, exc_info=True)

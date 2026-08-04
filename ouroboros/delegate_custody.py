@@ -132,9 +132,12 @@ class RunCustody:
     unread_disclosed: bool = False
     # The staged-output half of the terminal story (D7). ``output_artifact`` is the
     # task-drive-relative path the terminal payload was staged to (empty when it fit
-    # inline); ``output_complete`` is whether what was staged is the VERIFIED full
-    # content (a truncated engine preview whose full artifact could not be fetched and
-    # verified stages as incomplete and can never be acknowledged); ``output_sha`` is
+    # inline); ``output_complete`` is whether what was staged is the full content as
+    # far as the run's OWN report can establish it — its served size, or the preview
+    # carried as a prefix (`_resolve_full_primary_output`); the engine publishes no
+    # content hash for the primary output, so equal length binds the body to the run's
+    # CLAIM about it, not to a digest of it. An artifact that matches neither stages as
+    # incomplete and can never be acknowledged. ``output_sha`` is
     # the content hash of what is CURRENTLY staged; ``output_consumed`` is whether the
     # canonical acknowledgement exists FOR THAT HASH — a re-stage of different content
     # at the same path resets it, because an ack names bytes, not a path. All replayed,
@@ -578,9 +581,18 @@ def retire_project(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
 def close_absent_run(drive_root: Any, gateway: Any, custody: RunCustody, reason: str) -> None:
     """Close custody over a run the daemon says it does not have.
 
-    Nothing is mutating, so this is not a containment fault; and there is no terminal
-    detail, so it is not a settlement either — ``settle_run`` would have to invent the
-    tokens and the spend. The registration we created is the one obligation that survives
+    This is not a containment fault BY THE DAEMON WE ASKED — but "absent" is a fact
+    about the daemon that answered, not about the run. Under the D30 owned daemon
+    Ouroboros provisions the engine itself, under its own ``CLAUDEXOR_CONFIG_DIR``,
+    and `ensure_running` will restart one and rediscover its descriptor: across that
+    provisioning boundary a 404 can mean we are asking a DIFFERENT daemon than the one
+    that accepted the run, whose child may still be alive and still writing. So the
+    honest reading is that the run is unreachable and its state unknowable from here,
+    not that nothing is mutating. Custody closing anyway is a deliberate trade — an
+    unreachable run cannot be cancelled, verified or settled, and holding it open
+    re-faults it forever — and the registration obligation below is what still has to
+    be discharged. There is no terminal detail either, so this is not a settlement:
+    ``settle_run`` would have to invent the tokens and the spend. The registration we created is the one obligation that survives
     the run, so custody closes ONLY once it is discharged: the absent-run FACT and the
     completion of the registration obligation are two different things (P34R.4). Closing
     over a failed retirement replayed as ``project_owned=False`` — the CLOSED_ABSENT row
@@ -639,7 +651,7 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
                 custody.run_id,
                 drive_root=pathlib.Path(custody.ledger_root or drive_root),
                 route=custody.route_id,
-                model=str(summary.get("model") or custody.model or ""),
+                model=str(summary.get("model") or ""),
                 task_id=custody.task_id,
                 root_task_id=custody.root_task_id,
                 parent_task_id=custody.parent_task_id,

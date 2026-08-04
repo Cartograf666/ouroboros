@@ -1245,7 +1245,20 @@ def _apply_scope_authority(
     Authority is read from the EVIDENCE, not from the number: a window that is merely
     large enough is not a window that was established — an expired record, an outage-
     carried record, and the unevidenced designated-default sentinel all size a prompt
-    at >=1M and all fail here (the BIBLE P3 rule stated in code)."""
+    at >=1M and all fail here (the BIBLE P3 rule stated in code).
+
+    WHOSE window, for a retrieving row: the ACKED HARNESS ROUTE's. ``scope_model_id``
+    is that row's opaque ``harness[=model]`` spec, and `reviewer_window.reviewer_route`
+    fingerprints it under its own provider precisely so the owner's ack is recorded
+    against the route it travels. It is NOT the model the engine later reports back —
+    that arrives only after the run, is absent on telemetry that predates the receipt,
+    and would make the authority of a row depend on a fact no pre-flight can know.
+    Re-keying this lookup to the reported model was measured: it fails every session
+    scope row, closing a delivery path the owner deliberately opened. When the engine
+    resolves something other than what the route asked for, that divergence is already
+    disclosed on its own axis — ``capability_delta``, reason
+    ``session_route_resolves_its_own_model`` — which is where a landing below the ask
+    belongs, not in the window predicate."""
     resolved = _scope_window(scope_model_id, session=delegated)
     if delegated:
         from ouroboros.tools.scope_review_session import session_scope_authority

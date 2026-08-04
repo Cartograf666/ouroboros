@@ -286,6 +286,42 @@ def test_retry_terminal_cost_uses_logical_root_authority(tmp_path, monkeypatch):
     assert projection["cost_final"] is True
 
 
+def test_a_root_narrowed_by_a_childs_open_row_reports_that_rows_count(tmp_path, monkeypatch):
+    """THIRD site of one class: `non_final_rows` is `cost_final`'s DISCLOSED CAUSE and
+    rides with it by contract (`task_results.py`: "a projection reporting cost_final:
+    false with every dollar bucket at zero ... is a flag no reader can reconstruct").
+
+    The root branch re-derives `cost_final` against the SUBTREE — so a root whose own
+    rows are all settled goes non-final purely because a CHILD still has one open. It
+    left the count describing this task alone, which for exactly that root is 0: the
+    projection said "not final, caused by nothing"."""
+    from supervisor import events
+
+    monkeypatch.setattr(
+        "supervisor.state.reconstruct_task_cost",
+        lambda *_args, **_kwargs: {
+            # This task's OWN rows are complete and final.
+            "cost_accounting_status": "available", "cost_usd": 0.75,
+            "cost_final": True, "non_final_rows": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "ouroboros.usage_accounting.usage_breakdown",
+        lambda root, *, root_task_id="", **_kwargs: {
+            "accounted_usd": 2.0, "cost_final": False, "non_final_rows": 3,
+        },
+    )
+    task = {"id": "root-1", "root_task_id": "root-1", "parent_task_id": "",
+            "delegation_role": "root", "budget_drive_root": str(tmp_path)}
+
+    projection = events._authoritative_terminal_cost("root-1", task, dict(task), {}, tmp_path)
+
+    assert projection["cost_final"] is False
+    assert projection["cost_with_children_partial"] is True
+    # The cause travels with the flag it explains, and it is the SUBTREE's count.
+    assert projection["non_final_rows"] == 3
+
+
 def test_reaper_admission_block_terminalizes_retry(tmp_path, monkeypatch):
     from ouroboros.task_results import STATUS_FAILED, load_task_result
     from supervisor import queue

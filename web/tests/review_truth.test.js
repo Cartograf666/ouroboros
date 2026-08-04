@@ -197,6 +197,11 @@ test('a delegated frame yields a small harness chip; an ordinary frame yields no
     assert.equal(chip.label, 'codex');           // short harness name, not a slogan
     assert.ok(chip.icon);                        // icon, Claudexor-style
     assert.match(chip.title, /codex/);
+    // WHERE it ran is all the chip can see. It has no access to the run's spend, so
+    // it must not describe the billing: "on your codex subscription" told the owner
+    // the work was covered, which the ledger alone can say (and only when the harness
+    // says it — a zero there may mean unknown pricing, never "free").
+    assert.ok(!/subscription/i.test(chip.title), chip.title);
     // The opaque `harness=model` spelling prints the HARNESS part only.
     assert.equal(executorChip({ executor_route: 'codex=gpt-5.6-sol' }).label, 'codex');
     // An unknown harness still gets a chip (a generic mark), never a crash.

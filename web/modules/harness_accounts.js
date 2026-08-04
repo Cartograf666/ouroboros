@@ -52,29 +52,43 @@ export function quotaSummary(snapshots, harnessId, subjectId = '') {
         // `!subjectId ||` wildcard made the native row match EVERY subject on the
         // harness, so the default account reported a named profile's exhausted
         // window — red styling and all — as its own.
-        return String(subject.subject_id || '') === String(subjectId);
+        if (String(subject.subject_id || '') !== String(subjectId)) return false;
+        // The RUNTIME ignores a stale reading ("an old reading must not block a lane",
+        // subagents.py `harness_window_wait_hint`), so a card that paints one red is
+        // reporting a block that will not happen: the lane still dispatches. Same bar,
+        // same answer, on both sides of the glass.
+        return String(snap?.freshness || '') === 'fresh';
     });
     let worst = null;
+    // The runtime's own bar, per snapshot: spent when a constraint is cooling down OR
+    // its window is fully used — ANY constraint, not just the one with the highest
+    // ratio. Reading exhaustion off `worst` alone hid a cooling constraint whenever
+    // some other window happened to report a larger used_ratio, and dropped it
+    // entirely when the cooling one reported no ratio at all.
+    let exhausted = false;
+    let exhaustedResetsAt = '';
     for (const snap of rows) {
         for (const constraint of snap.constraints || []) {
             const used = Number(constraint.used_ratio);
+            const spent = Boolean(constraint.cooldown_until) || (Number.isFinite(used) && used >= 1.0);
+            if (spent && !exhausted) {
+                exhausted = true;
+                exhaustedResetsAt = String(constraint.cooldown_until || constraint.resets_at || '');
+            }
             if (!Number.isFinite(used)) continue;
             if (!worst || used > worst.used) {
-                worst = {
-                    used,
-                    resetsAt: String(constraint.resets_at || constraint.cooldown_until || ''),
-                    exhausted: used >= 1.0 || Boolean(constraint.cooldown_until),
-                };
+                worst = { used, resetsAt: String(constraint.resets_at || constraint.cooldown_until || '') };
             }
         }
     }
-    if (!worst) return { label: '', exhausted: false, resetsAt: '' };
-    const percent = Math.min(100, Math.round(worst.used * 100));
+    if (!worst && !exhausted) return { label: '', exhausted: false, resetsAt: '' };
+    const percent = worst ? Math.min(100, Math.round(worst.used * 100)) : 100;
+    const resetsAt = exhausted ? (exhaustedResetsAt || worst?.resetsAt || '') : (worst?.resetsAt || '');
     return {
-        exhausted: worst.exhausted,
-        resetsAt: worst.resetsAt,
-        label: worst.exhausted
-            ? `window exhausted — resets ${worst.resetsAt || 'soon'}`
+        exhausted,
+        resetsAt,
+        label: exhausted
+            ? `window exhausted — resets ${resetsAt || 'soon'}`
             : `${percent}% of window used`,
     };
 }
@@ -115,8 +129,16 @@ export function deviceCodeDisclosure(job) {
 // clicked: the server forces client_pty for every non-codex login, so a
 // `device`-mode click on claude/cursor comes back with a copy-paste command and
 // nothing else — and demanding mode==='attach' left that card stuck on
-// "Login running…" with the one thing the user needed never rendered. The
-// command is only ever issued for a job that really is client_pty.
+// "Login running…" with the one thing the user needed never rendered.
+//
+// What makes that safe is WHICH answer the command is read from, not the server
+// being careful: `_login_create` issues one only for a genuine client_pty job,
+// and this module stores `attachCommand` from that create answer alone. The POLL
+// route (`_login_job_read`) still returns an `attach_command` for EVERY job,
+// including the daemon-transport codex device flow that must never show one — it
+// is simply never read. Left as-is deliberately: making the server stop emitting
+// it costs more lines than the one that already ignores it, and the create answer
+// is the authority either way.
 export function loginCardFace(active) {
     if (!active) return 'none';
     if (active.error) return 'error';

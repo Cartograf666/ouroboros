@@ -174,6 +174,20 @@ export function describeLastExecution(entry) {
     return parts.join(' · ');
 }
 
+export function profileOptionsFor(profiles, savedPin) {
+    // Mirrors the model list's own rule: a SAVED pin the daemon no longer discovers
+    // (account signed out, daemon down, profile renamed) matched no option, so the
+    // select fell back to its first entry and redrew the row as "automatic rotation".
+    // The pin only LOOKED gone — until the owner saved the panel, which then really
+    // did delete it, silently widening which account the reviewer may spend.
+    const options = [{ value: '', label: 'Account: automatic rotation' },
+        ...(profiles || []).map((p) => ({ value: p, label: `Account: ${p} (pinned)` }))];
+    if (savedPin && !options.some((o) => o.value === savedPin)) {
+        options.push({ value: savedPin, label: `Account: ${savedPin} (not in discovery)` });
+    }
+    return options;
+}
+
 export function capabilityBadge(row, harnessesById) {
     // DISPLAY-only facts: never a control (6.2).
     if (row.route.kind === ROUTE_KIND_SESSION) {
@@ -278,8 +292,7 @@ function rowHtml(row, group) {
         modelOptions.push({ value: split.model, label: `${split.model} (not in discovery)` });
     }
     const profiles = session ? (state.profilesByHarness[split.harness] || []) : [];
-    const profileOptions = [{ value: '', label: 'Account: automatic rotation' },
-        ...profiles.map((p) => ({ value: p, label: `Account: ${p} (pinned)` }))];
+    const profileOptions = profileOptionsFor(profiles, row.route.profile_id);
     const last = state.lastExecutions[row.slot_id];
     const surfaceDefault = group === 'scope' ? 'scope review effort' : 'review effort';
     return `
@@ -288,7 +301,7 @@ function rowHtml(row, group) {
                 ${selectHtml(`data-slot-route aria-label="Reviewer route"`, groups, choice)}
                 ${row._customApi ? `<input data-slot-custom-api placeholder="provider/model-id" value="${escapeHtml(row.route.target_id || '')}" spellcheck="false">` : ''}
                 ${session ? selectHtml('data-slot-model aria-label="Harness model"', [{ label: '', options: modelOptions }], split.model) : ''}
-                ${session && profiles.length ? selectHtml('data-slot-profile aria-label="Credential account"', [{ label: '', options: profileOptions }], row.route.profile_id || '') : ''}
+                ${session && profileOptions.length > 1 ? selectHtml('data-slot-profile aria-label="Credential account"', [{ label: '', options: profileOptions }], row.route.profile_id || '') : ''}
                 ${effortSelectHtml('data-slot-effort aria-label="Reasoning effort"', row.effort, surfaceDefault)}
                 <button type="button" class="settings-ghost-btn" data-slot-remove title="Remove this slot">Remove</button>
             </div>

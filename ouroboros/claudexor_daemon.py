@@ -324,12 +324,34 @@ class OwnedClaudexorDaemon:
                 tail = log_path.read_bytes()[-500:].decode("utf-8", errors="replace")
             except OSError:
                 pass
+            # OUR OWN child, and it never became a daemon we can reach: leaving it
+            # alive orphans a process holding this config dir, and leaving the handle
+            # set makes the NEXT ensure_running spawn a second one beside it. Killed
+            # here rather than in `stop()`, which by contract only ever terminates a
+            # daemon we successfully started.
+            self._terminate_child()
             raise ClaudexorUnavailable(
                 "daemon_spawn_failed",
                 "the owned claudexord did not publish a live control descriptor "
                 f"within {_SPAWN_WAIT_SEC:.0f}s"
                 + (f"; log tail: {tail}" if tail else ""),
             )
+
+    def _terminate_child(self) -> None:
+        """Stop and forget the child this manager spawned. Caller holds the lock."""
+        proc, self._proc = self._proc, None
+        if proc is None or proc.poll() is not None:
+            return
+        from ouroboros.platform_layer import kill_process_group_id, process_group_id
+
+        try:
+            pgid = process_group_id(proc.pid)
+            if pgid:
+                kill_process_group_id(pgid)
+            else:
+                proc.terminate()
+        except Exception:
+            proc.terminate()
 
     def _enable_rotation(self, endpoint: Any) -> None:
         """D28 at provisioning: ONE settings patch turns profile auto-rotation
@@ -357,21 +379,9 @@ class OwnedClaudexorDaemon:
     def stop(self) -> bool:
         """Terminate ONLY a self-started daemon; attached daemons are left alone."""
         with self._lock:
-            proc = self._proc
-            if proc is None or proc.poll() is not None:
-                return False
-            from ouroboros.platform_layer import kill_process_group_id, process_group_id
-
-            try:
-                pgid = process_group_id(proc.pid)
-                if pgid:
-                    kill_process_group_id(pgid)
-                else:
-                    proc.terminate()
-            except Exception:
-                proc.terminate()
-            self._proc = None
-            return True
+            live = self._proc is not None and self._proc.poll() is None
+            self._terminate_child()
+            return live
 
 
 _MANAGER: Optional[OwnedClaudexorDaemon] = None

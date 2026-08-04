@@ -567,8 +567,10 @@ def _preview_payload(full: Dict[str, Any], text: str, artifact: Optional[Dict[st
               "be reported as its verdict, until the whole artifact has been read.")
              if full_ok else
              "PARTIAL and INCOMPLETE AT THE SOURCE: the engine reported its primary output "
-             "as a bounded preview and the full artifact could not be fetched and verified "
-             "(see primary_output_full). Treat this result as incomplete evidence, not as "
+             "as a bounded preview and the full artifact could not be matched to the size "
+             "or the preview the run itself reported (see primary_output_full; the engine "
+             "publishes no content hash for it, so that match is the whole of the check). "
+             "Treat this result as incomplete evidence, not as "
              "the verdict; it can never be acknowledged as fully read.")
             if artifact else
             "PARTIAL and UNRECOVERABLE INLINE: the full payload could not be staged to the "
@@ -688,7 +690,8 @@ def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str,
             "note": ("The whole terminal payload is inline." if full_ok else
                      "INLINE BUT INCOMPLETE AT THE SOURCE: the engine reported its "
                      "primary output as a bounded preview and the full artifact could "
-                     "not be fetched and verified (see primary_output_full). Treat this "
+                     "not be matched to the size or the preview the run itself reported "
+                     "(see primary_output_full). Treat this "
                      "as incomplete evidence, not as the verdict."),
         }
         if full_note is not None:
@@ -1316,6 +1319,17 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     ``since_seq``. Progress is the JOURNAL cursor, so SSE ``: ping`` keepalives cannot
     masquerade as progress — they never reach the cursor at all. The hard kill stays
     with the outer task watchdog; this only tunes the passive wait.
+
+    NARROW-ONLY, like ``_bounded_max_seconds``: the wait may not outlive the nanny's
+    own deadline. This tool is deliberately absent from ``_DEADLINE_CLAMPED_TOOLS``
+    (its ToolEntry value IS its outer bound), so nothing upstream cuts it — measured,
+    a 2100s window against ten seconds of remaining deadline ran the full 2100s and
+    the task slid past its deadline mid-tool, the exact defect that set built for
+    ``web_search``. Clamping HERE instead of there keeps the graceful typed
+    ``no_progress`` return the wait exists to give, where the outer clamp would have
+    delivered a thread-kill. No deadline (remaining 0.0) and an already-elapsed one
+    are both left unclamped — byte-identical to before, and forced finalization owns
+    the expired case.
     """
     from ouroboros.config import get_delegate_wait_max_sec, get_delegate_wait_sec
     from ouroboros.gateways.claudexor import ClaudexorGateway, ClaudexorUnavailable
@@ -1332,6 +1346,11 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     except (TypeError, ValueError):
         window = get_delegate_wait_sec()
     window = max(1, min(window, ceiling))
+    from ouroboros.deadline_utils import deadline_remaining_sec
+
+    remaining = int(deadline_remaining_sec(ctx))
+    if remaining > 0:
+        window = max(1, min(window, remaining))
 
     try:
         gateway = ClaudexorGateway()

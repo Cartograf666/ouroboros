@@ -951,7 +951,7 @@ def run_delegated_review_session(
             "effective_route_ids": [
                 str(h) for h in (summary.get("harnesses") or []) if str(h)
             ],
-            "model": str(summary.get("model") or route.model or ""),
+            "model": str(summary.get("model") or ""),
             "spend": spend,
             "spend_estimated": estimated,
             # D22/D29 APPLIED facts, verbatim from the run's own telemetry
@@ -1015,7 +1015,7 @@ def _poll_session_terminal(gateway: Any, custody: Any, custody_drive: Any, entry
                             run_id, exc_info=True)
             raise TimeoutError(
                 f"delegated review session {run_id} exceeded the slot budget "
-                f"of {seconds:g}s and was cancelled"
+                f"of {seconds:g}s"
             )
         time.sleep(min(_SESSION_POLL_SEC, max(0.0, deadline - time.monotonic())))
         detail = gateway.get_run(run_id)
@@ -1035,9 +1035,9 @@ def _full_session_text(gateway: Any, run_id: str, detail: Dict[str, Any]) -> str
     if not full_ok:
         raise RuntimeError(
             f"delegated review session {run_id} produced a truncated primary "
-            f"output whose full artifact could not be fetched and verified "
-            f"({(disclosure or {}).get('reason')}); a verdict is never read "
-            "from a preview"
+            f"output whose full artifact could not be matched to the size or the "
+            f"preview the run reported ({(disclosure or {}).get('reason')}); a "
+            "verdict is never read from a preview"
         )
     text = ""
     if isinstance(primary, dict):
@@ -1255,6 +1255,11 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             # requested value dressed up as applied.
             "applied_profile": facts.get("applied_profile", ""),
             "applied_access": facts.get("applied_access", ""),
+            # Whether the durable start row actually landed. `record_started`'s answer
+            # is already a fact the caller acts on; carrying it into the actor record
+            # too means a verdict delivered by a run with NO durable custody is legible
+            # afterwards instead of looking identical to a custodied one.
+            "custody_durable": bool(facts.get("custody_durable")),
             "output_conformance": conformance,
             "settlement": facts["settlement"],
             # The ledger row is written by settle_run (record_subscription_session);

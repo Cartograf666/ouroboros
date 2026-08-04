@@ -12,9 +12,29 @@ import {
     describeLastExecution,
     encodeRouteChoice,
     mintSlotId,
+    profileOptionsFor,
     routeChoiceGroups,
     splitSessionTarget,
 } from '../modules/reviewer_slots.js';
+
+test('a saved account pin survives a discovery list that no longer contains it', () => {
+    // The select's value must EXIST as an option or the browser silently selects the
+    // first one — "automatic rotation" — so a row pinned to one account redrew as
+    // unpinned whenever the daemon was down or that account was signed out. Nothing
+    // looked wrong, and saving the panel made the widening real.
+    const discovered = profileOptionsFor(['koshak', 'valentine'], 'koshak');
+    assert.deepEqual(discovered.map((o) => o.value), ['', 'koshak', 'valentine']);
+
+    const undiscovered = profileOptionsFor(['valentine'], 'koshak');
+    assert.deepEqual(undiscovered.map((o) => o.value), ['', 'valentine', 'koshak']);
+    assert.match(undiscovered[2].label, /not in discovery/);
+
+    // Discovery empty entirely (daemon down) is the SAME case, not a special one.
+    assert.deepEqual(profileOptionsFor([], 'koshak').map((o) => o.value), ['', 'koshak']);
+    // No pin: nothing invented, and the rotation entry stays the only default.
+    assert.deepEqual(profileOptionsFor([], '').map((o) => o.value), ['']);
+    assert.deepEqual(profileOptionsFor(null, '').map((o) => o.value), ['']);
+});
 
 test('the provider shown for a delegated row is the harness name, never Claudexor', () => {
     const groups = routeChoiceGroups({

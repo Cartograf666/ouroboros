@@ -372,8 +372,22 @@ def _physical_call_count(row: Dict[str, Any]) -> int:
 
 def _breakdown_bucket(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     bucket = _summary(rows)
-    prompt = sum(max(0, int(row.get("prompt_tokens") or 0)) for row in rows)
-    completion = sum(max(0, int(row.get("completion_tokens") or 0)) for row in rows)
+
+    def summed(field: str) -> Optional[int]:
+        """Sum the rows that HAVE this count; None when not one of them does.
+
+        `int(row.get(field) or 0)` collapsed an ABSENT count into a reported zero, so a
+        bucket whose provider returned no token counts at all published a confident
+        "0 tokens" — the render-unknown-as-zero shape this module refuses everywhere
+        else (`cost = None  # legacy zero may mean unknown pricing, never "free"`). A
+        zero here is now only ever a MEASURED zero, and a partially-reporting bucket
+        still sums the rows that did report rather than being erased by the ones that
+        did not."""
+        present = [row.get(field) for row in rows if row.get(field) is not None]
+        return sum(max(0, int(value)) for value in present) if present else None
+
+    prompt = summed("prompt_tokens")
+    completion = summed("completion_tokens")
     prompt_cache_ttls: Dict[str, int] = {}
     for row in rows:
         ttl = str(row.get("prompt_cache_ttl") or "").strip()
@@ -383,9 +397,12 @@ def _breakdown_bucket(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "physical_calls": sum(_physical_call_count(row) for row in rows),
         "prompt_tokens": prompt,
         "completion_tokens": completion,
-        "total_tokens": prompt + completion,
-        "cached_tokens": sum(max(0, int(row.get("cached_tokens") or 0)) for row in rows),
-        "cache_write_tokens": sum(max(0, int(row.get("cache_write_tokens") or 0)) for row in rows),
+        # Unknown on BOTH halves is an unknown total; one known half is a real total
+        # of what was measured, reported as the number it is.
+        "total_tokens": (None if prompt is None and completion is None
+                         else (prompt or 0) + (completion or 0)),
+        "cached_tokens": summed("cached_tokens"),
+        "cache_write_tokens": summed("cache_write_tokens"),
         "prompt_cache_ttls": prompt_cache_ttls,
     })
     return bucket

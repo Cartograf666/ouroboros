@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -590,6 +591,16 @@ def _last_execution_path() -> "pathlib.Path":
     return pathlib.Path(DATA_DIR) / "state" / LAST_EXECUTION_FILENAME
 
 
+# `run_parallel_review` runs the triad and the scope surfaces CONCURRENTLY, in two
+# threads of one process, and each finishes by folding its own rows into this one
+# file. `write_text_atomic` makes the write untearable but cannot make the
+# read-modify-write around it atomic: both threads read the same "before", and the
+# slower one wrote its rows over the faster one's. The surface that vanished was
+# whichever finished first — so the panel silently lost a whole row's «Выполняется
+# как» line. In-process lock only: the concurrency is threads, not processes.
+_LAST_EXECUTION_LOCK = threading.Lock()
+
+
 def record_reviewer_slot_executions(surface: str, actors: Any, slots_by_id: Dict[str, Any]) -> None:
     """Record each actor's last effective execution (best-effort, atomic).
 
@@ -600,62 +611,63 @@ def record_reviewer_slot_executions(surface: str, actors: Any, slots_by_id: Dict
     from ouroboros.utils import utc_now_iso, write_text_atomic
 
     path = _last_execution_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
+    with _LAST_EXECUTION_LOCK:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
             data = {}
-    except (OSError, ValueError):
-        data = {}
-    for actor in actors or []:
-        slot = slots_by_id.get(getattr(actor, "slot_id", ""))
-        if slot is None:
-            continue
-        usage = dict(getattr(actor, "usage", {}) or {})
-        route_kind = str(getattr(getattr(slot, "route", None), "value", "") or "api_chat")
-        delegated_route = str(usage.get("delegated_route") or "")
-        session = route_kind == "agent_session" or bool(delegated_route)
-        effective: Dict[str, Any] = {
-            # For a session the harness resolves route/model on its side; for
-            # api_chat what was sent is what ran.
-            "route": (f"agent_session:{delegated_route}" if delegated_route
-                      else route_kind),
-            # APPLIED honesty: a session whose telemetry disclosed no resolved
-            # model shows ABSENCE — the requested model must never be dressed
-            # up as the applied one. An api row's sent model IS its applied one.
-            "model": (str(usage.get("resolved_model") or "") if session
-                      else str(getattr(slot, "model", "") or "")),
-            # No "effort": no APPLIED effort exists anywhere upstream (no
-            # applied/resolved effort in any receipt or telemetry), so the only
-            # value available is the REQUESTED one — already recorded below. Echoing
-            # it here dressed the request up as the applied value, the exact thing
-            # the model rule above forbids.
-            "verdict_method": str(usage.get("verdict_method") or ""),
-        }
-        # D29 applied account/access, verbatim from the engine receipt; absent
-        # keys mean the telemetry predates the receipt — shown as absence.
-        if usage.get("applied_profile"):
-            effective["profile_id"] = str(usage["applied_profile"])
-        if usage.get("applied_access"):
-            effective["access"] = str(usage["applied_access"])
-        data[str(actor.slot_id)] = {
-            "ts": utc_now_iso(),
-            "surface": str(surface or ""),
-            "requested": {
-                "route_kind": route_kind,
-                "model": str(getattr(slot, "model", "") or ""),
-                "effort": str(getattr(slot, "effort", "") or ""),
-                "session_target": str(getattr(slot, "session_target", "") or ""),
-                "profile_id": str(getattr(slot, "session_profile", "") or ""),
-            },
-            "effective": effective,
-            "capability_delta": usage.get("capability_delta") or [],
-            "status": str(getattr(actor, "status", "") or ""),
-        }
-    if len(data) > _LAST_EXECUTION_CAP:
-        ordered = sorted(data.items(), key=lambda kv: str(kv[1].get("ts") or ""))
-        data = dict(ordered[-_LAST_EXECUTION_CAP:])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=1))
+        for actor in actors or []:
+            slot = slots_by_id.get(getattr(actor, "slot_id", ""))
+            if slot is None:
+                continue
+            usage = dict(getattr(actor, "usage", {}) or {})
+            route_kind = str(getattr(getattr(slot, "route", None), "value", "") or "api_chat")
+            delegated_route = str(usage.get("delegated_route") or "")
+            session = route_kind == "agent_session" or bool(delegated_route)
+            effective: Dict[str, Any] = {
+                # For a session the harness resolves route/model on its side; for
+                # api_chat what was sent is what ran.
+                "route": (f"agent_session:{delegated_route}" if delegated_route
+                          else route_kind),
+                # APPLIED honesty: a session whose telemetry disclosed no resolved
+                # model shows ABSENCE — the requested model must never be dressed
+                # up as the applied one. An api row's sent model IS its applied one.
+                "model": (str(usage.get("resolved_model") or "") if session
+                          else str(getattr(slot, "model", "") or "")),
+                # No "effort": no APPLIED effort exists anywhere upstream (no
+                # applied/resolved effort in any receipt or telemetry), so the only
+                # value available is the REQUESTED one — already recorded below. Echoing
+                # it here dressed the request up as the applied value, the exact thing
+                # the model rule above forbids.
+                "verdict_method": str(usage.get("verdict_method") or ""),
+            }
+            # D29 applied account/access, verbatim from the engine receipt; absent
+            # keys mean the telemetry predates the receipt — shown as absence.
+            if usage.get("applied_profile"):
+                effective["profile_id"] = str(usage["applied_profile"])
+            if usage.get("applied_access"):
+                effective["access"] = str(usage["applied_access"])
+            data[str(actor.slot_id)] = {
+                "ts": utc_now_iso(),
+                "surface": str(surface or ""),
+                "requested": {
+                    "route_kind": route_kind,
+                    "model": str(getattr(slot, "model", "") or ""),
+                    "effort": str(getattr(slot, "effort", "") or ""),
+                    "session_target": str(getattr(slot, "session_target", "") or ""),
+                    "profile_id": str(getattr(slot, "session_profile", "") or ""),
+                },
+                "effective": effective,
+                "capability_delta": usage.get("capability_delta") or [],
+                "status": str(getattr(actor, "status", "") or ""),
+            }
+        if len(data) > _LAST_EXECUTION_CAP:
+            ordered = sorted(data.items(), key=lambda kv: str(kv[1].get("ts") or ""))
+            data = dict(ordered[-_LAST_EXECUTION_CAP:])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=1))
 
 
 def reviewer_slot_last_executions() -> Dict[str, Any]:

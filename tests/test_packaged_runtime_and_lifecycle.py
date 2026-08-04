@@ -150,11 +150,17 @@ def test_install_deps_targets_the_user_site_for_a_bundled_interpreter(tmp_path):
 
 
 def test_install_deps_reports_a_failing_pip(tmp_path):
+    """Reported at WARNING, not ERROR: this failure is RETURNED as the function's own
+    value and every caller consumes it (the three tests below exist to prove that), so
+    it is a handled outcome, not an unhandled fault. Logging it at error level made an
+    ordinary offline/mirror-flaky bootstrap — which continues, and may well have every
+    package it needs already — indistinguishable from a crash in the launcher log."""
     sink = []
     context, _calls = _install_deps_context(tmp_path, sys.executable, 1, sink)
     assert bootstrap_module.install_deps(context) is False
-    errors = [msg for level, msg in sink if level == "error"]
-    assert any("pip exited 1" in msg and "boom" in msg for msg in errors)
+    assert [msg for level, msg in sink if level == "error"] == []
+    warnings = [msg for level, msg in sink if level == "warning"]
+    assert any("pip exited 1" in msg and "boom" in msg for msg in warnings)
 
 
 # --------------------------------------------------------------------------
@@ -186,7 +192,12 @@ def test_bootstrap_repo_reports_a_failed_dependency_install(tmp_path, monkeypatc
     monkeypatch.setattr(bootstrap_module, "verify_claude_runtime", lambda c: True)
     monkeypatch.setattr(bootstrap_module, "install_deps", lambda c: False)
     assert bootstrap_module.bootstrap_repo(context) is False
-    assert any("FAILED dependency install" in msg for level, msg in sink if level == "error")
+    # WARNING, not ERROR, for the same reason as `install_deps` itself: bootstrap
+    # RETURNS False here and the caller decides what to do about it. The line is the
+    # explanation attached to a handled outcome, and the assertion below is what
+    # actually proves the outcome was not swallowed.
+    assert [msg for level, msg in sink if level == "error"] == []
+    assert any("FAILED dependency install" in msg for level, msg in sink if level == "warning")
 
     monkeypatch.setattr(bootstrap_module, "ensure_managed_repo", lambda c: "unchanged")
     assert bootstrap_module.bootstrap_repo(context) is True  # no install needed, no failure

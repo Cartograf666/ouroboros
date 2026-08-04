@@ -312,6 +312,14 @@ def read_primary_artifact_to_eof(gateway: Any, run_id: str,
     matches neither the reported size nor the reported preview is a NAMED refusal,
     never a green check standing on a claim nobody read.
 
+    What "verify" is worth here, exactly: the engine publishes NO content hash for
+    the primary output, so both checks compare the body against the run's own
+    DESCRIPTION of it — an equal byte count, or the preview carried as a prefix.
+    That catches a truncated, empty or wrong-length read, which is what this gate is
+    for. It does not bind the bytes to a digest, so it cannot tell a correct body
+    from a corrupted one of the same length. Stated rather than implied, because the
+    strong reading is the tempting one.
+
     This is a plain EOF read: the production custody acknowledgement (the durable
     D7 row) is part of the delegation path this smoke deliberately does not drive.
     """
@@ -346,8 +354,9 @@ def read_primary_artifact_to_eof(gateway: Any, run_id: str,
                 "primary_artifact_unverified",
                 f"the primary artifact {path!r} was fetched ({len(raw)} bytes) but "
                 f"matches neither the reported size ({reported!r}) nor the reported "
-                "preview; a body that cannot be tied to the run's own claim does not "
-                "count as the result",
+                "preview; the engine publishes no content hash, so those two are the "
+                "whole of the check, and a body that matches neither does not count "
+                "as the result",
                 run_id=run_id, path=path, read_bytes=len(raw), reported_bytes=reported,
             )
     return {

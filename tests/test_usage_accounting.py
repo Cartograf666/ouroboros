@@ -69,6 +69,51 @@ def test_projection_uses_explicit_runtime_limit_over_environment(data_root):
     assert ua.usage_projection(data_root, global_limit_usd=7.5)["limit_usd"] == 7.5
 
 
+def test_a_bucket_whose_rows_disclosed_no_token_counts_reports_absence_not_zero(data_root):
+    """`disclosed_tokens` keeps null as null at the ROW level, on the control schema's
+    own instruction ("null until a harness reported it — never render null as 0"), and
+    then `_breakdown_bucket` summed `int(row.get(field) or 0)` and handed back a
+    confident 0. So a page of delegated sessions that reported no token counts at all
+    displayed "0 tokens used" — the same render-unknown-as-zero claim this module
+    refuses one axis over for cost.
+
+    A bucket is absent only when NOT ONE contributing row has the count; a bucket where
+    some rows reported still sums the ones that did, rather than being erased by the
+    ones that did not."""
+    ua.record_subscription_session(
+        "sess-silent", drive_root=data_root, route="codex", task_id="t1",
+        prompt_tokens=None, completion_tokens=None, cached_tokens=None,
+        spend_usd=0.0, spend_estimated=False,
+    )
+    silent = ua.usage_breakdown(data_root)
+    assert silent["prompt_tokens"] is None
+    assert silent["completion_tokens"] is None
+    assert silent["total_tokens"] is None
+    assert silent["cached_tokens"] is None
+    # The row itself is still counted — absence of TOKENS is not absence of the row.
+    assert silent["subscription_sessions"] == 1
+
+    ua.record_subscription_session(
+        "sess-reporting", drive_root=data_root, route="codex", task_id="t1",
+        prompt_tokens=120, completion_tokens=None, cached_tokens=None,
+        spend_usd=0.0, spend_estimated=False,
+    )
+    mixed = ua.usage_breakdown(data_root)
+    assert mixed["prompt_tokens"] == 120           # the one that reported
+    assert mixed["completion_tokens"] is None      # still nobody
+    assert mixed["total_tokens"] == 120            # a real total of what was measured
+
+    # And a MEASURED zero stays a zero: the fix must not turn every 0 into absence.
+    ua.record_subscription_session(
+        "sess-real-zero", drive_root=data_root, route="codex", task_id="t1",
+        prompt_tokens=0, completion_tokens=0, cached_tokens=0,
+        spend_usd=0.0, spend_estimated=False,
+    )
+    measured = ua.usage_breakdown(data_root)
+    assert measured["completion_tokens"] == 0
+    assert measured["cached_tokens"] == 0
+
+
 def test_breakdown_uses_final_rows_and_keeps_unattributed_explicit(data_root):
     reservation = ua.reserve_attempt(_request(
         data_root, category="review", prompt_tokens_estimate=10,

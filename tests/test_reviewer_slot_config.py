@@ -290,6 +290,62 @@ def test_session_executor_prefers_the_slots_own_target(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_the_two_surfaces_that_run_concurrently_do_not_erase_each_others_rows(monkeypatch):
+    """`run_parallel_review` runs the triad and the scope surfaces CONCURRENTLY (its
+    own first line says so), in two threads of one process, and each finishes by
+    folding its rows into ONE projection file. `write_text_atomic` makes the write
+    untearable but says nothing about the read-modify-write around it: both threads
+    read the same "before", and whichever wrote last erased the other surface's rows
+    outright — the panel lost a whole row's «Выполняется как» line, silently.
+
+    The interleave is forced rather than raced: the first writer is held between its
+    read and its write for long enough that an unlocked second writer would read the
+    stale empty file underneath it."""
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from ouroboros import utils as ouro_utils
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewSlot
+    from ouroboros.reviewer_slot_config import (
+        record_reviewer_slot_executions,
+        reviewer_slot_last_executions,
+    )
+
+    real_now = ouro_utils.utc_now_iso
+    held = threading.Event()
+
+    def _slow_first_writer():
+        # Called once per recorded row, AFTER the read and BEFORE the write.
+        if not held.is_set():
+            held.set()
+            time.sleep(0.5)
+        return real_now()
+
+    monkeypatch.setattr(ouro_utils, "utc_now_iso", _slow_first_writer)
+
+    def _record(slot_id, surface):
+        slot = ReviewSlot(slot_id=slot_id, model="openai/gpt-5.6-sol", effort="high",
+                          route=ReviewRouteKind.API_CHAT)
+        actor = SimpleNamespace(slot_id=slot_id, status="ok", usage={})
+        record_reviewer_slot_executions(surface, [actor], {slot_id: slot})
+
+    triad = threading.Thread(target=_record, args=("t_triad", "multi_model_review"))
+    triad.start()
+    held.wait(2.0)          # the triad thread is now parked between read and write
+    time.sleep(0.1)
+    scope = threading.Thread(target=_record, args=("s_scope", "scope_review"))
+    scope.start()
+    triad.join(5.0)
+    scope.join(5.0)
+
+    rows = reviewer_slot_last_executions()
+    assert "t_triad" in rows and "s_scope" in rows, sorted(rows)
+    assert rows["t_triad"]["surface"] == "multi_model_review"
+    assert rows["s_scope"]["surface"] == "scope_review"
+
+
 def test_last_execution_projection_round_trips():
     from types import SimpleNamespace
 
