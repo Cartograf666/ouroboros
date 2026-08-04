@@ -8,12 +8,17 @@ never reach a page), so these handlers translate: status aggregation, login
 job create, login job read/cancel. Nothing here interprets a credential and
 nothing here stores one.
 
-Login shapes ("красота-сначала", D30): a structural device-code card wherever
-the engine can host the flow itself (codex today; claude/cursor once the
-engine's own upstream extension discloses their OAuth link the same way), and
-the FALLBACK is a copy-paste ``claudexor setup attach <jobId>`` command the
-user runs in the USER'S OWN terminal outside this UI, with the card polling
-the job. There is no in-app terminal surface, and none may be added.
+Login shapes ("красота-сначала", D30): a structural link/device-code card
+wherever the engine can host the flow itself — codex device-code today, and
+claude/cursor via the engine's disclosure-driven login modes (3.3.7): the job
+snapshot's transient overlay carries the ``oauth_url`` sign-in link, and a
+claude job additionally accepts the browser's paste-code through
+``POST /v2/setup/jobs/{id}/input``. Capability is discovered from the engine's
+own ``/v2/operations`` catalog, never assumed. The FALLBACK — only for an
+engine that predates those modes — is a copy-paste ``claudexor setup attach
+<jobId>`` command the user runs in the USER'S OWN terminal outside this UI,
+demoted card-side to a collapsed Advanced affordance. There is no in-app
+terminal surface, and none may be added.
 """
 
 from __future__ import annotations
@@ -29,13 +34,39 @@ from ouroboros.gateway._helpers import json_error, request_json_or
 
 log = logging.getLogger(__name__)
 
-# "daemon" transport is DELIBERATELY not accepted: on macOS it is the
-# Terminal.app handoff, and D30 forbids that mechanism outright — the fallback
-# is the copy-paste attach command in the USER'S own terminal, never a window
-# this app opens. When the engine's upstream extension makes claude/cursor
-# logins fully daemon-hosted (structural OAuth disclosure, no Terminal), the
-# device path below simply starts working for them and nothing here changes.
+# An EXPLICIT "daemon" transport is DELIBERATELY not accepted from the
+# browser: on a pre-disclosure engine it is the macOS Terminal.app handoff,
+# and D30 forbids that mechanism outright. Whether an OMITTED transport may
+# default to the engine-hosted flow is decided per-engine from the
+# /v2/operations catalog (see _login_disclosure_native), never assumed.
 _LOGIN_TRANSPORTS = ("", "client_pty")
+
+# The engine advertises its disclosure-driven login modes (3.3.7 contract) by
+# implementing the setup-job input route: `POST /v2/setup/jobs/:id/input`
+# ships in the same engine change that makes claude/cursor login jobs
+# disclosure-driven (oauth_url in the snapshot overlay, no Terminal). One
+# structural marker for the one feature; read from the catalog the handshake
+# itself advertises (`operationsPath`).
+_LOGIN_INPUT_PATH = "/v2/setup/jobs/:id/input"
+
+
+def _login_disclosure_native(operations: List[Dict[str, Any]]) -> bool:
+    """Does this engine host claude/cursor logins itself (no Terminal)?
+
+    True iff the ``/v2/operations`` catalog advertises the setup-job input
+    route (matched by path or by its catalog id — both are stable engine
+    spellings). Pure for unit tests; a caller that could not READ the catalog
+    must pass [] and get False — capability fails CLOSED onto the attach
+    fallback, which works on every engine, rather than open onto a transport
+    that an old engine serves as the forbidden Terminal.app handoff."""
+    for op in operations:
+        if not isinstance(op, dict):
+            continue
+        if str(op.get("path") or "") == _LOGIN_INPUT_PATH:
+            return True
+        if str(op.get("id") or "") == "post:setup.jobs.id.input":
+            return True
+    return False
 
 
 def _login_capable_harness_ids(rows: List[Dict[str, Any]]) -> "set | None":
@@ -188,7 +219,7 @@ async def api_claudexor_status(request: Request) -> JSONResponse:
 
 
 def _build_login_request(harness: str, profile_id: str, transport: str,
-                         login_flow: str) -> Dict[str, Any]:
+                         login_flow: str, *, disclosure_native: bool = False) -> Dict[str, Any]:
     """The setup-job request body, honoring the engine's wire contract.
 
     Pure so the harness-specific transport rule is unit-testable without a
@@ -197,16 +228,20 @@ def _build_login_request(harness: str, profile_id: str, transport: str,
     loginFlow=browser_redirect — device/app-server flows are daemon-owned and a
     client_pty job without it is a hard 400 — and loginFlow exists ONLY for
     codex, so it is never sent for another harness (that too is a 400).
+
+    ``disclosure_native`` is the /v2/operations answer (see
+    _login_disclosure_native): on such an engine a NON-codex login omits the
+    transport so the engine hosts the flow itself and discloses the sign-in
+    link through the snapshot overlay — no Terminal, no attach command needed.
+    On an older engine the omitted transport would default daemon-side to the
+    macOS Terminal.app handoff D30 forbids, so client_pty is forced instead:
+    the card polls the sealed job and offers the copy-paste attach command as
+    the demoted Advanced fallback.
     """
     request: Dict[str, Any] = {"harness": harness, "action": "login", "authRequest": "subscription"}
     if profile_id:
         request["profileId"] = profile_id
-    # A NON-codex login with no explicit transport would default daemon-side to
-    # transport=daemon — the macOS Terminal.app handoff D30 forbids. Force the
-    # attach fallback instead: the card polls the sealed job, consumes the
-    # structured OAuth disclosure WHEN the engine surfaces one, and otherwise
-    # shows the copy-paste command for the user's own terminal.
-    if harness != "codex" and not transport:
+    if harness != "codex" and not transport and not disclosure_native:
         transport = "client_pty"
     if transport:
         request["transport"] = transport
@@ -235,6 +270,16 @@ def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
     endpoint = get_owned_daemon().ensure_running()
     with ClaudexorGateway(endpoint) as gateway:
         gateway.handshake()
+        # Capability, not folklore: the engine's own route catalog says whether
+        # it hosts claude/cursor logins itself (disclosure-driven, 3.3.7). A
+        # catalog read failure fails CLOSED onto the attach fallback — it works
+        # on every engine, while a mis-defaulted transport on an old engine
+        # would be the forbidden Terminal.app handoff.
+        try:
+            disclosure_native = _login_disclosure_native(gateway.operations())
+        except Exception:
+            log.debug("operations catalog read failed; assuming pre-disclosure engine", exc_info=True)
+            disclosure_native = False
         if profile_id:
             try:
                 gateway.create_credential_profile(harness, profile_id)
@@ -242,10 +287,12 @@ def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
                 # An existing registration is fine; the login job below is
                 # what decides whether the profile is usable.
                 log.debug("credential-profile create skipped", exc_info=True)
-        request_body = _build_login_request(harness, profile_id, transport, login_flow)
+        request_body = _build_login_request(
+            harness, profile_id, transport, login_flow,
+            disclosure_native=disclosure_native)
         job = gateway.setup_job_create(request_body)
     job_id = str(job.get("id") or job.get("jobId") or "")
-    out = {"job": job, "job_id": job_id}
+    out = {"job": job, "job_id": job_id, "disclosure_native": disclosure_native}
     if request_body.get("transport") == "client_pty" and job_id:
         # The fallback card's copy-paste command, run OUTSIDE this UI. Read
         # from the REQUEST actually sent (the non-codex default is forced
@@ -270,47 +317,72 @@ async def api_claudexor_login(request: Request) -> JSONResponse:
         return json_error(f"{type(exc).__name__}: Claudexor login failed")
 
 
-def _login_job_read(job_id: str) -> Dict[str, Any]:
+def _login_job_call(job_id: str, op: str, value: str = "") -> Dict[str, Any]:
     from ouroboros.claudexor_daemon import attach_login_command, owned_config_dir
     from ouroboros.gateways.claudexor import ClaudexorGateway, discover_daemon_at
 
     endpoint = discover_daemon_at(owned_config_dir())
     with ClaudexorGateway(endpoint) as gateway:
         gateway.handshake()
-        snapshot = gateway.setup_job_snapshot(job_id)
-    return {"job": snapshot, "attach_command": attach_login_command(job_id)}
-
-
-def _login_job_cancel(job_id: str) -> Dict[str, Any]:
-    from ouroboros.claudexor_daemon import owned_config_dir
-    from ouroboros.gateways.claudexor import ClaudexorGateway, discover_daemon_at
-
-    endpoint = discover_daemon_at(owned_config_dir())
-    with ClaudexorGateway(endpoint) as gateway:
-        gateway.handshake()
-        return gateway.setup_job_cancel(job_id)
+        answer = gateway.setup_job_call(job_id, op, value=value)
+    if op == "snapshot":
+        return {"job": answer, "attach_command": attach_login_command(job_id)}
+    if op == "input":
+        return {"ok": True, "job": answer}
+    return answer
 
 
 async def api_claudexor_login_job(request: Request) -> JSONResponse:
-    """GET/DELETE /api/claudexor/login/{job_id} — poll or cancel one job.
+    """The job-scoped login proxy — one endpoint, three verbs:
 
-    The GET snapshot carries the transient device-code disclosure when the
-    flow has one; the DELETE is the card's cancel action.
+    - ``GET /api/claudexor/login/{job_id}`` — poll: the snapshot carries the
+      transient disclosure (device code / oauth_url) when the flow has one.
+    - ``DELETE /api/claudexor/login/{job_id}`` — the card's cancel action.
+    - ``POST /api/claudexor/login/{job_id}/input`` — forward ONE line of user
+      input (the claude OAuth paste-code) to the engine's setup-job input
+      route. The value rides through and is never logged or stored here.
+      Capability degradation is TYPED: an engine that predates the input
+      route (or no longer knows the job) answers 404, which comes back as
+      ``code=input_not_supported`` so the card can fall back to the Advanced
+      attach affordance instead of showing a raw error.
     """
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
     job_id = str(request.path_params.get("job_id") or "").strip()
     if not job_id:
         return json_error("job_id is required", 400)
+    is_input = request.method == "POST"
+    value = ""
+    if is_input:
+        body: Dict[str, Any] = await request_json_or(request, {})
+        value = str((body or {}).get("value") or "").strip()
+        if not value:
+            return json_error("value is required", 400)
+        if len(value) > 1024:
+            # The engine's ControlSetupJobInputRequest caps the value at 1024
+            # chars; refuse at this edge with the same bar (a paste-code is
+            # one short line — an oversized body is a caller bug).
+            return json_error("value is implausibly long for a sign-in code", 400)
+    op = "input" if is_input else ("cancel" if request.method == "DELETE" else "snapshot")
     try:
-        if request.method == "DELETE":
-            return JSONResponse(await asyncio.to_thread(_login_job_cancel, job_id))
-        return JSONResponse(await asyncio.to_thread(_login_job_read, job_id))
+        return JSONResponse(await asyncio.to_thread(_login_job_call, job_id, op, value))
     except ClaudexorUnavailable as exc:
+        status = int(getattr(exc, "status_code", 0) or 0)
+        if is_input and status == 404:
+            return json_error(
+                "This engine does not accept sign-in codes for this job "
+                "(input route not available)", 404, code="input_not_supported")
+        if is_input and status == 409:
+            # The engine's TYPED input conflicts ride through verbatim —
+            # setup_input_not_applicable (the callback already completed; no
+            # code needed) and setup_input_already_submitted (a repeat the
+            # server refused). Answers, not failures: the card maps the code
+            # to friendly copy.
+            return json_error(str(exc), 409, code=exc.code)
         return json_error(f"{exc.code}: {exc}", 503)
     except Exception as exc:
-        log.exception("api_claudexor_login_job failed")
-        return json_error(f"{type(exc).__name__}: Claudexor login job read failed")
+        log.exception("api_claudexor_login_job failed (%s)", op)
+        return json_error(f"{type(exc).__name__}: Claudexor login job {op} failed")
 
 
 __all__ = [

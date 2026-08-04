@@ -72,14 +72,6 @@ class DaemonEndpoint:
     token: str
 
 
-def _version_tuple(value: str) -> tuple[int, ...]:
-    parts: List[int] = []
-    for chunk in str(value or "").split("."):
-        digits = "".join(c for c in chunk if c.isdigit())
-        parts.append(int(digits) if digits else 0)
-    return tuple(parts or [0])
-
-
 def engine_at_least(version: str, minimum: str) -> bool:
     """Is the reported engine at or past ``minimum``? THE version-floor predicate.
 
@@ -87,7 +79,14 @@ def engine_at_least(version: str, minimum: str) -> bool:
     cannot disagree about what "old enough to refuse" means. An unparsable or absent
     version compares as ``(0,)`` — below every floor, so it fails CLOSED.
     """
-    return _version_tuple(version) >= _version_tuple(minimum)
+    pair: List[tuple] = []
+    for value in (version, minimum):
+        parts: List[int] = []
+        for chunk in str(value or "").split("."):
+            digits = "".join(c for c in chunk if c.isdigit())
+            parts.append(int(digits) if digits else 0)
+        pair.append(tuple(parts or [0]))
+    return pair[0] >= pair[1]
 
 
 def operator_home() -> pathlib.Path:
@@ -479,19 +478,43 @@ class ClaudexorGateway:
         )
         return body if isinstance(body, dict) else {}
 
-    def setup_job_snapshot(self, job_id: str) -> Dict[str, Any]:
-        """The job snapshot, device-code disclosure included — a transient
-        read-time projection the daemon never journals."""
+    def setup_job_call(self, job_id: str, op: str, *, value: str = "") -> Dict[str, Any]:
+        """One job-scoped setup call: ``snapshot`` (GET; the transient
+        device-code/oauth_url disclosure rides it and is never journaled),
+        ``cancel`` (POST), or ``input`` (POST /v2/setup/jobs/{id}/input —
+        deliver ONE line of user input, the claude OAuth paste-code, to a
+        login job that awaits it; engine 3.3.7+).
+
+        The input value is live login material, the same custody rule as the
+        device code: it rides this loopback request once and is never logged,
+        stored, or echoed by this client. An engine that predates the input
+        route answers 404, which the caller must treat as a typed capability
+        gap, not a bug.
+        """
         from urllib.parse import quote
 
-        body = self._request("GET", f"/v2/setup/jobs/{quote(str(job_id), safe='')}/snapshot")
+        base = f"/v2/setup/jobs/{quote(str(job_id), safe='')}"
+        if op == "snapshot":
+            body = self._request("GET", f"{base}/snapshot")
+        elif op == "cancel":
+            body = self._request("POST", f"{base}/cancel")
+        elif op == "input":
+            body = self._request("POST", f"{base}/input", json_body={"value": str(value)})
+        else:
+            raise ValueError(f"unknown setup job op: {op!r}")
         return body if isinstance(body, dict) else {}
 
-    def setup_job_cancel(self, job_id: str) -> Dict[str, Any]:
-        from urllib.parse import quote
+    def operations(self) -> List[Dict[str, Any]]:
+        """GET /v2/operations — the engine's own implemented-route catalog.
 
-        body = self._request("POST", f"/v2/setup/jobs/{quote(str(job_id), safe='')}/cancel")
-        return body if isinstance(body, dict) else {}
+        The handshake advertises this path (``operationsPath``); the catalog is
+        how a caller discovers a capability structurally instead of branching
+        on version folklore (verified live: ``{protocolMajor, operations:[{id,
+        method, path, ...}]}``).
+        """
+        body = self._request("GET", "/v2/operations")
+        ops = body.get("operations") if isinstance(body, dict) else None
+        return [row for row in (ops or []) if isinstance(row, dict)]
 
     def patch_settings(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """POST /v2/settings — the daemon's own live settings patch (used once

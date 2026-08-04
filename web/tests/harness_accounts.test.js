@@ -4,11 +4,20 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
+    ATTACH_FALLBACK_MS,
+    accountLoginConfirmed,
     accountRows,
+    attachFallbackDue,
+    confirmLoginLive,
     deviceCodeDisclosure,
+    failureText,
     jobStateSummary,
     loginCardFace,
+    loginInputSupport,
+    loginStatusLine,
+    loginVerdict,
     quotaSummary,
+    submitLoginInput,
     verificationBadge,
 } from '../modules/harness_accounts.js';
 
@@ -126,7 +135,8 @@ test('the device-code disclosure is found wherever the snapshot nests it', () =>
     const job = { snapshot: { disclosures: { deviceCode: {
         flow: 'chatgptDeviceCode', verificationUrl: 'https://auth.example/device', userCode: 'ABCD-1234',
     } } } };
-    assert.deepEqual(deviceCodeDisclosure(job), { url: 'https://auth.example/device', code: 'ABCD-1234' });
+    assert.deepEqual(deviceCodeDisclosure(job),
+        { url: 'https://auth.example/device', code: 'ABCD-1234', flow: 'chatgptDeviceCode' });
     assert.equal(deviceCodeDisclosure({ state: 'running' }), null);
     assert.equal(deviceCodeDisclosure(null), null);
 });
@@ -137,12 +147,12 @@ test('a URL-ONLY disclosure renders: the flow discriminates, not the code field'
     // flows — the latter is the sign-in link a TERMINAL-mode claude/cursor login
     // prints. Requiring both fields matched neither, so a published link showed
     // nothing at all; the login card is the whole point of D30's structural face.
-    for (const flow of ['oauth_url', 'chatgpt']) {
+    for (const flow of ['oauth_url', 'chatgpt', 'oauth_url_input']) {
         const job = { snapshot: { disclosures: { deviceCode: {
             flow, verificationUrl: 'https://claude.ai/oauth/authorize?x=1', userCode: '',
         } } } };
         assert.deepEqual(deviceCodeDisclosure(job),
-            { url: 'https://claude.ai/oauth/authorize?x=1', code: '' }, flow);
+            { url: 'https://claude.ai/oauth/authorize?x=1', code: '', flow }, flow);
         // …and the card must actually pick the structural face for it.
         assert.equal(loginCardFace({ mode: 'attach', attachCommand: 'cmd', job }), 'device', flow);
     }
@@ -238,30 +248,221 @@ test('DTO end-to-end: EMPTY and MULTI-ACCOUNT schema-parsed bodies', () => {
     assert.equal(verificationBadge(claudeNative).label, 'not logged in');
 });
 
-test('the login card prefers a STRUCTURED disclosure over the copy-paste fallback', () => {
-    // A sealed attach job with no structured facts yet: copy-paste face.
-    assert.equal(loginCardFace({ mode: 'attach', attachCommand: 'CLAUDEXOR_CONFIG_DIR=/d claudexor setup attach j1', job: { state: 'waiting_for_input' } }), 'attach');
-    // The SAME job once the engine (upstream extension) surfaces a structured
-    // OAuth disclosure: the structural card wins — no terminal needed.
-    assert.equal(loginCardFace({ mode: 'attach', attachCommand: 'cmd', job: {
+test('the attach command is DEMOTED: never a card face, only a due fallback', () => {
+    // The owner rejected terminal-first login ("Via your terminal" buttons and
+    // an attach-command card body). A job with a command but nothing
+    // structured renders the WAITING face; the command surfaces only through
+    // attachFallbackDue as a collapsed Advanced affordance.
+    const attachOnly = { attachCommand: 'CLAUDEXOR_CONFIG_DIR=/d claudexor setup attach j1', startedAtMs: 1000, job: { state: 'waiting_for_input' } };
+    assert.equal(loginCardFace(attachOnly), 'progress');
+    // The SAME job once the engine surfaces a structured OAuth disclosure:
+    // the structural card wins — no terminal needed.
+    assert.equal(loginCardFace({ ...attachOnly, job: {
         state: 'waiting_for_input',
         snapshot: { disclosures: { deviceCode: { flow: 'chatgptDeviceCode', verificationUrl: 'https://a/b', userCode: 'XY-12' } } },
     } }), 'device');
-    // Errors outrank everything; nothing structured and no command = progress.
-    assert.equal(loginCardFace({ error: 'nope', mode: 'attach', attachCommand: 'cmd', job: {} }), 'error');
-    assert.equal(loginCardFace({ mode: 'device', job: { state: 'running' } }), 'progress');
+    // Errors outrank everything; nothing at all = progress; no job = none.
+    assert.equal(loginCardFace({ error: 'nope', attachCommand: 'cmd', job: {} }), 'error');
+    assert.equal(loginCardFace({ job: { state: 'running' } }), 'progress');
     assert.equal(loginCardFace(null), 'none');
 });
 
-test('a device-BUTTON login that the server forced to client_pty still shows its command', () => {
-    // _build_login_request forces transport=client_pty for every non-codex
-    // harness, so "Connect claude" (mode 'device') comes back with a copy-paste
-    // command and nothing structured. Keying the attach face on the CLICKED mode
-    // left that card on "Login running…" forever with no way to finish the login.
-    assert.equal(loginCardFace({
-        mode: 'device', attachCommand: 'CLAUDEXOR_CONFIG_DIR=/d claudexor setup attach j1',
-        job: { state: 'waiting_for_input' },
-    }), 'attach');
-    // And a job the server issued NO command for stays on progress.
-    assert.equal(loginCardFace({ mode: 'device', attachCommand: '', job: { state: 'running' } }), 'progress');
+test('card shape 2 keys on the disclosure FLOW string — the typed enum decides, no harness branching', () => {
+    // The engine's 3.3.7 FINAL contract: `oauth_url_input` is the disclosure
+    // flow for a job that also accepts a pasted code (claude's
+    // manual-callback path); `oauth_url`/`chatgpt` stay link-only. The enum
+    // decides for ANY harness — no boolean sidecar, no name fallback.
+    const withInput = { snapshot: { disclosures: { deviceCode: {
+        flow: 'oauth_url_input', verificationUrl: 'https://platform.claude.com/oauth/authorize?x=1', userCode: '' } } } };
+    assert.equal(loginInputSupport(withInput), true);
+    // A URL-only disclosure: shape 1, no input — even when the harness that
+    // produced it happens to be claude (the flow is the truth, not the name).
+    for (const flow of ['oauth_url', 'chatgpt', 'chatgptDeviceCode']) {
+        const job = { snapshot: { disclosures: { deviceCode: {
+            flow, verificationUrl: 'https://cursor.com/loginDeepControl?x=1', userCode: '' } } } };
+        assert.equal(loginInputSupport(job), false, flow);
+    }
+    // No disclosure at all: no input field.
+    assert.equal(loginInputSupport({ state: 'running' }), false);
+    assert.equal(loginInputSupport(null), false);
+});
+
+test('the verdict never contradicts the state, and never fails off a verification-race read', () => {
+    // The owner's live finding: a codex login SUCCEEDED while the card said
+    // "Login failed · completed" — the engine's post-login probe read the
+    // auth store codex clears at login start. Verification-flavored failures
+    // are 'recheck' (judged by live account status), not final failures.
+    assert.equal(loginVerdict({ job: { state: 'running', phase: 'awaiting_user' } }).kind, 'pending');
+    assert.equal(loginVerdict({ job: { state: 'succeeded', phase: 'completed' } }).kind, 'success');
+    for (const reason of ['capability_verification_failed', 'auth_not_ready']) {
+        const verdict = loginVerdict({ job: { state: 'failed', phase: 'completed', outcome: { reason } } });
+        assert.equal(verdict.kind, 'recheck', reason);
+        assert.equal(verdict.reason, reason);
+    }
+    // A failure with NO typed reason is also unproven — recheck.
+    assert.equal(loginVerdict({ job: { state: 'failed', phase: 'completed' } }).kind, 'recheck');
+    // Genuine failures stay final, with their typed reason carried.
+    const launch = loginVerdict({ job: { state: 'failed', outcome: { reason: 'launch_failed' } } });
+    assert.deepEqual(launch, { kind: 'failure', reason: 'launch_failed' });
+    assert.equal(loginVerdict({ job: { state: 'timed_out', outcome: { reason: 'timed_out' } } }).kind, 'failure');
+    assert.equal(loginVerdict({ job: { state: 'cancelled', outcome: { reason: 'cancelled_by_user' } } }).kind, 'failure');
+    // Wording: a real failure names its reason in words, no enum glue.
+    assert.equal(failureText('launch_failed'), 'Sign-in failed — launch failed.');
+});
+
+test('the live state line renders plain words and NOTHING on a terminal job', () => {
+    // "Login failed · completed" is structurally impossible: terminal jobs
+    // render a verdict, and this line answers '' for them.
+    assert.equal(loginStatusLine({ job: { state: 'failed', phase: 'completed' } }), '');
+    assert.equal(loginStatusLine({ job: { state: 'succeeded', phase: 'completed' } }), '');
+    assert.equal(loginStatusLine({ job: { state: 'queued', phase: 'preparing' } }), 'Starting the sign-in…');
+    assert.equal(loginStatusLine({ job: { state: 'waiting_for_input', phase: 'launching' } }), 'Waiting for the sign-in link…');
+    assert.equal(loginStatusLine({ job: { state: 'running', phase: 'verifying' } }), 'Checking the sign-in…');
+    const disclosed = { job: { state: 'waiting_for_input', phase: 'awaiting_user' },
+        snapshot: { disclosures: { deviceCode: { flow: 'oauth_url', verificationUrl: 'https://a/b', userCode: '' } } } };
+    assert.equal(loginStatusLine(disclosed), 'Waiting for you to finish signing in in the browser…');
+});
+
+test('accountLoginConfirmed reads the exact harness+profile row from live status', () => {
+    const payload = { profiles: {
+        harnessAccounts: [
+            { harness_id: 'codex', native_login_detected: true, identity: {} },
+            { harness_id: 'claude', native_login_detected: false, identity: {} },
+        ],
+        profiles: [
+            { profile: { harness_id: 'codex', profile_id: 'koshak' },
+              status: { verification: 'passed', verification_source: 'vendor' }, identity: {} },
+        ],
+    } };
+    // The default account (empty profile id) is confirmed by the daemon's own
+    // local-store detection — the same evidence the row badge renders.
+    assert.equal(accountLoginConfirmed(payload, 'codex', ''), true);
+    assert.equal(accountLoginConfirmed(payload, 'claude', ''), false);
+    // A named profile is judged by ITS row, never the native pseudo-row.
+    assert.equal(accountLoginConfirmed(payload, 'codex', 'koshak'), true);
+    assert.equal(accountLoginConfirmed(payload, 'codex', 'other'), false);
+    assert.equal(accountLoginConfirmed({}, 'codex', ''), false);
+});
+
+function fakeResponse(status, body) {
+    return { ok: status >= 200 && status < 300, status, json: async () => body };
+}
+
+test('submitLoginInput posts the code once and types the 404 capability gap (mock fetch)', async () => {
+    const calls = [];
+    const ok = await submitLoginInput('j 1', 'ABCD-1234', { fetchImpl: async (url, init) => {
+        calls.push({ url, init });
+        return fakeResponse(200, { ok: true, job: {} });
+    } });
+    assert.deepEqual(ok, { ok: true, degraded: false, conflict: '', error: '' });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, '/api/claudexor/login/j%201/input');
+    assert.equal(calls[0].init.method, 'POST');
+    assert.deepEqual(JSON.parse(calls[0].init.body), { value: 'ABCD-1234' });
+
+    // DEGRADED-ENGINE PATH: the gateway's typed 404 (input_not_supported —
+    // the engine predates the route or reaped the job) is `degraded`, so the
+    // card falls back to Advanced instead of dead-ending on a raw error.
+    const degraded = await submitLoginInput('j1', 'X', {
+        fetchImpl: async () => fakeResponse(404, { error: 'input route not available', code: 'input_not_supported' }),
+    });
+    assert.equal(degraded.ok, false);
+    assert.equal(degraded.degraded, true);
+    // Any other failure is an ordinary error, NOT a capability degrade.
+    const busy = await submitLoginInput('j1', 'X', { fetchImpl: async () => fakeResponse(503, { error: 'daemon down' }) });
+    assert.deepEqual(busy, { ok: false, degraded: false, conflict: '', error: 'daemon down' });
+    const dead = await submitLoginInput('j1', 'X', { fetchImpl: async () => { throw new Error('network gone'); } });
+    assert.equal(dead.degraded, false);
+    assert.ok(dead.error.includes('network gone'));
+});
+
+test('a 409 input conflict carries the engine code: the callback already completed', async () => {
+    // Typed by the engine (final contract): setup_input_not_applicable means
+    // the flow moved past the code step — e.g. claude's localhost callback
+    // completed on its own. An ANSWER, not an error: the card shows a quiet
+    // "no code needed" note and lets the job poll land the verdict.
+    const result = await submitLoginInput('j1', 'ABCD', {
+        fetchImpl: async () => fakeResponse(409, {
+            error: 'input is not applicable to this flow/phase',
+            code: 'setup_input_not_applicable',
+        }),
+    });
+    assert.deepEqual(result, {
+        ok: false, degraded: false, conflict: 'setup_input_not_applicable',
+        error: 'input is not applicable to this flow/phase',
+    });
+});
+
+test('a 409 repeat is typed too: the server is authoritative over the double-submit guard', async () => {
+    // setup_input_already_submitted: our busy/sent guard prevents UI repeats,
+    // but the server owns the truth (e.g. a second tab already sent a code).
+    // The card treats it as already-sent, never as a failure.
+    const result = await submitLoginInput('j1', 'ABCD', {
+        fetchImpl: async () => fakeResponse(409, {
+            error: 'a code was already submitted for this job',
+            code: 'setup_input_already_submitted',
+        }),
+    });
+    assert.equal(result.conflict, 'setup_input_already_submitted');
+    assert.equal(result.degraded, false);
+    assert.equal(result.ok, false);
+    // A 409 with no code still classifies as a conflict, never a raw error.
+    const untyped = await submitLoginInput('j1', 'ABCD', {
+        fetchImpl: async () => fakeResponse(409, { error: 'conflict' }),
+    });
+    assert.equal(untyped.conflict, 'conflict');
+});
+
+test('confirmLoginLive re-polls live account status briefly instead of trusting one stale read', async () => {
+    // First poll: the account still looks logged out (the stale window).
+    // Second poll: the login shows up — confirmed, loop ends early.
+    const cold = { profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: false }], profiles: [] } };
+    const warm = { profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }], profiles: [] } };
+    let polls = 0;
+    const slept = [];
+    const confirmed = await confirmLoginLive('codex', '', {
+        fetchImpl: async () => fakeResponse(200, ++polls >= 2 ? warm : cold),
+        attempts: 4, delayMs: 7, sleepImpl: async (ms) => { slept.push(ms); },
+    });
+    assert.equal(confirmed.confirmed, true);
+    assert.equal(polls, 2);
+    assert.deepEqual(slept, [7]);   // no sleep before the first poll
+    assert.deepEqual(confirmed.payload, warm);
+
+    // Still cold after every attempt: unconfirmed, with the last payload so
+    // the caller can render the rows it actually saw.
+    let coldPolls = 0;
+    const unconfirmed = await confirmLoginLive('codex', '', {
+        fetchImpl: async () => { coldPolls += 1; return fakeResponse(200, cold); },
+        attempts: 3, delayMs: 1, sleepImpl: async () => {},
+    });
+    assert.equal(unconfirmed.confirmed, false);
+    assert.equal(coldPolls, 3);   // bounded — it does not poll forever
+    assert.deepEqual(unconfirmed.payload, cold);
+
+    // A card closed mid-check aborts without a verdict.
+    const stale = await confirmLoginLive('codex', '', {
+        fetchImpl: async () => fakeResponse(200, cold),
+        attempts: 3, delayMs: 1, sleepImpl: async () => {}, isStale: () => true,
+    });
+    assert.equal(stale.stale, true);
+});
+
+test('the Advanced fallback is due on a disclosure that never comes, or an engine that predates the modes', () => {
+    const base = { attachCommand: 'CLAUDEXOR_CONFIG_DIR=/d claudexor setup attach j1', startedAtMs: 100000, engineDegraded: false, job: { state: 'waiting_for_input' } };
+    // Inside the grace window: not due — the card just says it is waiting.
+    assert.equal(attachFallbackDue(base, 100000 + ATTACH_FALLBACK_MS - 1), false);
+    // Window elapsed with no disclosure: due.
+    assert.equal(attachFallbackDue(base, 100000 + ATTACH_FALLBACK_MS), true);
+    // An engine the create answer flagged as pre-disclosure: due immediately.
+    assert.equal(attachFallbackDue({ ...base, engineDegraded: true }, 100001), true);
+    // A rendered disclosure keeps the fallback hidden (link-first, always)…
+    const disclosed = { ...base, job: { snapshot: { disclosures: { deviceCode: {
+        flow: 'oauth_url', verificationUrl: 'https://a/b', userCode: '' } } } } };
+    assert.equal(attachFallbackDue(disclosed, 100000 + ATTACH_FALLBACK_MS * 2), false);
+    // …unless the engine is degraded (the input route 404'd mid-flow).
+    assert.equal(attachFallbackDue({ ...disclosed, engineDegraded: true }, 100001), true);
+    // No command = nothing to fall back to (the daemon-hosted codex flow).
+    assert.equal(attachFallbackDue({ ...base, attachCommand: '' }, 100000 + ATTACH_FALLBACK_MS * 2), false);
+    assert.equal(attachFallbackDue(null, 999999), false);
 });

@@ -337,6 +337,232 @@ def test_login_endpoint_validates_before_any_daemon_work():
 
 
 # ---------------------------------------------------------------------------
+# No-terminal login UX (3.3.7 contract): disclosure-driven claude/cursor jobs
+# and the paste-code input proxy.
+# ---------------------------------------------------------------------------
+
+
+def test_login_disclosure_capability_reads_the_operations_catalog():
+    """The engine advertises its disclosure-driven login modes by implementing
+    the setup-job input route; the predicate reads the /v2/operations catalog
+    (path or catalog id — verified live shapes) and fails CLOSED on nothing."""
+    from ouroboros.gateway.claudexor_accounts import _login_disclosure_native
+
+    by_path = [{"id": "post:setup.jobs", "method": "POST", "path": "/v2/setup/jobs"},
+               {"id": "whatever", "method": "POST", "path": "/v2/setup/jobs/:id/input"}]
+    assert _login_disclosure_native(by_path) is True
+    by_id = [{"id": "post:setup.jobs.id.input", "method": "POST", "path": ""}]
+    assert _login_disclosure_native(by_id) is True
+    without = [{"id": "post:setup.jobs.id.cancel", "method": "POST",
+                "path": "/v2/setup/jobs/:id/cancel"}, "not-a-dict"]
+    assert _login_disclosure_native(without) is False
+    assert _login_disclosure_native([]) is False
+
+
+def test_login_request_transport_default_is_capability_gated():
+    """On a disclosure-native engine a non-codex login OMITS the transport so
+    the engine hosts the flow itself (oauth_url in the snapshot overlay, no
+    Terminal, no attach command). On an older engine the omitted transport
+    would be the forbidden Terminal.app handoff, so client_pty stays forced."""
+    from ouroboros.gateway.claudexor_accounts import _build_login_request
+
+    native = _build_login_request("claude", "", "", "", disclosure_native=True)
+    assert "transport" not in native
+    legacy = _build_login_request("claude", "", "", "", disclosure_native=False)
+    assert legacy["transport"] == "client_pty"
+    # An EXPLICIT client_pty ask survives on any engine (the card's fallback).
+    explicit = _build_login_request("cursor", "", "client_pty", "", disclosure_native=True)
+    assert explicit["transport"] == "client_pty"
+    # Codex is untouched by the capability: its device flow was already
+    # daemon-hosted, transport stays absent either way.
+    for flag in (True, False):
+        codex = _build_login_request("codex", "", "", "device_auth", disclosure_native=flag)
+        assert "transport" not in codex and codex["loginFlow"] == "device_auth"
+
+
+def _input_request(job_id: str, body: dict):
+    from starlette.requests import Request
+
+    payload = json.dumps(body).encode()
+
+    async def receive():
+        return {"type": "http.request", "body": payload, "more_body": False}
+
+    return Request({
+        "type": "http", "method": "POST",
+        "path": f"/api/claudexor/login/{job_id}/input",
+        "headers": [(b"content-type", b"application/json")], "query_string": b"",
+        "path_params": {"job_id": job_id},
+    }, receive)
+
+
+def test_login_input_endpoint_validates_before_any_daemon_work():
+    import asyncio
+
+    from ouroboros.gateway.claudexor_accounts import api_claudexor_login_job
+
+    missing_job = asyncio.run(api_claudexor_login_job(_input_request("", {"value": "x"})))
+    assert missing_job.status_code == 400 and b"job_id is required" in missing_job.body
+    missing_value = asyncio.run(api_claudexor_login_job(_input_request("j1", {})))
+    assert missing_value.status_code == 400 and b"value is required" in missing_value.body
+    # The cap mirrors the engine's ControlSetupJobInputRequest (1..1024).
+    oversized = asyncio.run(api_claudexor_login_job(_input_request("j1", {"value": "x" * 1025})))
+    assert oversized.status_code == 400
+
+
+def test_login_input_endpoint_proxies_the_code_to_the_engine(monkeypatch, tmp_path):
+    """Thin proxy: the value rides through to the engine's input route
+    verbatim and the answer comes back; nothing is stored or interpreted."""
+    import asyncio
+
+    from ouroboros import claudexor_daemon as owned
+    from ouroboros.gateway.claudexor_accounts import api_claudexor_login_job
+    from ouroboros.gateways import claudexor as gw
+
+    seen = {}
+
+    class FakeGateway:
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self):
+            return {}
+
+        def setup_job_call(self, job_id, op, *, value=""):
+            seen["job_id"], seen["op"], seen["value"] = job_id, op, value
+            return {"jobId": job_id, "state": "running", "phase": "verifying"}
+
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
+
+    resp = asyncio.run(api_claudexor_login_job(_input_request("j1", {"value": " ABCD-1234 "})))
+    assert resp.status_code == 200
+    body = json.loads(resp.body)
+    assert body["ok"] is True and body["job"]["state"] == "running"
+    # Trimmed once at the edge (a paste carries whitespace), then verbatim.
+    assert seen == {"job_id": "j1", "op": "input", "value": "ABCD-1234"}
+
+
+def test_login_input_engine_404_is_a_typed_capability_gap(monkeypatch, tmp_path):
+    """DEGRADED-ENGINE PATH: an engine that predates the input route (or no
+    longer knows the job) answers 404; the proxy types it as
+    input_not_supported so the card can fall back to the Advanced attach
+    affordance. Every other refusal stays an ordinary 503 — and a 404 on the
+    POLL keeps its ordinary meaning (no capability spin)."""
+    import asyncio
+
+    from starlette.requests import Request
+
+    from ouroboros import claudexor_daemon as owned
+    from ouroboros.gateway.claudexor_accounts import api_claudexor_login_job
+    from ouroboros.gateways import claudexor as gw
+
+    class Refusing:
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self):
+            return {}
+
+        def setup_job_call(self, job_id, op, *, value=""):
+            raise gw.ClaudexorUnavailable("http_404", "no such route", status_code=404)
+
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(gw, "ClaudexorGateway", Refusing)
+
+    resp = asyncio.run(api_claudexor_login_job(_input_request("j1", {"value": "x"})))
+    assert resp.status_code == 404
+    body = json.loads(resp.body)
+    assert body["code"] == "input_not_supported"
+
+    # The SAME engine 404 on a GET poll is an ordinary lane refusal (503):
+    # input_not_supported is typed only where the input capability was asked.
+    poll = Request({
+        "type": "http", "method": "GET", "path": "/api/claudexor/login/j1",
+        "headers": [], "query_string": b"", "path_params": {"job_id": "j1"},
+    })
+    polled = asyncio.run(api_claudexor_login_job(poll))
+    assert polled.status_code == 503
+
+    class Down:
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self):
+            raise gw.ClaudexorUnavailable("daemon_unreachable", "gone")
+
+        def setup_job_call(self, job_id, op, *, value=""):  # pragma: no cover - unreached
+            raise AssertionError
+
+    monkeypatch.setattr(gw, "ClaudexorGateway", Down)
+    down = asyncio.run(api_claudexor_login_job(_input_request("j1", {"value": "x"})))
+    assert down.status_code == 503 and b"daemon_unreachable" in down.body
+
+
+def test_login_input_409_conflicts_ride_through_typed(monkeypatch, tmp_path):
+    """The engine's TYPED input conflicts (final 3.3.7 contract) pass through
+    verbatim as 409 + code — setup_input_not_applicable (the callback already
+    completed; no code needed) and setup_input_already_submitted (a repeat
+    the authoritative server refused). Answers, not failures: the card maps
+    the code to friendly copy, so the proxy must not collapse them into 503."""
+    import asyncio
+
+    from ouroboros import claudexor_daemon as owned
+    from ouroboros.gateway.claudexor_accounts import api_claudexor_login_job
+    from ouroboros.gateways import claudexor as gw
+
+    class Conflicted:
+        code = "setup_input_not_applicable"
+
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self):
+            return {}
+
+        def setup_job_call(self, job_id, op, *, value=""):
+            raise gw.ClaudexorUnavailable(
+                Conflicted.code, "input refused for this flow/phase", status_code=409)
+
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(gw, "ClaudexorGateway", Conflicted)
+
+    for code in ("setup_input_not_applicable", "setup_input_already_submitted"):
+        Conflicted.code = code
+        resp = asyncio.run(api_claudexor_login_job(_input_request("j1", {"value": "x"})))
+        assert resp.status_code == 409, code
+        body = json.loads(resp.body)
+        assert body["code"] == code
+
+
+# ---------------------------------------------------------------------------
 # Phase 6, owner directive #1: the executor fact reaches the chat frame.
 # «бейдж точно нужен, но не рекламный … что ТУТ бабл \ субагент на codex»
 # ---------------------------------------------------------------------------

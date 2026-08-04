@@ -256,6 +256,11 @@ def collect_routes(
             endpoint=api_claudexor_login_job,
             methods=["GET", "DELETE"],
         ),
+        Route(
+            "/api/claudexor/login/{job_id}/input",
+            endpoint=api_claudexor_login_job,
+            methods=["POST"],
+        ),
         WebSocketRoute("/ws", endpoint=ws_endpoint),
     ]
     return routes

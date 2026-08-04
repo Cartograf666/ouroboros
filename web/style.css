@@ -5909,6 +5909,36 @@ textarea.chat-input {
     white-space: pre-wrap;
     word-break: break-all;
 }
+/* Link-first login card (no-terminal UX): the sign-in link is the prominent
+   action; copy stays an explicit secondary affordance. */
+.harness-signin-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.harness-signin-actions a.btn { text-decoration: none; }
+.harness-code-entry { display: flex; flex-direction: column; gap: 6px; }
+.harness-code-entry label { font-size: 12px; color: var(--text-secondary); }
+.harness-code-entry-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.harness-code-entry-row input {
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 13px;
+    padding: 6px 10px;
+    border: 1px solid var(--ui-card-border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-control);
+    color: var(--text-primary);
+    min-width: 220px;
+}
+/* The demoted attach fallback: collapsed by default, visually secondary. */
+.harness-advanced {
+    align-self: stretch;
+    border-top: 1px solid var(--divider);
+    padding-top: 8px;
+}
+.harness-advanced summary {
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+.harness-advanced[open] summary { margin-bottom: 6px; }
+.harness-advanced p { margin: 4px 0; }
 
 /* Phase 6: per-bubble/subagent executor chip (owner directive: a small chip
    like Claudexor's, never a promotional badge). Reuses .harness-chip. */

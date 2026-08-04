@@ -2,13 +2,21 @@
 // daemon's account surface, MCP-card style: one row per account, two HONEST
 // verification statuses, quota with a resets_at timer, login cards.
 //
-// «Красота-сначала»: a structural device-code card wherever the engine hosts
-// the flow itself; the FALLBACK is a copy-paste `claudexor setup attach …`
-// command the user runs in the USER'S OWN terminal outside this UI, with the
-// card polling the job. No terminal panel exists in this UI, and none may be
-// added. No harness-name branches either: the in-app flow is ASKED FOR
-// (login_flow=device_auth) and a typed refusal flips the card to the
-// terminal-command path — capability is discovered, never hardcoded.
+// «Красота-сначала»: the login card is LINK-FIRST — the engine disclosures the
+// sign-in URL (and a one-time code for the codex device flow) through the job
+// snapshot's transient overlay, and the card renders "Open sign-in link" +
+// copy affordances + a live state line. A job that also accepts user input
+// (the claude OAuth paste-code, disclosure flow `oauth_url_input`) shows an
+// ALWAYS-VISIBLE code entry: claude's CLI only asks for the code when the
+// browser cannot reach its localhost callback (e.g. another device), so the
+// field cannot depend on a prompt this UI cannot observe — the input is
+// OPTIONAL by design (the callback may complete on its own). The copy-paste
+// `claudexor setup attach …` command survives ONLY as a collapsed Advanced
+// affordance for engines that predate the disclosure modes or jobs whose link
+// never arrives — never the primary UI. No terminal panel exists in this UI,
+// and none may be added. Shape selection keys on the disclosure's typed FLOW
+// (url-only `oauth_url`/`chatgpt` vs `oauth_url_input`; 3.3.7 final
+// contract) — no harness-name branches, no boolean sidecar.
 //
 // Pure helpers up top are node-tested without a DOM.
 
@@ -113,7 +121,11 @@ export function deviceCodeDisclosure(job) {
         if (!node || typeof node !== 'object' || seen.has(node)) continue;
         seen.add(node);
         if (node.flow && node.verificationUrl) {
-            return { url: String(node.verificationUrl), code: String(node.userCode || '') };
+            return {
+                url: String(node.verificationUrl),
+                code: String(node.userCode || ''),
+                flow: String(node.flow),
+            };
         }
         for (const value of Object.values(node)) {
             if (value && typeof value === 'object') stack.push(value);
@@ -123,31 +135,162 @@ export function deviceCodeDisclosure(job) {
 }
 
 // Which face the login card shows, in priority order. STRUCTURED WINS: when
-// the engine surfaces an OAuth device/link disclosure on ANY job — including a
-// sealed client_pty job once the upstream extension discloses claude/cursor
-// links structurally — the card renders it, and the copy-paste command is only
-// the fallback for a job with nothing structured yet. Pure for node tests.
-//
-// The ATTACH face is keyed on HAVING the command, not on the button that was
-// clicked: the server forces client_pty for every non-codex login, so a
-// `device`-mode click on claude/cursor comes back with a copy-paste command and
-// nothing else — and demanding mode==='attach' left that card stuck on
-// "Login running…" with the one thing the user needed never rendered.
-//
-// What makes that safe is WHICH answer the command is read from, not the server
-// being careful: `_login_create` issues one only for a genuine client_pty job,
-// and this module stores `attachCommand` from that create answer alone. The POLL
-// route (`_login_job_read`) still returns an `attach_command` for EVERY job,
-// including the daemon-transport codex device flow that must never show one — it
-// is simply never read. Left as-is deliberately: making the server stop emitting
-// it costs more lines than the one that already ignores it, and the create answer
-// is the authority either way.
+// the engine surfaces an OAuth device/link disclosure on ANY job the card
+// renders it (link-first). There is deliberately NO attach face any more: the
+// copy-paste command is a demoted, collapsed Advanced affordance under the
+// waiting face (attachFallbackDue below), never a primary card body — the
+// owner rejected terminal-first login outright. Pure for node tests.
 export function loginCardFace(active) {
     if (!active) return 'none';
     if (active.error) return 'error';
     if (deviceCodeDisclosure(active.job || {})) return 'device';
-    if (active.attachCommand) return 'attach';
     return 'progress';
+}
+
+// How long the card waits for the engine to disclose a sign-in link before
+// offering the collapsed Advanced attach fallback.
+export const ATTACH_FALLBACK_MS = 20000;
+
+export function attachFallbackDue(active, nowMs) {
+    // The demoted fallback: only for a job that HAS a copy-paste command (the
+    // create answer issues one exactly for client_pty jobs — the POLL route's
+    // per-job attach_command is deliberately never read), and only when the
+    // primary path has nothing better: the engine predates the disclosure
+    // modes (engineDegraded — the create answer said so, or the input route
+    // 404'd), or no disclosure arrived within the window. A rendered
+    // disclosure keeps the fallback hidden unless the engine is degraded:
+    // link-first, always.
+    if (!active || !active.attachCommand) return false;
+    if (active.engineDegraded) return true;
+    if (deviceCodeDisclosure(active.job || {})) return false;
+    const started = Number(active.startedAtMs) || 0;
+    return started > 0 && (Number(nowMs) - started) >= ATTACH_FALLBACK_MS;
+}
+
+export function loginInputSupport(job) {
+    // Card shape 2 discriminator: can the user paste the browser's code back
+    // into this job? The engine's typed disclosure FLOW is the structural
+    // marker (3.3.7 final contract): `oauth_url_input` = sign-in link plus an
+    // optional paste-code the daemon forwards (claude's manual-callback
+    // path); `oauth_url`/`chatgpt` stay link-only. No boolean sidecar and no
+    // harness-name fallback — the enum decides. The input is OPTIONAL by
+    // design: claude's localhost callback may complete the login with no code
+    // ever shown, so the field's presence never implies obligation.
+    return deviceCodeDisclosure(job)?.flow === 'oauth_url_input';
+}
+
+// Job-failure reasons a stale post-login verification read can fabricate:
+// codex clears its auth store when a login STARTS, so a probe in that window
+// reads "not logged in" while the vendor login is succeeding — the owner's
+// codex login SUCCEEDED while the card said "Login failed · completed". These
+// verdicts are re-checked against live account status before the card is
+// allowed to say "failed".
+export const VERIFY_RACE_REASONS = ['capability_verification_failed', 'auth_not_ready'];
+
+export function loginVerdict(job) {
+    // State and verdict must never contradict: a non-terminal job has NO
+    // verdict, a succeeded job is success, and a failed job is only a final
+    // failure when its typed outcome reason is one no verification race can
+    // fabricate. Everything else is 'recheck' — judged by live account
+    // status, not by one stale read.
+    const summary = jobStateSummary(job);
+    if (!summary.terminal) return { kind: 'pending', reason: '' };
+    if (summary.succeeded) return { kind: 'success', reason: '' };
+    const outcome = job?.outcome || job?.job?.outcome || {};
+    const reason = String(outcome.reason || '') || summary.state;
+    if (summary.state === 'failed'
+        && (!outcome.reason || VERIFY_RACE_REASONS.includes(String(outcome.reason)))) {
+        return { kind: 'recheck', reason };
+    }
+    return { kind: 'failure', reason };
+}
+
+export function failureText(reason) {
+    return `Sign-in failed — ${String(reason || 'unknown reason').replace(/_/g, ' ')}.`;
+}
+
+export function loginStatusLine(job) {
+    // The live state line for a non-terminal job — plain words mapped from
+    // the typed state/phase, never raw enum spellings glued together (the old
+    // "Login failed · completed" contradiction is structurally impossible
+    // now: a terminal job renders a verdict, never this line).
+    const summary = jobStateSummary(job);
+    if (summary.terminal) return '';
+    if (summary.phase === 'verifying') return 'Checking the sign-in…';
+    if (deviceCodeDisclosure(job)) return 'Waiting for you to finish signing in in the browser…';
+    if (summary.phase === 'awaiting_user' || summary.state === 'waiting_for_input') {
+        return 'Waiting for the sign-in link…';
+    }
+    return 'Starting the sign-in…';
+}
+
+export function accountLoginConfirmed(payload, harness, profileId = '') {
+    // The account-status truth the verdict re-check reads: the row for THIS
+    // harness+profile shows a login — vendor-verified or the daemon's own
+    // local-store detection (accountRows already projects both as 'passed').
+    const row = accountRows(payload).find((r) =>
+        r.harness === String(harness || '')
+        && String(r.profile_id || '') === String(profileId || ''));
+    return String(row?.status?.verification || '') === 'passed';
+}
+
+export async function submitLoginInput(jobId, value, { fetchImpl = apiFetch } = {}) {
+    // ONE code line to the engine via the gateway proxy. Typed non-2xx
+    // answers keep their meaning: 404 is a capability gap (`degraded` — the
+    // engine predates the route, or reaped the job) and 409 is a typed input
+    // CONFLICT (`conflict` carries the engine's code:
+    // setup_input_not_applicable = the callback already completed and no code
+    // is needed; setup_input_already_submitted = a repeat the server, being
+    // authoritative over our double-submit guard, refused). Neither is a raw
+    // error — the card maps both to friendly copy.
+    try {
+        const resp = await fetchImpl(`/api/claudexor/login/${encodeURIComponent(jobId)}/input`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok) return { ok: true, degraded: false, conflict: '', error: '' };
+        if (resp.status === 404) {
+            return { ok: false, degraded: true, conflict: '', error: String(data.error || 'input not supported') };
+        }
+        if (resp.status === 409) {
+            return { ok: false, degraded: false, conflict: String(data.code || 'conflict'), error: String(data.error || 'input conflict') };
+        }
+        return { ok: false, degraded: false, conflict: '', error: String(data.error || `HTTP ${resp.status}`) };
+    } catch (error) {
+        return { ok: false, degraded: false, conflict: '', error: String(error?.message || error) };
+    }
+}
+
+export const CONFIRM_POLL_MS = 2500;
+export const CONFIRM_ATTEMPTS = 4;
+
+export async function confirmLoginLive(harness, profileId, {
+    fetchImpl = apiFetch, attempts = CONFIRM_ATTEMPTS, delayMs = CONFIRM_POLL_MS,
+    sleepImpl = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    isStale = () => false,
+} = {}) {
+    // The verify-race re-check: briefly re-poll live account status and let
+    // IT decide, instead of declaring failure off the job's one stale
+    // verification read. Bounded; answers with the last payload so the caller
+    // can refresh the rows from the same reads.
+    let payload = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+        if (attempt > 0) await sleepImpl(delayMs);
+        if (isStale()) return { confirmed: false, stale: true, payload };
+        try {
+            const resp = await fetchImpl('/api/claudexor/status', { cache: 'no-store' });
+            const data = await resp.json().catch(() => ({}));
+            if (resp.ok) {
+                payload = data;
+                if (accountLoginConfirmed(data, harness, profileId)) {
+                    return { confirmed: true, stale: false, payload };
+                }
+            }
+        } catch (err) { /* transient; the next attempt retries */ }
+    }
+    return { confirmed: false, stale: false, payload };
 }
 
 export function jobStateSummary(job) {
@@ -209,7 +352,10 @@ export function accountRows(payload) {
 
 const state = {
     payload: null,
-    activeJob: null, // { harness, jobId, mode: 'device'|'attach', job, attachCommand, error }
+    // { harness, profile, jobId, job, attachCommand, error, startedAtMs,
+    //   engineDegraded, inputValue, inputBusy, inputSent, inputError,
+    //   verdict, confirming, advancedOpen }
+    activeJob: null,
     pollTimer: 0,
     jobTimer: 0,
 };
@@ -273,7 +419,6 @@ function rowHtml(row, payload) {
             </div>
             <div class="harness-account-actions">
                 <button type="button" class="settings-ghost-btn" data-harness-login>${row.status?.verification ? 'Re-login' : 'Log in'}</button>
-                <button type="button" class="settings-ghost-btn" data-harness-login-terminal title="Copy-paste command for your own terminal">Via your terminal</button>
                 ${row.kind === 'native' ? '<button type="button" class="settings-ghost-btn" data-harness-add-profile title="Register one more account for this agent (D28 rotation uses every enabled account)">Add account…</button>' : ''}
             </div>
         </div>
@@ -321,7 +466,6 @@ function renderRows() {
                 </div>
                 <div class="harness-account-actions">
                     <button type="button" class="settings-ghost-btn" data-harness-login>Connect</button>
-                    <button type="button" class="settings-ghost-btn" data-harness-login-terminal title="Copy-paste command for your own terminal">Via your terminal</button>
                 </div>
             </div>
         `);
@@ -331,13 +475,7 @@ function renderRows() {
     host.querySelectorAll('[data-harness-login]').forEach((button) => {
         button.addEventListener('click', () => {
             const row = button.closest('[data-harness]');
-            startLogin(row?.dataset.harness, row?.dataset.profile, 'device');
-        });
-    });
-    host.querySelectorAll('[data-harness-login-terminal]').forEach((button) => {
-        button.addEventListener('click', () => {
-            const row = button.closest('[data-harness]');
-            startLogin(row?.dataset.harness, row?.dataset.profile, 'attach');
+            startLogin(row?.dataset.harness, row?.dataset.profile);
         });
     });
     host.querySelectorAll('[data-harness-add-profile]').forEach((button) => {
@@ -345,7 +483,7 @@ function renderRows() {
             const row = button.closest('[data-harness]');
             const profile = (window.prompt('Name for the additional account (e.g. work, backup):') || '')
                 .trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
-            if (profile) startLogin(row?.dataset.harness, profile, 'device');
+            if (profile) startLogin(row?.dataset.harness, profile);
         });
     });
     renderLoginCard();
@@ -365,46 +503,107 @@ function renderLoginCard() {
         `<h4>Connect ${escapeHtml(active.harness)}${active.profile ? ` (${escapeHtml(active.profile)})` : ''}</h4>`];
     if (face === 'error') {
         bits.push(`<div class="settings-inline-note" data-tone="error">${escapeHtml(active.error)}</div>`);
-        if (active.mode === 'device') {
-            // "above", not "below": the account rows — and their “Via your
-            // terminal” buttons — render before this card, so the old word sent
-            // the user down the page past the control it names.
-            bits.push(`<div class="settings-inline-note">The in-app code flow is not available for this agent yet — use
-                “Via your terminal” above: it gives one command to paste into your own terminal, and this card
-                tracks the login live.</div>`);
-        }
     } else if (face === 'device') {
-        // URL-only flows (`chatgpt`, `oauth_url`) carry no code: show the link
-        // alone rather than numbered steps ending in an empty code box.
-        bits.push(disclosure.code ? `
-            <div class="harness-device-code">
-                <p>1. Open <a href="${escapeHtml(disclosure.url)}" target="_blank" rel="noopener">${escapeHtml(disclosure.url)}</a></p>
-                <p>2. Enter this one-time code:</p>
-                <div class="harness-code" data-device-code>${escapeHtml(disclosure.code)}</div>
-            </div>
-        ` : `
-            <div class="harness-device-code">
-                <p>Open <a href="${escapeHtml(disclosure.url)}" target="_blank" rel="noopener">${escapeHtml(disclosure.url)}</a> to finish signing in.</p>
-            </div>
-        `);
-    } else if (face === 'attach') {
+        // LINK-FIRST: the prominent action is opening the disclosed sign-in
+        // URL, with an explicit copy affordance (the macOS-app card pattern).
         bits.push(`
-            <p>Run this in <strong>your own terminal</strong> (outside Ouroboros), then finish the login there.
-            This card follows the progress automatically:</p>
-            <pre class="harness-attach-command" data-attach-command>${escapeHtml(active.attachCommand)}</pre>
-            <button type="button" class="settings-ghost-btn" data-copy-attach>Copy command</button>
+            <div class="harness-signin-actions">
+                <a class="btn btn-primary" data-open-signin href="${escapeHtml(disclosure.url)}" target="_blank" rel="noopener">Open sign-in link</a>
+                <button type="button" class="settings-ghost-btn" data-copy-signin-link>Copy link</button>
+            </div>
         `);
-    } else {
-        bits.push(`<div class="settings-inline-status" data-tone="muted">Login ${escapeHtml(summary.state || 'starting')}${summary.phase ? ` · ${escapeHtml(summary.phase)}` : ''}…</div>`);
+        if (disclosure.code) {
+            // The codex device flow: big selectable one-time code, explicit
+            // Copy (never auto-copied).
+            bits.push(`
+                <div class="harness-device-code">
+                    <p>Enter this one-time code on that page:</p>
+                    <div class="harness-code" data-device-code>${escapeHtml(disclosure.code)}</div>
+                    <button type="button" class="settings-ghost-btn" data-copy-device-code>Copy code</button>
+                </div>
+            `);
+        }
     }
-    if (summary.terminal) {
-        bits.push(`<div class="settings-inline-status" data-tone="${summary.succeeded ? 'ok' : 'error'}">${summary.succeeded ? 'Connected.' : `Login ${escapeHtml(summary.state)}.`}</div>`);
+    // The live state line and the verdict are mutually exclusive by
+    // construction (loginStatusLine answers '' on a terminal job), so the
+    // card can never say two contradicting things at once.
+    if (face !== 'error') {
+        const line = loginStatusLine(active.job || {});
+        if (line) bits.push(`<div class="settings-inline-status" data-tone="muted" data-login-state>${escapeHtml(line)}</div>`);
+    }
+    // Shape 2: the ALWAYS-VISIBLE paste-code entry for a job whose disclosure
+    // flow is `oauth_url_input`. Claude's CLI prompts for the code only when
+    // the browser cannot reach its localhost callback (e.g. the browser is on
+    // another device), and this UI cannot observe that prompt — so the field
+    // is unconditional while the job awaits the user, with the hint carrying
+    // both the "if" and the optionality (no code is needed when the callback
+    // completes on its own).
+    if (face === 'device' && loginInputSupport(active.job || {}) && !summary.terminal) {
+        const busy = active.inputBusy || active.inputSent;
+        bits.push(`
+            <div class="harness-code-entry" data-code-entry>
+                <label for="harness-code-input">If the browser shows a code instead of finishing, paste it here (otherwise the sign-in completes on its own):</label>
+                <div class="harness-code-entry-row">
+                    <input type="text" id="harness-code-input" data-login-code-input autocomplete="off" spellcheck="false"
+                        placeholder="sign-in code" value="${escapeHtml(active.inputValue || '')}"${active.inputSent ? ' disabled' : ''}>
+                    <button type="button" class="settings-ghost-btn" data-login-code-submit${busy ? ' disabled' : ''}>${active.inputBusy ? 'Sending…' : (active.inputSent ? 'Code sent' : 'Submit code')}</button>
+                </div>
+                ${active.inputError ? `<div class="settings-inline-note" data-tone="error">${escapeHtml(active.inputError)}</div>` : ''}
+                ${active.inputSent ? `<div class="settings-inline-status" data-tone="muted">${escapeHtml(active.inputNote || 'Code sent — finishing the sign-in…')}</div>` : ''}
+            </div>
+        `);
+    }
+    // The verdict: success, a REAL failure with its typed reason, or the
+    // in-between "confirming" state while live account status is re-checked.
+    if (active.confirming) {
+        bits.push('<div class="settings-inline-status" data-tone="muted" data-login-verdict>Confirming the sign-in…</div>');
+    } else if (active.verdict?.kind === 'success') {
+        bits.push('<div class="settings-inline-status" data-tone="ok" data-login-verdict>Connected.</div>');
+    } else if (active.verdict?.kind === 'failure') {
+        bits.push(`<div class="settings-inline-status" data-tone="error" data-login-verdict>${escapeHtml(failureText(active.verdict.reason))}</div>`);
+    }
+    // The demoted attach fallback: a collapsed Advanced affordance, only when
+    // due (engine predates the disclosure modes, or no link within the
+    // window) and only while the job can still be attached.
+    if (!summary.terminal && attachFallbackDue(active, Date.now())) {
+        bits.push(`
+            <details class="harness-advanced" data-login-advanced${active.advancedOpen ? ' open' : ''}>
+                <summary>Advanced: sign in from your own terminal</summary>
+                <p>${active.engineDegraded
+        ? 'This engine cannot host the sign-in in the app yet. Run this in your own terminal (outside Ouroboros); the card follows the progress automatically:'
+        : 'No sign-in link arrived yet. You can run this in your own terminal (outside Ouroboros) instead; the card follows the progress automatically:'}</p>
+                <pre class="harness-attach-command" data-attach-command>${escapeHtml(active.attachCommand)}</pre>
+                <button type="button" class="settings-ghost-btn" data-copy-attach>Copy command</button>
+            </details>
+        `);
     }
     bits.push('<button type="button" class="settings-ghost-btn" data-login-dismiss>Close</button>', '</div>');
     host.innerHTML = bits.join('');
+    wireLoginCard(host, active, summary);
+}
+
+function wireLoginCard(host, active, summary) {
+    host.querySelector('[data-copy-signin-link]')?.addEventListener('click', () => {
+        const disclosure = deviceCodeDisclosure(active.job || {});
+        if (disclosure?.url) navigator.clipboard?.writeText(disclosure.url);
+    });
+    host.querySelector('[data-copy-device-code]')?.addEventListener('click', () => {
+        const disclosure = deviceCodeDisclosure(active.job || {});
+        if (disclosure?.code) navigator.clipboard?.writeText(disclosure.code);
+    });
     host.querySelector('[data-copy-attach]')?.addEventListener('click', () => {
         navigator.clipboard?.writeText(active.attachCommand || '');
     });
+    const advanced = host.querySelector('[data-login-advanced]');
+    // Re-renders (every poll tick) must not slam the user's Advanced section
+    // shut: the open state is carried on the job and re-applied.
+    advanced?.addEventListener('toggle', () => { active.advancedOpen = advanced.open; });
+    const codeInput = host.querySelector('[data-login-code-input]');
+    codeInput?.addEventListener('input', () => { active.inputValue = codeInput.value; });
+    codeInput?.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') { event.preventDefault(); submitCodeFromCard(active); }
+    });
+    host.querySelector('[data-login-code-submit]')?.addEventListener('click', () => submitCodeFromCard(active));
     host.querySelector('[data-login-dismiss]')?.addEventListener('click', async () => {
         if (active.jobId && !summary.terminal) {
             try { await apiFetch(`/api/claudexor/login/${encodeURIComponent(active.jobId)}`, { method: 'DELETE' }); } catch (err) { /* cancel is best-effort */ }
@@ -416,13 +615,61 @@ function renderLoginCard() {
     });
 }
 
-async function startLogin(harness, profile, mode) {
+async function submitCodeFromCard(active) {
+    // Double-submit guard: one POST in flight at a time, and an accepted code
+    // is final — the button stays disabled after success.
+    if (!active || active.inputBusy || active.inputSent) return;
+    const value = String(active.inputValue || '').trim();
+    if (!value) return;
+    // The job may have finished while the user typed: render the verdict
+    // instead of posting into a dead job.
+    if (jobStateSummary(active.job || {}).terminal) { renderLoginCard(); return; }
+    active.inputBusy = true;
+    active.inputError = '';
+    renderLoginCard();
+    const result = await submitLoginInput(active.jobId, value);
+    if (state.activeJob !== active) return;   // card closed while in flight
+    active.inputBusy = false;
+    if (result.ok) {
+        active.inputSent = true;
+    } else if (result.conflict === 'setup_input_not_applicable') {
+        // Typed 409: the callback already completed (or the flow moved past
+        // the code step) — no code is needed. An answer, not an error: quiet
+        // note, and the job poll lands the verdict.
+        active.inputSent = true;
+        active.inputNote = 'No code needed — the sign-in is already completing.';
+    } else if (result.conflict === 'setup_input_already_submitted') {
+        // Typed 409: the server already has a code (it is authoritative over
+        // our double-submit guard, e.g. a second browser tab).
+        active.inputSent = true;
+        active.inputNote = 'Code already received — finishing the sign-in.';
+    } else if (result.degraded) {
+        // The engine predates the input route, or reaped the job. Degrade to
+        // the Advanced fallback when one exists; otherwise say what is known.
+        if (!jobStateSummary(active.job || {}).terminal && active.attachCommand) {
+            active.engineDegraded = true;
+            active.inputError = 'This engine cannot accept the code here — see Advanced below.';
+        } else {
+            active.inputError = 'The engine did not accept the code (the sign-in may have already finished).';
+        }
+    } else {
+        active.inputError = result.error || 'Code submission failed; try again.';
+    }
+    renderLoginCard();
+}
+
+async function startLogin(harness, profile) {
     if (!harness) return;
-    const body = { harness };
+    // One start shape for every harness: the in-app flow is asked for and the
+    // server/engine decide the hosting (loginFlow rides only for codex).
+    const body = { harness, login_flow: 'device_auth' };
     if (profile) body.profile_id = profile;
-    if (mode === 'attach') body.transport = 'client_pty';
-    else body.login_flow = 'device_auth';
-    state.activeJob = { harness, profile, mode, job: null, jobId: '', attachCommand: '', error: '' };
+    state.activeJob = {
+        harness, profile, jobId: '', job: null, attachCommand: '', error: '',
+        startedAtMs: Date.now(), engineDegraded: false,
+        inputValue: '', inputBusy: false, inputSent: false, inputError: '', inputNote: '',
+        verdict: null, confirming: false, advancedOpen: false,
+    };
     renderLoginCard();
     try {
         const resp = await apiFetch('/api/claudexor/login', {
@@ -435,6 +682,10 @@ async function startLogin(harness, profile, mode) {
         state.activeJob.jobId = String(data.job_id || '');
         state.activeJob.job = data.job || {};
         state.activeJob.attachCommand = String(data.attach_command || '');
+        // An engine that predates the disclosure modes never sends a link;
+        // the demoted Advanced fallback may show right away (still collapsed).
+        state.activeJob.engineDegraded = data.disclosure_native === false
+            && !!state.activeJob.attachCommand;
         startJobPolling();
     } catch (error) {
         state.activeJob.error = String(error.message || error);
@@ -456,12 +707,40 @@ function startJobPolling() {
             // daemon-transport codex device flow, which must never show it.
             if (resp.ok) active.job = data.job || active.job;
         } catch (err) { /* transient poll failure; the next tick retries */ }
-        renderLoginCard();
-        if (jobStateSummary(state.activeJob?.job || {}).terminal) {
+        const verdict = loginVerdict(state.activeJob?.job || {});
+        if (verdict.kind !== 'pending') {
             stopJobPolling();
-            refreshStatus();
+            settleVerdict(state.activeJob, verdict);
+            return;
         }
+        renderLoginCard();
     }, JOB_POLL_MS);
+}
+
+async function settleVerdict(active, verdict) {
+    if (!active) return;
+    if (verdict.kind !== 'recheck') {
+        active.verdict = verdict;
+        renderLoginCard();
+        refreshStatus();
+        return;
+    }
+    // The verify-race: never declare failure off one stale verification read
+    // (the owner's codex login SUCCEEDED while the card said "Login failed ·
+    // completed"). Live account status — the truth the rows themselves render
+    // — briefly re-polled, is the judge.
+    active.confirming = true;
+    renderLoginCard();
+    const check = await confirmLoginLive(active.harness, active.profile || '', {
+        isStale: () => state.activeJob !== active,
+    });
+    if (state.activeJob !== active) return;
+    active.confirming = false;
+    if (check.payload) state.payload = check.payload;
+    active.verdict = check.confirmed
+        ? { kind: 'success', reason: '' }
+        : { kind: 'failure', reason: verdict.reason };
+    renderRows();
 }
 
 function stopJobPolling() {
