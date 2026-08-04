@@ -5,6 +5,7 @@ import test from 'node:test';
 
 import {
     ATTACH_FALLBACK_MS,
+    UNCONFIRMED_TEXT,
     accountLoginConfirmed,
     accountRows,
     attachFallbackDue,
@@ -13,9 +14,12 @@ import {
     failureText,
     jobStateSummary,
     loginCardFace,
+    loginCardHtml,
     loginInputSupport,
     loginStatusLine,
     loginVerdict,
+    pollResponseApplies,
+    preserveCardFocus,
     quotaSummary,
     submitLoginInput,
     verificationBadge,
@@ -465,4 +469,163 @@ test('the Advanced fallback is due on a disclosure that never comes, or an engin
     // No command = nothing to fall back to (the daemon-hosted codex flow).
     assert.equal(attachFallbackDue({ ...base, attachCommand: '' }, 100000 + ATTACH_FALLBACK_MS * 2), false);
     assert.equal(attachFallbackDue(null, 999999), false);
+});
+
+// ---------------------------------------------------------------------------
+// Card rendering: the sign-in link is a PRIMARY click target, the verdict owns
+// the card once it lands, and a re-check that ran out is not a failure.
+// ---------------------------------------------------------------------------
+
+function cardWithUrl(url, extra = {}) {
+    return {
+        harness: 'claude', profile: '', jobId: 'j1', attachCommand: '', startedAtMs: 0,
+        job: { state: 'waiting_for_input', phase: 'awaiting_user',
+            snapshot: { disclosures: { deviceCode: { flow: 'oauth_url', verificationUrl: url, userCode: '' } } } },
+        ...extra,
+    };
+}
+
+test('the disclosed sign-in URL is rendered only for http/https, through the house helper', () => {
+    // The link is the card's primary action now — one click, engine-supplied
+    // text. utils.safeExternalHrefAttr is the single house gate for that
+    // (http/https only, escaped by the helper), and everything else must
+    // render NO clickable link rather than a scheme the browser will execute.
+    const safe = loginCardHtml(cardWithUrl('https://platform.claude.com/oauth/authorize?x=1&y=2'), 0);
+    assert.ok(safe.includes('href="https://platform.claude.com/oauth/authorize?x=1&amp;y=2"'));
+    assert.ok(safe.includes('data-open-signin'));
+    assert.ok(loginCardHtml(cardWithUrl('http://127.0.0.1:1455/callback'), 0).includes('data-open-signin'));
+
+    for (const hostile of [
+        'javascript:alert(document.cookie)',
+        'JavaScript:alert(1)',
+        'data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==',
+        'vbscript:msgbox(1)',
+        'file:///etc/passwd',
+        'not a url at all',
+        '//evil.example/oauth',
+    ]) {
+        const html = loginCardHtml(cardWithUrl(hostile), 0);
+        assert.ok(!html.includes('data-open-signin'), hostile);
+        assert.ok(!html.includes('href='), hostile);
+        assert.ok(html.includes('data-unsafe-signin-link'), hostile);
+        // …and the raw scheme never reaches the DOM as an attribute value.
+        assert.ok(!html.includes(hostile), hostile);
+    }
+});
+
+test('a settled verdict silences the live status line, so the card never says both', () => {
+    // The owner hit a card reading "Waiting for the sign-in link…" beside a
+    // verdict: an overlapping poll tick applied a snapshot captured before the
+    // job settled. Two guards, and this is the rendering half.
+    const pending = cardWithUrl('https://a.example/b');
+    assert.ok(loginCardHtml(pending, 0).includes('data-login-state'));
+
+    const settled = { ...pending, verdict: { kind: 'success', reason: '' } };
+    const html = loginCardHtml(settled, 0);
+    assert.ok(!html.includes('data-login-state'));
+    assert.ok(html.includes('Connected.'));
+    // Same while the live re-check is deciding.
+    assert.ok(!loginCardHtml({ ...pending, confirming: true }, 0).includes('data-login-state'));
+});
+
+test('an exhausted re-check says the sign-in is UNCONFIRMED, never that it failed', () => {
+    // The row it waits for routinely lands a tick after the bounded re-poll
+    // gives up, so a hard "Sign-in failed" there is a lie about a login that
+    // may have succeeded. A genuine typed failure keeps its own wording.
+    const unconfirmed = loginCardHtml(cardWithUrl('https://a.example/b', {
+        verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' } }), 0);
+    assert.ok(unconfirmed.includes(UNCONFIRMED_TEXT));
+    assert.ok(!unconfirmed.includes('Sign-in failed'));
+    assert.ok(UNCONFIRMED_TEXT.includes('Refresh'));
+
+    const failed = loginCardHtml(cardWithUrl('https://a.example/b', {
+        verdict: { kind: 'failure', reason: 'launch_failed' } }), 0);
+    assert.ok(failed.includes(failureText('launch_failed')));
+    assert.ok(!failed.includes(UNCONFIRMED_TEXT));
+});
+
+test('a poll answer applies only to the job it was captured for, and only while unsettled', () => {
+    // The ordering rule behind the contradictory card: two overlapping async
+    // ticks can land out of order, so an OLDER snapshot must never be written
+    // over a job that has already settled — or onto a card that has since been
+    // closed or reopened for another account.
+    const active = { jobId: 'j1' };
+    assert.equal(pollResponseApplies(active, active), true);
+    assert.equal(pollResponseApplies(active, { jobId: 'j2' }), false);   // reopened
+    assert.equal(pollResponseApplies(active, null), false);              // closed
+    assert.equal(pollResponseApplies(null, null), false);
+    assert.equal(pollResponseApplies({ ...active, verdict: { kind: 'success' } },
+        active), false);
+    const confirming = { jobId: 'j1', confirming: true };
+    assert.equal(pollResponseApplies(confirming, confirming), false);
+});
+
+// ---------------------------------------------------------------------------
+// The 3-second poll re-render must not eat the caret. Minimal element stubs
+// (the repo's house idiom — no jsdom) plus node's fake timers, so the re-render
+// cadence itself is what the assertion runs through.
+// ---------------------------------------------------------------------------
+
+function fakeCodeInput({ disabled = false, start = 3, end = 5 } = {}) {
+    const calls = { focus: 0, range: null };
+    return {
+        disabled, value: 'ABCD-1234', selectionStart: start, selectionEnd: end,
+        hasAttribute: (name) => name === 'data-login-code-input',
+        focus() { calls.focus += 1; },
+        setSelectionRange(from, to) { calls.range = [from, to]; },
+        calls,
+    };
+}
+
+function fakeCardHost(replacement, focused) {
+    return {
+        swaps: 0,
+        contains: (node) => node === focused,
+        querySelector: () => replacement,
+    };
+}
+
+test('the paste-code field survives every poll re-render, caret and selection intact', (t) => {
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    const typing = fakeCodeInput({ start: 3, end: 5 });
+    const replacement = fakeCodeInput({ start: 0, end: 0 });
+    const host = fakeCardHost(replacement, typing);
+    const doc = { activeElement: typing };
+    // Exactly what the job poll does: swap the card's DOM on every tick.
+    setInterval(() => preserveCardFocus(host, () => { host.swaps += 1; }, doc), 3000);
+
+    t.mock.timers.tick(3000);
+    assert.equal(host.swaps, 1);
+    assert.equal(replacement.calls.focus, 1);
+    assert.deepEqual(replacement.calls.range, [3, 5]);
+    t.mock.timers.tick(3000);
+    assert.equal(host.swaps, 2);
+    assert.equal(replacement.calls.focus, 2, 'every tick restores focus, not just the first');
+    t.mock.timers.reset();
+});
+
+test('a re-render never STEALS focus, and never focuses a field the code already left', () => {
+    // Nothing in the card focused: the swap happens, the caret stays wherever
+    // the owner actually put it (another field, another section).
+    const elsewhere = { hasAttribute: () => false };
+    const replacement = fakeCodeInput();
+    const host = fakeCardHost(replacement, null);
+    preserveCardFocus(host, () => { host.swaps += 1; }, { activeElement: elsewhere });
+    assert.equal(host.swaps, 1);
+    assert.equal(replacement.calls.focus, 0);
+
+    // Focused, but the code was accepted meanwhile: the replacement renders
+    // disabled and must not be focused (nor asked for a selection range).
+    const typing = fakeCodeInput();
+    const sent = fakeCodeInput({ disabled: true });
+    const host2 = fakeCardHost(sent, typing);
+    preserveCardFocus(host2, () => { host2.swaps += 1; }, { activeElement: typing });
+    assert.equal(host2.swaps, 1);
+    assert.equal(sent.calls.focus, 0);
+    assert.equal(sent.calls.range, null);
+
+    // No document at all (module imported in node): the swap still runs.
+    const host3 = fakeCardHost(replacement, null);
+    preserveCardFocus(host3, () => { host3.swaps += 1; }, null);
+    assert.equal(host3.swaps, 1);
 });

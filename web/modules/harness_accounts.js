@@ -21,7 +21,7 @@
 // Pure helpers up top are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
-import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { escapeHtmlAttr as escapeHtml, safeExternalHrefAttr } from './utils.js';
 
 const POLL_MS = 5000;
 const JOB_POLL_MS = 3000;
@@ -209,6 +209,14 @@ export function failureText(reason) {
     return `Sign-in failed — ${String(reason || 'unknown reason').replace(/_/g, ' ')}.`;
 }
 
+// A bounded re-check that RAN OUT is not a failure. The verdict it re-checks
+// was already judged unproven (a verification race), and the account row it
+// waits for routinely lands a tick after the window closes — so the honest
+// answer is "not confirmed yet", pointing at the two places the truth appears,
+// never a hard "Sign-in failed" for a login that may well have succeeded.
+export const UNCONFIRMED_TEXT =
+    'Could not confirm the sign-in yet — check the account row above, or press Refresh.';
+
 export function loginStatusLine(job) {
     // The live state line for a non-terminal job — plain words mapped from
     // the typed state/phase, never raw enum spellings glued together (the old
@@ -291,6 +299,18 @@ export async function confirmLoginLive(harness, profileId, {
         } catch (err) { /* transient; the next attempt retries */ }
     }
     return { confirmed: false, stale: false, payload };
+}
+
+export function pollResponseApplies(captured, current) {
+    // Whether a poll answer may still be written onto the card. It belongs to
+    // the job it was captured for (`captured === current`: the card may have
+    // been closed, or reopened for another account, while the request was in
+    // flight) and only while that job is UNSETTLED — a verdict, or the live
+    // re-check that decides one, has already taken the card, and a snapshot
+    // captured before the job settled would put a pending state back under it.
+    // Pure so the ordering rule is asserted without a DOM or a timer.
+    return Boolean(captured) && captured === current
+        && !captured.verdict && !captured.confirming;
 }
 
 export function jobStateSummary(job) {
@@ -489,11 +509,11 @@ function renderRows() {
     renderLoginCard();
 }
 
-function renderLoginCard() {
-    const host = document.getElementById('harness-login-card');
-    if (!host) return;
-    const active = state.activeJob;
-    if (!active) { host.innerHTML = ''; return; }
+export function loginCardHtml(active, nowMs = Date.now()) {
+    // The card's whole body as a STRING — pure, so every face is asserted in
+    // node without a DOM: the unsafe-URL refusal, the unconfirmed re-check,
+    // and the rule that a verdict silences the live status line.
+    if (!active) return '';
     const summary = jobStateSummary(active.job || {});
     const disclosure = deviceCodeDisclosure(active.job || {});
     const face = loginCardFace(active);
@@ -506,10 +526,19 @@ function renderLoginCard() {
     } else if (face === 'device') {
         // LINK-FIRST: the prominent action is opening the disclosed sign-in
         // URL, with an explicit copy affordance (the macOS-app card pattern).
-        bits.push(`
+        // That link is now a PRIMARY click target built from engine-supplied
+        // text, so it goes through the house helper: http/https only, escaped
+        // by the helper itself. Anything else — javascript:, data:, a
+        // malformed string — yields '' and renders NO clickable link at all.
+        const href = safeExternalHrefAttr(disclosure.url);
+        bits.push(href ? `
             <div class="harness-signin-actions">
-                <a class="btn btn-primary" data-open-signin href="${escapeHtml(disclosure.url)}" target="_blank" rel="noopener">Open sign-in link</a>
+                <a class="btn btn-primary" data-open-signin href="${href}" target="_blank" rel="noopener">Open sign-in link</a>
                 <button type="button" class="settings-ghost-btn" data-copy-signin-link>Copy link</button>
+            </div>
+        ` : `
+            <div class="settings-inline-note" data-tone="error" data-unsafe-signin-link>
+                The engine disclosed a sign-in link this app will not open (only http and https links are opened).
             </div>
         `);
         if (disclosure.code) {
@@ -526,8 +555,12 @@ function renderLoginCard() {
     }
     // The live state line and the verdict are mutually exclusive by
     // construction (loginStatusLine answers '' on a terminal job), so the
-    // card can never say two contradicting things at once.
-    if (face !== 'error') {
+    // card can never say two contradicting things at once. The verdict slot
+    // ALSO silences it explicitly: once a verdict (or its re-check) owns the
+    // card, a snapshot that still reads pending — a poll response captured
+    // before the job settled — must not print "Waiting for the sign-in link…"
+    // underneath "Connected.".
+    if (face !== 'error' && !active.verdict && !active.confirming) {
         const line = loginStatusLine(active.job || {});
         if (line) bits.push(`<div class="settings-inline-status" data-tone="muted" data-login-state>${escapeHtml(line)}</div>`);
     }
@@ -561,11 +594,15 @@ function renderLoginCard() {
         bits.push('<div class="settings-inline-status" data-tone="ok" data-login-verdict>Connected.</div>');
     } else if (active.verdict?.kind === 'failure') {
         bits.push(`<div class="settings-inline-status" data-tone="error" data-login-verdict>${escapeHtml(failureText(active.verdict.reason))}</div>`);
+    } else if (active.verdict?.kind === 'unconfirmed') {
+        // The re-check window closed without the row appearing. Unknown, not
+        // failed — worded so the owner looks where the answer actually lands.
+        bits.push(`<div class="settings-inline-status" data-tone="warn" data-login-verdict>${escapeHtml(UNCONFIRMED_TEXT)}</div>`);
     }
     // The demoted attach fallback: a collapsed Advanced affordance, only when
     // due (engine predates the disclosure modes, or no link within the
     // window) and only while the job can still be attached.
-    if (!summary.terminal && attachFallbackDue(active, Date.now())) {
+    if (!summary.terminal && attachFallbackDue(active, nowMs)) {
         bits.push(`
             <details class="harness-advanced" data-login-advanced${active.advancedOpen ? ' open' : ''}>
                 <summary>Advanced: sign in from your own terminal</summary>
@@ -578,8 +615,37 @@ function renderLoginCard() {
         `);
     }
     bits.push('<button type="button" class="settings-ghost-btn" data-login-dismiss>Close</button>', '</div>');
-    host.innerHTML = bits.join('');
-    wireLoginCard(host, active, summary);
+    return bits.join('');
+}
+
+export function preserveCardFocus(host, swap, doc = typeof document === 'undefined' ? null : document) {
+    // The card re-renders on EVERY 3-second poll tick by replacing its whole
+    // DOM, and the replacement dropped the caret out of the paste-code field
+    // mid-typing — a sign-in code cannot be typed into a field that dies every
+    // three seconds. The focused entry and its selection are captured across
+    // the swap and restored onto the element that replaced it.
+    const prior = doc ? doc.activeElement : null;
+    const keep = Boolean(prior && host.contains?.(prior)
+        && prior.hasAttribute?.('data-login-code-input'));
+    const start = keep ? prior.selectionStart : null;
+    const end = keep ? prior.selectionEnd : null;
+    swap();
+    if (!keep) return;
+    const next = host.querySelector?.('[data-login-code-input]');
+    if (!next || next.disabled) return;
+    next.focus?.();
+    if (typeof next.setSelectionRange === 'function' && start !== null) {
+        next.setSelectionRange(start, end === null ? start : end);
+    }
+}
+
+function renderLoginCard() {
+    const host = document.getElementById('harness-login-card');
+    if (!host) return;
+    const active = state.activeJob;
+    if (!active) { host.innerHTML = ''; return; }
+    preserveCardFocus(host, () => { host.innerHTML = loginCardHtml(active, Date.now()); });
+    wireLoginCard(host, active, jobStateSummary(active.job || {}));
 }
 
 function wireLoginCard(host, active, summary) {
@@ -695,9 +761,18 @@ async function startLogin(harness, profile) {
 
 function startJobPolling() {
     stopJobPolling();
+    // ONE poll in flight at a time. The tick is async while the interval is
+    // not, so a slow round-trip used to let the next tick overtake it — and
+    // two responses landing out of order meant an OLDER snapshot could
+    // overwrite a terminal one. That is the contradictory card the owner hit
+    // by hand: a live "waiting" line beside a settled verdict.
+    let inFlight = false;
     state.jobTimer = setInterval(async () => {
         const active = state.activeJob;
         if (!active?.jobId) return stopJobPolling();
+        if (inFlight) return;
+        inFlight = true;
+        let snapshot = null;
         try {
             const resp = await apiFetch(`/api/claudexor/login/${encodeURIComponent(active.jobId)}`, { cache: 'no-store' });
             const data = await resp.json().catch(() => ({}));
@@ -705,12 +780,15 @@ function startJobPolling() {
             // copy-paste command: it issues one exactly for a client_pty job,
             // while the poll route hands one back for every job including the
             // daemon-transport codex device flow, which must never show it.
-            if (resp.ok) active.job = data.job || active.job;
-        } catch (err) { /* transient poll failure; the next tick retries */ }
-        const verdict = loginVerdict(state.activeJob?.job || {});
+            if (resp.ok) snapshot = data.job || null;
+        } catch (err) { /* transient poll failure; the next tick retries */
+        } finally { inFlight = false; }
+        if (!pollResponseApplies(active, state.activeJob)) return;
+        if (snapshot) active.job = snapshot;
+        const verdict = loginVerdict(active.job || {});
         if (verdict.kind !== 'pending') {
             stopJobPolling();
-            settleVerdict(state.activeJob, verdict);
+            settleVerdict(active, verdict);
             return;
         }
         renderLoginCard();
@@ -737,9 +815,12 @@ async function settleVerdict(active, verdict) {
     if (state.activeJob !== active) return;
     active.confirming = false;
     if (check.payload) state.payload = check.payload;
+    // An exhausted window is not a failure verdict: the job's own read was
+    // already judged unproven, and the account row often appears a tick after
+    // the bounded re-poll gives up. Say that, and say where to look.
     active.verdict = check.confirmed
         ? { kind: 'success', reason: '' }
-        : { kind: 'failure', reason: verdict.reason };
+        : { kind: 'unconfirmed', reason: verdict.reason };
     renderRows();
 }
 

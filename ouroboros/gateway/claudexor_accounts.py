@@ -45,26 +45,27 @@ _LOGIN_TRANSPORTS = ("", "client_pty")
 # implementing the setup-job input route: `POST /v2/setup/jobs/:id/input`
 # ships in the same engine change that makes claude/cursor login jobs
 # disclosure-driven (oauth_url in the snapshot overlay, no Terminal). One
-# structural marker for the one feature; read from the catalog the handshake
-# itself advertises (`operationsPath`).
-_LOGIN_INPUT_PATH = "/v2/setup/jobs/:id/input"
+# structural marker for the one feature, and it is the catalog ID — the
+# engine's own stable identifier for the operation, not the path spelling.
+_LOGIN_INPUT_OPERATION_ID = "post:setup.jobs.id.input"
 
 
 def _login_disclosure_native(operations: List[Dict[str, Any]]) -> bool:
     """Does this engine host claude/cursor logins itself (no Terminal)?
 
     True iff the ``/v2/operations`` catalog advertises the setup-job input
-    route (matched by path or by its catalog id — both are stable engine
-    spellings). Pure for unit tests; a caller that could not READ the catalog
-    must pass [] and get False — capability fails CLOSED onto the attach
-    fallback, which works on every engine, rather than open onto a transport
-    that an old engine serves as the forbidden Terminal.app handoff."""
+    route under its EXACT catalog id. The path spelling is deliberately NOT a
+    second, independent way to answer yes: a route template is a much weaker
+    identifier (any engine that ever mounted that shape, under any id, would
+    pass), and a false positive here is the expensive direction — it sends an
+    OLD engine down the transportless path, whose daemon-side default is the
+    macOS Terminal.app handoff D30 forbids. A false NEGATIVE only costs the
+    attach fallback, which works on every engine. Pure for unit tests; a
+    caller that could not READ the catalog must pass [] and get False."""
     for op in operations:
         if not isinstance(op, dict):
             continue
-        if str(op.get("path") or "") == _LOGIN_INPUT_PATH:
-            return True
-        if str(op.get("id") or "") == "post:setup.jobs.id.input":
+        if str(op.get("id") or "") == _LOGIN_INPUT_OPERATION_ID:
             return True
     return False
 
@@ -354,15 +355,23 @@ async def api_claudexor_login_job(request: Request) -> JSONResponse:
     is_input = request.method == "POST"
     value = ""
     if is_input:
-        body: Dict[str, Any] = await request_json_or(request, {})
-        value = str((body or {}).get("value") or "").strip()
-        if not value:
-            return json_error("value is required", 400)
-        if len(value) > 1024:
+        # STRICT, and strict in the proxy sense: a JSON OBJECT carrying a
+        # `value` that is ALREADY a string of the length the engine accepts.
+        # Nothing is coerced (`str(123)` is not a sign-in code) and nothing is
+        # rewritten — an edge that trims decides for the engine what the user
+        # typed, and a length check on the trimmed form is not the check the
+        # engine performs. A non-object body is refused here rather than
+        # raising an AttributeError one line later.
+        body: Any = await request_json_or(request, {})
+        raw = body.get("value") if isinstance(body, dict) else None
+        if not isinstance(raw, str) or not raw:
+            return json_error("value is required (a non-empty JSON string)", 400)
+        if len(raw) > 1024:
             # The engine's ControlSetupJobInputRequest caps the value at 1024
             # chars; refuse at this edge with the same bar (a paste-code is
             # one short line — an oversized body is a caller bug).
             return json_error("value is implausibly long for a sign-in code", 400)
+        value = raw
     op = "input" if is_input else ("cancel" if request.method == "DELETE" else "snapshot")
     try:
         return JSONResponse(await asyncio.to_thread(_login_job_call, job_id, op, value))

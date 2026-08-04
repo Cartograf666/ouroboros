@@ -345,14 +345,23 @@ def test_login_endpoint_validates_before_any_daemon_work():
 def test_login_disclosure_capability_reads_the_operations_catalog():
     """The engine advertises its disclosure-driven login modes by implementing
     the setup-job input route; the predicate reads the /v2/operations catalog
-    (path or catalog id — verified live shapes) and fails CLOSED on nothing."""
+    under the operation's EXACT id, and fails closed on everything else.
+
+    The id is the whole pin. Accepting the PATH template as a second,
+    independent yes made the answer true for an operation with ANY id — a
+    route shape is not an identity — and a false positive is the expensive
+    direction: it sends a pre-3.3.7 engine down the transportless path, whose
+    daemon-side default is the Terminal.app handoff D30 forbids."""
     from ouroboros.gateway.claudexor_accounts import _login_disclosure_native
 
-    by_path = [{"id": "post:setup.jobs", "method": "POST", "path": "/v2/setup/jobs"},
-               {"id": "whatever", "method": "POST", "path": "/v2/setup/jobs/:id/input"}]
-    assert _login_disclosure_native(by_path) is True
-    by_id = [{"id": "post:setup.jobs.id.input", "method": "POST", "path": ""}]
+    by_id = [{"id": "post:setup.jobs", "method": "POST", "path": "/v2/setup/jobs"},
+             {"id": "post:setup.jobs.id.input", "method": "POST", "path": "/v2/setup/jobs/:id/input"}]
     assert _login_disclosure_native(by_id) is True
+    # The id carries the capability even when the path is spelled differently.
+    assert _login_disclosure_native([{"id": "post:setup.jobs.id.input", "path": ""}]) is True
+    # The route SHAPE alone never does — a foreign id is not this operation.
+    foreign_id = [{"id": "whatever", "method": "POST", "path": "/v2/setup/jobs/:id/input"}]
+    assert _login_disclosure_native(foreign_id) is False
     without = [{"id": "post:setup.jobs.id.cancel", "method": "POST",
                 "path": "/v2/setup/jobs/:id/cancel"}, "not-a-dict"]
     assert _login_disclosure_native(without) is False
@@ -380,6 +389,105 @@ def test_login_request_transport_default_is_capability_gated():
         assert "transport" not in codex and codex["loginFlow"] == "device_auth"
 
 
+def _create_login(monkeypatch, tmp_path, body: dict, *, operations, raises=False):
+    """Run the REAL create path against a fake daemon, answering the probe with
+    ``operations`` (or raising for the catalog-unreadable case). Returns
+    ``(answer, request_body_actually_sent)``."""
+    from ouroboros import claudexor_daemon as owned
+    from ouroboros.gateway.claudexor_accounts import _login_create
+    from ouroboros.gateways import claudexor as gw
+
+    sent: dict = {}
+
+    class FakeDaemon:
+        def ensure_running(self):
+            return object()
+
+    class FakeGateway:
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self):
+            return {}
+
+        def operations(self):
+            if raises:
+                raise gw.ClaudexorUnavailable("daemon_unreachable", "catalog unreadable")
+            return operations
+
+        def setup_job_create(self, request, *, idempotency_key=""):
+            sent.clear()
+            sent.update(request)
+            return {"id": "job-1", "state": "queued"}
+
+    monkeypatch.setattr(owned, "get_owned_daemon", lambda: FakeDaemon())
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
+    return _login_create(body), sent
+
+
+_INPUT_OP = {"id": "post:setup.jobs.id.input", "method": "POST",
+             "path": "/v2/setup/jobs/:id/input"}
+
+
+def test_login_create_transport_is_gated_by_the_executed_probe(monkeypatch, tmp_path):
+    """End-to-end through the real create path, not just the pure predicate.
+
+    A disclosure-native engine hosts the flow itself: no transport, no attach
+    command, and the answer DISCLOSES the capability it decided on
+    (`disclosure_native`) so the card can demote the fallback honestly. An
+    engine whose catalog merely mounts a same-shaped route under a foreign id
+    is NOT that engine: it must still be forced to client_pty, because the
+    transportless default on an old engine is the forbidden Terminal.app
+    handoff."""
+    native, sent = _create_login(monkeypatch, tmp_path, {"harness": "claude"},
+                                operations=[_INPUT_OP])
+    assert native["disclosure_native"] is True
+    assert "transport" not in sent
+    # No client_pty job ⇒ no attach command to demote into Advanced.
+    assert "attach_command" not in native
+
+    wrong_id, sent = _create_login(
+        monkeypatch, tmp_path, {"harness": "claude"},
+        operations=[{"id": "post:setup.jobs.input", "method": "POST",
+                     "path": "/v2/setup/jobs/:id/input"}])
+    assert wrong_id["disclosure_native"] is False
+    assert sent["transport"] == "client_pty"
+    assert wrong_id["attach_command"].endswith("claudexor setup attach job-1")
+
+
+def test_login_create_fails_closed_when_the_catalog_cannot_be_read(monkeypatch, tmp_path):
+    """The probe's `except` path, executed: an unreadable catalog is not a
+    capability claim. It degrades to the attach fallback (works on every
+    engine) instead of gambling the transportless default."""
+    answer, sent = _create_login(monkeypatch, tmp_path, {"harness": "cursor"},
+                                operations=[], raises=True)
+    assert answer["disclosure_native"] is False
+    assert sent["transport"] == "client_pty"
+    assert "attach_command" in answer
+
+
+def test_login_create_keeps_the_codex_invariant_on_both_engines(monkeypatch, tmp_path):
+    """Codex is untouched by the capability: its device flow was always
+    daemon-hosted, so the transport stays absent (and loginFlow rides only for
+    codex) whether or not the engine is disclosure-native — and a job with no
+    client_pty transport never carries an attach command."""
+    for operations in ([_INPUT_OP], []):
+        answer, sent = _create_login(monkeypatch, tmp_path,
+                                     {"harness": "codex", "login_flow": "device_auth"},
+                                     operations=operations)
+        assert "transport" not in sent
+        assert sent["loginFlow"] == "device_auth"
+        assert "attach_command" not in answer
+        assert answer["disclosure_native"] is bool(operations)
+
+
 def _input_request(job_id: str, body: dict):
     from starlette.requests import Request
 
@@ -405,9 +513,21 @@ def test_login_input_endpoint_validates_before_any_daemon_work():
     assert missing_job.status_code == 400 and b"job_id is required" in missing_job.body
     missing_value = asyncio.run(api_claudexor_login_job(_input_request("j1", {})))
     assert missing_value.status_code == 400 and b"value is required" in missing_value.body
-    # The cap mirrors the engine's ControlSetupJobInputRequest (1..1024).
+    # The cap mirrors the engine's ControlSetupJobInputRequest (1..1024), read
+    # off the ORIGINAL string — not a trimmed rewrite of it.
     oversized = asyncio.run(api_claudexor_login_job(_input_request("j1", {"value": "x" * 1025})))
     assert oversized.status_code == 400
+    assert asyncio.run(api_claudexor_login_job(_input_request("j1", {"value": " " * 1025}))).status_code == 400
+    # STRICT body shape: `value` must already BE a string, and the body must
+    # already BE an object. A coerced str(123) is not a sign-in code, and a
+    # non-object body used to reach `.get` and raise (a 500 for a 400 fault).
+    for bad in (123, None, True, ["ABCD"], {"v": "ABCD"}, ""):
+        refused = asyncio.run(api_claudexor_login_job(_input_request("j1", {"value": bad})))
+        assert refused.status_code == 400, bad
+        assert b"value is required" in refused.body, bad
+    for body in ("just-a-string", ["ABCD"], 7, None):
+        refused = asyncio.run(api_claudexor_login_job(_input_request("j1", body)))
+        assert refused.status_code == 400, body
 
 
 def test_login_input_endpoint_proxies_the_code_to_the_engine(monkeypatch, tmp_path):
@@ -446,8 +566,11 @@ def test_login_input_endpoint_proxies_the_code_to_the_engine(monkeypatch, tmp_pa
     assert resp.status_code == 200
     body = json.loads(resp.body)
     assert body["ok"] is True and body["job"]["state"] == "running"
-    # Trimmed once at the edge (a paste carries whitespace), then verbatim.
-    assert seen == {"job_id": "j1", "op": "input", "value": "ABCD-1234"}
+    # UNCHANGED — a proxy that trims is a proxy that decides. Whichever side
+    # normalizes a pasted code (the card does, before it posts) must be the
+    # side that owns the meaning; this edge only validates and forwards, so
+    # what the engine reads is exactly what the caller sent.
+    assert seen == {"job_id": "j1", "op": "input", "value": " ABCD-1234 "}
 
 
 def test_login_input_engine_404_is_a_typed_capability_gap(monkeypatch, tmp_path):
