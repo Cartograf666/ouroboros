@@ -1060,13 +1060,18 @@ def _managed_commit_gate_failure(reason: str, message: str) -> str:
     if ok:
         return f"{message}\n\nThe managed update was rolled back: {detail}"
     try:
-        mark_update_tx_gate_blocked(reason, detail)
+        pinned = bool(mark_update_tx_gate_blocked(reason, detail))
     except Exception as exc:
         log.warning("pinning the update tx gate_blocked failed", exc_info=True)
+        pinned = False
+        detail = f"{detail}; re-phase raised {type(exc).__name__}: {exc}"
+    if not pinned:
+        # The message must not claim the tx is pinned when nothing was written
+        # (absent/corrupt marker, or the write itself failed).
         return (
             f"{message}\n\n⚠️ MANAGED_UPDATE_ROLLBACK_FAILED ({detail}); the update tx "
-            f"marker could NOT be re-phased to gate_blocked ({type(exc).__name__}: {exc}) — "
-            "if a tx marker remains, clear or roll it back before the next boot."
+            "marker could NOT be re-phased to gate_blocked — if a tx marker remains, "
+            "clear or roll it back before the next boot."
         )
     return (
         f"{message}\n\n⚠️ MANAGED_UPDATE_GATE_BLOCKED: rollback could not be verified "

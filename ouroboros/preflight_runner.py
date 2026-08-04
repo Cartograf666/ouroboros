@@ -824,7 +824,7 @@ def _diagnosis(header: str, remediation: str, body: str, max_output: int) -> str
     """Header, then remediation, THEN the bounded pytest body.
 
     The caller re-truncates this string from the TAIL at the same limit
-    (ouroboros/tools/review_helpers.py:1547 passes ``limit=MAX_OUTPUT=8000``),
+    (ouroboros/tools/review_helpers.py (_run_review_preflight_tests) passes ``limit=MAX_OUTPUT=8000``),
     so a remediation printed after a full-budget body is the first thing lost —
     precisely when the output is long enough to need it. The prefix and the
     truncation marker are reserved out of the body's budget too, so the whole

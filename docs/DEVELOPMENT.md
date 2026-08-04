@@ -1864,17 +1864,18 @@ Rules that keep this a fail-closed gate rather than a flake generator:
   failing attempt forever. The lost ref is logged and named in the returned message instead.
   The gate is not the only return that reaches that state: BOTH `_verify_reviewed_commit_binding`
   mismatches (`review_binding_mismatch`, `review_tag_binding_mismatch`) abandon the commit after
-  the same `committing_assisted` write, so all three go through `_managed_update_gate_rollback`,
-  which now takes the rejecting check's name. And because *clearing the marker is the last thing
-  the rollback does*, a rollback that FAILS leaves the exact phase it was called to escape — so
-  every unsuccessful rollback re-phases the tx to a terminal `gate_blocked`
-  (`mark_update_tx_gate_blocked`) that `finalize_managed_update_on_boot` logs and refuses instead of
-  promoting. "Unsuccessful" includes RAISED, and the re-phase runs in its own `try` for exactly that
-  reason: the rollback executes several git commands before it clears the marker, so an exception
-  halfway through is the case that most needs pinning, and an attempt nested inside the rollback's
-  own `try` would be the one case that skipped it. The returned text reports what actually happened
-  — it claims the tx is pinned only when that write returned true, and otherwise says the marker
-  still reads `committing_assisted` and must be cleared before the next boot.
+  the same `committing_assisted` write, so all three route through the shared managed-failure
+  helpers (`_review_binding_failure` / `_managed_post_commit_tests_gate` →
+  `_managed_commit_gate_failure`). And because *clearing the marker is the last thing the rollback
+  does*, a rollback that FAILS leaves the exact phase it was called to escape — so every
+  unsuccessful rollback re-phases the tx to `gate_blocked` (`mark_update_tx_gate_blocked`), whose
+  boot branch in `finalize_managed_update_on_boot` RETRIES the rollback rather than resuming or
+  promoting the refused merge. "Unsuccessful" includes RAISED, and the re-phase runs in its own
+  `try` for exactly that reason: the rollback executes several git commands before it clears the
+  marker, so an exception halfway through is the case that most needs pinning, and an attempt
+  nested inside the rollback's own `try` would be the one case that skipped it. The returned text
+  reports what actually happened — it claims the tx is pinned only when that write returned true,
+  and otherwise says the marker could not be re-phased and must be cleared before the next boot.
 - **A detected leak is itself a hard block.** `_execute_pytest_pass` returns
   `(returncode, output, containment_error)` and reaps *before* returning, because a `finally:` block
   cannot alter an already-computed tuple — a scan whose verdict no caller can see is exactly the
@@ -1897,8 +1898,9 @@ Rules that keep this a fail-closed gate rather than a flake generator:
   operand xdist always prints) after terminal decoration is stripped, never a free substring: bare
   `node down:`, `crashed while running`, `replacing crashed worker` and `maximum crashed workers
   reached` all occur in ordinary assertion text and captured logs of tests that reason about worker
-  pools. They are deliberately NOT `^`-anchored, because `handle_crashitem` reports the crash as a
-  TestReport longrepr and `-q` re-emits it mid-line in the short summary.
+  pools. Every pattern IS `^`-anchored to the stripped line; the `-q` short-summary re-emission
+  (`handle_crashitem` reports the crash as a TestReport longrepr) is matched by its own anchored
+  `FAILED/ERROR`-prefixed pattern rather than by unanchoring the phrase.
 - **A worker killed by the per-test timeout gets the OPPOSITE remediation.** `--timeout-method=thread`
   does not fail the slow test; it dumps stacks and `os._exit`s the worker, which reaches the
   controller wearing exactly the crash phrasing above. So `_crash_remediation` first looks for
@@ -1958,7 +1960,7 @@ Rules that keep this a fail-closed gate rather than a flake generator:
   that the pytest CONTROLLER exited; a child a test spawned and never waited on survives it, and once
   the controller is gone that child is invisible to both the `pgrep -P` parent→child walk (the ppid
   links died with the parent) and the temp-root command-line sweep (its argv names no sweepable
-  path). `platform_layer.ProcessContainer` *spawns* pytest (`container.spawn`, not `Popen` + `adopt`)
+  path). `process_containment.ProcessContainer` *spawns* pytest (`container.spawn`, not `Popen` + `adopt`)
   and is reaped in `finally` after EVERY pass, green included, which is what actually keeps pass 1
   out of pass 2 and off the machine. Spawning through the container is what closes the Windows
   assignment race: a Job Object holds only what has been assigned to it, so anything the process

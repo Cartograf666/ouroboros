@@ -867,7 +867,8 @@ class TestAutoPushBehavior:
         monkeypatch.setattr(
             update_merge,
             "mark_update_tx_gate_blocked",
-            lambda reason, detail: marked.append((reason, detail)),
+            # The real helper returns True when the valid tx was re-phased.
+            lambda reason, detail: marked.append((reason, detail)) or True,
         )
 
         result = git_mod._managed_commit_gate_failure("post_tests", "tests failed")

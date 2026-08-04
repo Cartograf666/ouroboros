@@ -492,13 +492,15 @@ def release_assisted_writer_gate_after_task(
         release_update_lock(lock_fh)
 
 
-def mark_update_tx_gate_blocked(reason: str, detail: str = "") -> None:
-    """Keep full failure evidence while preserving the phase boot recovery can retry.
+def mark_update_tx_gate_blocked(reason: str, detail: str = "") -> bool:
+    """Re-phase a valid live tx to ``gate_blocked`` with full failure evidence.
 
-    Only a VALID live tx is re-marked. An absent marker means the update already
-    finished or was cleared — inventing a gate_blocked tx from nothing would leave
-    a permanent phantom transaction blocking every later managed update; a corrupt
-    marker keeps its raw evidence for the owner instead of being overwritten."""
+    Boot's ``gate_blocked`` branch RETRIES the rollback (never a terminal stop),
+    while the pre-gate phase comes OFF the marker: a refused merge left in
+    ``committing_assisted`` reads to boot recovery as "died mid-commit" and gets
+    promoted without the gate rerunning. Only a VALID live tx is re-marked
+    (returns True): an absent marker would mint a permanent phantom transaction,
+    and a corrupt one keeps its raw evidence for the owner (both return False)."""
     status, tx = read_update_tx_strict()
     if status != "valid":
         _log_supervisor({
@@ -506,8 +508,10 @@ def mark_update_tx_gate_blocked(reason: str, detail: str = "") -> None:
             "reason": str(reason or "managed_update_gate_failed"),
             "marker_status": status,
         })
-        return
+        return False
     tx.update({
+        "gate_blocked_from_phase": str(tx.get("phase") or ""),
+        "phase": GATE_BLOCKED_PHASE,
         "gate_blocked_reason": str(reason or "managed_update_gate_failed"),
         "gate_blocked_detail": str(detail or ""),
         "gate_blocked_at": utc_now_iso(),
@@ -518,6 +522,7 @@ def mark_update_tx_gate_blocked(reason: str, detail: str = "") -> None:
         "reason": tx["gate_blocked_reason"],
         "detail": tx["gate_blocked_detail"],
     })
+    return True
 
 
 def read_update_tx_strict() -> Tuple[str, Dict[str, Any]]:
