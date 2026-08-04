@@ -1187,9 +1187,13 @@ Before every commit, verify the following:
   disclosed base/target, close new writers, drain existing direct/ephemeral
   turns, stop workers and tracked services, then re-plan before mutation.
 - Clean fast-forwards land the official SHA directly. Git also builds clean
-  merges for dirty or divergent local history. The reviewed assisted resolver
-  runs only when Git reports a real conflict; filenames do not create a second
-  update policy. Hard reset is an explicitly confirmed recovery only.
+  merges for divergent local history, with parents = reviewed HEAD + official
+  target. Dirty local work never enters that history: the apply stashes it and
+  restores it as uncommitted content (boot finalize on success, the pre-update
+  tree on rollback; a conflicting restore keeps the stash and discloses the
+  recovery command). The reviewed assisted resolver runs only when Git reports
+  a real conflict; filenames do not create a second update policy. Hard reset
+  is an explicitly confirmed recovery only.
 - The authorized resolver stages the complete merge, including tracked binary
   files. Review receives their exact staged mode/blob/size plus the HEAD and
   official MERGE_HEAD object ids; deletions carry an explicit absent stage and

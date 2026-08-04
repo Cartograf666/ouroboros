@@ -571,21 +571,6 @@ def _apply_clean_merge_fenced(request: Request, plan: dict) -> JSONResponse:
         "unpushed_lines": [], "warnings": [],
     })
     attempt_id = uuid.uuid4().hex[:12]
-    # Owner decision (Q1=C): dirty local work never enters committed history on a
-    # clean auto-update. Stash it (tracked + untracked) before the apply; boot
-    # finalization restores it as uncommitted content, and a rollback restores it
-    # onto the exact pre-update tree it was taken from.
-    stash_sha = ""
-    if int(plan.get("local_dirty_count") or 0) > 0:
-        from supervisor.update_merge import stash_local_changes_for_update
-
-        stash_ok, stash_sha, stash_error = stash_local_changes_for_update(attempt_id)
-        if not stash_ok:
-            _respawn_workers_after_failed_update()
-            return JSONResponse(
-                {"error": f"could not preserve local changes before the update: {stash_error}"},
-                status_code=409,
-            )
     tx = {
         "pre_update_sha": str(plan.get("base_sha") or ""),
         "pre_update_branch": branch,
@@ -593,12 +578,49 @@ def _apply_clean_merge_fenced(request: Request, plan: dict) -> JSONResponse:
         "target_ref": str(plan.get("target_ref") or ""),
         "update_channel": str(plan.get("update_channel") or ""),
         "merge_commit": merge_commit,
-        "phase": "pending_boot_smoke",
+        "phase": "stashing_local_work",
         "pre_restart_smoke": "pending",
         "rollback_attempted": False,
         "attempt_id": attempt_id,
-        "stash_sha": stash_sha,
+        "stash_sha": "",
     }
+    # Owner decision (Q1=C): dirty local work never enters committed history on a
+    # clean auto-update. The decision to stash binds to the LIVE worktree at apply
+    # time (not the plan's possibly-stale dirty count), the durable pre-stash tx
+    # phase lands BEFORE the stash mutation (boot recovers a crash in between),
+    # and an unexplained still-dirty tree fails closed instead of being cleaned.
+    stash_sha = ""
+    rc_ds, dirty_now, dirty_error = git_capture(["git", "status", "--porcelain"])
+    if rc_ds != 0:
+        _respawn_workers_after_failed_update()
+        return JSONResponse(
+            {"error": f"could not inspect local changes before the update: {dirty_error}"},
+            status_code=409,
+        )
+    if dirty_now.strip():
+        from supervisor.update_merge import (
+            clear_update_tx,
+            stash_local_changes_for_update,
+            write_update_tx as _write_tx,
+        )
+
+        _write_tx(tx)
+        stash_ok, stash_sha, stash_error = stash_local_changes_for_update(attempt_id)
+        if stash_ok and not stash_sha:
+            rc_rs, still_dirty, _rse = git_capture(["git", "status", "--porcelain"])
+            if rc_rs != 0 or still_dirty.strip():
+                stash_ok, stash_error = False, (
+                    "the worktree still reports local changes after an empty stash"
+                )
+        if not stash_ok:
+            clear_update_tx()
+            _respawn_workers_after_failed_update()
+            return JSONResponse(
+                {"error": f"could not preserve local changes before the update: {stash_error}"},
+                status_code=409,
+            )
+    tx["stash_sha"] = stash_sha
+    tx["phase"] = "pending_boot_smoke"
     write_update_tx(tx)
     ok, msg = apply_managed_merge_update(branch, merge_commit)
     if not ok:

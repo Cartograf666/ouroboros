@@ -2051,6 +2051,20 @@ def _boot_managed_update_tasks() -> None:
         result = finalize_managed_update_on_boot(
             supervisor_ready=_wait_for_supervisor_update_finalize()
         )
+        stash_note = str(result.get("stash_note") or "")
+        if stash_note:
+            # Q1=C disclosure contract: a stash restore that conflicted keeps the
+            # entry and the OWNER must see the exact recovery command, not only
+            # the supervisor log.
+            try:
+                from supervisor.message_bus import send_with_budget
+                from supervisor.state import load_state as _load_state
+
+                owner_chat = int((_load_state() or {}).get("owner_chat_id") or 0)
+                if owner_chat:
+                    send_with_budget(owner_chat, f"📦 Managed update: {stash_note}")
+            except Exception:
+                log.debug("stash note owner notification failed", exc_info=True)
         if result.get("rolled_back") is True:
             # This generation imported the rejected candidate. Preserve queued roots
             # through shutdown, then exec the restored code instead of limping on.

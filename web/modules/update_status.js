@@ -136,7 +136,7 @@ export function initUpdateStatus({ showPage, openDashboardTab, ws } = {}) {
             <h3 class="update-dialog-title">Update ${escapeHtml(base)} → ${escapeHtml(target)}</h3>
             <div class="update-dialog-meta">${plan.local_dirty_count} local change(s)${conflicts.length ? ` · ${conflicts.length} conflict(s)` : (plan.merge_commit && plan.merge_commit !== plan.target_sha ? ' · automatic Git merge' : ' · direct fast-forward')}</div>
             ${conflicts.length ? `<ul class="update-dialog-conflicts">${conflicts.map((r) => `<li>${escapeHtml(r)}</li>`).join('')}</ul>` : ''}
-            <div class="update-dialog-note">Git handles clean updates directly. Ouroboros joins only when Git reports a real conflict. A rescue snapshot and rollback protect the current checkout.</div>
+            <div class="update-dialog-note">Git handles clean updates directly. Ouroboros joins only when Git reports a real conflict. A rescue snapshot and rollback protect the current checkout; uncommitted local edits are stashed and restored as uncommitted work after the update.</div>
             <div class="update-dialog-actions">
                 ${primary}
                 <button data-open-details class="btn btn-default">Open details</button>

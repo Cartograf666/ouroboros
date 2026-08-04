@@ -44,6 +44,61 @@ def _git_run(
     return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
 
 
+def _build_clean_merge_commit(
+    tmp_wt: str,
+    base_sha: str,
+    target_sha: str,
+    *,
+    fast_forwardable: bool,
+    local_dirty_count: int,
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """Build the durable merge commit for a CLEAN plan inside the temp worktree.
+
+    Owner decision (2026-08, Q1=C): local dirty work NEVER enters committed
+    history on a clean auto-update. The commit merges the reviewed HEAD (base)
+    and the official target only; the apply path stashes dirty work and
+    restores it as uncommitted content after the update. clean(snapshot,
+    target) implies clean(base, target) for ordinary hunk overlaps, but
+    file/directory-type collisions CAN break the implication — a conflicting
+    base re-merge is returned as ``{"base_conflicts": [...]}`` so the caller
+    routes it to the assisted lane. Returns (merge_commit, failure|None)."""
+    if local_dirty_count:
+        if fast_forwardable:
+            # Base is an ancestor of the target: pure official history,
+            # no merge commit needed at all.
+            return target_sha, None
+        rc_r, _ro, reset_error = _git_run(["git", "-C", tmp_wt, "reset", "--hard", base_sha])
+        if rc_r != 0:
+            return "", {"error": reset_error or "could not reset plan worktree to base"}
+        rc_bm, _bo, base_merge_error = _git_run(
+            ["git", "-C", tmp_wt, "merge", "--no-commit", "--no-ff", target_sha]
+        )
+        if rc_bm == 1:
+            rc_u, unmerged_out, _ue = _git_run(
+                ["git", "-C", tmp_wt, "diff", "--name-only", "--diff-filter=U"]
+            )
+            base_conflicts = (
+                [ln.strip() for ln in unmerged_out.splitlines() if ln.strip()]
+                if rc_u == 0 else []
+            )
+            if base_conflicts:
+                return "", {"base_conflicts": base_conflicts}
+            return "", {"error": base_merge_error or "base merge failed without an inventory"}
+        if rc_bm != 0:
+            return "", {"error": base_merge_error or "clean base merge unexpectedly failed"}
+    rc_mt, merged_tree, _mte = _git_run(["git", "-C", tmp_wt, "write-tree"])
+    if rc_mt != 0 or not merged_tree:
+        return "", {"error": "could not build merged tree"}
+    rc_mc, built, commit_error = _git_run([
+        "git", "commit-tree", merged_tree,
+        "-p", base_sha, "-p", target_sha,
+        "-m", f"Merge official Ouroboros update {target_sha[:12]} (auto)",
+    ])
+    if rc_mc != 0 or not built:
+        return "", {"error": commit_error or "could not build merge commit"}
+    return built, None
+
+
 def plan_managed_update_merge(
     fetch: bool = False, branch: Optional[str] = None, build: bool = False
 ) -> Dict[str, Any]:
@@ -54,9 +109,12 @@ def plan_managed_update_merge(
     always cleans up the temp index + worktree; classification uses update_merge_policy.
 
     When ``build=True`` AND the merge is clean, the merged tree is committed as a real
-    merge commit (parents = [local_snapshot, target]) whose sha is returned as
-    ``merge_commit`` — a durable object in the shared DB that survives temp-worktree
-    removal, ready for ``apply_managed_merge_update`` to land on the live repo."""
+    merge commit (parents = [reviewed HEAD, target]; a fast-forwardable base lands the
+    official target itself) whose sha is returned as ``merge_commit`` — a durable
+    object in the shared DB that survives temp-worktree removal, ready for
+    ``apply_managed_merge_update`` to land on the live repo. Dirty local work is used
+    only to CLASSIFY conflicts (via the synthetic snapshot); it never enters the built
+    commit — the apply path stashes and restores it (owner decision Q1=C)."""
     import shutil
     import tempfile
 
@@ -265,51 +323,34 @@ def plan_managed_update_merge(
         kind = str(plan["kind"])
         merge_commit = ""
         if build and kind == "clean":
-            # Commit the (clean) merged tree as a real merge commit in the shared object
-            # DB so it survives temp-worktree removal and can be landed on the live repo.
-            #
-            # Owner decision (2026-08, Q1=C): local dirty work NEVER enters committed
-            # history on a clean auto-update. The commit merges the reviewed HEAD and
-            # the official target only; the apply path stashes dirty work and restores
-            # it as uncommitted content after the update. clean(snapshot, target)
-            # implies clean(base, target): the snapshot only ADDS local hunks on top
-            # of base, so dropping them cannot introduce a conflict.
-            if local_dirty_count:
-                if fast_forward_rc == 0:
-                    # Base is an ancestor of the target: pure official history,
-                    # no merge commit needed at all.
-                    merge_commit = target_sha
-                else:
-                    for redo in (
-                        ["git", "-C", tmp_wt, "reset", "--hard", base_sha],
-                        ["git", "-C", tmp_wt, "merge", "--no-commit", "--no-ff", target_sha],
-                    ):
-                        rc_redo, _ro, redo_error = _git_run(redo)
-                        if rc_redo != 0:
-                            return {"available": True, "kind": "unknown", **pins,
-                                    "error": redo_error or "clean base merge unexpectedly failed"}
-            if not merge_commit:
-                rc_mt, merged_tree, _mte = _git_run(["git", "-C", tmp_wt, "write-tree"])
-                if rc_mt != 0 or not merged_tree:
+            built, failure = _build_clean_merge_commit(
+                tmp_wt, base_sha, target_sha,
+                fast_forwardable=(fast_forward_rc == 0),
+                local_dirty_count=local_dirty_count,
+            )
+            if failure is not None:
+                if failure.get("base_conflicts"):
+                    # Exotic but real (e.g. file/directory collisions): the local
+                    # snapshot merged cleanly while the committed base does not.
+                    # Route to the assisted lane with the BASE conflict inventory
+                    # instead of refusing forever with kind=unknown.
+                    base_plan = classify_conflicts(failure["base_conflicts"])
                     return {
                         "available": True,
-                        "kind": "unknown",
-                        "error": "could not build merged tree",
+                        "kind": base_plan["kind"] if base_plan["kind"] != "clean" else "unknown",
+                        "auto_mergeable": False,
+                        "doc_conflict_paths": base_plan["doc_conflict_paths"],
+                        "code_conflict_paths": base_plan["code_conflict_paths"],
+                        "hot_code_paths": base_plan["hot_code_paths"],
+                        "local_dirty_count": local_dirty_count,
+                        "local_snapshot": local_snapshot,
+                        "merge_commit": "",
+                        "recommended_strategy": "assisted",
                         **pins,
                     }
-                rc_mc, built, commit_error = _git_run([
-                    "git", "commit-tree", merged_tree,
-                    "-p", base_sha, "-p", target_sha,
-                    "-m", f"Merge official Ouroboros update {target_sha[:12]} (auto)",
-                ])
-                if rc_mc != 0 or not built:
-                    return {
-                        "available": True,
-                        "kind": "unknown",
-                        "error": commit_error or "could not build merge commit",
-                        **pins,
-                    }
-                merge_commit = built
+                return {"available": True, "kind": "unknown", **pins,
+                        "error": failure.get("error") or "could not build merge commit"}
+            merge_commit = built
         return {
             "available": True,
             "kind": kind,
@@ -654,6 +695,19 @@ def release_update_lock(fh) -> None:
         pass
 
 
+def find_update_stash_sha(attempt_id: str) -> str:
+    """Return the stash SHA created for ``attempt_id``, or empty when absent."""
+    marker = f"managed-update-{attempt_id}"
+    rc_l, listing, _le = _g.git_capture(["git", "stash", "list", "--format=%H %gs"])
+    if rc_l != 0:
+        return ""
+    for line in listing.splitlines():
+        sha, _sep, subject = line.strip().partition(" ")
+        if marker in subject:
+            return sha
+    return ""
+
+
 def stash_local_changes_for_update(attempt_id: str) -> Tuple[bool, str, str]:
     """Stash tracked+untracked local work before a clean auto-update apply
     (owner decision Q1=C: dirty work rides the stash, never committed history).
@@ -664,24 +718,27 @@ def stash_local_changes_for_update(attempt_id: str) -> Tuple[bool, str, str]:
     )
     if rc != 0:
         return False, "", error or "git stash push failed"
-    rc_l, listing, list_error = _g.git_capture(["git", "stash", "list", "--format=%H %gs"])
-    if rc_l != 0:
-        return False, "", list_error or "git stash list failed"
-    for line in listing.splitlines():
-        sha, _sep, subject = line.strip().partition(" ")
-        if marker in subject:
-            return True, sha, ""
-    # "No local changes to save" — the worktree raced clean; nothing to restore later.
+    sha = find_update_stash_sha(attempt_id)
+    if sha:
+        return True, sha, ""
+    # "No local changes to save" — the worktree raced clean; nothing to restore
+    # later. The caller fail-closes if the tree still reports dirty.
     return True, "", ""
 
 
-def restore_update_stash(stash_sha: str, context: str = "") -> Tuple[bool, str]:
-    """Pop the exact update stash entry (matched by SHA) back onto the worktree.
+def restore_update_stash(
+    stash_sha: str, context: str = "", on_applied=None
+) -> Tuple[bool, str]:
+    """Apply-then-drop the exact update stash entry (matched by SHA).
 
-    On a pop conflict the partial apply is reset away and the stash entry is
+    On an apply conflict the partial apply is reset away and the stash entry is
     KEPT, so local work is never lost — the returned note tells the owner the
     exact `git stash apply` command. Restoring onto the pre-update tree (the
-    rollback path) always applies cleanly because the stash was taken there."""
+    rollback path) always applies cleanly because the stash was taken there.
+    apply+drop (NOT pop) keeps this crash-idempotent: dying between apply and
+    drop leaves the entry in place for the replay. ``on_applied`` runs between
+    the successful apply and the drop so the caller can persist a durable
+    "restored" marker that survives a crash in that window."""
     if not stash_sha:
         return True, ""
     rc_l, listing, list_error = _g.git_capture(["git", "stash", "list", "--format=%H %gd"])
@@ -695,8 +752,14 @@ def restore_update_stash(stash_sha: str, context: str = "") -> Tuple[bool, str]:
             break
     if not ref:
         return True, "stash entry already consumed"
-    rc_p, _po, pop_error = _g.git_capture(["git", "stash", "pop", ref])
+    rc_p, _po, apply_error = _g.git_capture(["git", "stash", "apply", ref])
     if rc_p == 0:
+        if on_applied is not None:
+            try:
+                on_applied()
+            except Exception:
+                _g.log.warning("restore_update_stash on_applied hook failed", exc_info=True)
+        _g.git_capture(["git", "stash", "drop", ref])
         _log_supervisor({
             "type": "managed_update_stash_restored",
             "context": context,
@@ -707,7 +770,7 @@ def restore_update_stash(stash_sha: str, context: str = "") -> Tuple[bool, str]:
     _g.git_capture(["git", "clean", "-fd"])
     note = (
         "local changes could not be restored automatically "
-        f"({(pop_error or '').strip() or 'conflict with the updated tree'}); they are "
+        f"({(apply_error or '').strip() or 'conflict with the updated tree'}); they are "
         f"preserved in git stash entry {stash_sha[:12]} — recover with "
         f"`git stash apply {stash_sha}`"
     )
@@ -715,7 +778,7 @@ def restore_update_stash(stash_sha: str, context: str = "") -> Tuple[bool, str]:
         "type": "managed_update_stash_restore_failed",
         "context": context,
         "stash_sha": stash_sha,
-        "error": (pop_error or "").strip(),
+        "error": (apply_error or "").strip(),
     })
     return False, note
 
@@ -761,10 +824,24 @@ def rollback_managed_update(
     tx["phase"] = "rolling_back"
     tx["rollback_reason"] = str(reason or "update_rollback")
     write_update_tx(tx)
+    # Q1=C replay guard: a previous rollback attempt that already RESTORED the
+    # owner's stashed work (durable stash_restored marker, written between the
+    # stash apply and its drop) must not reset that work away on resume. When
+    # HEAD already sits at the pre-update SHA on the right branch, the repo part
+    # of the rollback is done — skip the destructive re-reset and re-restore.
+    resume_with_restored_work = False
+    if bool(tx.get("stash_restored")):
+        rc_rh, resumed_head, _rhe = _g.git_capture(["git", "rev-parse", "--verify", "HEAD"])
+        rc_rb, resumed_branch, _rbe = _g.git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        resume_with_restored_work = (
+            rc_rh == 0 and resumed_head == pre and rc_rb == 0 and resumed_branch == branch
+        )
     # Disarm launcher replay before touching the checkout. If interrupted from
     # here onward, the durable rolling_back phase resumes this exact operation.
     if not _g._clear_update_intent():
         return False, "rollback could not clear update intent before restoring the repository"
+    if resume_with_restored_work:
+        return _finish_rollback(tx, pre, branch, reason, "", reopen_writer_admission)
     rc_h, cur_head, _he = _g.git_capture(["git", "rev-parse", "--short", "HEAD"])
     if rc_h == 0 and cur_head:
         _g.git_capture(["git", "branch", "-f", f"failed-update-{cur_head}", "HEAD"])
@@ -805,7 +882,24 @@ def rollback_managed_update(
     if stash_sha:
         # Q1=C: the pre-update tree is exactly where the stash was taken, so this
         # restore is conflict-free; a kept stash entry is disclosed, never dropped.
-        _restored, stash_note = restore_update_stash(stash_sha, context="rollback")
+        # The durable stash_restored marker is written BETWEEN apply and drop so
+        # a crash in that window resumes as "already restored" instead of the
+        # replayed reset wiping the recovered work.
+        def _mark_restored() -> None:
+            tx["stash_restored"] = True
+            write_update_tx(tx)
+
+        _restored, stash_note = restore_update_stash(
+            stash_sha, context="rollback", on_applied=_mark_restored,
+        )
+    return _finish_rollback(tx, pre, branch, reason, stash_note, reopen_writer_admission)
+
+
+def _finish_rollback(
+    tx: Dict[str, Any], pre: str, branch: str, reason: str,
+    stash_note: str, reopen_writer_admission: bool,
+) -> Tuple[bool, str]:
+    """Shared rollback tail: close admission, clear the tx, log, reopen, report."""
     gate_reason = "managed_update:rollback"
     try:
         from supervisor.workers import close_repo_writer_admission
@@ -1058,16 +1152,20 @@ def _finalize_pending_boot_smoke(tx: Dict[str, Any], supervisor_ready: bool) -> 
         if not _g._clear_update_intent():
             mark_update_tx_gate_blocked("finalize_intent_cleanup_failed")
             return {"finalized": False, "reason": "could not clear update intent"}
-        if not clear_update_tx():
-            mark_update_tx_gate_blocked("finalize_marker_cleanup_failed")
-            return {"finalized": False, "reason": "could not clear update marker"}
         # Q1=C: the boot survived on the merged tree — bring the owner's stashed
-        # local work back as uncommitted content. A conflicting restore keeps the
-        # stash entry and the note discloses the manual recovery command.
+        # local work back as uncommitted content BEFORE clearing the tx, so the
+        # durable stash_sha pointer survives a crash in this window (a replayed
+        # finalize sees "already consumed" and the restored tree stays). A
+        # conflicting restore keeps the stash entry and the note discloses the
+        # manual recovery command.
         stash_note = ""
         stash_sha = str(tx.get("stash_sha") or "")
         if stash_sha:
             _restored, stash_note = restore_update_stash(stash_sha, context="boot_finalize")
+        if not clear_update_tx():
+            mark_update_tx_gate_blocked("finalize_marker_cleanup_failed")
+            return {"finalized": False, "reason": "could not clear update marker",
+                    **({"stash_note": stash_note} if stash_note else {})}
         _log_supervisor({
             "type": "managed_update_finalized",
             "head": head,
@@ -1438,6 +1536,26 @@ def finalize_managed_update_on_boot(supervisor_ready: bool = True) -> Dict[str, 
             _log_supervisor({"type": "managed_update_tx_corrupt_on_boot"})
             return {"finalized": False, "reason": "corrupt tx marker — left for owner"}
         phase = str(tx.get("phase") or "")
+        if phase == "stashing_local_work":
+            # Crash between the durable pre-stash marker and the merge apply:
+            # nothing was applied yet. Restore whatever the attempt stashed
+            # (the tx may predate the stash_sha write), then clear the marker —
+            # the owner simply retries the update.
+            sha = str(tx.get("stash_sha") or "") or find_update_stash_sha(
+                str(tx.get("attempt_id") or "")
+            )
+            stash_note = ""
+            if sha:
+                _restored, stash_note = restore_update_stash(sha, context="boot_stash_recovery")
+            if not clear_update_tx():
+                mark_update_tx_gate_blocked("stash_recovery_marker_cleanup_failed")
+                return {"finalized": False, "reason": "could not clear update marker"}
+            _log_supervisor({
+                "type": "managed_update_stash_recovered_on_boot",
+                **({"stash_note": stash_note} if stash_note else {}),
+            })
+            return {"finalized": False, "reason": "recovered pre-apply stash crash",
+                    **({"stash_note": stash_note} if stash_note else {})}
         if phase == "pending_boot_smoke":
             return _finalize_pending_boot_smoke(tx, supervisor_ready)
         if phase == "applying_replace":

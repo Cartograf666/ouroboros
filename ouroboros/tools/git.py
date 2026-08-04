@@ -987,11 +987,11 @@ def _log_test_failure(ctx: ToolContext, commit_message: str, test_output: str) -
         pass
 
 
-def _run_pre_push_tests(ctx: ToolContext) -> Optional[str]:
+def _run_pre_push_tests(ctx: ToolContext, force: bool = False) -> Optional[str]:
     if ctx is None:
         log.warning("_run_pre_push_tests called with ctx=None, skipping tests")
         return None
-    if os.environ.get("OUROBOROS_PRE_PUSH_TESTS", "1") != "1":
+    if not force and os.environ.get("OUROBOROS_PRE_PUSH_TESTS", "1") != "1":
         return None
     tests_dir = pathlib.Path(ctx.repo_dir) / "tests"
     if not tests_dir.exists():
@@ -1009,8 +1009,8 @@ def _run_pre_push_tests(ctx: ToolContext) -> Optional[str]:
         return f"⚠️ PRE_PUSH_TEST_ERROR: Unexpected error running tests: {e}"
 
 
-def _git_commit_with_tests(ctx: ToolContext) -> Optional[str]:
-    test_error = _run_pre_push_tests(ctx)
+def _git_commit_with_tests(ctx: ToolContext, force: bool = False) -> Optional[str]:
+    test_error = _run_pre_push_tests(ctx, force=force)
     if test_error:
         log.error("Post-commit verification failed")
         ctx.last_push_succeeded = False
@@ -1022,11 +1022,11 @@ def _git_commit_with_tests(ctx: ToolContext) -> Optional[str]:
     return None
 
 
-def _post_commit_result(ctx, commit_message, skip_tests, tw_ref) -> Optional[str]:
+def _post_commit_result(ctx, commit_message, skip_tests, tw_ref, force: bool = False) -> Optional[str]:
     global _consecutive_test_failures
-    if skip_tests:
+    if skip_tests and not force:
         return None
-    push_error = _git_commit_with_tests(ctx)
+    push_error = _git_commit_with_tests(ctx, force=force)
     if push_error:
         _consecutive_test_failures += 1
         _log_test_failure(ctx, commit_message, push_error)
@@ -1061,10 +1061,15 @@ def _managed_post_commit_tests_gate(
 ) -> Optional[str]:
     """BLOCKING post-commit test gate for managed-update merges only: a failed
     suite rolls the assisted merge back instead of shipping a warning (ordinary
-    commits keep the warning-only contract later in the flow)."""
+    commits keep the warning-only contract later in the flow). The gate is
+    MANDATORY: neither the caller's skip_tests nor OUROBOROS_PRE_PUSH_TESTS=0
+    can wave a managed merge through untested."""
     if not managed_tx:
         return None
-    post_test_error = _post_commit_result(ctx, commit_message, skip_tests, test_warning_ref)
+    del skip_tests  # deliberately ignored for managed merges
+    post_test_error = _post_commit_result(
+        ctx, commit_message, False, test_warning_ref, force=True,
+    )
     if not post_test_error:
         return None
     failure = test_warning_ref[0].strip() or post_test_error
