@@ -25,9 +25,13 @@ _evo_task: asyncio.Task | None = None
 
 
 def _request_restart(request: Request) -> None:
+    # Every caller here is an OWNER action through the control surface (Reset All
+    # Data, Rollback, Apply Update) — never the agent's own restart tool, which
+    # goes through the supervisor. Saying so lets the re-exec re-read the runtime
+    # mode from settings instead of re-pinning the inherited boot baseline.
     callback = getattr(getattr(request.app, "state", None), "request_restart", None)
     if callable(callback):
-        callback()
+        callback(owner=True)
 
 
 def _runtime_branch_defaults(request: Request) -> tuple[str, str]:

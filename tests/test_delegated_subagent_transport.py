@@ -45,6 +45,22 @@ def test_route_parsing_is_opaque(raw, expected):
     assert subagents.parse_subagent_harness(raw) == expected
 
 
+def test_an_explicit_off_is_a_decision_an_empty_value_is_not(monkeypatch):
+    """Both spellings mean "no delegated route"; they differ in owner intent.
+
+    Settings' Subagents section turns delegation on by itself once a subscription
+    is connected, and it may only do that over a value nobody decided. Without a
+    distinguishable "off" the owner's own Off saved as empty and came back On on
+    the next load — an un-saveable choice. Runtime behaviour is identical.
+    """
+    assert subagents.parse_subagent_harness("off") is None
+    assert subagents.parse_subagent_harness("OFF") is None
+    assert subagents.parse_subagent_harness("  off  ") is None
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "off")
+    assert subagents.get_subagent_harness() is None
+    assert subagents.resolve_subagent_executor("auto", route=None).executor == "native"
+
+
 def test_get_subagent_harness_reads_the_env_key(monkeypatch):
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=some-model:high")
     route = subagents.get_subagent_harness()

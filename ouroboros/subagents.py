@@ -165,9 +165,16 @@ class DelegationRoute:
 
 
 def parse_subagent_harness(value: Any) -> DelegationRoute | None:
-    """Parse ``harness[=model][:effort]`` — Claudexor's own reviewer-panel spelling."""
+    """Parse ``harness[=model][:effort]`` — Claudexor's own reviewer-panel spelling.
+
+    Two spellings mean "no delegated route", and the difference is OWNER intent,
+    not runtime behaviour: empty is "never decided" (Settings may still offer the
+    connected-subscription default), ``off`` is "the owner turned delegation off"
+    and Settings leaves it off. Reserved token in Ouroboros's own setting
+    vocabulary, not a harness name — no harness is ever branched on here.
+    """
     raw = str(value or "").strip()
-    if not raw:
+    if not raw or raw.lower() == "off":
         return None
     route_id, _, tail = raw.partition("=")
     model, _, effort = tail.partition(":")

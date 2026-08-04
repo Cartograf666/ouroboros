@@ -3,6 +3,12 @@ import { bindEffortSegments, syncEffortSegments } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
 import { applyMcpSettings, collectMcpSettings, initMcpSettings } from './mcp_settings.js';
 import { collectReviewerSlots, initReviewerSlots, reloadReviewerSlots } from './reviewer_slots.js';
+import {
+    applySubagentsSettings,
+    collectSubagentsSettings,
+    initSubagentsSection,
+    reloadSubagentsSection,
+} from './subagents_settings.js';
 import { initHarnessAccounts } from './harness_accounts.js';
 import { SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
 import { showToast } from './toast.js';
@@ -343,6 +349,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     let settingsDirty = false;
     initMcpSettings({ onChange: updateSettingsDirtyState });
     initReviewerSlots({ onChange: () => updateSettingsDirtyState() });
+    initSubagentsSection({ onChange: () => updateSettingsDirtyState() });
     initHarnessAccounts();
 
     function anthropicKeyConfigured() {
@@ -517,6 +524,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         delete mutativeInput.dataset.effortTouched;
         mutativeInput.value =
             ({ true: 'on', false: 'off' }[rawMutative] || (runtimeMode === 'light' ? 'off' : 'on'));
+        // The delegation route lives next to it in Models → Subagents.
+        applySubagentsSettings(s);
         // Post-task evolution: one owner-facing selector maps to enable + cadence.
         const evoEnabled =
             ({ true: 'on', '1': 'on', on: 'on', false: 'off', '0': 'off', off: 'off' }[
@@ -614,9 +623,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         renderExtensionSettingsSections(page, sections);
         renderRequestedSkillSecrets(page, extData.skills || [], data);
         renderCustomSecrets(page, data);
-        // Await the reviewer rows BEFORE the clean baseline: their async
-        // arrival must not read as an unsaved owner edit.
-        await reloadReviewerSlots();
+        // Await the reviewer rows and the Subagents accounts BEFORE the clean
+        // baseline: their async arrival must not read as an unsaved owner edit.
+        await Promise.all([reloadReviewerSlots(), reloadSubagentsSection()]);
         setSettingsCleanBaseline();
         closeSettingsModelPickers();
         _renderNetworkHint(data._meta);
@@ -683,6 +692,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             // 6.1: the ONE structured reviewer-slot setting; {} until the rows
             // view has loaded, so an unrelated save cannot blank it.
             ...collectReviewerSlots(),
+            // Same rule for the delegated-subagent route: {} until the accounts
+            // read succeeded, so an unrelated save cannot turn delegation off
+            // because this page could not reach the daemon.
+            ...collectSubagentsSettings(),
         };
         setupModelSlots().forEach((slot) => {
             body[slot.settingKey] = fieldValue(slot.settingsInputId);

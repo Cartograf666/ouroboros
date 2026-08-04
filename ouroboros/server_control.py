@@ -9,7 +9,22 @@ import sys
 from typing import Any
 
 
-def restart_current_process(host: str, port: int, *, repo_dir: pathlib.Path, log: Any) -> None:
+def restart_current_process(
+    host: str,
+    port: int,
+    *,
+    repo_dir: pathlib.Path,
+    log: Any,
+    owner_initiated: bool = False,
+) -> None:
+    """Re-exec this server process.
+
+    ``owner_initiated`` marks the restart the OWNER asked for (the chat Restart
+    button, and the control endpoints that restart on the owner's behalf). Only
+    that restart drops the inherited runtime-mode ratchet pin, so the child
+    re-pins from ``load_settings()``; an agent- or supervisor-initiated restart
+    keeps inheriting it exactly as before.
+    """
     env = os.environ.copy()
     desired_host = str(host)
     try:
@@ -24,6 +39,17 @@ def restart_current_process(host: str, port: int, *, repo_dir: pathlib.Path, log
     env["OUROBOROS_SERVER_HOST"] = desired_host
     env["OUROBOROS_SERVER_PORT"] = str(port)
     env.pop("OUROBOROS_MANAGED_BY_LAUNCHER", None)
+    if owner_initiated:
+        # The ratchet pin is exported so a CHILD inherits the parent's baseline
+        # and cannot widen its own scope. Carried across an owner restart it also
+        # pinned the mode the owner just raised in Settings and pressed Restart to
+        # apply: the replacement re-pinned the OLD baseline from this env and the
+        # new mode never took effect, on this restart or any later one. Dropping
+        # the key here makes the child re-pin from load_settings() — the file only
+        # the owner can author. Agent/supervisor restarts keep inheriting it.
+        from ouroboros.config import BOOT_RUNTIME_MODE_ENV_KEY
+
+        env.pop(BOOT_RUNTIME_MODE_ENV_KEY, None)
     raw_argv = sys.argv
     try:
         saved = json.loads(os.environ.get("OUROBOROS_SERVER_REEXEC_ARGV_JSON", "") or "[]")

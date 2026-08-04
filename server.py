@@ -88,6 +88,10 @@ log = logging.getLogger("server")
 RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 _restart_requested = threading.Event()
+# Set only when the OWNER asked for the restart (the chat Restart button, and the
+# control endpoints that restart on the owner's behalf). The single fact the
+# re-exec needs to decide whether the runtime-mode ratchet pin rides along.
+_owner_restart_requested = threading.Event()
 _LAUNCHER_MANAGED = str(os.environ.get("OUROBOROS_MANAGED_BY_LAUNCHER", "") or "").strip() == "1"
 
 # Captured in main() for Settings LAN-reachability metadata.
@@ -134,7 +138,10 @@ def _installed_skill_names():
 
 
 def _restart_current_process(host: str, port: int) -> None:
-    _restart_current_process_impl(host, port, repo_dir=REPO_DIR, log=log)
+    _restart_current_process_impl(
+        host, port, repo_dir=REPO_DIR, log=log,
+        owner_initiated=_owner_restart_requested.is_set(),
+    )
 
 from ouroboros.config import (
     load_settings, save_settings, apply_settings_to_env as _apply_settings_to_env,
@@ -1305,7 +1312,7 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                 ctx.send_with_budget(chat_id, "Stopping active task. New settings apply to the next message.")
             except Exception:
                 log.warning("Failed to send owner restart stop notice; continuing restart", exc_info=True)
-            _request_restart_exit()
+            _request_restart_exit(owner=True)
         elif lowered == "/review" or lowered.startswith("/review "):
             # Target the requesting chat so the ack and results return to the
             # external transport owner, not the default web owner_chat_id.
@@ -1998,8 +2005,15 @@ def _perform_supervisor_restart(
     _request_restart_exit()
 
 
-def _request_restart_exit() -> None:
-    """Signal server shutdown with restart exit code."""
+def _request_restart_exit(owner: bool = False) -> None:
+    """Signal server shutdown with restart exit code.
+
+    ``owner`` is the ONE fact the re-exec needs: an owner-initiated restart
+    re-reads the runtime mode from settings, an agent- or supervisor-initiated
+    one keeps inheriting the boot pin (see server_control.restart_current_process).
+    """
+    if owner:
+        _owner_restart_requested.set()
     _restart_requested.set()
 
 

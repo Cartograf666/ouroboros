@@ -419,3 +419,71 @@ def test_ws_reloads_when_sha_unknown_after_reconnect():
     assert "previouslyConnected && newSha" in source, (
         "Reload must only fire when previouslyConnected=true and server returns a non-empty SHA"
     )
+
+
+def test_only_an_owner_restart_asks_for_the_runtime_mode_to_be_re_read(tmp_path, monkeypatch):
+    """The owner raises the mode in Settings, presses Restart, and the mode never changes.
+
+    ``restart_current_process`` re-execs with ``os.environ.copy()``, so the ratchet
+    pin ``OUROBOROS_BOOT_RUNTIME_MODE`` rode into the replacement and the child
+    re-pinned the OLD baseline from it — verified live: the process held
+    ``OUROBOROS_RUNTIME_MODE=advanced`` under ``OUROBOROS_BOOT_RUNTIME_MODE=light``
+    and ``/api/state`` kept reporting light, on that restart and every later one.
+
+    One fact decides it, and the two directions are pinned here: the owner's
+    ``/restart`` marks the restart owner-initiated, the agent's restart request
+    (via the supervisor) does not.
+    """
+    import server
+    import supervisor.message_bus as message_bus
+
+    class Bridge:
+        def get_updates(self, offset=0, timeout=1):
+            return [{
+                "update_id": offset,
+                "message": {"chat": {"id": 1}, "from": {"id": 1}, "text": "/restart"},
+            }]
+
+    class Ctx:
+        consciousness = None
+
+        def load_state(self):
+            return {}
+
+        def save_state(self, _state):
+            return None
+
+        def update_state(self, mutator):
+            live = {}
+            mutator(live)
+            return live
+
+        def send_with_budget(self, _chat_id, _text):
+            return None
+
+        def safe_restart(self, **_kwargs):
+            return True, "OK"
+
+        def kill_workers(self, force=True, **_kwargs):
+            return None
+
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "log_chat", lambda *args, **kwargs: None)
+
+    server._owner_restart_requested.clear()
+    server._restart_requested.clear()
+    try:
+        server._process_bridge_updates(Bridge(), 0, Ctx())
+        assert server._owner_restart_requested.is_set(), \
+            "the owner's Restart button must mark the restart owner-initiated"
+
+        # The agent's own restart request goes through the same exit signal and
+        # must NOT claim owner intent: its baseline stays pinned.
+        server._owner_restart_requested.clear()
+        server._restart_requested.clear()
+        server._request_restart_exit()
+        assert server._restart_requested.is_set()
+        assert not server._owner_restart_requested.is_set()
+    finally:
+        server._owner_restart_requested.clear()
+        server._restart_requested.clear()

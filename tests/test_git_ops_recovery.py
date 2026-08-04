@@ -733,6 +733,59 @@ def test_safe_restart_fallback_does_not_rewrite_dev_branch(monkeypatch):
     ]
 
 
+def test_a_stand_can_keep_its_pinned_checkout_across_restarts(monkeypatch):
+    """OUROBOROS_DISABLE_MANAGED_UPDATES=1 is the lever for running a stand.
+
+    A test stand launched against a PINNED checkout had that checkout moved under
+    the operator mid-test: the launcher-managed path resets the repo onto the
+    managed dev branch on every start (reflog "checkout: moving from <sha> to
+    ouroboros", version 6.89.0 -> 6.87.5). server.py already had a local-dev
+    branch that skips the BOOTSTRAP reset, but bootstrap is only one of three
+    callers — the owner restart and the agent restart reset the tree too. The
+    lever therefore sits at `safe_restart`, the choke point all three share, and
+    keeps the parts that are not a tree move: deps sync and the import test.
+    """
+    monkeypatch.setenv("OUROBOROS_DISABLE_MANAGED_UPDATES", "1")
+
+    def fail_checkout(*_args, **_kwargs):
+        raise AssertionError("a stand with managed updates disabled must not be checked out")
+
+    events = []
+    deps = []
+    monkeypatch.setattr(git_ops, "checkout_and_reset", fail_checkout)
+    monkeypatch.setattr(git_ops, "sync_runtime_dependencies",
+                        lambda reason: deps.append(reason) or (True, reason))
+    monkeypatch.setattr(git_ops, "import_test",
+                        lambda: {"ok": True, "stdout": "", "stderr": "", "returncode": 0})
+    monkeypatch.setattr(git_ops, "append_jsonl", lambda _path, payload: events.append(payload))
+
+    ok, message = git_ops.safe_restart(reason="bootstrap", unsynced_policy="rescue_and_reset")
+    assert ok is True
+    assert "managed checkout disabled" in message
+    assert deps == ["bootstrap"], "the deps sync is not a tree move and must still run"
+    assert [e["type"] for e in events] == ["managed_checkout_disabled"], \
+        "a suppressed checkout is disclosed, never silent"
+
+    # A broken tree still fails closed — the lever pins the checkout, it does not
+    # promise the pinned checkout imports.
+    monkeypatch.setattr(git_ops, "import_test",
+                        lambda: {"ok": False, "stdout": "", "stderr": "boom", "returncode": 1})
+    ok_broken, message_broken = git_ops.safe_restart(reason="owner_restart")
+    assert ok_broken is False
+    assert "Import test failed" in message_broken
+
+    # Without the lever nothing changes: the ordinary managed path still runs.
+    monkeypatch.delenv("OUROBOROS_DISABLE_MANAGED_UPDATES")
+    checkouts = []
+    monkeypatch.setattr(git_ops, "checkout_and_reset",
+                        lambda branch, reason="unspecified", unsynced_policy="ignore":
+                        checkouts.append(branch) or (True, "ok"))
+    monkeypatch.setattr(git_ops, "import_test",
+                        lambda: {"ok": True, "stdout": "", "stderr": "", "returncode": 0})
+    assert git_ops.safe_restart(reason="bootstrap")[0] is True
+    assert checkouts == [git_ops.BRANCH_DEV]
+
+
 def test_configure_remote_adds_origin_even_when_managed_remote_exists(monkeypatch):
     calls = []
 

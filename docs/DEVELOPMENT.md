@@ -1194,6 +1194,17 @@ Before every commit, verify the following:
   For `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`, Settings presents explicit On/Off;
   the empty runtime-default state remains a backend/default behavior, not a third
   owner-facing button.
+- One capability, one section. Delegation (`OUROBOROS_SUBAGENT_HARNESS`) and the
+  write permission (`OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`) share Models → Subagents
+  (`web/modules/subagents_settings.js`), beside Reviewer Slots: both answer "where
+  and how far do subagents run". Never render a second control over the same
+  settings key — two controls carry two drafts, and the last one collected wins.
+- A control the owner cannot use is worse than none. With no coding-agent
+  subscription connected the Subagents section says so and points at Providers →
+  Harness Accounts instead of rendering a delegation toggle whose every dispatch
+  would silently fall back to an API child. Harness lists come from the accounts
+  panel's own source (`accountRows` over `/api/claudexor/status`) — one catalog
+  path, one login-capable discriminator.
 
 #### LLM Call Rules
 - [ ] New LLM calls go through the shared `LLMClient` / `llm.py` layer — no ad-hoc HTTP clients or direct provider SDKs outside that layer. **Exception (v5.7.0+):** skill / extension `plugin.py` modules may call providers directly because they have not yet been migrated to a host-mediated `api.invoke_llm(...)` bridge. When that bridge lands, the exception goes away. Runtime callers (anything inside `ouroboros/`) must still use `LLMClient`.

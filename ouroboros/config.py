@@ -309,7 +309,9 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL": 1,
     # Delegated subagents. NARROW key, read ONLY by the subagent scheduler; deliberately
     # absent from provider_models.MODEL_SETTING_KEYS (see ARCHITECTURE "Delegated
-    # subagents"). Empty = delegation off. Wait keys bound the nanny's QUIET wait only.
+    # subagents"). Empty = delegation off AND undecided (Settings' Subagents section
+    # offers the connected-subscription default); the literal `off` = delegation off
+    # because the owner said so. Wait keys bound the nanny's QUIET wait only.
     "OUROBOROS_SUBAGENT_HARNESS": "",
     "OUROBOROS_DELEGATE_WAIT_SEC": 120,
     "OUROBOROS_DELEGATE_WAIT_MAX_SEC": 1800,

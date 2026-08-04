@@ -2,6 +2,7 @@ import { renderPageHeader, renderSegmentedField, renderTabStrip } from './page_h
 import { PAGE_ICONS } from './page_icons.js';
 import { renderHarnessAccountsSection } from './harness_accounts.js';
 import { renderReviewerSlotsSection } from './reviewer_slots.js';
+import { renderSubagentsSection } from './subagents_settings.js';
 
 const SETTINGS_TABS = [
     { value: 'providers', label: 'Providers' },
@@ -326,6 +327,8 @@ export function renderSettingsPage() {
 
                     ${renderReviewerSlotsSection()}
 
+                    ${renderSubagentsSection()}
+
                     <div class="form-section">
                         <h3>Other Model Slots</h3>
                         <div class="form-grid two">
@@ -491,26 +494,9 @@ export function renderSettingsPage() {
                         </div>
                     </div>
 
-                    <div class="form-section">
-                        <h3>Mutative Subagents</h3>
-                        <div class="settings-section-copy">
-                            Master switch for whether Ouroboros may spawn mutative ("acting") subagents that write code &mdash; in an isolated git worktree of this repo, an external workspace, or a from-scratch project &mdash; and return patches for the parent to review and integrate. Read-only subagents are always allowed.
-                            Default behavior follows Runtime Mode when no owner override exists: OFF in Light, ON in Advanced/Pro. This control saves an explicit On/Off override.
-                            <br><strong>Human controlled:</strong> the agent cannot self-enable this; applies on the next task (no restart).
-                        </div>
-                        <div class="settings-effort-card">
-                            <label>Allow Mutative Subagents</label>
-                            <input id="s-allow-mutative-subagents" type="hidden" value="on">
-                            ${renderSegmentedField({
-                                target: 's-allow-mutative-subagents',
-                                title: 'Applies on the next task; no restart required.',
-                                options: [
-                                    { value: 'off', label: 'Off' },
-                                    { value: 'on', label: 'On' },
-                                ],
-                            })}
-                        </div>
-                    </div>
+                    <!-- Allow Mutative Subagents moved to Models → Subagents: one
+                         subagent story in one place, and two controls over one
+                         setting would have carried two drafts. -->
 
                     <div class="form-section">
                         <h3>Post-Task Self-Evolution</h3>

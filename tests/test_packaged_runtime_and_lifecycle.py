@@ -9,6 +9,7 @@ the latch and its durable finalize_now control are withdrawn together, and
 only the task's OWN progress withdraws them.
 """
 
+import logging
 import pathlib
 import subprocess
 import sys
@@ -851,3 +852,44 @@ def test_start_agent_never_overwrites_an_operator_env_host(monkeypatch, tmp_path
     os.environ.pop("OUROBOROS_SERVER_HOST", None)  # silence: settings may stand in
     launcher.start_agent(port=52123)
     assert captured["env"]["OUROBOROS_SERVER_HOST"] == "127.0.0.1"
+
+
+def test_an_owner_restart_re_execs_without_the_inherited_runtime_mode_pin(monkeypatch, tmp_path):
+    """The re-exec env is the whole mechanism, so assert on the real env it hands execvpe.
+
+    ``OUROBOROS_BOOT_RUNTIME_MODE`` exists so a CHILD inherits the parent's ratchet
+    baseline. Carried across the OWNER's own restart it also pinned the mode the
+    owner had just raised in Settings: the replacement re-pinned the old baseline
+    from this env and the new mode never took effect. An agent- or supervisor-
+    initiated restart is the case the pin is for and must keep inheriting it.
+    """
+    import os
+
+    from ouroboros.config import BOOT_RUNTIME_MODE_ENV_KEY
+    from ouroboros.server_control import restart_current_process
+
+    captured = {}
+
+    def _capture_exec(_executable, _argv, env):
+        captured["env"] = dict(env)
+
+    monkeypatch.setattr(os, "execvpe", _capture_exec)
+    monkeypatch.setenv(BOOT_RUNTIME_MODE_ENV_KEY, "light")
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+
+    restart_current_process(
+        "127.0.0.1", 8765, repo_dir=tmp_path, log=logging.getLogger("test"),
+        owner_initiated=True,
+    )
+    assert BOOT_RUNTIME_MODE_ENV_KEY not in captured["env"], \
+        "an owner restart must let the child re-pin from load_settings()"
+    # Only the PIN is dropped: the mode itself is re-authored from settings by
+    # apply_settings_to_env before the child pins its baseline.
+    assert captured["env"]["OUROBOROS_RUNTIME_MODE"] == "advanced"
+
+    captured.clear()
+    restart_current_process(
+        "127.0.0.1", 8765, repo_dir=tmp_path, log=logging.getLogger("test"),
+    )
+    assert captured["env"][BOOT_RUNTIME_MODE_ENV_KEY] == "light", \
+        "agent/supervisor restarts keep inheriting the owner-pinned baseline"
