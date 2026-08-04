@@ -717,10 +717,19 @@ SSOT used by commit/scope/skill review: `2` for `N ≥ 3`, `N` for `N` in
 ### Rules for reviewers
 
 - Outside the force-plan gate, `plan_review` remains advisory: the implementer
-  decides what to do with the feedback. Under force-plan, execution requires a
-  typed `GREEN` or a valid fingerprint-bound disposition closing
-  `REVIEW_REQUIRED`; `REVISE_PLAN` requires changed plan text/fingerprint and a
-  fresh `plan_task` review.
+  decides what to do with the feedback. Force-plan follows the owner-selected
+  `OUROBOROS_REVIEW_ENFORCEMENT`: `blocking` holds normal finalization until
+  `GREEN` or a valid fingerprint-bound disposition closes `REVIEW_REQUIRED`,
+  while `advisory` permits agent judgment and preserves an explicit disclosure.
+  Reviewer unavailability is audit evidence, not a disposition-able verdict:
+  blocking retries the same fingerprint/wave against its immutable first-panel
+  scout snapshot until review returns or a real rail fires.
+  `REVISE_PLAN` still requires changed plan text/fingerprint and a fresh review
+  in the blocking lane. Blocking permits analysis and non-mutating preparation
+  while review recovers, but implementation starts only after closure or a real
+  task-wide rail. This remains an LLM-first obligation, not a per-write/per-shell
+  gate; real deadline, budget, provider, or round rails preserve useful best-effort
+  work instead of replacing it with a terminal planning error.
 - A FAIL/RISK finding must identify a concrete defect in a named file/function/
   symbol/authority/coupling, or a concrete smaller existing extension seam that
   satisfies the same requirements. Generic concerns without that evidence are

@@ -168,6 +168,92 @@ def test_budget_exhaustion_projects_deferred_child_before_forced_return(
     )
 
 
+def test_blocking_open_plan_round_rail_preserves_useful_candidate(tmp_path, monkeypatch):
+    from ouroboros.task_results import (
+        STATUS_RUNNING,
+        record_plan_review_attempt,
+        write_task_result,
+    )
+
+    loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    registry._ctx.task_metadata["force_plan"] = True
+    write_task_result(tmp_path, "parent1", STATUS_RUNNING, result="running")
+    record_plan_review_attempt(tmp_path, "parent1", fingerprint="a" * 64)
+    loop._replace_delivery_candidate(
+        registry,
+        limit_ctx,
+        trace,
+        "Useful verified work completed before the rail.",
+        control="candidate",
+    )
+    monkeypatch.setattr(loop, "get_review_enforcement", lambda: "blocking")
+    monkeypatch.setattr(
+        loop,
+        "call_llm_with_retry",
+        lambda *_args, **_kwargs: ({"role": "assistant", "content": ""}, 0.0),
+    )
+
+    text, usage, _returned_trace = loop._handle_round_limit(limit_ctx)
+
+    assert text.startswith("Useful verified work completed before the rail.")
+    assert "Blocking plan review remained open" in text
+    assert "`round_limit`" in text
+    assert usage["reason_code"] == "round_limit"
+
+
+def test_forced_swarm_router_uses_cached_unconfirmed_receipt(tmp_path, monkeypatch):
+    loop, registry, limit_ctx, _trace = _forced_test_context(tmp_path)
+    registry._ctx.is_ephemeral_turn = True
+    registry._ctx.task_metadata.update({"force_plan": True, "force_plan_source": "swarm"})
+    registry._ctx._swarm_handoff_attempt = {
+        "task_id": "swarm-task-1",
+        "routing_token": "route-token",
+        "status": "unconfirmed",
+        "reason": "confirmation_timeout",
+        "response": "PROMOTE_UNCONFIRMED",
+    }
+    monkeypatch.setattr(
+        loop,
+        "call_llm_with_retry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("forced router fallback must not start a new model round")
+        ),
+    )
+
+    text, usage, _returned_trace = loop._handle_round_limit(limit_ctx)
+
+    assert "swarm-task-1" in text
+    assert "admission was not confirmed" in text
+    assert "No second routing event was emitted" in text
+    assert usage["reason_code"] == "round_limit"
+
+
+def test_forced_swarm_router_keeps_confirmed_handoff_successful(tmp_path, monkeypatch):
+    loop, registry, limit_ctx, _trace = _forced_test_context(tmp_path)
+    registry._ctx.is_ephemeral_turn = True
+    registry._ctx.task_metadata.update({"force_plan": True, "force_plan_source": "swarm"})
+    registry._ctx._swarm_handoff_attempt = {
+        "task_id": "swarm-task-1",
+        "routing_token": "route-token",
+        "status": "scheduled",
+        "reason": "",
+        "response": "OK: task swarm-task-1 accepted and durably scheduled",
+    }
+    monkeypatch.setattr(
+        loop,
+        "call_llm_with_retry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("forced router fallback must not start a new model round")
+        ),
+    )
+
+    text, usage, _returned_trace = loop._handle_round_limit(limit_ctx)
+
+    assert "Swarm admitted managed task swarm-task-1" in text
+    assert usage.get("execution_status") != "failed"
+    assert usage.get("reason_code") != "round_limit"
+
+
 def test_physical_budget_exit_discloses_stale_candidate_after_service_teardown(
     tmp_path, monkeypatch,
 ):
