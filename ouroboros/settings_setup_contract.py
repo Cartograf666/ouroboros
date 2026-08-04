@@ -9,6 +9,8 @@ from ouroboros.config import SETTINGS_DEFAULTS, VALID_RUNTIME_MODES
 from ouroboros.provider_models import (
     ANTHROPIC_DIRECT_DEFAULTS,
     CLOUDRU_DIRECT_DEFAULTS,
+    MINIMAX_DIRECT_DEFAULTS,
+    MINIMAX_REGION_ENDPOINTS,
     OPENAI_DIRECT_DEFAULTS,
 )
 
@@ -33,6 +35,7 @@ _MODEL_DEFAULTS = {
     },
     "openai": dict(OPENAI_DIRECT_DEFAULTS),
     "cloudru": dict(CLOUDRU_DIRECT_DEFAULTS),
+    "minimax": dict(MINIMAX_DIRECT_DEFAULTS),
     "anthropic": dict(ANTHROPIC_DIRECT_DEFAULTS),
     # No defaults: model names are server-specific; user must fill all slots.
     "openai-compatible": {"main": "", "heavy": "", "light": "", "vision": "", "fallback": ""},
@@ -58,6 +61,8 @@ _PROVIDER_FIELDS = _rows(("id", "stateKey", "settingKey", "settingsInputId", "la
     ("openrouter-key", "openrouterKey", "OPENROUTER_API_KEY", "s-openrouter", "OpenRouter API Key", "sk-or-v1-...", "Optional. Best when you want one router for OpenAI, Anthropic, Google, and more.", "password", "primary"),
     ("openai-key", "openaiKey", "OPENAI_API_KEY", "s-openai", "OpenAI API Key", "sk-...", "Optional. If this is the only remote key, the next step prefills direct openai::... models.", "password", "primary"),
     ("cloudru-key", "cloudruKey", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "s-cloudru-key", "Cloud.ru Foundation Models API Key", "Cloud.ru API key", "Optional. If this is the only remote key, the next step prefills direct cloudru::... models.", "password", "more"),
+    ("minimax-key", "minimaxKey", "MINIMAX_API_KEY", "s-minimax-key", "MiniMax API Key", "MiniMax API key", "Optional. If this is the only remote key, the next step prefills direct minimax::... models.", "password", "more"),
+    ("minimax-region", "minimaxRegion", "MINIMAX_REGION", "s-minimax-region", "MiniMax Region", "global_en or cn_zh", "Choose global_en for the global endpoint or cn_zh for the China endpoint.", "text", "more"),
     ("anthropic-key", "anthropicKey", "ANTHROPIC_API_KEY", "s-anthropic", "Anthropic API Key", "sk-ant-...", "Optional. Saved for direct anthropic::... models and Claude tooling.", "password", "primary"),
     ("openai-compatible-url", "compatibleBaseUrl", "OPENAI_COMPATIBLE_BASE_URL", "s-compatible-url", "OpenAI-compatible Base URL", "http://localhost:11434/v1", "Base URL for your OpenAI-compatible endpoint (e.g. Ollama, LM Studio, vLLM). Required when using openai-compatible:: models.", "url", "more"),
     ("openai-compatible-key", "compatibleApiKey", "OPENAI_COMPATIBLE_API_KEY", "s-compatible-key", "OpenAI-compatible API Key", "Leave empty for no auth", "API key for the endpoint. Leave empty if your server does not require authentication.", "password", "more"),
@@ -67,6 +72,7 @@ _PROFILE_SPECS = {
     "openrouter": ("OpenRouter", "OpenRouter is present, so the next step keeps router-style defaults while still saving any extra direct keys you paste here.", "OpenRouter-style routing remains active. Unprefixed provider IDs like openai/gpt-5.6-terra or anthropic/claude-sonnet-5 continue to route through OpenRouter."),
     "openai": ("OpenAI", "OpenAI is present, so the next step prefills direct openai:: model values.", "OpenAI-only setup detected. These defaults are explicit and official."),
     "cloudru": ("Cloud.ru Foundation Models", "Cloud.ru is present, so the next step prefills direct cloudru:: model values.", "Cloud.ru-only setup detected. These defaults use explicit cloudru:: model IDs."),
+    "minimax": ("MiniMax", "MiniMax is present, so the next step prefills direct minimax:: model values.", "MiniMax-only setup detected. These defaults include MiniMax-M3 and MiniMax-M2.7."),
     "anthropic": ("Anthropic", "Anthropic is present, so the next step prefills direct anthropic:: model values.", "Anthropic-only setup detected. These defaults are explicit and official."),
     "openai-compatible": ("OpenAI-compatible endpoint", "An OpenAI-compatible base URL is configured. Enter the model names your server exposes in the next step.", "OpenAI-compatible endpoint detected. Use openai-compatible::your-model-name for every slot. The model list is whatever your server supports."),
     "direct-multi": ("Direct multi-provider", "Multiple direct providers are present, so the next step keeps your model values editable without forcing one provider family.", "Multiple direct providers are configured. Start here, then split model slots across them if you want."),
@@ -134,7 +140,7 @@ _LOCAL_PRESETS: Dict[str, Dict[str, Any]] = {
     "qwen3-32b": {"label": "Qwen3-32B Instruct Q4_K_M", "source": "Qwen/Qwen3-32B-GGUF", "filename": "Qwen3-32B-Q4_K_M.gguf", "contextLength": 32768, "chatFormat": ""},
 }
 
-_MODEL_SUGGESTIONS = list(dict.fromkeys(("x-ai/grok-4.5", "google/gemini-3.6-flash", "openai/gpt-5.6-terra", "openai/gpt-5.6-sol", "openai/gpt-5.6-luna", "openai::gpt-5.6-terra", "openai::gpt-5.6-sol", "openai::gpt-5.6-luna", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5", "anthropic::claude-sonnet-5", "anthropic::claude-opus-5", "anthropic::claude-opus-4-6", "deepseek/deepseek-v4-pro", "openai-compatible::meta-llama/compatible", "cloudru::zai-org/GLM-4.7")))
+_MODEL_SUGGESTIONS = list(dict.fromkeys(("x-ai/grok-4.5", "google/gemini-3.6-flash", "openai/gpt-5.6-terra", "openai/gpt-5.6-sol", "openai/gpt-5.6-luna", "openai::gpt-5.6-terra", "openai::gpt-5.6-sol", "openai::gpt-5.6-luna", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5", "anthropic::claude-sonnet-5", "anthropic::claude-opus-5", "anthropic::claude-opus-4-6", "deepseek/deepseek-v4-pro", "openai-compatible::meta-llama/compatible", "cloudru::zai-org/GLM-4.7", "minimax::MiniMax-M3", "minimax::MiniMax-M2.7")))
 
 
 def _string(value: Any) -> str:
@@ -183,6 +189,7 @@ def derive_provider_profile(settings: dict) -> str:
     direct = [
         ("OPENAI_API_KEY", "openai"),
         ("CLOUDRU_FOUNDATION_MODELS_API_KEY", "cloudru"),
+        ("MINIMAX_API_KEY", "minimax"),
         ("ANTHROPIC_API_KEY", "anthropic"),
     ]
     configured = [name for key, name in direct if flags[key]]
@@ -311,17 +318,25 @@ def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, st
 
     for field in _PROVIDER_FIELDS:
         value = keys[field["settingKey"]]
-        if value and field.get("inputType") != "url" and len(value) < 10:
+        if (
+            value
+            and (field.get("inputType") or "password") == "password"
+            and len(value) < 10
+        ):
             return {}, f"{field['label'].replace(' API Key', '')} API key looks too short."
 
     has_remote = any(
         value
         for setting_key, value in keys.items()
-        if setting_key != "OPENAI_COMPATIBLE_API_KEY"
+        if setting_key not in {"OPENAI_COMPATIBLE_API_KEY", "MINIMAX_REGION"}
     )
     has_local = bool(local_source)
     if not has_remote and not has_local:
-        return {}, "Configure OpenRouter, OpenAI, OpenAI-compatible, Cloud.ru, Anthropic, or a local model before continuing."
+        return {}, "Configure OpenRouter, OpenAI, OpenAI-compatible, Cloud.ru, MiniMax, Anthropic, or a local model before continuing."
+    minimax_region = keys.get("MINIMAX_REGION", "").lower()
+    if minimax_region and minimax_region not in MINIMAX_REGION_ENDPOINTS:
+        return {}, "MiniMax Region must be global_en or cn_zh."
+    keys["MINIMAX_REGION"] = minimax_region
     if has_local and "/" in local_source and not local_source.startswith(("/", "~")) and not local_filename:
         return {}, "Local HuggingFace sources need a GGUF filename."
     if review_enforcement not in {"advisory", "blocking"}:

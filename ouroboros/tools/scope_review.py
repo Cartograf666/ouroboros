@@ -182,10 +182,11 @@ def _scope_reviewer_window(model: str) -> int:
     try:
         from ouroboros.capability_evidence import probe, route_fingerprint
         from ouroboros.config import DATA_DIR, load_settings
-        from ouroboros.provider_models import provider_for_model
+        from ouroboros.provider_models import provider_for_model, resolve_minimax_base_url
         settings = load_settings()
         provider = provider_for_model(model)
         base_url = ""
+        api_key = None
         if provider == "openai":
             base_url = str(settings.get("OPENAI_BASE_URL") or "")
         elif provider == "openai-compatible":
@@ -194,6 +195,9 @@ def _scope_reviewer_window(model: str) -> int:
             base_url = str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "")
         elif provider == "gigachat":
             base_url = str(settings.get("GIGACHAT_BASE_URL") or "")
+        elif provider == "minimax":
+            base_url = resolve_minimax_base_url(settings.get("MINIMAX_REGION") or "")
+            api_key = str(settings.get("MINIMAX_API_KEY") or "") or None
         # Probe the scope slot, not the active main route (which honors USE_LOCAL_MAIN).
         use_local = review_model_uses_local(model)
         route_fp = route_fingerprint(
@@ -209,6 +213,7 @@ def _scope_reviewer_window(model: str) -> int:
             base_url=base_url,
             use_local=use_local,
             allow_fetch=bool(lazy),
+            api_key=api_key,
         )
         if int(ev.window_tokens or 0) > 0:
             window = int(ev.window_tokens)

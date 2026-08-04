@@ -486,6 +486,7 @@ def test_unknown_tool_under_local_only_config_uses_local_light(monkeypatch):
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -502,6 +503,25 @@ def test_unknown_tool_under_local_only_config_uses_local_light(monkeypatch):
     assert stub.calls[0]["use_local"] is True
 
 
+def test_minimax_key_enables_remote_safety_routing(monkeypatch):
+    from ouroboros.safety import (
+        _REMOTE_PROVIDER_KEYS,
+        _any_remote_provider_configured,
+        _light_model_has_reachable_provider,
+    )
+
+    for key in _REMOTE_PROVIDER_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    assert not _any_remote_provider_configured()
+    assert not _light_model_has_reachable_provider("minimax::MiniMax-M2.7")
+
+    monkeypatch.setenv("MINIMAX_API_KEY", "minimax-key")
+
+    assert _any_remote_provider_configured()
+    assert _light_model_has_reachable_provider("minimax::MiniMax-M2.7")
+
+
 def test_unknown_tool_with_no_safety_backend_fails_open_with_warning(monkeypatch):
     """When the runtime has neither remote keys nor local routing configured,
     the safety check must fail open with a visible ``SAFETY_WARNING`` rather
@@ -515,6 +535,7 @@ def test_unknown_tool_with_no_safety_backend_fails_open_with_warning(monkeypatch
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -546,6 +567,7 @@ def test_openrouter_only_with_direct_provider_light_model_fails_open(monkeypatch
     for k in (
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -581,6 +603,7 @@ def test_mixed_remote_local_provider_mismatch_local_failure_fails_open(monkeypat
     for k in (
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -612,6 +635,7 @@ def test_explicit_local_light_failure_still_blocks(monkeypatch):
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -638,6 +662,7 @@ def test_local_fallback_runtime_error_fails_open_with_warning(monkeypatch):
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -988,6 +1013,7 @@ def test_usage_event_uses_local_provider_when_use_local_light(monkeypatch):
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",

@@ -26,6 +26,7 @@ def test_model_catalog_tags_provider_values(monkeypatch):
         "OPENAI_COMPATIBLE_BASE_URL": "https://compat.example/v1",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY": "cloudru-key",
         "GIGACHAT_CREDENTIALS": "giga-creds",
+        "MINIMAX_API_KEY": "minimax-key",
     })
 
     async def fake_openrouter(_client, _api_key):
@@ -43,6 +44,7 @@ def test_model_catalog_tags_provider_values(monkeypatch):
             "openai": "gpt-4.1",
             "openai-compatible": "compatible-pro",
             "cloudru": "cloudru-pro",
+            "minimax": "MiniMax-M3",
         }[provider_id]
         return [model_catalog_api._build_model_catalog_entry(provider_id, provider_label, model_id, model_id)]
 
@@ -64,6 +66,9 @@ def test_model_catalog_tags_provider_values(monkeypatch):
     assert "openai-compatible::compatible-pro" in values
     assert "cloudru::cloudru-pro" in values
     assert "gigachat::giga-pro" in values
+    # MiniMax rides the shared OpenAI-compatible live fetcher (GET /v1/models on
+    # the region host), so the fake returns exactly one model for it.
+    assert "minimax::MiniMax-M3" in values
     assert payload["errors"] == []
 
 

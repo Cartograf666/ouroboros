@@ -25,6 +25,7 @@ from ouroboros.config import (
 from ouroboros.gateway._helpers import json_error, json_exception, request_drive_root
 from ouroboros.onboarding_wizard import build_onboarding_html
 from ouroboros.platform_layer import is_container_env
+from ouroboros.provider_models import MINIMAX_REGION_ENDPOINTS, resolve_minimax_base_url
 from ouroboros.server_runtime import (
     apply_runtime_provider_defaults,
     classify_runtime_provider_change,
@@ -48,6 +49,7 @@ _SECRET_SETTING_KEYS = {
     "GIGACHAT_CREDENTIALS",
     "GIGACHAT_PASSWORD",
     "ANTHROPIC_API_KEY",
+    "MINIMAX_API_KEY",
     "GITHUB_TOKEN",
     "OUROBOROS_NETWORK_PASSWORD",
 }
@@ -227,6 +229,9 @@ _RESTART_REQUIRED_KEYS = frozenset({
     "OPENAI_BASE_URL",
     "OPENAI_COMPATIBLE_BASE_URL",
     "CLOUDRU_FOUNDATION_MODELS_BASE_URL",
+    # Region selects the MiniMax base URL (api.minimax.io vs api.minimaxi.com),
+    # so it changes routing exactly like the base-URL keys above it.
+    "MINIMAX_REGION",
     "GIGACHAT_SCOPE",
     "GIGACHAT_BASE_URL",
     "GIGACHAT_VERIFY_SSL_CERTS",
@@ -493,6 +498,8 @@ def _active_main_route(
         base_url = str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "")
     elif provider == "gigachat":
         base_url = str(settings.get("GIGACHAT_BASE_URL") or "")
+    elif provider == "minimax":
+        base_url = resolve_minimax_base_url(settings.get("MINIMAX_REGION") or "")
     # CW7 (v6.34.0): honour the USE_LOCAL_MAIN routing setting — a local-routed main
     # lane must report provider='local' so the Max gate consults the local n_ctx
     # (Capability Evidence local-health) instead of the remote OUROBOROS_MODEL metadata.
@@ -517,20 +524,20 @@ def _max_context_block(settings: Dict[str, Any], *, allow_generative: bool = Fal
         from ouroboros.config import DATA_DIR
 
         route = _active_main_route(settings)
-        # Thread the in-flight OPENAI_COMPATIBLE_API_KEY into the probe ONLY when the
-        # active route is openai-compatible (first-run onboarding, where the key is not
-        # yet on disk). For any other provider this override would reach
+        # Thread the in-flight key into the probe ONLY for the active route's own
+        # provider (openai-compatible or minimax; first-run onboarding, where the key
+        # is not yet on disk). Threading another provider's key would reach
         # LLMClient.probe_oversized_context and replace that provider's resolved key
-        # with the compatible one on the generative probe path (cross-provider key bleed,
-        # since the generative probe also runs for openai/openrouter/cloudru).
-        compatible_api_key = (
-            (str(settings.get("OPENAI_COMPATIBLE_API_KEY") or "") or None)
-            if route.get("provider") == "openai-compatible"
-            else None
-        )
+        # on the generative probe path (cross-provider key bleed, since the
+        # generative probe also runs for openai/openrouter/cloudru).
+        route_api_key = None
+        if route.get("provider") == "openai-compatible":
+            route_api_key = str(settings.get("OPENAI_COMPATIBLE_API_KEY") or "") or None
+        elif route.get("provider") == "minimax":
+            route_api_key = str(settings.get("MINIMAX_API_KEY") or "") or None
         ev = probe(DATA_DIR, provider=route["provider"], model=route["model"],
                    base_url=route["base_url"], use_local=route["use_local"], allow_fetch=True,
-                   allow_generative=allow_generative, api_key=compatible_api_key)
+                   allow_generative=allow_generative, api_key=route_api_key)
         if confirms_at_least(ev, ONE_MILLION):
             return None
         win = int(ev.window_tokens or 0)
@@ -576,6 +583,7 @@ _REVIEW_ROUTE_BASE_URL_KEYS = frozenset({
     "OPENAI_COMPATIBLE_BASE_URL",
     "CLOUDRU_FOUNDATION_MODELS_BASE_URL",
     "GIGACHAT_BASE_URL",
+    "MINIMAX_REGION",
 })
 
 
@@ -596,6 +604,8 @@ def _review_slot_route(settings: Dict[str, Any], model: str) -> Dict[str, Any]:
         base_url = str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "")
     elif provider == "gigachat":
         base_url = str(settings.get("GIGACHAT_BASE_URL") or "")
+    elif provider == "minimax":
+        base_url = resolve_minimax_base_url(settings.get("MINIMAX_REGION") or "")
     use_local = provider == "local" or str(model or "").endswith(" (local)")
     return {
         "provider": "local" if use_local else provider,
@@ -1146,6 +1156,10 @@ async def api_settings_post(request: Request) -> JSONResponse:
                 old_settings.get("MCP_SERVERS"),
             )
         current = _merge_settings_payload(old_effective_settings, body)
+        minimax_region = str(current.get("MINIMAX_REGION") or "").strip().lower()
+        if minimax_region and minimax_region not in MINIMAX_REGION_ENDPOINTS:
+            return json_error("MINIMAX_REGION must be global_en or cn_zh.", 400)
+        current["MINIMAX_REGION"] = minimax_region
         # Generic settings saves operate on the current boot baseline. A pending
         # next-boot mode written by /api/owner/runtime-mode is preserved on disk
         # below, but never hot-applied to this process/env.

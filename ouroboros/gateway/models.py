@@ -13,6 +13,7 @@ from starlette.responses import JSONResponse
 
 from ouroboros.config import load_settings
 from ouroboros.gateway._helpers import json_error, json_exception
+from ouroboros.provider_models import resolve_minimax_base_url
 
 log = logging.getLogger(__name__)
 
@@ -223,6 +224,25 @@ def _provider_specs(
     anthropic_api_key = str(settings.get("ANTHROPIC_API_KEY", "") or "").strip()
     if anthropic_api_key:
         specs.append(("anthropic", lambda client: _fetch_anthropic_model_catalog(client, anthropic_api_key)))
+
+    minimax_api_key = str(settings.get("MINIMAX_API_KEY", "") or "").strip()
+    if minimax_api_key:
+        # MiniMax serves an OpenAI-compatible GET /v1/models on the region host
+        # (platform.minimax.io API reference), so the catalog is fetched live like
+        # every other remote provider instead of shipping a hardcoded list.
+        minimax_base_url = resolve_minimax_base_url(
+            str(settings.get("MINIMAX_REGION", "") or "")
+        )
+        specs.append((
+            "minimax",
+            lambda client: _fetch_openai_compatible_model_catalog(
+                client,
+                "minimax",
+                "MiniMax",
+                minimax_api_key,
+                minimax_base_url,
+            ),
+        ))
 
     compatible_api_key = str(settings.get("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
     compatible_base_url = str(settings.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
