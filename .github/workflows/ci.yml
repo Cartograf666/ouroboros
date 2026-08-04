@@ -673,8 +673,10 @@ jobs:
           HOME_DIR="$RUNNER_TEMP/ouroboros-smoke-home"
           mkdir -p "$SMOKE_ROOT" "$HOME_DIR"
           tar -xzf "${{ steps.release_asset.outputs.path }}" -C "$SMOKE_ROOT"
-          test -f "$SMOKE_ROOT/Ouroboros/repo.bundle"
-          test -f "$SMOKE_ROOT/Ouroboros/repo_bundle_manifest.json"
+          # PyInstaller 6 onedir puts datas under _internal/ (the runtime resolves
+          # the bundle root itself — packaged_cli walks Resources/Frameworks/_internal).
+          test -f "$SMOKE_ROOT/Ouroboros/_internal/repo.bundle"
+          test -f "$SMOKE_ROOT/Ouroboros/_internal/repo_bundle_manifest.json"
           HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
             "$SMOKE_ROOT/Ouroboros/bin/ouroboros" --help >/dev/null
           echo "sbom_path=$SMOKE_ROOT" >> "$GITHUB_OUTPUT"
@@ -689,8 +691,10 @@ jobs:
           $HomeDir = Join-Path $env:RUNNER_TEMP "ouroboros-smoke-home"
           New-Item -ItemType Directory -Force -Path $SmokeRoot, $HomeDir | Out-Null
           Expand-Archive -Path "${{ steps.release_asset.outputs.path }}" -DestinationPath $SmokeRoot
-          if (-not (Test-Path "$SmokeRoot\Ouroboros\repo.bundle")) { throw "repo.bundle missing" }
-          if (-not (Test-Path "$SmokeRoot\Ouroboros\repo_bundle_manifest.json")) { throw "repo bundle manifest missing" }
+          # PyInstaller 6 onedir puts datas under _internal\ (the runtime resolves
+          # the bundle root itself — packaged_cli walks Resources/Frameworks/_internal).
+          if (-not (Test-Path "$SmokeRoot\Ouroboros\_internal\repo.bundle")) { throw "repo.bundle missing" }
+          if (-not (Test-Path "$SmokeRoot\Ouroboros\_internal\repo_bundle_manifest.json")) { throw "repo bundle manifest missing" }
           $env:HOME = $HomeDir
           $env:USERPROFILE = $HomeDir
           $env:LOCALAPPDATA = Join-Path $HomeDir "AppData\Local"
