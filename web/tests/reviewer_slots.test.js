@@ -154,10 +154,13 @@ test('the runs-as line is the capability_delta projection, compact and honest', 
                      verdict_method: 'light_model_extraction' },
         capability_delta: [{ reason: 'extraction_instead_of_schema' }],
     });
-    assert.ok(line.includes('runs as agent_session:codex'));
-    assert.ok(line.includes('model gpt-5.6-sol'));
+    assert.ok(line.includes('codex session'));
+    assert.ok(line.includes('gpt-5.6-sol'));
     assert.ok(line.includes('verdict via light model extraction'));
     assert.ok(line.includes('1 capability delta disclosed'));
+    // The timestamp is humanized for the visible line; the raw ISO instant
+    // stays recoverable in the row tooltip, never inline.
+    assert.ok(!line.includes('2026-08-03T10:00:00Z'));
     assert.equal(describeLastExecution(null), '');
 });
 
@@ -166,7 +169,7 @@ test('capability badges display facts and never configure', () => {
     assert.ok(capabilityBadge(sessionRow, { codex: { status: 'ok' } }).includes('route ok'));
     assert.ok(capabilityBadge(sessionRow, {}).includes('not discovered'));
     const apiRow = { route: { kind: ROUTE_KIND_API, target_id: 'openai/gpt-5.6-luna' } };
-    assert.equal(capabilityBadge(apiRow, {}), 'api pack delivery');
+    assert.equal(capabilityBadge(apiRow, {}), 'API delivery');
 });
 
 test('the runs-as line shows APPLIED account/access and honest absence for an undisclosed model', () => {
@@ -183,5 +186,5 @@ test('the runs-as line shows APPLIED account/access and honest absence for an un
     assert.ok(!bare.includes('account'));
     // An api row keeps its sent-model-is-applied-model reading with no noise.
     const api = describeLastExecution({ effective: { route: 'api_chat', model: 'openai/x' } });
-    assert.ok(api.includes('model openai/x') && !api.includes('not disclosed'));
+    assert.ok(api.includes('openai/x') && !api.includes('not disclosed'));
 });

@@ -5819,20 +5819,29 @@ textarea.chat-input {
    Borders read the theme's --divider like every other panel surface. They used
    to name --border, which this dark-only :root never declares, so all three
    rules silently took their literal grey fallback instead of the token. */
-.reviewer-slots-heading { margin: 14px 0 6px; }
-.reviewer-slot-rows { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+/* Subsection rhythm: the section's flex gap (14px) is the baseline; the small
+   negative bottom margins pull a heading and its Add toolbar to 8px from the
+   rows they belong to, so heading+rows+toolbar reads as one group. */
+.reviewer-slots-heading { margin: 10px 0 -6px; }
+.reviewer-slot-rows { display: flex; flex-direction: column; gap: 8px; margin-bottom: -6px; }
 .reviewer-slot-row {
     border: 1px solid var(--divider);
     border-radius: 8px;
-    padding: 8px 10px;
+    padding: 10px 12px;
 }
 .reviewer-slot-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 /* Field chrome comes from the shared .form-field rule above (dark-app tokens);
-   only the row's compact sizing is local. */
+   only the row's sizing is local. Proportions follow the content (owner
+   feedback): the route select stays compact — its widest dropdown OPTION must
+   not set the closed width; the free-text model id (long provider/model ids)
+   takes the flexible room; effort stays compact; Remove docks right. */
 .reviewer-slot-controls select,
-.reviewer-slot-controls input { min-width: 140px; max-width: 100%; width: auto; }
-/* API model ids are long (provider/model); give the free-entry room. */
-.reviewer-slot-controls input[data-slot-custom-api] { min-width: 240px; }
+.reviewer-slot-controls input { min-width: 140px; max-width: 100%; width: auto; flex: 0 1 auto; }
+.reviewer-slot-controls select[data-slot-route],
+.reviewer-slot-controls select[data-advisory-route] { max-width: 240px; }
+.reviewer-slot-controls input[data-slot-custom-api] { flex: 1 1 260px; min-width: 240px; max-width: 520px; }
+.reviewer-slot-controls select[data-slot-model] { flex: 1 1 220px; max-width: 420px; }
+.reviewer-slot-controls [data-slot-remove] { margin-left: auto; }
 /* The base .local-toggle carries padding-bottom:8px for form layouts; inside a
    center-aligned control row that padding shoves the checkbox off-axis. The
    row's generic input sizing above also hits the toggle's CHECKBOX (an input),
@@ -5843,8 +5852,7 @@ textarea.chat-input {
     width: 14px;
     padding: 0;
 }
-.reviewer-slot-meta { font-size: 12px; margin-top: 4px; }
-.reviewer-slot-runs-as { font-size: 12px; margin-top: 2px; font-style: italic; }
+.reviewer-slot-meta { font-size: 12px; margin-top: 6px; }
 /* Account rows are purpose-built (identity left, actions right), not the
    settings key/value grid — .settings-custom-secret-row's 0.65fr/1.35fr
    columns inverted the proportions and its align-items:end sank the text. */

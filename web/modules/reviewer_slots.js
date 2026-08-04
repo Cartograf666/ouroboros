@@ -18,6 +18,7 @@
 // Pure helpers live at the top and are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
+import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
 export const ROUTE_KIND_API = 'api_chat';
@@ -161,11 +162,21 @@ export function buildReviewerSlotsSetting(state) {
 export function describeLastExecution(entry) {
     if (!entry || typeof entry !== 'object') return '';
     const effective = entry.effective || {};
-    const parts = [`runs as ${effective.route || 'api_chat'}`];
+    const parts = [];
     // APPLIED facts only: a session run whose telemetry predates the engine
     // receipt shows honest absence, never the requested value as applied.
-    if (effective.model) parts.push(`model ${effective.model}`);
-    else if (String(effective.route || '').startsWith('agent_session')) parts.push('model not disclosed');
+    // One quiet line (owner feedback): the route is spelled only when it says
+    // more than the row's own delivery badge (which coding agent really ran),
+    // and the timestamp is humanized — the raw route + ISO instant stay
+    // recoverable in the line's tooltip (lastRunMetaTitle).
+    const route = String(effective.route || '');
+    if (route.startsWith('agent_session')) {
+        const harness = route.slice('agent_session'.length).replace(/^:/, '');
+        parts.push(harness ? `${harness} session` : 'agent session');
+        parts.push(effective.model || 'model not disclosed');
+    } else if (effective.model) {
+        parts.push(effective.model);
+    }
     if (effective.profile_id) parts.push(`account ${effective.profile_id}`);
     if (effective.access) parts.push(`access ${effective.access}`);
     // No applied effort is rendered: none exists upstream, so the key is not emitted.
@@ -175,8 +186,16 @@ export function describeLastExecution(entry) {
     }
     const deltas = Array.isArray(entry.capability_delta) ? entry.capability_delta.length : 0;
     if (deltas) parts.push(`${deltas} capability delta${deltas === 1 ? '' : 's'} disclosed`);
-    if (entry.ts) parts.push(`at ${entry.ts}`);
+    const when = formatRelativeAge(Date.parse(entry.ts || ''), 'just now');
+    if (when) parts.push(when);
     return parts.join(' · ');
+}
+
+function lastRunMetaTitle(entry) {
+    // The tooltip keeps the raw facts the visible line compresses away.
+    const route = String(entry?.effective?.route || 'api_chat');
+    const ts = String(entry?.ts || '');
+    return `UI projection of capability_delta (D22) — ran as ${route}${ts ? ` at ${ts}` : ''}`;
 }
 
 export function profileOptionsFor(profiles, savedPin) {
@@ -200,7 +219,7 @@ export function capabilityBadge(row, harnessesById) {
         const status = harness ? (harness.status || 'unknown') : 'not discovered';
         return `agent session — retrieves context with its own tools · route ${status}`;
     }
-    return 'api pack delivery';
+    return 'API delivery';
 }
 
 export function advisoryRouteTransition(prev, decoded, memory = {}) {
@@ -262,22 +281,23 @@ export function renderReviewerSlotsSection() {
         <div class="form-section" id="reviewer-slots-section">
             <h3>Reviewer Slots</h3>
             <div class="settings-section-copy">
-                Commit review rows: the triad, the scope reviewers, and one optional advisory
-                pre-reviewer. Each row picks its delivery in one list — an API model, or a coding
-                agent running on your subscription — plus its own reasoning effort.
-                Agent-session delivery applies to <strong>commit review only</strong>: plan review,
-                task acceptance and skill review run on the API reviewer rows. If you delegate
-                <em>every</em> commit-review or scope row, those API surfaces fall back to the shipped
-                default models and spend API budget — keep at least one API row to avoid it.
+                Who reviews each commit: the triad rows, the scope rows, and one optional advisory
+                pre-reviewer. Each row picks its delivery — an API model, or a coding agent on your
+                subscription — plus its own reasoning effort.
+            </div>
+            <div class="settings-inline-note">
+                Coding-agent delivery covers <strong>commit review only</strong>. If every triad or
+                scope row is delegated, plan review, task acceptance and skill review fall back to
+                the shipped default models and spend API budget — keep at least one API row.
             </div>
             <div id="reviewer-slots-error" class="ui-status" data-tone="error" hidden></div>
             <datalist id="reviewer-api-model-catalog"></datalist>
-            <h4 class="reviewer-slots-heading">Triad slots <span class="muted" id="reviewer-triad-limit"></span></h4>
+            <h4 class="reviewer-slots-heading">Triad slots <span class="muted" id="reviewer-triad-limit" title="The commit gate's real ceiling"></span></h4>
             <div id="reviewer-triad-rows" class="reviewer-slot-rows"></div>
             <div class="settings-toolbar">
                 <button type="button" class="settings-ghost-btn" id="btn-add-triad-slot">Add triad slot</button>
             </div>
-            <h4 class="reviewer-slots-heading">Scope slots <span class="muted" id="reviewer-scope-limit"></span></h4>
+            <h4 class="reviewer-slots-heading">Scope slots <span class="muted" id="reviewer-scope-limit" title="The scope pool's real width"></span></h4>
             <div id="reviewer-scope-rows" class="reviewer-slot-rows"></div>
             <div class="settings-toolbar">
                 <button type="button" class="settings-ghost-btn" id="btn-add-scope-slot">Add scope slot</button>
@@ -312,11 +332,15 @@ function selectHtml(attrs, groups, selected) {
 }
 
 function effortSelectHtml(attrs, selected, surfaceDefault) {
+    // Compact closed state (owner feedback on field proportions): the wordy
+    // "Default (scope review effort)" label made this select as wide as the
+    // model field. Which setting the default follows moves to the tooltip.
     const options = [
-        { value: '', label: `Default (${surfaceDefault})` },
+        { value: '', label: 'Default effort' },
         ...EFFORT_CHOICES.map((effort) => ({ value: effort, label: effort })),
     ];
-    return selectHtml(attrs, [{ label: '', options }], selected || '');
+    return selectHtml(`${attrs} title="Reasoning effort — default: ${escapeHtml(surfaceDefault)}"`,
+        [{ label: '', options }], selected || '');
 }
 
 function rowHtml(row, group) {
@@ -334,6 +358,12 @@ function rowHtml(row, group) {
     const profiles = session ? (state.profilesByHarness[split.harness] || []) : [];
     const profileOptions = profileOptionsFor(profiles, row.route.profile_id);
     const last = state.lastExecutions[row.slot_id];
+    const lastText = last ? describeLastExecution(last) : '';
+    // ONE quiet meta line per row (owner feedback): the delivery badge and the
+    // last-run projection share it; nothing is dropped — the raw route + ISO
+    // timestamp live in the tooltip.
+    const metaParts = [capabilityBadge(row, harnessesById())];
+    if (lastText) metaParts.push(`Last run: ${lastText}`);
     const surfaceDefault = group === 'scope' ? 'scope review effort' : 'review effort';
     return `
         <div class="reviewer-slot-row" data-slot-group="${group}" data-slot-id="${escapeHtml(row.slot_id)}">
@@ -345,8 +375,7 @@ function rowHtml(row, group) {
                 ${effortSelectHtml('data-slot-effort aria-label="Reasoning effort"', row.effort, surfaceDefault)}
                 <button type="button" class="settings-ghost-btn" data-slot-remove title="Remove this slot">Remove</button>
             </div>
-            <div class="reviewer-slot-meta muted">${escapeHtml(capabilityBadge(row, harnessesById()))}</div>
-            ${last ? `<div class="reviewer-slot-runs-as muted" title="UI projection of capability_delta (D22)">Last run: ${escapeHtml(describeLastExecution(last))}</div>` : ''}
+            <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
         </div>
     `;
 }
@@ -363,6 +392,10 @@ function advisoryHtml() {
         { label: 'API', options: [{ value: API_ROUTE_CHOICE, label: 'Claude (Anthropic API key)' }] },
         ...routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice }).slice(1),
     ];
+    const last = state.lastExecutions.advisory_slot_1;
+    const lastText = last ? describeLastExecution(last) : '';
+    const metaParts = [capabilityBadge({ route: advisory.route || {} }, harnessesById())];
+    if (lastText) metaParts.push(`Last run: ${lastText}`);
     return `
         <div class="reviewer-slot-row" data-advisory-row>
             <div class="reviewer-slot-controls">
@@ -370,8 +403,7 @@ function advisoryHtml() {
                 ${selectHtml('data-advisory-route aria-label="Advisory route"', groups, choice)}
                 ${effortSelectHtml('data-advisory-effort aria-label="Advisory effort"', advisory.effort === 'low' ? '' : advisory.effort, 'low')}
             </div>
-            <div class="reviewer-slot-meta muted">${escapeHtml(capabilityBadge({ route: advisory.route || {} }, harnessesById()))}</div>
-            ${state.lastExecutions.advisory_slot_1 ? `<div class="reviewer-slot-runs-as muted" title="UI projection of capability_delta (D22)">Last run: ${escapeHtml(describeLastExecution(state.lastExecutions.advisory_slot_1))}</div>` : ''}
+            <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
         </div>
     `;
 }
@@ -402,10 +434,12 @@ function renderRows() {
         datalist.innerHTML = state.catalogModels
             .map((id) => `<option value="${escapeHtml(id)}"></option>`).join('');
     }
+    // The count stays in the heading; what the limit MEANS moved to the span's
+    // title (owner feedback: headers carried parenthetical jargon).
     const triadLimit = document.getElementById('reviewer-triad-limit');
-    if (triadLimit) triadLimit.textContent = `(${state.triad.length}/${state.limits.triad} — the commit gate's real ceiling)`;
+    if (triadLimit) triadLimit.textContent = `${state.triad.length}/${state.limits.triad}`;
     const scopeLimit = document.getElementById('reviewer-scope-limit');
-    if (scopeLimit) scopeLimit.textContent = `(${state.scope.length}/${state.limits.scope} — the scope pool's real width)`;
+    if (scopeLimit) scopeLimit.textContent = `${state.scope.length}/${state.limits.scope}`;
     const addTriad = document.getElementById('btn-add-triad-slot');
     if (addTriad) addTriad.disabled = state.triad.length >= state.limits.triad;
     const addScope = document.getElementById('btn-add-scope-slot');
