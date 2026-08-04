@@ -15,7 +15,6 @@ MINIMAX_REGION_ENDPOINTS: dict[str, str] = {
     "cn_zh": "https://api.minimaxi.com/v1",
 }
 MINIMAX_DEFAULT_REGION = "global_en"
-MINIMAX_MODEL_IDS: tuple[str, ...] = ("MiniMax-M3", "MiniMax-M2.7")
 
 
 def resolve_minimax_base_url(region: str = "") -> str:
@@ -305,7 +304,10 @@ MINIMAX_DIRECT_DEFAULTS = {
     "heavy": "minimax::MiniMax-M3",
     "light": "minimax::MiniMax-M2.7",
     "fallback": "minimax::MiniMax-M2.7",
-    "deep_self_review": "minimax::MiniMax-M3",
+    # NO deep_self_review default: MiniMax documents M3 as "up to 1M tokens" with a
+    # GUARANTEED minimum of 512K (platform.minimax.io, 2026-08). Deep review sizes
+    # against a firm 1M window, so the guaranteed floor decides — the slot follows
+    # the Cloud.ru/GigaChat clear-instead-of-fill path; owners can opt in manually.
 }
 
 ANTHROPIC_DIRECT_DEFAULTS = {

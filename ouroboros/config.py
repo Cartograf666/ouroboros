@@ -512,15 +512,10 @@ def _exclusive_direct_remote_provider_env() -> str:
     # exactly one is configured.
     if has_openrouter or has_legacy_base or has_compatible:
         return ""
-    direct = [
-        name for name, present in (
-            ("openai", has_openai),
-            ("anthropic", has_anthropic),
-            ("minimax", has_minimax),
-            ("cloudru", has_cloudru),
-            ("gigachat", has_gigachat),
-        ) if present
-    ]
+    direct = [name for name, present in (
+        ("openai", has_openai), ("anthropic", has_anthropic), ("minimax", has_minimax),
+        ("cloudru", has_cloudru), ("gigachat", has_gigachat),
+    ) if present]
     return direct[0] if len(direct) == 1 else ""
 
 

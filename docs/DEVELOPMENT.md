@@ -356,8 +356,8 @@ not migrate their runtime representations.
 ### Provider Independence
 
 Ouroboros must remain fully operational when configured with a SINGLE isolated
-provider — a local model, or only one of OpenAI / Anthropic / Cloud.ru / GigaChat —
-with no second provider and no OpenRouter. This is a standing invariant, not a
+provider — a local model, or only one of OpenAI / Anthropic / MiniMax / Cloud.ru /
+GigaChat — with no second provider and no OpenRouter. This is a standing invariant, not a
 per-feature nicety:
 
 - **Core capability floor.** The agent loop, the multi-model commit (triad)

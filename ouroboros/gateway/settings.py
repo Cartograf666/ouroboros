@@ -229,6 +229,9 @@ _RESTART_REQUIRED_KEYS = frozenset({
     "OPENAI_BASE_URL",
     "OPENAI_COMPATIBLE_BASE_URL",
     "CLOUDRU_FOUNDATION_MODELS_BASE_URL",
+    # Region selects the MiniMax base URL (api.minimax.io vs api.minimaxi.com),
+    # so it changes routing exactly like the base-URL keys above it.
+    "MINIMAX_REGION",
     "GIGACHAT_SCOPE",
     "GIGACHAT_BASE_URL",
     "GIGACHAT_VERIFY_SSL_CERTS",
@@ -521,12 +524,12 @@ def _max_context_block(settings: Dict[str, Any], *, allow_generative: bool = Fal
         from ouroboros.config import DATA_DIR
 
         route = _active_main_route(settings)
-        # Thread the in-flight OPENAI_COMPATIBLE_API_KEY into the probe ONLY when the
-        # active route is openai-compatible (first-run onboarding, where the key is not
-        # yet on disk). For any other provider this override would reach
+        # Thread the in-flight key into the probe ONLY for the active route's own
+        # provider (openai-compatible or minimax; first-run onboarding, where the key
+        # is not yet on disk). Threading another provider's key would reach
         # LLMClient.probe_oversized_context and replace that provider's resolved key
-        # with the compatible one on the generative probe path (cross-provider key bleed,
-        # since the generative probe also runs for openai/openrouter/cloudru).
+        # on the generative probe path (cross-provider key bleed, since the
+        # generative probe also runs for openai/openrouter/cloudru).
         route_api_key = None
         if route.get("provider") == "openai-compatible":
             route_api_key = str(settings.get("OPENAI_COMPATIBLE_API_KEY") or "") or None

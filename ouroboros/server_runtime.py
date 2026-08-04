@@ -45,12 +45,14 @@ _DIRECT_PROVIDER_AUTO_DEFAULTS = {
         "OUROBOROS_MODEL_LIGHT": GIGACHAT_DIRECT_DEFAULTS["light"],
         "OUROBOROS_MODEL_FALLBACKS": GIGACHAT_DIRECT_DEFAULTS["fallback"],
     },
+    # NB: no OUROBOROS_MODEL_DEEP_SELF_REVIEW — MiniMax guarantees only a 512K
+    # window floor ("up to 1M"), below the 1M deep-review sizing target, so the
+    # slot takes the same clear-instead-of-fill branch as Cloud.ru/GigaChat.
     "minimax": {
         "OUROBOROS_MODEL": MINIMAX_DIRECT_DEFAULTS["main"],
         "OUROBOROS_MODEL_HEAVY": MINIMAX_DIRECT_DEFAULTS["heavy"],
         "OUROBOROS_MODEL_LIGHT": MINIMAX_DIRECT_DEFAULTS["light"],
         "OUROBOROS_MODEL_FALLBACKS": MINIMAX_DIRECT_DEFAULTS["fallback"],
-        "OUROBOROS_MODEL_DEEP_SELF_REVIEW": MINIMAX_DIRECT_DEFAULTS["deep_self_review"],
     },
 }
 # Legacy values that should be auto-replaced with a provider's direct defaults.
