@@ -510,4 +510,72 @@
  * @property {boolean=} ok
  */
 
+/**
+ * @typedef {Object} UpdateMergePlan
+ * @property {boolean=} available
+ * @property {boolean=} auto_mergeable
+ * @property {'clean'|'conflicting'|'current'|'unavailable'|'unknown'=} kind
+ * @property {string=} error
+ * @property {string=} remote
+ * @property {string=} remote_branch
+ * @property {string=} target_ref
+ * @property {string=} update_channel
+ * @property {string=} current_branch
+ * @property {string=} base_sha
+ * @property {string=} target_sha
+ * @property {number=} local_dirty_count
+ * @property {string=} local_snapshot
+ * @property {string=} merge_commit
+ * @property {string[]=} code_conflict_paths
+ * @property {string[]=} doc_conflict_paths
+ * @property {string[]=} hot_code_paths
+ * @property {'auto_merge'|'assisted'=} recommended_strategy
+ */
+
+/**
+ * @typedef {Object} UpdatePreflightRequest
+ */
+
+/**
+ * @typedef {Object} UpdatePreflightResponse
+ * @property {UpdateMergePlan} merge_plan
+ */
+
+/**
+ * @typedef {Object} UpdateApplyRequest
+ * @property {'auto_merge'|'assisted'|'manual'|'replace'} strategy
+ * @property {string=} expected_base_sha
+ * @property {string=} expected_target_sha
+ * @property {boolean=} confirm_recovery
+ */
+
+/**
+ * @typedef {Object} UpdateApplySuccessResponse
+ * @property {'ok'|'restart_required'|'assisted_started'|'manual'} status
+ * @property {boolean=} restarting
+ * @property {'auto_merge'|'assisted'|'manual'|'replace'=} strategy
+ * @property {string=} task_id
+ * @property {UpdateMergePlan=} merge_plan
+ * @property {string=} error
+ */
+
+/**
+ * @typedef {Object} UpdateApplyErrorResponse
+ * @property {string} error
+ * @property {string=} reason
+ * @property {string[]=} blockers
+ * @property {boolean=} rolled_back
+ * @property {string=} rollback
+ * @property {boolean=} restart_required
+ * @property {UpdateMergePlan=} merge_plan
+ * @property {Object=} smoke
+ */
+
+/**
+ * @typedef {Object} UpdateStatusReadyOutbound
+ * @property {'update_status_ready'} type
+ * @property {boolean} available
+ * @property {?boolean} check_ok
+ */
+
 export const GATEWAY_CONTRACT_VERSION = '6.87.6';

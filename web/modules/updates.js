@@ -1,6 +1,6 @@
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 import { showToast } from './toast.js';
-import { apiFetch } from './api_client.js';
+import { apiClient, apiFetch, updateStrategyForPlan } from './api_client.js';
 
 export function initUpdates({ mount, state }) {
     const page = document.createElement('div');
@@ -24,11 +24,16 @@ export function initUpdates({ mount, state }) {
                 <div class="updates-actions">
                     <button class="btn btn-primary" id="btn-update-apply" disabled>Update Now</button>
                 </div>
+                <details class="updates-recovery">
+                    <summary>Recovery</summary>
+                    <p>Replace the active checkout with the exact official version from the selected channel. A rescue copy is saved first, but this is intentionally more destructive than Update Now.</p>
+                    <button class="btn btn-danger btn-sm" id="btn-update-replace">Replace with Official Version (Recovery)</button>
+                </details>
             </section>
             <section class="updates-card">
                 <div class="evo-versions-header">
                     <div id="updates-current" class="evo-versions-branch"></div>
-                    <button class="btn btn-primary" id="updates-promote">Promote to Stable</button>
+                    <button class="btn btn-primary" id="updates-promote">Promote to QA</button>
                 </div>
                 <div class="evo-versions-cols">
                     <div class="evo-versions-col">
@@ -51,6 +56,7 @@ export function initUpdates({ mount, state }) {
 
     const checkBtn = page.querySelector('#btn-update-check');
     const applyBtn = page.querySelector('#btn-update-apply');
+    const replaceBtn = page.querySelector('#btn-update-replace');
     const badge = page.querySelector('#updates-badge');
     const summary = page.querySelector('#updates-summary');
     const meta = page.querySelector('#updates-meta');
@@ -84,18 +90,30 @@ export function initUpdates({ mount, state }) {
                 <span class="evo-runtime-chip"><strong>Action:</strong> use git or install a launcher-managed build</span>
             `;
             applyBtn.disabled = true;
+            replaceBtn.disabled = true;
             applyBtn.dataset.safe = '0';
             applyBtn.textContent = 'Unavailable';
             setBadge('offline', 'Unavailable');
             return;
         }
-        if (Array.isArray(data.warnings) && data.warnings.includes('official_status_requires_check')) {
+        if (!data.from_cache && Array.isArray(data.warnings) && data.warnings.includes('official_status_requires_check')) {
             summary.textContent = 'Click Check for updates to refresh official update status.';
             meta.innerHTML = '<span class="evo-runtime-chip"><strong>Official repo:</strong> razzant/ouroboros</span>';
             applyBtn.disabled = true;
+            replaceBtn.disabled = false;
             applyBtn.dataset.safe = '0';
             applyBtn.textContent = 'Check Required';
             setBadge('offline', 'Not checked');
+            return;
+        }
+        if (data.check_ok === false) {
+            summary.textContent = 'Could not check the official update channel. Try again when the network is available.';
+            meta.innerHTML = '<span class="evo-runtime-chip"><strong>Official repo:</strong> razzant/ouroboros</span>';
+            applyBtn.disabled = true;
+            replaceBtn.disabled = false;
+            applyBtn.dataset.safe = '0';
+            applyBtn.textContent = 'Check Failed';
+            setBadge('error', 'Check failed');
             return;
         }
         const currentVersion = data.current_version || 'unknown';
@@ -111,12 +129,14 @@ export function initUpdates({ mount, state }) {
         meta.innerHTML = [
             `<span class="evo-runtime-chip"><strong>Official repo:</strong> razzant/ouroboros</span>`,
             `<span class="evo-runtime-chip"><strong>Remote ref:</strong> ${escapeHtml(data.remote || 'managed')}/${escapeHtml(data.remote_branch || '')}</span>`,
+            `<span class="evo-runtime-chip"><strong>Channel:</strong> ${escapeHtml(data.update_channel || 'stable')}</span>`,
             `<span class="evo-runtime-chip"><strong>Divergence:</strong> ${escapeHtml(divergenceText(data))}</span>`,
             `<span class="evo-runtime-chip"><strong>Latest:</strong> ${escapeHtml(latestMsg)}</span>`,
         ].join('');
         applyBtn.disabled = !canUpdate;
+        replaceBtn.disabled = false;
         applyBtn.dataset.safe = safe ? '1' : '0';
-        applyBtn.textContent = !canUpdate ? 'No Update Available' : (safe ? 'Update Now' : 'Update with Options');
+        applyBtn.textContent = !canUpdate ? 'No Update Available' : 'Update Now';
         setBadge(canUpdate ? (safe ? 'online' : 'starting') : 'offline', canUpdate ? 'Available' : 'Current');
     }
 
@@ -124,18 +144,14 @@ export function initUpdates({ mount, state }) {
         checkBtn.disabled = true;
         setBadge('starting', fetchRemote ? 'Checking...' : 'Loading...');
         try {
-            const resp = await apiFetch(fetchRemote ? '/api/update/check' : '/api/update/status', {
-                method: fetchRemote ? 'POST' : 'GET',
-                cache: 'no-store',
-            });
-            const data = await resp.json().catch(() => ({}));
-            if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+            const data = await (fetchRemote ? apiClient.updateCheck() : apiClient.updateStatus());
             renderStatus(data);
             renderOfficialTags(data.official_tags || []);
         } catch (err) {
             summary.textContent = `Failed to load update status: ${err.message || err}`;
             meta.innerHTML = '';
             applyBtn.disabled = true;
+            replaceBtn.disabled = true;
             setBadge('error', 'Error');
         } finally {
             checkBtn.disabled = false;
@@ -206,8 +222,13 @@ export function initUpdates({ mount, state }) {
             const data = await resp.json();
             if (data.status === 'ok') {
                 showToast(`Rollback successful: ${data.message}. Server is restarting...`, 'success');
+            } else if (data.status === 'restart_required') {
+                showToast(`Rollback completed: ${data.message}. Restart Ouroboros to finish.`, 'error');
             } else {
-                showToast(`Rollback failed: ${data.error || 'unknown error'}`, 'error');
+                const suffix = data.restart_required
+                    ? ' Runtime shutdown was incomplete; restart Ouroboros before retrying.'
+                    : '';
+                showToast(`Rollback failed: ${data.error || 'unknown error'}${suffix}`, 'error');
             }
         } catch (err) {
             showToast('Rollback failed: ' + (err.message || err), 'error');
@@ -216,32 +237,54 @@ export function initUpdates({ mount, state }) {
 
     async function applyUpdate() {
         if (!latestStatus?.available) return;
-        const safe = latestStatus.safe_to_apply;
-        let strategy = 'replace';
-        if (!safe) {
-            const localBits = divergenceText(latestStatus);
-            const proceed = confirm(
-                `This update will replace the active managed checkout with the selected official version.\n\nLocal state: ${localBits}\n\nLocal commits will be preserved on a local-keep-* branch before the active branch moves. Dirty files will be saved in a rescue snapshot. Continue?`,
-            );
-            if (!proceed) return;
-            strategy = latestStatus.ahead ? 'stash' : 'replace';
-        }
         applyBtn.disabled = true;
-        applyBtn.textContent = 'Preparing...';
+        applyBtn.textContent = 'Checking...';
         try {
-            const resp = await apiFetch('/api/update/apply', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ strategy }),
-            });
-            const data = await resp.json().catch(() => ({}));
-            if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-            const keep = data.keep_branch ? ` Local commits preserved as ${data.keep_branch}.` : '';
-            showToast(`Update prepared. Server is restarting.${keep}`, 'success');
+            const preflight = await apiClient.updatePreflight();
+            const plan = preflight?.merge_plan || {};
+            const strategy = updateStrategyForPlan(plan);
+            if (!strategy) throw new Error(plan.error || 'No actionable update plan is available.');
+            applyBtn.textContent = 'Applying...';
+            const data = await apiClient.updateApply(strategy, plan);
+            if (data.status === 'assisted_started') {
+                showToast('Ouroboros is resolving the update merge under review. Watch progress in chat.', 'success');
+            } else if (data.status === 'restart_required') {
+                showToast('Update landed, but automatic restart failed. Restart Ouroboros to finish.', 'error');
+            } else {
+                showToast('Update applied. Server is restarting.', 'success');
+            }
         } catch (err) {
-            showToast('Update failed: ' + (err.message || err), 'error');
-            applyBtn.disabled = false;
-            applyBtn.textContent = safe ? 'Update Now' : 'Update with Options';
+            const restartRequired = Boolean(err?.body?.restart_required);
+            const suffix = restartRequired ? ' Runtime shutdown was incomplete; restart Ouroboros before retrying.' : '';
+            showToast('Update failed: ' + (err.message || err) + suffix, 'error');
+            applyBtn.disabled = restartRequired;
+            applyBtn.textContent = restartRequired ? 'Restart Required' : 'Update Now';
+        }
+    }
+
+    async function replaceWithOfficial() {
+        const proceed = confirm(
+            'Recovery will replace the active checkout with the exact official version from the selected channel.\n\nA rescue snapshot and a local keep branch preserve a copy, but the active branch will be reset. Continue?',
+        );
+        if (!proceed) return;
+        replaceBtn.disabled = true;
+        try {
+            const preflight = await apiClient.updatePreflight();
+            const plan = preflight?.merge_plan || {};
+            if (!plan.base_sha || !plan.target_sha) {
+                throw new Error(plan.error || 'Could not resolve an exact recovery target.');
+            }
+            const data = await apiClient.updateApply('replace', plan, { confirmRecovery: true });
+            if (data.status === 'restart_required') {
+                showToast('Recovery landed, but automatic restart failed. Restart Ouroboros to finish.', 'error');
+            } else {
+                showToast('Official version restored. Server is restarting.', 'success');
+            }
+        } catch (err) {
+            const restartRequired = Boolean(err?.body?.restart_required);
+            const suffix = restartRequired ? ' Runtime shutdown was incomplete; restart Ouroboros before retrying.' : '';
+            showToast('Recovery failed: ' + (err.message || err) + suffix, 'error');
+            replaceBtn.disabled = restartRequired;
         }
     }
 
@@ -250,6 +293,7 @@ export function initUpdates({ mount, state }) {
         loadVersions();
     });
     applyBtn.addEventListener('click', applyUpdate);
+    replaceBtn.addEventListener('click', replaceWithOfficial);
     page.querySelector('#updates-promote').addEventListener('click', async () => {
         if (!confirm('Promote current ouroboros branch to ouroboros-stable?')) return;
         try {

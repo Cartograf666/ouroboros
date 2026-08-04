@@ -52,7 +52,7 @@ def test_scope_review_uses_active_subject_and_system_governance(tmp_path, monkey
 
     def fake_build(repo_dir, _message, **kwargs):
         captured["subject"] = pathlib.Path(repo_dir)
-        captured["governance"] = pathlib.Path(kwargs["governance_repo_dir"])
+        captured["governance"] = pathlib.Path(kwargs["context"].governance_repo_dir)
         return None, mod._TouchedContextStatus(status="empty")
 
     monkeypatch.setattr(mod, "_build_scope_prompt", fake_build)
@@ -94,6 +94,31 @@ def test_scope_review_refuses_ambiguous_workspace_root(tmp_path):
     assert result.blocked is True
     assert result.status == "error"
     assert "workspace_root is set without workspace_mode" in result.block_message
+
+
+def test_managed_resolver_enables_binary_metadata_context(tmp_path, monkeypatch):
+    mod = _get_module("ouroboros.tools.scope_review")
+    registry = _get_module("ouroboros.tools.registry")
+    repo = tmp_path / "repo"
+    drive = tmp_path / "data"
+    repo.mkdir()
+    drive.mkdir()
+    captured = {}
+
+    def fake_build(_repo_dir, _message, **kwargs):
+        captured["represent_binary"] = kwargs["context"].represent_binary
+        return None, mod._TouchedContextStatus(status="empty")
+
+    monkeypatch.setattr(mod, "_build_scope_prompt", fake_build)
+    monkeypatch.setattr(
+        registry, "_authorized_managed_update_resolver", lambda _ctx: True
+    )
+    ctx = registry.ToolContext(repo_dir=repo, drive_root=drive, task_id="resolver")
+
+    result = mod.run_scope_review(ctx, "review assisted update", scope_model="test")
+
+    assert result.blocked is True
+    assert captured == {"represent_binary": True}
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +184,94 @@ class TestTouchedFilePack:
         pack, omitted = mod.build_touched_file_pack(tmp_path, ["image.png"])
         assert "image.png" in omitted
         assert "```" not in pack or "image.png" not in pack.split("```")[1] if "```" in pack else True
+
+    def test_represents_binary_with_exact_git_metadata(self, tmp_path):
+        subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@ouroboros"],
+            cwd=str(tmp_path), check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "TestBot"],
+            cwd=str(tmp_path), check=True,
+        )
+        binary = tmp_path / "native.so"
+        binary.write_bytes(b"old\x00payload")
+        subprocess.run(["git", "add", "-f", "native.so"], cwd=str(tmp_path), check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=str(tmp_path), check=True)
+        binary.write_bytes(b"new\x00payload")
+        subprocess.run(["git", "add", "native.so"], cwd=str(tmp_path), check=True)
+
+        mod = _get_module("ouroboros.tools.review_helpers")
+        pack, omitted = mod.build_touched_file_pack(
+            tmp_path, ["native.so"], represent_binary=True
+        )
+
+        assert omitted == []
+        assert "staged blob" in pack
+        assert "pre-merge HEAD blob" in pack
+        assert "official MERGE_HEAD blob" in pack
+        assert "unknown" not in pack
+
+    def test_binary_metadata_without_stage_zero_stays_omitted(self, tmp_path):
+        subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+        (tmp_path / "native.so").write_bytes(b"unstaged\x00payload")
+
+        mod = _get_module("ouroboros.tools.review_helpers")
+        pack, omitted = mod.build_touched_file_pack(
+            tmp_path, ["native.so"], represent_binary=True
+        )
+
+        assert omitted == ["native.so"]
+        assert "no readable stage-0" in pack
+
+    def test_staged_binary_deletion_has_exact_parent_metadata(self, tmp_path):
+        subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@ouroboros"], cwd=str(tmp_path), check=True)
+        subprocess.run(["git", "config", "user.name", "TestBot"], cwd=str(tmp_path), check=True)
+        binary = tmp_path / "logo.png"
+        binary.write_bytes(b"png\x00payload")
+        subprocess.run(["git", "add", "logo.png"], cwd=str(tmp_path), check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=str(tmp_path), check=True)
+        subprocess.run(["git", "rm", "logo.png"], cwd=str(tmp_path), check=True)
+
+        helpers = _get_module("ouroboros.tools.review_helpers")
+        pack, omitted = helpers.build_touched_file_pack(
+            tmp_path, ["logo.png"], represent_binary=True
+        )
+        scope = _get_module("ouroboros.tools.scope_review")
+        scope_pack = scope._inline_deleted_file_pack(
+            "", ["logo.png"], tmp_path, represent_binary=True
+        )
+
+        assert omitted == []
+        assert "staged blob: `absent (deletion)`" in pack
+        assert "pre-merge HEAD:" in pack
+        assert "staged blob: `absent (deletion)`" in scope_pack
+
+    def test_extensionless_binary_deletion_has_exact_parent_metadata(self, tmp_path):
+        subprocess.run(["git", "init"], cwd=str(tmp_path), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@ouroboros"], cwd=str(tmp_path), check=True)
+        subprocess.run(["git", "config", "user.name", "TestBot"], cwd=str(tmp_path), check=True)
+        binary = tmp_path / "firmware"
+        binary.write_bytes(b"firmware\x00payload")
+        subprocess.run(["git", "add", "firmware"], cwd=str(tmp_path), check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=str(tmp_path), check=True)
+        subprocess.run(["git", "rm", "firmware"], cwd=str(tmp_path), check=True)
+
+        helpers = _get_module("ouroboros.tools.review_helpers")
+        pack, omitted = helpers.build_touched_file_pack(
+            tmp_path, ["firmware"], represent_binary=True
+        )
+        scope = _get_module("ouroboros.tools.scope_review")
+        scope_pack = scope._inline_deleted_file_pack(
+            "", ["firmware"], tmp_path, represent_binary=True
+        )
+
+        assert omitted == []
+        assert "staged blob: `absent (deletion)`" in pack
+        assert "pre-merge HEAD:" in pack
+        assert "staged blob: `absent (deletion)`" in scope_pack
 
     def test_omits_large_files(self, tmp_path):
         # _FILE_SIZE_LIMIT is now 1MB; write a file slightly above that threshold
@@ -590,12 +703,16 @@ class TestRunScopeReviewFailClosed:
         )
 
         _, status_full = mod._build_scope_prompt(
-            tmp_path, "test commit", scope_model="anthropic/claude-fable-5"
+            tmp_path,
+            "test commit",
+            context=mod._ScopePromptContext(scope_model="anthropic/claude-fable-5"),
         )
         assert status_full.status == "fixed_overflow"
 
         _, status_sub = mod._build_scope_prompt(
-            tmp_path, "test commit", scope_model="gigachat::GigaChat-3-Ultra"
+            tmp_path,
+            "test commit",
+            context=mod._ScopePromptContext(scope_model="gigachat::GigaChat-3-Ultra"),
         )
         assert status_sub.status == "budget_exceeded"
 

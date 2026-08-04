@@ -490,6 +490,30 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
+                        <h3>Update Channel</h3>
+                        <div class="settings-section-copy">
+                            Chooses which official branch Update checks. Your local work branch stays <code>ouroboros</code>.
+                            <code>Stable</code> follows released code on <code>main</code> (default),
+                            <code>QA</code> follows <code>ouroboros-stable</code>, and
+                            <code>Development</code> follows <code>ouroboros</code>.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label>Official Update Source</label>
+                            <input id="s-update-channel" type="hidden" value="stable">
+                            ${renderSegmentedField({
+                                target: 's-update-channel',
+                                modifier: 'data-update-channel-group',
+                                title: 'Applies immediately; no restart required.',
+                                options: [
+                                    { value: 'stable', label: 'Stable' },
+                                    { value: 'qa', label: 'QA' },
+                                    { value: 'development', label: 'Development' },
+                                ],
+                            })}
+                        </div>
+                    </div>
+
+                    <div class="form-section">
                         <h3>Runtime Mode</h3>
                         <div class="settings-section-copy">
                             Separate axis from Review Enforcement. Controls how far Ouroboros is allowed to self-modify.

@@ -361,6 +361,31 @@ def _isolate_workspace_executor_globals():
                 svc._SERVICES.update(saved_svc_services)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_repo_writer_gate():
+    """Reset the process-global repo-writer admission latch between tests.
+
+    ``supervisor.workers._repo_writer_gate_reason`` is process-wide by design (the
+    managed-update fence). A test that drives a REAL ``rollback_managed_update``
+    boot path closes it with ``reopen_writer_admission=False`` — deliberately, on
+    the production contract that a restart clears it — but the pytest process
+    never restarts, so the latch leaks into whatever test xdist schedules next
+    (e.g. the emergency-cleanup shutdown test then sees ``preserve_pending``).
+    Snapshot → run → restore, same pattern as the service-registry isolation."""
+    try:
+        from supervisor import workers
+    except Exception:
+        yield
+        return
+    with workers._repo_writer_gate_lock:
+        saved = workers._repo_writer_gate_reason
+    try:
+        yield
+    finally:
+        with workers._repo_writer_gate_lock:
+            workers._repo_writer_gate_reason = saved
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_teardown(item, nextitem):  # noqa: ARG001
     """Keep a valid asyncio event loop available during the teardown phase.

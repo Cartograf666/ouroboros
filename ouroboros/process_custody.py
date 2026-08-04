@@ -29,14 +29,17 @@ import logging
 import os
 import pathlib
 import subprocess
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
 from ouroboros.platform_layer import (
+    kill_process_tree,
     kill_process_group_id,
     pid_is_alive,
     process_command,
     process_group_id,
+    process_group_is_alive,
     process_start_time,
     subprocess_new_group_kwargs,
 )
@@ -133,7 +136,8 @@ def record_process(
         "owner_task": str(owner_task_id or ""),
         "session_id": _SESSION_ID,
     }
-    append_jsonl(ledger_path(drive_root), entry)
+    if not append_jsonl(ledger_path(drive_root), entry):
+        raise OSError("process custody record could not be written")
     return entry
 
 
@@ -167,8 +171,14 @@ def spawn_supervised(
             scope=scope,
             owner_task_id=owner_task_id,
         )
-    except Exception:
+    except Exception as exc:
         log.warning("process custody record failed for pid %s (%s)", proc.pid, purpose, exc_info=True)
+        kill_process_tree(proc)
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        raise RuntimeError("spawned process could not enter durable custody") from exc
     return proc
 
 
@@ -200,10 +210,25 @@ def _fingerprint_matches(entry: Dict[str, Any]) -> bool:
     return True
 
 
-def _read_ledger(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
+def _service_group_survives_leader(entry: Dict[str, Any]) -> bool:
+    """Keep dead-leader service evidence while its recorded group still exists."""
+    purpose = str(entry.get("purpose") or "")
+    scope = str(entry.get("scope") or "")
+    pgid = int(entry.get("pgid") or 0)
+    return bool(
+        purpose.startswith(("service:", "workspace_service:"))
+        and scope in {"task", "session"}
+        and pgid > 0
+        and process_group_is_alive(pgid)
+    )
+
+
+def _read_ledger_records(
+    drive_root: pathlib.Path, *, strict: bool
+) -> tuple[bool, List[Dict[str, Any]]]:
     path = ledger_path(drive_root)
     if not path.exists():
-        return []
+        return True, []
     entries: List[Dict[str, Any]] = []
     try:
         import json
@@ -215,11 +240,16 @@ def _read_ledger(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
             try:
                 obj = json.loads(line)
             except ValueError:
+                if strict:
+                    return False, []
                 continue
-            if isinstance(obj, dict) and obj.get("pid"):
-                entries.append(obj)
+            if not isinstance(obj, dict) or not obj.get("pid"):
+                if strict:
+                    return False, []
+                continue
+            entries.append(obj)
     except OSError:
-        return []
+        return False, []
     # Last record per pid wins (a pid may be re-registered by a newer spawn).
     by_pid: Dict[int, Dict[str, Any]] = {}
     for entry in entries:
@@ -228,7 +258,15 @@ def _read_ledger(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
         except (TypeError, ValueError):
             continue
     by_pid.pop(0, None)
-    return list(by_pid.values())
+    return True, list(by_pid.values())
+
+
+def _read_ledger_strict(drive_root: pathlib.Path) -> tuple[bool, List[Dict[str, Any]]]:
+    return _read_ledger_records(drive_root, strict=True)
+
+
+def _read_ledger(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
+    return _read_ledger_records(drive_root, strict=False)[1]
 
 
 def _rewrite_ledger(drive_root: pathlib.Path, entries: List[Dict[str, Any]]) -> None:
@@ -332,6 +370,63 @@ def live_kept_service_pids(drive_root: pathlib.Path) -> "set[int]":
     return pids
 
 
+def quiesce_custodied_services(
+    drive_root: pathlib.Path, *, timeout_sec: float = 5.0
+) -> tuple[bool, List[str]]:
+    """Kill and verify every ledgered task/session service before repo replacement."""
+    drive_root = pathlib.Path(drive_root)
+    readable, entries = _read_ledger_strict(drive_root)
+    if not readable:
+        return False, ["custody_ledger:unreadable"]
+    targets: List[Dict[str, Any]] = []
+    survivors: List[Dict[str, Any]] = []
+    blockers: List[str] = []
+    for entry in entries:
+        purpose = str(entry.get("purpose") or "")
+        is_service = purpose.startswith(("service:", "workspace_service:"))
+        leader_matches = _fingerprint_matches(entry)
+        if (
+            is_service
+            and str(entry.get("scope") or "") in {"task", "session"}
+            and (leader_matches or _service_group_survives_leader(entry))
+        ):
+            targets.append(entry)
+        elif leader_matches:
+            survivors.append(entry)
+
+    from ouroboros.platform_layer import kill_pid_tree
+
+    for entry in targets:
+        pid = int(entry.get("pid") or 0)
+        pgid = int(entry.get("pgid") or 0)
+        if pgid > 0:
+            kill_process_group_id(pgid)
+        else:
+            kill_pid_tree(pid)
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while targets and time.monotonic() < deadline:
+        if not any(
+            _fingerprint_matches(entry) or _service_group_survives_leader(entry)
+            for entry in targets
+        ):
+            break
+        time.sleep(0.05)
+    for entry in targets:
+        if _fingerprint_matches(entry) or _service_group_survives_leader(entry):
+            survivors.append(entry)
+            blockers.append(f"custody_service:{int(entry.get('pid') or 0)}")
+        else:
+            append_jsonl(drive_root / "logs" / "supervisor.jsonl", {
+                "ts": utc_now_iso(),
+                "type": "process_reaped_for_update",
+                "pid": int(entry.get("pid") or 0),
+                "pgid": int(entry.get("pgid") or 0),
+                "purpose": entry.get("purpose"),
+            })
+    _rewrite_ledger(drive_root, survivors)
+    return not blockers, blockers
+
+
 def reap_orphaned_processes(
     drive_root: pathlib.Path,
     *,
@@ -382,8 +477,10 @@ def reap_orphaned_processes(
         pid = int(entry.get("pid") or 0)
         scope = str(entry.get("scope") or "task")
         same_session = str(entry.get("session_id") or "") == _SESSION_ID
-        if not _fingerprint_matches(entry):
-            continue  # dead or recycled pid: prune silently
+        leader_matches = _fingerprint_matches(entry)
+        group_survives = _service_group_survives_leader(entry)
+        if not leader_matches and not group_survives:
+            continue  # dead/recycled pid with no surviving service group: prune silently
         owner_task = str(entry.get("owner_task") or "")
         purpose = str(entry.get("purpose") or "")
         task_owner_gone = (

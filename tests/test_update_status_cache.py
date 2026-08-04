@@ -1,85 +1,122 @@
-"""Regression tests for passive managed-update status cache overlay."""
+"""Target-bound passive managed-update cache regressions."""
 
 import ouroboros.gateway.control as control
 import supervisor.git_ops as git_ops
-import supervisor.state as supervisor_state
 
 
-def _base_status(current_sha: str) -> dict:
-    return {
-        "managed": True,
-        "current_sha": current_sha,
-        "current_short_sha": current_sha[:8],
-        "current_branch": "ouroboros",
-        "target_ref": "managed/ouroboros",
-        "dirty": False,
-        "available": False,
-        "safe_to_apply": False,
-        "warnings": ["official_status_requires_check"],
-    }
+CURRENT = "a" * 40
+LATEST = "b" * 40
 
 
-def _wire_status(monkeypatch, *, current_sha: str, latest_sha: str, target_is_ancestor: bool = False) -> None:
-    monkeypatch.setattr(git_ops, "compute_managed_update_status", lambda fetch=False: _base_status(current_sha))
+def _wire(monkeypatch, *, cache_channel="stable", cache_ref="refs/ouroboros-managed/tags/v6.87.5", ancestor=False):
+    import ouroboros.update_channels as update_channels
+
+    monkeypatch.setattr(update_channels, "get_update_channel", lambda settings=None: "stable")
+    monkeypatch.setattr(git_ops, "_read_managed_repo_meta", lambda: {"managed_remote_name": "managed"})
+    monkeypatch.setattr(git_ops, "managed_branch_defaults", lambda: ("ouroboros", "ouroboros-stable"))
+    monkeypatch.setattr(git_ops, "_managed_update_target", lambda: ("managed", "main", "managed/main"))
     monkeypatch.setattr(
-        supervisor_state,
+        git_ops,
+        "_resolve_managed_update_target",
+        lambda *_args: ("refs/ouroboros-managed/tags/v6.87.5", LATEST, ""),
+    )
+    monkeypatch.setattr(
+        git_ops,
         "load_state",
         lambda: {
             "managed_update_cache": {
+                "remote": "managed",
+                "remote_branch": "main",
+                "target_ref": cache_ref,
+                "update_channel": cache_channel,
                 "available": True,
                 "safe_to_apply": True,
-                "latest_sha": latest_sha,
-                "latest_short_sha": latest_sha[:8],
+                "latest_sha": LATEST,
+                "latest_short_sha": LATEST[:8],
                 "latest_message": "release",
                 "behind": 1,
                 "ahead": 0,
-                "checked_at": "2026-06-24T00:00:00Z",
+                "checked_at": "2026-08-03T00:00:00Z",
             }
         },
     )
-    monkeypatch.setattr(supervisor_state, "update_state", lambda _fn: None)
-    monkeypatch.setattr(control, "get_version", lambda: "6.42.0")
 
     def fake_git_capture(cmd):
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return 0, "ouroboros", ""
+        if cmd == ["git", "rev-parse", "HEAD"]:
+            return 0, CURRENT, ""
+        if cmd == ["git", "status", "--porcelain"]:
+            return 0, "", ""
         if cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
-            return (0 if target_is_ancestor else 1, "", "")
-        return (0, "6.43.0\n", "")
+            return (0 if ancestor else 1), "", ""
+        if cmd[:4] == ["git", "rev-list", "--left-right", "--count"]:
+            return 0, "0 1", ""
+        if cmd == ["git", "show", f"{LATEST}:VERSION"]:
+            return 0, "6.87.5", ""
+        raise AssertionError(cmd)
 
     monkeypatch.setattr(git_ops, "git_capture", fake_git_capture)
+    monkeypatch.setattr(control, "get_version", lambda: "6.87.5")
 
 
-def test_passive_update_status_ignores_cache_for_current_head(monkeypatch):
-    sha = "a" * 40
-    _wire_status(monkeypatch, current_sha=sha, latest_sha=sha)
+def test_passive_status_uses_cache_only_for_same_target_identity(monkeypatch):
+    _wire(monkeypatch)
 
-    status = control._managed_update_payload(fetch=False, include_tags=False)
-
-    assert status["available"] is False
-    assert status.get("from_cache") is not True
-    assert status.get("latest_sha", "") == ""
-
-
-def test_passive_update_status_uses_cache_for_new_target(monkeypatch):
-    current_sha = "a" * 40
-    latest_sha = "b" * 40
-    _wire_status(monkeypatch, current_sha=current_sha, latest_sha=latest_sha)
-
-    status = control._managed_update_payload(fetch=False, include_tags=False)
+    status = git_ops.compute_managed_update_status(fetch=False)
 
     assert status["available"] is True
-    assert status["safe_to_apply"] is True
-    assert status["latest_sha"] == latest_sha
-    assert status["behind"] == 1
+    assert status["latest_sha"] == LATEST
     assert status["from_cache"] is True
 
 
-def test_passive_update_status_ignores_cache_when_target_is_ancestor(monkeypatch):
-    current_sha = "c" * 40
-    latest_sha = "b" * 40
-    _wire_status(monkeypatch, current_sha=current_sha, latest_sha=latest_sha, target_is_ancestor=True)
+def test_passive_status_rejects_cache_from_previous_channel(monkeypatch):
+    _wire(monkeypatch, cache_channel="qa", cache_ref="managed/ouroboros-stable")
 
-    status = control._managed_update_payload(fetch=False, include_tags=False)
+    status = git_ops.compute_managed_update_status(fetch=False)
 
     assert status["available"] is False
     assert status.get("from_cache") is not True
-    assert status.get("latest_sha", "") == ""
+
+
+def test_passive_status_rejects_consumed_target(monkeypatch):
+    _wire(monkeypatch, ancestor=True)
+
+    status = git_ops.compute_managed_update_status(fetch=False)
+
+    assert status["available"] is False
+    assert status.get("from_cache") is not True
+
+
+def test_payload_reads_version_from_pinned_sha(monkeypatch):
+    monkeypatch.setattr(
+        git_ops,
+        "compute_managed_update_status",
+        lambda fetch=False: {"latest_sha": LATEST, "target_ref": "managed/main"},
+    )
+    seen = []
+
+    def fake_capture(cmd):
+        seen.append(cmd)
+        return 0, "6.87.5", ""
+
+    monkeypatch.setattr(git_ops, "git_capture", fake_capture)
+    monkeypatch.setattr(control, "get_version", lambda: "6.87.5")
+
+    payload = control._managed_update_payload(fetch=False, include_tags=False)
+
+    assert payload["latest_version"] == "6.87.5"
+    assert ["git", "show", f"{LATEST}:VERSION"] in seen
+    assert ["git", "show", "managed/main:VERSION"] not in seen
+
+
+def test_failed_remote_check_is_typed_not_reported_as_current(monkeypatch):
+    _wire(monkeypatch)
+    monkeypatch.setattr(git_ops, "ensure_official_update_remote", lambda: (True, ""))
+    monkeypatch.setattr(git_ops, "git_fetch_bounded", lambda _remote: (124, "", "timed out"))
+
+    status = git_ops.compute_managed_update_status(fetch=True)
+
+    assert status["check_ok"] is False
+    assert status["available"] is False
+    assert any(item.startswith("fetch_error:") for item in status["warnings"])

@@ -1344,15 +1344,25 @@ def _finish_task_done_dispatch(
 def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
     task_id = evt.get("task_id")
     wid = evt.get("worker_id")
-    if task_id:
-        try:
-            from supervisor.update_merge import abort_orphaned_assisted_tx
-
-            abort_orphaned_assisted_tx(str(task_id))
-        except Exception:
-            log.debug("assisted-merge orphan watchdog failed", exc_info=True)
     meta = ctx.RUNNING.get(str(task_id or ""), {}) if task_id else {}
     task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
+    event_metadata = evt.get("metadata")
+    task_metadata = (
+        task.get("metadata")
+        if isinstance(task.get("metadata"), dict)
+        else event_metadata if isinstance(event_metadata, dict) else None
+    )
+    if task_id:
+        try:
+            from supervisor.update_merge import (
+                abort_orphaned_assisted_tx,
+                release_assisted_writer_gate_after_task,
+            )
+
+            abort_orphaned_assisted_tx(str(task_id), task_metadata)
+            release_assisted_writer_gate_after_task(task_metadata)
+        except Exception:
+            log.debug("assisted-merge orphan watchdog failed", exc_info=True)
     task_type = str(evt.get("task_type") or task.get("type") or "")
 
     final_task_result: Dict[str, Any] = {}
@@ -1502,6 +1512,14 @@ def _handle_deep_self_review_request(evt: Dict[str, Any], ctx: Any) -> None:
 
 def _handle_promote_to_stable(evt: Dict[str, Any], ctx: Any) -> None:
     import subprocess as sp
+
+    from supervisor.git_ops import promote_branch_exact
+    from supervisor.update_merge import (
+        acquire_update_lock,
+        active_update_tx,
+        release_update_lock,
+    )
+
     target = ctx.BRANCH_DEV
     evolution_claim = evt.get("evolution_claim")
     if isinstance(evolution_claim, dict):
@@ -1542,38 +1560,43 @@ def _handle_promote_to_stable(evt: Dict[str, Any], ctx: Any) -> None:
                     "matches the reviewed commit receipt.",
                 )
             return
+        # Promote the exact reviewed SHA (TOCTOU-safe: the dev branch may move
+        # between the check above and the ref update inside promote_branch_exact).
         target = commit_sha
-    # Local branch promotion always works without a remote.
+
+    lock_fh = None
     try:
-        sp.run(
-            ["git", "branch", "-f", ctx.BRANCH_STABLE, target],
-            cwd=str(ctx.REPO_DIR), check=True,
-        )
-        new_sha = sp.run(
-            ["git", "rev-parse", ctx.BRANCH_STABLE],
-            cwd=str(ctx.REPO_DIR), capture_output=True, text=True, check=True,
-        ).stdout.strip()
-    except Exception as e:
+        lock_fh = acquire_update_lock()
+        if active_update_tx():
+            ok, result = False, {"error": "a managed update transaction is still active"}
+        else:
+            ok, result = promote_branch_exact(
+                target, ctx.BRANCH_STABLE, push_remote=True,
+                repo_dir=str(ctx.REPO_DIR),
+            )
+    except RuntimeError as exc:
+        ok, result = False, {"error": str(exc)}
+    finally:
+        if lock_fh is not None:
+            release_update_lock(lock_fh)
+    if not ok:
         st = ctx.load_state()
         if st.get("owner_chat_id"):
-            ctx.send_with_budget(int(st["owner_chat_id"]), f"❌ Failed to promote to stable: {e}")
+            ctx.send_with_budget(
+                int(st["owner_chat_id"]),
+                f"❌ Failed to promote to stable: {result.get('error') or 'unknown error'}",
+            )
         return
-
-    # Optional remote push; local promotion remains authoritative.
-    remote_status = ""
-    try:
-        sp.run(["git", "remote", "get-url", "origin"], cwd=str(ctx.REPO_DIR),
-               capture_output=True, check=True)
-        sp.run(
-            ["git", "push", "origin", f"{target}:{ctx.BRANCH_STABLE}"],
-            cwd=str(ctx.REPO_DIR), check=True,
-        )
-        remote_status = " (pushed to origin)"
-    except Exception:
-        log.debug("No remote or push failed — local-only promote")
 
     st = ctx.load_state()
     if st.get("owner_chat_id"):
+        new_sha = str(result["sha"])
+        if result.get("remote_pushed"):
+            remote_status = " (pushed to origin)"
+        elif result.get("remote_error"):
+            remote_status = f" (local only; remote push failed: {result['remote_error']})"
+        else:
+            remote_status = ""
         ctx.send_with_budget(
             int(st["owner_chat_id"]),
             f"✅ Promoted: {ctx.BRANCH_DEV} → {ctx.BRANCH_STABLE} ({new_sha[:8]}){remote_status}",

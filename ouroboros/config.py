@@ -1,8 +1,7 @@
 """
 Ouroboros — Shared configuration (single source of truth).
 
-Paths, settings defaults, load/save with file locking.
-Only imports ouroboros.platform_layer (platform abstraction, no circular deps).
+Paths, settings defaults, load/save with file locking and cycle-free setting metadata.
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ from typing import Any, Optional, Sequence
 from ouroboros.platform_layer import pid_lock_acquire as _compat_pid_lock_acquire
 from ouroboros.platform_layer import pid_lock_release as _compat_pid_lock_release
 from ouroboros.provider_models import compute_direct_review_models_fallback, local_only_review_route_env, migrate_model_value, review_model_uses_local as review_model_uses_local
+from ouroboros.update_channels import UPDATE_SETTINGS_DEFAULTS, normalize_update_channel
 
 
 # Paths
@@ -61,7 +61,7 @@ def _guard_live_settings_write() -> None:
 
 
 # Settings defaults
-SETTINGS_DEFAULTS = {
+SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OPENROUTER_API_KEY": "",
     "OPENAI_API_KEY": "",
     "OPENAI_BASE_URL": "",
@@ -714,10 +714,7 @@ def get_plan_task_swarm_max_wait_sec() -> float:
 
 
 def get_restart_drain_max_sec() -> int:
-    raw = os.environ.get(
-        "OUROBOROS_RESTART_DRAIN_MAX_SEC",
-        SETTINGS_DEFAULTS["OUROBOROS_RESTART_DRAIN_MAX_SEC"],
-    )
+    raw = os.environ.get("OUROBOROS_RESTART_DRAIN_MAX_SEC", SETTINGS_DEFAULTS["OUROBOROS_RESTART_DRAIN_MAX_SEC"])
     try:
         parsed = int(float(raw))
     except (TypeError, ValueError):
@@ -1287,6 +1284,8 @@ def _coerce_setting_value(key: str, value):
     # Normalize runtime mode on read so all consumers see the closed enum.
     if key == "OUROBOROS_RUNTIME_MODE":
         return normalize_runtime_mode(value)
+    if key == "OUROBOROS_UPDATE_CHANNEL":
+        return normalize_update_channel(value)
     if key == "OUROBOROS_CONTEXT_MODE":
         return normalize_context_mode(value)
     # Trim so whitespace-only config is not treated as a configured skills repo.
@@ -1528,7 +1527,7 @@ def apply_settings_to_env(settings: dict) -> None:
         "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", "OUROBOROS_MAX_SUBAGENT_DEPTH", "OUROBOROS_PLAN_TASK_SWARM_TIMEOUT_SEC",
         "OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "OUROBOROS_PLAN_TASK_SWARM_HEARTBEAT_STALE_SEC", "TOTAL_BUDGET",
         "OUROBOROS_PER_TASK_COST_USD", "GITHUB_TOKEN", "GITHUB_REPO", "OUROBOROS_RUB_USD_RATE", "OUROBOROS_PRICING_TTL_SEC",
-        "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
+        "OUROBOROS_TOOL_TIMEOUT_SEC", "OUROBOROS_MANAGED_UPDATE_FETCH_TIMEOUT_SEC", "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", "OUROBOROS_FINALIZATION_GRACE_SEC",
         "OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", "OUROBOROS_TASK_IDLE_TIMEOUT_SEC", "OUROBOROS_TASK_ABS_CEILING_SEC",
         "OUROBOROS_PACING_INTERVAL_SEC", "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC", "OUROBOROS_MAX_ROUNDS",
         "OUROBOROS_TRANSIENT_RETRY_MAX", "OUROBOROS_IMAGE_INPUT_MODE", "OUROBOROS_BG_MAX_ROUNDS", "OUROBOROS_BG_WAKEUP_MIN",
@@ -1546,7 +1545,7 @@ def apply_settings_to_env(settings: dict) -> None:
         # Unified disposable-artifact GC retention (replaces per-subsystem keys).
         "OUROBOROS_GC_RETENTION_DAYS",
         # Runtime-mode, context-mode, and skills-repo plumbing.
-        "OUROBOROS_RUNTIME_MODE", "OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SKILLS_REPO_PATH",
+        "OUROBOROS_RUNTIME_MODE", "OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SKILLS_REPO_PATH", "OUROBOROS_UPDATE_CHANNEL",
         "OUROBOROS_HOST_SERVICE_PORT",
         # Acting (mutative) subagents: owner toggle + worktree/projects roots.
         "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "OUROBOROS_SUBAGENT_WORKTREE_ROOT", "OUROBOROS_SUBAGENT_PROJECTS_ROOT",

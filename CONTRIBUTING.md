@@ -91,8 +91,8 @@ git rebase upstream/ouroboros
 ```
 
 Open the pull request with the base branch set to lowercase `ouroboros`.
-`main` is the default public branch, and `ouroboros-stable` is a recovery
-branch. Neither is the contribution target.
+`main` is the stable public/update branch, and `ouroboros-stable` is the QA
+promotion branch. Neither is the contribution target.
 
 Keep the worktree clean when producing final evidence: commit the intended
 changes on your pull request branch, then confirm that `git status --short` is

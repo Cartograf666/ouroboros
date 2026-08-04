@@ -15,6 +15,7 @@ import urllib.request
 from typing import Any, Callable, Dict, Optional
 
 from ouroboros.config import SETTINGS_DEFAULTS
+from ouroboros.update_channels import get_managed_update_fetch_timeout_sec, normalize_update_channel
 from ouroboros.utils import atomic_write_json
 
 DEFAULT_COLAB_APP_ROOT = "/content/drive/MyDrive/Ouroboros"
@@ -22,6 +23,34 @@ DEFAULT_COLAB_REPO_DIR = "/content/ouroboros_repo"
 DEFAULT_OFFICIAL_REPO_URL = "https://github.com/razzant/ouroboros.git"
 
 _SECRET_KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN")
+
+
+def _run_colab_git_network(args: list[str], *, cwd: pathlib.Path | None = None) -> str:
+    """Run clone/fetch non-interactively with the managed-update wall-clock ceiling."""
+    from ouroboros.platform_layer import kill_process_tree, subprocess_new_group_kwargs
+
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "LANG": "C"}
+    proc = subprocess.Popen(
+        ["git", "-c", "http.lowSpeedLimit=1024", "-c", "http.lowSpeedTime=30", *args],
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        **subprocess_new_group_kwargs(),
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=get_managed_update_fetch_timeout_sec())
+    except subprocess.TimeoutExpired as exc:
+        kill_process_tree(proc)
+        try:
+            proc.communicate(timeout=10)
+        except Exception:
+            pass
+        raise RuntimeError("official git operation timed out") from exc
+    if proc.returncode != 0:
+        raise RuntimeError((stderr or stdout or "official git operation failed").strip())
+    return (stdout or "").strip()
 
 
 def get_colab_secret(name: str, *, required: bool = True) -> str:
@@ -81,7 +110,17 @@ def masked_secret_status(settings: Dict[str, Any]) -> Dict[str, bool]:
     return {key: bool(str(settings.get(key, "") or "").strip()) for key in _SECRET_KEYS}
 
 
-def build_colab_settings(secrets: Dict[str, str], *, github_repo: str = "", total_budget: float = 10.0, runtime_mode: str = "advanced", max_workers: int = 1, models: Dict[str, str] | None = None, network_password: str = "", existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def build_colab_settings(
+    secrets: Dict[str, str],
+    *,
+    github_repo: str = "",
+    total_budget: float = 10.0,
+    runtime_mode: str = "advanced",
+    max_workers: int = 1,
+    models: Dict[str, str] | None = None,
+    network_password: str = "",
+    existing: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Build a Drive-persisted settings payload for Colab.
 
     On a re-run, ``existing`` (the current Drive ``settings.json``) is merged over
@@ -113,6 +152,9 @@ def build_colab_settings(secrets: Dict[str, str], *, github_repo: str = "", tota
     settings["OUROBOROS_RUNTIME_MODE"] = runtime_mode
     settings["OUROBOROS_MAX_WORKERS"] = int(max_workers)
     settings["OUROBOROS_SERVER_HOST"] = "127.0.0.1"
+    settings["OUROBOROS_UPDATE_CHANNEL"] = normalize_update_channel(
+        settings.get("OUROBOROS_UPDATE_CHANNEL")
+    )
     if network_password:
         settings["OUROBOROS_NETWORK_PASSWORD"] = network_password
     for key, value in (models or {}).items():
@@ -155,8 +197,7 @@ def _ff_to_origin_if_ahead(repo_dir: pathlib.Path, branch: str) -> bool:
     """
     cwd = str(repo_dir)
     try:
-        if subprocess.run(["git", "fetch", "origin", branch], cwd=cwd, capture_output=True).returncode != 0:
-            return False
+        _run_colab_git_network(["fetch", "origin", branch], cwd=repo_dir)
         rc = subprocess.run(["git", "merge", "--ff-only", f"origin/{branch}"], cwd=cwd, capture_output=True).returncode
         return rc == 0
     except Exception:
@@ -179,12 +220,20 @@ def configure_colab_personal_origin(repo_dir: pathlib.Path, data_dir: pathlib.Pa
     return {"ok": ok, "message": message, "repo": resolved, "restored_from_origin": restored}
 
 
-def clone_or_update_repo(repo_dir: pathlib.Path, source_url: str = DEFAULT_OFFICIAL_REPO_URL, branch: str = "ouroboros") -> pathlib.Path:
+def clone_or_update_repo(
+    repo_dir: pathlib.Path,
+    source_url: str = DEFAULT_OFFICIAL_REPO_URL,
+    source_branch: str = "main",
+    local_branch: str = "ouroboros",
+) -> pathlib.Path:
+    """Fetch one official channel while keeping the local work branch stable."""
     repo_dir = pathlib.Path(repo_dir)
+    fresh_clone = False
     if not (repo_dir / ".git").exists():
         if repo_dir.exists():
             raise RuntimeError(f"{repo_dir} exists but is not a git repository")
-        subprocess.run(["git", "clone", "--branch", branch, source_url, str(repo_dir)], check=True)
+        _run_colab_git_network(["clone", "--no-checkout", source_url, str(repo_dir)])
+        fresh_clone = True
     remotes = subprocess.run(["git", "remote"], cwd=str(repo_dir), capture_output=True, text=True, check=False).stdout.split()
     if "managed" in remotes:
         subprocess.run(["git", "remote", "set-url", "managed", source_url], cwd=str(repo_dir), check=False)
@@ -201,16 +250,131 @@ def clone_or_update_repo(repo_dir: pathlib.Path, source_url: str = DEFAULT_OFFIC
             subprocess.run(["git", "remote", "set-url", "managed", source_url], cwd=str(repo_dir), check=False)
         else:
             subprocess.run(["git", "remote", "add", "managed", source_url], cwd=str(repo_dir), check=False)
-    subprocess.run(["git", "fetch", "managed"], cwd=str(repo_dir), check=False)
-    remote_ref = f"managed/{branch}"
-    has_remote_ref = subprocess.run(["git", "rev-parse", "--verify", remote_ref], cwd=str(repo_dir), capture_output=True, check=False).returncode == 0
-    if has_remote_ref:
-        has_local_branch = subprocess.run(["git", "rev-parse", "--verify", branch], cwd=str(repo_dir), capture_output=True, check=False).returncode == 0
-        if has_local_branch:
-            subprocess.run(["git", "checkout", branch], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "merge", "--ff-only", remote_ref], cwd=str(repo_dir), check=True)
-        else:
-            subprocess.run(["git", "checkout", "-B", branch, remote_ref], cwd=str(repo_dir), check=True)
+    subprocess.run(["git", "config", "user.name", "Ouroboros"], cwd=str(repo_dir), check=True)
+    subprocess.run(["git", "config", "user.email", "ouroboros@local.mac"], cwd=str(repo_dir), check=True)
+    try:
+        from supervisor.update_source import MANAGED_TAG_NAMESPACE
+
+        _run_colab_git_network(
+            [
+                "fetch",
+                "managed",
+                "+refs/heads/*:refs/remotes/managed/*",
+                f"+refs/tags/*:{MANAGED_TAG_NAMESPACE}/*",
+            ],
+            cwd=repo_dir,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"official update fetch failed: {exc}") from exc
+    branch_ref = f"managed/{source_branch}"
+    has_remote_ref = subprocess.run(["git", "rev-parse", "--verify", branch_ref], cwd=str(repo_dir), capture_output=True, check=False).returncode == 0
+    if not has_remote_ref:
+        raise RuntimeError(f"official update branch is unavailable: {branch_ref}")
+    from supervisor.update_source import (
+        official_ref_has_constitution,
+        resolve_managed_update_target,
+    )
+
+    def _capture(args):
+        result = subprocess.run(
+            args,
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode, (result.stdout or "").strip(), (result.stderr or "").strip()
+
+    update_channel = "stable" if source_branch == "main" else (
+        "qa" if source_branch == "ouroboros-stable" else "development"
+    )
+    remote_ref, resolved, target_error = resolve_managed_update_target(
+        "managed",
+        source_branch,
+        branch_ref,
+        update_channel=update_channel,
+        capture=_capture,
+    )
+    if not remote_ref or not resolved:
+        raise RuntimeError(target_error or f"official update target is unavailable: {branch_ref}")
+
+    if not official_ref_has_constitution(remote_ref, repo_dir=repo_dir):
+        raise RuntimeError(
+            f"official update target lacks a non-empty regular BIBLE.md: {remote_ref}"
+        )
+    has_local_branch = subprocess.run(["git", "rev-parse", "--verify", local_branch], cwd=str(repo_dir), capture_output=True, check=False).returncode == 0
+    if fresh_clone:
+        # `git clone --no-checkout` still creates a local branch for the remote
+        # HEAD. Never let that unrelated default override the selected channel.
+        subprocess.run(["git", "checkout", "-B", local_branch, remote_ref], cwd=str(repo_dir), check=True)
+    elif has_local_branch:
+        subprocess.run(["git", "checkout", local_branch], cwd=str(repo_dir), check=True)
+        can_fast_forward = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", "HEAD", remote_ref],
+            cwd=str(repo_dir),
+            capture_output=True,
+        )
+        if can_fast_forward.returncode == 0:
+            # Failure here (for example local dirty files) must preserve the
+            # checkout; the normal smart updater can reconcile it later.
+            subprocess.run(
+                ["git", "merge", "--ff-only", remote_ref],
+                cwd=str(repo_dir),
+                capture_output=True,
+                check=False,
+            )
+        elif can_fast_forward.returncode != 1:
+            raise RuntimeError(f"could not compare local {local_branch} with {remote_ref}")
+        # Local-ahead and truly diverged checkouts stay untouched. The selected
+        # channel is persisted below and the normal smart updater owns merging.
+    else:
+        subprocess.run(["git", "checkout", "-B", local_branch, remote_ref], cwd=str(repo_dir), check=True)
+    local_stable_branch = "ouroboros-stable"
+    has_local_stable = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{local_stable_branch}"],
+        cwd=str(repo_dir),
+        check=False,
+    ).returncode == 0
+    if not has_local_stable:
+        # Desktop creates this fallback from its bundled source SHA. Colab has
+        # no bundle: prefer the fetched Stable channel even when the first run
+        # intentionally selected QA/Development, then never auto-advance it.
+        stable_seed, _stable_sha, _stable_error = resolve_managed_update_target(
+            "managed",
+            "main",
+            "managed/main",
+            update_channel="stable",
+            capture=_capture,
+        )
+        stable_seed = stable_seed or remote_ref
+        if not official_ref_has_constitution(stable_seed, repo_dir=repo_dir):
+            stable_seed = remote_ref
+        subprocess.run(
+            ["git", "branch", local_stable_branch, stable_seed],
+            cwd=str(repo_dir),
+            check=True,
+        )
+    version_path = repo_dir / "VERSION"
+    app_version = version_path.read_text(encoding="utf-8").strip() if version_path.is_file() else ""
+    # Source-mode Colab owns the same managed-update contract as desktop. This
+    # marker describes provenance/local branches; runtime settings choose the feed.
+    atomic_write_json(
+        repo_dir / ".git" / "ouroboros-managed.json",
+        {
+            "schema_version": 1,
+            "app_version": app_version,
+            "source_sha": resolved,
+            "source_branch": source_branch,
+            "managed_remote_name": "managed",
+            "managed_remote_url": source_url,
+            "managed_remote_branch": source_branch,
+            "managed_local_branch": local_branch,
+            "managed_local_stable_branch": local_stable_branch,
+            "managed_remote_stable_branch": "ouroboros-stable",
+            "colab_source_mode": True,
+        },
+        trailing_newline=True,
+    )
     return repo_dir
 
 

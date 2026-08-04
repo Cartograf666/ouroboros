@@ -24,10 +24,12 @@ _evo_cache: Dict[str, Any] = {}
 _evo_task: asyncio.Task | None = None
 
 
-def _request_restart(request: Request) -> None:
+def _request_restart(request: Request) -> bool:
     callback = getattr(getattr(request.app, "state", None), "request_restart", None)
     if callable(callback):
         callback()
+        return True
+    return False
 
 
 def _runtime_branch_defaults(request: Request) -> tuple[str, str]:
@@ -41,51 +43,10 @@ def _managed_update_payload(*, fetch: bool, include_tags: bool) -> dict[str, Any
     from supervisor.git_ops import compute_managed_update_status, git_capture
 
     status = compute_managed_update_status(fetch=fetch)
-    # P2 2F check-on-restart cache: a passive read (fetch=False) bails before resolving the
-    # official ref ("official_status_requires_check"), so overlay the boot/manual-check cache
-    # — the badge shows availability after a restart without re-fetching on every poll. A real
-    # fetch refreshes the cache. Fresh local `dirty` still gates `safe_to_apply` downward.
-    try:
-        from supervisor.state import load_state, update_state
-
-        if fetch and status.get("latest_sha"):
-            from ouroboros.utils import utc_now_iso
-
-            _snapshot = {
-                "available": bool(status.get("available")),
-                "safe_to_apply": bool(status.get("safe_to_apply")),
-                "latest_sha": status.get("latest_sha") or "",
-                "latest_short_sha": status.get("latest_short_sha") or "",
-                "latest_message": status.get("latest_message") or "",
-                "behind": int(status.get("behind") or 0),
-                "ahead": int(status.get("ahead") or 0),
-                "checked_at": utc_now_iso(),
-            }
-            update_state(lambda s: s.__setitem__("managed_update_cache", _snapshot))
-        elif not fetch and not status.get("available"):
-            cache = (load_state() or {}).get("managed_update_cache") or {}
-            cached_latest_sha = cache.get("latest_sha") or ""
-            current_sha = status.get("current_sha") or ""
-            cache_target_consumed = bool(cached_latest_sha and cached_latest_sha == current_sha)
-            if cached_latest_sha and current_sha and not cache_target_consumed:
-                rc, _out, _err = git_capture(["git", "merge-base", "--is-ancestor", cached_latest_sha, current_sha])
-                cache_target_consumed = rc == 0
-            if cache.get("available") and cached_latest_sha and not cache_target_consumed:
-                status["available"] = True
-                status["safe_to_apply"] = bool(cache.get("safe_to_apply")) and not status.get("dirty")
-                status["latest_sha"] = cached_latest_sha
-                status["latest_short_sha"] = cache.get("latest_short_sha") or ""
-                status["latest_message"] = cache.get("latest_message") or ""
-                status["behind"] = int(cache.get("behind") or 0)
-                status["ahead"] = int(cache.get("ahead") or 0)
-                status["from_cache"] = True
-                status["checked_at"] = cache.get("checked_at") or ""
-    except Exception:
-        log.debug("managed update status cache overlay failed", exc_info=True)
     latest_version = ""
-    target_ref = status.get("target_ref") or ""
-    if target_ref and status.get("latest_sha"):
-        rc, version_text, _ = git_capture(["git", "show", f"{target_ref}:VERSION"])
+    latest_sha = status.get("latest_sha") or ""
+    if latest_sha:
+        rc, version_text, _ = git_capture(["git", "show", f"{latest_sha}:VERSION"])
         if rc == 0:
             latest_version = version_text.strip()
     official_tags = []
@@ -101,14 +62,50 @@ def _managed_update_payload(*, fetch: bool, include_tags: bool) -> dict[str, Any
     }
 
 
+def _acquire_repo_mutation_lock() -> tuple[Any, JSONResponse | None]:
+    """Serialize owner-triggered repo/reset mutations with managed updates."""
+    from supervisor.update_merge import (
+        acquire_update_lock,
+        active_update_tx,
+        release_update_lock,
+    )
+
+    try:
+        lock_fh = acquire_update_lock()
+    except RuntimeError:
+        return None, json_error(
+            "Another update or recovery operation is already changing the checkout.",
+            409,
+        )
+    if active_update_tx():
+        release_update_lock(lock_fh)
+        return None, json_error(
+            "A managed update transaction is still active; finish or recover it first.",
+            409,
+        )
+    return lock_fh, None
+
+
+def _release_repo_mutation_lock(lock_fh: Any) -> None:
+    from supervisor.update_merge import release_update_lock
+
+    if lock_fh is not None:
+        release_update_lock(lock_fh)
+
+
 async def api_reset(request: Request) -> JSONResponse:
     """Reset all runtime data (state, memory, logs, settings) but keep repo."""
     import shutil
 
     data_dir = request_drive_root(request)
+    lock_fh, lock_error = _acquire_repo_mutation_lock()
+    if lock_error is not None:
+        return lock_error
     try:
         deleted = []
-        for subdir in ("state", "memory", "logs", "archive", "locks", "task_results", "uploads"):
+        # Keep synchronization files until restart. Removing the directory that
+        # contains the held managed-update lock would let a second updater enter.
+        for subdir in ("state", "memory", "logs", "archive", "task_results", "uploads"):
             target = data_dir / subdir
             if target.exists():
                 shutil.rmtree(target, ignore_errors=True)
@@ -121,6 +118,8 @@ async def api_reset(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "deleted": deleted, "restarting": True})
     except Exception as exc:
         return json_exception(exc)
+    finally:
+        _release_repo_mutation_lock(lock_fh)
 
 
 async def api_command(request: Request) -> JSONResponse:
@@ -196,37 +195,78 @@ async def api_git_log(_request: Request) -> JSONResponse:
         return json_exception(exc)
 
 
+def _git_rollback_fenced(request: Request, target: str) -> JSONResponse:
+    """Run the complete restore transaction off the gateway event loop."""
+    try:
+        from supervisor.git_ops import git_capture, rollback_to_version
+
+        lock_fh, lock_error = _acquire_repo_mutation_lock()
+        if lock_error is not None:
+            return lock_error
+        try:
+            rc, target_sha, error = git_capture(
+                ["git", "rev-parse", "--verify", f"{target}^{{commit}}"]
+            )
+            if rc != 0:
+                return json_error(error or f"cannot resolve {target}", 400)
+            blockers = _quiesce_repo_writers("manual_rollback")
+            if blockers:
+                return _fence_failure(blockers)
+            ok, msg = rollback_to_version(target_sha, reason="ui_rollback")
+            if not ok:
+                return JSONResponse(
+                    {"error": msg, "restart_required": True}, status_code=500
+                )
+            try:
+                restarting = _request_restart(request)
+            except Exception:
+                log.warning("manual rollback landed but restart request failed", exc_info=True)
+                restarting = False
+            return JSONResponse({
+                "status": "ok" if restarting else "restart_required",
+                "message": msg,
+                "restarting": restarting,
+            })
+        finally:
+            _release_repo_mutation_lock(lock_fh)
+    except Exception as exc:
+        return json_exception(exc)
+
+
 async def api_git_rollback(request: Request) -> JSONResponse:
     """Roll back to a specific commit or tag, then restart."""
     try:
         body = await request.json()
         target = body.get("target", "").strip()
-        if not target:
-            return json_error("missing target", 400)
-        from supervisor.git_ops import rollback_to_version
-
-        ok, msg = rollback_to_version(target, reason="ui_rollback")
-        if not ok:
-            return json_error(msg, 400)
-        _request_restart(request)
-        return JSONResponse({"status": "ok", "message": msg})
     except Exception as exc:
         return json_exception(exc)
+    if not target:
+        return json_error("missing target", 400)
+    return await asyncio.to_thread(_git_rollback_fenced, request, target)
 
 
 async def api_git_promote(request: Request) -> JSONResponse:
     """Promote the current dev branch to the runtime's stable branch."""
     try:
-        import subprocess as sp
+        lock_fh, lock_error = _acquire_repo_mutation_lock()
+        if lock_error is not None:
+            return lock_error
+        try:
+            from supervisor.git_ops import promote_branch_exact
 
-        branch_dev, branch_stable = _runtime_branch_defaults(request)
-        sp.run(
-            ["git", "branch", "-f", branch_stable, branch_dev],
-            cwd=str(request_repo_dir(request)),
-            check=True,
-            capture_output=True,
-        )
-        return JSONResponse({"status": "ok", "message": f"{branch_stable} updated to match {branch_dev}"})
+            branch_dev, branch_stable = _runtime_branch_defaults(request)
+            ok, result = promote_branch_exact(
+                branch_dev, branch_stable, push_remote=False
+            )
+            if not ok:
+                return json_error(str(result.get("error") or "promotion failed"), 400)
+            return JSONResponse({
+                "status": "ok",
+                "sha": result["sha"],
+                "message": f"{branch_stable} updated to {result['sha'][:8]}",
+            })
+        finally:
+            _release_repo_mutation_lock(lock_fh)
     except Exception as exc:
         return json_exception(exc)
 
@@ -242,7 +282,12 @@ async def api_update_status(_request: Request) -> JSONResponse:
 async def api_update_check(_request: Request) -> JSONResponse:
     """Fetch the managed remote and return fresh update status."""
     try:
-        return JSONResponse(_managed_update_payload(fetch=True, include_tags=True))
+        payload = await asyncio.to_thread(
+            _managed_update_payload,
+            fetch=True,
+            include_tags=True,
+        )
+        return JSONResponse(payload)
     except Exception as exc:
         return json_exception(exc)
 
@@ -250,8 +295,9 @@ async def api_update_check(_request: Request) -> JSONResponse:
 def _respawn_workers_after_failed_update() -> None:
     """Revive workers when an update aborts after they were stopped (no restart follows)."""
     try:
-        from supervisor.workers import ensure_worker_pool_started
+        from supervisor.workers import ensure_worker_pool_started, open_repo_writer_admission
 
+        open_repo_writer_admission()
         ensure_worker_pool_started(allow_disabled_restart=True)
     except Exception:
         log.warning("update_apply: failed to respawn workers after aborted update", exc_info=True)
@@ -264,337 +310,582 @@ async def api_update_preflight(_request: Request) -> JSONResponse:
     try:
         from supervisor.update_merge import plan_managed_update_merge
 
-        return JSONResponse({"merge_plan": plan_managed_update_merge(fetch=True)})
+        plan = await asyncio.to_thread(plan_managed_update_merge, fetch=True)
+        return JSONResponse({"merge_plan": plan})
     except Exception as exc:
         return json_exception(exc)
 
 
-def _is_protected_for_managed_update(path: str) -> bool:
-    """A managed-update path that must NOT be auto-resolved by the agent (BIBLE/CHECKLISTS/
-    SAFETY + release/managed invariants) — routed to MANUAL (owner) instead."""
-    from ouroboros.runtime_mode_policy import is_protected_runtime_path
-    from supervisor.update_merge_policy import is_protected_doc
-
-    return bool(is_protected_doc(path) or is_protected_runtime_path(path))
+_KNOWN_UPDATE_PLAN_KINDS = frozenset({"clean", "conflicting"})
+_UPDATE_STRATEGIES = frozenset({"auto_merge", "assisted", "manual", "replace"})
 
 
-def _official_protected_hits(plan: dict) -> list:
-    """PROTECTED paths the official update would touch (conflicting OR clean delta). Computed
-    from the plan with a read-only `git diff base..target` (no mutation) so the apply path can
-    route to MANUAL BEFORE stopping workers / staging anything."""
-    from supervisor.git_ops import git_capture
-
-    base = str(plan.get("base_sha") or "")
-    target = str(plan.get("target_sha") or "")
-    paths = set(plan.get("protected_conflict_paths") or [])
-    if base and target:
-        rc, delta, _e = git_capture(["git", "diff", "--name-only", base, target])
-        if rc == 0:
-            paths |= {p for p in delta.splitlines() if p.strip()}
-    return sorted(p for p in paths if _is_protected_for_managed_update(p))
-
-
-def _start_assisted_merge(plan: dict) -> JSONResponse:
-    """Orchestrate the AUTOMATED assisted managed-update merge (P2/SC2). Under the FAIL-CLOSED
-    update lock with workers stopped: re-plan, route official PROTECTED-path changes to MANUAL
-    (never the agent), durably rescue local work, stage a REAL `git merge --no-commit` into the
-    LIVE worktree (MERGE_HEAD + conflict markers) via the supervisor, and enqueue the single
-    authorized resolution task. The agent resolves the markers with normal file tools and the
-    UNMODIFIED commit_reviewed lands a reviewed 2-parent merge commit (Q11) — no blocked git,
-    no parallel trust path. The merge state + tx marker survive a restart (resumable recovery)."""
-    import uuid as _uuid
-
-    from ouroboros.utils import utc_now_iso
-    from supervisor.git_ops import BRANCH_DEV, _create_rescue_snapshot, git_capture
-    from supervisor.state import load_state
-    from supervisor.update_merge import (
-        acquire_update_lock,
-        active_update_tx,
-        create_rescue_local_ref,
-        enqueue_assisted_resolution_task,
-        materialize_assisted_merge_live,
-        plan_managed_update_merge,
-        release_update_lock,
-        rollback_managed_update,
-        write_update_tx,
+def _plan_is_clean(plan: dict) -> bool:
+    """True for a complete deterministic Git plan with no semantic conflict."""
+    return (
+        str(plan.get("kind") or "") == "clean"
+        and type(plan.get("local_dirty_count")) is int
+        and plan.get("local_dirty_count") >= 0
+        and bool(str(plan.get("merge_commit") or ""))
+        and not plan.get("code_conflict_paths")
+        and not plan.get("doc_conflict_paths")
     )
 
+
+def _pins_match(plan: dict, base_sha: str, target_sha: str) -> bool:
+    return bool(
+        base_sha
+        and target_sha
+        and str(plan.get("base_sha") or "") == base_sha
+        and str(plan.get("target_sha") or "") == target_sha
+    )
+
+
+def _quiesce_repo_writers(reason: str) -> list[str]:
+    """Close new writers, drain in-process turns, then prove the pool stopped."""
+    from supervisor.git_ops import DRIVE_ROOT
+    from supervisor.workers import (
+        close_repo_writer_admission,
+        drain_repo_writers,
+        kill_workers_for_update,
+        open_repo_writer_admission,
+    )
+
+    close_repo_writer_admission(f"managed_update:{reason}")
+    blocked = drain_repo_writers()
+    if blocked:
+        open_repo_writer_admission()
+        return [f"active:{label}" for label in blocked]
+    survivors = kill_workers_for_update(
+        result_reason="Task interrupted by an owner-requested managed update.",
+        terminal_status="interrupted",
+    )
+    if survivors:
+        return survivors
+    try:
+        from ouroboros.tools.services import kill_all_services
+
+        stopped = kill_all_services(DRIVE_ROOT, wait=True, include_keep_alive=True)
+    except Exception as exc:
+        return [f"services:{type(exc).__name__}: {exc}"]
+    failed = [
+        str(item.get("service_id") or item.get("name") or "unknown")
+        for item in stopped
+        if isinstance(item, dict)
+        and (item.get("stop_failed") or item.get("state") == "running" or item.get("lifecycle") == "running")
+    ]
+    try:
+        from ouroboros.process_custody import quiesce_custodied_services
+
+        _custody_ok, custody_blockers = quiesce_custodied_services(DRIVE_ROOT)
+    except Exception as exc:
+        custody_blockers = [f"custody_ledger:{type(exc).__name__}: {exc}"]
+    return [f"service:{label}" for label in failed] + custody_blockers
+
+
+def _fence_failure(blockers: list[str]) -> JSONResponse:
+    restart_required = not all(str(item).startswith("active:") for item in blockers)
+    return JSONResponse(
+        {
+            "error": (
+                "Could not prove every repository writer stopped. The repository was not "
+                "changed, but runtime shutdown may be incomplete."
+            ),
+            "reason": "update_writer_fence_blocked",
+            "blockers": blockers,
+            "restart_required": restart_required,
+        },
+        status_code=409,
+    )
+
+
+def _rollback_fenced_update(reason: str, error: str, **extra: Any) -> JSONResponse:
+    from supervisor.update_merge import mark_update_tx_gate_blocked, rollback_managed_update
+
+    ok, message = rollback_managed_update(reason)
+    if ok:
+        _respawn_workers_after_failed_update()
+        return JSONResponse(
+            {"error": error, "rolled_back": True, "rollback": message, **extra},
+            status_code=409,
+        )
+    mark_update_tx_gate_blocked(reason, message)
+    return JSONResponse(
+        {
+            "error": error,
+            "rolled_back": False,
+            "rollback": message,
+            "restart_required": True,
+            **extra,
+        },
+        status_code=500,
+    )
+
+
+def _restart_response(request: Request, *, strategy: str, plan: dict) -> JSONResponse:
+    try:
+        restarting = _request_restart(request)
+    except Exception as exc:
+        log.warning("managed update landed but restart request failed", exc_info=True)
+        restarting = False
+        restart_error = f"{type(exc).__name__}: {exc}"
+    else:
+        restart_error = "restart callback is unavailable" if not restarting else ""
+    if not restarting:
+        return JSONResponse(
+            {
+                "status": "restart_required",
+                "error": restart_error,
+                "strategy": strategy,
+                "merge_plan": plan,
+            }
+        )
+    return JSONResponse(
+        {"status": "ok", "restarting": True, "strategy": strategy, "merge_plan": plan}
+    )
+
+
+def _start_assisted_merge_fenced(plan: dict) -> JSONResponse:
+    """Stage the exact planned merge and enqueue its one reviewed resolver."""
+    import uuid as _uuid
+
+    from supervisor.git_ops import BRANCH_DEV, _create_rescue_snapshot, git_capture
+    from supervisor.state import budget_remaining, load_state
+    from supervisor.update_merge import (
+        assisted_writer_gate_reason,
+        create_rescue_local_ref,
+        enqueue_assisted_resolution_task,
+        ensure_assisted_resolver_ready,
+        materialize_assisted_merge_live,
+        write_update_tx,
+    )
+    from supervisor.workers import close_repo_writer_admission, kill_workers_for_update
+
     branch = BRANCH_DEV
+    base_sha = str(plan.get("base_sha") or "")
+    target_sha = str(plan.get("target_sha") or "")
+    local_snapshot = str(plan.get("local_snapshot") or "")
+    if not local_snapshot or not target_sha:
+        _respawn_workers_after_failed_update()
+        return JSONResponse({"error": "could not build local snapshot / target"}, status_code=409)
     try:
-        lock_fh = acquire_update_lock()
-    except RuntimeError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=409)
+        remaining = budget_remaining(load_state() or {}, strict=True)
+    except Exception:
+        _respawn_workers_after_failed_update()
+        return JSONResponse(
+            {"error": "Assisted update cannot start because model budget authority is unavailable."},
+            status_code=409,
+        )
+    if remaining <= 0:
+        _respawn_workers_after_failed_update()
+        return JSONResponse(
+            {"error": "Assisted update needs model budget to review local changes; nothing was changed."},
+            status_code=409,
+        )
+
+    rc_b, cur_branch, _be = git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    rc_s, status_txt, _se = git_capture(["git", "status", "--porcelain"])
+    _create_rescue_snapshot(branch, "ui_update_assisted_merge", {
+        "current_branch": cur_branch if rc_b == 0 else "",
+        "dirty_lines": [ln for ln in status_txt.splitlines() if ln.strip()] if rc_s == 0 else [],
+        "unpushed_lines": [], "warnings": [],
+    })
+    if not create_rescue_local_ref(local_snapshot):
+        _respawn_workers_after_failed_update()
+        return JSONResponse({"error": "could not preserve the local update snapshot"}, status_code=409)
+
+    st = load_state() or {}
     try:
-        if active_update_tx():  # TOCTOU: re-check UNDER the lock
-            return JSONResponse({"error": "a managed update is already in progress"}, status_code=409)
-        try:
-            from supervisor.workers import kill_workers
-
-            kill_workers(
-                result_reason="Task interrupted by an owner-requested assisted merge update.",
-                terminal_status="interrupted",
-            )
-        except Exception:
-            log.warning("assisted merge: failed to stop workers", exc_info=True)
-
-        plan2 = plan_managed_update_merge(fetch=False, build=False)
-        if not plan2.get("available"):
-            _respawn_workers_after_failed_update()
-            return JSONResponse({"error": "no managed update available", **plan2}, status_code=409)
-        base_sha = str(plan2.get("base_sha") or "")
-        target_sha = str(plan2.get("target_sha") or "")
-        local_snapshot = str(plan2.get("local_snapshot") or "")
-        # (Protected-path official changes were already routed to MANUAL upstream, BEFORE
-        # kill_workers — see _apply_managed_merge — so no protected recheck / task loss here.)
-        if not local_snapshot or not target_sha:
-            _respawn_workers_after_failed_update()
-            return JSONResponse({"error": "could not build local snapshot / target", **plan2}, status_code=409)
-
-        rc_b, cur_branch, _be = git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-        rc_s, status_txt, _se = git_capture(["git", "status", "--porcelain"])
-        _create_rescue_snapshot(branch, "ui_update_assisted_merge", {
-            "current_branch": cur_branch if rc_b == 0 else "",
-            "dirty_lines": [ln for ln in status_txt.splitlines() if ln.strip()] if rc_s == 0 else [],
-            "unpushed_lines": [], "warnings": [],
-        })
-        create_rescue_local_ref(local_snapshot)  # durable ref: local work survives any rollback/gc
-
-        st = load_state() or {}
-        try:
-            owner_chat_id = int(st.get("owner_chat_id") or 0)
-        except (TypeError, ValueError):
-            owner_chat_id = 0
-        task_id = "update_assisted_merge_" + _uuid.uuid4().hex[:8]
-        tx = {
-            "phase": "materializing_assisted",
-            "pre_update_sha": base_sha,
-            "pre_update_branch": branch,
-            "base_sha": base_sha,
-            "target_sha": target_sha,
-            "local_snapshot": local_snapshot,
-            "conflict_paths": (list(plan2.get("code_conflict_paths") or [])
-                               + list(plan2.get("doc_conflict_paths") or [])),
-            "task_id": task_id,
-            "owner_chat_id": owner_chat_id,
-            "resolution_attempts": 0,
-            "requested_at": utc_now_iso(),
-        }
-        write_update_tx(tx)  # BEFORE destructive materialization (crash-safe recovery)
-        ok, msg = materialize_assisted_merge_live(branch, local_snapshot, target_sha, base_sha)
-        if not ok:
-            rollback_managed_update("assisted_materialize_failed")
-            _respawn_workers_after_failed_update()
-            return JSONResponse({"error": f"could not stage the merge: {msg}"}, status_code=409)
-        tx["phase"] = "assisted_resolution"
-        write_update_tx(tx)
-        enqueue_assisted_resolution_task(tx)  # enqueues the authorized task + spawns a worker
-        return JSONResponse({"status": "assisted_started", "task_id": task_id, "merge_plan": plan2})
-    finally:
-        release_update_lock(lock_fh)
+        owner_chat_id = int(st.get("owner_chat_id") or 0)
+    except (TypeError, ValueError):
+        owner_chat_id = 0
+    task_id = "update_assisted_merge_" + _uuid.uuid4().hex[:8]
+    tx = {
+        "phase": "materializing_assisted",
+        "pre_update_sha": base_sha,
+        "pre_update_branch": branch,
+        "base_sha": base_sha,
+        "target_sha": target_sha,
+        "target_ref": str(plan.get("target_ref") or ""),
+        "update_channel": str(plan.get("update_channel") or ""),
+        "local_snapshot": local_snapshot,
+        "conflict_paths": (
+            list(plan.get("code_conflict_paths") or [])
+            + list(plan.get("doc_conflict_paths") or [])
+        ),
+        "task_id": task_id,
+        "owner_chat_id": owner_chat_id,
+        "resolution_attempts": 0,
+        "requested_at": utc_now_iso(),
+    }
+    close_repo_writer_admission(assisted_writer_gate_reason(tx))
+    if not ensure_assisted_resolver_ready(base_sha):
+        blockers = kill_workers_for_update(
+            result_reason="Assisted update resolver did not become ready.",
+            terminal_status="interrupted",
+        )
+        if blockers:
+            return _fence_failure([f"resolver:{item}" for item in blockers])
+        _respawn_workers_after_failed_update()
+        return JSONResponse(
+            {"error": "Assisted update could not boot its resolver before staging conflicts."},
+            status_code=409,
+        )
+    write_update_tx(tx)
+    ok, msg = materialize_assisted_merge_live(branch, local_snapshot, target_sha, base_sha)
+    if not ok:
+        return _rollback_fenced_update(
+            "assisted_materialize_failed", f"could not stage the merge: {msg}"
+        )
+    tx["phase"] = "assisted_resolution"
+    write_update_tx(tx)
+    if not enqueue_assisted_resolution_task(tx):
+        return _rollback_fenced_update(
+            "assisted_worker_start_failed",
+            "the merge was staged but its resolver worker could not start",
+        )
+    return JSONResponse({"status": "assisted_started", "task_id": task_id, "merge_plan": plan})
 
 
-async def _apply_managed_merge(request: Request, strategy: str) -> JSONResponse:
-    """Staged merge-aware update apply (P2). auto_merge lands a CLEAN 3-way merge behind a
-    FAIL-CLOSED lock with a pre-restart smoke + transactional rollback (local work is
-    preserved in the merge's local-snapshot parent + a rescue snapshot). assisted/
-    doc_reconcile route to the agent-assisted flow; manual returns the plan without
-    mutating."""
+def _apply_clean_merge_fenced(request: Request, plan: dict) -> JSONResponse:
+    """Land one exact clean plan transactionally, then request restart."""
     import uuid
 
     from supervisor.git_ops import BRANCH_DEV, _create_rescue_snapshot, git_capture
     from supervisor.update_merge import (
-        acquire_update_lock,
         apply_managed_merge_update,
-        plan_managed_update_merge,
-        release_update_lock,
-        rollback_managed_update,
         update_restart_smoke,
         write_update_tx,
     )
 
     branch = BRANCH_DEV
-    plan = plan_managed_update_merge(fetch=True, build=False)
-    if not plan.get("available"):
-        return JSONResponse({"error": "no managed update available", **plan}, status_code=409)
-    kind = str(plan.get("kind") or "")
-
-    if strategy == "manual":
-        # No mutation: hand the UI the plan; recovery artifacts are created only on apply.
-        return JSONResponse({"status": "manual", "merge_plan": plan})
-
-    # Official changes to PROTECTED paths (BIBLE/CHECKLISTS/SAFETY + release invariants) route to
-    # MANUAL on EVERY mutating strategy — checked on the initial plan BEFORE any kill_workers /
-    # rescue / materialization, so a read-only handoff never interrupts active tasks. The official
-    # delta (base..target) does not change when workers stop, so this pre-kill check is sufficient.
-    protected_hits = _official_protected_hits(plan)
-    if protected_hits:
+    merge_commit = str(plan.get("merge_commit") or "")
+    if not merge_commit:
+        _respawn_workers_after_failed_update()
+        return JSONResponse({"error": "clean update plan did not produce a target commit"}, status_code=409)
+    rc_b, cur_branch, _be = git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    rc_s, status_txt, _se = git_capture(["git", "status", "--porcelain"])
+    _create_rescue_snapshot(branch, "ui_update_apply_merge", {
+        "current_branch": cur_branch if rc_b == 0 else "",
+        "dirty_lines": [ln for ln in status_txt.splitlines() if ln.strip()] if rc_s == 0 else [],
+        "unpushed_lines": [], "warnings": [],
+    })
+    attempt_id = uuid.uuid4().hex[:12]
+    tx = {
+        "pre_update_sha": str(plan.get("base_sha") or ""),
+        "pre_update_branch": branch,
+        "target_sha": str(plan.get("target_sha") or ""),
+        "target_ref": str(plan.get("target_ref") or ""),
+        "update_channel": str(plan.get("update_channel") or ""),
+        "merge_commit": merge_commit,
+        "phase": "stashing_local_work",
+        "pre_restart_smoke": "pending",
+        "rollback_attempted": False,
+        "attempt_id": attempt_id,
+        "stash_sha": "",
+    }
+    # Owner decision (Q1=C): dirty local work never enters committed history on a
+    # clean auto-update. The decision to stash binds to the LIVE worktree at apply
+    # time (not the plan's possibly-stale dirty count), the durable pre-stash tx
+    # phase lands BEFORE the stash mutation (boot recovers a crash in between),
+    # and an unexplained still-dirty tree fails closed instead of being cleaned.
+    stash_sha = ""
+    rc_ds, dirty_now, dirty_error = git_capture(["git", "status", "--porcelain"])
+    if rc_ds != 0:
+        _respawn_workers_after_failed_update()
         return JSONResponse(
-            {"status": "manual", "reason": "protected_paths", "protected_paths": protected_hits,
-             "merge_plan": plan}
+            {"error": f"could not inspect local changes before the update: {dirty_error}"},
+            status_code=409,
+        )
+    if dirty_now.strip():
+        from supervisor.update_merge import (
+            clear_update_tx,
+            stash_local_changes_for_update,
+            write_update_tx as _write_tx,
         )
 
-    local_dirty = int(plan.get("local_dirty_count") or 0)
-    if (
-        strategy in ("assisted", "doc_reconcile")
-        or (strategy == "auto_merge" and kind != "clean")
-        # P3/P9 (triad): auto_merge fast-commits the local-snapshot parent into history
-        # WITHOUT the commit_reviewed gate. That is only acceptable when the local work is
-        # already-reviewed COMMITTED history; UNCOMMITTED dirty/untracked content must NOT
-        # land unreviewed. So a dirty working tree routes to the REVIEWED assisted task
-        # (which still PRESERVES the local changes — Q2), never a silent auto-commit.
-        or (strategy == "auto_merge" and local_dirty > 0)
-    ):
-        # Conflicts (code/doc) OR uncommitted local work: hand the merge to Ouroboros as an
-        # AUTOMATED, REVIEWED task. The supervisor stages a real merge into the live worktree
-        # and the agent resolves the markers; the resulting commit flows through the standard
-        # triad/scope immune review (Q11) before it lands — no blocked git, no parallel trust
-        # path. The owner watches progress in chat (no manual git).
-        return _start_assisted_merge(plan)
+        _write_tx(tx)
+        stash_ok, stash_sha, stash_error = stash_local_changes_for_update(attempt_id)
+        if stash_ok and not stash_sha:
+            rc_rs, still_dirty, _rse = git_capture(["git", "status", "--porcelain"])
+            if rc_rs != 0 or still_dirty.strip():
+                stash_ok, stash_error = False, (
+                    "the worktree still reports local changes after an empty stash"
+                )
+        if not stash_ok:
+            clear_update_tx()
+            _respawn_workers_after_failed_update()
+            return JSONResponse(
+                {"error": f"could not preserve local changes before the update: {stash_error}"},
+                status_code=409,
+            )
+    tx["stash_sha"] = stash_sha
+    tx["phase"] = "pending_boot_smoke"
+    write_update_tx(tx)
+    ok, msg = apply_managed_merge_update(branch, merge_commit)
+    if not ok:
+        return _rollback_fenced_update(
+            "merge_apply_failed", f"merge apply failed: {msg}"
+        )
+    smoke = update_restart_smoke()
+    if not smoke.get("ok"):
+        return _rollback_fenced_update(
+            "pre_restart_smoke_failed",
+            "pre-restart smoke failed",
+            smoke=smoke,
+        )
+    tx["pre_restart_smoke"] = "passed"
+    write_update_tx(tx)
+    return _restart_response(request, strategy="auto_merge", plan=plan)
 
-    # ---- auto_merge (clean) ----
+
+def _apply_smart_update_fenced(
+    request: Request,
+    *,
+    expected_base_sha: str,
+    expected_target_sha: str,
+) -> JSONResponse:
+    from supervisor.update_merge import (
+        acquire_update_lock,
+        active_update_tx,
+        plan_managed_update_merge,
+        release_update_lock,
+    )
+
+    plan = plan_managed_update_merge(fetch=True, build=False)
+    kind = str(plan.get("kind") or "")
+    if not plan.get("available") or kind not in _KNOWN_UPDATE_PLAN_KINDS:
+        return JSONResponse(
+            {"error": plan.get("error") or "no actionable managed update", "merge_plan": plan},
+            status_code=409,
+        )
+    if not _pins_match(plan, expected_base_sha, expected_target_sha):
+        return JSONResponse(
+            {"error": "the update changed after preflight; check again", "reason": "release_moved", "merge_plan": plan},
+            status_code=409,
+        )
     try:
         lock_fh = acquire_update_lock()
     except RuntimeError as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
     try:
-        from supervisor.update_merge import active_update_tx
-
-        if active_update_tx():  # TOCTOU: re-check UNDER the lock before any mutation
+        if active_update_tx():
             return JSONResponse({"error": "a managed update is already in progress"}, status_code=409)
-        try:
-            from supervisor.workers import kill_workers
-
-            kill_workers(
-                result_reason="Task interrupted by an owner-requested managed merge update (restart follows).",
-                terminal_status="interrupted",
-            )
-        except Exception:
-            log.warning("update_apply(merge): failed to stop workers", exc_info=True)
-
-        # Re-plan + build AFTER stopping writers; never trust the pre-kill plan. Re-check
-        # BOTH clean-merge AND a clean working tree here: a worker (or any in-process path)
-        # may have dirtied/untracked files between the pre-kill plan and now, and auto_merge
-        # must NEVER fast-commit uncommitted local content unreviewed (P3/P9) — a dirty
-        # post-kill plan aborts back to the reviewed assisted/manual path.
+        blockers = _quiesce_repo_writers("smart")
+        if blockers:
+            return _fence_failure(blockers)
         plan2 = plan_managed_update_merge(fetch=False, build=True)
-        merge_commit = str(plan2.get("merge_commit") or "")
-        if plan2.get("kind") != "clean" or not merge_commit or int(plan2.get("local_dirty_count") or 0) > 0:
+        if (
+            not plan2.get("available")
+            or str(plan2.get("kind") or "") not in _KNOWN_UPDATE_PLAN_KINDS
+            or not _pins_match(plan2, expected_base_sha, expected_target_sha)
+            or str(plan2.get("target_ref") or "") != str(plan.get("target_ref") or "")
+            or str(plan2.get("update_channel") or "") != str(plan.get("update_channel") or "")
+        ):
             _respawn_workers_after_failed_update()
             return JSONResponse(
-                {"error": "update is no longer a clean auto-merge after stopping workers", **plan2},
+                {"error": "the update plan changed while writers were stopping; nothing was applied", "reason": "release_moved", "merge_plan": plan2},
                 status_code=409,
             )
-        # (Protected-path official changes were already routed to MANUAL upstream, BEFORE
-        # kill_workers — see the early _official_protected_hits check in _apply_managed_merge.)
+        if _plan_is_clean(plan2):
+            return _apply_clean_merge_fenced(request, plan2)
+        return _start_assisted_merge_fenced(plan2)
+    except Exception as exc:
+        log.warning("managed smart update failed after writer fence", exc_info=True)
+        from supervisor.update_merge import active_update_tx as _active_tx
 
-        rc_b, cur_branch, _be = git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-        rc_s, status_txt, _se = git_capture(["git", "status", "--porcelain"])
-        _create_rescue_snapshot(
-            branch,
-            "ui_update_apply_merge",
-            {
-                "current_branch": cur_branch if rc_b == 0 else "",
-                "dirty_lines": [ln for ln in status_txt.splitlines() if ln.strip()] if rc_s == 0 else [],
-                "unpushed_lines": [],
-                "warnings": [],
-            },
-        )
-        write_update_tx(
-            {
-                "pre_update_sha": str(plan2.get("base_sha") or ""),
-                "pre_update_branch": branch,
-                "target_sha": str(plan2.get("target_sha") or ""),
-                "merge_commit": merge_commit,
-                "phase": "pending_boot_smoke",
-                "rollback_attempted": False,
-                "attempt_id": uuid.uuid4().hex[:12],
-            }
-        )
-
-        ok, msg = apply_managed_merge_update(branch, merge_commit)
-        if not ok:
-            rollback_managed_update("merge_apply_failed")
-            _respawn_workers_after_failed_update()
-            return JSONResponse({"error": f"merge apply failed (rolled back): {msg}"}, status_code=409)
-
-        smoke = update_restart_smoke()
-        if not smoke.get("ok"):
-            rollback_managed_update("pre_restart_smoke_failed")
-            _respawn_workers_after_failed_update()
-            return JSONResponse(
-                {"error": "pre-restart smoke failed; rolled back to the prior version", "smoke": smoke},
-                status_code=409,
+        if _active_tx():
+            return _rollback_fenced_update(
+                "smart_update_exception",
+                f"managed update failed: {type(exc).__name__}: {exc}",
             )
-
-        _request_restart(request)
-        return JSONResponse(
-            {"status": "ok", "restarting": True, "strategy": "auto_merge", "merge_plan": plan2}
-        )
+        _respawn_workers_after_failed_update()
+        return json_exception(exc)
     finally:
         release_update_lock(lock_fh)
 
 
-async def api_update_apply(request: Request) -> JSONResponse:
-    """Apply a managed update. Default is the merge-aware auto_merge (P2); auto_merge/
-    assisted/doc_reconcile/manual route to the staged merge flow, while the legacy
-    'replace' (advanced escape hatch) hard-resets to the remote behind a warning."""
-    body = await request_json_or(request, {}, exceptions=(Exception,))
-    strategy = str(body.get("strategy") or "auto_merge")
-    # Reject ANY mutating apply while a managed-update tx is already in flight (the legacy
-    # 'replace' path would otherwise kill_workers + hard-reset over an in-progress assisted
-    # resolution). 'manual' is read-only and always allowed. The merge paths re-check the tx
-    # under the lock (TOCTOU); this is the cheap front gate.
-    if strategy != "manual":
-        from supervisor.update_merge import active_update_tx
+async def _apply_smart_update(
+    request: Request,
+    *,
+    expected_base_sha: str,
+    expected_target_sha: str,
+) -> JSONResponse:
+    return await asyncio.to_thread(
+        _apply_smart_update_fenced,
+        request,
+        expected_base_sha=expected_base_sha,
+        expected_target_sha=expected_target_sha,
+    )
 
+
+def _apply_replace_recovery_fenced(
+    request: Request,
+    *,
+    expected_base_sha: str,
+    expected_target_sha: str,
+) -> JSONResponse:
+    import uuid
+
+    from supervisor.git_ops import (
+        BRANCH_DEV,
+        _write_update_intent,
+        checkout_and_reset,
+        prepare_managed_update,
+    )
+    from supervisor.update_merge import (
+        acquire_update_lock,
+        active_update_tx,
+        plan_managed_update_merge,
+        release_update_lock,
+        update_restart_smoke,
+        write_update_tx,
+    )
+
+    plan = plan_managed_update_merge(fetch=True, build=False)
+    if (
+        str(plan.get("kind") or "") not in (_KNOWN_UPDATE_PLAN_KINDS | {"current"})
+        or not _pins_match(plan, expected_base_sha, expected_target_sha)
+    ):
+        return JSONResponse(
+            {"error": "the recovery target changed after preflight", "reason": "release_moved", "merge_plan": plan},
+            status_code=409,
+        )
+    try:
+        lock_fh = acquire_update_lock()
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    try:
         if active_update_tx():
             return JSONResponse({"error": "a managed update is already in progress"}, status_code=409)
-    if strategy in ("auto_merge", "assisted", "doc_reconcile", "manual"):
-        return await _apply_managed_merge(request, strategy)
-    try:
-        from supervisor.git_ops import BRANCH_DEV, _clear_update_intent, checkout_and_reset, prepare_managed_update
-
-        ok, payload = prepare_managed_update(strategy)
-        if not ok:
-            return JSONResponse(payload, status_code=409)
-        # Stop workers AFTER the update is validated/prepared but BEFORE the
-        # hard reset of the live repo: a self-modifying task writing between
-        # the rescue snapshot and the reset would have its edits destroyed
-        # unrescued. Doing this pre-validation killed all workers on a plain
-        # 409 (no update available) with no restart to revive them.
-        try:
-            from supervisor.workers import kill_workers
-
-            kill_workers(
-                result_reason="Task interrupted by an owner-requested managed update (restart follows).",
-                terminal_status="interrupted",
+        blockers = _quiesce_repo_writers("replace_recovery")
+        if blockers:
+            return _fence_failure(blockers)
+        plan2 = plan_managed_update_merge(fetch=False, build=False)
+        if (
+            str(plan2.get("kind") or "") not in (_KNOWN_UPDATE_PLAN_KINDS | {"current"})
+            or not _pins_match(plan2, expected_base_sha, expected_target_sha)
+            or str(plan2.get("target_ref") or "") != str(plan.get("target_ref") or "")
+            or str(plan2.get("update_channel") or "") != str(plan.get("update_channel") or "")
+        ):
+            _respawn_workers_after_failed_update()
+            return JSONResponse(
+                {"error": "the recovery target changed while writers were stopping", "reason": "release_moved", "merge_plan": plan2},
+                status_code=409,
             )
-        except Exception:
-            log.warning("update_apply: failed to stop workers before reset", exc_info=True)
+        ok, payload = prepare_managed_update(
+            "replace",
+            expected_base_sha=expected_base_sha,
+            expected_target_sha=expected_target_sha,
+            arm_intent=False,
+        )
+        if not ok:
+            _respawn_workers_after_failed_update()
+            return JSONResponse(payload, status_code=409)
+        tx = {
+            "pre_update_sha": expected_base_sha,
+            "pre_update_branch": BRANCH_DEV,
+            "target_sha": expected_target_sha,
+            "target_ref": str(plan2.get("target_ref") or ""),
+            "update_channel": str(plan2.get("update_channel") or ""),
+            "merge_commit": expected_target_sha,
+            "phase": "applying_replace",
+            "pre_restart_smoke": "pending",
+            "pre_update_dirty_count": int(plan2.get("local_dirty_count") or 0),
+            "attempt_id": uuid.uuid4().hex[:12],
+            "strategy": "replace",
+        }
+        write_update_tx(tx)
+        _write_update_intent(dict(payload["update_intent"]))
         try:
             checkout_ok, checkout_msg = checkout_and_reset(
                 BRANCH_DEV,
                 reason="ui_update_apply",
                 unsynced_policy="rescue_and_reset",
             )
-        except Exception as checkout_exc:
-            _clear_update_intent()
-            _respawn_workers_after_failed_update()
-            return JSONResponse(
-                {"error": f"Prepared update but checkout failed: {checkout_exc}", **payload},
-                status_code=409,
+        except Exception as exc:
+            return _rollback_fenced_update(
+                "replace_checkout_exception", f"recovery checkout failed: {exc}", **payload
             )
         if not checkout_ok:
-            _clear_update_intent()
-            _respawn_workers_after_failed_update()
-            return JSONResponse(
-                {"error": f"Prepared update but checkout failed: {checkout_msg}", **payload},
-                status_code=409,
+            return _rollback_fenced_update(
+                "replace_checkout_failed", f"recovery checkout failed: {checkout_msg}", **payload
             )
-        _request_restart(request)
-        return JSONResponse({"status": "ok", "restarting": True, **payload})
+        tx["phase"] = "pending_boot_smoke"
+        write_update_tx(tx)
+        smoke = update_restart_smoke()
+        if not smoke.get("ok"):
+            return _rollback_fenced_update(
+                "replace_pre_restart_smoke_failed", "pre-restart smoke failed", smoke=smoke
+            )
+        tx["pre_restart_smoke"] = "passed"
+        write_update_tx(tx)
+        return _restart_response(request, strategy="replace", plan=plan2)
     except Exception as exc:
+        log.warning("managed replace recovery failed after writer fence", exc_info=True)
+        if active_update_tx():
+            return _rollback_fenced_update(
+                "replace_update_exception",
+                f"managed recovery failed: {type(exc).__name__}: {exc}",
+            )
+        _respawn_workers_after_failed_update()
         return json_exception(exc)
+    finally:
+        release_update_lock(lock_fh)
+
+
+async def _apply_replace_recovery(
+    request: Request,
+    *,
+    expected_base_sha: str,
+    expected_target_sha: str,
+) -> JSONResponse:
+    return await asyncio.to_thread(
+        _apply_replace_recovery_fenced,
+        request,
+        expected_base_sha=expected_base_sha,
+        expected_target_sha=expected_target_sha,
+    )
+
+
+async def api_update_apply(request: Request) -> JSONResponse:
+    """Apply an exact managed plan; replacement is an explicit recovery only."""
+    body = await request_json_or(request, {}, exceptions=(Exception,))
+    if not isinstance(body, dict):
+        return json_error("JSON body must be an object.", 400)
+    strategy = str(body.get("strategy") or "auto_merge").strip().lower()
+    if strategy not in _UPDATE_STRATEGIES:
+        return json_error(f"unsupported update strategy: {strategy or 'missing'}", 400)
+    expected_base_sha = str(body.get("expected_base_sha") or "").strip()
+    expected_target_sha = str(body.get("expected_target_sha") or "").strip()
+    if strategy == "manual":
+        from supervisor.update_merge import plan_managed_update_merge
+
+        plan = await asyncio.to_thread(plan_managed_update_merge, fetch=True)
+        return JSONResponse({"status": "manual", "merge_plan": plan})
+    if strategy != "manual":
+        from supervisor.update_merge import active_update_tx
+
+        if active_update_tx():
+            return JSONResponse({"error": "a managed update is already in progress"}, status_code=409)
+    if not expected_base_sha or not expected_target_sha:
+        return json_error("fresh preflight base and target SHA are required", 400)
+    if strategy == "replace":
+        if body.get("confirm_recovery") is not True:
+            return json_error("replace is a recovery action and requires confirm_recovery=true", 400)
+        return await _apply_replace_recovery(
+            request,
+            expected_base_sha=expected_base_sha,
+            expected_target_sha=expected_target_sha,
+        )
+    # auto_merge and assisted share one smart flow; the fresh plan, not the
+    # caller's guess, decides whether the supervisor can fast-forward/merge or
+    # Ouroboros must resolve it through reviewed assisted mode.
+    return await _apply_smart_update(
+        request,
+        expected_base_sha=expected_base_sha,
+        expected_target_sha=expected_target_sha,
+    )
 
 
 async def api_evolution_data(request: Request) -> JSONResponse:

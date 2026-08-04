@@ -10,7 +10,7 @@ import pathlib
 import re
 import subprocess
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.config import get_runtime_mode
 from ouroboros.runtime_mode_policy import (
@@ -23,7 +23,12 @@ from ouroboros.runtime_mode_policy import (
     protected_write_block_message,
 )
 from ouroboros.platform_layer import acquire_exclusive_file_lock, unlink_lockfile
-from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
+from ouroboros.tools.registry import (
+    ToolContext,
+    ToolEntry,
+    _authorized_managed_update_resolver,
+    active_repo_dir_for,
+)
 from ouroboros.tools.commit_gate import (
     _check_advisory_freshness,
     _check_overlapping_review_attempt,
@@ -420,7 +425,7 @@ def _stage_candidate_for_review(
             f"⚠️ GIT_ERROR (add): {_sanitize_git_error(str(exc))}",
         )
         return [], None, error
-    if not paths:
+    if not paths and not _authorized_managed_update_resolver(ctx):
         removed = _unstage_binaries(ctx.repo_dir)
         if removed:
             log.warning("Unstaged %d binary files: %s", len(removed), removed)
@@ -516,7 +521,11 @@ def _run_reviewed_stage_cycle(
         return stage_error
     protected_staged_paths = protected_paths_in(classification_paths)
     runtime_mode = _current_runtime_mode()
-    if protected_staged_paths and not mode_allows_protected_write(runtime_mode):
+    if (
+        protected_staged_paths
+        and not mode_allows_protected_write(runtime_mode)
+        and not _authorized_managed_update_resolver(ctx)
+    ):
         msg = _protected_paths_block_message(
             protected_staged_paths,
             runtime_mode=runtime_mode,
@@ -978,11 +987,11 @@ def _log_test_failure(ctx: ToolContext, commit_message: str, test_output: str) -
         pass
 
 
-def _run_pre_push_tests(ctx: ToolContext) -> Optional[str]:
+def _run_pre_push_tests(ctx: ToolContext, force: bool = False) -> Optional[str]:
     if ctx is None:
         log.warning("_run_pre_push_tests called with ctx=None, skipping tests")
         return None
-    if os.environ.get("OUROBOROS_PRE_PUSH_TESTS", "1") != "1":
+    if not force and os.environ.get("OUROBOROS_PRE_PUSH_TESTS", "1") != "1":
         return None
     tests_dir = pathlib.Path(ctx.repo_dir) / "tests"
     if not tests_dir.exists():
@@ -1000,8 +1009,8 @@ def _run_pre_push_tests(ctx: ToolContext) -> Optional[str]:
         return f"⚠️ PRE_PUSH_TEST_ERROR: Unexpected error running tests: {e}"
 
 
-def _git_commit_with_tests(ctx: ToolContext) -> Optional[str]:
-    test_error = _run_pre_push_tests(ctx)
+def _git_commit_with_tests(ctx: ToolContext, force: bool = False) -> Optional[str]:
+    test_error = _run_pre_push_tests(ctx, force=force)
     if test_error:
         log.error("Post-commit verification failed")
         ctx.last_push_succeeded = False
@@ -1013,18 +1022,100 @@ def _git_commit_with_tests(ctx: ToolContext) -> Optional[str]:
     return None
 
 
-def _post_commit_result(ctx, commit_message, skip_tests, tw_ref):
+def _post_commit_result(ctx, commit_message, skip_tests, tw_ref, force: bool = False) -> Optional[str]:
     global _consecutive_test_failures
-    if skip_tests:
-        return
-    push_error = _git_commit_with_tests(ctx)
+    if skip_tests and not force:
+        return None
+    push_error = _git_commit_with_tests(ctx, force=force)
     if push_error:
         _consecutive_test_failures += 1
         _log_test_failure(ctx, commit_message, push_error)
         tw_ref[0] = (f"\n\n⚠️ TESTS_FAILED (commit preserved, "
                      f"consecutive failures: {_consecutive_test_failures}):\n{push_error}")
+        return push_error
     else:
         _consecutive_test_failures = 0
+    return None
+
+
+def _managed_commit_gate_failure(reason: str, message: str) -> str:
+    """Rollback a landed assisted commit, or keep the failed gate durable."""
+    from supervisor.update_merge import (
+        mark_update_tx_gate_blocked,
+        rollback_managed_update,
+    )
+
+    ok, detail = rollback_managed_update(reason)
+    if ok:
+        return f"{message}\n\nThe managed update was rolled back: {detail}"
+    mark_update_tx_gate_blocked(reason, detail)
+    return (
+        f"{message}\n\n⚠️ MANAGED_UPDATE_GATE_BLOCKED: rollback could not be verified "
+        f"({detail}). Restart/recovery is required."
+    )
+
+
+def _managed_post_commit_tests_gate(
+    ctx, commit_message: str, commit_start: float, skip_tests: bool,
+    test_warning_ref, managed_tx: Dict[str, Any],
+) -> Optional[str]:
+    """BLOCKING post-commit test gate for managed-update merges only: a failed
+    suite rolls the assisted merge back instead of shipping a warning (ordinary
+    commits keep the warning-only contract later in the flow). The gate is
+    MANDATORY: neither the caller's skip_tests nor OUROBOROS_PRE_PUSH_TESTS=0
+    can wave a managed merge through untested."""
+    if not managed_tx:
+        return None
+    del skip_tests  # deliberately ignored for managed merges
+    post_test_error = _post_commit_result(
+        ctx, commit_message, False, test_warning_ref, force=True,
+    )
+    if not post_test_error:
+        return None
+    failure = test_warning_ref[0].strip() or post_test_error
+    failure = _managed_commit_gate_failure("assisted_post_commit_tests_failed", failure)
+    _record_commit_attempt(
+        ctx, commit_message, "failed",
+        block_reason="post_commit_tests_failed", block_details=failure,
+        duration_sec=time.time() - commit_start, phase="post_commit_tests",
+    )
+    return failure
+
+
+def _review_binding_failure(
+    ctx: ToolContext,
+    commit_message: str,
+    commit_start: float,
+    message: str,
+    *,
+    binding_kind: str,
+    fingerprints: Tuple[Dict[str, Any], Dict[str, Any]],
+    managed_tx: Dict[str, Any],
+) -> str:
+    """Record either exact-tree binding failure through one shared path."""
+    block_reason, phase, managed_reason = {
+        "commit": ("review_binding_mismatch", "commit_binding", "assisted_commit_binding_mismatch"),
+        "tag": ("review_tag_binding_mismatch", "tag_binding", "assisted_tag_binding_mismatch"),
+    }[binding_kind]
+    pre_fingerprint, post_fingerprint = fingerprints
+    _record_commit_attempt(
+        ctx,
+        commit_message,
+        "failed",
+        block_reason=block_reason,
+        block_details=message,
+        duration_sec=time.time() - commit_start,
+        phase=phase,
+        pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
+        post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
+        fingerprint_status="mismatch",
+        triad_models=getattr(ctx, "_last_triad_models", []),
+        scope_model=getattr(ctx, "_last_scope_model", ""),
+        triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
+        scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
+        degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
+    )
+    return _managed_commit_gate_failure(managed_reason, message) if managed_tx else message
 
 
 def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
@@ -1164,7 +1255,12 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
 
     for e in write_list:
         norm = normalize_repo_path(e["path"])
-        if not ctx.is_workspace_mode() and is_protected_runtime_path(norm) and not mode_allows_protected_write(_current_runtime_mode()):
+        if (
+            not ctx.is_workspace_mode()
+            and is_protected_runtime_path(norm)
+            and not mode_allows_protected_write(_current_runtime_mode())
+            and not _authorized_managed_update_resolver(ctx)
+        ):
             return protected_write_block_message(
                 path=norm,
                 runtime_mode=_current_runtime_mode(),
@@ -1249,7 +1345,12 @@ def _str_replace_editor(
         return "⚠️ STR_REPLACE_ERROR: old_str is required (cannot be empty)."
 
     norm = normalize_repo_path(path)
-    if not ctx.is_workspace_mode() and is_protected_runtime_path(norm) and not mode_allows_protected_write(_current_runtime_mode()):
+    if (
+        not ctx.is_workspace_mode()
+        and is_protected_runtime_path(norm)
+        and not mode_allows_protected_write(_current_runtime_mode())
+        and not _authorized_managed_update_resolver(ctx)
+    ):
         return protected_write_block_message(
             path=norm,
             runtime_mode=_current_runtime_mode(),
@@ -1858,8 +1959,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
     # reviewed 2-parent merge (native MERGE_HEAD), with push/tag suppressed + an inline
     # pre-restart smoke. Any OTHER task is blocked from committing while the tx is active.
     from supervisor.update_merge import managed_assisted_tx_for
-
-    _managed_tx, _managed_block = managed_assisted_tx_for(getattr(ctx, "task_id", ""))
+    _managed_tx, _managed_block = managed_assisted_tx_for(getattr(ctx, "task_id", ""), getattr(ctx, "task_metadata", None))
     if _managed_block:
         _record_commit_attempt(ctx, commit_message, "blocked",
                                block_reason="managed_update_in_progress", block_details=_managed_block,
@@ -1954,7 +2054,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             # PRIMARY conflict-marker leakage gate (a `git add`-ed marker file is a resolved
             # entry that --diff-filter=U misses), then mark the crash-window phase before the
             # native 2-parent commit (MERGE_HEAD is still set, so `git commit` records both
-            # parents — local_snapshot + target).
+            # parents — reviewed pre_update_sha + target).
             from supervisor.update_merge import managed_assisted_marker_check, write_update_tx
 
             _mok, _merr = managed_assisted_marker_check()
@@ -1969,6 +2069,9 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             commit_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir).strip()
         except Exception as e:
             err_msg = f"⚠️ GIT_ERROR (commit): {_sanitize_git_error(str(e))}"
+            if _managed_tx:
+                from supervisor.update_merge import restore_assisted_resolution_after_commit_error
+                restore_assisted_resolution_after_commit_error(_managed_tx)
             _record_commit_attempt(ctx, commit_message, "failed",
                                    block_reason="infra_failure", block_details=err_msg,
                                    duration_sec=time.time() - _commit_start,
@@ -1993,25 +2096,18 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             )
             if evolution_claim:
                 binding_msg += " " + _preserve_evolution_orphan(ctx, commit_sha)
-            _record_commit_attempt(
-                ctx,
-                commit_message,
-                "failed",
-                block_reason="review_binding_mismatch",
-                block_details=binding_msg,
-                duration_sec=time.time() - _commit_start,
-                phase="commit_binding",
-                pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
-                post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
-                fingerprint_status="mismatch",
-                triad_models=getattr(ctx, "_last_triad_models", []),
-                scope_model=getattr(ctx, "_last_scope_model", ""),
-                triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
-                scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
-                degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
+            return _review_binding_failure(
+                ctx, commit_message, _commit_start, binding_msg,
+                binding_kind="commit",
+                fingerprints=(pre_fingerprint, post_fingerprint),
+                managed_tx=_managed_tx,
             )
-            return binding_msg
         reviewed_binding = post_fingerprint.get("binding", {}) or {}
+        gate_failure = _managed_post_commit_tests_gate(
+            ctx, commit_message, _commit_start, skip_tests, test_warning_ref, _managed_tx,
+        )
+        if gate_failure:
+            return gate_failure
         # A managed-update merge commit must NOT auto-tag/auto-push pre-restart (an un-smoked
         # update would otherwise reach origin / create a version tag, and a later rollback would
         # diverge from origin). The official version tag is handled on the owner's terms.
@@ -2047,24 +2143,12 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                 binding_msg += " " + _preserve_evolution_orphan(
                     ctx, commit_sha, created_tag=created_tag,
                 )
-            _record_commit_attempt(
-                ctx,
-                commit_message,
-                "failed",
-                block_reason="review_tag_binding_mismatch",
-                block_details=binding_msg,
-                duration_sec=time.time() - _commit_start,
-                phase="tag_binding",
-                pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
-                post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
-                fingerprint_status="mismatch",
-                triad_models=getattr(ctx, "_last_triad_models", []),
-                scope_model=getattr(ctx, "_last_scope_model", ""),
-                triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
-                scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
-                degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
+            return _review_binding_failure(
+                ctx, commit_message, _commit_start, binding_msg,
+                binding_kind="tag",
+                fingerprints=(pre_fingerprint, post_fingerprint),
+                managed_tx=_managed_tx,
             )
-            return binding_msg
         if evolution_claim:
             receipt_error = _record_evolution_commit_receipt(
                 ctx, commit_message, _commit_start, evolution_claim, commit_sha,
@@ -2072,7 +2156,11 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             )
             if receipt_error:
                 return receipt_error
-        _post_commit_result(ctx, commit_message, skip_tests, test_warning_ref)
+        if not _managed_tx:
+            # Ordinary self-modification contract: post-commit tests are reported
+            # as a warning. Managed-update merges already ran them as the BLOCKING
+            # assisted_post_commit_tests gate right after the commit above.
+            _post_commit_result(ctx, commit_message, skip_tests, test_warning_ref)
         push_status = ""
         if not _managed_tx and evolution_claim:
             publication_error = _evolution_publication_stopped_result(

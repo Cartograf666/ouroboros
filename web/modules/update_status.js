@@ -5,7 +5,7 @@
 // transparent control surface. Non-invasive: the detailed Dashboard -> Updates panel
 // stays the place for recovery/details.
 
-import { apiClient } from './api_client.js';
+import { apiClient, updateStrategyForPlan } from './api_client.js';
 
 function escapeHtml(value) {
     return String(value ?? '').replace(/[&<>"']/g, (c) => (
@@ -22,7 +22,36 @@ async function safe(fn) {
     }
 }
 
-export function initUpdateStatus({ showPage, openDashboardTab } = {}) {
+export function updatePillText(status = {}) {
+    const currentVersion = String(status.current_version || '');
+    const latestVersion = String(status.latest_version || '');
+    const currentSha = String(status.current_short_sha || status.current_sha || '').slice(0, 8);
+    const latestSha = String(status.latest_short_sha || status.latest_sha || '').slice(0, 8);
+    if (currentVersion && latestVersion && currentVersion === latestVersion) {
+        return currentSha && latestSha
+            ? `Update ${currentSha} → ${latestSha}`
+            : `Update available${latestSha ? ` · ${latestSha}` : ''}`;
+    }
+    const current = currentVersion || currentSha;
+    const latest = latestVersion || latestSha;
+    return current && latest ? `Update ${current} → ${latest}` : 'Update available';
+}
+
+export function verifiedUpdatePlan(preflight) {
+    const plan = preflight?.merge_plan;
+    if (!plan || typeof plan !== 'object') return null;
+    const strategy = updateStrategyForPlan(plan);
+    if (
+        !strategy
+        || !plan.base_sha
+        || !plan.target_sha
+        || !Number.isInteger(plan.local_dirty_count)
+        || plan.local_dirty_count < 0
+    ) return null;
+    return { plan, strategy };
+}
+
+export function initUpdateStatus({ showPage, openDashboardTab, ws } = {}) {
     function ensurePill() {
         let pill = document.getElementById('update-pill');
         if (!pill) {
@@ -48,9 +77,7 @@ export function initUpdateStatus({ showPage, openDashboardTab } = {}) {
             pill.hidden = true;
             return;
         }
-        const cur = status.current_version || (status.current_sha ? String(status.current_sha).slice(0, 8) : '');
-        const next = status.latest_version || (status.latest_sha ? String(status.latest_sha).slice(0, 8) : '');
-        pill.textContent = (cur && next) ? `Update ${cur} → ${next}` : 'Update available';
+        pill.textContent = updatePillText(status);
         pill.classList.toggle('has-local', Boolean(status.dirty || status.ahead));
         pill.hidden = false;
     }
@@ -66,32 +93,53 @@ export function initUpdateStatus({ showPage, openDashboardTab } = {}) {
         document.body.appendChild(overlay);
 
         const pre = await safe(() => apiClient.updatePreflight());
-        const plan = (pre && pre.merge_plan) || {};
-        const kind = plan.kind || 'unknown';
-        // Auto-update only for a clean merge AND a clean working tree: the backend routes a
-        // clean merge with uncommitted local work to the reviewed assisted task (never an
-        // unreviewed auto-commit), so the dialog must offer assisted there, not Auto-update.
-        const clean = kind === 'clean' && Number(plan.local_dirty_count || 0) === 0;
+        const verified = verifiedUpdatePlan(pre);
+        if (!verified) {
+            overlay.querySelector('.update-dialog').innerHTML = `
+                <h3 class="update-dialog-title">Update plan unavailable</h3>
+                <div class="update-dialog-meta">The update could not be verified. No files were changed.</div>
+                <div class="update-dialog-actions">
+                    <button data-retry class="btn btn-primary">Retry</button>
+                    <button data-open-details class="btn btn-default">Open details</button>
+                    <button data-close class="btn btn-default">Cancel</button>
+                </div>`;
+            overlay.addEventListener('click', (event) => {
+                const t = event.target;
+                if (t === overlay || t.hasAttribute?.('data-close')) overlay.remove();
+                if (t.hasAttribute?.('data-retry')) {
+                    overlay.remove();
+                    openUpdateDialog();
+                }
+                if (t.hasAttribute?.('data-open-details')) {
+                    overlay.remove();
+                    showPage?.('dashboard');
+                    openDashboardTab?.('updates');
+                }
+            });
+            return;
+        }
+        const { plan, strategy } = verified;
         const hot = new Set(plan.hot_code_paths || []);
         const conflicts = [
-            ...((plan.protected_conflict_paths || []).map((p) => `Protected: ${p}`)),
             ...((plan.code_conflict_paths || []).map((p) => (hot.has(p) ? `Code (hot): ${p}` : `Code: ${p}`))),
             ...((plan.doc_conflict_paths || []).map((p) => `Docs: ${p}`)),
         ];
         const base = plan.base_sha ? String(plan.base_sha).slice(0, 8) : '';
         const target = plan.target_sha ? String(plan.target_sha).slice(0, 8) : '';
-        const primary = clean
-            ? '<button data-strategy="auto_merge" class="btn btn-primary">Auto-update</button>'
-            : '<button data-strategy="assisted" class="btn btn-primary">Ouroboros-assisted update</button>';
+        const primary = strategy === 'auto_merge'
+            ? '<button data-strategy="auto_merge" class="btn btn-primary">Update now</button>'
+            : (strategy === 'assisted'
+                ? '<button data-strategy="assisted" class="btn btn-primary">Update with Ouroboros</button>'
+                : '<button class="btn btn-primary" disabled>Update unavailable</button>');
 
         overlay.querySelector('.update-dialog').innerHTML = `
             <h3 class="update-dialog-title">Update ${escapeHtml(base)} → ${escapeHtml(target)}</h3>
-            <div class="update-dialog-meta">${plan.local_dirty_count || 0} local change(s)${conflicts.length ? ` · ${conflicts.length} conflict(s)` : ' · clean merge'}</div>
+            <div class="update-dialog-meta">${plan.local_dirty_count} local change(s)${conflicts.length ? ` · ${conflicts.length} conflict(s)` : (plan.merge_commit && plan.merge_commit !== plan.target_sha ? ' · automatic Git merge' : ' · direct fast-forward')}</div>
             ${conflicts.length ? `<ul class="update-dialog-conflicts">${conflicts.map((r) => `<li>${escapeHtml(r)}</li>`).join('')}</ul>` : ''}
-            <div class="update-dialog-note">Your local work is preserved in a rescue snapshot first; a smoke test runs before the restart is accepted, and a failed update auto-rolls-back to the current version.</div>
+            <div class="update-dialog-note">Git handles clean updates directly. Ouroboros joins only when Git reports a real conflict. A rescue snapshot and rollback protect the current checkout; uncommitted local edits are stashed and restored as uncommitted work after the update.</div>
             <div class="update-dialog-actions">
                 ${primary}
-                <button data-strategy="manual" class="btn btn-default">Open details</button>
+                <button data-open-details class="btn btn-default">Open details</button>
                 <button data-close class="btn btn-default">Cancel</button>
             </div>
             <div class="update-dialog-status" hidden></div>`;
@@ -103,29 +151,28 @@ export function initUpdateStatus({ showPage, openDashboardTab } = {}) {
                 overlay.remove();
                 return;
             }
-            const strat = t.dataset?.strategy;
-            if (!strat) return;
-            if (strat === 'manual') {
+            if (t.hasAttribute?.('data-open-details')) {
                 overlay.remove();
                 showPage?.('dashboard');
                 openDashboardTab?.('updates');
                 return;
             }
+            const strat = t.dataset?.strategy;
+            if (!strat) return;
             statusEl.hidden = false;
             statusEl.textContent = 'Applying update…';
-            const data = await apiClient.updateApply(strat).catch((e) => ({ error: String((e && e.message) || e) }));
+            const data = await apiClient.updateApply(strat, plan).catch((e) => ({
+                error: String((e && e.message) || e),
+                restart_required: Boolean(e?.body?.restart_required),
+            }));
             if (data && data.status === 'ok' && data.restarting) {
                 statusEl.textContent = 'Update applied; smoke-test passed; restarting…';
             } else if (data && data.status === 'assisted_started') {
                 statusEl.textContent = 'Ouroboros is resolving the merge under review — watch progress in chat.';
-            } else if (data && data.status === 'manual') {
-                // The backend routed this update to MANUAL (e.g. it touches protected paths like
-                // BIBLE/CHECKLISTS/SAFETY) — surface that handoff, don't show a generic failure.
-                const prot = Array.isArray(data.protected_paths) && data.protected_paths.length
-                    ? ` (protected: ${data.protected_paths.slice(0, 6).map(escapeHtml).join(', ')})`
-                    : '';
-                statusEl.textContent = `This update needs manual handling${prot} — opening the detailed Updates panel…`;
-                setTimeout(() => { overlay.remove(); showPage?.('dashboard'); openDashboardTab?.('updates'); }, 1500);
+            } else if (data && data.status === 'restart_required') {
+                statusEl.textContent = 'The update landed, but automatic restart failed. Restart Ouroboros to finish.';
+            } else if (data && data.restart_required) {
+                statusEl.textContent = `Did not complete: ${data.error}. Runtime shutdown was incomplete; restart Ouroboros before retrying.`;
             } else {
                 statusEl.textContent = (data && data.error) ? `Did not complete: ${data.error}` : 'Update did not complete.';
             }
@@ -133,6 +180,7 @@ export function initUpdateStatus({ showPage, openDashboardTab } = {}) {
     }
 
     refresh();
+    ws?.on?.('update_status_ready', refresh);
     window.addEventListener('ouro:page-shown', (event) => {
         if (event?.detail?.page === 'chat') refresh();
     });

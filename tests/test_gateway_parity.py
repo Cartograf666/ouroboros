@@ -14,6 +14,13 @@ from ouroboros.gateway.contracts import (
     SkillDeleteResponse,
     SkillLifecycleQueueResponse,
     StateResponse,
+    UpdateApplyErrorResponse,
+    UpdateApplyRequest,
+    UpdateApplySuccessResponse,
+    UpdateMergePlan,
+    UpdatePreflightRequest,
+    UpdatePreflightResponse,
+    UpdateStatusReadyOutbound,
     VideoOutbound,
 )
 from ouroboros.gateway.router import collect_routes
@@ -89,6 +96,13 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "TaskCancelResponse",
         "LogTailResponse",
         "SkillDeleteResponse",
+        "UpdateMergePlan",
+        "UpdatePreflightRequest",
+        "UpdatePreflightResponse",
+        "UpdateApplyRequest",
+        "UpdateApplySuccessResponse",
+        "UpdateApplyErrorResponse",
+        "UpdateStatusReadyOutbound",
     ):
         assert re.search(rf"@typedef \{{Object\}} {name}\b", text), f"api_types.js missing {name}"
     api_client = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_client.js").read_text(
@@ -99,10 +113,20 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
     # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
     for cls in (ChatInbound, ChatOutbound, PhotoOutbound, VideoOutbound,
-                StateResponse, OwnerScopeReviewFloorResponse):
+                StateResponse, OwnerScopeReviewFloorResponse, UpdateMergePlan,
+                UpdatePreflightRequest, UpdatePreflightResponse, UpdateApplyRequest,
+                UpdateApplySuccessResponse, UpdateApplyErrorResponse,
+                UpdateStatusReadyOutbound):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+    assert UpdatePreflightResponse.__required_keys__ == frozenset({"merge_plan"})
+    assert re.search(r"@property \{'auto_merge'\|'assisted'\|'manual'\|'replace'\} strategy\b", text)
+    assert re.search(r"@property \{string=\} expected_base_sha\b", text)
+    assert re.search(r"@property \{string=\} expected_target_sha\b", text)
+    assert re.search(r"@property \{boolean=\} confirm_recovery\b", text)
+    assert re.search(r"@property \{'ok'\|'restart_required'\|'assisted_started'\|'manual'\} status\b", text)
+    assert re.search(r"@typedef \{Object\} UpdateApplyErrorResponse.*?@property \{string\} error\b", text, re.S)
     assert re.search(r"@property \{boolean\} context_mode_auto_low\b", text), (
         "StateResponse.context_mode_auto_low must be a JSDoc boolean — the owner control branches on it"
     )
@@ -138,6 +162,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     assert re.search(r"@property \{string=\} error\b", text), "SkillDeleteResponse missing optional error"
     assert {"chat", "command", "photo", "video", "typing", "log", "heartbeat", "extension_lifecycle"} <= set(WS_MESSAGE_TYPES)
     assert "message_annotation" in WS_MESSAGE_TYPES
+    assert "update_status_ready" in WS_MESSAGE_TYPES
     assert _js_typedef_fields(text, "MessageAnnotationOutbound") == {
         "type",
         "annotation_type",

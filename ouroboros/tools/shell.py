@@ -31,7 +31,12 @@ from ouroboros.runtime_mode_policy import (
 )
 from ouroboros.tools.commit_gate import _invalidate_advisory
 from ouroboros.shell_parse import embedded_absolute_path_tokens, is_absolute_path_text, recover_stringified_argv, shell_argv_with_inline
-from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
+from ouroboros.tools.registry import (
+    ToolContext,
+    ToolEntry,
+    _authorized_managed_update_resolver,
+    active_repo_dir_for,
+)
 from ouroboros.tool_access import (
     active_tool_profile,
     decide_tool_access,
@@ -64,6 +69,7 @@ _RUN_SHELL_DEFAULT_TIMEOUT_SEC = 360
 _CONTROL_DIR_BACKUP_MAX_BYTES = 5 * 1024 * 1024
 _OUTPUT_DIR_MAX_FILES = 1000
 _OUTPUT_DIR_MAX_BYTES = 50 * 1024 * 1024
+
 
 def _tracked_subprocess_run(cmd, **kwargs):
     """subprocess.run replacement with process-tree tracking. When capturing TEXT
@@ -1521,7 +1527,6 @@ def _room_default_cwd_edit_block(ctx: ToolContext, cwd: str) -> str:
 def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "", budget: float = 5.0, validate: bool = False, bucket: str = "", skill_name: str = "", outputs: List[str] | None = None) -> str:
     """Delegate SDK edits with cwd and protected-path safety hooks."""
     from ouroboros.tools.git import _acquire_git_lock, _release_git_lock
-
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         return "⚠️ CLAUDE_CODE_UNAVAILABLE: ANTHROPIC_API_KEY not set."
@@ -1633,7 +1638,8 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "", budget: floa
     before_outputs = _snapshot_declared_outputs(ctx, outputs, work_dir_path, cwd_root=work_dir_root, changed_paths=set(before_changed or []))
     system_repo_mode = repo_mode and pathlib.Path(target_repo_root).resolve(strict=False) == system_repo_root
     runtime_mode = get_runtime_mode()
-    if system_repo_mode and not mode_allows_protected_write(runtime_mode):
+    update_resolver = _authorized_managed_update_resolver(ctx)
+    if system_repo_mode and not mode_allows_protected_write(runtime_mode) and not update_resolver:
         protected_dirty_before = _protected_runtime_dirty_paths(target_repo_root)
         if protected_dirty_before:
             restored_sidecars = _restore_skill_control_changes(skill_control_snapshots) if skill_control_snapshots else []
@@ -1693,7 +1699,7 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "", budget: floa
                 budget=budget,
                 system_prompt=system_prompt,
                 repo_root=str(target_repo_root if repo_mode else work_dir_path),
-                protect_runtime_paths=system_repo_mode,
+                protect_runtime_paths=system_repo_mode and not update_resolver,
                 write_path_blocker=write_path_blocker,
             )
 
@@ -1735,7 +1741,7 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "", budget: floa
                     + ". Created control paths and sidecar changes were reverted where possible; edit payload code files instead."
                 )
 
-            if system_repo_mode and not mode_allows_protected_write(runtime_mode):
+            if system_repo_mode and not mode_allows_protected_write(runtime_mode) and not update_resolver:
                 protected_dirty_after = _protected_runtime_dirty_paths(target_repo_root)
                 if protected_dirty_after:
                     restored = _restore_protected_runtime_paths(target_repo_root, protected_dirty_after)
@@ -1784,7 +1790,7 @@ def _claude_code_edit(ctx: ToolContext, prompt: str, cwd: str = "", budget: floa
                     "without outputs=[...]. If it created a deliverable, register it "
                     "with outputs or write_file(root=artifact_store) before claiming it."
                 )
-            if system_repo_mode and mode_allows_protected_write(runtime_mode):
+            if system_repo_mode and (mode_allows_protected_write(runtime_mode) or update_resolver):
                 protected_written = protected_paths_in(result.changed_files or after_changed)
                 if protected_written:
                     output += "\n\n" + core_patch_notice(protected_written)

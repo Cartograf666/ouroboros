@@ -580,6 +580,21 @@ def process_group_id(pid: int) -> int:
         return 0
 
 
+def process_group_is_alive(pgid: int) -> bool:
+    """Return whether a Unix process group still has at least one member."""
+    if IS_WINDOWS or int(pgid or 0) <= 0:
+        return False
+    try:
+        os.killpg(int(pgid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def current_process_group_id() -> int:
     """Return the current Unix process group id or 0 when unavailable."""
     if IS_WINDOWS:

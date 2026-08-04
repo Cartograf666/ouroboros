@@ -317,7 +317,7 @@ def test_owner_restart_copy_is_explicit_about_stopped_task():
     assert "panic_stop.flag" in source
     assert "owner_restart_flag.unlink(missing_ok=True)" in source
     assert "stable_skip_flag.unlink(missing_ok=True)" in source
-    assert source.index("safe_restart(reason=\"owner_restart\"") < source.index("Stopping active task. New settings apply to the next message.")
+    assert source.index("_safe_restart_serialized(") < source.index("Stopping active task. New settings apply to the next message.")
     assert source.index("owner_restart_no_resume.flag") < source.index("Stopping active task. New settings apply to the next message.")
 
 

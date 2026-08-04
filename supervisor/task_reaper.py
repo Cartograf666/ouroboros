@@ -260,8 +260,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
     task_id = str(job.get("task_id") or "")
     task = job.get("task") if isinstance(job.get("task"), dict) else {}
     task_metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
-    evolution_tx = task_metadata.get("evolution_transaction")
-    terminal_metadata = {"evolution_transaction": dict(evolution_tx)} if isinstance(evolution_tx, dict) else {}
+    terminal_metadata = workers_mod.terminal_task_metadata(task_metadata)
     task_type = str(job.get("task_type") or "")
     terminal_reason = str(job.get("terminal_reason") or "idle_timeout")
     attempt = int(job.get("attempt") or 1)

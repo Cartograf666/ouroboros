@@ -1177,6 +1177,42 @@ Before every commit, verify the following:
 
 ---
 
+## Managed Update Rule
+
+- Keep the local work branch and the official update feed separate. The local
+  branch is `ouroboros`; `OUROBOROS_UPDATE_CHANNEL` maps Stable to `main`, QA to
+  `ouroboros-stable`, and Development to `ouroboros`. QA and Development follow
+  their branch tips. Stable resolves the newest plain `vX.Y.Z` tag whose commit
+  is present in both `main` and `ouroboros-stable`.
+- A preflight chooses one exact official target SHA. Apply must bind to the
+  disclosed base/target, close new writers, drain existing direct/ephemeral
+  turns, stop workers and tracked services, then re-plan before mutation.
+- Clean fast-forwards land the official SHA directly. Git also builds clean
+  merges for divergent local history, with parents = reviewed HEAD + official
+  target. Dirty local work never enters that history: the apply stashes it and
+  restores it as uncommitted content (boot finalize on success, the pre-update
+  tree on rollback; a conflicting restore keeps the stash and discloses the
+  recovery command). The reviewed assisted resolver runs only when Git reports
+  a real conflict; filenames do not create a second update policy. Hard reset
+  is an explicitly confirmed recovery only.
+- The authorized resolver stages the complete merge, including tracked binary
+  files. Review receives their exact staged mode/blob/size plus the HEAD and
+  official MERGE_HEAD object ids; deletions carry an explicit absent stage and
+  exact parent identities. Missing exact metadata still blocks. This exception
+  does not weaken the ordinary commit pipeline's binary policy.
+- Write the update transaction before mutation. Reopen writers only after a
+  verified abort/rollback or a healthy restart. An unverified rollback keeps
+  its retryable phase plus the full failure evidence; a legacy `gate_blocked`
+  marker retries rollback on boot. Delayed evolution cleanup also acquires the
+  same update lock and honors this admission owner; it must not stash/reset
+  behind the fence. Managed merge tests pass before restart; the ordinary
+  self-modification commit/tag/test/push ordering remains unchanged.
+- Manual Restore reuses the same writer fence and pins the previous HEAD on a
+  local recovery branch before reset. Promotion resolves the development SHA
+  once and uses that exact SHA for both the local QA ref and any remote push.
+
+---
+
 ## Mutation Attribution Rule
 
 - Attribution is evidence, not exclusion. The host captures a `system_repo`

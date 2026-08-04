@@ -69,6 +69,13 @@ export function extensionRoutePath(skill, route, params = null) {
     return `${extensionRoutePrefix(skill)}${cleanRoute}${query}`;
 }
 
+export function updateStrategyForPlan(plan = {}) {
+    if (!plan.available) return '';
+    const kind = String(plan.kind || '');
+    if (!['clean', 'conflicting'].includes(kind)) return '';
+    return kind === 'clean' ? 'auto_merge' : 'assisted';
+}
+
 export const apiClient = {
     /** @returns {Promise<import('./api_types.js').HealthResponse>} */
     health: () => fetchJson('/api/health', { cache: 'no-store' }),
@@ -114,6 +121,14 @@ export const apiClient = {
     /** @returns {Promise<import('./api_types.js').FsDirsResponse>} */
     fsDirs: (path = '') => fetchJson(`/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`, { cache: 'no-store' }),
     updateStatus: () => fetchJson('/api/update/status', { cache: 'no-store' }),
+    updateCheck: () => jsonPost('/api/update/check', {}),
+    /** @returns {Promise<import('./api_types.js').UpdatePreflightResponse>} */
     updatePreflight: () => jsonPost('/api/update/preflight', {}),
-    updateApply: (strategy) => jsonPost('/api/update/apply', { strategy }),
+    /** @returns {Promise<import('./api_types.js').UpdateApplySuccessResponse>} */
+    updateApply: (strategy, plan = {}, { confirmRecovery = false } = {}) => jsonPost('/api/update/apply', {
+        strategy,
+        expected_base_sha: String(plan.base_sha || ''),
+        expected_target_sha: String(plan.target_sha || ''),
+        ...(confirmRecovery ? { confirm_recovery: true } : {}),
+    }),
 };
