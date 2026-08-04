@@ -484,7 +484,7 @@ def apply_runtime_provider_defaults(settings: dict) -> tuple[dict, bool, list[st
     for key in _ALL_MODEL_SLOT_KEYS:
         if key not in provider_defaults:
             # This provider has NO reachable value for that slot (deep review needs
-            # the >=1M window Cloud.ru and GigaChat are documented below). Leaving a
+            # the >=1M window Cloud.ru/GigaChat/MiniMax do not guarantee). Leaving a
             # SHIPPED default in place would keep an unreachable OpenRouter-form
             # route, so clear it — the review is then honestly unavailable. An
             # explicit owner value is never touched.

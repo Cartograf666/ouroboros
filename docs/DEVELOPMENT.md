@@ -377,9 +377,10 @@ per-feature nicety:
   an unconfigured provider.
   EXCEPTION (v6.82.0): the deep-self-review slot is filled only for providers whose
   model carries the >=1M window that review sizes against — OpenAI and Anthropic.
-  Cloud.ru and GigaChat are documented below that floor, so their shipped deep value
-  is CLEARED instead (an explicit owner value is never touched) and deep review is
-  honestly unavailable rather than advertised and doomed to overflow its route.
+  Cloud.ru and GigaChat are documented below that floor, and MiniMax guarantees only
+  a 512K minimum ("up to 1M"), so their shipped deep value is CLEARED instead (an
+  explicit owner value is never touched) and deep review is honestly unavailable
+  rather than advertised and doomed to overflow its route.
 - **Scope-review ≥1M floor (BIBLE P3).** A direct-provider-only setup fills the
   scope-reviewer slot with its own model (mirroring the Cloud.ru pattern). Where the
   single provider has no 1M-context model, the disclosed fallback (v6.80.0) is the
