@@ -293,6 +293,70 @@ class MessageAnnotationOutbound(TypedDict):
     ts: NotRequired[str]
 
 
+class UpdateMergePlan(TypedDict, total=False):
+    """Exact, channel-bound merge plan shared by preflight and apply responses."""
+
+    available: bool
+    auto_mergeable: bool
+    kind: Literal["clean", "conflicting", "current", "unavailable", "unknown"]
+    error: str
+    remote: str
+    remote_branch: str
+    target_ref: str
+    update_channel: str
+    current_branch: str
+    base_sha: str
+    target_sha: str
+    local_dirty_count: int
+    local_snapshot: str
+    merge_commit: str
+    code_conflict_paths: List[str]
+    doc_conflict_paths: List[str]
+    hot_code_paths: List[str]
+    recommended_strategy: Literal["auto_merge", "assisted"]
+
+
+class UpdatePreflightRequest(TypedDict, total=False):
+    """POST /api/update/preflight has an intentionally empty JSON body."""
+
+
+class UpdatePreflightResponse(TypedDict):
+    merge_plan: UpdateMergePlan
+
+
+class UpdateApplyRequest(TypedDict):
+    strategy: Literal["auto_merge", "assisted", "manual", "replace"]
+    expected_base_sha: NotRequired[str]
+    expected_target_sha: NotRequired[str]
+    confirm_recovery: NotRequired[bool]
+
+
+class UpdateApplySuccessResponse(TypedDict):
+    status: Literal["ok", "restart_required", "assisted_started", "manual"]
+    restarting: NotRequired[bool]
+    strategy: NotRequired[Literal["auto_merge", "assisted", "manual", "replace"]]
+    task_id: NotRequired[str]
+    merge_plan: NotRequired[UpdateMergePlan]
+    error: NotRequired[str]
+
+
+class UpdateApplyErrorResponse(TypedDict):
+    error: str
+    reason: NotRequired[str]
+    blockers: NotRequired[List[str]]
+    rolled_back: NotRequired[bool]
+    rollback: NotRequired[str]
+    restart_required: NotRequired[bool]
+    merge_plan: NotRequired[UpdateMergePlan]
+    smoke: NotRequired[Dict[str, Any]]
+
+
+class UpdateStatusReadyOutbound(TypedDict):
+    type: Literal["update_status_ready"]
+    available: bool
+    check_ok: Optional[bool]
+
+
 class ProjectCreateRequest(TypedDict, total=False):
     """POST /api/projects body (v6.59.0). ONE source: ``path`` (attach an existing
     owner folder; optional ``init_git`` attach-snapshot commit — never auto-init),
@@ -844,6 +908,7 @@ WS_MESSAGE_TYPES: tuple[str, ...] = (
     "message_annotation",
     "projects_changed",
     "task_named",
+    "update_status_ready",
 )
 
 
@@ -863,6 +928,13 @@ __all__ = [
     "ExtensionLifecycleOutbound",
     "ProjectsChangedOutbound",
     "MessageAnnotationOutbound",
+    "UpdateMergePlan",
+    "UpdatePreflightRequest",
+    "UpdatePreflightResponse",
+    "UpdateApplyRequest",
+    "UpdateApplySuccessResponse",
+    "UpdateApplyErrorResponse",
+    "UpdateStatusReadyOutbound",
     "ProjectCreateRequest",
     "ProjectEntry",
     "ProjectDeleteResponse",

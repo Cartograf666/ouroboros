@@ -206,6 +206,15 @@ def test_nested_pytest_keeps_the_original_live_root_marker(tmp_path):
         "OUROBOROS_DATA_DIR": str(inherited_disposable),
         "OUROBOROS_SETTINGS_PATH": str(inherited_disposable / "settings.json"),
     }
+    # A Windows child python cannot even boot without SystemRoot, and the nested
+    # conftest's fresh mkdtemp needs a real TEMP (the ntpath fallback chain would
+    # otherwise land in the repo cwd). POSIX children boot fine with a bare env —
+    # same passthrough precedent as the scrubbed-child test above. The conftest
+    # Popen patch injects the OUROBOROS_* markers this test is actually about.
+    if os.name == "nt":
+        for key in ("SystemRoot", "TEMP", "TMP"):
+            if os.environ.get(key):
+                env[key] = os.environ[key]
     code = """
 import importlib.util, json, os, pathlib
 spec = importlib.util.spec_from_file_location('nested_conftest', pathlib.Path('tests/conftest.py'))
@@ -956,7 +965,9 @@ def test_orphan_ref_transaction_failure_falls_back_to_safe_ref_cas(tmp_path, mon
 
     def _fail_transactions(cmd, *args, **kwargs):
         if cmd[:3] == ["git", "update-ref", "--stdin"]:
-            return subprocess.CompletedProcess(cmd, 1, "", "injected transaction failure")
+            # BYTES streams: the transaction call deliberately runs in binary mode
+            # (text-mode pipes CRLF-mangle --stdin commands on Windows).
+            return subprocess.CompletedProcess(cmd, 1, b"", b"injected transaction failure")
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(git_tools.subprocess, "run", _fail_transactions)

@@ -149,7 +149,7 @@ def estimate_cost_optional(model: str, prompt_tokens: int, completion_tokens: in
 def infer_api_key_type(model: str, provider: Optional[str] = None) -> str:
     """Infer which API key is used based on model name."""
     provider_name = str(provider or "").strip().lower()
-    if provider_name in {"local", "openrouter", "openai", "anthropic", "openai-compatible", "cloudru", "gigachat"}:
+    if provider_name in {"local", "openrouter", "openai", "anthropic", "openai-compatible", "cloudru", "gigachat", "minimax"}:
         return provider_name
     raw_model = str(model or "").strip()
     direct_provider = provider_for_model(raw_model)
@@ -166,7 +166,12 @@ def infer_api_key_type(model: str, provider: Optional[str] = None) -> str:
         return "cloudru"
     if normalized.startswith("gigachat/"):
         return "gigachat"
-    if normalized.startswith(("anthropic/", "google/", "openai/", "x-ai/", "qwen/")):
+    # NB: un-prefixed "minimax/..." deliberately falls through to OpenRouter below —
+    # unlike cloudru/gigachat, minimax IS a real OpenRouter vendor namespace, and
+    # slash-form ids stay router-style by design (direct routing uses minimax::,
+    # already resolved by provider_for_model above). Classifying minimax/ as the
+    # direct key would make safety.py demand MINIMAX_API_KEY on OpenRouter installs.
+    if normalized.startswith(("anthropic/", "google/", "openai/", "x-ai/", "qwen/", "minimax/")):
         return "openrouter"
     if "claude" in normalized.lower():
         return "anthropic"

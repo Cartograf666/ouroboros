@@ -125,6 +125,13 @@ def reviewer_route(model_id: str, *, session: bool = False) -> tuple:
     if session:
         return SESSION_ROUTE_PROVIDER, ""
     provider = provider_for_model(str(model_id or ""))
+    if provider == "minimax":
+        # MiniMax's base url is derived from the region, not a settings key
+        # (v6.88.0 direct provider — merged from the public line).
+        from ouroboros.provider_models import resolve_minimax_base_url
+
+        return provider, str(
+            resolve_minimax_base_url(load_settings().get("MINIMAX_REGION") or "") or "")
     settings_key = {
         "openai": "OPENAI_BASE_URL",
         "openai-compatible": "OPENAI_COMPATIBLE_BASE_URL",
@@ -180,6 +187,12 @@ def resolve_reviewer_window(
         route_fp = route_fingerprint(
             provider=effective_provider, base_url=base_url, model=model,
         )
+        # MiniMax's catalog endpoint needs the key even for metadata (their
+        # /models is authenticated); every other provider probes keyless.
+        _probe_api_key = None
+        if effective_provider == "minimax":
+            from ouroboros.config import load_settings as _ls
+            _probe_api_key = str(_ls().get("MINIMAX_API_KEY") or "") or None
         with _route_probe_lock(route_fp):
             ev = probe(
                 DATA_DIR,
@@ -188,6 +201,7 @@ def resolve_reviewer_window(
                 base_url=base_url,
                 use_local=use_local,
                 allow_fetch=True,
+                api_key=_probe_api_key,
             )
         window = int(getattr(ev, "window_tokens", 0) or 0)
         if window > 0:

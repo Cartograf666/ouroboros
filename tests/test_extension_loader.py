@@ -424,6 +424,7 @@ def test_forbidden_extension_settings_carries_repo_secrets():
     """The forbidden-settings tuple must match the repo-credentials set
     ``skill_exec`` already refuses to forward."""
     assert "OPENROUTER_API_KEY" in FORBIDDEN_EXTENSION_SETTINGS
+    assert "MINIMAX_API_KEY" in FORBIDDEN_EXTENSION_SETTINGS
     assert "GITHUB_TOKEN" in FORBIDDEN_EXTENSION_SETTINGS
     assert "OUROBOROS_NETWORK_PASSWORD" in FORBIDDEN_EXTENSION_SETTINGS
 

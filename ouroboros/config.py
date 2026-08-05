@@ -1,8 +1,7 @@
 """
 Ouroboros — Shared configuration (single source of truth).
 
-Paths, settings defaults, load/save with file locking.
-Only imports ouroboros.platform_layer (platform abstraction, no circular deps).
+Paths, settings defaults, load/save with file locking and cycle-free setting metadata.
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ from typing import Any, Optional, Sequence
 from ouroboros.platform_layer import pid_lock_acquire as _compat_pid_lock_acquire
 from ouroboros.platform_layer import pid_lock_release as _compat_pid_lock_release
 from ouroboros.provider_models import compute_direct_review_models_fallback, local_only_review_route_env, migrate_model_value, review_model_uses_local as review_model_uses_local
+from ouroboros.update_channels import UPDATE_SETTINGS_DEFAULTS, normalize_update_channel
 
 
 # Paths
@@ -61,7 +61,7 @@ def _guard_live_settings_write() -> None:
 
 
 # Settings defaults
-SETTINGS_DEFAULTS = {
+SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OPENROUTER_API_KEY": "",
     "OPENAI_API_KEY": "",
     "OPENAI_BASE_URL": "",
@@ -77,6 +77,8 @@ SETTINGS_DEFAULTS = {
     "GIGACHAT_VERIFY_SSL_CERTS": "true",
     "GIGACHAT_PROFANITY_CHECK": "",
     "ANTHROPIC_API_KEY": "",
+    "MINIMAX_API_KEY": "",
+    "MINIMAX_REGION": "",
 
     "OUROBOROS_NETWORK_PASSWORD": "",
     "OUROBOROS_SERVER_HOST": "127.0.0.1",
@@ -527,6 +529,7 @@ def _exclusive_direct_remote_provider_env() -> str:
     has_openrouter = bool(str(os.environ.get("OPENROUTER_API_KEY", "") or "").strip())
     has_openai = bool(str(os.environ.get("OPENAI_API_KEY", "") or "").strip())
     has_anthropic = bool(str(os.environ.get("ANTHROPIC_API_KEY", "") or "").strip())
+    has_minimax = bool(str(os.environ.get("MINIMAX_API_KEY", "") or "").strip())
     has_legacy_base = bool(str(os.environ.get("OPENAI_BASE_URL", "") or "").strip())
     has_compatible = bool(str(os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip())
     has_cloudru = bool(str(os.environ.get("CLOUDRU_FOUNDATION_MODELS_API_KEY", "") or "").strip())
@@ -536,18 +539,14 @@ def _exclusive_direct_remote_provider_env() -> str:
     )
     # OpenRouter / legacy OpenAI base / OpenAI-compatible all route through the
     # OpenRouter-style stack, so their presence means "not an exclusive direct
-    # provider". Among the real direct providers (official OpenAI, Anthropic,
-    # Cloud.ru, GigaChat), return one only when exactly one is configured.
+    # provider". Among the registered direct providers, return one only when
+    # exactly one is configured.
     if has_openrouter or has_legacy_base or has_compatible:
         return ""
-    direct = [
-        name for name, present in (
-            ("openai", has_openai),
-            ("anthropic", has_anthropic),
-            ("cloudru", has_cloudru),
-            ("gigachat", has_gigachat),
-        ) if present
-    ]
+    direct = [name for name, present in (
+        ("openai", has_openai), ("anthropic", has_anthropic), ("minimax", has_minimax),
+        ("cloudru", has_cloudru), ("gigachat", has_gigachat),
+    ) if present]
     return direct[0] if len(direct) == 1 else ""
 
 
@@ -581,7 +580,7 @@ def resolve_effort(task_type: str) -> str:
 
 def direct_provider_review_models_fallback(provider: str) -> list[str]:
     """Return the exact review-models list a direct-provider fallback emits."""
-    if provider not in ("openai", "anthropic", "cloudru", "gigachat"):
+    if provider not in ("openai", "anthropic", "minimax", "cloudru", "gigachat"):
         return []
     main_model = str(
         os.environ.get("OUROBOROS_MODEL", SETTINGS_DEFAULTS["OUROBOROS_MODEL"]) or ""
@@ -1250,6 +1249,8 @@ def _coerce_setting_value(key: str, value):
     # Normalize runtime mode on read so all consumers see the closed enum.
     if key == "OUROBOROS_RUNTIME_MODE":
         return normalize_runtime_mode(value)
+    if key == "OUROBOROS_UPDATE_CHANNEL":
+        return normalize_update_channel(value)
     if key == "OUROBOROS_CONTEXT_MODE":
         return normalize_context_mode(value)
     # Trim so whitespace-only config is not treated as a configured skills repo.

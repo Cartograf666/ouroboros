@@ -1149,11 +1149,7 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
         suppress_chat_log = bool(msg.get("suppress_chat_log"))
         task_constraint = msg.get("task_constraint") if isinstance(msg.get("task_constraint"), dict) else None
         task_metadata = msg.get("task_metadata") if isinstance(msg.get("task_metadata"), dict) else None
-        image_data = (
-            (image_base64, image_mime, image_caption)
-            if image_base64
-            else None
-        )
+        image_data = (image_base64, image_mime, image_caption) if image_base64 else None
         log_text = text or image_caption or ("(image attached)" if image_base64 else "")
         now_iso = utc_now_iso()
         if not client_message_id:
@@ -1275,7 +1271,11 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             _execute_panic_stop(ctx.consciousness, ctx.kill_workers)
         elif lowered.startswith("/restart"):
             ctx.send_with_budget(chat_id, "♻️ Restarting.")
-            ok, restart_msg = ctx.safe_restart(reason="owner_restart", unsynced_policy="rescue_and_reset")
+            ok, restart_msg = _safe_restart_serialized(
+                ctx.safe_restart,
+                reason="owner_restart",
+                unsynced_policy="rescue_and_reset",
+            )
             if not ok:
                 ctx.send_with_budget(chat_id, f"⚠️ Restart cancelled: {restart_msg}")
                 continue
@@ -1298,6 +1298,7 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                     force=True,
                     terminal_status="cancelled",
                     result_reason="Owner restart stopped this task before process restart.",
+                    **_managed_update_pending_kwargs(),
                 )
             except Exception:
                 owner_restart_flag.unlink(missing_ok=True)
@@ -1468,7 +1469,11 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
             _managed_update_active = False
         block = _has_active_evolution_transaction() or _managed_update_active
         policy = "rescue_and_block" if block else "rescue_and_reset"
-        ok, msg = git_ops_module.safe_restart(reason="bootstrap", unsynced_policy=policy)
+        ok, msg = _safe_restart_serialized(
+            git_ops_module.safe_restart,
+            reason="bootstrap",
+            unsynced_policy=policy,
+        )
         if not ok and policy == "rescue_and_block":
             try:
                 from supervisor.evolution_lifecycle import pause_evolution_campaign
@@ -1609,9 +1614,9 @@ def _run_supervisor(settings: dict) -> None:
         import types
         import queue as _queue_mod
 
-        kill_workers()
-        spawn_workers(max_workers)
         restored_pending = restore_pending_from_snapshot()
+        kill_workers(preserve_pending=True)
+        spawn_workers(max_workers)
         persist_queue_snapshot(reason="startup")
         _resume_interrupted_project_deletions()
         try:
@@ -1981,8 +1986,10 @@ def _perform_supervisor_restart(
                     "the exact reviewed evolution commit.",
                 )
             return
-    ok, msg = ctx.safe_restart(
-        reason="agent_restart_request", unsynced_policy="rescue_and_block",
+    ok, msg = _safe_restart_serialized(
+        ctx.safe_restart,
+        reason="agent_restart_request",
+        unsynced_policy="rescue_and_block",
     )
     if not ok:
         try:
@@ -1997,7 +2004,12 @@ def _perform_supervisor_restart(
             ctx.send_with_budget(int(st["owner_chat_id"]), f"⚠️ Restart skipped: {msg}")
         return
     cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested=True)
-    ctx.kill_workers(force=True, terminal_status=cleanup_status, result_reason=cleanup_reason)
+    ctx.kill_workers(
+        force=True,
+        terminal_status=cleanup_status,
+        result_reason=cleanup_reason,
+        **_managed_update_pending_kwargs(),
+    )
     st2 = ctx.load_state()
     st2["session_id"] = uuid.uuid4().hex
     ctx.save_state(st2)
@@ -2015,6 +2027,101 @@ def _request_restart_exit(owner: bool = False) -> None:
     if owner:
         _owner_restart_requested.set()
     _restart_requested.set()
+
+
+def _managed_update_pending_kwargs() -> dict:
+    """Preserve queued work while a durable tx or its pre-tx quiesce owns restart."""
+    try:
+        from supervisor.update_merge import active_update_tx
+
+        if active_update_tx():
+            return {"preserve_pending": True}
+        from supervisor.workers import repo_writer_admission_closed, worker_pool_admission_state
+
+        gate = repo_writer_admission_closed()
+        disabled = str(worker_pool_admission_state().get("disabled_reason") or "")
+        if gate.startswith("managed_update:") or disabled == "managed_update":
+            return {"preserve_pending": True}
+        return {}
+    except Exception:
+        return {"preserve_pending": True}
+
+
+def _safe_restart_serialized(safe_restart_fn, *, reason: str, unsynced_policy: str):
+    """Serialize checkout/reset with update apply; only a landed update may restart."""
+    from supervisor import git_ops
+    from supervisor.update_merge import (
+        acquire_update_lock,
+        read_update_tx_strict,
+        release_update_lock,
+    )
+
+    try:
+        lock_fh = acquire_update_lock()
+    except RuntimeError:
+        return False, "Managed update is changing the checkout; restart was deferred."
+    try:
+        status, tx = read_update_tx_strict()
+        if status == "corrupt":
+            return False, "Managed update state is unreadable; restart was deferred."
+        if status == "absent" and not git_ops._clear_update_intent():
+            return False, (
+                "An update intent marker with no update transaction could not be removed; "
+                "restart was deferred rather than applying an orphaned update."
+            )
+        allowed_phases = {"pending_boot_smoke", "applying_replace"}
+        if status == "valid" and str(tx.get("phase") or "") not in allowed_phases:
+            return False, "Managed update merge is still being resolved; restart was deferred."
+        return safe_restart_fn(reason=reason, unsynced_policy=unsynced_policy)
+    finally:
+        release_update_lock(lock_fh)
+
+
+def _wait_for_supervisor_update_finalize() -> bool:
+    """Wait for a real init outcome; slow dependency sync is not a failed boot."""
+    _supervisor_ready.wait()
+    return not bool(_supervisor_error)
+
+
+def _boot_managed_update_tasks() -> None:
+    """Finalize a pending update, restart after rollback, then refresh its feed."""
+    try:
+        from supervisor.git_ops import compute_managed_update_status
+        from supervisor.update_merge import finalize_managed_update_on_boot
+
+        result = finalize_managed_update_on_boot(
+            supervisor_ready=_wait_for_supervisor_update_finalize()
+        )
+        stash_note = str(result.get("stash_note") or "")
+        if stash_note:
+            # Q1=C disclosure contract: a stash restore that conflicted keeps the
+            # entry and the OWNER must see the exact recovery command, not only
+            # the supervisor log.
+            try:
+                from supervisor.message_bus import send_with_budget
+                from supervisor.state import load_state as _load_state
+
+                owner_chat = int((_load_state() or {}).get("owner_chat_id") or 0)
+                if owner_chat:
+                    send_with_budget(owner_chat, f"📦 Managed update: {stash_note}")
+            except Exception:
+                log.debug("stash note owner notification failed", exc_info=True)
+        if result.get("rolled_back") is True:
+            # This generation imported the rejected candidate. Preserve queued roots
+            # through shutdown, then exec the restored code instead of limping on.
+            from supervisor.workers import close_repo_writer_admission
+
+            close_repo_writer_admission("managed_update:rollback_restart")
+            _request_restart_exit()
+            return
+        update_status = compute_managed_update_status(fetch=True)
+        broadcast_ws_sync({
+            "type": "update_status_ready",
+            "available": bool(update_status.get("available")),
+            "check_ok": update_status.get("check_ok"),
+        })
+    except Exception:
+        log.debug("boot managed-update tasks failed", exc_info=True)
 
 
 def _shutdown_task_cleanup_args(restart_requested: bool) -> tuple[str, str]:
@@ -2185,46 +2292,6 @@ async def lifespan(app):
     # and run a one-shot boot-time update check (check-on-restart) so the main-screen
     # Update badge reflects availability. Both run OFF the startup critical path and
     # fail-soft — a missing managed remote / offline boot simply yields no badge.
-    def _boot_managed_update_tasks():
-        try:
-            _supervisor_ready.wait(timeout=60)
-            from supervisor.git_ops import compute_managed_update_status
-            from supervisor.update_merge import finalize_managed_update_on_boot
-
-            # A HEALTHY boot only — _supervisor_ready is also set on supervisor INIT FAILURE
-            # (alongside _supervisor_error), so gate on the error too or finalize would clear a
-            # pending update as "finalized" on a failed boot, defeating the boot-loop rollback.
-            finalize_managed_update_on_boot(
-                supervisor_ready=_supervisor_ready.is_set() and not _supervisor_error
-            )
-            status = compute_managed_update_status(fetch=True)
-            # Persist the boot check-on-restart result so the passive Update pill can show
-            # availability without a network fetch on every poll (P2 2F: boot fetches once,
-            # the badge reads this cache; no periodic polling). A passive
-            # compute_managed_update_status(fetch=False) bails before resolving the official
-            # ref, so without this cache the pill stays hidden after a restart.
-            try:
-                from supervisor.state import update_state
-                from ouroboros.utils import utc_now_iso
-
-                def _cache_update_status(s):
-                    s["managed_update_cache"] = {
-                        "available": bool(status.get("available")),
-                        "safe_to_apply": bool(status.get("safe_to_apply")),
-                        "latest_sha": status.get("latest_sha") or "",
-                        "latest_short_sha": status.get("latest_short_sha") or "",
-                        "latest_message": status.get("latest_message") or "",
-                        "behind": int(status.get("behind") or 0),
-                        "ahead": int(status.get("ahead") or 0),
-                        "checked_at": utc_now_iso(),
-                    }
-
-                update_state(_cache_update_status)
-            except Exception:
-                log.debug("boot managed-update cache failed", exc_info=True)
-        except Exception:
-            log.debug("boot managed-update tasks failed", exc_info=True)
-
     threading.Thread(
         target=_boot_managed_update_tasks, daemon=True, name="boot-managed-update",
     ).start()
@@ -2414,7 +2481,12 @@ async def lifespan(app):
                 log.debug("Failed to record server_shutdown event", exc_info=True)
             from supervisor.workers import kill_workers
             cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested)
-            kill_workers(force=True, terminal_status=cleanup_status, result_reason=cleanup_reason)
+            kill_workers(
+                force=True,
+                terminal_status=cleanup_status,
+                result_reason=cleanup_reason,
+                **_managed_update_pending_kwargs(),
+            )
         except Exception:
             pass
         try:
@@ -2478,9 +2550,14 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
                 archive_service_logs=False,
                 terminal_status=cleanup_status,
                 result_reason=cleanup_reason,
+                **_managed_update_pending_kwargs(),
             )
         else:
-            kill_workers(force=True, archive_service_logs=False)
+            kill_workers(
+                force=True,
+                archive_service_logs=False,
+                **_managed_update_pending_kwargs(),
+            )
     except Exception:
         pass
     import multiprocessing

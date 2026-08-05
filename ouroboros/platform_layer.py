@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
 
 log = logging.getLogger(__name__)
@@ -30,10 +31,8 @@ _PATH_BOOTSTRAPPED = False
 def local_zoneinfo():
     """Best-effort DST-aware local timezone.
 
-    ``datetime.now().astimezone().tzinfo`` only yields a *fixed* current-offset
-    zone, which drifts by an hour across a DST boundary. Resolve the IANA local
-    zone (via ``TZ`` or ``/etc/localtime``) so callers stay DST-correct; fall
-    back to the fixed offset only when no IANA name can be found.
+    ``astimezone().tzinfo`` is a *fixed* offset that drifts across DST; resolve the IANA
+    zone (``TZ`` or ``/etc/localtime``), falling back to the fixed offset.
     """
     import datetime
     from zoneinfo import ZoneInfo
@@ -127,18 +126,12 @@ def bootstrap_process_path() -> list[str]:
 
 
 def scrub_repo_from_pythonpath(env: dict[str, str], repo_dir: "str | pathlib.Path | None") -> dict[str, str]:
-    """Return a copy of *env* with any ``PYTHONPATH`` entry that resolves to the
-    Ouroboros system repo dir removed.
+    """Return a copy of *env* with any ``PYTHONPATH`` entry resolving to the Ouroboros
+    system repo dir removed.
 
-    A command run inside an EXTERNAL workspace (a target project under
-    ``user_files`` or an external project root, e.g. the SWE-bench dig-direct
-    ``/app``) inherits the worker's ``PYTHONPATH``, which points at the Ouroboros
-    repo so the agent's own tools can import ``ouroboros``/``supervisor``. That
-    same entry lets the target's ``import web``/``import server``/``import
-    ouroboros`` resolve to OUROBOROS's modules instead of the target's, shadowing
-    the project under test. Dropping ONLY the repo entry isolates the target while
-    preserving every other ``PYTHONPATH`` entry (the project's own paths). No-op
-    when ``PYTHONPATH`` is unset/empty or carries no repo entry."""
+    An EXTERNAL-workspace command inherits the worker's ``PYTHONPATH`` repo entry, which
+    makes the target's ``import web``/``server``/``ouroboros`` resolve to OUROBOROS's modules.
+    Dropping ONLY the repo entry isolates the target; no-op without one."""
     out = dict(env)
     raw = out.get("PYTHONPATH", "")
     if not raw or not repo_dir:
@@ -395,6 +388,38 @@ def pid_is_alive(pid: int) -> bool:
 
     if pid <= 0:
         return False
+    if IS_WINDOWS:
+        # os.kill(pid, 0) is WRONG on Windows: signal 0 is CTRL_C_EVENT, so
+        # os.kill sends Ctrl+C to the target pid's CONSOLE PROCESS GROUP instead
+        # of probing liveness — when the pid shares this process's console (e.g.
+        # our own pid, or a sibling under the same runner console) it delivers a
+        # KeyboardInterrupt to the whole group. Probe with OpenProcess +
+        # GetExitCodeProcess, which never signals anything.
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        _STILL_ACTIVE = 259
+        _ERROR_ACCESS_DENIED = 5
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            # A live but access-protected process reads as alive; anything else
+            # (invalid parameter -> no such pid) reads as dead.
+            return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True  # opened but unreadable -> fail SAFE toward alive
+            return int(code.value) == _STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -498,22 +523,17 @@ def _win32_unlock(fd: int) -> None:
 def kill_process_tree(proc: subprocess.Popen) -> None:
     """Force-kill a subprocess and its entire process tree.
 
-    On POSIX the immediate process group is SIGKILLed first (fast path for the
-    common case), then any descendants that escaped into their own
-    session/process group are swept by PID. Without that sweep a timed-out or
-    cancelled child which spawned grandchildren in new groups (for example
-    pytest running tests that use ``subprocess_new_group_kwargs``) would leak
-    runaway orphan processes. Descendants are collected BEFORE the kill because
-    once the parent dies its children are reparented and the ppid links we rely
-    on disappear.
+    On POSIX the immediate process group is SIGKILLed first, then descendants that
+    escaped into their own session/group are swept by PID — without that sweep a
+    cancelled child which spawned grandchildren in new groups leaks orphans.
+    Descendants are collected BEFORE the kill: once the parent dies its children are
+    reparented and the ppid links disappear.
     """
     pid = proc.pid
     if IS_WINDOWS:
         try:
-            _hidden_run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                capture_output=True, timeout=10,
-            )
+            _hidden_run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True, timeout=10)
         except Exception:
             pass
         return
@@ -580,6 +600,21 @@ def process_group_id(pid: int) -> int:
         return 0
 
 
+def process_group_is_alive(pgid: int) -> bool:
+    """Return whether a Unix process group still has at least one member."""
+    if IS_WINDOWS or int(pgid or 0) <= 0:
+        return False
+    try:
+        os.killpg(int(pgid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def current_process_group_id() -> int:
     """Return the current Unix process group id or 0 when unavailable."""
     if IS_WINDOWS:
@@ -593,35 +628,35 @@ def current_process_group_id() -> int:
 def process_start_time(pid: int) -> str:
     """Best-effort stable start-time token for (pid, start_time) fingerprints.
 
-    POSIX: ``ps -o lstart=`` (portable across macOS/Linux); Linux fallback
-    reads /proc/<pid>/stat field 22 (clock ticks since boot). Windows:
-    empty string — callers degrade to pid-liveness semantics there.
-    Returns "" when the pid is gone or the platform offers no stable token.
-    """
+    A bare pid is not an identity — the kernel reuses it. ``(pid, start_time)`` is, which is what
+    lets a caller refuse to signal a pid it merely used to own. POSIX uses ``ps -o lstart=``,
+    falling back to the same /proc field the containment scan dates candidates by, so the
+    fingerprint stays real on an image with no usable ``ps``. Windows returns "" (callers degrade
+    to pid liveness), as does a pid that is already gone."""
     if pid <= 0:
         return ""
     if os.name == "nt":
         return ""
     try:
-        out = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=5,
-        )
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
         text = (out.stdout or "").strip()
         if out.returncode == 0 and text:
             return text
     except Exception:
         pass
+    ticks = _proc_start_ticks(pid)
+    return str(ticks) if ticks else ""
+
+
+def _proc_start_ticks(pid: int) -> int:
+    """Boot-relative start time (``/proc/<pid>/stat`` field 22), or 0 when it cannot be read."""
     try:
-        stat_path = pathlib.Path(f"/proc/{pid}/stat")
-        if stat_path.exists():
-            fields = stat_path.read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[-1].split()
-            # rsplit removed fields 1-2 (pid, comm); starttime is field 22 → index 19 here.
-            if len(fields) >= 20:
-                return fields[19]
-    except Exception:
-        pass
-    return ""
+        with open(f"/proc/{int(pid)}/stat", "rb") as handle:
+            fields = handle.read().rpartition(b")")[2].split()
+        return int(fields[19]) if len(fields) >= 20 else 0  # rpartition dropped fields 1-2
+    except (OSError, ValueError):
+        return 0
 
 
 def process_command(pid: int) -> str:
@@ -629,12 +664,8 @@ def process_command(pid: int) -> str:
     if IS_WINDOWS:
         return ""
     try:
-        result = subprocess.run(
-            ["ps", "-p", str(int(pid)), "-o", "command="],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
+        result = subprocess.run(["ps", "-p", str(int(pid)), "-o", "command="],
+                                capture_output=True, text=True, timeout=3)
         return result.stdout.strip()
     except Exception:
         return ""
@@ -644,10 +675,7 @@ def force_kill_pid(pid: int) -> None:
     """Force-kill a single process by PID."""
     if IS_WINDOWS:
         try:
-            _hidden_run(
-                ["taskkill", "/F", "/PID", str(pid)],
-                capture_output=True, timeout=10,
-            )
+            _hidden_run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=10)
         except Exception:
             pass
     else:
@@ -660,24 +688,19 @@ def force_kill_pid(pid: int) -> None:
 def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None) -> None:
     """Force-kill a PID tree recursively.
 
-    ``exclude_pids`` are spared along with their own descendants. Used to keep
-    deliberately-kept (``service_teardown=keep``) services alive when a worker is
-    force-killed on cancel/timeout, so a verifier can still reach them; spared
-    children reparent to init and are governed by the custody reaper thereafter.
+    ``exclude_pids`` are spared along with their own descendants, keeping
+    ``service_teardown=keep`` services reachable for a verifier when a worker is
+    force-killed; spared children reparent to init and fall to the custody reaper.
     """
     exclude = {int(p) for p in (exclude_pids or set())}
     if IS_WINDOWS:
         # exclude_pids is a POSIX-only nicety: descendant enumeration relies on
-        # `pgrep -P`, which does not exist on Windows, so honouring exclusions
-        # here would enumerate nothing and LEAK the worker's whole subprocess
-        # tree (only the root would die). taskkill /T reliably kills the tree;
-        # kept-service sparing is not supported on Windows (and leaking the tree
-        # is strictly worse than not sparing). Always tree-kill.
+        # `pgrep -P`, which Windows lacks, so honouring exclusions here would
+        # enumerate nothing and LEAK the worker's whole tree (only the root would
+        # die). taskkill /T always tree-kills; sparing is unsupported on Windows.
         try:
-            _hidden_run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                capture_output=True, timeout=10,
-            )
+            _hidden_run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True, timeout=10)
         except Exception:
             pass
         return
@@ -708,10 +731,8 @@ def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None) -> None:
 def _collect_descendants(pid: int, result: list[int]) -> None:
     """Recursively collect all descendant PIDs via pgrep."""
     try:
-        out = subprocess.run(
-            ["pgrep", "-P", str(pid)],
-            capture_output=True, text=True, timeout=3,
-        )
+        out = subprocess.run(["pgrep", "-P", str(pid)],
+                             capture_output=True, text=True, timeout=3)
         for line in out.stdout.strip().splitlines():
             line = line.strip()
             if line:
@@ -723,10 +744,9 @@ def _collect_descendants(pid: int, result: list[int]) -> None:
 
 
 def collect_descendant_pids(pid: int) -> List[int]:
-    """Public: return all descendant PIDs of ``pid`` (depth-first, children last).
+    """Public: all descendant PIDs of ``pid`` (depth-first, children last).
 
-    Keeps process-tree discovery inside the platform layer so callers do not
-    reach into the private recursive helper."""
+    Keeps tree discovery in the platform layer, off the private recursive helper."""
     result: List[int] = []
     try:
         _collect_descendants(int(pid), result)
@@ -738,10 +758,9 @@ def collect_descendant_pids(pid: int) -> List[int]:
 def kill_processes_referencing(marker: str) -> None:
     """Force-kill any process whose command line references ``marker``.
 
-    Sweeps children that double-forked and were reparented to init, escaping both
-    ``killpg`` (own session) and the ``pgrep -P`` parent->child walk. ``marker``
-    is matched literally (regex specials escaped) so a temp path containing
-    ``.``/``+`` cannot over-match unrelated command lines."""
+    Sweeps children that double-forked to init, escaping both ``killpg`` and the
+    ``pgrep -P`` walk. ``marker`` is matched literally (regex specials escaped) so a
+    temp path containing ``.``/``+`` cannot over-match unrelated command lines."""
     if IS_WINDOWS or not marker:
         return
     try:
@@ -937,9 +956,6 @@ def resolve_bundled_ripgrep() -> Optional[str]:
 
 # Claude runtime resolution.
 
-from dataclasses import dataclass
-
-
 @dataclass
 class ClaudeRuntimeState:
     """Structured Claude SDK/CLI availability snapshot."""
@@ -950,12 +966,10 @@ class ClaudeRuntimeState:
     cli_path: str = ""
     cli_version: str = ""
     interpreter_path: str = ""
-
     # Legacy user-site runtime.
     legacy_detected: bool = False
     legacy_sdk_path: str = ""
     legacy_sdk_version: str = ""
-
     # Operational state.
     ready: bool = False
     api_key_set: bool = False
@@ -991,9 +1005,7 @@ def _find_bundled_cli(sdk_path: str) -> Optional[str]:
     """Locate the bundled CLI binary inside the SDK package."""
     cli_name = "claude.exe" if IS_WINDOWS else "claude"
     bundled = pathlib.Path(sdk_path) / "_bundled" / cli_name
-    if bundled.exists() and bundled.is_file():
-        return str(bundled)
-    return None
+    return str(bundled) if bundled.is_file() else None
 
 
 def _probe_cli_version(cli_path: str) -> str:
@@ -1004,7 +1016,6 @@ def _probe_cli_version(cli_path: str) -> str:
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
-            import re
             m = re.match(r"([0-9]+\.[0-9]+\.[0-9]+)", result.stdout.strip())
             if m:
                 return m.group(1)
@@ -1018,10 +1029,7 @@ def _detect_legacy_user_site_sdk() -> tuple[bool, str, str]:
     sdk_path = _find_sdk_package_path()
     if not sdk_path:
         return False, "", ""
-    normalised = pathlib.Path(sdk_path).resolve()
-    parts_lower = [p.lower() for p in normalised.parts]
-    in_app_bundle = "python-standalone" in parts_lower
-    if in_app_bundle:
+    if "python-standalone" in [p.lower() for p in pathlib.Path(sdk_path).resolve().parts]:
         return False, "", ""
     try:
         import importlib.metadata
@@ -1046,15 +1054,9 @@ def resolve_claude_runtime() -> ClaudeRuntimeState:
     sdk_path = _find_sdk_package_path()
     if sdk_path:
         state.sdk_path = sdk_path
-
-    # App-managed SDK lives inside python-standalone.
-    if sdk_path:
-        normalised = pathlib.Path(sdk_path).resolve()
-        parts_lower = [p.lower() for p in normalised.parts]
+        # App-managed SDK lives inside python-standalone.
+        parts_lower = [p.lower() for p in pathlib.Path(sdk_path).resolve().parts]
         state.app_managed = "python-standalone" in parts_lower
-
-    # Bundled CLI.
-    if sdk_path:
         cli = _find_bundled_cli(sdk_path)
         if cli:
             state.cli_path = cli
@@ -1195,9 +1197,32 @@ if IS_WINDOWS:
     import ctypes
     import ctypes.wintypes
 
-    _kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    # `use_last_error=True` so `ctypes.get_last_error()` reads the code the CALL set: without it
+    # ctypes does not snapshot the thread's last error, and the failure text below would quote
+    # whatever ctypes' own bookkeeping left behind. Same pattern as the file-lock helpers above.
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
 
-    _INVALID_HANDLE_VALUE = ctypes.wintypes.HANDLE(-1)
+    # Explicit ABI declarations: without restype=HANDLE, ctypes truncates 64-bit
+    # HANDLEs to c_int — a job/process handle above 2^31 comes back corrupted and
+    # every later Job Object call silently operates on garbage.
+    _kernel32.CreateJobObjectW.restype = ctypes.wintypes.HANDLE
+    _kernel32.CreateJobObjectW.argtypes = (ctypes.wintypes.LPVOID, ctypes.wintypes.LPCWSTR)
+    _kernel32.SetInformationJobObject.restype = ctypes.wintypes.BOOL
+    _kernel32.SetInformationJobObject.argtypes = (
+        ctypes.wintypes.HANDLE, ctypes.c_int, ctypes.wintypes.LPVOID, ctypes.wintypes.DWORD,
+    )
+    _kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
+    _kernel32.OpenProcess.argtypes = (ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
+    _kernel32.AssignProcessToJobObject.restype = ctypes.wintypes.BOOL
+    _kernel32.AssignProcessToJobObject.argtypes = (ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE)
+    _kernel32.TerminateJobObject.restype = ctypes.wintypes.BOOL
+    _kernel32.TerminateJobObject.argtypes = (ctypes.wintypes.HANDLE, ctypes.wintypes.UINT)
+    _kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = (ctypes.wintypes.HANDLE,)
+
+    # .value, not the HANDLE instance: with restype=HANDLE the calls return plain
+    # ints (or None for NULL), and an int never equals a ctypes instance.
+    _INVALID_HANDLE_VALUE = ctypes.wintypes.HANDLE(-1).value
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
     _JOBOBJECTINFOCLASS_EXTENDED = 9
     _PROCESS_SET_QUOTA = 0x0100
@@ -1245,7 +1270,7 @@ def create_kill_on_close_job() -> Optional[Any]:
         return None
     try:
         handle = _kernel32.CreateJobObjectW(None, None)
-        if handle in (0, _INVALID_HANDLE_VALUE):
+        if not handle or handle == _INVALID_HANDLE_VALUE:
             log.warning("CreateJobObjectW failed")
             return None
         info = _ExtendedLimitInfo()
@@ -1288,24 +1313,36 @@ def assign_pid_to_job(job_handle: Any, pid: int) -> bool:
         return False
 
 
-def terminate_job(job_handle: Any, exit_code: int = 1) -> None:
-    """Terminate all processes in a Job Object."""
+def terminate_job(job_handle: Any, exit_code: int = 1) -> str:
+    """Terminate all processes in a Job Object; "" on success, else the reason it is unproven.
+
+    A FALSE Win32 BOOL is a failure exactly like a raised call, and swallowing either let
+    ``ProcessContainer.reap`` report a clean teardown while job members were still running."""
     if not IS_WINDOWS or job_handle is None:
-        return
+        return ""
     try:
-        _kernel32.TerminateJobObject(job_handle, exit_code)
-    except Exception:
-        pass
+        if not _kernel32.TerminateJobObject(job_handle, exit_code):
+            return (f"TerminateJobObject returned false (Win32 error {ctypes.get_last_error()}), "
+                    "so the processes held by the job cannot be assumed dead")
+    except Exception as exc:
+        return f"TerminateJobObject failed ({exc}), so the job's processes are unaccounted for"
+    return ""
 
 
-def close_job(job_handle: Any) -> None:
-    """Close a Job Object handle (triggers kill-on-close if set)."""
+def close_job(job_handle: Any) -> str:
+    """Close a Job Object handle (triggers kill-on-close if set); "" on success, else the reason.
+
+    The handle is the last thing holding kill-on-close, so a close that did not happen leaves
+    survivors AND leaks the handle; the caller reports it rather than discarding it."""
     if not IS_WINDOWS or job_handle is None:
-        return
+        return ""
     try:
-        _kernel32.CloseHandle(job_handle)
-    except Exception:
-        pass
+        if not _kernel32.CloseHandle(job_handle):
+            return (f"CloseHandle on the Job Object returned false (Win32 error "
+                    f"{ctypes.get_last_error()}), so kill-on-close never fired")
+    except Exception as exc:
+        return f"CloseHandle on the Job Object failed ({exc}), so kill-on-close never fired"
+    return ""
 
 
 def resume_process(pid: int) -> bool:
@@ -1314,6 +1351,10 @@ def resume_process(pid: int) -> bool:
         return False
     try:
         _ntdll = ctypes.windll.ntdll  # type: ignore[attr-defined]
+        # Same 64-bit ABI rule as the kernel32 block: an undeclared HANDLE
+        # argument is truncated to c_int, corrupting handles above 2^31.
+        _ntdll.NtResumeProcess.restype = ctypes.c_int32
+        _ntdll.NtResumeProcess.argtypes = (ctypes.wintypes.HANDLE,)
         handle = _kernel32.OpenProcess(_PROCESS_SUSPEND_RESUME, False, pid)
         if not handle:
             log.warning("OpenProcess(%d) failed for resume", pid)

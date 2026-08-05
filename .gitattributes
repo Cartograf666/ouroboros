@@ -1,0 +1,5 @@
+# SVG assets are hashed by content for cache-busting (`?v=<sha256[:10]>` in the
+# public site HTML) and byte-compared between repo/assets and the site mirror.
+# Pin them to LF on checkout so Windows (core.autocrlf=true on CI runners) sees
+# the exact committed bytes and the hashes stay platform-independent.
+*.svg text eol=lf

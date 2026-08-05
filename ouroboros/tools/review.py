@@ -1348,8 +1348,12 @@ def _run_unified_review(ctx: ToolContext, commit_message: str,
     # Build touched-file pack for full current context.
     try:
         touched_paths = [f.strip() for f in changed.strip().splitlines() if f.strip()]
+        from ouroboros.tools.registry import _authorized_managed_update_resolver
+
         current_files_section, _omitted = build_touched_file_pack(
-            pathlib.Path(target_repo), touched_paths
+            pathlib.Path(target_repo),
+            touched_paths,
+            represent_binary=_authorized_managed_update_resolver(ctx),
         )
         if _omitted:
             current_files_section += (

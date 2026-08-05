@@ -1,8 +1,101 @@
 import os
 import subprocess
 import time
+from types import SimpleNamespace
 
 import supervisor.git_ops as git_ops
+
+
+def _git(repo, *args):
+    return subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _history_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "config", "user.email", "test@ouroboros")
+    (repo / "value.txt").write_text("one\n", encoding="utf-8")
+    _git(repo, "add", "value.txt")
+    _git(repo, "commit", "-qm", "one")
+    first = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "branch", "-M", "ouroboros")
+    (repo / "value.txt").write_text("two\n", encoding="utf-8")
+    _git(repo, "commit", "-qam", "two")
+    second = _git(repo, "rev-parse", "HEAD")
+    return repo, first, second
+
+
+def test_manual_rollback_pins_previous_head_before_reset(tmp_path, monkeypatch):
+    repo, first, second = _history_repo(tmp_path)
+    git_ops.init(repo, tmp_path / "data", "")
+    monkeypatch.setattr(git_ops, "_has_remote", lambda _name=None: False)
+    monkeypatch.setattr(git_ops, "load_state", lambda: {})
+    monkeypatch.setattr(git_ops, "save_state", lambda _state: None)
+
+    ok, message = git_ops.rollback_to_version(first, reason="test")
+
+    assert ok, message
+    assert _git(repo, "rev-parse", "HEAD") == first
+    keep_branches = _git(repo, "branch", "--list", "rollback-keep-*").splitlines()
+    assert len(keep_branches) == 1
+    keep_branch = keep_branches[0].lstrip("* ")
+    assert _git(repo, "rev-parse", keep_branch) == second
+    assert keep_branch in message
+
+
+def test_promotion_push_uses_captured_sha_when_dev_advances(tmp_path, monkeypatch):
+    repo, first, second = _history_repo(tmp_path)
+    _git(repo, "branch", "ouroboros-stable", first)
+    git_ops.init(repo, tmp_path / "data", "")
+    monkeypatch.setattr(git_ops, "_has_remote", lambda _name=None: True)
+    pushed = []
+
+    def fake_push(args, **_kwargs):
+        pushed.append(list(args))
+        (repo / "value.txt").write_text("three\n", encoding="utf-8")
+        _git(repo, "commit", "-qam", "three")
+        return 0, "", ""
+
+    monkeypatch.setattr(git_ops, "_git_network_bounded", fake_push)
+
+    ok, result = git_ops.promote_branch_exact(
+        "ouroboros", "ouroboros-stable", push_remote=True
+    )
+
+    assert ok, result
+    assert result["sha"] == second
+    assert _git(repo, "rev-parse", "ouroboros-stable") == second
+    assert _git(repo, "rev-parse", "ouroboros") != second
+    assert pushed == [[
+        "push", "origin", f"{second}:refs/heads/ouroboros-stable"
+    ]]
+
+
+def test_event_promotion_refuses_while_managed_update_is_active(monkeypatch):
+    import supervisor.events as events
+    import supervisor.update_merge as update_merge
+
+    token = object()
+    released = []
+    monkeypatch.setattr(update_merge, "acquire_update_lock", lambda: token)
+    monkeypatch.setattr(update_merge, "active_update_tx", lambda: {"phase": "pending_boot_smoke"})
+    monkeypatch.setattr(update_merge, "release_update_lock", lambda value: released.append(value))
+    monkeypatch.setattr(
+        git_ops,
+        "promote_branch_exact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("promotion must be fenced")),
+    )
+    ctx = SimpleNamespace(
+        BRANCH_DEV="ouroboros", BRANCH_STABLE="ouroboros-stable", load_state=lambda: {}
+    )
+
+    events._handle_promote_to_stable({}, ctx)
+
+    assert released == [token]
 
 
 def test_git_capture_repairs_corrupt_index(monkeypatch, tmp_path):
@@ -403,6 +496,8 @@ def test_checkout_and_reset_does_not_rescue_for_only_managed_ahead_commits(monke
 
 
 def test_checkout_and_reset_applies_explicit_update_intent(monkeypatch, tmp_path):
+    import supervisor.update_merge as update_merge
+
     git_dir = tmp_path / ".git"
     git_dir.mkdir()
 
@@ -421,13 +516,19 @@ def test_checkout_and_reset_applies_explicit_update_intent(monkeypatch, tmp_path
         "_read_update_intent",
         lambda: {"branch": "ouroboros", "target_sha": "remote-sha"},
     )
+    monkeypatch.setattr(
+        update_merge,
+        "read_update_tx_strict",
+        lambda: ("valid", {"phase": "applying_replace", "target_sha": "remote-sha"}),
+    )
+    monkeypatch.setattr(git_ops._update_source, "official_ref_has_constitution", lambda *_a, **_k: True)
     monkeypatch.setattr(git_ops, "load_state", lambda: {})
 
     saved_state = {}
     monkeypatch.setattr(git_ops, "save_state", lambda state: saved_state.update(state))
 
     def fake_git_capture(cmd):
-        if cmd == ["git", "rev-parse", "--verify", "remote-sha"]:
+        if cmd == ["git", "rev-parse", "--verify", "remote-sha^{commit}"]:
             return 0, "remote-sha", ""
         if cmd == ["git", "rev-list", "--left-right", "--count", "ouroboros...remote-sha"]:
             return 0, "0 1", ""
@@ -467,6 +568,8 @@ def test_checkout_and_reset_applies_explicit_update_intent(monkeypatch, tmp_path
 
 
 def test_checkout_and_reset_preserves_ahead_head_before_update_intent(monkeypatch, tmp_path):
+    import supervisor.update_merge as update_merge
+
     git_dir = tmp_path / ".git"
     git_dir.mkdir()
 
@@ -485,6 +588,12 @@ def test_checkout_and_reset_preserves_ahead_head_before_update_intent(monkeypatc
         "_read_update_intent",
         lambda: {"branch": "ouroboros", "target_sha": "remote-sha"},
     )
+    monkeypatch.setattr(
+        update_merge,
+        "read_update_tx_strict",
+        lambda: ("valid", {"phase": "applying_replace", "target_sha": "remote-sha"}),
+    )
+    monkeypatch.setattr(git_ops._update_source, "official_ref_has_constitution", lambda *_a, **_k: True)
     monkeypatch.setattr(git_ops, "load_state", lambda: {})
     monkeypatch.setattr(git_ops, "save_state", lambda _state: None)
     monkeypatch.setattr(git_ops, "append_jsonl", lambda _path, _payload: None)
@@ -493,7 +602,7 @@ def test_checkout_and_reset_preserves_ahead_head_before_update_intent(monkeypatc
 
     def fake_git_capture(cmd):
         capture_calls.append(cmd)
-        if cmd == ["git", "rev-parse", "--verify", "remote-sha"]:
+        if cmd == ["git", "rev-parse", "--verify", "remote-sha^{commit}"]:
             return 0, "remote-sha", ""
         if cmd == ["git", "rev-list", "--left-right", "--count", "ouroboros...remote-sha"]:
             return 0, "2 1", ""
@@ -526,6 +635,8 @@ def test_checkout_and_reset_preserves_ahead_head_before_update_intent(monkeypatc
 
 
 def test_checkout_and_reset_blocks_when_update_ahead_check_fails(monkeypatch, tmp_path):
+    import supervisor.update_merge as update_merge
+
     git_dir = tmp_path / ".git"
     git_dir.mkdir()
 
@@ -540,9 +651,15 @@ def test_checkout_and_reset_blocks_when_update_ahead_check_fails(monkeypatch, tm
         "_read_update_intent",
         lambda: {"branch": "ouroboros", "target_sha": "remote-sha"},
     )
+    monkeypatch.setattr(
+        update_merge,
+        "read_update_tx_strict",
+        lambda: ("valid", {"phase": "applying_replace", "target_sha": "remote-sha"}),
+    )
+    monkeypatch.setattr(git_ops._update_source, "official_ref_has_constitution", lambda *_a, **_k: True)
 
     def fake_git_capture(cmd):
-        if cmd == ["git", "rev-parse", "--verify", "remote-sha"]:
+        if cmd == ["git", "rev-parse", "--verify", "remote-sha^{commit}"]:
             return 0, "remote-sha", ""
         if cmd == ["git", "rev-list", "--left-right", "--count", "ouroboros...remote-sha"]:
             return 128, "", "bad revision"
@@ -571,6 +688,150 @@ def test_checkout_and_reset_blocks_when_update_ahead_check_fails(monkeypatch, tm
     assert ["git", "checkout", "-B", "ouroboros", "remote-sha"] not in checkout_calls
 
 
+def test_checkout_and_reset_invalid_update_intent_never_falls_back_to_branch_tip(
+    monkeypatch, tmp_path
+):
+    import supervisor.update_merge as update_merge
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(git_ops, "REPO_DIR", tmp_path)
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
+    monkeypatch.setattr(
+        git_ops,
+        "_read_managed_repo_meta",
+        lambda: {"managed_remote_name": "managed", "managed_remote_branch": "ouroboros"},
+    )
+    monkeypatch.setattr(
+        git_ops,
+        "_read_update_intent",
+        lambda: {"branch": "ouroboros", "target_sha": "missing-sha"},
+    )
+    monkeypatch.setattr(
+        update_merge,
+        "read_update_tx_strict",
+        lambda: ("valid", {"phase": "applying_replace", "target_sha": "missing-sha"}),
+    )
+    cleared = []
+    monkeypatch.setattr(git_ops, "_clear_update_intent", lambda: cleared.append(True) or True)
+    monkeypatch.setattr(git_ops, "append_jsonl", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        git_ops,
+        "git_capture",
+        lambda cmd: (1, "", "unknown revision")
+        if cmd == ["git", "rev-parse", "--verify", "missing-sha^{commit}"]
+        else (_ for _ in ()).throw(AssertionError(cmd)),
+    )
+    monkeypatch.setattr(
+        git_ops.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid intent must not touch the checkout")
+        ),
+    )
+
+    ok, message = git_ops.checkout_and_reset(
+        "ouroboros",
+        reason="ui_update_apply",
+        unsynced_policy="ignore",
+    )
+
+    assert ok is False
+    assert "checkout was left unchanged" in message
+    assert cleared == [True]
+
+
+def test_checkout_and_reset_rejects_orphan_or_mismatched_update_intent(
+    monkeypatch, tmp_path
+):
+    import supervisor.update_merge as update_merge
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(git_ops, "REPO_DIR", tmp_path)
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
+    monkeypatch.setattr(
+        git_ops,
+        "_read_managed_repo_meta",
+        lambda: {"managed_remote_name": "managed"},
+    )
+    monkeypatch.setattr(
+        git_ops,
+        "_read_update_intent",
+        lambda: {"branch": "ouroboros", "target_sha": "intent-sha"},
+    )
+    monkeypatch.setattr(
+        git_ops,
+        "git_capture",
+        lambda cmd: (0, "intent-sha", "")
+        if cmd == ["git", "rev-parse", "--verify", "intent-sha^{commit}"]
+        else (_ for _ in ()).throw(AssertionError(cmd)),
+    )
+    monkeypatch.setattr(
+        git_ops._update_source,
+        "official_ref_has_constitution",
+        lambda *_a, **_k: True,
+    )
+    monkeypatch.setattr(git_ops, "append_jsonl", lambda *_a, **_k: None)
+    monkeypatch.setattr(git_ops, "_clear_update_intent", lambda: True)
+    monkeypatch.setattr(
+        git_ops.subprocess,
+        "run",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("orphan intent must not touch the checkout")
+        ),
+    )
+
+    for tx in (
+        ("absent", {}),
+        ("valid", {"phase": "applying_replace", "target_sha": "other-sha"}),
+    ):
+        monkeypatch.setattr(update_merge, "read_update_tx_strict", lambda tx=tx: tx)
+        ok, message = git_ops.checkout_and_reset(
+            "ouroboros", reason="ui_update_apply", unsynced_policy="ignore"
+        )
+        assert ok is False
+        assert "checkout was left unchanged" in message
+
+
+def test_checkout_and_reset_rejects_target_without_constitution(monkeypatch, tmp_path):
+    import supervisor.update_merge as update_merge
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(git_ops, "REPO_DIR", tmp_path)
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
+    monkeypatch.setattr(git_ops, "_read_managed_repo_meta", lambda: {"managed": True})
+    monkeypatch.setattr(
+        git_ops,
+        "_read_update_intent",
+        lambda: {"branch": "ouroboros", "target_sha": "target-sha"},
+    )
+    monkeypatch.setattr(
+        update_merge,
+        "read_update_tx_strict",
+        lambda: ("valid", {"phase": "applying_replace", "target_sha": "target-sha"}),
+    )
+    monkeypatch.setattr(
+        git_ops,
+        "git_capture",
+        lambda cmd: (0, "target-sha", "")
+        if cmd == ["git", "rev-parse", "--verify", "target-sha^{commit}"]
+        else (_ for _ in ()).throw(AssertionError(cmd)),
+    )
+    monkeypatch.setattr(
+        git_ops._update_source,
+        "official_ref_has_constitution",
+        lambda *_a, **_k: False,
+    )
+    monkeypatch.setattr(git_ops, "append_jsonl", lambda *_a, **_k: None)
+    monkeypatch.setattr(git_ops, "_clear_update_intent", lambda: True)
+
+    ok, message = git_ops.checkout_and_reset(
+        "ouroboros", reason="ui_update_apply", unsynced_policy="ignore"
+    )
+
+    assert ok is False
+    assert "checkout was left unchanged" in message
+
+
 def test_compute_managed_update_status_passive_does_not_ensure_remote(monkeypatch):
     monkeypatch.setattr(
         git_ops,
@@ -584,6 +845,11 @@ def test_compute_managed_update_status_passive_does_not_ensure_remote(monkeypatc
         git_ops,
         "ensure_official_update_remote",
         lambda: (_ for _ in ()).throw(AssertionError("passive status mutated remotes")),
+    )
+    monkeypatch.setattr(
+        git_ops,
+        "_resolve_managed_update_target",
+        lambda *_args: ("", "", "no cached official tags"),
     )
 
     def fake_git_capture(cmd):
@@ -603,7 +869,75 @@ def test_compute_managed_update_status_passive_does_not_ensure_remote(monkeypatc
     assert "official_status_requires_check" in status["warnings"]
 
 
+def test_official_fetch_timeout_kills_the_process_tree(monkeypatch):
+    import ouroboros.platform_layer as platform_layer
+    from ouroboros.tools import shell
+
+    calls = []
+
+    class FakeProcess:
+        returncode = 1
+
+        def __init__(self):
+            self.communicates = 0
+
+        def communicate(self, timeout=None):
+            assert self in shell._active_subprocesses
+            self.communicates += 1
+            if self.communicates == 1:
+                raise subprocess.TimeoutExpired(["git", "fetch"], timeout)
+            return "", "still running"
+
+    proc = FakeProcess()
+    monkeypatch.setattr(git_ops.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(
+        platform_layer,
+        "kill_process_tree",
+        lambda child: calls.append(child),
+    )
+
+    rc, out, error = git_ops.git_fetch_bounded("managed", timeout=0.01)
+
+    assert rc == git_ops.FETCH_TIMEOUT_RC
+    assert out == ""
+    assert "exceeded" in error
+    assert calls == [proc]
+    assert proc not in shell._active_subprocesses
+
+
+def test_dependency_sync_is_panic_tracked_and_killed_on_timeout(monkeypatch):
+    import ouroboros.platform_layer as platform_layer
+    from ouroboros.tools import shell
+
+    killed = []
+
+    class HungProcess:
+        returncode = 1
+
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            assert self in shell._active_subprocesses
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired(["pip", "install"], timeout)
+            return -9
+
+    proc = HungProcess()
+    monkeypatch.setattr(git_ops.subprocess, "Popen", lambda *_a, **_k: proc)
+    monkeypatch.setattr(platform_layer, "kill_process_tree", lambda value: killed.append(value))
+
+    ok, _message = git_ops.sync_runtime_dependencies("managed_update_test")
+
+    assert ok is False
+    assert killed == [proc]
+    assert proc not in shell._active_subprocesses
+
+
 def test_managed_update_target_uses_manifest_remote_name(monkeypatch):
+    import ouroboros.update_channels as update_channels
+
     monkeypatch.setattr(
         git_ops,
         "_read_managed_repo_meta",
@@ -612,30 +946,28 @@ def test_managed_update_target_uses_manifest_remote_name(monkeypatch):
             "managed_remote_branch": "ouroboros",
         },
     )
+    monkeypatch.setattr(update_channels, "get_update_branch", lambda settings=None: "main")
 
-    remote_name, remote_branch, target_ref = git_ops._managed_update_target("ouroboros")
+    remote_name, remote_branch, target_ref = git_ops._managed_update_target()
 
     assert remote_name == "official"
-    assert remote_branch == "ouroboros"
-    assert target_ref == "official/ouroboros"
+    assert remote_branch == "main"
+    assert target_ref == "official/main"
 
 
 def test_prepare_managed_update_preserves_dev_branch_not_current_head(monkeypatch, tmp_path):
     monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
+    monkeypatch.setattr(git_ops, "_read_managed_repo_meta", lambda: {"managed_remote_name": "managed"})
+    monkeypatch.setattr(git_ops, "_managed_update_target", lambda: ("managed", "main", "managed/main"))
     monkeypatch.setattr(
         git_ops,
-        "compute_managed_update_status",
-        lambda fetch=False: {
-            "managed": True,
-            "available": True,
-            "latest_sha": "remote-sha",
-            "target_ref": "managed/ouroboros",
-        },
+        "_resolve_managed_update_target",
+        lambda *_args: ("refs/ouroboros-managed/tags/v6.87.5", "remote-sha", ""),
     )
     monkeypatch.setattr(
         git_ops,
         "_collect_repo_sync_state",
-        lambda: {"current_branch": "ouroboros-stable", "dirty_lines": [], "unpushed_lines": [], "warnings": []},
+        lambda: {"current_branch": "ouroboros", "dirty_lines": [], "unpushed_lines": [], "warnings": []},
     )
     monkeypatch.setattr(
         git_ops,
@@ -645,13 +977,20 @@ def test_prepare_managed_update_preserves_dev_branch_not_current_head(monkeypatc
             "untracked": {"copied_files": 0, "skipped_files": 0, "truncated": False},
         },
     )
-    monkeypatch.setattr(git_ops, "_write_update_intent", lambda _payload: None)
+    intent_writes = []
+    monkeypatch.setattr(git_ops, "_write_update_intent", lambda payload: intent_writes.append(payload))
     monkeypatch.setattr(git_ops, "append_jsonl", lambda _path, _payload: None)
 
     capture_calls = []
 
     def fake_git_capture(cmd):
         capture_calls.append(cmd)
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return 0, "ouroboros", ""
+        if cmd == ["git", "rev-parse", "--verify", "HEAD"]:
+            return 0, "base-sha", ""
+        if cmd == ["git", "rev-parse", "--verify", "managed/main^{commit}"]:
+            return 0, "remote-sha", ""
         if cmd == ["git", "rev-list", "--left-right", "--count", "ouroboros...remote-sha"]:
             return 0, "1 0", ""
         if cmd[:2] == ["git", "branch"] and cmd[-1] == "ouroboros":
@@ -660,24 +999,26 @@ def test_prepare_managed_update_preserves_dev_branch_not_current_head(monkeypatc
 
     monkeypatch.setattr(git_ops, "git_capture", fake_git_capture)
 
-    ok, payload = git_ops.prepare_managed_update("replace")
+    ok, payload = git_ops.prepare_managed_update(
+        "replace", expected_base_sha="base-sha", expected_target_sha="remote-sha",
+        arm_intent=False,
+    )
 
     assert ok is True
     assert payload["keep_branch"].startswith("local-keep-")
+    assert payload["update_intent"]["target_sha"] == "remote-sha"
+    assert intent_writes == []
     assert any(cmd[:2] == ["git", "branch"] and cmd[-1] == "ouroboros" for cmd in capture_calls)
 
 
 def test_prepare_managed_update_blocks_when_ahead_check_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path / "data")
+    monkeypatch.setattr(git_ops, "_read_managed_repo_meta", lambda: {"managed_remote_name": "managed"})
+    monkeypatch.setattr(git_ops, "_managed_update_target", lambda: ("managed", "main", "managed/main"))
     monkeypatch.setattr(
         git_ops,
-        "compute_managed_update_status",
-        lambda fetch=False: {
-            "managed": True,
-            "available": True,
-            "latest_sha": "remote-sha",
-            "target_ref": "managed/ouroboros",
-        },
+        "_resolve_managed_update_target",
+        lambda *_args: ("refs/ouroboros-managed/tags/v6.87.5", "remote-sha", ""),
     )
     monkeypatch.setattr(
         git_ops,
@@ -694,13 +1035,21 @@ def test_prepare_managed_update_blocks_when_ahead_check_fails(monkeypatch, tmp_p
     )
 
     def fake_git_capture(cmd):
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return 0, "ouroboros", ""
+        if cmd == ["git", "rev-parse", "--verify", "HEAD"]:
+            return 0, "base-sha", ""
+        if cmd == ["git", "rev-parse", "--verify", "managed/main^{commit}"]:
+            return 0, "remote-sha", ""
         if cmd == ["git", "rev-list", "--left-right", "--count", "ouroboros...remote-sha"]:
             return 128, "", "bad revision"
         raise AssertionError(cmd)
 
     monkeypatch.setattr(git_ops, "git_capture", fake_git_capture)
 
-    ok, payload = git_ops.prepare_managed_update("replace")
+    ok, payload = git_ops.prepare_managed_update(
+        "replace", expected_base_sha="base-sha", expected_target_sha="remote-sha"
+    )
 
     assert ok is False
     assert "Could not compare local branch with managed update target" in payload["error"]

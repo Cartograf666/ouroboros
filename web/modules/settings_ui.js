@@ -95,6 +95,14 @@ const PROVIDER_CARDS = [
         ],
     },
     {
+        id: 'minimax', title: 'MiniMax', icon: '', hint: 'Direct regional OpenAI-compatible runtime', advanced: true,
+        fields: [
+            { id: 's-minimax-key', settingKey: 'MINIMAX_API_KEY', label: 'API Key', placeholder: 'MiniMax API key' },
+            { id: 's-minimax-region', label: 'Region', placeholder: 'global_en or cn_zh' },
+        ],
+        note: 'Use <code>minimax::MiniMax-M3</code> or <code>minimax::MiniMax-M2.7</code> in the Models tab. Leave Region empty for <code>global_en</code>; use <code>cn_zh</code> for the China endpoint.',
+    },
+    {
         id: 'gigachat', title: 'GigaChat', icon: '/static/providers/gigachat.svg', hint: 'Sber GigaChat via the gigachat library', advanced: true,
         fields: [
             { id: 's-gigachat-credentials', settingKey: 'GIGACHAT_CREDENTIALS', label: 'Authorization Key', placeholder: 'Base64 client_id:secret (OAuth)' },
@@ -192,6 +200,7 @@ export const SECRET_KEYS = [
     ['GIGACHAT_CREDENTIALS', 'GigaChat Authorization Key', 'Base64 client_id:secret'],
     ['GIGACHAT_PASSWORD', 'GigaChat Password (basic auth)', 'password'],
     ['ANTHROPIC_API_KEY', 'Anthropic API Key', 'sk-ant-...'],
+    ['MINIMAX_API_KEY', 'MiniMax API Key', 'MiniMax key'],
     ['GITHUB_TOKEN', 'GitHub Token', 'ghp_...'],
     ['OUROBOROS_NETWORK_PASSWORD', 'Network Password', 'Required for LAN/Docker binds'],
 ];
@@ -268,7 +277,7 @@ export function renderSettingsPage() {
                     <details class="settings-more-providers" id="settings-more-providers">
                         <summary>
                             <span class="settings-provider-title"><span>More providers</span></span>
-                            <span class="settings-provider-hint">Cloud.ru Foundation Models and GigaChat</span>
+                            <span class="settings-provider-hint">Cloud.ru Foundation Models, MiniMax, and GigaChat</span>
                         </summary>
                         <div class="settings-more-providers-body">
                             ${PROVIDER_CARDS.filter((card) => card.advanced).map(providerSettingsCard).join('')}
@@ -465,6 +474,30 @@ export function renderSettingsPage() {
                                 ],
                             })}
                             <div id="s-safety-skip-counter" class="settings-section-copy"></div>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>Update Channel</h3>
+                        <div class="settings-section-copy">
+                            Chooses which official branch Update checks. Your local work branch stays <code>ouroboros</code>.
+                            <code>Stable</code> follows released code on <code>main</code> (default),
+                            <code>QA</code> follows <code>ouroboros-stable</code>, and
+                            <code>Development</code> follows <code>ouroboros</code>.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label>Official Update Source</label>
+                            <input id="s-update-channel" type="hidden" value="stable">
+                            ${renderSegmentedField({
+                                target: 's-update-channel',
+                                modifier: 'data-update-channel-group',
+                                title: 'Applies immediately; no restart required.',
+                                options: [
+                                    { value: 'stable', label: 'Stable' },
+                                    { value: 'qa', label: 'QA' },
+                                    { value: 'development', label: 'Development' },
+                                ],
+                            })}
                         </div>
                     </div>
 

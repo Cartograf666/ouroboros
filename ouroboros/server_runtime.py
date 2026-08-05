@@ -9,6 +9,7 @@ from ouroboros.provider_models import (
     ANTHROPIC_DIRECT_DEFAULTS,
     CLOUDRU_DIRECT_DEFAULTS,
     GIGACHAT_DIRECT_DEFAULTS,
+    MINIMAX_DIRECT_DEFAULTS,
     OPENAI_DIRECT_DEFAULTS,
     compute_direct_review_models_fallback,
     migrate_model_value,
@@ -44,13 +45,22 @@ _DIRECT_PROVIDER_AUTO_DEFAULTS = {
         "OUROBOROS_MODEL_LIGHT": GIGACHAT_DIRECT_DEFAULTS["light"],
         "OUROBOROS_MODEL_FALLBACKS": GIGACHAT_DIRECT_DEFAULTS["fallback"],
     },
+    # NB: no OUROBOROS_MODEL_DEEP_SELF_REVIEW — MiniMax guarantees only a 512K
+    # window floor ("up to 1M"), below the 1M deep-review sizing target, so the
+    # slot takes the same clear-instead-of-fill branch as Cloud.ru/GigaChat.
+    "minimax": {
+        "OUROBOROS_MODEL": MINIMAX_DIRECT_DEFAULTS["main"],
+        "OUROBOROS_MODEL_HEAVY": MINIMAX_DIRECT_DEFAULTS["heavy"],
+        "OUROBOROS_MODEL_LIGHT": MINIMAX_DIRECT_DEFAULTS["light"],
+        "OUROBOROS_MODEL_FALLBACKS": MINIMAX_DIRECT_DEFAULTS["fallback"],
+    },
 }
 # Legacy values that should be auto-replaced with a provider's direct defaults.
-# Cloud.ru and GigaChat intentionally have NO entry: such a provider-only user's
+# Cloud.ru, GigaChat, and MiniMax intentionally have NO entry: such a provider-only user's
 # main/code/light slots match the shipped SETTINGS_DEFAULTS or the shared
 # _PRIOR_SHIPPED_SLOT_DEFAULTS below (google/gemini era) and migrate via the
 # `current in {"", default, *legacy}` check, and the review/scope slots are
-# rebuilt from the (now cloudru::/gigachat::) main by _normalize_direct_review_models
+# rebuilt from the provider-prefixed main by _normalize_direct_review_models
 # — so no per-provider legacy set is needed (verified by
 # test_apply_runtime_provider_defaults_cloudru_*).
 _DIRECT_PROVIDER_LEGACY_DEFAULTS = {
@@ -108,7 +118,7 @@ for _legacy_defaults in _DIRECT_PROVIDER_LEGACY_DEFAULTS.values():
     for _slot in ("OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT"):
         _legacy_defaults[_slot].add(_LEGACY_GEMINI_31_FLASH_LITE)
 # Outgoing SHIPPED OpenRouter defaults (v6.81 and earlier), applied for EVERY
-# exclusive-direct provider (incl. cloudru/gigachat, which have no per-provider
+# exclusive-direct provider (incl. cloudru/gigachat/minimax, which have no per-provider
 # legacy table): before v6.82.0 a stored copy of the shipped default matched the
 # `current in {"", default}` check because SETTINGS_DEFAULTS still carried it;
 # after the defaults refresh these stored copies are still "the old DEFAULT, not
@@ -242,6 +252,7 @@ def _exclusive_direct_remote_provider(settings: dict) -> str:
     has_openrouter = bool(_setting_text(settings, "OPENROUTER_API_KEY"))
     has_official_openai = bool(_setting_text(settings, "OPENAI_API_KEY"))
     has_anthropic = bool(_setting_text(settings, "ANTHROPIC_API_KEY"))
+    has_minimax = bool(_setting_text(settings, "MINIMAX_API_KEY"))
     has_legacy_openai_base = bool(_setting_text(settings, "OPENAI_BASE_URL"))
     has_compatible = bool(_setting_text(settings, "OPENAI_COMPATIBLE_BASE_URL"))
     has_cloudru = bool(_setting_text(settings, "CLOUDRU_FOUNDATION_MODELS_API_KEY"))
@@ -250,14 +261,15 @@ def _exclusive_direct_remote_provider(settings: dict) -> str:
         and bool(_setting_text(settings, "GIGACHAT_PASSWORD"))
     )
     # Mirror config._exclusive_direct_remote_provider_env: OpenRouter / legacy
-    # base / compatible disqualify exclusivity; among the real direct providers
-    # (OpenAI, Anthropic, Cloud.ru, GigaChat) return one only when exactly one is set.
+    # base / compatible disqualify exclusivity; among the registered direct
+    # providers return one only when exactly one is set.
     if has_openrouter or has_legacy_openai_base or has_compatible:
         return ""
     direct = [
         name for name, present in (
             ("openai", has_official_openai),
             ("anthropic", has_anthropic),
+            ("minimax", has_minimax),
             ("cloudru", has_cloudru),
             ("gigachat", has_gigachat),
         ) if present
@@ -373,6 +385,7 @@ def has_remote_provider(settings: dict) -> bool:
             "OPENROUTER_API_KEY",
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",
+            "MINIMAX_API_KEY",
             "OPENAI_COMPATIBLE_BASE_URL",
             "CLOUDRU_FOUNDATION_MODELS_API_KEY",
             "GIGACHAT_CREDENTIALS",
@@ -471,7 +484,7 @@ def apply_runtime_provider_defaults(settings: dict) -> tuple[dict, bool, list[st
     for key in _ALL_MODEL_SLOT_KEYS:
         if key not in provider_defaults:
             # This provider has NO reachable value for that slot (deep review needs
-            # the >=1M window Cloud.ru and GigaChat are documented below). Leaving a
+            # the >=1M window Cloud.ru/GigaChat/MiniMax do not guarantee). Leaving a
             # SHIPPED default in place would keep an unreachable OpenRouter-form
             # route, so clear it — the review is then honestly unavailable. An
             # explicit owner value is never touched.

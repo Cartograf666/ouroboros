@@ -370,7 +370,7 @@ def _parse_staged_name_status(repo_dir: pathlib.Path) -> list:
     return entries
 
 
-def _classify_deleted_for_inline(path: str) -> Optional[str]:
+def _classify_deleted_for_inline(path: str, repo_dir: pathlib.Path) -> Optional[str]:
     """Return a suppression reason for deleted HEAD content, or None to inline."""
     fp = pathlib.Path(path)
     fname_lower = fp.name.lower()
@@ -379,6 +379,9 @@ def _classify_deleted_for_inline(path: str) -> Optional[str]:
         return "sensitive (env/credential/key)"
     if suffix_lower in BINARY_EXTENSIONS:
         return "binary extension"
+    from ouroboros.tools.review_binary_context import staged_path_is_binary
+    if staged_path_is_binary(repo_dir, path):
+        return "binary content"
     return None
 
 
@@ -386,6 +389,8 @@ def _inline_deleted_file_pack(
     current_files_section: str,
     deleted_paths: list,
     repo_dir: pathlib.Path,
+    *,
+    represent_binary: bool = False,
 ) -> str:
     """Append deleted-file HEAD content or explicit suppression markers."""
     if not deleted_paths:
@@ -394,8 +399,18 @@ def _inline_deleted_file_pack(
     notes: list[str] = []
     for dp in deleted_paths:
         suffix = pathlib.Path(dp).suffix.lstrip(".") or "text"
-        suppress_reason = _classify_deleted_for_inline(dp)
+        suppress_reason = _classify_deleted_for_inline(dp, repo_dir)
         if suppress_reason is not None:
+            if represent_binary and suppress_reason.startswith("binary"):
+                from ouroboros.tools.review_binary_context import render_staged_binary_metadata
+
+                metadata = render_staged_binary_metadata(repo_dir, dp)
+                if metadata is None:
+                    raise RuntimeError(
+                        f"deleted binary {dp} has no exact staged Git metadata"
+                    )
+                notes.append(f"### {dp}\n\n{metadata}\n")
+                continue
             notes.append(
                 f"### {dp}\n\n*(DELETED — {suppress_reason}; content suppressed)*\n"
             )
@@ -523,6 +538,8 @@ def _render_touched_section(
     deleted_paths: list,
     skipped_by_design: list,
     diff_only_paths: list,
+    *,
+    represent_binary: bool = False,
 ) -> tuple:
     """Build the touched-files prompt section.
 
@@ -536,8 +553,15 @@ def _render_touched_section(
     claim content the pack does not hold (BIBLE P1).
     """
     kept = [path for path in current_context_paths if path not in diff_only_paths]
-    section, pack_omitted = build_touched_file_pack(repo_dir, kept)
-    section = _inline_deleted_file_pack(section, deleted_paths, repo_dir)
+    section, pack_omitted = build_touched_file_pack(
+        repo_dir, kept, represent_binary=represent_binary
+    )
+    section = _inline_deleted_file_pack(
+        section,
+        deleted_paths,
+        repo_dir,
+        represent_binary=represent_binary,
+    )
     if skipped_by_design:
         skip_note = (
             "## CURRENT FILE CONTEXT DEDUPLICATION NOTE\n"
@@ -616,6 +640,14 @@ def _zero_context_staged_diff(repo_dir: pathlib.Path) -> str:
         return ""
 
 
+@dataclass(frozen=True)
+class _ScopePromptContext:
+    drive_root: Optional[pathlib.Path] = None
+    scope_model: str = ""
+    governance_repo_dir: Optional[pathlib.Path] = None
+    represent_binary: bool = False
+
+
 
 
 def _build_scope_prompt(
@@ -626,11 +658,14 @@ def _build_scope_prompt(
     review_rebuttal: str = "",
     review_history: Optional[list] = None,
     scope_review_history: Optional[list] = None,
-    drive_root: Optional[pathlib.Path] = None,
-    scope_model: str = "",
-    governance_repo_dir: Optional[pathlib.Path] = None,
+    context: Optional[_ScopePromptContext] = None,
 ) -> tuple:
     """Build the scope prompt or a touched-context/budget status sentinel."""
+    context = context or _ScopePromptContext()
+    drive_root = context.drive_root
+    scope_model = context.scope_model
+    governance_repo_dir = context.governance_repo_dir
+    represent_binary = context.represent_binary
     _SCOPE_CONTEXT_MANIFEST.set({})
     # Missing checklist is fail-closed, matching the triad.
     scope_checklist = load_checklist_section("Intent / Scope Review Checklist")
@@ -700,6 +735,7 @@ def _build_scope_prompt(
             deleted_paths,
             current_skipped_by_design,
             diff_only_paths,
+            represent_binary=represent_binary,
         )
 
     current_files_section, omitted, snapshot_included = _render_current_section([])
@@ -1334,6 +1370,8 @@ def run_scope_review(
     scope_model_id = scope_model or _get_scope_model()
     delegated = str(getattr(route, "value", route) or "") == "agent_session"
 
+    from ouroboros.tools.registry import _authorized_managed_update_resolver
+
     try:
         if delegated:
             # Session delivery (5.2): same task/checklist/contract, no assembled
@@ -1359,9 +1397,16 @@ def run_scope_review(
                 review_rebuttal=review_rebuttal,
                 review_history=review_history,
                 scope_review_history=scope_review_history,
-                drive_root=pathlib.Path(ctx.drive_root) if getattr(ctx, "drive_root", None) else None,
-                scope_model=scope_model_id,
-                governance_repo_dir=governance_repo,
+                context=_ScopePromptContext(
+                    drive_root=(
+                        pathlib.Path(ctx.drive_root)
+                        if getattr(ctx, "drive_root", None)
+                        else None
+                    ),
+                    scope_model=scope_model_id,
+                    governance_repo_dir=governance_repo,
+                    represent_binary=_authorized_managed_update_resolver(ctx),
+                ),
             )
     except RuntimeError as exc:
         return ScopeReviewResult(

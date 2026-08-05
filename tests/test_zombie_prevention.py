@@ -118,6 +118,7 @@ def test_kill_workers_writes_failure_for_running_and_pending(tmp_path):
     orig_q_drive = queue.DRIVE_ROOT
     orig_q_pending = queue.PENDING
     orig_q_running = queue.RUNNING
+    orig_disabled = workers._WORKER_POOL_DISABLED_REASON
 
     workers.DRIVE_ROOT = tmp_path
     queue.DRIVE_ROOT = tmp_path
@@ -143,6 +144,7 @@ def test_kill_workers_writes_failure_for_running_and_pending(tmp_path):
         queue.DRIVE_ROOT = orig_q_drive
         queue.PENDING = orig_q_pending
         queue.RUNNING = orig_q_running
+        workers._WORKER_POOL_DISABLED_REASON = orig_disabled
 
     results_dir = tmp_path / "task_results"
     for tid in ("run1", "run2", "pend1", "pend2"):
@@ -195,3 +197,87 @@ def test_kill_workers_can_record_owner_restart_cancellation(tmp_path):
         data = json.loads((tmp_path / "task_results" / f"{tid}.json").read_text(encoding="utf-8"))
         assert data["status"] == "cancelled"
         assert data["result"] == "Owner restart stopped this task before process restart."
+
+
+def test_managed_update_preserves_pending_tasks_for_the_new_process(tmp_path):
+    import supervisor.queue as queue
+    import supervisor.workers as workers
+
+    orig_drive = workers.DRIVE_ROOT
+    orig_workers = dict(workers.WORKERS)
+    orig_running = dict(workers.RUNNING)
+    orig_pending = list(workers.PENDING)
+    orig_q_drive = queue.DRIVE_ROOT
+    orig_q_pending = queue.PENDING
+    orig_q_running = queue.RUNNING
+    orig_disabled = workers._WORKER_POOL_DISABLED_REASON
+
+    workers.DRIVE_ROOT = tmp_path
+    queue.DRIVE_ROOT = tmp_path
+    workers.WORKERS.clear()
+    workers.RUNNING.clear()
+    workers.PENDING[:] = [{"id": "queued-after-update", "type": "task"}]
+    queue.PENDING = workers.PENDING
+
+    try:
+        with mock.patch.object(queue, "persist_queue_snapshot"):
+            survivors = workers.kill_workers_for_update(
+                result_reason="Managed update",
+                terminal_status="interrupted",
+            )
+        assert survivors == []
+        assert [task["id"] for task in workers.PENDING] == ["queued-after-update"]
+        assert not (tmp_path / "task_results" / "queued-after-update.json").exists()
+    finally:
+        workers.DRIVE_ROOT = orig_drive
+        workers.WORKERS.clear()
+        workers.WORKERS.update(orig_workers)
+        workers.RUNNING.clear()
+        workers.RUNNING.update(orig_running)
+        workers.PENDING[:] = orig_pending
+        queue.DRIVE_ROOT = orig_q_drive
+        queue.PENDING = orig_q_pending
+        queue.RUNNING = orig_q_running
+        workers._WORKER_POOL_DISABLED_REASON = orig_disabled
+
+
+def test_managed_update_drops_children_of_interrupted_roots(tmp_path):
+    import supervisor.queue as queue
+    import supervisor.workers as workers
+
+    orig_drive = workers.DRIVE_ROOT
+    orig_workers = dict(workers.WORKERS)
+    orig_running = dict(workers.RUNNING)
+    orig_pending = list(workers.PENDING)
+    orig_q_drive = queue.DRIVE_ROOT
+    orig_q_pending = queue.PENDING
+    orig_q_running = queue.RUNNING
+    orig_disabled = workers._WORKER_POOL_DISABLED_REASON
+    workers.DRIVE_ROOT = tmp_path
+    queue.DRIVE_ROOT = tmp_path
+    workers.WORKERS.clear()
+    workers.RUNNING.clear()
+    workers.RUNNING["root-1"] = {"task": {"id": "root-1", "type": "task"}, "worker_id": 0}
+    workers.PENDING[:] = [
+        {"id": "child-1", "type": "task", "parent_task_id": "root-1", "root_task_id": "root-1"},
+        {"id": "independent", "type": "task"},
+    ]
+    queue.PENDING = workers.PENDING
+    queue.RUNNING = workers.RUNNING
+    try:
+        with mock.patch.object(queue, "persist_queue_snapshot"):
+            workers.kill_workers_for_update(result_reason="Managed update")
+        assert [task["id"] for task in workers.PENDING] == ["independent"]
+        child = json.loads((tmp_path / "task_results" / "child-1.json").read_text())
+        assert child["status"] == "cancelled"
+    finally:
+        workers.DRIVE_ROOT = orig_drive
+        workers.WORKERS.clear()
+        workers.WORKERS.update(orig_workers)
+        workers.RUNNING.clear()
+        workers.RUNNING.update(orig_running)
+        workers.PENDING[:] = orig_pending
+        queue.DRIVE_ROOT = orig_q_drive
+        queue.PENDING = orig_q_pending
+        queue.RUNNING = orig_q_running
+        workers._WORKER_POOL_DISABLED_REASON = orig_disabled

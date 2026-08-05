@@ -26,7 +26,11 @@ from ouroboros.runtime_mode_policy import (
 )
 from ouroboros.tools.commit_gate import _invalidate_advisory
 from ouroboros.shell_parse import embedded_absolute_path_tokens, is_absolute_path_text, recover_stringified_argv, shell_argv_with_inline
-from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
+from ouroboros.tools.registry import (
+    ToolContext,
+    ToolEntry,
+    active_repo_dir_for,
+)
 from ouroboros.tool_access import (
     active_tool_profile,
     decide_tool_access,
@@ -50,6 +54,7 @@ _RUN_SHELL_DEFAULT_TIMEOUT_SEC = 360
 _CONTROL_DIR_BACKUP_MAX_BYTES = 5 * 1024 * 1024
 _OUTPUT_DIR_MAX_FILES = 1000
 _OUTPUT_DIR_MAX_BYTES = 50 * 1024 * 1024
+
 
 def _tracked_subprocess_run(cmd, **kwargs):
     """subprocess.run replacement with process-tree tracking. When capturing TEXT

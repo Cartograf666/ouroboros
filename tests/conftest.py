@@ -123,9 +123,11 @@ def _mock_pollution_files(root: pathlib.Path) -> set[pathlib.Path]:
 # Files whose tests spawn REAL OS processes / bind REAL ports / mutate process-global state.
 # Under `pytest -n` (xdist) they flake — or crash a worker, which (with --max-worker-restart=0)
 # fails that worker's WHOLE co-located batch, surfacing as spurious failures in unrelated files.
-# So CI runs them in a SERIAL pass (`-m serial`) and excludes them from the parallel pass
-# (`-m "not serial" -n auto`). A NEW real-process/port/global-state test should mark itself
-# `@pytest.mark.serial` (preferred) or be added here. See docs/DEVELOPMENT.md "Pytest marker lanes".
+# So CI **and the hermetic commit gate** (ouroboros/preflight_runner.py, v6.88.0) run them in a
+# SERIAL pass (`-m serial`) and exclude them from the parallel pass (`-m "not serial" -n auto`);
+# in the gate a crashed worker is a named hard block, not a retry. A NEW real-process/port/
+# global-state test should mark itself `@pytest.mark.serial` (preferred) or be added here.
+# See docs/DEVELOPMENT.md "Pytest marker lanes".
 _SERIAL_TEST_FILES = frozenset({
     "test_workspace_executor.py",
     "test_workspace_executor_cleanup.py",
@@ -149,6 +151,11 @@ _SERIAL_TEST_FILES = frozenset({
     # AND mutates the module-global tools.services._SERVICES (NOT covered by the
     # _isolate_workspace_executor_globals fixture, which isolates a different dict).
     "test_services_tool_v2.py",
+    # Its own autouse fixture documents that the writer fence "deliberately latches PROCESS-wide
+    # state" (workers admission/survivor/blocker latches, update_merge/git_ops module globals);
+    # under -n the replace-family no-side-effect pins (replace_env["calls"] == []) intermittently
+    # observe git calls leaked by co-located modules. Same module-global class -> serial lane.
+    "test_update_apply_routing.py",
 })
 
 
@@ -359,6 +366,31 @@ def _isolate_workspace_executor_globals():
             with svc._LOCK:
                 svc._SERVICES.clear()
                 svc._SERVICES.update(saved_svc_services)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_repo_writer_gate():
+    """Reset the process-global repo-writer admission latch between tests.
+
+    ``supervisor.workers._repo_writer_gate_reason`` is process-wide by design (the
+    managed-update fence). A test that drives a REAL ``rollback_managed_update``
+    boot path closes it with ``reopen_writer_admission=False`` — deliberately, on
+    the production contract that a restart clears it — but the pytest process
+    never restarts, so the latch leaks into whatever test xdist schedules next
+    (e.g. the emergency-cleanup shutdown test then sees ``preserve_pending``).
+    Snapshot → run → restore, same pattern as the service-registry isolation."""
+    try:
+        from supervisor import workers
+    except Exception:
+        yield
+        return
+    with workers._repo_writer_gate_lock:
+        saved = workers._repo_writer_gate_reason
+    try:
+        yield
+    finally:
+        with workers._repo_writer_gate_lock:
+            workers._repo_writer_gate_reason = saved
 
 
 @pytest.hookimpl(hookwrapper=True)

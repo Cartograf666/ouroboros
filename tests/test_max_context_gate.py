@@ -76,3 +76,31 @@ def test_max_gate_threads_compatible_key_only_for_compatible_route(monkeypatch):
         {"OUROBOROS_MODEL": "openai/gpt-5.5", "OPENAI_COMPATIBLE_API_KEY": "THEKEY"}
     ) is None
     assert seen["key"] is None
+
+
+def test_max_gate_uses_minimax_region_and_in_flight_key(monkeypatch):
+    seen = {}
+
+    def _cap(provider, model, base_url, allow_fetch=True, api_key=None):
+        seen.update({
+            "provider": provider,
+            "model": model,
+            "base_url": base_url,
+            "api_key": api_key,
+        })
+        return 1_000_000
+
+    monkeypatch.setattr(ce, "_provider_metadata_window", _cap)
+    settings = {
+        "OUROBOROS_MODEL": "minimax::MiniMax-M3",
+        "MINIMAX_API_KEY": "minimax-key",
+        "MINIMAX_REGION": "cn_zh",
+    }
+
+    assert gw._max_context_block(settings) is None
+    assert seen == {
+        "provider": "minimax",
+        "model": "minimax::MiniMax-M3",
+        "base_url": "https://api.minimaxi.com/v1",
+        "api_key": "minimax-key",
+    }

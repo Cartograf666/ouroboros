@@ -1,6 +1,7 @@
 """Process custody: supervised spawn chokepoint, ledger, reaper, lifeline."""
 
 import json
+import multiprocessing
 import os
 import pathlib
 import re
@@ -38,6 +39,10 @@ _POPEN_ALLOWLIST = {
     "launcher.py",                        # custody host process (pre-runtime)
     "ouroboros/process_custody.py",       # the chokepoint itself
     "ouroboros/platform_layer.py",        # primitives (hidden_run helpers)
+    # ProcessContainer.spawn IS the custody for the hermetic gate's short-lived
+    # pytest root: membership is env-token/Job-Object-held and reaped at teardown,
+    # so routing it through spawn_supervised would double-custody a bounded child.
+    "ouroboros/process_containment.py",
     "ouroboros/packaged_cli.py",          # user-facing CLI wrapper (foreground)
     "ouroboros/cli.py",                   # dev CLI (foreground)
     "ouroboros/server_control.py",        # restart exec path
@@ -53,7 +58,24 @@ _POPEN_ALLOWLIST = {
     "ouroboros/local_model.py",           # custody record added at spawn
     "ouroboros/extension_companion.py",   # custody write-through added at spawn
     "ouroboros/tools/services.py",        # routed through spawn_supervised
+    "supervisor/update_source.py",       # bounded foreground git network calls (waited + killed on timeout)
+    "supervisor/update_merge.py",        # bounded pre-restart import/compile smoke
+    "supervisor/git_ops.py",             # bounded dependency sync (waited + panic-tracked)
+    "ouroboros/colab_bootstrap.py",      # bounded Colab clone/fetch helper
 }
+
+
+def _spawn_service_from_worker_process(drive_root: str, result_queue) -> None:
+    proc = spawn_supervised(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        drive_root=pathlib.Path(drive_root),
+        purpose="service:worker-owned",
+        scope="session",
+        owner_task_id="worker-task",
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    result_queue.put(proc.pid)
 
 
 def test_popen_sites_are_custodied_or_allowlisted():
@@ -106,6 +128,43 @@ def test_spawn_supervised_records_ledger_entry(tmp_path):
 
 
 @_POSIX_ONLY
+def test_update_quiesce_kills_service_recorded_by_worker_process(tmp_path):
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    worker = ctx.Process(
+        target=_spawn_service_from_worker_process,
+        args=(str(tmp_path), result_queue),
+    )
+    worker.start()
+    service_pid = result_queue.get(timeout=20)
+    worker.join(timeout=20)
+    assert worker.exitcode == 0
+    try:
+        assert process_custody.pid_is_alive(service_pid)
+
+        ok, blockers = process_custody.quiesce_custodied_services(tmp_path)
+
+        assert ok is True
+        assert blockers == []
+        assert not process_custody.pid_is_alive(service_pid)
+    finally:
+        from ouroboros.platform_layer import kill_pid_tree
+
+        kill_pid_tree(service_pid)
+
+
+def test_update_quiesce_blocks_on_unreadable_custody_ledger(tmp_path):
+    path = ledger_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{broken\n", encoding="utf-8")
+
+    ok, blockers = process_custody.quiesce_custodied_services(tmp_path)
+
+    assert ok is False
+    assert blockers == ["custody_ledger:unreadable"]
+
+
+@_POSIX_ONLY
 def test_reaper_kills_stale_session_entry(tmp_path, monkeypatch):
     proc = spawn_supervised(
         [sys.executable, "-c", "import time; time.sleep(60)"],
@@ -130,6 +189,67 @@ def test_reaper_kills_stale_session_entry(tmp_path, monkeypatch):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+
+
+def test_spawn_supervised_kills_child_when_custody_record_fails(tmp_path, monkeypatch):
+    killed = []
+
+    class FakeProc:
+        pid = 4321
+
+        def wait(self, timeout=None):
+            return -9
+
+    proc = FakeProc()
+    monkeypatch.setattr(process_custody.subprocess, "Popen", lambda *_a, **_k: proc)
+    monkeypatch.setattr(
+        process_custody,
+        "record_process",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("ledger full")),
+    )
+    monkeypatch.setattr(process_custody, "kill_process_tree", lambda value: killed.append(value))
+
+    with pytest.raises(RuntimeError, match="durable custody"):
+        spawn_supervised(
+            [sys.executable, "-c", "pass"],
+            drive_root=tmp_path,
+            purpose="service:test",
+            scope="task",
+        )
+
+    assert killed == [proc]
+
+
+def test_update_quiesce_kills_service_group_that_outlives_leader(tmp_path, monkeypatch):
+    entry = {
+        "pid": 123,
+        "pgid": 456,
+        "purpose": "service:background-child",
+        "scope": "session",
+    }
+    rewritten = []
+    killed = []
+    group_alive = {456: True}
+    monkeypatch.setattr(process_custody, "_read_ledger_strict", lambda _root: (True, [entry]))
+    monkeypatch.setattr(process_custody, "_fingerprint_matches", lambda _entry: False)
+    monkeypatch.setattr(process_custody, "process_group_is_alive", lambda pgid: group_alive.get(pgid, False))
+    monkeypatch.setattr(
+        process_custody,
+        "kill_process_group_id",
+        lambda pgid: (killed.append(pgid), group_alive.__setitem__(pgid, False)),
+    )
+    monkeypatch.setattr(
+        process_custody,
+        "_rewrite_ledger",
+        lambda _root, entries: rewritten.extend(entries),
+    )
+
+    ok, blockers = process_custody.quiesce_custodied_services(tmp_path)
+
+    assert ok is True
+    assert blockers == []
+    assert killed == [456]
+    assert rewritten == []
 
 
 @_POSIX_ONLY

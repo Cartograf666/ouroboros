@@ -43,7 +43,7 @@
         modelsDirty: false,
         localSourceOpen: Boolean(INITIAL_STATE.localSource),
         moreProvidersOpen: Boolean(
-            INITIAL_STATE.cloudruKey || INITIAL_STATE.compatibleBaseUrl || INITIAL_STATE.compatibleApiKey,
+            INITIAL_STATE.cloudruKey || INITIAL_STATE.minimaxKey || INITIAL_STATE.compatibleBaseUrl || INITIAL_STATE.compatibleApiKey,
         ),
         localStatusText: 'Status: Offline',
         localStatusTone: 'muted',
@@ -117,6 +117,7 @@
             const direct = [
                 ['OPENAI_API_KEY', 'openai'],
                 ['CLOUDRU_FOUNDATION_MODELS_API_KEY', 'cloudru'],
+                ['MINIMAX_API_KEY', 'minimax'],
                 ['ANTHROPIC_API_KEY', 'anthropic'],
             ].filter(([settingKey]) => configured[settingKey]);
             if (hasOpenrouter) return 'openrouter';
@@ -225,9 +226,12 @@
             const localFilename = trim(state.localFilename);
             const shortKey = keyValues.find(([field, value]) => value && (field.inputType || 'password') === 'password' && value.length < 10);
             if (shortKey) return `${shortKey[0].label.replace(' API Key', '')} API key looks too short.`;
-            const hasRemote = keyValues.some(([field, value]) => value && field.settingKey !== 'OPENAI_COMPATIBLE_API_KEY');
+            const hasRemote = keyValues.some(([field, value]) => value && !['OPENAI_COMPATIBLE_API_KEY', 'MINIMAX_REGION'].includes(field.settingKey));
             if (!hasRemote && !localSource) {
                 return 'Enter at least one remote key or a local model source before continuing.';
+            }
+            if (trim(state.minimaxRegion) && !['global_en', 'cn_zh'].includes(trim(state.minimaxRegion).toLowerCase())) {
+                return 'MiniMax Region must be global_en or cn_zh.';
             }
             if (localSource && !hasRemote && trim(state.localRoutingMode) === 'cloud') {
                 return 'Local-only setups must route at least one model to the local runtime.';
@@ -549,6 +553,7 @@
         if (trim(state.openrouterKey)) rows.splice(1, 0, ['OpenRouter', 'configured']);
         if (trim(state.openaiKey)) rows.splice(1, 0, ['OpenAI', 'configured']);
         if (trim(state.cloudruKey)) rows.splice(1, 0, ['Cloud.ru', 'configured']);
+        if (trim(state.minimaxKey)) rows.splice(1, 0, ['MiniMax', 'configured']);
         if (trim(state.anthropicKey)) rows.splice(1, 0, ['Anthropic', 'configured']);
         if (hasLocalModel()) {
             rows.splice(
@@ -710,7 +715,7 @@
                         note: slot.note,
                     })).join('')}
                 </div>
-            <div class="wizard-inline-note">Direct providers use <code>openai::gpt-5.6-terra</code>, <code>cloudru::zai-org/GLM-4.7</code>, and <code>anthropic::claude-sonnet-5</code>. OpenAI-compatible endpoints use <code>openai-compatible::your-model-name</code>. Plain <code>openai/...</code> or <code>anthropic/...</code> stays router-style by design.</div>
+            <div class="wizard-inline-note">Direct providers use explicit <code>provider::model</code> values, including <code>minimax::MiniMax-M3</code> and <code>minimax::MiniMax-M2.7</code>. OpenAI-compatible endpoints use <code>openai-compatible::your-model-name</code>. Plain slash-form model IDs stay router-style by design.</div>
         `;
     }
 

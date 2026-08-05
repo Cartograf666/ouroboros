@@ -673,13 +673,22 @@ def _create_isolated_checkout(
     if add.returncode != 0:
         raise RuntimeError(f"worktree add failed: {add.stderr.strip()}")
     if staged_patch.strip():
+        # TEXT stdin on purpose, symmetric with the text-mode capture that produced
+        # `staged_patch` (see the `git diff --cached --binary` capture sites and the
+        # test's helper): this exact pairing is the configuration Windows CI was
+        # green with through v6.87.5, and switching only this side to bytes broke
+        # CRLF worktrees there. On POSIX text mode is an identity. A staged BINARY
+        # file on a CRLF-translating platform can still fail the roundtrip — that
+        # failure is loud (RuntimeError with git's stderr), never silent.
         apply = subprocess.run(
             ["git", "apply", "--index", "--whitespace=nowarn", "--binary"],
-            cwd=str(checkout), input=staged_patch, capture_output=True, text=True, timeout=120,
+            cwd=str(checkout), input=staged_patch,
+            capture_output=True, text=True, timeout=120,
         )
         if apply.returncode != 0:
             raise RuntimeError(
-                f"staged diff did not apply to the isolated checkout: {apply.stderr.strip()}"
+                "staged diff did not apply to the isolated checkout: "
+                f"{(apply.stderr or '').strip()}"
             )
     return checkout_root, checkout
 

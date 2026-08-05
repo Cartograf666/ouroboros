@@ -1569,10 +1569,18 @@ def test_all_schedule_failures_still_reach_reviewer_panel(monkeypatch, tmp_path)
 
     ctx = _make_ctx(tmp_path)
     ctx.task_id = "parent-all-schedule-failed"
+    # A REAL queue, not _make_ctx's MagicMock attribute: _planning_swarm_timing
+    # treats a mock event_queue as non-live and clamps the scout window to 0.25s
+    # regardless of the env below, reintroducing the slow-runner race.
+    ctx.event_queue = queue.Queue()
     monkeypatch.setenv("OUROBOROS_MAX_WORKERS", "3")
-    # 0.25s, not 0: a zero-length window is refused before launch now, and this test is about
-    # a schedule FAILURE reaching the panel, not about window admission.
-    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "0.25")
+    # A generous window, not 0 and not 0.25: a zero-length window is refused before
+    # launch (this test is about a schedule FAILURE reaching the panel, not window
+    # admission), and 0.25s raced slow Windows runners — the durable wave write ate
+    # the whole window, so the pre-launch plan refused BEFORE _schedule_task ran and
+    # the "queue refused" detail never existed. Every schedule fails, so the collect
+    # loop still exits immediately (no scouts to wait for).
+    monkeypatch.setenv("OUROBOROS_PLAN_TASK_SWARM_MAX_WAIT_SEC", "30")
     monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "m1,m2")
     monkeypatch.setattr(control, "_schedule_task", lambda *_a, **_k: "ERROR: queue refused")
     monkeypatch.setattr(pr, "_load_plan_checklist", lambda: "checklist")

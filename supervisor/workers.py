@@ -206,17 +206,24 @@ def worker_pool_admission_state(ctx: Any = None) -> Dict[str, Any]:
     with _queue_lock:
         disabled_reason = str(_WORKER_POOL_DISABLED_REASON or "")
         worker_count = len(pool)
-    available = worker_count > 0 and not disabled_reason
+    update_reason = repo_writer_admission_closed()
+    available = worker_count > 0 and not disabled_reason and not update_reason
     return {
         "available": available,
         "reason_code": "" if available else "worker_pool_unavailable",
-        "disabled_reason": disabled_reason or ("no_workers" if not worker_count else ""),
+        "disabled_reason": disabled_reason or update_reason or ("no_workers" if not worker_count else ""),
         "worker_count": worker_count,
     }
 
 
 def ensure_worker_pool_started(n: int = 0, *, allow_disabled_restart: bool = False) -> bool:
     """Start an absent pool; only explicit internal recovery may clear disablement."""
+    with _queue_lock:
+        # Update admission can be closed while the one authorized assisted
+        # resolver is already running. That does not make an existing healthy
+        # pool absent and must never trigger a second full-pool spawn.
+        if WORKERS and not _WORKER_POOL_DISABLED_REASON:
+            return True
     state = worker_pool_admission_state()
     if state["available"]:
         return True
@@ -230,6 +237,87 @@ _chat_agent = None
 # Serializes every direct-chat caller; _chat_agent has mutable per-call state.
 import threading as _threading
 _chat_agent_lock = _threading.Lock()
+_ephemeral_chat_lock = _threading.Lock()
+_repo_writer_gate_lock = _threading.Lock()
+_repo_writer_gate_reason = ""
+
+
+def close_repo_writer_admission(reason: str) -> None:
+    """Stop new in-process chat turns from entering the managed checkout."""
+    global _repo_writer_gate_reason
+    with _repo_writer_gate_lock:
+        _repo_writer_gate_reason = str(reason or "managed update")
+
+
+def open_repo_writer_admission(expected_reason: str = "") -> bool:
+    """Open the process-local gate, optionally only for the exact current owner."""
+    global _repo_writer_gate_reason
+    with _repo_writer_gate_lock:
+        if expected_reason and _repo_writer_gate_reason != expected_reason:
+            return False
+        _repo_writer_gate_reason = ""
+    return True
+
+
+def repo_writer_admission_closed() -> str:
+    with _repo_writer_gate_lock:
+        reason = _repo_writer_gate_reason
+    if reason:
+        return reason
+    # The in-memory latch disappears on restart; the transaction marker does
+    # not. Let that durable state close the same gate during boot recovery.
+    try:
+        from supervisor.update_merge import active_update_tx
+
+        tx = active_update_tx()
+        if tx:
+            return f"managed_update_tx:{tx.get('phase') or 'unknown'}"
+    except Exception:
+        log.warning("Could not read durable managed-update admission state", exc_info=True)
+        return "managed_update_tx:unreadable"
+    return ""
+
+
+def repo_writer_task_allowed(task: Dict[str, Any]) -> bool:
+    """Only the tx-authorized resolver may dispatch while the gate is closed."""
+    if not repo_writer_admission_closed():
+        return True
+    try:
+        from supervisor.update_merge import authorized_assisted_task
+
+        return bool(authorized_assisted_task(
+            str(task.get("id") or ""),
+            task.get("metadata") if isinstance(task.get("metadata"), dict) else None,
+        ))
+    except Exception:
+        return False
+
+
+def drain_repo_writers(timeout: float = 30.0) -> List[str]:
+    """Wait for the two existing in-process writer lanes after admission closes."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    blocked: List[str] = []
+    for label, lock in (("direct_chat", _chat_agent_lock), ("ephemeral_chat", _ephemeral_chat_lock)):
+        remaining = max(0.0, deadline - time.monotonic())
+        if not lock.acquire(timeout=remaining):
+            blocked.append(label)
+            continue
+        lock.release()
+    return blocked
+
+
+def _repo_writer_turn_allowed(chat_id: int) -> bool:
+    reason = repo_writer_admission_closed()
+    if not reason:
+        return True
+    try:
+        send_with_budget(
+            chat_id,
+            "🔒 An update is using the repository. Try this message again when it finishes.",
+        )
+    except Exception:
+        log.debug("Could not report managed-update writer gate", exc_info=True)
+    return False
 
 
 def _get_chat_agent():
@@ -783,6 +871,8 @@ def handle_chat_direct(
     task_metadata: Optional[dict] = None,
 ) -> None:
     with _chat_agent_lock:
+        if not _repo_writer_turn_allowed(chat_id):
+            return
         _handle_chat_direct_locked(
             chat_id,
             text,
@@ -953,11 +1043,6 @@ def _run_chat_task(
             log.debug("Suppressed exception", exc_info=True)
 
 
-# Serializes ephemeral same-route turns so concurrent main-chat messages each get
-# their own response in order, without ever touching the running locked turn.
-_ephemeral_chat_lock = _threading.Lock()
-
-
 def handle_chat_ephemeral(
     chat_id: int,
     text: str,
@@ -988,6 +1073,8 @@ def handle_chat_ephemeral(
     from ouroboros.agent import make_agent
 
     with _ephemeral_chat_lock:
+        if not _repo_writer_turn_allowed(chat_id):
+            return
         agent = make_agent(repo_dir=str(REPO_DIR), drive_root=str(DRIVE_ROOT), event_queue=get_event_q())
         _run_chat_task(
             agent, chat_id, text, image_data,
@@ -1104,6 +1191,11 @@ def _current_custody_session_id() -> str:
         return ""
 
 
+def _prepare_worker_task_runtime() -> None:
+    """Load the managed-update authorization path before a live merge can conflict."""
+    import supervisor.update_merge  # noqa: F401
+
+
 def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
                 custody_session_id: str = "") -> None:
     import os as _os
@@ -1205,6 +1297,19 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     except Exception as _e:
         _log_worker_crash(wid, _drive, "make_agent", _e, _tb.format_exc())
         return
+    try:
+        _prepare_worker_task_runtime()
+        from ouroboros.utils import append_jsonl as _append_jsonl
+        from ouroboros.utils import get_git_info as _get_git_info
+        from ouroboros.utils import utc_now_iso as _utc_now_iso
+
+        _branch, _sha = _get_git_info(_pathlib.Path(repo_dir))
+        _append_jsonl(_drive / "logs" / "events.jsonl", {
+            "ts": _utc_now_iso(), "type": "worker_ready", "worker_id": wid,
+            "pid": _os.getpid(), "git_branch": _branch, "git_sha": _sha,
+        })
+    except Exception as _e:
+        _log_worker_crash(wid, _drive, "worker_ready", _e, _tb.format_exc())
     while True:
         try:
             task = in_q.get()
@@ -1276,6 +1381,25 @@ def _write_failure_result(
         raise
 
 
+def terminal_task_metadata(task_metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Project ONLY lifecycle-relevant metadata onto a terminal task_done event.
+
+    Terminal events reach chat logs and the UI, so arbitrary task metadata
+    (workspace paths, secret-bearing fields) must not ride along. Exactly two
+    consumers need fields here: the evolution campaign tally reads
+    ``evolution_transaction``, and the assisted-merge watchdog / writer-gate
+    release in events._handle_task_done reads ``managed_update`` (its
+    authority_fingerprint) — a reaped resolver task would otherwise leave the
+    update tx orphaned and the writer gate latched until restart."""
+    meta = task_metadata if isinstance(task_metadata, dict) else {}
+    out: Dict[str, Any] = {}
+    for key in ("evolution_transaction", "managed_update"):
+        value = meta.get(key)
+        if isinstance(value, dict):
+            out[key] = dict(value)
+    return out
+
+
 def _emit_task_done_terminal(
     task: Optional[Dict[str, Any]],
     task_id: str,
@@ -1305,7 +1429,7 @@ def _emit_task_done_terminal(
     reason_code = reason_code or ("worker_terminal_failure" if status == "failed" else status)
     task_metadata = (task or {}).get("metadata")
     task_metadata = task_metadata if isinstance(task_metadata, dict) else {}
-    evolution_tx = task_metadata.get("evolution_transaction")
+    terminal_metadata = terminal_task_metadata(task_metadata)
     try:
         # Only the four keys whose EMISSION RULE differs are read by name: the
         # accounting verdict always rides, the two disclosure flags ride only
@@ -1339,8 +1463,7 @@ def _emit_task_done_terminal(
                 review_trigger="worker_terminal",
             ),
             "reason_code": reason_code,
-            **({"metadata": {"evolution_transaction": dict(evolution_tx)}}
-               if isinstance(evolution_tx, dict) else {}),
+            **({"metadata": terminal_metadata} if terminal_metadata else {}),
             **emitted,
         })
         return True
@@ -1370,8 +1493,10 @@ def _log_worker_crash(wid: int, drive_root: pathlib.Path, phase: str, exc: Excep
         log.debug("Suppressed exception", exc_info=True)
 
 
-def _first_worker_boot_event_since(offset_bytes: int) -> Optional[Dict[str, Any]]:
-    """Read first worker_boot event after a file offset."""
+def _first_worker_event_since(
+    offset_bytes: int, event_type: str = "worker_boot"
+) -> Optional[Dict[str, Any]]:
+    """Read the first event of one worker lifecycle type after a file offset."""
     path = DRIVE_ROOT / "logs" / "events.jsonl"
     if not path.exists():
         return None
@@ -1395,9 +1520,13 @@ def _first_worker_boot_event_since(offset_bytes: int) -> Optional[Dict[str, Any]
         except Exception:
             log.debug("Suppressed exception in loop", exc_info=True)
             continue
-        if isinstance(evt, dict) and str(evt.get("type") or "") == "worker_boot":
+        if isinstance(evt, dict) and str(evt.get("type") or "") == event_type:
             return evt
     return None
+
+
+def _first_worker_boot_event_since(offset_bytes: int) -> Optional[Dict[str, Any]]:
+    return _first_worker_event_since(offset_bytes, "worker_boot")
 
 
 def _verify_worker_sha_after_spawn(events_offset: int, timeout_sec: float = 90.0) -> None:
@@ -1624,6 +1753,7 @@ def kill_workers(
     terminal_status: str = "",
     archive_service_logs: bool = True,
     disable_reason: str = "",
+    preserve_pending: bool = False,
 ) -> None:
     global _WORKER_POOL_DISABLED_REASON
     from supervisor import queue
@@ -1646,8 +1776,15 @@ def kill_workers(
         _kill_survivors()
         WORKERS.clear()
         orphaned_ids = []
+        drained_ids = []
         try:
             done_status = terminal_status or "failed"
+            running_task_ids = set(RUNNING)
+            interrupted_roots = {
+                str((meta.get("task") or {}).get("root_task_id") or task_id)
+                for task_id, meta in RUNNING.items()
+                if isinstance(meta, dict)
+            }
             for task_id in list(RUNNING):
                 meta = RUNNING.get(task_id) or {}
                 task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
@@ -1664,20 +1801,38 @@ def kill_workers(
                     persisted = done_status
                 if _emit_task_done_terminal(task, str(task_id), persisted or done_status):
                     orphaned_ids.append(task_id)
-            drained = queue.drain_all_pending()
-            drained_ids = []
-            for task in drained:
-                tid = task.get("id")
-                if tid:
-                    try:
-                        persisted = _write_failure_result(tid, reason=result_reason, status=terminal_status)
-                    except Exception:
-                        log.warning("Failed to write failure result for pending task %s", tid, exc_info=True)
-                        persisted = done_status
-                    if _emit_task_done_terminal(task, str(tid), persisted or done_status):
-                        drained_ids.append(tid)
-                    else:
-                        PENDING.append(task)
+            if preserve_pending:
+                kept = []
+                for task in PENDING:
+                    parent_id = str(task.get("parent_task_id") or "")
+                    root_id = str(task.get("root_task_id") or "")
+                    if parent_id and (parent_id in running_task_ids or root_id in interrupted_roots):
+                        tid = str(task.get("id") or "")
+                        if tid:
+                            persisted = _write_failure_result(
+                                tid,
+                                reason="Parent task was interrupted before this child started.",
+                                status="cancelled",
+                            )
+                            if _emit_task_done_terminal(task, tid, persisted or "cancelled"):
+                                drained_ids.append(tid)
+                        continue
+                    kept.append(task)
+                PENDING[:] = kept
+            else:
+                drained = queue.drain_all_pending()
+                for task in drained:
+                    tid = task.get("id")
+                    if tid:
+                        try:
+                            persisted = _write_failure_result(tid, reason=result_reason, status=terminal_status)
+                        except Exception:
+                            log.warning("Failed to write failure result for pending task %s", tid, exc_info=True)
+                            persisted = done_status
+                        if _emit_task_done_terminal(task, str(tid), persisted or done_status):
+                            drained_ids.append(tid)
+                        else:
+                            PENDING.append(task)
             if orphaned_ids or drained_ids:
                 append_jsonl(
                     DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -1702,6 +1857,38 @@ def kill_workers(
                 "force": force,
             },
         )
+
+
+@_serialized_worker_lifecycle
+def kill_workers_for_update(*, result_reason: str, terminal_status: str = "interrupted") -> List[str]:
+    """Stop the current pool and return anything whose death could not be proven."""
+    from ouroboros.platform_layer import kill_pid_tree
+
+    with _queue_lock:
+        fenced = list(WORKERS.values())
+    teardown_error = ""
+    try:
+        kill_workers(
+            result_reason=result_reason,
+            terminal_status=terminal_status,
+            disable_reason="managed_update",
+            preserve_pending=True,
+        )
+    except Exception as exc:
+        teardown_error = f"teardown:{type(exc).__name__}: {exc}"
+    survivors: List[str] = []
+    for worker in fenced:
+        try:
+            if worker.proc.is_alive() and worker.proc.pid:
+                kill_pid_tree(worker.proc.pid)
+                worker.proc.join(timeout=3)
+            if worker.proc.is_alive():
+                survivors.append(f"worker:{worker.proc.pid or worker.wid}")
+        except Exception as exc:
+            survivors.append(f"worker:{worker.wid}:{type(exc).__name__}")
+    if teardown_error:
+        survivors.append(teardown_error)
+    return survivors
 
 
 def _kill_survivors() -> None:
@@ -2044,6 +2231,8 @@ def assign_tasks() -> None:
                 # and project-leased candidates)
                 chosen_idx = None
                 for i, candidate in enumerate(PENDING):
+                    if not repo_writer_task_allowed(candidate):
+                        continue
                     if isinstance(candidate.get("_budget_pause"), dict):
                         continue
                     root_task_id = str(candidate.get("root_task_id") or "").strip()
