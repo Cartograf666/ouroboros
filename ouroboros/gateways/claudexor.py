@@ -36,7 +36,23 @@ log = logging.getLogger(__name__)
 CONTROL_API_REL = ".claudexor/v3/daemon/control-api.json"
 PROTOCOL_HEADER = "X-Claudexor-Protocol-Major"
 _CONNECT_TIMEOUT_SEC = 5.0
+# The client-wide read default, and the CEILING on any self-bounding caller's ask
+# (`delegate_progress.poll_bound` reads it): a per-request value above it is not a bound
+# at all, it is a hung read granted more rope than it would have had. Generous on
+# purpose: most calls here would rather wait than fail, and a run start can take a while
+# to answer.
 _READ_TIMEOUT_SEC = 60.0
+# The FLOOR under such a caller's ask, not a bound anything asks for by name. Every
+# `delegate_wait` poll asks for what its window has left; this is where that narrowing
+# stops, because a nearly spent window asking for its own 0.2s turns a healthy daemon
+# into a timeout, while the 60s default would outrun the very deadline the wait clamps
+# itself to (measured, 4.51s of wall against a 4.2s window, and that was a fast daemon).
+# Five seconds is a real answer from a healthy loopback daemon and a rounding error
+# against the finalization grace the clamp reserves. It bounds the READ phase only:
+# `_request` gives connect its own `_CONNECT_TIMEOUT_SEC`, so a call bounded here can
+# still cost up to ~10s of wall when the connection itself is what hangs. Passed per
+# request via ``_request(timeout_sec=...)``; it never changes the default.
+SHORT_POLL_TIMEOUT_SEC = 5.0
 _ATTEMPTS_REL = "attempts"
 _ATTEMPT_RECORD = "attempt.yaml"
 
@@ -254,9 +270,24 @@ class ClaudexorGateway:
 
     # -- transport -------------------------------------------------------------
 
-    def _request(self, method: str, path: str, *, json_body: Any = None, headers: Optional[Dict[str, str]] = None) -> Any:
+    def _request(self, method: str, path: str, *, json_body: Any = None,
+                 headers: Optional[Dict[str, str]] = None,
+                 timeout_sec: Optional[float] = None) -> Any:
+        # ``timeout_sec`` replaces the client's read default for THIS call only, for a
+        # caller that is bounding ITSELF — today every `delegate_wait` poll, each asking
+        # for what its window has left, floored at ``SHORT_POLL_TIMEOUT_SEC`` and never
+        # raised above the default (``delegate_progress.poll_bound``). It sets the
+        # read/write/pool phases; connect keeps its own ``_CONNECT_TIMEOUT_SEC``, so a
+        # call bounded at five seconds is up to ~10s of wall across the two phases, and
+        # any claim about what a bound costs has to say which of the two it means.
+        # Absent, the call is not passed at all rather than passed as None — httpx reads
+        # an explicit ``timeout=None`` as "no timeout", which is the opposite of the
+        # default it would otherwise inherit.
+        bound: Dict[str, Any] = {} if timeout_sec is None else {
+            "timeout": httpx.Timeout(float(timeout_sec), connect=_CONNECT_TIMEOUT_SEC)}
         try:
-            response = self._client.request(method, path, json=json_body, headers=headers or None)
+            response = self._client.request(method, path, json=json_body,
+                                            headers=headers or None, **bound)
         except httpx.HTTPError as exc:
             raise ClaudexorUnavailable(
                 "daemon_unreachable",
@@ -304,10 +335,15 @@ class ClaudexorGateway:
 
     # -- operations ------------------------------------------------------------
 
-    def handshake(self) -> Dict[str, Any]:
-        """Negotiate protocol major and enforce the minimum engine version."""
+    def handshake(self, *, timeout_sec: Optional[float] = None) -> Dict[str, Any]:
+        """Negotiate protocol major and enforce the minimum engine version.
+
+        ``timeout_sec`` bounds this call the way ``get_run`` is bounded: a caller
+        holding a clamped window pays for the OPENING round trip out of that window,
+        so an unbounded handshake could spend it before the window began.
+        """
         body = self._request(
-            "POST", "/v2/handshake",
+            "POST", "/v2/handshake", timeout_sec=timeout_sec,
             json_body={"protocolMajor": CLAUDEXOR_PROTOCOL_MAJOR, "client": "ouroboros"},
         )
         if not isinstance(body, dict):
@@ -401,8 +437,8 @@ class ClaudexorGateway:
             raise ClaudexorUnavailable("malformed_response", "run start returned no handle")
         return body
 
-    def get_run(self, run_id: str) -> Dict[str, Any]:
-        body = self._request("GET", f"/v2/runs/{run_id}")
+    def get_run(self, run_id: str, *, timeout_sec: Optional[float] = None) -> Dict[str, Any]:
+        body = self._request("GET", f"/v2/runs/{run_id}", timeout_sec=timeout_sec)
         return body if isinstance(body, dict) else {}
 
     def get_run_artifact(self, run_id: str, path: str) -> bytes:

@@ -43,17 +43,22 @@ def _stage_full_output(ctx: ToolContext, run_id: str, text: str) -> Optional[Dic
     """
     from ouroboros.tool_access import resource_root_path
 
+    # The bytes DECLARED here and the bytes WRITTEN must be one object: the sha256 below
+    # becomes the artifact's identity (`custody.output_sha`), and the read receipt measures
+    # the file with `read_bytes`. A text write translates "\n" to os.linesep, so on Windows
+    # the declared hash described a file that never existed on disk and the D7
+    # acknowledgement could never be recorded for any staged output.
+    staged_bytes = text.encode("utf-8", "replace")
     try:
         base = resource_root_path(ctx, "task_drive") / _ARTIFACT_SUBDIR
         base.mkdir(parents=True, exist_ok=True)
         target = base / f"{_safe_run_filename(run_id)}.json"
         tmp = target.with_name(f".{target.name}.tmp")
-        tmp.write_text(text, encoding="utf-8")
+        tmp.write_bytes(staged_bytes)
         tmp.replace(target)
     except Exception:
         log.warning("Failed to stage delegated run output for %s", run_id, exc_info=True)
         return None
-    staged_bytes = text.encode("utf-8", "replace")
     return {
         "root": "task_drive",
         "path": f"{_ARTIFACT_SUBDIR}/{target.name}",

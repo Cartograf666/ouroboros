@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ouroboros import delegate_custody as custody
+from ouroboros import delegate_progress as progress
 from ouroboros.delegate_custody import RunCustody as _RunCustody
 from ouroboros.tool_capabilities import tool_result_limit
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
@@ -59,8 +60,6 @@ _TERMINAL_STATES = custody.TERMINAL_STATES
 _POLL_INTERVAL_SEC = 3.0
 # Claudexor's own schema bound on maxSeconds (packages/schema/src/control.ts).
 _CLAUDEXOR_MAX_SECONDS = 604_800
-_TIMELINE_TAIL = 12
-_TIMELINE_LABEL_CHARS = 300
 
 # The process-local memo of the durable custody rows (the authority lives in the module
 # above); re-bound here because sibling code and tests name it on this surface.
@@ -507,27 +506,6 @@ def _reported_cost(summary: Dict[str, Any]) -> Dict[str, Any]:
         "cost_final": True,
         "note": "subscription session — already paid; the nanny's own model calls are metered separately",
     }
-
-
-def _timeline_tail(detail: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """The last few session events, each label bounded.
-
-    The same delivery class as the terminal payload, one surface over: a harness-supplied
-    title is unbounded, and twelve long ones push the progress payload past the tool-result
-    cap, where head-truncation severs the JSON. Bounded here through the shared disclosed
-    contract (OMISSION NOTE + original length, with its anti-waste floor) rather than a
-    hand-rolled slice+ellipsis — DEVELOPMENT.md forbids new hand-rolled sites (P34R.5).
-    """
-    def _label(value: Any) -> Any:
-        return truncate_review_artifact(value, _TIMELINE_LABEL_CHARS) \
-            if isinstance(value, str) else value
-
-    rows = [row for row in (detail.get("timeline") or []) if isinstance(row, dict)]
-    return [
-        {"type": _label(row.get("type")), "title": _label(row.get("title")),
-         "severity": _label(row.get("severity"))}
-        for row in rows[-_TIMELINE_TAIL:]
-    ]
 
 
 # -- output delivery -----------------------------------------------------------
@@ -1328,21 +1306,27 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                    since_seq: Optional[int] = None) -> str:
     """Time-bounded, progress-aware wait (docs/DEVELOPMENT.md "Timeout & Wait Control").
 
-    Returns as soon as the run is terminal OR its journal event cursor advances past
-    ``since_seq``. Progress is the JOURNAL cursor, so SSE ``: ping`` keepalives cannot
-    masquerade as progress — they never reach the cursor at all. The hard kill stays
-    with the outer task watchdog; this only tunes the passive wait.
+    HOLDS the window it was given. It returns early only on a terminal state or a
+    containment fault; a journal-cursor advance past ``since_seq`` is RECORDED and
+    streamed to the human live, and the model is woken once, at expiry, with the whole
+    sequence in ``advances``. Returning on the first advance made the caller's window
+    meaningless against a healthy run — the only path that ever consulted it was the
+    SILENT one, so a streaming run cost a full-context round per event batch (measured:
+    18 rounds, 861k prompt tokens, for a run that was doing fine). Progress is the
+    JOURNAL cursor, so SSE ``: ping`` keepalives cannot masquerade as it.
 
-    NARROW-ONLY, like ``_bounded_max_seconds``: the wait may not outlive the nanny's
-    own deadline. This tool is deliberately absent from ``_DEADLINE_CLAMPED_TOOLS``
-    (its ToolEntry value IS its outer bound), so nothing upstream cuts it — measured,
-    a 2100s window against ten seconds of remaining deadline ran the full 2100s and
-    the task slid past its deadline mid-tool, the exact defect that set built for
-    ``web_search``. Clamping HERE instead of there keeps the graceful typed
-    ``no_progress`` return the wait exists to give, where the outer clamp would have
-    delivered a thread-kill. No deadline (remaining 0.0) and an already-elapsed one
-    are both left unclamped — byte-identical to before, and forced finalization owns
-    the expired case.
+    NARROW-ONLY, like ``_bounded_max_seconds``: the wait may not outlive the nanny's own
+    deadline, minus the finalization grace it needs to answer at all. This tool is absent
+    from ``_DEADLINE_CLAMPED_TOOLS`` (its ToolEntry value IS its outer bound), so nothing
+    upstream cuts it — measured, a 2100s window against ten seconds of remaining deadline
+    ran the full 2100s and slid the task past its deadline mid-tool, the defect that set
+    built for ``web_search``. Clamping HERE keeps the graceful typed ``no_progress``
+    return where the outer clamp delivers a thread-kill. Only "no deadline set" is left
+    unclamped; a SPENT deadline clamps to the floor, the window is measured from before
+    the connection, and every call is BOUNDED by what it has left (``progress.poll_bound``)
+    so no read can outrun it as the 60s default could. Only the LAST poll of a spent
+    window may go unanswered gracefully; a daemon that fails while the window still has
+    time is the typed refusal it was, never a wait reported as quiet.
     """
     from ouroboros.config import get_delegate_wait_max_sec, get_delegate_wait_sec
     from ouroboros.gateways.claudexor import ClaudexorGateway, ClaudexorUnavailable
@@ -1358,16 +1342,19 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
         window = int(wait_sec) if wait_sec is not None else get_delegate_wait_sec()
     except (TypeError, ValueError):
         window = get_delegate_wait_sec()
-    window = max(1, min(window, ceiling))
-    from ouroboros.deadline_utils import deadline_remaining_sec, parse_deadline_ts
+    from ouroboros.deadline_utils import parse_deadline_ts, window_within_deadline
 
-    remaining = int(deadline_remaining_sec(ctx))
-    if remaining > 0:
-        window = max(1, min(window, remaining))
+    window = window_within_deadline(ctx, max(1, min(window, ceiling)))
 
+    # The clock starts HERE, before the connection: the window is a promise about how
+    # long this CALL holds, and the opening handshake plus first poll are part of it.
+    # Started after them, an unbounded connection could spend the whole deadline before
+    # the window it was clamped into had begun.
+    started = time.monotonic()
+    deadline = started + window
     try:
         gateway = ClaudexorGateway()
-        gateway.handshake()
+        gateway.handshake(timeout_sec=progress.poll_bound(deadline - time.monotonic()))
     except ClaudexorUnavailable as exc:
         return _fail("delegate_wait", exc.code, str(exc), run_id=rid)
 
@@ -1380,16 +1367,11 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     # (an old row, an unknown run) stay null — never invented.
     _started_ts, _run_max_seconds = custody.run_timing(custody.custody_root(ctx), rid)
     _started_at = parse_deadline_ts(_started_ts)
-
-    def _run_elapsed_seconds() -> Optional[int]:
-        if _started_at is None:
-            return None
-        return max(0, int((_dt.datetime.now(tz=_dt.timezone.utc) - _started_at).total_seconds()))
-
     try:
-        detail = gateway.get_run(rid)
+        detail = progress.bounded_poll(gateway, rid, deadline - time.monotonic())
         baseline = int(since_seq) if since_seq is not None else int(detail.get("lastSeq") or 0)
-        deadline = time.monotonic() + window
+        seen = progress.WindowObservations()
+        seen.observe_baseline(detail, baseline)
         while True:
             summary = custody.summary_of(detail)
             state = str(summary.get("state") or "")
@@ -1435,34 +1417,41 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                 _record_containment(ctx, entry, payload)
                 return json.dumps(payload, ensure_ascii=False, indent=2)
             if last_seq > baseline:
-                return json.dumps({
-                    "status": "progress",
-                    "run_id": rid,
-                    "state": state,
-                    "last_seq": last_seq,
-                    "elapsed_seconds": _run_elapsed_seconds(),
-                    "max_seconds": _run_max_seconds or None,
-                    "waiting_on_user": bool(summary.get("waitingOnUser")),
-                    "timeline_tail": _timeline_tail(detail),
-                    "note": "New session events since the last cursor. Call delegate_wait "
-                            "again with since_seq=last_seq to keep watching.",
-                }, ensure_ascii=False, indent=2)
+                # The STREAM is not collapsed — the TIMER is. Every advance reaches the
+                # live progress surface the instant this loop sees it, so the human's
+                # view stays as rich; what stops is waking the MODEL per event batch.
+                # The emit is also the frame the supervisor's idle enforcer reads, which
+                # a silently blocking wait would starve.
+                progress.emit(ctx, rid, seen.record(detail, last_seq, int(time.monotonic() - started)))
+                baseline = last_seq          # so the NEXT advance is counted once
+            def _expired() -> str:
+                return progress.rendered_window(
+                    run_id=rid, state=state, last_seq=last_seq, window=window,
+                    elapsed_seconds=(None if _started_at is None else max(0, int(
+                        (_dt.datetime.now(tz=_dt.timezone.utc) - _started_at).total_seconds()))),
+                    max_seconds=_run_max_seconds or None,
+                    waiting_on_user=bool(summary.get("waitingOnUser")),
+                    detail=detail, seen=seen,
+                    budget=tool_result_limit("delegate_wait"))
+
             if time.monotonic() >= deadline:
-                return json.dumps({
-                    "status": "no_progress",
-                    "run_id": rid,
-                    "state": state,
-                    "last_seq": last_seq,
-                    "waited_sec": window,
-                    "elapsed_seconds": _run_elapsed_seconds(),
-                    "max_seconds": _run_max_seconds or None,
-                    "waiting_on_user": bool(summary.get("waitingOnUser")),
-                    "reason": "non_terminal_and_no_new_session_events_within_wait_window",
-                    "note": "The run is alive but silent. Decide: keep waiting (call again), "
-                            "or delegate_cancel if it is stuck.",
-                }, ensure_ascii=False, indent=2)
+                return _expired()
             time.sleep(min(_POLL_INTERVAL_SEC, max(0.0, deadline - time.monotonic())))
-            detail = gateway.get_run(rid)
+            # BOUNDED whether or not the window is spent: a poll STARTED a moment before
+            # expiry still carries the client's 60s read default, so the clamp bounded the
+            # sleeping and not the waiting. What an UNANSWERED one MEANS is what differs.
+            # The last poll of a spent window is bounded and never skipped — terminal
+            # state and breach are judged on fresh data or not at all — and a daemon too
+            # slow to answer THAT one is this window's expiry. Earlier, the window still
+            # has time and there is no expiry to report: the typed refusal propagates to
+            # the handler below, because a daemon that died mid-window relayed as a quiet
+            # completed wait is a fabricated duration on top of a run nobody is watching.
+            left = deadline - time.monotonic()
+            fresh = (progress.expiring_poll(gateway, rid) if left <= 0
+                     else progress.bounded_poll(gateway, rid, left))
+            if fresh is None:
+                return _expired()   # unanswered AT expiry: expire on what is already held
+            detail = fresh
     except ClaudexorUnavailable as exc:
         return _fail("delegate_wait", exc.code, str(exc), run_id=rid)
     finally:
@@ -1565,18 +1554,27 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("delegate_wait", {
             "name": "delegate_wait",
             "description": (
-                "Wait for a delegated run, bounded in time. Returns as soon as the run is "
-                "TERMINAL or produced NEW session events since your cursor; otherwise it "
-                "returns a typed no-progress reason so you stay free to read your mailbox "
-                "and react to the supervisor. Keepalives are not progress. Pass "
-                "since_seq=last_seq from the previous call to keep following. A large "
-                "terminal result is delivered as a bounded preview plus an artifact: read "
+                "Wait for a delegated run, bounded in time. Returns IMMEDIATELY only when "
+                "the run is TERMINAL or hit a containment fault; otherwise it HOLDS the "
+                "window you asked for — the run's narration streams to your human live "
+                "while you wait, so you are not the transport for it — and comes back at "
+                "expiry with `advances`, every journal-cursor movement seen during the "
+                "window, plus elapsed/max seconds and `quiet_for_sec`. A silent window "
+                "returns a typed no-progress reason. Keepalives are not progress. Calling "
+                "again with a tiny wait_sec to 'check' is a busy-poll: it costs a "
+                "full-context round per call and buys nothing, because this call already "
+                "waited. Pass since_seq=last_seq to keep following. A large terminal "
+                "result is delivered as a bounded preview plus an artifact: read "
                 "output_delivery and finish reading the artifact before you rely on it."
             ),
             "parameters": {"type": "object", "required": ["run_id"], "properties": {
                 "run_id": {"type": "string", "description": "Run id from delegate_start."},
-                "wait_sec": {"type": "integer", "description": "Quiet cutoff for THIS call (clamped to the configured ceiling)."},
-                "since_seq": {"type": "integer", "description": "Event cursor: return once the run passes it."},
+                "wait_sec": {"type": "integer", "description":
+                    "How long THIS call holds before handing control back to you (clamped "
+                    "to the configured ceiling and to your own remaining deadline). It is a "
+                    "WINDOW, not a quiet cutoff: a run that is streaming keeps streaming to "
+                    "your human for the whole of it, and you get the whole batch at the end."},
+                "since_seq": {"type": "integer", "description": "Event cursor: advances past it are recorded as progress."},
             }},
         }, lambda ctx, run_id, wait_sec=None, since_seq=None: _delegate_wait(ctx, run_id, wait_sec, since_seq), timeout_sec=2100),
         ToolEntry("delegate_cancel", {

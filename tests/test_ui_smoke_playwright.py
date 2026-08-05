@@ -3092,7 +3092,7 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
 
                 # 2. Scope-review capability notice -> owner confirm -> route-scoped ack.
                 # 6.2: the scope route is a Reviewer Slots row now — pick the
-                # custom-API choice in the grouped combobox and type the id.
+                # API-model route in the grouped combobox and type the id.
                 page.click('[data-nav-page="settings"]')
                 page.wait_for_selector("#s-context-mode", state="attached", timeout=30_000)
                 page.locator('[data-settings-tab="models"]').click()
@@ -3101,7 +3101,7 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
                     '#reviewer-scope-rows .reviewer-slot-row [data-slot-route]'
                 ).first
                 scope_route.wait_for(state="visible", timeout=30_000)
-                scope_route.select_option("api:__custom__")
+                scope_route.select_option("api")
                 custom_input = page.locator(
                     '#reviewer-scope-rows .reviewer-slot-row [data-slot-custom-api]'
                 ).first

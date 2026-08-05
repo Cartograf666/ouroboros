@@ -563,6 +563,216 @@ def test_the_price_of_the_inversion_is_named(tmp_path):
         ) is True, code
 
 
+def test_a_windows_spelled_repo_path_is_a_repo_mention_on_every_platform(tmp_path, monkeypatch):
+    """"An ABSOLUTE path" is a platform-neutral promise, and it was a POSIX-only one.
+
+    Both mention scans in this fence — the non-python branch and the python
+    unresolved-target branch — harvested `embedded_absolute_path_tokens` (which requires
+    a leading `/`) plus the `./`-anchored relative regex, so `C:\\Users\\...\\repo` and a
+    UNC share named nothing to either. On a Windows host the fence therefore engaged for
+    NO non-python inline payload however it spelled the repo, and no python payload whose
+    target the AST could not resolve. `runtime_data_write_targets` in the same module had
+    always harvested all three spellings; the two scanners simply disagreed.
+
+    Pinned on BOTH platforms, in the only two ways that ARE platform-neutral:
+
+      * the SCAN. The Windows spellings must reach `repo_target_mentioned` — that is
+        what the harvest does and what the pre-fix scan did not. Asserting a `True`
+        VERDICT on a hardcoded foreign path (`C:\\Users\\runneradmin\\work\\repo`) instead
+        would pass on POSIX for the WRONG reason — the token is not absolute there, so
+        it lands under the tmp repo — and fail on Windows, where the same token is
+        absolute and outside the tmp repo. That token is foreign on both platforms, so
+        its verdict is `False` on both; only the harvest distinguishes the fix.
+      * the VERDICT on the repo named in the HOST's own spelling, which is the shape a
+        Windows CI run actually produces. There the string starts with a drive letter,
+        so it is refused only because of this harvest; on POSIX the pre-existing POSIX
+        harvest answers it.
+    """
+    import ouroboros.tools.shell_guards as shell_guards
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    windows_repo = r"C:\Users\runneradmin\work\repo"
+    unc_repo = r"\\build-share\ouroboros\repo"
+    scanned: list[str] = []
+    real_mentioned = shell_guards.repo_target_mentioned
+
+    def _spy(argv, **kwargs):
+        scanned.extend(str(token) for token in argv)
+        return real_mentioned(argv, **kwargs)
+
+    monkeypatch.setattr(shell_guards, "repo_target_mentioned", _spy)
+
+    # 1. THE SCAN. Non-python inline code naming a Windows path — drive letter or UNC
+    #    share — hands that token to the containment check on every platform. The
+    #    verdict is False because this particular root is foreign to the tmp repo
+    #    everywhere, which is also the non-over-block half: a Windows path mentioned on
+    #    a POSIX host is not a repo path and must not be treated as one.
+    for spelling in (windows_repo, unc_repo):
+        for code in (f"require('fs').writeFileSync('{spelling}\\\\a.py','x')",
+                     f"require('fs').readFileSync('{spelling}\\\\a.py')"):
+            scanned.clear()
+            assert shell_guards.light_shell_repo_mutation(
+                ["node18", "-e", code], repo_dir=repo, cwd=str(repo), work_dir=repo,
+            ) is False, code
+            assert any(token.startswith(spelling) for token in scanned), \
+                f"the scan never saw the Windows spelling: {code} -> {scanned}"
+    # The same for the python unresolved-target site, which is the second call site of
+    # the one defect: no cwd to fall back on, so the decision rests on the scan alone.
+    scanned.clear()
+    dynamic = (f"import os,pathlib;p=pathlib.Path(r'{windows_repo}');"
+               "(p/os.environ['N']).write_text('x')")
+    assert shell_guards.light_shell_repo_mutation(
+        ["python3.11", "-c", dynamic], repo_dir=repo, cwd="", work_dir=None,
+    ) is False
+    assert any(token.startswith("C:") for token in scanned), scanned
+
+    # 2. THE VERDICT, on the repo spelled the way THIS host spells it — the CI shape.
+    #    On Windows this is a drive-letter token and it is this harvest that refuses it.
+    for code in (f"require('fs').writeFileSync('{repo}/probe.txt','x')",
+                 f"require('fs').readFileSync('{repo}/probe.txt')"):
+        assert shell_guards.light_shell_repo_mutation(
+            ["node18", "-e", code], repo_dir=repo, cwd=str(repo), work_dir=repo,
+        ) is True, code
+    # The controls that make the lines above mean something: with the SAME cwd, a
+    # payload naming no path at all still runs (the disclosed hole, unchanged).
+    assert shell_guards.light_shell_repo_mutation(
+        ["node18", "-e", "eval(process.env.CODE)"],
+        repo_dir=repo, cwd=str(repo), work_dir=repo,
+    ) is False
+    assert shell_guards.light_shell_repo_mutation(
+        ["python3.11", "-c", "import os;open(os.environ['N'],'w').write('x')"],
+        repo_dir=repo, cwd="", work_dir=None,
+    ) is False
+
+
+def test_a_windows_spelled_token_is_judged_where_it_comes_from(tmp_path):
+    """The containment half of the same fix, and the reason the harvest costs nothing.
+
+    A `C:\\…` token is not absolute to POSIX `pathlib`, so joining it onto the work dir
+    — which IS the system repository by default — made every Windows path merely
+    MENTIONED in a payload read as repo-internal. Judged with Windows grammar instead,
+    the answer is the true one on both hosts: inside a Windows-spelled repo root, and
+    outside every other. Runnable anywhere: the root is passed in, so POSIX exercises
+    exactly the arithmetic Windows performs natively.
+    """
+    windows_repo = pathlib.Path(r"C:\Users\runneradmin\work\repo")
+    for code, verdict in (
+        (r"require('fs').writeFileSync('C:\Users\runneradmin\work\repo\a.py','x')", True),
+        (r"require('fs').writeFileSync('C:\Users\runneradmin\work\repo\\a.py','x')", True),
+        (r"require('fs').writeFileSync('C:/Users/runneradmin/work/repo/a.py','x')", True),
+        (r"require('fs').writeFileSync('C:\Users\runneradmin\work\other\a.py','x')", False),
+        (r"require('fs').writeFileSync('D:\Users\runneradmin\work\repo\a.py','x')", False),
+    ):
+        assert light_shell_repo_mutation(
+            ["node18", "-e", code],
+            repo_dir=windows_repo, cwd=str(tmp_path), work_dir=tmp_path,
+        ) is verdict, code
+
+
+def test_a_backslash_idiom_is_not_a_windows_path(tmp_path):
+    """The price the Windows harvest must NOT charge: POSIX capability.
+
+    Harvesting Windows spellings arrived with a UNC alternative that matched any doubled
+    backslash after a non-alphanumeric — i.e. the commonest escape idiom in every
+    language that is not Python — and with a drive-letter token that POSIX `pathlib`
+    joins onto the cwd. Measured together, four ordinary `node -e` one-liners that name
+    no repo path flipped from allowed to REFUSED in light mode. A restriction has to
+    earn its keep: this one bought nothing (none of these is a repo path anywhere) and
+    cost working invocations, so the UNC alternative now requires a real `\\\\server\\share`
+    and the drive-letter token is judged with Windows grammar.
+
+    The last payload is the sharp one: it NAMES a Windows path, and is still allowed
+    because that path is not the repo. Windows-native behaviour is the same for all
+    four — `C:\\tmp\\out.txt` resolves outside the tmp repo, and the `/g` of the first
+    payload joins to `C:\\g`, also outside.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for code in (r"s.replace(/\\/g,'/')",
+                 r'const s = "a\\\\b"; console.log(s)',
+                 r"console.log('\\b')",
+                 r"console.log('C:\\tmp\\out.txt')"):
+        assert light_shell_repo_mutation(
+            ["node", "-e", code], repo_dir=repo, cwd=str(repo), work_dir=repo,
+        ) is False, code
+
+
+def test_the_template_literal_exact_root_hole_is_disclosed_not_fenced(tmp_path):
+    """DELIBERATELY REVERSED (2026-08-05): this test used to pin a backtick DELIMITER that
+    closed the hole below; the delimiter was removed and the hole is now pinned as a
+    DISCLOSED residual instead.
+
+    The hole: JavaScript's template literal is the everyday way to spell a Windows path
+    without doubling separators — ``String.raw`C:\\repo` `` — and neither harvest
+    treats the closing backtick as a delimiter, so the token is the root plus a trailing
+    backtick: one character past the real root, a SIBLING of it. Light mode therefore
+    ALLOWS ``rmSync(String.raw`<root>`, {recursive:true})`` — deleting the EXACT repo
+    root. Only the root itself escapes: any path UNDER it still carries a separator
+    before the stray backtick and resolves inside, so the fence still refuses it.
+
+    Why disclosed rather than fenced: the round-3 delimiter fix closed this but (a) it
+    was found by adversarial review, not by the Windows failures this commit exists to
+    fix — an adjacent hole, which owner policy says to disclose, not fence («не уходить
+    в погоню за edge cases»); and (b) it NARROWED capability the base had: a write to a
+    real sibling whose name contains a literal backtick was newly refused («Защиту можно
+    ослаблять но не усиливать»). Both grammars behave identically, which is the parity
+    the Windows work was asked to deliver. A future change that turns the backtick back
+    into a delimiter must fail this pin and re-open that deliberation with the owner.
+    """
+    from ouroboros.shell_parse import (
+        EMBEDDED_WINDOWS_ABSOLUTE_PATH_RE,
+        embedded_absolute_path_tokens,
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    windows_repo = pathlib.Path(r"C:\Users\runneradmin\work\repo")
+
+    def _rm_root(root: str) -> str:
+        return 'require("fs").rmSync(String.raw`' + root + '`, {recursive:true})'
+
+    # 1. THE HARVEST: the backtick is an ordinary path byte, so the token is the root
+    #    plus the closing backtick — a sibling name, not the root.
+    win_tokens = EMBEDDED_WINDOWS_ABSOLUTE_PATH_RE.findall(_rm_root(str(windows_repo)))
+    posix_tokens = embedded_absolute_path_tokens(_rm_root(str(repo)))
+    assert win_tokens == [str(windows_repo) + "`"], win_tokens
+    assert posix_tokens == [str(repo) + "`"], posix_tokens
+
+    # 2. THE DISCLOSED HOLE: deleting the exact root through a template literal is
+    #    ALLOWED in both spellings, because the harvested token reads as a sibling.
+    assert light_shell_repo_mutation(
+        ["node18", "-e", _rm_root(str(windows_repo))],
+        repo_dir=windows_repo, cwd=str(tmp_path), work_dir=tmp_path,
+    ) is False
+    assert light_shell_repo_mutation(
+        ["node18", "-e", _rm_root(str(repo))],
+        repo_dir=repo, cwd=str(tmp_path), work_dir=tmp_path,
+    ) is False
+
+    # 3. THE FENCE STILL ENGAGES under the root: a template-literal write INSIDE the
+    #    repo keeps its separator before the stray backtick and is refused, both
+    #    spellings — the hole is exactly one path wide.
+    assert light_shell_repo_mutation(
+        ["node18", "-e",
+         'require("fs").writeFileSync(String.raw`' + str(repo) + '/a.py`, "x")'],
+        repo_dir=repo, cwd=str(tmp_path), work_dir=tmp_path,
+    ) is True
+    assert light_shell_repo_mutation(
+        ["node18", "-e",
+         'require("fs").writeFileSync(String.raw`' + str(windows_repo) + '\\a.py`, "x")'],
+        repo_dir=windows_repo, cwd=str(tmp_path), work_dir=tmp_path,
+    ) is True
+
+    # 4. THE RESTORED CAPABILITY: a real sibling path with a literal backtick in its
+    #    name runs, as it did at base — the delimiter refused it.
+    assert light_shell_repo_mutation(
+        ["node18", "-e",
+         'require("fs").writeFileSync("' + str(tmp_path / "repo`backup" / "a") + '", "x")'],
+        repo_dir=repo, cwd=str(tmp_path), work_dir=tmp_path,
+    ) is False
+
+
 # ---------------------------------------------------------------------------
 # ONE write vocabulary: the AST walker knows everything the regex calls a write.
 # ---------------------------------------------------------------------------

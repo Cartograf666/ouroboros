@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import ntpath
 import pathlib
 import re
 from typing import Any, Dict, List
@@ -920,12 +921,49 @@ def parse_porcelain_paths(output: str) -> list[str]:
     return sorted({p for p in paths if p})
 
 
+# Absolute in WINDOWS grammar: `C:\…`/`C:/…`, or a UNC share with both segments.
+# Deliberately NOT `shell_parse.is_absolute_path_text`, which also admits a leading
+# `/`: on Windows a drive-less rooted path means "this drive", which is exactly what
+# joining it onto the work dir already answers correctly.
+_WINDOWS_ABSOLUTE_TOKEN_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/])")
+
+
+def _windows_shaped_path_inside(root: pathlib.Path, path_text: str) -> bool:
+    """Containment for a Windows-spelled token, judged with WINDOWS path grammar.
+
+    POSIX ``pathlib`` does not read ``C:\\repo\\x`` as absolute, so the generic branch
+    below JOINED it onto the work dir — and since the default shell cwd IS the system
+    repository, every Windows-shaped path merely MENTIONED in an inline payload read as
+    repo-internal and the light-mode fence refused it. A drive/UNC token is absolute
+    where it comes from, so it is compared as one against the root read the same way:
+    on POSIX a foreign drive is simply not under a POSIX root, and on Windows the token
+    IS absolute natively, so the resolving branch below answers it instead of this one.
+
+    DISCLOSED residual: a backslash is a legal character in a POSIX filename, so a
+    literal `C:\\x` created relative to the repo cwd is no longer counted as a repo
+    mention here. Nothing in the repository is named that, and this fence is a
+    pre-execution mention scan, not the last control — the cost of the alternative was
+    refusing every payload that merely SPELLS a Windows path.
+    """
+    try:
+        return pathlib.PureWindowsPath(ntpath.normpath(path_text)).is_relative_to(
+            pathlib.PureWindowsPath(ntpath.normpath(str(root)))
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def _candidate_path_inside(root: pathlib.Path, work_dir: pathlib.Path, path_text: str) -> bool:
     text = str(path_text or "").strip()
     if not text or text in {"-", "--"}:
         return False
     if text.startswith(("-", "$")) or text in {"|", "&&", "||", ";", ">", ">>"}:
         return False
+    if _WINDOWS_ABSOLUTE_TOKEN_RE.match(text) and not pathlib.Path(text).is_absolute():
+        # The host's own grammar cannot read this token, so reading it with the host's
+        # grammar anyway (joining a foreign absolute path onto the work dir) is the one
+        # answer guaranteed to be wrong. Judge it where it comes from.
+        return _windows_shaped_path_inside(root, text)
     try:
         root_resolved = pathlib.Path(root).resolve()
         base = pathlib.Path(text)
@@ -1192,7 +1230,11 @@ def _dynamic_write_could_hit_repo(
         except (OSError, ValueError):
             pass
     text = str(inline or "")
-    mentioned = [*embedded_absolute_path_tokens(text), *EMBEDDED_RELATIVE_PATH_RE.findall(text)]
+    mentioned = [
+        *embedded_absolute_path_tokens(text),
+        *EMBEDDED_WINDOWS_ABSOLUTE_PATH_RE.findall(text),
+        *EMBEDDED_RELATIVE_PATH_RE.findall(text),
+    ]
     return bool(mentioned) and repo_target_mentioned(
         ["", *mentioned], repo_dir=repo_dir, cwd=cwd, work_dir=work_dir,
     )
@@ -1273,9 +1315,10 @@ def light_shell_repo_mutation(
     #    stays python-only, because the default shell cwd IS the system repository and
     #    applying it to every family refused ordinary `node -e`/`ruby -e` work that
     #    provably writes elsewhere or only reads.
-    #  * A PLAIN relative spelling is INVISIBLE to this branch. The mention scan is
-    #    `embedded_absolute_path_tokens` + `EMBEDDED_RELATIVE_PATH_RE`, and that regex
-    #    anchors on `./`/`../`, so `node -e "…('ouroboros/safety.py')"` names the repo
+    #  * A PLAIN relative spelling is INVISIBLE to this branch. The mention scan is the
+    #    same three-source harvest `runtime_data_write_targets` performs — POSIX absolute,
+    #    Windows absolute, `./`/`../` relative — and none of those regexes anchors on a
+    #    bare separator, so `node -e "…('ouroboros/safety.py')"` names the repo
     #    to a reader but not to the scan and RUNS — for a write as much as for a read.
     #    Disclosed, not closed: widening the regex would be a strengthening.
     #  * The OTHER hole named above, `node -e "eval(process.env.C)"`, stays OPEN — a
@@ -1301,6 +1344,7 @@ def light_shell_repo_mutation(
                 )
             mentioned = [
                 *embedded_absolute_path_tokens(inline),
+                *EMBEDDED_WINDOWS_ABSOLUTE_PATH_RE.findall(inline),
                 *EMBEDDED_RELATIVE_PATH_RE.findall(inline),
             ]
             return bool(mentioned) and repo_target_mentioned(

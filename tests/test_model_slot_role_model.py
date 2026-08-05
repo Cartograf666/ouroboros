@@ -573,7 +573,7 @@ def test_availability_is_a_dispatch_fact_not_a_schedule_fact(tmp_path, monkeypat
     class _Healthy:
         engine_version = "9.9.9"
 
-        def handshake(self):
+        def handshake(self, **_kw):
             return {}
 
         def agent_capabilities(self):
@@ -1028,7 +1028,15 @@ def test_a_blocked_pin_ends_the_task_unrun_and_spends_nothing(tmp_path, monkeypa
     # The durable record is the authority, and it states the block plus WHY.
     import json as _json
 
-    record = _json.loads((drive / "task_results" / "pinned1.json").read_text())
+    result_path = drive / "task_results" / "pinned1.json"
+    # The record carries the "⚠️ EXECUTOR_UNAVAILABLE" prose, whose U+FE0F tail is
+    # undefined in cp1252 — so a locale-bound read dies on a Windows runner while the
+    # production reader (`utils.read_json_dict`) has always named utf-8. The encoding
+    # is stated here for the same reason, and the hostility is pinned below so a
+    # future edit cannot quietly drop back to an ASCII fixture and hide the class.
+    with pytest.raises(UnicodeDecodeError):
+        result_path.read_text(encoding="cp1252")
+    record = _json.loads(result_path.read_text(encoding="utf-8"))
     assert record["status"] == "failed"
     assert record["reason_code"] == "subagent_executor_unavailable"
     assert record["effective_executor"] == "blocked"

@@ -181,7 +181,7 @@ def test_status_payload_filters_api_key_only_adapters(monkeypatch, tmp_path):
         def __exit__(self, *args):
             return False
 
-        def handshake(self):
+        def handshake(self, **_kw):
             return {}
 
         def agent_capabilities(self):
@@ -262,7 +262,7 @@ def test_a_vouched_login_survives_an_unreadable_manifest(monkeypatch, tmp_path):
         def __exit__(self, *args):
             return False
 
-        def handshake(self):
+        def handshake(self, **_kw):
             return {}
 
         def agent_capabilities(self):
@@ -413,7 +413,7 @@ def _create_login(monkeypatch, tmp_path, body: dict, *, operations, raises=False
         def __exit__(self, *args):
             return False
 
-        def handshake(self):
+        def handshake(self, **_kw):
             return {}
 
         def operations(self):
@@ -551,7 +551,7 @@ def test_login_input_endpoint_proxies_the_code_to_the_engine(monkeypatch, tmp_pa
         def __exit__(self, *args):
             return False
 
-        def handshake(self):
+        def handshake(self, **_kw):
             return {}
 
         def setup_job_call(self, job_id, op, *, value=""):
@@ -597,7 +597,7 @@ def test_login_input_engine_404_is_a_typed_capability_gap(monkeypatch, tmp_path)
         def __exit__(self, *args):
             return False
 
-        def handshake(self):
+        def handshake(self, **_kw):
             return {}
 
         def setup_job_call(self, job_id, op, *, value=""):
@@ -631,7 +631,7 @@ def test_login_input_engine_404_is_a_typed_capability_gap(monkeypatch, tmp_path)
         def __exit__(self, *args):
             return False
 
-        def handshake(self):
+        def handshake(self, **_kw):
             raise gw.ClaudexorUnavailable("daemon_unreachable", "gone")
 
         def setup_job_call(self, job_id, op, *, value=""):  # pragma: no cover - unreached
@@ -666,7 +666,7 @@ def test_login_input_409_conflicts_ride_through_typed(monkeypatch, tmp_path):
         def __exit__(self, *args):
             return False
 
-        def handshake(self):
+        def handshake(self, **_kw):
             return {}
 
         def setup_job_call(self, job_id, op, *, value=""):

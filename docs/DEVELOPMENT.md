@@ -1271,9 +1271,13 @@ Before every commit, verify the following:
 #### Timeout & Wait Control
 - [ ] For cognitive/long-horizon work (subagent waits and review),
   prefer **progress-aware / re-decidable waits** over a single fixed cutoff that
-  discards in-flight work. A passive wait that does not kill should keep extending
-  while the observed task is non-terminal **and** progressing, up to a generous
-  ceiling, then fail closed with a precise structured reason.
+  discards in-flight work. A passive wait that does not kill should stay in its
+  window while the observed task is non-terminal **and** progressing, up to a
+  generous ceiling, then fail closed with a precise structured reason. Progress
+  ADMITS the wait to keep waiting; it does not hand control back per event —
+  returning on each advance woke a full-context nanny round every poll interval
+  (measured: 18 rounds, 861k prompt tokens, for a run that was doing fine), so
+  the observations are carried back once, at the window's expiry.
 - [ ] Planning-scout collection is deliberately different: every started scout
   shares one terminal-or-cutoff boundary, and the reviewer receives explicit
   omissions at that boundary without a heartbeat-based early stop or inline

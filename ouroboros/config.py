@@ -826,7 +826,10 @@ def get_delegate_wait_max_sec() -> int:
 
 
 def get_delegate_wait_sec() -> int:
-    """Default quiet cutoff for ONE ``delegate_wait`` call, in seconds."""
+    """Default WINDOW one ``delegate_wait`` call holds, in seconds.
+
+    Not a quiet cutoff: the wait holds this long and returns the advances it saw,
+    so this also bounds how long the nanny stays out of its own mailbox."""
     return _clamped_number_setting(
         "OUROBOROS_DELEGATE_WAIT_SEC", low=1, high=get_delegate_wait_max_sec(), cast=int)
 

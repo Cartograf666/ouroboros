@@ -337,6 +337,40 @@ def test_the_daemon_token_is_never_returned_to_callers():
         assert "secret-token" not in json.dumps(gateway.quota_snapshots())
 
 
+def test_a_per_request_bound_reaches_httpx_and_absence_is_not_an_unbounded_call():
+    """The per-request bound had no pin at all: `_request` could be mutated to ignore
+    `timeout_sec` outright and 253 tests stayed green, because everything that exercises
+    it goes through `MockTransport`, which sees the request and never the timeout. So the
+    one caller that needs it — a `delegate_wait` poll bounded by what its window has left
+    — was relying on transport behaviour nothing checked.
+
+    Both directions matter, and the second is the subtle one. Present, the value must
+    ARRIVE at the client call (a bound that is computed and dropped is a 60s read wearing
+    a five-second name). Absent, the kwarg must not be passed AT ALL: httpx reads an
+    explicit `timeout=None` as "no timeout whatsoever", the exact opposite of the client
+    default it would otherwise inherit, so the harmless-looking `timeout=timeout_sec`
+    turns every ordinary call unbounded."""
+    calls = []
+
+    class _Recorder:
+        def request(self, method, path, **kwargs):
+            calls.append(kwargs)
+            return httpx.Response(200, json={"id": path.rsplit("/", 1)[-1], "summary": {}})
+
+    gateway = cx.ClaudexorGateway(cx.DaemonEndpoint("127.0.0.1", 1, "secret-token"))
+    gateway.close()
+    gateway._client = _Recorder()
+
+    gateway.get_run("run-1", timeout_sec=5.0)
+    assert "timeout" in calls[-1], "a computed bound that never reaches httpx is not a bound"
+    assert calls[-1]["timeout"].read == 5.0, calls[-1]
+    assert calls[-1]["timeout"].connect == cx._CONNECT_TIMEOUT_SEC, calls[-1]
+
+    gateway.get_run("run-2")
+    assert "timeout" not in calls[-1], \
+        "an absent bound must inherit the client default, and httpx reads timeout=None as NO timeout"
+
+
 # -- 3.4 the nanny verbs -------------------------------------------------------
 
 
@@ -465,7 +499,7 @@ class _HealthStub:
         self.status, self.profiles, self.reset_at = status, profiles, reset_at
         self.engine_version = engine_version
 
-    def handshake(self): return {}
+    def handshake(self, **_kw): return {}
     def agent_capabilities(self):
         return {"harnesses": [{
             "id": "some-route", "enabled": self.status == "ok", "status": self.status,
@@ -760,7 +794,7 @@ def _started_request(tmp_path, *, acting: bool, monkeypatch,
     class _Stub:
         engine_version = ""
 
-        def handshake(self): return {}
+        def handshake(self, **_kw): return {}
         def agent_capabilities(self):
             return {"harnesses": [{
                 "id": "some-route", "enabled": True, "status": "ok",
@@ -985,8 +1019,8 @@ def test_a_widened_run_is_cancelled_and_typed_not_reported_as_progress(tmp_path,
     cancelled = {}
 
     class _Stub:
-        def handshake(self): return {}
-        def get_run(self, rid):
+        def handshake(self, **_kw): return {}
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 7, "summary": {
                 "state": "cancelled" if cancelled else "running",
                 "effectiveAccess": "full",
@@ -1073,7 +1107,7 @@ def test_a_mutating_run_is_refused_when_the_root_and_the_granted_write_root_disa
     class _Stub:
         engine_version = CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
 
-        def handshake(self): return {}
+        def handshake(self, **_kw): return {}
         def agent_capabilities(self):
             return {"harnesses": [{"id": "some-route", "enabled": True, "status": "ok",
                                    "accessProfilesSupported": ["readonly", "workspace_write"]}]}
@@ -1188,7 +1222,7 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
 
     class _NeverReached:
-        def handshake(self): reached.append("handshake"); return {}
+        def handshake(self, **_kw): reached.append("handshake"); return {}
         def close(self): pass
 
     from ouroboros.gateways import claudexor as _gw
@@ -1214,8 +1248,8 @@ def test_the_agent_facing_cost_tells_the_same_story_as_the_ledger(tmp_path, monk
 
     def _wait_with_spend(spend_field):
         class _Stub:
-            def handshake(self): return {}
-            def get_run(self, rid):
+            def handshake(self, **_kw): return {}
+            def get_run(self, rid, **_kw):
                 return {"lastSeq": 9, "summary": {"state": "succeeded", **spend_field}}
             def close(self): pass
 
@@ -1256,8 +1290,8 @@ def test_settlement_reads_the_harnesss_own_spend_field(tmp_path, monkeypatch):
     retired = []
 
     class _Stub:
-        def handshake(self): return {}
-        def get_run(self, rid):
+        def handshake(self, **_kw): return {}
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9, "summary": {"state": "succeeded", "spendUsd": 4.10,
                                               "inputTokens": 10, "outputTokens": 5}}
         def remove_project(self, pid): retired.append(pid)
@@ -1328,8 +1362,8 @@ def _settled_run(tmp_path, monkeypatch, summary):
     from ouroboros.tools.registry import ToolContext
 
     class _Stub:
-        def handshake(self): return {}
-        def get_run(self, rid): return {"lastSeq": 9, "summary": dict(summary)}
+        def handshake(self, **_kw): return {}
+        def get_run(self, rid, **_kw): return {"lastSeq": 9, "summary": dict(summary)}
         def remove_project(self, pid): pass
         def close(self): pass
 
@@ -1362,8 +1396,8 @@ def _waited_run(tmp_path, monkeypatch, summary, requested_model="m"):
     from ouroboros.tools.registry import ToolContext
 
     class _Stub:
-        def handshake(self): return {}
-        def get_run(self, rid): return {"lastSeq": 9, "summary": dict(summary)}
+        def handshake(self, **_kw): return {}
+        def get_run(self, rid, **_kw): return {"lastSeq": 9, "summary": dict(summary)}
         def remove_project(self, pid): pass
         def close(self): pass
 
@@ -1624,7 +1658,7 @@ def test_the_start_request_asks_for_the_substrate_it_claims(tmp_path, monkeypatc
     seen = {}
 
     class _Stub:
-        def handshake(self): return {}
+        def handshake(self, **_kw): return {}
         def agent_capabilities(self):
             return {"harnesses": [{"id": "some-route", "enabled": True, "status": "ok",
                                    "accessProfilesSupported": ["readonly"]}]}
@@ -1656,7 +1690,7 @@ def test_a_202_handle_without_a_run_id_is_a_live_run_not_a_failure(tmp_path, mon
     from ouroboros.gateways import claudexor as gw
 
     class _Stub:
-        def handshake(self): return {}
+        def handshake(self, **_kw): return {}
         def agent_capabilities(self):
             return {"harnesses": [{"id": "some-route", "enabled": True, "status": "ok",
                                    "accessProfilesSupported": ["readonly"]}]}
@@ -1686,8 +1720,8 @@ def test_a_failed_ledger_write_leaves_the_session_retryable(tmp_path, monkeypatc
     retired = []
 
     class _Stub:
-        def handshake(self): return {}
-        def get_run(self, rid):
+        def handshake(self, **_kw): return {}
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9, "summary": {"state": "succeeded", "spendUsd": 0.0}}
         def remove_project(self, pid): retired.append(pid)
         def close(self): pass
@@ -1813,8 +1847,8 @@ def _isolation_stub(monkeypatch, *, run_dir, engine_version=CLAUDEXOR_DELEGATED_
     class _Stub:
         engine_version = ""
 
-        def handshake(self): return {}
-        def get_run(self, rid):
+        def handshake(self, **_kw): return {}
+        def get_run(self, rid, *, timeout_sec=None):
             return {"lastSeq": 7, "summary": {
                 "state": "cancelled" if cancelled else state,
                 "effectiveAccess": effective_access,
@@ -1878,8 +1912,9 @@ def _waiting(tmp_path, monkeypatch, *, acting=True):
         task_id="t-nanny", route_id="some-route", model="m",
         project_id="prj", project_owned=False,
     )
-    # since_seq=0 so a HEALTHY run answers `progress` immediately: the distinguishing
-    # signal is "was this halted as a containment fault", not how long the poll idled.
+    # since_seq=0 so a HEALTHY run records its advance and answers `progress` when the
+    # one-second window expires; a BREACH is what returns immediately, mid-window. The
+    # distinguishing signal is "was this halted as a containment fault", not the timing.
     out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1, since_seq=0))
     delegate._CUSTODY.clear()
     return out
@@ -2290,7 +2325,7 @@ class _LiveRunStub:
     def __init__(self, run_id="run-live", state="running"):
         self.run_id, self.state, self.cancels = run_id, state, []
 
-    def handshake(self): return {}
+    def handshake(self, **_kw): return {}
     def agent_capabilities(self):
         return {"harnesses": [{"id": "some-route", "enabled": True, "status": "ok",
                                "accessProfilesSupported": ["readonly"]}]}
@@ -2300,7 +2335,7 @@ class _LiveRunStub:
     # `effectiveAccess` is what the daemon DERIVES, and the containment reader treats an
     # undisclosed profile on a run that has already produced journal events as unverified.
     # A read-only fixture that omits it is not a narrower daemon, it is an unfaithful one.
-    def get_run(self, rid):
+    def get_run(self, rid, *, timeout_sec=None):
         return {"lastSeq": 1, "summary": {"state": self.state, "effectiveAccess": "readonly"}}
     def cancel_run(self, rid, reason=""):
         self.cancels.append((rid, reason))
@@ -2665,7 +2700,7 @@ def test_delegated_spend_settles_into_the_canonical_budget_ledger(tmp_path, monk
     canonical.mkdir(parents=True)
 
     class _Terminal(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 3, "summary": {"state": "succeeded", "spendUsd": 1.25,
                                               "effectiveAccess": "readonly",
                                               "inputTokens": 10, "outputTokens": 5}}
@@ -2746,8 +2781,8 @@ def test_an_absent_run_closes_only_after_its_registration_is_discharged(tmp_path
     class _AbsentRunGateway:
         """get_run 404s (run gone); remove_project is temporarily unreachable."""
         def __init__(self): self.removals, self.remove_fails = [], True
-        def handshake(self): return {}
-        def get_run(self, rid):
+        def handshake(self, **_kw): return {}
+        def get_run(self, rid, **_kw):
             raise ClaudexorUnavailable("not_found", "no such run", status_code=404)
         def remove_project(self, pid):
             self.removals.append(pid)
@@ -2964,11 +2999,11 @@ def test_reconciliation_recovers_a_pending_invocation_whose_worker_died(tmp_path
     class _TerminalRecovery:
         removed: list = []
 
-        def handshake(self): return {}
+        def handshake(self, **_kw): return {}
         def start_run(self, request, *, idempotency_key=""):
             posted.append((idempotency_key, dict(request)))
             return {"runId": "run-recovered"}
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 2, "summary": {"state": "succeeded", "spendUsd": 0.5,
                                               "effectiveAccess": "readonly"}}
         def remove_project(self, pid): _TerminalRecovery.removed.append(pid)
@@ -2999,14 +3034,14 @@ def test_reconciliation_recovers_a_pending_invocation_whose_worker_died(tmp_path
 
     class _Refusing:
         def __init__(self): self.removed = []
-        def handshake(self): return {}
+        def handshake(self, **_kw): return {}
         def start_run(self, request, *, idempotency_key=""):
             raise ClaudexorUnavailable("bad_request", "no", status_code=400)
         def remove_project(self, pid): self.removed.append(pid)
         def close(self): pass
 
     class _Unreachable:
-        def handshake(self): return {}
+        def handshake(self, **_kw): return {}
         def start_run(self, request, *, idempotency_key=""):
             raise ClaudexorUnavailable("daemon_unreachable", "down", status_code=0)
         def close(self): pass
@@ -3169,7 +3204,7 @@ def test_cancel_never_claims_more_than_a_terminal_receipt_proves(
     class _Stub(_LiveRunStub):
         def cancel_run(self, rid, reason=""):
             return {"accepted": accepted, "status": "accepted" if accepted else "rejected"}
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 3, "summary": {"state": state, "spendUsd": 0.0}}
 
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
@@ -3215,7 +3250,7 @@ def test_an_unverifiable_cancel_is_a_loud_durable_incident(tmp_path, monkeypatch
     # condition, not a permanent scar.
     class _Stopped(_LiveRunStub):
         def cancel_run(self, rid, reason=""): return {"accepted": True, "status": "accepted"}
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 4, "summary": {"state": "cancelled", "spendUsd": 0.0}}
 
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stopped())
@@ -3237,7 +3272,7 @@ def test_cancelling_a_run_this_module_already_settled_is_not_an_incident(tmp_pat
     from ouroboros.gateways import claudexor as gw
 
     class _Finished(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9, "summary": {"state": "succeeded", "spendUsd": 0.0,
                                               "inputTokens": 1, "outputTokens": 1}}
         def cancel_run(self, rid, reason=""):
@@ -3246,7 +3281,7 @@ def test_cancelling_a_run_this_module_already_settled_is_not_an_incident(tmp_pat
     class _Deaf(_LiveRunStub):
         def cancel_run(self, rid, reason=""):
             raise gw.ClaudexorUnavailable("daemon_unreachable", "connection refused")
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             raise gw.ClaudexorUnavailable("daemon_unreachable", "connection refused")
 
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Finished())
@@ -3313,7 +3348,7 @@ def test_settlement_claims_terminal_only_when_the_durable_facts_landed(tmp_path,
     failing = {"now": True}
 
     class _Stub(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9, "summary": {"state": "succeeded", "spendUsd": 0.0,
                                               "inputTokens": 3, "outputTokens": 2}}
         def remove_project(self, pid):
@@ -3368,7 +3403,7 @@ def test_a_retirement_that_landed_is_not_replayed_as_still_owned(tmp_path, monke
     removed = []
 
     class _Stub(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9, "summary": {"state": "succeeded", "spendUsd": 0.0}}
         def remove_project(self, pid): removed.append(pid)
 
@@ -3407,7 +3442,7 @@ def test_a_large_delegated_result_is_delivered_whole_or_declared_partial(tmp_pat
     verdict = "V" * 120_000
 
     class _Stub(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9, "primaryOutput": verdict,
                     "finalSummary": "S" * 60_000,
                     "outcomeBanner": "B" * 40_000,
@@ -3491,7 +3526,7 @@ def test_the_coverage_ack_binds_to_what_delivery_actually_hands_the_model(
     budget = tool_result_limit("read_file")
 
     class _Stub(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9, "primaryOutput": "V" * (budget * 2),
                     "summary": {"state": "succeeded", "spendUsd": 0.0}}
 
@@ -3572,7 +3607,7 @@ def test_reading_the_staged_artifact_whole_writes_the_canonical_acknowledgement(
     from ouroboros.tools.core import _read_file
 
     class _Stub(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9, "primaryOutput": "V" * 120_000,
                     "summary": {"state": "succeeded", "spendUsd": 0.0}}
 
@@ -3638,6 +3673,61 @@ def test_reading_the_staged_artifact_whole_writes_the_canonical_acknowledgement(
     delegate._CUSTODY.clear()
 
 
+def test_the_staged_artifact_is_the_bytes_it_declares_even_under_a_translating_text_layer(
+    tmp_path, monkeypatch,
+):
+    """The artifact's sha256 IS its identity — `custody.output_sha` — and the read
+    receipt measures the file with `read_bytes`, so the declared bytes and the written
+    bytes have to be one object. Staging used a TEXT write, whose `newline=None` layer
+    translates every "\\n" to `os.linesep`: on Windows the payload (always
+    `json.dumps(..., indent=2)`, so always multi-line) landed as CRLF while the
+    published hash described the LF form, `record_output_consumed` refused on the
+    mismatch, and the D7 acknowledgement could never be written for any delegated run —
+    every result stayed "settled but NOT COLLECTED" forever.
+
+    Runnable anywhere: the platform's text layer is emulated by a translating
+    `Path.write_text`, which the fixed code simply never calls. Reverting to a text
+    write brings the failure back on POSIX too, which is the point.
+    """
+    import hashlib
+
+    import ouroboros.delegate_custody as dc
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.gateways import claudexor as gw
+
+    class _Stub(_LiveRunStub):
+        def get_run(self, rid, **_kw):
+            return {"lastSeq": 9, "primaryOutput": "V" * 120_000,
+                    "summary": {"state": "succeeded", "spendUsd": 0.0}}
+
+    real_write_text = pathlib.Path.write_text
+
+    def _windows_shaped_write_text(self, data, *args, **kwargs):
+        return real_write_text(self, str(data).replace("\n", "\r\n"), *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", _windows_shaped_write_text)
+    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
+    delegate._CUSTODY.clear()
+    delegate._READ_COVERAGE.clear()
+    dc.record_started(tmp_path, delegate._RunCustody(
+        run_id="run-1", task_id="t-a", route_id="r", model="m",
+        project_id="p", project_owned=False, root_task_id="t-a", ledger_root=str(tmp_path)))
+    ctx = _nanny_ctx(tmp_path)
+
+    out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
+    artifact = out["output_delivery"]["artifact"]
+    on_disk = pathlib.Path(artifact["abs_path"]).read_bytes()
+    assert b"\r\n" not in on_disk, "the staged payload is bytes, not translated text"
+    assert len(on_disk) == artifact["bytes"]
+    assert hashlib.sha256(on_disk).hexdigest() == artifact["sha256"]
+
+    # ...and therefore the acknowledgement can actually land.
+    _read_artifact_whole(ctx, artifact)
+    assert sum(1 for t in _event_types(tmp_path) if t == "delegate_run_output_consumed") == 1
+    assert dc.settled_unread_outputs(tmp_path) == []
+    delegate._CUSTODY.clear()
+
+
 def test_an_unread_result_is_a_loud_durable_fact_at_settlement(tmp_path, monkeypatch):
     """Owner directive: full-output consumption must be LOAD-BEARING before settlement.
     Until now the D7 acknowledgement was pure disclosure — the module said so in words,
@@ -3657,7 +3747,7 @@ def test_an_unread_result_is_a_loud_durable_fact_at_settlement(tmp_path, monkeyp
     from ouroboros.gateways import claudexor as gw
 
     class _Huge(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9, "primaryOutput": "V" * 120_000,
                     "summary": {"state": "succeeded", "spendUsd": 0.0,
                                 "effectiveAccess": "readonly"}}
@@ -3779,7 +3869,7 @@ def test_a_line_the_delivery_layer_cut_is_not_covered(tmp_path, monkeypatch):
     budget = tool_result_limit("read_file")
 
     class _Stub(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             # One ~120K-char JSON line in the staged artifact: longer than any
             # deliverable read_file window.
             return {"lastSeq": 9, "primaryOutput": "V" * 120_000,
@@ -3840,7 +3930,7 @@ def test_a_restaged_different_artifact_does_not_inherit_the_old_acknowledgement(
 
     class _Stub(_LiveRunStub):
         payload = "A" * 30_000 + "\n" + ("x\n" * 200)
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9, "primaryOutput": self.payload,
                     "summary": {"state": "succeeded", "spendUsd": 0.0}}
 
@@ -3898,7 +3988,7 @@ def test_a_truncated_primary_output_is_resolved_from_the_artifact_route(
     fetched_paths = []
 
     class _Stub(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9,
                     "primaryOutput": {"kind": "answer", "path": "final/answer.md",
                                       "text": preview, "bytes": len(full_text),
@@ -3945,7 +4035,7 @@ def test_an_unresolvable_truncated_output_is_disclosed_and_never_acknowledged(
     from ouroboros.gateways import claudexor as gw
 
     class _FetchFails(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9,
                     "primaryOutput": {"kind": "answer", "path": "final/answer.md",
                                       "text": "small preview", "bytes": 999_999,
@@ -3974,7 +4064,7 @@ def test_an_unresolvable_truncated_output_is_disclosed_and_never_acknowledged(
     big_preview = "P" * 120_000
 
     class _WrongBytes(_FetchFails):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9,
                     "primaryOutput": {"kind": "answer", "path": "final/answer.md",
                                       "text": big_preview, "bytes": 999_999,
@@ -4020,7 +4110,7 @@ def test_a_reconciled_run_with_an_unread_artifact_is_visible_as_uncollected(
         def __init__(self):
             super().__init__()
             self.retire_ok = False
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 9, "primaryOutput": "V" * 120_000,
                     "summary": {"state": "succeeded", "spendUsd": 0.0}}
         def remove_project(self, pid):
@@ -4064,11 +4154,13 @@ def test_the_progress_payload_survives_a_verbose_harness_too(tmp_path, monkeypat
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gw
 
+    published = 30                   # what this harness puts on the timeline, in ONE batch
+
     class _Chatty(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, *, timeout_sec=None):
             return {"lastSeq": 42, "summary": {"state": "running", "effectiveAccess": "readonly"},
                     "timeline": [{"type": "tool", "title": "T" * 20_000, "severity": "info"}
-                                 for _ in range(30)]}
+                                 for _ in range(published)]}
 
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Chatty())
     delegate._CUSTODY.clear()
@@ -4085,6 +4177,27 @@ def test_the_progress_payload_survives_a_verbose_harness_too(tmp_path, monkeypat
     assert all("OMISSION NOTE" in row["title"] and "original length 20000" in row["title"]
                for row in payload["timeline_tail"])
     assert all(len(row["title"]) < 500 for row in payload["timeline_tail"])
+    # The advance list carries the same verbose labels through the same bound. Whether
+    # this stub's payload also needs SHEDDING depends on the budget policy (it no longer
+    # does, now that the list is sized against what the rest of the payload leaves), so
+    # the shedding regime is pinned where a budget can be named:
+    # test_label_shedding_is_disclosed_on_the_row_that_gave_them_up. What must hold HERE,
+    # in either regime: every advance accounts for its labels — kept plus disclosed-shed
+    # equals what the harness ACTUALLY PUBLISHED — and no kept label escaped the bound.
+    #
+    # It used to read `== _TIMELINE_TAIL`, which pinned the defect instead of the rule:
+    # against this same 30-row stub, kept(12) + shed(0) satisfied it while the eighteen
+    # rows the batch dropped at observation went undisclosed and unnoticed. The display
+    # tail is how many rows a row may SHOW; it was never how many arrived.
+    advances = payload["advances"]
+    assert advances, payload
+    for row in advances:
+        assert "advances_omitted" not in row, row      # a head marker has no `events`
+        kept, shed = row["events"], row.get("events_omitted", 0)
+        assert len(kept) + shed == published, row
+        assert kept or shed, row                       # never a silently empty row
+        assert all("OMISSION NOTE" in event["title"] for event in kept), row
+        assert all(len(event["title"]) < 500 for event in kept), row
 
 
 # -- 3.12 reconciliation on restart / parent terminalization -------------------
@@ -4111,7 +4224,7 @@ def test_an_orphaned_delegated_run_is_reconciled_when_its_owner_is_gone(tmp_path
     dc._CUSTODY.clear()
 
     class _Router(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return (finished if rid == "run-done" else live).get_run(rid)
         def cancel_run(self, rid, reason=""):
             return live.cancel_run(rid, reason)
@@ -4143,11 +4256,11 @@ def test_what_the_daemon_says_is_absent_is_closed_not_faulted_forever(tmp_path):
     import ouroboros.delegate_custody as dc
 
     class _NoSuchRun(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             raise cx.ClaudexorUnavailable("run_not_found", "no such run", status_code=404)
 
     class _NoSuchProject(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return {"lastSeq": 2, "summary": {"state": "succeeded", "spendUsd": 0.0}}
         def remove_project(self, pid):
             raise cx.ClaudexorUnavailable("project_not_found", "no such project", status_code=404)
@@ -4160,7 +4273,7 @@ def test_what_the_daemon_says_is_absent_is_closed_not_faulted_forever(tmp_path):
     dc._CUSTODY.clear()
 
     class _Router(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             return (_NoSuchProject() if rid.endswith("project") else _NoSuchRun()).get_run(rid)
         def remove_project(self, pid): _NoSuchProject().remove_project(pid)
 
@@ -4185,7 +4298,7 @@ def test_what_the_daemon_says_is_absent_is_closed_not_faulted_forever(tmp_path):
 
     # A daemon that is merely UNREACHABLE still faults: absence and ignorance stay apart.
     class _Deaf(_LiveRunStub):
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             raise cx.ClaudexorUnavailable("daemon_unreachable", "connection refused")
 
     dc.record_started(tmp_path, dc.RunCustody(
@@ -4307,9 +4420,9 @@ def test_a_breach_whose_cancel_was_never_verified_is_not_reported_as_cancelled(
     class _RefusingStub:
         engine_version = CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
 
-        def handshake(self): return {}
+        def handshake(self, **_kw): return {}
 
-        def get_run(self, rid):
+        def get_run(self, rid, **_kw):
             # Still RUNNING: the cancel changed nothing the daemon will confirm.
             return {"lastSeq": 7, "summary": {
                 "state": "running", "effectiveAccess": "workspace_write",
@@ -4380,9 +4493,9 @@ def _wait_against_a_live_run(ctx, tmp_path, monkeypatch, *, wait_sec):
     run_dir.mkdir(exist_ok=True)
 
     class _AliveStub:
-        def handshake(self): return {"compatible": True, "protocolMajor": 3}
+        def handshake(self, **_kw): return {"compatible": True, "protocolMajor": 3}
 
-        def get_run(self, rid):
+        def get_run(self, rid, *, timeout_sec=None):
             return {"lastSeq": 0, "summary": {
                 "state": "running", "effectiveAccess": "workspace_write",
                 "runDir": str(run_dir),
@@ -4448,22 +4561,40 @@ def test_the_wait_window_never_outlives_the_nannys_own_deadline(tmp_path, monkey
     The bound belongs HERE rather than in that set: the outer clamp is a thread-kill,
     while the wait's whole contract is the graceful typed `no_progress` return. So the
     window narrows to the remaining deadline and the caller still gets its answer, in
-    time to finalize."""
+    time to finalize.
+
+    The deadline is set ABOVE the finalization reserve on purpose. With a 3s deadline the
+    reserve subtraction drives the window to the `max(1, …)` FLOOR, and a `<= 3` assertion
+    then holds for a reason that has nothing to do with the clamp — the arithmetic being
+    pinned here would be untested. The floor is exercised separately at the end."""
     from ouroboros.deadline_utils import deadline_remaining_sec
+    from ouroboros.task_pacing import effective_finalization_reserve_sec
 
     ctx = _delegating_ctx(tmp_path, acting=True)
+    reserve = int(effective_finalization_reserve_sec(ctx))
     ctx.task_metadata = dict(ctx.task_metadata or {})
     ctx.task_metadata["deadline_at"] = (
         datetime.datetime.now(datetime.timezone.utc)
-        + datetime.timedelta(seconds=3)).isoformat()
+        + datetime.timedelta(seconds=reserve + 5)).isoformat()
 
     out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=8)
 
-    # It waited the DEADLINE, not the asked-for window, and came back BEFORE the
-    # deadline rather than being killed after it.
-    assert elapsed < 5.0, elapsed
+    # It waited the DEADLINE (minus the reserve), not the asked-for window: strictly
+    # under the 8s asked for AND strictly over the 1s floor, so this measures the clamp
+    # itself. It also came back BEFORE the deadline rather than being killed after it.
     assert out["status"] == "no_progress", out
-    assert out["waited_sec"] <= 3, out
+    assert 1 < out["waited_sec"] <= 5, out
+    assert elapsed < 6.0, elapsed
+    assert deadline_remaining_sec(ctx) > reserve, "the wait ate into the finalization grace"
+
+    # The floor, kept from the original scenario: a deadline SHORTER than the reserve
+    # still yields a positive window and a graceful typed return, never 0 or negative.
+    ctx.task_metadata["deadline_at"] = (
+        datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(seconds=3)).isoformat()
+    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=8)
+    assert out["status"] == "no_progress" and out["waited_sec"] == 1, out
+    assert elapsed < 3.0, elapsed
     assert deadline_remaining_sec(ctx) > 0, "the wait ate the whole remaining deadline"
 
 
@@ -4479,3 +4610,924 @@ def test_a_wait_with_no_deadline_keeps_the_full_window_it_asked_for(tmp_path, mo
 
     out, _ = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=2)
     assert out["status"] == "no_progress" and out["waited_sec"] == 2, out
+
+
+def test_the_wait_leaves_the_grace_it_needs_to_answer_at_all(tmp_path, monkeypatch):
+    """The clamp now targets the remaining deadline MINUS the finalization grace, for
+    the reason `_deadline_clamped_timeout` subtracts it for the network tools. While the
+    wait returned on the first advance this never bit, because a busy run came back in
+    seconds; now that the window is really held, aiming at the whole remaining deadline
+    means routinely returning at the instant there is no time left to emit an answer."""
+    from ouroboros.config import get_finalization_grace_sec
+
+    grace = int(get_finalization_grace_sec())
+    ctx = _delegating_ctx(tmp_path, acting=True)
+    ctx.task_metadata = dict(ctx.task_metadata or {})
+    ctx.task_metadata["deadline_at"] = (
+        datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(seconds=grace + 4)).isoformat()
+
+    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=8)
+
+    # Without the reserve it would have held the asked-for 8s and come back with only
+    # the grace period left; with it, the window is what remains ABOVE the grace.
+    assert out["waited_sec"] <= 4, out
+    assert elapsed < 6.0, elapsed
+
+
+@pytest.mark.parametrize("seconds_left, ask, expected_window", [
+    pytest.param(lambda reserve: 0.5, 8, 1, id="half_a_second_left_is_still_a_deadline"),
+    pytest.param(lambda reserve: -5.0, 8, 1, id="a_deadline_already_behind_us"),
+    pytest.param(None, 2, 2, id="no_deadline_at_all_keeps_the_whole_window"),
+    pytest.param(lambda reserve: reserve + 60, 2, 2, id="a_comfortable_remainder_binds_on_the_ask"),
+])
+def test_the_clamp_keys_on_whether_a_deadline_exists_not_on_int_of_what_is_left(
+        tmp_path, monkeypatch, seconds_left, ask, expected_window):
+    """The clamp above is only as good as the question it asks, and it used to ask
+    ``int(deadline_remaining_sec(ctx)) > 0`` — a test for "is there time left" that two
+    real shapes answer with a flat NO, and both of them are the shapes where the clamp
+    matters MOST:
+
+    * half a second of deadline left truncates to ``int(0.5) == 0``, and
+    * a deadline already spent leaves a NEGATIVE remainder.
+
+    In both, the clamp was skipped entirely and the wait held its whole asked-for window
+    — up to the 1800s ceiling — while the task it belongs to was already out of time.
+    A wait that outlives its task's deadline is exactly the defect the clamp exists for,
+    and it was open in the last instant before the deadline and every instant after.
+
+    What separates those from the one case that legitimately takes the full window is
+    not the SIZE of the remainder but whether a deadline EXISTS at all:
+    ``deadline_remaining_sec`` answers a flat 0.0 for "no deadline set", so only
+    ``parse_deadline_ts`` on the metadata can tell "nothing to obey" from "nothing left".
+    Both spent shapes land on the ``max(1, …)`` floor and still return the graceful typed
+    payload rather than being killed mid-tool; the deadline-less wait still gets what it
+    asked for, and so does a wait with room to spare (the clamp NARROWS, it never
+    lengthens and never shrinks a window that fits)."""
+    from ouroboros.task_pacing import effective_finalization_reserve_sec
+
+    ctx = _delegating_ctx(tmp_path, acting=True)
+    if seconds_left is not None:
+        ctx.task_metadata = dict(ctx.task_metadata or {})
+        ctx.task_metadata["deadline_at"] = (
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+                seconds=seconds_left(float(effective_finalization_reserve_sec(ctx))))
+        ).isoformat()
+
+    out, elapsed = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=ask)
+
+    assert out["status"] == "no_progress", out
+    assert out["waited_sec"] == expected_window, out
+    # `waited_sec` is what the payload CLAIMS; the wall clock is what the task actually
+    # spent, and the seconds held past a spent deadline are what the caller pays for.
+    assert elapsed < expected_window + 2.0, elapsed
+
+
+# -- the window is a WINDOW: the timer waits, the human's stream does not ------
+
+
+class _StreamingStub:
+    """A daemon whose journal cursor advances on EVERY poll — i.e. a healthy run.
+
+    `_LiveRunStub` and `_AliveStub` both hold `lastSeq` constant, so every existing wait
+    test exercises the silent path. This is the busy one, and it is the shape that used
+    to cost a full-context nanny round per event batch.
+    """
+
+    def __init__(self, *, state="running", batch=1, title="running tests"):
+        self.seq, self.state, self.batch, self.title = 0, state, batch, title
+
+    def handshake(self, **_kw): return {"compatible": True, "protocolMajor": 3}
+
+    def get_run(self, rid, *, timeout_sec=None):
+        self.seq += 1
+        return {
+            "lastSeq": self.seq,
+            "summary": {"state": self.state, "effectiveAccess": "readonly"},
+            "timeline": [{"type": "tool", "title": self.title, "severity": "info"}
+                         for _ in range(self.seq * self.batch)],
+        }
+
+    def close(self): pass
+
+
+class _FinishesOnTheSecondPoll(_StreamingStub):
+    """A streaming run that goes terminal on its SECOND answer — so which poll the wait
+    does or does not issue decides whether the model is told the run is over."""
+
+    def get_run(self, rid, *, timeout_sec=None):
+        detail = super().get_run(rid, timeout_sec=timeout_sec)
+        if self.seq >= 2:
+            detail["summary"]["state"] = "succeeded"
+            detail["summary"]["spendUsd"] = 0.0
+            detail["primaryOutput"] = "done"
+        return detail
+
+
+def _wait_against_a_streaming_run(ctx, tmp_path, monkeypatch, *, wait_sec, stub=None, since_seq=0):
+    """Drive `_delegate_wait` against a run that keeps advancing. Returns
+    (payload, elapsed_sec)."""
+    import time
+
+    import ouroboros.gateways.claudexor as gw
+    import ouroboros.tools.delegate as delegate
+
+    stub = stub if stub is not None else _StreamingStub()
+    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: stub)
+    delegate._CUSTODY.clear()
+    delegate._CUSTODY["run-1"] = delegate._RunCustody(
+        task_id="t-a", route_id="some-route", model="m",
+        project_id="prj", project_owned=False,
+    )
+    try:
+        started = time.monotonic()
+        out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=wait_sec,
+                                                 since_seq=since_seq))
+        return out, time.monotonic() - started
+    finally:
+        delegate._CUSTODY.clear()
+
+
+def test_a_streaming_run_no_longer_wakes_the_model_per_event_batch(tmp_path, monkeypatch):
+    """THE defect: the advance check sat BEFORE the deadline check, so the only path that
+    ever consulted the caller's window was the SILENT one. A run that streams — which is
+    what a healthy Claudexor run does — tripped it on the very first poll, the loop never
+    reached its sleep, and `wait_sec` bought nothing. Measured on one real task: 18 nanny
+    rounds, a 3s median gap, 861,177 prompt tokens and $0.39 spent narrating a run that
+    was doing fine.
+
+    The window is now held, and the advances arrive as a SEQUENCE rather than one wake-up
+    each."""
+    out, elapsed = _wait_against_a_streaming_run(
+        _nanny_ctx(tmp_path), tmp_path, monkeypatch, wait_sec=4)
+
+    assert elapsed >= 3.5, f"the wait returned early on an advance: {elapsed}s"
+    assert out["status"] == "progress", out
+    assert out["waited_sec"] == 4, out
+    seqs = [row["seq"] for row in out["advances"]]
+    assert len(seqs) >= 2, out["advances"]
+    assert seqs == sorted(set(seqs)), seqs
+    assert out["last_seq"] == seqs[-1], out
+    assert isinstance(out["quiet_for_sec"], int)
+
+
+def test_the_human_keeps_the_live_stream_while_the_model_waits(tmp_path, monkeypatch):
+    """The owner's binding correction: hold the TIMER, never the stream. Every advance
+    reaches the live progress surface the instant the loop sees it — the human's view of
+    the delegated run gets richer (the harness's own event titles, at observation time,
+    instead of the nanny's paraphrase one round later), and it is the same frame the
+    supervisor's idle enforcer stamps `last_progress_at` from."""
+    import time
+
+    emitted = []
+    ctx = _nanny_ctx(tmp_path)
+    ctx.emit_progress_fn = lambda text: emitted.append((text, time.monotonic()))
+
+    started = time.monotonic()
+    out, _ = _wait_against_a_streaming_run(ctx, tmp_path, monkeypatch, wait_sec=4)
+    returned = time.monotonic()
+
+    assert len(emitted) == len(out["advances"]), (emitted, out["advances"])
+    assert emitted[0][1] < started + 1.0, "the first advance must not wait for the window"
+    assert all(at < returned for _, at in emitted)
+    assert any("running tests" in text for text, _ in emitted), emitted
+    assert all("run-1" in text for text, _ in emitted), emitted
+
+
+def test_the_wait_adopts_the_standing_tail_before_it_starts_watching(tmp_path, monkeypatch):
+    """A run does not go quiet while nobody is waiting on it, so the first `get_run` of a
+    window routinely answers with a tail the caller has already been shown. Without
+    adopting that tail as HISTORY, the window's first advance re-announced all of it as
+    new session events — to the human's live stream and to the model alike. Here the
+    daemon publishes four rows per cursor step, and the caller says it has read to the
+    cursor the first poll returns: every advance must then carry the four rows that step
+    actually added, never the eight rows standing on the timeline."""
+    stub = _StreamingStub(batch=4, title="step")
+    out, _ = _wait_against_a_streaming_run(
+        _nanny_ctx(tmp_path), tmp_path, monkeypatch, wait_sec=2, stub=stub, since_seq=1)
+
+    assert out["advances"], out
+    assert [len(row["events"]) for row in out["advances"]] == [4] * len(out["advances"]), \
+        out["advances"]
+
+
+def test_a_progress_emit_failure_never_aborts_the_wait(tmp_path, monkeypatch):
+    """The progress channel is narration. A broken one must not abort a wait that is
+    holding a live, possibly overpowered, run."""
+    def _boom(_text):
+        raise RuntimeError("progress channel is gone")
+
+    ctx = _nanny_ctx(tmp_path)
+    ctx.emit_progress_fn = _boom
+
+    out, elapsed = _wait_against_a_streaming_run(ctx, tmp_path, monkeypatch, wait_sec=2)
+
+    assert out["status"] == "progress", out
+    assert elapsed >= 1.5, elapsed
+
+
+def test_a_terminal_state_still_returns_immediately_mid_window(tmp_path, monkeypatch):
+    """The terminal check runs FIRST on every poll, so holding the window costs nothing
+    when the run finishes: a 120s window returns the moment the state goes terminal."""
+    import ouroboros.delegate_custody as dc
+
+    dc._CUSTODY.clear()
+    out, elapsed = _wait_against_a_streaming_run(
+        _nanny_ctx(tmp_path), tmp_path, monkeypatch,
+        wait_sec=120, stub=_FinishesOnTheSecondPoll())
+    dc._CUSTODY.clear()
+
+    assert out["status"] == "terminal", out
+    assert elapsed < 10.0, elapsed
+
+
+def test_a_containment_breach_still_halts_mid_window(tmp_path, monkeypatch):
+    """The other early exit, pinned at a window where "immediate" and "at expiry" are
+    actually distinguishable — the existing breach coverage all runs at wait_sec=1."""
+    import time
+
+    import ouroboros.tools.delegate as delegate
+
+    run_dir = tmp_path / "run-1"
+    home = tmp_path / "operator-home"
+    home.mkdir()
+    monkeypatch.setattr(cx, "operator_home", lambda: home)
+    _isolation_stub(monkeypatch, run_dir=run_dir)
+    _write_attempt(run_dir, isolated=False, home_dir=str(home))
+
+    ctx = _delegating_ctx(tmp_path, acting=True)
+    delegate._CUSTODY.clear()
+    delegate._CUSTODY["run-1"] = delegate._RunCustody(
+        task_id="t-nanny", route_id="some-route", model="m",
+        project_id="prj", project_owned=False,
+    )
+    started = time.monotonic()
+    out = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=120, since_seq=0))
+    elapsed = time.monotonic() - started
+    delegate._CUSTODY.clear()
+
+    assert out["status"] == "refused" and out["reason"] == "home_isolation_not_applied", out
+    assert elapsed < 10.0, elapsed
+
+
+class _SlowPollStub(_StreamingStub):
+    """A streaming daemon that is SLOW to answer, and records when each read STARTED.
+
+    Every other stub in this file replies instantly, so the poll the loop issues after its
+    window is already spent cost nothing and no test could see it. A real `get_run` carries
+    a read timeout — the client's 60-second default, or whatever bound the caller passed —
+    and that read is what the task pays for in wall clock past its own deadline. So this
+    honours the bound the way httpx does: it RAISES at the bound rather than answering
+    late, which is the only reason a bound is worth anything.
+    """
+
+    def __init__(self, *, read_sec=1.2, **kwargs):
+        import time
+
+        super().__init__(**kwargs)
+        self.read_sec, self.reads, self._clock = read_sec, [], time.monotonic
+
+    def get_run(self, rid, *, timeout_sec=None):
+        import time
+
+        from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+        self.reads.append(self._clock())
+        bound = self.read_sec if timeout_sec is None else min(self.read_sec, float(timeout_sec))
+        time.sleep(bound)
+        if bound < self.read_sec:
+            raise ClaudexorUnavailable("daemon_unreachable",
+                                       "Claudexor daemon unreachable: ReadTimeout")
+        return super().get_run(rid)
+
+
+def test_every_poll_is_bounded_by_what_the_window_has_left(tmp_path, monkeypatch):
+    """The bound belongs on EVERY poll, not just the one after the window is spent.
+
+    A poll started a moment BEFORE expiry carries the client's own 60-second read
+    default, so it can answer long after the window — and after the task deadline the
+    clamp above exists to protect. Measured against an unbounded in-loop poll: 2.11s of
+    wall for a window that reported `waited_sec=1`, with the deadline already crossed.
+    The window is the ceiling for the transport too, so what each poll may ASK for is
+    what the window still has (never below the floor a bound is useful at, and never
+    above the read default the client would have used anyway — a bound that WIDENS the
+    ask is not a bound)."""
+    from ouroboros.delegate_progress import bounded_poll
+    from ouroboros.gateways.claudexor import _READ_TIMEOUT_SEC, SHORT_POLL_TIMEOUT_SEC
+
+    asked = []
+
+    class _Recorder:
+        def get_run(self, rid, *, timeout_sec=None):
+            asked.append(timeout_sec)
+            return {"lastSeq": 1, "summary": {"state": "running"}}
+
+    gateway = _Recorder()
+    bounded_poll(gateway, "run-1", 40.0)      # plenty of window left -> ask for it
+    bounded_poll(gateway, "run-1", 0.5)       # nearly spent -> the floor, not 60s
+    bounded_poll(gateway, "run-1", -3.0)      # spent -> the floor, still bounded
+    assert asked == [40.0, SHORT_POLL_TIMEOUT_SEC, SHORT_POLL_TIMEOUT_SEC], asked
+    assert all(value is not None for value in asked), \
+        "an unbounded poll is the client's 60s default, which outlives any window"
+
+    # The other direction, which a floor alone got backwards: a long window has MORE
+    # than the client's own read default left, and `max()` handed that surplus to the
+    # transport as the ask (measured: 1797.0 for a 1800s window). A hung daemon then
+    # stopped failing at sixty seconds and held the whole window — reported afterwards
+    # as a wait that saw nothing. A bound NARROWS in both directions or it is decoration.
+    asked.clear()
+    bounded_poll(gateway, "run-1", 1797.0)
+    bounded_poll(gateway, "run-1", 61.0)
+    assert asked == [_READ_TIMEOUT_SEC, _READ_TIMEOUT_SEC], \
+        f"a bound above the client's own default grants a hung read MORE rope: {asked}"
+
+
+class _BoundRecordingStub(_StreamingStub):
+    """A healthy streaming daemon that records the BOUND every read was given.
+
+    `_SlowPollStub` proves what a bound COSTS; this one proves each read HAS one, which
+    is a fact about the call site rather than about the helper it calls."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bounds, self.handshake_bounds = [], []
+
+    def handshake(self, **kwargs):
+        self.handshake_bounds.append(kwargs.get("timeout_sec"))
+        return super().handshake(**kwargs)
+
+    def get_run(self, rid, *, timeout_sec=None):
+        self.bounds.append(timeout_sec)
+        return super().get_run(rid, timeout_sec=timeout_sec)
+
+
+class _DiesAfter(_StreamingStub):
+    """A streaming daemon that answers ``answers`` polls and then stops answering.
+
+    Not SLOW — gone: a daemon that was restarted, started 503ing, or lost its socket
+    while the wait was holding its window. The transport reports exactly that as the
+    typed `ClaudexorUnavailable` this stub raises."""
+
+    def __init__(self, *, answers=1, **kwargs):
+        super().__init__(**kwargs)
+        self.answers = answers
+
+    def get_run(self, rid, *, timeout_sec=None):
+        from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+        detail = super().get_run(rid, timeout_sec=timeout_sec)
+        if self.seq > self.answers:
+            raise ClaudexorUnavailable(
+                "daemon_unreachable", "Claudexor daemon unreachable: ConnectError: [Errno 61]")
+        return detail
+
+
+def test_every_read_the_wait_issues_carries_a_bound_and_the_window_is_it(tmp_path, monkeypatch):
+    """The helper's arithmetic is pinned above; this pins WHICH READS GET IT.
+
+    A test that calls `bounded_poll` directly says nothing about the call site, so the
+    call site could go back to bounding only the poll after the window is spent —
+    `progress.bounded_poll(gateway, rid, 0.0) if spent else gateway.get_run(rid)` — and
+    186 tests stayed green while every in-window read carried the client's 60s default
+    again. So the wait is driven end to end and every read it issues is inspected: the
+    opening one, each in-loop one, and the last one after the window is spent."""
+    import ouroboros.gateways.claudexor as gw
+    import ouroboros.tools.delegate as delegate
+
+    monkeypatch.setattr(gw, "SHORT_POLL_TIMEOUT_SEC", 0.4)   # so the floor is visible
+    monkeypatch.setattr(delegate, "_POLL_INTERVAL_SEC", 1.0)  # several in-loop polls, cheaply
+    window = 3
+    stub = _BoundRecordingStub()
+
+    out, _ = _wait_against_a_streaming_run(
+        _nanny_ctx(tmp_path), tmp_path, monkeypatch, wait_sec=window, stub=stub)
+
+    assert out["status"] == "progress" and out["waited_sec"] == window, out
+    assert len(stub.bounds) >= 3, stub.bounds
+    assert all(value is not None for value in stub.bounds), \
+        f"an unbounded read inherits the client's 60s default, which outlives the window: {stub.bounds}"
+    assert stub.handshake_bounds and all(v is not None for v in stub.handshake_bounds), \
+        f"the opening handshake is paid for out of the same window: {stub.handshake_bounds}"
+    # The OPENING read is bounded by the whole window (the clock starts before the
+    # connection), and every later one by what is left — so the sequence never rises.
+    assert stub.bounds[0] <= window, stub.bounds
+    assert stub.bounds == sorted(stub.bounds, reverse=True), stub.bounds
+    assert all(gw.SHORT_POLL_TIMEOUT_SEC <= value <= window for value in stub.bounds), stub.bounds
+    assert all(value <= gw._READ_TIMEOUT_SEC for value in stub.bounds), stub.bounds
+    # ...and the last one, issued once the window is spent, sits on the floor.
+    assert stub.bounds[-1] == pytest.approx(gw.SHORT_POLL_TIMEOUT_SEC), stub.bounds
+
+
+def test_a_daemon_that_dies_mid_window_is_refused_not_reported_as_a_quiet_wait(
+        tmp_path, monkeypatch):
+    """A failing poll may only become an expiry once there is a window to expire.
+
+    Merging the spent-window poll into the general one widened its `ClaudexorUnavailable`
+    swallow from that ONE call to EVERY call, and the result is a fabrication rather than
+    a gap: measured on a 1800s window whose daemon died three seconds in, the model was
+    handed `status: progress`, `waited_sec: 1800` and "The run advanced 1 time(s) during
+    the 1800s you asked to wait" after 3.0s of wall. Before any advance it reads worse —
+    `no_progress` over a full window, with a note inviting a `delegate_cancel` of a live
+    overpowered run because the transport blipped.
+
+    A daemon that dies while the window still has time is the typed refusal it always
+    was: the caller's own `except ClaudexorUnavailable` turns it into a `_fail`, and the
+    nanny is told the transport is gone rather than told a story about a quiet run."""
+    import ouroboros.tools.delegate as delegate
+
+    monkeypatch.setattr(delegate, "_POLL_INTERVAL_SEC", 0.2)
+    window = 600
+    stub = _DiesAfter(answers=1)
+
+    out, elapsed = _wait_against_a_streaming_run(
+        _nanny_ctx(tmp_path), tmp_path, monkeypatch, wait_sec=window, stub=stub)
+
+    assert out["status"] == "refused", out
+    assert out["reason"] == "daemon_unreachable", out
+    assert out["run_id"] == "run-1", out
+    # The duration is the tell: the wall clock is seconds, so any `waited_sec` at all
+    # would be a window nobody waited, and the advance it saw is not a completed wait.
+    assert "waited_sec" not in out and "advances" not in out, out
+    assert elapsed < 30.0, elapsed
+
+
+def test_a_daemon_that_dies_only_at_the_spent_window_poll_still_expires_gracefully(
+        tmp_path, monkeypatch):
+    """The other half of the same split, and the reason it is a split rather than a
+    removal. Once the window IS spent there is nothing left to wait for, so a daemon that
+    cannot answer the last poll is this window's expiry — the graceful typed payload,
+    built on what the wait already holds — and never a transport refusal raised out of a
+    tool that is still holding a live, possibly overpowered, run."""
+    stub = _DiesAfter(answers=1)
+
+    out, elapsed = _wait_against_a_streaming_run(
+        _nanny_ctx(tmp_path), tmp_path, monkeypatch, wait_sec=1, stub=stub)
+
+    assert out["status"] == "progress", out
+    assert out["waited_sec"] == 1, out
+    assert stub.seq == 2, f"the spent window still owes its last poll: {stub.seq}"
+    assert 0.9 <= elapsed < 6.0, elapsed
+
+
+def test_the_last_poll_of_a_spent_window_is_bounded_not_skipped(tmp_path, monkeypatch):
+    """The window used to be checked only at the TOP of the loop, so the sleep that
+    consumed the last of it was always followed by one more `gateway.get_run` — and that
+    call is not free. It carries the gateway's 60s read default, so against a slow daemon
+    the wall clock outran the deadline the clamp above exists to protect: measured, a call
+    reporting `waited_sec=1` spent 3.42s, 1.92s past the deadline, mid-tool.
+
+    Skipping that poll entirely was the wrong half of the trade (see the terminal case
+    below). It is BOUNDED instead: still exactly one read past the window, but one whose
+    cost is `SHORT_POLL_TIMEOUT_SEC`, not a minute — and a daemon that cannot answer
+    inside the bound expires the window gracefully rather than failing the tool, which is
+    the second stub here. The typed payload is unchanged either way; both expiry returns
+    render through the same `_expired()`.
+
+    The window is measured from BEFORE the connection (the opening handshake and first
+    poll are part of what this call holds), so the ask here is comfortably longer than
+    the opening read — otherwise the window is already spent when the daemon first
+    answers and there is no second poll to bound, which is its own correct behaviour and
+    a different case from this one.
+    """
+    import ouroboros.gateways.claudexor as gw
+
+    stub = _SlowPollStub(read_sec=1.2)
+
+    window = 3
+    out, elapsed = _wait_against_a_streaming_run(
+        _nanny_ctx(tmp_path), tmp_path, monkeypatch, wait_sec=window, stub=stub)
+
+    assert out["status"] == "progress" and out["waited_sec"] == window, out
+    # The wait's own deadline: the window starts BEFORE the opening read, so it expires
+    # `window` seconds after that read began. Exactly ONE read may start at or after it.
+    assert stub.reads, "the wait never polled at all"
+    deadline = stub.reads[0] + window
+    assert len([at for at in stub.reads if at >= deadline]) == 1, \
+        f"the window paid for more than one last poll: {stub.reads}, deadline {deadline}"
+    assert len(stub.reads) == 2, stub.reads
+    # ...and the wall clock the TASK pays stays within the BOUND of that deadline, rather
+    # than within a 60s read of it.
+    assert elapsed < window + gw.SHORT_POLL_TIMEOUT_SEC + 0.6, elapsed
+
+    # A daemon slower than the bound: the read is cut AT the bound, and an expiry is what
+    # the caller gets — never a transport refusal raised out of a tool holding a live run.
+    monkeypatch.setattr(gw, "SHORT_POLL_TIMEOUT_SEC", 0.4)
+    slower = _SlowPollStub(read_sec=1.2)
+    out, elapsed = _wait_against_a_streaming_run(
+        _nanny_ctx(tmp_path), tmp_path, monkeypatch, wait_sec=window, stub=slower)
+
+    assert out["status"] == "progress" and out["waited_sec"] == window, out
+    assert len(slower.reads) == 2, slower.reads
+    assert elapsed < window + 0.4 + 0.6, elapsed
+    # The BOUND is what ended that read, not the daemon: it cost the bound, not the 1.2s
+    # the daemon wanted — which is the whole of what a per-request timeout buys here.
+    last_read_sec = (slower.reads[0] + elapsed) - slower.reads[1]
+    assert last_read_sec < 0.4 + 0.3, last_read_sec
+
+
+def test_a_run_that_finishes_during_the_last_sleep_is_reported_terminal(tmp_path, monkeypatch):
+    """The cost of the OTHER half of that trade, and the reason the last poll is bounded
+    rather than dropped. Returning straight after the sleep judged terminal state and
+    containment breach on data read BEFORE it, so a run that succeeded during that sleep
+    came back `status: progress`, `state: running`, with no settlement — and the model paid
+    another full-context nanny round for a run that was already done, which is the exact
+    cost this whole window exists to remove. At a window of 3s or less (the deadline
+    clamp's own floor produces 1s) the second poll never happened at all.
+    """
+    import ouroboros.delegate_custody as dc
+
+    dc._CUSTODY.clear()
+    out, elapsed = _wait_against_a_streaming_run(
+        _nanny_ctx(tmp_path), tmp_path, monkeypatch,
+        wait_sec=1, stub=_FinishesOnTheSecondPoll())
+    dc._CUSTODY.clear()
+
+    assert out["status"] == "terminal", out
+    assert out["state"] == "succeeded", out
+    assert out["settlement"]["settled"] is True, out["settlement"]
+    assert elapsed < 6.0, elapsed
+
+
+def test_the_advance_list_is_a_list_not_a_count(tmp_path, monkeypatch):
+    """A count would be cheaper and would also be a lie about what the run did. The list
+    keeps one row per advance with its `seq` and `at_sec`; under budget pressure the rows
+    shed their event LABELS oldest-first, and every shedding is disclosed ON its row — a
+    shed label already reached the live stream, and the row itself is on the run in
+    Claudexor's own timeline. (A BATCH-cut row is the one that reached neither, which is
+    why it is counted rather than dropped; see the batch test.)"""
+    from ouroboros.tool_capabilities import tool_result_limit
+
+    import ouroboros.gateways.claudexor as gw
+    import ouroboros.tools.delegate as delegate
+
+    monkeypatch.setattr(gw, "ClaudexorGateway",
+                        lambda *a, **k: _StreamingStub(batch=4, title="T" * 20_000))
+    delegate._CUSTODY.clear()
+    delegate._CUSTODY["run-1"] = delegate._RunCustody(
+        task_id="t-a", route_id="some-route", model="m",
+        project_id="prj", project_owned=False,
+    )
+    raw = delegate._delegate_wait(_nanny_ctx(tmp_path), "run-1", wait_sec=4, since_seq=0)
+    delegate._CUSTODY.clear()
+
+    assert len(raw) <= tool_result_limit("delegate_wait")
+    payload = json.loads(raw)
+    rows = payload["advances"]
+    assert len(rows) >= 2 and all("seq" in row and "at_sec" in row for row in rows), rows
+    assert rows[-1]["events"], "the newest advance keeps its labels"
+    # No SILENT loss, in whichever regime the budget put this payload: a row that gave
+    # up its labels says so, and a window whose head was dropped says that instead. The
+    # label-shedding regime itself is pinned directly below, where a budget can be named
+    # rather than inferred from a stub's byte sizes.
+    assert all(row.get("events") or row.get("events_omitted") or "advances_omitted" in row
+               for row in rows), rows
+
+
+def test_a_verbose_timeline_tail_cannot_push_the_whole_payload_over_the_limit():
+    """The advance list is sized against what the REST of the payload leaves, not a
+    fixed share of the budget. `timeline_tail` carries harness-authored text — three
+    fields, each bounded at 300 chars, twelve rows — so it can eat most of the limit on
+    its own; a list that fitted its own third then rode on top and the whole result
+    overflowed, where the generic truncator cut the JSON mid-structure and the model got
+    something it could not parse. That is the same failure the measured bound exists to
+    prevent, one level up."""
+    from ouroboros.delegate_progress import WindowObservations, window_payload
+    from ouroboros.loop_tool_execution import _truncate_tool_result
+    from ouroboros.tool_capabilities import tool_result_limit
+
+    limit = tool_result_limit("delegate_wait")
+    # TWO long fields per row is what tips it: one alone stays under the limit.
+    verbose = [{"title": "T" * 400, "type": "Y" * 400, "severity": "info"}
+               for _ in range(12)]
+    seen = WindowObservations()
+    timeline = []
+    for i in range(601):
+        timeline = timeline + [{"title": "x" * 80, "type": "e"}]
+        seen.record({"timeline": list(timeline)}, i + 1, i * 3)
+
+    payload = window_payload(
+        run_id="run-1", state="running", last_seq=601, window=1800,
+        elapsed_seconds=1800, max_seconds=1800, waiting_on_user=False,
+        detail={"timeline": verbose}, seen=seen, budget=limit)
+
+    raw = json.dumps(payload, ensure_ascii=False, indent=2)
+    assert len(raw) <= limit, len(raw)
+    assert _truncate_tool_result(raw, "delegate_wait", {}) == raw, \
+        "the generic truncator had to cut a payload the sizing claimed would fit"
+    assert json.loads(raw) == payload, "the model received unparseable JSON"
+    # The tail keeps its full bounded self; it is the ADVANCE list that yields room.
+    assert len(payload["timeline_tail"]) == 12
+    assert payload["advances"], "the list yielded room without disappearing"
+
+
+def test_the_advance_list_yields_entirely_rather_than_pushing_the_payload_over():
+    """One notch past the sibling above, where the residual cannot hold even the FLOOR.
+    The fit loop kept a 400-char floor for the advance list no matter what was left, so
+    the floor itself overflowed: twelve tail rows with all three harness fields at 20 000
+    chars left ~400 chars once the closing `note` was reserved, the floor shipped 422 on
+    top, and the 15 018-char result crossed a 15 000 limit — where the generic truncator
+    cut the JSON mid-structure and the model got a payload it could not parse. The
+    payload WITHOUT the list measured 14 596, so this is the module's own floor
+    overflowing, not harness text that no sizing could have fitted.
+
+    The floor is an ask, not a guarantee: the list drops to its omission marker, and the
+    drop is disclosed where the list stood."""
+    from ouroboros.delegate_progress import WindowObservations, window_payload
+    from ouroboros.loop_tool_execution import _truncate_tool_result
+    from ouroboros.tool_capabilities import tool_result_limit
+
+    limit = tool_result_limit("delegate_wait")
+    verbose = [{"title": "T" * 20_000, "type": "Y" * 20_000, "severity": "S" * 20_000}
+               for _ in range(12)]
+    seen = WindowObservations()
+    timeline = []
+    for i in range(12):
+        timeline = timeline + [{"title": "x" * 80, "type": "e"}]
+        seen.record({"timeline": list(timeline)}, i + 1, i * 3)
+
+    payload = window_payload(
+        run_id="run-1", state="running", last_seq=12, window=1800,
+        elapsed_seconds=1800, max_seconds=1800, waiting_on_user=False,
+        detail={"timeline": verbose}, seen=seen, budget=limit)
+    raw = json.dumps(payload, ensure_ascii=False, indent=2)
+
+    assert len(raw) <= limit, len(raw)
+    assert _truncate_tool_result(raw, "delegate_wait", {}) == raw, \
+        "the generic truncator had to cut a payload the sizing claimed would fit"
+    assert json.loads(raw) == payload, "the model received unparseable JSON"
+    # Nothing vanished quietly: the list says it yielded, how much, and through where.
+    marker, = payload["advances"]
+    assert marker["advances_omitted"] == len(seen.advances) == 12, marker
+    assert marker["omitted_through_seq"] == 12, marker
+    # ...and the note points at where the omitted rows ACTUALLY are. It used to say they
+    # "were streamed live and are in the event log": the first half is untrue of a batch
+    # bigger than the display tail (those rows never reached the live line at all) and
+    # the second of all of them (Ouroboros persists no timeline; the daemon's own run
+    # directory holds it). A recovery instruction that sends the reader to a log that
+    # never had the rows is worse than no instruction.
+    assert "Claudexor's own timeline" in marker["note"], marker
+    assert "event log" not in marker["note"], marker
+
+
+def test_label_shedding_is_disclosed_on_the_row_that_gave_them_up():
+    """The regime `test_the_advance_list_is_a_list_not_a_count` cannot name: a budget
+    that forces labels out but keeps every advance. Oldest-first, disclosed per row,
+    newest labels kept — a silently emptied `events` list would be a lie about what the
+    run did, and this is the only place that lie is cheap to tell."""
+    from ouroboros.delegate_progress import WindowObservations
+
+    seen = WindowObservations()
+    timeline = []
+    for i in range(8):
+        timeline = timeline + [{"title": "L" * 200, "type": "harness.event"}]
+        seen.record({"timeline": list(timeline)}, i + 1, i)
+
+    rows = seen.rows(1200)          # room for the spine and a couple of label sets
+
+    assert [row["seq"] for row in rows] == list(range(1, 9)), "no advance was dropped"
+    assert rows[-1]["events"], "the newest advance keeps its labels"
+    shed = [row for row in rows if "events_omitted" in row]
+    assert shed, rows
+    assert all(row["events"] == [] for row in shed), shed
+    assert all(row["events_omitted"] > 0 for row in shed), shed
+    assert [row["seq"] for row in shed] == sorted(row["seq"] for row in shed), shed
+    assert shed[0]["seq"] == 1, "shedding starts at the OLDEST advance"
+    assert len(json.dumps(rows, ensure_ascii=False, indent=2)) <= 1200
+
+
+def test_a_batch_bigger_than_the_display_tail_says_how_much_it_is_not_showing():
+    """The cut that had NO vocabulary at all: not the budget's, the OBSERVATION's.
+
+    `record` sized each batch with the display tail written for the standing timeline —
+    the last twelve rows, head dropped in silence. That is right for a timeline whose
+    head the model has already seen and wrong for a batch whose head arrived one poll
+    ago. Reproduced against a harness emitting sixteen rows per cursor step: 48 rows
+    published in-window, 36 delivered, and E17-E20 / E33-E36 / E49-E52 gone from the live
+    stream AND from `advances`, with the rows carrying only ['at_sec', 'events', 'seq'].
+
+    A batch may still be bounded — a busy daemon can publish hundreds of rows between two
+    three-second polls. What it may not do is cut without saying so, in a module whose
+    whole point is that an omission is disclosed."""
+    from ouroboros.delegate_progress import WindowObservations, live_line
+
+    seen = WindowObservations()
+    timeline, per_step = [], 16
+    for step in range(1, 4):
+        timeline.extend({"type": "tool", "title": f"E{step * per_step - per_step + i}"}
+                        for i in range(per_step))
+        seen.record({"timeline": list(timeline)}, step, step)
+
+    rows = seen.rows(100_000)             # a budget that forces no shedding of its own
+    assert len(rows) == 3, rows
+    for row in rows:
+        assert "events_omitted" in row, f"the batch was cut and said nothing: {row}"
+        assert len(row["events"]) + row["events_omitted"] == per_step, row
+        assert row["events_omitted"] == per_step - 12, row
+    # The human's stream is the surface that had no marker whatsoever.
+    assert "+4 earlier in this batch" in live_line("run-1", seen.advances[0])
+    # And the two cuts ADD rather than one overwriting the other: a row whose batch was
+    # already cut, then shed for budget, must report ALL sixteen and not just the twelve
+    # this payload dropped.
+    tight = seen.rows(400)
+    assert [row["seq"] for row in tight if "seq" in row] == [1, 2, 3], tight
+    assert [row["events_omitted"] for row in tight if "seq" in row] == [per_step] * 3, tight
+
+
+def test_a_long_busy_windows_advance_list_is_measured_not_estimated():
+    """The sibling of the verbose-harness case, from the other direction: not a handful
+    of enormous labels but HIGH CARDINALITY — 601 advances of twelve ordinary titles,
+    which is simply what a healthy run looks like when it is watched for a long window.
+    It is not an exotic shape either: the 1800s ceiling divided by the 3s poll interval
+    is 600, so this is the WORST case the wait can actually produce, not a synthetic one.
+
+    The bound used to be ESTIMATED: a running total decremented by each shed row, and
+    then a survivor count of `budget // 40` on the assumption that a bare spine row
+    costs about forty characters. Both assumptions ran UNDER the truth (a rendered
+    `{"seq": …, "at_sec": …, "events": [], "events_omitted": …}` costs far more than
+    forty, and the caller renders with `indent=2`, which the estimate never accounted
+    for), so this shape left here already over `tool_result_limit("delegate_wait")`. The
+    generic truncator then cut the JSON mid-structure and the model was handed a payload
+    it could not parse AT ALL — strictly worse than any amount of shedding, because a
+    disclosed omission is still readable and a severed object is not.
+
+    So the size is MEASURED, with the caller's own rendering, and re-measured after every
+    shed — including the head shedding, which pays for its own marker row."""
+    from ouroboros.loop_tool_execution import _truncate_tool_result
+    from ouroboros.tool_capabilities import tool_result_limit
+
+    from ouroboros import delegate_progress as progress
+
+    limit = tool_result_limit("delegate_wait")
+    advances, labels = 601, 12
+    # The daemon serves the timeline as a growing LIST, not a delta — so drive `record`
+    # with that shape rather than hand-building rows, and each poll's batch is fresh.
+    timeline = []
+    seen = progress.WindowObservations()
+    for seq in range(1, advances + 1):
+        timeline.extend({"type": "tool", "title": f"advance {seq:04d} · " + "T" * 65,
+                         "severity": "info"} for _ in range(labels))
+        seen.record({"timeline": timeline}, seq, seq)
+    assert len(seen.advances) == advances
+
+    payload = progress.window_payload(
+        run_id="run-1", state="running", last_seq=advances, window=600,
+        elapsed_seconds=600, max_seconds=1800, waiting_on_user=False,
+        detail={"timeline": timeline}, seen=seen, budget=limit)
+    # Exactly how `_delegate_wait` renders it, which is the rendering that has to fit.
+    raw = json.dumps(payload, ensure_ascii=False, indent=2)
+
+    # THE defect: what the model is handed arrives WHOLE and parses.
+    assert len(raw) <= limit, len(raw)
+    delivered = _truncate_tool_result(raw, "delegate_wait", {})
+    assert delivered == raw, "the generic truncator had to cut this payload"
+    assert json.loads(delivered) == payload, "the model received unparseable JSON"
+    rows = payload["advances"]
+    # The list is sized against what is LEFT of the budget, not a fixed share: a share
+    # bounds only itself, and `timeline_tail` (harness-authored text) can eat most of
+    # the limit on its own — which is how a sub-block that fitted its third still
+    # overflowed the result. So the invariant is the WHOLE payload above, and here that
+    # the list did take a real share of it rather than being emptied to make room.
+    assert len(json.dumps(rows, ensure_ascii=False, indent=2)) < len(raw)
+
+    # It shed from the HEAD and it SAYS so, with the accounting adding up: a payload that
+    # pretended the window started later than it did is the one shape forbidden here.
+    marker, kept = rows[0], rows[1:]
+    assert kept, rows
+    assert marker["advances_omitted"] == advances - len(kept), (marker, len(kept))
+    assert marker["omitted_through_seq"] == kept[0]["seq"] - 1, (marker, kept[0])
+    # ...and the note points at where the omitted rows ACTUALLY are. It used to say they
+    # "were streamed live and are in the event log": the first half is untrue of a batch
+    # bigger than the display tail (those rows never reached the live line at all) and
+    # the second of all of them (Ouroboros persists no timeline; the daemon's own run
+    # directory holds it). A recovery instruction that sends the reader to a log that
+    # never had the rows is worse than no instruction.
+    assert "Claudexor's own timeline" in marker["note"], marker
+    assert "event log" not in marker["note"], marker
+    assert [row["seq"] for row in kept] == list(range(kept[0]["seq"], advances + 1))
+    assert kept[-1]["seq"] == advances, "the NEWEST advance is never the one shed"
+
+
+def _timeline(*titles):
+    """A daemon `get_run` detail carrying exactly these timeline rows, in this order."""
+    return {"timeline": [{"type": "tool", "title": title, "severity": "info"}
+                         for title in titles]}
+
+
+def test_a_bounded_rolling_timeline_records_the_whole_batch_that_arrived():
+    """A real daemon timeline is BOUNDED: past some depth its LENGTH stops growing while
+    the cursor keeps moving, so the number of new rows can no longer be read from the
+    length. The batch was then taken as a SINGLE tail row, and everything else that
+    arrived between two polls vanished — from the live stream the human is watching AND
+    from `advances`, with nothing on the payload disclosing the loss. Silent loss of an
+    advance is the one failure this whole path exists to prevent.
+
+    Nor does the CURSOR carry the count — that was the first answer here and it was wrong
+    in both directions (see the `batch=4` and cursor-overshoot shapes below). The batch is
+    read off the DATA: the longest overlap between the END of the previous tail and the
+    START of this one is what survived the roll. The review's own shape is first — a full
+    twelve-row tail that rolls by two, which is simply two events arriving inside one poll
+    interval.
+    """
+    from ouroboros.delegate_progress import WindowObservations
+
+    a = [f"A{i}" for i in range(1, 13)]
+    seen = WindowObservations()
+
+    first = seen.record(_timeline(*a), 12, 0)
+    assert [row["title"] for row in first.events] == a
+
+    # THE defect: A1 and A2 fell off the front, B1 and B2 arrived, and the LENGTH is
+    # unchanged. Both belong to this advance, in order.
+    second = seen.record(_timeline(*a[2:], "B1", "B2"), 14, 3)
+    assert [row["title"] for row in second.events] == ["B1", "B2"]
+
+    # A three-event roll from the same rolled state — the batch is a delta, not a
+    # constant, and it is read against the PREVIOUS tail rather than from zero.
+    third = seen.record(_timeline(*a[5:], "B1", "B2", "B3", "B4", "B5"), 17, 6)
+    assert [row["title"] for row in third.events] == ["B3", "B4", "B5"]
+
+    # NOTHING changed on the timeline while the cursor moved (a journal entry that never
+    # became a timeline row). There is no news, and inventing some would re-announce rows
+    # the human was already shown.
+    quiet = seen.record(_timeline(*a[5:], "B1", "B2", "B3", "B4", "B5"), 18, 7)
+    assert [row["title"] for row in quiet.events] == []
+
+    # A tail with NOTHING in common with the previous one — a replaced timeline, not a
+    # roll. All of it is new; it must not raise and must not over-slice into rows that
+    # are not there.
+    c = [f"C{i}" for i in range(1, 13)]
+    fourth = seen.record(_timeline(*c), 35, 9)
+    assert [row["title"] for row in fourth.events] == c
+
+    # Every observation is still exactly one advance, in order, whatever the batch was.
+    assert [advance.seq for advance in seen.advances] == [12, 14, 17, 18, 35]
+    assert [advance.at_sec for advance in seen.advances] == [0, 3, 6, 7, 9]
+
+
+def test_a_daemon_that_adds_more_rows_than_cursor_steps_loses_none_of_them():
+    """The cursor is not a row count, and this repo's own `_StreamingStub(batch=4)` is the
+    proof: it publishes FOUR timeline rows for every single `lastSeq` step, which is what a
+    harness whose journal entry carries several session events looks like. Reading the
+    batch off the cursor took one row per step and three of every four vanished — end to
+    end, a daemon that produced E1..E16 delivered E1..E12 and E16, with E13/E14/E15 gone
+    from the live stream and from `advances`, and no `events_omitted` anywhere saying so.
+    """
+    from ouroboros.delegate_progress import WindowObservations
+
+    rows = [f"E{i}" for i in range(1, 17)]
+    seen, recorded = WindowObservations(), []
+    for step in range(4):
+        end = (step + 1) * 4                      # four rows per single cursor step
+        window = rows[max(0, end - 12):end]       # ...through a twelve-row rolling tail
+        recorded.extend(row["title"] for row in seen.record(_timeline(*window), step + 1, step).events)
+
+    assert recorded == rows, "a row the daemon published never reached the record"
+    assert [advance.seq for advance in seen.advances] == [1, 2, 3, 4]
+
+
+def test_a_growing_timeline_still_records_exactly_the_rows_that_are_new():
+    """The control the rolling shapes above must not cost: while the list is still
+    GROWING, the tail comparison has to land on the plain append, even when the cursor
+    disagrees. A daemon whose `seq` counts more than the timeline shows — journal
+    entries that never become timeline rows — must not inflate the batch beyond the
+    rows that actually arrived, and must not re-report rows already recorded."""
+    from ouroboros.delegate_progress import WindowObservations
+
+    a = [f"A{i}" for i in range(1, 13)]
+    seen = WindowObservations()
+    assert [row["title"] for row in seen.record(_timeline(*a), 12, 0).events] == a
+
+    # Three rows appended; the cursor jumped far further than three.
+    grown = seen.record(_timeline(*a, "B1", "B2", "B3"), 99, 3)
+    assert [row["title"] for row in grown.events] == ["B1", "B2", "B3"]
+
+    # The same overshoot against a ROLLED tail, where the length cannot help either: one
+    # row arrived, the cursor moved by three. Reading the batch off the cursor took the
+    # last three rows and re-emitted A11 and A12 — rows this window had already reported
+    # — as new session events.
+    seen = WindowObservations()
+    seen.record(_timeline(*a), 12, 0)
+    rolled = seen.record(_timeline(*a[1:], "B1"), 15, 3)
+    assert [row["title"] for row in rolled.events] == ["B1"]
+
+
+def test_the_standing_tail_is_adopted_as_history_only_for_a_caught_up_caller():
+    """A wait that attaches to a run which has been talking for a while must not announce
+    the whole standing tail as this window's news — to the human's live stream or to the
+    model. But `since_seq` is the CALLER's cursor, and a caller BEHIND the daemon is
+    asking for exactly those standing rows; adopting them there would drop the very batch
+    it called for. Rows carry no cursor of their own, so it is all or nothing, and only
+    the caught-up caller can be told nothing."""
+    from ouroboros.delegate_progress import WindowObservations
+
+    a = [f"A{i}" for i in range(1, 13)]
+    detail = dict(_timeline(*a), lastSeq=12)
+
+    caught_up = WindowObservations()
+    caught_up.observe_baseline(detail, 12)
+    assert [row["title"] for row in caught_up.record(dict(_timeline(*a, "B1"), lastSeq=13),
+                                                     13, 1).events] == ["B1"]
+
+    behind = WindowObservations()
+    behind.observe_baseline(detail, 4)
+    assert [row["title"] for row in behind.record(detail, 12, 1).events] == a

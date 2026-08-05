@@ -100,7 +100,7 @@ class FakeGateway:
         cls.nonterminal = False
         cls.project_unregistered = False
 
-    def handshake(self):
+    def handshake(self, **_kw):
         return {"compatible": True, "protocolMajor": 3, "engine": {"version": self.engine_version}}
 
     def agent_capabilities(self):
@@ -137,7 +137,7 @@ class FakeGateway:
             raise exc
         return {"runId": "run-1", "runDir": "/tmp/fake-run"}
 
-    def get_run(self, run_id):
+    def get_run(self, run_id, **_kw):
         if FakeGateway.nonterminal:
             return {"summary": {"state": "running"}, "lastSeq": 1}
         return json.loads(json.dumps(FakeGateway.detail))

@@ -1189,11 +1189,19 @@ class TestAbandonedChildAccounting:
                 self.calls += 1
                 if self.calls == 1:
                     raise sp.TimeoutExpired(cmd="claude", timeout=timeout or 1)
+                # Serialized the way the real child emits it (`_emit_child_control`),
+                # not by string interpolation: a hand-built line with a raw path in it
+                # is invalid JSON the moment the path contains backslashes, and the
+                # parent then drops the control line instead of settling.
                 return (
-                    f'{gw._CHILD_ATTEMPT_LINE}{{"attempt_id": "a1", "drive_root": "{tmp_path}",'
-                    ' "model": "claude", "provider": "anthropic",'
-                    ' "reservation_upper_bound_usd": 7.5}\n'
-                    f'{gw._CHILD_USAGE_LINE}{{"prompt_tokens": 900, "completion_tokens": 10}}\n',
+                    gw._CHILD_ATTEMPT_LINE + json.dumps({
+                        "attempt_id": "a1", "drive_root": str(tmp_path),
+                        "model": "claude", "provider": "anthropic",
+                        "reservation_upper_bound_usd": 7.5,
+                    }) + "\n"
+                    + gw._CHILD_USAGE_LINE + json.dumps({
+                        "prompt_tokens": 900, "completion_tokens": 10,
+                    }) + "\n",
                     "killed",
                 )
 

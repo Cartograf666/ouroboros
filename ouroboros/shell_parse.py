@@ -12,8 +12,25 @@ from typing import Any, List
 
 EMBEDDED_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.\-])/[^\s'\"\\),;\]]+")
 _HTML_CLOSING_TAG_PATH_RE = re.compile(r"/[A-Za-z][A-Za-z0-9:-]*>")
+# A path absolute in WINDOWS grammar: a drive letter plus a separator, or a UNC
+# share. The UNC alternative REQUIRES both segments (`\\server\share`) because a
+# bare `\\`-plus-text is not a path at all — it is the commonest escape idiom in
+# every other language (`s.replace(/\\/g,'/')`, `"a\\b"`, `'\\b'`), and matching it
+# made the light-mode inline fence refuse ordinary `node -e` payloads that named no
+# repo path (v6.89.x). A share segment cannot be spelled by accident.
+# A BACKTICK is deliberately NOT a delimiter, in either grammar. Treating it as one
+# (added and then removed 2026-08-05) closed the template-literal exact-root hole
+# (``rmSync(String.raw`<root>`)`` harvests root+backtick = a sibling, so deleting the
+# exact root is ALLOWED — only the root itself; anything under it still resolves
+# inside) but also newly refused writes to real sibling paths with a literal backtick
+# in the name, which the base allowed. Owner policy: protection may be weakened, never
+# strengthened, and a review-found adjacent hole is disclosed, not fenced. The hole is
+# pinned as disclosed in test_interpreter_family_write_fence.py.
 EMBEDDED_WINDOWS_ABSOLUTE_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_.-])(?:[A-Za-z]:[\\/][^\s'\"),;\]]+|\\\\[^\s'\"),;\]]+)"
+    r"(?<![A-Za-z0-9_.-])(?:"
+    r"[A-Za-z]:[\\/][^\s'\"),;\]]+"
+    r"|\\\\[^\s'\"),;\]\\/]+[\\/][^\s'\"),;\]]+"
+    r")"
 )
 _SHELLS = {"sh", "bash", "zsh"}
 
