@@ -1310,23 +1310,27 @@ def test_reload_all_called_on_settings_save():
         / "settings.py"
     ).read_text(encoding="utf-8")
     tree = ast.parse(src)
+    # The reload lives in the extracted post-save side-effects helper; the pin
+    # follows the seam so the regression teeth survive the extraction: the
+    # endpoint must reach the helper, and the helper must reach the reload.
+    endpoint_text = helper_text = ""
     for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.AsyncFunctionDef)
-            and node.name == "api_settings_post"
-        ):
-            body_text = ast.unparse(node)
-            assert "reload_all" in body_text or "_reload_extensions" in body_text, (
-                "api_settings_post must call extension_loader.reload_all on "
-                "OUROBOROS_SKILLS_REPO_PATH change."
-            )
-            assert "OUROBOROS_SKILLS_REPO_PATH" in body_text
-            assert "OUROBOROS_RUNTIME_MODE" in body_text, (
-                "api_settings_post must also reconcile extensions when "
-                "runtime mode changes."
-            )
-            return
-    assert False, "api_settings_post function not found in gateway/settings.py"
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "api_settings_post":
+            endpoint_text = ast.unparse(node)
+        if isinstance(node, ast.FunctionDef) and node.name == "_apply_settings_save_side_effects":
+            helper_text = ast.unparse(node)
+    assert "_apply_settings_save_side_effects" in endpoint_text, (
+        "api_settings_post must invoke the post-save side-effects helper."
+    )
+    assert "reload_all" in helper_text or "_reload_extensions" in helper_text, (
+        "the post-save side-effects helper must call extension_loader.reload_all "
+        "on OUROBOROS_SKILLS_REPO_PATH change."
+    )
+    assert "OUROBOROS_SKILLS_REPO_PATH" in helper_text
+    assert "OUROBOROS_RUNTIME_MODE" in helper_text, (
+        "the post-save side-effects helper must also reconcile extensions when "
+        "runtime mode changes."
+    )
 
 
 def test_reload_all_called_from_server_startup():
