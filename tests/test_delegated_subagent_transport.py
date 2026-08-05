@@ -4585,7 +4585,13 @@ def test_the_wait_window_never_outlives_the_nannys_own_deadline(tmp_path, monkey
     assert out["status"] == "no_progress", out
     assert 1 < out["waited_sec"] <= 5, out
     assert elapsed < 6.0, elapsed
-    assert deadline_remaining_sec(ctx) > reserve, "the wait ate into the finalization grace"
+    # The clamp's ARITHMETIC is the `waited_sec <= 5` line above: the granted window
+    # never targets the grace. This wall-clock line is the smoke over it, and it gets
+    # one second of tolerance: between stamping the deadline and returning, the runner
+    # itself spends time (imports, stub spawn, polls) — windows-latest measured 10.6ms
+    # PAST the exact boundary on a run whose twin had passed, i.e. the strict `>` was
+    # racing runner speed, not pinning the clamp.
+    assert deadline_remaining_sec(ctx) > reserve - 1.0,         "the wait blew past the finalization grace by more than runner overhead"
 
     # The floor, kept from the original scenario: a deadline SHORTER than the reserve
     # still yields a positive window and a graceful typed return, never 0 or negative.
