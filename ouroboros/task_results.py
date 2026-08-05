@@ -657,6 +657,16 @@ def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
     attempt = copied.get("current_attempt", {})
     if not isinstance(attempt, dict):
         raise ValueError("PLAN_REVIEW_STATE_INVALID: current_attempt must be an object")
+    if not attempt and latest:
+        # Schema v1 originally had no current_attempt pointer: its validated
+        # latest review was the current authority. Normalize it in-memory; the
+        # next locked write persists it, while any new raw attempt supersedes it.
+        attempt = {
+            "fingerprint": latest,
+            "status": "open",
+            "reason": "legacy_latest_review",
+        }
+        copied["current_attempt"] = attempt
     if attempt:
         fingerprint = str(attempt.get("fingerprint") or "")
         status = str(attempt.get("status") or "")
@@ -871,7 +881,6 @@ def reserve_plan_review_wave(
     plan_text_hash: str,
     scout_roles: List[str],
     cutoff_at: str,
-    component_hashes: Optional[Dict[str, str]] = None,
 ) -> tuple[Dict[str, Any], bool]:
     created = False
 
@@ -885,9 +894,6 @@ def reserve_plan_review_wave(
         state["waves"].append({
             "request_fingerprint": fingerprint,
             "plan_text_hash": plan_text_hash,
-            # Per-field hashes of the envelope this wave was created from — diagnostics
-            # only (ENVELOPE_MISMATCH), never part of the binding identity.
-            "component_hashes": dict(component_hashes or {}),
             "created_at": utc_now_iso(),
             "scout_cutoff_at": cutoff_at,
             "phase": "scheduling",
@@ -1022,8 +1028,14 @@ def record_plan_review_result(
         wave = next((item for item in state["waves"] if item["request_fingerprint"] == fingerprint), None)
         if wave is None:
             raise ValueError("PLAN_REVIEW_STATE_INVALID: reviewed wave is missing")
-        if require_latest and str(state.get("latest_review_fingerprint") or "") != fingerprint:
-            raise ValueError("PLAN_REVIEW_DISPOSITION_STALE: review is not immediately preceding")
+        current = state.get("current_attempt")
+        if require_latest and (
+            str(state.get("latest_review_fingerprint") or "") != fingerprint
+            or not isinstance(current, dict)
+            or str(current.get("status") or "") != "open"
+            or str(current.get("fingerprint") or "") != fingerprint
+        ):
+            raise ValueError("PLAN_REVIEW_DISPOSITION_STALE: review is not latest still-current")
         existing_review = wave.get("review") if isinstance(wave.get("review"), dict) else {}
         if existing_review.get("closed"):
             existing_comparable = copy.deepcopy(existing_review)

@@ -197,7 +197,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── tools/               ← Auto-discovered tool plugins
       │   ├── extension_dispatch.py ← Extension tool dispatch helper extracted from registry.py; preserves liveness, safety, async, and out-of-process error contracts
       │   ├── release_sync.py    ← Release-metadata sync library; advisory_review uses sync_release_metadata before provider spend when VERSION is in scope; _preflight_check uses check_history_limit for P9 row caps; agents can also call it directly for version-carrier sync
-      │   ├── review_synthesis.py ← LLM-based commit-finding synthesis (fail-open to the original findings on synthesis error) plus the strict plan-review parser/aggregator and fingerprint-bound `review_disposition` validator; plan outcomes are exactly `GREEN`, `REVIEW_REQUIRED`, or `REVISE_PLAN`
+      │   ├── review_synthesis.py ← LLM-based commit-finding synthesis (fail-open to the original findings on synthesis error) plus the strict plan-review parser/aggregator, reference-only `review_disposition` validator, and requested/effective context disclosure; plan outcomes are exactly `GREEN`, `REVIEW_REQUIRED`, or `REVISE_PLAN`
       │   ├── ci.py              ← CI trigger and monitoring (GitHub Actions API)
       │   ├── claude_advisory_review.py ← Advisory pre-review tool (read-only Claude Agent SDK)
       │   ├── recent_tasks.py    ← Read-only context recovery tool exposing recent task_results summaries/traces for LLM-first continuation recovery
@@ -206,8 +206,8 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── git_pr.py          ← PR integration tools: fetch_pr_ref, create_integration_branch, cherry_pick_pr_commits, stage_adaptations, stage_pr_merge (non-core, require enable_tools)
       │   ├── github.py          ← GitHub integration: issues (list/get/comment/close) + PR tools: list_github_prs, get_github_pr, comment_on_pr (non-core; github.py is in _FROZEN_TOOL_MODULES so PR inspection/comment tools work in packaged builds)
       │   ├── parallel_review.py ← Parallel triad+scope orchestration and verdict aggregation (extracted from git.py)
-      │   ├── plan_review.py     ← Pre-implementation design review (adaptive context levels, shared ReviewCoordinator slots, duplicate model IDs allowed, `plan_task` tool); one scout wave per exact fingerprint waits to a shared boundary, sends every ready non-empty handoff plus explicit omissions to the panel, exact-hash binds included snapshots when still current, and keeps every post-review scout change audit-only. (v6.61.0) Agent-declared `plan_class` (self_mod|external|creative|research) structurally escalates to self_mod when files_to_touch resolve under the system repo (path fact, P5); non-self_mod reviewers get BIBLE+DEVELOPMENT full but ARCHITECTURE as the lossless nav map, context_level defaults to minimal, and planning scouts are framed to the plan's own domain instead of repo archaeology.
-      │   ├── plan_review_runtime.py ← Reviewer-slot execution and plan-envelope resolution policy used by `plan_review.py`
+      │   ├── plan_review.py     ← Pre-implementation design review (adaptive context levels, shared ReviewCoordinator slots, duplicate model IDs allowed, `plan_task` tool); one scout wave per exact requested-envelope fingerprint waits to a shared boundary, sends every ready non-empty handoff plus explicit omissions to the panel, exact-hash binds included snapshots when still current, and keeps every post-review scout change audit-only. Typed non-minimal Atlas/quorum-fit failures rebuild that same wave once at loud `minimal`; `REVIEW_REQUIRED` closes through a separate latest-reference disposition call with no envelope replay. (v6.61.0) Agent-declared `plan_class` (self_mod|external|creative|research) structurally escalates to self_mod when files_to_touch resolve under the system repo (path fact, P5); non-self_mod reviewers get BIBLE+DEVELOPMENT full but ARCHITECTURE as the lossless nav map, context_level defaults to minimal, and planning scouts are framed to the plan's own domain instead of repo archaeology.
+      │   ├── plan_review_runtime.py ← Reviewer-slot execution plus plan-envelope, deadline-rail, and handoff-hash runtime helpers used by `plan_review.py`
       │   ├── review.py          ← Task acceptance review tool plus multi-review adapters backed by the shared review substrate
       │   ├── review_context_atlas.py ← Deterministic bounded-context compiler for scope_review, plan_task, and deep_self_review; raw-inlines selected files and accounts for every tracked path in the manifest. Optional additive `centrality_scores` (rel_path→bonus) consumed in candidate scoring; empty default keeps scope/plan selection byte-identical (deep self-review is the only producer)
       │   ├── query_code.py     ← Read-only structured code intelligence tool (`query_code`) over the code inventory: symbols, definitions, references, callers/callees, impact, structural search, and relevant file ranking (v6.47.0: generalized `root=user_files` for read-only intelligence over an external target, e.g. a benchmark `/app`, with search_code-shape path guards + bounded symlink-safe structural walks)
@@ -2230,9 +2230,10 @@ for the same pinned reviewer — never the reviewer model or the ≥1M window fl
 sizes it PER SLOT from the same calibrated helper — closing the former "planned
 follow-up work" gap that made a Claude plan slot 400 deterministically: a slot the
 shared prompt cannot fit gets a FREE deterministic `preflight_oversize` record instead
-of a guaranteed-400 call, and fewer callable slots than the review quorum is a loud
-typed `PLAN_REVIEW_DEGRADED_PREFLIGHT_OVERSIZE` with NO reviewer called — never a
-silent absence of review.
+of a guaranteed-400 call. If the requested non-minimal prompt leaves fewer callable
+slots than quorum, plan review rebuilds once at loud `minimal`; only a minimal prompt
+that still leaves fewer than quorum returns typed
+`PLAN_REVIEW_DEGRADED_PREFLIGHT_OVERSIZE` with no reviewer called.
 Non-responded scope actor records also surface the provider failure text
 (`error` field in `build_scope_actor_record`) so a deterministic 400 is visible
 in the verdict without observability digging. The scope coverage contract
@@ -2278,23 +2279,29 @@ that, a missing-artifact stop was reported on BOTH branches as an overflow,
 quoting a token count below the budget it claimed to exceed and prescribing a
 diff split that cannot shrink an unchanged artifact. The refusal is also a
 recorded `atlas_refused` ladder step naming what did not assemble, so the
-terminal is explainable after the fact. Both atlas assembly failures are one
-predicate — `review_context_atlas.atlas_assembly_failed` over
-`ATLAS_ASSEMBLY_FAILURE_STATUSES` — consulted by every consumer (scope review,
-plan review, deep self-review) instead of each re-deriving a status test, so a
-new failure status refuses everywhere at once; `atlas_unassembled_required`
-reads the ONE carrier (`manifest["unassembled_required"]`) that discriminates
-the two, and `ATLAS_MISSING_ARTIFACT_REMEDY` is the single remedy sentence for
-the artifact case, since narrowing the reviewed change (a smaller diff, a
-smaller plan, a lower plan `context_level`) leaves the artifact just as
-required. The two terminal causes are not exclusive: an atlas refusal that
+terminal is explainable after the fact. Both atlas assembly failures are
+classified by one predicate — `review_context_atlas.atlas_assembly_failed` over
+`ATLAS_ASSEMBLY_FAILURE_STATUSES` — instead of each consumer re-deriving a
+status test. Scope review and deep self-review remain strict consumers and do
+not review the remainder. Plan review is the deliberate consumer-specific
+carve-out: a typed failure of a requested non-minimal Atlas rebuilds the SAME
+fingerprint/scout wave once at `minimal`, with the generated Atlas absent and a
+loud persisted requested/effective level and reason disclosure. A planned-touch
+snapshot that could not fit stays an explicit omission. The same one-shot
+fallback applies when the final requested prompt leaves fewer than reviewer
+quorum callable; preflight exclusions that still leave quorum do not trigger
+it. If the minimal prompt still cannot fit, review stops. Compiler exceptions and monetary
+budget admission do not trigger fallback. `atlas_unassembled_required` reads
+the ONE carrier (`manifest["unassembled_required"]`) that discriminates the
+typed causes, and `ATLAS_MISSING_ARTIFACT_REMEDY` remains the strict-consumer
+remedy. The two terminal causes are not exclusive: an atlas refusal that
 dropped a required artifact can ITSELF be a hard-budget overflow, and that mixed
 state reports BOTH causes and picks `ATLAS_MIXED_ASSEMBLY_REMEDY`, because either
 single-cause remedy states something false about the other half (read the second
 cause with `atlas_hard_budget_overflowed`; pinned by
-`test_mixed_terminal_reports_both_causes_and_the_mixed_remedy`). The
-`budget_exceeded` and provider-oversize
-outcomes are recorded as evidence but never satisfy the P3 gate, and since v6.80.0
+`test_mixed_terminal_reports_both_causes_and_the_mixed_remedy`). For scope
+review, `budget_exceeded` and provider-oversize outcomes are recorded
+as evidence but never satisfy the P3 gate, and since v6.80.0
 no setting makes them non-blocking — in `max` they block. The P3-aligned remedy
 for a structurally oversized repo stays shrinking/splitting the reviewed tree,
 never lowering the reviewer below the 1M context floor.
@@ -2316,7 +2323,46 @@ the normal actor's authoritative or fail-closed status in `max`.
 
 `plan_review.py` runs the existing multi-model Atlas-backed panel before large implementation plans. Read-only planning scouts use the normal subagent pool and persist full raw handoff artifacts. (v6.79.0) A NEW wave is admitted before launch — and only a new one: worker capacity, the shared `review_helpers.review_wave_budget_gate` (the same admission the reviewer wave and skill review use, no second budget authority; it prices one opening round per scout, a deliberate lower bound), and a consumable window. Each scout's contract deadline is bound to that window (the wave's shared cutoff minus the finalization grace and a margin, the reserve capped at a fraction of a short window) instead of inheriting the parent deadline verbatim, so a scout cannot keep spending past the moment the parent stops reading; a wave whose window has already closed is refused with a typed reason instead of being launched and then omitted. The recovery/collection path is never admitted against — those handoffs are already paid for, and refusing them would abandon spend rather than save it. With delegation disabled (`OUROBOROS_MAX_SUBAGENT_DEPTH=0`) the same gate that refuses any child refuses the scouts, and plan review completes on the existing `degraded_evidence` path. Authoritative wave/review history is the bounded additive `plan_review_state` inside the existing `task_results/<id>.json`, updated under that result's per-file lock; the task-writable `plan_task_handoffs.json` projection is audit-only and is never read for closure or scout identity. Immediately before the first panel dispatch, the host writes the exact planning-scout handoff component of the reviewer input once to a fingerprint-keyed continuity snapshot. Normal retries reuse that handoff snapshot, including pure outage and A→B→A; governance documents, HEAD snapshots, Atlas content, and other live review context are rebuilt. Once a panel attempt is durably recorded, `reviewed_result_hashes` in `plan_review_state` additionally fail closed on included-result drift. An exceptional retry after the snapshot write but before that durable panel record still relies on the host write-once audit projection, which is continuity evidence rather than a security boundary against deliberate self-tampering by the same root task. The host persists every intended scout and one absolute cutoff before the first launch, then persists each issued task id or scheduling failure immediately; if launch completed before that second write, resume recovers the exact durable direct-child id instead of scheduling again. Fingerprint-keyed history therefore survives A→B→A without launching a duplicate wave; an older open `REVIEW_REQUIRED` result is re-presented from cache before it can accept a disposition, and every resume spends only the remainder of the original cutoff. Every successfully launched scout is awaited until terminal state or that shared cutoff; the panel receives every ready non-empty handoff plus exactly one typed omission per unfulfilled scout intent, including bounded redacted scheduling/terminal detail. A reviewer-included snapshot receives the common exact-hash `integrated` disposition when still current. If the child changes after the snapshot entered the prompt, the old hash remains non-authoritative, the paid review still persists once with a bounded `CHILD_RESULT_STALE` warning, and the newer result is audit-only. All task ids in a reviewed planning wave — included or omitted — are excluded from the generic child-absorption gate and root-acceptance quiescence once their review is authoritative, so late arrivals cannot reopen either boundary. A pre-panel unavailable/rail attempt may stop those scouts from holding quiescence open, but completed results remain visible to the generic absorption path until a panel attempt is recorded. Governance documents always come from the system repo, while planned file snapshots and Atlas inventory come from `active_repo_dir_for(ctx)`. A missing/mixed subject root or any planned path escaping that root fails loudly instead of silently reviewing Ouroboros in place of an external workspace.
 
-The reviewer horizon carries the goal, mandatory invariants, scope boundaries, non-goals, chosen existing extension seam, and explicitly rejected expansions together with task aliases, forensic refs, handoffs, and omissions. Reviewers stay generative, but each finding must identify a concrete defect or a concrete smaller existing extension point; there is no numeric finding quota. The only public aggregate values are `GREEN`, `REVIEW_REQUIRED`, and `REVISE_PLAN`. `REVIEW_REQUIRED` may be closed on the same fingerprint without another reviewer call only by a valid fingerprint-bound `review_disposition` that addresses every finding exactly once with `accept | reject | defer`, evidence-based rationale, and a plan-revision reference for accepted findings. `REVISE_PLAN` requires changed plan text and therefore a changed fingerprint followed by a new `plan_task` call. Unknown, duplicate, contradictory, incomplete, or stale dispositions fail closed where a bindable review exists. A VACUOUS `review_disposition` (the empty object schema-filling models emit instead of omitting the optional field) still means "absent" and runs a real wave with a disclosed note. A NON-EMPTY disposition that can close nothing now FAILS FAST (v6.80.0) instead of being discarded before a paid wave: `PLAN_REVIEW_DISPOSITION_UNBINDABLE` reports the claimed fingerprint, the latest stored review fingerprint, the submitted request fingerprint, whether the plan text still matches, any `ENVELOPE_MISMATCH` components, and the two ways forward — the anti-wedge escape ("omit the field entirely") is stated EXPLICITLY in the error text, which is what the v6.65.0/1 silent discard was protecting. A disposition may also HONESTLY bind the wave it NAMES when all FOUR conditions hold: its `review_fingerprint` EQUALS the fingerprint of the envelope being submitted, that fingerprint is the state's `latest_review_fingerprint`, that review is an open `REVIEW_REQUIRED`, and the plan text still hashes to the stored `plan_text_hash`. The first condition is the P3 gate itself: `files_to_touch` is exported in the tool schema as part of the review IDENTITY, so binding a DRIFTED envelope with a prepended `ENVELOPE_MISMATCH` warning let a review of `[a.py]` close a submission for `[a.py, b.py, c.py]` — stale plan-review evidence authorising materially expanded scope. Agent-authored drift is therefore UNBINDABLE (fail-fast, no wave, no money; the escape is to omit the disposition and get a real review of the new envelope). The binding fingerprint is a pure function of the AGENT-PASSED envelope — host-resolved `plan_class` and `context_level` are EXCLUDED (they made the identity unreproducible by the agent), while per-field `component_hashes` stored at wave creation may include resolved values, so `ENVELOPE_MISMATCH` on a BOUND wave now reports exactly that host-resolved drift. Stored fingerprints from earlier releases are invalidated once by this change, harmlessly (the affected review simply re-runs). State-lookup failures stay loud `PLAN_REVIEW_STATE_INVALID` errors, never treated as absence. `scripts/run_plan_review.py` remains a thin operator wrapper over this production panel.
+Planning scouts deliberately keep the shared scheduler's `executor=auto` contract.
+When a harness route is selected and healthy, they run through that harness; when it
+is unavailable, the existing resolver may fall back loudly to native execution. Plan
+review contains no harness-name branch or duplicate route policy.
+
+The reviewer horizon carries the goal, mandatory invariants, scope boundaries,
+non-goals, chosen existing extension seam, rejected expansions, task aliases,
+forensic refs, scout handoffs, and omissions. Reviewers stay generative, but each
+finding must identify a concrete defect or a concrete smaller existing extension
+point; there is no numeric finding quota. The only public aggregate values are
+`GREEN`, `REVIEW_REQUIRED`, and `REVISE_PLAN`. `GREEN` means every responding
+reviewer returned GREEN; a preflight-excluded slot was not called and did not
+vote.
+
+`REVIEW_REQUIRED` is main-agent-first. The agent reads every raw response and
+may `accept | reject | defer` every finding, including all of them. In blocking
+mode it closes the latest result through a second `plan_task` call containing
+`review_disposition` ONLY; the call references the durable fingerprint and
+addresses every finding exactly once, with rationale and a plan-revision
+reference for accepted findings, and makes no LLM call. Plan, goal, scope,
+files, and context are not replayed. Mixed disposition/envelope calls and a
+vacuous disposition-only call are rejected before recording a new attempt.
+Closure is allowed only when the claimed fingerprint is both the latest review
+and the still-current open attempt, and its wave is `reviewed`, `integrated`,
+non-degraded `REVIEW_REQUIRED`; exact replay is idempotent. Thus a newer raw,
+invalid, or unavailable plan attempt cannot resurrect older authority. In
+advisory mode the agent may proceed without closure under the existing loud
+host disclosure.
+
+Quorum `REVISE_PLAN` cannot be converted into a disposition. Blocking mode
+requires changed plan text, a new requested-envelope fingerprint, and a fresh
+panel. Advisory mode may still proceed under loud host disclosure and the main
+agent's rationale. Reviewer unavailability remains retryable and
+non-dispositionable. Ordinary invalid review-mode envelopes continue to record
+a domain-separated current attempt before semantic validation, preventing a
+fallback to stale GREEN/REVIEW_REQUIRED. State-lookup failures stay loud
+`PLAN_REVIEW_STATE_INVALID` errors. The requested agent envelope remains the
+fingerprint identity; a host-resolved effective context level is evidence
+metadata and never creates a second wave. `scripts/run_plan_review.py` remains
+a thin operator wrapper over this production panel.
 
 Force-plan reuses those authorities rather than adding a second review state machine. `ouroboros/tools/plan_review.py` owns the tool workflow and durable transitions; its small sibling `ouroboros/tools/plan_review_runtime.py` owns reviewer execution and plan-envelope resolution. The bounded `plan_review_state` in `task_results/<id>.json` remains the durable review SSOT, while `OUROBOROS_REVIEW_ENFORCEMENT` remains the owner policy SSOT. Every submitted envelope that reaches `plan_task` supersedes prior authority: invalid plan/goal/scope input stores a domain-separated open attempt, while a valid envelope stores its canonical fingerprint before repository/path validation. The reducer therefore cannot resurrect an older durable GREEN when a newer envelope fails validation. Reviewer unavailability remains non-dispositionable audit evidence plus `current_attempt=unavailable`; retrying the unchanged plan reuses the paid scout wave and reruns the panel against the immutable first-attempt scout snapshot. In `blocking`, the LLM-first obligation permits analysis and non-mutating preparation while review recovers but begins implementation only after closure or a real task-wide rail; this is deliberately not a mechanical write/shell gate. In `advisory`, a reviewed-open or unavailable attempt may proceed by agent judgment with a host-owned disclosure. A planning deadline skip records `current_attempt=rail_degraded` before returning, so the same durable reducer releases best-effort work instead of re-requesting an impossible `plan_task`. Existing deadline, budget, provider, and round rails preserve the open planning state in the disclosure; they never replace the useful delivery candidate with `SWARM_INITIATIVE_BLOCKED`.
 

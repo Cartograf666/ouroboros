@@ -543,8 +543,11 @@ deliverable) while tripling cost. The agent must choose `context_level`
 explicitly for `self_mod` plans; non-self_mod plans may omit it (defaults to
 `minimal`). That field controls only the generated repository Atlas: `minimal`
 omits Atlas accounting for bounded/local plans, while `localized`, `broad`, and
-`constitutional` add progressively larger Atlas packs. Planning scouts are
-likewise class-framed: `self_mod` scouts keep the repo-archaeology emphasis;
+`constitutional` add progressively larger Atlas packs. A typed non-minimal
+Atlas assembly failure or final quorum-fit failure rebuilds the same requested
+fingerprint/scout wave once at loud `minimal`; compiler exceptions, monetary
+budget refusal, and a minimal prompt that still cannot fit do not. Planning
+scouts are likewise class-framed: `self_mod` scouts keep the repo-archaeology emphasis;
 external/creative/research scouts are steered to the plan's own domain
 (requirements, verification, sources, design) and never default to Ouroboros
 internals.
@@ -554,7 +557,9 @@ the system repository; planned snapshots and Atlas inventory always use
 `active_repo_dir_for(ctx)`. A workspace/subject mismatch, an unavailable root,
 or a `files_to_touch` path escaping that subject must fail loudly. Do not fall
 back to reviewing the Ouroboros repo for an external plan. Read-only scouts use
-the existing worker pool and persist full raw handoffs. Wait for every launched
+the existing worker pool with its generic `executor=auto` route (selected
+healthy harness first, existing loud native fallback) and persist full raw
+handoffs. Wait for every launched
 scout until it is terminal or the shared swarm ceiling is reached; give the
 panel every ready non-empty handoff and an explicit reason for every omission.
 Launch only one scout wave per exact plan fingerprint. A handoff is marked
@@ -566,13 +571,18 @@ shared evidence horizon—not copied corpora or a second planning engine.
 The planning horizon must state the goal, mandatory invariants, scope
 boundaries, non-goals, chosen existing extension seam, and explicitly rejected
 expansions. Plan review publishes exactly `GREEN`, `REVIEW_REQUIRED`, or
-`REVISE_PLAN`. A `REVIEW_REQUIRED` result may close without a second LLM call
-only through `review_disposition` bound to the immediately preceding plan
-fingerprint: every finding appears exactly once as `accept`, `reject`, or
-`defer`, with evidence-based rationale, and each acceptance names the matching
-plan revision. `REVISE_PLAN` requires changed plan text/fingerprint and another
-`plan_task` call. Unknown, stale, duplicate, contradictory, or incomplete
-dispositions fail closed. Reviewers remain generative, but a finding must name
+`REVISE_PLAN`. `REVIEW_REQUIRED` findings are inputs: the main agent may accept,
+reject, or defer any/all of them. Blocking closes the latest still-current,
+reviewed, integrated, non-degraded result without a second LLM call through a
+separate `plan_task` call containing `review_disposition` only: every finding
+appears exactly once with evidence-based rationale, and each acceptance names
+the matching plan revision. Never replay plan/goal/scope/files/context with the
+disposition. Mixed calls and vacuous disposition-only calls fail before a new
+attempt is recorded; exact replay is idempotent. Blocking `REVISE_PLAN` requires
+changed plan text/fingerprint and another panel, while advisory may proceed only
+under loud host disclosure and the main agent's rationale. Unknown, stale,
+duplicate, contradictory, or incomplete dispositions fail closed. Reviewers
+remain generative, but a finding must name
 a concrete defect or a concrete smaller existing extension seam; never require
 a fixed number of findings.
 
@@ -589,7 +599,8 @@ the remaining live reviewer context is rebuilt. An unavailable reviewer
 never becomes a disposition-able verdict; a repeat call reuses that handoff snapshot and
 retries the panel, including after A→B→A. Blocking stays in
 analysis and non-mutating preparation until closure or a real task-wide rail;
-advisory may proceed by agent judgment with a host-owned disclosure. A planning
+advisory may proceed by agent judgment with a host-owned disclosure, including
+an explicitly rejected `REVISE_PLAN`. A planning
 deadline skip records a typed rail attempt before returning so the reducer cannot
 misread it as an absent `plan_task` call.
 The short-lived Swarm router admits one new root and transfers the intent; it

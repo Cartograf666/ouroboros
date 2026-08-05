@@ -10,10 +10,12 @@ import os
 import pathlib
 
 from ouroboros.config import review_model_uses_local
+from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.llm import LLMClient
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for
 from ouroboros.tools.review_helpers import load_checklist_section
 from ouroboros.tools.review_synthesis import build_plan_review_messages, normalize_plan_scope
+from ouroboros.utils import utc_now_iso
 
 
 PLAN_REVIEW_MAX_TOKENS = 65536
@@ -22,6 +24,46 @@ PLAN_REVIEW_SLOT_TIMEOUT_SEC = 560
 PLAN_CLASSES = ("self_mod", "external", "creative", "research")
 
 log = logging.getLogger(__name__)
+
+
+def plan_deadline_skip(ctx: ToolContext, *, emit: bool = False) -> str:
+    """Project the existing deadline rail without starting paid planning work."""
+    from ouroboros.config import get_plan_task_deadline_min_sec
+
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    deadline = parse_deadline_ts(metadata.get("deadline_at"))
+    if deadline is None:
+        return ""
+    remaining = (deadline - utc_now()).total_seconds()
+    scaled = max(0.0, remaining / 4.0)
+    minimum = get_plan_task_deadline_min_sec()
+    if remaining > 0 and scaled >= minimum:
+        return ""
+    if emit:
+        try:
+            event_queue = getattr(ctx, "event_queue", None)
+            if event_queue is not None:
+                event_queue.put_nowait({
+                    "type": "plan_task_deadline_skip",
+                    "task_id": str(getattr(ctx, "task_id", "") or ""),
+                    "remaining_sec": round(remaining, 1),
+                    "scaled_ceiling_sec": round(scaled, 1),
+                    "min_useful_sec": minimum,
+                    "ts": utc_now_iso(),
+                })
+        except Exception:
+            pass
+    cause = (
+        "the task deadline has expired; no new planning scout or reviewer work was started."
+        if remaining <= 0 else
+        f"insufficient time for useful planning — remaining {int(remaining)}s gives a "
+        f"swarm window of {int(scaled)}s (< {int(minimum)}s useful floor)."
+    )
+    return (
+        f"PLAN_TASK_SKIPPED_DEADLINE: {cause} Proceed with your own best plan "
+        "directly; do not re-call plan_task under this deadline."
+    )
 
 
 def record_raw_plan_request_attempt(
@@ -38,6 +80,24 @@ def record_raw_plan_request_attempt(
         state_root, task_id, fingerprint=fingerprint, status="open", reason=reason,
     )
     return fingerprint
+
+
+def reviewed_handoff_hashes(handoffs: dict) -> dict[str, str]:
+    """Hash the exact in-memory scout snapshots before reviewer dispatch."""
+    from ouroboros.tools.join_ledger import _child_result_sha256
+
+    included = [str(item) for item in handoffs.get("included_task_ids") or [] if str(item)]
+    wait = handoffs.get("wait") if isinstance(handoffs.get("wait"), dict) else {}
+    tasks = wait.get("tasks") if isinstance(wait.get("tasks"), dict) else {}
+    result: dict[str, str] = {}
+    for task_id in included:
+        snapshot = tasks.get(task_id)
+        if not isinstance(snapshot, dict):
+            raise ValueError(
+                f"PLAN_REVIEW_STATE_INVALID: included scout {task_id} has no reviewed snapshot"
+            )
+        result[task_id] = _child_result_sha256(snapshot)
+    return result
 
 
 def validate_plan_request_envelope(request, state_root: pathlib.Path, task_id: str) -> tuple[dict, str]:

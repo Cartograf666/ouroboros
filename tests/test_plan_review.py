@@ -339,7 +339,6 @@ def test_reviewer_unavailability_stays_retryable_not_durable_verdict(tmp_path):
         fingerprint,
         None,
         pr.plan_text_fingerprint(request.plan),
-        request,
     ) is None
     other_handoffs = {
         "schema_version": 1,
@@ -650,7 +649,6 @@ def test_substantive_finding_survives_peer_outage_and_retries_same_wave(tmp_path
         fingerprint,
         None,
         pr.plan_text_fingerprint(request.plan),
-        request,
     ) is None
     write_task_result(
         tmp_path,
@@ -675,7 +673,6 @@ def test_substantive_finding_survives_peer_outage_and_retries_same_wave(tmp_path
         fingerprint,
         {"review_fingerprint": fingerprint, "items": []},
         pr.plan_text_fingerprint(request.plan),
-        request,
     )
     assert rejected.startswith("ERROR: PLAN_REVIEW_RETRY_REQUIRED")
 
@@ -760,6 +757,21 @@ def test_planning_state_requires_real_task_id(tmp_path):
     with pytest.raises(ValueError, match="PLAN_REVIEW_TASK_ID_REQUIRED"):
         _planning_state_location(ctx)
     assert not (tmp_path / "task_results" / "plan_review.json").exists()
+
+
+def test_disposition_without_task_id_returns_typed_state_error(tmp_path):
+    import ouroboros.tools.plan_review as pr
+    from ouroboros.tools.registry import ToolContext
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    result = pr._handle_plan_task(
+        ctx,
+        review_disposition={"review_fingerprint": "a" * 64, "items": []},
+    )
+
+    assert result.startswith("ERROR: PLAN_REVIEW_STATE_INVALID:")
+    assert "PLAN_REVIEW_TASK_ID_REQUIRED" in result
+    assert not (tmp_path / "task_results").exists()
 
 
 def _contract_review_text(signal: str) -> str:
@@ -1232,6 +1244,9 @@ def test_planning_swarm_persists_intents_before_launch_and_partial_failure(monke
     leaked = "abcdefghijklmnop-secret-value"
 
     def fake_schedule(ctx_arg, _internal=None, **_kwargs):
+        # Planning scouts use the generic scheduler default: a configured live
+        # harness is selected there, with its existing loud native fallback.
+        assert _kwargs.get("executor", "auto") == "auto"
         calls["count"] += 1
         state = load_plan_review_state(tmp_path, str(ctx_arg.task_id))
         assert len(state["waves"]) == 1
@@ -2461,18 +2476,9 @@ class TestPlanReviewFormatOutput(unittest.TestCase):
         self.assertIn("12,345", out)
 
 
-def test_oversized_planned_required_artifact_refuses_typed(tmp_path, monkeypatch):
-    """XG-1R.4. `_run_plan_review_async` used to put EVERY files_to_touch path
-    into `already_included`, while `build_head_snapshot_section` silently
-    replaced a >1MB HEAD snapshot with an omission marker. A planned required
-    artifact (here a force-included `prompts/` file over 1MB) was therefore in
-    NEITHER the plan prompt NOR the atlas — the atlas trusted the false claim
-    and returned an `already_included` row before requiredness ran — and plan
-    review dispatched reviewers anyway, bypassing the BIBLE P3 assembly-failure
-    rule. Now only snapshots that actually SURVIVED into the prompt are
-    declared, the omitted path flows into the normal atlas classification, and
-    the hoisted requiredness predicate refuses with the typed failure naming
-    the artifact — before any reviewer slot is called."""
+def test_oversized_planned_artifact_degrades_loudly_to_minimal(tmp_path, monkeypatch):
+    """A touched file too large for both snapshot and Atlas remains a loud omission,
+    while the same fingerprint/scout wave still receives a minimal panel review."""
     import asyncio
     import subprocess
 
@@ -2519,16 +2525,13 @@ def test_oversized_planned_required_artifact_refuses_typed(tmp_path, monkeypatch
         ),
     ))
 
-    # The typed refusal names the artifact and no reviewer slot was called.
-    assert "PLAN_REVIEW_SKIPPED" in result
+    assert "PLAN_CONTEXT_DEGRADED" in result
+    assert "effective context_level=minimal" in result
     assert "prompts/huge.md" in result
-    assert dispatched["called"] is False
+    assert "PLAN_REVIEW_SKIPPED" not in result
+    assert dispatched["called"] is True
 
-    # Control: in a repo WITHOUT the oversized required artifact, an ordinary
-    # small planned file must NOT trip the refusal — its surviving snapshot
-    # stays declared as included and reviewers are dispatched. (The huge
-    # prompts/ file must go entirely: since XR-1 an untouched >1MB required
-    # artifact refuses ANY review on the repo, by design.)
+    # Control: a small planned file keeps the requested context without degradation.
     repo_ok = tmp_path / "repo_ok"
     repo_ok.mkdir()
     (repo_ok / "ok.py").write_text("print(1)\n", encoding="utf-8")
@@ -2550,6 +2553,7 @@ def test_oversized_planned_required_artifact_refuses_typed(tmp_path, monkeypatch
         ),
     ))
     assert "PLAN_REVIEW_SKIPPED" not in result_ok
+    assert "PLAN_CONTEXT_DEGRADED" not in result_ok
     assert dispatched["called"] is True
 
 
@@ -2562,7 +2566,9 @@ class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as raw:
             ctx = _make_ctx(pathlib.Path(raw))
             freeze = MagicMock(return_value={"path": "unused"})
+            atlas = SimpleNamespace(text="small atlas", manifest={}, status="ok")
             with (
+                patch.object(pr, "compile_review_context_atlas", return_value=atlas) as compile_atlas,
                 patch.object(pr, "build_head_snapshot_section", return_value=""),
                 patch.object(pr, "_load_plan_checklist", return_value="checklist"),
                 patch.object(pr, "load_governance_doc", return_value="doc"),
@@ -2574,60 +2580,71 @@ class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
                     "estimated_wave_usd": 2.0,
                     "remaining_usd": 1.0,
                     "limit_usd": 1.0,
-                }),
+                }) as admission,
+                patch.object(pr, "_run_plan_review_slots", new=AsyncMock()) as slots,
             ):
                 result = await pr._run_plan_review_async(
                     ctx,
-                    _plan_request("my plan", "my goal", [], context_level="minimal"),
+                    _plan_request("my plan", "my goal", [], context_level="localized"),
                 )
 
         self.assertIn("PLAN_REVIEW_SKIPPED_BUDGET", result)
+        self.assertNotIn("PLAN_CONTEXT_DEGRADED", result)
+        compile_atlas.assert_called_once()
+        admission.assert_called_once()
+        slots.assert_not_awaited()
         freeze.assert_not_called()
 
-    async def test_budget_gate_skips_when_oversized(self):
-        """An assembled prompt no slot can fit is a loud typed preflight degradation.
+    async def test_degraded_minimal_budget_refusal_keeps_loud_disclosure(self):
+        from ouroboros.tools import plan_review as pr
 
-        v6.80.0: the shared "assembled prompt too large" gate became a PER-SLOT
-        calibrated fit check, so a prompt above every slot's cap now reports
-        PLAN_REVIEW_DEGRADED_PREFLIGHT_OVERSIZE with NO reviewer called (instead of
-        paying for slots with a guaranteed provider 400)."""
+        ctx = _make_ctx()
+        atlas = SimpleNamespace(
+            text="",
+            manifest={
+                "unassembled_required": [{
+                    "path": "huge.py", "reason": "required file exceeded the atlas hard budget",
+                }],
+            },
+            status="required_artifact_omitted",
+        )
+        with (
+            patch.object(pr, "compile_review_context_atlas", return_value=atlas),
+            patch.object(pr, "_load_plan_checklist", return_value="checklist"),
+            patch.object(pr, "load_governance_doc", return_value=""),
+            patch.object(pr, "_start_planning_swarm", side_effect=_completed_planning_swarm),
+            patch("ouroboros.config.get_review_models", return_value=["model-a", "model-b"]),
+            patch.object(pr, "_get_review_models", return_value=["model-a", "model-b"]),
+            patch.object(pr, "review_wave_budget_gate", return_value={
+                "estimated_wave_usd": 2.0, "remaining_usd": 1.0, "limit_usd": 1.0,
+            }),
+            patch.object(pr, "_run_plan_review_slots", new=AsyncMock()) as slots,
+        ):
+            result = await pr._run_plan_review_async(
+                ctx, _plan_request("P", "G", [], context_level="constitutional"),
+            )
+
+        self.assertIn("PLAN_CONTEXT_DEGRADED", result)
+        self.assertIn("huge.py", result)
+        self.assertIn("PLAN_REVIEW_SKIPPED_BUDGET", result)
+        self.assertIn("effective review packet retained", result)
+        self.assertNotIn("Reviewers received", result)
+        slots.assert_not_awaited()
+
+    async def test_quorum_oversize_degrades_same_call_to_minimal(self):
         from ouroboros.tools import plan_review as pr
 
         ctx = _make_ctx()
         ctx.repo_dir = pathlib.Path(".")
         atlas = SimpleNamespace(text="x" * 1_000_000, manifest={}, status="budget_constrained")
+        reviews = [
+            {"model": model, "text": _review_text("GREEN"), "error": None}
+            for model in ("model-a", "model-b")
+        ]
 
-        with (
-            patch.object(pr, "compile_review_context_atlas", return_value=atlas),
-            patch.object(pr, "build_head_snapshot_section", return_value=("", frozenset())),
-            patch.object(pr, "_load_plan_checklist", return_value="checklist"),
-            patch.object(pr, "load_governance_doc", return_value=""),
-            patch.object(pr, "_start_planning_swarm", side_effect=_completed_planning_swarm),
-            # Two distinct models so the quorum gate (v4.39.0) passes and we
-            # actually reach the budget check under test. Patch BOTH
-            # `_cfg.get_review_models` (quorum gate reads this) and
-            # `pr._get_review_models` (parallel-run reads this) so the test
-            # is hermetic against developer `OUROBOROS_REVIEW_MODELS`.
-            patch("ouroboros.config.get_review_models",
-                  return_value=["model-a", "model-b"]),
-            patch.object(pr, "_get_review_models", return_value=["model-a", "model-b"]),
-            # estimate_tokens returns a large number
-            patch("ouroboros.tools.plan_review.estimate_tokens", return_value=1_100_000),
-        ):
-            result = await pr._run_plan_review_async(
-                ctx,
-                _plan_request(
-                    "my plan", "my goal", [], context_level="constitutional",
-                ),
-            )
+        def sized(text):
+            return 1_100_000 if len(text) > 500_000 else 10_000
 
-        self.assertIn("PLAN_REVIEW_DEGRADED_PREFLIGHT_OVERSIZE", result)
-
-        atlas = SimpleNamespace(
-            text="small atlas",
-            manifest={"estimated_total_tokens": 950_000},
-            status="budget_exceeded",
-        )
         with (
             patch.object(pr, "compile_review_context_atlas", return_value=atlas),
             patch.object(pr, "build_head_snapshot_section", return_value=("", frozenset())),
@@ -2637,7 +2654,9 @@ class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
             patch("ouroboros.config.get_review_models",
                   return_value=["model-a", "model-b"]),
             patch.object(pr, "_get_review_models", return_value=["model-a", "model-b"]),
-            patch("ouroboros.tools.plan_review.estimate_tokens", return_value=10_000),
+            patch("ouroboros.tools.plan_review.estimate_tokens", side_effect=sized),
+            patch.object(pr, "review_wave_budget_gate", return_value=None),
+            patch.object(pr, "_run_plan_review_slots", new=AsyncMock(return_value=reviews)) as slots,
         ):
             result = await pr._run_plan_review_async(
                 ctx,
@@ -2646,19 +2665,46 @@ class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
                 ),
             )
 
-        self.assertIn("PLAN_REVIEW_SKIPPED", result)
-        self.assertIn("generated repository atlas exceeded hard budget", result)
-        # The half that must NOT change: for a genuine overflow the budget knob
-        # IS the remedy, so the original sentence stays.
-        self.assertIn("choose a smaller context_level", result)
+        self.assertIn("PLAN_CONTEXT_DEGRADED", result)
+        self.assertIn("requested context_level=constitutional", result)
+        self.assertIn("effective context_level=minimal", result)
+        self.assertNotIn("PLAN_REVIEW_DEGRADED_PREFLIGHT_OVERSIZE", result)
+        slots.assert_awaited_once()
 
-    async def test_required_artifact_omission_refuses_the_review(self):
-        """Consumer 3 of 3 (BIBLE P3): an atlas that could not assemble a REQUIRED
-        artifact must not be reviewed on the remainder. Before the shared
-        `atlas_assembly_failed` predicate this branch tested `status ==
-        "budget_exceeded"` only, so the new failure status sailed through and
-        plan review ran on a pack missing a required file."""
+    async def test_minimal_still_oversize_stops_after_one_fallback(self):
         from ouroboros.tools import plan_review as pr
+
+        ctx = _make_ctx()
+        atlas = SimpleNamespace(text="small atlas", manifest={}, status="ok")
+        swarm = MagicMock(side_effect=_completed_planning_swarm)
+        with (
+            patch.object(pr, "compile_review_context_atlas", return_value=atlas),
+            patch.object(pr, "_load_plan_checklist", return_value="checklist"),
+            patch.object(pr, "load_governance_doc", return_value=""),
+            patch.object(pr, "_start_planning_swarm", swarm),
+            patch("ouroboros.config.get_review_models", return_value=["model-a", "model-b"]),
+            patch.object(pr, "_get_review_models", return_value=["model-a", "model-b"]),
+            patch.object(pr, "estimate_tokens", return_value=1_100_000),
+            patch.object(
+                pr, "review_wave_budget_gate", side_effect=AssertionError("fit must stop first"),
+            ),
+            patch.object(pr, "_run_plan_review_slots", new=AsyncMock()) as slots,
+        ):
+            result = await pr._run_plan_review_async(
+                ctx, _plan_request("P", "G", [], context_level="constitutional"),
+            )
+
+        self.assertIn("PLAN_CONTEXT_DEGRADED", result)
+        self.assertIn("effective context_level=minimal", result)
+        self.assertIn("PLAN_REVIEW_DEGRADED_PREFLIGHT_OVERSIZE", result)
+        self.assertIn("effective review packet retained", result)
+        self.assertNotIn("Reviewers received", result)
+        swarm.assert_called_once()
+        slots.assert_not_awaited()
+
+    async def test_required_artifact_omission_degrades_loudly_and_persists_resolution(self):
+        from ouroboros.tools import plan_review as pr
+        from ouroboros.task_results import load_plan_review_state
 
         ctx = _make_ctx()
         ctx.repo_dir = pathlib.Path(".")
@@ -2672,72 +2718,66 @@ class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
             },
             status="required_artifact_omitted",
         )
+        reviews = [
+            {"model": model, "text": _review_text("GREEN"), "error": None}
+            for model in ("model-a", "model-b")
+        ]
+        swarm = MagicMock(side_effect=_completed_planning_swarm)
+        request = _plan_request("my plan", "my goal", [], context_level="constitutional")
         with (
             patch.object(pr, "compile_review_context_atlas", return_value=atlas),
+            patch.object(pr, "build_head_snapshot_section", return_value=("", frozenset())),
+            patch.object(pr, "_load_plan_checklist", return_value="checklist"),
+            patch.object(pr, "load_governance_doc", return_value=""),
+            patch.object(pr, "_start_planning_swarm", swarm),
+            patch("ouroboros.config.get_review_models", return_value=["model-a", "model-b"]),
+            patch.object(pr, "_get_review_models", return_value=["model-a", "model-b"]),
+            patch("ouroboros.tools.plan_review.estimate_tokens", return_value=10_000),
+            patch.object(pr, "review_wave_budget_gate", return_value=None),
+            patch.object(pr, "_run_plan_review_slots", new=AsyncMock(return_value=reviews)) as slots,
+        ):
+            result = await pr._run_plan_review_async(ctx, request)
+
+        self.assertIn("PLAN_CONTEXT_DEGRADED", result)
+        self.assertIn("ouroboros/llm.py", result)
+        self.assertNotIn("PLAN_REVIEW_SKIPPED", result)
+        swarm.assert_called_once()
+        slots.assert_awaited_once()
+        state = load_plan_review_state(pathlib.Path(ctx.drive_root), ctx.task_id)
+        wave = state["waves"][0]
+        self.assertEqual(wave["request_fingerprint"], swarm.call_args.args[2])
+        self.assertEqual(wave["review"]["requested_context_level"], "constitutional")
+        self.assertEqual(wave["review"]["effective_context_level"], "minimal")
+        cached = pr._reuse_or_disposition_plan_review(
+            ctx, wave["request_fingerprint"], None, pr.plan_text_fingerprint(request.plan),
+        )
+        self.assertIn("PLAN_CONTEXT_DEGRADED", cached)
+
+    async def test_unexpected_atlas_compiler_exception_does_not_fallback(self):
+        from ouroboros.tools import plan_review as pr
+
+        ctx = _make_ctx()
+        ctx.repo_dir = pathlib.Path(".")
+        with (
+            patch.object(pr, "compile_review_context_atlas", side_effect=RuntimeError("boom")),
             patch.object(pr, "build_head_snapshot_section", return_value=("", frozenset())),
             patch.object(pr, "_load_plan_checklist", return_value="checklist"),
             patch.object(pr, "load_governance_doc", return_value=""),
             patch.object(pr, "_start_planning_swarm", side_effect=_completed_planning_swarm),
             patch("ouroboros.config.get_review_models", return_value=["model-a", "model-b"]),
             patch.object(pr, "_get_review_models", return_value=["model-a", "model-b"]),
-            patch("ouroboros.tools.plan_review.estimate_tokens", return_value=10_000),
+            patch.object(pr, "_run_plan_review_slots", new=AsyncMock()) as slots,
         ):
             result = await pr._run_plan_review_async(
-                ctx,
-                _plan_request("my plan", "my goal", [], context_level="constitutional"),
+                ctx, _plan_request("my plan", "my goal", [], context_level="localized"),
             )
 
-        self.assertIn("PLAN_REVIEW_SKIPPED", result)
-        self.assertIn("ouroboros/llm.py", result)
+        self.assertIn("Failed to build review context atlas: boom", result)
+        self.assertNotIn("PLAN_CONTEXT_DEGRADED", result)
+        slots.assert_not_awaited()
 
-    async def test_required_artifact_remedy_is_not_the_inert_context_level_knob(self):
-        """The refusal reused the `budget_exceeded` remedy verbatim, and "choose a
-        smaller context_level" is INERT here: `context_level` feeds only
-        `target_total_tokens`, while required artifacts are selected against
-        `hard_total_tokens`. Executed at every level the same artifact is missing,
-        so the owner is told to turn a knob that cannot change the outcome."""
+    async def test_mixed_assembly_failure_degrades_and_discloses_both_causes(self):
         from ouroboros.tools import plan_review as pr
-
-        ctx = _make_ctx()
-        ctx.repo_dir = pathlib.Path(".")
-        atlas = SimpleNamespace(
-            text="atlas without ouroboros/llm.py",
-            manifest={
-                "estimated_total_tokens": 500_000,
-                "unassembled_required": [
-                    {"path": "ouroboros/llm.py", "reason": "required file exceeded the atlas hard budget"}
-                ],
-            },
-            status="required_artifact_omitted",
-        )
-        results = {}
-        for level in ("localized", "broad", "constitutional"):
-            with (
-                patch.object(pr, "compile_review_context_atlas", return_value=atlas),
-                patch.object(pr, "build_head_snapshot_section", return_value=("", frozenset())),
-                patch.object(pr, "_load_plan_checklist", return_value="checklist"),
-                patch.object(pr, "load_governance_doc", return_value=""),
-                patch.object(pr, "_start_planning_swarm", side_effect=_completed_planning_swarm),
-                patch("ouroboros.config.get_review_models", return_value=["model-a", "model-b"]),
-                patch.object(pr, "_get_review_models", return_value=["model-a", "model-b"]),
-                patch("ouroboros.tools.plan_review.estimate_tokens", return_value=10_000),
-            ):
-                results[level] = await pr._run_plan_review_async(
-                    ctx, _plan_request("my plan", "my goal", [], context_level=level),
-                )
-
-        for level, result in results.items():
-            self.assertNotIn("choose a smaller context_level", result, level)
-            self.assertIn("Shrink or split the named artifact(s)", result, level)
-
-    async def test_mixed_assembly_failure_reports_both_causes_and_mixed_remedy(self):
-        """The MIXED failure: required rows survive on a pack that ALSO overflowed
-        the hard budget (required candidates are marked budget_omitted before the
-        rendered pack is tested against it). The refusal must render BOTH causes
-        and prescribe the mixed remedy — each single-cause remedy states something
-        false for the other cause ("narrowing cannot help" vs "split the plan")."""
-        from ouroboros.tools import plan_review as pr
-        from ouroboros.tools.review_context_atlas import ATLAS_MIXED_ASSEMBLY_REMEDY
 
         ctx = _make_ctx()
         ctx.repo_dir = pathlib.Path(".")
@@ -2752,6 +2792,10 @@ class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
             },
             status="budget_exceeded",
         )
+        reviews = [
+            {"model": model, "text": _review_text("GREEN"), "error": None}
+            for model in ("model-a", "model-b")
+        ]
         with (
             patch.object(pr, "compile_review_context_atlas", return_value=atlas),
             patch.object(pr, "build_head_snapshot_section", return_value=("", frozenset())),
@@ -2761,20 +2805,19 @@ class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
             patch("ouroboros.config.get_review_models", return_value=["model-a", "model-b"]),
             patch.object(pr, "_get_review_models", return_value=["model-a", "model-b"]),
             patch("ouroboros.tools.plan_review.estimate_tokens", return_value=10_000),
+            patch.object(pr, "review_wave_budget_gate", return_value=None),
+            patch.object(pr, "_run_plan_review_slots", new=AsyncMock(return_value=reviews)) as slots,
         ):
             result = await pr._run_plan_review_async(
                 ctx,
                 _plan_request("my plan", "my goal", [], context_level="constitutional"),
             )
 
-        self.assertIn("PLAN_REVIEW_SKIPPED", result)
-        # Both causes are rendered — the overflow is not suppressed behind the rows…
+        self.assertIn("PLAN_CONTEXT_DEGRADED", result)
+        self.assertNotIn("PLAN_REVIEW_SKIPPED", result)
         self.assertIn("ouroboros/llm.py", result)
         self.assertIn("exceeded hard budget", result)
-        # …and the remedy is the mixed one, neither single-cause half-truth.
-        self.assertIn(ATLAS_MIXED_ASSEMBLY_REMEDY, result)
-        self.assertNotIn("choose a smaller context_level", result)
-        self.assertNotIn("narrowing the reviewed change cannot help", result)
+        slots.assert_awaited_once()
 
     async def test_proceeds_when_within_budget(self):
         """When prompt is within budget, reviewers are called."""
@@ -2892,7 +2935,8 @@ class TestPlanReviewToolRegistration(unittest.TestCase):
         # context_level is NOT schema-required (triad r2 self_consistency): the host
         # enforces explicit choice for self_mod while non-self_mod may omit it
         # (defaults to minimal) — an unconditional `required` contradicted that.
-        self.assertEqual(tool.schema["parameters"]["required"], ["plan", "goal"])
+        self.assertEqual(tool.schema["parameters"]["required"], [])
+        self.assertIn("review_disposition ONLY", tool.schema["description"])
         self.assertNotIn("auto", params["context_level"].get("enum", []))
 
     def test_public_registry_rejects_unknown_plan_task_arguments(self):
@@ -3104,9 +3148,10 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
         self.assertEqual(summary["aggregate_signal"], "REVIEW_REQUIRED")
         self.assertIn("must precede AGGREGATE", summary["projection_errors"][1])
 
-    def _write_review(self, tmp_path, *, aggregate="REVIEW_REQUIRED", component_hashes=None):
+    def _write_review(self, tmp_path, *, aggregate="REVIEW_REQUIRED"):
         from ouroboros.task_results import (
             plan_review_wave_handoffs,
+            record_plan_review_attempt,
             record_plan_review_collection,
             record_plan_review_result,
             reserve_plan_review_wave,
@@ -3128,6 +3173,7 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
                 {"finding_id": "plan-slot-2:f2", "summary": "two"},
             ],
         }
+        record_plan_review_attempt(tmp_path, "parent", fingerprint=fingerprint)
         reserve_plan_review_wave(
             tmp_path,
             "parent",
@@ -3135,7 +3181,6 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
             plan_text_hash=hashlib.sha256(b"P").hexdigest(),
             scout_roles=[],
             cutoff_at="2099-01-01T00:00:00+00:00",
-            component_hashes=component_hashes,
         )
         record_plan_review_collection(
             tmp_path,
@@ -3350,6 +3395,7 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
         import ouroboros.tools.plan_review as pr
         from ouroboros.task_results import (
             load_plan_review_state,
+            record_plan_review_attempt,
             record_plan_review_collection,
             record_plan_review_result,
             reserve_plan_review_wave,
@@ -3397,6 +3443,9 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
                     },
                 )
 
+            # A valid A re-presentation selects A as the current authority before
+            # the free reference-only disposition call.
+            record_plan_review_attempt(root, ctx.task_id, fingerprint=a_fp)
             represented = pr._reuse_or_disposition_plan_review(ctx, a_fp, None, a_hash)
             self.assertIn("PLAN_REVIEW_OUTCOME: REVIEW_REQUIRED", represented)
             self.assertIn("Cached exact review:** True", represented)
@@ -3456,6 +3505,106 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
             self.assertTrue(stored["review"]["closed"])
             self.assertEqual(len(stored["review"]["disposition"]["items"]), 2)
 
+    def test_legacy_integrated_review_without_status_accepts_disposition(self):
+        import tempfile
+
+        import ouroboros.tools.plan_review as pr
+        from ouroboros.task_results import (
+            PLAN_REVIEW_STATE_KEY,
+            load_plan_review_state,
+            task_result_path,
+        )
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            ctx, fingerprint = self._write_review(root)
+            result_path = task_result_path(root, ctx.task_id, create=False)
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result[PLAN_REVIEW_STATE_KEY]["waves"][0].pop("review_evidence_status")
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            self.assertNotIn(
+                "review_evidence_status",
+                load_plan_review_state(root, ctx.task_id)["waves"][0],
+            )
+
+            out = pr._handle_plan_task(ctx, review_disposition={
+                "review_fingerprint": fingerprint,
+                "items": [
+                    {
+                        "finding_id": "plan-slot-1:f1",
+                        "decision": "reject",
+                        "rationale": "The finding does not change the selected seam.",
+                    },
+                    {
+                        "finding_id": "plan-slot-2:f2",
+                        "decision": "reject",
+                        "rationale": "The finding is outside the explicit non-goals.",
+                    },
+                ],
+            })
+
+            self.assertIn('"outcome":"REVIEW_REQUIRED","closed":true', out)
+            stored = load_plan_review_state(root, ctx.task_id)["waves"][0]
+            self.assertEqual(stored["review_evidence_status"], "integrated")
+
+    def test_legacy_open_review_without_current_attempt_accepts_disposition(self):
+        import tempfile
+
+        import ouroboros.tools.plan_review as pr
+        from ouroboros.task_results import (
+            PLAN_REVIEW_STATE_KEY,
+            load_plan_review_state,
+            plan_review_gate_projection,
+            task_result_path,
+        )
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            ctx, fingerprint = self._write_review(root)
+            result_path = task_result_path(root, ctx.task_id, create=False)
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result[PLAN_REVIEW_STATE_KEY].pop("current_attempt")
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+
+            legacy = load_plan_review_state(root, ctx.task_id)
+            self.assertEqual(
+                legacy["current_attempt"],
+                {
+                    "fingerprint": fingerprint,
+                    "status": "open",
+                    "reason": "legacy_latest_review",
+                },
+            )
+            self.assertFalse(plan_review_gate_projection(legacy, "blocking")["allow"])
+
+            disposition = {
+                "review_fingerprint": fingerprint,
+                "items": [
+                    {
+                        "finding_id": "plan-slot-1:f1",
+                        "decision": "reject",
+                        "rationale": "The finding does not change the selected seam.",
+                    },
+                    {
+                        "finding_id": "plan-slot-2:f2",
+                        "decision": "reject",
+                        "rationale": "The finding is outside the explicit non-goals.",
+                    },
+                ],
+            }
+            out = pr._handle_plan_task(ctx, review_disposition=disposition)
+
+            self.assertIn('"outcome":"REVIEW_REQUIRED","closed":true', out)
+            stored = load_plan_review_state(root, ctx.task_id)
+            self.assertEqual(stored["current_attempt"], legacy["current_attempt"])
+            self.assertTrue(plan_review_gate_projection(stored, "blocking")["allow"])
+
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result[PLAN_REVIEW_STATE_KEY].pop("current_attempt")
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            replayed = pr._handle_plan_task(ctx, review_disposition=disposition)
+            self.assertIn('"outcome":"REVIEW_REQUIRED","closed":true', replayed)
+
     def test_closed_disposition_replay_is_idempotent_and_contradiction_is_rejected(self):
         import tempfile
 
@@ -3514,6 +3663,7 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
         from ouroboros.task_results import (
             load_plan_review_state,
             plan_review_wave,
+            record_plan_review_attempt,
             record_plan_review_result,
         )
 
@@ -3566,8 +3716,21 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
                     require_latest=True,
                 )
 
+            record_plan_review_attempt(
+                root, ctx.task_id, fingerprint="b" * 64, reason="newer raw attempt",
+            )
+            before = load_plan_review_state(root, ctx.task_id)
+            with pytest.raises(ValueError, match="PLAN_REVIEW_DISPOSITION_STALE"):
+                record_plan_review_result(
+                    root,
+                    ctx.task_id,
+                    fingerprint=fingerprint,
+                    review=replay,
+                    require_latest=True,
+                )
+            self.assertEqual(load_plan_review_state(root, ctx.task_id), before)
+
     def test_disposition_closes_near_deadline_without_configured_reviewers(self):
-        import asyncio
         import tempfile
         from datetime import datetime, timedelta, timezone
 
@@ -3586,11 +3749,13 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
                 context_notes="", plan_class="external", scope={}, include_tests=False,
             )
             from ouroboros.task_results import (
+                record_plan_review_attempt,
                 record_plan_review_collection,
                 record_plan_review_result,
                 reserve_plan_review_wave,
             )
 
+            record_plan_review_attempt(root, "parent", fingerprint=fingerprint)
             reserve_plan_review_wave(
                 root,
                 "parent",
@@ -3630,18 +3795,12 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
             with (
                 patch("ouroboros.config.get_review_models", return_value=[]),
                 patch.object(pr, "_get_review_models", side_effect=AssertionError("no reviewer call")),
+                patch.object(
+                    pr, "_record_raw_plan_request_attempt",
+                    side_effect=AssertionError("disposition-only must not create a raw attempt"),
+                ),
             ):
-                out = asyncio.run(pr._run_plan_review_async(
-                    ctx,
-                    _plan_request(
-                        "P",
-                        "G",
-                        [],
-                        context_level="minimal",
-                        plan_class="external",
-                        review_disposition=disposition,
-                    ),
-                ))
+                out = pr._handle_plan_task(ctx, review_disposition=disposition)
             self.assertIn('"outcome":"REVIEW_REQUIRED","closed":true', out)
             self.assertNotIn("PLAN_TASK_SKIPPED_DEADLINE", out)
 
@@ -3719,124 +3878,51 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
             self.assertIn("PLAN_REVIEW_DISPOSITION_REQUIRED", as_vacuous)
             self.assertNotIn("PLAN_REVIEW_DISPOSITION_STALE", as_vacuous)
 
-    def test_populated_disposition_without_prior_review_is_ignored_unbindable(self):
-        # v6.80.0: an UNBINDABLE non-empty disposition FAILS FAST instead of being
-        # discarded before a paid wave. The v6.65.2 anti-wedge guarantee is preserved
-        # EXPLICITLY in the error text ("OMIT review_disposition entirely"), so a model
-        # that fabricated a placeholder learns the exact way out instead of silently
-        # paying for a full scout+reviewer wave it did not intend.
+    def test_disposition_without_prior_review_is_stale_and_free(self):
         import tempfile
         import ouroboros.tools.plan_review as pr
         from ouroboros.tools.registry import ToolContext
 
         with tempfile.TemporaryDirectory() as raw:
             root = pathlib.Path(raw)
-            for populated in (
-                {"review_fingerprint": "d" * 64, "items": []},
-                {"review_fingerprint": "dummy", "items": [{
-                    "finding_id": "dummy",
-                    "decision": "reject",
-                    "rationale": "not prior review",
-                }]},
-                {"review_fingerprint": "", "items": [{
-                    "finding_id": "plan-slot-1:f1",
-                    "decision": "reject",
-                    "rationale": "n/a",
-                }]},
-            ):
-                ctx = ToolContext(repo_dir=root, drive_root=root)
-                ctx.task_id = "parent"
-                out = pr._reuse_or_disposition_plan_review(
-                    ctx, "c" * 64, populated, hashlib.sha256(b"P").hexdigest()
+            ctx = ToolContext(repo_dir=root, drive_root=root)
+            ctx.task_id = "parent"
+            with patch.object(pr, "_run_plan_review_async") as run:
+                out = pr._handle_plan_task(
+                    ctx,
+                    review_disposition={"review_fingerprint": "d" * 64, "items": []},
                 )
-                self.assertIsNotNone(out, f"unbindable={populated!r} must fail fast")
-                self.assertIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", out)
-                self.assertIn("OMIT review_disposition entirely", out)
-                self.assertIn("no wave was launched", out)
+            self.assertIn("PLAN_REVIEW_DISPOSITION_STALE", out)
+            run.assert_not_called()
+            self.assertFalse((root / "task_results" / "parent.json").exists())
 
-    def test_agent_envelope_drift_is_unbindable_not_a_warning(self):
-        """The P3 plan gate: a review of `[a.py]` must NOT close a submission for
-        `[a.py, b.py, c.py]`.
-
-        `files_to_touch` is exported in the tool schema as PART OF THE REVIEW IDENTITY
-        ("a review_disposition can only close a review submitted with the SAME list"),
-        and the binding fingerprint is a pure function of the agent's envelope. Binding a
-        drifted envelope and merely PREPENDING an ENVELOPE_MISMATCH note let stale plan
-        review authorise materially expanded scope; the claimed fingerprint must equal
-        the submitted one, and a mismatch fails fast so the agent runs a real review."""
+    def test_mixed_disposition_and_plan_envelope_is_rejected_without_mutation(self):
         import tempfile
-
         import ouroboros.tools.plan_review as pr
-        from ouroboros.tools.review_synthesis import plan_review_component_hashes
-
-        reviewed = pr._PlanReviewRequest(plan="P", goal="G", files_to_touch=["a.py"])
-        submitted = pr._PlanReviewRequest(
-            plan="P", goal="G", files_to_touch=["a.py", "b.py", "c.py"],
-        )
-        plan_hash = hashlib.sha256(b"P").hexdigest()
-        disposition = {"review_fingerprint": "a" * 64, "items": [
-            {"finding_id": "plan-slot-1:f1", "decision": "reject", "rationale": "one"},
-            {"finding_id": "plan-slot-2:f2", "decision": "reject", "rationale": "two"},
-        ]}
+        from ouroboros.task_results import load_plan_review_state
 
         with tempfile.TemporaryDirectory() as raw:
-            ctx, _ = self._write_review(
-                pathlib.Path(raw),
-                component_hashes=plan_review_component_hashes(reviewed),
-            )
-            # The submitted envelope grew, so its fingerprint differs from the reviewed
-            # one: the disposition names a review of something else and cannot close it.
-            drifted = pr._reuse_or_disposition_plan_review(
-                ctx, "e" * 64, disposition, plan_hash, submitted,
-            )
-            self.assertIsNotNone(drifted)
-            self.assertIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", drifted)
-            self.assertIn("ENVELOPE_MISMATCH on: files_to_touch", drifted)
-            self.assertIn("OMIT review_disposition entirely", drifted)
-            self.assertIn("no wave was launched", drifted)
-
-        # The SAME agent envelope still closes its own review, and HOST-RESOLVED drift
-        # (resolved plan_class / context_level, deliberately outside the binding
-        # identity) is reported as a note rather than blocking the close.
-        with tempfile.TemporaryDirectory() as raw:
-            ctx, fingerprint = self._write_review(
-                pathlib.Path(raw),
-                component_hashes=plan_review_component_hashes(reviewed),
-            )
-            escalated = pr._PlanReviewRequest(
-                plan="P", goal="G", files_to_touch=["a.py"], plan_class="self_mod",
-            )
-            bound = pr._reuse_or_disposition_plan_review(
-                ctx, fingerprint,
-                {**disposition, "review_fingerprint": fingerprint},
-                plan_hash, escalated,
-            )
-            self.assertIsNotNone(bound)
-            self.assertNotIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", bound)
-            self.assertIn("ENVELOPE_MISMATCH on: plan_class", bound)
-
-        # ...and the unbindable path names the same drift instead of nothing.
-        state = {
-            "latest_review_fingerprint": "a" * 64,
-            "waves": [{
-                "request_fingerprint": "a" * 64,
-                "plan_text_hash": plan_hash,
-                "component_hashes": plan_review_component_hashes(reviewed),
-            }],
-        }
-        unbindable = pr._unbindable_disposition_error(
-            state, "e" * 64, {"review_fingerprint": "z" * 64, "items": []}, plan_hash, submitted,
-        )
-        self.assertIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", unbindable)
-        self.assertIn("ENVELOPE_MISMATCH on: files_to_touch", unbindable)
-        # An UNCHANGED envelope reports nothing, and so does a caller with no request.
-        same = pr._unbindable_disposition_error(
-            state, "e" * 64, {"review_fingerprint": "z" * 64, "items": []}, plan_hash, reviewed,
-        )
-        self.assertNotIn("ENVELOPE_MISMATCH", same)
-        self.assertNotIn("ENVELOPE_MISMATCH", pr._unbindable_disposition_error(
-            state, "e" * 64, {"review_fingerprint": "z" * 64, "items": []}, plan_hash,
-        ))
+            root = pathlib.Path(raw)
+            ctx, fingerprint = self._write_review(root)
+            before = load_plan_review_state(root, ctx.task_id)
+            disposition = {
+                "review_fingerprint": fingerprint,
+                "items": [
+                    {"finding_id": "plan-slot-1:f1", "decision": "reject", "rationale": "one"},
+                    {"finding_id": "plan-slot-2:f2", "decision": "reject", "rationale": "two"},
+                ],
+            }
+            with patch.object(pr, "_record_raw_plan_request_attempt") as record, patch.object(
+                pr, "_run_plan_review_async",
+            ) as run:
+                out = pr._handle_plan_task(
+                    ctx, plan="P changed", goal="G", files_to_touch=["a.py", "b.py"],
+                    review_disposition=disposition,
+                )
+            self.assertIn("PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE", out)
+            record.assert_not_called()
+            run.assert_not_called()
+            self.assertEqual(load_plan_review_state(root, ctx.task_id), before)
 
     def test_state_lookup_failure_is_error_not_absence(self):
         # Consultation guard: an indeterminate state store must ERROR, never be
@@ -3861,33 +3947,44 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
             self.assertIn("PLAN_REVIEW_STATE_INVALID", out)
             self.assertNotIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", out)
 
-    def test_handle_plan_task_surfaces_unbindable_disposition_error(self):
-        """v6.80.0: the tool result is the fail-fast error itself, not a note tacked
-        onto a review that was paid for anyway."""
+    def test_disposition_cannot_revive_review_superseded_by_new_attempt(self):
+        import tempfile
         import ouroboros.tools.plan_review as pr
-        from unittest.mock import patch
-        from ouroboros.tools.registry import ToolContext
+        from ouroboros.task_results import load_plan_review_state, record_plan_review_attempt
 
-        async def _stub(ctx, request):
-            return pr._unbindable_disposition_error(
-                {"waves": []}, "c" * 64, request.review_disposition, "planhash",
-            )
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            ctx, fingerprint = self._write_review(root)
+            record_plan_review_attempt(root, ctx.task_id, fingerprint="b" * 64)
+            before = load_plan_review_state(root, ctx.task_id)
+            with patch.object(pr, "_run_plan_review_async") as run:
+                out = pr._handle_plan_task(ctx, review_disposition={
+                    "review_fingerprint": fingerprint,
+                    "items": [
+                        {"finding_id": "plan-slot-1:f1", "decision": "reject", "rationale": "one"},
+                        {"finding_id": "plan-slot-2:f2", "decision": "reject", "rationale": "two"},
+                    ],
+                })
+            self.assertIn("PLAN_REVIEW_DISPOSITION_STALE", out)
+            run.assert_not_called()
+            self.assertEqual(load_plan_review_state(root, ctx.task_id), before)
+
+    def test_vacuous_disposition_only_is_rejected_before_raw_attempt(self):
+        import ouroboros.tools.plan_review as pr
+        from ouroboros.tools.registry import ToolContext
 
         ctx = ToolContext(repo_dir=pathlib.Path("."), drive_root=pathlib.Path("."))
         ctx.task_id = "parent"
-        with patch.object(pr, "_record_raw_plan_request_attempt"), patch.object(
-            pr, "_run_plan_review_async", _stub,
-        ):
+        with patch.object(pr, "_record_raw_plan_request_attempt") as record, patch.object(
+            pr, "_run_plan_review_async",
+        ) as run:
             out = pr._handle_plan_task(
-                ctx,
-                plan="P",
-                goal="G",
-                review_disposition={"review_fingerprint": "dummy", "items": [
-                    {"finding_id": "dummy", "decision": "reject", "rationale": "x"}
-                ]},
+                ctx, review_disposition={"review_fingerprint": "", "items": []},
             )
-        self.assertIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", out)
-        self.assertIn("OMIT review_disposition entirely", out)
+        self.assertIn("PLAN_REVIEW_DISPOSITION_EMPTY", out)
+        self.assertIn("No plan attempt was recorded", out)
+        record.assert_not_called()
+        run.assert_not_called()
 
     def test_handle_plan_task_notes_ignored_vacuous_disposition(self):
         import ouroboros.tools.plan_review as pr

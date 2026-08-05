@@ -645,6 +645,13 @@ and an agent-selected context level: `minimal`, `localized`, `broad`, or
 but omits the generated Atlas; `localized` adds a bounded neighborhood around
 planned files, `broad` is for shared contracts, and `constitutional` is
 reserved for self-evolution / immune-system surfaces.
+If a requested non-minimal Atlas has a typed assembly failure, or its final
+prompt leaves fewer than reviewer quorum callable, plan review rebuilds the
+same fingerprint/scout wave once at loud `minimal`. Reviewers must judge only
+the evidence actually present; the requested/effective levels, cause, Atlas
+omission, and any planned-touch snapshot omission remain explicit. A compiler
+exception, monetary budget refusal, or minimal prompt that still does not fit
+does not trigger another fallback.
 
 **Reviewer role is GENERATIVE, not audit.** The primary job is to contribute
 ideas the implementer may not see, using the repository evidence available for
@@ -699,7 +706,8 @@ duplicates allowed) via `config.adaptive_quorum(N)` — the same reviewer-slot
 SSOT used by commit/scope/skill review: `2` for `N ≥ 3`, `N` for `N` in
 `{1, 2}` (i.e. `min(2, N)`).
 
-- **GREEN** — all reviewers PASS. Read every reviewer's `## PROPOSALS` section
+- **GREEN** — all responding reviewers PASS. A preflight-excluded slot was not
+  called and did not vote. Read every called reviewer's `## PROPOSALS` section
   (they are the point of this call), then proceed with implementation.
 - **REVIEW_REQUIRED** — one or more of: (a) a `REVISE_PLAN` count BELOW the
   adaptive quorum (minority dissent — e.g. exactly one dissent in a 2+-slot
@@ -707,25 +715,37 @@ SSOT used by commit/scope/skill review: `2` for `N ≥ 3`, `N` for `N` in
   degradation occurred (a reviewer errored, timed out, or returned an
   unparseable response, so `GREEN` cannot be confirmed). Read every reviewer's
   full response and all PROPOSALS before deciding: a single dissenting reviewer
-  often sees the structural issue the others missed.
+  often sees the structural issue the others missed. Findings are inputs to the
+  main agent, which may accept, reject, or defer each one, including all of them.
 - **REVISE_PLAN** — a `REVISE_PLAN` count **at or above `adaptive_quorum(N)`**
   (2-of-N for 3+ slots, both in a 2-slot setup, and the lone reviewer in a
-  1-slot setup). Quorum confirms a structural problem with the plan. Redesign
-  before writing code. A single dissent in a multi-reviewer setup surfaces as
-  `REVIEW_REQUIRED`, not `REVISE_PLAN`.
+  1-slot setup). Quorum confirms a structural problem with the plan. Blocking
+  mode requires changed plan text and a fresh panel; advisory mode may proceed
+  only under loud host disclosure and the main agent's rationale. A single
+  dissent in a multi-reviewer setup surfaces as `REVIEW_REQUIRED`, not
+  `REVISE_PLAN`.
 
 ### Rules for reviewers
 
 - Outside the force-plan gate, `plan_review` remains advisory: the implementer
   decides what to do with the feedback. Force-plan follows the owner-selected
   `OUROBOROS_REVIEW_ENFORCEMENT`: `blocking` holds normal finalization until
-  `GREEN` or a valid fingerprint-bound disposition closes `REVIEW_REQUIRED`,
+  `GREEN` or a valid reference-only disposition closes `REVIEW_REQUIRED`,
   while `advisory` permits agent judgment and preserves an explicit disclosure.
+  The disposition is a separate `plan_task` call containing only
+  `review_disposition`; it may close only the latest still-current, reviewed,
+  integrated, non-degraded `REVIEW_REQUIRED` fingerprint. It never resends the
+  plan envelope or calls a reviewer, covers every finding exactly once, and
+  exact replay is idempotent. Mixed disposition/envelope calls and vacuous
+  disposition-only calls are rejected before recording a new attempt. Ordinary
+  invalid review-mode envelopes still record a new current attempt so stale
+  review authority cannot revive.
   Reviewer unavailability is audit evidence, not a disposition-able verdict:
   blocking retries the same fingerprint/wave against its immutable first-panel
   scout snapshot until review returns or a real rail fires.
   `REVISE_PLAN` still requires changed plan text/fingerprint and a fresh review
-  in the blocking lane. Blocking permits analysis and non-mutating preparation
+  in the blocking lane; advisory may proceed only with loud disclosure and the
+  main agent's rationale. Blocking permits analysis and non-mutating preparation
   while review recovers, but implementation starts only after closure or a real
   task-wide rail. This remains an LLM-first obligation, not a per-write/per-shell
   gate; real deadline, budget, provider, or round rails preserve useful best-effort
