@@ -4,6 +4,7 @@ Split from test_commit_gate.py to keep each test module within the ~1000-line li
 """
 import importlib
 import json
+import pathlib
 import os
 import sys
 
@@ -43,16 +44,6 @@ def test_resolve_claude_code_model(monkeypatch, case_id, env_value, expected):
     else:
         monkeypatch.setenv("CLAUDE_CODE_MODEL", env_value)
     assert gw.resolve_claude_code_model() == expected
-
-
-def test_shell_edit_uses_resolve_claude_code_model_helper():
-    """claude_code_edit path must use resolve_claude_code_model(), not raw os.environ.get."""
-    import inspect
-    sys.path.insert(0, REPO)
-    shell_mod = importlib.import_module("ouroboros.tools.shell")
-    source = inspect.getsource(shell_mod._claude_code_edit)
-    assert "resolve_claude_code_model" in source
-    assert 'os.environ.get("CLAUDE_CODE_MODEL"' not in source
 
 
 def test_advisory_uses_resolve_claude_code_model_helper():
@@ -637,27 +628,21 @@ def test_budget_gate_skip_becomes_stale_after_edit(monkeypatch, tmp_path):
 # SDK break-after-ResultMessage fix (spurious exit code 1 prevention)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("mode", ["readonly", "edit"])
-def test_run_async_breaks_after_result_message(mode):
-    """Both ``_run_readonly_async`` and ``_run_edit_async`` use
-    ClaudeSDKClient.receive_response and must stop
-    iterating after ResultMessage. Root cause: the SDK stream can raise
+def test_run_async_breaks_after_result_message():
+    """``_run_readonly_async`` uses ClaudeSDKClient.receive_response and must
+    stop iterating after ResultMessage. Root cause: the SDK stream can raise
     when iterated past the ResultMessage because the CLI subprocess has
     exited and the message reader hits a closed pipe.
 
     The fix adds a ``break`` after processing ResultMessage. The test
     verifies that the break prevents the post-ResultMessage Exception
     from reaching the caller as a failure.
-
-    Parametrized in v5.15.x — previously two near-identical tests
-    test_run_{readonly,edit}_async_breaks_after_result_message, ~150 LOC
-    of duplicated mock setup.
     """
     import sys
 
     sys.path.insert(0, REPO)
 
-    # ---- Shared mock message types ------------------------------------
+    # ---- Mock message types --------------------------------------------
     AssistantMsg = type("AssistantMessage", (), {})
     ResultMsg = type("ResultMessage", (), {})
 
@@ -665,11 +650,11 @@ def test_run_async_breaks_after_result_message(mode):
         def __init__(self, text):
             self.text = text
 
-    text_payload = "Edit output" if mode == "edit" else "Hello"
-    session_id = "edit-session-456" if mode == "edit" else "test-session-123"
-    in_tokens = 20 if mode == "edit" else 10
-    out_tokens = 10 if mode == "edit" else 5
-    cost = 0.002 if mode == "edit" else 0.001
+    text_payload = "Hello"
+    session_id = "test-session-123"
+    in_tokens = 10
+    out_tokens = 5
+    cost = 0.001
 
     class FakeAssistantMessage(AssistantMsg):
         def __init__(self):
@@ -727,23 +712,14 @@ def test_run_async_breaks_after_result_message(mode):
                 )
 
         gw.ClaudeSDKClient = FakeSDKClient
-        if mode == "readonly":
-            result = asyncio.run(gw._run_readonly_async(
-                prompt="test",
-                cwd="/tmp",
-                model="opus",
-                max_turns=1,
-                effort=None,
-                max_budget_usd=1.0,
-            ))
-        else:
-            result = asyncio.run(gw._run_edit_async(
-                prompt="test edit",
-                cwd="/tmp",
-                model="opus",
-                max_turns=1,
-                budget=1.0,
-            ))
+        result = asyncio.run(gw._run_readonly_async(
+            prompt="test",
+            cwd="/tmp",
+            model="opus",
+            max_turns=1,
+            effort=None,
+            max_budget_usd=1.0,
+        ))
     finally:
         gw.AssistantMessage = orig_AssistantMessage
         gw.ResultMessage = orig_ResultMessage
@@ -754,80 +730,6 @@ def test_run_async_breaks_after_result_message(mode):
     assert result.success, f"Expected success but got error: {result.error}"
     assert result.session_id == session_id
     assert text_payload in result.result_text
-
-
-@pytest.mark.parametrize(
-    ("cwd", "expected_repo_name"),
-    [
-        ("", None),          # self repo root
-        ("external", "external"),  # nested external git root
-    ],
-)
-def test_claude_code_edit_invalidates_target_repo_root(monkeypatch, tmp_path, cwd, expected_repo_name):
-    """Phase 3: claude_code_edit should invalidate advisory for the nearest git root."""
-    import subprocess
-    from types import SimpleNamespace
-
-    sys.path.insert(0, REPO)
-    shell_mod = importlib.import_module("ouroboros.tools.shell")
-    git_mod = importlib.import_module("ouroboros.tools.git")
-    gw = importlib.import_module("ouroboros.gateways.claude_code")
-
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    target_root = tmp_path
-    if expected_repo_name:
-        target_root = tmp_path / expected_repo_name
-        target_root.mkdir()
-        subprocess.run(["git", "init", "-q", str(target_root)], check=True)
-
-    class FakeResult:
-        def __init__(self):
-            self.success = True
-            self.result_text = "ok"
-            self.session_id = "sess-1"
-            self.cost_usd = 0.0
-            self.usage = {}
-            self.changed_files = []
-            self.diff_stat = ""
-            self.validation_summary = ""
-            self.error = ""
-
-        def to_tool_output(self):
-            return json.dumps({"success": True})
-
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.setattr(gw, "resolve_claude_code_model", lambda: "opus")
-    monkeypatch.setattr(gw, "run_edit", lambda **kwargs: FakeResult())
-    monkeypatch.setattr(git_mod, "_acquire_git_lock", lambda ctx: object())
-    monkeypatch.setattr(git_mod, "_release_git_lock", lambda lock: None)
-    monkeypatch.setattr(shell_mod, "_load_project_context", lambda repo_dir: "")
-    monkeypatch.setattr(shell_mod, "_get_diff_stat", lambda repo_dir: "")
-    monkeypatch.setattr(shell_mod, "run_cmd", lambda *args, **kwargs: "")
-
-    change_calls = iter([[], ["foo.py"], ["foo.py"]])
-    monkeypatch.setattr(shell_mod, "_get_changed_files", lambda repo_dir: next(change_calls))
-    invalidate_calls = []
-    monkeypatch.setattr(
-        shell_mod,
-        "_invalidate_advisory",
-        lambda ctx, **kwargs: invalidate_calls.append(kwargs),
-    )
-
-    ctx = SimpleNamespace(
-        repo_dir=tmp_path,
-        drive_root=tmp_path,
-        branch_dev="ouroboros",
-        emit_progress_fn=lambda *_: None,
-        pending_events=[],
-    )
-
-    raw = shell_mod._claude_code_edit(ctx, prompt="edit something", cwd=cwd)
-    assert json.loads(raw)["success"] is True
-    assert len(invalidate_calls) == 1
-    mutation_root = invalidate_calls[0]["mutation_root"]
-    assert mutation_root == target_root
-    assert invalidate_calls[0]["source_tool"] == "claude_code_edit"
-    assert invalidate_calls[0]["changed_paths"] == ["foo.py"]
 
 
 # ---------------------------------------------------------------------------
@@ -1018,28 +920,110 @@ class TestLLMFallbackExtraction:
         result = self.mod._llm_extract_advisory_items(raw_text, self._make_ctx())
         assert result == expected
 
-    def test_fallback_window_includes_tail_for_long_inputs(self, monkeypatch):
-        """For inputs longer than head+tail budget, _build_fallback_window must preserve
-        the TAIL (where JSON lives) and show a head excerpt + omission note — not a
-        first-N truncation that would discard the JSON at the end."""
-        head_chars = self.mod._FALLBACK_HEAD_CHARS
-        tail_chars = self.mod._FALLBACK_TAIL_CHARS
+    def test_mid_artifact_critical_survives_the_verdict(self, monkeypatch):
+        """A critical raised in the MIDDLE of a long advisory must reach the verdict.
 
-        # Build a text that is bigger than the combined budget.
-        # Head = 'A' * head_chars, middle filler, tail contains a distinct marker.
-        tail_marker = "TAIL_JSON_MARKER"
-        filler_size = head_chars + tail_chars + 10_000  # clearly over budget
-        preamble = "A" * filler_size
-        raw_text = preamble + tail_marker
+        Extraction used to read a 4K head + 60K tail window: everything between was
+        dropped, so a mid-artifact critical vanished — and because entries may carry
+        `obligation_id`, a surviving advisory row could then close an obligation whose
+        critical had just been cut away. The shared SSOT reads the WHOLE artifact, so
+        either the array is read from it directly or the whole text reaches the
+        extractor — the middle is never cut away before the verdict.
+        """
+        seen = {}
+        expected = [{"item": "bug_hunting", "verdict": "FAIL", "severity": "critical",
+                     "reason": "off-by-one in the mid-artifact path"}]
 
-        window = self.mod._build_fallback_window(raw_text)
+        def fake_chat(_self, **kwargs):
+            seen["prompt"] = kwargs["messages"][0]["content"]
+            return {"content": json.dumps(expected)}, {"cost": 0.0001}
 
-        # Tail marker must be present
-        assert tail_marker in window, "Tail (where JSON lives) must be included in the window"
-        # Omission note must be present for middle-section awareness
-        assert "OMISSION NOTE" in window, "Omission note must mark the skipped middle section"
-        # Window must be shorter than full raw_text
-        assert len(window) < len(raw_text)
+        import ouroboros.llm as llm_mod
+        monkeypatch.setattr(llm_mod.LLMClient, "chat", fake_chat)
+
+        marker = "MID_ARTIFACT_CRITICAL_MARKER"
+        raw_text = ("A" * 80_000) + marker + json.dumps(expected) + ("B" * 80_000)
+        result = self.mod._llm_extract_advisory_items(raw_text, self._make_ctx())
+
+        assert result == expected
+        if "prompt" in seen:  # if a light-model call was needed, it saw everything
+            assert marker in seen["prompt"]
+            assert "OMISSION NOTE" not in seen["prompt"]
+            assert raw_text in seen["prompt"]
+
+    def test_oversize_artifact_refuses_typed_instead_of_guessing(self, monkeypatch):
+        """Beyond the one-send extraction bound the answer is a typed refusal — never
+        a verdict fabricated from whatever part happened to be visible."""
+        calls = []
+
+        def counting_chat(_self, **kwargs):
+            # Counted, NOT raised: an exception here would be swallowed by the
+            # extractor's own guard and the test would pass for the wrong reason.
+            calls.append(kwargs)
+            return {"content": "[]"}, {"cost": 0.0001}
+
+        import ouroboros.llm as llm_mod
+        from ouroboros.review_execution import _EXTRACT_MAX_CHARS
+        monkeypatch.setattr(llm_mod.LLMClient, "chat", counting_chat)
+
+        raw_text = "x" * (_EXTRACT_MAX_CHARS + 1)
+        assert self.mod._llm_extract_advisory_items(raw_text, self._make_ctx()) == []
+        # No windowed read was attempted at all — the refusal is typed, not a guess.
+        assert calls == [], "extraction ran on an artifact over the one-send bound"
+
+    def test_bare_empty_array_from_the_light_model_is_not_a_clean_verdict(self):
+        """TRAP: the canonicalizer legitimately returns "[]" for "no findings here".
+        Cleanliness is judged on the RAW artifact, so moving it onto the canonical
+        text would fabricate a verified-clean verdict out of a failed extraction."""
+        # The light model's "[]" yields no items...
+        assert self.mod._parse_advisory_output("[]") == []
+        # ...and the raw artifact it came from is NOT clean: no NO_FINDINGS sentinel,
+        # no bare-`[]` body — so the run stays parse_failure rather than clean.
+        assert self.mod._is_clean_verdict("I could not complete the review.") is False
+        assert self.mod._is_clean_verdict("blah blah [] blah") is False
+        # The genuine clean shapes still are clean.
+        assert self.mod._is_clean_verdict("[]") is True
+        assert self.mod._is_clean_verdict(json.dumps({"result": "[]\nNO_FINDINGS"})) is True
+
+    def test_delegated_advisory_asks_the_schema_and_discloses_off_pin(self):
+        """The delegated advisory asks for the structured verdict like every other
+        review session, trusts it only on outputConformance == "passed", and emits the
+        same three capability deltas the substrate emits."""
+        from ouroboros.review_execution import REVIEW_SESSION_OUTPUT_SCHEMA
+
+        asked = {}
+
+        def fake_runner(**kwargs):
+            # The delivery knobs now ride ONE immutable invocation value.
+            invocation = kwargs["invocation"]
+            asked.update({f: getattr(invocation, f) for f in
+                          ("task_id", "surface", "slot_id", "output_schema")})
+            return {
+                "text": '[]', "run_id": "run-9", "route_id": "pinned-route",
+                "model": "m", "spend": None, "spend_estimated": False,
+                "settlement": {}, "schema_asked": True, "conformance": "failed",
+                "effective_route_ids": ["other-route"],
+            }
+
+        import ouroboros.review_execution as rx
+        original = rx.run_delegated_review_session
+        rx.run_delegated_review_session = fake_runner
+        try:
+            result, _model = self.mod._run_advisory_delegated(
+                "prompt", pathlib.Path("/tmp"), self._make_ctx(),
+            )
+        finally:
+            rx.run_delegated_review_session = original
+
+        assert asked["output_schema"] == REVIEW_SESSION_OUTPUT_SCHEMA
+        usage = result.usage
+        assert usage["schema_asked"] is True
+        # Reported but NOT conformed => not trusted.
+        assert usage["output_conformance"] == "failed"
+        assert usage["conformance_trusted"] is False
+        reasons = {d["reason"] for d in usage["capability_delta"]}
+        assert reasons == {"schema_not_conformed_on_effective_route",
+                           "session_ran_off_pinned_route"}, reasons
 
     def test_resolve_fallback_model_no_env_uses_config_default(self, monkeypatch):
         """When OUROBOROS_MODEL_LIGHT is unset, the fallback model falls back to Main

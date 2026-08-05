@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+    executorChip,
     formatReviewProjection,
     summarizeChatLiveEvent,
     taskOutcomeSeverity,
@@ -183,4 +184,118 @@ test('review-only subagent projection explicitly has no collapsed activity', () 
     assert.equal(summary.activityPreview, '');
     assert.match(summary.body, /panel_review_only/);
     assert.equal(summary.expandByDefault, true);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 6, owner directive #1: the per-bubble / per-subagent executor chip.
+// «бейдж точно нужен, но не рекламный … что ТУТ бабл \ субагент на codex»
+// ---------------------------------------------------------------------------
+
+test('a delegated frame yields a small harness chip; an ordinary frame yields none', () => {
+    const chip = executorChip({ executor_route: 'codex' });
+    assert.equal(chip.harness, 'codex');
+    assert.equal(chip.label, 'codex');           // short harness name, not a slogan
+    assert.ok(chip.icon);                        // icon, Claudexor-style
+    assert.match(chip.title, /codex/);
+    // WHERE it ran is all the chip can see. It has no access to the run's spend, so
+    // it must not describe the billing: "on your codex subscription" told the owner
+    // the work was covered, which the ledger alone can say (and only when the harness
+    // says it — a zero there may mean unknown pricing, never "free").
+    assert.ok(!/subscription/i.test(chip.title), chip.title);
+    // The opaque `harness=model` spelling prints the HARNESS part only.
+    assert.equal(executorChip({ executor_route: 'codex=gpt-5.6-sol' }).label, 'codex');
+    // An unknown harness still gets a chip (a generic mark), never a crash.
+    assert.equal(executorChip({ executor_route: 'opencode' }).label, 'opencode');
+    // ABSENT FACT -> no chip at all: no placeholder, no "api" noise on every
+    // ordinary bubble (the native path is the unremarkable case).
+    assert.equal(executorChip({}), null);
+    assert.equal(executorChip({ executor_route: '' }), null);
+    assert.equal(executorChip(null), null);
+});
+
+test('the chip is layered truth: decision before evidence, receipt only from evidence', () => {
+    // PRE-COMPLETION: the route is a DISPATCH decision, so the chip states only
+    // that — never "Ran on your ... account", a receipt nothing has issued yet.
+    // The claude harness prints its product name (owner decision: "Claude Code").
+    const dispatched = executorChip({ executor_route: 'claude' });
+    assert.equal(dispatched.label, 'Claude Code');
+    assert.match(dispatched.title, /Dispatched to Claude Code/);
+    assert.match(dispatched.title, /itself runs on the API/);
+    assert.doesNotMatch(dispatched.title, /Ran on your/);
+
+    // EVIDENCE with settled runs: the completion-seam reconciliation proved the
+    // delegation happened, so the chip may finally say so — with the count and
+    // the ledger-derived subscription spend.
+    const delegated = executorChip({
+        executor_route: 'claude',
+        execution_evidence: {
+            delegated_runs_started: 1, delegated_runs_settled: 1,
+            subscription_cost_usd: 0.0, harness_models: ['claude-sonnet'],
+        },
+    });
+    assert.match(delegated.title, /Delegated to your Claude Code account — 1 run\(s\), \$0\.00 subscription/);
+
+    // EVIDENCE with zero runs: the route was assigned and no delegated run left
+    // a durable record — the chip points at the ledger instead of asserting
+    // "ran natively" as a fact (a run started past a failed durable write is
+    // still possible: started_uncustodied).
+    const unused = executorChip({
+        executor_route: 'claude',
+        execution_evidence: {
+            delegated_runs_started: 0, delegated_runs_settled: 0,
+            subscription_cost_usd: null, harness_models: [],
+        },
+    });
+    assert.match(unused.label, /no run recorded/);
+    assert.match(unused.title, /no durable record of a delegated run/);
+    // Zero custody rows prove neither non-execution nor the API path
+    // (started_uncustodied exists) — the title must assert NEITHER.
+    assert.doesNotMatch(unused.title, /natively|ran on the API/);
+
+    // Undisclosed spend never renders as a number.
+    const undisclosed = executorChip({
+        executor_route: 'codex',
+        execution_evidence: {
+            delegated_runs_started: 2, delegated_runs_settled: 2,
+            subscription_cost_usd: null, harness_models: [],
+        },
+    });
+    assert.match(undisclosed.title, /spend undisclosed/);
+    assert.doesNotMatch(undisclosed.title, /\$/);
+
+    // An estimated sum never renders as an exact receipt: the ~ prefix rides.
+    const estimated = executorChip({
+        executor_route: 'codex',
+        execution_evidence: {
+            delegated_runs_started: 1, delegated_runs_settled: 1,
+            subscription_cost_usd: 0.42, subscription_cost_estimated: true,
+            harness_models: [],
+        },
+    });
+    assert.match(estimated.title, /~\$0\.42 subscription/);
+});
+
+test('the chip rides both projections: an ordinary progress bubble and a subagent row', () => {
+    const bubble = summarizeChatLiveEvent({
+        is_progress: true, content: 'working on the thing', task_id: 't1',
+        executor_route: 'codex',
+    });
+    assert.equal(bubble.executorChip.harness, 'codex');
+
+    const subagentRow = summarizeChatLiveEvent({
+        is_progress: true, content: 'child progress',
+        delegation_role: 'subagent', subagent_task_id: 'child-1',
+        subagent_event: 'running', subagent_role: 'implementer',
+        executor_route: 'claude=sonnet-5',
+    });
+    assert.equal(subagentRow.executorChip.harness, 'claude');
+
+    // Neither projection invents a chip when the fact is absent.
+    assert.equal('executorChip' in summarizeChatLiveEvent({
+        is_progress: true, content: 'plain', task_id: 't2',
+    }), false);
+    assert.equal('executorChip' in summarizeChatLiveEvent({
+        is_progress: true, content: 'plain child', delegation_role: 'subagent',
+        subagent_task_id: 'child-2', subagent_event: 'running',
+    }), false);
 });

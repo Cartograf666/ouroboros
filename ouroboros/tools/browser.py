@@ -311,7 +311,10 @@ def _ensure_playwright_installed(*, engine: str = "chromium", allow_install: boo
                 f"Install manually: pip3 install playwright && python3 -m playwright install {engine}"
             )
         log.info("Playwright not found, installing...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
+        from ouroboros.platform_layer import pip_install_target_args
+
+        subprocess.check_call([sys.executable, "-m", "pip", "install",
+                               *pip_install_target_args(sys.executable), "playwright"])
 
     current_browser_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
     if not (current_browser_path and current_browser_path != "0" and not _playwright_browsers_path_managed):
@@ -826,6 +829,12 @@ def _is_owner_settings_self_elevation_post(request: Any) -> bool:
         "ouroboros_post_task_evolution" in body
         or "ouroboros_allow_mutative_subagents" in body
         or "ouroboros_evolution_persistent_objective" in body
+        # v6.88: the delegated-executor POLICY. D1 makes the executor axis the OWNER's,
+        # and this key is the whole of it — which route answers, on whose subscription.
+        # It rides the generic settings path deliberately (the Settings UI sets a route
+        # string often, and a dedicated endpoint would be ceremony for nothing), so it
+        # joins the keys already guarded here rather than getting a mechanism of its own.
+        or "ouroboros_subagent_harness" in body
     )
 
 

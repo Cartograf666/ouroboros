@@ -440,7 +440,7 @@ def test_build_check_prompt_includes_runtime_mode(monkeypatch):
     from ouroboros.safety import _build_check_prompt
 
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
-    prompt = _build_check_prompt("claude_code_edit", {"prompt": "edit"})
+    prompt = _build_check_prompt("run_command", {"command": "ls"})
 
     assert "Runtime mode: pro" in prompt
 

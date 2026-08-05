@@ -159,15 +159,6 @@ def test_room_first_shell_result_carries_cwd_note(tmp_path, monkeypatch):
     assert "project-room cwd" not in out2  # one-shot per task
 
 
-def test_room_claude_code_edit_default_cwd_refused(tmp_path, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    from ouroboros.tools.shell import _claude_code_edit
-
-    ctx, _, _ = _room_ctx(tmp_path)
-    out = _claude_code_edit(ctx, prompt="fix everything")
-    assert "ROOM_WRITE_VIA_TASK" in out
-
-
 # --- affordance map + context fact: stated rule == actual surface ------------------
 
 def test_affordance_map_names_room_dir(tmp_path):

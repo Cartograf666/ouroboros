@@ -23,10 +23,9 @@ from ouroboros.tool_capabilities import (
     FOREGROUND_MUTATIVE_TOOLS,
     REVIEWED_MUTATIVE_TOOLS,
     STATEFUL_BROWSER_TOOLS,
-    TOOL_RESULT_LIMITS as _TOOL_RESULT_LIMITS,
-    DEFAULT_TOOL_RESULT_LIMIT as _DEFAULT_TOOL_RESULT_LIMIT,
     UNTRUNCATED_TOOL_RESULTS as _UNTRUNCATED_TOOL_RESULTS,
     UNTRUNCATED_REPO_READ_PATHS as _UNTRUNCATED_REPO_READ_PATHS,
+    tool_result_limit as _tool_result_limit,
 )
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.tools.review_synthesis import PLAN_REVIEW_CONTROL_PREFIX
@@ -334,7 +333,7 @@ def _truncate_tool_result(
     tool_args: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Cap tool result unless it is an untruncated artifact."""
-    limit = _TOOL_RESULT_LIMITS.get(tool_name, _DEFAULT_TOOL_RESULT_LIMIT)
+    limit = _tool_result_limit(tool_name)
     s = str(result)
     if _should_skip_tool_result_truncation(tool_name, tool_args):
         return s

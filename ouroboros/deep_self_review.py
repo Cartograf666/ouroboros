@@ -12,6 +12,8 @@ log = logging.getLogger(__name__)
 # Pack filtering is shared with scope review.
 from ouroboros.tools.review_context_atlas import (  # noqa: E402
     ReviewContextAtlasRequest,
+    atlas_assembly_failed,
+    atlas_assembly_failure_reason,
     compile_review_context_atlas,
 )
 from ouroboros.tools.review_helpers import (  # noqa: E402
@@ -149,8 +151,9 @@ def _append_omission_section(parts: list[str], skipped: list[str]) -> None:
         "## OMITTED FILES (not included in review pack)",
         "Reasons: sensitive=secrets/keys, vendored/minified=third-party bundled asset, "
         "binary/media=images/fonts/compiled blobs, excluded_dir=non-agent-logic directory, "
-        "excluded_test=wider tests excluded, oversized=>1MB, read_error=unreadable, "
-        "budget_omitted=required atlas file did not fit.",
+        "excluded_test=wider tests excluded, oversized=>1MB, read_error=unreadable. "
+        "(A required atlas file that does not fit never reaches this list: it fails "
+        "the pack instead of shrinking it.)",
         "Full per-file coverage for every tracked path is in the atlas coverage "
         "manifest (persisted to state/deep_self_review_context.json).",
         "",
@@ -294,16 +297,22 @@ def build_review_pack(
         )
 
     atlas = _compile(False)
-    if atlas.status == "budget_exceeded":
+    if atlas_assembly_failed(atlas):
         # Graceful compact retry (mirrors scope review): the durable manifest
         # keeps full per-file coverage while the visible prompt switches to the
         # compact coverage index, freeing manifest tokens for required files.
         atlas = _compile(True)
-    if atlas.status == "budget_exceeded":
+    if atlas_assembly_failed(atlas):
+        # No pack: a review that could not assemble a required artifact does not
+        # run on the remainder (BIBLE P3). The manifest carries the disclosure.
         return "", {
             "file_count": 0,
             "total_chars": 0,
-            "skipped": ["FATAL: generated repository atlas exceeded hard budget even with the compact manifest"],
+            "skipped": [
+                "FATAL: "
+                + atlas_assembly_failure_reason(atlas)
+                + " (even with the compact manifest)"
+            ],
             "context_manifest": atlas.manifest,
         }
     skipped.extend(
@@ -388,12 +397,26 @@ def run_deep_self_review(
                     "❌ Deep self-review unavailable: configure "
                     "OUROBOROS_MODEL_DEEP_SELF_REVIEW and the matching provider API key."
                 ), {}
-        input_limit = calibrated_input_token_limit(
-            model,
-            context_window=_DEEP_MODEL_CONTEXT_WINDOW,
+        # The reviewer's REAL window (Capability Evidence), not the assumed 1M:
+        # the configured deep-review model may be a 200K route, and sizing its
+        # pack for 1M loses the whole review to a prompt-too-long 400.
+        from ouroboros.reviewer_window import (
+            reviewer_context_window,
+            window_scaled_reserves,
+        )
+
+        deep_window = reviewer_context_window(model)
+        deep_output_reserve, deep_margin = window_scaled_reserves(
+            deep_window,
             output_reserve=_DEEP_MAX_OUTPUT_TOKENS,
             tokenizer_margin=_DEEP_OUTPUT_MARGIN_TOKENS,
         )
+        input_limit = max(0, calibrated_input_token_limit(
+            model,
+            context_window=deep_window,
+            output_reserve=deep_output_reserve,
+            tokenizer_margin=deep_margin,
+        ))
 
         emit_progress("Building generated review atlas and memory pack...")
         pack_text, stats = build_review_pack(
@@ -441,7 +464,7 @@ def run_deep_self_review(
                 f"❌ Review pack too large: ~{estimated_tokens:,} tokens "
                 f"({full_prompt_chars:,} chars of system+pack, {stats['file_count']} files). "
                 f"Maximum is ~{input_limit:,} tokens "
-                f"(window minus {_DEEP_MAX_OUTPUT_TOKENS:,} output reserve, "
+                f"({deep_window:,}-token window minus {deep_output_reserve:,} output reserve, "
                 f"calibrated for {model}). "
                 "Reduce codebase size or split review."
             ), {}

@@ -151,13 +151,47 @@ class CapabilityEvidence:
         }
 
 
-def confirms_at_least(evidence: Optional[CapabilityEvidence], threshold: int = ONE_MILLION) -> bool:
-    """True only when KNOWN (confirmed/asserted) evidence meets the threshold.
+def is_known(evidence: Any, *, require_fresh: bool = False) -> bool:
+    """Whether ``evidence`` is a KNOWN (confirmed/asserted) sourced observation.
 
-    unprobeable / failed / None / below-threshold all fail closed."""
+    The SSOT for "does this record count as evidence at all". ``require_fresh``
+    additionally rejects a STALE record — one past its TTL that the probe could not
+    re-verify (an expired cache read on the no-fetch hot path, or a prior record kept
+    across a provider outage). ``probe`` already documents that contract ("a stale or
+    absent record then reads as unknown"); stating it HERE is what keeps every caller
+    from restating it, or forgetting to.
+
+    Accepts any evidence-shaped record (``status`` / ``window_tokens`` / ``stale``),
+    so a surface that carries the same fields — e.g. ``reviewer_window.ReviewerWindow``
+    — reuses this predicate instead of re-deriving it."""
     if evidence is None:
         return False
-    return evidence.status in _KNOWN_STATUS and int(evidence.window_tokens or 0) >= int(threshold)
+    return (
+        str(getattr(evidence, "status", "") or "") in _KNOWN_STATUS
+        and int(getattr(evidence, "window_tokens", 0) or 0) > 0
+        and not (require_fresh and bool(getattr(evidence, "stale", False)))
+    )
+
+
+def confirms_at_least(
+    evidence: Any, threshold: int = ONE_MILLION, *, require_fresh: bool = False,
+) -> bool:
+    """True only when KNOWN evidence meets the threshold.
+
+    unprobeable / failed / None / below-threshold all fail closed.
+
+    ``require_fresh`` picks the caller's freshness policy EXPLICITLY, because the two
+    directions carry opposite risk and the choice must be visible at the call site:
+
+    * a gate that AUTHORIZES on the evidence (blocking scope-review authority, BIBLE
+      P3) passes ``require_fresh=True`` — an expired or outage-carried window is a
+      dated impression, not the sourced Capability Evidence the floor turns on;
+    * a gate that would DOWNGRADE the owner's own cognitive horizon on a provider blip
+      keeps the default ``False`` — this module's standing invariant is that an outage
+      must never erase a prior confirmed record (P4/P1)."""
+    return is_known(evidence, require_fresh=require_fresh) and (
+        int(getattr(evidence, "window_tokens", 0) or 0) >= int(threshold)
+    )
 
 
 # --- Route fingerprint ---------------------------------------------------------

@@ -106,6 +106,16 @@
  * @property {string=} model_lane
  * @property {string=} requested_model_lane
  * @property {string=} effective_model_lane
+ * @property {string=} executor_route
+ *   Phase 6: the OPAQUE harness route RESOLVED AT DISPATCH for this bubble /
+ *   subagent (delegated routes only) — the route it was sent to, not a receipt
+ *   from the engine saying where it landed. Absent/empty = the ordinary native
+ *   path; no chip is drawn.
+ * @property {Object=} execution_evidence
+ *   The completion-seam EVIDENCE the route decision is reconciled against:
+ *   {delegated_runs_started, delegated_runs_settled, subscription_cost_usd,
+ *   harness_models}. Terminal frames only; absent = "no evidence yet",
+ *   never "ran natively".
  * @property {string=} model
  * @property {string=} task_group_id
  * @property {string=} task_event
@@ -122,6 +132,10 @@
  * @property {?number=} reserved_usd
  * @property {?number=} unresolved_upper_bound_usd
  * @property {?number=} unknown_unmetered
+ * @property {?number=} non_final_rows
+ *   v6.87.48: the count of OPEN ledger rows — the disclosed cause of `cost_final: false`,
+ *   which can hold with every dollar bucket at zero (an estimated $0.00, or a dispatched
+ *   row whose reservation is exactly zero).
  * @property {string=} result
  * @property {boolean=} result_truncated
  * @property {string=} trace_summary
@@ -578,4 +592,4 @@
  * @property {?boolean} check_ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.88.0';
+export const GATEWAY_CONTRACT_VERSION = '6.89.0';

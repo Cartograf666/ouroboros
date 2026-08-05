@@ -127,6 +127,14 @@ def _provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
             "memory sooner — without changing the model or reasoning effort."
         )
     kind = str(accumulated_usage.get("_last_llm_error_kind") or "").strip()
+    if kind == "subscription_window_exhausted":
+        reset_at = str(accumulated_usage.get("_last_llm_reset_at") or "").strip()
+        when = f" It resets at {reset_at}." if reset_at else ""
+        return (
+            " The subscription window for the delegated route is spent. This is "
+            f"TRANSIENT, not a billing refusal — waiting cures it.{when} Retrying is "
+            "scheduled against that reset time, not the ordinary short backoff."
+        )
     if kind in {"quota_exhausted", "auth_error", "request_too_large", "bad_request", "context_overflow"}:
         guidance = {
             "quota_exhausted": "The provider rejected the request for quota/billing reasons; retrying the same request will not help until the key/account limit changes.",
@@ -167,7 +175,7 @@ def _skill_names_touched_by_trace(llm_trace: Dict[str, Any]) -> List[str]:
         if not isinstance(call, dict):
             continue
         tool = str(call.get("tool") or "")
-        if tool not in {"write_file", "edit_text", "claude_code_edit"}:
+        if tool not in {"write_file", "edit_text"}:
             continue
         args = call.get("args") if isinstance(call.get("args"), dict) else {}
         bucket = str(args.get("bucket") or "").strip().lower()
@@ -176,7 +184,7 @@ def _skill_names_touched_by_trace(llm_trace: Dict[str, Any]) -> List[str]:
             if skill_name not in names:
                 names.append(skill_name)
             continue
-        candidates = [str(args.get("cwd") or "")] if tool == "claude_code_edit" else [str(args.get("path") or "")]
+        candidates = [str(args.get("path") or "")]
         for raw in candidates:
             norm = raw.replace("\\", "/").strip().lstrip("/")
             if norm.startswith("data/"):
@@ -4951,19 +4959,14 @@ def _maybe_downgrade_max_unconfirmed(mode: str, use_local: bool, model: str = ""
     if mode != "max":
         return mode
     try:
-        from ouroboros.capability_evidence import ONE_MILLION
+        from ouroboros.capability_evidence import ONE_MILLION, is_known
         from ouroboros.context import _context_fit_route
 
         _route, evidence = _context_fit_route(
             {"model": model, "use_local_model": use_local},
             allow_fetch=allow_fetch,
         )
-        known = (
-            str(getattr(evidence, "status", "")) in {"confirmed", "asserted"}
-            and not bool(getattr(evidence, "stale", False))
-            and int(getattr(evidence, "window_tokens", 0) or 0) > 0
-        )
-        if known and int(evidence.window_tokens or 0) < ONE_MILLION:
+        if is_known(evidence, require_fresh=True) and int(evidence.window_tokens or 0) < ONE_MILLION:
             log.info(
                 "Exact route evidence reports a sub-1M context window "
                 "(%s tokens, use_local=%s); using the task-local Low projection.",
@@ -5013,6 +5016,7 @@ def _rebind_context_fit_plan(
         raise RuntimeError(
             "CONTEXT_FIT_REBUILD_FAILED: immutable context core is unavailable for route switch"
         )
+    from ouroboros.capability_evidence import is_known
     from ouroboros.context import _context_fit_route
     from ouroboros.context_fit import _failed_route_evidence, _route_calibration_ratio
 
@@ -5035,11 +5039,7 @@ def _rebind_context_fit_plan(
         str(getattr(evidence, "route_fp", "") or ""),
         str(route.get("model") or model),
     )
-    known_window = (
-        str(getattr(evidence, "status", "") or "") in {"confirmed", "asserted"}
-        and not bool(getattr(evidence, "stale", False))
-        and int(getattr(evidence, "window_tokens", 0) or 0) > 0
-    )
+    known_window = is_known(evidence, require_fresh=True)
     window_tokens = int(getattr(evidence, "window_tokens", 0) or 0)
 
     def project(projection: Any) -> Any:
@@ -5066,8 +5066,8 @@ def _rebind_context_fit_plan(
         model=str(route.get("model") or model),
         provider=str(route.get("provider") or ""),
         route_fp=str(getattr(evidence, "route_fp", "") or ""),
-        evidence_status=str(getattr(evidence, "status", "") or ""),
-        evidence_stale=bool(getattr(evidence, "stale", False)),
+        status=str(getattr(evidence, "status", "") or ""),
+        stale=bool(getattr(evidence, "stale", False)),
         window_tokens=window_tokens,
         max_projection=max_projection,
         low_projection=low_projection,
@@ -5097,7 +5097,7 @@ def _rebind_context_fit_plan(
                 "core_sha256": rebound.core_sha256,
                 "preferred_mode": preferred,
                 "effective_mode": mode,
-                "evidence_status": rebound.evidence_status,
+                "evidence_status": rebound.status,
                 "window_tokens": rebound.window_tokens,
                 "projected_prompt_tokens": projected_prompt_tokens,
             },
@@ -5659,6 +5659,16 @@ def _cleanup_loop_resources(
     ctx.tools._ctx._delivery_control_required = False
     if ctx.drive_root is None or not ctx.task_id:
         return
+    try:
+        from ouroboros.delegate_custody import custody_root, release_task_runs
+
+        # A delegated run is a resource this task HOLDS, like a service or an executor:
+        # a terminalized parent that leaves one running has a mutating process nothing
+        # is watching. The durable reconciler still covers a worker that dies before
+        # reaching here; this is the ordinary path.
+        release_task_runs(custody_root(ctx.tools._ctx), ctx.task_id)
+    except Exception:
+        log.debug("Failed to release delegated runs for task %s", ctx.task_id, exc_info=True)
     try:
         from ouroboros.owner_mailbox import cleanup_task_mailbox
 

@@ -120,7 +120,9 @@ def test_search_code_has_result_limit():
     for _handoff_tool in ("wait_task", "wait_tasks", "get_task_result"):
         assert _handoff_tool in UNTRUNCATED_TOOL_RESULTS
     from ouroboros.tool_capabilities import FOREGROUND_MUTATIVE_TOOLS
-    assert "claude_code_edit" in FOREGROUND_MUTATIVE_TOOLS
+    # D10 retired claude_code_edit — the only foreground-mutative tool. The
+    # CLASS stays wired (an empty set) so a successor lands as one entry.
+    assert FOREGROUND_MUTATIVE_TOOLS == frozenset()
 
 
 def test_extract_video_frames_visible_where_media_siblings_are_visible():
@@ -560,12 +562,17 @@ def test_local_readonly_subagent_execute_blocks_forbidden_tools(tmp_path, monkey
     assert registry.get_schema_by_name("write_file") is None
     assert registry.get_schema_by_name("enable_tools") is None
     assert registry.get_schema_by_name("schedule_subagent") is not None
+    # switch_model changes COGNITIVE POWER, not authority: a child that started cheap and
+    # found the work harder raises its own strength, and nothing about its sandbox moves.
+    # It was on the blocked list until v6.87.7 purely because power and authority were
+    # conflated; a read-only child stays read-only at any model.
+    assert registry.get_schema_by_name("switch_model") is not None
+    assert "LOCAL_READONLY_SUBAGENT_BLOCKED" not in registry.execute("switch_model", {})
     monkeypatch.setattr(mcp_client, "ensure_configured_from_settings", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("MCP touched")))
     assert "LOCAL_READONLY_SUBAGENT_BLOCKED" not in registry.execute("list_files", {"path": "."})
     blocked_tools = [
         "write_file",
         "edit_text",
-        "claude_code_edit",
         "knowledge_write",
         "update_scratchpad",
         "update_identity",
@@ -574,7 +581,6 @@ def test_local_readonly_subagent_execute_blocks_forbidden_tools(tmp_path, monkey
         "task_acceptance_review",
         "skill_review",
         "request_restart",
-        "switch_model",
         "enable_tools",
         "run_command",
         "skill_exec",

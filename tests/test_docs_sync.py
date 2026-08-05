@@ -136,3 +136,37 @@ def test_phase3_widget_authoring_docs_match_recursive_schema_v1():
     assert "stable tree path" in authoring
     assert "transitively passive" in authoring_flat
     assert "dynamic_ui_schema" in authoring
+
+
+def test_architecture_mirror_matches_the_split_axes_contracts():
+    """XG-2.2/XG-2.3 (v6.87.28 review gate): the P6 mirror tracks schedule-vs-dispatch.
+
+    Every pin here failed on the pre-fix docs: the module map claimed
+    `swarm_efficiency.lanes_used` while `_build_swarm_efficiency` emits
+    `lanes_requested`; `subagents.py` was said to own task-group compaction after
+    `compact_task_group` was deleted; the control map said `schedule_subagent`
+    surfaces effective lane(s) after `_finalize_schedule_emission` went
+    request-only; the `swarm_fanout` enumeration promised requested/effective
+    lanes after `_emit_swarm_fanout` dropped `effective_model_lanes`; and both
+    `wait_tasks` field enumerations omitted the emitted `capability_delta`.
+    """
+    arch = _read("docs/ARCHITECTURE.md")
+    development = _read("docs/DEVELOPMENT.md")
+    arch_flat = " ".join(arch.split())
+    dev_flat = " ".join(development.split())
+
+    # swarm_efficiency reports the REQUEST: lanes_requested, never lanes_used.
+    assert "lanes_requested" in arch
+    assert "lanes_used" not in arch
+    # Task-group compaction left with the degenerate lane fan-out (v6.87.28).
+    assert "task-group compaction" not in arch
+    assert "compact_task_group" not in arch
+    # schedule_subagent reports the request only; the axes resolve at dispatch.
+    assert "schedule_subagent surfaces effective_lane(s)" not in arch_flat
+    assert "schedule_subagent reports the requested lane only" in arch_flat
+    # swarm_fanout carries the requested lane; a wave event written before any
+    # child starts cannot know what the children ran on.
+    assert "requested/effective lanes" not in arch
+    # Both wait_tasks projection enumerations disclose capability_delta.
+    assert "trace_summary, capability_delta when the child has something to disclose" in arch_flat
+    assert "trace_summary, capability_delta when disclosable, duplicate_of" in dev_flat

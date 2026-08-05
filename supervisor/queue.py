@@ -157,6 +157,8 @@ from supervisor.task_reaper import (  # noqa: E402,F401 — re-exported for enfo
     ensure_reaper_started as _ensure_reaper_started,
     reap_queue as _reap_queue,
     reap_timed_out_task as _reap_timed_out_task,
+    request_finalization_grace as _request_finalization_grace,
+    resolve_grace_episode_for_spared_task as _resolve_grace_episode_for_spared_task,
 )
 
 
@@ -728,11 +730,17 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 "project_id": t.get("project_id"),
                 "allowed_resources": t.get("allowed_resources"), "deadline_at": t.get("deadline_at"),
                 "task_contract": t.get("task_contract"),
-                "model_lane": t.get("model_lane"),
+                # Scheduling INTENT survives a restart and is all a PENDING child has;
+                # `parent_model_lane` above all, because an omitted lane inherits it and
+                # only the parent knew it. The derived half rides along for a RUNNING row.
+                "model_lane": t.get("model_lane"), "parent_model_lane": t.get("parent_model_lane"),
                 "requested_model_lane": t.get("requested_model_lane"),
+                "requested_executor": t.get("requested_executor"),
                 "effective_model_lane": t.get("effective_model_lane"),
-                "model": t.get("model"),
-                "use_local_model": t.get("use_local_model"),
+                "model": t.get("model"), "use_local_model": t.get("use_local_model"),
+                "effective_executor": t.get("effective_executor"), "tool_profile": t.get("tool_profile"),
+                "executor_route": t.get("executor_route"), "reasoning_effort": t.get("reasoning_effort"),
+                "capability_delta": t.get("capability_delta"),
                 "task_group_id": t.get("task_group_id"),
                 "task_group": t.get("task_group"),
                 "subagent_envelope": t.get("subagent_envelope"),
@@ -808,7 +816,10 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
             return 0
         if (time.time() - ts_unix) > max_age_sec:
             return 0
-        from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED, load_task_result
+        from ouroboros.task_results import (
+            _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED, STATUS_CANCELLED,
+            load_task_result, write_task_result,
+        )
         raw_fences = snap.get("acceptance_fences", [])
         raw_budget_fences = snap.get("budget_root_fences", [])
         snapshot_pending = [
@@ -836,8 +847,6 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                 },
             )
             try:
-                from ouroboros.task_results import STATUS_CANCELLED, write_task_result
-
                 for task in snapshot_pending:
                     task_id = str(task.get("id") or "")
                     if task_id:
@@ -889,8 +898,6 @@ def restore_pending_from_snapshot(max_age_sec: int = 900) -> int:
                 task_id = str(task.get("id") or "")
                 skipped_fenced.append(task_id)
                 try:
-                    from ouroboros.task_results import STATUS_CANCELLED, write_task_result
-
                     existing = load_task_result(DRIVE_ROOT, task_id) or {}
                     write_task_result(
                         DRIVE_ROOT,
@@ -1225,11 +1232,12 @@ def _enforce_task_timeouts_locked(
         last_progress_at = float(meta.get("last_progress_at") or started_at)
         idle_sec = max(0.0, now - last_progress_at)
         subtree_progressing = _subtree_progressing(task_id, now, idle_timeout)
+        own_progress = idle_sec < idle_timeout
         # Keep an orchestrator alive while it (a) makes own progress, (b) has a freshly
         # progressing RUNNING descendant, OR (c) has a QUEUED descendant still waiting for a
         # worker — killing it then would orphan the queued subtree. Only the abs ceiling /
         # explicit deadline / budget are unconditional.
-        progressing = idle_sec < idle_timeout or subtree_progressing or _has_pending_descendant(task_id)
+        progressing = own_progress or subtree_progressing or _has_pending_descendant(task_id)
         ceiling_reached = runtime_sec >= abs_ceiling
 
         # Hard axes (deadline_at, abs ceiling) stop the task regardless of activity; the
@@ -1237,6 +1245,17 @@ def _enforce_task_timeouts_locked(
         # progressing. This honors an explicit/caller deadline promptly while never letting
         # the removed blanket wall-clock kill a productively-waiting orchestrator.
         if not ceiling_reached and not deadline_reached and progressing:
+            # An outstanding episode outlives this reprieve or is withdrawn by it; the
+            # rule (own progress answers the request, sparing only suspends its clock)
+            # lives with the rest of the episode mechanics in task_reaper. The latch is
+            # checked here so the drive resolution (which may read the result record)
+            # stays off the no-episode path.
+            if meta.get("finalization_requested_at") and _resolve_grace_episode_for_spared_task(
+                _task_drive_for_task(task, str(task_id)), str(task_id), meta,
+                chat_id=int(task.get("chat_id") or owner_chat_id or 0),
+                own_progress=own_progress, now=now,
+            ):
+                RUNNING[task_id] = meta
             continue
 
         if ceiling_reached:
@@ -1249,35 +1268,15 @@ def _enforce_task_timeouts_locked(
         if finalization_requested_at <= 0 and FINALIZATION_GRACE_SEC > 0:
             meta["finalization_requested_at"] = now
             meta["finalization_reason"] = terminal_reason
+            # The control's msg_id IS the episode's identity: it is what the
+            # symmetric withdraw revokes, so the latch and the mailbox control
+            # can never name different episodes.
+            meta["finalization_control_msg_id"] = _request_finalization_grace(
+                _task_drive_for_task(task, str(task_id)), str(task_id), terminal_reason,
+                chat_id=int(task.get("chat_id") or owner_chat_id or 0),
+                stamp=int(now),
+            )
             RUNNING[task_id] = meta
-            # Typed finalize_now control -> cooperative tool-less final answer
-            # inside the grace window. Written to the task's ACTIVE drive (the
-            # one the loop drains; child drive for forked/workspace tasks).
-            try:
-                from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, write_owner_message
-                write_owner_message(_task_drive_for_task(task, str(task_id)), terminal_reason, str(task_id), kind=KIND_FINALIZE_NOW)
-            except Exception:
-                log.debug("Failed to write finalize_now control for %s", task_id, exc_info=True)
-            try:
-                from supervisor import workers as _workers_mod
-                _workers_mod.get_event_q().put({
-                    "type": "send_message",
-                    "chat_id": int(task.get("chat_id") or owner_chat_id or 0),
-                    "text": (
-                        f"⏳ Task {task_id} reached {terminal_reason}. "
-                        "Finalize artifacts/results now; supervisor will stop the task after the grace window."
-                    ),
-                    "format": "markdown",
-                    "is_progress": True,
-                    "task_id": str(task_id),
-                    "progress_meta": {
-                        "task_incident": terminal_reason,
-                        "toast_once": f"{task_id}:{terminal_reason}:{int(finalization_requested_at or now)}",
-                    },
-                    "ts": utc_now_iso(),
-                })
-            except Exception:
-                log.debug("Failed to emit finalization grace warning for %s", task_id, exc_info=True)
             continue
         if finalization_requested_at > 0 and now - finalization_requested_at < FINALIZATION_GRACE_SEC:
             continue
@@ -1356,8 +1355,6 @@ def _enforce_task_timeouts_locked(
         persist_queue_snapshot(reason="task_timeout_reap_queued")
 
 
-
-
 def queue_deep_self_review_task(reason: str, model: str = "", force: bool = False, chat_id: Optional[int] = None) -> Optional[str]:
     """Queue a deep self-review task.
 
@@ -1365,8 +1362,7 @@ def queue_deep_self_review_task(reason: str, model: str = "", force: bool = Fals
     ``/review``) so the queued ack and the task results return to the requester
     instead of always defaulting to the web owner's ``owner_chat_id``.
     """
-    st = load_state()
-    target_chat_id = chat_id if chat_id else st.get("owner_chat_id")
+    target_chat_id = chat_id if chat_id else load_state().get("owner_chat_id")
     if not target_chat_id:
         return None
     if (not force) and queue_has_task_type("deep_self_review"):
@@ -1581,8 +1577,6 @@ def enqueue_evolution_task_if_needed() -> None:
             "🧬 Evolution stayed off: the campaign changed before its next task could be attached. Start it again when ready.",
         )
         return
-    from ouroboros.contracts.task_contract import attach_task_contract
-
     task = {
         "id": tid, "type": "evolution",
         "chat_id": int(owner_chat_id),

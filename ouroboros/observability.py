@@ -509,6 +509,83 @@ def latest_llm_response_text(drive_root: pathlib.Path, task_id: str) -> str:
     return ""
 
 
+SALVAGED_OUTPUT_NOTE_LIMIT = 4000
+SALVAGED_OUTPUT_DIR = "salvaged"
+
+
+def preserve_salvaged_output(preserve_root: pathlib.Path, task_id: str, text: str) -> str:
+    """Write the FULL salvaged text durably under ``preserve_root``; return its path.
+
+    The observability root is the drive's durable forensic area
+    (``prune_observability_blobs`` deliberately never deletes it), so a copy
+    landed here survives the child-drive removal that follows a cancel/timeout
+    publication. Returns "" when nothing could be written.
+    """
+    safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task_id or "")).strip("_")
+    if not safe_task or not str(text or ""):
+        return ""
+    path = _observability_root(pathlib.Path(preserve_root)) / SALVAGED_OUTPUT_DIR / f"{safe_task}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _chmod_private_dir(path.parent)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+    try:
+        tmp.write_text(str(text), encoding="utf-8")
+        _chmod_private(tmp)
+        os.replace(tmp, path)
+        _chmod_private(path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return str(path)
+
+
+def salvaged_output_note(
+    drive_root: pathlib.Path,
+    task_id: str,
+    *,
+    preserve_root: pathlib.Path | None = None,
+) -> str:
+    """Terminal-result suffix carrying the last persisted assistant text, or "".
+
+    SSOT for every supervisor path that ends a task the task did not end itself
+    (timeout kill, owner/agent cancellation). Those paths also DELETE the drive
+    the text lives on, so a path that skips the salvage does not merely omit
+    progress — it destroys the only copy (BIBLE P1). Keeping the note in one
+    place is what makes "did this terminal path rescue the partial result?" a
+    single answerable question instead of a per-call-site habit.
+
+    The note itself is a bounded preview, but a truncated preview of a copy the
+    caller is about to delete is not a rescue: when the preview loses content,
+    the full text is preserved under ``preserve_root`` (the CANONICAL drive,
+    which outlives the child drive) and the note points at that copy. If no
+    durable copy can be made, the note carries the whole text — the terminal
+    result is then the only copy there is, and it must be complete.
+    """
+    from ouroboros.utils import truncate_review_artifact
+
+    try:
+        salvaged = latest_llm_response_text(pathlib.Path(drive_root), str(task_id))
+    except Exception:
+        return ""
+    if not salvaged:
+        return ""
+    preview = truncate_review_artifact(salvaged, SALVAGED_OUTPUT_NOTE_LIMIT)
+    if preview == salvaged:
+        return "\n\nLast agent output (salvaged best-effort, unreviewed):\n" + salvaged
+    if preserve_root is not None:
+        try:
+            full_path = preserve_salvaged_output(pathlib.Path(preserve_root), str(task_id), salvaged)
+        except Exception:
+            full_path = ""
+        if full_path:
+            return ("\n\nLast agent output (salvaged best-effort, unreviewed; "
+                    f"full copy preserved at {full_path}):\n" + preview)
+    return "\n\nLast agent output (salvaged best-effort, unreviewed):\n" + salvaged
+
+
 def prune_observability_blobs(
     drive_root: pathlib.Path,
     retention_days: int | None = None,

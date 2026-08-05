@@ -40,6 +40,12 @@ def test_contributor_trust_boundary_covers_functional_review_dependencies():
         "ouroboros/outcomes.py",
         "ouroboros/platform_layer.py",
         "ouroboros/pricing.py",
+        # The v6.87.21 seam split moved route vocabulary, transport dispatch and
+        # api_chat prompt rendering BELOW the substrate into review_execution.py;
+        # a PR editing the route/executor seam there must still trip a trusted
+        # rerun, exactly as one editing review_substrate.py does (XG-5R4.1).
+        "ouroboros/review_execution.py",
+        "ouroboros/review_substrate.py",
         "ouroboros/review_state.py",
         "ouroboros/runtime_mode_policy.py",
         "ouroboros/usage_accounting.py",
@@ -252,6 +258,7 @@ def test_contributor_snapshot_rejects_version_bump(tmp_path, monkeypatch):
     "relative_path",
     [
         "ouroboros/review_substrate.py",
+        "ouroboros/review_execution.py",
         "ouroboros/utils.py",
         "ouroboros/tools/registry.py",
     ],

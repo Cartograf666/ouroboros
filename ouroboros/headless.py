@@ -417,15 +417,9 @@ def copy_child_task_result(parent_drive_root: pathlib.Path, task: Dict[str, Any]
     child_result = load_task_result(child_drive, task_id)
     if not isinstance(child_result, dict):
         return None
-    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
-    task_constraint = task.get("task_constraint") if isinstance(task.get("task_constraint"), dict) else {}
-    if not task_constraint and isinstance(metadata.get("task_constraint"), dict):
-        task_constraint = metadata.get("task_constraint") or {}
-    readonly_subagent = (
-        str(task.get("delegation_role") or metadata.get("delegation_role") or "") == "subagent"
-        and str(task_constraint.get("mode") or "") == _LOCAL_READONLY_SUBAGENT_MODE
+    workspace_task = (
+        _workspace_root_from_task(task) is not None and not task_is_readonly_subagent(task)
     )
-    workspace_task = _workspace_root_from_task(task) is not None and not readonly_subagent
     child_status = str(child_result.get("status") or "completed")
     existing = canonical_existing if workspace_task and child_status in _FINAL_STATUSES else {}
     existing_artifact_status = str((existing or {}).get("artifact_status") or "").strip().lower()
@@ -749,12 +743,8 @@ def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any
         }
         if artifact_error:
             fields["artifact_error"] = artifact_error
-        provisional = {
-            **existing,
-            **fields,
-            "artifacts": merged,
-            "artifact_status": fields.get("artifact_status", existing.get("artifact_status")),
-        }
+        # ``fields`` already carries "artifacts" and "artifact_status".
+        provisional = {**existing, **fields}
         provisional.pop("artifact_bundle", None)
         try:
             from ouroboros.outcomes import artifact_bundle_from_result, refresh_verification_ledger_artifacts
@@ -1139,32 +1129,8 @@ def _git_stdout(
     allow_rc: Iterable[int] = (0,),
     errors: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    try:
-        result = subprocess.run(
-            list(cmd),
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        if errors is not None:
-            errors.append({"type": "git_timeout", "command": list(cmd), "message": "git command timed out"})
-        return ""
-    except Exception as exc:
-        if errors is not None:
-            errors.append({"type": "git_exception", "command": list(cmd), "message": f"{type(exc).__name__}: {exc}"})
-        return ""
-    if result.returncode not in set(allow_rc):
-        if errors is not None:
-            errors.append({
-                "type": "git_error",
-                "command": list(cmd),
-                "returncode": result.returncode,
-                "stderr": (result.stderr or "")[-2000:],
-            })
-        return ""
-    return result.stdout or ""
+    """Text projection of ``_git_bytes`` (same rc/timeout/error handling)."""
+    return _git_bytes(cmd, cwd, allow_rc=allow_rc, errors=errors).decode("utf-8", errors="replace")
 
 
 def _workspace_patch_base(

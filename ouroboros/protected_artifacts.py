@@ -15,7 +15,7 @@ from ouroboros.shell_parse import (
     unwrap_env_argv,
 )
 from ouroboros.tool_access import resolve_shell_cwd
-from ouroboros.tools.shell_guards import writer_target_tokens
+from ouroboros.tools.shell_guards import interpreter_family, writer_target_tokens
 from ouroboros.workspace_executor import executor_ref_from_ctx, map_backend_path, map_host_path
 
 _DEFAULT_DENIED_OPERATIONS = frozenset({
@@ -469,20 +469,13 @@ def _uses_powershell_encoded_command(argv: list[str], shell_name: str) -> bool:
     return any(str(arg or "").strip().lower() in _POWERSHELL_ENCODED_SWITCHES for arg in argv[1:])
 
 
-def _looks_like_versioned_python_interpreter(name: str) -> bool:
-    for prefix in ("python", "pypy"):
-        suffix = name.removeprefix(prefix)
-        if suffix == name or not suffix:
-            continue
-        suffix = suffix.removesuffix("m")
-        parts = suffix.split(".")
-        if parts and all(part.isdigit() for part in parts):
-            return True
-    return False
-
-
 def _is_high_risk_interpreter(name: str) -> bool:
-    return name in _HIGH_RISK_INTERPRETERS or _looks_like_versioned_python_interpreter(name)
+    # Versioned spellings classify through the ONE structural family classifier
+    # (shell_guards.interpreter_family). The local recognizer this replaces knew
+    # only versioned pythons (python3.11, pypy3.9m), so ruby3.2 / php8.3 /
+    # perl5.38 / node18 slipped this guard exactly as they slipped the write
+    # fences (XG-2R.2). The set keeps the shells, which are not a family.
+    return name in _HIGH_RISK_INTERPRETERS or bool(interpreter_family(name))
 
 
 _INTERPRETER_INLINE_CODE_FLAGS = frozenset({"-c", "-e", "-E", "-r", "--command"})

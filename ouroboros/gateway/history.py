@@ -33,6 +33,11 @@ _ACCOUNTING_SUMMARY_FIELDS = (
     "accounted_usd",
     "unknown_unmetered",
     "cost_final",
+    # `cost_final`'s DISCLOSED CAUSE travels with the flag it explains — without it
+    # the client's "Pending (N open)" text could never render (costs.js reads
+    # `accounting.non_final_rows`), so the reason for a non-final cost never
+    # reached the owner at all.
+    "non_final_rows",
     "attempt_counts",
 )
 
@@ -67,6 +72,12 @@ _PROGRESS_META_FIELDS = (
     "requested_model_lane",
     "effective_model_lane",
     "model",
+    # Phase 6: the resolved delegated route (a harness id), so a replayed
+    # bubble keeps its executor chip instead of losing it on reload.
+    "executor_route",
+    # The completion-seam evidence block (delegated runs started/settled,
+    # subscription spend, harness models) — the chip's layered truth on replay.
+    "execution_evidence",
     "task_group_id",
 )
 

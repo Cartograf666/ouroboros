@@ -835,6 +835,32 @@ def embedded_python_candidates(base_dir: pathlib.Path) -> List[pathlib.Path]:
     ]
 
 
+EMBEDDED_PYTHON_DIR_NAME = "python-standalone"
+
+
+def interpreter_is_embedded(interpreter: str) -> bool:
+    """True when ``interpreter`` is the packaged ``python-standalone`` runtime."""
+    try:
+        return EMBEDDED_PYTHON_DIR_NAME in pathlib.Path(interpreter).resolve().parts
+    except (OSError, ValueError):
+        return False
+
+
+def pip_install_target_args(interpreter: str) -> List[str]:
+    """Extra pip flags so an install never writes INSIDE the packaged bundle.
+
+    The embedded interpreter lives in the signed bundle, so its own
+    ``site-packages`` is the wrong install target: writing there breaks the code
+    signature and fails outright on a read-only install. ``--user`` redirects to
+    the user site under ``PYTHONUSERBASE`` (set by
+    ``launcher_bootstrap.embedded_python_env`` for every process that runs the
+    embedded interpreter). A non-embedded interpreter — a dev venv, a system
+    python — gets NO flag: ``--user`` is refused inside a virtualenv, so a blanket
+    flag would trade one broken install for another.
+    """
+    return ["--user"] if interpreter_is_embedded(interpreter) else []
+
+
 def project_venv_python(project_root: pathlib.Path) -> str:
     """Return the executable for a valid project ``.venv`` on this platform.
 
@@ -872,15 +898,37 @@ def embedded_ripgrep_candidates(base_dir: pathlib.Path) -> List[pathlib.Path]:
     return [base_dir / "ripgrep-standalone" / "bin" / "rg"]
 
 
-def _resolve_bundled(candidates_for: Callable[[pathlib.Path], List[pathlib.Path]]) -> Optional[str]:
-    """First existing path from ``candidates_for(base)`` over the frozen and source roots."""
+BUNDLE_DIR_ENV = "OUROBOROS_BUNDLE_DIR"
+
+
+def bundled_resource_bases() -> List[pathlib.Path]:
+    """Roots to search for a resource shipped INSIDE the packaged bundle.
+
+    SSOT for every bundled-payload lookup, because the process that consumes a
+    bundled payload is usually NOT the frozen launcher. In a packaged install the
+    launcher runs the server/CLI as a SEPARATE child of the embedded interpreter,
+    out of the launcher-managed repo under the data dir: that child has no
+    ``sys._MEIPASS`` and its ``__file__`` parent is the managed repo, so both
+    historical bases miss and every bundled payload silently reads as absent.
+    The launcher therefore hands the bundle root down by value in
+    ``OUROBOROS_BUNDLE_DIR`` and it is searched FIRST. The other two bases stay
+    for the frozen process itself and for the dev/source layout (payloads sit at
+    the repo root, two levels up from this module).
+    """
     bases: List[pathlib.Path] = []
+    env_base = str(os.environ.get(BUNDLE_DIR_ENV) or "").strip()
+    if env_base:
+        bases.append(pathlib.Path(env_base))
     frozen_base = getattr(sys, "_MEIPASS", None)
     if frozen_base:
         bases.append(pathlib.Path(frozen_base))
-    # Dev/source layout: the standalone dirs sit at the repo root, two levels up.
     bases.append(pathlib.Path(__file__).resolve().parent.parent)
-    for base in bases:
+    return bases
+
+
+def _resolve_bundled_payload(candidates_for: Callable[[pathlib.Path], List[pathlib.Path]]) -> Optional[str]:
+    """First existing candidate across the bundle bases, or None."""
+    for base in bundled_resource_bases():
         for candidate in candidates_for(base):
             try:
                 if candidate.is_file():
@@ -893,16 +941,17 @@ def _resolve_bundled(candidates_for: Callable[[pathlib.Path], List[pathlib.Path]
 def resolve_bundled_node() -> Optional[str]:
     """Return the path to the bundled, signed Node.js runtime if present.
 
-    The packaged app ships an official notarized node under ``node-standalone``, preferred
-    over a PATH (e.g. Homebrew) node that macOS code-signing enforcement can SIGKILL when
-    launched from the packaged process tree.
+    The packaged app ships an official notarized node under ``node-standalone``
+    (re-signed under the hardened runtime by the build's signing pass). Prefer it
+    over a PATH (e.g. Homebrew) node, which macOS code-signing enforcement can
+    SIGKILL when launched from the packaged process tree.
     """
-    return _resolve_bundled(embedded_node_candidates)
+    return _resolve_bundled_payload(embedded_node_candidates)
 
 
 def resolve_bundled_ripgrep() -> Optional[str]:
     """Return the bundled rg path if present."""
-    return _resolve_bundled(embedded_ripgrep_candidates)
+    return _resolve_bundled_payload(embedded_ripgrep_candidates)
 
 
 # Claude runtime resolution.

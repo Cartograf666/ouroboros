@@ -5,7 +5,7 @@ from __future__ import annotations
 CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "read_file", "list_files", "write_file", "edit_text",
     "search_code", "query_code", "plan_task",
-    "run_command", "claude_code_edit", "run_script",
+    "run_command", "run_script",
     "start_service", "service_status", "service_logs", "stop_service",
     "vcs_status", "vcs_diff", "vcs_commit_reviewed", "commit_reviewed",
     "vcs_restore", "vcs_revert", "vcs_pull_ff", "vcs_rollback",
@@ -49,6 +49,10 @@ LOCAL_READONLY_SUBAGENT_MODE: str = "local_readonly_subagent"
 # remains available by explicit product decision, so this mode is not a remote
 # website sandbox.
 LOCAL_READONLY_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
+    # switch_model changes COGNITIVE POWER, not authority: a child that started on
+    # the cheap lane and finds the work harder raises itself instead of failing or
+    # asking the parent to respawn it (BIBLE P5). Nothing about the sandbox changes.
+    "switch_model",
     "read_file", "list_files", "search_code", "query_code",
     "vcs_status", "vcs_diff",
     "chat_history", "recent_tasks", "get_task_result", "wait_task", "wait_tasks",
@@ -58,6 +62,10 @@ LOCAL_READONLY_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     # updates the existing child result through join_ledger's lineage/hash authority.
     # It has no repo/control-plane effect, so remains valid for read-only subagents.
     "tree_note", "tree_read", "override_delegation_constraint",
+    # Nanny verbs. The child gets no shell — it gets the right to ASK the host to run a
+    # session, and the host derives the access profile from THIS task's authority, so a
+    # read-only child can only ever host a read-only session.
+    "delegate_start", "delegate_wait", "delegate_cancel",
     "web_search", "browse_page", "browser_action", "analyze_screenshot", "vlm_query", "view_image",
     # Bounded media projection: writes derived frames only under artifact_store/video_frames.
     "ocr_pdf", "youtube_transcript", "extract_video_frames",
@@ -74,6 +82,10 @@ ACTING_SUBAGENT_MODE: str = "acting_subagent"
 # MCP tools are denied unless explicitly granted per-child via
 # TaskConstraint.external_tool_grants.
 ACTING_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
+    # switch_model changes COGNITIVE POWER, not authority: a child that started on
+    # the cheap lane and finds the work harder raises itself instead of failing or
+    # asking the parent to respawn it (BIBLE P5). Nothing about the sandbox changes.
+    "switch_model",
     "read_file", "list_files", "search_code", "query_code",
     "vcs_status", "vcs_diff",
     "write_file", "edit_text",
@@ -84,6 +96,9 @@ ACTING_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "verify_and_record",
     "knowledge_read", "knowledge_list",
     "tree_note", "tree_read", "override_delegation_constraint",
+    # Same nanny verbs, same host-derived profile — an acting child hosts a
+    # workspace_write session confined to its own write root.
+    "delegate_start", "delegate_wait", "delegate_cancel",
     "web_search", "browse_page", "browser_action", "analyze_screenshot", "vlm_query", "view_image",
     "ocr_pdf", "youtube_transcript", "extract_video_frames",
     "list_available_tools",
@@ -138,7 +153,6 @@ TOOL_RESULT_LIMITS: dict[str, int] = {
     "read_file": 80_000,
     "recent_tasks": 80_000,
     "knowledge_read": 80_000,
-    "claude_code_edit": 80_000,
     "run_command": 80_000,
     "run_script": 80_000,
     "search_code": 80_000,
@@ -156,6 +170,18 @@ TOOL_RESULT_LIMITS: dict[str, int] = {
 
 DEFAULT_TOOL_RESULT_LIMIT: int = 15_000
 
+
+def tool_result_limit(tool_name: str) -> int:
+    """The char budget a tool's result is delivered under.
+
+    Read by the truncator AND by producers that must fit inside it: a tool whose payload
+    is structured JSON has to bound itself, because outer head-truncation cuts mid-string
+    and destroys the document. Both sides asking the same function is what keeps a
+    producer's idea of "small enough" from drifting away from the cap actually applied.
+    """
+    return TOOL_RESULT_LIMITS.get(str(tool_name or ""), DEFAULT_TOOL_RESULT_LIMIT)
+
+
 # Reviewed mutative tools must not end with ambiguous executor timeouts.
 REVIEWED_MUTATIVE_TOOLS: frozenset[str] = frozenset({
     "commit_reviewed",
@@ -164,6 +190,6 @@ REVIEWED_MUTATIVE_TOOLS: frozenset[str] = frozenset({
 
 # Foreground mutative tools may keep editing files after Python future timeout;
 # the loop must wait for terminal completion instead of returning while they run.
-FOREGROUND_MUTATIVE_TOOLS: frozenset[str] = frozenset({
-    "claude_code_edit",
-})
+# Empty since D10 retired the SDK edit gateway (the one foreground tool that
+# kept editing after a Python-future timeout); the seam stays for successors.
+FOREGROUND_MUTATIVE_TOOLS: frozenset[str] = frozenset()

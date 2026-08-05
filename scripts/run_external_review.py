@@ -102,6 +102,7 @@ _REVIEW_SUBSTRATE_PATHS = frozenset({
     "ouroboros/pricing.py",
     "ouroboros/provider_models.py",
     "ouroboros/preflight_runner.py",
+    "ouroboros/review_execution.py",
     "ouroboros/review_substrate.py",
     "ouroboros/review_state.py",
     "ouroboros/runtime_mode_policy.py",
@@ -1200,12 +1201,12 @@ def main() -> int:
         print(message, file=sys.stderr)
         return 2
 
-    from ouroboros.tools.claude_advisory_review import _MAX_DIFF_CHARS_ERROR
-
     reviewable_chars = (
         len(staged) if contributor_snapshot is not None
         else _operator_reviewable_diff_chars(len(staged))
     )
+    from ouroboros.tools.claude_advisory_review import _MAX_DIFF_CHARS_ERROR
+
     if reviewable_chars > _MAX_DIFF_CHARS_ERROR:
         print(
             f"ERROR: staged diff is {reviewable_chars:,} chars — over the advisory hard cap "

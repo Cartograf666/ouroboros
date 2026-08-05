@@ -88,6 +88,10 @@ log = logging.getLogger("server")
 RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 _restart_requested = threading.Event()
+# Set only when the OWNER asked for the restart (the chat Restart button, and the
+# control endpoints that restart on the owner's behalf). The single fact the
+# re-exec needs to decide whether the runtime-mode ratchet pin rides along.
+_owner_restart_requested = threading.Event()
 _LAUNCHER_MANAGED = str(os.environ.get("OUROBOROS_MANAGED_BY_LAUNCHER", "") or "").strip() == "1"
 
 # Captured in main() for Settings LAN-reachability metadata.
@@ -134,7 +138,10 @@ def _installed_skill_names():
 
 
 def _restart_current_process(host: str, port: int) -> None:
-    _restart_current_process_impl(host, port, repo_dir=REPO_DIR, log=log)
+    _restart_current_process_impl(
+        host, port, repo_dir=REPO_DIR, log=log,
+        owner_initiated=_owner_restart_requested.is_set(),
+    )
 
 from ouroboros.config import (
     load_settings, save_settings, apply_settings_to_env as _apply_settings_to_env,
@@ -781,15 +788,49 @@ def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconc
             from ouroboros.process_custody import reap_orphaned_processes
             from supervisor.queue import RUNNING as _running_tasks
 
+            live_tasks = set(_running_tasks.keys())
             reap_orphaned_processes(
-                DATA_DIR, running_task_ids=set(_running_tasks.keys()),
+                DATA_DIR, running_task_ids=live_tasks,
                 live_owner_skills=_installed_skill_names(),
             )
+            # A delegated Claudexor run is an orphan under exactly the same predicate:
+            # its owning task is no longer running. It has no pid, so the process
+            # reaper cannot see it — but it is still spending quota and still writing.
+            _reconcile_delegated_runs(live_tasks)
         except Exception:
             log.debug("Periodic custody reap failed", exc_info=True)
     if time.time() - last_review_reconcile[0] > 300:
         last_review_reconcile[0] = time.time()
         _periodic_zombie_reconcile()
+
+
+def _reconcile_delegated_runs(running_task_ids: set) -> None:
+    """Settle or cancel delegated runs whose owning task is gone (startup + tick)."""
+    try:
+        from ouroboros.delegate_custody import reconcile_orphaned_runs
+
+        outcomes = reconcile_orphaned_runs(DATA_DIR, running_task_ids=running_task_ids)
+        if outcomes:
+            log.info("Delegated-run reconciliation handled %d orphan(s): %s", len(outcomes), outcomes)
+    except Exception:
+        log.debug("Delegated-run reconciliation failed", exc_info=True)
+
+
+def _startup_custody_sweep() -> None:
+    """Both custody surfaces, swept once per generation at supervisor startup.
+
+    Nothing is running yet, so every ledgered process and every open delegated run is
+    by definition ownerless: the generation that was watching them did not survive.
+    """
+    try:
+        from ouroboros.process_custody import reap_orphaned_processes
+
+        reaped = reap_orphaned_processes(DATA_DIR, live_owner_skills=_installed_skill_names())
+        if reaped:
+            log.info("Process custody reaper killed %d orphaned process(es): %s", len(reaped), reaped)
+    except Exception:
+        log.debug("Process custody startup reap failed", exc_info=True)
+    _reconcile_delegated_runs(set())
 
 
 def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:
@@ -1272,7 +1313,7 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                 ctx.send_with_budget(chat_id, "Stopping active task. New settings apply to the next message.")
             except Exception:
                 log.warning("Failed to send owner restart stop notice; continuing restart", exc_info=True)
-            _request_restart_exit()
+            _request_restart_exit(owner=True)
         elif lowered == "/review" or lowered.startswith("/review "):
             # Target the requesting chat so the ack and results return to the
             # external transport owner, not the default web owner_chat_id.
@@ -1602,14 +1643,7 @@ def _run_supervisor(settings: dict) -> None:
                 })
         except Exception:
             log.debug("Headless task drive prune failed", exc_info=True)
-        try:
-            from ouroboros.process_custody import reap_orphaned_processes
-
-            reaped = reap_orphaned_processes(DATA_DIR, live_owner_skills=_installed_skill_names())
-            if reaped:
-                log.info("Process custody reaper killed %d orphaned process(es): %s", len(reaped), reaped)
-        except Exception:
-            log.debug("Process custody startup reap failed", exc_info=True)
+        _startup_custody_sweep()
 
         try:
             from ouroboros import subagent_worktrees
@@ -1983,8 +2017,15 @@ def _perform_supervisor_restart(
     _request_restart_exit()
 
 
-def _request_restart_exit() -> None:
-    """Signal server shutdown with restart exit code."""
+def _request_restart_exit(owner: bool = False) -> None:
+    """Signal server shutdown with restart exit code.
+
+    ``owner`` is the ONE fact the re-exec needs: an owner-initiated restart
+    re-reads the runtime mode from settings, an agent- or supervisor-initiated
+    one keeps inheriting the boot pin (see server_control.restart_current_process).
+    """
+    if owner:
+        _owner_restart_requested.set()
     _restart_requested.set()
 
 

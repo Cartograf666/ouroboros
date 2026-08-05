@@ -116,7 +116,20 @@ MAX_FUNCTION_LINES = 300
 # delivery work is not blocked by a moving "current count + epsilon" gate.
 # This is still a coarse smoke alarm; per-module/function complexity checks and
 # review remain the tools for preventing local bloat.
-MAX_TOTAL_FUNCTIONS = 5000
+# 5000 -> 5100 at the v6.89.0 Claudexor-integration synthesis: eight branches
+# each fit under 5000 alone and their union ships a whole delegation subsystem
+# (nanny transport, custody, review lanes, owned daemon, slots UI) while also
+# DELETING the claude_code edit path, the multi-slot fan-out and the enumerated
+# write fence. A disclosed budget raise, not a silent one (P7: the next cycle
+# owes consolidation before growth).
+# 5100 → 6000 (2026-08-05, owner decision): the merge of the public v6.88.0
+# line (MiniMax provider, crash-safe managed updates, two-pass gate,
+# process_containment) into the Claudexor-integration line unions two
+# independently-green trees, and the owner raised the ceiling with real
+# headroom outright — a gate that fails on every routine union is churn, not
+# protection ("подними сразу до 6000 чтобы не бесило"). The consolidation
+# debt above still stands; the gate now guards against runaway growth only.
+MAX_TOTAL_FUNCTIONS = 6000
 GRANDFATHERED_OVERSIZED_FUNCTIONS = {
     ("agent_startup_checks.py", "verify_restart"),  # managed #53 boot diagnostic flow, 307 lines
     ("git.py", "_run_reviewed_stage_cycle"),  # reviewed-commit gate orchestration, 302 lines
@@ -165,6 +178,14 @@ GRANDFATHERED_OVERSIZED_MODULES = {
     # REPO-RELATIVE path (not the bare basename) so a future skill's plugin.py is
     # not silently exempted (SKILL.md convention is `entry: plugin.py`).
     "skills/unix_computer_use/plugin.py",
+    # 2026-08-05 merge of the public v6.88.0 line: its crash-safe managed-update
+    # hardening grew git_ops.py to 1597 (three lines under the gate), and the
+    # Claudexor-integration line's owner-restart lever tipped the union past
+    # 1600. Trimming a freshly-hardened update/rescue module at the merge seam
+    # is higher-risk than the debt; splitting the managed-update transaction
+    # helpers out of git_ops is the tracked follow-up (same class as
+    # registry/events above).
+    "git_ops.py",
 }
 # Bundle-only launcher is not part of the self-editable function budget.
 FUNCTION_COUNT_EXCLUDED_FILES = {"launcher.py"}

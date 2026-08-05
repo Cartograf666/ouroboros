@@ -54,8 +54,17 @@ _SKILL_OWNER_STATE_FILENAMES = SKILL_OWNER_STATE_FILENAMES
 _SELF_AUTHORED_MARKER = ".self_authored.json"
 
 
-def _render_line_slice(path: str, content: str, max_lines: int = 2000, start_line: int = 1) -> str:
-    """Return a line-ranged file view with the shared read-tool header."""
+def _render_line_slice(path: str, content: str, max_lines: int = 2000, start_line: int = 1,
+                       start_char: int = 0) -> str:
+    """Return a line-ranged file view with the shared read-tool header.
+
+    ``start_char`` is a SUB-LINE cursor: it skips that many characters of the selected
+    window's body before rendering. It exists because delivery is char-bounded (the
+    outer tool-result truncator cuts at ``tool_result_limit``): a single line longer
+    than the budget can never be delivered whole by any line window, so the reader
+    advances WITHIN it by re-reading the same window with a growing ``start_char``.
+    Disclosed in the header, so the view never silently masquerades as the whole line.
+    """
     start_raw, max_raw = _coerce_line_window(start_line, max_lines)
     max_raw = max(1, max_raw)
     lines = content.splitlines(keepends=True)
@@ -63,8 +72,20 @@ def _render_line_slice(path: str, content: str, max_lines: int = 2000, start_lin
     start = max(1, min(start_raw, total + 1))
     end = min(start + max_raw - 1, total)
     result = "".join(lines[start - 1:end])
-    header = f"# {path} — lines {start}\u2013{end} of {total}\n"
+    offset = _coerce_start_char(start_char)
+    if offset:
+        result = result[offset:]
+        header = f"# {path} — lines {start}\u2013{end} of {total} (from char {offset} of this window)\n"
+    else:
+        header = f"# {path} — lines {start}\u2013{end} of {total}\n"
     return header + result
+
+
+def _coerce_start_char(start_char: Any = 0) -> int:
+    try:
+        return max(0, int(start_char))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _coerce_line_window(start_line: Any = 1, max_lines: Any = 2000) -> tuple[int, int]:
@@ -943,7 +964,8 @@ def _protected_artifact_list_block(
     return ""
 
 
-def _annotate_reread(ctx: ToolContext, target: Any, start_line: int, max_lines: int, result: str) -> str:
+def _annotate_reread(ctx: ToolContext, target: Any, start_line: int, max_lines: int, result: str,
+                     start_char: int = 0) -> str:
     """Append an advisory hint when the SAME file slice is re-read unchanged.
 
     Per-task, key on (resolved path, slice); the change signal is (size, mtime).
@@ -957,7 +979,7 @@ def _annotate_reread(ctx: ToolContext, target: Any, start_line: int, max_lines: 
         return result
     if not isinstance(result, str) or result.startswith("⚠️"):
         return result
-    key = f"{resolved}|{int(start_line)}|{int(max_lines)}"
+    key = f"{resolved}|{int(start_line)}|{int(max_lines)}|{_coerce_start_char(start_char)}"
     sig = (st.st_size, st.st_mtime_ns)
     seen = getattr(ctx, "_read_file_seen", None)
     if not isinstance(seen, dict):
@@ -997,6 +1019,7 @@ def _read_file(
     root: str = "active_workspace",
     max_lines: int = 2000,
     start_line: int = 1,
+    start_char: int = 0,
     bucket: str = "",
     skill_name: str = "",
 ) -> str:
@@ -1067,7 +1090,21 @@ def _read_file(
         if block_msg:
             return block_msg
         content = read_text(target)
-        return _annotate_reread(ctx, target, start_line, max_lines, _render_line_slice(_root_display_path(normalized, path), content, max_lines=max_lines, start_line=start_line))
+        rendered = _render_line_slice(_root_display_path(normalized, path), content,
+                                      max_lines=max_lines, start_line=start_line, start_char=start_char)
+        if normalized == "task_drive":
+            # D7 coverage acknowledgement: what counts as read is what the DELIVERY
+            # layer will actually hand the model, so the hook receives the rendered
+            # view and applies the same char budget the outer truncator applies.
+            # Disclosure only — nothing on this path may ever block or fail the read.
+            try:
+                from ouroboros.tools.delegate import acknowledge_staged_output_read
+
+                acknowledge_staged_output_read(ctx, target, content, start_line, max_lines,
+                                               start_char=start_char, rendered=rendered)
+            except Exception:
+                log.warning("staged-output coverage acknowledgement hook failed", exc_info=True)
+        return _annotate_reread(ctx, target, start_line, max_lines, rendered, start_char=start_char)
     except FileNotFoundError:
         # Self-locating error (v6.70.0): the resolved absolute path turns a
         # bare not-found into an actionable correction (wrong root vs wrong
@@ -1883,6 +1920,11 @@ def get_tools() -> List[ToolEntry]:
                               "description": "Maximum number of lines to return (default 2000)."},
                 "start_line": {"type": "integer", "default": 1,
                                "description": "1-indexed line to start reading from (default 1 = beginning)."},
+                "start_char": {"type": "integer", "default": 0,
+                               "description": "Sub-line cursor: skip this many characters of the selected "
+                                              "window before rendering. Use it to advance WITHIN a single "
+                                              "line longer than the delivery limit (the result would "
+                                              "otherwise be cut at the tool-result budget)."},
                 "bucket": {"type": "string", "description": "Required only for root=skill_payload."},
                 "skill_name": {"type": "string", "description": "Required only for root=skill_payload."},
             }, "required": ["path"]},

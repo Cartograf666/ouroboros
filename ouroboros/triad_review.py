@@ -26,10 +26,18 @@ class ReviewActorRecord:
     tokens_out: int = 0
     cost_usd: float = 0.0
     slot: int = 0
+    slot_id: str = ""  # the id the row physically ran under, carried not re-derived
     prompt_ref: Dict[str, Any] = field(default_factory=dict)
     response_ref: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        # The durable id is the one the review substrate actually ran this row
+        # under, carried on the envelope. Re-deriving it from the record's
+        # position is wrong whenever position is not row: an oversized skill
+        # review merges C chunk passes over M rows into ONE results list
+        # (skill_review_passes), so position M+1 is row 1 on its second pass.
+        from ouroboros.review_substrate import slot_id_for_row
+
         return {
             "model_id": self.model_id,
             "status": self.status,
@@ -39,7 +47,11 @@ class ReviewActorRecord:
             "tokens_out": self.tokens_out,
             "cost_usd": self.cost_usd,
             "slot": self.slot,
-            "slot_id": f"slot_{self.slot}" if self.slot else "",
+            # LEGACY-READ-ONLY fallback: every live producer stamps slot_id (the one
+            # dispatch entry is review._handle_multi_model_review — skill_review binds
+            # run_review to exactly it, pinned by test), so the positional mint here
+            # can only fire when re-serializing an envelope persisted before the carry.
+            "slot_id": self.slot_id or (slot_id_for_row(self.slot) if self.slot else ""),
             "prompt_ref": dict(self.prompt_ref),
             "response_ref": dict(self.response_ref),
         }
@@ -87,6 +99,7 @@ def _actor_record(
         tokens_out=int(actor.get("tokens_out", 0) or 0),
         cost_usd=float(actor.get("cost_estimate", 0.0) or 0.0),
         slot=idx + 1,
+        slot_id=str(actor.get("slot_id") or ""),
         prompt_ref=dict(actor.get("prompt_ref") or {}),
         response_ref=dict(actor.get("response_ref") or {}),
     )
@@ -474,3 +487,65 @@ ACCEPTANCE_SURFACE_RULES = (
         "terminal judgement ends the loop and surfaces both positions to the owner; it is not a "
         "concession. "
 )
+
+
+def review_query_error_payload(
+    *,
+    ctx: Any,
+    model: str,
+    messages: list,
+    slot_id: str,
+    error: str,
+) -> dict:
+    """Durable failure envelope for one errored multi-model review row.
+
+    The envelope carries the row id too: an errored row is still a row, and
+    its durable actor record must name the same one its refs do. Imports stay
+    lazy so this module's dependency graph remains the primitives it declares.
+    """
+    payload = {"error": error, "usage": {}, "slot_id": slot_id, "prompt_ref": {}, "response_ref": {}}
+    try:
+        from ouroboros.observability import new_call_id, persist_call
+        from ouroboros.tools.review_helpers import review_drive_root
+
+        drive_root = review_drive_root(ctx)
+        task_id = str(getattr(ctx, "task_id", "") or "multi_model_review") if ctx is not None else "multi_model_review"
+        call_id = new_call_id(f"review_multi_model_review_{slot_id}_error")
+        payload["prompt_ref"] = persist_call(
+            drive_root,
+            task_id=task_id,
+            call_id=f"{call_id}_prompt",
+            call_type="multi_model_review_prompt",
+            payload={"messages": messages, "slot_id": slot_id, "model": model},
+            manifest={"surface": "multi_model_review", "slot_id": slot_id, "model": model, "synthetic": True},
+        )
+        payload["response_ref"] = persist_call(
+            drive_root,
+            task_id=task_id,
+            call_id=f"{call_id}_error",
+            call_type="multi_model_review_error",
+            payload={"error": error},
+            manifest={"surface": "multi_model_review", "slot_id": slot_id, "model": model, "status": "error", "synthetic": True},
+        )
+    except Exception:
+        pass
+    return payload
+
+
+_PROVIDER_OVERSIZE_MARKERS = (
+    # Anthropic: "prompt is too long: 1166914 tokens > 1000000 maximum"
+    "prompt is too long",
+    # Anthropic: "input length and `max_tokens` exceed context limit"
+    "exceed context limit",
+    # OpenAI error code + message variants
+    "context_length_exceeded",
+    "maximum context length",
+)
+
+
+def is_provider_oversize_error(error_text: str) -> bool:
+    """Mechanical fault classification: does this provider error mean the prompt
+    exceeded the model's REAL context window? Deliberately tight markers — any
+    other provider/transport error keeps the fail-closed blocking path."""
+    low = str(error_text or "").lower()
+    return any(marker in low for marker in _PROVIDER_OVERSIZE_MARKERS)

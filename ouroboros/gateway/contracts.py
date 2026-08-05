@@ -104,6 +104,18 @@ class ChatOutbound(TypedDict):
     model_lane: NotRequired[str]
     requested_model_lane: NotRequired[str]
     effective_model_lane: NotRequired[str]
+    # Phase 6: the OPAQUE harness route RESOLVED AT DISPATCH for this
+    # bubble/subagent (`resolve_subagent_dispatch`, stamped once) — a delegated
+    # route only; absent/empty means the ordinary native path and the UI draws
+    # no chip. It is the route the run was sent to, not a receipt from the
+    # engine saying where it landed: a landing below the ask is disclosed on
+    # `capability_delta`, not by rewriting this field.
+    executor_route: NotRequired[str]
+    # The completion-seam EVIDENCE the route decision is reconciled against
+    # (subagents.envelope_from_task): delegated runs started/settled, disclosed
+    # subscription spend, engine-reported models. Terminal frames only; its
+    # absence means "no evidence yet", never "ran natively".
+    execution_evidence: NotRequired[Dict[str, Any]]
     model: NotRequired[str]
     task_group_id: NotRequired[str]
     task_event: NotRequired[str]
@@ -123,6 +135,9 @@ class ChatOutbound(TypedDict):
     reserved_usd: NotRequired[Optional[float]]
     unresolved_upper_bound_usd: NotRequired[Optional[float]]
     unknown_unmetered: NotRequired[Optional[int]]
+    # v6.87.48: count of OPEN ledger rows — the disclosed cause of
+    # ``cost_final: false``, which can hold with every dollar bucket at zero.
+    non_final_rows: NotRequired[Optional[int]]
     result: NotRequired[str]
     result_truncated: NotRequired[bool]  # P3: WS preview was capped; fetch full via task id
     trace_summary: NotRequired[str]
@@ -524,6 +539,10 @@ class SettingsSaveResponse(TypedDict, total=False):
     immediate_changed: bool
     next_task_changed: bool
     warnings: list[str]
+    # True when the save landed while an agent task was already STARTED: that
+    # task keeps its start-time config (snapshot boundary); changes apply from
+    # the next task. Queued-but-unstarted tasks re-read settings at start.
+    agent_task_running: bool
 
 
 class OwnerRuntimeModeResponse(TypedDict):
@@ -830,6 +849,12 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/mcp/status",
     "POST /api/mcp/refresh",
     "POST /api/mcp/test",
+    "GET /api/reviewer-slots",
+    "GET /api/claudexor/status",
+    "POST /api/claudexor/login",
+    "GET /api/claudexor/login/{job_id}",
+    "DELETE /api/claudexor/login/{job_id}",
+    "POST /api/claudexor/login/{job_id}/input",
     "GET /api/extensions",
     "GET /api/extensions/{skill}/manifest",
     "GET /api/extensions/{skill}/module/{entry}",

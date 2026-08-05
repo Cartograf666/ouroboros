@@ -74,11 +74,11 @@ def test_build_swarm_efficiency_rolls_up_fanout_events(tmp_path):
     logs.mkdir()
     events = [
         {"type": "swarm_fanout", "parent_task_id": "root1", "task_ids": ["c1", "c2"],
-         "inter_wave_latency_sec": 0.0, "effective_model_lanes": ["heavy", "heavy"]},
+         "inter_wave_latency_sec": 0.0, "requested_model_lane": "heavy"},
         {"type": "swarm_fanout", "parent_task_id": "root1", "task_ids": ["c3"],
-         "inter_wave_latency_sec": 194.0, "effective_model_lanes": ["light"]},
+         "inter_wave_latency_sec": 194.0, "requested_model_lane": "light"},
         {"type": "swarm_fanout", "parent_task_id": "other", "task_ids": ["x1"],
-         "inter_wave_latency_sec": 5.0, "effective_model_lanes": ["heavy"]},
+         "inter_wave_latency_sec": 5.0, "requested_model_lane": "heavy"},
         {"type": "llm_round", "parent_task_id": "root1"},
     ]
     (logs / "events.jsonl").write_text(
@@ -88,7 +88,7 @@ def test_build_swarm_efficiency_rolls_up_fanout_events(tmp_path):
     assert roll["subagent_count"] == 3            # c1,c2,c3 (other-parent x1 excluded)
     assert roll["wave_count"] == 2
     assert roll["inter_wave_latency_sec_total"] == 194.0
-    assert sorted(roll["lanes_used"]) == ["heavy", "light"]
+    assert sorted(roll["lanes_requested"]) == ["heavy", "light"]
 
 
 # --- B2: burst/absorb advisory fires when >=1 OTHER child is still live ---
@@ -171,7 +171,7 @@ def test_write_task_result_persists_swarm_efficiency(tmp_path):
 
     drive = tmp_path / "drive"
     drive.mkdir()
-    roll = {"subagent_count": 3, "wave_count": 2, "inter_wave_latency_sec_total": 194.0, "lanes_used": ["heavy", "light"]}
+    roll = {"subagent_count": 3, "wave_count": 2, "inter_wave_latency_sec_total": 194.0, "lanes_requested": ["heavy", "light"]}
     rec = write_task_result(drive, "fa11fa11", STATUS_COMPLETED, swarm_efficiency=roll)
     assert rec.get("swarm_efficiency") == roll          # accepted as a field (no TypeError)
     persisted = load_task_result(drive, "fa11fa11")

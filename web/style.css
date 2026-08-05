@@ -2916,7 +2916,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     color: var(--text-secondary);
 }
 
-.form-field input, .form-field select {
+.form-field input, .form-field select,
+.reviewer-slot-controls input, .reviewer-slot-controls select {
     padding: 8px 12px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--divider);
@@ -5812,4 +5813,147 @@ textarea.chat-input {
     .project-panel-backdrop {
         transition: none;
     }
+}
+
+/* Reviewer Slots (6.2) + Harness Accounts (D30).
+   Borders read the theme's --divider like every other panel surface. They used
+   to name --border, which this dark-only :root never declares, so all three
+   rules silently took their literal grey fallback instead of the token. */
+/* Subsection rhythm: the section's flex gap (14px) is the baseline; the small
+   negative bottom margins pull a heading and its Add toolbar to 8px from the
+   rows they belong to, so heading+rows+toolbar reads as one group. */
+.reviewer-slots-heading { margin: 10px 0 -6px; }
+.reviewer-slot-rows { display: flex; flex-direction: column; gap: 8px; margin-bottom: -6px; }
+.reviewer-slot-row {
+    border: 1px solid var(--divider);
+    border-radius: 8px;
+    padding: 10px 12px;
+}
+.reviewer-slot-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+/* Field chrome comes from the shared .form-field rule above (dark-app tokens);
+   only the row's sizing is local. Proportions follow the content (owner
+   feedback): the route select stays compact — its widest dropdown OPTION must
+   not set the closed width; the free-text model id (long provider/model ids)
+   takes the flexible room; effort stays compact; Remove docks right. */
+.reviewer-slot-controls select,
+.reviewer-slot-controls input { min-width: 140px; max-width: 100%; width: auto; flex: 0 1 auto; }
+.reviewer-slot-controls select[data-slot-route],
+.reviewer-slot-controls select[data-advisory-route] { max-width: 240px; }
+.reviewer-slot-controls input[data-slot-custom-api] { flex: 1 1 260px; min-width: 240px; max-width: 520px; }
+.reviewer-slot-controls select[data-slot-model] { flex: 1 1 220px; max-width: 420px; }
+.reviewer-slot-controls [data-slot-remove] { margin-left: auto; }
+/* The base .local-toggle carries padding-bottom:8px for form layouts; inside a
+   center-aligned control row that padding shoves the checkbox off-axis. The
+   row's generic input sizing above also hits the toggle's CHECKBOX (an input),
+   stretching an empty 140px box between the glyph and its label. */
+.reviewer-slot-controls .local-toggle { padding-bottom: 0; }
+.reviewer-slot-controls .local-toggle input[type="checkbox"] {
+    min-width: 0;
+    width: 14px;
+    padding: 0;
+}
+.reviewer-slot-meta { font-size: 12px; margin-top: 6px; }
+/* Account rows are purpose-built (identity left, actions right), not the
+   settings key/value grid — .settings-custom-secret-row's 0.65fr/1.35fr
+   columns inverted the proportions and its align-items:end sank the text. */
+.harness-account-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid var(--ui-card-border);
+    border-radius: var(--radius);
+    background: var(--ui-card-bg-soft);
+}
+.harness-account-main { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; flex: 1; }
+.harness-account-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.harness-chip {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--divider);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.harness-exhausted { opacity: 0.62; }
+/* The login card frames itself: .panel-card is an onboarding.css class the
+   settings pages never load, so leaning on it rendered a bare, frameless
+   card (finding #4). Same ui-card tokens as every other panel surface. */
+.harness-login-card {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 16px 18px;
+    border: 1px solid var(--ui-card-border);
+    border-radius: var(--radius);
+    background: var(--ui-card-bg);
+}
+.harness-login-card h4 { margin: 0; font-size: 14px; }
+.harness-login-card p { margin: 0; color: var(--text-secondary); font-size: 13px; line-height: 1.5; }
+.harness-device-code p { margin: 4px 0; }
+.harness-code {
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 22px;
+    letter-spacing: 0.18em;
+    padding: 8px 12px;
+    border: 1px dashed var(--divider);
+    border-radius: 8px;
+    display: inline-block;
+    user-select: all;
+}
+.harness-attach-command {
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 12px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: var(--surface-control);
+    overflow-x: auto;
+    user-select: all;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+/* Link-first login card (no-terminal UX): the sign-in link is the prominent
+   action; copy stays an explicit secondary affordance. */
+.harness-signin-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.harness-signin-actions a.btn { text-decoration: none; }
+.harness-code-entry { display: flex; flex-direction: column; gap: 6px; }
+.harness-code-entry label { font-size: 12px; color: var(--text-secondary); }
+.harness-code-entry-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.harness-code-entry-row input {
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 13px;
+    padding: 6px 10px;
+    border: 1px solid var(--ui-card-border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-control);
+    color: var(--text-primary);
+    min-width: 220px;
+}
+/* The demoted attach fallback: collapsed by default, visually secondary. */
+.harness-advanced {
+    align-self: stretch;
+    border-top: 1px solid var(--divider);
+    padding-top: 8px;
+}
+.harness-advanced summary {
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+.harness-advanced[open] summary { margin-bottom: 6px; }
+.harness-advanced p { margin: 4px 0; }
+
+/* Phase 6: per-bubble/subagent executor chip (owner directive: a small chip
+   like Claudexor's, never a promotional badge). Reuses .harness-chip. */
+.chat-live-executor-chip {
+    font-size: 10px;
+    padding: 0 6px;
+    margin-right: 6px;
+    vertical-align: middle;
+    opacity: 0.85;
 }

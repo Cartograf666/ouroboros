@@ -734,9 +734,11 @@ def test_scheduled_scout_receives_the_wave_bound_deadline(monkeypatch, tmp_path)
     )
 
     assert out["started"] is True
-    # Internal seam only: the public schema never carries it.
-    assert "deadline_at" not in seen_public
-    child_deadline = pr.parse_deadline_ts(str(seen.get("deadline_at") or ""))
+    # v6.87.7: `deadline_at` is a public schedule_subagent parameter, so the scout deadline
+    # rides the same channel any parent uses instead of the runtime-internal mapping. What
+    # this test actually guards is unchanged — the scout is bound INSIDE the wave cutoff.
+    assert not seen
+    child_deadline = pr.parse_deadline_ts(str(seen_public.get("deadline_at") or ""))
     cutoff = pr.parse_deadline_ts(
         pr.plan_review_wave(
             pr.load_plan_review_state(tmp_path, ctx.task_id), out["handoffs"]["request_fingerprint"],

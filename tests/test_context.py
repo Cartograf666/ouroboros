@@ -27,6 +27,11 @@ def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
     assert "Under blocking" in content
     assert "non-mutating preparation" in content
     assert "begin implementation only after review closes" in content
+    # Fan-out integration mechanics (owner-approved, 2026-08-05): parallel
+    # children cannot see each other's edits, so a plan gives them disjoint
+    # write regions or plans the parent synthesis for the expected overlap.
+    assert "cannot see each other's edits" in content
+    assert "disjoint write regions" in content
     assert content.rstrip().endswith("Fix the marketplace retry flow.")
 
 
@@ -453,7 +458,7 @@ class TestAdvisoryReviewStatusInContext:
         ))
         state.advisory_runs[-1].status = "stale"
         state.last_stale_from_edit_ts = "2026-04-07T10:00:00+00:00"
-        state.last_stale_reason = "claude_code_edit mutated tracked.py"
+        state.last_stale_reason = "edit_text mutated tracked.py"
         state.last_stale_repo_key = repo_key
         state.record_attempt(CommitAttemptRecord(
             ts="2026-04-07T10:01:00+00:00",

@@ -101,6 +101,12 @@ TOOL_POLICY: Dict[str, str] = {
 
     # Control / messaging / internal side effects.
     "schedule_subagent": POLICY_SKIP,
+    # Delegated sessions: the access profile is derived HOST-SIDE from the calling
+    # task's own authority and cannot be widened by the model, so the nanny verbs add
+    # no reach beyond what the task already has (same reasoning as schedule_subagent).
+    "delegate_start": POLICY_SKIP,
+    "delegate_wait": POLICY_SKIP,
+    "delegate_cancel": POLICY_SKIP,
     "cancel_task": POLICY_SKIP,
     # Parent's explicit decision to abandon a child result: stamps parent_decision +
     # records the reason on the tree ledger; tree-scoped, no external effect (like cancel_task).
@@ -122,7 +128,6 @@ TOOL_POLICY: Dict[str, str] = {
     "advisory_review": POLICY_SKIP,
     "start_service": POLICY_CHECK_CONDITIONAL,
     "stop_service": POLICY_SKIP,
-    "claude_code_edit": POLICY_SKIP,
 
     # External skill surface.
     "list_skills": POLICY_SKIP,
@@ -620,8 +625,7 @@ def _resolve_safety_routing() -> Tuple[bool, bool, Optional[str]]:
 _UNCHECKED_WARNING_SUFFIX = (
     "The tool call was allowed so the agent is not hard-blocked on a misconfigured "
     "runtime — the hardcoded sandbox (registry.py SAFETY_CRITICAL_PATHS, mutative-git "
-    "via shell, gh repo/auth) still applies to every tool, and the claude_code_edit "
-    "post-execution revert still applies when the failing call is claude_code_edit."
+    "via shell, gh repo/auth) still applies to every tool."
 )
 
 

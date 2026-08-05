@@ -1354,6 +1354,89 @@ class TestAdvisorySkipTests:
         assert "skip_tests" in guidance, \
             f"Guidance should mention skip_tests=True escape hatch: {guidance!r}"
 
+    def test_next_step_guidance_stale_template_class_is_closed_by_the_projection(self):
+        """The v6.74.5 stale-template class ("Last advisory run was blocked by
+        SyntaxError" over a record from ANOTHER snapshot): the binding lives
+        UPSTREAM — review_evidence's hash_mismatch sets stale_from_edit for a
+        blocked record whose hash differs from the current tree, and the
+        guidance then routes to the generic invalidated message, never
+        asserting the problem class. Both production-reachable combinations
+        are pinned here; the (record != current, stale_from_edit=False)
+        combination is UNREACHABLE from build_review_projection by
+        construction (find_by_hash matches exactly; a mismatching latest sets
+        hash_mismatch)."""
+        from ouroboros.review_state import AdvisoryReviewState, AdvisoryRunRecord
+        from ouroboros.tools.claude_advisory_review import _next_step_guidance
+
+        latest = AdvisoryRunRecord(
+            snapshot_hash="abc123def4567890",
+            commit_message="test",
+            status="preflight_blocked",
+            ts="2026-04-20T00:00:00Z",
+            raw_result="SyntaxError: invalid syntax at foo.py:3",
+        )
+        state = AdvisoryReviewState()
+
+        # Record from another snapshot -> the projection flags it stale
+        # (hash_mismatch, review_evidence.py) -> generic message, no class.
+        mismatched = _next_step_guidance(
+            latest=latest, state=state,
+            stale_from_edit=True, stale_from_edit_ts="now (hash mismatch)",
+            open_obs=[], open_debts=[], effective_is_fresh=False,
+        )
+        assert "Last advisory run was blocked" not in mismatched, mismatched
+        assert "SyntaxError" not in mismatched, mismatched
+        assert "invalidated" in mismatched, mismatched
+        assert "advisory_review" in mismatched, mismatched   # the actionable step
+
+        # A record of the CURRENT snapshot keeps the specific, actionable claim.
+        matched = _next_step_guidance(
+            latest=latest, state=state,
+            stale_from_edit=False, stale_from_edit_ts=None,
+            open_obs=[], open_debts=[], effective_is_fresh=False,
+        )
+        assert "Last advisory run was blocked" in matched, matched
+        assert "syntax preflight" in matched, matched
+
+    def test_projection_flags_a_blocked_record_from_another_snapshot_as_stale(self, tmp_path):
+        """The load-bearing upstream fact for the previous test: a
+        preflight_blocked record whose hash differs from the CURRENT tree makes
+        build_review_projection set stale_from_edit=True (hash_mismatch
+        includes the blocked statuses), so the production guidance call
+        (_handle_review_status passes projection fields verbatim) can never
+        assert the recorded problem class over a tree the record never saw."""
+        from ouroboros.review_evidence import build_review_projection
+        from ouroboros.review_state import AdvisoryRunRecord, load_state, save_state
+        from ouroboros.tools.claude_advisory_review import _next_step_guidance
+
+        drive = tmp_path / "drive"
+        (drive / "state").mkdir(parents=True)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        state = load_state(drive)
+        state.add_run(AdvisoryRunRecord(
+            snapshot_hash="oldsnapshot00000",
+            commit_message="test",
+            status="preflight_blocked",
+            ts="2026-04-20T00:00:00Z",
+            raw_result="SyntaxError: invalid syntax at foo.py:3",
+        ))
+        save_state(drive, state)
+
+        projection = build_review_projection(
+            drive, repo_dir=repo,
+            snapshot_hash_fn=lambda *_a, **_k: "newsnapshot11111",
+        )
+        assert projection["stale_from_edit"] is True
+        guidance = _next_step_guidance(
+            projection["guidance_run"], projection["state"],
+            projection["stale_from_edit"], projection["stale_from_edit_ts"],
+            projection["open_obligations"], projection["open_debts"],
+            effective_is_fresh=projection["effective_is_fresh"],
+        )
+        assert "Last advisory run was blocked" not in guidance, guidance
+        assert "SyntaxError" not in guidance, guidance
+
 
 class TestBypassPathTestsRun:
     """When skip_advisory_pre_review=True, _run_reviewed_stage_cycle must run

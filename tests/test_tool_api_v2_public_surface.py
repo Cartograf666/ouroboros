@@ -2,7 +2,6 @@ import pathlib
 import re
 import shlex
 import sys
-from types import ModuleType, SimpleNamespace
 
 from ouroboros.tools.registry import ToolRegistry
 
@@ -41,12 +40,20 @@ def test_legacy_tool_names_are_not_public_schemas(tmp_path):
         assert registry.get_schema_by_name(name) is None
         assert registry.execute(name, {}).startswith("⚠️ Unknown tool")
 
+    # D10: the external coding gateway tool was retired; delegate_start is its
+    # successor. The dead name must be gone from the public schema surface.
+    # (Not folded into LEGACY_PUBLIC_TOOL_NAMES because prompts/SYSTEM.md keeps
+    # one deliberate retirement note that mentions the old name.)
+    assert "claude_code_edit" not in names
+    assert registry.get_schema_by_name("claude_code_edit") is None
+    assert registry.execute("claude_code_edit", {}).startswith("⚠️ Unknown tool")
+
     assert {
         "read_file",
         "write_file",
         "search_code",
         "run_command",
-        "claude_code_edit",
+        "delegate_start",
         "commit_reviewed",
         "schedule_subagent",
         "skill_review",
@@ -1174,188 +1181,6 @@ def test_workspace_run_command_outputs_cannot_import_user_files(tmp_path, monkey
     assert not (data / "task_results" / "artifacts" / "task1" / "outside.txt").exists()
 
 
-def test_light_mode_allows_claude_code_edit_external_user_files_cwd(tmp_path, monkeypatch):
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    registry, _repo, _data, desktop = _registry_under_fake_home(tmp_path, monkeypatch)
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
-    captured = {}
-
-    def fake_run_edit(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(
-            success=True,
-            cost_usd=0,
-            usage={},
-            changed_files=[],
-            diff_stat="",
-            validation_summary="",
-            error="",
-            result_text="ok",
-            to_tool_output=lambda: "OK: external edit",
-        )
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute("claude_code_edit", {"prompt": "edit external file", "cwd": str(desktop)})
-
-    assert "LIGHT_MODE_BLOCKED" not in result
-    assert result.startswith("OK: external edit")
-    assert "ARTIFACT_AUDIT_GAP" in result
-    assert pathlib.Path(captured["cwd"]) == desktop
-
-
-def test_claude_code_edit_user_files_cwd_reuses_user_files_secret_guard(tmp_path, monkeypatch):
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    registry, _repo, _data, desktop = _registry_under_fake_home(tmp_path, monkeypatch)
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
-
-    def fake_run_edit(**kwargs):
-        blocker = kwargs.get("write_path_blocker")
-        control_plane_case_variant = pathlib.Path.home() / "ouroboros" / "repo" / "README.md"
-        assert blocker is not None
-        assert "credential-like" in blocker(desktop / ".env")
-        assert "credential-like" in blocker(desktop / "Credentials.json")
-        assert "overlaps" in blocker(control_plane_case_variant)
-        assert blocker(desktop / "report.html") == ""
-        return SimpleNamespace(
-            success=True,
-            cost_usd=0,
-            usage={},
-            changed_files=[],
-            diff_stat="",
-            validation_summary="",
-            error="",
-            result_text="ok",
-            to_tool_output=lambda: "OK: external edit",
-        )
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute("claude_code_edit", {"prompt": "edit external file", "cwd": str(desktop)})
-
-    assert result.startswith("OK: external edit")
-
-
-def test_claude_code_edit_artifact_store_cwd_reuses_artifact_control_guard(tmp_path, monkeypatch):
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
-    artifact_store = pathlib.Path(registry._ctx.drive_root) / "task_results" / "artifacts" / "task1"
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
-
-    def fake_run_edit(**kwargs):
-        blocker = kwargs.get("write_path_blocker")
-        assert blocker is not None
-        assert "reserved" in blocker(artifact_store / ".artifact_manifest.json")
-        assert blocker(artifact_store / "report.html") == ""
-        return SimpleNamespace(
-            success=True,
-            cost_usd=0,
-            usage={},
-            changed_files=[],
-            diff_stat="",
-            validation_summary="",
-            error="",
-            result_text="ok",
-            to_tool_output=lambda: "OK: artifact edit",
-        )
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute("claude_code_edit", {"prompt": "edit artifact", "cwd": str(artifact_store)})
-
-    assert result.startswith("OK: artifact edit")
-
-
-def test_claude_code_edit_external_outputs_are_registered(tmp_path, monkeypatch):
-    from ouroboros.artifacts import collect_task_artifact_records
-
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    registry, _repo, data, desktop = _registry_under_fake_home(tmp_path, monkeypatch)
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
-
-    def fake_run_edit(**kwargs):
-        pathlib.Path(kwargs["cwd"], "deck.html").write_text("<h1>ok</h1>", encoding="utf-8")
-        return SimpleNamespace(
-            success=True,
-            cost_usd=0,
-            usage={},
-            changed_files=[],
-            diff_stat="",
-            validation_summary="",
-            error="",
-            result_text="ok",
-            to_tool_output=lambda: "OK: external edit",
-        )
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute(
-        "claude_code_edit",
-        {"prompt": "create external file", "cwd": str(desktop), "outputs": ["deck.html"]},
-    )
-
-    assert result.startswith("OK: external edit")
-    assert "ARTIFACT_OUTPUTS" in result
-    assert (data / "task_results" / "artifacts" / "task1" / "deck.html").read_text(encoding="utf-8") == "<h1>ok</h1>"
-    records = collect_task_artifact_records(data, "task1")
-    assert records[0]["kind"] == "process_output"
-    assert records[0]["source_path"] == str(desktop / "deck.html")
-
-
-def test_claude_code_edit_outputs_require_fresh_file_change(tmp_path, monkeypatch):
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    registry, _repo, data, desktop = _registry_under_fake_home(tmp_path, monkeypatch)
-    (desktop / "deck.html").write_text("old", encoding="utf-8")
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
-
-    def fake_run_edit(**_kwargs):
-        return SimpleNamespace(
-            success=True,
-            cost_usd=0,
-            usage={},
-            changed_files=[],
-            diff_stat="",
-            validation_summary="",
-            error="",
-            result_text="ok",
-            to_tool_output=lambda: "OK: external edit",
-        )
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute("claude_code_edit", {"prompt": "create external file", "cwd": str(desktop), "outputs": ["deck.html"]})
-
-    # C2 (v6.36.0): present-but-unchanged declared output is cosmetic, not blocking.
-    assert not result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
-    assert "unchanged output (cosmetic)" in result
-    assert not (data / "task_results" / "artifacts" / "task1" / "deck.html").exists()
-
-
 def test_repeated_user_file_write_updates_same_canonical_artifact(tmp_path, monkeypatch):
     from ouroboros.artifacts import collect_task_artifact_records
 
@@ -1446,47 +1271,6 @@ def test_search_code_user_files_default_path_prunes_protected_children(tmp_path,
     assert "Desktop/notes.txt" in result
 
 
-def test_claude_code_edit_workspace_allows_task_drive_cwd(tmp_path, monkeypatch):
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    registry, _repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    registry._ctx.workspace_mode = "workspace"
-    registry._ctx.workspace_root = str(workspace)
-    registry._ctx.active_repo_dir = lambda: workspace
-    task_drive = registry._ctx.task_drive_root()
-    task_drive.mkdir(parents=True, exist_ok=True)
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
-    captured = {}
-
-    def fake_run_edit(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(
-            success=True,
-            cost_usd=0,
-            usage={},
-            changed_files=[],
-            diff_stat="",
-            validation_summary="",
-            error="",
-            result_text="ok",
-            to_tool_output=lambda: "OK: task drive edit",
-        )
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute("claude_code_edit", {"prompt": "edit artifact", "cwd": str(task_drive)})
-
-    assert result == "OK: task drive edit"
-    assert pathlib.Path(captured["cwd"]) == task_drive
-    assert (data / "task_results" / "artifacts" / "task1").exists() is False
-
-
 def test_task_drive_root_is_scratch_even_for_forked_workspace(tmp_path, monkeypatch):
     registry, _repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     child_drive = data / "headless_tasks" / "task1" / "data"
@@ -1504,29 +1288,19 @@ def test_invalid_workspace_overlap_blocked_at_tool_boundary(tmp_path, monkeypatc
     registry, repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     registry._ctx.workspace_mode = "workspace"
     registry._ctx.workspace_root = str(repo)
-    called = {"value": False}
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
 
-    def fake_run_edit(**_kwargs):
-        called["value"] = True
-        return SimpleNamespace(success=True, cost_usd=0, usage={}, changed_files=[], diff_stat="", validation_summary="", error="", result_text="", to_tool_output=lambda: "OK")
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute("claude_code_edit", {"prompt": "try forged workspace", "cwd": str(repo)})
+    result = registry.execute("run_command", {"command": "echo forged-workspace-probe"})
 
     assert "WORKSPACE_MODE_BLOCKED" in result
     assert "overlaps" in result
-    assert called["value"] is False
+    assert "forged-workspace-probe" not in result
 
     registry._ctx.workspace_root = str(pathlib.Path(str(repo).replace("Ouroboros", "ouroboros")))
-    case_result = registry.execute("claude_code_edit", {"prompt": "try forged workspace", "cwd": str(repo)})
+    case_result = registry.execute("run_command", {"command": "echo forged-workspace-probe"})
 
     assert "WORKSPACE_MODE_BLOCKED" in case_result
     assert "overlaps" in case_result
+    assert "forged-workspace-probe" not in case_result
 
 
 def test_system_repo_write_blocks_when_active_workspace_differs(tmp_path, monkeypatch):

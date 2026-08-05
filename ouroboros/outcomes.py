@@ -134,7 +134,6 @@ _BLOCKING_TOOL_STATUSES = frozenset({
     "root_required_active_workspace",
 })
 _RECOVERY_TOOL_NAMES = frozenset({
-    "claude_code_edit",
     "edit_text",
     "run_command",
     "run_script",
@@ -465,10 +464,9 @@ def infra_failed_axes(reason_code: str, *, lifecycle: str = "failed", review_tri
 
 # Tools/roots whose successful use means the turn produced reviewable work.
 # Root-aware write tools: these take a `root` arg, so the scratch-exclusion rule
-# applies directly. claude_code_edit uses `cwd` (not `root`) and resolves its own
-# work dir, so it is NOT root-checked here; its deliverables surface via the
-# artifact_registered flag (declared outputs), and workspace/headless claude_code_edit
-# is review-eligible anyway because such tasks are not direct chat.
+# applies directly. (The retired SDK edit gateway was the one cwd-based coding
+# tool; delegated coding now rides the subagent lane, whose integration lands
+# through integrate_subagent_patch below — D10.)
 _ROOT_WRITE_TOOLS = frozenset({"write_file", "edit_text"})
 _EFFECT_COMMIT_TOOLS = frozenset({"commit_reviewed", "vcs_commit_reviewed"})
 # Exclusion model: only pure scratch is exempt. Every other root is a real surface
@@ -479,10 +477,9 @@ _SCRATCH_ROOTS = frozenset({"task_drive"})
 _OK_TOOL_STATUSES = frozenset({"", "ok", "ok_autocorrected"})
 # Process/service tools that produce a registered deliverable when given outputs=[...].
 _EFFECT_PROCESS_TOOLS = frozenset({"run_command", "run_script", "start_service"})
-# Substantial coding tool (cwd-based, no root arg): any successful run is real
-# work. Over-counting a rare scratch edit is the safe direction for an immune
-# gate; under-counting a real repo/deliverable edit (no outputs=[...]) is not.
-_EFFECT_CODING_TOOLS = frozenset({"claude_code_edit"})
+# Substantial cwd-based coding tools: none since D10 retired the SDK edit
+# gateway; the set stays so the projection shape (and its consumers) hold.
+_EFFECT_CODING_TOOLS = frozenset()
 # Parent integration of a child's patch stages a repo mutation -> reviewable work.
 _EFFECT_INTEGRATION_TOOLS = frozenset({"integrate_subagent_patch"})
 
@@ -491,8 +488,7 @@ def reviewable_effect_projection(llm_trace: Dict[str, Any]) -> List[Dict[str, An
     """Return the structured tool effects shared by review and delivery binding.
 
     Reviewable effects are a successful repo commit; a successful write_file/
-    edit_text to any non-scratch root; any successful claude_code_edit (a
-    substantial coding tool that uses cwd, not root); a successful
+    edit_text to any non-scratch root; a successful
     run_command/run_script/start_service that declared deliverable outputs; or any
     successful tool that registered a canonical artifact (artifact_registered — a
     stopped service's outputs or a user_files write). Pure scratch (root=task_drive)

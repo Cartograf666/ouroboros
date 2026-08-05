@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import logging
 
 from ouroboros import model_concurrency
+from ouroboros.deadline_utils import seconds_until
 from ouroboros.llm import LLMClient, LocalContextTooLargeError, add_usage
 from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
@@ -124,6 +125,12 @@ _TRANSIENT_RETRY_KINDS = frozenset({"provider_transient", "provider_incomplete_r
 # model down even though it is not a same-model retry kind. Kept separate so widening the
 # cooldown trigger never enlarges the same-model transient-retry budget.
 _COOLDOWN_ERROR_KINDS = _TRANSIENT_RETRY_KINDS | frozenset({"rate_limit"})
+# A subscription window that is spent but heals on a timer. SSOT for the name.
+# Deliberately NOT `quota_exhausted`: that class is classified PERMANENT, which is
+# correct for a billing refusal (402, no credits) and wrong for a plan window whose
+# only cure is waiting. Scheduling follows `reset_at`, not the 60s-capped exponential
+# backoff, so a six-hour window never becomes sixty one-minute retries.
+SUBSCRIPTION_WINDOW_EXHAUSTED = "subscription_window_exhausted"
 _TRANSIENT_RETRY_DEFAULT = 6
 _TRANSIENT_BACKOFF_CAP_SEC = 60.0
 # Stop retrying when the remaining task deadline cannot absorb the backoff
@@ -245,6 +252,22 @@ def _cooldown_kind_for_empty_response(usage: Dict[str, Any], event_type: str) ->
     return body_kind if body_kind in _COOLDOWN_ERROR_KINDS else event_type
 
 
+def _retry_backoff_sec(
+    accumulated_usage: Dict[str, Any], error_kind: str, attempt: int, is_transient: bool,
+) -> float:
+    """Seconds to wait before retrying the same request.
+
+    A KNOWN reset instant wins over guesswork: a spent subscription window is scheduled
+    against its own ``reset_at``, never through the 60s-capped exponential, so a
+    six-hour window never becomes sixty one-minute retries. ``_sleep_within_deadline``
+    then honestly refuses when the task deadline cannot absorb that wait.
+    """
+    retry_after = accumulated_usage.get("_last_llm_retry_after_sec")
+    if error_kind == SUBSCRIPTION_WINDOW_EXHAUSTED and retry_after is not None:
+        return max(0.0, float(retry_after))
+    return min(2.0 ** attempt * 4, _TRANSIENT_BACKOFF_CAP_SEC if is_transient else 30.0)
+
+
 def _sleep_within_deadline(seconds: float, deadline_ts: Optional[float]) -> bool:
     """Sleep ``seconds`` if the task deadline (epoch seconds) allows another
     attempt afterwards. Returns False — without sleeping — when the remaining
@@ -303,6 +326,12 @@ class LlmErrorClassification:
     retry_same_request: bool
     status_code: Optional[int] = None
     provider_code: str = ""
+    # Wall-clock seconds until the failure can heal, when the provider states it.
+    # Set only by classes whose recovery is a KNOWN INSTANT (a subscription window
+    # reset), never by classes whose recovery is guesswork — those keep the ordinary
+    # exponential backoff.
+    retry_after_sec: Optional[float] = None
+    reset_at: str = ""
 
 
 def _emit_live_log(event_queue: Optional[queue.Queue], payload: Dict[str, Any]) -> None:
@@ -483,6 +512,18 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
     safe = safe_error or sanitize_tool_result_for_log(repr(exc))
     if isinstance(exc, LocalContextTooLargeError):
         return LlmErrorClassification("context_overflow", False)
+    # Structured fact, not a keyword scan (Bible P5): a transport that KNOWS its
+    # window is spent carries the typed code plus the reset instant.
+    if str(getattr(exc, "code", "") or "") == SUBSCRIPTION_WINDOW_EXHAUSTED:
+        reset_at = str(getattr(exc, "reset_at", "") or "")
+        return LlmErrorClassification(
+            SUBSCRIPTION_WINDOW_EXHAUSTED,
+            True,
+            _exception_status_code(exc),
+            "",
+            seconds_until(reset_at),
+            reset_at,
+        )
     status_code = _exception_status_code(exc)
     provider_code = _exception_provider_code(exc, safe)
     low = str(safe or "").lower()
@@ -622,6 +663,12 @@ def _record_llm_call_error(
         ctx.accumulated_usage["_last_llm_provider_message"] = provider_message
     ctx.accumulated_usage["_last_llm_error_kind"] = classification.kind
     ctx.accumulated_usage["_last_llm_retry_same_request"] = classification.retry_same_request
+    if classification.retry_after_sec is not None:
+        ctx.accumulated_usage["_last_llm_retry_after_sec"] = classification.retry_after_sec
+        ctx.accumulated_usage["_last_llm_reset_at"] = classification.reset_at
+    else:
+        ctx.accumulated_usage.pop("_last_llm_retry_after_sec", None)
+        ctx.accumulated_usage.pop("_last_llm_reset_at", None)
     if classification.status_code:
         ctx.accumulated_usage["_last_llm_status_code"] = classification.status_code
     if classification.provider_code:
@@ -1000,10 +1047,7 @@ def call_llm_with_retry(
             attempt_budget = transient_budget if is_transient else min(max_retries, transient_budget)
             if attempt >= attempt_budget - 1:
                 break
-            backoff = min(
-                2.0 ** attempt * 4,
-                _TRANSIENT_BACKOFF_CAP_SEC if is_transient else 30.0,
-            )
+            backoff = _retry_backoff_sec(accumulated_usage, error_kind, attempt, is_transient)
             if not _sleep_within_deadline(backoff, deadline_ts):
                 _emit_retry_deadline_exhausted(
                     drive_logs, task_id=task_id, execution_id=execution_id,

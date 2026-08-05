@@ -2,6 +2,14 @@ import { refreshModelCatalog } from './settings_catalog.js';
 import { bindEffortSegments, syncEffortSegments } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
 import { applyMcpSettings, collectMcpSettings, initMcpSettings } from './mcp_settings.js';
+import { collectReviewerSlots, initReviewerSlots, reloadReviewerSlots } from './reviewer_slots.js';
+import {
+    applySubagentsSettings,
+    collectSubagentsSettings,
+    initSubagentsSection,
+    reloadSubagentsSection,
+} from './subagents_settings.js';
+import { initHarnessAccounts } from './harness_accounts.js';
 import { SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
 import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
@@ -16,9 +24,14 @@ let setupContract = {};
 const INPUT_FIELDS = [
     ['s-openai-base-url', 'OPENAI_BASE_URL'], ['s-openai-compatible-base-url', 'OPENAI_COMPATIBLE_BASE_URL'], ['s-cloudru-base-url', 'CLOUDRU_FOUNDATION_MODELS_BASE_URL'],
     ['s-gigachat-scope', 'GIGACHAT_SCOPE'], ['s-gigachat-user', 'GIGACHAT_USER'], ['s-gigachat-base-url', 'GIGACHAT_BASE_URL'], ['s-gigachat-verify-ssl', 'GIGACHAT_VERIFY_SSL_CERTS'],
+    // 6.4 (D10): the Claude Code model picker is gone with claude_code_edit;
+    // CLAUDE_CODE_MODEL stays a backend setting for the api-route advisory.
     ['s-minimax-region', 'MINIMAX_REGION'],
-    ['s-server-host', 'OUROBOROS_SERVER_HOST', '127.0.0.1'], ['s-claude-code-model', 'CLAUDE_CODE_MODEL', 'opus[1m]'],
-    ['s-review-models', 'OUROBOROS_REVIEW_MODELS'], ['s-scope-review-models', 'OUROBOROS_SCOPE_REVIEW_MODELS'], ['s-deep-self-review-model', 'OUROBOROS_MODEL_DEEP_SELF_REVIEW'], ['s-skills-repo-path', 'OUROBOROS_SKILLS_REPO_PATH'],
+    ['s-server-host', 'OUROBOROS_SERVER_HOST', '127.0.0.1'],
+    // 6.1: OUROBOROS_REVIEW_MODELS / OUROBOROS_SCOPE_REVIEW_MODELS are no
+    // longer authored here — the Reviewer Slots section composes the ONE
+    // structured setting; the comma keys stay a backend-derived projection.
+    ['s-deep-self-review-model', 'OUROBOROS_MODEL_DEEP_SELF_REVIEW'], ['s-skills-repo-path', 'OUROBOROS_SKILLS_REPO_PATH'],
     ['s-clawhub-registry-url', 'OUROBOROS_CLAWHUB_REGISTRY_URL'], ['s-websearch-model', 'OUROBOROS_WEBSEARCH_MODEL'], ['s-gh-repo', 'GITHUB_REPO'],
     ['s-local-source', 'LOCAL_MODEL_SOURCE'], ['s-local-filename', 'LOCAL_MODEL_FILENAME'], ['s-local-chat-format', 'LOCAL_MODEL_CHAT_FORMAT'],
     ['s-subagent-worktree-root', 'OUROBOROS_SUBAGENT_WORKTREE_ROOT'], ['s-subagent-projects-root', 'OUROBOROS_SUBAGENT_PROJECTS_ROOT'],
@@ -26,8 +39,10 @@ const INPUT_FIELDS = [
     ['s-evo-objective', 'OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE', ''],
 ];
 const VALUE_FIELDS = [
-    ['s-effort-task', 'OUROBOROS_EFFORT_TASK', 'medium'], ['s-effort-evolution', 'OUROBOROS_EFFORT_EVOLUTION', 'high'], ['s-effort-review', 'OUROBOROS_EFFORT_REVIEW', 'high'],
-    ['s-effort-consciousness', 'OUROBOROS_EFFORT_CONSCIOUSNESS', 'high'], ['s-effort-scope-review', 'OUROBOROS_EFFORT_SCOPE_REVIEW', 'high'], ['s-effort-deep-self-review', 'OUROBOROS_EFFORT_DEEP_SELF_REVIEW', 'high'],
+    // 6.3: Review / Scope Review efforts are per-slot rows on the Models page
+    // now; their global keys remain backend defaults, no longer UI-authored.
+    ['s-effort-task', 'OUROBOROS_EFFORT_TASK', 'medium'], ['s-effort-evolution', 'OUROBOROS_EFFORT_EVOLUTION', 'high'],
+    ['s-effort-consciousness', 'OUROBOROS_EFFORT_CONSCIOUSNESS', 'high'], ['s-effort-deep-self-review', 'OUROBOROS_EFFORT_DEEP_SELF_REVIEW', 'high'],
     ['s-review-enforcement', 'OUROBOROS_REVIEW_ENFORCEMENT', 'advisory'], ['s-task-review-mode', 'OUROBOROS_TASK_REVIEW_MODE', 'auto'], ['s-runtime-mode', 'OUROBOROS_RUNTIME_MODE', 'advanced'],
     ['s-update-channel', 'OUROBOROS_UPDATE_CHANNEL', 'stable'],
     ['s-context-mode', 'OUROBOROS_CONTEXT_MODE', 'max'], ['s-image-input-mode', 'OUROBOROS_IMAGE_INPUT_MODE', 'auto'],
@@ -338,6 +353,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     let settingsBaseline = '';
     let settingsDirty = false;
     initMcpSettings({ onChange: updateSettingsDirtyState });
+    initReviewerSlots({ onChange: () => updateSettingsDirtyState() });
+    initSubagentsSection({ onChange: () => updateSettingsDirtyState() });
+    initHarnessAccounts();
 
     function anthropicKeyConfigured() {
         const input = byId('s-anthropic');
@@ -511,6 +529,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         delete mutativeInput.dataset.effortTouched;
         mutativeInput.value =
             ({ true: 'on', false: 'off' }[rawMutative] || (runtimeMode === 'light' ? 'off' : 'on'));
+        // The delegation route lives next to it in Models → Subagents.
+        applySubagentsSettings(s);
         // Post-task evolution: one owner-facing selector maps to enable + cadence.
         const evoEnabled =
             ({ true: 'on', '1': 'on', on: 'on', false: 'off', '0': 'off', off: 'off' }[
@@ -609,6 +629,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         renderExtensionSettingsSections(page, sections);
         renderRequestedSkillSecrets(page, extData.skills || [], data);
         renderCustomSecrets(page, data);
+        // Await the reviewer rows and the Subagents accounts BEFORE the clean
+        // baseline: their async arrival must not read as an unsaved owner edit.
+        await Promise.all([reloadReviewerSlots(), reloadSubagentsSection()]);
         setSettingsCleanBaseline();
         closeSettingsModelPickers();
         _renderNetworkHint(data._meta);
@@ -672,6 +695,13 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 ? ({ on: 'true', off: 'false' }[mutativeInput?.value] ?? '')
                 : (rawMutative ? ({ true: 'true', false: 'false' }[rawMutative] ?? rawMutative) : ''),
             ...collectMcpSettings(),
+            // 6.1: the ONE structured reviewer-slot setting; {} until the rows
+            // view has loaded, so an unrelated save cannot blank it.
+            ...collectReviewerSlots(),
+            // Same rule for the delegated-subagent route: {} until the accounts
+            // read succeeded, so an unrelated save cannot turn delegation off
+            // because this page could not reach the daemon.
+            ...collectSubagentsSettings(),
         };
         setupModelSlots().forEach((slot) => {
             body[slot.settingKey] = fieldValue(slot.settingsInputId);
@@ -679,7 +709,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => {
             const value = fieldValue(id).trim();
-            body[key] = key === 'OUROBOROS_SERVER_HOST' ? value || fallback : value || (key === 'CLAUDE_CODE_MODEL' ? fallback : '');
+            body[key] = key === 'OUROBOROS_SERVER_HOST' ? value || fallback : value || '';
         });
         VALUE_FIELDS
             // Owner-only keys travel through their audited owner endpoints, never
@@ -819,10 +849,24 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         for (const notice of pending) {
             const ack = notice.needs_ack;
             const seen = Number(notice.window_tokens || 0);
+            // Each delivery is judged by ITS OWN floor: the api row by the
+            // constitutional 1M, a RETRIEVING row by the 200K session floor. Asking
+            // about 1M for a retrieving row would demand a confirmation its own gate
+            // never wanted, so the floor rides with the notice.
+            const floor = Number(notice.floor_tokens || 0) || 1000000;
+            const floorText = floor.toLocaleString('en-US');
+            // A STALE record can report a full 1M and still not authorize, so say WHY
+            // the ack is being asked for — otherwise the prompt reads "this route
+            // reports 1000000 tokens, please confirm 1000000 tokens".
+            const reading = !(seen > 0)
+                ? 'no window metadata'
+                : (notice?.needs_ack?.evidence?.stale
+                    ? `${seen} tokens from an EXPIRED reading the provider could not re-confirm`
+                    : `${seen} tokens`);
             const confirmed = window.confirm(
-                'Scope review is fail-closed unless its reviewer\'s 1,000,000-token context '
-                + `window is known, and this route reports ${seen > 0 ? `${seen} tokens` : 'no window metadata'}.\n\n`
-                + 'Confirm that this model supports a 1,000,000-token context window?\n'
+                `Scope review is fail-closed unless its reviewer's ${floorText}-token context `
+                + `window is currently known, and this route reports ${reading}.\n\n`
+                + `Confirm that this reviewer supports a ${floorText}-token context window?\n`
                 + `  provider: ${ack.provider || '(default)'}\n  model: ${ack.model}\n`
                 + `  base_url: ${ack.base_url || '(default)'}\n\n`
                 + 'This applies only to this exact model/provider. Answering No leaves scope '
@@ -831,7 +875,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             if (!confirmed) continue;
             await apiClient.ownerCapabilityAck({
                 provider: ack.provider, model: ack.model, base_url: ack.base_url,
-                window_tokens: 1000000, note: 'owner-confirmed scope reviewer window',
+                window_tokens: floor, note: 'owner-confirmed scope reviewer window',
             });
             acked += 1;
         }
@@ -1198,7 +1242,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 statusType = 'warn';
             }
             if (reviewAcks > 0) {
-                statusMsg = `${statusMsg} Confirmed a 1M-token window for ${reviewAcks} scope-review route(s).`;
+                statusMsg = `${statusMsg} Confirmed the required context window for ${reviewAcks} scope-review route(s).`;
             }
             if (reviewAckError) {
                 statusMsg = `${statusMsg} The scope-reviewer window confirmation was not saved: ${reviewAckError}`;

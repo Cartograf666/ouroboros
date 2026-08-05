@@ -183,7 +183,7 @@ def test_denylist_is_allowlist_complement_blocks_all_host_surfaces():
     core = rcb._core_tool_names()
     # nothing in the allowlist is denied; everything else is
     assert denied == core - rcb._ALLOWED_CORE_TOOLS
-    for t in ("run_command", "run_script", "claude_code_edit", "write_file", "edit_text",
+    for t in ("run_command", "run_script", "write_file", "edit_text",
               "start_service", "stop_service", "verify_and_record", "commit_reviewed",
               "integrate_subagent_patch", "create_github_issue", "schedule_subagent",
               "skill_exec", "toggle_skill", "submit_skill_to_hub", "vcs_pull_ff",

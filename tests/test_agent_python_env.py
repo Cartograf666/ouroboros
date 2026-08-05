@@ -45,13 +45,25 @@ def test_git_pre_push_tests_uses_sys_executable():
     assert "run_hermetic_pytest" in git_tools
 
 
-def test_shell_validation_uses_sys_executable():
+def test_shell_no_longer_launches_pytest_at_all():
+    """The shell validation runner retired WITH its only consumer (D10).
+
+    `_run_validation` was `claude_code_edit`'s own `validate=True`
+    implementation — one caller since the initial bundle — so it left with the
+    tool. The interpreter-handle invariant this pin protected (a packaged app
+    must run pytest through the interpreter that launched it, never bare
+    `python`) keeps its two FIRST-CLASS homes, each pinned by its own test
+    above: the preflight runner and the git pre-push tests. This pin now
+    asserts the new truth at the old location: shell.py launches pytest in NO
+    form, so an ad-hoc runner with the wrong interpreter cannot sneak back in
+    beside process tools — a new pytest launch belongs in
+    preflight_runner/run_hermetic_pytest, where the sibling pins bind it.
+    """
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     source = (repo_root / "ouroboros" / "tools" / "shell.py").read_text(encoding="utf-8")
     assert '["python", "-m", "pytest"' not in source
-    assert '"-m", "pytest"' in source
-    assert "sys.executable" in source
-    assert "OUROBOROS_AGENT_PYTHON" in source
+    assert '"-m", "pytest"' not in source
+    assert '"pytest"' not in source
 
 
 def test_sys_executable_minus_m_pytest_exits_zero():

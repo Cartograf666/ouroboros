@@ -121,10 +121,13 @@ def test_process_without_outputs_is_not_an_effect():
     ]})
 
 
-def test_claude_code_edit_is_an_effect():
-    # Substantial coding tool (cwd-based, no root): any successful run is reviewable
-    # work. Over-counting a rare scratch edit is the safe immune-gate direction.
-    assert turn_has_reviewable_effects({"tool_calls": [
+def test_cwd_coding_effect_class_is_empty_since_d10():
+    # D10 retired the one cwd-based coding tool; the effect CLASS stays wired
+    # (an empty set), so a successor lands as one entry, not a new mechanism.
+    from ouroboros.outcomes import _EFFECT_CODING_TOOLS
+
+    assert _EFFECT_CODING_TOOLS == frozenset()
+    assert not turn_has_reviewable_effects({"tool_calls": [
         {"tool": "claude_code_edit", "is_error": False, "status": "ok", "args": {"cwd": "Desktop"}},
     ]})
 

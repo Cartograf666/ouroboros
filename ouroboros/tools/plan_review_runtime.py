@@ -77,12 +77,16 @@ async def run_plan_review_slots(
     system_prompt: str,
     user_content: str,
     user_stable_len: int = 0,
+    slot_ids: list[str] | None = None,
 ) -> list[dict]:
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+    from ouroboros.tools.review_synthesis import minted_plan_slot_ids
 
+    # Owner decision D15: plan review stays api_chat — no route list is consulted here.
+    row_ids = list(slot_ids) if slot_ids is not None else minted_plan_slot_ids(models)
     slots = [
         ReviewSlot(
-            slot_id=f"plan_slot_{idx + 1}",
+            slot_id=row_id,
             model=str(model),
             effort=PLAN_REVIEW_EFFORT,
             timeout_sec=PLAN_REVIEW_SLOT_TIMEOUT_SEC,
@@ -91,7 +95,7 @@ async def run_plan_review_slots(
             role_hint="plan reviewer",
             use_local=review_model_uses_local(str(model)),
         )
-        for idx, model in enumerate(models)
+        for row_id, model in zip(row_ids, models, strict=True)
     ]
     request = ReviewRequest(
         surface="plan_review",
@@ -127,6 +131,9 @@ def _plan_raw_result_from_actor(actor: dict, request_model: str) -> dict:
     if actor.get("status") not in {"ok", "empty"} and not error:
         error = str(actor.get("status") or "review failed")
     return {
+        # Identity is CARRIED, never re-derived: the row keeps the slot_id the
+        # substrate ran, so duplicate-model plan rows stay distinguishable.
+        "slot_id": str(actor.get("slot_id") or ""),
         "model": str(usage.get("resolved_model") or actor.get("model") or request_model),
         "request_model": request_model or actor.get("model") or "",
         "text": text,
@@ -181,31 +188,8 @@ def resolve_plan_class(ctx: ToolContext, plan_class: str, files_to_touch: list) 
     return ("external" if active != system_repo else "self_mod"), ""
 
 
-def resolve_plan_context_level(raw_level: str, *, plan_class: str = "self_mod") -> str:
-    level = str(raw_level or "").strip().lower()
-    valid = {"minimal", "localized", "broad", "constitutional"}
-    if level not in valid:
-        if not level and plan_class in ("external", "creative", "research"):
-            return "minimal"
-        raise ValueError(
-            "plan_task requires an explicit context_level chosen by the agent "
-            f"({', '.join(sorted(valid))}); do not rely on host-side auto selection."
-        )
-    return level
-
-
-def plan_context_target_tokens(level: str) -> int:
-    return {
-        "localized": 80_000,
-        "broad": 350_000,
-        "constitutional": 850_000,
-    }.get(str(level or ""), 80_000)
-
-
 def classify_reviewer_error(exc: BaseException, model: str) -> str:
     """Return actionable reviewer failure text without swallowing details."""
-    import json
-
     exc_type = type(exc).__name__
     exc_str = str(exc)
     if isinstance(exc, json.JSONDecodeError):

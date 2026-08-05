@@ -93,7 +93,12 @@ def build_user_content(task: Dict[str, Any]) -> Any:
                 "gathering, and non-mutating preparation while review is open, but begin implementation "
                 "only after review closes or a real task-wide rail fires. Under advisory, you may proceed "
                 "by judgment with explicit disclosure. When the work decomposes into independent parts, "
-                "fan out subagents within the configured caps and reconcile them. Planning or reviewer "
+                "fan out subagents within the configured caps and reconcile them. Parallel children each "
+                "work from your base snapshot and cannot see each other's edits; their patches integrate "
+                "independently, so two children writing the same region of the same file conflict at "
+                "integration — expected mechanics, not a failure. Give children disjoint write regions, "
+                "or explicitly plan the parent-synthesis step that resolves the expected overlap. "
+                "Planning or reviewer "
                 "unavailability must not replace useful work with a terminal planning error.\n"
                 "[/SWARM_INITIATIVE]\n\n"
             )
@@ -404,15 +409,15 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
                 runtime_mode=str(runtime_mode or ""),
             )
             # v6.57.0 (1.6): a delegated child sees its OWN effective tool profile
-            # (shell/writable roots/lane) up front — the same summary the parent got at
-            # schedule time — so it never wastes a round discovering shell is off.
+            # (shell/writable roots/lane) up front. The lane is the one dispatch
+            # resolved; a fallback to the REQUEST would name an unresolved strength.
             try:
                 if str(task.get("delegation_role") or "").strip() == "subagent":
                     from ouroboros.tool_access import active_tool_profile, summarize_subagent_profile
 
                     runtime_data["capabilities"]["self_profile"] = summarize_subagent_profile(
                         active_tool_profile(ctx),
-                        effective_lane=str(task.get("effective_model_lane") or task.get("requested_model_lane") or ""),
+                        effective_lane=str(task.get("effective_model_lane") or ""),
                     )
             except Exception:
                 log.debug("Failed to build subagent self_profile summary", exc_info=True)
@@ -1169,6 +1174,42 @@ def build_health_invariants(env: Any) -> str:
         pass
 
     try:
+        from ouroboros.delegate_custody import settled_unread_outputs
+
+        drive_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
+        for run in settled_unread_outputs(drive_root):
+            # Owner doctrine D7, made load-bearing: a delegated result that was paid for
+            # and never read to EOF is the launched-never-collected class. Not CRITICAL —
+            # nothing is live and nothing is mutating — but it stays visible until the
+            # read happens, which is the whole difference between a disclosure and a fact
+            # someone acts on. It clears itself the moment the acknowledgement lands.
+            checks.append(
+                f"WARNING: DELEGATED RESULT NEVER READ — run {run.run_id or '?'} settled "
+                f"with its full output staged at {run.output_artifact} and never read to "
+                f"EOF (owner task {run.task_id or '?'}). Read it with read_file "
+                f"root='task_drive' until the artifact is covered end to end, or say "
+                f"plainly that the result was not collected."
+            )
+    except Exception:
+        pass
+
+    try:
+        from ouroboros.delegate_custody import open_containment_faults
+
+        drive_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
+        for fault in open_containment_faults(drive_root):
+            # An overpowered mutating run we asked to stop and could not verify stopped
+            # is an incident, not a tool-result string. It stays CRITICAL until a
+            # terminal receipt or a settlement clears it.
+            checks.append(
+                f"CRITICAL: DELEGATED RUN MAY STILL BE LIVE — run {fault.get('run_id') or '?'} "
+                f"({fault.get('reason') or 'unverified'}), owner task "
+                f"{fault.get('task_id') or '?'}, since {fault.get('ts') or '?'}"
+            )
+    except Exception:
+        pass
+
+    try:
         stray_note = _stray_server_note(env)
         if stray_note:
             checks.append(stray_note)
@@ -1492,8 +1533,8 @@ def build_llm_messages(
         "preferred_mode": plan.preferred_mode,
         "initial_mode": plan.initial_mode,
         "route_fp": plan.route_fp,
-        "evidence_status": plan.evidence_status,
-        "evidence_stale": plan.evidence_stale,
+        "evidence_status": plan.status,
+        "evidence_stale": plan.stale,
         "window_tokens": plan.window_tokens,
         "max_estimated_tokens": plan.max_projection.estimated_tokens,
         "max_calibrated_tokens": plan.max_projection.calibrated_tokens,

@@ -15,21 +15,27 @@ import inspect
 import logging
 import os
 import pathlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, List, Optional
 
 from ouroboros.llm import LLMClient
-from ouroboros.config import review_model_uses_local
-from ouroboros.review_substrate import review_repo_dirs_for
+from ouroboros.review_substrate import review_repo_dirs_for, scope_reviewer_slots
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.review_context_atlas import (
     ReviewContextAtlasRequest,
+    atlas_assembly_failed,
+    atlas_assembly_failure_reason,
+    atlas_hard_budget_overflowed,
+    atlas_unassembled_required,
     compile_review_context_atlas,
 )
 from ouroboros.tools.scope_review_contract import (
     SCOPE_REQUIRED_ITEMS,
+    TouchedContextStatus as _TouchedContextStatus,
     build_scope_block_message as _build_block_message,
     classify_scope_findings as _classify_scope_findings,
+    compute_touched_context_status as _compute_touched_status,
+    ladder_terminal_cause as _ladder_terminal_cause,
     normalize_scope_items as _normalize_scope_items,
 )
 from ouroboros.tools.review_synthesis import build_scope_review_prompt
@@ -52,7 +58,7 @@ from ouroboros.tools.review_helpers import (
     format_review_history_entry,
     parse_git_name_status,
 )
-from ouroboros.triad_review import extract_json_array
+from ouroboros.triad_review import REVIEW_JSON_MATRIX_CONTRACT, extract_json_array
 from ouroboros.utils import (
     run_cmd,
     utc_now_iso,
@@ -71,12 +77,10 @@ _SCOPE_REQUIRED_ITEMS = SCOPE_REQUIRED_ITEMS  # compatibility export used by tes
 # routed spelling alike, exactly as the sentinel spanned spellings for the previous
 # designated default (v6.55.0-v6.81: anthropic/claude-fable-5). The sentinel still
 # grants only the conservative 1M figure, and a real probe/owner-ack supersedes it.
-_SCOPE_MODEL_DEFAULT = "openai/gpt-5.6-terra"
+from ouroboros.tools.scope_window import SCOPE_MODEL_DEFAULT as _SCOPE_MODEL_DEFAULT  # noqa: E402
 _SCOPE_MAX_TOKENS = 100_000  # 100K output tokens
 _SCOPE_REVIEW_SLOT_TIMEOUT_SEC = 900
-from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET as _REVIEW_BUDGET
-
-_SCOPE_BUDGET_TOKEN_LIMIT = _REVIEW_BUDGET
+from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET as _SCOPE_BUDGET_TOKEN_LIMIT
 
 # The shared prompt-size SSOT (920K) governs INPUT only, but the reviewer also
 # reserves _SCOPE_MAX_TOKENS for OUTPUT inside that same 1M window. 920K input +
@@ -84,11 +88,13 @@ _SCOPE_BUDGET_TOKEN_LIMIT = _REVIEW_BUDGET
 # tens of thousands of tokens on atlas-heavy prompts. Gate assembled INPUT on a
 # conservative effective cap and retry once with a compact atlas prompt before
 # applying the configured blocking/advisory scope authority.
-_SCOPE_MODEL_CONTEXT_WINDOW = 1_000_000
-# Conservative sub-floor window for UNKNOWN reviewers without Capability Evidence.
-# The P3 authority check makes its findings advisory instead of pretending the
-# route is 1M-capable.
-_SCOPE_FAILCLOSED_WINDOW = 200_000
+# The 1M constitutional window, the conservative sub-floor for unevidenced
+# routes, and the shipped default reviewer identity live in `tools/scope_window`
+# (the window-authority SSOT); imported here under the historical names.
+from ouroboros.tools.scope_window import (  # noqa: E402
+    SCOPE_FAILCLOSED_WINDOW as _SCOPE_FAILCLOSED_WINDOW,
+    SCOPE_MODEL_CONTEXT_WINDOW as _SCOPE_MODEL_CONTEXT_WINDOW,
+)
 _SCOPE_OUTPUT_MARGIN_TOKENS = 155_000
 _SCOPE_INPUT_TOKEN_LIMIT = min(
     _SCOPE_BUDGET_TOKEN_LIMIT,
@@ -102,31 +108,13 @@ _SCOPE_INPUT_TOKEN_LIMIT = min(
 # whole process and no observation could ever reach it. The calibration shrinks the
 # PROMPT for the same pinned reviewer — never the reviewer model or the >=1M window
 # floor (BIBLE P3).
+from ouroboros.reviewer_window import (
+    ReviewerWindow,
+    window_scaled_reserves as _shared_window_scaled_reserves,
+)
 from ouroboros.tools.review_helpers import (
     calibrated_input_token_limit as _calibrated_input_token_limit,
 )
-
-# Window provenance vocabulary shared with the diagnostics wording (RS5).
-_WINDOW_CONFIRMED = "confirmed"
-_WINDOW_ASSERTED = "asserted"
-_WINDOW_UNKNOWN = "unknown_conservative"
-_WINDOW_SENTINEL = "designated_default_sentinel"
-
-# ROUTE FINGERPRINTS whose metadata window was already lazily probed in this process.
-# The lazy probe exists for an OFF-DEFAULT env-only pin, whose route otherwise never
-# reaches a fetching probe call site (the Max-context gate only probes the MAIN route),
-# so the pin was structurally condemned to the conservative sub-floor window.
-#
-# Keyed by the full ROUTE fingerprint, not the model name: capability is a property of
-# provider+base_url+model, and evidence is stored under that same fingerprint. Keyed by
-# model alone, a hot `OPENAI_BASE_URL` / `OPENAI_COMPATIBLE_BASE_URL` /
-# `CLOUDRU_FOUNDATION_MODELS_BASE_URL` / `GIGACHAT_BASE_URL` change produced a route with
-# no evidence and NO second probe, so the next scope review silently fell to the
-# conservative sub-floor and the advertised owner-ack path was unreachable.
-_LAZY_WINDOW_PROBED: set = set()
-# (model, resolved_window) -> provenance label, memoised by the window resolver.
-_WINDOW_PROVENANCE: dict = {}
-
 
 def _scope_review_skipped_in_low_context() -> bool:
     """Whether the owner's context mode declares scope review out of scope.
@@ -145,122 +133,19 @@ def _scope_review_skipped_in_low_context() -> bool:
         return False
 
 
-def _is_designated_default_reviewer(model: str) -> bool:
-    """True iff ``model`` is the shipped default reviewer (``openai/gpt-5.6-terra``),
-    across provider spellings (``openai::gpt-5.6-terra``, ``openrouter::openai/...``)."""
-    def _normalized(m: str) -> str:
-        text = str(m or "").strip()
-        if text.startswith("openrouter::"):
-            text = text[len("openrouter::"):]
-        try:
-            from ouroboros.provider_models import normalize_model_identity
-            return normalize_model_identity(text)
-        except Exception:
-            return text
-    return bool(model) and _normalized(model) == _normalized(_SCOPE_MODEL_DEFAULT)
-
-
-def _scope_reviewer_window(model: str) -> int:
-    """Reviewer context window (tokens) from Capability Evidence, FAIL-CLOSED on
-    absent evidence. Replaces the deleted static per-model window table: a
-    confirmed/asserted probe (provider metadata or owner-ack) for the reviewer's REAL
-    active route gives the real window. With NO evidence, the 1M blocking-floor
-    sentinel is granted ONLY to the SHIPPED designated reviewer (gpt-5.6-terra, a real
-    >=1M-window model — 1.05M per OpenRouter /models metadata, checked 2026-07-29);
-    any other no-evidence reviewer returns a conservative sub-floor
-    window so the P3 authority check downgrades it (visibly) instead of silently
-    treating a 200K model as 1M and overflowing its real window into a provider 400
-    (the v6.46.0 scope-discard bug). A non-default >=1M reviewer must be owner-acked
-    to regain 1M — the fact of a PIN is routing intent, never evidence.
-
-    An off-default pin gets ONE lazy metadata-only probe per process (never
-    generative, never a paid call): without it the pin's route reached no fetching
-    probe call site at all, so the owner's pin could not become "known" through any
-    path. Afterwards the cache answers and the path stays hot-path safe. Provenance
-    for the resolved number is memoised for the diagnostics wording."""
-    model = str(model or "")
-    try:
-        from ouroboros.capability_evidence import probe, route_fingerprint
-        from ouroboros.config import DATA_DIR, load_settings
-        from ouroboros.provider_models import provider_for_model, resolve_minimax_base_url
-        settings = load_settings()
-        provider = provider_for_model(model)
-        base_url = ""
-        api_key = None
-        if provider == "openai":
-            base_url = str(settings.get("OPENAI_BASE_URL") or "")
-        elif provider == "openai-compatible":
-            base_url = str(settings.get("OPENAI_COMPATIBLE_BASE_URL") or "")
-        elif provider == "cloudru":
-            base_url = str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "")
-        elif provider == "gigachat":
-            base_url = str(settings.get("GIGACHAT_BASE_URL") or "")
-        elif provider == "minimax":
-            base_url = resolve_minimax_base_url(settings.get("MINIMAX_REGION") or "")
-            api_key = str(settings.get("MINIMAX_API_KEY") or "") or None
-        # Probe the scope slot, not the active main route (which honors USE_LOCAL_MAIN).
-        use_local = review_model_uses_local(model)
-        route_fp = route_fingerprint(
-            provider="local" if use_local else provider, base_url=base_url, model=model,
-        )
-        lazy = route_fp not in _LAZY_WINDOW_PROBED and not _is_designated_default_reviewer(model)
-        if lazy:
-            _LAZY_WINDOW_PROBED.add(route_fp)
-        ev = probe(
-            DATA_DIR,
-            provider="local" if use_local else provider,
-            model=model,
-            base_url=base_url,
-            use_local=use_local,
-            allow_fetch=bool(lazy),
-            api_key=api_key,
-        )
-        if int(ev.window_tokens or 0) > 0:
-            window = int(ev.window_tokens)
-            _WINDOW_PROVENANCE[(model, window)] = (
-                _WINDOW_ASSERTED
-                if str(getattr(ev, "status", "") or "") == "asserted"
-                else _WINDOW_CONFIRMED
-            )
-            return window
-    except Exception:
-        pass
-    if _is_designated_default_reviewer(model):
-        _WINDOW_PROVENANCE[(model, _SCOPE_MODEL_CONTEXT_WINDOW)] = _WINDOW_SENTINEL
-        return _SCOPE_MODEL_CONTEXT_WINDOW
-    _WINDOW_PROVENANCE[(model, _SCOPE_FAILCLOSED_WINDOW)] = _WINDOW_UNKNOWN
-    return _SCOPE_FAILCLOSED_WINDOW
-
-
-def _scope_reviewer_window_evidence(model: str) -> tuple:
-    """``(window_tokens, provenance)``.
-
-    Deliberately LAYERED over ``_scope_reviewer_window`` rather than replacing it: that
-    function is the single window seam every caller already uses, and a number supplied
-    by a substituted seam must still get an honest — if coarser — provenance label
-    instead of a fabricated "confirmed"."""
-    window = _scope_reviewer_window(model)
-    memoised = _WINDOW_PROVENANCE.get((str(model or ""), int(window)))
-    if memoised:
-        return window, memoised
-    return window, (
-        _WINDOW_SENTINEL if int(window) >= _SCOPE_MODEL_CONTEXT_WINDOW else _WINDOW_UNKNOWN
-    )
-
-
-def _window_provenance_phrase(window: int, provenance: str) -> str:
-    """Honest four-way wording for a reviewer window (RS5).
-
-    The old single phrasing called every sub-1M window "known", which read as a
-    measured fact even when it was the conservative fallback for an unprobed route."""
-    if provenance == _WINDOW_CONFIRMED:
-        return f"confirmed {window}-token window"
-    if provenance == _WINDOW_ASSERTED:
-        return f"owner-asserted {window}-token window"
-    if provenance == _WINDOW_SENTINEL:
-        return f"designated-default {window}-token sentinel window"
-    return f"unknown window, conservatively treated as {window} tokens"
-
+# Window authority moved to `tools/scope_window.py` (module-size gate at
+# synthesis); re-imported under the old private aliases so every caller and
+# test keeps one patch point on THIS module.
+from ouroboros.tools.scope_window import (  # noqa: E402
+    WINDOW_ASSERTED as _WINDOW_ASSERTED,  # noqa: F401 (test-read re-export)
+    WINDOW_CONFIRMED as _WINDOW_CONFIRMED,  # noqa: F401 (test-read re-export)
+    WINDOW_SENTINEL as _WINDOW_SENTINEL,  # noqa: F401 (test-read re-export)
+    WINDOW_STALE as _WINDOW_STALE,  # noqa: F401 (test-read re-export)
+    WINDOW_UNKNOWN as _WINDOW_UNKNOWN,  # noqa: F401 (test-read re-export)
+    scope_window as _scope_window,
+    scope_window_provenance as _scope_window_provenance,
+    window_provenance_phrase as _window_provenance_phrase,
+)
 
 def _low_context_skip_result(scope_model: str) -> "ScopeReviewResult":
     """Typed, non-blocking record of the owner-declared low-context-mode skip.
@@ -292,18 +177,21 @@ def _low_context_skip_result(scope_model: str) -> "ScopeReviewResult":
     )
 
 
-def _scope_sub_floor_finding(scope_model: str, window: int, provenance: str = _WINDOW_UNKNOWN) -> dict:
+def _scope_sub_floor_finding(
+    scope_model: str, window: int, provenance: str = _WINDOW_UNKNOWN, observed_at: str = "",
+) -> dict:
     return {
         "verdict": "FAIL",
         "severity": "advisory",
         "item": "scope_review_sub_floor",
         "reason": (
             f"⚠️ SCOPE_REVIEW_SUB_FLOOR: scope reviewer {scope_model} resolves to a "
-            f"{_window_provenance_phrase(window, provenance)} for authority purposes, "
-            "below the >=1M blocking scope floor (BIBLE P3). Its findings are "
-            "ADVISORY-ONLY and cannot satisfy the blocking scope gate; configure a "
-            ">=1M-window scope model, or owner-ack this route's window, to restore "
-            "an authoritative verdict."
+            f"{_window_provenance_phrase(window, provenance, observed_at)} for authority purposes, "
+            "which does not establish the >=1M blocking scope floor with sourced, "
+            "current Capability Evidence (BIBLE P3). Its findings are ADVISORY-ONLY "
+            "and cannot satisfy the blocking scope gate; connect the provider so the "
+            "route can be probed, owner-ack this route's window, or configure a "
+            ">=1M-window scope model, to restore an authoritative verdict."
         ),
         "model": scope_model,
     }
@@ -319,11 +207,11 @@ def _window_scaled_reserves(window: int) -> tuple:
     still produce the full checklist JSON) and an eighth for tokenizer margin.
     >=1M windows keep the absolute reserves unchanged.
     """
-    if window >= _SCOPE_MODEL_CONTEXT_WINDOW:
-        return _SCOPE_MAX_TOKENS, _SCOPE_OUTPUT_MARGIN_TOKENS
-    output_reserve = min(_SCOPE_MAX_TOKENS, max(8_192, window // 4))
-    tokenizer_margin = min(_SCOPE_OUTPUT_MARGIN_TOKENS, window // 8)
-    return output_reserve, tokenizer_margin
+    return _shared_window_scaled_reserves(
+        window,
+        output_reserve=_SCOPE_MAX_TOKENS,
+        tokenizer_margin=_SCOPE_OUTPUT_MARGIN_TOKENS,
+    )
 
 
 def _effective_scope_input_limit(*, scope_model: str = "") -> int:
@@ -335,7 +223,7 @@ def _effective_scope_input_limit(*, scope_model: str = "") -> int:
     of a deterministic provider 400. Its blocking authority is checked separately and
     stays fail-closed."""
     model = scope_model or _get_scope_model()
-    window = _scope_reviewer_window(model)
+    window = _scope_window(model).sizing_window(_SCOPE_FAILCLOSED_WINDOW)
     output_reserve, tokenizer_margin = _window_scaled_reserves(window)
     return max(0, _calibrated_input_token_limit(
         model,
@@ -356,13 +244,23 @@ _SCOPE_CONTEXT_MANIFEST = contextvars.ContextVar("scope_context_manifest", defau
 _SCOPE_STABLE_PREFIX_LEN = contextvars.ContextVar("scope_stable_prefix_len", default=0)
 
 
-class _ScopeAtlasBudgetExceeded(RuntimeError):
-    def __init__(self, manifest: dict):
+class _ScopeAtlasNotAssembled(RuntimeError):
+    """The atlas did not assemble — an oversized pack, or an omitted REQUIRED artifact.
+
+    Both are refusals under the BIBLE P3 scope floor: the ladder degrades the
+    fixed part and retries, and scope review never runs on the remainder.
+    """
+
+    def __init__(self, manifest: dict, reason: str = ""):
         self.manifest = dict(manifest or {})
         token_count = int(self.manifest.get("estimated_total_tokens") or 0)
         super().__init__(
-            "Generated Scope Atlas exceeded hard budget"
-            + (f" (~{token_count:,} estimated tokens)" if token_count else "")
+            "Generated Scope Atlas did not assemble: "
+            + (
+                reason
+                or "exceeded hard budget"
+                + (f" (~{token_count:,} estimated tokens)" if token_count else "")
+            )
         )
 
 
@@ -382,7 +280,7 @@ class ScopeReviewResult:
     raw_text: str = ""
     model_id: str = ""
     # responded|error|parse_failure|empty_response|budget_exceeded|fixed_overflow|
-    # sub_floor|omitted|empty
+    # sub_floor|session_advisory|omitted|empty — only `responded` is AUTHORITATIVE
     status: str = "responded"
     prompt_chars: int = 0
     # measured (len(prompt)) | estimated_from_tokens (no prompt was assembled)
@@ -393,14 +291,6 @@ class ScopeReviewResult:
     context_manifest: dict = field(default_factory=dict)
     prompt_ref: dict = field(default_factory=dict)
     response_ref: dict = field(default_factory=dict)
-
-
-@dataclass
-class _TouchedContextStatus:
-    """Touched-context sentinel; ``None`` means context OK."""
-    status: str  # "empty" | "omitted" | "budget_exceeded" | "fixed_overflow"
-    omitted_paths: List[str] = field(default_factory=list)
-    token_count: int = 0  # estimated full prompt tokens when budget is exceeded
 
 
 def _get_scope_model() -> str:
@@ -556,20 +446,6 @@ def _inline_deleted_file_pack(
     return joint
 
 
-def _compute_touched_status(
-    current_files_section: str,
-    deleted_paths: list,
-    omitted: list,
-    current_paths: list,
-) -> Optional["_TouchedContextStatus"]:
-    """Return touched-context failure status, or None when context is complete."""
-    if not current_files_section.strip() and not deleted_paths:
-        return _TouchedContextStatus(status="empty")
-    if omitted and current_paths:
-        return _TouchedContextStatus(status="omitted", omitted_paths=list(omitted))
-    return None
-
-
 def _gather_scope_packs(
     repo_dir: pathlib.Path,
     all_touched_paths: list,
@@ -577,10 +453,21 @@ def _gather_scope_packs(
     drive_root: Optional[pathlib.Path] = None,
     compact: bool = False,
     scope_model: str = "",
+    diff_only_paths: Optional[list] = None,
+    snapshot_included_paths: Optional[frozenset] = None,
 ) -> str:
     """Collect the bounded wider repository atlas, failing closed on git errors."""
-    # Canonical docs and touched files are injected explicitly; avoid duplicating them.
-    already_included = frozenset(set(all_touched_paths) | set(_CANONICAL_CONTEXT_DOCS))
+    # WHICH snapshots the fixed part actually holds is the assembler's fact,
+    # never re-derived from the touched LIST: `all_touched_paths` also names
+    # files the fixed part omits by design (touched tests) or suppresses (a
+    # sensitive/oversized deletion), and claiming those as "included in fixed
+    # prompt context" is a false coverage claim (BIBLE P1) that also hides them
+    # from the atlas's own requiredness classification. Unclaimed paths are
+    # classified by the atlas; a canonical doc is claimed only if it exists.
+    already_included = frozenset(
+        set(snapshot_included_paths or frozenset())
+        | {doc for doc in _CANONICAL_CONTEXT_DOCS if (repo_dir / doc).is_file()}
+    )
     _input_limit = _effective_scope_input_limit(scope_model=scope_model)
     try:
         atlas = compile_review_context_atlas(
@@ -588,6 +475,7 @@ def _gather_scope_packs(
                 repo_dir=repo_dir,
                 anchors=tuple(all_touched_paths),
                 already_included=already_included,
+                diff_only_included=frozenset(diff_only_paths or ()),
                 fixed_prompt_tokens=fixed_prompt_tokens,
                 target_total_tokens=min(850_000, _input_limit),
                 hard_total_tokens=_input_limit,
@@ -597,13 +485,13 @@ def _gather_scope_packs(
                 compact_manifest=compact,
             )
         )
+        # Set the manifest FIRST: disclosure accompanies the refusal below, it
+        # never replaces it (BIBLE P3).
         _SCOPE_CONTEXT_MANIFEST.set(atlas.manifest)
-        if atlas.status == "budget_exceeded":
-            raise _ScopeAtlasBudgetExceeded(atlas.manifest)
+        if atlas_assembly_failed(atlas):
+            raise _ScopeAtlasNotAssembled(atlas.manifest, atlas_assembly_failure_reason(atlas))
         repo_pack_section = atlas.text or "(no additional repo files)"
-    except _ScopeAtlasBudgetExceeded:
-        raise
-    except RuntimeError:
+    except RuntimeError:  # includes _ScopeAtlasNotAssembled
         raise
     except Exception as exc:
         raise RuntimeError(f"review_context_atlas error: {exc}") from exc
@@ -620,14 +508,6 @@ def _record_ladder_steps(steps: list) -> None:
     _SCOPE_CONTEXT_MANIFEST.set(manifest)
 
 
-def _ladder_terminal_status(scope_model: str, token_count: int) -> "_TouchedContextStatus":
-    """Terminal status when the guaranteed-fit ladder exhausts every step."""
-    known_window = _scope_reviewer_window(scope_model)
-    if known_window and known_window < _SCOPE_MODEL_CONTEXT_WINDOW:
-        return _TouchedContextStatus(status="budget_exceeded", token_count=token_count)
-    return _TouchedContextStatus(status="fixed_overflow", token_count=token_count)
-
-
 def _render_touched_section(
     repo_dir: pathlib.Path,
     current_context_paths: list,
@@ -642,6 +522,11 @@ def _render_touched_section(
     ``diff_only_paths`` are degraded to an explicit disclosed note (their
     changes stay fully visible in the staged diff) — the guaranteed-fit
     ladder's step for oversized fixed parts.
+
+    Returns ``(section, pack_omitted, snapshot_included)``. ``snapshot_included``
+    is the CONSERVATIVE set of paths whose full snapshot this section really
+    carries — the atlas is told that and nothing more, so no coverage row can
+    claim content the pack does not hold (BIBLE P1).
     """
     kept = [path for path in current_context_paths if path not in diff_only_paths]
     section, pack_omitted = build_touched_file_pack(
@@ -657,8 +542,10 @@ def _render_touched_section(
         skip_note = (
             "## CURRENT FILE CONTEXT DEDUPLICATION NOTE\n"
             "The following touched files are not duplicated as full current-file "
-            "snapshots because they are either canonical docs injected above or "
-            "tests whose exact changes are visible in the staged diff below:\n"
+            "snapshots HERE because they are either canonical docs injected above "
+            "or tests whose exact changes are visible in the staged diff below. "
+            "A touched test is an atlas anchor, so its full snapshot appears once "
+            "in the generated atlas when the atlas selects it:\n"
             + "\n".join(f"- {path}" for path in skipped_by_design)
             + "\n"
         )
@@ -675,7 +562,14 @@ def _render_touched_section(
             + "\n"
         )
         section = section + "\n\n" + degrade_note if section.strip() else degrade_note
-    return section, pack_omitted
+    # Only paths that CANNOT be absent: kept, not omitted by the pack builder,
+    # and a real file on disk (the builder can emit nothing else). Deleted paths
+    # are never claimed — they leave the index, so the atlas has no row for them.
+    snapshot_included = frozenset(
+        path for path in kept
+        if path not in set(pack_omitted) and (repo_dir / path).is_file()
+    )
+    return section, pack_omitted, snapshot_included
 
 
 def _build_scope_history_section(scope_review_history: Optional[list]) -> str:
@@ -714,22 +608,12 @@ def _build_scope_history_section(scope_review_history: Optional[list]) -> str:
     )
 
 
-def _zero_context_staged_diff(repo_dir: pathlib.Path) -> str:
-    """Return every staged +/- line without unchanged hunk context."""
-    try:
-        return run_cmd(["git", "diff", "--cached", "-U0"], cwd=repo_dir)
-    except Exception:
-        return ""
-
-
 @dataclass(frozen=True)
 class _ScopePromptContext:
     drive_root: Optional[pathlib.Path] = None
     scope_model: str = ""
     governance_repo_dir: Optional[pathlib.Path] = None
     represent_binary: bool = False
-
-
 
 
 def _build_scope_prompt(
@@ -762,7 +646,6 @@ def _build_scope_prompt(
     canonical_docs = _load_canonical_context_docs(
         pathlib.Path(governance_repo_dir or repo_dir)
     )
-    critical_calibration = CRITICAL_FINDING_CALIBRATION  # noqa: F841 — used in f-string below
     rebuttal_section = _shared_build_rebuttal_section(review_rebuttal)
     _open_obs_for_scope = []
     _drive_root = pathlib.Path(drive_root) if drive_root else None
@@ -820,7 +703,7 @@ def _build_scope_prompt(
             represent_binary=represent_binary,
         )
 
-    current_files_section, omitted = _render_current_section([])
+    current_files_section, omitted, snapshot_included = _render_current_section([])
     touched_status = _compute_touched_status(
         current_files_section, deleted_paths, omitted, current_context_paths
     )
@@ -840,7 +723,7 @@ def _build_scope_prompt(
             history_block=f"{rebuttal_section}{history_section}{scope_history_section}",
             diff_text=diff_text,
             repo_pack_placeholder=repo_pack_placeholder,
-            critical_calibration=critical_calibration,
+            critical_calibration=CRITICAL_FINDING_CALIBRATION,
         )
         _SCOPE_STABLE_PREFIX_LEN.set(stable_len)
         return prompt_text
@@ -858,6 +741,9 @@ def _build_scope_prompt(
             "drive_root": drive_root,
             "scope_model": scope_model,
             "compact": compact,
+            # The ladder owns which snapshots survived; the atlas is TOLD.
+            "diff_only_paths": list(diff_only_paths),
+            "snapshot_included_paths": snapshot_included,
         }
         return _gather_scope_packs(
             repo_dir,
@@ -890,6 +776,8 @@ def _build_scope_prompt(
     compact = False
     compact_diff_attempted = False
     last_known_tokens = 0
+    unassembled_required: list = []
+    atlas_overflowed = False
     # One AGGREGATED record of the guaranteed-fit ladder (RS5): a per-step event
     # stream would be noise, but a silent ladder makes an oversized pack
     # unexplainable after the fact (BIBLE P1).
@@ -900,15 +788,33 @@ def _build_scope_prompt(
         atlas_text = None
         try:
             atlas_text = _atlas_section(fixed_prompt_tokens, compact)
-        except _ScopeAtlasBudgetExceeded as exc:
+        except _ScopeAtlasNotAssembled as exc:
+            refusal = exc
             if not compact:
                 compact = True
                 try:
                     atlas_text = _atlas_section(fixed_prompt_tokens, True)
-                except _ScopeAtlasBudgetExceeded as compact_exc:
-                    last_known_tokens = int(compact_exc.manifest.get("estimated_total_tokens") or 0)
-            else:
-                last_known_tokens = int(exc.manifest.get("estimated_total_tokens") or 0)
+                except _ScopeAtlasNotAssembled as compact_exc:
+                    refusal = compact_exc
+            if atlas_text is None:
+                last_known_tokens = int(refusal.manifest.get("estimated_total_tokens") or 0)
+                # The atlas manifest stays the ONE carrier of what did not assemble,
+                # and a refusal is a ladder STEP with a trace row exactly like the
+                # assembly branch below (an empty trace explains nothing — P1).
+                unassembled_required = [
+                    str(row.get("path") or "?") for row in atlas_unassembled_required(refusal.manifest)
+                ]
+                # The refusal can carry TWO causes at once (missing required
+                # artifact AND hard-budget overflow) — capture both facts.
+                atlas_overflowed = atlas_hard_budget_overflowed(refusal.manifest)
+                ladder_steps.append({
+                    "step": "atlas_refused", "compact": compact, "reason": str(refusal),
+                    "unassembled_required": list(unassembled_required),
+                    "atlas_overflowed": atlas_overflowed,
+                    "tokens_after": last_known_tokens,
+                    "diff_only_files": len(diff_only_paths),
+                    "zero_context_diff": compact_diff_attempted,
+                })
 
         deficit = 0
         if atlas_text is not None:
@@ -917,6 +823,8 @@ def _build_scope_prompt(
                 raise RuntimeError("scope review atlas placeholder missing")
             prompt = head + atlas_text + tail
             prompt_tokens = estimate_tokens(prompt)
+            unassembled_required = []  # assembled: no earlier refusal is the cause now
+            atlas_overflowed = False
             ladder_steps.append({
                 "step": "compact_atlas" if compact else "full_atlas",
                 "tokens_before": last_known_tokens,
@@ -941,25 +849,39 @@ def _build_scope_prompt(
 
         if not degradable:
             if not compact_diff_attempted:
+                # Every staged +/- line without unchanged hunk context.
                 compact_diff_attempted = True
-                compact_diff = _zero_context_staged_diff(repo_dir)
+                try:
+                    compact_diff = run_cmd(["git", "diff", "--cached", "-U0"], cwd=repo_dir)
+                except Exception:
+                    compact_diff = ""
                 if compact_diff.strip() and compact_diff != diff_text:
                     diff_text = compact_diff
                     continue
             # Terminal pack status: >=1M authority is fixed_overflow; a sub-floor
             # pack is budget_exceeded here and the authority policy turns it into
-            # a block unless the owner explicitly selected advisory scope.
+            # a block unless the owner explicitly selected advisory scope. The
+            # CAUSE travels separately — both branches report the real one. The
+            # window is the evidence-resolved sizing window, never a hardcoded table.
             _record_ladder_steps(ladder_steps)
-            return None, _ladder_terminal_status(
-                scope_model or _get_scope_model(),
-                last_known_tokens or fixed_prompt_tokens,
+            known = _scope_window(
+                scope_model or _get_scope_model()
+            ).sizing_window(_SCOPE_FAILCLOSED_WINDOW)
+            return None, _TouchedContextStatus(
+                status="budget_exceeded" if known and known < _SCOPE_MODEL_CONTEXT_WINDOW else "fixed_overflow",
+                token_count=last_known_tokens or fixed_prompt_tokens,
+                unassembled_required=list(unassembled_required),
+                atlas_overflowed=bool(atlas_overflowed),
             )
         freed = 0
         while degradable and freed < deficit + 2_000:
             path = degradable.pop(0)
             diff_only_paths.append(path)
             freed += _touched_token_estimate(path)
-        current_files_section, _ = _render_current_section(diff_only_paths)
+        # Re-render AND re-read what the shrunken section now holds: a path just
+        # degraded to diff-only has stopped being a survivor, so the next atlas
+        # build must not be told otherwise.
+        current_files_section, _, snapshot_included = _render_current_section(diff_only_paths)
 
 
 def _log_scope_result(
@@ -995,42 +917,68 @@ def _log_scope_result(
         pass
 
 
-def _call_scope_llm(prompt: str, scope_model: str | None = None, ctx: ToolContext | None = None) -> tuple:
-    """Execute the scope review LLM call synchronously.
+def _call_scope_llm(
+    prompt: str,
+    scope_model: str | None = None,
+    ctx: ToolContext | None = None,
+    slot_id: str = "",
+    route: Any = None,
+    session_task: str = "",
+    session_root: str = "",
+    slot_effort: str = "",
+    session_target: str = "",
+    session_profile: str = "",
+) -> tuple:
+    """Execute the scope review call synchronously — api pack or agent session.
 
     Returns (raw_text, usage, error_msg) — error_msg is non-empty on failure.
     ``usage`` may contain a private ``_review_refs`` entry with durable prompt
     and response refs from the shared review substrate.
-    """
+
+    ``slot_id`` is the identity of the configured row this call belongs to,
+    supplied by whoever fanned the rows out. ``route`` is the row's configured
+    delivery: on ``agent_session`` the substrate's session executor delivers
+    ``session_task`` in ``session_root`` and the api pack is never rendered
+    (5.2); parsing, classification and blocking above this call are identical
+    for both deliveries (5.3)."""
     from ouroboros.config import resolve_effort as _resolve_effort
+    from ouroboros.review_execution import ReviewRouteKind
+
     scope_model = scope_model or _get_scope_model()
-    scope_effort = _resolve_effort("scope_review")
+    # 6.1/6.3: the row's own effort wins; the global key stays the default.
+    scope_effort = slot_effort or _resolve_effort("scope_review")
+    delegated = str(getattr(route, "value", route) or "") == "agent_session"
     # Output budget scales with the reviewer window: requesting the absolute
     # 100K reserve on a small-window model would 400 on input+max_tokens.
-    _scope_output_tokens, _ = _window_scaled_reserves(_scope_reviewer_window(scope_model))
-    # Split at the recorded stable/dynamic boundary so the byte-stable prefix
-    # (instructions + checklist + canonical docs) carries the provider cache
-    # marker while the per-commit tail (diff/atlas/history) stays unmarked.
-    from ouroboros.tools.review_helpers import cached_prompt_blocks
-
-    _stable_len = int(_SCOPE_STABLE_PREFIX_LEN.get() or 0)
-    if 0 < _stable_len <= len(prompt):
-        system_content: Any = cached_prompt_blocks(prompt[:_stable_len], prompt[_stable_len:])
+    _scope_output_tokens, _ = _window_scaled_reserves(
+        _scope_window(scope_model).sizing_window(_SCOPE_FAILCLOSED_WINDOW)
+    )
+    if delegated:
+        messages: Any = []
     else:
-        # No recorded boundary (e.g. a caller that did not assemble via
-        # _build_scope_prompt): send a plain string. Marking the WHOLE prompt —
-        # per-commit diff included — as a 1h cache block would pay the extended
-        # write premium on content that never repeats.
-        system_content = prompt
-    messages = [
-        {"role": "system", "content": system_content},
-        {
-            "role": "user",
-            "content": "Review the staged change and context above. Output ONLY a JSON array.",
-        },
-    ]
+        # Split at the recorded stable/dynamic boundary so the byte-stable prefix
+        # (instructions + checklist + canonical docs) carries the provider cache
+        # marker while the per-commit tail (diff/atlas/history) stays unmarked.
+        from ouroboros.tools.review_helpers import cached_prompt_blocks
+
+        _stable_len = int(_SCOPE_STABLE_PREFIX_LEN.get() or 0)
+        if 0 < _stable_len <= len(prompt):
+            system_content: Any = cached_prompt_blocks(prompt[:_stable_len], prompt[_stable_len:])
+        else:
+            # No recorded boundary (e.g. a caller that did not assemble via
+            # _build_scope_prompt): send a plain string. Marking the WHOLE prompt —
+            # per-commit diff included — as a 1h cache block would pay the extended
+            # write premium on content that never repeats.
+            system_content = prompt
+        messages = [
+            {"role": "system", "content": system_content},
+            {
+                "role": "user",
+                "content": "Review the staged change and context above. Output ONLY a JSON array.",
+            },
+        ]
     try:
-        from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+        from ouroboros.review_substrate import ReviewRequest, run_review_request
 
         request = ReviewRequest(
             surface="scope_review",
@@ -1041,16 +989,40 @@ def _call_scope_llm(prompt: str, scope_model: str | None = None, ctx: ToolContex
             max_tokens=_scope_output_tokens,
             temperature=0.2,
             no_proxy=True,
+            session_task=session_task if delegated else "",
+            session_root=session_root if delegated else "",
+            # The extraction fallback canonicalizes to the SCOPE contract: the
+            # required-matrix shape with the eight verbatim item ids (D19 — the
+            # light model follows the review's own contract, never a looser one).
+            policy=(
+                {
+                    "output_contract": (
+                        REVIEW_JSON_MATRIX_CONTRACT
+                        + "\nRequired item ids (verbatim, one entry each): "
+                        + ", ".join(sorted(SCOPE_REQUIRED_ITEMS))
+                    ),
+                }
+                if delegated
+                else {}
+            ),
         )
-        slot = ReviewSlot(
-            slot_id="scope_slot_1",
-            model=scope_model,
-            effort=scope_effort,
+        # Identity comes from the configured row, never from the row's model.
+        row = scope_reviewer_slots([scope_model], effort=scope_effort)[0]
+        slot = replace(
+            row,
+            slot_id=slot_id or row.slot_id,
             timeout_sec=_SCOPE_REVIEW_SLOT_TIMEOUT_SEC,
             max_tokens=_scope_output_tokens,
             temperature=0.2,
-            role_hint="scope reviewer",
-            use_local=review_model_uses_local(scope_model),
+            # ROUTE is CARRIED, never re-derived: the one-element slot list above
+            # re-reads ROUTES **row 1**, which sent a mixed config's api row as
+            # agent_session (pack, no task) — the caller's fanned-out route is the
+            # authority (p5x XG fix, kept through the 6.1 threading).
+            route=ReviewRouteKind.AGENT_SESSION if delegated else ReviewRouteKind.API_CHAT,
+            # The fanned-out row's own session target (6.1); '' keeps the
+            # shared session-route fallback.
+            session_target=session_target if delegated else "",
+            session_profile=session_profile if delegated else "",
         )
         result = run_review_request(
             request,
@@ -1082,23 +1054,9 @@ def _call_scope_llm(prompt: str, scope_model: str | None = None, ctx: ToolContex
         return "", None, error_msg
 
 
-_PROVIDER_OVERSIZE_MARKERS = (
-    # Anthropic: "prompt is too long: 1166914 tokens > 1000000 maximum"
-    "prompt is too long",
-    # Anthropic: "input length and `max_tokens` exceed context limit"
-    "exceed context limit",
-    # OpenAI error code + message variants
-    "context_length_exceeded",
-    "maximum context length",
-)
-
-
-def _is_provider_oversize_error(error_text: str) -> bool:
-    """Mechanical fault classification: does this provider error mean the prompt
-    exceeded the model's REAL context window? Deliberately tight markers — any
-    other provider/transport error keeps the fail-closed blocking path."""
-    low = str(error_text or "").lower()
-    return any(marker in low for marker in _PROVIDER_OVERSIZE_MARKERS)
+# Provider-oversize fault classification moved to triad_review (shared review
+# primitive); the alias keeps this module's historical name for its two readers.
+from ouroboros.triad_review import is_provider_oversize_error as _is_provider_oversize_error  # noqa: E402
 
 
 def _provider_error_is_oversize(usage: dict, prompt_tokens_est: int, scope_model: str) -> bool:
@@ -1185,26 +1143,24 @@ def _handle_prompt_signals(
     if context_status.status == "budget_exceeded":
         token_count = context_status.token_count
         # Report the REAL window-scaled reserves, not the 1M constants.
-        _window, _provenance = (
-            _scope_reviewer_window_evidence(scope_model) if scope_model
-            else (_SCOPE_MODEL_CONTEXT_WINDOW, _WINDOW_SENTINEL)
+        _resolved = _scope_window(scope_model) if scope_model else ReviewerWindow(
+            window_tokens=_SCOPE_MODEL_CONTEXT_WINDOW,
         )
+        _window = _resolved.sizing_window(_SCOPE_FAILCLOSED_WINDOW)
+        _provenance = _scope_window_provenance(_resolved)
         _output_reserve, _ = _window_scaled_reserves(_window)
+        _budget = (f"input budget ({input_limit} tokens, reserving {_output_reserve} for "
+                   f"output within its {_window_provenance_phrase(_window, _provenance, _resolved.observed_at)})")
+        _cause, _remedy = _ladder_terminal_cause(context_status, input_limit, budget_phrase=_budget)
         log.warning(
-            "Scope review prompt (~%d tokens) exceeds reviewer input limit (%d); "
-            "window=%d provenance=%s (fail-closed).",
-            token_count,
-            input_limit,
-            _window,
-            _provenance,
+            "Scope review pack did not assemble: %s; window=%d provenance=%s (fail-closed).",
+            _cause, _window, _provenance,
         )
         return ScopeReviewResult(
             blocked=True,
             block_message=(
-                "⚠️ SCOPE_REVIEW_BLOCKED: the configured reviewer cannot fit the "
-                "irreducible scope prompt within its "
-                f"{_window_provenance_phrase(_window, _provenance)}, so the "
-                "required >=1M blocking scope gate has no authoritative verdict."
+                f"⚠️ SCOPE_REVIEW_BLOCKED: {_cause}, so the required >=1M blocking "
+                "scope gate has no authoritative verdict."
             ),
             status="sub_floor",
             # No prompt string exists on this path (the fit ladder returned a
@@ -1217,35 +1173,28 @@ def _handle_prompt_signals(
                 "severity": "advisory",
                 "item": "scope_review_skipped",
                 "reason": (
-                    f"⚠️ SCOPE_REVIEW_SKIPPED: Full scope-review prompt (~{token_count} tokens) "
-                    f"exceeds the scope input budget ({input_limit} tokens, "
-                    f"reserving {_output_reserve} for output within its "
-                    f"{_window_provenance_phrase(_window, _provenance)}). "
-                    "The blocking scope gate has no authoritative verdict. "
-                    "Consider reducing codebase size or configuring a >=1M reviewer."
+                    f"⚠️ SCOPE_REVIEW_SKIPPED: {_cause}. The blocking scope gate has "
+                    f"no authoritative verdict. {_remedy}"
                 ),
                 "model": scope_model or "scope_reviewer",
             }],
         )
 
     if context_status.status == "fixed_overflow":
-        # The guaranteed-fit ladder exhausted every degradation step: even with
-        # all touched files reduced to diff-only and the atlas reduced to its
-        # manifest, the irreducible prompt (checklist + canonical docs + staged
-        # diff) exceeds the reviewer input budget. This is a structural
-        # condition the owner must see — fail CLOSED, never a silent skip.
+        # The guaranteed-fit ladder exhausted every degradation step. TWO failures
+        # land here — an irreducible prompt that overflows, and a REQUIRED artifact
+        # that never assembled — and they can COINCIDE, so the cause(s) are READ
+        # from the status, not assumed, and every one that applies is rendered.
+        # Either way: a structural condition the owner must see, failing CLOSED.
         token_count = context_status.token_count
+        cause, remedy = _ladder_terminal_cause(context_status, input_limit)
         return ScopeReviewResult(
             blocked=True,
             status="fixed_overflow",
             prompt_chars=token_count * 4,
             prompt_chars_source="estimated_from_tokens",
             block_message=(
-                f"⚠️ SCOPE_REVIEW_BLOCKED: the irreducible scope prompt (checklist + canonical "
-                f"docs + staged diff) is ~{token_count} estimated tokens and exceeds the scope "
-                f"reviewer input budget ({input_limit}). Every touched file was already degraded "
-                "to diff-only and the atlas to its manifest. Split the commit into smaller "
-                "staged diffs, or configure a larger-window scope reviewer. "
+                f"⚠️ SCOPE_REVIEW_BLOCKED: {cause}. {remedy} "
                 "Fail-closed stop — not a skippable budget condition."
             ),
         )
@@ -1290,31 +1239,73 @@ def _handle_prompt_signals(
 
 
 def _apply_scope_authority(
-    ctx: ToolContext,
     critical_findings: List[dict],
     advisory_findings: List[dict],
     *,
     scope_model_id: str,
-    prompt_tokens_est: int,
     result_kwargs: dict,
+    delegated: bool = False,
 ) -> tuple[List[dict], List[dict], Optional[ScopeReviewResult]]:
-    """Apply the established one-pass P3 sub-floor downgrade semantics."""
-    window, provenance = _scope_reviewer_window_evidence(scope_model_id)
-    if not (window and window < _SCOPE_MODEL_CONTEXT_WINDOW):
+    """One-pass P3 authority for THIS row's delivery: is the reviewer's window ESTABLISHED
+    enough for its verdict to gate a commit? ``api_chat`` must fit the whole assembled pack
+    (constitutional >=1M; sub-floor BLOCKS); ``agent_session`` assembles none and needs
+    SOURCED window evidence instead (scope_review_session owns that decision). NEITHER is
+    waved through — skipping this for sessions let one gate with no window test at all.
+    Authority is read from the EVIDENCE, not from the number: a window that is merely
+    large enough is not a window that was established — an expired record, an outage-
+    carried record, and the unevidenced designated-default sentinel all size a prompt
+    at >=1M and all fail here (the BIBLE P3 rule stated in code).
+
+    WHOSE window, for a retrieving row: the ACKED HARNESS ROUTE's. ``scope_model_id``
+    is that row's opaque ``harness[=model]`` spec, and `reviewer_window.reviewer_route`
+    fingerprints it under its own provider precisely so the owner's ack is recorded
+    against the route it travels. It is NOT the model the engine later reports back —
+    that arrives only after the run, is absent on telemetry that predates the receipt,
+    and would make the authority of a row depend on a fact no pre-flight can know.
+    Re-keying this lookup to the reported model was measured: it fails every session
+    scope row, closing a delivery path the owner deliberately opened. When the engine
+    resolves something other than what the route asked for, that divergence is already
+    disclosed on its own axis — ``capability_delta``, reason
+    ``session_route_resolves_its_own_model`` — which is where a landing below the ask
+    belongs, not in the window predicate."""
+    resolved = _scope_window(scope_model_id, session=delegated)
+    if delegated:
+        from ouroboros.tools.scope_review_session import session_scope_authority
+
+        # EVIDENCE, never the sizing fallback: the session floor is gated on SOURCED
+        # provenance, and a fail-closed sizing number handed over as a window would
+        # read as evidence for exactly the number the session floor sits at. A STALE
+        # record sizes a prompt but authorises nothing (same rule as the api row), so
+        # its provenance is blanked before the session predicate reads it.
+        return session_scope_authority(
+            critical_findings, advisory_findings, scope_model=scope_model_id,
+            window=int(resolved.window_tokens or 0),
+            provenance="" if resolved.stale else str(resolved.status or ""),
+            result_kwargs=result_kwargs,
+            phrase=_window_provenance_phrase(
+                resolved.sizing_window(_SCOPE_FAILCLOSED_WINDOW),
+                _scope_window_provenance(resolved), resolved.observed_at),
+        )
+    if resolved.blocking_authority_allowed:
         return critical_findings, advisory_findings, None
+    window = resolved.sizing_window(_SCOPE_FAILCLOSED_WINDOW)
+    provenance = _scope_window_provenance(resolved)
     for finding in critical_findings:
         finding["severity"] = "advisory"
         finding["reason"] = "[sub-floor scope reviewer] " + str(finding.get("reason", ""))
     advisory_findings = list(critical_findings) + list(advisory_findings)
     critical_findings = []
-    advisory_findings.append(_scope_sub_floor_finding(scope_model_id, window, provenance))
+    advisory_findings.append(
+        _scope_sub_floor_finding(scope_model_id, window, provenance, resolved.observed_at)
+    )
     return critical_findings, advisory_findings, ScopeReviewResult(
         blocked=True,
         block_message=(
             f"⚠️ SCOPE_REVIEW_BLOCKED: scope reviewer {scope_model_id} has a "
-            f"{_window_provenance_phrase(window, provenance)}, below the required "
-            ">=1M floor. Its advisory findings were preserved, but it cannot supply "
-            "the authoritative scope verdict required to commit."
+            f"{_window_provenance_phrase(window, provenance, resolved.observed_at)}, which does not "
+            "establish the required >=1M floor with sourced Capability Evidence. Its "
+            "advisory findings were preserved, but it cannot supply the authoritative "
+            "scope verdict required to commit."
         ),
         critical_findings=critical_findings,
         advisory_findings=advisory_findings,
@@ -1332,6 +1323,11 @@ def run_scope_review(
     review_history: Optional[list] = None,
     scope_review_history: Optional[list] = None,  # prior scope rounds for this commit
     scope_model: Optional[str] = None,
+    slot_id: str = "",  # identity of the configured row this call runs (see scope_reviewer_slots)
+    route: Any = None,  # the row's configured delivery (ReviewRouteKind); None/api_chat = api
+    slot_effort: str = "",  # the row's own effort (6.1); "" = global scope_review effort
+    session_target: str = "",  # the row's own harness[=model] target; "" = shared route
+    session_profile: str = "",  # optional credential pin (Q2-в); "" = rotation
 ) -> ScopeReviewResult:
     """Run the blocking scope review, or record the owner-declared low-mode skip."""
     if _scope_review_skipped_in_low_context():
@@ -1345,26 +1341,46 @@ def run_scope_review(
             block_message=f"⚠️ SCOPE_REVIEW_BLOCKED: invalid review roots: {exc}.",
         )
     scope_model_id = scope_model or _get_scope_model()
+    delegated = str(getattr(route, "value", route) or "") == "agent_session"
+
     from ouroboros.tools.registry import _authorized_managed_update_resolver
 
     try:
-        prompt, context_status = _build_scope_prompt(
-            repo_dir, commit_message,
-            goal=goal, scope=scope,
-            review_rebuttal=review_rebuttal,
-            review_history=review_history,
-            scope_review_history=scope_review_history,
-            context=_ScopePromptContext(
-                drive_root=(
-                    pathlib.Path(ctx.drive_root)
-                    if getattr(ctx, "drive_root", None)
-                    else None
-                ),
-                scope_model=scope_model_id,
+        if delegated:
+            # Session delivery (5.2): same task/checklist/contract, no assembled
+            # pack — the session retrieves with its own tools in the repo root.
+            from ouroboros.tools.scope_review_session import ScopeIntentContext as _Intent
+            from ouroboros.tools.scope_review_session import build_scope_session_task
+
+            session_task, session_manifest = build_scope_session_task(
+                repo_dir, commit_message,
+                _Intent(goal=goal, scope=scope, review_rebuttal=review_rebuttal,
+                        review_history=review_history,
+                        scope_review_history=scope_review_history),
+                drive_root=pathlib.Path(ctx.drive_root) if getattr(ctx, "drive_root", None) else None,
                 governance_repo_dir=governance_repo,
-                represent_binary=_authorized_managed_update_resolver(ctx),
-            ),
-        )
+            )
+            _SCOPE_CONTEXT_MANIFEST.set(session_manifest)
+            prompt, context_status = session_task, None
+        else:
+            session_task = ""
+            prompt, context_status = _build_scope_prompt(
+                repo_dir, commit_message,
+                goal=goal, scope=scope,
+                review_rebuttal=review_rebuttal,
+                review_history=review_history,
+                scope_review_history=scope_review_history,
+                context=_ScopePromptContext(
+                    drive_root=(
+                        pathlib.Path(ctx.drive_root)
+                        if getattr(ctx, "drive_root", None)
+                        else None
+                    ),
+                    scope_model=scope_model_id,
+                    governance_repo_dir=governance_repo,
+                    represent_binary=_authorized_managed_update_resolver(ctx),
+                ),
+            )
     except RuntimeError as exc:
         return ScopeReviewResult(
             blocked=True,
@@ -1378,11 +1394,11 @@ def run_scope_review(
             context_manifest=_current_scope_context_manifest(),
         )
 
+    # Pack-budget signals belong to an ASSEMBLED pack: a session assembles none, so its
+    # context_status is None and this returns None by construction — no route branch.
     signal_result = _handle_prompt_signals(
-        prompt,
-        context_status,
+        prompt, context_status, scope_model=scope_model_id,
         input_limit=_effective_scope_input_limit(scope_model=scope_model_id),
-        scope_model=scope_model_id,
     )
     if signal_result is not None:
         # Keep _handle_prompt_signals as the status SSOT for early exits.
@@ -1392,7 +1408,12 @@ def run_scope_review(
 
     _prompt_chars = len(prompt)  # type: ignore[arg-type]
     _prompt_tokens_est = estimate_tokens(prompt)  # type: ignore[arg-type]
-    raw_text, usage, llm_error = _call_scope_llm(prompt, scope_model=scope_model_id, ctx=ctx)  # type: ignore[arg-type]
+    raw_text, usage, llm_error = _call_scope_llm(
+        prompt, scope_model=scope_model_id, ctx=ctx, slot_id=slot_id,
+        route=route, session_task=session_task, session_root=str(repo_dir),
+        slot_effort=slot_effort, session_target=session_target,
+        session_profile=session_profile,
+    )  # type: ignore[arg-type]
     _usage = dict(usage or {})
     _review_refs = dict(_usage.pop("_review_refs", {}) or {})
     _prompt_ref = dict(_review_refs.get("prompt_ref") or {})
@@ -1540,12 +1561,8 @@ def run_scope_review(
         "response_ref": _response_ref,
     }
     critical_findings, advisory_findings, authority_block = _apply_scope_authority(
-        ctx,
-        critical_findings,
-        advisory_findings,
-        scope_model_id=scope_model_id,
-        prompt_tokens_est=_prompt_tokens_est,
-        result_kwargs=result_kwargs,
+        critical_findings, advisory_findings, scope_model_id=scope_model_id,
+        result_kwargs=result_kwargs, delegated=delegated,
     )
     if authority_block is not None:
         return authority_block

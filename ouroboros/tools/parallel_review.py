@@ -6,6 +6,7 @@ import hashlib
 import logging
 
 from ouroboros.utils import run_cmd
+from ouroboros.review_substrate import scope_reviewer_slots
 from ouroboros.tools.review_helpers import build_scope_actor_record, format_review_history_entry
 from ouroboros.tools.scope_review import (
     run_scope_review,
@@ -87,49 +88,74 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
 
     def _run_scope():
         try:
-            try:
-                from ouroboros.config import get_scope_review_models
-
-                scope_models = get_scope_review_models()
-            except Exception:
-                scope_models = [_get_scope_model()]
-            scope_models = scope_models or [_get_scope_model()]
+            # Identity of every scope row comes from the one SSOT that owns it, so
+            # the actor record and the substrate call agree on which row spoke.
+            # No except/fallback here BY DESIGN: any failure to read the configured
+            # scope rows must surface. The config validator already guarantees "scope
+            # needs at least one slot" or a ValueError, so a silent single-row
+            # substitute could only ever replace a configured authority with a
+            # different one and spend API money on a row the owner never chose.
+            scope_slots = list(scope_reviewer_slots())
+            scope_models = [slot.model for slot in scope_slots]
             ctx._last_scope_model = ",".join(scope_models)
-            def _run_one_scope(model: str):
+            def _run_one_scope(slot):
                 # P3 one-pass contract: one substantive scope call per configured
                 # actor. Transport retry remains inside the same review substrate;
                 # never launch an automatic second degraded review call here.
+                # The row's configured delivery rides with it (5.3: same task,
+                # same criteria, same output contract — only delivery differs;
+                # adaptive_quorum below is delivery-blind and unchanged).
                 return run_scope_review(
                     ctx, commit_message, goal=goal, scope=scope,
                     review_rebuttal=review_rebuttal,
                     review_history=_history_snapshot,
                     scope_review_history=_scope_history,
-                    scope_model=model,
+                    scope_model=slot.model,
+                    slot_id=slot.slot_id,
+                    route=slot.route,
+                    slot_effort=slot.effort,
+                    session_target=slot.session_target,
+                    session_profile=getattr(slot, "session_profile", ""),
                 )
 
-            with _cf.ThreadPoolExecutor(max_workers=min(len(scope_models), 4)) as scope_pool:
-                futures = [scope_pool.submit(_run_one_scope, model) for model in scope_models]
+            with _cf.ThreadPoolExecutor(max_workers=min(len(scope_slots), 4)) as scope_pool:
+                futures = [scope_pool.submit(_run_one_scope, slot) for slot in scope_slots]
                 results = [future.result() for future in futures]
             ctx._last_scope_raw_results = [
                 build_scope_actor_record(
                     result,
-                    fallback_model_id=getattr(result, "model_id", "") or model,
-                    slot_id=f"scope_slot_{idx + 1}",
+                    fallback_model_id=getattr(result, "model_id", "") or slot.model,
+                    slot_id=slot.slot_id,
                 )
-                for idx, (result, model) in enumerate(zip(results, scope_models))
+                for result, slot in zip(results, scope_slots)
             ]
             # Reviewer-slot SSOT applies to scope too (Bible P3): a single configured
             # scope reviewer is honored but recorded as loud durable degraded-trust,
             # and a configured>=2-but-<quorum-responded scope run must never silently
             # pass on "any responded". Only an authoritative `responded` actor counts
-            # toward quorum; budget_exceeded/advisory are a structural context-floor
-            # skip, not an authoritative responder (so we never over-block them).
+            # toward quorum; a context-floor row is not an authoritative responder and
+            # is left out of the count because its OWN authority function already
+            # blocked (it is not counted out in order to let it pass).
             from ouroboros.config import adaptive_quorum
             _scope_statuses = [str(getattr(r, "status", "") or "") for r in results]
+            # `responded` is the ONLY authoritative status. A retrieving (session) row
+            # whose window is not sourced-proven arrives as `session_advisory`: its
+            # coverage is declaredly not host-attested, so it must never be counted as
+            # the authoritative verdict that satisfies the blocking scope quorum — it is
+            # advisory evidence, and the shortfall it leaves is disclosed below. Such a
+            # row also arrives BLOCKED (its own authority function decides that, exactly
+            # as the api row's `sub_floor` twin does), so counting it out of the quorum
+            # here can no longer let the gate fail open.
             _responded = sum(1 for s in _scope_statuses if s == "responded")
+            _session_advisory = sum(1 for s in _scope_statuses if s == "session_advisory")
             _required = adaptive_quorum(len(scope_models))
             _single_scope_reviewer = len(scope_models) == 1
             _scope_degraded: list = []
+            if _session_advisory:
+                _scope_degraded.append(
+                    f"scope_session_advisory_only: {_session_advisory} retrieving row(s) "
+                    "carried no authoritative verdict (window not sourced-proven)"
+                )
             if _single_scope_reviewer:
                 _scope_degraded.append("single_reviewer_no_diversity")
             elif _responded < _required and not any(getattr(r, "blocked", False) for r in results):
@@ -140,6 +166,7 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
                 "scope_responded_count": _responded,
                 "scope_required_quorum": _required,
                 "single_reviewer_no_diversity": _single_scope_reviewer,
+                "scope_session_advisory_only_count": _session_advisory,
                 "scope_degraded_reasons": _scope_degraded,
             }
             if len(results) == 1:
@@ -168,8 +195,15 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
             # Bible P3 negative control: configured>=2 but a PARTIAL authoritative
             # quorum (0 < responded < required) is a loud quorum FAILURE — block vs
             # advisory FOLLOWS owner enforcement (never hardcode a block). A
-            # zero-responded run is a structural floor/skip handled by the
-            # per-result status, so it stays advisory-only here.
+            # zero-responded run is NOT decided here: each delivery's own authority
+            # function already returns a BLOCKING result when its window cannot
+            # authorise (api `sub_floor`, retrieving `session_advisory`). Measured, the
+            # ONLY non-blocking scope status is `skipped_low_context_mode`: a
+            # budget_exceeded PACK arrives here as a BLOCKING `sub_floor` row, and no
+            # ScopeReviewResult carries status "budget_exceeded" at all. Widening this
+            # condition to `_responded < _required` would make this aggregate a SECOND
+            # owner of that decision and would turn the owner-declared low-context skip
+            # into a block — so the fix for a fail-open row belongs in the row, not here.
             partial_quorum_shortfall = (
                 not _single_scope_reviewer and 0 < _responded < _required and not blocked
             )
@@ -215,11 +249,11 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
                     **_scope_quorum_manifest,
                     "actors": [
                         {
-                            "slot_id": f"scope_slot_{idx + 1}",
-                            "model": model,
+                            "slot_id": slot.slot_id,
+                            "model": slot.model,
                             "context_manifest": getattr(result, "context_manifest", {}) or {},
                         }
-                        for idx, (result, model) in enumerate(zip(results, scope_models))
+                        for result, slot in zip(results, scope_slots)
                     ],
                 },
             )

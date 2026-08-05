@@ -40,6 +40,7 @@ from ouroboros.shell_parse import (
 from ouroboros.tools.shell_guards import (
     LIGHT_SHELL_WRITER_COMMANDS,
     PROTECTED_RUNTIME_PATHS_LOWER,
+    interpreter_family,
     light_shell_repo_mutation,
     parse_porcelain_paths,
     process_shell_guard_args,
@@ -548,27 +549,8 @@ def _light_mode_payload_mutation_allowed(
 ) -> bool:
     """Return True for light-mode data skill payload edits that do not touch repo files."""
 
-    if runtime_mode != "light" or tool_name not in {"edit_text", "write_file", "claude_code_edit"}:
+    if runtime_mode != "light" or tool_name not in {"edit_text", "write_file"}:
         return False
-    if tool_name == "claude_code_edit":
-        cwd_text = str(args.get("cwd", "") or "")
-        if not cwd_text and effective_constraint and effective_constraint.mode == "skill_repair" and implicit_skill_cwd_allowed:
-            cwd_text = "."
-        elif not cwd_text:
-            return False
-        try:
-            _cwd_path, cwd_root, _allowed_roots = resolve_shell_cwd(ctx, cwd_text)
-            if cwd_root in {"user_files", "task_drive", "artifact_store"}:
-                return True
-        except Exception:
-            pass
-        return is_skill_payload_path(
-            pathlib.Path(ctx.drive_root),
-            cwd_text,
-            constraint=effective_constraint,
-            allow_short_relative=allow_short_relative,
-            allow_control_plane=False,
-        )
     requested_root = str(args.get("root", "") or "active_workspace")
     try:
         requested_root = normalize_root(requested_root)
@@ -602,7 +584,6 @@ _HEAL_MODE_ALLOWED_TOOLS = frozenset({
     "list_files",
     "write_file",
     "edit_text",
-    "claude_code_edit",
     "list_skills",
     "skill_review", "skill_preflight",
 })
@@ -633,30 +614,11 @@ def _heal_protected_payload_sidecar(path_text: str) -> bool:
     return is_skill_payload_control_filename(path_text)
 
 
-def _heal_claude_code_edit_block(ctx: Any, args: Dict[str, Any], task_constraint: Optional[TaskConstraint]) -> str:
-    expected_bucket, expected_skill = constraint_bucket_skill(task_constraint)
-    requested_bucket = str(args.get("bucket", "") or "").strip()
-    requested_skill = str(args.get("skill_name", "") or "").strip()
-    if (
-        (requested_bucket and requested_bucket != expected_bucket)
-        or (requested_skill and requested_skill != expected_skill)
-    ):
-        return (
-            "⚠️ SKILL_REDIRECT_BLOCKED: active skill_repair "
-            "task is scoped to the selected skill payload."
-        )
-    cwd_text = str(args.get("cwd", "") or ".")
-    if not _task_constraint_path_allowed(cwd_text, task_constraint, pathlib.Path(ctx.drive_root)):
-        return "⚠️ HEAL_MODE_BLOCKED: Repair claude_code_edit cwd is limited to the selected skill payload."
-    return ""
-
-
 _WORKSPACE_ALLOWED_TOOLS = frozenset({
     "read_file",
     "list_files",
     "write_file",
     "edit_text",
-    "claude_code_edit",
     "search_code",
     "query_code",
     "run_command",
@@ -827,7 +789,6 @@ def _normalize_dispatch_path_args(ctx: Any, name: str, args: Dict[str, Any]) -> 
 _WEB_TOOLS = frozenset({"web_search", "browse_page", "browser_action", "youtube_transcript"})
 _REPO_MUTATION_TOOLS = frozenset({
     "write_file",
-    "claude_code_edit",
     "commit_reviewed",
     "vcs_commit_reviewed",
     "edit_text",
@@ -892,6 +853,12 @@ def _disabled_tools(ctx: Any) -> frozenset:
         raw = source.get("disabled_tools") if isinstance(source, dict) else None
         if isinstance(raw, (list, tuple)):
             names.update(str(n).strip() for n in raw if str(n).strip())
+    # D10 compatibility: `claude_code_edit` was retired; saved contracts that
+    # withheld the external coding gateway keep withholding its SUCCESSOR — the
+    # delegated coding session's start verb. The dead name stays in the set
+    # too (harmless: nothing registers it), so old contracts round-trip as-is.
+    if "claude_code_edit" in names:
+        names.add("delegate_start")
     return frozenset(names)
 
 
@@ -936,8 +903,6 @@ def _builtin_tool_availability(name: str, ctx: Any = None) -> tuple[bool, str, s
         if not metadata and not contract:
             return True, "", ""
     tool = str(name or "").strip()
-    if tool == "claude_code_edit" and not os.environ.get("ANTHROPIC_API_KEY", "").strip():
-        return False, "missing_credential", "ANTHROPIC_API_KEY"
     if tool == "web_search":
         try:
             from ouroboros.tools.search import _available_web_search_backends
@@ -1259,7 +1224,7 @@ class ToolRegistry:
 
     _FROZEN_TOOL_MODULES = [
         "browser", "ci", "claude_advisory_review", "compact_context", "control",
-        "core", "evolution_stats", "git", "git_pr", "git_rollback", "github",
+        "core", "delegate", "evolution_stats", "git", "git_pr", "git_rollback", "github",
         "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal",
         "recent_tasks",
         "query_code", "review", "search", "services", "shell", "skill_exec", "skill_publish",
@@ -1961,7 +1926,10 @@ class ToolRegistry:
                 write_target_argvs.append(inline_argv)
         explicit_write_targets = list(dict.fromkeys(str(token) for target_argv in write_target_argvs for token in writer_target_tokens(target_argv) if str(token or "").strip()))
         executable_path_tokens = {str(target_argv[0]) for target_argv in write_target_argvs if target_argv}
-        writeish = shell_has_write_indicator(raw_cmd) or (bool(argv_for_write) and argv_executable in LIGHT_SHELL_WRITER_COMMANDS) or bool(explicit_write_targets)
+        # Writer-command membership canonicalizes versioned interpreter spellings to
+        # their family (`ruby3.2` is `ruby`), so a versioned basename is exactly as
+        # write-suspect as the unversioned one (XG-2R.2).
+        writeish = shell_has_write_indicator(raw_cmd) or (bool(argv_for_write) and (interpreter_family(argv_executable) or argv_executable) in LIGHT_SHELL_WRITER_COMMANDS) or bool(explicit_write_targets)
         if protected_artifact_block := protected_artifact_shell_block_reason(self._ctx, raw_cmd, cwd=str(args.get("cwd") or ""), default_cwd=active_repo_dir_for(self._ctx)):
             return protected_artifact_block
         if writeish and (executor_state_block := workspace_executor_state_write_block(raw_cmd, drive_root=pathlib.Path(self._ctx.drive_root), cwd=str(args.get("cwd") or ""), default_cwd=active_repo_dir_for(self._ctx))):
@@ -2156,7 +2124,9 @@ class ToolRegistry:
                 repo_dir=pathlib.Path(self._ctx.active_repo_dir()),
                 cwd=str(args.get("cwd") or ""),
                 work_dir=pathlib.Path(work_dir),
-                detect_interpreter_inline=str(args.get("__tool_name") or "") == "run_script",
+                # Inline-code inspection now reaches EVERY surface this check guards
+                # (it defaults ON in the fence) — scoping it to `__tool_name ==
+                # "run_script"` let run_command mutate the repo first (XG-7B3.1).
             ):
                 return (
                     "⚠️ LIGHT_MODE_BLOCKED: runtime_mode=light refuses "
@@ -2167,7 +2137,17 @@ class ToolRegistry:
                     "reviewed Ouroboros self-modification."
                 )
             runtime_data_executable = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe") if argv else ""
-            runtime_data_scan = writeish or runtime_data_executable in {"python", "python3", "node", "ruby", "perl", "php", "sh", "bash", "zsh"}
+            # Versioned interpreter basenames (python3.11, ruby3.2, php8.3,
+            # perl5.38, node18) must trigger the runtime_data scan exactly like
+            # their unversioned spellings. Classification is the shared structural
+            # `interpreter_family` — the exact-set + `startswith("python")` pair
+            # recognized versions of ONE family and let every other family's
+            # versioned spelling bypass the guard (XG-2R.2).
+            runtime_data_scan = (
+                writeish
+                or runtime_data_executable in {"sh", "bash", "zsh"}
+                or bool(interpreter_family(runtime_data_executable))
+            )
             if runtime_data_scan:
                 own_task_drive = pathlib.Path(self._ctx.task_drive_root())
                 own_artifact_dir = task_artifact_dir_path(
@@ -2422,10 +2402,6 @@ class ToolRegistry:
             return "⚠️ HEAL_MODE_BLOCKED: Repair may only review the selected skill."
         if name == "skill_preflight" and str(args.get("skill", "") or "").strip() != heal_skill:
             return "⚠️ HEAL_MODE_BLOCKED: Repair may only preflight the selected skill."
-        if name == "claude_code_edit":
-            block_msg = _heal_claude_code_edit_block(self._ctx, args, task_constraint)
-            if block_msg:
-                return block_msg
         if ext_tool or is_mcp or name not in _HEAL_MODE_ALLOWED_TOOLS:
             return (
                 "⚠️ HEAL_MODE_BLOCKED: Repair tasks may inspect/edit skill "
@@ -2491,7 +2467,7 @@ class ToolRegistry:
                 "The parent must grant dynamic tools explicitly per child."
             )
         # Cover the full repo-mutating surface explicitly (CODE_TOOLS ∪ _REPO_MUTATION_TOOLS):
-        # write_file/edit_text/claude_code_edit AND shell/process tools (run_command/run_script/
+        # write_file/edit_text AND shell/process tools (run_command/run_script/
         # start_service) are all is_code_tool=True, but gating on the union makes the
         # "no OTHER task writes the repo while a merge is staged" contract robust to flag drift.
         if entry is not None and (name in self.CODE_TOOLS or name in _REPO_MUTATION_TOOLS):
@@ -2664,7 +2640,7 @@ class ToolRegistry:
                     "workspace; write only to root=task_drive, root=artifact_store, or root=user_files. "
                     "active_workspace/system_repo map to the live Ouroboros repo and are blocked."
                 )
-            if name in ("claude_code_edit", "run_command", "run_script", "start_service", "integrate_subagent_patch"):
+            if name in ("run_command", "run_script", "start_service", "integrate_subagent_patch"):
                 return (
                     "⚠️ ACTING_NO_WORKSPACE_BLOCKED: shell/coding/service/integration tools need an "
                     "isolated workspace (their default target is the live repo). Schedule a self_worktree "
@@ -2691,7 +2667,7 @@ class ToolRegistry:
             return f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(self._entries.keys()))}"
         raw_bucket = str(args.get("bucket", "") or "")
         raw_skill_name = str(args.get("skill_name", "") or "")
-        short_path_text = str(args.get("cwd", "") or "") if name == "claude_code_edit" else str(args.get("path", "") or "")
+        short_path_text = str(args.get("path", "") or "")
         short_form_decision = decide_payload_short_form(
             bucket=raw_bucket,
             skill_name=raw_skill_name,
@@ -2714,7 +2690,6 @@ class ToolRegistry:
             and name in (
                 "write_file",
                 "edit_text",
-                "claude_code_edit",
             )
         ):
             _root_arg = str(args.get("root", "") or "").strip().lower()
@@ -2735,7 +2710,6 @@ class ToolRegistry:
         if redirect_err and name in (
             "write_file",
             "edit_text",
-            "claude_code_edit",
         ):
             return f"⚠️ SKILL_REDIRECT_BLOCKED: {redirect_err}"
         # Existing skill_repair constraint remains authoritative.

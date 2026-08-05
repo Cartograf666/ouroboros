@@ -598,8 +598,8 @@ def test_acting_no_workspace_blocks_live_repo_write_and_shell(tmp_path):
     assert "ACTING_NO_WORKSPACE_BLOCKED" in out
     assert not (repo / "x.txt").exists()
     assert "ACTING_NO_WORKSPACE_BLOCKED" in reg.execute("run_command", {"cmd": "echo hi > z.txt"})
-    # claude_code_edit is not in the acting tool set -> blocked by the acting hard-block.
-    assert "ACTING_SUBAGENT_BLOCKED" in reg.execute("claude_code_edit", {"cwd": ".", "instructions": "x"})
+    # The retired claude_code_edit no longer exists at all for an acting child.
+    assert "Unknown tool" in reg.execute("claude_code_edit", {"cwd": ".", "instructions": "x"})
     assert "ACTING_NO_WORKSPACE_BLOCKED" in reg.execute("start_service", {"name": "svc", "cmd": "sleep 1"})
 
 

@@ -229,7 +229,11 @@ may not weaken it.
    blocking would have stopped is loudly and durably recorded.
 2. **Advisory pre-review**: a cheaper preflight on the same snapshot,
    mandatory before the blocking review; staleness-aware (any
-   worktree-mutating tool invalidates the snapshot).
+   worktree-mutating tool invalidates the snapshot). The owner may leave
+   the advisory reviewer unconfigured. That does not make the preflight
+   optional — it makes it UNAVAILABLE, and a commit then rides the audited
+   bypass of the same name below, durably recorded. An unconfigured
+   advisory must never read as a clean preflight.
 3. **Plan review**: multi-model architectural review of plans before
    implementation starts, mandatory for non-trivial or
    direction-changing work.
@@ -252,11 +256,20 @@ following bounds are constitutional:
   surface plus all prompts plus
   [docs/CHECKLISTS.md](docs/CHECKLISTS.md), and so must the scope
   reviewer wherever scope review applies (the owner's `max` context
-  mode). Tests are excludable when
+  mode) — except a RETRIEVING scope reviewer admitted under the Context
+  window floor below, whose surface is declared unasserted rather than
+  claimed. Tests are excludable when
   unrelated to the change. Memory files are excludable at Ouroboros's
   discretion. **Prompts and functional code are never excludable.**
   If a review pack would cut prompts or functional modules to fit,
   that is a signal to refactor the repo, not to reduce scope.
+
+  Where the assembler cannot fit a required artifact, that is a FAILURE
+  to assemble, not a smaller pack: it records a typed entry naming the
+  artifact and the reason, and the review does not proceed on the
+  remainder. Disclosure is owed in addition to the refusal, never
+  instead of it. A required artifact that does not fit is the signal to
+  refactor, exactly as above.
 - **Context window floor.** Where scope review applies, the blocking
   scope reviewer runs on a model with at least a 1M-token context
   window. If the repo approaches this limit, the correct response is to
@@ -264,6 +277,47 @@ following bounds are constitutional:
   lower the floor. A smaller reviewer is a weaker reviewer, and a
   reviewer whose window cannot be established by sourced Capability
   Evidence is treated as too small rather than assumed adequate.
+
+  **Retrieving scope reviewers (owner-declared, lower assurance).** A scope
+  reviewer may instead RETRIEVE the surface itself through read-only tools
+  rather than receive it assembled. Ouroboros does not claim this is
+  equivalent to the pushed floor and does not claim the surface was
+  covered: a retrieving reviewer reads what it chooses, and the host
+  cannot establish from outside what a vendor session actually held in
+  context. This mode is therefore admitted on the same honest footing as
+  the `low` coupling below — as a DECLARED reduction in assurance, never
+  as a substitute claim. It is bounded by four conditions:
+
+  - the owner selects it explicitly per scope slot. This is an OWNER
+    INTENT, not an enforced control: the reviewer-slot setting travels the
+    ordinary settings path, so an agent that can write settings can reach
+    it — as it already could reach the legacy reviewer-model keys. What is
+    enforced is the condition below: a slot the agent switched to this
+    mode acquires no authority from the switch, and blocks for want of an
+    authoritative verdict exactly as any unestablished reviewer does;
+  - the reviewer's context window is established by sourced Capability
+    Evidence at 200K tokens or more — the same evidence discipline as the
+    1M floor, only a different number. A row that does not meet it keeps
+    its findings as advisory evidence and cannot supply the authoritative
+    scope verdict a commit requires;
+  - every review taken this way records a typed, durable row naming the
+    mode and the reviewer, so a retrieved verdict is never mistaken for a
+    pushed one in any later audit;
+  - the artifacts the session opened are NOT recorded, and this bound says
+    so rather than promising forensics nobody produces. The host does not
+    see what a vendor session read; recording it awaits an upstream
+    Claudexor capability to report a session's read events. Until that
+    exists, the coverage manifest states plainly that coverage is the
+    session's own retrieval and is not host-attested — which is the honest
+    form of the same disclosure, and is what the condition above already
+    makes non-certifying.
+
+  The cost is stated as plainly as the `low` cost: a retrieving reviewer
+  may reach a verdict having consulted less of the repository than a
+  pushed reviewer received, and Ouroboros accepts that trade knowingly
+  rather than disguising it. This bound applies ONLY where scope review
+  applies; the diff-reviewer triad has no context floor of its own and
+  gains none here.
 
   Whether scope review applies is decided by ONE owner-selected control,
   the context-size mode of P1 — not by a separate reviewer-strength dial:
@@ -279,11 +333,15 @@ following bounds are constitutional:
     "scope review silently failed to run" (P1).
 
   The cost is stated plainly: in `low` the whole-repository
-  architectural review is lost and only the diff reviewers remain. That
-  is also the honest answer for an install with no ≥1M reviewer at all
-  (a fully local or single-small-provider setup): choose `low` and lose
-  scope review openly, rather than run a partial-coverage reviewer that
-  looks like the gate. In EVERY mode the staged diff is still
+  architectural review is lost and only the diff reviewers remain. For an
+  install with no ≥1M reviewer at all (a fully local or
+  single-small-provider setup) `low` remains a legitimate owner choice —
+  and, since the retrieving mode above, no longer the only one admitted:
+  the owner may instead declare a retrieving scope slot under its four
+  bounds, whose assurance is DECLARED lower rather than claimed equal.
+  Both are selectable today. What stays forbidden either way is an
+  undeclared partial-coverage reviewer that
+  looks like the pushed gate. In EVERY mode the staged diff is still
   blocking-reviewed by the diff-reviewer triad, and lowering the mode is
   owner-only — the agent cannot switch scope review off for its own
   commits.
@@ -294,8 +352,11 @@ following bounds are constitutional:
   protection of the constitutional core.
 - **Audited bypass only.** An advisory-bypass path, defined in
   [docs/CHECKLISTS.md](docs/CHECKLISTS.md), is a named exception scoped
-  to cosmetic changes and release-artifact metadata. Every bypass is
-  durably audited. Silent bypass is forbidden.
+  to cosmetic changes and release-artifact metadata, and to a commit
+  whose advisory reviewer is UNCONFIGURED (Component 2 above) — the
+  preflight is then unavailable, not waived, and the bypass is what
+  makes that visible. Every bypass is durably audited. Silent bypass is
+  forbidden.
 - **Owner-chosen enforcement, loud advisory.** The owner selects review
   enforcement (`blocking` or `advisory`). Advisory enforcement is
   legitimate ONLY while every decision that blocking enforcement would

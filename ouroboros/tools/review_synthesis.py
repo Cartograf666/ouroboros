@@ -306,6 +306,32 @@ def normalize_plan_scope(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return result
 
 
+def resolve_plan_context_level(raw_level: str, *, plan_class: str = "self_mod") -> str:
+    """Normalize the agent-declared context level (pure, same family as the scope above)."""
+    level = str(raw_level or "").strip().lower()
+    valid = {"minimal", "localized", "broad", "constitutional"}
+    if level not in valid:
+        # v6.61.0 (5.2): non-self_mod classes default to `minimal` — the generated Atlas is repo
+        # archaeology, needed only on request. self_mod keeps the explicit-choice contract.
+        if not level and plan_class in ("external", "creative", "research"):
+            return "minimal"
+        allowed = ", ".join(sorted(valid))
+        raise ValueError(
+            "plan_task requires an explicit context_level chosen by the agent "
+            f"({allowed}); do not rely on host-side auto selection."
+        )
+    return level
+
+
+def plan_context_target_tokens(level: str) -> int:
+    """The atlas TARGET the resolved level buys (the hard budget is the reviewer's window)."""
+    return {
+        "localized": 80_000,
+        "broad": 350_000,
+        "constitutional": 850_000,
+    }.get(str(level or ""), 80_000)
+
+
 def plan_review_fingerprint(
     *,
     plan: str,
@@ -535,25 +561,93 @@ def plan_slot_fit(models: Any, slot_limits: Any, estimated_tokens: int) -> tuple
     return callable_models, oversize, error
 
 
+def minted_plan_slot_ids(models: Any) -> List[str]:
+    """Ids for the CONFIGURED plan rows, from the one mint, in configured order.
+
+    Minted BEFORE any fit filtering (identity is CARRIED, never re-derived —
+    ARCHITECTURE.md, reviewer-slot identity): a row that later drops out keeps
+    this id on its typed preflight-oversize record and the surviving rows keep
+    theirs, so filtration never renumbers plan_slot_N.
+    """
+    from ouroboros.review_substrate import PLAN_SLOT_ID_PREFIX, slot_id_for_row
+
+    return [slot_id_for_row(idx + 1, prefix=PLAN_SLOT_ID_PREFIX) for idx in range(len(models or []))]
+
+
+def carry_plan_slot_ids(
+    slot_ids: List[str],
+    configured_models: Any,
+    fit_models: Any,
+    oversize_results: List[dict],
+) -> tuple:
+    """``(callable_slot_ids, stamped_oversize)``: identity carried through fit filtration.
+
+    ``plan_slot_fit`` partitions the configured rows by NAME (a name either fits
+    its calibrated cap or does not, so duplicate rows travel together) and both
+    of its outputs preserve configured order, so the walk below re-reads the
+    partition it already made: surviving rows keep the ids minted for their
+    configured positions, and each preflight-oversize record answers under the
+    ORIGINAL id of the row it reports on — a typed oversize disposition, never a
+    silent renumber.
+    """
+    fit_names = {str(model) for model in (fit_models or [])}
+    callable_ids: List[str] = []
+    dropped_ids: List[str] = []
+    for sid, model in zip(slot_ids, configured_models, strict=True):
+        (callable_ids if str(model) in fit_names else dropped_ids).append(sid)
+    stamped = [
+        {**record, "slot_id": sid}
+        for record, sid in zip(oversize_results, dropped_ids, strict=True)
+    ]
+    return callable_ids, stamped
+
+
+def plan_slot_fit_with_identity(models: Any, slot_limits: Any, estimated_tokens: int) -> tuple:
+    """``plan_slot_fit`` with configured-row identity carried through it.
+
+    ``(fit_models, callable_slot_ids, stamped_oversize, error)``: ids are minted
+    for the CONFIGURED rows first, so the compacted callable list is never the
+    thing identity is derived from.
+    """
+    slot_ids = minted_plan_slot_ids(models)
+    fit_models, oversize, error = plan_slot_fit(models, slot_limits, estimated_tokens)
+    callable_ids, stamped = carry_plan_slot_ids(slot_ids, models, fit_models, oversize)
+    return fit_models, callable_ids, stamped, error
+
+
 def per_slot_input_token_limits(
     models: Any,
     *,
-    context_window: int,
+    context_window: Optional[int] = None,
     output_reserve: int,
     tokenizer_margin: int,
 ) -> Dict[str, int]:
-    """Per-slot calibrated input caps for a prompt fanned across mixed families."""
+    """Per-slot calibrated input caps for a prompt fanned across mixed families.
+
+    ``context_window=None`` (the default) resolves each slot's REAL window from
+    Capability Evidence and scales the reserves to it, so a sub-1M slot gets a
+    fit-sized pack instead of a prompt sized for a window it does not have.
+    An explicit window stays honoured for callers that pin one deliberately."""
+    from ouroboros.reviewer_window import reviewer_context_window, window_scaled_reserves
     from ouroboros.tools.review_helpers import calibrated_input_token_limit
 
-    return {
-        str(model): calibrated_input_token_limit(
-            str(model),
-            context_window=context_window,
-            output_reserve=output_reserve,
-            tokenizer_margin=tokenizer_margin,
+    limits: Dict[str, int] = {}
+    for model in (models or []):
+        window = (
+            int(context_window)
+            if context_window is not None
+            else reviewer_context_window(str(model))
         )
-        for model in (models or [])
-    }
+        slot_output_reserve, slot_margin = window_scaled_reserves(
+            window, output_reserve=output_reserve, tokenizer_margin=tokenizer_margin,
+        )
+        limits[str(model)] = max(0, calibrated_input_token_limit(
+            str(model),
+            context_window=window,
+            output_reserve=slot_output_reserve,
+            tokenizer_margin=slot_margin,
+        ))
+    return limits
 
 
 def parse_plan_review_signal(text: str) -> str:
@@ -595,15 +689,42 @@ def _strict_plan_findings_block(text: str) -> tuple[Optional[List[Any]], str]:
     return parsed, ""
 
 
+def plan_row_key(result: Dict[str, Any], position: int):
+    """Identity key for one raw plan row: the CARRIED slot_id whenever the row has
+    one (identity is carried, never re-derived — the raw list's arrival order is
+    NOT row order once fit filtration drops a middle row). The 1-based position
+    survives only as the legacy-read-only key for rows persisted before identity
+    was carried; every live wave stamps slot_id on oversize and answered rows alike."""
+    return str(result.get("slot_id") or "") or position
+
+
+def assemble_plan_raw_results(oversize_rows: List[dict], slot_rows: List[dict]) -> List[dict]:
+    """Every raw plan row, in CONFIGURED row order.
+
+    Each configured row is exactly one of the two inputs (a typed preflight-oversize
+    record or an answered slot), so the union's size IS the configured count. Rows
+    sort by the position their CARRIED slot_id holds in the mint — plain
+    ``oversize + answered`` concatenation put a filtered MIDDLE row's record first,
+    and every positional consumer downstream then stitched findings and disposition
+    ids to the wrong configured row (XG-5R2.1)."""
+    rows = list(oversize_rows) + list(slot_rows)
+    rank = {sid: idx for idx, sid in enumerate(minted_plan_slot_ids(rows))}
+    return sorted(rows, key=lambda row: rank.get(str(row.get("slot_id") or ""), len(rank)))
+
+
 def addressable_plan_findings(
     result: Dict[str, Any], *, reviewer_index: int, signal: str
 ) -> tuple[List[Dict[str, Any]], str]:
+    # Identity is CARRIED: the finding prefix and reviewer_slot are the row's own
+    # slot_id whenever it has one. The positional plan-slot-N spelling survives
+    # only for legacy rows that predate the carry (legacy-read-only).
+    slot_label = str(result.get("slot_id") or "") or f"plan-slot-{reviewer_index}"
     model = str(result.get("model") or result.get("request_model") or f"Model {reviewer_index}")
     text = str(result.get("text") or "")
     if result.get("error") or not text.strip() or not signal:
         return ([{
-            "finding_id": f"plan-slot-{reviewer_index}:reviewer-unavailable",
-            "reviewer_slot": reviewer_index,
+            "finding_id": f"{slot_label}:reviewer-unavailable",
+            "reviewer_slot": slot_label,
             "model": model,
             "level": "RISK",
             "summary": "Reviewer failed to return a usable, parseable planning verdict.",
@@ -627,8 +748,8 @@ def addressable_plan_findings(
                 break
             local_ids.add(local_id)
             findings.append({
-                "finding_id": f"plan-slot-{reviewer_index}:{local_id}",
-                "reviewer_slot": reviewer_index,
+                "finding_id": f"{slot_label}:{local_id}",
+                "reviewer_slot": slot_label,
                 "model": model,
                 "level": level,
                 "summary": summary,
@@ -641,8 +762,8 @@ def addressable_plan_findings(
     if signal in {"REVIEW_REQUIRED", "REVISE_PLAN"}:
         reason = parse_error or "PLAN_FINDINGS_JSON contains no addressable finding"
         return ([{
-            "finding_id": f"plan-slot-{reviewer_index}:reviewer-response",
-            "reviewer_slot": reviewer_index,
+            "finding_id": f"{slot_label}:reviewer-response",
+            "reviewer_slot": slot_label,
             "model": model,
             "level": "FAIL" if signal == "REVISE_PLAN" else "RISK",
             "summary": f"Reviewer declared {signal}, but {reason}.",
@@ -650,8 +771,8 @@ def addressable_plan_findings(
         }], reason)
     if parse_error:
         return ([{
-            "finding_id": f"plan-slot-{reviewer_index}:findings-contract",
-            "reviewer_slot": reviewer_index,
+            "finding_id": f"{slot_label}:findings-contract",
+            "reviewer_slot": slot_label,
             "model": model,
             "level": "RISK",
             "summary": f"Reviewer findings projection is malformed: {parse_error}.",
@@ -663,7 +784,8 @@ def addressable_plan_findings(
 def summarize_plan_review_results(raw_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     signals: List[str] = []
     findings: List[Dict[str, Any]] = []
-    projection_errors: Dict[int, str] = {}
+    # Keyed by plan_row_key: the CARRIED slot_id (position only for legacy rows).
+    projection_errors: Dict[Any, str] = {}
     for index, result in enumerate(raw_results, start=1):
         if result.get("review_participation") == "preflight_excluded":
             signals.append("PREFLIGHT_EXCLUDED")
@@ -676,7 +798,7 @@ def summarize_plan_review_results(raw_results: List[Dict[str, Any]]) -> Dict[str
             result, reviewer_index=index, signal="" if signal == "DEGRADED" else signal
         )
         if error:
-            projection_errors[index] = error
+            projection_errors[plan_row_key(result, index)] = error
             if signal == "GREEN":
                 # Contradictory GREEN with valid addressable findings is
                 # substantive REVIEW_REQUIRED, not reviewer unavailability.
@@ -726,15 +848,25 @@ def format_plan_review_output(
     reviewer_retry_required: bool = False,
 ) -> str:
     summary = summarize_plan_review_results(raw_results)
+    # The configured row count is the raw list itself (one row per configured slot,
+    # oversize or answered); `models` is only the CALLED subset after fit filtering.
+    configured = len(raw_results) or len(models)
+    model_line = f"**Models:** {configured} parallel reviewers"
+    if raw_results and len(models) != configured:
+        model_line = (
+            f"**Models:** {configured} configured reviewer rows — {len(models)} called, "
+            f"{configured - len(models)} preflight-oversize"
+        )
     lines = [
-        "## Plan Review Results", "", f"**Goal:** {goal}",
-        f"**Models:** {len(models)} parallel reviewers",
+        "## Plan Review Results", "", f"**Goal:** {goal}", model_line,
         f"**Prompt size:** ~{estimated_tokens:,} tokens per reviewer", "", "---", "",
     ]
     signals = list(summary["signals"])
     for index, result in enumerate(raw_results, start=1):
+        # Rows are labeled by their CARRIED identity, never by list position.
+        key = plan_row_key(result, index)
         model = result.get("model") or result.get("request_model") or f"Model {index}"
-        lines.extend([f"### Reviewer {index}: {model}", ""])
+        lines.extend([f"### Reviewer {key}: {model}", ""])
         if result.get("error"):
             lines.extend([f"⚠️ **ERROR:** {result['error']}", "", "---", ""])
             continue
@@ -743,7 +875,7 @@ def format_plan_review_output(
             lines.extend(["⚠️ **ERROR:** Empty response from reviewer.", "", "---", ""])
             continue
         lines.extend([text, ""])
-        error = summary["projection_errors"].get(index)
+        error = summary["projection_errors"].get(key)
         if error:
             lines.extend([
                 f"⚠️ **FINDINGS CONTRACT:** {error}; the response is represented by a "

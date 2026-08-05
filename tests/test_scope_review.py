@@ -19,6 +19,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -540,7 +541,7 @@ class TestRunScopeReviewFailClosed:
         def fake_gather(_repo_dir, _paths, **kwargs):
             calls.append(bool(kwargs.get("compact")))
             if not kwargs.get("compact"):
-                raise mod._ScopeAtlasBudgetExceeded({"estimated_total_tokens": 900_000})
+                raise mod._ScopeAtlasNotAssembled({"estimated_total_tokens": 900_000})
             return "COMPACT ATLAS"
 
         monkeypatch.setattr(mod, "_gather_scope_packs", fake_gather)
@@ -579,7 +580,7 @@ class TestRunScopeReviewFailClosed:
         def fake_gather(_repo_dir, _paths, fixed_prompt_tokens=0, compact=False, **_kw):
             calls.append(compact)
             if compact:
-                raise mod._ScopeAtlasBudgetExceeded({"estimated_total_tokens": 900_001})
+                raise mod._ScopeAtlasNotAssembled({"estimated_total_tokens": 900_001})
             return "OVERSIZED ATLAS"
 
         monkeypatch.setattr(mod, "_gather_scope_packs", fake_gather)
@@ -638,12 +639,19 @@ class TestRunScopeReviewFailClosed:
         assert large_diff not in prompt
         assert "COMPACT ATLAS" in prompt
 
-    def test_sub_floor_windows_get_scaled_reserves_not_zero_limit(self):
+    def test_sub_floor_windows_get_scaled_reserves_not_zero_limit(self, tmp_path, monkeypatch):
         """Provider Independence: the absolute 1M reserves must not swallow a
         small window whole. GigaChat (131K) and any known sub-1M slot keep a
         positive input limit via window-scaled reserves; the >=1M reviewer
         keeps the absolute reserves unchanged."""
         mod = _get_module("ouroboros.tools.scope_review")
+        # Isolated evidence: every scope route (the designated default included) is
+        # probed now, so an ambient store would otherwise decide this arithmetic.
+        monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+        monkeypatch.setattr(
+            "ouroboros.capability_evidence.probe",
+            lambda *a, **k: mod.ReviewerWindow(0, "unprobeable"),
+        )
 
         giga = mod._effective_scope_input_limit(scope_model="gigachat::GigaChat-3-Ultra")
         assert giga > 50_000, f"gigachat input limit must be workable, got {giga}"
@@ -692,14 +700,16 @@ class TestRunScopeReviewFailClosed:
         monkeypatch.setattr(
             mod, "_gather_scope_packs",
             lambda *_a, **_k: (_ for _ in ()).throw(
-                mod._ScopeAtlasBudgetExceeded({"estimated_total_tokens": 999_999})
+                mod._ScopeAtlasNotAssembled({"estimated_total_tokens": 999_999})
             ),
         )
         monkeypatch.setattr(mod, "estimate_tokens", lambda _text: 800_000)
         # Capability Evidence: gigachat KNOWN sub-floor (131K), fable-5 >=1M.
         monkeypatch.setattr(
-            mod, "_scope_reviewer_window",
-            lambda m: 131_072 if "gigachat" in str(m).lower() else 1_000_000,
+            mod, "_scope_window",
+            lambda m, **_k: mod.ReviewerWindow(
+                131_072 if "gigachat" in str(m).lower() else 1_000_000, "confirmed",
+            ),
         )
 
         _, status_full = mod._build_scope_prompt(
@@ -882,7 +892,8 @@ class TestRunScopeReviewFailClosed:
         # downgrade (its target) from the separate sub-floor downgrade: an off-default
         # model with no Capability Evidence now fail-closes to the sub-floor (v6.46.0 fix),
         # which would empty critical_findings via the sub-floor path instead.
-        monkeypatch.setattr(mod, "_scope_reviewer_window", lambda m: 1_000_000)
+        monkeypatch.setattr(mod, "_scope_window",
+                            lambda m, **_k: mod.ReviewerWindow(1_000_000, "confirmed"))
 
         result = mod.run_scope_review(MockCtx(), "test commit", scope_model="test-scope")
 
@@ -912,7 +923,8 @@ class TestRunScopeReviewFailClosed:
         )
         monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
         monkeypatch.setattr(mod, "_call_scope_llm", lambda *a, **k: ("", None, oversize_error))
-        monkeypatch.setattr(mod, "_scope_reviewer_window", lambda _m: 1_000_000)
+        monkeypatch.setattr(mod, "_scope_window",
+                            lambda _m, **_k: mod.ReviewerWindow(1_000_000, "confirmed"))
 
         result = mod.run_scope_review(MockCtx(), "test commit", scope_model="anthropic/claude-fable-5")
 
@@ -964,8 +976,11 @@ class TestRunScopeReviewFailClosed:
         # Capability Evidence sources the reviewer window (no static table, v6.33.0):
         # treat opus-4.8 / gigachat as KNOWN sub-floor (<1M), fable-5 as >=1M.
         monkeypatch.setattr(
-            mod, "_scope_reviewer_window",
-            lambda m: 200_000 if ("opus" in str(m) or "gigachat" in str(m).lower()) else 1_000_000,
+            mod, "_scope_window",
+            lambda m, **_k: mod.ReviewerWindow(
+                200_000 if ("opus" in str(m) or "gigachat" in str(m).lower()) else 1_000_000,
+                "confirmed",
+            ),
         )
 
         result = mod.run_scope_review(
@@ -1014,7 +1029,8 @@ class TestRunScopeReviewFailClosed:
             }
             for item_id in sorted(mod._SCOPE_REQUIRED_ITEMS)
         ]
-        monkeypatch.setattr(mod, "_scope_reviewer_window", lambda _m: 200_000)
+        monkeypatch.setattr(mod, "_scope_window",
+                            lambda _m, **_k: mod.ReviewerWindow(200_000, "confirmed"))
         monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
         monkeypatch.setattr(
             mod,
@@ -1048,7 +1064,8 @@ class TestRunScopeReviewFailClosed:
                 return tmp_path
 
         error = "Error code: 400 - prompt is too long: 300000 tokens > 200000 maximum"
-        monkeypatch.setattr(mod, "_scope_reviewer_window", lambda _m: 200_000)
+        monkeypatch.setattr(mod, "_scope_window",
+                            lambda _m, **_k: mod.ReviewerWindow(200_000, "confirmed"))
         monkeypatch.setattr(mod, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
         monkeypatch.setattr(mod, "_call_scope_llm", lambda *a, **k: ("", None, error))
 
@@ -1061,7 +1078,8 @@ class TestRunScopeReviewFailClosed:
     def test_irreducible_sub_floor_prompt_blocks_default_floor(self, monkeypatch):
         """A pre-dispatch sub-floor fit failure cannot silently satisfy P3."""
         mod = _get_module("ouroboros.tools.scope_review")
-        monkeypatch.setattr(mod, "_scope_reviewer_window", lambda _m: 200_000)
+        monkeypatch.setattr(mod, "_scope_window",
+                            lambda _m, **_k: mod.ReviewerWindow(200_000, "confirmed"))
 
         result = mod._handle_prompt_signals(
             None,
@@ -1125,7 +1143,8 @@ class TestRunScopeReviewFailClosed:
         )
         monkeypatch.setattr(mod, "_effective_scope_input_limit", lambda *a, **k: 10)
 
-        monkeypatch.setattr(mod, "_scope_reviewer_window", lambda _m: 1_000_000)
+        monkeypatch.setattr(mod, "_scope_window",
+                            lambda _m, **_k: mod.ReviewerWindow(1_000_000, "confirmed"))
         result = mod.run_scope_review(MockCtx(), "test commit", scope_model="anthropic/claude-fable-5")
 
         assert result.blocked is True
@@ -1172,8 +1191,10 @@ class TestRunScopeReviewFailClosed:
         from ouroboros.tools.review_helpers import calibrated_input_token_limit
         # opus-4.8 KNOWN sub-floor (200K) via evidence; everything else >=1M.
         monkeypatch.setattr(
-            mod, "_scope_reviewer_window",
-            lambda m: 200_000 if "opus" in str(m) else 1_000_000,
+            mod, "_scope_window",
+            lambda m, **_k: mod.ReviewerWindow(
+                200_000 if "opus" in str(m) else 1_000_000, "confirmed",
+            ),
         )
 
         full = calibrated_input_token_limit(
@@ -1217,7 +1238,8 @@ class TestRunScopeReviewFailClosed:
             "_call_scope_llm",
             lambda *a, **k: (json.dumps(raw_items), {"prompt_tokens": 10, "completion_tokens": 5}, None),
         )
-        monkeypatch.setattr(mod, "_scope_reviewer_window", lambda _m: 1_000_000)
+        monkeypatch.setattr(mod, "_scope_window",
+                            lambda _m, **_k: mod.ReviewerWindow(1_000_000, "confirmed"))
 
         result = mod.run_scope_review(MockCtx(), "test commit", scope_model="test-scope")
         record = helpers.build_scope_actor_record(result, fallback_model_id="fallback-scope")
@@ -1771,9 +1793,10 @@ class TestHeadSnapshotSection:
         (tmp_path / "newfile.py").write_text("print('new')", encoding="utf-8")
 
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, ["newfile.py"])
+        result, included = mod.build_head_snapshot_section(tmp_path, ["newfile.py"])
         assert "File is new" in result
         assert "no HEAD snapshot" in result
+        assert "newfile.py" not in included  # no snapshot text -> not claimable
 
     def test_existing_file_shows_old_content(self, tmp_path):
         """Modified files should show the HEAD (old) content in the snapshot."""
@@ -1785,8 +1808,9 @@ class TestHeadSnapshotSection:
         (tmp_path / "existing.py").write_text("NEW_CONTENT_V2", encoding="utf-8")
 
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, ["existing.py"])
+        result, included = mod.build_head_snapshot_section(tmp_path, ["existing.py"])
         assert "OLD_CONTENT_V1" in result
+        assert "existing.py" in included  # full snapshot present -> claimable
         assert "NEW_CONTENT_V2" not in result  # HEAD snapshot, not current
 
     def test_deleted_file_shows_old_content(self, tmp_path):
@@ -1798,8 +1822,9 @@ class TestHeadSnapshotSection:
         (tmp_path / "deleted.py").unlink()
 
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, ["deleted.py"])
+        result, included = mod.build_head_snapshot_section(tmp_path, ["deleted.py"])
         assert "CONTENT_BEFORE_DELETE" in result
+        assert "deleted.py" in included
 
     def test_new_file_not_confused_with_git_error(self, tmp_path, monkeypatch):
         """git show non-zero for a new file must say 'File is new', not 'error'."""
@@ -1819,11 +1844,12 @@ class TestHeadSnapshotSection:
         monkeypatch.setattr(sp_module, "run", mock_run)
 
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, ["newfile.py"])
+        result, included = mod.build_head_snapshot_section(tmp_path, ["newfile.py"])
         assert "File is new" in result
         assert "no HEAD snapshot" in result
         # Must NOT render as a git error
         assert "HEAD snapshot error" not in result
+        assert "newfile.py" not in included
 
     def test_real_git_error_not_mislabeled_as_new_file(self, tmp_path, monkeypatch):
         """Real git failures (bad object, corrupt repo) must render as 'HEAD snapshot error',
@@ -1845,10 +1871,11 @@ class TestHeadSnapshotSection:
         monkeypatch.setattr(sp_module, "run", mock_run)
 
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, ["existing.py"])
+        result, included = mod.build_head_snapshot_section(tmp_path, ["existing.py"])
         # Must render as an error, not as a new file
         assert "HEAD snapshot error" in result
         assert "File is new" not in result
+        assert "existing.py" not in included
 
     def test_binary_file_omitted_cleanly(self, tmp_path):
         """Binary files (e.g. .png) must produce an omission note, not garbage bytes."""
@@ -1859,18 +1886,20 @@ class TestHeadSnapshotSection:
         (tmp_path / "logo.png").unlink()
 
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, ["logo.png"])
+        result, included = mod.build_head_snapshot_section(tmp_path, ["logo.png"])
         # Must produce an omission note, not binary garbage
         assert "omitted" in result.lower() or "binary" in result.lower()
         # Must not contain raw binary bytes
         assert "\x00" not in result
         assert "\xff" not in result
+        assert "logo.png" not in included
 
     def test_empty_paths_returns_placeholder(self, tmp_path):
         """Empty paths list returns a placeholder."""
         mod = _get_module("ouroboros.tools.review_helpers")
-        result = mod.build_head_snapshot_section(tmp_path, [])
+        result, included = mod.build_head_snapshot_section(tmp_path, [])
         assert "no touched files" in result
+        assert included == frozenset()
 
     def test_scope_prompt_omits_head_snapshots_section(self, tmp_path):
         """v4.33.0: _build_scope_prompt MUST NOT include a separate 'Pre-change snapshots' section.
@@ -2238,13 +2267,13 @@ class TestTriadPromptAntiPatternLock:
 
 
 def test_scope_reviewer_window_fail_closed_on_absent_evidence(monkeypatch, tmp_path):
-    """claudexor B4 + v6.46.0 false-1M fix: with NO capability evidence, ONLY the
-    SHIPPED designated reviewer (_SCOPE_MODEL_DEFAULT) is granted the 1M blocking
-    sentinel under blocking_1m. An OFF-DEFAULT reviewer (e.g. an
-    OUROBOROS_SCOPE_REVIEW_MODEL pin) fails closed to the conservative sub-floor —
-    so the P3 authority downgrades it visibly instead of silently treating a 200K model
-    as 1M and overflowing its real window into a provider 400. A non-default >=1M
-    reviewer must be owner-acked to regain 1M."""
+    """claudexor B4 + v6.46.0 false-1M fix: with NO capability evidence an OFF-DEFAULT
+    reviewer (e.g. an OUROBOROS_SCOPE_REVIEW_MODEL pin) fails closed to the conservative
+    sub-floor SIZE, instead of silently treating a 200K model as 1M and overflowing its
+    real window into a provider 400. The SHIPPED designated reviewer keeps the 1M
+    sentinel as a SIZE so the review is still dispatched — but NEITHER carries blocking
+    authority, because a model acquires no authority from its name (BIBLE P3: a window
+    that cannot be established by sourced Capability Evidence is treated as too small)."""
     from ouroboros.tools import scope_review as sr
     from ouroboros import capability_evidence
     from types import SimpleNamespace
@@ -2258,25 +2287,32 @@ def test_scope_reviewer_window_fail_closed_on_absent_evidence(monkeypatch, tmp_p
     )
 
     # An OFF-DEFAULT reviewer with no evidence fails closed to the sub-floor...
-    w_adv = sr._scope_reviewer_window("gigachat::GigaChat-3-Ultra")
-    assert 0 < w_adv < sr._SCOPE_MODEL_CONTEXT_WINDOW, w_adv  # fail-closed sub-floor
+    w_adv = sr._scope_window("gigachat::GigaChat-3-Ultra")
+    assert 0 < w_adv.window_tokens < sr._SCOPE_MODEL_CONTEXT_WINDOW, w_adv
 
     # ...as does a pinned off-default 200K model (the v6.46.0 bug: it used to be
     # wrongly trusted as 1M and overflowed).
-    w_offdefault = sr._scope_reviewer_window("anthropic/claude-sonnet-4.5")
-    assert w_offdefault == sr._SCOPE_FAILCLOSED_WINDOW, w_offdefault
+    w_offdefault = sr._scope_window("anthropic/claude-sonnet-4.5")
+    assert w_offdefault.window_tokens == sr._SCOPE_FAILCLOSED_WINDOW, w_offdefault
 
-    # The SHIPPED designated reviewer keeps the 1M sentinel under blocking_1m.
-    w_designated = sr._scope_reviewer_window(sr._SCOPE_MODEL_DEFAULT)
-    assert w_designated == sr._SCOPE_MODEL_CONTEXT_WINDOW, w_designated
+    # The SHIPPED designated reviewer keeps the 1M sentinel as a SIZING number...
+    w_designated = sr._scope_window(sr._SCOPE_MODEL_DEFAULT)
+    assert w_designated.window_tokens == sr._SCOPE_MODEL_CONTEXT_WINDOW, w_designated
 
     # Direct-provider and explicit OpenRouter spellings of the same shipped reviewer
     # are also the designated default. Regression guard for a provider spelling
     # (openai::/openrouter::) being misclassified as off-default.
-    w_direct = sr._scope_reviewer_window("openai::gpt-5.6-terra")
-    assert w_direct == sr._SCOPE_MODEL_CONTEXT_WINDOW, w_direct
-    w_openrouter = sr._scope_reviewer_window("openrouter::openai/gpt-5.6-terra")
-    assert w_openrouter == sr._SCOPE_MODEL_CONTEXT_WINDOW, w_openrouter
+    for spelling in ("openai::gpt-5.6-terra", "openrouter::openai/gpt-5.6-terra"):
+        assert sr._scope_window(spelling).window_tokens == sr._SCOPE_MODEL_CONTEXT_WINDOW
+
+    # ...and NONE of them — the designated default least of all — may block a commit
+    # on that invented number. Authority is computed from the evidence, not the name.
+    for model in (
+        "gigachat::GigaChat-3-Ultra", "anthropic/claude-sonnet-4.5",
+        sr._SCOPE_MODEL_DEFAULT, "openai::gpt-5.6-terra",
+        "openrouter::openai/gpt-5.6-terra",
+    ):
+        assert sr._scope_window(model).blocking_authority_allowed is False, model
 
 
 def test_scope_reviewer_window_uses_scope_slot_route_not_main(monkeypatch, tmp_path):
@@ -2306,7 +2342,7 @@ def test_scope_reviewer_window_uses_scope_slot_route_not_main(monkeypatch, tmp_p
     )
     monkeypatch.setattr(capability_evidence, "probe", fake_probe)
 
-    assert sr._scope_reviewer_window("openai::gpt-5.5") == 333_333
+    assert sr._scope_window("openai::gpt-5.5").window_tokens == 333_333
     assert captured["provider"] == "openai"
     assert captured["model"] == "openai::gpt-5.5"
     assert captured["base_url"] == "https://api.openai.test/v1"
@@ -2420,26 +2456,31 @@ def test_default_context_mode_is_max_and_agent_cannot_lower_it(monkeypatch):
     ) is True
 
 
-def test_window_provenance_wording_is_four_way(monkeypatch):
-    """RS5: the four cases must read differently — a conservative fallback must not
-    be reported with the same words as a confirmed measurement."""
+def test_window_provenance_wording_is_five_way():
+    """RS5: the cases must read differently — a conservative fallback must not be
+    reported with the same words as a confirmed measurement, and an EXPIRED record
+    must not be reported with the same words as a live one."""
     from ouroboros.tools import scope_review as sr
 
     phrases = {
         sr._window_provenance_phrase(200_000, sr._WINDOW_CONFIRMED),
         sr._window_provenance_phrase(200_000, sr._WINDOW_ASSERTED),
         sr._window_provenance_phrase(200_000, sr._WINDOW_UNKNOWN),
+        sr._window_provenance_phrase(1_000_000, sr._WINDOW_STALE),
         sr._window_provenance_phrase(1_000_000, sr._WINDOW_SENTINEL),
     }
-    assert len(phrases) == 4
+    assert len(phrases) == 5
     assert "confirmed" in sr._window_provenance_phrase(200_000, sr._WINDOW_CONFIRMED)
     assert "owner-asserted" in sr._window_provenance_phrase(200_000, sr._WINDOW_ASSERTED)
     assert "unknown window" in sr._window_provenance_phrase(200_000, sr._WINDOW_UNKNOWN)
     assert "designated-default" in sr._window_provenance_phrase(1_000_000, sr._WINDOW_SENTINEL)
+    assert "EXPIRED" in sr._window_provenance_phrase(1_000_000, sr._WINDOW_STALE)
 
-    # A substituted window seam still gets an honest (coarser) label, never "confirmed".
-    monkeypatch.setattr(sr, "_scope_reviewer_window", lambda _m: 250_000)
-    assert sr._scope_reviewer_window_evidence("x/y") == (250_000, sr._WINDOW_UNKNOWN)
+    # The label is read off the EVIDENCE, so a stale 1M record can never be labelled
+    # (or worded) as a confirmed one just because its number clears the floor.
+    stale = sr.ReviewerWindow(1_000_000, "confirmed", stale=True)
+    assert sr._scope_window_provenance(stale) == sr._WINDOW_STALE
+    assert sr._scope_window_provenance(sr.ReviewerWindow(250_000)) == sr._WINDOW_UNKNOWN
 
 
 def test_ladder_steps_are_recorded_once_aggregated(tmp_path, monkeypatch):
@@ -2464,6 +2505,314 @@ def test_ladder_steps_are_recorded_once_aggregated(tmp_path, monkeypatch):
     assert set(steps[0]) >= {"tokens_before", "tokens_after", "diff_only_files", "deficit"}
 
 
+def _repo_with_oversized_required_prompt(tmp_path, required_bytes=935_000):
+    """A repo whose UNCHANGED `prompts/` artifact cannot fit any atlas budget."""
+    import subprocess
+
+    (tmp_path / "docs").mkdir(exist_ok=True)
+    (tmp_path / "docs" / "CHECKLISTS.md").write_text(
+        "## Intent / Scope Review Checklist\n\nplaceholder\n", encoding="utf-8",
+    )
+    (tmp_path / "docs" / "DEVELOPMENT.md").write_text("dev guide\n", encoding="utf-8")
+    (tmp_path / "BIBLE.md").write_text("constitution\n", encoding="utf-8")
+    (tmp_path / "prompts").mkdir(exist_ok=True)
+    # Force-included by prefix => `required`, and never touched by this commit.
+    (tmp_path / "prompts" / "huge.md").write_text("x" * required_bytes, encoding="utf-8")
+    (tmp_path / "ok.py").write_text("print(1)\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-m", "init"],
+        cwd=str(tmp_path), capture_output=True,
+    )
+    (tmp_path / "ok.py").write_text("print(2)\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+
+
+def test_unassembled_required_terminal_names_the_artifact_not_a_phantom_overflow(
+    tmp_path, monkeypatch,
+):
+    """BIBLE P1/P3. The ladder terminates on TWO different failures. When it ends
+    because a REQUIRED artifact never assembled, the owner-facing block must say
+    so — not reuse the irreducible-prompt story, whose own quoted token count
+    contradicts the budget it claims to exceed, and whose remedy ("split the
+    staged diff") cannot shrink an UNCHANGED artifact. The refusal is also a
+    ladder STEP: a terminal with an empty trace explains nothing after the fact."""
+    from ouroboros.tools import scope_review as sr
+
+    _repo_with_oversized_required_prompt(tmp_path)
+    monkeypatch.setattr(sr, "_effective_scope_input_limit", lambda **_kw: 200_000)
+    monkeypatch.setattr(sr, "_scope_window",
+                        lambda _m, **_k: sr.ReviewerWindow(window_tokens=1_000_000, status="confirmed"))
+
+    prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
+
+    assert prompt is None
+    assert status.status == "fixed_overflow"          # authority branch unchanged
+    assert status.unassembled_required == ["prompts/huge.md"]  # cause carried
+    # The trace records the refusal steps, naming what did not assemble.
+    steps = sr._current_scope_context_manifest().get("ladder_steps") or []
+    assert [s for s in steps if s["step"] == "atlas_refused"], steps
+    assert steps[0]["unassembled_required"] == ["prompts/huge.md"]
+
+    result = sr._handle_prompt_signals(prompt, status, input_limit=200_000, scope_model="")
+    assert "prompts/huge.md" in result.block_message
+    # The false cause and its self-contradicting comparison are gone.
+    assert "irreducible scope prompt" not in result.block_message
+    assert f"({200_000})" not in result.block_message
+    assert "Split the commit into smaller staged diffs" not in result.block_message
+
+
+def test_sub_floor_terminal_reports_the_same_cause_as_the_1m_terminal(monkeypatch):
+    """The twin: `budget_exceeded` (sub-floor reviewer) is the other authority
+    branch of the same terminal and made the identical false claim. Fixing one
+    branch and leaving its sibling is the defect, not the fix. The genuine
+    overflow wording must survive on both."""
+    from ouroboros.tools import scope_review as sr
+
+    monkeypatch.setattr(
+        sr, "_scope_window", lambda _m, **_k: sr.ReviewerWindow(window_tokens=200_000, status="confirmed"),
+    )
+    missing = sr._TouchedContextStatus(
+        status="budget_exceeded", token_count=3_672,
+        unassembled_required=["prompts/huge.md"],
+    )
+    result = sr._handle_prompt_signals(None, missing, input_limit=200_000, scope_model="m/x")
+    assert "prompts/huge.md" in result.block_message
+    assert "prompts/huge.md" in result.advisory_findings[0]["reason"]
+    assert "cannot fit the irreducible scope prompt" not in result.block_message
+    assert "Full scope-review prompt" not in result.advisory_findings[0]["reason"]
+
+    # The half that must NOT change: a real overflow still reports an overflow.
+    overflow = sr._TouchedContextStatus(status="budget_exceeded", token_count=990_000)
+    plain = sr._handle_prompt_signals(None, overflow, input_limit=200_000, scope_model="m/x")
+    assert "irreducible scope prompt" in plain.block_message
+    assert "~990000 estimated tokens" in plain.advisory_findings[0]["reason"]
+
+
+def test_mixed_terminal_reports_both_causes_and_the_mixed_remedy(tmp_path, monkeypatch):
+    """The MIXED terminal: the refusal that dropped a required artifact was itself
+    a hard-budget overflow (even the content-free manifest did not fit beside the
+    fixed prompt). Reporting only the missing artifact prescribes
+    ATLAS_MISSING_ARTIFACT_REMEDY — "narrowing the reviewed change cannot help" —
+    which is false for, and cannot resolve, the overflow half. Both causes ride
+    the terminal, the trace, and the owner-facing block."""
+    from ouroboros.tools import scope_review as sr
+    from ouroboros.tools.review_context_atlas import ATLAS_MIXED_ASSEMBLY_REMEDY
+
+    _repo_with_oversized_required_prompt(tmp_path)
+    # An input budget so small the atlas hard allowance is zero: ANY rendered
+    # manifest overflows, while required prompts/huge.md was already dropped.
+    monkeypatch.setattr(sr, "_effective_scope_input_limit", lambda **_kw: 6_000)
+    monkeypatch.setattr(sr, "_scope_window",
+                        lambda _m, **_k: sr.ReviewerWindow(window_tokens=1_000_000, status="confirmed"))
+
+    prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
+
+    assert prompt is None
+    assert status.status == "fixed_overflow"          # authority branch unchanged
+    assert status.unassembled_required == ["prompts/huge.md"]  # cause 1 carried
+    assert status.atlas_overflowed is True                     # cause 2 carried
+    steps = sr._current_scope_context_manifest().get("ladder_steps") or []
+    refused = [s for s in steps if s["step"] == "atlas_refused"]
+    assert refused, steps
+    assert refused[0]["atlas_overflowed"] is True
+
+    result = sr._handle_prompt_signals(prompt, status, input_limit=6_000, scope_model="")
+    # Both causes are rendered — neither shadows the other…
+    assert "prompts/huge.md" in result.block_message
+    assert "content-free atlas manifest" in result.block_message
+    # …and the remedy is the mixed one, not the single-cause half-truth that
+    # cannot resolve the overflow.
+    assert ATLAS_MIXED_ASSEMBLY_REMEDY in result.block_message
+    assert "narrowing the reviewed change cannot help" not in result.block_message
+
+
+def test_mixed_sub_floor_terminal_reports_the_same_two_causes(monkeypatch):
+    """The sub-floor authority branch is the twin surface of the same terminal:
+    it must render the identical mixed cause and remedy."""
+    from ouroboros.tools import scope_review as sr
+    from ouroboros.tools.review_context_atlas import ATLAS_MIXED_ASSEMBLY_REMEDY
+
+    monkeypatch.setattr(
+        sr, "_scope_window", lambda _m, **_k: sr.ReviewerWindow(window_tokens=200_000, status="confirmed"),
+    )
+    mixed = sr._TouchedContextStatus(
+        status="budget_exceeded", token_count=3_672,
+        unassembled_required=["prompts/huge.md"], atlas_overflowed=True,
+    )
+    result = sr._handle_prompt_signals(None, mixed, input_limit=200_000, scope_model="m/x")
+    for text in (result.block_message, result.advisory_findings[0]["reason"]):
+        assert "prompts/huge.md" in text
+        assert "content-free atlas manifest" in text
+    assert ATLAS_MIXED_ASSEMBLY_REMEDY in result.advisory_findings[0]["reason"]
+    assert "narrowing the reviewed change cannot help" not in result.advisory_findings[0]["reason"]
+
+
+def test_diff_only_degradation_is_not_reported_as_fully_included(tmp_path, monkeypatch):
+    """P1. When the ladder drops a touched file's full snapshot, the durable
+    coverage manifest must say so. `already_included` was re-derived from ALL
+    touched paths instead of the surviving `kept` set that `_render_touched_section`
+    owns, so a file whose snapshot had just been removed was still recorded as
+    "included in fixed prompt context" — a claim the prompt itself contradicts."""
+    import subprocess
+
+    from ouroboros.tools import scope_review as sr
+
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "CHECKLISTS.md").write_text(
+        "## Intent / Scope Review Checklist\n\nplaceholder\n", encoding="utf-8",
+    )
+    # Two equal-sized big files: the ladder degrades only the first.
+    (tmp_path / "big_a.py").write_text("x = 1\n" * 40_000, encoding="utf-8")
+    (tmp_path / "big_b.py").write_text("y = 1\n" * 40_000, encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-m", "init"],
+        cwd=str(tmp_path), capture_output=True,
+    )
+    # Tiny change inside huge files: the diff fits, the snapshots do not.
+    (tmp_path / "big_a.py").write_text("z = 0\n" + "x = 1\n" * 39_999, encoding="utf-8")
+    (tmp_path / "big_b.py").write_text("z = 0\n" + "y = 1\n" * 39_999, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+
+    monkeypatch.setattr(sr, "_effective_scope_input_limit", lambda **_kw: 120_000)
+
+    prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
+
+    assert status is None and prompt is not None
+    assert "TOUCHED FILE BUDGET DEGRADATION NOTE" in prompt and "- big_a.py" in prompt
+    assert "### big_b.py" in prompt  # this one kept its snapshot
+    rows = {r["path"]: r for r in sr._current_scope_context_manifest()["coverage"]}
+    # The degraded file is disclosed as diff-only, the intact one is not.
+    assert "full snapshot omitted" in rows["big_a.py"]["reason"]
+    assert rows["big_b.py"]["reason"] == "included in fixed prompt context"
+
+
+def test_design_skipped_touched_test_is_not_claimed_as_fully_included(tmp_path):
+    """XG-1R4.1 / P1. `_gather_scope_packs` used to derive `already_included` from
+    the touched LIST (`all_touched_paths`), while `_build_scope_prompt` omits the
+    full snapshots of touched TESTS by design (`current_skipped_by_design`). The
+    durable row for a touched test therefore read "included in fixed prompt
+    context" while NO full snapshot of it existed anywhere in the pack — the same
+    false-coverage-claim class as XR-4/XG-1R.4, on the last surface still
+    deriving the claim instead of being told it.
+
+    `already_included` is now the CONSERVATIVE set the fixed part really carries,
+    so the touched test falls through to the atlas, where (being an anchor, hence
+    related to the change and not excludable under BIBLE P3) it is supplied in
+    FULL exactly once. The invariant under test is the general one: a coverage row
+    may never claim content the pack does not contain."""
+    import subprocess
+
+    from ouroboros.tools import scope_review as sr
+
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "CHECKLISTS.md").write_text(
+        "## Intent / Scope Review Checklist\n\nplaceholder\n", encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    # An INDENTED marker far from the change: unreachable through the staged diff
+    # (outside any -U3 hunk, and never picked as git's hunk-header funcname), so
+    # finding it in the prompt proves a real full snapshot.
+    body = ["def test_a():", "    UNCHANGED_TEST_BODY_MARKER_ZZZ = 1"]
+    body += [f"    filler_{idx} = {idx}" for idx in range(40)]
+    body += ["    assert True"]
+    (tmp_path / "tests" / "test_thing.py").write_text(
+        "\n".join(body) + "\n", encoding="utf-8",
+    )
+    (tmp_path / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-m", "init"],
+        cwd=str(tmp_path), capture_output=True,
+    )
+    (tmp_path / "tests" / "test_thing.py").write_text(
+        "\n".join(body) + "\n\n\ndef test_b():\n    assert True\n", encoding="utf-8",
+    )
+    (tmp_path / "mod.py").write_text("x = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+
+    prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
+
+    assert status is None and prompt
+    rows = {r["path"]: r for r in sr._current_scope_context_manifest()["coverage"]}
+    row = rows["tests/test_thing.py"]
+    # The false claim is gone…
+    assert row["reason"] != "included in fixed prompt context"
+    assert row["disposition"] != "already_included"
+    # …and the pack really carries what the row now says: the atlas supplied the
+    # touched test in full, so the unchanged body reached the reviewer.
+    assert row["disposition"] == "full"
+    assert "UNCHANGED_TEST_BODY_MARKER_ZZZ" in prompt
+    # The dedup note still explains the non-duplication in the fixed part.
+    assert "DEDUPLICATION NOTE" in prompt and "- tests/test_thing.py" in prompt
+    # The touched non-test keeps its true `already_included` claim.
+    assert rows["mod.py"]["reason"] == "included in fixed prompt context"
+
+
+def test_ladder_cannot_degrade_a_required_beyond_diff_artifact_to_diff_only(
+    tmp_path, monkeypatch,
+):
+    """XR-4 end-to-end. The guaranteed-fit ladder degrades the LARGEST touched
+    files to diff-only; when that file is an artifact owed in full regardless of
+    the change (here a `prompts/` file), the atlas used to accept the declared
+    drop without a typed failure and scope review PROCEEDED with the prompt's
+    full snapshot in neither the fixed prompt nor the atlas. Now the atlas
+    refuses (BIBLE P3), the refusal is a recorded ladder step, and the terminal
+    names the artifact — review does not proceed on the remainder."""
+    import subprocess
+
+    from ouroboros.tools import scope_review as sr
+
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "CHECKLISTS.md").write_text(
+        "## Intent / Scope Review Checklist\n\nplaceholder\n", encoding="utf-8",
+    )
+    (tmp_path / "prompts").mkdir()
+    # The prompts/ artifact is the LARGEST touched file: degraded first.
+    (tmp_path / "prompts" / "big_prompt.md").write_text(
+        "word here\n" * 45_000, encoding="utf-8",
+    )
+    (tmp_path / "big_b.py").write_text("y = 1\n" * 40_000, encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-m", "init"],
+        cwd=str(tmp_path), capture_output=True,
+    )
+    # Tiny changes inside huge files: the diff fits, the snapshots do not.
+    (tmp_path / "prompts" / "big_prompt.md").write_text(
+        "CHANGED\n" + "word here\n" * 44_999, encoding="utf-8",
+    )
+    (tmp_path / "big_b.py").write_text("z = 0\n" + "y = 1\n" * 39_999, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
+
+    monkeypatch.setattr(sr, "_effective_scope_input_limit", lambda **_kw: 120_000)
+    monkeypatch.setattr(sr, "_scope_window",
+                        lambda _m, **_k: sr.ReviewerWindow(window_tokens=1_000_000, status="confirmed"))
+
+    prompt, status = sr._build_scope_prompt(tmp_path, "test commit")
+
+    assert prompt is None
+    assert status.status == "fixed_overflow"          # authority branch unchanged
+    assert status.unassembled_required == ["prompts/big_prompt.md"]
+    steps = sr._current_scope_context_manifest().get("ladder_steps") or []
+    refused = [s for s in steps if s["step"] == "atlas_refused"]
+    assert refused, steps
+    # The refusal naming the artifact is a recorded ladder step (the FIRST
+    # refusal may be the pre-degradation hard-budget one with no named rows).
+    assert any(
+        s["unassembled_required"] == ["prompts/big_prompt.md"] for s in refused
+    ), refused
+    rows = {r["path"]: r for r in sr._current_scope_context_manifest()["coverage"]}
+    assert rows["prompts/big_prompt.md"]["disposition"] == "budget_omitted"
+    # An ORDINARY touched file may still ride the disclosed diff-only step
+    # (pinned by test_diff_only_degradation_is_not_reported_as_fully_included).
+
+
 def test_cold_start_sizes_down_and_passes_instead_of_400ing(tmp_path, monkeypatch):
     """RS4 anti-regression: with NO observation for an unknown model the cold-start
     density must make the cap SMALLER than the historical optimistic one (pack passes),
@@ -2473,7 +2822,8 @@ def test_cold_start_sizes_down_and_passes_instead_of_400ing(tmp_path, monkeypatc
 
     _DENSITY_MEMO.clear()
     monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(sr, "_scope_reviewer_window", lambda _m: 1_000_000)
+    monkeypatch.setattr(sr, "_scope_window",
+                        lambda _m, **_k: sr.ReviewerWindow(1_000_000, "confirmed"))
 
     cold = sr._effective_scope_input_limit(scope_model="unknown/brand-new-model")
     assert 0 < cold <= sr._SCOPE_INPUT_TOKEN_LIMIT, (
@@ -2491,3 +2841,351 @@ def test_cold_start_sizes_down_and_passes_instead_of_400ing(tmp_path, monkeypatc
     )
     from ouroboros.capability_evidence import resolve_token_density
     assert resolve_token_density(tmp_path, "unknown/brand-new-model")[1] == "measured"
+
+
+# --- scope-slot identity: one owner, one id per configured row ----------------
+
+
+def _run_scope_fanout(monkeypatch, tmp_path, models):
+    """Run the parallel scope fan-out over ``models`` and collect every id surface.
+
+    Returns (substrate_ids, actor_record_ids, manifest_ids): the ids the review
+    substrate physically ran the rows under (sorted — the rows run concurrently,
+    so completion order is not meaningful), the ids stamped on the durable actor
+    records, and the ids in the scope context manifest.
+    """
+    from types import SimpleNamespace
+
+    from ouroboros import config, review_substrate
+    from ouroboros.tools import parallel_review, review
+    from ouroboros.tools import scope_review as sr
+
+    rows = [
+        {
+            "item": item,
+            "verdict": "PASS",
+            "severity": "advisory",
+            "reason": "Concrete scope artifact was checked and passes.",
+        }
+        for item in sorted(sr._SCOPE_REQUIRED_ITEMS)
+    ]
+    substrate_ids: list = []
+    lock = threading.Lock()
+
+    def fake_run_review_request(request, *, slots, drive_root, llm, usage_ctx=None):
+        with lock:
+            substrate_ids.extend(slot.slot_id for slot in slots)
+        return SimpleNamespace(actors=[{
+            "slot_id": slots[0].slot_id,
+            "model": slots[0].model,
+            "status": "ok",
+            "raw_text": json.dumps(rows),
+            "usage": {},
+            "prompt_ref": {},
+            "response_ref": {},
+        }])
+
+    monkeypatch.setattr(config, "get_scope_review_models", lambda: list(models))
+    monkeypatch.setattr(review_substrate, "run_review_request", fake_run_review_request)
+    monkeypatch.setattr(sr, "_build_scope_prompt", lambda *a, **k: ("scope prompt", None))
+    monkeypatch.setattr(sr, "_scope_window",
+                        lambda _model, **_k: sr.ReviewerWindow(window_tokens=1_000_000, status="confirmed"))
+    monkeypatch.setattr(parallel_review, "run_cmd", lambda *_a, **_k: "staged diff")
+    monkeypatch.setattr(review, "_run_unified_review", lambda *_a, **_k: None)
+
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path, drive_root=tmp_path, task_id="scope-slot-identity",
+        pending_events=[], _review_history=[], _review_advisory=[], _scope_review_history={},
+    )
+    parallel_review.run_parallel_review(ctx, "identity commit")
+    actor_ids = [str(r.get("slot_id") or "") for r in (ctx._last_scope_raw_results or [])]
+    manifest = (ctx._last_scope_raw_result or {}).get("context_manifest") or {}
+    manifest_ids = [str(a.get("slot_id") or "") for a in (manifest.get("actors") or [])]
+    return sorted(substrate_ids), actor_ids, manifest_ids
+
+
+def test_scope_rows_sharing_a_model_keep_distinct_identities(tmp_path, monkeypatch):
+    """Duplicate model ids are valid independent slots (review_substrate contract,
+    and get_scope_review_models preserves them on purpose). Naming a row after its
+    model collapsed both rows onto one receipt id."""
+    substrate_ids, actor_ids, manifest_ids = _run_scope_fanout(
+        monkeypatch, tmp_path, ["model/a", "model/a"]
+    )
+    assert len(set(substrate_ids)) == 2, substrate_ids
+    assert len(set(actor_ids)) == 2, actor_ids
+    assert len(set(manifest_ids)) == 2, manifest_ids
+
+
+def test_scope_rows_whose_models_sanitize_alike_keep_distinct_identities(tmp_path, monkeypatch):
+    """Two DIFFERENT models can normalize to the same token (``openai::gpt-5`` and
+    ``openai/gpt/5`` both sanitize to ``openai_gpt_5``), which merged two rows."""
+    substrate_ids, actor_ids, manifest_ids = _run_scope_fanout(
+        monkeypatch, tmp_path, ["openai::gpt-5", "openai/gpt/5"]
+    )
+    assert len(set(substrate_ids)) == 2, substrate_ids
+    assert len(set(actor_ids)) == 2, actor_ids
+    assert len(set(manifest_ids)) == 2, manifest_ids
+
+
+def test_scope_row_identity_survives_editing_that_row_model(tmp_path, monkeypatch):
+    """Editing a slot's model in the settings UI must not re-identify the slot:
+    its receipts have to keep lining up with its own history."""
+    before_substrate, before_actors, _ = _run_scope_fanout(
+        monkeypatch, tmp_path, ["model/a", "model/b"]
+    )
+    after_substrate, after_actors, _ = _run_scope_fanout(
+        monkeypatch, tmp_path, ["model/a", "model/EDITED"]
+    )
+    assert before_substrate == after_substrate, (before_substrate, after_substrate)
+    assert before_actors == after_actors, (before_actors, after_actors)
+
+
+def test_scope_actor_records_and_substrate_agree_on_one_identity(tmp_path, monkeypatch):
+    """The durable actor record, the context manifest, and the substrate call that
+    produced the prompt/response refs must name the SAME row. They were derived
+    independently — positionally in the coordinator, from the model in the reviewer —
+    so one row carried two disagreeing identities."""
+    substrate_ids, actor_ids, manifest_ids = _run_scope_fanout(
+        monkeypatch, tmp_path, ["model/a", "model/b"]
+    )
+    assert sorted(substrate_ids) == sorted(actor_ids) == sorted(manifest_ids), (
+        substrate_ids, actor_ids, manifest_ids
+    )
+    # Pinned spelling: durable records written before v6.87.21 already carry these
+    # ids, so historical receipts line up with new ones without a translation table.
+    assert actor_ids == ["scope_slot_1", "scope_slot_2"], actor_ids
+
+
+def test_scope_row_ids_come_from_the_one_mint(tmp_path, monkeypatch):
+    """The coordinator must READ the row's id, not re-derive an identical string.
+
+    parallel_review stamped ``scope_slot_{idx + 1}`` on the actor record and the
+    manifest — byte-identical to the mint's output today, so nothing could tell
+    the two apart. Repointing the ONE mint separates them: a surface that reads it
+    follows, a surface that spells its own literal does not.
+    """
+    from ouroboros import review_substrate
+
+    monkeypatch.setattr(
+        review_substrate, "slot_id_for_row",
+        lambda index, *, prefix=review_substrate.SLOT_ID_PREFIX: f"{prefix}_row{int(index)}",
+    )
+    substrate_ids, actor_ids, manifest_ids = _run_scope_fanout(
+        monkeypatch, tmp_path, ["model/a", "model/b"]
+    )
+    expected = ["scope_slot_row1", "scope_slot_row2"]
+    assert substrate_ids == expected, substrate_ids
+    assert actor_ids == expected, actor_ids
+    assert manifest_ids == expected, manifest_ids
+
+# --- Blocking scope authority is a property of the EVIDENCE (v6.87.44) ----------
+
+def _seed_scope_evidence(monkeypatch, tmp_path, model, *, window, status, ts, use_ack=False):
+    """Write one Capability-Evidence record for ``model``'s real scope route."""
+    import json as _json
+    from ouroboros import capability_evidence as ce
+    from ouroboros.reviewer_window import reviewer_route
+
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    provider, base_url = reviewer_route(model)
+    fp = ce.route_fingerprint(provider=provider, base_url=base_url, model=model)
+    store = tmp_path / "state" / "capability_evidence.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    key = "owner_acks" if use_ack else "probes"
+    store.write_text(_json.dumps({key: {fp: {
+        "window_tokens": window, "status": status, "source": "provider_metadata",
+        "route_fp": fp, "model": model, "provider": provider, "ts": ts,
+    }}}), encoding="utf-8")
+    return fp
+
+
+def test_stale_evidence_cannot_authorize_a_blocking_scope_verdict(monkeypatch, tmp_path):
+    """BIBLE P3: blocking authority turns on SOURCED Capability Evidence, and an
+    EXPIRED record that the probe could not re-verify is a dated impression, not a
+    source. Before the typed result, `(window, status)` dropped `stale` on the floor,
+    so a five-day-old 1M record kept across a provider outage read as `confirmed 1M`
+    and signed the blocking verdict."""
+    import datetime
+
+    from ouroboros import capability_evidence as ce
+    from ouroboros.reviewer_window import resolve_reviewer_window
+    from ouroboros.tools import scope_review as sr
+
+    model = "anthropic/claude-fable-5"
+    old = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=5)).isoformat()
+    _seed_scope_evidence(monkeypatch, tmp_path, model, window=1_000_000,
+                         status="confirmed", ts=old)
+    # The provider is unreachable now, so `probe` keeps the prior record — as STALE.
+    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 0)
+    monkeypatch.setattr(ce, "_metadata_fetch_transport_failed", lambda *a, **k: True)
+
+    resolved = resolve_reviewer_window(model)
+    assert resolved.window_tokens == 1_000_000 and resolved.status == "confirmed"
+    assert resolved.stale is True, "the outage-carried record must arrive marked stale"
+    assert resolved.observed_at == old, "the observation time must survive the hand-off"
+    assert resolved.blocking_authority_allowed is False
+
+    # ...and the scope gate acts on it: criticals are preserved but demoted.
+    critical = [{"item": "architecture_fit", "verdict": "FAIL",
+                 "severity": "critical", "reason": "r"}]
+    crit_out, adv_out, result = sr._apply_scope_authority(
+        critical, [], scope_model_id=model, result_kwargs={},
+    )
+    assert crit_out == [] and result is not None and result.blocked is True
+    assert result.status == "sub_floor"
+    # The owner is told the window EXPIRED, not that it was "confirmed" — and WHEN it
+    # was last confirmed, which is the difference between a blip and a dead route.
+    assert "EXPIRED" in result.block_message
+    assert f"last confirmed {old}" in result.block_message
+    assert any("EXPIRED" in str(f.get("reason", "")) for f in adv_out)
+
+    # A CURRENT record for the same route authorises normally — the fix rejects
+    # staleness, not the route.
+    fresh = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    _seed_scope_evidence(monkeypatch, tmp_path, model, window=1_000_000,
+                         status="confirmed", ts=fresh)
+    assert resolve_reviewer_window(model).blocking_authority_allowed is True
+
+
+def test_designated_default_gets_no_authority_from_its_name(monkeypatch, tmp_path):
+    """A designated model does not acquire blocking authority from being designated.
+
+    The sentinel still SIZES an unevidenced default at 1M (so the review is dispatched
+    rather than declined before it starts), but sizing is not signing: with no sourced
+    evidence the scope verdict is advisory, exactly as for any other unevidenced route.
+    The same name-check used to disable the ONE lazy probe that could source the
+    default's window, which is why it could never stop being invented."""
+    from types import SimpleNamespace
+
+    from ouroboros import capability_evidence as ce
+    from ouroboros.tools import scope_review as sr
+
+    fetches = []
+
+    def fake_probe(_drive_root, **kw):
+        fetches.append(bool(kw.get("allow_fetch")))
+        return SimpleNamespace(window_tokens=0, status="unprobeable", source="none",
+                               route_fp="fp", stale=False, ts="")
+
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    monkeypatch.setattr(ce, "probe", fake_probe)
+
+    resolved = sr._scope_window(sr._SCOPE_MODEL_DEFAULT)
+    assert resolved.window_tokens == sr._SCOPE_MODEL_CONTEXT_WINDOW  # sizing survives
+    assert sr._scope_window_provenance(resolved) == sr._WINDOW_SENTINEL
+    assert resolved.blocking_authority_allowed is False
+    assert fetches == [True], "the default route must get the lazy probe like any other"
+
+    critical = [{"item": "architecture_fit", "verdict": "FAIL",
+                 "severity": "critical", "reason": "r"}]
+    crit_out, _adv, result = sr._apply_scope_authority(
+        critical, [], scope_model_id=sr._SCOPE_MODEL_DEFAULT, result_kwargs={},
+    )
+    assert crit_out == [] and result is not None and result.blocked is True
+
+    # Owner-acking that exact route is what restores authority — evidence, not name.
+    ce.record_owner_ack(tmp_path, provider="openrouter", model=sr._SCOPE_MODEL_DEFAULT,
+                        window_tokens=1_050_000, note="test")
+    monkeypatch.undo()
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    assert sr._scope_window(sr._SCOPE_MODEL_DEFAULT).blocking_authority_allowed is True
+
+
+def test_concurrent_resolution_of_one_route_shares_one_probe(monkeypatch, tmp_path):
+    """parallel_review runs the triad and the scope slots concurrently. Without the
+    per-route lock two slots on the SAME route both reach the provider for a window
+    the first one is already fetching; with it the second enters after the evidence
+    has been stored and reads it back, so one route costs one metadata fetch."""
+    import threading
+    from types import SimpleNamespace
+
+    from ouroboros import capability_evidence as ce
+    from ouroboros.tools import scope_review as sr
+
+    model = "anthropic/claude-fable-5"
+    in_probe, release = threading.Event(), threading.Event()
+    store: dict = {}   # stands in for capability_evidence.json, which the real probe writes
+    fetches: list = []
+
+    def fake_probe(_drive_root, **kw):
+        # `probe` serves a CURRENT record straight from its cache without touching the
+        # network whatever `allow_fetch` says; only an absent/expired one goes out.
+        if "ev" in store:
+            return store["ev"]
+        if not kw.get("allow_fetch"):
+            return SimpleNamespace(window_tokens=0, status="unprobeable", stale=False, ts="")
+        fetches.append(str(kw.get("model") or ""))
+        in_probe.set()
+        release.wait(10)              # the network probe is still in flight
+        store["ev"] = SimpleNamespace(
+            window_tokens=1_000_000, status="confirmed", stale=False,
+            ts="2026-08-02T00:00:00+00:00")
+        return store["ev"]
+
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    monkeypatch.setattr(ce, "probe", fake_probe)
+    monkeypatch.setattr("ouroboros.reviewer_window._LAZY_ROUTE_LOCKS", {})
+
+    out = {}
+    threads = [
+        threading.Thread(target=lambda k=k: out.__setitem__(k, sr._scope_window(model)))
+        for k in ("a", "b")
+    ]
+    threads[0].start()
+    assert in_probe.wait(10), "the first thread never reached the probe"
+    threads[1].start()
+    threads[1].join(0.5)
+    assert threads[1].is_alive(), (
+        "the second thread must WAIT for the in-flight probe on its route"
+    )
+    release.set()
+    for thread in threads:
+        thread.join(10)
+
+    assert fetches == [model], (
+        f"one route must cost ONE metadata fetch; got {len(fetches)}"
+    )
+    assert out["a"].window_tokens == out["b"].window_tokens == 1_000_000
+    assert out["a"].blocking_authority_allowed is out["b"].blocking_authority_allowed is True
+
+
+def test_expired_evidence_is_re_sourced_instead_of_wedging_the_process(monkeypatch, tmp_path):
+    """A long-lived process must be able to RE-confirm its scope reviewer.
+
+    The lazy probe used to be memoised for the lifetime of the process while the
+    evidence it produced expired after 24h, so a healthy, connected install that
+    stayed up past the TTL read its own reviewer as EXPIRED on every later
+    resolution: `blocking_authority_allowed` went False and stayed False, and
+    `_apply_scope_authority` blocked EVERY commit for the rest of the process's
+    life. How often a route may be re-probed is `capability_evidence.probe`'s TTL to
+    decide — a second, never-expiring rate limit here could only ever wedge."""
+    import datetime
+
+    from ouroboros import capability_evidence as ce
+    from ouroboros.reviewer_window import resolve_reviewer_window
+    from ouroboros.tools import scope_review as sr
+
+    model = "openai/gpt-5.6-terra"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    _seed_scope_evidence(monkeypatch, tmp_path, model, window=1_050_000,
+                         status="confirmed", ts=now.isoformat())
+    # The provider is up the whole time: a metadata read returns the real window.
+    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 1_050_000)
+    monkeypatch.setattr(ce, "_metadata_fetch_transport_failed", lambda *a, **k: False)
+
+    assert resolve_reviewer_window(model).blocking_authority_allowed is True
+
+    # ...25 hours later, in the SAME process: the one stored record has aged past the
+    # 24h confirmed TTL. Nothing about the install changed.
+    _seed_scope_evidence(monkeypatch, tmp_path, model, window=1_050_000, status="confirmed",
+                         ts=(now - datetime.timedelta(hours=25)).isoformat())
+
+    resolved = resolve_reviewer_window(model)
+    assert resolved.stale is False, "an expired record must be RE-SOURCED, not read as expired"
+    assert resolved.blocking_authority_allowed is True
+    _crit, _adv, result = sr._apply_scope_authority(
+        [{"item": "architecture_fit", "verdict": "FAIL",
+          "severity": "critical", "reason": "r"}],
+        [], scope_model_id=model, result_kwargs={},
+    )
+    assert result is None, "a healthy install must not block its own commits after 24h"

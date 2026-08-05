@@ -470,7 +470,7 @@ def test_exception_after_snapshot_retries_exact_frozen_evidence(monkeypatch, tmp
 
     panel_inputs = []
 
-    async def fail_then_pass(_ctx, models, _system_prompt, user_content, user_stable_len=0):
+    async def fail_then_pass(_ctx, models, _system_prompt, user_content, user_stable_len=0, slot_ids=None):
         panel_inputs.append(user_content)
         if len(panel_inputs) == 1:
             raise RuntimeError("injected post-freeze reviewer failure")
@@ -1585,11 +1585,11 @@ def test_all_schedule_failures_still_reach_reviewer_panel(monkeypatch, tmp_path)
     monkeypatch.setattr(control, "_schedule_task", lambda *_a, **_k: "ERROR: queue refused")
     monkeypatch.setattr(pr, "_load_plan_checklist", lambda: "checklist")
     monkeypatch.setattr(pr, "load_governance_doc", lambda *_a, **_k: "doc")
-    monkeypatch.setattr(pr, "build_head_snapshot_section", lambda *_a, **_k: "")
+    monkeypatch.setattr(pr, "build_head_snapshot_section", lambda *_a, **_k: ("", frozenset()))
     monkeypatch.setattr(pr, "_get_review_models", lambda: ["m1", "m2"])
     captured = {}
 
-    async def fake_slots(_ctx, models, _system_prompt, user_content, user_stable_len=0):
+    async def fake_slots(_ctx, models, _system_prompt, user_content, user_stable_len=0, slot_ids=None):
         captured["user_content"] = user_content
         return [{
             "model": model,
@@ -1654,10 +1654,10 @@ def test_cutoff_omissions_go_directly_to_reviewer_without_inline_model(monkeypat
     monkeypatch.setattr(pr, "_start_planning_swarm", capacity_swarm)
     monkeypatch.setattr(pr, "_load_plan_checklist", lambda: "checklist")
     monkeypatch.setattr(pr, "load_governance_doc", lambda *_a, **_k: "doc")
-    monkeypatch.setattr(pr, "build_head_snapshot_section", lambda *_a, **_k: "")
+    monkeypatch.setattr(pr, "build_head_snapshot_section", lambda *_a, **_k: ("", frozenset()))
     captured = {}
 
-    async def fake_slots(_ctx, models, system_prompt, user_content, user_stable_len=0):
+    async def fake_slots(_ctx, models, system_prompt, user_content, user_stable_len=0, slot_ids=None):
         captured["user_content"] = user_content
         return [{
             "model": m,
@@ -1758,7 +1758,7 @@ def test_scout_change_after_prompt_is_audit_only_without_paid_review_replay(monk
 
     calls = {"panel": 0}
 
-    async def mutate_then_review(_ctx, models, _system_prompt, _user_content, user_stable_len=0):
+    async def mutate_then_review(_ctx, models, _system_prompt, _user_content, user_stable_len=0, slot_ids=None):
         calls["panel"] += 1
         write_task_result(tmp_path, "scout-stale", "completed", result="changed after prompt")
         return [{
@@ -1774,7 +1774,7 @@ def test_scout_change_after_prompt_is_audit_only_without_paid_review_replay(monk
     monkeypatch.setattr(pr, "_run_plan_review_slots", mutate_then_review)
     monkeypatch.setattr(pr, "_load_plan_checklist", lambda: "checklist")
     monkeypatch.setattr(pr, "load_governance_doc", lambda *_a, **_k: "doc")
-    monkeypatch.setattr(pr, "build_head_snapshot_section", lambda *_a, **_k: "")
+    monkeypatch.setattr(pr, "build_head_snapshot_section", lambda *_a, **_k: ("", frozenset()))
     monkeypatch.setattr(pr, "_get_review_models", lambda: ["m1", "m2"])
     monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "m1,m2")
 
@@ -1818,7 +1818,7 @@ def test_paid_review_resumes_evidence_integration_without_panel_replay(monkeypat
     ctx.task_id = "parent-paid-review-resume"
     calls = {"panel": 0, "consumed": 0}
 
-    async def fake_slots(_ctx, models, _system_prompt, _user_content, user_stable_len=0):
+    async def fake_slots(_ctx, models, _system_prompt, _user_content, user_stable_len=0, slot_ids=None):
         calls["panel"] += 1
         return [{
             "model": model,
@@ -1842,7 +1842,7 @@ def test_paid_review_resumes_evidence_integration_without_panel_replay(monkeypat
     monkeypatch.setattr(pr, "record_plan_review_consumed", fail_first_consumed)
     monkeypatch.setattr(pr, "_load_plan_checklist", lambda: "checklist")
     monkeypatch.setattr(pr, "load_governance_doc", lambda *_a, **_k: "doc")
-    monkeypatch.setattr(pr, "build_head_snapshot_section", lambda *_a, **_k: "")
+    monkeypatch.setattr(pr, "build_head_snapshot_section", lambda *_a, **_k: ("", frozenset()))
     monkeypatch.setattr(pr, "_get_review_models", lambda: ["m1", "m2"])
     monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "m1,m2")
 
@@ -1911,10 +1911,10 @@ def test_terminal_zero_ready_scout_wave_still_reaches_reviewer_panel(monkeypatch
     monkeypatch.setattr(pr, "_start_planning_swarm", terminal_empty_swarm)
     monkeypatch.setattr(pr, "_load_plan_checklist", lambda: "checklist")
     monkeypatch.setattr(pr, "load_governance_doc", lambda *_a, **_k: "doc")
-    monkeypatch.setattr(pr, "build_head_snapshot_section", lambda *_a, **_k: "")
+    monkeypatch.setattr(pr, "build_head_snapshot_section", lambda *_a, **_k: ("", frozenset()))
     captured = {}
 
-    async def fake_slots(_ctx, models, _system_prompt, user_content, user_stable_len=0):
+    async def fake_slots(_ctx, models, _system_prompt, user_content, user_stable_len=0, slot_ids=None):
         captured["user_content"] = user_content
         return [{
             "model": model, "text": _review_text("GREEN"), "error": None,
@@ -2461,6 +2461,98 @@ class TestPlanReviewFormatOutput(unittest.TestCase):
         self.assertIn("12,345", out)
 
 
+def test_oversized_planned_required_artifact_refuses_typed(tmp_path, monkeypatch):
+    """XG-1R.4. `_run_plan_review_async` used to put EVERY files_to_touch path
+    into `already_included`, while `build_head_snapshot_section` silently
+    replaced a >1MB HEAD snapshot with an omission marker. A planned required
+    artifact (here a force-included `prompts/` file over 1MB) was therefore in
+    NEITHER the plan prompt NOR the atlas — the atlas trusted the false claim
+    and returned an `already_included` row before requiredness ran — and plan
+    review dispatched reviewers anyway, bypassing the BIBLE P3 assembly-failure
+    rule. Now only snapshots that actually SURVIVED into the prompt are
+    declared, the omitted path flows into the normal atlas classification, and
+    the hoisted requiredness predicate refuses with the typed failure naming
+    the artifact — before any reviewer slot is called."""
+    import asyncio
+    import subprocess
+
+    from ouroboros.tools import plan_review as pr
+
+    repo = tmp_path / "repo"
+    (repo / "prompts").mkdir(parents=True)
+    (repo / "prompts" / "huge.md").write_text("x" * 1_200_000, encoding="utf-8")
+    (repo / "ok.py").write_text("print(1)\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=str(repo), capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-m", "init"],
+        cwd=str(repo), capture_output=True,
+    )
+
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    ctx = _make_ctx(drive)
+    ctx.repo_dir = repo
+
+    dispatched = {"called": False}
+
+    async def _fake_slots(_ctx, models, _system, _user, user_stable_len=0, slot_ids=None):
+        dispatched["called"] = True
+        return [
+            {"model": str(m), "text": _review_text("GREEN"), "error": None}
+            for m in models
+        ]
+
+    monkeypatch.setattr(pr, "_load_plan_checklist", lambda: "checklist")
+    monkeypatch.setattr(pr, "load_governance_doc", lambda *_a, **_k: "")
+    monkeypatch.setattr(pr, "_start_planning_swarm", _completed_planning_swarm)
+    monkeypatch.setattr(pr, "review_wave_budget_gate", lambda *_a, **_k: None)
+    monkeypatch.setattr("ouroboros.config.get_review_models", lambda: ["model-a", "model-b"])
+    monkeypatch.setattr(pr, "_get_review_models", lambda: ["model-a", "model-b"])
+    monkeypatch.setattr(pr, "_run_plan_review_slots", _fake_slots)
+
+    result = asyncio.run(pr._run_plan_review_async(
+        ctx,
+        _plan_request(
+            "my plan", "my goal", ["prompts/huge.md", "ok.py"],
+            context_level="constitutional",
+        ),
+    ))
+
+    # The typed refusal names the artifact and no reviewer slot was called.
+    assert "PLAN_REVIEW_SKIPPED" in result
+    assert "prompts/huge.md" in result
+    assert dispatched["called"] is False
+
+    # Control: in a repo WITHOUT the oversized required artifact, an ordinary
+    # small planned file must NOT trip the refusal — its surviving snapshot
+    # stays declared as included and reviewers are dispatched. (The huge
+    # prompts/ file must go entirely: since XR-1 an untouched >1MB required
+    # artifact refuses ANY review on the repo, by design.)
+    repo_ok = tmp_path / "repo_ok"
+    repo_ok.mkdir()
+    (repo_ok / "ok.py").write_text("print(1)\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=str(repo_ok), capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=str(repo_ok), capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-m", "init"],
+        cwd=str(repo_ok), capture_output=True,
+    )
+    drive_ok = tmp_path / "drive_ok"
+    drive_ok.mkdir()
+    ctx_ok = _make_ctx(drive_ok)
+    ctx_ok.repo_dir = repo_ok
+    dispatched["called"] = False
+    result_ok = asyncio.run(pr._run_plan_review_async(
+        ctx_ok,
+        _plan_request(
+            "my plan", "another goal", ["ok.py"], context_level="constitutional",
+        ),
+    ))
+    assert "PLAN_REVIEW_SKIPPED" not in result_ok
+    assert dispatched["called"] is True
+
+
 class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
     async def test_declined_wave_does_not_freeze_pre_dispatch_snapshot(self):
         import tempfile
@@ -2507,7 +2599,7 @@ class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(pr, "compile_review_context_atlas", return_value=atlas),
-            patch.object(pr, "build_head_snapshot_section", return_value=""),
+            patch.object(pr, "build_head_snapshot_section", return_value=("", frozenset())),
             patch.object(pr, "_load_plan_checklist", return_value="checklist"),
             patch.object(pr, "load_governance_doc", return_value=""),
             patch.object(pr, "_start_planning_swarm", side_effect=_completed_planning_swarm),
@@ -2538,7 +2630,7 @@ class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch.object(pr, "compile_review_context_atlas", return_value=atlas),
-            patch.object(pr, "build_head_snapshot_section", return_value=""),
+            patch.object(pr, "build_head_snapshot_section", return_value=("", frozenset())),
             patch.object(pr, "_load_plan_checklist", return_value="checklist"),
             patch.object(pr, "load_governance_doc", return_value=""),
             patch.object(pr, "_start_planning_swarm", side_effect=_completed_planning_swarm),
@@ -2556,6 +2648,133 @@ class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("PLAN_REVIEW_SKIPPED", result)
         self.assertIn("generated repository atlas exceeded hard budget", result)
+        # The half that must NOT change: for a genuine overflow the budget knob
+        # IS the remedy, so the original sentence stays.
+        self.assertIn("choose a smaller context_level", result)
+
+    async def test_required_artifact_omission_refuses_the_review(self):
+        """Consumer 3 of 3 (BIBLE P3): an atlas that could not assemble a REQUIRED
+        artifact must not be reviewed on the remainder. Before the shared
+        `atlas_assembly_failed` predicate this branch tested `status ==
+        "budget_exceeded"` only, so the new failure status sailed through and
+        plan review ran on a pack missing a required file."""
+        from ouroboros.tools import plan_review as pr
+
+        ctx = _make_ctx()
+        ctx.repo_dir = pathlib.Path(".")
+        atlas = SimpleNamespace(
+            text="atlas without ouroboros/llm.py",
+            manifest={
+                "estimated_total_tokens": 500_000,
+                "unassembled_required": [
+                    {"path": "ouroboros/llm.py", "reason": "required file exceeded the atlas hard budget"}
+                ],
+            },
+            status="required_artifact_omitted",
+        )
+        with (
+            patch.object(pr, "compile_review_context_atlas", return_value=atlas),
+            patch.object(pr, "build_head_snapshot_section", return_value=("", frozenset())),
+            patch.object(pr, "_load_plan_checklist", return_value="checklist"),
+            patch.object(pr, "load_governance_doc", return_value=""),
+            patch.object(pr, "_start_planning_swarm", side_effect=_completed_planning_swarm),
+            patch("ouroboros.config.get_review_models", return_value=["model-a", "model-b"]),
+            patch.object(pr, "_get_review_models", return_value=["model-a", "model-b"]),
+            patch("ouroboros.tools.plan_review.estimate_tokens", return_value=10_000),
+        ):
+            result = await pr._run_plan_review_async(
+                ctx,
+                _plan_request("my plan", "my goal", [], context_level="constitutional"),
+            )
+
+        self.assertIn("PLAN_REVIEW_SKIPPED", result)
+        self.assertIn("ouroboros/llm.py", result)
+
+    async def test_required_artifact_remedy_is_not_the_inert_context_level_knob(self):
+        """The refusal reused the `budget_exceeded` remedy verbatim, and "choose a
+        smaller context_level" is INERT here: `context_level` feeds only
+        `target_total_tokens`, while required artifacts are selected against
+        `hard_total_tokens`. Executed at every level the same artifact is missing,
+        so the owner is told to turn a knob that cannot change the outcome."""
+        from ouroboros.tools import plan_review as pr
+
+        ctx = _make_ctx()
+        ctx.repo_dir = pathlib.Path(".")
+        atlas = SimpleNamespace(
+            text="atlas without ouroboros/llm.py",
+            manifest={
+                "estimated_total_tokens": 500_000,
+                "unassembled_required": [
+                    {"path": "ouroboros/llm.py", "reason": "required file exceeded the atlas hard budget"}
+                ],
+            },
+            status="required_artifact_omitted",
+        )
+        results = {}
+        for level in ("localized", "broad", "constitutional"):
+            with (
+                patch.object(pr, "compile_review_context_atlas", return_value=atlas),
+                patch.object(pr, "build_head_snapshot_section", return_value=("", frozenset())),
+                patch.object(pr, "_load_plan_checklist", return_value="checklist"),
+                patch.object(pr, "load_governance_doc", return_value=""),
+                patch.object(pr, "_start_planning_swarm", side_effect=_completed_planning_swarm),
+                patch("ouroboros.config.get_review_models", return_value=["model-a", "model-b"]),
+                patch.object(pr, "_get_review_models", return_value=["model-a", "model-b"]),
+                patch("ouroboros.tools.plan_review.estimate_tokens", return_value=10_000),
+            ):
+                results[level] = await pr._run_plan_review_async(
+                    ctx, _plan_request("my plan", "my goal", [], context_level=level),
+                )
+
+        for level, result in results.items():
+            self.assertNotIn("choose a smaller context_level", result, level)
+            self.assertIn("Shrink or split the named artifact(s)", result, level)
+
+    async def test_mixed_assembly_failure_reports_both_causes_and_mixed_remedy(self):
+        """The MIXED failure: required rows survive on a pack that ALSO overflowed
+        the hard budget (required candidates are marked budget_omitted before the
+        rendered pack is tested against it). The refusal must render BOTH causes
+        and prescribe the mixed remedy — each single-cause remedy states something
+        false for the other cause ("narrowing cannot help" vs "split the plan")."""
+        from ouroboros.tools import plan_review as pr
+        from ouroboros.tools.review_context_atlas import ATLAS_MIXED_ASSEMBLY_REMEDY
+
+        ctx = _make_ctx()
+        ctx.repo_dir = pathlib.Path(".")
+        atlas = SimpleNamespace(
+            text="",
+            manifest={
+                "status": "budget_exceeded",
+                "estimated_total_tokens": 950_000,
+                "unassembled_required": [
+                    {"path": "ouroboros/llm.py", "reason": "required file exceeded the atlas hard budget"}
+                ],
+            },
+            status="budget_exceeded",
+        )
+        with (
+            patch.object(pr, "compile_review_context_atlas", return_value=atlas),
+            patch.object(pr, "build_head_snapshot_section", return_value=("", frozenset())),
+            patch.object(pr, "_load_plan_checklist", return_value="checklist"),
+            patch.object(pr, "load_governance_doc", return_value=""),
+            patch.object(pr, "_start_planning_swarm", side_effect=_completed_planning_swarm),
+            patch("ouroboros.config.get_review_models", return_value=["model-a", "model-b"]),
+            patch.object(pr, "_get_review_models", return_value=["model-a", "model-b"]),
+            patch("ouroboros.tools.plan_review.estimate_tokens", return_value=10_000),
+        ):
+            result = await pr._run_plan_review_async(
+                ctx,
+                _plan_request("my plan", "my goal", [], context_level="constitutional"),
+            )
+
+        self.assertIn("PLAN_REVIEW_SKIPPED", result)
+        # Both causes are rendered — the overflow is not suppressed behind the rows…
+        self.assertIn("ouroboros/llm.py", result)
+        self.assertIn("exceeded hard budget", result)
+        # …and the remedy is the mixed one, neither single-cause half-truth.
+        self.assertIn(ATLAS_MIXED_ASSEMBLY_REMEDY, result)
+        self.assertNotIn("choose a smaller context_level", result)
+        self.assertNotIn("narrowing the reviewed change cannot help", result)
 
     async def test_proceeds_when_within_budget(self):
         """When prompt is within budget, reviewers are called."""
@@ -2575,7 +2794,7 @@ class TestPlanReviewBudgetGate(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(pr, "compile_review_context_atlas", return_value=atlas),
-            patch.object(pr, "build_head_snapshot_section", return_value=""),
+            patch.object(pr, "build_head_snapshot_section", return_value=("", frozenset())),
             patch.object(pr, "_load_plan_checklist", return_value="checklist"),
             patch.object(pr, "load_governance_doc", return_value=""),
             patch.object(pr, "_start_planning_swarm", side_effect=_completed_planning_swarm),

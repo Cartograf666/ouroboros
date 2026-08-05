@@ -692,6 +692,7 @@ def reconstruct_task_cost(
             "total_rounds": 0, "prompt_tokens": 0, "completion_tokens": 0,
             "cost_final": True, "reserved_usd": 0.0,
             "unresolved_upper_bound_usd": 0.0, "unknown_unmetered": 0,
+            "non_final_rows": 0,
         }
     else:
         try:
@@ -712,6 +713,8 @@ def reconstruct_task_cost(
                     bucket.get("unresolved_upper_bound_usd") or 0.0
                 ),
                 "unknown_unmetered": int(bucket.get("unknown_unmetered") or 0),
+                # The disclosed CAUSE of cost_final=false, carried with the flag.
+                "non_final_rows": int(bucket.get("non_final_rows") or 0),
                 "ledger_integrity_degraded": bool(bucket.get("integrity_degraded")),
             }
         except Exception:
@@ -722,7 +725,8 @@ def reconstruct_task_cost(
                 "cost_usd": None, "total_rounds": None,
                 "prompt_tokens": None, "completion_tokens": None,
                 "reserved_usd": None, "unresolved_upper_bound_usd": None,
-                "unknown_unmetered": None, "ledger_integrity_degraded": True,
+                "unknown_unmetered": None, "non_final_rows": None,
+                "ledger_integrity_degraded": True,
             }
     if fields:
         return projection

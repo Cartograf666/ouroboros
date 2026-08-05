@@ -215,10 +215,8 @@ def review_wave_budget_gate(
             prompt_chars=int(prompt_chars or 0),
             max_completion_tokens=max_completion_tokens,
         )
-        if admission.get("fits", True):
-            return None
-        emit_review_event(ctx, {
-            "type": "review_wave_budget_insufficient",
+        unpriced = int(admission.get("unpriced_slots") or 0)
+        base = {
             "surface": surface,
             "task_id": str(getattr(ctx, "task_id", "") or ""),
             "root_task_id": scope.root_task_id,
@@ -226,7 +224,22 @@ def review_wave_budget_gate(
             "remaining_usd": admission.get("remaining_usd"),
             "limit_usd": admission.get("limit_usd"),
             "slots": admission.get("slots"),
-            **(extra or {}),
+            "unpriced_slots": unpriced,
+        }
+        if admission.get("fits", True):
+            # An admitted wave is normally silent. It must NOT be silent when part of the
+            # estimate was unknowable: "fits, every slot priced" and "fits, but one slot
+            # contributed an unknown zero" are different facts, and a later cost forensic
+            # cannot tell them apart from an absence of events (BIBLE P1 — the gap is
+            # represented, never filled in). This is the only thing that makes the
+            # `unpriced_slots` count in the admission dict observable at all.
+            if unpriced:
+                emit_review_event(ctx, {
+                    "type": "review_wave_budget_partial_unknown", **base, **(extra or {}),
+                })
+            return None
+        emit_review_event(ctx, {
+            "type": "review_wave_budget_insufficient", **base, **(extra or {}),
         })
         return admission
     except Exception:
@@ -291,9 +304,7 @@ def load_governance_doc(
         if path.is_file():
             return path.read_text(encoding="utf-8")
     except Exception as exc:
-        if on_missing == "silent":
-            return fallback
-        if on_missing == "placeholder":
+        if on_missing in ("silent", "placeholder"):
             return fallback
         return f"[⚠️ OMISSION: {rel_path} could not be loaded ({path}): {exc}]"
     if on_missing == "silent":
@@ -609,19 +620,12 @@ def build_self_verification_template(
     return self_verify + circuit_breaker
 
 
-_OBLIGATION_SUFFIX_RE = re.compile(
-    r"\s*\(obligation\s+([a-z0-9][a-z0-9_-]*)\)\s*$",
-    re.IGNORECASE,
-)
+_OBLIGATION_SUFFIX_RE = re.compile(r"\s*\(obligation\s+([a-z0-9][a-z0-9_-]*)\)\s*$", re.IGNORECASE)
 
 
 def normalize_reviewer_obligation_id(value: object) -> str:
     text = str(value or "").strip().lower()
-    if not text:
-        return ""
-    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", text):
-        return ""
-    return text
+    return text if re.fullmatch(r"[a-z0-9][a-z0-9_-]*", text) else ""
 
 
 def strip_obligation_suffix(item_name: object) -> tuple[str, str]:
@@ -673,14 +677,13 @@ def build_rebuttal_section(review_rebuttal: str) -> str:
 
 def format_obligation_excerpt(reason: str, max_chars: int = 120) -> str:
     """Sanitize an obligation reason excerpt with explicit omission text."""
-    import re as _re
     # Redact before whitespace collapse so line-anchored secret patterns still match.
     try:
         redacted, _ = redact_prompt_secrets(str(reason or ""))
     except Exception:
         redacted = str(reason or "")  # redact is best-effort; never crash the review pipeline
     # Collapse whitespace to prevent multi-line prompt injection.
-    sanitized = _re.sub(r"\s+", " ", redacted).strip()
+    sanitized = re.sub(r"\s+", " ", redacted).strip()
     if len(sanitized) > max_chars:
         return (
             sanitized[:max_chars]
@@ -924,10 +927,7 @@ def build_touched_file_pack(
             continue
         try:
             fp_resolved.relative_to(repo_dir_resolved)
-            _inside_repo = True
         except ValueError:
-            _inside_repo = False
-        if not _inside_repo:
             omitted.append(rel)
             parts.append(f"### {rel}\n\n*(omitted — path escapes repository root)*\n")
             continue
@@ -1155,17 +1155,14 @@ def iter_repo_pack_entries(
         fname = fp.name.lower()
         fsuffix = fp.suffix.lower()
 
-        # Skip sensitive files.
         if fname in _SENSITIVE_NAMES or fsuffix in _SENSITIVE_EXTENSIONS:
             omitted.append(f"{rel} (sensitive)")
             continue
 
-        # Binary/media by extension.
         if fsuffix in _FULL_REPO_BINARY_EXTENSIONS:
             omitted.append(f"{rel} (binary/media)")
             continue
 
-        # Vendored/minified.
         if fname in _VENDORED_NAMES or any(fname.endswith(s) for s in _VENDORED_SUFFIXES):
             omitted.append(f"{rel} (vendored/minified)")
             continue
@@ -1183,7 +1180,6 @@ def iter_repo_pack_entries(
                 entries.append((rel, f"[SKIPPED: file too large ({size} bytes)]", "", ""))
             continue
 
-        # Content-based binary sniffer.
         if _is_probably_binary(fp):
             omitted.append(f"{rel} (binary content)")
             continue
@@ -1256,10 +1252,6 @@ def resolve_intent(
     )
 
 
-# ---------------------------------------------------------------------------
-# 5. build_goal_section
-# ---------------------------------------------------------------------------
-
 def build_goal_section(
     goal: str = "",
     scope: str = "",
@@ -1299,12 +1291,22 @@ def build_goal_section(
 def build_head_snapshot_section(
     repo_dir: Path,
     paths: list[str],
-) -> str:
-    """Build prompt text with HEAD snapshots of touched files."""
+) -> tuple[str, frozenset[str]]:
+    """Build prompt text with HEAD snapshots of touched files.
+
+    Returns ``(section_text, included_paths)`` where ``included_paths`` holds
+    exactly the paths whose FULL snapshot text made it into the section. Every
+    other path got an omission marker (sensitive/binary/oversized/new/error),
+    and the caller must NOT report it to the atlas as ``already_included`` —
+    that claim is what the atlas trusts, so a false one bypasses the BIBLE P3
+    required-artifact refusal (XG-1R.4). Same shape as
+    ``build_touched_file_pack``'s ``(section, omitted)`` contract.
+    """
     if not paths:
-        return "(no touched files)"
+        return "(no touched files)", frozenset()
 
     parts: list[str] = []
+    included: set[str] = set()
     for rel in paths:
         fp_rel = Path(rel)
         suffix = fp_rel.suffix.lower()
@@ -1344,6 +1346,7 @@ def build_head_snapshot_section(
                 # Decode only after binary/size checks.
                 content = raw_bytes.decode("utf-8", errors="replace")
                 parts.append(f"### {rel}\n\n```{lang}\n{content}\n```\n")
+                included.add(rel)
                 continue
             if result.returncode != 0:
                 # Distinguish a new file from a real git failure.
@@ -1373,7 +1376,7 @@ def build_head_snapshot_section(
         except Exception as exc:
             parts.append(f"### {rel}\n\n*(HEAD snapshot error: {exc})*\n")
 
-    return "\n".join(parts)
+    return "\n".join(parts), frozenset(included)
 
 
 def build_scope_section(scope: str = "") -> str:
@@ -1392,7 +1395,6 @@ def build_scope_section(scope: str = "") -> str:
 def get_advisory_runtime_diagnostics(model: str, prompt_chars: int,
                                      touched_paths: list) -> dict:
     """Collect best-effort advisory SDK diagnostics; never raises."""
-
     diag: dict = {
         "model": model,
         "prompt_chars": prompt_chars,
@@ -1400,7 +1402,6 @@ def get_advisory_runtime_diagnostics(model: str, prompt_chars: int,
         "touched_paths": touched_paths,
         "python": sys.executable,
     }
-    # SDK version.
     try:
         import importlib.metadata
         diag["sdk_version"] = importlib.metadata.version("claude-agent-sdk")
@@ -1422,12 +1423,11 @@ def get_advisory_runtime_diagnostics(model: str, prompt_chars: int,
 
 def check_worktree_version_sync(repo_dir) -> str:
     """Return a non-fatal warning when release version carriers disagree."""
-    from pathlib import Path as _Path
     from ouroboros.tools.release_sync import (
         is_release_version,
         version_carrier_desyncs,
     )
-    repo_dir = _Path(repo_dir)
+    repo_dir = Path(repo_dir)
     try:
         version_path = repo_dir / "VERSION"
         if not version_path.exists():
@@ -1460,11 +1460,11 @@ def check_worktree_readiness(
     paths: "list[str] | None" = None,
 ) -> "list[str]":
     """Run cheap deterministic pre-advisory checks; never crash."""
-    from pathlib import Path as _Path
-    repo_dir = _Path(repo_dir)
+    repo_dir = Path(repo_dir)
     warnings: list = []
 
     # 1. Uncommitted changes.
+    status_result = None
     try:
         path_args = (["--"] + list(paths)) if paths else []
         status_result = subprocess.run(
@@ -1490,15 +1490,10 @@ def check_worktree_readiness(
     except Exception:
         pass
 
-    # 3. Core Python changes without test changes.
+    # 3. Core Python changes without test changes (reuses the check-1 git status).
     try:
-        path_args = (["--"] + list(paths)) if paths else []
-        status_result2 = subprocess.run(
-            ["git", "status", "--porcelain"] + path_args,
-            cwd=str(repo_dir), capture_output=True, text=True, timeout=10,
-        )
-        if status_result2.returncode == 0:
-            changed_lines = (status_result2.stdout or "").splitlines()
+        if status_result is not None and status_result.returncode == 0:
+            changed_lines = (status_result.stdout or "").splitlines()
             has_py_in_core = False
             has_test_change = False
             for line in changed_lines:

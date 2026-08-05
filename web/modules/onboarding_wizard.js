@@ -482,11 +482,51 @@
         `;
     }
 
+    function renderHarnessAccountsCard() {
+        // D30: skippable coding-agent-accounts card. On the desktop first-run
+        // the wizard runs BEFORE the server exists, so the card degrades to a
+        // Settings pointer; on web it shows the live account count. The full
+        // login flows (device-code card, terminal-command fallback) live in
+        // Settings → Providers → Harness Accounts — never a terminal in-app.
+        if (state.harnessCardSkipped) return '';
+        const liveLine = HOST_MODE === 'desktop'
+            ? 'Available after launch: open Settings → Providers → Harness Accounts.'
+            : escapeHtml(state.harnessAccountsLine || 'Checking connected accounts…');
+        return `
+            <div class="panel-card" id="wizard-harness-card">
+                <h3>Coding-agent subscriptions (optional)</h3>
+                <p>Run delegated subagents and reviewers on your Codex CLI / Claude Code / Cursor
+                subscriptions instead of API tokens. Accounts are connected to Ouroboros's own
+                agent home — your personal logins are never imported.</p>
+                <div class="wizard-runtime-strip">
+                    <span class="wizard-runtime-status">${liveLine}</span>
+                    <button type="button" class="btn btn-secondary" id="wizard-harness-skip">Skip for now</button>
+                </div>
+            </div>
+        `;
+    }
+
+    async function refreshHarnessAccountsLine() {
+        if (HOST_MODE === 'desktop' || state.harnessCardSkipped) return;
+        try {
+            const data = await apiRequest('/api/claudexor/status', { cache: 'no-store' });
+            const daemonState = String(data?.daemon?.state || '');
+            const profiles = Array.isArray(data?.profiles?.profiles) ? data.profiles.profiles.length : 0;
+            state.harnessAccountsLine = daemonState === 'running'
+                ? `${profiles} account${profiles === 1 ? '' : 's'} connected. Manage them in Settings → Providers → Harness Accounts.`
+                : 'No accounts connected yet. Connect them any time in Settings → Providers → Harness Accounts.';
+        } catch (error) {
+            state.harnessAccountsLine = 'Connect accounts any time in Settings → Providers → Harness Accounts.';
+        }
+        const card = document.querySelector('#wizard-harness-card .wizard-runtime-status');
+        if (card) card.textContent = state.harnessAccountsLine;
+    }
+
     function renderClaudeCliControls() {
         return `
             <div class="panel-card" id="wizard-claude-card"${shouldShowClaudeCliCta() ? '' : ' hidden'}>
                 <h3>Claude Runtime</h3>
-                <p>Claude runtime powers delegated code editing and advisory review. It is managed automatically by the app.</p>
+                <p>Claude runtime powers the advisory pre-review on the API route. It is managed automatically by the app.</p>
                 <div class="wizard-runtime-strip">
                     <button type="button" class="btn btn-ghost" id="wizard-claude-install" ${state.claudeCliBusy || state.claudeCliInstalled ? 'disabled' : ''}>
                         ${escapeHtml(state.claudeCliBusy ? 'Repairing...' : (state.claudeCliInstalled ? 'Runtime OK' : 'Repair Runtime'))}
@@ -593,6 +633,7 @@
                 </div>
             </details>
             ${renderClaudeCliControls()}
+            ${renderHarnessAccountsCard()}
             <details class="wizard-collapse" data-collapse="local-model" ${localSourceOpen ? 'open' : ''}>
                 <summary>
                     <span>Local model settings</span>
@@ -1006,6 +1047,12 @@
             state.claudeCliDismissed = true;
             syncClaudeCliVisibility();
         });
+        document.getElementById('wizard-harness-skip')?.addEventListener('click', () => {
+            state.harnessCardSkipped = true;
+            const card = document.getElementById('wizard-harness-card');
+            if (card) card.hidden = true;
+        });
+        refreshHarnessAccountsLine();
         if (shouldShowClaudeCliCta()) {
             startClaudeCliStatusPolling();
             updateClaudeCliStatus();

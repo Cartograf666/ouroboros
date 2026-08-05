@@ -37,16 +37,46 @@ class BootstrapContext:
     log: Any
 
 
-def python_bytecode_env(data_dir: pathlib.Path, base: dict[str, str] | None = None) -> dict[str, str]:
-    """Return env values that keep bytecode caches outside packaged bundles."""
+def embedded_python_env(data_dir: pathlib.Path, base: dict[str, str] | None = None) -> dict[str, str]:
+    """Env for running the EMBEDDED interpreter without writing into the bundle.
+
+    The packaged interpreter lives INSIDE the signed application bundle, which is
+    read-only in principle (and whose signature any write invalidates). Python
+    has exactly two default write targets there and BOTH are redirected under the
+    data dir, in one place, so a new caller cannot pick up one and miss the other:
+
+    - bytecode caches -> ``PYTHONPYCACHEPREFIX``;
+    - ``pip install`` -> the user site under ``PYTHONUSERBASE`` (paired with the
+      ``--user`` flag at the pip call sites; ``site`` puts that directory on
+      ``sys.path`` automatically, so every child launched through this env
+      IMPORTS what was installed through it).
+
+    ``PYTHONNOUSERSITE`` is cleared for the same reason: an inherited value would
+    install to the user site and then refuse to import from it.
+
+    DISCLOSED, not fixed: ``site`` puts the user site AHEAD of the bundle's own
+    site-packages, and nothing prunes it. So a package installed here by an older
+    version keeps OUTRANKING the signed bundle's copy for as long as the data dir
+    survives — an upgrade can ship a newer dependency and still import the old one.
+    Making that impossible means either pruning logic or versioning this directory,
+    and versioning it silently abandons every dependency an existing install already
+    paid to download. Both are product decisions with real cost, so the behaviour is
+    stated here rather than changed unilaterally. Recovery is manual and total:
+    delete ``<data>/state/python-userbase`` and relaunch.
+    """
     env = dict(os.environ if base is None else base)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    pycache_dir = pathlib.Path(data_dir) / "state" / "pycache"
-    try:
-        pycache_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
+    state_dir = pathlib.Path(data_dir) / "state"
+    pycache_dir = state_dir / "pycache"
+    user_base = state_dir / "python-userbase"
+    for directory in (pycache_dir, user_base):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
     env["PYTHONPYCACHEPREFIX"] = str(pycache_dir)
+    env["PYTHONUSERBASE"] = str(user_base)
+    env.pop("PYTHONNOUSERSITE", None)
     return env
 
 
@@ -366,19 +396,51 @@ def sync_existing_repo_from_bundle(context: BootstrapContext) -> None:
     context.log.info("Managed repo sync outcome: %s", outcome)
 
 
-def install_deps(context: BootstrapContext) -> None:
-    """Install/update Python deps inside the embedded interpreter."""
+def _pip_output_tail(result: Any, limit: int = 800) -> str:
+    """Last chars of a captured pip run, whether it captured bytes or text."""
+    parts = []
+    for stream in (getattr(result, "stdout", None), getattr(result, "stderr", None)):
+        if isinstance(stream, bytes):
+            stream = stream.decode("utf-8", errors="replace")
+        if isinstance(stream, str) and stream.strip():
+            parts.append(stream.strip())
+    return ("\n".join(parts))[-limit:]
+
+
+def install_deps(context: BootstrapContext) -> bool:
+    """Install/update Python deps for the embedded interpreter.
+
+    ``pip_install_target_args`` keeps a packaged install OUT of the signed bundle
+    the embedded interpreter lives in; the return value reports whether pip
+    actually succeeded.
+    """
     try:
         requirements = context.repo_dir / "requirements.txt"
-        if requirements.exists():
-            context.hidden_run(
-                [context.embedded_python, "-m", "pip", "install", "-r", str(requirements)],
-                env=python_bytecode_env(context.data_dir),
-                timeout=240,
-                capture_output=True,
-            )
+        if not requirements.exists():
+            return True
+        from ouroboros.platform_layer import pip_install_target_args
+
+        result = context.hidden_run(
+            [context.embedded_python, "-m", "pip", "install",
+             *pip_install_target_args(context.embedded_python), "-r", str(requirements)],
+            env=embedded_python_env(context.data_dir),
+            timeout=240,
+            capture_output=True,
+        )
     except Exception as exc:
         context.log.warning("Dependency install/update failed: %s", exc)
+        return False
+    # A non-zero pip exit is a real, actionable failure (unreachable index, an
+    # unbuildable wheel, a read-only target): silently discarding it leaves the
+    # app to fail much later with an unexplained ImportError.
+    returncode = int(getattr(result, "returncode", 0) or 0)
+    if returncode != 0:
+        context.log.warning(
+            "Dependency install/update pip exited %d; the runtime may be missing packages:\n%s",
+            returncode, _pip_output_tail(result),
+        )
+        return False
+    return True
 
 
 _CLAUDE_SDK_BASELINE = "claude-agent-sdk>=0.1.60"
@@ -416,7 +478,7 @@ def verify_claude_runtime(context: BootstrapContext) -> bool:
              f"cli = Path(claude_agent_sdk.__file__).parent / '_bundled' / '{cli_name}'; "
              "ver = _m.version('claude-agent-sdk'); "
              "print('ok|' + ver if cli.exists() else 'no_cli|' + ver)"],
-            env=python_bytecode_env(context.data_dir),
+            env=embedded_python_env(context.data_dir),
             capture_output=True, text=True, timeout=30,
         )
         stdout = (result.stdout or "").strip()
@@ -438,10 +500,13 @@ def verify_claude_runtime(context: BootstrapContext) -> bool:
         context.log.warning("Claude runtime probe failed: %s", exc)
 
     context.log.info("Repairing Claude runtime baseline...")
+    from ouroboros.platform_layer import pip_install_target_args
+
     try:
         repair = context.hidden_run(
-            [context.embedded_python, "-m", "pip", "install", "--upgrade", _CLAUDE_SDK_BASELINE],
-            env=python_bytecode_env(context.data_dir),
+            [context.embedded_python, "-m", "pip", "install",
+             *pip_install_target_args(context.embedded_python), "--upgrade", _CLAUDE_SDK_BASELINE],
+            env=embedded_python_env(context.data_dir),
             timeout=120,
             capture_output=True,
         )
@@ -888,8 +953,14 @@ def bootstrap_native_skills(context: BootstrapContext) -> None:
     )
 
 
-def bootstrap_repo(context: BootstrapContext) -> None:
-    """Ensure the launcher-managed git repo exists and matches the embedded bundle."""
+def bootstrap_repo(context: BootstrapContext) -> bool:
+    """Ensure the launcher-managed git repo exists and matches the embedded bundle.
+
+    Returns whether the dependency install (when one was needed) succeeded —
+    a freshly created/synced checkout that could not land its requirements is
+    a fact the caller must be able to disclose, not a silently swallowed pip
+    exit code that resurfaces later as an unexplained ImportError.
+    """
     context.data_dir.mkdir(parents=True, exist_ok=True)
     outcome = ensure_managed_repo(context)
     context.log.info("Bootstrapping managed repository to %s (outcome=%s)", context.repo_dir, outcome)
@@ -909,7 +980,7 @@ def bootstrap_repo(context: BootstrapContext) -> None:
                     f"from ouroboros.world_profiler import generate_world_profile; "
                     f"generate_world_profile('{world_path}')",
                 ],
-                env=python_bytecode_env(context.data_dir, env),
+                env=embedded_python_env(context.data_dir, env),
                 timeout=30,
                 capture_output=True,
             )
@@ -917,7 +988,16 @@ def bootstrap_repo(context: BootstrapContext) -> None:
         context.log.warning("World profile generation failed: %s", exc)
 
     bootstrap_native_skills(context)
+    deps_ok = True
     if outcome != "unchanged":
-        install_deps(context)
+        deps_ok = install_deps(context)
+        if not deps_ok:
+            context.log.warning(
+                "Bootstrap finished with a FAILED dependency install (repo outcome=%s): "
+                "the checkout changed but its requirements did not land, so the server "
+                "may be missing packages. See the pip output above for the cause.",
+                outcome,
+            )
     verify_claude_runtime(context)
     context.log.info("Bootstrap complete.")
+    return deps_ok

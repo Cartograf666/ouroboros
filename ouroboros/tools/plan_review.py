@@ -40,14 +40,18 @@ from ouroboros.tools.plan_review_runtime import (
     get_review_models as _get_review_models,
     load_plan_checklist as _load_plan_checklist,
     record_raw_plan_request_attempt as _record_raw_plan_request_attempt,
-    plan_context_target_tokens as _plan_context_target_tokens,
     resolve_plan_class as _resolve_plan_class,
-    resolve_plan_context_level as _resolve_plan_context_level,
     run_plan_review_slots as _run_plan_review_slots,
     validate_plan_request_envelope as _validate_plan_request_envelope,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tools.review_context_atlas import ReviewContextAtlasRequest, compile_review_context_atlas
+from ouroboros.tools.review_context_atlas import (
+    ReviewContextAtlasRequest,
+    atlas_assembly_failed,
+    atlas_assembly_failure_reason,
+    atlas_assembly_remedy,
+    compile_review_context_atlas,
+)
 from ouroboros.tools.review_helpers import (
     build_head_snapshot_section,
     load_governance_doc,
@@ -60,6 +64,7 @@ from ouroboros.tools.review_synthesis import (
     addressable_plan_findings,
     vacuous_review_disposition as _vacuous_review_disposition,
     all_planning_tasks_terminal as _all_planning_tasks_known_terminal,
+    assemble_plan_raw_results as _assemble_plan_raw_results,
     bounded_planning_reason as _bounded_planning_reason,
     build_plan_review_system_prompt,
     build_plan_review_user_content,
@@ -69,12 +74,15 @@ from ouroboros.tools.review_synthesis import (
     normalize_plan_scope as _normalize_plan_scope,
     parse_plan_review_signal,
     bindable_claimed_wave as _bindable_claimed_wave,
+    minted_plan_slot_ids as _minted_plan_slot_ids,  # noqa: F401 — test-compat re-export
     per_slot_input_token_limits as _per_slot_input_token_limits,
     plan_envelope_mismatch_note as _envelope_note,
     plan_review_component_hashes as _plan_component_hashes,
     plan_review_fingerprint as _plan_request_fingerprint,
-    plan_slot_fit as _plan_slot_fit,
+    plan_context_target_tokens as _plan_context_target_tokens,
+    plan_slot_fit_with_identity as _plan_slot_fit_with_identity,
     plan_text_fingerprint,
+    resolve_plan_context_level as _resolve_plan_context_level,
     quorum_input_token_limit as _quorum_input_token_limit,
     unbindable_disposition_error as _unbindable_disposition_error,
     planning_handoff_selection as _planning_handoff_selection,
@@ -301,47 +309,22 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
         if isinstance(result, str) and vacuous_disposition:
             result += _VACUOUS_DISPOSITION_NOTE
         return result
-    except concurrent.futures.TimeoutError:
+    except (concurrent.futures.TimeoutError, asyncio.TimeoutError):
         return _plan_unavailable(
-            ctx,
-            f"ERROR: Plan review timed out after {_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC}s.",
-            "review_timeout",
-        )
-    except asyncio.TimeoutError:
-        return _plan_unavailable(
-            ctx,
-            f"ERROR: Plan review timed out after {_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC}s.",
-            "review_timeout",
-        )
+            ctx, f"ERROR: Plan review timed out after {_PLAN_REVIEW_WRAPPER_TIMEOUT_SEC}s.", "review_timeout")
     except Exception as e:
         log.error("plan_task failed: %s", e, exc_info=True)
-        return _plan_unavailable(
-            ctx,
-            f"ERROR: Plan review failed: {e}",
-            "review_failed",
-        )
+        return _plan_unavailable(ctx, f"ERROR: Plan review failed: {e}", "review_failed")
 
 
 def _plan_unavailable(ctx: ToolContext, message: str, reason: str) -> str:
     """Persist a retryable availability outcome after canonical validation."""
-
     try:
         root, task_id = _planning_state_location(ctx)
         mark_current_plan_review_unavailable(root, task_id, reason=reason)
     except (OSError, TimeoutError, ValueError) as exc:
         return f"{message}\nERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
     return message
-
-
-def _planning_swarm_count(context_level: str, files_to_touch: list) -> int:
-    try:
-        from ouroboros.config import get_max_active_subagents_per_root
-
-        cap = get_max_active_subagents_per_root()
-    except Exception:
-        cap = 3
-    desired = 2 if context_level in {"broad", "constitutional"} or len(files_to_touch or []) > 3 else 1
-    return max(1, min(int(cap or 1), desired))
 
 
 def _persist_planning_handoffs(ctx: ToolContext, handoffs: dict) -> dict:
@@ -358,11 +341,6 @@ def _persist_planning_snapshot(ctx: ToolContext, handoffs: dict) -> dict:
 def _planning_handoff_path(ctx: ToolContext) -> pathlib.Path:
     task_id = str(getattr(ctx, "task_id", "") or "plan_review")
     return pathlib.Path(ctx.drive_root) / "task_results" / "artifacts" / task_id / "plan_task_handoffs.json"
-
-
-def _planning_handoff_snapshot_path(ctx: ToolContext, fingerprint: str) -> pathlib.Path:
-    task_id = str(getattr(ctx, "task_id", "") or "plan_review")
-    return plan_review_handoff_snapshot_path(ctx.drive_root, task_id, fingerprint)
 
 
 def _planning_state_location(ctx: ToolContext) -> tuple[pathlib.Path, str]:
@@ -432,8 +410,7 @@ def _collect_planning_handoffs(
         "omissions": omissions,
         "consumed_task_ids": [],
     }
-    artifact = _persist_planning_handoffs(ctx, handoffs)
-    handoffs["artifact"] = artifact
+    handoffs["artifact"] = _persist_planning_handoffs(ctx, handoffs)
     return handoffs
 
 
@@ -506,10 +483,11 @@ def _schedule_planning_scouts(
         before_side = set(_scheduled_side_channel_ids(ctx))
         before_durable = set(_planning_direct_children(ctx))
         try:
-            # The scout deadline rides the POSITIONAL-ONLY internal-options mapping, not a new public
-            # parameter: `deadline_at` is runtime-internal and stays out of the strict schema.
+            # `deadline_at` became a public schedule_subagent parameter in v6.87.7, so the
+            # scout deadline now rides the same channel any parent would use. Narrowing is
+            # enforced downstream: the earlier of this and the parent's deadline wins.
             output = _schedule_task(
-                ctx, {"deadline_at": deadline_at}, objective=objective,
+                ctx, objective=objective, deadline_at=deadline_at,
                 expected_output=("A concise planning handoff with sections: summary, missed_touchpoints, "
                                  "risks, suggested_scope_adjustments, tests_to_run, blockers."),
                 role=role, context=context, constraints=constraints, memory_mode="forked", model_lane="light",
@@ -618,10 +596,10 @@ def _collect_host_planning_wave(
 
 def _retry_reviewed_wave_handoffs(ctx: ToolContext, wave: dict) -> dict:
     """Reuse the exact scout snapshot seen by the first reviewer attempt."""
-
     handoffs = plan_review_wave_handoffs(wave)
-    path = _planning_handoff_snapshot_path(
-        ctx, str(wave.get("request_fingerprint") or ""),
+    path = plan_review_handoff_snapshot_path(
+        ctx.drive_root, str(getattr(ctx, "task_id", "") or "plan_review"),
+        str(wave.get("request_fingerprint") or ""),
     )
     stored = read_json_dict(path)
     error = ""
@@ -677,7 +655,9 @@ def _start_planning_swarm(
         resumed = wave is not None
         created = False
         review = wave.get("review") if isinstance((wave or {}).get("review"), dict) else {}
-        orphan_snapshot = not review and _planning_handoff_snapshot_path(ctx, fingerprint).is_file()
+        orphan_snapshot = not review and plan_review_handoff_snapshot_path(
+            ctx.drive_root, str(getattr(ctx, "task_id", "") or "plan_review"), fingerprint,
+        ).is_file()
         snapshot_retry = bool(wave and (review.get("reviewer_slots_degraded") is True or orphan_snapshot))
         if snapshot_retry:
             handoffs = _retry_reviewed_wave_handoffs(ctx, wave)
@@ -695,7 +675,13 @@ def _start_planning_swarm(
                    if (handoffs.get("artifact") or {}).get("error") else {}),
             }
         if wave is None:
-            roles = [f"planning-scout-{idx + 1}" for idx in range(_planning_swarm_count(context_level, files_to_touch))]
+            try:
+                from ouroboros.config import get_max_active_subagents_per_root
+                _cap = get_max_active_subagents_per_root()
+            except Exception:
+                _cap = 3
+            _desired = 2 if context_level in {"broad", "constitutional"} or len(files_to_touch or []) > 3 else 1
+            roles = [f"planning-scout-{idx + 1}" for idx in range(max(1, min(int(_cap or 1), _desired)))]
             wave, created = reserve_plan_review_wave(
                 root, parent_id, fingerprint=fingerprint, plan_text_hash=plan_text_fingerprint(plan),
                 scout_roles=roles, cutoff_at=(_planning_now() + timedelta(seconds=max_wait)).isoformat(),
@@ -822,8 +808,7 @@ def _mark_planning_handoffs_consumed(ctx: ToolContext, handoffs: dict) -> dict:
     handoffs.pop("reviewed_result_hashes", None)
     handoffs.pop("review_evidence_status", None)
     handoffs.setdefault("wait", {})
-    artifact = _persist_planning_handoffs(ctx, handoffs)
-    handoffs["artifact"] = artifact
+    handoffs["artifact"] = _persist_planning_handoffs(ctx, handoffs)
     return wave
 
 
@@ -859,8 +844,7 @@ def _capture_late_planning_audit(ctx: ToolContext, handoffs: dict) -> None:
         "affects_review": False,
         "tasks": late_tasks,
     }
-    artifact = _persist_planning_handoffs(ctx, handoffs)
-    handoffs["artifact"] = artifact
+    handoffs["artifact"] = _persist_planning_handoffs(ctx, handoffs)
 
 
 def _resolve_plan_roots(
@@ -1152,17 +1136,15 @@ def _plan_deadline_skip(ctx: ToolContext, *, emit: bool = False) -> str:
                 })
         except Exception:
             pass
-    if remaining <= 0:
-        return (
-            "PLAN_TASK_SKIPPED_DEADLINE: the task deadline has expired; no new planning "
-            "scout or reviewer work was started. Proceed with your own best plan directly; "
-            "do not re-call plan_task under this deadline."
-        )
+    cause = (
+        "the task deadline has expired; no new planning scout or reviewer work was started."
+        if remaining <= 0 else
+        f"insufficient time for useful planning — remaining {int(remaining)}s gives a "
+        f"swarm window of {int(scaled)}s (< {int(minimum)}s useful floor)."
+    )
     return (
-        "PLAN_TASK_SKIPPED_DEADLINE: insufficient time for useful planning — "
-        f"remaining {int(remaining)}s gives a swarm window of {int(scaled)}s "
-        f"(< {int(minimum)}s useful floor). Proceed with your own best plan directly; "
-        "do not re-call plan_task under this deadline."
+        f"PLAN_TASK_SKIPPED_DEADLINE: {cause} Proceed with your own best plan "
+        "directly; do not re-call plan_task under this deadline."
     )
 
 
@@ -1171,22 +1153,13 @@ def _finalize_plan_review_output(
     finalization: _PlanReviewFinalization,
 ) -> str:
     """Persist the authoritative review result and render its public projection."""
-    request = finalization.request
     raw_results = finalization.raw_results
-    models = finalization.models
-    estimated_tokens = finalization.estimated_tokens
-    subject_repo = finalization.subject_repo
-    governance_repo = finalization.governance_repo
     planning_handoffs = finalization.planning_handoffs
-    state_root = finalization.state_root
-    state_task_id = finalization.state_task_id
     request_fingerprint = finalization.request_fingerprint
-    degraded_scout_note = finalization.degraded_scout_note
-    reviewed_result_hashes = finalization.reviewed_result_hashes
     ctx._last_plan_review_raw_results = raw_results
-    ctx._last_plan_review_estimated_tokens = estimated_tokens
-    ctx._last_plan_review_subject_root = str(subject_repo)
-    ctx._last_plan_review_governance_root = str(governance_repo)
+    ctx._last_plan_review_estimated_tokens = finalization.estimated_tokens
+    ctx._last_plan_review_subject_root = str(finalization.subject_repo)
+    ctx._last_plan_review_governance_root = str(finalization.governance_repo)
     summary = _summarize_plan_review_results(raw_results)
     aggregate_signal = str(summary["aggregate_signal"])
     reviewer_slots_degraded = bool(summary.get("degraded_count"))
@@ -1197,7 +1170,7 @@ def _finalize_plan_review_output(
     review_record = {
         "schema_version": 1,
         "request_fingerprint": request_fingerprint,
-        "plan_text_hash": plan_text_fingerprint(request.plan),
+        "plan_text_hash": plan_text_fingerprint(finalization.request.plan),
         "aggregate_signal": aggregate_signal,
         "findings": list(summary["findings"]),
         "reviewed_at": utc_now_iso(),
@@ -1213,8 +1186,9 @@ def _finalize_plan_review_output(
     if planning_handoffs:
         try:
             wave = record_plan_review_result(
-                state_root, state_task_id, fingerprint=request_fingerprint, review=review_record,
-                reviewed_result_hashes=reviewed_result_hashes,
+                finalization.state_root, finalization.state_task_id,
+                fingerprint=request_fingerprint, review=review_record,
+                reviewed_result_hashes=finalization.reviewed_result_hashes,
             )
         except (OSError, TimeoutError, ValueError) as exc:
             return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
@@ -1234,8 +1208,8 @@ def _finalize_plan_review_output(
     if availability_only:
         try:
             record_plan_review_attempt(
-                state_root,
-                state_task_id,
+                finalization.state_root,
+                finalization.state_task_id,
                 fingerprint=request_fingerprint,
                 status="unavailable",
                 reason="reviewer_unavailable",
@@ -1283,14 +1257,14 @@ def _finalize_plan_review_output(
     else:
         availability_note = ""
     return (
-        degraded_scout_note
+        finalization.degraded_scout_note
         + availability_note
         + _planning_disposition_warning_note(planning_handoffs)
         + _format_output(
             raw_results,
-            models,
-            request.goal,
-            estimated_tokens,
+            finalization.models,
+            finalization.request.goal,
+            finalization.estimated_tokens,
             availability_only=availability_only,
             reviewer_retry_required=reviewer_slots_degraded,
         )
@@ -1333,11 +1307,7 @@ async def _run_plan_review_async(
         context_notes=context_notes, plan_class=plan_class, scope=scope, include_tests=include_tests,
     )
     try:
-        record_plan_review_attempt(
-            state_root,
-            state_task_id,
-            fingerprint=request_fingerprint,
-        )
+        record_plan_review_attempt(state_root, state_task_id, fingerprint=request_fingerprint)
     except (OSError, TimeoutError, ValueError) as exc:
         return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
     if not deadline_blocked or has_prior_state:
@@ -1379,12 +1349,8 @@ async def _run_plan_review_async(
             if str(decision.get("status") or "") != "closed":
                 try:
                     record_plan_review_attempt(
-                        state_root,
-                        state_task_id,
-                        fingerprint=request_fingerprint,
-                        status="rail_degraded",
-                        reason="plan_task_deadline",
-                    )
+                        state_root, state_task_id, fingerprint=request_fingerprint,
+                        status="rail_degraded", reason="plan_task_deadline")
                 except (OSError, TimeoutError, ValueError) as exc:
                     return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
                 return _plan_deadline_skip(ctx, emit=True) or deadline_skip
@@ -1397,24 +1363,18 @@ async def _run_plan_review_async(
     if deadline_blocked:
         try:
             record_plan_review_attempt(
-                state_root,
-                state_task_id,
-                fingerprint=request_fingerprint,
-                status="rail_degraded",
-                reason="plan_task_deadline",
-            )
+                state_root, state_task_id, fingerprint=request_fingerprint,
+                status="rail_degraded", reason="plan_task_deadline")
         except (OSError, TimeoutError, ValueError) as exc:
             return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
         return _plan_deadline_skip(ctx, emit=True) or deadline_skip
     if not list(_cfg.get_review_models() or []):
         return _plan_unavailable(
-            ctx,
-            "ERROR: No review models configured. Set OUROBOROS_REVIEW_MODELS in settings.",
-            "review_models_unconfigured",
-        )
+            ctx, "ERROR: No review models configured. Set OUROBOROS_REVIEW_MODELS in settings.",
+            "review_models_unconfigured")
     models = _get_review_models()
     slot_limits = _per_slot_input_token_limits(
-        models, context_window=1_000_000, output_reserve=_PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000)
+        models, output_reserve=_PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000)
     plan_budget_limit = _quorum_input_token_limit(models, slot_limits)  # quorum, not the smallest window
     degraded_scout_note = ""
     planning_handoffs: dict = {}
@@ -1425,19 +1385,14 @@ async def _run_plan_review_async(
         swarm = _start_planning_swarm(ctx, resolved_request, request_fingerprint)
         if not swarm.get("started"):
             return _plan_unavailable(
-                ctx,
-                str(swarm.get("error") or "ERROR: plan_task planning swarm failed closed."),
-                "planning_scout_unavailable",
-            )
+                ctx, str(swarm.get("error") or "ERROR: plan_task planning swarm failed closed."),
+                "planning_scout_unavailable")
         planning_handoffs = dict(swarm.get("handoffs") or {})
         try:
             reviewed_result_hashes = _reviewed_handoff_hashes(planning_handoffs)
         except ValueError as exc:
             return _plan_unavailable(
-                ctx,
-                f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}",
-                "planning_evidence_invalid",
-            )
+                ctx, f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}", "planning_evidence_invalid")
         planning_handoff_raw = _format_planning_handoffs(planning_handoffs, raw=True)
         planning_handoff_compact = _format_planning_handoffs(planning_handoffs, raw=False)
         degraded_scout_note = (
@@ -1466,8 +1421,17 @@ async def _run_plan_review_async(
         "docs/CHECKLISTS.md",
     }
     head_snapshots = ""
+    # Only paths whose FULL snapshot text actually made it into the prompt may
+    # be declared `already_included` to the atlas below: the atlas trusts that
+    # claim, so an omission marker (oversized/sensitive/binary/error) reported
+    # as "included" would bypass the BIBLE P3 required-artifact refusal
+    # (XG-1R.4). Omitted paths flow into the normal atlas classification
+    # instead, where the hoisted requiredness predicate decides.
+    snapshot_included: frozenset[str] = frozenset()
     if files_to_touch:
-        head_snapshots = build_head_snapshot_section(subject_repo, files_to_touch)
+        head_snapshots, snapshot_included = build_head_snapshot_section(
+            subject_repo, files_to_touch
+        )
     system_prompt = _build_system_prompt(
         checklist,
         bible_text,
@@ -1505,8 +1469,10 @@ async def _run_plan_review_async(
                 ReviewContextAtlasRequest(
                     repo_dir=subject_repo,
                     anchors=tuple(files_to_touch),
+                    # NOT files_to_touch: only the snapshots that SURVIVED into
+                    # the prompt (see snapshot_included above, XG-1R.4).
                     already_included=frozenset(
-                        set(files_to_touch)
+                        set(snapshot_included)
                         | (canonical_docs if subject_repo == governance_repo else set())
                     ),
                     fixed_prompt_tokens=fixed_prompt_tokens,
@@ -1519,36 +1485,36 @@ async def _run_plan_review_async(
             )
         except Exception as e:
             return _plan_unavailable(
-                ctx,
-                f"ERROR: Failed to build review context atlas: {e}",
-                "review_atlas_failed",
-            )
+                ctx, f"ERROR: Failed to build review context atlas: {e}", "review_atlas_failed")
 
-        if atlas.status == "budget_exceeded":
-            estimated = int((atlas.manifest or {}).get("estimated_total_tokens") or 0)
+        if atlas_assembly_failed(atlas):
+            # Review does not proceed on the remainder; the typed reason renders
+            # EVERY cause and the shared remedy pick follows the cause set —
+            # `context_level` moves only `target_total_tokens` (inert here).
             return _plan_unavailable(
                 ctx,
-                "⚠️ PLAN_REVIEW_SKIPPED: generated repository atlas exceeded hard budget"
-                + (f" ({estimated:,} estimated tokens)" if estimated else "")
-                + ". Split the plan into a smaller scope or choose a smaller context_level.",
-                "review_atlas_budget_exceeded",
+                "⚠️ PLAN_REVIEW_SKIPPED: " + atlas_assembly_failure_reason(atlas) + ". "
+                + atlas_assembly_remedy(
+                    atlas.manifest,
+                    "Split the plan into a smaller scope or choose a smaller context_level.",
+                ),
+                "review_atlas_assembly_failed",
             )
 
         # Replace only the stable-prefix slot, not a copy quoted by plan text or a snapshot.
         slot = user_content.rfind(placeholder, 0, user_stable_len)
         if slot < 0:
             return _plan_unavailable(
-                ctx,
-                "ERROR: Failed to build review context atlas: placeholder missing.",
-                "review_atlas_invalid",
-            )
+                ctx, "ERROR: Failed to build review context atlas: placeholder missing.",
+                "review_atlas_invalid")
         user_content = user_content[:slot] + atlas.text + user_content[slot + len(placeholder):]
         user_stable_len += len(atlas.text) - len(placeholder)
     estimated_tokens = estimate_tokens(system_prompt + user_content)
     if estimated_tokens > plan_budget_limit and planning_handoff_raw:
         user_content = user_content.replace(planning_handoff_raw, planning_handoff_compact)
         estimated_tokens = estimate_tokens(system_prompt + user_content)
-    models, oversize_results, fit_error = _plan_slot_fit(models, slot_limits, estimated_tokens)
+    models, callable_slot_ids, oversize_results, fit_error = _plan_slot_fit_with_identity(
+        models, slot_limits, estimated_tokens)
     if fit_error:
         return _plan_unavailable(ctx, fit_error, "review_context_unavailable")
 
@@ -1572,18 +1538,17 @@ async def _run_plan_review_async(
         snapshot = _persist_planning_snapshot(ctx, planning_handoffs)
         if snapshot.get("error"):
             return _plan_unavailable(
-                ctx,
-                "ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: " + str(snapshot["error"]),
-                "planning_evidence_snapshot_failed",
-            )
+                ctx, "ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: " + str(snapshot["error"]),
+                "planning_evidence_snapshot_failed")
     ctx.emit_progress_fn(
         f"📐 plan_task: running {len(models)} parallel reviewers "
         f"(context={resolved_context_level}, ~{estimated_tokens:,} tokens each)…"
     )
 
-    raw_results = oversize_results + await _run_plan_review_slots(
-        ctx, models, system_prompt, user_content, user_stable_len=user_stable_len,
-    )
+    raw_results = _assemble_plan_raw_results(oversize_results, await _run_plan_review_slots(
+        ctx, models, system_prompt, user_content,
+        user_stable_len=user_stable_len, slot_ids=callable_slot_ids,
+    ))
     return _finalize_plan_review_output(ctx, _PlanReviewFinalization(
         request=request,
         raw_results=raw_results,

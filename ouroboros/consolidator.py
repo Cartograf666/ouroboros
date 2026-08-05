@@ -31,7 +31,7 @@ def _consolidation_route() -> Tuple[str, bool]:
     from ouroboros.provider_models import resolve_credentialed_model
     from ouroboros.subagents import resolve_subagent_lane
 
-    lane = resolve_subagent_lane("light", depth=0)
+    lane = resolve_subagent_lane("light")
     if lane.use_local_model:
         return lane.model, True
     return resolve_credentialed_model(lane.model), False

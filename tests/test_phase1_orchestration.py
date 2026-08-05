@@ -308,20 +308,23 @@ def test_effective_delegation_budget_honors_require_lane_and_scope():
     ignored = effective_delegation_budget({}, unresolved_constraints=[row], role="researcher", requested_lane="light")
     assert ignored.ok is True
 
+    # The INTENDED lane decides, not the literal request (v6.87.28: this gate runs at
+    # ADMISSION, before the child is dispatched, so no effective lane exists yet —
+    # `subagents.intended_lane` is what a request MEANS, and its one owner).
     requested_does_not_count = effective_delegation_budget(
         {},
         unresolved_constraints=[row],
         role="critic",
-        requested_lane="heavy",
-        effective_lane="light",
+        requested_lane="auto",
+        intended_lane="light",
     )
     assert requested_does_not_count.ok is False
 
-    blocked = effective_delegation_budget({}, unresolved_constraints=[row], role="critic", requested_lane="light", effective_lane="light")
+    blocked = effective_delegation_budget({}, unresolved_constraints=[row], role="critic", requested_lane="light", intended_lane="light")
     assert blocked.ok is False
     assert blocked.reason_code == "delegation_constraint_require_lane"
 
-    allowed = effective_delegation_budget({}, unresolved_constraints=[row], role="critic", requested_lane="heavy", effective_lane="heavy")
+    allowed = effective_delegation_budget({}, unresolved_constraints=[row], role="critic", requested_lane="heavy", intended_lane="heavy")
     assert allowed.ok is True
 
 

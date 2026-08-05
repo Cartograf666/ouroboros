@@ -3091,11 +3091,22 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
                 assert after["context_mode_auto_low"] is False
 
                 # 2. Scope-review capability notice -> owner confirm -> route-scoped ack.
+                # 6.2: the scope route is a Reviewer Slots row now — pick the
+                # custom-API choice in the grouped combobox and type the id.
                 page.click('[data-nav-page="settings"]')
                 page.wait_for_selector("#s-context-mode", state="attached", timeout=30_000)
                 page.locator('[data-settings-tab="models"]').click()
-                page.wait_for_selector("#s-scope-review-models", timeout=30_000)
-                page.locator("#s-scope-review-models").fill("openai-compatible::scope-reviewer-x")
+                page.wait_for_selector("#reviewer-slots-section", timeout=30_000)
+                scope_route = page.locator(
+                    '#reviewer-scope-rows .reviewer-slot-row [data-slot-route]'
+                ).first
+                scope_route.wait_for(state="visible", timeout=30_000)
+                scope_route.select_option("api:__custom__")
+                custom_input = page.locator(
+                    '#reviewer-scope-rows .reviewer-slot-row [data-slot-custom-api]'
+                ).first
+                custom_input.wait_for(state="visible", timeout=30_000)
+                custom_input.fill("openai-compatible::scope-reviewer-x")
                 page.locator("#btn-save-settings").click()
                 page.wait_for_function(
                     "() => (document.querySelector('#settings-status')?.textContent || '')"
@@ -3108,7 +3119,7 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
                 assert "1,000,000-token context window" in dialogs[0]
                 assert "openai-compatible::scope-reviewer-x" in dialogs[0], "the ack must name the exact route"
                 status_text = page.locator("#settings-status").inner_text()
-                assert "Confirmed a 1M-token window for 1 scope-review route(s)." in status_text
+                assert "Confirmed the required context window for 1 scope-review route(s)." in status_text
                 evidence = json.loads((data_dir / "state" / "capability_evidence.json").read_text(encoding="utf-8"))
                 acked = [
                     entry for entry in (evidence.get("acks") or evidence.get("probes") or {}).values()

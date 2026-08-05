@@ -37,6 +37,13 @@ export function costDashboardPresentation(data) {
     const rawLimit = optionalFiniteNumber(accounting.limit_usd);
     const limit = rawLimit !== null && rawLimit > 0 ? rawLimit : 0;
     const models = Object.entries(data.by_model || {});
+    // A flag without its cause is not reconstructible. `cost_final: false` holds with every
+    // dollar bucket at $0.00 and `unknown` at 0 — an ESTIMATED zero, or a dispatched row
+    // whose reservation is exactly zero — so the count of open rows rides beside the flag
+    // it explains rather than in a new tile nobody correlates. Absent on an older payload,
+    // and then this says only what it knows instead of inventing a zero.
+    const nonFinal = optionalFiniteNumber(accounting.non_final_rows);
+    const openCause = nonFinal !== null && nonFinal > 0 ? ` (${Math.trunc(nonFinal)} open)` : '';
     return {
         state: 'available',
         accountedLimit: `${formatUsd2(accounted)} / ${limit > 0 ? formatUsd2(limit) : '∞'}`,
@@ -44,7 +51,7 @@ export function costDashboardPresentation(data) {
         reserved: formatUsd2(reserved),
         unresolved: formatUsd2(unresolved),
         unknown: String(Math.trunc(unknown)),
-        final: accounting.cost_final === true ? 'Yes' : 'Pending',
+        final: accounting.cost_final === true ? 'Yes' : `Pending${openCause}`,
         calls: String(Math.trunc(calls)),
         topModel: models.length > 0 ? models[0][0] : '-',
     };

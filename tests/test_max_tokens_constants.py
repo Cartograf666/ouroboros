@@ -83,8 +83,8 @@ def test_summary_and_background_token_budgets():
         assert needle in src, f"{path} must contain {needle}"
 
 
-def test_claude_code_edit_sdk_max_turns():
-    """Edit and advisory paths must share the same default Claude Code turn budget (50)."""
+def test_claude_code_advisory_sdk_max_turns():
+    """The advisory path must use the shared default Claude Code turn budget (50)."""
     import ast
     from pathlib import Path
 
@@ -102,12 +102,9 @@ def test_claude_code_edit_sdk_max_turns():
                     found = True
     assert found, "DEFAULT_CLAUDE_CODE_MAX_TURNS not found in claude_code.py"
 
-    # Verify callers reference the shared constant
-    shell_src = Path("ouroboros/tools/shell.py").read_text(encoding="utf-8")
+    # Verify the surviving caller references the shared constant
     advisory_src = Path("ouroboros/tools/claude_advisory_review.py").read_text(encoding="utf-8")
-    assert "DEFAULT_CLAUDE_CODE_MAX_TURNS" in shell_src
     assert "DEFAULT_CLAUDE_CODE_MAX_TURNS" in advisory_src
-    assert "max_turns=25" not in shell_src
     assert "max_turns=8" not in advisory_src
 
 
@@ -216,7 +213,9 @@ def test_scope_input_limit_is_density_calibrated(monkeypatch, tmp_path):
     # This test verifies the CALIBRATION at a 1M window, not the window-resolution
     # policy: since the v6.46.0 false-1M fix an off-default model with no Capability
     # Evidence fail-closes to the sub-floor.
-    monkeypatch.setattr("ouroboros.tools.scope_review._scope_reviewer_window", lambda m: 1_000_000)
+    from ouroboros.reviewer_window import ReviewerWindow
+    monkeypatch.setattr("ouroboros.tools.scope_review._scope_window",
+                        lambda m: ReviewerWindow(1_000_000, "confirmed"))
     monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
 
     assert COLD_START_TOKEN_DENSITY >= 1.58, (
@@ -454,7 +453,7 @@ def test_tool_timeout_uses_max_of_settings_and_per_tool():
 
     # settings says 600, per-tool says 1200 → should return 1200
     with patch.object(mod, "load_settings", return_value={"OUROBOROS_TOOL_TIMEOUT_SEC": 600}):
-        result = mod._get_tool_timeout(FakeTools(), "claude_code_edit")
+        result = mod._get_tool_timeout(FakeTools(), "run_command")
     assert result == 1200, f"Expected 1200 (per-tool), got {result}"
 
 
@@ -540,3 +539,299 @@ def test_obligation_context_shows_all():
     src = open("ouroboros/agent_task_pipeline.py", encoding="utf-8").read()
     assert "open_obs[:4]" not in src, "open_obs[:4] cap should be removed"
     assert "obligation_ids[:4]" not in src, "obligation_ids[:4] cap should be removed"
+
+
+def test_unevidenced_reviewer_keeps_the_full_window_assumption(tmp_path, monkeypatch):
+    """An UNKNOWN reviewer route must not be silently assumed to be small.
+
+    v6.87.27: the window is resolved per reviewer from Capability Evidence, but
+    the ABSENT-evidence default stays the full window — the same policy
+    `context_fit` applies to the main lane (unknown routes try Max, never a
+    silent 200K; BIBLE P1). Guessing small is not the conservative direction on
+    these surfaces: the governance packs (BIBLE + DEVELOPMENT + ARCHITECTURE +
+    CHECKLISTS) run ~169K tokens, so a sub-floor guess made `plan_slot_fit`
+    decline EVERY plan review before dispatch on a cold-evidence install. Only
+    scope review fails closed, because its blocking authority is what a wrong
+    assumption would forge, and it applies that sub-floor itself.
+    """
+    from types import SimpleNamespace
+
+    from ouroboros import capability_evidence
+    from ouroboros.reviewer_window import REVIEWER_FULL_WINDOW, reviewer_context_window
+    from ouroboros.tools.plan_review import _PLAN_REVIEW_MAX_TOKENS
+    from ouroboros.tools.review_synthesis import per_slot_input_token_limits
+
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        capability_evidence, "probe", lambda *a, **k: SimpleNamespace(window_tokens=0, status=""),
+    )
+
+    assert reviewer_context_window("unevidenced/reviewer") == REVIEWER_FULL_WINDOW
+
+    # ...and the resulting slot cap is byte-identical to the historical explicit
+    # 1M call, so cold-evidence installs keep the pack they always had.
+    limits = per_slot_input_token_limits(
+        ["unevidenced/reviewer"],
+        output_reserve=_PLAN_REVIEW_MAX_TOKENS,
+        tokenizer_margin=155_000,
+    )
+    legacy = per_slot_input_token_limits(
+        ["unevidenced/reviewer"],
+        context_window=1_000_000,
+        output_reserve=_PLAN_REVIEW_MAX_TOKENS,
+        tokenizer_margin=155_000,
+    )
+    assert limits == legacy
+
+
+def test_known_small_window_reviewer_gets_its_real_window(tmp_path, monkeypatch):
+    """The D1 fix proper: CONFIRMED evidence replaces the 1M assumption."""
+    from types import SimpleNamespace
+
+    from ouroboros import capability_evidence
+    from ouroboros.reviewer_window import reviewer_context_window
+    from ouroboros.tools.plan_review import _PLAN_REVIEW_MAX_TOKENS
+    from ouroboros.tools.review_synthesis import per_slot_input_token_limits
+
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        capability_evidence,
+        "probe",
+        lambda *a, **k: SimpleNamespace(window_tokens=200_000, status="confirmed"),
+    )
+
+    assert reviewer_context_window("small/reviewer") == 200_000
+    limits = per_slot_input_token_limits(
+        ["small/reviewer"], output_reserve=_PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000,
+    )
+    # Reserves scale to the real window instead of zeroing the slot, and the cap
+    # is far below the 1M-sized one that would have drawn a provider 400.
+    assert 0 < limits["small/reviewer"] < 200_000
+
+
+def test_the_triad_sizes_its_shared_prompt_by_quorum_not_by_the_strictest_slot(monkeypatch):
+    """The commit that made this change touched no test file, so reverting it to
+    `min(...)` left the whole review suite green.
+
+    It matters because the shrink ladder can only cut the diff and the file snapshots —
+    the governance prefix is rebuilt unchanged on every rung and is ~138K tokens by
+    itself. Sizing the SHARED prompt to a 200K reviewer (calibrated limit ~91K) made
+    `_fit_shared_review_prompt` overflow whatever the change was, so every commit came
+    back `fixed_overflow` telling the owner to split a diff that was never the cause.
+    A small-window reviewer must drop out of the quorum, not shrink the gate.
+    """
+    import ouroboros.tools.review as review
+
+    panel = ["big/one", "big/two", "small/one"]
+    caps = {"big/one": 500_000, "big/two": 500_000, "small/one": 90_000}
+
+    limit = review._quorum_input_token_limit(panel, caps)
+    assert limit == 500_000, "the quorum-th largest cap, not the smallest"
+    assert limit > min(caps.values()), "a sub-quorum window must not size the shared prompt"
+
+    # With no quorum above it, the small window does bind — the panel cannot outvote it.
+    two_slot = {"big/one": 500_000, "small/one": 90_000}
+    assert review._quorum_input_token_limit(list(two_slot), two_slot) == 90_000
+
+
+
+def _triad_assemble(review, stable_fields, dynamic_fields):
+    """The production caller's assemble closure, rebuilt from the (monkeypatched)
+    templates — the fused `_fit_triad_prompt` takes assembly from its caller
+    (the 5.2/5.3 api/session split), so the test drives the same seam."""
+    def _assemble(files_section, staged_diff):
+        stable = review._REVIEW_PROMPT_TEMPLATE_STABLE.format(**stable_fields)
+        dynamic = review._REVIEW_PROMPT_TEMPLATE_DYNAMIC.format(**{
+            **dynamic_fields,
+            "current_files_section": files_section,
+            "diff_text": staged_diff,
+        })
+        return stable + "\n" + dynamic, len(stable) + 1
+    return _assemble
+
+
+
+def test_a_sub_quorum_window_degrades_its_own_slot_instead_of_blocking_the_commit_gate(
+    monkeypatch, tmp_path,
+):
+    """The CALL SITE, pinned by what it DOES rather than by what it says.
+
+    Asserting only the helper leaves `min(...)` free to come back in
+    `_fit_shared_review_prompt` — which is exactly how this shipped uncovered. Pinning
+    the call site with `inspect.getsource` kills that mutant but fails on correct code
+    too: extracting the sizing into a helper, or renaming it, breaks a test about
+    sizing behaviour for reasons that have nothing to do with sizing.
+
+    So drive the assembler instead. The governance prefix is IRREDUCIBLE — the shrink
+    ladder can only cut the diff and the file snapshots — so a prompt that clears the
+    quorum but not the smallest slot is precisely the case that decides which limit the
+    call site used, and it is the case the owner actually saw: every commit returning
+    `fixed_overflow` and telling them to split a diff that was never the cause.
+    """
+    import ouroboros.tools.review as review
+
+    caps = {"big/one": 500_000, "big/two": 500_000, "small/one": 90_000}
+    monkeypatch.setattr(review, "reviewer_context_window", lambda model: caps[str(model)])
+    monkeypatch.setattr(
+        review, "calibrated_input_token_limit", lambda model, **kw: caps[str(model)],
+    )
+    monkeypatch.setattr(review, "run_cmd", lambda *a, **kw: "")  # no git in this unit
+    monkeypatch.setattr(review, "_REVIEW_PROMPT_TEMPLATE_STABLE", "{preamble}")
+    monkeypatch.setattr(
+        review, "_REVIEW_PROMPT_TEMPLATE_DYNAMIC",
+        "{current_files_section}\n{diff_text}\n{changed_files}",
+    )
+
+    # ~150K tokens of prefix: above the small slot's cap, below the quorum's, and beyond
+    # the reach of every rung of the shrink ladder.
+    stable_fields = {"preamble": "g" * (150_000 * 4)}
+    dynamic_fields = {
+        "changed_files": "a.py",
+        "diff_text": "+x",
+        "current_files_section": "full snapshot of a.py",
+    }
+
+    _assemble = _triad_assemble(review, stable_fields, dynamic_fields)
+
+    def fit(models):
+        return review._fit_triad_prompt(
+            models, _assemble, dynamic_fields["current_files_section"],
+            dynamic_fields["diff_text"], dynamic_fields["changed_files"], tmp_path,
+        )
+
+    _, _, overflow = fit(["big/one", "big/two", "small/one"])
+    assert overflow == "", (
+        "a quorum of large reviewers must carry the gate; the small slot degrades "
+        f"its own review instead of blocking the commit: {overflow}"
+    )
+
+    # The other direction: with no quorum above it the small window really does bind, so
+    # this is the QUORUM limit and not simply the largest slot's.
+    _, _, overflow_two = fit(["big/one", "small/one"])
+    assert "REVIEW_BLOCKED" in overflow_two
+
+
+def _local_only_install(monkeypatch, tmp_path, n_ctx=16_384):
+    """Simulate a supported local-only install and return the probe's call log.
+
+    ``USE_LOCAL_MAIN=1`` with no cloud credential makes
+    ``review_model_uses_local`` True for every slot. The probe fake mirrors
+    ``capability_evidence.probe``'s routing contract: the LOCAL route answers
+    from local health (the running model's n_ctx, which is what
+    ``LOCAL_MODEL_CONTEXT_LENGTH`` configures), while the provider route
+    inferred from the model TEXT is unreachable offline and yields no evidence
+    — so a resolver that fingerprints the wrong route falls back to the
+    unknown-route 1M sizing assumption."""
+    from types import SimpleNamespace
+
+    from ouroboros import capability_evidence
+
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("USE_LOCAL_MAIN", "1")
+    for key in (
+        "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+        "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GIGACHAT_CREDENTIALS",
+        "GIGACHAT_USER", "GIGACHAT_PASSWORD", "OPENAI_COMPATIBLE_API_KEY",
+        "OPENAI_BASE_URL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    calls = []
+
+    def fake_probe(drive_root, **kwargs):
+        calls.append(dict(kwargs))
+        if kwargs.get("use_local"):
+            return SimpleNamespace(
+                window_tokens=n_ctx, status="confirmed", stale=False, ts="t",
+            )
+        return SimpleNamespace(window_tokens=0, status="unprobeable", stale=False, ts="")
+
+    monkeypatch.setattr(capability_evidence, "probe", fake_probe)
+    return calls
+
+
+def test_reviewer_window_default_resolves_the_effective_local_route(monkeypatch, tmp_path):
+    """The resolver's DEFAULT route is the dispatch route, not the model text.
+
+    ``resolve_reviewer_window`` defaulted ``use_local=False``, so every caller
+    that did not restate ``review_model_uses_local`` (triad ``_slot_input_limit``,
+    plan ``per_slot_input_token_limits``, deep self-review) fingerprinted the
+    provider inferred from the model id. On a local-only install that route has
+    no evidence, so sizing fell back to the 1M assumption while the request
+    itself was dispatched to a 16K local model. The predicate now lives in the
+    resolver — one authority for every present and future caller."""
+    calls = _local_only_install(monkeypatch, tmp_path)
+
+    from ouroboros.reviewer_window import reviewer_context_window
+
+    assert reviewer_context_window("openai/gpt-5.6-terra") == 16_384
+    assert calls[-1]["use_local"] is True
+    assert calls[-1]["provider"] == "local"
+
+
+def test_plan_review_sizing_honors_the_local_route(monkeypatch, tmp_path):
+    """XG-7A.1 call site 2: ``per_slot_input_token_limits`` on a local-only install.
+
+    Before the fix this produced the 1M-derived cap — a plan prompt sized for a
+    window the local model does not have, i.e. a guaranteed prompt-too-long
+    failure on a supported install."""
+    _local_only_install(monkeypatch, tmp_path)
+
+    from ouroboros.tools.plan_review import _PLAN_REVIEW_MAX_TOKENS
+    from ouroboros.tools.review_synthesis import per_slot_input_token_limits
+
+    model = "openai/gpt-5.6-terra"
+    limits = per_slot_input_token_limits(
+        [model], output_reserve=_PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000,
+    )
+    # Byte-identical to sizing pinned at the local window...
+    pinned_local = per_slot_input_token_limits(
+        [model], context_window=16_384,
+        output_reserve=_PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000,
+    )
+    assert limits == pinned_local
+    assert 0 < limits[model] < 16_384
+    # ...and far below the 1M-derived cap the old behavior produced.
+    oversized = per_slot_input_token_limits(
+        [model], context_window=1_000_000,
+        output_reserve=_PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000,
+    )
+    assert limits[model] < oversized[model]
+
+
+def test_triad_fit_sizes_against_the_local_route(monkeypatch, tmp_path):
+    """XG-7A.1 call site 1: ``_fit_shared_review_prompt`` on a local-only install.
+
+    Driven end to end through the REAL resolver (only the evidence probe is
+    faked), so the test also fails if the call site regains an explicit
+    ``use_local=False``. A ~40K-token irreducible governance prefix fits the
+    old 1M assumption comfortably — the old behavior shipped it to the 16K
+    local model — while honest local sizing must refuse it loudly."""
+    _local_only_install(monkeypatch, tmp_path)
+
+    import ouroboros.tools.review as review
+
+    monkeypatch.setattr(review, "run_cmd", lambda *a, **kw: "")  # no git in this unit
+    monkeypatch.setattr(review, "_REVIEW_PROMPT_TEMPLATE_STABLE", "{preamble}")
+    monkeypatch.setattr(
+        review, "_REVIEW_PROMPT_TEMPLATE_DYNAMIC",
+        "{current_files_section}\n{diff_text}\n{changed_files}",
+    )
+
+    stable_fields = {"preamble": "g" * (40_000 * 4)}
+    dynamic_fields = {
+        "changed_files": "a.py",
+        "diff_text": "+x",
+        "current_files_section": "full snapshot of a.py",
+    }
+
+    _assemble = _triad_assemble(review, stable_fields, dynamic_fields)
+    _, _, overflow = review._fit_triad_prompt(
+        ["openai/gpt-5.6-terra"], _assemble,
+        dynamic_fields["current_files_section"], dynamic_fields["diff_text"],
+        dynamic_fields["changed_files"], tmp_path,
+    )
+    assert "REVIEW_BLOCKED" in overflow, (
+        "a local-only install must size the triad prompt against the local "
+        "route's real window, not the provider inferred from the model text"
+    )

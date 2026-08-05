@@ -992,8 +992,13 @@ def sync_runtime_dependencies(reason: str) -> Tuple[bool, str]:
         log.info("Skipping pip install in frozen (PyInstaller) mode — deps are bundled.")
         return True, "frozen:bundled"
 
+    from ouroboros.platform_layer import pip_install_target_args
+
     req_path = REPO_DIR / "requirements.txt"
-    cmd: List[str] = [sys.executable, "-m", "pip", "install", "-q"]
+    # The sixth and last pip call site. On a packaged install `sys.executable` IS the
+    # bundled interpreter, so an unflagged install wrote into the signed bundle.
+    cmd: List[str] = [sys.executable, "-m", "pip", "install", "-q",
+                      *pip_install_target_args(sys.executable)]
     source = ""
     if req_path.exists():
         cmd += ["-r", str(req_path)]
@@ -1058,7 +1063,30 @@ def safe_restart(
     reason: str,
     unsynced_policy: str = "rescue_and_reset",
 ) -> Tuple[bool, str]:
-    """Checkout dev, sync deps, import-test, then fall back to stable if needed."""
+    """Checkout dev, sync deps, import-test, then fall back to stable if needed.
+
+    ``OUROBOROS_DISABLE_MANAGED_UPDATES=1`` is the stand lever: it keeps the deps
+    sync and the import test but skips the checkout, so a stand pinned to one sha
+    stays on it. This is the choke point EVERY unrequested tree move goes through
+    (bootstrap, owner restart, agent restart) — the local-dev bootstrap branch in
+    server.py only covered the first of the three. An explicit owner version
+    change (Update / Rollback) calls ``checkout_and_reset`` directly and is
+    deliberately still honoured: that one the operator asked for.
+    """
+    if str(os.environ.get("OUROBOROS_DISABLE_MANAGED_UPDATES", "") or "").strip() == "1":
+        append_jsonl(
+            DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            {"ts": utc_now_iso(), "type": "managed_checkout_disabled",
+             "reason": reason, "target_branch": BRANCH_DEV},
+        )
+        deps_ok, deps_msg = sync_runtime_dependencies(reason=reason)
+        if not deps_ok:
+            return False, f"Failed deps with managed checkout disabled: {deps_msg}"
+        t = import_test()
+        if t["ok"]:
+            return True, "OK: managed checkout disabled — staying on the current checkout"
+        return False, f"Import test failed with managed checkout disabled (rc={t.get('returncode', -1)})"
+
     ok, err = checkout_and_reset(BRANCH_DEV, reason=reason, unsynced_policy=unsynced_policy)
     if not ok:
         return False, f"Failed checkout {BRANCH_DEV}: {err}"

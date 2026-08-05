@@ -69,6 +69,51 @@ def test_projection_uses_explicit_runtime_limit_over_environment(data_root):
     assert ua.usage_projection(data_root, global_limit_usd=7.5)["limit_usd"] == 7.5
 
 
+def test_a_bucket_whose_rows_disclosed_no_token_counts_reports_absence_not_zero(data_root):
+    """`disclosed_tokens` keeps null as null at the ROW level, on the control schema's
+    own instruction ("null until a harness reported it — never render null as 0"), and
+    then `_breakdown_bucket` summed `int(row.get(field) or 0)` and handed back a
+    confident 0. So a page of delegated sessions that reported no token counts at all
+    displayed "0 tokens used" — the same render-unknown-as-zero claim this module
+    refuses one axis over for cost.
+
+    A bucket is absent only when NOT ONE contributing row has the count; a bucket where
+    some rows reported still sums the ones that did, rather than being erased by the
+    ones that did not."""
+    ua.record_subscription_session(
+        "sess-silent", drive_root=data_root, route="codex", task_id="t1",
+        prompt_tokens=None, completion_tokens=None, cached_tokens=None,
+        spend_usd=0.0, spend_estimated=False,
+    )
+    silent = ua.usage_breakdown(data_root)
+    assert silent["prompt_tokens"] is None
+    assert silent["completion_tokens"] is None
+    assert silent["total_tokens"] is None
+    assert silent["cached_tokens"] is None
+    # The row itself is still counted — absence of TOKENS is not absence of the row.
+    assert silent["subscription_sessions"] == 1
+
+    ua.record_subscription_session(
+        "sess-reporting", drive_root=data_root, route="codex", task_id="t1",
+        prompt_tokens=120, completion_tokens=None, cached_tokens=None,
+        spend_usd=0.0, spend_estimated=False,
+    )
+    mixed = ua.usage_breakdown(data_root)
+    assert mixed["prompt_tokens"] == 120           # the one that reported
+    assert mixed["completion_tokens"] is None      # still nobody
+    assert mixed["total_tokens"] == 120            # a real total of what was measured
+
+    # And a MEASURED zero stays a zero: the fix must not turn every 0 into absence.
+    ua.record_subscription_session(
+        "sess-real-zero", drive_root=data_root, route="codex", task_id="t1",
+        prompt_tokens=0, completion_tokens=0, cached_tokens=0,
+        spend_usd=0.0, spend_estimated=False,
+    )
+    measured = ua.usage_breakdown(data_root)
+    assert measured["completion_tokens"] == 0
+    assert measured["cached_tokens"] == 0
+
+
 def test_breakdown_uses_final_rows_and_keeps_unattributed_explicit(data_root):
     reservation = ua.reserve_attempt(_request(
         data_root, category="review", prompt_tokens_estimate=10,
@@ -131,6 +176,46 @@ def test_provider_failure_remains_unresolved(data_root):
     projection = ua.usage_projection(data_root)
     assert projection["unresolved_upper_bound_usd"] == 1.0
     assert _ledger(data_root)[-1]["state"] == "unresolved"
+
+
+def test_abandoned_attempt_settles_with_the_usage_the_dead_child_reported(data_root, monkeypatch):
+    """A killed out-of-process dispatch must not hold its bound forever."""
+    monkeypatch.setattr(ua, "estimate_cost_optional", lambda *a, **k: 0.42)
+    reservation = ua.reserve_attempt(_request(data_root, reservation_usd=None, max_budget_usd=5.0))
+    ua.mark_dispatched(reservation)
+    assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 5.0
+
+    state = ua.terminalize_abandoned_attempt(
+        reservation,
+        reason="child timed out",
+        usage={"prompt_tokens": 1200, "completion_tokens": 300},
+    )
+
+    assert state == "settled"
+    projection = ua.usage_projection(data_root)
+    assert projection["unresolved_upper_bound_usd"] == 0.0
+    assert projection["accounted_usd"] < 5.0
+    # Idempotent: a terminal attempt is never transitioned again (a post-terminal
+    # row would make the whole ledger unreadable for every later reader).
+    assert ua.terminalize_abandoned_attempt(reservation, reason="again") == "settled"
+    assert [row["state"] for row in _ledger(data_root)] == ["reserved", "dispatched", "settled"]
+
+
+def test_abandoned_attempt_without_reported_usage_stays_honestly_unresolved(data_root):
+    reservation = ua.reserve_attempt(_request(data_root))
+    ua.mark_dispatched(reservation)
+
+    assert ua.terminalize_abandoned_attempt(reservation, reason="child aborted") == "unresolved"
+    assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 1.0
+
+
+def test_abandoned_attempt_before_dispatch_is_released(data_root):
+    reservation = ua.reserve_attempt(_request(data_root))
+
+    assert ua.terminalize_abandoned_attempt(reservation, reason="never started") == "released"
+    projection = ua.usage_projection(data_root)
+    assert projection["reserved_usd"] == 0.0
+    assert projection["unresolved_upper_bound_usd"] == 0.0
 
 
 def test_lock_failure_is_fail_closed_before_send(data_root, monkeypatch):
@@ -985,7 +1070,7 @@ def test_claude_sdk_reserves_max_budget_and_settles_actual(data_root, monkeypatc
     monkeypatch.setattr(cc, "ClaudeSDKClient", Client)
     monkeypatch.setattr(cc, "ResultMessage", Result)
 
-    result = asyncio.run(cc._run_edit_async("do work", str(data_root), budget=2.0))
+    result = asyncio.run(cc._run_readonly_async("do work", str(data_root), max_budget_usd=2.0))
     assert result.success is True
     assert result.usage["ledger_attempt_ids"]
     projection = ua.usage_projection(data_root)
@@ -1124,3 +1209,70 @@ def test_cache_bearing_sends_are_measured_on_every_cache_inclusive_route(tmp_pat
     )
     measured = get_token_density(root, normalize_model_identity("gigachat/some-model"))
     assert abs(measured - 1.5) < 1e-6
+
+
+def test_an_open_row_is_not_final_however_little_it_costs(data_root):
+    """`cost_final` asked a STATE question of a dollar sum on three of its four terms.
+
+    `_reservation_cost` returns exactly `0.0` for `provider="local"` — a first-class
+    supported configuration, not a fixture — so a DISPATCHED row, a physical send still in
+    flight, held a $0.00 bound, added nothing to `unresolved`, and left the projection
+    reporting `cost_final: True`. `not reserved` and `not unresolved` were the two terms
+    the estimated-spend fix did not reach.
+    """
+    reservation = ua.reserve_attempt(_request(
+        data_root, model="local/test", provider="local", reservation_usd=None))
+    assert reservation.reservation_upper_bound_usd == 0.0, \
+        "a local send really does reserve exactly zero — this is the trap, not a mock"
+    ua.mark_dispatched(reservation)
+
+    projection = ua.usage_projection(data_root)
+    assert projection["unresolved_upper_bound_usd"] == 0.0
+    assert projection["unknown_unmetered"] == 0
+    assert projection["cost_final"] is False, \
+        "a send in flight is open however little it is expected to cost"
+
+    # Settling it closes the row — `_final_rows` keys by attempt_id, so the dispatched row
+    # is REPLACED, not accumulated. Without that the count would never reach zero.
+    ua.settle_attempt(reservation, {"prompt_tokens": 1}, cost_usd=0.0, cost_final=True)
+    assert ua.usage_projection(data_root)["cost_final"] is True
+
+    # And a RESERVED row at the same zero bound is open for the same reason.
+    ua.reserve_attempt(_request(
+        data_root, model="local/test", provider="local", reservation_usd=None))
+    assert ua.usage_projection(data_root)["reserved_usd"] == 0.0
+    assert ua.usage_projection(data_root)["cost_final"] is False
+
+
+def test_a_non_final_projection_names_its_cause(data_root):
+    """A flag without its cause is not reconstructible (docs/DEVELOPMENT.md).
+
+    An estimated $0.00 makes every dollar bucket zero and `unknown_unmetered` zero, so
+    `cost_final: false` arrived with nothing anywhere on the projection — or in the
+    dashboard it feeds — that could explain it. The count that DECIDES finality is the
+    same number that discloses it, so the two cannot disagree.
+    """
+    ua.record_subscription_session(
+        "s-est", drive_root=data_root, route="r", task_id="t", root_task_id="root",
+        spend_usd=0.0, spend_estimated=True)
+    projection = ua.usage_projection(data_root)
+    assert projection["cost_final"] is False
+    assert [projection[key] for key in (
+        "settled_usd", "confirmed_usd", "estimated_usd", "reserved_usd",
+        "unresolved_upper_bound_usd", "accounted_usd")] == [0.0] * 6
+    assert projection["unknown_unmetered"] == 0
+    assert projection["non_final_rows"] == 1, \
+        "the ONLY field on the projection that explains the flag"
+
+    # A second open row of a different kind is counted too, so the number is a real cause
+    # and not a boolean wearing an integer's clothes.
+    ua.mark_dispatched(ua.reserve_attempt(_request(data_root, reservation_usd=2.0)))
+    second = ua.usage_projection(data_root)
+    assert second["non_final_rows"] == 2 and second["cost_final"] is False
+
+    # A fully settled ledger says so with the same field.
+    ua.record_subscription_session(
+        "s-free", drive_root=data_root / "free", route="r", task_id="t",
+        root_task_id="root", spend_usd=0.0)
+    free = ua.usage_projection(data_root / "free")
+    assert free["non_final_rows"] == 0 and free["cost_final"] is True
