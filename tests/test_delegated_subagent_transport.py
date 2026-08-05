@@ -4789,7 +4789,9 @@ def test_the_human_keeps_the_live_stream_while_the_model_waits(tmp_path, monkeyp
 
     assert len(emitted) == len(out["advances"]), (emitted, out["advances"])
     assert emitted[0][1] < started + 1.0, "the first advance must not wait for the window"
-    assert all(at < returned for _, at in emitted)
+    # <=, not <: Windows's monotonic clock ticks at ~15.6ms, so an emit and the
+    # return inside one tick read EQUAL — the invariant is observed-by-return.
+    assert all(at <= returned for _, at in emitted)
     assert any("running tests" in text for text, _ in emitted), emitted
     assert all("run-1" in text for text, _ in emitted), emitted
 

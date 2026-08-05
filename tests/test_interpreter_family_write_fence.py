@@ -474,8 +474,10 @@ def test_legitimate_deliverable_writes_stay_allowed(tmp_path):
         # Computed filename, cwd outside the repo: cannot reach the repo.
         ["python3", "-c", "open(chr(100)+'eliverable.dat','w').write('x')"],
         ["node", "-e", "require('fs').writeFileSync(process.env.OUT,'x')"],
-        # A python READ is provably a read, wherever it points.
-        ["python3.11", "-c", f"print(open('{repo}/x.py').read())"],
+        # A python READ is provably a read, wherever it points. as_posix() keeps the
+        # source valid python on Windows too (raw C:\Users would be a \U escape,
+        # the parse would fail, and the fail-closed mention-scan would refuse).
+        ["python3.11", "-c", f"print(open('{pathlib.PurePath(repo).as_posix()}/x.py').read())"],
     ]
     for argv in allowed:
         assert light_shell_repo_mutation(
@@ -539,9 +541,10 @@ def test_the_price_of_the_inversion_is_named(tmp_path):
         repo_dir=repo, cwd=str(outside), work_dir=outside,
     ) is False
     assert light_shell_repo_mutation(
-        ["python3.11", "-c", f"print(open('{repo}/x.py').read())"],
+        ["python3.11", "-c",
+         f"print(open('{pathlib.PurePath(repo).as_posix()}/x.py').read())"],
         repo_dir=repo, cwd=str(outside), work_dir=outside,
-    ) is False
+    ) is False  # as_posix(): raw backslashes are escapes in python source (see above)
 
     # DISCLOSED HOLE, pinned so the claim above stays honest: "names a repo path"
     # means ABSOLUTE or `./`/`../`-prefixed. `EMBEDDED_RELATIVE_PATH_RE` anchors on
@@ -733,11 +736,14 @@ def test_the_template_literal_exact_root_hole_is_disclosed_not_fenced(tmp_path):
         return 'require("fs").rmSync(String.raw`' + root + '`, {recursive:true})'
 
     # 1. THE HARVEST: the backtick is an ordinary path byte, so the token is the root
-    #    plus the closing backtick — a sibling name, not the root.
+    #    plus the closing backtick — a sibling name, not the root. Each grammar is
+    #    probed on a synthetic literal of its own spelling (NOT the host's tmp path,
+    #    whose shape follows the host and starved the POSIX regex on Windows).
+    posix_repo = "/srv/host/repo"
     win_tokens = EMBEDDED_WINDOWS_ABSOLUTE_PATH_RE.findall(_rm_root(str(windows_repo)))
-    posix_tokens = embedded_absolute_path_tokens(_rm_root(str(repo)))
+    posix_tokens = embedded_absolute_path_tokens(_rm_root(posix_repo))
     assert win_tokens == [str(windows_repo) + "`"], win_tokens
-    assert posix_tokens == [str(repo) + "`"], posix_tokens
+    assert posix_tokens == [posix_repo + "`"], posix_tokens
 
     # 2. THE DISCLOSED HOLE: deleting the exact root through a template literal is
     #    ALLOWED in both spellings, because the harvested token reads as a sibling.
