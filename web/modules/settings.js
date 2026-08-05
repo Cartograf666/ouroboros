@@ -1242,7 +1242,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 statusType = 'warn';
             }
             if (reviewAcks > 0) {
-                statusMsg = `${statusMsg} Confirmed a 1M-token window for ${reviewAcks} scope-review route(s).`;
+                statusMsg = `${statusMsg} Confirmed the required context window for ${reviewAcks} scope-review route(s).`;
             }
             if (reviewAckError) {
                 statusMsg = `${statusMsg} The scope-reviewer window confirmation was not saved: ${reviewAckError}`;

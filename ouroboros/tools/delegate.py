@@ -24,6 +24,7 @@ a dict this process happens to still hold.
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import logging
 import pathlib
@@ -55,7 +56,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 log = logging.getLogger(__name__)
 
 _TERMINAL_STATES = custody.TERMINAL_STATES
-_SUCCEEDED_STATES = custody.SUCCEEDED_STATES
 _POLL_INTERVAL_SEC = 3.0
 # Claudexor's own schema bound on maxSeconds (packages/schema/src/control.ts).
 _CLAUDEXOR_MAX_SECONDS = 604_800
@@ -430,7 +430,7 @@ def _access_evidence(detail: Dict[str, Any], expected: str) -> Dict[str, Any]:
               "verified": bool(effective), "state": state}
     if effective:
         return report
-    if state in _SUCCEEDED_STATES:
+    if state in custody.SUCCEEDED_STATES:
         return {**report, "note":
                 "this run SUCCEEDED without ever disclosing an effective access "
                 f"profile, so there is no evidence the engine enforced {expected!r} — "
@@ -734,12 +734,6 @@ def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str,
                             full_ok=full_ok, full_note=full_note)
 
 
-# Proven-coverage ledger for staged artifacts: merged, sorted [start, end] line
-# intervals actually SERVED to the reader, keyed by path plus CONTENT hash — a re-wait
-# re-stages the identical payload and must not void an honest reader's partial proof,
-# while changed content honestly resets it. Process-local by design: the DURABLE fact
-# is the acknowledgement row itself; a restarted worker re-proves coverage by
-# re-reading, it never inherits an unproven claim.
 # -- tools --------------------------------------------------------------------
 
 
@@ -1365,7 +1359,7 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     except (TypeError, ValueError):
         window = get_delegate_wait_sec()
     window = max(1, min(window, ceiling))
-    from ouroboros.deadline_utils import deadline_remaining_sec
+    from ouroboros.deadline_utils import deadline_remaining_sec, parse_deadline_ts
 
     remaining = int(deadline_remaining_sec(ctx))
     if remaining > 0:
@@ -1384,10 +1378,6 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     # what its cap really is, from the durable start row. A nanny that cannot see
     # these confabulates "exceeded the cap" out of its own impatience. Absent facts
     # (an old row, an unknown run) stay null — never invented.
-    import datetime as _dt
-
-    from ouroboros.deadline_utils import parse_deadline_ts
-
     _started_ts, _run_max_seconds = custody.run_timing(custody.custody_root(ctx), rid)
     _started_at = parse_deadline_ts(_started_ts)
 

@@ -40,6 +40,12 @@ dependencies = [
     "uvicorn[standard]",
     "websockets",
     "pytest>=7.0",
+    # Runtime, not test-only: the hermetic commit gate's parallel pass hard-blocks
+    # with PREFLIGHT_PLUGIN_MISSING rather than degrading to serial, so a wheel /
+    # `pip install .` that carries pytest without these cannot commit at all.
+    # Floors kept in step with requirements.txt and _REQUIRED_PREFLIGHT_PLUGINS.
+    "pytest-xdist>=3.5",
+    "pytest-timeout>=2.1",
     "claude-agent-sdk>=0.1.60",
     "mcp>=1.6,<2.0",
     "PyYAML>=6.0",
@@ -84,7 +90,7 @@ markers = [
     "ui_browser: launches the real Ouroboros web UI in host/direct mode; excluded from default local runs",
     "ui_browser_docker: launches UI smoke checks against Docker runtime; excluded from default local runs",
     "portable_detail: portable/build artifact detail checks; excluded from default local runs",
-    "serial: real subprocess / real port / mutable module-global test — run in a serial pass, excluded from the `-n auto` parallel pass via `-m 'not serial'` (see .github/workflows/ci.yml)",
+    "serial: real subprocess / real port / mutable module-global test — run in a serial pass, excluded from the `-n auto` parallel pass via `-m 'not serial'` (see .github/workflows/ci.yml AND the hermetic commit gate ouroboros/preflight_runner.py, which runs the same two-pass split)",
     "skill_smoke: real-network OuroborosHub official-skill install + review-flow smoke; excluded from default local runs, opt in via `pytest -m skill_smoke` (canonical lane description: docs/DEVELOPMENT.md 'Pytest marker lanes')",
 ]
 

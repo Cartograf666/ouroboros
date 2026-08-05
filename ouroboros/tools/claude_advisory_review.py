@@ -768,6 +768,16 @@ def _advisory_sdk_budget(ctx: ToolContext, active_scope, drive_root, repo_dir) -
     return min(caps) if caps else None
 
 
+def _note_meta_error(ctx: ToolContext, meta: dict, err_msg: str) -> None:
+    """Record an advisory failure on the ctx meta snapshot (best-effort)."""
+    try:
+        meta["status"] = "error"
+        meta["error"] = err_msg
+        setattr(ctx, "_last_claude_advisory_meta", dict(meta))
+    except Exception:
+        pass
+
+
 def _run_claude_advisory(
     repo_dir: pathlib.Path,
     commit_message: str,
@@ -942,12 +952,7 @@ def _run_claude_advisory(
                 diag=diag,
             )
             log.error("Advisory SDK failure:\n%s", err_msg)
-            try:
-                meta["status"] = "error"
-                meta["error"] = err_msg
-                setattr(ctx, "_last_claude_advisory_meta", dict(meta))
-            except Exception:
-                pass
+            _note_meta_error(ctx, meta, err_msg)
             return [], err_msg, model, prompt_chars
 
         raw_text = str(result.result_text or "")
@@ -998,12 +1003,7 @@ def _run_claude_advisory(
                 "reason": "paid advisory SDK result had empty output",
                 "review_surface": review_surface,
             })
-            try:
-                meta["status"] = "error"
-                meta["error"] = err_msg
-                setattr(ctx, "_last_claude_advisory_meta", dict(meta))
-            except Exception:
-                pass
+            _note_meta_error(ctx, meta, err_msg)
             return [], err_msg, model, prompt_chars
 
         items = _parse_advisory_output(raw_text)
@@ -1031,12 +1031,7 @@ def _run_claude_advisory(
                 "reason": contract_error,
                 "review_surface": review_surface,
             })
-            try:
-                meta["status"] = "error"
-                meta["error"] = err_msg
-                setattr(ctx, "_last_claude_advisory_meta", dict(meta))
-            except Exception:
-                pass
+            _note_meta_error(ctx, meta, err_msg)
             return [], err_msg, model, prompt_chars
 
         if contract_warning:

@@ -633,7 +633,7 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
                 if not evt.get(_field) and _task.get(_field):
                     evt[_field] = str(_task.get(_field))
 
-    # Normalize usage across loop.py, web_search, and claude_code_edit producers.
+    # Normalize usage across loop.py, web_search, and delegated-run producers.
     # Tolerant coercion: one malformed token field must not raise and drop the
     # whole round from the budget ledger and events.jsonl (the exception would
     # be swallowed by dispatch_event and the cost silently lost).

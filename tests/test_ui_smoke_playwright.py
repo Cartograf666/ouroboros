@@ -3119,7 +3119,7 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
                 assert "1,000,000-token context window" in dialogs[0]
                 assert "openai-compatible::scope-reviewer-x" in dialogs[0], "the ack must name the exact route"
                 status_text = page.locator("#settings-status").inner_text()
-                assert "Confirmed a 1M-token window for 1 scope-review route(s)." in status_text
+                assert "Confirmed the required context window for 1 scope-review route(s)." in status_text
                 evidence = json.loads((data_dir / "state" / "capability_evidence.json").read_text(encoding="utf-8"))
                 acked = [
                     entry for entry in (evidence.get("acks") or evidence.get("probes") or {}).values()

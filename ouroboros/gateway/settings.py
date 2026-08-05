@@ -65,13 +65,6 @@ def _get_lan_ip() -> str:
         return ""
 
 
-_WILDCARD_HOSTS = frozenset({"0.0.0.0", ""})
-
-
-def _is_wildcard_host(host: str) -> bool:
-    return host in _WILDCARD_HOSTS
-
-
 def _trust_nonlocal_bind_without_password_enabled() -> bool:
     raw = os.environ.get("OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD", "")
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -92,12 +85,9 @@ def _build_network_meta(bind_host: str, bind_port: int) -> dict:
             "recommended_url": "",
             "warning": "Server is bound to localhost — not accessible from other devices.",
         }
-    wildcard = _is_wildcard_host(bind_host)
+    wildcard = bind_host in ("0.0.0.0", "")
     if wildcard:
-        if is_container_env():
-            lan_ip = ""
-        else:
-            lan_ip = _get_lan_ip()
+        lan_ip = "" if is_container_env() else _get_lan_ip()
     elif bind_host in ("::", "[::]"):
         # AF_INET startup cannot advertise an IPv6 wildcard LAN IP reliably.
         lan_ip = ""
@@ -337,6 +327,13 @@ def _start_supervisor_if_needed_for_request(request: Request, settings: dict) ->
     return bool(callback(settings)) if callable(callback) else False
 
 
+async def _json_body_or_empty(request: Request) -> Any:
+    try:
+        return await request.json()
+    except Exception:
+        return {}
+
+
 def _owner_audit(request: Request, action: str, payload: Dict[str, Any]) -> None:
     try:
         drive_root = request_drive_root(request)
@@ -445,10 +442,7 @@ def _has_started_agent_tasks() -> bool:
 
 async def api_owner_runtime_mode(request: Request) -> JSONResponse:
     """Persist the owner-selected runtime mode for the next boot."""
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await _json_body_or_empty(request)
     from ouroboros import config as _config
 
     raw_mode = str((body or {}).get("mode") or "").strip().lower()
@@ -485,10 +479,7 @@ async def api_owner_runtime_mode(request: Request) -> JSONResponse:
 
 async def api_owner_auto_grant(request: Request) -> JSONResponse:
     """Persist the owner auto-grant toggle outside generic settings writes."""
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await _json_body_or_empty(request)
     if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
         return json_error("'enabled' must be a boolean", 400)
     enabled = bool(body.get("enabled"))
@@ -498,6 +489,21 @@ async def api_owner_auto_grant(request: Request) -> JSONResponse:
     os.environ["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"] = current["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"]
     _owner_audit(request, "auto_grant", {"enabled": enabled})
     return JSONResponse({"ok": True, "enabled": enabled})
+
+
+def _provider_base_url(settings: Dict[str, Any], provider: str) -> str:
+    """The settings key a provider's base URL resolves through (shared by both routes)."""
+    if provider == "openai":
+        return str(settings.get("OPENAI_BASE_URL") or "")
+    if provider == "openai-compatible":
+        return str(settings.get("OPENAI_COMPATIBLE_BASE_URL") or "")
+    if provider == "cloudru":
+        return str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "")
+    if provider == "gigachat":
+        return str(settings.get("GIGACHAT_BASE_URL") or "")
+    if provider == "minimax":
+        return resolve_minimax_base_url(settings.get("MINIMAX_REGION") or "")
+    return ""
 
 
 def _active_main_route(
@@ -516,17 +522,7 @@ def _active_main_route(
 
     model = str(model_override or settings.get("OUROBOROS_MODEL") or _config.SETTINGS_DEFAULTS.get("OUROBOROS_MODEL") or "").strip()
     provider = provider_for_model(model)
-    base_url = ""
-    if provider == "openai":
-        base_url = str(settings.get("OPENAI_BASE_URL") or "")
-    elif provider == "openai-compatible":
-        base_url = str(settings.get("OPENAI_COMPATIBLE_BASE_URL") or "")
-    elif provider == "cloudru":
-        base_url = str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "")
-    elif provider == "gigachat":
-        base_url = str(settings.get("GIGACHAT_BASE_URL") or "")
-    elif provider == "minimax":
-        base_url = resolve_minimax_base_url(settings.get("MINIMAX_REGION") or "")
+    base_url = _provider_base_url(settings, provider)
     # CW7 (v6.34.0): honour the USE_LOCAL_MAIN routing setting — a local-routed main
     # lane must report provider='local' so the Max gate consults the local n_ctx
     # (Capability Evidence local-health) instead of the remote OUROBOROS_MODEL metadata.
@@ -638,17 +634,7 @@ def _review_slot_route(settings: Dict[str, Any], model: str, *, session: bool = 
         return {"provider": SESSION_ROUTE_PROVIDER, "model": str(model or ""),
                 "base_url": "", "use_local": False}
     provider = provider_for_model(str(model or ""))
-    base_url = ""
-    if provider == "openai":
-        base_url = str(settings.get("OPENAI_BASE_URL") or "")
-    elif provider == "openai-compatible":
-        base_url = str(settings.get("OPENAI_COMPATIBLE_BASE_URL") or "")
-    elif provider == "cloudru":
-        base_url = str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "")
-    elif provider == "gigachat":
-        base_url = str(settings.get("GIGACHAT_BASE_URL") or "")
-    elif provider == "minimax":
-        base_url = resolve_minimax_base_url(settings.get("MINIMAX_REGION") or "")
+    base_url = _provider_base_url(settings, provider)
     use_local = provider == "local" or str(model or "").endswith(" (local)")
     return {
         "provider": "local" if use_local else provider,
@@ -926,10 +912,7 @@ async def api_owner_context_mode(request: Request) -> JSONResponse:
     Owner-only like runtime mode, but NOT boot-pinned: it hot-applies on the next
     task (mirrors the auto-grant toggle), so no restart is required.
     """
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await _json_body_or_empty(request)
     from ouroboros import config as _config
 
     raw_mode = str((body or {}).get("mode") or "").strip().lower()
@@ -986,10 +969,7 @@ async def api_owner_scope_review_floor(request: Request) -> JSONResponse:
     surface is frozen and because an owner customization is never destroyed: the write is
     accepted, stored, audited, and answered with an explicit deprecation notice naming the
     control that actually decides."""
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await _json_body_or_empty(request)
     raw = str((body or {}).get("floor") or "").strip().lower()
     if raw not in {"blocking_1m", "advisory"}:
         return json_error("'floor' must be one of: blocking_1m, advisory", 400)
@@ -1022,10 +1002,7 @@ async def api_owner_safety_mode(request: Request) -> JSONResponse:
     ratcheted in save_settings — ONLY this dedicated, audited endpoint may lower it.
     The deterministic registry sandbox, protected paths, and light-mode guards run
     in every mode (BIBLE P3: the LLM supervisor is a layer, not the floor)."""
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await _json_body_or_empty(request)
     from ouroboros import config as _config
 
     raw_mode = str((body or {}).get("mode") or "").strip().lower()
@@ -1051,10 +1028,7 @@ async def api_acknowledge_capability(request: Request) -> JSONResponse:
     only the exact provider+model+base_url+headers/options it was issued for, and
     is invalidated by any route change. CI/headless may supply the same ack via
     config, but it must carry the same fingerprint (no repo-wide trust flag)."""
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await _json_body_or_empty(request)
     provider = str((body or {}).get("provider") or "").strip()
     model = str((body or {}).get("model") or "").strip()
     if not provider or not model:
@@ -1232,9 +1206,8 @@ async def api_claude_code_install(request: Request) -> JSONResponse:
     """Repair/update Claude runtime using the app-managed interpreter."""
     try:
         import subprocess as _sp
-        import sys as _sys
 
-        interpreter = _sys.executable
+        interpreter = sys.executable
         try:
             from ouroboros.platform_layer import resolve_claude_runtime
             rt = resolve_claude_runtime()
@@ -1245,7 +1218,6 @@ async def api_claude_code_install(request: Request) -> JSONResponse:
 
         # Import SDK baseline at call time: one SSOT, clean endpoint error if broken.
         from ouroboros.launcher_bootstrap import _CLAUDE_SDK_BASELINE as sdk_baseline
-
         from ouroboros.platform_layer import pip_install_target_args
 
         result = await asyncio.to_thread(
@@ -1278,6 +1250,73 @@ async def api_claude_code_install(request: Request) -> JSONResponse:
         }, status_code=500)
 
 
+def _apply_settings_save_side_effects(
+    request: Request,
+    current: Dict[str, Any],
+    old_effective_settings: Dict[str, Any],
+    all_changed: list,
+) -> None:
+    """Post-save hot-reload side effects (MCP, extensions, supervisor budgets/timeouts)."""
+    if any(k in all_changed for k in ("MCP_ENABLED", "MCP_SERVERS", "MCP_TOOL_TIMEOUT_SEC")):
+        try:
+            from ouroboros.mcp_client import (
+                reconfigure_from_settings as _mcp_reconfigure,
+                refresh_all_background as _mcp_refresh_background,
+            )
+            _mcp_reconfigure(current)
+            _mcp_refresh_background(reason="settings")
+        except Exception:
+            log.warning("MCP reconfigure after settings change failed", exc_info=True)
+
+    # Skills repo/runtime changes require extension loader reconciliation.
+    try:
+        from ouroboros.extension_loader import reload_all as _reload_extensions
+        new_path = str(current.get("OUROBOROS_SKILLS_REPO_PATH") or "").strip()
+        old_path = str(old_effective_settings.get("OUROBOROS_SKILLS_REPO_PATH") or "").strip()
+        new_runtime_mode = str(current.get("OUROBOROS_RUNTIME_MODE") or "").strip()
+        old_runtime_mode = str(old_effective_settings.get("OUROBOROS_RUNTIME_MODE") or "").strip()
+        if new_path != old_path or new_runtime_mode != old_runtime_mode:
+            # Use load_settings so extensions do not capture a stale snapshot.
+            from ouroboros.config import load_settings as _load_settings
+            reload_drive_root = pathlib.Path(
+                request.app.state.drive_root
+                if hasattr(request.app, "state") and hasattr(request.app.state, "drive_root")
+                else request_drive_root(request)
+            )
+            if (
+                (bool(os.environ.get("PYTEST_CURRENT_TEST")) or "pytest" in sys.modules)
+                and reload_drive_root == pathlib.Path.home() / "Ouroboros" / "data"
+                and not os.environ.get("OUROBOROS_DATA_DIR")
+            ):
+                log.info("Skipping extension reload_all against real DATA_DIR during pytest settings save")
+            else:
+                _reload_extensions(
+                    reload_drive_root,
+                    _load_settings,
+                    repo_path=new_path or None,
+                )
+    except Exception:
+        log.error("Extension reload after settings change failed", exc_info=True)
+
+    try:
+        from supervisor.state import refresh_budget_from_settings
+        refresh_budget_from_settings(current)
+    except Exception:
+        pass
+    try:
+        from supervisor.queue import refresh_timeouts_from_settings
+        refresh_timeouts_from_settings(current)
+    except Exception:
+        pass
+    try:
+        from supervisor.message_bus import refresh_budget_limit
+        raw_budget = current.get("TOTAL_BUDGET")
+        new_budget = float(raw_budget) if raw_budget is not None else 0.0
+        refresh_budget_limit(new_budget)
+    except Exception:
+        pass
+
+
 async def api_settings_post(request: Request) -> JSONResponse:
     try:
         body = await request.json()
@@ -1303,9 +1342,6 @@ async def api_settings_post(request: Request) -> JSONResponse:
             raw_cadence = str(body.get(cadence_key) or "").strip()
             if raw_cadence and not _config.is_valid_post_task_evolution_cadence(raw_cadence):
                 return json_error(f"{cadence_key} must be one of: off, llm, every_n:<positive int>.", 400)
-        # Reviewer-slot SSOT (6.1): refuse a malformed structured value AT SAVE
-        # TIME with its row-precise reason — persisting it would make every
-        # review surface block later with the same message but a worse moment.
         # Reviewer-slot SSOT (6.1): refuse a malformed structured value with 400;
         # disclose (never block, recommendation A) the all-delegated API fallback
         # (D4) from the INCOMING value. Both live in reviewer_slot_save_check.
@@ -1441,64 +1477,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
         _apply_settings_to_env(current)
         _start_supervisor_if_needed_for_request(request, current)
 
-        if any(k in all_changed for k in ("MCP_ENABLED", "MCP_SERVERS", "MCP_TOOL_TIMEOUT_SEC")):
-            try:
-                from ouroboros.mcp_client import (
-                    reconfigure_from_settings as _mcp_reconfigure,
-                    refresh_all_background as _mcp_refresh_background,
-                )
-                _mcp_reconfigure(current)
-                _mcp_refresh_background(reason="settings")
-            except Exception:
-                log.warning("MCP reconfigure after settings change failed", exc_info=True)
-
-        # Skills repo/runtime changes require extension loader reconciliation.
-        try:
-            from ouroboros.extension_loader import reload_all as _reload_extensions
-            new_path = str(current.get("OUROBOROS_SKILLS_REPO_PATH") or "").strip()
-            old_path = str(old_effective_settings.get("OUROBOROS_SKILLS_REPO_PATH") or "").strip()
-            new_runtime_mode = str(current.get("OUROBOROS_RUNTIME_MODE") or "").strip()
-            old_runtime_mode = str(old_effective_settings.get("OUROBOROS_RUNTIME_MODE") or "").strip()
-            if new_path != old_path or new_runtime_mode != old_runtime_mode:
-                # Use load_settings so extensions do not capture a stale snapshot.
-                from ouroboros.config import load_settings as _load_settings
-                reload_drive_root = pathlib.Path(
-                    request.app.state.drive_root
-                    if hasattr(request.app, "state") and hasattr(request.app.state, "drive_root")
-                    else request_drive_root(request)
-                )
-                if (
-                    (bool(os.environ.get("PYTEST_CURRENT_TEST")) or "pytest" in sys.modules)
-                    and reload_drive_root == pathlib.Path.home() / "Ouroboros" / "data"
-                    and not os.environ.get("OUROBOROS_DATA_DIR")
-                ):
-                    log.info("Skipping extension reload_all against real DATA_DIR during pytest settings save")
-                else:
-                    _reload_extensions(
-                        reload_drive_root,
-                        _load_settings,
-                        repo_path=new_path or None,
-                    )
-        except Exception:
-            log.error("Extension reload after settings change failed", exc_info=True)
-
-        try:
-            from supervisor.state import refresh_budget_from_settings
-            refresh_budget_from_settings(current)
-        except Exception:
-            pass
-        try:
-            from supervisor.queue import refresh_timeouts_from_settings
-            refresh_timeouts_from_settings(current)
-        except Exception:
-            pass
-        try:
-            from supervisor.message_bus import refresh_budget_limit
-            raw_budget = current.get("TOTAL_BUDGET")
-            new_budget = float(raw_budget) if raw_budget is not None else 0.0
-            refresh_budget_limit(new_budget)
-        except Exception:
-            pass
+        _apply_settings_save_side_effects(request, current, old_effective_settings, all_changed)
 
         warnings = []
         if _reviewer_fallback_warning:

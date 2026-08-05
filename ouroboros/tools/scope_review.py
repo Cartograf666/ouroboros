@@ -80,9 +80,7 @@ _SCOPE_REQUIRED_ITEMS = SCOPE_REQUIRED_ITEMS  # compatibility export used by tes
 from ouroboros.tools.scope_window import SCOPE_MODEL_DEFAULT as _SCOPE_MODEL_DEFAULT  # noqa: E402
 _SCOPE_MAX_TOKENS = 100_000  # 100K output tokens
 _SCOPE_REVIEW_SLOT_TIMEOUT_SEC = 900
-from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET as _REVIEW_BUDGET
-
-_SCOPE_BUDGET_TOKEN_LIMIT = _REVIEW_BUDGET
+from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET as _SCOPE_BUDGET_TOKEN_LIMIT
 
 # The shared prompt-size SSOT (920K) governs INPUT only, but the reviewer also
 # reserves _SCOPE_MAX_TOKENS for OUTPUT inside that same 1M window. 920K input +
@@ -133,7 +131,6 @@ def _scope_review_skipped_in_low_context() -> bool:
         return get_owner_context_mode() == "low"
     except Exception:
         return False
-
 
 
 # Window authority moved to `tools/scope_window.py` (module-size gate at
@@ -494,9 +491,7 @@ def _gather_scope_packs(
         if atlas_assembly_failed(atlas):
             raise _ScopeAtlasNotAssembled(atlas.manifest, atlas_assembly_failure_reason(atlas))
         repo_pack_section = atlas.text or "(no additional repo files)"
-    except _ScopeAtlasNotAssembled:
-        raise
-    except RuntimeError:
+    except RuntimeError:  # includes _ScopeAtlasNotAssembled
         raise
     except Exception as exc:
         raise RuntimeError(f"review_context_atlas error: {exc}") from exc
@@ -511,25 +506,6 @@ def _record_ladder_steps(steps: list) -> None:
     manifest = dict(_SCOPE_CONTEXT_MANIFEST.get({}) or {})
     manifest["ladder_steps"] = list(steps)
     _SCOPE_CONTEXT_MANIFEST.set(manifest)
-
-
-def _ladder_terminal_status(
-    scope_model: str, token_count: int, unassembled_required: Optional[list] = None,
-    atlas_overflowed: bool = False,
-) -> "_TouchedContextStatus":
-    """Terminal status when the guaranteed-fit ladder exhausts every step: the
-    status picks the AUTHORITY branch (sub-floor vs >=1M) while the CAUSE rides
-    separately, because the ladder terminates on two different failures — which
-    can coincide — and both authority branches must report every one that
-    happened. The window is the evidence-resolved sizing window (never a
-    hardcoded table): a sub-1M resolved window reports `budget_exceeded`."""
-    known = _scope_window(scope_model).sizing_window(_SCOPE_FAILCLOSED_WINDOW)
-    return _TouchedContextStatus(
-        status="budget_exceeded" if known and known < _SCOPE_MODEL_CONTEXT_WINDOW else "fixed_overflow",
-        token_count=token_count,
-        unassembled_required=list(unassembled_required or []),
-        atlas_overflowed=bool(atlas_overflowed),
-    )
 
 
 def _render_touched_section(
@@ -632,22 +608,12 @@ def _build_scope_history_section(scope_review_history: Optional[list]) -> str:
     )
 
 
-def _zero_context_staged_diff(repo_dir: pathlib.Path) -> str:
-    """Return every staged +/- line without unchanged hunk context."""
-    try:
-        return run_cmd(["git", "diff", "--cached", "-U0"], cwd=repo_dir)
-    except Exception:
-        return ""
-
-
 @dataclass(frozen=True)
 class _ScopePromptContext:
     drive_root: Optional[pathlib.Path] = None
     scope_model: str = ""
     governance_repo_dir: Optional[pathlib.Path] = None
     represent_binary: bool = False
-
-
 
 
 def _build_scope_prompt(
@@ -680,7 +646,6 @@ def _build_scope_prompt(
     canonical_docs = _load_canonical_context_docs(
         pathlib.Path(governance_repo_dir or repo_dir)
     )
-    critical_calibration = CRITICAL_FINDING_CALIBRATION  # noqa: F841 — used in f-string below
     rebuttal_section = _shared_build_rebuttal_section(review_rebuttal)
     _open_obs_for_scope = []
     _drive_root = pathlib.Path(drive_root) if drive_root else None
@@ -758,7 +723,7 @@ def _build_scope_prompt(
             history_block=f"{rebuttal_section}{history_section}{scope_history_section}",
             diff_text=diff_text,
             repo_pack_placeholder=repo_pack_placeholder,
-            critical_calibration=critical_calibration,
+            critical_calibration=CRITICAL_FINDING_CALIBRATION,
         )
         _SCOPE_STABLE_PREFIX_LEN.set(stable_len)
         return prompt_text
@@ -884,21 +849,29 @@ def _build_scope_prompt(
 
         if not degradable:
             if not compact_diff_attempted:
+                # Every staged +/- line without unchanged hunk context.
                 compact_diff_attempted = True
-                compact_diff = _zero_context_staged_diff(repo_dir)
+                try:
+                    compact_diff = run_cmd(["git", "diff", "--cached", "-U0"], cwd=repo_dir)
+                except Exception:
+                    compact_diff = ""
                 if compact_diff.strip() and compact_diff != diff_text:
                     diff_text = compact_diff
                     continue
             # Terminal pack status: >=1M authority is fixed_overflow; a sub-floor
             # pack is budget_exceeded here and the authority policy turns it into
             # a block unless the owner explicitly selected advisory scope. The
-            # CAUSE travels separately — both branches report the real one.
+            # CAUSE travels separately — both branches report the real one. The
+            # window is the evidence-resolved sizing window, never a hardcoded table.
             _record_ladder_steps(ladder_steps)
-            return None, _ladder_terminal_status(
-                scope_model or _get_scope_model(),
-                last_known_tokens or fixed_prompt_tokens,
-                unassembled_required=unassembled_required,
-                atlas_overflowed=atlas_overflowed,
+            known = _scope_window(
+                scope_model or _get_scope_model()
+            ).sizing_window(_SCOPE_FAILCLOSED_WINDOW)
+            return None, _TouchedContextStatus(
+                status="budget_exceeded" if known and known < _SCOPE_MODEL_CONTEXT_WINDOW else "fixed_overflow",
+                token_count=last_known_tokens or fixed_prompt_tokens,
+                unassembled_required=list(unassembled_required),
+                atlas_overflowed=bool(atlas_overflowed),
             )
         freed = 0
         while degradable and freed < deficit + 2_000:

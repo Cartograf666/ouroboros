@@ -65,6 +65,12 @@ def _stage_full_output(ctx: ToolContext, run_id: str, text: str) -> Optional[Dic
     }
 
 
+# Proven-coverage ledger for staged artifacts: merged, sorted [start, end] line
+# intervals actually SERVED to the reader, keyed by path plus CONTENT hash — a re-wait
+# re-stages the identical payload and must not void an honest reader's partial proof,
+# while changed content honestly resets it. Process-local by design: the DURABLE fact
+# is the acknowledgement row itself; a restarted worker re-proves coverage by
+# re-reading, it never inherits an unproven claim.
 _READ_COVERAGE: Dict[str, List[List[int]]] = {}
 _READ_COVERAGE_MAX_KEYS = 128
 
