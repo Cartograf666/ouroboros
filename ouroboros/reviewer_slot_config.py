@@ -93,7 +93,10 @@ class AdvisorySlotConfig:
 
     enabled: bool = True
     kind: str = "api"  # api | agent_session
-    target_id: str = ""  # session spec on agent_session; '' = shared route
+    # agent_session: harness[=model] spec ('' = shared route). api: the
+    # Claude-SDK model spelling — sonnet, opus[1m], claude-… — NOT an
+    # OpenRouter catalog id ('' = resolve_claude_code_model() default).
+    target_id: str = ""
     effort: str = "low"
     profile_id: str = ""  # optional manual credential pin (Q2-в); '' = rotation
 

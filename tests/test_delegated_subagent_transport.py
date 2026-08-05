@@ -1351,6 +1351,143 @@ def _settled_run(tmp_path, monkeypatch, summary):
             next(e for e in events if e.get("type") == "delegate_run_settled"))
 
 
+def _waited_run(tmp_path, monkeypatch, summary, requested_model="m"):
+    """Drive one terminal `delegate_wait` for `summary`; return the agent payload.
+
+    Same transport walk as `_settled_run`, with the custody row's REQUESTED
+    model under test-control — the requested-vs-applied disclosure compares it
+    against the engine summary's own `model`."""
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.gateways import claudexor as gw
+    from ouroboros.tools.registry import ToolContext
+
+    class _Stub:
+        def handshake(self): return {}
+        def get_run(self, rid): return {"lastSeq": 9, "summary": dict(summary)}
+        def remove_project(self, pid): pass
+        def close(self): pass
+
+    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
+    delegate._CUSTODY.clear()
+    delegate._CUSTODY["run-1"] = delegate._RunCustody(
+        task_id="t-a", route_id="r", model=requested_model,
+        project_id="p", project_owned=False)
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "t-a"
+    ctx.task_metadata = {"root_task_id": "t-a"}
+    payload = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
+    delegate._CUSTODY.clear()
+    return payload
+
+
+def test_the_terminal_payload_carries_the_applied_model_and_the_mismatch_delta(tmp_path, monkeypatch):
+    """(owner, 2026-08-04, option A) The APPLIED model from the run summary
+    reaches the nanny payload, and a requested≠applied pair — both non-empty —
+    is an ADVISORY capability_delta in the review lane's own lexicon, never a
+    failure: the run completes on what the engine gave, and engine aliases
+    ('sonnet' beside 'claude-opus-5') make strict equality advisory-only."""
+    # The settle seam also writes the last-delegation projection into the
+    # canonical data plane; isolate it per-test (xdist workers share the
+    # pytest-global OUROBOROS_DATA_DIR).
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path / "proj-data")
+    mismatched = _waited_run(tmp_path / "mm", monkeypatch,
+                             {"state": "succeeded", "spendUsd": 0.0, "model": "claude-opus-5"},
+                             requested_model="sonnet")
+    assert mismatched["state"] == "succeeded", "disclosed, never failed"
+    assert mismatched["model"] == "claude-opus-5"
+    assert mismatched["capability_delta"] == [{
+        "kind": "capability_delta",
+        "requested": "model sonnet",
+        "effective": "model claude-opus-5",
+        "reason": "session_route_resolves_its_own_model",
+    }]
+
+    # Agreement (or aliases matching exactly): no delta is invented.
+    agreed = _waited_run(tmp_path / "ok", monkeypatch,
+                         {"state": "succeeded", "spendUsd": 0.0, "model": "sonnet"},
+                         requested_model="sonnet")
+    assert agreed["model"] == "sonnet" and "capability_delta" not in agreed
+
+    # An engine that disclosed no model: absence stays absence — empty model,
+    # no delta, the requested value never dressed up as the applied one.
+    silent = _waited_run(tmp_path / "sil", monkeypatch,
+                         {"state": "succeeded", "spendUsd": 0.0},
+                         requested_model="sonnet")
+    assert silent["model"] == "" and "capability_delta" not in silent
+
+
+def test_the_last_delegation_projection_is_written_at_the_settle_seam(tmp_path, monkeypatch):
+    """The Subagents section's «last delegated run» receipt: {ts, route,
+    requested_model, applied_model, run_id} in the canonical data plane, and
+    the gateway status payload serves it back even with the daemon down."""
+    from ouroboros.subagents import subagent_last_delegation
+
+    # Isolated data plane: the projection is keyed off config.DATA_DIR, which
+    # xdist workers would otherwise share (and the sibling test writes it too).
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path / "proj-data")
+    _waited_run(tmp_path / "proj", monkeypatch,
+                {"state": "succeeded", "spendUsd": 0.0, "model": "claude-opus-5"},
+                requested_model="sonnet")
+    record = subagent_last_delegation()
+    assert record["route"] == "r" and record["run_id"] == "run-1"
+    assert record["requested_model"] == "sonnet"
+    assert record["applied_model"] == "claude-opus-5"
+    assert record["ts"]
+
+    # Idempotent per run: re-reading the SAME terminal run (a parent polling an
+    # already-settled delegate_wait) must not re-stamp `ts` — the "N ago" line
+    # would otherwise call an old run fresh.
+    from ouroboros.subagents import record_last_delegation
+    record_last_delegation(route="r", requested_model="sonnet",
+                           applied_model="claude-opus-5", run_id="run-1")
+    assert subagent_last_delegation()["ts"] == record["ts"]
+
+    # The status endpoint's payload carries the projection unconditionally —
+    # it is Ouroboros state, not daemon truth (daemon down ≠ receipt gone).
+    from ouroboros.gateway.claudexor_accounts import _status_payload
+
+    payload = _status_payload(False)
+    assert payload["subagent_last_delegation"]["run_id"] == "run-1"
+
+
+def test_no_receipt_on_a_failed_settlement_and_one_after_the_successful_retry(tmp_path, monkeypatch):
+    """Negative pin (delta gate 2026-08-05): a settlement whose durable
+    obligations FAILED must not mint the last-delegation receipt (it would be
+    re-minted on every retry with a fresh ts); the receipt appears exactly when
+    a retry settles successfully."""
+    import ouroboros.delegate_custody as custody_mod
+    from ouroboros.subagents import subagent_last_delegation
+
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path / "receipt-data")
+
+    real_settle = custody_mod.settle_run
+    outcomes = iter([False, True])
+
+    def _flaky_settle(drive_root, gateway, custody, detail):
+        ok = next(outcomes)
+        result = real_settle(drive_root, gateway, custody, detail)
+        if not ok:
+            custody.settled = False
+            result = dict(result)
+            result["settled"] = False
+        return result
+
+    monkeypatch.setattr(custody_mod, "settle_run", _flaky_settle)
+    monkeypatch.setattr("ouroboros.tools.delegate.custody.settle_run", _flaky_settle, raising=False)
+
+    _waited_run(tmp_path / "w1", monkeypatch,
+                {"state": "succeeded", "spendUsd": 0.0, "model": "claude-opus-5"},
+                requested_model="sonnet")
+    assert subagent_last_delegation() == {}, "receipt minted on a FAILED settlement"
+
+    _waited_run(tmp_path / "w2", monkeypatch,
+                {"state": "succeeded", "spendUsd": 0.0, "model": "claude-opus-5"},
+                requested_model="sonnet")
+    record = subagent_last_delegation()
+    assert record.get("run_id") == "run-1"
+    assert record.get("applied_model") == "claude-opus-5"
+
+
 def test_an_estimated_spend_is_not_a_settled_one(tmp_path, monkeypatch):
     """`spendUsd` is half the disclosure; `spendEstimated` is the other half.
 
@@ -4265,6 +4402,40 @@ def _wait_against_a_live_run(ctx, tmp_path, monkeypatch, *, wait_sec):
         return out, time.monotonic() - started
     finally:
         delegate._CUSTODY.clear()
+
+
+def test_wait_payload_carries_elapsed_and_cap_facts(tmp_path, monkeypatch):
+    """Nanny facts against premature cancels: the wait payload states how long
+    the run has ACTUALLY been going and what its cap really is, from the durable
+    start row — a nanny that cannot see these confabulated "exceeded the cap" at
+    153s of a 180s run and cancelled, discarding the whole spend. Facts only:
+    no auto-timeout, no threshold."""
+    from ouroboros import delegate_custody as custody
+
+    ctx = _delegating_ctx(tmp_path, acting=True)
+    drive = custody.custody_root(ctx)
+    assert custody.emit(drive, custody.STARTED, {
+        "run_id": "run-1", "task_id": "t-nanny", "route": "some-route",
+        "model": "m", "max_seconds": 180,
+    })
+
+    out, _ = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=1)
+
+    assert out["status"] == "no_progress", out
+    assert out["max_seconds"] == 180
+    assert isinstance(out["elapsed_seconds"], int) and out["elapsed_seconds"] >= 0
+
+
+def test_wait_payload_facts_stay_null_for_a_row_that_predates_them(tmp_path, monkeypatch):
+    """Absent facts stay absent: a run whose STARTED row predates `max_seconds`
+    (or whose row never landed) reports nulls, never invented numbers."""
+    ctx = _delegating_ctx(tmp_path, acting=True)
+
+    out, _ = _wait_against_a_live_run(ctx, tmp_path, monkeypatch, wait_sec=1)
+
+    assert out["status"] == "no_progress", out
+    assert out["elapsed_seconds"] is None
+    assert out["max_seconds"] is None
 
 
 def test_the_wait_window_never_outlives_the_nannys_own_deadline(tmp_path, monkeypatch):

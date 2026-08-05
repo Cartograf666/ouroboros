@@ -1323,7 +1323,14 @@ def _finish_task_done_dispatch(
                 "trace_summary_truncated": len(trace_text) > 4000,
                 "error": truncate_for_log(str(effective_result.get("error") or ""), 1000),
                 "artifact_status": str(effective_result.get("artifact_status") or ""),
+                # The terminal frame carries the route so the finished card's chip can be
+                # rebuilt on replay, and the completion-seam EVIDENCE (below) so the chip
+                # upgrades from the neutral "dispatched" decision to what actually ran.
+                "executor_route": str(effective_result.get("executor_route") or ""),
             }
+            _envelope = effective_result.get("subagent_envelope")
+            if isinstance(_envelope, dict) and isinstance(_envelope.get("execution_evidence"), dict):
+                progress_meta["execution_evidence"] = _envelope["execution_evidence"]
             if isinstance(task_done_event.get("outcome_axes"), dict):
                 progress_meta["outcome_axes"] = task_done_event["outcome_axes"]
             if task_done_event.get("reason_code"):

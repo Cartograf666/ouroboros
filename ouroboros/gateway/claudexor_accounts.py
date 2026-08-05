@@ -121,6 +121,7 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
         ClaudexorUnavailable,
         discover_daemon_at,
     )
+    from ouroboros.subagents import subagent_last_delegation
 
     daemon = get_owned_daemon().status_dict()
     payload: Dict[str, Any] = {
@@ -129,6 +130,10 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
         "harnesses": [],
         "profiles": {},
         "quota": [],
+        # The Subagents section's «last delegated run» receipt — Ouroboros's
+        # own projection, not daemon truth, so it is served even with the
+        # daemon down. {} = no delegated run recorded (absence, not a default).
+        "subagent_last_delegation": subagent_last_delegation(),
     }
     if daemon.get("state") != "running":
         return payload

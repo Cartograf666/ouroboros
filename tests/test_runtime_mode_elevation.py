@@ -578,11 +578,18 @@ def test_owner_runtime_mode_endpoint_reports_no_restart_when_mode_unchanged(isol
 
     app = Starlette(routes=[Route("/api/owner/runtime-mode", endpoint=api_owner_runtime_mode, methods=["POST"])])
     app.state.drive_root = isolated_settings.parent
+    before = isolated_settings.stat().st_mtime_ns
     response = TestClient(app).post("/api/owner/runtime-mode", json={"mode": "advanced"})
 
     assert response.status_code == 200, response.text
     assert response.json() == {"ok": True, "runtime_mode": "advanced", "restart_required": False}
     assert os.environ["OUROBOROS_RUNTIME_MODE"] == "advanced"
+    # A no-change POST must not rewrite settings.json: the rewrite raced a
+    # concurrent generic save (last-writer-wins over a stale read).
+    assert isolated_settings.stat().st_mtime_ns == before
+    assert json.loads(isolated_settings.read_text(encoding="utf-8")) == {
+        "OUROBOROS_RUNTIME_MODE": "advanced",
+    }
 
 
 def test_owner_runtime_mode_endpoint_reports_restart_until_pending_mode_is_active(isolated_settings, monkeypatch):
@@ -646,6 +653,77 @@ def test_generic_settings_save_preserves_pending_runtime_mode_without_hot_apply(
     assert on_disk["TOTAL_BUDGET"] == 77.0
     assert os.environ["OUROBOROS_RUNTIME_MODE"] == "advanced"
     assert os.environ["OUROBOROS_BOOT_RUNTIME_MODE"] == "advanced"
+
+
+def test_settings_save_warns_when_an_agent_task_is_running(isolated_settings, monkeypatch):
+    """Owner decision (2026-08-05, option B): the task-start snapshot boundary
+    stays, and a save landing while an agent task runs must SAY that the running
+    task keeps its previous reviewer/subagent config — a bare "Settings saved"
+    read as "applied to the task you are watching"."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from ouroboros import config as cfg
+    from ouroboros.gateway import settings as settings_mod
+    from ouroboros.gateway.settings import api_settings_post
+
+    _seed_disk(isolated_settings, {"OUROBOROS_RUNTIME_MODE": "advanced"})
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    # The REAL save endpoint applies saved keys to os.environ; register the key
+    # with monkeypatch so teardown restores it (the save below writes "claude",
+    # which otherwise leaks into later tests' route resolution). delenv on an
+    # ABSENT key records nothing — setenv is what makes teardown restore.
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "")
+    cfg.initialize_runtime_mode_baseline("advanced")
+    monkeypatch.setattr(settings_mod, "apply_runtime_provider_defaults", lambda s: (s, False, []))
+    monkeypatch.setattr(settings_mod, "_start_supervisor_if_needed_for_request", lambda *_a, **_k: False)
+    monkeypatch.setattr(settings_mod, "_has_started_agent_tasks", lambda: True)
+
+    app = Starlette(routes=[Route("/api/settings", endpoint=api_settings_post, methods=["POST"])])
+    app.state.drive_root = isolated_settings.parent
+    client = TestClient(app)
+
+    # A next-task-class key (the delegation route) changed while a task runs.
+    resp = client.post("/api/settings", json={"OUROBOROS_SUBAGENT_HARNESS": "off"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "saved"
+    assert data.get("agent_task_running") is True
+    warnings = data.get("warnings") or []
+    assert any("keeps the configuration it started with" in w for w in warnings), warnings
+    assert any("next task" in w for w in warnings), warnings
+
+    # No running task -> no warning noise.
+    monkeypatch.setattr(settings_mod, "_has_started_agent_tasks", lambda: False)
+    resp2 = client.post("/api/settings", json={"OUROBOROS_SUBAGENT_HARNESS": "claude"})
+    assert resp2.status_code == 200, resp2.text
+    data2 = resp2.json()
+    assert "agent_task_running" not in data2
+    assert not any("keeps the configuration" in w for w in (data2.get("warnings") or []))
+
+
+def test_started_predicate_is_read_only_and_never_constructs_the_agent(monkeypatch):
+    """Negative pin (delta gate 2026-08-05): _has_started_agent_tasks must never
+    call workers._get_chat_agent() — that CONSTRUCTS the agent and inserts the
+    canonical repo into sys.path (proven test-isolation poison). Reading the
+    existing instance (or its absence) is the whole contract."""
+    import supervisor.workers as workers
+    from ouroboros.gateway.settings import _has_started_agent_tasks
+
+    def _boom():
+        raise AssertionError("predicate constructed the agent")
+
+    monkeypatch.setattr(workers, "_get_chat_agent", _boom)
+    monkeypatch.setattr(workers, "RUNNING", {}, raising=False)
+    monkeypatch.setattr(workers, "_chat_agent", None, raising=False)
+    assert _has_started_agent_tasks() is False
+
+    class _Busy:
+        _busy = True
+
+    monkeypatch.setattr(workers, "_chat_agent", _Busy(), raising=False)
+    assert _has_started_agent_tasks() is True
 
 
 def test_owner_auto_grant_endpoint_persists_outside_generic_settings(isolated_settings, monkeypatch):

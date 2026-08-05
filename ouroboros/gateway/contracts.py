@@ -111,6 +111,11 @@ class ChatOutbound(TypedDict):
     # engine saying where it landed: a landing below the ask is disclosed on
     # `capability_delta`, not by rewriting this field.
     executor_route: NotRequired[str]
+    # The completion-seam EVIDENCE the route decision is reconciled against
+    # (subagents.envelope_from_task): delegated runs started/settled, disclosed
+    # subscription spend, engine-reported models. Terminal frames only; its
+    # absence means "no evidence yet", never "ran natively".
+    execution_evidence: NotRequired[Dict[str, Any]]
     model: NotRequired[str]
     task_group_id: NotRequired[str]
     task_event: NotRequired[str]
@@ -470,6 +475,10 @@ class SettingsSaveResponse(TypedDict, total=False):
     immediate_changed: bool
     next_task_changed: bool
     warnings: list[str]
+    # True when the save landed while an agent task was already STARTED: that
+    # task keeps its start-time config (snapshot boundary); changes apply from
+    # the next task. Queued-but-unstarted tasks re-read settings at start.
+    agent_task_running: bool
 
 
 class OwnerRuntimeModeResponse(TypedDict):

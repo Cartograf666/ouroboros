@@ -391,6 +391,10 @@ def _terminal_payload(run_id: str, detail: Dict[str, Any],
         "status": "terminal",
         "run_id": run_id,
         "state": str(summary.get("state") or ""),
+        # The APPLIED model, from the engine's own summary — '' when the run
+        # never disclosed one (live unpinned runs really do), shown as absence
+        # rather than the requested model dressed up as the applied one.
+        "model": str(summary.get("model") or ""),
         "outcome_banner": detail.get("outcomeBanner"),
         "outcome_facts": summary.get("outcomeFacts"),
         "output_conformance": summary.get("outputConformance"),
@@ -676,6 +680,19 @@ def _delivered_terminal_payload(ctx: ToolContext, run_id: str, detail: Dict[str,
     a truncated preview delivers 256 KiB wearing the whole result's name.
     """
     full = _terminal_payload(run_id, detail, authority)
+    # Requested-vs-applied model, the review lane's own lexicon and rule
+    # (AgentSessionReviewExecutor): compared only when BOTH are non-empty —
+    # the engine writes aliases ('sonnet' beside 'claude-opus-5'), so a
+    # mismatch is an advisory disclosure, never a failure of the run.
+    requested_model = str(getattr(entry, "model", "") or "") if entry is not None else ""
+    applied_model = str(full.get("model") or "")
+    if requested_model and applied_model and requested_model != applied_model:
+        full["capability_delta"] = [{
+            "kind": "capability_delta",
+            "requested": f"model {requested_model}",
+            "effective": f"model {applied_model}",
+            "reason": "session_route_resolves_its_own_model",
+        }]
     primary, full_ok, full_note = _resolve_full_primary_output(
         gateway, run_id, full.get("primary_output"))
     full["primary_output"] = primary
@@ -1138,8 +1155,10 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     ), shape={
         # The shape rides on the SAME durable row as custody, so a forensic reader never
         # has to join two events to learn what authority a run was started with.
+        # `max_seconds` rides too: delegate_wait reports elapsed-vs-cap from this row.
         "effort": route.effort, "access": access, "mode": authority.mode,
         "isolation": authority.isolation, "delegated": authority.delegated, "root": root,
+        "max_seconds": seconds,
     })
     # The AUTHORITY guidance and the CUSTODY warning are independent facts about the same
     # start, so both are said. An undurable custody row is the louder one and goes first:
@@ -1361,6 +1380,22 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     # Re-derived from the LIVE context rather than read back from custody: the nanny's
     # authority is the authority, and a lost custody record must not become a wider run.
     authority = _derive_authority(ctx)
+    # FACTS against premature cancels: how long the run has actually been going and
+    # what its cap really is, from the durable start row. A nanny that cannot see
+    # these confabulates "exceeded the cap" out of its own impatience. Absent facts
+    # (an old row, an unknown run) stay null — never invented.
+    import datetime as _dt
+
+    from ouroboros.deadline_utils import parse_deadline_ts
+
+    _started_ts, _run_max_seconds = custody.run_timing(custody.custody_root(ctx), rid)
+    _started_at = parse_deadline_ts(_started_ts)
+
+    def _run_elapsed_seconds() -> Optional[int]:
+        if _started_at is None:
+            return None
+        return max(0, int((_dt.datetime.now(tz=_dt.timezone.utc) - _started_at).total_seconds()))
+
     try:
         detail = gateway.get_run(rid)
         baseline = int(since_seq) if since_seq is not None else int(detail.get("lastSeq") or 0)
@@ -1373,9 +1408,23 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
             if breach:
                 return _halt_breached_run(ctx, gateway, entry, breach)
             if state in _TERMINAL_STATES:
+                was_settled = bool(entry.settled)
                 settlement = custody.settle_run(custody.custody_root(ctx), gateway, entry, detail)
                 payload = _delivered_terminal_payload(ctx, rid, detail, authority, entry, gateway)
                 payload["settlement"] = settlement
+                # The «last delegated run» settings receipt (Subagents section):
+                # requested vs applied model, written ONLY when THIS call performed
+                # a SUCCESSFUL settlement — a later wait re-reading an already-settled
+                # run must not re-date it (or replace a newer run as "last"), and a
+                # settlement whose durable obligations failed must not mint a receipt
+                # it would re-mint on every retry. The delegated REVIEW sessions never
+                # pass here — they have their own receipt store
+                # (reviewer_slot_last_execution.json).
+                if not was_settled and bool(settlement.get("settled")):
+                    from ouroboros.subagents import record_last_delegation
+                    record_last_delegation(
+                        route=entry.route_id, requested_model=entry.model,
+                        applied_model=str(payload.get("model") or ""), run_id=rid)
                 # D7 made load-bearing: settlement is where "paid for and never read"
                 # becomes permanent, so the parent is told in WORDS here — not left to
                 # infer it from `output_delivery.consumed`. Re-settling an already
@@ -1401,6 +1450,8 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                     "run_id": rid,
                     "state": state,
                     "last_seq": last_seq,
+                    "elapsed_seconds": _run_elapsed_seconds(),
+                    "max_seconds": _run_max_seconds or None,
                     "waiting_on_user": bool(summary.get("waitingOnUser")),
                     "timeline_tail": _timeline_tail(detail),
                     "note": "New session events since the last cursor. Call delegate_wait "
@@ -1413,6 +1464,8 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                     "state": state,
                     "last_seq": last_seq,
                     "waited_sec": window,
+                    "elapsed_seconds": _run_elapsed_seconds(),
+                    "max_seconds": _run_max_seconds or None,
                     "waiting_on_user": bool(summary.get("waitingOnUser")),
                     "reason": "non_terminal_and_no_new_session_events_within_wait_window",
                     "note": "The run is alive but silent. Decide: keep waiting (call again), "
@@ -1504,7 +1557,12 @@ def get_tools() -> List[ToolEntry]:
             ),
             "parameters": {"type": "object", "required": ["prompt"], "properties": {
                 "prompt": {"type": "string", "description": "The complete task for the delegated session."},
-                "max_seconds": {"type": "integer", "description": "Wall-clock cap for the run; narrowed to your own remaining deadline."},
+                "max_seconds": {"type": "integer", "description":
+                    "Wall-clock cap for the run; narrowed to your own remaining deadline. "
+                    "Harness runs routinely need 3-5+ minutes end to end, so do not set a "
+                    "tight cap for what feels like a quick edit. While delegate_wait shows "
+                    "an advancing cursor the run is WORKING, and it enforces this cap "
+                    "itself — cancelling a progressing run discards the whole run's spend."},
                 "retry_of": {"type": "string", "description":
                     "EXPLICIT retry token: the pending_invocation_id from a start whose "
                     "outcome was unknown (transport failure, lost response). Replays THAT "

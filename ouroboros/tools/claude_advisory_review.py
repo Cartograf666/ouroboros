@@ -790,9 +790,16 @@ def _run_claude_advisory(
 
     if delegated_route:
         model = ""  # the session route resolves its own model; reported after the run
+        _slot = None
     else:
         from ouroboros.gateways.claude_code import resolve_claude_code_model
-        model = resolve_claude_code_model()
+        from ouroboros.reviewer_slot_config import advisory_slot_config
+
+        # The advisory row's own target applies on the api kind too (6.1): here
+        # target_id is a Claude-SDK model spelling (sonnet, opus[1m], claude-…),
+        # NOT an OpenRouter catalog id; '' keeps today's environment default.
+        _slot = advisory_slot_config()
+        model = (_slot.target_id or "").strip() or resolve_claude_code_model()
     options = dict(options or {})
     drive_root = options.get("drive_root")
     include_repo_diff = bool(options.get("include_repo_diff", True))
@@ -883,7 +890,11 @@ def _run_claude_advisory(
             from ouroboros.config import resolve_effort
             from ouroboros.usage_accounting import current_usage_scope
 
-            scope_effort = resolve_effort("scope_review")
+            # D-5b fix: the api route runs at the ADVISORY row's own effort, the
+            # same field the delegated branch already honors — never the scope
+            # reviewer's. The parser guarantees a non-empty effort ("low"
+            # default, legacy config included), so the fallback is dead but honest.
+            scope_effort = _slot.effort or resolve_effort("scope_review")
             active_scope = current_usage_scope()
             max_budget_usd = options.get("max_budget_usd")
             if max_budget_usd is None:
@@ -1295,7 +1306,17 @@ def _resolve_matching_obligations(
 def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryReviewState",
                         stale_from_edit: bool, stale_from_edit_ts: Optional[str],
                         open_obs: list, open_debts: list, effective_is_fresh: bool = False) -> str:
-    """Return a concrete next-step string based on current advisory state."""
+    """Return a concrete next-step string based on current advisory state.
+
+    Snapshot binding of record-derived claims (the v6.74.5 "SyntaxError" stale
+    template that cost a release ~25 min) is enforced UPSTREAM by the
+    projection: a blocked record whose hash differs from the current tree sets
+    ``stale_from_edit`` (review_evidence hash_mismatch), which routes to the
+    generic "invalidated" message below instead of asserting the problem class
+    — that assertion only ever fires for a record of the CURRENT snapshot. The
+    one unbindable case stays as before: an uncomputable current hash cannot
+    establish a mismatch either way.
+    """
     def _debt_hint() -> str:
         parts = []
         if open_obs:

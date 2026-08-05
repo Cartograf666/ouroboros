@@ -1199,6 +1199,10 @@ Before every commit, verify the following:
   (`web/modules/subagents_settings.js`), beside Reviewer Slots: both answer "where
   and how far do subagents run". Never render a second control over the same
   settings key — two controls carry two drafts, and the last one collected wins.
+  The delegated-run MODEL is the owner's default, authored here as the `=model`
+  tail of the same key from engine discovery ("Engine default model" = empty
+  tail); reasoning effort stays derived per call, and a hand-written `:effort`
+  remainder rides through verbatim with no control over it.
 - A control the owner cannot use is worse than none. With no coding-agent
   subscription connected the Subagents section says so and points at Providers →
   Harness Accounts instead of rendering a delegation toggle whose every dispatch

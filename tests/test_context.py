@@ -27,6 +27,11 @@ def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
     assert "Under blocking" in content
     assert "non-mutating preparation" in content
     assert "begin implementation only after review closes" in content
+    # Fan-out integration mechanics (owner-approved, 2026-08-05): parallel
+    # children cannot see each other's edits, so a plan gives them disjoint
+    # write regions or plans the parent synthesis for the expected overlap.
+    assert "cannot see each other's edits" in content
+    assert "disjoint write regions" in content
     assert content.rstrip().endswith("Fix the marketplace retry flow.")
 
 

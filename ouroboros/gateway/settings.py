@@ -415,6 +415,28 @@ def _has_running_agent_tasks() -> bool:
         return False
 
 
+def _has_started_agent_tasks() -> bool:
+    """STARTED tasks only — the ones the snapshot boundary actually binds.
+
+    A queued-but-unstarted task re-reads settings in ``handle_task``, so warning
+    that it "keeps the previous configuration" would be false; ``PENDING`` is
+    deliberately excluded (unlike ``_has_running_agent_tasks``, whose callers
+    gate on any outstanding work). READ-ONLY on purpose: ``_get_chat_agent()``
+    CONSTRUCTS the agent (and inserts the canonical repo into ``sys.path``) —
+    an answer to "is anything started?" must never start something to find out.
+    Disclosed residual: a live EPHEMERAL turn (workers' local ephemeral agent)
+    is invisible here — it holds no reviewer/subagent stage this warning
+    guards, and reaching it read-only would require a new surface."""
+    try:
+        import supervisor.workers as _workers
+        if _workers.RUNNING:
+            return True
+        agent = getattr(_workers, "_chat_agent", None)
+        return bool(getattr(agent, "_busy", False))
+    except Exception:
+        return False
+
+
 async def api_owner_runtime_mode(request: Request) -> JSONResponse:
     """Persist the owner-selected runtime mode for the next boot."""
     try:
@@ -431,9 +453,13 @@ async def api_owner_runtime_mode(request: Request) -> JSONResponse:
     active_mode = _config.get_runtime_mode()
     next_mode = _config.normalize_runtime_mode(raw_mode)
     restart_required = active_mode != next_mode
-    current = dict(old_settings)
-    current["OUROBOROS_RUNTIME_MODE"] = next_mode
-    _owner_write_settings(current)
+    if next_mode != previous_mode:
+        # A no-change POST must not rewrite settings.json: the rewrite raced a
+        # concurrent generic save (last-writer-wins over a stale read) for zero
+        # information gain. The audit and the response stay identical either way.
+        current = dict(old_settings)
+        current["OUROBOROS_RUNTIME_MODE"] = next_mode
+        _owner_write_settings(current)
     _owner_audit(
         request,
         "runtime_mode",
@@ -1364,6 +1390,17 @@ async def api_settings_post(request: Request) -> JSONResponse:
         ]
         restart_keys = _classify_settings_changes(old_effective_settings, current)
 
+        # Snapshot BEFORE the save lands: only a task already started at that
+        # moment keeps the previous configuration. Measuring after the write
+        # would misreport a task that started in between (it re-reads the NEW
+        # settings in handle_task) as one that kept the old. Disclosed residual
+        # (adjudicated 2026-08-05): the opposite ms-interleaving exists too — a
+        # task that reads settings idle-side just before this save and flips
+        # busy just after it gets no warning; a silent miss in that window
+        # beats a false "keeps the old config" over a task that has the new.
+        # Linearizing properly would need a settings-generation handshake —
+        # machinery a warning string does not justify.
+        started_before_save = _has_started_agent_tasks()
         settings_to_save = dict(current)
         settings_to_save["OUROBOROS_RUNTIME_MODE"] = pending_runtime_mode
         # The Max->Low auto-downgrade above is an owner-endpoint, system-initiated
@@ -1492,7 +1529,20 @@ async def api_settings_post(request: Request) -> JSONResponse:
             k for k in all_changed
             if k not in _IMMEDIATE_KEYS and k not in _RESTART_REQUIRED_KEYS
         ]
+        agent_task_running = bool(next_task_changed) and started_before_save
+        if agent_task_running:
+            # Owner decision (2026-08-05): the task-start snapshot boundary STAYS —
+            # a running task keeps the config it started with, and the save says so
+            # loudly instead of letting "Saved" read as "applied to the task you are
+            # watching" (the reviewer-slot save at 21:56 read exactly that way).
+            warnings.append(
+                "An agent task is running right now: it keeps the configuration it "
+                "started with (models, reviewers, subagents). The saved changes apply "
+                "from the next task."
+            )
         resp: Dict[str, Any] = {"status": "saved"}
+        if agent_task_running:
+            resp["agent_task_running"] = True
         if not all_changed:
             resp["no_changes"] = True
         if restart_keys:

@@ -198,6 +198,22 @@ function lastRunMetaTitle(entry) {
     return `UI projection of capability_delta (D22) — ran as ${route}${ts ? ` at ${ts}` : ''}`;
 }
 
+export function sessionModelOptions(harness, currentModel) {
+    // The ONE model-options fragment for a session row's model select (triad,
+    // scope, advisory, and the Subagents section import it too). "Engine
+    // default model" is the empty tail; a SAVED model discovery no longer
+    // lists keeps a "(not in discovery)" option, or the browser silently
+    // redraws the select as the first entry and the next Save erases the pin
+    // (same rule as profileOptionsFor / routeChoiceGroups).
+    const models = harness?.models || [];
+    const options = [{ value: '', label: 'Engine default model' },
+        ...models.map((m) => ({ value: String(m.id || m.value || m), label: String(m.id || m.label || m) }))];
+    if (currentModel && !options.some((o) => o.value === currentModel)) {
+        options.push({ value: currentModel, label: `${currentModel} (not in discovery)` });
+    }
+    return options;
+}
+
 export function profileOptionsFor(profiles, savedPin) {
     // Mirrors the model list's own rule: a SAVED pin the daemon no longer discovers
     // (account signed out, daemon down, profile renamed) matched no option, so the
@@ -349,12 +365,7 @@ function rowHtml(row, group) {
     const session = row.route.kind === ROUTE_KIND_SESSION;
     const split = session ? splitSessionTarget(row.route.target_id) : { harness: '', model: '' };
     const harness = session ? harnessesById()[split.harness] : null;
-    const models = harness?.models || [];
-    const modelOptions = [{ value: '', label: 'Engine default model' },
-        ...models.map((m) => ({ value: String(m.id || m.value || m), label: String(m.id || m.label || m) }))];
-    if (split.model && !modelOptions.some((o) => o.value === split.model)) {
-        modelOptions.push({ value: split.model, label: `${split.model} (not in discovery)` });
-    }
+    const modelOptions = sessionModelOptions(harness, split.model);
     const profiles = session ? (state.profilesByHarness[split.harness] || []) : [];
     const profileOptions = profileOptionsFor(profiles, row.route.profile_id);
     const last = state.lastExecutions[row.slot_id];
@@ -382,16 +393,28 @@ function rowHtml(row, group) {
 
 function advisoryHtml() {
     const advisory = state.advisory;
+    // TRAP: the advisory state carries kind='api' while ROUTE_KIND_API is
+    // 'api_chat', so every branch here tests `!== ROUTE_KIND_SESSION` — a
+    // naive `=== ROUTE_KIND_API` silently never matches.
     const session = advisory.route?.kind === ROUTE_KIND_SESSION;
-    const choice = session
-        ? `session:${splitSessionTarget(advisory.route.target_id).harness}`
-        : API_ROUTE_CHOICE;
+    const split = session ? splitSessionTarget(advisory.route.target_id)
+        : { harness: '', model: '' };
+    const choice = session ? `session:${split.harness}` : API_ROUTE_CHOICE;
     // Both optgroups are labeled (finding #7): an unlabeled first group made
     // the API entry read as stray next to the labeled subscriptions group.
     const groups = [
         { label: 'API', options: [{ value: API_ROUTE_CHOICE, label: 'Claude (Anthropic API key)' }] },
         ...routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice }).slice(1),
     ];
+    // Session branch: the SAME model-options fragment the triad rows use —
+    // rewriting it here would lose the "(not in discovery)" guard and let a
+    // Save with the daemon down erase the owner's model. Api branch: free-text
+    // WITHOUT the catalog datalist — the advisory api route is the Claude
+    // Agent SDK, whose model spellings (sonnet, opus[1m], claude-…) are not
+    // the OpenRouter catalog ids the datalist suggests.
+    const modelOptions = session ? sessionModelOptions(harnessesById()[split.harness], split.model) : [];
+    const profiles = session ? (state.profilesByHarness[split.harness] || []) : [];
+    const profileOptions = session ? profileOptionsFor(profiles, advisory.route?.profile_id) : [];
     const last = state.lastExecutions.advisory_slot_1;
     const lastText = last ? describeLastExecution(last) : '';
     const metaParts = [capabilityBadge({ route: advisory.route || {} }, harnessesById())];
@@ -401,6 +424,10 @@ function advisoryHtml() {
             <div class="reviewer-slot-controls">
                 <label class="local-toggle"><input type="checkbox" data-advisory-enabled ${advisory.enabled !== false ? 'checked' : ''}> Enabled</label>
                 ${selectHtml('data-advisory-route aria-label="Advisory route"', groups, choice)}
+                ${session
+                    ? selectHtml('data-advisory-model aria-label="Advisory harness model"', [{ label: '', options: modelOptions }], split.model)
+                    : `<input data-advisory-api-model placeholder="Claude model — empty = default" value="${escapeHtml(advisory.route?.target_id || '')}" spellcheck="false" aria-label="Advisory Claude model">`}
+                ${session && profileOptions.length > 1 ? selectHtml('data-advisory-profile aria-label="Advisory credential account"', [{ label: '', options: profileOptions }], advisory.route?.profile_id || '') : ''}
                 ${effortSelectHtml('data-advisory-effort aria-label="Advisory effort"', advisory.effort === 'low' ? '' : advisory.effort, 'low')}
             </div>
             <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
@@ -512,6 +539,22 @@ function bindRowEvents() {
             state.advisory.route = result.route;
             Object.assign(advisoryRouteMemory, result.memory);
             renderRows();
+            state.onChange();
+        });
+        // Mirrors of the triad-row model/api/profile handlers. These controls
+        // exist only on their own kind's branch of advisoryHtml, so each
+        // querySelector binds at most one of them per render.
+        advisoryEl.querySelector('[data-advisory-model]')?.addEventListener('change', (event) => {
+            const split = splitSessionTarget(state.advisory.route?.target_id);
+            state.advisory.route.target_id = composeSessionTarget(split.harness, event.target.value);
+            state.onChange();
+        });
+        advisoryEl.querySelector('[data-advisory-api-model]')?.addEventListener('input', (event) => {
+            state.advisory.route.target_id = String(event.target.value || '').trim();
+            state.onChange();
+        });
+        advisoryEl.querySelector('[data-advisory-profile]')?.addEventListener('change', (event) => {
+            state.advisory.route.profile_id = String(event.target.value || '');
             state.onChange();
         });
         advisoryEl.querySelector('[data-advisory-effort]')?.addEventListener('change', (event) => {

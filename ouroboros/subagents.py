@@ -198,6 +198,69 @@ def get_subagent_harness() -> DelegationRoute | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# «Last delegated run» projection — the Subagents section's receipt line.
+#
+# The same disclosure pattern as reviewer_slot_last_execution.json (D22): what
+# the last delegated subagent run REALLY ran as, written at the delegate settle
+# seam, served through the gateway, rendered as ONE muted line. Disclosure
+# only — nothing routes off it, and absence is shown as absence.
+# ---------------------------------------------------------------------------
+
+LAST_DELEGATION_FILENAME = "subagent_last_delegation.json"
+
+
+def _last_delegation_path():
+    import pathlib
+
+    from ouroboros.config import DATA_DIR
+
+    return pathlib.Path(DATA_DIR) / "state" / LAST_DELEGATION_FILENAME
+
+
+def record_last_delegation(*, route: str, requested_model: str,
+                           applied_model: str, run_id: str) -> None:
+    """Record the last delegated run's route + requested/applied model.
+
+    Best-effort and atomic, in the CANONICAL data plane beside the saved
+    settings (the reviewer-slot projection's own rule): this is UI state, not
+    per-task forensics — those live in the custody event log and the ledger.
+    ``applied_model`` is the engine summary's own value, '' when the run never
+    disclosed one — the requested model is never dressed up as the applied one.
+    """
+    import json
+
+    from ouroboros.utils import utc_now_iso, write_text_atomic
+
+    try:
+        path = _last_delegation_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Idempotent per run: a re-read of an ALREADY-terminal run must not
+        # re-stamp `ts`, or the "N ago" line would call an old run fresh.
+        if subagent_last_delegation().get("run_id") == str(run_id or ""):
+            return
+        write_text_atomic(path, json.dumps({
+            "ts": utc_now_iso(),
+            "route": str(route or ""),
+            "requested_model": str(requested_model or ""),
+            "applied_model": str(applied_model or ""),
+            "run_id": str(run_id or ""),
+        }, ensure_ascii=False, indent=1))
+    except Exception:
+        log.debug("subagent last-delegation projection write failed", exc_info=True)
+
+
+def subagent_last_delegation() -> Dict[str, Any]:
+    """Read the projection ({} on any read problem — disclosure only)."""
+    import json
+
+    try:
+        data = json.loads(_last_delegation_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 @dataclass(frozen=True)
 class SubagentExecutorResolution:
     """Outcome of the execution rule table (TZ 3.5)."""
@@ -956,6 +1019,7 @@ def build_subagent_envelope(
     status: str = "",
     usage: Dict[str, Any] | None = None,
     cost_usd: float | None = None,
+    execution_evidence: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     usage_data = dict(usage or {})
     if cost_usd is None:
@@ -966,7 +1030,7 @@ def build_subagent_envelope(
             cost_usd = float(raw_cost) if raw_cost is not None else None
         except (TypeError, ValueError):
             cost_usd = None
-    return {
+    envelope = {
         "task_id": str(task_id or ""),
         "lineage": {
             "parent_task_id": str(parent_task_id or ""),
@@ -1015,6 +1079,45 @@ def build_subagent_envelope(
         "usage": usage_data,
         "cost_usd": round(float(cost_usd), 6) if cost_usd is not None else None,
     }
+    if execution_evidence is not None:
+        # ADDITIVE, completion-time only. `executor_route`/`effective_executor`
+        # above are DISPATCH decisions and are never overwritten; this block is
+        # the EVIDENCE those decisions are reconciled against — what the delegate
+        # custody rows prove actually ran. Absent means "no evidence yet"
+        # (pre-completion), never "ran natively".
+        envelope["execution_evidence"] = dict(execution_evidence)
+    return envelope
+
+
+# The statuses at which execution evidence exists to reconcile: the child is over,
+# so the custody rows are the complete story of its delegated runs. A RUNNING
+# envelope carries no evidence — the neutral "dispatched" reading is the honest one.
+_EVIDENCE_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
+
+
+def _execution_evidence_for_task(task: Mapping[str, Any], status: str) -> Dict[str, Any] | None:
+    """Evidence for the completion envelope, or None when there is nothing to say.
+
+    Derived only for a child whose dispatch named a harness route — the native
+    path has no delegation claim to reconcile — and only at a terminal status.
+    Reads the same durable custody rows the delegate tools write, on the same
+    canonical (budget) drive. Fail-soft: a completion must never break on a
+    forensic read.
+    """
+    if str(status or "") not in _EVIDENCE_TERMINAL_STATUSES:
+        return None
+    if not str(task.get("executor_route") or "").strip():
+        return None
+    drive = str(task.get("budget_drive_root") or task.get("drive_root") or "").strip()
+    if not drive:
+        return None
+    try:
+        from ouroboros import delegate_custody as custody
+
+        return custody.task_execution_evidence(drive, str(task.get("id") or ""))
+    except Exception:
+        log.debug("execution-evidence derivation failed", exc_info=True)
+        return None
 
 
 def envelope_from_task(
@@ -1061,4 +1164,5 @@ def envelope_from_task(
             "rounds": int(usage.get("rounds") or 0),
         },
         cost_usd=cost_usd,
+        execution_evidence=_execution_evidence_for_task(task, status),
     )

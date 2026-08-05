@@ -397,6 +397,30 @@ def test_extraction_never_fabricates_a_clean_verdict():
     assert method == "unparsed"
 
 
+def test_a_fenced_verdict_stays_unparsed_at_this_layer():
+    """Disclosed residual (audit 2026-08-05): a verdict wrapped in a ```json
+    fence that only the coordinator's downstream scanner parses is telemetered
+    `unparsed` HERE — labeling it would need a duplicate parser (drift) or a
+    backward import of the coordinator (the one-way seam ARCHITECTURE pins).
+    The refusal-quoting-an-array case also stays `unparsed`."""
+    llm = FakeLLM(reply="UNEXTRACTABLE")
+    fenced = (
+        "Review complete. My findings:\n```json\n"
+        '[{"item": "x", "verdict": "FAIL", "severity": "critical", "reason": "r"}]\n'
+        "```\nEnd of review."
+    )
+    text, method, _usage = canonicalize_session_verdict(
+        fenced, conformance_passed=False, llm=llm)
+    assert method == "unparsed"
+    assert text == fenced
+    assert len(llm.calls) == 1  # extraction was still consulted first (D19 order)
+
+    quoted = ('I reviewed NOTHING. The contract asked for entries like '
+              '[{"item": "a", "verdict": "PASS", "severity": "advisory", "reason": "e"}].')
+    _text2, method2, _u2 = canonicalize_session_verdict(
+        quoted, conformance_passed=False, llm=FakeLLM(reply="UNEXTRACTABLE"))
+    assert method2 == "unparsed"
+
 def test_extraction_runs_under_its_own_physical_rail():
     """The extraction is NOT a review call: it claims no send from the reviewing
     actor's two-physical-send rail (D19)."""

@@ -111,6 +111,11 @@
  *   subagent (delegated routes only) — the route it was sent to, not a receipt
  *   from the engine saying where it landed. Absent/empty = the ordinary native
  *   path; no chip is drawn.
+ * @property {Object=} execution_evidence
+ *   The completion-seam EVIDENCE the route decision is reconciled against:
+ *   {delegated_runs_started, delegated_runs_settled, subscription_cost_usd,
+ *   harness_models}. Terminal frames only; absent = "no evidence yet",
+ *   never "ran natively".
  * @property {string=} model
  * @property {string=} task_group_id
  * @property {string=} task_event

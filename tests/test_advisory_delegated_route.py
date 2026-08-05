@@ -183,6 +183,78 @@ def test_explicit_skip_still_bypasses_on_the_delegated_route(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# The advisory row's model/effort on the api route (6.1 + the D-5b fix)
+# ---------------------------------------------------------------------------
+
+
+_SLOTS_API_ADVISORY = json.dumps({
+    "triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "openai/x"}}],
+    "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "openai/y"}}],
+    "advisory": {"enabled": True, "route": {"kind": "api", "target_id": "sonnet"},
+                 "effort": "high"},
+})
+
+
+def _stub_run_readonly(captured):
+    from types import SimpleNamespace
+
+    def _fake(prompt, cwd, model, max_turns=None, effort="", max_budget_usd=None, **kwargs):
+        captured.update({"model": model, "effort": effort})
+        return SimpleNamespace(success=True, result_text=_ADVISORY_ITEMS, session_id="sess-1",
+                               cost_usd=0.0, usage={}, error="", stderr_tail="")
+    return _fake
+
+
+def test_api_route_applies_the_advisory_rows_model_and_effort(tmp_path, monkeypatch):
+    """On kind=api the row's target_id IS the Claude-SDK model and the row's
+    effort rides the call — not resolve_effort('scope_review') (D-5b): the
+    owner's advisory effort used to be silently ignored on this route."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", _SLOTS_API_ADVISORY)
+    captured = {}
+    monkeypatch.setattr("ouroboros.gateways.claude_code.run_readonly",
+                        _stub_run_readonly(captured))
+    ctx = _ctx(tmp_path)
+    items, raw, model, _chars = advisory._run_claude_advisory(
+        ctx.repo_dir, "msg", ctx, options={"include_repo_diff": False},
+    )
+    assert not raw.startswith("⚠️ ADVISORY_ERROR"), raw
+    assert [i["item"] for i in items] == ["correctness"]
+    assert captured["model"] == "sonnet" and model == "sonnet"
+    assert captured["effort"] == "high"
+
+
+def test_api_route_empty_target_falls_back_to_the_environment_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("CLAUDE_CODE_MODEL", "opus-env-default")
+    slots = json.loads(_SLOTS_API_ADVISORY)
+    slots["advisory"] = {"enabled": True, "route": {"kind": "api", "target_id": ""}}
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", json.dumps(slots))
+    captured = {}
+    monkeypatch.setattr("ouroboros.gateways.claude_code.run_readonly",
+                        _stub_run_readonly(captured))
+    ctx = _ctx(tmp_path)
+    _items, raw, model, _chars = advisory._run_claude_advisory(
+        ctx.repo_dir, "msg", ctx, options={"include_repo_diff": False},
+    )
+    assert not raw.startswith("⚠️ ADVISORY_ERROR"), raw
+    assert captured["model"] == "opus-env-default" and model == "opus-env-default"
+    # The parser's non-empty default ("low") is still the ROW's field — the
+    # scope reviewer's effort never leaks in.
+    assert captured["effort"] == "low"
+
+
+def test_advisory_session_target_still_rejects_double_colon():
+    from ouroboros.reviewer_slot_config import parse_reviewer_slots
+
+    slots = json.loads(_SLOTS_API_ADVISORY)
+    slots["advisory"] = {"enabled": True,
+                         "route": {"kind": "agent_session", "target_id": "codex::gpt"}}
+    with pytest.raises(ValueError, match="'::'"):
+        parse_reviewer_slots(json.dumps(slots))
+
+
+# ---------------------------------------------------------------------------
 # The route reader itself
 # ---------------------------------------------------------------------------
 

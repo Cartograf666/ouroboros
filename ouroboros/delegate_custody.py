@@ -334,6 +334,82 @@ def lookup(drive_root: Any, task_id: str, run_id: str) -> Tuple[str, Optional[Ru
     return OWNED, custody
 
 
+def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
+    """Aggregate ONE task's delegated-run facts from the durable custody rows.
+
+    The completion-seam reconciliation reads this: `executor_route` is a DISPATCH
+    decision, these rows are the EVIDENCE of what actually ran, and the two are
+    compared exactly once (``subagents.envelope_from_task``) instead of in every
+    reader. ``subscription_cost_usd`` is the sum of DISCLOSED settled spend and
+    ``None`` while nothing settled or any settled run left its spend undisclosed —
+    unknown never renders as zero.
+    """
+    tid = str(task_id or "")
+    started: set = set()
+    settled: set = set()
+    models: List[str] = []
+    cost_total, cost_known, cost_estimated = 0.0, True, False
+    for row in _iter_rows(event_log_path(drive_root)):
+        if str(row.get("task_id") or "") != tid:
+            continue
+        run_id = str(row.get("run_id") or "")
+        if not run_id:
+            continue
+        kind = str(row.get("type") or "")
+        if kind == STARTED:
+            started.add(run_id)
+        elif kind == SETTLED and run_id not in settled:
+            settled.add(run_id)
+            if row.get("spend_disclosed") and row.get("cost_usd") is not None:
+                try:
+                    cost_total += float(row.get("cost_usd") or 0.0)
+                except (TypeError, ValueError):
+                    cost_known = False
+                if row.get("spend_estimated"):
+                    cost_estimated = True
+            else:
+                cost_known = False
+        # ENGINE-reported models only (SETTLED rows): a STARTED row carries the
+        # requested pin, and with an owner default model that pin is routinely
+        # non-empty — listing it would name a model that never executed.
+        if kind == SETTLED:
+            model = str(row.get("model") or "")
+            if model and model not in models:
+                models.append(model)
+    return {
+        # A settled row whose started row fell out of the log is still a run that ran.
+        "delegated_runs_started": len(started | settled),
+        "delegated_runs_settled": len(settled),
+        "subscription_cost_usd": round(cost_total, 6) if (settled and cost_known) else None,
+        # The settlement row's own estimated/final distinction, carried instead of
+        # dropped: an estimated sum must never render as an exact receipt.
+        "subscription_cost_estimated": bool(settled and cost_known and cost_estimated),
+        "harness_models": models,
+    }
+
+
+def run_timing(drive_root: Any, run_id: str) -> Tuple[str, int]:
+    """``(started_ts_iso, max_seconds)`` for a run, from its durable STARTED row.
+
+    Empty/0 when the run is unknown or the row predates the ``max_seconds``
+    field — absent facts stay absent, never invented.
+    """
+    rid = str(run_id or "").strip()
+    started_ts, max_seconds = "", 0
+    if not rid:
+        return started_ts, max_seconds
+    for row in _iter_rows(event_log_path(drive_root)):
+        if str(row.get("run_id") or "") != rid or str(row.get("type") or "") != STARTED:
+            continue
+        started_ts = started_ts or str(row.get("ts") or "")
+        if not max_seconds:
+            try:
+                max_seconds = int(row.get("max_seconds") or 0)
+            except (TypeError, ValueError):
+                max_seconds = 0
+    return started_ts, max_seconds
+
+
 def idempotency_key(*parts: Any) -> str:
     """A deterministic IDENTITY for one logical start — the lookup key, not the wire key.
 
@@ -680,6 +756,10 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
             "run_id": custody.run_id,
             "task_id": custody.task_id,
             "route": custody.route_id,
+            # The ENGINE-reported model (the STARTED row carries only the requested
+            # pin, which is usually empty) — so execution evidence can name what
+            # the harness really ran without joining to the ledger.
+            "model": str(summary.get("model") or ""),
             "state": str(summary.get("state") or ""),
             # The SAME facts the ledger row just recorded. An undisclosed spend was emitted
             # here as `0.0` beside a flag — the render-unknown-as-zero shape the ledger row
@@ -1194,8 +1274,10 @@ __all__ = [
     "record_started",
     "release_task_runs",
     "retire_project",
+    "run_timing",
     "settle_run",
     "settled_output_unread",
     "settled_unread_outputs",
     "summary_of",
+    "task_execution_evidence",
 ]

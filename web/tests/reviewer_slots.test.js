@@ -15,6 +15,7 @@ import {
     mintSlotId,
     profileOptionsFor,
     routeChoiceGroups,
+    sessionModelOptions,
     splitSessionTarget,
 } from '../modules/reviewer_slots.js';
 
@@ -170,6 +171,66 @@ test('capability badges display facts and never configure', () => {
     assert.ok(capabilityBadge(sessionRow, {}).includes('not discovered'));
     const apiRow = { route: { kind: ROUTE_KIND_API, target_id: 'openai/gpt-5.6-luna' } };
     assert.equal(capabilityBadge(apiRow, {}), 'API delivery');
+});
+
+test('the session model-options fragment guards a saved model discovery no longer lists', () => {
+    // ONE fragment for every session model select (triad, scope, advisory,
+    // Subagents): "Engine default model" first, discovery next, and a saved
+    // model the daemon cannot see right now keeps an option — otherwise the
+    // browser silently redraws the select as "Engine default" and the next
+    // Save really erases the pin (REG:1190 #7 class).
+    const listed = sessionModelOptions({ models: [{ id: 'sonnet' }, { id: 'claude-opus-5' }] }, 'sonnet');
+    assert.deepEqual(listed.map((o) => o.value), ['', 'sonnet', 'claude-opus-5']);
+    assert.equal(listed[0].label, 'Engine default model');
+
+    const unlisted = sessionModelOptions({ models: [{ id: 'claude-opus-5' }] }, 'sonnet');
+    assert.deepEqual(unlisted.map((o) => o.value), ['', 'claude-opus-5', 'sonnet']);
+    assert.match(unlisted[2].label, /not in discovery/);
+
+    // Daemon down (no harness at all) is the SAME case, not a special one.
+    assert.deepEqual(sessionModelOptions(null, 'sonnet').map((o) => o.value), ['', 'sonnet']);
+    assert.deepEqual(sessionModelOptions(null, '').map((o) => o.value), ['']);
+});
+
+test('an advisory session model composes into the target and survives save-load', () => {
+    // Compose exactly as the data-advisory-model handler does…
+    const target = composeSessionTarget('codex', 'gpt-5.6-luna');
+    const setting = JSON.parse(buildReviewerSlotsSetting({
+        triad: [{ slot_id: 't1', route: { kind: ROUTE_KIND_API, target_id: 'openai/x' }, effort: '' }],
+        scope: [{ slot_id: 's1', route: { kind: ROUTE_KIND_API, target_id: 'openai/y' }, effort: '' }],
+        advisory: { enabled: true, route: { kind: ROUTE_KIND_SESSION, target_id: target, profile_id: 'koshak' }, effort: 'low' },
+    }));
+    // …and the saved value round-trips model AND profile pin intact.
+    assert.equal(setting.advisory.route.kind, ROUTE_KIND_SESSION);
+    assert.equal(setting.advisory.route.target_id, 'codex=gpt-5.6-luna');
+    assert.equal(setting.advisory.route.profile_id, 'koshak');
+    assert.ok(!setting.advisory.route.target_id.includes('::'));
+    assert.deepEqual(splitSessionTarget(setting.advisory.route.target_id),
+        { harness: 'codex', model: 'gpt-5.6-luna' });
+});
+
+test('switching the advisory harness resets the model to the bare harness', () => {
+    // The model belongs to the harness it was picked for (same rule as the
+    // triad rows and the Subagents tail): A→B lands on B's engine default,
+    // spelled as the bare harness — never A's model carried across.
+    const saved = { kind: ROUTE_KIND_SESSION, target_id: 'claude=claude-opus-5' };
+    const out = advisoryRouteTransition(saved, { kind: ROUTE_KIND_SESSION, harness: 'codex' },
+        { api: null, session: { ...saved } });
+    assert.deepEqual(out.route, { kind: ROUTE_KIND_SESSION, target_id: 'codex' });
+});
+
+test('the advisory api-route model input round-trips as the raw target', () => {
+    // kind stays the advisory's own 'api' (NOT api_chat — the branch trap),
+    // and the free-text SDK spelling rides target_id verbatim; no profile pin
+    // is emitted on the api kind.
+    const setting = JSON.parse(buildReviewerSlotsSetting({
+        triad: [{ slot_id: 't1', route: { kind: ROUTE_KIND_API, target_id: 'openai/x' }, effort: '' }],
+        scope: [{ slot_id: 's1', route: { kind: ROUTE_KIND_API, target_id: 'openai/y' }, effort: '' }],
+        advisory: { enabled: true, route: { kind: 'api', target_id: 'sonnet', profile_id: 'koshak' }, effort: 'low' },
+    }));
+    assert.equal(setting.advisory.route.kind, 'api');
+    assert.equal(setting.advisory.route.target_id, 'sonnet');
+    assert.equal('profile_id' in setting.advisory.route, false);
 });
 
 test('the runs-as line shows APPLIED account/access and honest absence for an undisclosed model', () => {

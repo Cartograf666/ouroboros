@@ -534,6 +534,12 @@ def canonicalize_session_verdict(
     canonical, usage = _extract_verdict_via_light_model(text, contract=contract, llm=llm)
     if canonical is not None:
         return canonical, "light_model_extraction", usage
+    # `unparsed` is the honest end of THIS layer's knowledge. The coordinator's
+    # own fenced scanner may still parse the text downstream; labeling that
+    # here would need either a duplicate parser (drift) or a backward import
+    # of the coordinator (the one-way seam ARCHITECTURE pins) — both cost more
+    # than the telemetry cosmetics are worth. Disclosed residual: a fenced
+    # verdict that lands downstream is telemetered `unparsed` at this layer.
     return text, "unparsed", usage
 
 
@@ -556,9 +562,19 @@ def _extract_verdict_via_light_model(
             from ouroboros.llm import LLMClient
 
             llm = LLMClient()
+        from dataclasses import replace as _replace
+
+        from ouroboros.usage_accounting import UsageScope, current_usage_scope, usage_scope
+
         # A FRESH one-send rail: the extraction must not claim a send from the
         # reviewing actor's two-physical-send rail (D19 — not a review call).
-        with physical_attempt_limit(1):
+        # The ledger row keeps the actor's task/category attribution but is
+        # sub-labeled `review_substrate.extraction`, so the small light-model
+        # rows beside the $0.00 subscription settlements read as what they are —
+        # verdict extraction, not review-slot spend.
+        _scope = _replace(current_usage_scope() or UsageScope(),
+                          source="review_substrate.extraction")
+        with physical_attempt_limit(1), usage_scope(_scope):
             message, usage = llm.chat(
                 messages=[{"role": "user", "content": prompt}],
                 model=model,
@@ -775,7 +791,7 @@ def run_delegated_review_session(
         if route is None:
             raise ReviewRouteUnavailable(
                 "delegated review session has no configured session route "
-                f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty)"
+                f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)"
             )
         project_id, existing_project, key, schema_asked = "", "", "", False
     gateway = ClaudexorGateway()
@@ -1177,7 +1193,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         if route is None:
             raise ReviewRouteUnavailable(
                 "agent_session review slot has no configured session route "
-                f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty)"
+                f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)"
             )
         return route
 

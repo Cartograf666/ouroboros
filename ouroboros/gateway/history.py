@@ -75,6 +75,9 @@ _PROGRESS_META_FIELDS = (
     # Phase 6: the resolved delegated route (a harness id), so a replayed
     # bubble keeps its executor chip instead of losing it on reload.
     "executor_route",
+    # The completion-seam evidence block (delegated runs started/settled,
+    # subscription spend, harness models) — the chip's layered truth on replay.
+    "execution_evidence",
     "task_group_id",
 )
 

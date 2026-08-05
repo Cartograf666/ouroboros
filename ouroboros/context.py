@@ -93,7 +93,12 @@ def build_user_content(task: Dict[str, Any]) -> Any:
                 "gathering, and non-mutating preparation while review is open, but begin implementation "
                 "only after review closes or a real task-wide rail fires. Under advisory, you may proceed "
                 "by judgment with explicit disclosure. When the work decomposes into independent parts, "
-                "fan out subagents within the configured caps and reconcile them. Planning or reviewer "
+                "fan out subagents within the configured caps and reconcile them. Parallel children each "
+                "work from your base snapshot and cannot see each other's edits; their patches integrate "
+                "independently, so two children writing the same region of the same file conflict at "
+                "integration — expected mechanics, not a failure. Give children disjoint write regions, "
+                "or explicitly plan the parent-synthesis step that resolves the expected overlap. "
+                "Planning or reviewer "
                 "unavailability must not replace useful work with a terminal planning error.\n"
                 "[/SWARM_INITIATIVE]\n\n"
             )

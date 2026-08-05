@@ -92,6 +92,13 @@ const HARNESS_CHIP_ICON = {
     cursor: '▸',
 };
 
+// Presentation names only, never behavior: the route id stays the opaque
+// Claudexor spelling; the owner knows the `claude` harness as the Claude Code
+// product, so that is what the chip prints.
+const HARNESS_CHIP_NAME = {
+    claude: 'Claude Code',
+};
+
 export function executorChip(evt) {
     const route = String(evt?.executor_route || '').trim();
     if (!route) return null;
@@ -99,18 +106,41 @@ export function executorChip(evt) {
     // part only, never interpreted beyond splitting the spelling Claudexor uses.
     const harness = route.split('=')[0].trim().toLowerCase();
     if (!harness) return null;
+    const name = HARNESS_CHIP_NAME[harness] || harness;
+    const base = { harness, icon: HARNESS_CHIP_ICON[harness] || '◆', label: name };
+    // LAYERED TRUTH. The route is a DISPATCH decision; whether a delegated run
+    // actually happened is EVIDENCE, reconciled once at the completion seam
+    // (subagents.envelope_from_task -> execution_evidence) and carried on the
+    // terminal frame. Before evidence exists the chip states only the decision —
+    // never "ran on", which is a receipt nothing has issued yet.
+    const evidence = (evt && typeof evt.execution_evidence === 'object' && evt.execution_evidence)
+        ? evt.execution_evidence : null;
+    if (!evidence) {
+        return { ...base, title: `Dispatched to ${name} — this subagent itself runs on the API` };
+    }
+    const started = Number(evidence.delegated_runs_started || 0);
+    const settled = Number(evidence.delegated_runs_settled || 0);
+    if (!started) {
+        return {
+            ...base,
+            label: `${name} (no run recorded)`,
+            title: `The ${name} route was assigned, but there is no durable record of a delegated run for this subagent`,
+        };
+    }
+    if (!settled) {
+        return {
+            ...base,
+            title: `Delegated to your ${name} account — ${started} run(s) started, none settled`,
+        };
+    }
+    const cost = evidence.subscription_cost_usd;
+    const approx = evidence.subscription_cost_estimated ? '~' : '';
+    const costPart = (cost === null || cost === undefined)
+        ? 'subscription spend undisclosed'
+        : `${approx}$${Number(cost).toFixed(2)} subscription`;
     return {
-        harness,
-        icon: HARNESS_CHIP_ICON[harness] || '◆',
-        label: harness,
-        // "This work" restated the bubble the tooltip is attached to, and
-        // "subscription" asserted the billing shape — a harness account can be a
-        // metered one, and the chip cannot see the run's spend at all. The ledger's
-        // own rule is that a session is free ONLY when the harness says it was
-        // (usage_accounting: "legacy zero may mean unknown pricing, never free"), so
-        // the chip states WHERE the work ran and leaves what it cost to the row that
-        // measured it.
-        title: `Ran on your ${harness} account (delegated session)`,
+        ...base,
+        title: `Delegated to your ${name} account — ${settled} run(s), ${costPart}`,
     };
 }
 
