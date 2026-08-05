@@ -362,147 +362,6 @@ def plan_text_fingerprint(plan: str) -> str:
     return sha256(plan.encode("utf-8")).hexdigest()
 
 
-# Review identity is the fingerprint of the AGENT-PASSED envelope only. Component
-# hashes exist purely to DIAGNOSE a mismatch, so they may carry host-resolved values
-# (resolved plan_class / context_level) that must never enter the binding identity.
-_PLAN_COMPONENT_KEYS = (
-    "goal", "files_to_touch", "context_notes", "scope",
-    "include_tests", "plan_class", "context_level",
-)
-
-
-def plan_review_component_hashes(request: Any) -> Dict[str, str]:
-    """Per-field hashes of one plan-review envelope, for ENVELOPE_MISMATCH detail."""
-    hashes: Dict[str, str] = {}
-    for key in _PLAN_COMPONENT_KEYS:
-        value = getattr(request, key, None)
-        if key == "scope":
-            value = normalize_plan_scope(value if isinstance(value, dict) else None)
-        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-        hashes[key] = sha256(encoded.encode("utf-8")).hexdigest()[:16]
-    return hashes
-
-
-def plan_envelope_mismatch_fields(stored: Any, submitted: Any) -> List[str]:
-    """Component names that differ between two envelopes.
-
-    Only components present in BOTH maps are compared, so a wave stored before per-slot
-    hashes existed reports nothing. There is no "omitted vs explicitly empty" axis to
-    honour: ``_handle_plan_task`` coerces every omitted optional field to ``""``/``[]``/
-    ``False`` before it is hashed OR fingerprinted, so an omission and an explicit empty
-    are the same envelope — and both already changed the request fingerprint."""
-    stored_map = dict(stored or {})
-    submitted_map = dict(submitted or {})
-    return [
-        key for key in _PLAN_COMPONENT_KEYS
-        if key in stored_map and key in submitted_map
-        and stored_map[key] != submitted_map[key]
-    ]
-
-
-def plan_envelope_mismatch_note(wave: Any, request: Any) -> str:
-    """Free ENVELOPE_MISMATCH warning when a disposition BOUND a drifted envelope.
-
-    Since the binding identity is the agent envelope's own fingerprint and a disposition
-    may only close a review of the SAME fingerprint (``bindable_claimed_wave``), a bound
-    wave can differ only in HOST-RESOLVED components (resolved ``plan_class`` /
-    ``context_level``), which are diagnosed here and deliberately excluded from identity.
-    Agent-authored drift such as ``files_to_touch`` is no longer bindable at all — it is
-    rejected by ``unbindable_disposition_error``, which reports the same field list."""
-    if request is None:
-        return ""
-    drifted = plan_envelope_mismatch_fields(
-        (wave or {}).get("component_hashes"), plan_review_component_hashes(request),
-    )
-    if not drifted:
-        return ""
-    return (
-        "NOTE: ENVELOPE_MISMATCH on: " + ", ".join(drifted) + ". Your review_disposition "
-        "closed the review it named, but that review saw a DIFFERENT envelope for these "
-        "components, so the findings you dispositioned do not cover what changed.\n\n"
-    )
-
-
-def bindable_claimed_wave(
-    state: Any, disposition: Any, plan_text_hash: str, request_fingerprint: str,
-) -> Optional[Dict[str, Any]]:
-    """The wave a disposition HONESTLY names, or None.
-
-    Binds only when all four hold: the claimed ``review_fingerprint`` equals the
-    SUBMITTED envelope's fingerprint, it is the state's latest review fingerprint,
-    that wave's review is an OPEN ``REVIEW_REQUIRED``, and the submitted plan text
-    still hashes to the stored ``plan_text_hash``.
-
-    The envelope-equality condition is the P3 plan gate itself. ``files_to_touch`` is
-    exported in the tool schema as PART OF THE REVIEW IDENTITY ("a review_disposition
-    can only close a review submitted with the SAME list"), and the binding fingerprint
-    is a pure function of the AGENT's envelope, so a claimed fingerprint that differs
-    from the submitted one means the reviewers never saw what is now being planned.
-    Binding it with a warning let a review of ``[a.py]`` authorise ``[a.py, b.py,
-    c.py]`` — stale evidence closing materially expanded scope. A mismatch is therefore
-    UNBINDABLE: the caller fails fast (no wave, no money) and the always-available
-    escape is to omit the disposition and run a real review of the new envelope."""
-    claimed = str((disposition or {}).get("review_fingerprint") or "").strip()
-    if not claimed or not isinstance(state, dict):
-        return None
-    if claimed != str(request_fingerprint or "").strip():
-        return None
-    if str(state.get("latest_review_fingerprint") or "") != claimed:
-        return None
-    for wave in state.get("waves") or []:
-        if str(wave.get("request_fingerprint") or "") != claimed:
-            continue
-        review = wave.get("review") if isinstance(wave.get("review"), dict) else {}
-        if str(review.get("aggregate_signal") or "") != "REVIEW_REQUIRED" or bool(review.get("closed")):
-            return None
-        if not plan_text_hash or str(wave.get("plan_text_hash") or "") != str(plan_text_hash):
-            return None
-        return dict(wave)
-    return None
-
-
-def unbindable_disposition_error(
-    state: Any, fingerprint: str, disposition: Any, plan_text_hash: str = "",
-    request: Any = None,
-) -> str:
-    """Fail-fast text for a non-empty disposition that can close nothing.
-
-    Discarding it silently and paying for a whole scout+reviewer wave hid the real
-    cause from the agent (v6.65.0/1 chose the discard to un-wedge submissions; the
-    wedge escape is preserved EXPLICITLY in this message instead).
-
-    The submitted envelope comes from the CALLER's ``request``: a disposition never
-    carries component hashes, so reading them off it made the ENVELOPE_MISMATCH clause
-    unreachable and the wave's stored hashes write-only data."""
-    claimed = str((disposition or {}).get("review_fingerprint") or "").strip() or "(none)"
-    latest = str((state or {}).get("latest_review_fingerprint") or "") or "(none)"
-    stored_plan_hash = ""
-    for wave in (state or {}).get("waves") or []:
-        if str(wave.get("request_fingerprint") or "") == latest:
-            stored_plan_hash = str(wave.get("plan_text_hash") or "")
-            break
-    plan_matches = bool(plan_text_hash) and stored_plan_hash == str(plan_text_hash)
-    mismatches = plan_envelope_mismatch_fields(
-        (next((w for w in (state or {}).get("waves") or []
-               if str(w.get("request_fingerprint") or "") == latest), {}) or {}).get("component_hashes"),
-        plan_review_component_hashes(request) if request is not None else None,
-    )
-    return (
-        "ERROR: PLAN_REVIEW_DISPOSITION_UNBINDABLE: your review_disposition names "
-        f"review_fingerprint={claimed}, but that does not name an OPEN REVIEW_REQUIRED "
-        "review OF THE ENVELOPE YOU JUST SUBMITTED "
-        f"(latest stored review fingerprint={latest}; submitted request fingerprint="
-        f"{str(fingerprint or '') or '(none)'}; plan text "
-        f"{'matches' if plan_matches else 'does NOT match'} the stored plan)."
-        + (f" ENVELOPE_MISMATCH on: {', '.join(mismatches)}." if mismatches else "")
-        + " Nothing was reviewed and no wave was launched, so no money was spent. Two "
-        "ways forward: (1) OMIT review_disposition entirely — that is ALWAYS available "
-        "and runs a real review of this plan; or (2) re-submit the exact plan and "
-        "envelope that produced the REVIEW_REQUIRED result you are trying to close, "
-        "with its own review_fingerprint."
-    )
-
-
 def quorum_input_token_limit(models: Any, slot_limits: Any) -> int:
     """Assembly budget for ONE shared prompt fanned across mixed-window slots: the largest cap that
     still leaves a review QUORUM callable, i.e. the quorum-th largest per-slot cap.
@@ -905,7 +764,11 @@ def format_plan_review_output(
         )
     lines.append("")
     if aggregate == "GREEN":
-        lines.append("All reviewers converged on GREEN. Read every reviewer's PROPOSALS section and proceed with implementation.")
+        lines.append(
+            "All responding reviewers returned GREEN. Read every called reviewer's "
+            "PROPOSALS section and proceed with implementation. Any preflight-excluded "
+            "slot shown above was not called and did not return a verdict."
+        )
     elif aggregate == "REVIEW_REQUIRED":
         reasons = []
         if summary["revise_count"] == 1:
@@ -920,12 +783,15 @@ def format_plan_review_output(
             "Read every full response, then retry the same fingerprint without a disposition; "
             "the existing scout wave is reused."
             if reviewer_retry_required else
-            "Read every full response and disposition the addressable findings before coding."
+            "Read every full response. In blocking mode, close the result through the "
+            "main agent's disposition before coding; in advisory mode, the main agent may "
+            "proceed under the host's loud disclosure."
         )
     else:
         lines.append(
             f"{summary['revise_count']} reviewer(s) independently flagged REVISE_PLAN; "
-            "change the plan before writing code."
+            "blocking mode requires a changed plan and fresh panel; advisory mode may "
+            "proceed only under loud host disclosure and the main agent's rationale."
         )
     if availability_only:
         findings_heading = "## Reviewer Availability Evidence (audit only)"
@@ -948,15 +814,27 @@ def render_plan_review_result(review: Dict[str, Any], *, cached: bool = False) -
     elif aggregate == "REVIEW_REQUIRED" and closed:
         explanation = "Every finding was dispositioned for this unchanged fingerprint; no reviewer was called."
     elif aggregate == "REVISE_PLAN":
-        explanation = "The plan text must change, producing a new fingerprint and review."
+        explanation = (
+            "Blocking mode requires changed plan text and a fresh review. Advisory mode "
+            "may proceed only under loud host disclosure and the main agent's rationale."
+        )
     else:
-        explanation = "Disposition every finding id before implementation; do not rerun reviewers."
+        explanation = (
+            "Blocking mode requires a main-agent disposition; advisory mode may proceed "
+            "under loud host disclosure. Do not rerun reviewers."
+        )
     findings = [item for item in (review.get("findings") or []) if isinstance(item, dict)]
-    return "\n".join([
+    findings_heading = "## Resolved Findings" if closed else "## Findings Requiring Disposition"
+    context_note = render_plan_context_degradation(
+        str(review.get("requested_context_level") or ""),
+        str(review.get("effective_context_level") or ""),
+        str(review.get("context_degradation_reason") or ""),
+    )
+    return context_note + "\n".join([
         "## Plan Review Results", "",
         f"**Plan fingerprint:** `{review.get('request_fingerprint') or ''}`",
         f"**Cached exact review:** {bool(cached)}", "",
-        "## Findings Requiring Disposition", "", "```json",
+        findings_heading, "", "```json",
         json.dumps(findings, ensure_ascii=False, indent=2, default=str), "```", "",
         "## Aggregate Signal", "", f"**{aggregate}**", "", explanation, "",
         PLAN_REVIEW_CONTROL_PREFIX + json.dumps(
@@ -966,10 +844,25 @@ def render_plan_review_result(review: Dict[str, Any], *, cached: bool = False) -
     ])
 
 
+def render_plan_context_degradation(requested: str, effective: str, reason: str) -> str:
+    """Render the one loud disclosure shared by fresh and cached plan results."""
+    if not requested or not effective or requested == effective:
+        return ""
+    return (
+        "⚠️ PLAN_CONTEXT_DEGRADED: "
+        f"requested context_level={requested}; effective context_level={effective}. "
+        f"Reason: {reason or 'the requested generated context could not fit'}. "
+        "The same plan fingerprint, scout wave, and handoffs were preserved. The "
+        "effective review packet retained the governance documents, plan, scout evidence, "
+        "and surviving planned-touch snapshots; Generated Atlas evidence was omitted and "
+        "snapshot omissions remained explicit.\n\n"
+    )
+
+
 VACUOUS_DISPOSITION_NOTE = (
-    "\n\nNOTE: an empty review_disposition was ignored as absent. Omit the field "
-    "entirely unless you are closing the immediately preceding REVIEW_REQUIRED "
-    "result for this exact unchanged plan."
+    "\n\nNOTE: an empty review_disposition was ignored in this review-mode call. "
+    "Omit the field when submitting a plan; to close REVIEW_REQUIRED, make a separate "
+    "call containing a complete review_disposition only."
 )
 
 def vacuous_review_disposition(value: object) -> bool:
@@ -988,6 +881,37 @@ def vacuous_review_disposition(value: object) -> bool:
     return items is None or items == []
 
 
+def same_review_disposition(left: object, right: object) -> bool:
+    """Semantic equality for idempotent replay, ignoring storage-only timestamps."""
+    def signature(value: object) -> tuple[str, tuple[tuple[str, str, str, str], ...]]:
+        payload = value if isinstance(value, dict) else {}
+        items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        normalized = sorted(
+            (
+                str(item.get("finding_id") or ""), str(item.get("decision") or ""),
+                str(item.get("rationale") or ""), str(item.get("plan_revision") or ""),
+            )
+            for item in items if isinstance(item, dict)
+        )
+        return str(payload.get("review_fingerprint") or ""), tuple(normalized)
+    return signature(left) == signature(right)
+
+
+def replay_closed_review_disposition(
+    review: Dict[str, Any], fingerprint: str, disposition: Dict[str, Any],
+) -> str:
+    """Accept only an exact semantic replay of the disposition that closed review."""
+    updated, error = validate_plan_review_disposition(review, fingerprint, disposition)
+    if error or updated is None:
+        return error
+    if not same_review_disposition(review.get("disposition"), updated.get("disposition")):
+        return (
+            "ERROR: PLAN_REVIEW_DISPOSITION_IMMUTABLE: this exact review was already "
+            "closed by a different disposition."
+        )
+    return render_plan_review_result(review, cached=True)
+
+
 def validate_plan_review_disposition(
     review: Dict[str, Any], fingerprint: str, disposition: Any
 ) -> tuple[Optional[Dict[str, Any]], str]:
@@ -1001,11 +925,14 @@ def validate_plan_review_disposition(
     if str(disposition.get("review_fingerprint") or "").strip() != expected_fp or fingerprint != expected_fp:
         return None, (
             "ERROR: PLAN_REVIEW_DISPOSITION_STALE: review_disposition must name the "
-            "exact immediately preceding plan fingerprint."
+            "exact latest still-current plan fingerprint."
         )
     aggregate = str(review.get("aggregate_signal") or "")
     if aggregate == "REVISE_PLAN":
-        return None, "ERROR: PLAN_REVIEW_REVISION_REQUIRED: change the plan text before a fresh review."
+        return None, (
+            "ERROR: PLAN_REVIEW_REVISION_REQUIRED: blocking mode requires changed plan "
+            "text and a fresh review; advisory mode may proceed under loud host disclosure."
+        )
     if aggregate == "GREEN":
         return None, invalid + "the prior result is already GREEN"
     if aggregate != "REVIEW_REQUIRED":

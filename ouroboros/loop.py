@@ -274,8 +274,8 @@ def _force_plan_reminder(decision: Dict[str, Any]) -> str:
     if outcome == "REVIEW_REQUIRED":
         return (
             "[SWARM_INITIATIVE] Blocking plan review remains REVIEW_REQUIRED. Re-call "
-            "plan_task with the exact fingerprint and a complete review_disposition, then "
-            "continue; do not rerun the reviewer wave."
+            "plan_task with a complete review_disposition as the only field, naming the "
+            "latest fingerprint, then continue; do not resend the plan or rerun reviewers."
         )
     if outcome == "REVISE_PLAN":
         return (
