@@ -5,15 +5,27 @@ Two editing primitives beyond exact-match ``edit_text`` and full-file
 
 - ``apply_patch``  — context-anchored multi-file diff (V4A-style, no line
   numbers): hunks locate themselves by surrounding lines plus optional ``@@``
-  anchors. Atomic across all files/hunks: any unmatched hunk aborts the whole
-  patch with per-hunk diagnostics.
-- ``edit_batch``   — atomic batch of COUNTED exact replacements. Each edit
-  declares how many occurrences it expects (default 1); a count mismatch
-  aborts the whole batch. This is the safe form of "replace all".
+  anchors. Atomic VALIDATION across all files/hunks: any unmatched hunk aborts
+  the whole patch before a single byte is written, with per-hunk diagnostics.
+- ``edit_batch``   — batch of COUNTED exact replacements, validated as a whole.
+  Each edit declares how many occurrences it expects (default 1); a count
+  mismatch aborts the whole batch before anything is written. This is the safe
+  form of "replace all".
+
+Atomicity is over VALIDATION, not the write phase: nothing is written until every
+file, hunk and count resolves, but the writes themselves are a per-file sequence,
+so a mid-write I/O fault can leave earlier files applied. That case discloses
+itself (``EDIT_OPS_PARTIAL_WRITE_FAILED``), names the written files and marks the
+advisory snapshot stale.
 
 Both target the repo lanes only (active_workspace / system_repo) and reuse the
-same guard chain as ``edit_text``: root access, protected artifact paths,
-project-room write guard, protected runtime paths.
+same guard chain as ``edit_text``: path canonicalization FIRST (see
+``_resolve_edit_target`` — a guard that judges a different spelling than the
+write uses is not a guard), then root access, protected artifact paths,
+project-room write guard, protected runtime paths. Because their paths ride
+inside the payload rather than a ``path`` arg, the dispatch gates in
+``registry.py`` read them back out through ``_payload_write_paths`` so the
+acting-subagent and protected-write fences apply identically.
 
 (An ``edit_sketch`` fast-apply tool — strong-model sketch merged by the cheap
 LIGHT model — lived here through the editbench evaluation and was removed: the
@@ -23,6 +35,12 @@ in the result and a pre-write syntax check — moved into write_file.)
 
 ``_syntax_check`` and ``_unified_diff`` are shared helpers, also used by the
 repo write path (git._repo_write).
+
+Newlines follow the existing repo-write lane rather than diverging from it: the
+lane reads with universal newlines and writes ``\n``, so a CRLF file is rewritten
+LF-only — by ``edit_text`` and ``write_file`` today, and by these tools for the
+same reason. Stated here because a patch tool implies surgical byte fidelity; a
+lane-wide newline contract is not this module's to change.
 """
 
 from __future__ import annotations
@@ -36,11 +54,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.config import get_runtime_mode
 from ouroboros.runtime_mode_policy import (
+    core_patch_notice,
     is_protected_runtime_path,
     mode_allows_protected_write,
     normalize_repo_path,
+    protected_paths_in,
     protected_write_block_message,
 )
+from ouroboros.tool_access import canonical_repo_relative_path
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
 from ouroboros.utils import safe_relpath, write_text
 
@@ -53,10 +74,15 @@ log = logging.getLogger(__name__)
 
 def _resolve_edit_target(
     ctx: ToolContext, path: str, root: str, *, error_tag: str
-) -> Tuple[Optional[pathlib.Path], str]:
+) -> Tuple[Optional[pathlib.Path], str, str]:
     """Resolve ``path`` under ``root`` with the same guards as edit_text.
 
-    Returns ``(target, "")`` on success or ``(None, error_message)``.
+    Returns ``(target, canonical_rel, "")`` on success or ``(None, "", error)``.
+
+    The canonical rel is returned, not just used internally: it is the file's
+    IDENTITY. Callers plan, dedup, diagnose and invalidate by it, so two
+    spellings of one file inside a single call collapse to one entry instead of
+    two writes where the last silently discards the first.
     """
     from ouroboros.tools.core import (
         _access_or_block,
@@ -65,12 +91,12 @@ def _resolve_edit_target(
     )
 
     if not path or not str(path).strip():
-        return None, f"⚠️ {error_tag}: path is required."
+        return None, "", f"⚠️ {error_tag}: path is required."
     normalized, block = _access_or_block(ctx, root, "edit")
     if block:
-        return None, block
+        return None, "", block
     if normalized not in {"active_workspace", "system_repo"}:
-        return None, (
+        return None, "", (
             f"⚠️ {error_tag}: root={normalized!r} is not supported; "
             "these tools edit repo lanes only (active_workspace / system_repo). "
             "Use write_file/edit_text for data-plane roots."
@@ -82,19 +108,30 @@ def _resolve_edit_target(
             active_root = resource_root_path(ctx, "active_workspace")
             system_root = resource_root_path(ctx, "system_repo")
             if active_root.resolve(strict=False) != system_root.resolve(strict=False):
-                return None, (
+                return None, "", (
                     f"⚠️ {error_tag}: root=system_repo edits require the active "
                     "workspace to be the system repo."
                 )
         except Exception as exc:  # noqa: BLE001 - validation must fail closed
-            return None, f"⚠️ {error_tag}: could not validate system_repo root: {type(exc).__name__}: {exc}"
+            return None, "", f"⚠️ {error_tag}: could not validate system_repo root: {type(exc).__name__}: {exc}"
+    # CANONICALIZE BEFORE ANY GUARD READS THE PATH. `ctx.repo_path` applies
+    # `normalize_root_relative` (absolute-inside-root and redundant root-basename
+    # spellings collapse to the same target), so a guard that inspects the RAW
+    # spelling desyncs from the file that actually gets written: `repo/BIBLE.md`
+    # and `/…/repo/BIBLE.md` are not members of the protected-path table while
+    # `BIBLE.md` is. `edit_text`/`write_file` are immune because the dispatcher
+    # normalizes their `path` arg once in `_normalize_dispatch_path_args`; these
+    # tools carry their paths inside the patch text / edits[] entries, so they
+    # must do the same normalization here — before the protected checks, and for
+    # the dedup keys and diagnostics too.
+    path = canonical_repo_relative_path(ctx, normalized, path)
     protected_block = _protected_artifact_write_block(
         ctx, normalized, [path], prefix=error_tag
     )
     if protected_block:
-        return None, protected_block
+        return None, "", protected_block
     if normalized == "active_workspace" and project_room_lens_dir(ctx) is not None:
-        return None, (
+        return None, "", (
             "⚠️ ROOM_WRITE_VIA_TASK: this room's files are edited by PROMOTED tasks — "
             "call promote_chat_to_task for real work there. For a deliberate edit of "
             'the Ouroboros system repo, pass root="system_repo" explicitly.'
@@ -104,15 +141,29 @@ def _resolve_edit_target(
         not ctx.is_workspace_mode()
         and is_protected_runtime_path(norm)
         and not mode_allows_protected_write(_runtime_mode())
+        # The assisted managed-update resolver edits whatever official file the
+        # merge conflicts on; git._repo_write and _str_replace_editor both carry
+        # this exemption, so withholding it here would make these tools the one
+        # lane that cannot finish a conflict resolution.
+        and not _authorized_resolver(ctx)
     ):
-        return None, protected_write_block_message(
+        return None, "", protected_write_block_message(
             path=norm, runtime_mode=_runtime_mode(), action="edit"
         )
     try:
         target = ctx.repo_path(path)
     except ValueError as e:
-        return None, f"⚠️ PATH_ERROR: {e}"
-    return target, ""
+        return None, "", f"⚠️ PATH_ERROR: {e}"
+    return target, safe_relpath(path), ""
+
+
+def _authorized_resolver(ctx: ToolContext) -> bool:
+    try:
+        from ouroboros.tools.registry import _authorized_managed_update_resolver
+
+        return bool(_authorized_managed_update_resolver(ctx))
+    except Exception:
+        return False
 
 
 def _runtime_mode() -> str:
@@ -137,10 +188,44 @@ def _finish_mutation(ctx: ToolContext, changed_paths: List[str], source_tool: st
         log.debug("%s: advisory invalidation failed (non-critical)", source_tool, exc_info=True)
     if ctx.is_workspace_mode():
         return "Files are on disk but NOT committed. Do not commit; the headless runner will emit a patch artifact."
-    return (
+    footer = (
         "Files are on disk but NOT committed. Run commit_reviewed when ready.\n"
         "⚠️ Advisory pre-review is now stale — run advisory_review before commit_reviewed."
     )
+    # A pro-mode edit of a protected surface announces itself here exactly as it
+    # does from git._repo_write / _str_replace_editor (SYSTEM.md's protected-write
+    # contract): the mode ALLOWS the write, and the notice is what keeps it visible.
+    protected = protected_paths_in(changed_paths)
+    if protected and mode_allows_protected_write(_runtime_mode()):
+        footer += "\n\n" + core_patch_notice(protected)
+    return footer
+
+
+def _partial_write_failure(
+    ctx: ToolContext, changed_paths: List[str], source_tool: str, tag: str, detail: str
+) -> str:
+    """Report an I/O failure that landed AFTER some files were already written.
+
+    Validation is atomic — nothing is written until every file and hunk resolves
+    — but the write phase itself is a sequence of per-file writes, so a disk
+    error mid-sequence leaves the earlier files applied. Those files are real
+    worktree mutations, so the advisory snapshot must go stale here exactly as it
+    would on success; otherwise `commit_reviewed` would accept them against a
+    pre-review taken before they existed. The residual is disclosed, not hidden.
+    """
+
+    if changed_paths:
+        _finish_mutation(ctx, changed_paths, source_tool)
+        # NOT the tools' own *_ERROR prefix: those read as validation refusals
+        # (a counted/context miss) and are classified as policy denials. This is a
+        # genuine partial mutation from an I/O fault and must stay an execution
+        # failure, so it carries its own prefix and lands in the generic `error`.
+        return (
+            f"⚠️ EDIT_OPS_PARTIAL_WRITE_FAILED ({tag}): {detail}\n"
+            f"PARTIALLY APPLIED — these files WERE written: {', '.join(changed_paths)}. "
+            "Re-read them before retrying; advisory pre-review is now stale."
+        )
+    return f"⚠️ {tag}: {detail}\nNothing was written."
 
 
 def _line_positions(text: str, needle: str, limit: int = 5) -> List[str]:
@@ -266,6 +351,21 @@ def _parse_patch(patch: str) -> Tuple[List[_FileOp], str]:
     return ops, ""
 
 
+def patch_target_paths(patch: str) -> List[str]:
+    """Every file path a patch addresses, derived from the REAL parser.
+
+    The dispatch protected-path gate needs the same targets the handler will
+    write. Deriving them from ``_parse_patch`` (rather than a second header
+    scanner) is what keeps the gate from drifting: a parse failure returns no
+    paths, and the handler refuses that patch before any write.
+    """
+
+    ops, err = _parse_patch(patch or "")
+    if err:
+        return []
+    return [op.path for op in ops if op.path]
+
+
 def _find_sequence(
     file_lines: List[str], seq: List[str], start: int, *, fuzzy: bool
 ) -> List[int]:
@@ -340,7 +440,10 @@ def _apply_hunks_to_text(
         file_lines[pos:pos + len(old)] = new
         cursor = pos + len(new)
         if fuzzy_used:
-            notes.append(f"hunk {hi}: matched after trailing-whitespace normalization")
+            notes.append(
+                f"hunk {hi}: matched ignoring trailing whitespace — the replaced lines, "
+                "INCLUDING context lines, now carry the patch's trailing whitespace"
+            )
     return "\n".join(file_lines), notes, ""
 
 
@@ -358,10 +461,9 @@ def _apply_patch(ctx: ToolContext, patch: str, root: str = "active_workspace") -
     all_notes: List[str] = []
     seen: Dict[str, str] = {}  # rel path -> pending content (chained updates)
     for op in ops:
-        target, terr = _resolve_edit_target(ctx, op.path, root, error_tag="APPLY_PATCH_BLOCKED")
+        target, rel, terr = _resolve_edit_target(ctx, op.path, root, error_tag="APPLY_PATCH_BLOCKED")
         if terr:
             return terr
-        rel = safe_relpath(op.path)
         if op.kind == "add":
             if rel in seen or target.exists():
                 return (
@@ -410,13 +512,19 @@ def _apply_patch(ctx: ToolContext, patch: str, root: str = "active_workspace") -
         try:
             write_text(target, content)
         except Exception as e:  # noqa: BLE001 - surface the failed path
-            return f"⚠️ APPLY_PATCH_ERROR: write failed for {rel}: {e} (earlier files in this patch WERE written)"
+            return _partial_write_failure(
+                ctx, changed_paths, "apply_patch", "APPLY_PATCH_ERROR",
+                f"write failed for {rel}: {e}",
+            )
         changed_paths.append(rel)
     for target, rel in planned_deletes:
         try:
             target.unlink()
         except Exception as e:  # noqa: BLE001 - surface the failed path
-            return f"⚠️ APPLY_PATCH_ERROR: delete failed for {rel}: {e}"
+            return _partial_write_failure(
+                ctx, changed_paths, "apply_patch", "APPLY_PATCH_ERROR",
+                f"delete failed for {rel}: {e}",
+            )
         changed_paths.append(rel)
 
     footer = _finish_mutation(ctx, changed_paths, "apply_patch")
@@ -458,12 +566,14 @@ def _edit_batch(ctx: ToolContext, edits: List[Dict[str, Any]], root: str = "acti
         if count < 1:
             errors.append(f"edit {idx} ({path or '?'}): count must be >= 1")
             continue
-        rel = safe_relpath(path) if path else ""
+        # Resolve BEFORE keying: the canonical rel is the file's identity, so two
+        # spellings of one file in a single batch share one buffer instead of two
+        # that overwrite each other.
+        target, rel, terr = _resolve_edit_target(ctx, path, root, error_tag="EDIT_BATCH_BLOCKED")
+        if terr:
+            errors.append(f"edit {idx}: {terr.lstrip('⚠️ ')}")
+            continue
         if rel not in contents:
-            target, terr = _resolve_edit_target(ctx, path, root, error_tag="EDIT_BATCH_BLOCKED")
-            if terr:
-                errors.append(f"edit {idx}: {terr.lstrip('⚠️ ')}")
-                continue
             if not target.exists():
                 errors.append(f"edit {idx} ({rel}): file not found")
                 continue
@@ -495,7 +605,10 @@ def _edit_batch(ctx: ToolContext, edits: List[Dict[str, Any]], root: str = "acti
         try:
             write_text(targets[rel], text)
         except Exception as e:  # noqa: BLE001 - surface the failed path
-            return f"⚠️ EDIT_BATCH_ERROR: write failed for {rel}: {e} (earlier files WERE written)"
+            return _partial_write_failure(
+                ctx, changed, "edit_batch", "EDIT_BATCH_ERROR",
+                f"write failed for {rel}: {e}",
+            )
         changed.append(rel)
     footer = _finish_mutation(ctx, changed, "edit_batch")
     return (
@@ -519,6 +632,11 @@ def _syntax_check(rel: str, content: str) -> str:
     except SyntaxError as e:
         return f"content has a Python syntax error at line {e.lineno}: {e.msg}"
     except ValueError as e:
+        # compile() raises a bare ValueError for content Python cannot even scan
+        # (a NUL byte, for one). Report it against the format actually checked —
+        # "not valid JSON" for a .py file sends the fix in the wrong direction.
+        if rel.endswith(".py"):
+            return f"content is not valid Python source: {e}"
         return f"content is not valid JSON: {e}"
     except Exception:
         return ""
@@ -532,11 +650,24 @@ def _unified_diff(rel: str, before: str, after: str, cap: int = 400) -> str:
             fromfile=f"a/{rel}", tofile=f"b/{rel}", lineterm="",
         )
     )
+    # splitlines() drops the final terminator, so adding or removing the trailing
+    # newline is invisible to the line diff. This rail exists to let the agent
+    # VERIFY an overwrite; reporting "no textual changes" for a file whose bytes
+    # did change is the one thing it must never do.
+    trailing_note = ""
+    if before.endswith("\n") != after.endswith("\n"):
+        trailing_note = (
+            "\\ No newline at end of file (the previous version had one)"
+            if before.endswith("\n")
+            else "\\ Newline added at end of file"
+        )
     if not diff_lines:
-        return "(no textual changes)"
+        return trailing_note or "(no textual changes)"
     clipped = diff_lines[:cap]
     if len(diff_lines) > cap:
         clipped.append(f"... diff truncated ({len(diff_lines) - cap} more lines)")
+    if trailing_note:
+        clipped.append(trailing_note)
     return "\n".join(clipped)
 
 
@@ -549,8 +680,11 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("apply_patch", {
             "name": "apply_patch",
             "description": (
-                "Apply a context-anchored multi-file patch (no line numbers). Atomic: "
-                "any unmatched hunk aborts the whole patch. Format:\n"
+                "Apply a context-anchored multi-file patch (no line numbers). Validation is "
+                "atomic: every file and hunk must resolve before ANYTHING is written, so "
+                "an unmatched hunk aborts the whole patch untouched (a mid-write disk "
+                "error is the one case that can leave earlier files applied, and it says "
+                "so). Format:\n"
                 "*** Begin Patch\n"
                 "*** Update File: relative/path.py\n"
                 "@@ def nearest_function\n"
@@ -575,10 +709,12 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("edit_batch", {
             "name": "edit_batch",
             "description": (
-                "Atomic batch of COUNTED exact replacements across one or more files. "
+                "Batch of COUNTED exact replacements across one or more files. "
                 "Each edit replaces ALL occurrences of old_str in its file and declares "
                 "the exact number it expects via count (default 1). Any count mismatch "
-                "aborts the WHOLE batch with per-edit diagnostics — read the file(s) "
+                "aborts the WHOLE batch before anything is written, with per-edit "
+                "diagnostics (a mid-write disk error is the one case that can leave "
+                "earlier files applied, and it says so) — read the file(s) "
                 "first and state counts you verified. This is the safe 'replace all': "
                 "use count>1 for identical repeated edits instead of many edit_text calls."
             ),

@@ -885,8 +885,8 @@ substitute the configured reviewer model.
 Preferred workflow for non-trivial edits: choose the right edit tool first —
 `edit_text` for one exact replacement, `edit_batch` for several exact
 replacements or a counted replace-all (each edit declares how many occurrences
-it expects; a mismatch aborts the whole batch atomically), `apply_patch` for
-scattered multi-file changes (context-anchored hunks, atomic across files),
+it expects; a mismatch aborts the whole batch before anything is written), `apply_patch` for
+scattered multi-file changes (context-anchored hunks, validated across all files before the first write),
 and `write_file` for new files or intentional full rewrites (overwrites return
 the diff vs the previous version and block syntactically invalid .py/.json
 unless forced) — then `advisory_review`, then `commit_reviewed`
@@ -948,7 +948,7 @@ Before every commit, verify the following:
 - [ ] No gratuitous abstract layers (Bible P7)
 
 #### Structural Rules
-- [ ] New Tool? `get_tools()` exports it using the `ToolEntry` pattern from `registry.py`, an explicit entry is added to `ouroboros/safety.py::TOOL_POLICY` (`POLICY_SKIP` for trusted built-ins, `POLICY_CHECK` for opaque or outward-facing ones), AND the intended visibility is declared in `ouroboros/tool_capabilities.py` (`CORE_TOOL_NAMES`, local-readonly/acting subagent allowlists, parallel/truncation sets as appropriate). If workspace tasks should see the tool, update the workspace allowlist in `tools/registry.py` too. Without the policy entry the tool falls through to `DEFAULT_POLICY = POLICY_CHECK` and pays a light-model LLM call per invocation, and without the capability/allowlist wiring a packaged/visible tool can still be unreachable to subagents or workspace tasks.
+- [ ] New Tool? `get_tools()` exports it using the `ToolEntry` pattern from `registry.py`, an explicit entry is added to `ouroboros/safety.py::TOOL_POLICY` (`POLICY_SKIP` for trusted built-ins, `POLICY_CHECK` for opaque or outward-facing ones), AND the intended visibility is declared in `ouroboros/tool_capabilities.py` (`CORE_TOOL_NAMES`, local-readonly/acting subagent allowlists, parallel/truncation sets as appropriate). If workspace tasks should see the tool, update the workspace allowlist in `tools/registry.py` too. Without the policy entry the tool falls through to `DEFAULT_POLICY = POLICY_CHECK` and pays a light-model LLM call per invocation, and without the capability/allowlist wiring a packaged/visible tool can still be unreachable to subagents or workspace tasks. **A tool that WRITES the repo working tree needs the GUARD surfaces too, not only the visibility ones:** add it to `_ROOT_ARG_REPO_WRITE_TOOLS` (the single set behind the acting-no-workspace fence, the protected-write gate and the acting root-enum narrowing) and make sure its target paths are canonicalized — via `_PATH_NORMALIZED_TOOLS` if it takes a top-level `path`, or via `canonical_repo_relative_path` + `_payload_write_paths` if its paths ride inside the payload. Visibility lists are all green while these are missing, so the gap does not surface as a failing test: `apply_patch`/`edit_batch` shipped a protected-path bypass that way (a guard reading `repo/BIBLE.md` while the write landed on `BIBLE.md`). Tests must exercise the REAL guard chain — a test that monkeypatches the resolver proves the mechanics, not the fence.
 - [ ] New Gateway (if extracted)? Contains no business logic, only transport.
 - [ ] New memory/data files? Should they appear in LLM context (`context.py`)?
 

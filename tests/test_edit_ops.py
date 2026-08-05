@@ -234,13 +234,15 @@ def ws(tmp_path, monkeypatch):
 
 
 def _fake_resolver(ctx):
+    from ouroboros.utils import safe_relpath
+
     def resolver(_ctx, path, _root, *, error_tag):
         if not path:
-            return None, f"⚠️ {error_tag}: path is required."
+            return None, "", f"⚠️ {error_tag}: path is required."
         try:
-            return ctx.repo_path(path), ""
+            return ctx.repo_path(path), safe_relpath(path), ""
         except ValueError as e:
-            return None, f"⚠️ PATH_ERROR: {e}"
+            return None, "", f"⚠️ PATH_ERROR: {e}"
     return resolver
 
 
@@ -457,3 +459,255 @@ def test_repo_write_force_bypass_is_disclosed(tmp_path):
     out = _repo_write(ctx, path="fixture_broken.py", content="def f(:\n", force=True)
     assert out.startswith("✅")
     assert "SYNTAX_GUARD_BYPASSED" in out
+
+
+# ---------------------------------------------------------------------------
+# guard parity with edit_text (the fences these tools must NOT be weaker than)
+# ---------------------------------------------------------------------------
+
+def _guard_registry(tmp_path):
+    """A registry over a throwaway repo, so guards run for real (no fake resolver)."""
+    import subprocess
+
+    from ouroboros.tools.registry import ToolRegistry
+
+    repo = tmp_path / "repo"
+    (repo / "ouroboros").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    return ToolRegistry(repo_dir=repo, drive_root=drive), repo
+
+
+def _protected_call(tool, path):
+    if tool == "edit_text":
+        return {"path": path, "old_str": "P1 honest", "new_str": "P1 loose"}
+    if tool == "apply_patch":
+        return {"patch": f"*** Update File: {path}\n-P1 honest\n+P1 loose\n"}
+    return {"edits": [{"path": path, "old_str": "P1 honest", "new_str": "P1 loose"}]}
+
+
+@pytest.mark.parametrize("tool", ["edit_text", "apply_patch", "edit_batch"])
+@pytest.mark.parametrize("spelling", ["canonical", "absolute", "root_basename"])
+def test_protected_path_blocked_in_every_spelling(tmp_path, tool, spelling):
+    """A protected path is refused however it is SPELLED.
+
+    ``ctx.repo_path`` collapses an absolute-inside-root path and a redundant
+    root-basename prefix onto the same file, so a guard reading the raw spelling
+    would pass `repo/BIBLE.md` straight through to a write on `BIBLE.md`.
+    edit_text is canonicalized at dispatch; apply_patch/edit_batch carry their
+    paths inside the payload and must canonicalize before their own guards.
+    """
+    reg, repo = _guard_registry(tmp_path)
+    spellings = {
+        "canonical": "BIBLE.md",
+        "absolute": str(repo / "BIBLE.md"),
+        "root_basename": "repo/BIBLE.md",
+    }
+    (repo / "BIBLE.md").write_text("P1 honest\n", encoding="utf-8")
+    result = str(reg.execute(tool, _protected_call(tool, spellings[spelling])))
+    assert "BLOCKED" in result, result[:200]
+    assert (repo / "BIBLE.md").read_text() == "P1 honest\n"
+
+
+@pytest.mark.parametrize("tool", ["write_file", "apply_patch", "edit_batch"])
+def test_acting_subagent_without_workspace_cannot_touch_the_live_repo(tmp_path, tool):
+    """An acting child with no isolated workspace must not reach the live repo.
+
+    active_workspace falls back to the LIVE repo for such a child, which is why
+    the fence exists; a new repo-lane write tool that misses it is a weaker lane,
+    not a new capability.
+    """
+    from ouroboros.contracts.task_constraint import TaskConstraint
+
+    reg, repo = _guard_registry(tmp_path)
+    (repo / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+    reg._is_acting_subagent = lambda: True
+    reg._ctx.task_constraint = TaskConstraint(mode="acting")
+    args = {
+        "write_file": {"path": "mod.py", "content": "VALUE = 2\n"},
+        "apply_patch": {"patch": "*** Update File: mod.py\n-VALUE = 1\n+VALUE = 2\n"},
+        "edit_batch": {"edits": [{"path": "mod.py", "old_str": "VALUE = 1", "new_str": "VALUE = 2"}]},
+    }[tool]
+    result = str(reg.execute(tool, args))
+    assert "ACTING_NO_WORKSPACE_BLOCKED" in result, result[:200]
+    assert (repo / "mod.py").read_text() == "VALUE = 1\n"
+
+
+def test_acting_subagent_schema_narrows_root_for_every_repo_write_tool():
+    from ouroboros.tools.registry import _ROOT_ARG_REPO_WRITE_TOOLS
+
+    assert {"write_file", "edit_text", "apply_patch", "edit_batch"} == set(_ROOT_ARG_REPO_WRITE_TOOLS)
+
+
+def test_patch_target_paths_come_from_the_real_parser():
+    from ouroboros.tools.edit_ops import patch_target_paths
+
+    assert patch_target_paths(
+        "*** Begin Patch\n*** Update File: a.py\n-x\n+y\n*** Add File: b.py\n+z\n"
+        "*** Delete File: c.py\n*** End Patch\n"
+    ) == ["a.py", "b.py", "c.py"]
+    # An unparseable patch yields no targets; the handler refuses it before any write.
+    assert patch_target_paths("garbage without a header") == []
+
+
+# ---------------------------------------------------------------------------
+# content fidelity of the overwrite-verification rail
+# ---------------------------------------------------------------------------
+
+def test_unified_diff_reports_a_final_newline_change():
+    # The rail exists so the agent can VERIFY an overwrite: claiming "no textual
+    # changes" for a file whose bytes changed is the one unacceptable answer.
+    out = edit_ops._unified_diff("f.txt", "value\n", "value")
+    assert "No newline at end of file" in out
+    assert out != "(no textual changes)"
+    assert edit_ops._unified_diff("f.txt", "value", "value\n").startswith("\\ Newline added")
+    assert edit_ops._unified_diff("f.txt", "same\n", "same\n") == "(no textual changes)"
+
+
+def test_syntax_check_names_the_format_it_checked():
+    # compile() raises a bare ValueError on a NUL byte; calling that "not valid
+    # JSON" for a .py file sends the fix in the wrong direction.
+    message = edit_ops._syntax_check("mod.py", "x = 1\x00\n")
+    assert message and "JSON" not in message
+    assert "Python" in message
+
+
+# ---------------------------------------------------------------------------
+# partial-write disclosure (validation is atomic; the write phase is not)
+# ---------------------------------------------------------------------------
+
+def test_partial_write_marks_advisory_stale_and_says_so(tmp_path, monkeypatch):
+    """Files written before an I/O failure are real mutations.
+
+    If the advisory snapshot stayed fresh, commit_reviewed would accept them
+    against a pre-review taken before they existed.
+    """
+    from ouroboros.tools import commit_gate
+
+    invalidated = []
+    monkeypatch.setattr(
+        commit_gate, "_invalidate_advisory",
+        lambda ctx, **kw: invalidated.append(tuple(kw.get("changed_paths") or ())),
+    )
+    repo = tmp_path / "ws"
+    repo.mkdir()
+    (repo / "one.py").write_text("A = 1\n", encoding="utf-8")
+    (repo / "two.py").write_text("B = 1\n", encoding="utf-8")
+    ctx = _FakeCtx(repo)
+    monkeypatch.setattr(edit_ops, "_resolve_edit_target", _fake_resolver(ctx))
+    real_write = edit_ops.write_text
+
+    def flaky(target, content):
+        if target.name == "two.py":
+            raise OSError("disk full")
+        return real_write(target, content)
+
+    monkeypatch.setattr(edit_ops, "write_text", flaky)
+    result = edit_ops._apply_patch(
+        ctx,
+        "*** Update File: one.py\n-A = 1\n+A = 2\n*** Update File: two.py\n-B = 1\n+B = 2\n",
+    )
+    assert "EDIT_OPS_PARTIAL_WRITE_FAILED" in result and "PARTIALLY APPLIED" in result and "one.py" in result
+    assert (repo / "one.py").read_text() == "A = 2\n"
+    assert invalidated == [("one.py",)]
+
+
+def test_edit_ops_refusals_are_policy_denials_not_execution_failures():
+    """A counted/context refusal is the DESIGNED path, not a broken executor.
+
+    Untyped, these fall through to the generic `error` status and degrade
+    execution health with a false tool_failure headline — the exact regression
+    v6.57.0 removed for the other write tools.
+    """
+    from ouroboros.loop_tool_execution import _extract_result_metadata
+    from ouroboros.outcomes import _POLICY_DENIAL_STATUSES
+
+    for text in (
+        "⚠️ APPLY_PATCH_ERROR: hunk 1: context not found in m.py (searched from line 1).",
+        "⚠️ EDIT_BATCH_ERROR: batch aborted, NOTHING was written (atomic).",
+    ):
+        status = _extract_result_metadata("t", text, False)["status"]
+        assert status == "edit_ops_blocked"
+        assert status in _POLICY_DENIAL_STATUSES
+
+
+def test_one_file_under_two_spellings_is_one_target(tmp_path):
+    """Two spellings of one file in a single call must not race each other.
+
+    ``ctx.repo_path`` maps them to the same file, so keying the plan by the RAW
+    spelling produced two buffers, two writes, and a last-write-wins that
+    silently dropped the first edit while reporting both as applied.
+    """
+    reg, repo = _guard_registry(tmp_path)
+    (repo / "f.txt").write_text("A = 1\nB = 1\n", encoding="utf-8")
+    result = str(reg.execute("edit_batch", {"edits": [
+        {"path": "f.txt", "old_str": "A = 1", "new_str": "A = 2"},
+        {"path": "repo/f.txt", "old_str": "B = 1", "new_str": "B = 2"},
+    ]}))
+    assert result.startswith("✅"), result[:200]
+    assert (repo / "f.txt").read_text() == "A = 2\nB = 2\n"
+    assert "across 1 file" in result, result[:200]
+
+    (repo / "g.txt").write_text("X = 1\nY = 1\n", encoding="utf-8")
+    result = str(reg.execute("apply_patch", {"patch":
+        "*** Update File: g.txt\n-X = 1\n+X = 2\n"
+        f"*** Update File: {repo / 'g.txt'}\n-Y = 1\n+Y = 2\n"
+    }))
+    assert result.startswith("✅"), result[:200]
+    assert (repo / "g.txt").read_text() == "X = 2\nY = 2\n"
+
+
+def test_partial_write_is_an_execution_failure_not_a_policy_denial():
+    """A validation refusal is harmless telemetry; a half-applied write is not."""
+    from ouroboros.loop_tool_execution import _extract_result_metadata
+    from ouroboros.outcomes import _POLICY_DENIAL_STATUSES
+
+    partial = (
+        "⚠️ EDIT_OPS_PARTIAL_WRITE_FAILED (APPLY_PATCH_ERROR): write failed for b.py: disk full\n"
+        "PARTIALLY APPLIED — these files WERE written: a.py."
+    )
+    status = _extract_result_metadata("t", partial, False)["status"]
+    assert status not in _POLICY_DENIAL_STATUSES
+    assert status == "error"
+
+
+@pytest.mark.parametrize("tool", ["write_file", "apply_patch", "edit_batch"])
+def test_pro_mode_protected_edit_announces_itself(tmp_path, monkeypatch, tool):
+    """A pro-mode protected write is ALLOWED; the notice is what keeps it visible.
+
+    git._repo_write and _str_replace_editor both append it, so a repo-write tool
+    that stays silent makes a protected edit look like an ordinary one.
+    """
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
+    from ouroboros import config
+
+    monkeypatch.setattr(config, "get_runtime_mode", lambda: "pro")
+    reg, repo = _guard_registry(tmp_path)
+    (repo / "BIBLE.md").write_text("P1 honest\n", encoding="utf-8")
+    args = {
+        "write_file": {"path": "BIBLE.md", "content": "P1 honest v2\n"},
+        "apply_patch": {"patch": "*** Update File: BIBLE.md\n-P1 honest\n+P1 honest v2\n"},
+        "edit_batch": {"edits": [{"path": "BIBLE.md", "old_str": "P1 honest", "new_str": "P1 honest v2"}]},
+    }[tool]
+    result = str(reg.execute(tool, args))
+    assert result.startswith("✅"), result[:200]
+    assert "CORE_PATCH_NOTICE" in result, result[:300]
+
+
+def test_managed_update_resolver_keeps_its_exemption(tmp_path, monkeypatch):
+    """The assisted resolver edits whatever official file the merge conflicts on.
+
+    git._repo_write carries this exemption; withholding it here would make these
+    tools the one lane that cannot finish a conflict resolution.
+    """
+    from ouroboros.tools import registry as registry_mod
+
+    reg, repo = _guard_registry(tmp_path)
+    (repo / "BIBLE.md").write_text("P1 honest\n", encoding="utf-8")
+    monkeypatch.setattr(registry_mod, "_authorized_managed_update_resolver", lambda ctx: True)
+    result = str(reg.execute("apply_patch", {
+        "patch": "*** Update File: BIBLE.md\n-P1 honest\n+P1 resolved\n",
+    }))
+    assert result.startswith("✅"), result[:200]
+    assert (repo / "BIBLE.md").read_text() == "P1 resolved\n"

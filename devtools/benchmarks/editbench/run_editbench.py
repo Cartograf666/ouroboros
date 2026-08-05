@@ -9,7 +9,8 @@ metrics from the isolated data root.
 Configs:
   write_file_only / edit_text_only / apply_patch_only / edit_batch_only
                     — exactly one editing tool available;
-  default           — the write_file + edit_text + apply_patch + edit_batch set;
+  default           — the historical set (write_file + edit_text), i.e. the new
+                      tools disabled, so it measures the pre-PR baseline;
   full              — all editing tools available (agent's free choice).
 
 Shell/process/web/delegation tools are disabled in EVERY config so the agent
@@ -47,7 +48,7 @@ from devtools.benchmarks.common.manifests import (  # noqa: E402
     admit_benchmark_run,
     finalize_run_manifest,
 )
-from devtools.benchmarks.common.run_roots import assert_outside_repo  # noqa: E402
+from devtools.benchmarks.common.run_roots import assert_outside_repo, timestamp_run_id  # noqa: E402
 from devtools.benchmarks.common.server_runner import (  # noqa: E402
     IsolatedServer,
     _api,
@@ -520,7 +521,27 @@ def main() -> int:
             task_configs = TASKS[task_name]["configs"]
         jobs.extend((task_name, config, idx) for config in task_configs for idx in range(1, args.runs + 1))
 
-    run_root = pathlib.Path(tempfile.mkdtemp(prefix="editbench_"))
+    # FAIL FAST on missing fixtures. t2-t5 read `fixtures_v2/`, which is GENERATED
+    # from the current tree by make_fixtures_v2.py and is deliberately not committed
+    # (it is the tree under measurement, not a pinned snapshot). Discovering that
+    # inside copytree() would happen AFTER the isolated server is up and the paid t1
+    # jobs have already run — pure argv/path arithmetic belongs before admission.
+    missing = sorted({
+        str(TASKS[t]["workspace"]) for t, _c, _i in jobs
+        if not pathlib.Path(TASKS[t]["workspace"]).is_dir()
+    })
+    if missing:
+        raise SystemExit(
+            "editbench: fixture tree(s) not found: " + ", ".join(missing) + "\n"
+            "Generate them first: python devtools/benchmarks/editbench/make_fixtures_v2.py"
+        )
+
+    # DERIVE the run root, do not CREATE it: admission is the outer boundary, so a
+    # seed-gate refusal must leave no filesystem footprint (DEVELOPMENT's
+    # admission-as-outer-boundary rule). timestamp_run_id's pid+counter suffix is
+    # what keeps two runs started in the same second apart; the atomic manifest
+    # write below creates the tree.
+    run_root = pathlib.Path(tempfile.gettempdir()) / timestamp_run_id("editbench")
     data_root = run_root / "data"
     out_dir = pathlib.Path(args.out).expanduser() if args.out else run_root / "results"
     out_dir = assert_outside_repo(out_dir, REPO_DIR)

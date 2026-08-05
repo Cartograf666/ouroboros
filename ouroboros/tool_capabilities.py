@@ -168,9 +168,11 @@ TOOL_RESULT_LIMITS: dict[str, int] = {
     # tree_read returns the shared task-tree coordination tail (up to 200 entries); the 15k
     # default would truncate the swarm blackboard and defeat the coordination contract.
     "tree_read": 80_000,
-    # apply_patch results carry per-hunk diagnostics; write_file appends the
-    # overwrite diff.
+    # apply_patch results carry per-hunk diagnostics, edit_batch per-edit ones
+    # (an aborted batch reports EVERY failed edit so one retry can fix them all);
+    # write_file appends the overwrite diff.
     "apply_patch": 80_000,
+    "edit_batch": 80_000,
     "write_file": 80_000,
 }
 

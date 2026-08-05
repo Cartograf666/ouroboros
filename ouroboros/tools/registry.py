@@ -53,7 +53,7 @@ from ouroboros.tools.shell_guards import (
 from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
 from ouroboros.protected_artifacts import shell_block_reason as protected_artifact_shell_block_reason
 from ouroboros.git_shell_policy import run_shell_git_block_reason, workspace_git_safety_violation
-from ouroboros.tool_access import is_external_workspace, light_cognitive_or_root_redirect, normalize_root, normalize_root_relative, resolve_shell_cwd, shell_cwd_block_message, workspace_mode_block_reason
+from ouroboros.tool_access import canonical_repo_relative_path, is_external_workspace, light_cognitive_or_root_redirect, normalize_root, normalize_root_relative, resolve_shell_cwd, shell_cwd_block_message, workspace_mode_block_reason
 from ouroboros.python_interpreter import record_python_resolution, resolve_process_python
 from ouroboros.utils import safe_relpath
 from ouroboros.contracts.task_constraint import TaskConstraint, VALID_WRITE_SURFACES, normalize_task_constraint
@@ -700,10 +700,54 @@ _SHELL_GUARDED_TOOLS = _PROCESS_COMMAND_TOOLS | {"verify_and_record"}
 # Path-bearing file tools whose active_workspace/system_repo path arg is normalized
 # ONCE at dispatch (execute) so the handler AND every guard (protected-path,
 # protected-artifact, shrink) resolve the identical target — no desync bypass.
-# apply_patch/edit_batch are DELIBERATELY absent: they carry no top-level `path`
-# arg (paths live inside the patch text / edits[] entries), so their handlers
-# normalize each target themselves via the shared edit_text guard chain.
+# apply_patch/edit_batch are absent because they carry no top-level `path` arg
+# (their paths live inside the patch text / edits[] entries), so this seam has
+# nothing to rewrite. They are NOT exempt from the canonicalization itself: both
+# the dispatch guards below and their handlers run every payload path through
+# `canonical_repo_relative_path`, the same normalization this seam applies.
 _PATH_NORMALIZED_TOOLS = frozenset({"read_file", "write_file", "edit_text", "list_files", "search_code", "query_code"})
+
+# Repo-lane write tools that take a top-level `root` arg. Every gate keyed to
+# "a write that lands in the repo working tree" must judge the whole set, not
+# the historical write_file/edit_text pair — a new editing primitive that misses
+# one of these gates is a silently weaker lane, not a new capability.
+_ROOT_ARG_REPO_WRITE_TOOLS = frozenset({"write_file", "edit_text", "apply_patch", "edit_batch"})
+
+
+def _payload_write_paths(name: str, args: Dict[str, Any]) -> List[str]:
+    """Repo paths a write tool will touch, in the spelling its guards must judge.
+
+    write_file/edit_text carry `path`/`files[]` and were already canonicalized by
+    `_normalize_dispatch_path_args`. apply_patch addresses files inside the patch
+    text (`*** Update File: <path>`) and edit_batch inside `edits[]`, so their
+    paths reach this point RAW and are canonicalized here — otherwise a
+    protected-path gate reads `repo/BIBLE.md` (not a protected-table member)
+    while the write lands on `BIBLE.md`.
+    """
+
+    paths: List[str] = []
+    if name == "write_file":
+        if isinstance(args.get("path"), str) and args["path"]:
+            paths.append(args["path"])
+        for entry in args.get("files") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                paths.append(entry["path"])
+    elif name == "edit_text":
+        if isinstance(args.get("path"), str):
+            paths.append(args["path"])
+    elif name == "edit_batch":
+        for entry in args.get("edits") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                paths.append(entry["path"])
+    elif name == "apply_patch":
+        # Derived from the REAL parser (lazy import: edit_ops imports this
+        # module), so the gate can never drift from what apply_patch will do.
+        # An unparseable patch yields no paths and is refused by the handler
+        # before any write, so the gate has nothing to miss.
+        from ouroboros.tools.edit_ops import patch_target_paths
+
+        paths.extend(patch_target_paths(str(args.get("patch") or "")))
+    return [p for p in paths if str(p or "").strip()]
 
 
 def _normalize_dispatch_path_args(ctx: Any, name: str, args: Dict[str, Any]) -> str:
@@ -1375,7 +1419,7 @@ class ToolRegistry:
             # Advertise only what the acting profile can actually execute: writes go
             # ONLY to the isolated surface (active_workspace); reads use the read roots;
             # browser evaluate is unavailable (rejected at execute time).
-            if entry.name in {"write_file", "edit_text"}:
+            if entry.name in _ROOT_ARG_REPO_WRITE_TOOLS:
                 schema = copy.deepcopy(schema)
                 root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
                 if isinstance(root_schema.get("enum"), list):
@@ -2644,7 +2688,7 @@ class ToolRegistry:
         # have active_workspace/system_repo fall back to the LIVE repo. Confine it
         # to data roots and block shell/coding/service (whose default target is the repo).
         if acting_subagent and not workspace_mode:
-            if name in ("write_file", "edit_text") and str(args.get("root", "") or "active_workspace") in ("active_workspace", "system_repo"):
+            if name in _ROOT_ARG_REPO_WRITE_TOOLS and str(args.get("root", "") or "active_workspace") in ("active_workspace", "system_repo"):
                 return (
                     "⚠️ ACTING_NO_WORKSPACE_BLOCKED: this acting subagent has no resolved isolated "
                     "workspace; write only to root=task_drive, root=artifact_store, or root=user_files. "
@@ -2763,17 +2807,12 @@ class ToolRegistry:
             )
 
         protected_write_paths = []
-        if name in ("write_file", "edit_text"):
-            if name == "write_file":
-                maybe_path = str(args.get("path", "") or "")
-                if maybe_path:
-                    protected_write_paths.append(maybe_path)
-                for f_entry in args.get("files") or []:
-                    if isinstance(f_entry, dict):
-                        protected_write_paths.append(str(f_entry.get("path", "") or ""))
-            elif name == "edit_text":
-                protected_write_paths.append(str(args.get("path", "") or ""))
+        if name in _ROOT_ARG_REPO_WRITE_TOOLS:
             root_name = str(args.get("root", "") or "active_workspace")
+            protected_write_paths = [
+                canonical_repo_relative_path(self._ctx, root_name, p)
+                for p in _payload_write_paths(name, args)
+            ]
             protected_root = root_name in {"active_workspace", "system_repo"}
             # self_worktree is a checkout of the system repo: keep the protected
             # block active even though workspace_mode is set (only external_workspace
