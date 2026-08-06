@@ -217,6 +217,23 @@ export function failureText(reason) {
 export const UNCONFIRMED_TEXT =
     'Could not confirm the sign-in yet — check the account row above, or press Refresh.';
 
+export function jobDetail(job) {
+    // The engine's own SENTENCE about a settled job, beside the typed reason:
+    // `message` on the job (dual-level, because the POLL route answers the
+    // envelope while CREATE answers the bare job — the same shape every other
+    // field here is read through). The card used to drop it entirely: a codex
+    // login that ended `auth_not_ready` rendered only the fixed
+    // UNCONFIRMED_TEXT, while the daemon had already said exactly what was
+    // wrong ("native Codex session is not logged in") and that text was
+    // sitting in the snapshot the card was holding. A typed reason names a
+    // CATEGORY; this names the thing that happened, so it is the half the
+    // owner needs and the half that reached no reader.
+    for (const value of [job?.message, job?.job?.message]) {
+        if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return '';
+}
+
 export function loginStatusLine(job) {
     // The live state line for a non-terminal job — plain words mapped from
     // the typed state/phase, never raw enum spellings glued together (the old
@@ -629,6 +646,19 @@ export function loginCardHtml(active, nowMs = Date.now()) {
         // The re-check window closed without the row appearing. Unknown, not
         // failed — worded so the owner looks where the answer actually lands.
         bits.push(`<div class="settings-inline-status" data-tone="warn" data-login-verdict>${escapeHtml(UNCONFIRMED_TEXT)}</div>`);
+    }
+    // …and beside that verdict, the engine's own explanation. The two verdict
+    // texts above are FIXED constants (deliberately: one is a category, the
+    // other an honest "unknown"), so without this line a settled login says
+    // nothing about WHY — the daemon's sentence lived in the snapshot and was
+    // rendered nowhere. Only for a settled non-success verdict: beside
+    // "Connected." a stale message would contradict the outcome, and while the
+    // job is pending the live status line already owns the card.
+    if (active.verdict?.kind === 'failure' || active.verdict?.kind === 'unconfirmed') {
+        const detail = jobDetail(active.job || {});
+        if (detail) {
+            bits.push(`<div class="settings-inline-note" data-login-detail>${escapeHtml(detail)}</div>`);
+        }
     }
     // The demoted attach fallback: a collapsed Advanced affordance, only when
     // due (engine predates the disclosure modes, or no link within the
