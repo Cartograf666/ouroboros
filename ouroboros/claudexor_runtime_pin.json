@@ -1,12 +1,12 @@
 {
  "schema_version": 1,
  "release": {
-  "version": "3.3.8",
-  "build_sha": "83d3e4e1d61cc39843e8cff03c29608d0c92782e",
+  "version": "3.3.9",
+  "build_sha": "9fce318d880b74a9fc6288eaf9ced386583b8e8a",
   "protocol_major": 3,
-  "archive_url": "https://github.com/razzant/claudexor/releases/download/v3.3.8/claudexor-runtime-3.3.8.tar.gz",
-  "sha256": "e1adf7ef691ab052d2e36b3729949b6deb8d378314e041a939f1c2d3a78510c9",
-  "size_bytes": 20674155,
+  "archive_url": "https://github.com/razzant/claudexor/releases/download/v3.3.9/claudexor-runtime-3.3.9.tar.gz",
+  "sha256": "09f408aec52031e9ca8cce81841bd9c9025087b04dba00864fc237a1b517e424",
+  "size_bytes": 20674714,
   "node_version": "24.16.0",
   "node_artifacts": {
    "darwin-arm64": {
