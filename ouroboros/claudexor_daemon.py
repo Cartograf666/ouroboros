@@ -314,7 +314,12 @@ class OwnedClaudexorDaemon:
                 env.pop(crossing, None)
             command_bin = pathlib.Path(command[0]).parent
             if command_bin.is_dir():
-                env["PATH"] = f"{command_bin}{os.pathsep}{env.get('PATH', '')}"
+                # Windows materializes os.environ with its native "Path" key; a
+                # plain dict lookup of "PATH" misses it and would hand the child
+                # a PATH holding only the Node bin dir (the engine then reports
+                # git_missing). Prepend onto whichever key the host actually has.
+                path_key = next((k for k in env if k.upper() == "PATH"), "PATH")
+                env[path_key] = f"{command_bin}{os.pathsep}{env.get(path_key, '')}"
             runtime = get_runtime_manager().status()
             log_path = config_dir / "daemon.log"
             from ouroboros.config import DATA_DIR

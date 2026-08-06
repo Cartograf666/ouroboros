@@ -1212,3 +1212,61 @@ def test_a_home_marked_for_another_data_plane_is_never_adopted(monkeypatch, tmp_
     with pytest.raises(ClaudexorUnavailable) as err:
         manager.ensure_running()
     assert err.value.code == "foreign_daemon_home"
+
+
+def test_spawn_env_prepends_onto_the_hosts_own_path_key(monkeypatch, tmp_path):
+    """WINDOWS PATH-KEY REGRESSION (first live 3-OS gate run on the 3.3.8 pin):
+    os.environ materializes with the native "Path" key there, a plain dict
+    lookup of "PATH" misses it, and the spawned daemon received a PATH holding
+    only the Node bin dir — the engine then refused with git_missing. The env
+    builder must prepend onto whichever casing the host actually has and must
+    not add a second, differently-cased key beside it."""
+    import os as os_mod
+    import sys
+
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    data_dir = tmp_path / "data"
+    config_dir = data_dir / "claudexor"
+    _point_owned_home(monkeypatch, config_dir, data_dir)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("OUROBOROS_CLAUDEXOR_BIN", sys.executable)
+    monkeypatch.setattr(owned, "_SPAWN_WAIT_SEC", 0.05)
+    monkeypatch.setattr(owned, "_SPAWN_POLL_SEC", 0.01)
+
+    # Windows-style environment: the variable exists only as "Path".
+    fake_environ = {k: v for k, v in os_mod.environ.items() if k.upper() != "PATH"}
+    fake_environ["Path"] = "C:/hostedtoolcache/git/bin"
+    monkeypatch.setattr(os_mod, "environ", fake_environ)
+
+    captured = {}
+
+    class _NeverReadyChild:
+        pid = 424244
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    def _capture_spawn(command, **kwargs):
+        captured["env"] = kwargs["env"]
+        return _NeverReadyChild()
+
+    import ouroboros.platform_layer as platform_layer
+
+    monkeypatch.setattr(platform_layer, "process_group_id", lambda _pid: 0)
+    import ouroboros.process_custody as custody_mod
+
+    monkeypatch.setattr(custody_mod, "spawn_supervised", _capture_spawn)
+
+    manager = owned.OwnedClaudexorDaemon()
+    with pytest.raises(ClaudexorUnavailable):
+        manager.ensure_running()
+
+    env = captured["env"]
+    node_bin = str(pathlib.Path(sys.executable).parent)
+    assert "PATH" not in env, "a second differently-cased PATH key was added"
+    assert env["Path"].startswith(node_bin + os_mod.pathsep)
+    assert env["Path"].endswith("C:/hostedtoolcache/git/bin")
