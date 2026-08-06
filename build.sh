@@ -162,6 +162,14 @@ if [ "${#COMPILE_TARGETS[@]}" -gt 0 ]; then
     # prefix, and the seal would seal nothing.
     env -u PYTHONDONTWRITEBYTECODE -u PYTHONPYCACHEPREFIX \
         "$APP_EMBEDDED_PY" -m compileall -q -f --invalidation-mode unchecked-hash "${COMPILE_TARGETS[@]}" || true
+    # Python console-script sources under python-standalone/bin are launchers,
+    # not importable runtime modules. compileall still descends into that folder
+    # (for example bottle.py -> bin/__pycache__/bottle.*.pyc), but macOS treats a
+    # nested `bin` directory as code-bearing and codesign then refuses the data
+    # bytecode as an unsigned code object. Keep sealed bytecode in stdlib and
+    # site-packages, while removing only these non-imported launcher caches.
+    find "$APP_PATH" -type d -path '*/python-standalone/bin/__pycache__' \
+        -prune -exec rm -rf {} + 2>/dev/null || true
     # Post-condition: the seal is only meaningful if .pyc actually landed in-tree.
     if [ -z "$(find "$APP_PATH" -name '*.pyc' -type f -print -quit 2>/dev/null)" ]; then
         echo "ERROR: precompile produced no in-bundle .pyc — the codesign seal would not cover bytecode." >&2
