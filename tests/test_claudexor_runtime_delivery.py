@@ -410,6 +410,26 @@ def test_status_is_read_only_and_exposes_update_before_and_after_staging(
     assert ready["state"] == "ready"
 
 
+def test_status_distinguishes_fresh_missing_from_a_corrupt_target(tmp_path, monkeypatch):
+    """Fresh absence means Install; a broken immutable target means Fix."""
+    _data_plane(monkeypatch, tmp_path)
+    archive = _archive(tmp_path / "runtime.tar.gz")
+    pin = _pin(archive)
+    manager = runtime.ClaudexorRuntimeManager(pin)
+
+    fresh = manager.status()
+    assert fresh["state"] == "missing"
+    assert fresh["last_error"] is None
+
+    target = runtime.managed_runtime_dir(pin)
+    target.mkdir(parents=True)
+    (target / "managed-runtime.json").write_text("{broken", encoding="utf-8")
+
+    corrupt = manager.status()
+    assert corrupt["state"] == "error"
+    assert corrupt["last_error"] == "managed runtime files are incomplete or fail identity checks"
+
+
 def test_probe_requires_exact_bundled_node_and_stamped_identity(tmp_path, monkeypatch):
     archive = _archive(tmp_path / "runtime.tar.gz")
     pin = _pin(archive)

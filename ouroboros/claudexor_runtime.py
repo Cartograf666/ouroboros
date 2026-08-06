@@ -593,6 +593,7 @@ class ClaudexorRuntimeManager:
             else ""
         )
         pin = self._pin
+        target_root_present = bool(pin is not None and managed_runtime_dir(pin).exists())
         target_version = pin.version if pin is not None else ""
         version = str(installed_meta.get("version") or (engine_version if running else ""))
         build_sha = str(installed_meta.get("build_sha") or (engine_build_sha if running else ""))
@@ -619,6 +620,12 @@ class ClaudexorRuntimeManager:
                 staged_version = str(target_meta.get("version") or "")
             else:
                 state = "ready"
+        elif target_root_present:
+            # A first install has no target directory at all. If the immutable
+            # target exists but fails metadata/entrypoint identity checks, it is
+            # a damaged installation and the UI must offer Fix, not Install.
+            state = "error"
+            last_error = last_error or "managed runtime files are incomplete or fail identity checks"
         elif last_error and (pin is not None or self._pin_error or override_error):
             state = "error"
         elif pin is not None and (
