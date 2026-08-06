@@ -18,6 +18,18 @@ import ouroboros.tools.claude_advisory_review as advisory
 from tests.test_review_agent_session_route import FakeGateway, _terminal_detail
 
 
+@pytest.fixture(autouse=True)
+def _owned_gateway_uses_each_test_transport(monkeypatch):
+    from ouroboros import claudexor_daemon
+    from ouroboros.gateways import claudexor as gateway_module
+
+    monkeypatch.setattr(
+        claudexor_daemon,
+        "ensure_owned_gateway",
+        lambda: gateway_module.ClaudexorGateway(),
+    )
+
+
 @pytest.fixture()
 def fake_route(monkeypatch):
     from ouroboros import delegate_custody as custody

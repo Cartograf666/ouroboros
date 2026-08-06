@@ -454,13 +454,13 @@ def probe_subagent_executor(
     route = get_subagent_harness()
     if route is None:
         return resolve_subagent_executor(requested, route=None)
-    from ouroboros.gateways.claudexor import ClaudexorGateway, ClaudexorUnavailable
+    from ouroboros.claudexor_daemon import ensure_owned_gateway
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
     run_shape = shape if shape is not None else delegated_run_shape(False)
     gateway = None
     try:
-        gateway = ClaudexorGateway()
-        gateway.handshake()
+        gateway = ensure_owned_gateway()
         unavailable, reset_at = route_health(gateway, route.route_id, run_shape)
     except ClaudexorUnavailable as exc:
         return resolve_subagent_executor(

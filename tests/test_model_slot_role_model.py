@@ -18,6 +18,18 @@ from ouroboros import fallback_cooldown as fcd
 from ouroboros import subagents
 
 
+@pytest.fixture(autouse=True)
+def _owned_gateway_uses_each_test_transport(monkeypatch):
+    from ouroboros import claudexor_daemon
+    from ouroboros.gateways import claudexor as gateway_module
+
+    monkeypatch.setattr(
+        claudexor_daemon,
+        "ensure_owned_gateway",
+        lambda: gateway_module.ClaudexorGateway(),
+    )
+
+
 # ---------------------------------------------------------------- accessors
 
 def test_heavy_and_light_empty_fall_back_to_main(monkeypatch):

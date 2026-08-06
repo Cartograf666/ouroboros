@@ -49,6 +49,9 @@ pip install -q -r requirements-launcher.txt
 echo "--- Installing agent dependencies into python-standalone ---"
 python-standalone/bin/pip3 install -q -r requirements.txt
 
+echo "--- Fetching exact Claudexor runtime seed ---"
+python-standalone/bin/python3 scripts/fetch_claudexor_runtime.py --output-dir claudexor-runtime
+
 echo "--- Installing Chromium for browser tools (bundled into python-standalone) ---"
 # Full Chromium app bundle breaks nested-bundle codesign on arm64 runners.
 PLAYWRIGHT_BROWSERS_PATH=0 python-standalone/bin/python3 -m playwright install --only-shell chromium

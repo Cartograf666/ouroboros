@@ -55,15 +55,15 @@ def test_bundled_payload_resolves_through_bundle_dir_env(tmp_path, monkeypatch):
     monkeypatch.delenv(platform_layer.BUNDLE_DIR_ENV, raising=False)
     monkeypatch.delattr(sys, "_MEIPASS", raising=False)
 
-    # XG-7B.5: bundled_resource_bases keeps the repo root as the dev-layout
-    # base, so a dev machine that ran scripts/download_ripgrep_standalone.sh
-    # legitimately resolves a payload with no bundle env at all. Only assert
-    # the pre-fix miss when that dev payload is absent.
-    dev_payload_present = any(
+    # The resolver also keeps the repo root as the dev-layout base and, for an
+    # older launcher, recovers immutable resources from the embedded Python
+    # path. Only assert the historical miss when neither fallback exists.
+    fallback_payload_present = any(
         candidate.exists()
-        for candidate in platform_layer.embedded_ripgrep_candidates(REPO_ROOT)
+        for base in [REPO_ROOT, *platform_layer.bundled_resource_ancestor_bases()]
+        for candidate in platform_layer.embedded_ripgrep_candidates(base)
     )
-    if not dev_payload_present:
+    if not fallback_payload_present:
         assert platform_layer.resolve_bundled_ripgrep() is None  # the pre-fix behaviour
 
     monkeypatch.setenv(platform_layer.BUNDLE_DIR_ENV, str(bundle))

@@ -173,7 +173,8 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── gateways/            ← External API adapters (thin transport, no business logic)
       │   ├── claude_code.py   ← Claude Agent SDK gateway (one live path since D10 retired `claude_code_edit`: the read-only advisory path, isolated in a Python child process with structured signal/timeout errors and normalized SDK usage; v6.87.9 pins the delegated trust surface — no filesystem settings/MCP config from the target directory, one tool allowlist deriving the base set + deny list + default-deny hook, read confinement, and parent-side settlement of a killed child's reservation)
       │   └── claudexor.py     ← Claudexor v3 control-plane gateway (loopback discovery, protocol-major + minimum-version handshake, project registration, run start/poll/cancel; the daemon token stays inside this module). (D30) Also the account-surface translations — credential profiles, harness model discovery, setup/login jobs with their transient device-code snapshots — all read/translate only: the daemon owns every auth fact. Default discovery prefers the OWNED daemon once provisioned (`claudexor_daemon.owned_daemon_provisioned`), an explicit `home=` still reads that home verbatim, and `discover_daemon_at` reads the `CLAUDEXOR_CONFIG_DIR` override layout (`<config_dir>/daemon/control-api.json`)
-      ├── claudexor_daemon.py  ← (D30) The Ouroboros-OWNED claudexord: data-plane config dir (`data/claudexor` as `CLAUDEXOR_CONFIG_DIR` — the override IS the complete relocatable root; the operator's `~/.claudexor` is never read or imported), supervision after the local-model template (`process_custody.spawn_supervised`, session scope, custody-reaped by fingerprint), ATTACH-IF-ALIVE (a live daemon on our home is attached, never duplicated), OWN-ONLY-IF-SELF-STARTED (`stop` terminates only a self-spawned process; a foreign daemon is never killed here). Provisioning is an OWNER ACTION (the first login/connect spawns it) — never a boot-time side effect — and from that moment default daemon discovery cuts over to the owned home. `attach_login_command` renders the fallback login card's copy-paste `claudexor setup attach …` command, run by the user in the user's OWN terminal: there is no in-app terminal surface. Binary resolution: `OUROBOROS_CLAUDEXOR_BIN` env → PATH → the engine's managed `~/.claudexor/node/bin`; absence is the typed `claudexord_not_installed` refusal. STALE LIFECYCLE: liveness is an AUTHENTICATED handshake (the per-home bearer token is the identity proof — only OUR daemon can accept it); a dead daemon whose home carries our ownership marker (`ouroboros-owned.json`, written at provision, naming our data plane) is restarted under the same supervision and RECONCILED by fresh discovery + authenticated handshake against the rewritten descriptor; a live responder that refuses the token is a FOREIGN daemon on a recycled port — typed `foreign_daemon` disclosure, never killed, never blocking the restart of our own dead daemon; a home whose marker names ANOTHER data plane is refused typed (`foreign_daemon_home`) before any spawn — restart there would be adoption
+      ├── claudexor_runtime.py ← Exact managed engine delivery. One reviewed pin selects the existing public Node-free Claudexor closure by version/build SHA/URL/SHA-256/size, protocol, exact tested Node, and entrypoint. New packages carry that compressed archive as a seed; an older app whose immutable resources predate the feature downloads the same bytes. Both paths verify size+digest, extract a regular-file tree into a private staging directory, run the side-effect-free identity probe with the host Node, and atomically promote one immutable version under the deliberately short `data/state/cx` root (separate from auth/config/runs, and short enough for the closure's package-manager paths on legacy Windows `MAX_PATH`). Directory names carry version plus a SHA prefix for path economy; the full build SHA, archive digest/size and probe result remain the admitted identity. There is no mutable `current` pointer or background updater: the code pin is the next-spawn selection. Status is read-only. A newer tree may be staged beside a live older daemon, which continues until its next natural start
+      ├── claudexor_daemon.py  ← (D30) The Ouroboros-OWNED claudexord: data-plane config dir (`data/claudexor` as `CLAUDEXOR_CONFIG_DIR` — the override IS the complete relocatable root; the operator's `~/.claudexor` is never read or imported), supervision after the local-model template (`process_custody.spawn_supervised`, session scope, custody-reaped by fingerprint), ATTACH-IF-ALIVE (a live daemon on our home is attached, never duplicated), OWN-ONLY-IF-SELF-STARTED (`stop` terminates only a self-spawned process; a foreign daemon is never killed here). Provisioning is an OWNER ACTION (Connect or an actual delegated/reviewer start) — never a boot-time/status-read side effect. `ensure_owned_gateway` is the one explicit install/probe/spawn seam above the pure transport gateway: it stages the reviewed target in the foreground, preserves an already-live authenticated older daemon without hot swap, and selects the exact target on the next spawn. `OUROBOROS_CLAUDEXOR_BIN` remains an explicit operator override; a pinned managed-runtime failure never silently launches an arbitrary PATH binary. STALE LIFECYCLE: liveness is an AUTHENTICATED handshake (the per-home bearer token is the identity proof — only OUR daemon can accept it); a dead daemon whose home carries our ownership marker (`ouroboros-owned.json`, written at provision, naming our data plane) is restarted under the same supervision and RECONCILED by fresh discovery + authenticated handshake against the rewritten descriptor; a live responder that refuses the token is a FOREIGN daemon on a recycled port — typed `foreign_daemon` disclosure, never killed, never blocking the restart of our own dead daemon; a home whose marker names ANOTHER data plane is refused typed (`foreign_daemon_home`) before any spawn — restart there would be adoption
       ├── gateway/             ← Gateway Boundary v1: all browser-facing HTTP/WS route ownership and frontend contract SSOT
       │   ├── contracts.py     ← PRO-frozen HTTP/WS envelope and endpoint index (canonical replacement for the legacy contracts/api_v1.py surface)
       │   ├── router.py        ← Starlette route collector for /api/* and /ws
@@ -190,7 +191,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── extensions.py    ← extensions/skills HTTP surface (GET /api/extensions, GET /api/extensions/<skill>/manifest, ALL /api/extensions/<skill>/<rest:path>, POST /api/skills/<skill>/toggle, POST /api/skills/<skill>/delete, POST /api/skills/<skill>/review, POST /api/skills/<skill>/grants)
       │   ├── marketplace.py   ← ClawHub + OuroborosHub HTTP surface
       │   ├── mcp.py           ← MCP Settings API surface backed by the shared MCPManager
-      │   ├── claudexor_accounts.py ← (D30) Harness Accounts HTTP surface: THREE thin proxies of the owned daemon's account truth (GET /api/claudexor/status[?include=models] — daemon state + harness catalog + credential profiles with both honest verification statuses + quota windows; POST /api/claudexor/login — one setup job, the FIRST of which provisions the owned daemon; GET/DELETE /api/claudexor/login/{job_id} — snapshot with the transient device-code disclosure / cancel). Zero auth logic on this side; the browser never sees the daemon token. The fallback login card is a copy-paste `claudexor setup attach …` command for the user's own terminal — no in-app terminal exists
+      │   ├── claudexor_accounts.py ← (D30) Harness Accounts HTTP surface: THREE thin proxies of the owned daemon's account truth (GET /api/claudexor/status[?include=models] — side-effect-free daemon/runtime state + harness catalog + credential profiles with both honest verification statuses + quota windows; POST /api/claudexor/login — one Connect intent that foreground-installs/repairs/updates the exact managed runtime, starts or attaches the owned daemon, then continues its setup job; GET/DELETE /api/claudexor/login/{job_id} — snapshot with the transient device-code disclosure / cancel). Zero auth logic on this side; the browser never sees the daemon token. The fallback login card is a copy-paste `claudexor setup attach …` command for the user's own terminal — no in-app terminal exists
       │   ├── host_service.py  ← Loopback-only Host Service API for reviewed skill callbacks
       │   ├── history.py       ← Chat history + cost breakdown endpoint factories
       │   ├── projects.py      ← Multi-project CRUD surface (v6.32.0): GET /api/projects, POST /api/projects, POST /api/projects/from-task (bind an existing task to a new project). (v6.33.0 removed the /sleep + /wake status endpoints.)
@@ -888,6 +889,7 @@ finalization states.
 │   │   ├── extension_reconcile/ ← Worker-written extension reconcile markers consumed by the server lifespan pickup task
 │   │   ├── review_continuations/ ← Per-task blocked-review continuation payloads (+ quarantined corrupt files under `corrupt/`)
 │   │   ├── workspace_executor_processes/ ← Durable local/docker executor foreground/service cleanup records for panic/shutdown recovery
+│   │   ├── cx/ ← Managed Claudexor runtime store: immutable `<version>-<sha12>/` trees (each with its `managed-runtime.json`), `node/` exact managed Node copies, `cache/` verified archives, `install.lock`
 │   │   └── skills/              ← Phase 3 external-skill state plane (sibling of advisory_review.json, not shared)
 │   │       └── <skill_name>/
 │   │           ├── enabled.json ← {"enabled": bool, "updated_at": iso_ts}
@@ -901,6 +903,7 @@ finalization states.
 │   │           ├── auth_token.json ← content-hash-bound Host Service token for reviewed live extensions
 │   │           ├── extension_calls/ ← transient per-call child-process payload/result JSON files for isolated-dep extension catalog/tool/route/WS dispatch; files are private runtime transport state and are removed after each dispatch
 │   │           └── __extension_imports/<pid>-<uuid>/skill/  ← Phase 4 staged import tree for type:extension skills (in-process host loads tag the leaf with the owner PID; created on load, removed on unload; see §13.1)
+│   ├── claudexor/ ← Ouroboros-owned Claudexor home (`CLAUDEXOR_CONFIG_DIR`): daemon descriptor/token, credential profiles, runs, `ouroboros-owned.json`, `daemon.log` — never the operator's `~/.claudexor`
 │   ├── memory/
 │   │   ├── identity.md     ← Agent's self-description (persistent)
 │   │   ├── scratchpad.md   ← Working memory (auto-generated from scratchpad_blocks.json)
@@ -1845,6 +1848,13 @@ in a `ToolContext`, a child's environment, or a harness sandbox. The HTTP client
 with `trust_env=False` so an ambient proxy variable cannot intercept the loopback
 control plane.
 
+Discovery remains pure I/O and retains the explicit/operator read path for compatible
+callers. Production starts do not ask that gateway to install or spawn: the four
+start/probe call sites first obtain a handshaken owned gateway from
+`claudexor_daemon.ensure_owned_gateway`. Keeping that lifecycle above transport is what
+lets account status stay side-effect-free and keeps harness-specific mechanisms out of
+Ouroboros.
+
 **Custody is durable, because the run is not ours to kill.** A delegated run lives
 inside the daemon, survives our worker, and the bearer token means anything that can
 name it can reach it — so custody in a module dict was custody that died with the
@@ -1928,12 +1938,30 @@ artifact has been read in full.
 3.3.0, but Ouroboros does not yet use it, so a registration WE created is retired when
 the run settles; a pre-existing registration is left alone.
 
-**Daemon lifecycle is attach-only.** `claudexord` is shared per user: a session-scoped
-reap would kill the owner's other runs, and `process_custody` scope `daemon` is never
-reaped at all. There is also nothing to spawn — the daemon's launch command is only
-discoverable THROUGH the daemon. An absent daemon is therefore a typed lane refusal
-(`daemon_not_discovered` / `daemon_unreachable`), after which an `auto` child runs
-natively with a visible marker; it is never a hard task failure.
+**Daemon lifecycle is owned, explicit, and lazy.** Reading status, booting the app,
+and `delegate_wait`/`delegate_cancel` never install or spawn anything. Connect,
+`delegate_start`, reviewer-session start, and the real executor readiness probe call
+the single `claudexor_daemon.ensure_owned_gateway` seam. It foreground-installs or
+repairs the exact reviewed target through `claudexor_runtime`, then starts the daemon
+under Ouroboros's isolated `CLAUDEXOR_CONFIG_DIR`. A new package finds the same archive
+in its immutable resources; an older package updated through managed Git downloads it
+from the pinned public URL. The same pin carries exact official Node archives for every
+supported host. An exact packaged Node wins; a source checkout or older package that
+lacks it downloads the review-bound platform archive into `data/state/cx/node`, extracts
+only its named executable, and verifies the exact Node version before probing Claudexor.
+Node and engine preparation remain one foreground Connect/lazy-ensure transaction and
+neither path imports or modifies the operator's personal Claudexor home.
+
+An authenticated live daemon is useful serving state, not an update casualty. A new
+pin is extracted and probed beside it, while the current process continues to serve;
+the staged version becomes active only when that daemon next starts naturally. A
+temporary staging failure is shown in runtime status but does not kill or replace the
+live process. If no daemon is serving and the exact target cannot be prepared, start
+fails with the runtime's typed reason. There is no fallback from a reviewed pin to an
+arbitrary PATH install. `OUROBOROS_CLAUDEXOR_BIN` is the one explicit operator override.
+The owned daemon remains session-scoped and stop remains own-only-if-self-started, so
+an attached or foreign process is never killed. This lifecycle changes only daemon
+delivery; delegated-run custody below still follows the durable run receipts.
 
 **Three nanny verbs** (`tools/delegate.py`), registered in BOTH child allowlists:
 `delegate_start`, `delegate_wait`, `delegate_cancel`. There is deliberately no `hurry`:

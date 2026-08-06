@@ -12,8 +12,9 @@
 #
 # TWO LANES, AND WHY.
 #
-#   fixture — Claudexor's `fake-*` harnesses: deterministic, offline, no model, no
-#             credentials, no vendor CLI. Costs $0 and a couple of runner minutes, so
+#   fixture — Claudexor's `fake-*` harnesses: deterministic, no model, no
+#             credentials, no vendor CLI. Its only network fetches are the exact runtime
+#             and Node archives pinned by this checkout. Costs $0 and a couple of runner minutes, so
 #             it runs on ordinary pushes and PRs. It is a GATEWAY/PLATFORM SMOKE on this
 #             platform — daemon discovery, protocol handshake, project registration,
 #             the delegated-marker version floor, polling to terminal, reading the
@@ -35,8 +36,8 @@
 #
 #   live    — a real harness on an explicit API key, editing a README at low effort on
 #             a weak model (the owner's own test rule, plan §4.10 answer 84). Token
-#             cost is pennies; the real price is minutes and flakiness — three vendor
-#             CLI installs, a cold daemon, and someone else's rate limits. Paying that
+#             cost is pennies; the real price is minutes and flakiness — vendor CLI
+#             installs across three OSes, cold daemons, and someone else's rate limits. Paying that
 #             on every push would make PR feedback on the seam hostage to vendor
 #             availability, which is the same trade this repository already made for
 #             `integration-test` in ci.yml. So it runs where the other paid lanes run:
@@ -62,10 +63,20 @@ on:
     branches: [ouroboros, ouroboros-stable]
     paths:
       - 'ouroboros/gateways/**'
+      - 'ouroboros/claudexor_daemon.py'
+      - 'ouroboros/claudexor_runtime.py'
+      - 'ouroboros/claudexor_runtime_pin.json'
+      - 'ouroboros/platform_layer.py'
       - 'ouroboros/tools/delegate.py'
+      - 'ouroboros/review_execution.py'
       - 'ouroboros/subagents.py'
       - 'ouroboros/config.py'
       - 'scripts/claudexor_platform_smoke.py'
+      - 'scripts/fetch_claudexor_runtime.py'
+      - 'Ouroboros.spec'
+      - 'build.sh'
+      - 'build_linux.sh'
+      - 'build_windows.ps1'
       - '.github/workflows/claudexor-platform-gate.yml'
     tags:
       - 'v*'
@@ -73,17 +84,23 @@ on:
     branches: [ouroboros]
     paths:
       - 'ouroboros/gateways/**'
+      - 'ouroboros/claudexor_daemon.py'
+      - 'ouroboros/claudexor_runtime.py'
+      - 'ouroboros/claudexor_runtime_pin.json'
+      - 'ouroboros/platform_layer.py'
       - 'ouroboros/tools/delegate.py'
+      - 'ouroboros/review_execution.py'
       - 'ouroboros/subagents.py'
       - 'ouroboros/config.py'
       - 'scripts/claudexor_platform_smoke.py'
+      - 'scripts/fetch_claudexor_runtime.py'
+      - 'Ouroboros.spec'
+      - 'build.sh'
+      - 'build_linux.sh'
+      - 'build_windows.ps1'
       - '.github/workflows/claudexor-platform-gate.yml'
   workflow_dispatch:
     inputs:
-      claudexor_spec:
-        description: 'npm spec for the engine (must resolve to >= the delegated-marker floor in ouroboros/config.py)'
-        required: false
-        default: ''
       run_live_lane:
         description: 'Also run the paid live lane (real API keys, real harness)'
         type: boolean
@@ -105,36 +122,26 @@ defaults:
     shell: bash
 
 env:
-  # The engine floor is owned by ouroboros/config.py
-  # (CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION); this spec must resolve at or above it.
-  # An unresolvable spec is a loud npm failure, which is the correct outcome: it
-  # means the engine this seam requires is not published yet.
-  #
-  # Why `next` and not `^3.3.2`: no stable 3.3.x has ever been published — the
-  # registry goes 3.2.0 → 3.2.1 → 3.3.7-rc.0 — so the caret spec was unresolvable from
-  # birth, and npm's prerelease-exclusion rule means it would STAY unresolvable
-  # for every -rc even after one exists. The engine ≥3.3.0 lives on the `next`
-  # dist-tag until a stable 3.3.x lands; flip this back to a caret spec then.
-  # A dispatch run can still pin an exact version via the claudexor_spec input.
-  CLAUDEXOR_NPM_SPEC_DEFAULT: 'claudexor@next'
   # Windows runners default subprocess/stdout decoding to cp1252; a UnicodeEncodeError
   # in a diagnostic path would mask the real failure.
   PYTHONUTF8: '1'
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
-  # Fixture lane — free, offline, deterministic. Wiring only.
+  # Fixture lane — free, deterministic. Exact public runtime + wiring.
   # ────────────────────────────────────────────────────────────────────────────
   fixture:
     # The job name is a check name, and a check name is read by people who never open
     # the summary. It carries the caveat itself, not just the workflow title above it.
-    name: fixture · ${{ matrix.os }} · offline fake harness, no model, no credentials
+    name: fixture · ${{ matrix.os }} · exact managed runtime, fake harness, no model
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
+    env:
+      OUROBOROS_DATA_DIR: ${{ runner.temp }}/ouroboros-data
     steps:
       - uses: actions/checkout@v4
         with:
@@ -145,36 +152,18 @@ jobs:
         with:
           python-version: '3.10'
           cache: 'pip'
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
       - name: Install Ouroboros dependencies
         run: pip install -r requirements.txt
-      - name: Install Claudexor
-        # A floating spec (claudexor@next) is fine for discovery, but the receipt
-        # must carry the exact version that was actually installed — recorded here,
-        # unconditionally, before any later step can fail.
-        run: |
-          set -euo pipefail
-          npm install -g "${CLAUDEXOR_SPEC:-$CLAUDEXOR_NPM_SPEC_DEFAULT}"
-          INSTALLED="$(claudexor --version)"
-          echo "installed claudexor: ${INSTALLED} (spec: ${CLAUDEXOR_SPEC:-$CLAUDEXOR_NPM_SPEC_DEFAULT})" | tee -a "$GITHUB_STEP_SUMMARY"
-        env:
-          CLAUDEXOR_SPEC: ${{ inputs.claudexor_spec }}
-      - name: Start the daemon and report the engine
-        run: |
-          set -euo pipefail
-          claudexor daemon start
-          claudexor about --json || true
-          cat "$HOME/.claudexor/v3/daemon/control-api.json"
-      - name: One delegated task through the seam (fake harness)
-        run: python scripts/claudexor_platform_smoke.py --lane fixture --max-seconds 300
+      - name: Install, probe, start, and drive one fake task through the managed runtime
+        run: python scripts/claudexor_platform_smoke.py --managed-runtime --lane fixture --max-seconds 300
       - name: Daemon log on failure
         if: failure()
-        run: tail -n 200 "$HOME/.claudexor/v3/daemon/claudexord.log" || true
-      - name: Stop the daemon
-        if: always()
-        run: claudexor daemon stop || true
+        run: |
+          python - <<'PY'
+          import os, pathlib
+          path = pathlib.Path(os.environ["OUROBOROS_DATA_DIR"]) / "claudexor" / "daemon.log"
+          if path.is_file(): print(path.read_text(encoding="utf-8", errors="replace")[-20000:])
+          PY
 
   # ────────────────────────────────────────────────────────────────────────────
   # Live lane — real harness, explicit API key, one README edit. Costs money.
@@ -200,10 +189,16 @@ jobs:
           # Weak model + low effort, per the owner's test rule (plan §4.10, answer 84).
           - harness: claude
             model: claude-haiku-4-5
+            secret_name: anthropic
+            secret_env: ANTHROPIC_API_KEY
           - harness: codex
             model: gpt-5.4-mini
+            secret_name: openai
+            secret_env: OPENAI_API_KEY
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    env:
+      OUROBOROS_DATA_DIR: ${{ runner.temp }}/ouroboros-data
     steps:
       - uses: actions/checkout@v4
         with:
@@ -214,63 +209,62 @@ jobs:
           cache: 'pip'
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          # Lockstep pair: must equal pin.node_version in ouroboros/claudexor_runtime_pin.json.
+          node-version: '24.16.0'
       - name: Install Ouroboros dependencies
         run: pip install -r requirements.txt
-      - name: Install Claudexor and the harness CLI
+      - name: Stage the host-owned bundled Node layout
         run: |
           set -euo pipefail
-          npm install -g "${CLAUDEXOR_SPEC:-$CLAUDEXOR_NPM_SPEC_DEFAULT}"
-          INSTALLED="$(claudexor --version)"
-          echo "installed claudexor: ${INSTALLED} (spec: ${CLAUDEXOR_SPEC:-$CLAUDEXOR_NPM_SPEC_DEFAULT})" | tee -a "$GITHUB_STEP_SUMMARY"
+          python - <<'PY'
+          import os, pathlib, shutil, subprocess
+          source = pathlib.Path(subprocess.check_output(
+              ["node", "-p", "process.execPath"], text=True, encoding="utf-8").strip())
+          target = pathlib.Path("node-standalone") / ("node.exe" if os.name == "nt" else "bin/node")
+          target.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copy2(source, target)
+          target.chmod(0o755)
+          print(f"staged Node {subprocess.check_output([str(target), '--version'], text=True, encoding='utf-8').strip()} at {target}")
+          PY
+      - name: Install only the selected harness CLI
+        run: |
+          set -euo pipefail
           case "${{ matrix.harness }}" in
             claude) npm install -g @anthropic-ai/claude-code ;;
             codex)  npm install -g @openai/codex ;;
             *) echo "unknown harness ${{ matrix.harness }}" >&2; exit 1 ;;
           esac
-        env:
-          CLAUDEXOR_SPEC: ${{ inputs.claudexor_spec }}
       - name: Require the API key
         # A missing secret is a hard red, not a skip: a lane that quietly passes
         # without credentials is the dishonest green this gate exists to avoid.
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ matrix.harness == 'claude' && secrets.ANTHROPIC_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ matrix.harness == 'codex' && secrets.OPENAI_API_KEY || '' }}
         run: |
           set -euo pipefail
           case "${{ matrix.harness }}" in
             claude) test -n "${ANTHROPIC_API_KEY:-}" || { echo "ANTHROPIC_API_KEY secret is not set" >&2; exit 1; } ;;
             codex)  test -n "${OPENAI_API_KEY:-}"    || { echo "OPENAI_API_KEY secret is not set" >&2; exit 1; } ;;
           esac
-      - name: Start the daemon and store the key
+      - name: Install, probe, start, and drive one live task through the managed runtime
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          set -euo pipefail
-          claudexor daemon start
-          # --from-env, never a positional: the value must not reach a command line,
-          # a process listing or the workflow log.
-          case "${{ matrix.harness }}" in
-            claude) claudexor secrets set anthropic --from-env ANTHROPIC_API_KEY ;;
-            codex)  claudexor secrets set openai    --from-env OPENAI_API_KEY ;;
-          esac
-          claudexor secrets list
-          claudexor capabilities --json || true
-      - name: One delegated README edit through the seam
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ matrix.harness == 'claude' && secrets.ANTHROPIC_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ matrix.harness == 'codex' && secrets.OPENAI_API_KEY || '' }}
         run: |
           python scripts/claudexor_platform_smoke.py \
+            --managed-runtime \
             --lane live \
             --harness "${{ matrix.harness }}" \
             --model "${{ matrix.model }}" \
             --effort low \
+            --secret-name "${{ matrix.secret_name }}" \
+            --secret-env "${{ matrix.secret_env }}" \
             --max-seconds 900
       - name: Daemon log on failure
         if: failure()
-        run: tail -n 200 "$HOME/.claudexor/v3/daemon/claudexord.log" || true
-      - name: Stop the daemon
-        if: always()
-        run: claudexor daemon stop || true
+        run: |
+          python - <<'PY'
+          import os, pathlib
+          path = pathlib.Path(os.environ["OUROBOROS_DATA_DIR"]) / "claudexor" / "daemon.log"
+          if path.is_file(): print(path.read_text(encoding="utf-8", errors="replace")[-20000:])
+          PY

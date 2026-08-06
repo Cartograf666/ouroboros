@@ -37,6 +37,7 @@ site/public/assets/
 python-standalone/
 node-standalone/
 ripgrep-standalone/
+/claudexor-runtime/
 
 # OS
 .DS_Store

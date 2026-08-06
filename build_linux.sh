@@ -39,6 +39,9 @@ echo "--- Installing launcher dependencies ---"
 echo "--- Installing agent dependencies into python-standalone ---"
 python-standalone/bin/pip3 install -q -r requirements.txt
 
+echo "--- Fetching exact Claudexor runtime seed ---"
+python-standalone/bin/python3 scripts/fetch_claudexor_runtime.py --output-dir claudexor-runtime
+
 rm -rf build dist
 
 export PYINSTALLER_CONFIG_DIR="$PWD/.pyinstaller-cache"

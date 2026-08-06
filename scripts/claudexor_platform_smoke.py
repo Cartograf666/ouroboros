@@ -9,8 +9,9 @@ left open beside it as Q8):
             daemon, negotiate the protocol, register a run root, start a MUTATING
             run pinned to the named harness, poll it to a terminal state, read its
             PRIMARY ARTIFACT to EOF, observe the child's edit on disk, and read
-            back the applied-containment facts. That is the transport, the
-            platform paths and the Ouroboros-to-Claudexor seam. The artifact read
+            back the applied-containment facts. For a managed runtime it also
+            exercises the serving closure's identity-bound graceful stop. That is
+            the transport, lifecycle, platform paths and Ouroboros-to-Claudexor seam. The artifact read
             is a plain EOF read verified against the size the run itself reported
             — it is NOT the production custody acknowledgement, which never runs
             here.
@@ -56,9 +57,10 @@ There is deliberately no "harness unavailable, skipping" branch: the whole point
 the gate is to notice when the delegated path stops working on a platform.
 
 Usage:
-    python scripts/claudexor_platform_smoke.py --lane fixture
-    python scripts/claudexor_platform_smoke.py --lane live --harness claude \
-        --model claude-haiku-4-5 --effort low
+    python scripts/claudexor_platform_smoke.py --managed-runtime --lane fixture
+    python scripts/claudexor_platform_smoke.py --managed-runtime --lane live --harness claude \
+        --model claude-haiku-4-5 --effort low \
+        --secret-name anthropic --secret-env ANTHROPIC_API_KEY
 """
 
 from __future__ import annotations
@@ -387,6 +389,61 @@ def mutation_evidence(lane: str, root: pathlib.Path) -> Tuple[bool, str]:
     return True, f"{README_NAME} was edited and contains {LIVE_EXPECT_TOKEN!r}"
 
 
+def graceful_stop_managed_runtime(
+    command: List[str], config_dir: pathlib.Path, version: str, build_sha: str
+) -> Dict[str, Any]:
+    """Exercise the serving closure's identity-bound replacement-stop contract."""
+    if not command or not version or len(build_sha) != 40 or any(
+        char not in "0123456789abcdef" for char in build_sha
+    ):
+        raise SmokeFailure(
+            "graceful_stop_identity_missing",
+            "the managed daemon handshake did not provide an exact serving version/build SHA",
+        )
+    from ouroboros.platform_layer import subprocess_hidden_kwargs
+
+    env = dict(os.environ)
+    env["CLAUDEXOR_CONFIG_DIR"] = str(config_dir)
+    for crossing in ("CLAUDEXOR_DAEMON_SOCK", "CLAUDEXOR_CONTROL_PORT"):
+        env.pop(crossing, None)
+    try:
+        completed = subprocess.run(
+            [*command, "--stop", version, build_sha],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            env=env,
+            **subprocess_hidden_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SmokeFailure(
+            "graceful_stop_failed",
+            f"the serving closure's --stop command failed: {type(exc).__name__}: {exc}",
+        ) from exc
+    receipt = None
+    for line in reversed((completed.stdout or "").splitlines()):
+        try:
+            candidate = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(candidate, dict):
+            receipt = candidate
+            break
+    if completed.returncode != 0 or not isinstance(receipt, dict) or receipt.get("stopped") is not True:
+        detail = (completed.stderr or completed.stdout or "").strip()[-500:]
+        raise SmokeFailure(
+            "graceful_stop_failed",
+            f"the serving closure did not confirm a graceful stop (exit {completed.returncode})"
+            + (f": {detail}" if detail else ""),
+        )
+    return {
+        "stopped": True,
+        "already_stopped": receipt.get("alreadyStopped") is True,
+        "outcome": str(receipt.get("outcome") or ""),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -463,6 +520,12 @@ def emit_summary(lane: str, facts: Dict[str, Any], verdict: str, detail: str) ->
             print(f"[smoke] could not write GITHUB_STEP_SUMMARY: {exc}", flush=True)
 
 
+def handshake_engine_sha(body: Dict[str, Any]) -> str:
+    """Return the serving build identity from the frozen protocol-v3 shape."""
+    engine = body.get("engine")
+    return str(engine.get("sha") or "") if isinstance(engine, dict) else ""
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -480,17 +543,29 @@ def run_smoke(args: argparse.Namespace) -> Dict[str, Any]:
         "delegated_marker_floor": CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION,
     }
 
-    endpoint = cx.discover_daemon()
-    facts["daemon"] = f"{endpoint.host}:{endpoint.port}"
+    owned_daemon = None
+    if args.managed_runtime:
+        from ouroboros.claudexor_daemon import ensure_owned_gateway, get_owned_daemon
 
-    gateway = cx.ClaudexorGateway(endpoint)
+        owned_daemon = get_owned_daemon()
+        gateway = ensure_owned_gateway()
+        owned_status = owned_daemon.status_dict()
+        facts["daemon"] = str(owned_status.get("config_dir") or "managed")
+        facts["managed_runtime"] = owned_status.get("runtime") or {}
+    else:
+        endpoint = cx.discover_daemon()
+        facts["daemon"] = f"{endpoint.host}:{endpoint.port}"
+        gateway = cx.ClaudexorGateway(endpoint)
     root: Optional[pathlib.Path] = None
     owned_project = ""
     run_id = ""
+    gateway_closed = False
     try:
         body = gateway.handshake()  # enforces the TRANSPORT floor, raises if below
         engine = str(gateway.engine_version or "")
+        engine_build_sha = handshake_engine_sha(body)
         facts["engine_version"] = engine or "(unreported)"
+        facts["engine_build_sha"] = engine_build_sha or "(unreported)"
         facts["protocol_major"] = body.get("protocolMajor")
 
         # The MARKER floor. Below it the engine answers `execution.delegated` with a
@@ -505,6 +580,16 @@ def run_smoke(args: argparse.Namespace) -> Dict[str, Any]:
                 "purpose — the gate exists to notice exactly this.",
                 engine_version=engine,
             )
+
+        if args.secret_env:
+            value = str(os.environ.get(args.secret_env) or "")
+            if not value:
+                raise SmokeFailure(
+                    "secret_env_missing",
+                    f"the requested secret environment variable {args.secret_env!r} is empty",
+                )
+            gateway.set_secret(args.secret_name, value)
+            facts["managed_secret"] = args.secret_name
 
         root = seed_fixture_repo()
         facts["run_root"] = str(root)
@@ -559,6 +644,21 @@ def run_smoke(args: argparse.Namespace) -> Dict[str, Any]:
         facts["mutation_evidence"] = why
         if not mutated:
             raise SmokeFailure("no_mutation", why, **facts)
+        if owned_daemon is not None:
+            if owned_project:
+                gateway.remove_project(owned_project)
+                owned_project = ""
+            gateway.close()
+            gateway_closed = True
+            from ouroboros.claudexor_daemon import owned_config_dir
+            from ouroboros.claudexor_runtime import get_runtime_manager
+
+            facts["graceful_stop"] = graceful_stop_managed_runtime(
+                get_runtime_manager().resolve_command(),
+                owned_config_dir(),
+                engine,
+                engine_build_sha,
+            )
         return facts
     except SmokeFailure as exc:
         # Everything learned before the refusal belongs in the report: a summary that
@@ -581,7 +681,10 @@ def run_smoke(args: argparse.Namespace) -> Dict[str, Any]:
                 gateway.remove_project(owned_project)
             except Exception as exc:
                 print(f"[smoke] could not retire project {owned_project}: {exc}", flush=True)
-        gateway.close()
+        if not gateway_closed:
+            gateway.close()
+        if owned_daemon is not None:
+            owned_daemon.stop()
         if root is not None:
             shutil.rmtree(str(root), ignore_errors=True)
 
@@ -590,16 +693,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lane", choices=("fixture", "live"), required=True)
     parser.add_argument(
+        "--managed-runtime", action="store_true",
+        help="Install/probe/start Ouroboros's exact pinned runtime before the smoke.",
+    )
+    parser.add_argument(
         "--harness", default="",
         help="Claudexor route id. Defaults to fake-implement on the fixture lane.",
     )
     parser.add_argument("--model", default="")
     parser.add_argument("--effort", default="low")
+    parser.add_argument("--secret-name", default="")
+    parser.add_argument("--secret-env", default="")
     parser.add_argument("--max-seconds", type=int, default=600)
     parser.add_argument("--grace-seconds", type=int, default=120)
     args = parser.parse_args(argv)
     if not args.harness:
         args.harness = "fake-implement" if args.lane == "fixture" else "claude"
+    if bool(args.secret_name) != bool(args.secret_env):
+        parser.error("--secret-name and --secret-env must be provided together")
     if args.lane == "fixture":
         # A fixture lane that quietly accepted a real route would spend money under a
         # name that promises it does not.
@@ -625,7 +736,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     emit_summary(
         args.lane, facts, "PASSED",
         "the pinned run completed on this platform, its primary artifact was read "
-        "to EOF, and its edit is on disk",
+        "to EOF, and its edit is on disk"
+        + (", with the managed daemon stopped gracefully" if args.managed_runtime else ""),
     )
     return 0
 

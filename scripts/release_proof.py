@@ -27,7 +27,9 @@ RELEASE_GATES = (
     "skill-smoke",
     "packaged-artifact-smoke",
 )
-COMMON_SMOKE_CHECKS = frozenset({"embedded_repo_bundle", "packaged_cli_help"})
+COMMON_SMOKE_CHECKS = frozenset(
+    {"embedded_repo_bundle", "embedded_claudexor_runtime", "packaged_cli_help"}
+)
 REQUIRED_SMOKE_CHECKS = {
     "macos-arm64": COMMON_SMOKE_CHECKS
     | frozenset(

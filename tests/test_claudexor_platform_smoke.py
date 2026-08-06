@@ -96,6 +96,48 @@ def test_the_asked_edit_is_evidence(tmp_path):
     assert ok
 
 
+def test_managed_smoke_stops_the_serving_identity_with_the_same_home(
+    tmp_path, monkeypatch
+):
+    captured = {}
+    monkeypatch.setenv("CLAUDEXOR_DAEMON_SOCK", "foreign.sock")
+    monkeypatch.setenv("CLAUDEXOR_CONTROL_PORT", "9999")
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return smoke.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout='{"stopped":true,"outcome":"exited","detail":"fixture"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr(smoke.subprocess, "run", fake_run)
+    receipt = smoke.graceful_stop_managed_runtime(
+        ["/exact/node", "/exact/claudexord.bundle.cjs"],
+        tmp_path / "owned-home",
+        "3.3.7",
+        "a" * 40,
+    )
+
+    assert captured["command"][-3:] == ["--stop", "3.3.7", "a" * 40]
+    assert captured["env"]["CLAUDEXOR_CONFIG_DIR"] == str(tmp_path / "owned-home")
+    assert "CLAUDEXOR_DAEMON_SOCK" not in captured["env"]
+    assert "CLAUDEXOR_CONTROL_PORT" not in captured["env"]
+    assert receipt == {"stopped": True, "already_stopped": False, "outcome": "exited"}
+
+
+def test_serving_build_identity_comes_from_the_frozen_handshake_shape():
+    build_sha = "a" * 40
+    body = {
+        "protocolMajor": 3,
+        "engine": {"version": "3.3.7", "sha": build_sha, "entry": "claudexord.bundle.cjs"},
+    }
+
+    assert smoke.handshake_engine_sha(body) == build_sha
+
+
 # -- the honesty block ---------------------------------------------------------
 
 
@@ -140,6 +182,20 @@ def test_the_summary_reaches_the_step_summary_file(tmp_path, monkeypatch):
     smoke.emit_summary("live", {"engine_version": "9.9.9"}, "PASSED", "ok")
     written = target.read_text(encoding="utf-8")
     assert "9.9.9" in written and "subscription" in written.lower()
+
+
+def test_three_os_gate_installs_the_reviewed_runtime_instead_of_floating_npm():
+    workflow = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / ".github" / "workflows" / "claudexor-platform-gate.yml"
+    ).read_text(encoding="utf-8")
+    assert "os: [ubuntu-latest, windows-latest, macos-latest]" in workflow
+    assert workflow.count("--managed-runtime") == 2
+    assert "node-version: '24.16.0'" in workflow
+    assert workflow.count("Stage the host-owned bundled Node layout") == 1
+    assert "claudexor@next" not in workflow
+    assert "CLAUDEXOR_NPM_SPEC" not in workflow
+    assert "npm install -g claudexor" not in workflow
 
 
 # -- the request shape (needs the seam) ----------------------------------------

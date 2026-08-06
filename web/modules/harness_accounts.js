@@ -387,8 +387,9 @@ export function renderHarnessAccountsSection() {
             <div class="settings-section-copy">
                 Coding-agent subscriptions (Codex CLI, Claude Code, Cursor) used by delegated
                 subagents and reviewer slots. Accounts live in Ouroboros's own agent home —
-                your personal logins are never read or imported. Login and verification are
-                the agent daemon's own flows; Ouroboros only shows them.
+                your personal logins are never read or imported. Claudexor is installed,
+                repaired, and updated automatically when you connect or start delegated work;
+                login and verification remain the agent daemon's own flows.
             </div>
             <div id="harness-daemon-status" class="settings-inline-status">Checking daemon…</div>
             <div id="harness-accounts-rows" class="settings-secret-list"></div>
@@ -400,23 +401,50 @@ export function renderHarnessAccountsSection() {
     `;
 }
 
-function daemonStatusLine(payload) {
+export function runtimeActionLabel(payload) {
+    const state = String(payload?.daemon?.runtime?.state || '');
+    if (state === 'error') return 'Fix & connect';
+    if (state === 'missing') return 'Install & connect';
+    if (state === 'update_available') return 'Update & connect';
+    return 'Connect';
+}
+
+export function daemonStatusLine(payload) {
     const daemon = payload?.daemon || {};
+    const runtime = daemon.runtime || {};
+    const runtimeState = String(runtime.state || '');
     const status = String(daemon.state || 'unknown');
+    if (daemon.ownership_problem) {
+        return { tone: 'error', text: `This daemon home is not managed from here: ${daemon.ownership_problem}` };
+    }
+    if (runtimeState === 'installing') {
+        const version = runtime.target_version ? ` ${runtime.target_version}` : '';
+        return { tone: 'muted', text: `Installing or checking Claudexor${version}…` };
+    }
+    if (runtimeState === 'error') {
+        const detail = runtime.last_error ? `: ${runtime.last_error}.` : '.';
+        return { tone: 'error', text: `Claudexor needs repair${detail} Connect retries automatically.` };
+    }
+    if (runtimeState === 'update_staged') {
+        const target = runtime.staged_version || runtime.target_version || '?';
+        const current = daemon.engine_version || runtime.version || '?';
+        return { tone: 'warn', text: `Claudexor ${target} is ready and will activate after the daemon next restarts. Engine ${current} keeps running until then.` };
+    }
     if (status === 'running') {
-        return { tone: 'ok', text: `Daemon running (engine ${daemon.engine_version || '?'}) · home ${payload.config_dir || ''}` };
+        return { tone: 'ok', text: `Claudexor ready (engine ${daemon.engine_version || '?'}) · home ${payload.config_dir || ''}` };
     }
     if (status === 'not_provisioned') {
-        return { tone: 'muted', text: 'No accounts connected yet. The first login starts Ouroboros’s own agent daemon.' };
+        if (runtimeState === 'ready') {
+            const version = runtime.version ? ` ${runtime.version}` : '';
+            return { tone: 'muted', text: `Claudexor${version} is ready. Connect an account to start Ouroboros’s own agent daemon.` };
+        }
+        return { tone: 'muted', text: 'No accounts connected yet. Connect installs Claudexor and starts Ouroboros’s own agent daemon automatically.' };
     }
     if (status === 'stale') {
         return { tone: 'warn', text: 'Daemon home exists but the daemon is not answering; the next login restarts it.' };
     }
     if (status === 'foreign_daemon') {
         return { tone: 'warn', text: 'Another daemon answered on the stale port (not ours — left untouched). The next login restarts our own daemon on a fresh port.' };
-    }
-    if (daemon.ownership_problem) {
-        return { tone: 'error', text: `This daemon home is not managed from here: ${daemon.ownership_problem}` };
     }
     return { tone: 'error', text: `Daemon ${status}${daemon.last_error ? `: ${daemon.last_error}` : ''}` };
 }
@@ -438,8 +466,8 @@ function rowHtml(row, payload) {
                 ${quota.label ? `<span class="settings-inline-status" data-tone="${quota.exhausted ? 'warn' : 'muted'}" ${quota.exhausted && quota.resetsAt ? `data-resets-at="${escapeHtml(quota.resetsAt)}"` : ''}>${escapeHtml(quota.label)}</span>` : ''}
             </div>
             <div class="harness-account-actions">
-                <button type="button" class="settings-ghost-btn" data-harness-login>${row.status?.verification ? 'Re-login' : 'Log in'}</button>
-                ${row.kind === 'native' ? '<button type="button" class="settings-ghost-btn" data-harness-add-profile title="Register one more account for this agent (D28 rotation uses every enabled account)">Add account…</button>' : ''}
+                <button type="button" class="settings-ghost-btn" data-harness-login>${runtimeActionLabel(payload)}</button>
+                ${row.kind === 'native' ? '<button type="button" class="settings-ghost-btn" data-harness-add-profile title="Register one more account for this agent (rotation uses every enabled account)">Add account…</button>' : ''}
             </div>
         </div>
     `;
@@ -485,7 +513,7 @@ function renderRows() {
                     <span class="settings-inline-status" data-tone="muted">no account connected</span>
                 </div>
                 <div class="harness-account-actions">
-                    <button type="button" class="settings-ghost-btn" data-harness-login>Connect</button>
+                    <button type="button" class="settings-ghost-btn" data-harness-login>${runtimeActionLabel(payload)}</button>
                 </div>
             </div>
         `);
@@ -523,6 +551,7 @@ export function loginCardHtml(active, nowMs = Date.now()) {
         `<h4>Connect ${escapeHtml(active.harness)}${active.profile ? ` (${escapeHtml(active.profile)})` : ''}</h4>`];
     if (face === 'error') {
         bits.push(`<div class="settings-inline-note" data-tone="error">${escapeHtml(active.error)}</div>`);
+        bits.push('<button type="button" class="btn btn-primary" data-login-retry>Try again</button>');
     } else if (face === 'device') {
         // LINK-FIRST: the prominent action is opening the disclosed sign-in
         // URL, with an explicit copy affordance (the macOS-app card pattern).
@@ -561,7 +590,9 @@ export function loginCardHtml(active, nowMs = Date.now()) {
     // before the job settled — must not print "Waiting for the sign-in link…"
     // underneath "Connected.".
     if (face !== 'error' && !active.verdict && !active.confirming) {
-        const line = loginStatusLine(active.job || {});
+        const line = active.preparingRuntime
+            ? 'Installing or checking Claudexor…'
+            : loginStatusLine(active.job || {});
         if (line) bits.push(`<div class="settings-inline-status" data-tone="muted" data-login-state>${escapeHtml(line)}</div>`);
     }
     // Shape 2: the ALWAYS-VISIBLE paste-code entry for a job whose disclosure
@@ -649,6 +680,10 @@ function renderLoginCard() {
 }
 
 function wireLoginCard(host, active, summary) {
+    host.querySelector('[data-login-retry]')?.addEventListener('click', () => {
+        stopJobPolling();
+        startLogin(active.harness, active.profile);
+    });
     host.querySelector('[data-copy-signin-link]')?.addEventListener('click', () => {
         const disclosure = deviceCodeDisclosure(active.job || {});
         if (disclosure?.url) navigator.clipboard?.writeText(disclosure.url);
@@ -734,8 +769,9 @@ async function startLogin(harness, profile) {
         harness, profile, jobId: '', job: null, attachCommand: '', error: '',
         startedAtMs: Date.now(), engineDegraded: false,
         inputValue: '', inputBusy: false, inputSent: false, inputError: '', inputNote: '',
-        verdict: null, confirming: false, advancedOpen: false,
+        verdict: null, confirming: false, advancedOpen: false, preparingRuntime: true,
     };
+    const active = state.activeJob;
     renderLoginCard();
     try {
         const resp = await apiFetch('/api/claudexor/login', {
@@ -744,17 +780,21 @@ async function startLogin(harness, profile) {
             body: JSON.stringify(body),
         });
         const data = await resp.json().catch(() => ({}));
+        if (state.activeJob !== active) return;
         if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-        state.activeJob.jobId = String(data.job_id || '');
-        state.activeJob.job = data.job || {};
-        state.activeJob.attachCommand = String(data.attach_command || '');
+        active.preparingRuntime = false;
+        active.jobId = String(data.job_id || '');
+        active.job = data.job || {};
+        active.attachCommand = String(data.attach_command || '');
         // An engine that predates the disclosure modes never sends a link;
         // the demoted Advanced fallback may show right away (still collapsed).
-        state.activeJob.engineDegraded = data.disclosure_native === false
-            && !!state.activeJob.attachCommand;
+        active.engineDegraded = data.disclosure_native === false
+            && !!active.attachCommand;
         startJobPolling();
     } catch (error) {
-        state.activeJob.error = String(error.message || error);
+        if (state.activeJob !== active) return;
+        active.preparingRuntime = false;
+        active.error = String(error.message || error);
     }
     renderLoginCard();
 }
