@@ -168,6 +168,15 @@ class TestBuildSh:
         # unsigned code objects and make the outer app signature fail closed.
         assert "python-standalone/bin/__pycache__" in src
         assert "-prune -exec rm -rf {} +" in src
+        assert "-name '*.cstemp' -type f -delete" in src, (
+            "best-effort nested signing may leave scratch files that make the "
+            "final deep-sign refuse a missing code object"
+        )
+        assert "--options runtime --deep" in src, (
+            "the outer app signature must seal Python bytecode nested beneath "
+            "Contents/Frameworks"
+        )
+        assert "codesign --verify --strict --deep" in src
 
     def test_macos_dmg_includes_finder_install_layout(self):
         src = _read("build.sh")

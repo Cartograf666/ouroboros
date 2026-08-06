@@ -197,15 +197,24 @@ if [ "$SIGN_MODE" != "0" ]; then
                 --entitlements "$ENTITLEMENTS" "$f" 2>&1 || true
         fi
     done
+    # A failed best-effort nested sign can leave an atomic-replace scratch file.
+    # `--deep` treats that stale .cstemp as a missing code object and refuses the
+    # bundle, so prune only codesign's own temporary artifacts before the seal.
+    find "$APP_PATH" -name '*.cstemp' -type f -delete 2>/dev/null || true
     echo "Signed embedded binaries"
 
     echo "--- Signing the app bundle ---"
-    codesign -s "$SIGN_IDENTITY" --timestamp --force --options runtime \
+    # PyInstaller places the standalone Python tree under Contents/Frameworks.
+    # macOS therefore classifies its sealed .pyc files as nested code objects;
+    # outer signing without --deep refuses them as unsigned. Mach-O children
+    # already carry their explicit signatures above; deep signing seals the
+    # remaining bytecode objects into the final app hierarchy.
+    codesign -s "$SIGN_IDENTITY" --timestamp --force --options runtime --deep \
         --entitlements "$ENTITLEMENTS" "$APP_PATH"
 
     echo "--- Verifying signature ---"
     codesign -dvv "$APP_PATH"
-    codesign --verify --strict "$APP_PATH"
+    codesign --verify --strict --deep "$APP_PATH"
     echo "Signature OK"
 else
     echo ""
