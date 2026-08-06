@@ -4614,6 +4614,7 @@ def test_every_migrated_launcher_routes_through_both_manifest_seams():
         bench / "osworld" / "run_step_agent.py",
         bench / "osworld" / "run_cu_bridge_agent.py",
         bench / "osworld" / "osworld_adapter_skeleton.py",
+        bench / "editbench" / "run_editbench.py",
     ]
     for path in migrated:
         source = path.read_text(encoding="utf-8")

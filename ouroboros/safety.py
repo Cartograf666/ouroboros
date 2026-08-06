@@ -78,6 +78,8 @@ TOOL_POLICY: Dict[str, str] = {
     # Mutative but separately guarded by sandbox/revert/review gates.
     "write_file": POLICY_SKIP,
     "edit_text": POLICY_SKIP,
+    "apply_patch": POLICY_SKIP,
+    "edit_batch": POLICY_SKIP,
     "commit_reviewed": POLICY_SKIP,
     "vcs_commit_reviewed": POLICY_SKIP,
     "knowledge_write": POLICY_SKIP,

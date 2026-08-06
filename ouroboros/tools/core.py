@@ -1946,6 +1946,9 @@ def get_tools() -> List[ToolEntry]:
                 "Write UTF-8 file(s) to a declared resource root. "
                 "Default root=active_workspace. "
                 "OK messages show root:path. "
+                "Overwriting an existing repo file returns the unified diff vs the "
+                "previous version — CHECK IT; invalid .py/.json content is blocked "
+                "before writing (force=true bypasses). "
                 "Use mode='append' to write a large file in chunks across multiple calls "
                 "(useful when the full content exceeds a single LLM output budget). "
                 "Set bucket/skill_name ONLY for root=skill_payload (skill authoring); leave empty for normal file edits."
@@ -1974,6 +1977,8 @@ def get_tools() -> List[ToolEntry]:
             "description": (
                 "Replace exactly one occurrence of old_str with new_str in a file. "
                 "Default root=active_workspace. Result messages show root:path. "
+                "For several edits at once, repeated identical replacements, or "
+                "counted replace-all, prefer edit_batch (one atomic call). "
                 "Set bucket/skill_name ONLY for root=skill_payload (skill authoring); leave empty for normal edits."
             ),
             "parameters": {"type": "object", "properties": {

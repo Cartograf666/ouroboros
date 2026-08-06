@@ -453,6 +453,13 @@ def _extract_result_metadata(fn_name: str, result: Any, is_error: bool) -> Dict[
         status = "write_file_blocked"
     elif text.startswith("⚠️ EDIT_TEXT_"):
         status = "edit_text_blocked"
+    elif text.startswith("⚠️ APPLY_PATCH_") or text.startswith("⚠️ EDIT_BATCH_"):
+        # Counted/context refusals are these tools' DESIGNED path (a miscount is
+        # an atomic refusal, not a corruption) and are user-correctable exactly
+        # like edit_text's "old_str not found". Without a typed status they fall
+        # through to the generic `error` and become an execution-health failure,
+        # which is the false `tool_failure` headline v6.57.0 removed for writes.
+        status = "edit_ops_blocked"
     elif text.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"):
         status = "artifact_output_error"
     elif text.startswith("⚠️ SAFETY_VIOLATION") or text.startswith("⚠️ CRITICAL SAFETY_VIOLATION"):

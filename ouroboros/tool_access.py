@@ -1089,6 +1089,37 @@ def canonical_data_root(ctx: Any) -> pathlib.Path:
     return pathlib.Path(getattr(ctx, "drive_root")).resolve(strict=False)
 
 
+def canonical_repo_relative_path(ctx: Any, root: str, path: str) -> str:
+    """Collapse a repo-lane path to the spelling its GUARDS must judge.
+
+    ``ToolContext.repo_path`` already runs ``normalize_root_relative``, so an
+    absolute path inside the root and a redundant root-basename prefix write to
+    the SAME file a bare relative path does. A guard that inspects the raw
+    spelling therefore desyncs from the operation: ``repo/BIBLE.md`` is not a
+    member of the protected-path table while ``BIBLE.md`` is.
+
+    ``write_file``/``edit_text`` are canonicalized once at dispatch
+    (``_normalize_dispatch_path_args``). Tools that carry paths INSIDE their
+    payload (``apply_patch``'s patch text, ``edit_batch``'s ``edits[]``) cannot
+    use that seam, so they call this instead — one shared normalization point is
+    what keeps a guard from desyncing from the write. Returns the input
+    unchanged for non-repo roots or when the root cannot be resolved: this only
+    ever shortens toward the root, so the caller's ``safe_relpath`` +
+    confinement check still rejects a genuine escape.
+    """
+
+    if root not in {"active_workspace", "system_repo"}:
+        return path
+    try:
+        base = resource_root_path(ctx, root)  # type: ignore[arg-type]
+    except Exception:
+        return path
+    try:
+        return normalize_root_relative(base, path)
+    except Exception:
+        return path
+
+
 def resource_root_path(
     ctx: Any,
     root: ResourceRoot,
