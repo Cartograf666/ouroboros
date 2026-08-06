@@ -140,14 +140,16 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
-    env:
-      OUROBOROS_DATA_DIR: ${{ runner.temp }}/ouroboros-data
     steps:
       - uses: actions/checkout@v4
         with:
           # This job starts a daemon that spawns children; do not leave GITHUB_TOKEN
           # in .git/config where one of them could read it.
           persist-credentials: false
+      - name: Point the Ouroboros data root at the runner temp
+        # The `runner` context is not available in job-level `env` — GitHub rejects
+        # the whole workflow file at parse time. RUNNER_TEMP is, via the shell.
+        run: echo "OUROBOROS_DATA_DIR=$RUNNER_TEMP/ouroboros-data" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
@@ -197,12 +199,14 @@ jobs:
             secret_env: OPENAI_API_KEY
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
-    env:
-      OUROBOROS_DATA_DIR: ${{ runner.temp }}/ouroboros-data
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Point the Ouroboros data root at the runner temp
+        # Same parse-time restriction as the fixture lane: `runner` is not a valid
+        # context for job-level `env`; RUNNER_TEMP is available to the shell.
+        run: echo "OUROBOROS_DATA_DIR=$RUNNER_TEMP/ouroboros-data" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
