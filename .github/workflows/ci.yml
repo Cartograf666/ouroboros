@@ -645,6 +645,8 @@ jobs:
           test "$(uname -m)" = "arm64"
           test -f "$MOUNT/Ouroboros.app/Contents/Resources/repo.bundle"
           test -f "$MOUNT/Ouroboros.app/Contents/Resources/repo_bundle_manifest.json"
+          python scripts/fetch_claudexor_runtime.py --verify-only \
+            --output-dir "$MOUNT/Ouroboros.app/Contents/Resources/claudexor-runtime"
           test -L "$MOUNT/Applications"
           test "$(readlink "$MOUNT/Applications")" = "/Applications"
           test -x "$MOUNT/Install CLI.command"
@@ -652,6 +654,11 @@ jobs:
           lipo -archs "$MOUNT/Ouroboros.app/Contents/MacOS/$APP_EXECUTABLE" | tr ' ' '\n' | grep -qx arm64
           HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
             "$MOUNT/Ouroboros.app/Contents/Resources/bin/ouroboros" --help >/dev/null
+          HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
+            OUROBOROS_DATA_DIR="$RUNNER_TEMP/ouroboros-claudexor-smoke" \
+            OUROBOROS_BUNDLE_DIR="$MOUNT/Ouroboros.app/Contents/Resources" \
+            python scripts/claudexor_platform_smoke.py \
+              --managed-runtime --lane fixture --max-seconds 300
           if [ "${{ needs.release-preflight.outputs.is_prerelease }}" != "true" ] \
               && [ "$HAS_APPLE_SIGNING" = "true" ]; then
             codesign --verify --deep --strict "$MOUNT/Ouroboros.app"
@@ -677,8 +684,15 @@ jobs:
           # the bundle root itself — packaged_cli walks Resources/Frameworks/_internal).
           test -f "$SMOKE_ROOT/Ouroboros/_internal/repo.bundle"
           test -f "$SMOKE_ROOT/Ouroboros/_internal/repo_bundle_manifest.json"
+          python scripts/fetch_claudexor_runtime.py --verify-only \
+            --output-dir "$SMOKE_ROOT/Ouroboros/_internal/claudexor-runtime"
           HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
             "$SMOKE_ROOT/Ouroboros/bin/ouroboros" --help >/dev/null
+          HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
+            OUROBOROS_DATA_DIR="$RUNNER_TEMP/ouroboros-claudexor-smoke" \
+            OUROBOROS_BUNDLE_DIR="$SMOKE_ROOT/Ouroboros/_internal" \
+            python scripts/claudexor_platform_smoke.py \
+              --managed-runtime --lane fixture --max-seconds 300
           echo "sbom_path=$SMOKE_ROOT" >> "$GITHUB_OUTPUT"
 
       - name: Smoke final Windows archive
@@ -695,6 +709,8 @@ jobs:
           # the bundle root itself — packaged_cli walks Resources/Frameworks/_internal).
           if (-not (Test-Path "$SmokeRoot\Ouroboros\_internal\repo.bundle")) { throw "repo.bundle missing" }
           if (-not (Test-Path "$SmokeRoot\Ouroboros\_internal\repo_bundle_manifest.json")) { throw "repo bundle manifest missing" }
+          python scripts/fetch_claudexor_runtime.py --verify-only --output-dir "$SmokeRoot\Ouroboros\_internal\claudexor-runtime"
+          if ($LASTEXITCODE -ne 0) { throw "embedded Claudexor runtime verification failed: $LASTEXITCODE" }
           $env:HOME = $HomeDir
           $env:USERPROFILE = $HomeDir
           $env:LOCALAPPDATA = Join-Path $HomeDir "AppData\Local"
@@ -704,6 +720,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA, $env:APPDATA | Out-Null
           & "$SmokeRoot\Ouroboros\bin\ouroboros.cmd" --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "packaged CLI smoke failed: $LASTEXITCODE" }
+          $env:OUROBOROS_DATA_DIR = Join-Path $env:RUNNER_TEMP "ouroboros-claudexor-smoke"
+          $env:OUROBOROS_BUNDLE_DIR = "$SmokeRoot\Ouroboros\_internal"
+          python scripts/claudexor_platform_smoke.py --managed-runtime --lane fixture --max-seconds 300
+          if ($LASTEXITCODE -ne 0) { throw "packaged Claudexor runtime smoke failed: $LASTEXITCODE" }
           Add-Content -Path $env:GITHUB_OUTPUT -Value "sbom_path=$SmokeRoot"
 
       - name: Record packaged artifact smoke
@@ -720,6 +740,7 @@ jobs:
             --commit "$GITHUB_SHA" \
             --tag "$GITHUB_REF_NAME" \
             --check embedded_repo_bundle \
+            --check embedded_claudexor_runtime \
             --check packaged_cli_help \
             "${EXTRA_CHECKS[@]}"
 

@@ -92,6 +92,7 @@ def test_stop_never_kills_a_daemon_it_did_not_start():
 
 def test_ensure_running_without_binary_is_a_typed_refusal(monkeypatch, tmp_path):
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    from ouroboros import claudexor_runtime as runtime
 
     import ouroboros.config as config_mod
     # Ownership is verified FIRST (never adopt); this test is about the binary,
@@ -99,7 +100,13 @@ def test_ensure_running_without_binary_is_a_typed_refusal(monkeypatch, tmp_path)
     monkeypatch.setattr(config_mod, "DATA_DIR", tmp_path)
     monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
     monkeypatch.setattr(owned, "owned_daemon_provisioned", lambda: False)
-    monkeypatch.setattr(owned, "resolve_claudexord", lambda: "")
+    class MissingRuntime:
+        def ensure(self):
+            raise runtime.ClaudexorRuntimeError(
+                "claudexord_not_installed", "fixture runtime is absent"
+            )
+
+    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: MissingRuntime())
     manager = owned.OwnedClaudexorDaemon()
     with pytest.raises(ClaudexorUnavailable) as err:
         manager.ensure_running()
@@ -806,7 +813,7 @@ def test_a_spawn_that_never_publishes_a_descriptor_does_not_leave_the_child_runn
     config_dir = data_dir / "claudexor"
     _point_owned_home(monkeypatch, config_dir, data_dir)
     config_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(owned, "resolve_claudexord", lambda: sys.executable)
+    monkeypatch.setenv("OUROBOROS_CLAUDEXOR_BIN", sys.executable)
     monkeypatch.setattr(owned, "_SPAWN_WAIT_SEC", 0.3)
     monkeypatch.setattr(owned, "_SPAWN_POLL_SEC", 0.05)
 
@@ -843,6 +850,51 @@ def test_a_spawn_that_never_publishes_a_descriptor_does_not_leave_the_child_runn
     assert manager.stop() is False
 
 
+def test_first_spawn_loser_attaches_to_the_winners_endpoint(monkeypatch, tmp_path):
+    """A concurrent first-use winner is success, not a false spawn failure."""
+    from ouroboros import claudexor_runtime as runtime
+    from ouroboros.gateways.claudexor import DaemonEndpoint
+
+    data_dir = tmp_path / "data"
+    config_dir = data_dir / "claudexor"
+    _point_owned_home(monkeypatch, config_dir, data_dir)
+    monkeypatch.setattr(owned, "verify_owned_home", lambda: "")
+
+    class ReadyRuntime:
+        def ensure(self):
+            return ["/fixture/node", "/fixture/claudexord.bundle.cjs"]
+
+        def status(self):
+            return {"source": "download"}
+
+    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: ReadyRuntime())
+
+    class ExitedLoser:
+        pid = 424243
+
+        def poll(self):
+            return 1
+
+        def terminate(self):
+            raise AssertionError("an exited loser must not be terminated")
+
+    child = ExitedLoser()
+    import ouroboros.process_custody as custody_mod
+
+    monkeypatch.setattr(custody_mod, "spawn_supervised", lambda *_args, **_kwargs: child)
+    endpoint = DaemonEndpoint(host="127.0.0.1", port=45681, token="winner-token")
+    manager = owned.OwnedClaudexorDaemon()
+    monkeypatch.setattr(manager, "_classify_liveness", lambda: (None, "not_provisioned", ""))
+    monkeypatch.setattr(manager, "_alive_endpoint", lambda: endpoint)
+    rotations = []
+    monkeypatch.setattr(manager, "_enable_rotation", rotations.append)
+
+    assert manager.ensure_running() is endpoint
+    assert rotations == [endpoint]
+    assert manager._proc is None
+    assert manager.stop() is False
+
+
 def test_dead_owned_daemon_is_restarted_and_reconciled(monkeypatch, tmp_path):
     """The stale case end-to-end: descriptor exists, daemon dead, ownership
     marker OURS -> ensure_running restarts under the same supervision
@@ -865,7 +917,7 @@ def test_dead_owned_daemon_is_restarted_and_reconciled(monkeypatch, tmp_path):
     _stale_home(config_dir, marker_data_dir=str(data_dir.resolve()))
     old_descriptor = (config_dir / "daemon" / "control-api.json").read_text()
 
-    monkeypatch.setattr(owned, "resolve_claudexord", lambda: sys.executable)
+    monkeypatch.setenv("OUROBOROS_CLAUDEXOR_BIN", sys.executable)
     spawned: dict = {}
     servers: list = []
     import ouroboros.process_custody as custody_mod
@@ -983,6 +1035,167 @@ def test_foreign_responder_on_stale_port_is_disclosed_not_killed(monkeypatch, tm
         foreign.shutdown()
 
 
+def _exact_runtime_pin(runtime_mod):
+    """A valid exact pin (all five Node platforms) for lifecycle fixtures."""
+    node_artifacts = {
+        key: runtime_mod.NodeRuntimeArtifact(
+            archive_url=f"https://node.example.test/node-v24.16.0-{key}.tar.gz",
+            sha256="a" * 64,
+            size_bytes=1,
+            executable=f"node-v24.16.0-{key}/bin/node",
+        )
+        for key in ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-x64")
+    }
+    return runtime_mod.ClaudexorRuntimePin(
+        version="3.4.0",
+        build_sha="1" * 40,
+        protocol_major=3,
+        archive_url="https://example.test/releases/runtime.tar.gz",
+        sha256="b" * 64,
+        size_bytes=1,
+        node_version="24.16.0",
+        node_artifacts=node_artifacts,
+        entrypoint="dist/claudexord.js",
+    )
+
+
+def test_live_daemon_serving_the_exact_pin_is_never_repaired_in_place(monkeypatch, tmp_path):
+    """S1 guard: when the live authenticated handshake already matches the pin
+    (version + build SHA), ensure_running returns the live endpoint WITHOUT
+    touching its serving directory — even when the on-disk copy of that SAME
+    target is broken. Disk repair belongs to the next natural start (owner
+    decision 2A: side-by-side, current work is never touched)."""
+    from ouroboros import claudexor_runtime as runtime
+    from ouroboros.gateways.claudexor import DaemonEndpoint
+
+    data_dir = tmp_path / "data"
+    config_dir = data_dir / "claudexor"
+    _point_owned_home(monkeypatch, config_dir, data_dir)
+
+    pin = _exact_runtime_pin(runtime)
+    manager = runtime.ClaudexorRuntimeManager(pin)
+    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: manager)
+
+    # The daemon's own pinned target on disk is corrupted: any disk probe of
+    # this target fails, which without the guard would drive _install and a
+    # promote that replaces the serving directory under the live process.
+    target = runtime.managed_runtime_dir(pin)
+    target.mkdir(parents=True)
+    (target / "managed-runtime.json").write_text("{corrupt", encoding="utf-8")
+
+    def no_install(*_args, **_kwargs):
+        raise AssertionError("a live pinned daemon's serving directory must not be repaired")
+
+    monkeypatch.setattr(manager, "_install", no_install)
+    import ouroboros.process_custody as custody_mod
+
+    def no_spawn(*_args, **_kwargs):
+        raise AssertionError("no spawn may happen while the pinned daemon is live")
+
+    monkeypatch.setattr(custody_mod, "spawn_supervised", no_spawn)
+
+    endpoint = DaemonEndpoint(host="127.0.0.1", port=45695, token="live")
+    daemon = owned.OwnedClaudexorDaemon()
+
+    def live_classify():
+        daemon._engine_version = pin.version
+        daemon._engine_build_sha = pin.build_sha
+        return endpoint, "running", ""
+
+    monkeypatch.setattr(daemon, "_classify_liveness", live_classify)
+    before = sorted(p.name for p in target.parent.iterdir())
+
+    assert daemon.ensure_running() is endpoint
+    # The serving directory was not replaced, repaired, or cleaned up.
+    assert (target / "managed-runtime.json").read_text(encoding="utf-8") == "{corrupt"
+    assert sorted(p.name for p in target.parent.iterdir()) == before
+    assert daemon._proc is None
+
+
+def test_staged_update_activates_only_at_the_next_natural_start(monkeypatch, tmp_path):
+    """Staged-activation orchestration (owner decision 2A), end to end: with a
+    live OLD daemon, ensure() stages a DIFFERENT exact target and
+    ensure_running still answers the old endpoint with no spawn and no stop;
+    once the old daemon dies naturally, the next start spawns exactly the
+    staged command."""
+    from ouroboros import claudexor_runtime as runtime
+    from ouroboros.gateways.claudexor import DaemonEndpoint
+
+    data_dir = tmp_path / "data"
+    config_dir = data_dir / "claudexor"
+    _point_owned_home(monkeypatch, config_dir, data_dir)
+    monkeypatch.setattr(owned, "verify_owned_home", lambda: "")
+
+    new_command = ["/fixture/node", "/fixture/state/cx/3.4.0-111111111111/dist/claudexord.js"]
+    ensures: list = []
+
+    class _StagedPin:
+        version = "3.4.0"
+        build_sha = "1" * 40
+
+    class StagingRuntime:
+        pin = _StagedPin()
+
+        def ensure(self):
+            ensures.append("ensure")
+            return list(new_command)
+
+        def status(self):
+            return {"source": "download"}
+
+    monkeypatch.setattr(runtime, "get_runtime_manager", lambda: StagingRuntime())
+
+    old_endpoint = DaemonEndpoint(host="127.0.0.1", port=45696, token="old")
+    new_endpoint = DaemonEndpoint(host="127.0.0.1", port=45697, token="new")
+    daemon = owned.OwnedClaudexorDaemon()
+    old_alive = {"value": True}
+
+    def classify():
+        if old_alive["value"]:
+            daemon._engine_version = "3.2.1"
+            daemon._engine_build_sha = "2" * 40
+            return old_endpoint, "running", ""
+        daemon._engine_version = ""
+        daemon._engine_build_sha = ""
+        return None, "stale", "connection refused"
+
+    monkeypatch.setattr(daemon, "_classify_liveness", classify)
+
+    spawns: list = []
+
+    class _LiveChild:
+        pid = 424244
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            raise AssertionError("staging must never stop a daemon")
+
+    import ouroboros.process_custody as custody_mod
+
+    monkeypatch.setattr(
+        custody_mod,
+        "spawn_supervised",
+        lambda command, **_kwargs: spawns.append(list(command)) or _LiveChild(),
+    )
+    monkeypatch.setattr(daemon, "_alive_endpoint", lambda: new_endpoint)
+    monkeypatch.setattr(daemon, "_enable_rotation", lambda _endpoint: None)
+
+    # Phase 1: the OLD endpoint keeps serving; the new target is only staged.
+    assert daemon.ensure_running() is old_endpoint
+    assert ensures == ["ensure"]
+    assert spawns == []
+    assert daemon._proc is None  # nothing spawned, nothing stopped
+
+    # Phase 2: the old daemon died naturally; the next start selects the
+    # staged exact target the previous ensure() prepared.
+    old_alive["value"] = False
+    assert daemon.ensure_running() is new_endpoint
+    assert ensures == ["ensure", "ensure"]
+    assert spawns == [new_command]
+
+
 def test_a_home_marked_for_another_data_plane_is_never_adopted(monkeypatch, tmp_path):
     """The never-adopt rule: a marker naming a different data plane makes
     ensure_running refuse typed BEFORE any spawn — restart there = adoption."""
@@ -992,7 +1205,7 @@ def test_a_home_marked_for_another_data_plane_is_never_adopted(monkeypatch, tmp_
     config_dir = data_dir / "claudexor"
     _point_owned_home(monkeypatch, config_dir, data_dir)
     _stale_home(config_dir, marker_data_dir=str(tmp_path / "someone-elses-data"))
-    monkeypatch.setattr(owned, "resolve_claudexord", lambda: "/bin/true")
+    monkeypatch.setenv("OUROBOROS_CLAUDEXOR_BIN", "/bin/true")
 
     manager = owned.OwnedClaudexorDaemon()
     assert manager.status_dict()["ownership_problem"]

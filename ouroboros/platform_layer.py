@@ -28,6 +28,16 @@ _SUBPROCESS_NO_WINDOW = (
 _PATH_BOOTSTRAPPED = False
 
 
+def executable_name_candidates(name: str) -> List[str]:
+    """Platform spellings for an executable stored in a known directory."""
+    base = str(name or "").strip()
+    if not base:
+        return []
+    if IS_WINDOWS:
+        return [f"{base}.cmd", f"{base}.exe", f"{base}.bat", base]
+    return [base]
+
+
 def local_zoneinfo():
     """Best-effort DST-aware local timezone.
 
@@ -891,6 +901,42 @@ def embedded_node_candidates(base_dir: pathlib.Path) -> List[pathlib.Path]:
     return [base_dir / "node-standalone" / "bin" / "node"]
 
 
+def node_distribution_platform() -> str:
+    """Return the Node.js archive platform key supported by Ouroboros."""
+    machine = platform.machine().strip().lower()
+    architecture = {
+        "amd64": "x64",
+        "x86_64": "x64",
+        "arm64": "arm64",
+        "aarch64": "arm64",
+    }.get(machine, "")
+    if IS_WINDOWS:
+        return "win32-x64" if architecture == "x64" else ""
+    if IS_MACOS and architecture:
+        return f"darwin-{architecture}"
+    if IS_LINUX and architecture:
+        return f"linux-{architecture}"
+    return ""
+
+
+def probe_node_version(node_path: str) -> str:
+    """Return a normalized bundled-Node version, or ``""`` on probe failure."""
+    try:
+        result = _hidden_run(
+            [str(node_path), "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return str(result.stdout or "").strip().removeprefix("v")
+
+
 def embedded_ripgrep_candidates(base_dir: pathlib.Path) -> List[pathlib.Path]:
     """Return candidate bundled ripgrep paths."""
     if IS_WINDOWS:
@@ -899,6 +945,35 @@ def embedded_ripgrep_candidates(base_dir: pathlib.Path) -> List[pathlib.Path]:
 
 
 BUNDLE_DIR_ENV = "OUROBOROS_BUNDLE_DIR"
+
+
+def bundled_resource_ancestor_bases(executable: "str | pathlib.Path | None" = None) -> List[pathlib.Path]:
+    """Bundle roots recoverable from an embedded interpreter path.
+
+    Managed updates replace the server checkout but not the frozen launcher.
+    Launchers predating ``OUROBOROS_BUNDLE_DIR`` still start the updated server
+    with ``.../Resources/python-standalone/...`` (macOS) or
+    ``.../_internal/python-standalone/...`` (portable builds).  The interpreter
+    path therefore remains a durable, cross-platform pointer to the old app's
+    resource root.
+    """
+    try:
+        start = pathlib.Path(executable or sys.executable).resolve()
+    except (OSError, ValueError):
+        return []
+    found: List[pathlib.Path] = []
+    chain = [start.parent, *start.parents]
+    for ancestor in chain:
+        if ancestor.name == EMBEDDED_PYTHON_DIR_NAME:
+            found.append(ancestor.parent)
+        for child_name in ("Resources", "_internal"):
+            candidate = ancestor / child_name
+            try:
+                if any(path.is_file() for path in embedded_python_candidates(candidate)):
+                    found.append(candidate)
+            except OSError:
+                continue
+    return found
 
 
 def bundled_resource_bases() -> List[pathlib.Path]:
@@ -922,8 +997,20 @@ def bundled_resource_bases() -> List[pathlib.Path]:
     frozen_base = getattr(sys, "_MEIPASS", None)
     if frozen_base:
         bases.append(pathlib.Path(frozen_base))
+    bases.extend(bundled_resource_ancestor_bases())
     bases.append(pathlib.Path(__file__).resolve().parent.parent)
-    return bases
+    unique: List[pathlib.Path] = []
+    seen = set()
+    for base in bases:
+        try:
+            key = base.resolve()
+        except OSError:
+            key = base
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(base)
+    return unique
 
 
 def _resolve_bundled_payload(candidates_for: Callable[[pathlib.Path], List[pathlib.Path]]) -> Optional[str]:

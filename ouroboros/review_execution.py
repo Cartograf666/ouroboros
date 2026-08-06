@@ -734,8 +734,9 @@ def run_delegated_review_session(
     ``TimeoutError`` or ``RuntimeError``.
     """
     from ouroboros import delegate_custody as custody
+    from ouroboros.claudexor_daemon import ensure_owned_gateway
     from ouroboros.gateways.claudexor import (
-        ClaudexorGateway, ClaudexorSubscriptionWindowExhausted, ClaudexorUnavailable,
+        ClaudexorSubscriptionWindowExhausted, ClaudexorUnavailable,
     )
     from ouroboros.subagents import DelegationRoute, delegated_run_shape, route_health
 
@@ -794,9 +795,8 @@ def run_delegated_review_session(
                 f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)"
             )
         project_id, existing_project, key, schema_asked = "", "", "", False
-    gateway = ClaudexorGateway()
+    gateway = ensure_owned_gateway()
     try:
-        gateway.handshake()
         # Health is asked about the route actually being run: on a retry that is the
         # STORED invocation's route, not whatever the environment names today.
         unavailable, reset_at = route_health(gateway, route.route_id, shape)
@@ -1408,4 +1408,3 @@ def _execute_slot_attempt(
     renders its prompt once instead of once per attempt.
     """
     return (executor or _review_route_executor(assignment, llm=llm)).execute()
-

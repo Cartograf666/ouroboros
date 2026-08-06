@@ -91,6 +91,27 @@ When a Gateway exists, it should follow these guidelines:
   who owns a run, whether a cancel was verified, whether a settlement landed — is
   `ouroboros/delegate_custody.py`, not transport.
 
+`ouroboros/claudexor_runtime.py` owns engine delivery, separately from both the
+gateway and `data/claudexor` auth/config/run state. Its tracked pin names one
+public Claudexor closure by exact identity and the exact Node version proven
+with it, including exact per-platform Node archive URL/size/SHA-256/member facts.
+Build scripts fetch the closure before PyInstaller and package it as
+`claudexor-runtime/<archive>`; managed updates of an older immutable app use the
+same URL instead. A matching packaged Node is preferred. Source mode or a package
+without that exact Node obtains the selected official archive under the same
+foreground ensure lock, extracts only the named executable into `data/state/cx`,
+and probes its version before the closure. Seed and download paths use exact
+size/SHA-256 admission, private staging, identity probes, and atomic immutable
+promotion. Do not add npm, `latest`/`next`, a mutable current pointer, a second
+manifest verifier, or background update policy to this path. `status()` must
+remain read-only.
+
+`ouroboros/claudexor_daemon.py::ensure_owned_gateway` is the explicit lifecycle
+seam used by Connect and actual delegated/reviewer starts. It may stage a new
+target beside a live authenticated daemon, but never hot-swaps that process;
+next spawn follows the code pin. A pinned target never silently degrades to a
+PATH binary. The gateway below remains pure I/O.
+
 ### Relationship Between Entities
 
 ```
@@ -2270,8 +2291,14 @@ signing material never persists across runs.
 The tagged build binds public release assets to their source and verification
 record. Each platform shard locates the final DMG, tarball, or ZIP after all
 packaging steps, then performs a smoke test against that final archive. The
-smoke checks require the embedded repository bundle and run the packaged CLI
-with `--help` in an isolated home directory. The macOS check also requires the
+smoke checks require the embedded repository bundle, run the packaged CLI with
+`--help` in an isolated home directory, then use the embedded Claudexor seed and
+Node from that extracted final artifact to perform install, extraction, exact
+identity probe, owned-daemon handshake, one fake task, and an identity-bound
+graceful stop of the serving closure. The separate
+Claudexor platform gate repeats that fixture path on ordinary branch changes and
+adds the explicit-key live compatibility matrix; neither path installs a
+floating Claudexor npm package. The macOS check also requires the
 `Applications -> /Applications` drag target, the separate `Install CLI.command`
 payload, and an arm64 app executable.
 

@@ -558,6 +558,18 @@ class ClaudexorGateway:
         body = self._request("POST", "/v2/settings", json_body=dict(request))
         return body if isinstance(body, dict) else {}
 
+    def set_secret(self, name: str, value: str) -> Dict[str, Any]:
+        """Store one managed secret through the daemon's non-journaled route.
+
+        The value stays in this loopback request and is never returned or logged.
+        This is transport only; callers own the choice of managed slot.
+        """
+        body = self._request(
+            "POST", "/v2/secrets",
+            json_body={"name": str(name), "value": str(value)},
+        )
+        return body if isinstance(body, dict) else {}
+
 
 # -- applied-fact artifacts ----------------------------------------------------
 

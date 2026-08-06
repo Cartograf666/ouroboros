@@ -343,6 +343,24 @@ class TestBuildLinuxSh:
 class TestBuildWindowsPs1:
     """build_windows.ps1 must install Chromium/WebKit with PLAYWRIGHT_BROWSERS_PATH=0 before PyInstaller."""
 
+    def test_critical_native_commands_fail_fast_on_windows_powershell_5(self):
+        src = _read("build_windows.ps1")
+        assert "function Invoke-NativeChecked" in src
+        assert "$ExitCode = $LASTEXITCODE" in src
+        assert "if ($ExitCode -ne 0)" in src
+        for description in (
+            "Node.js runtime download",
+            "Launcher dependency installation",
+            "ripgrep runtime download",
+            "Agent dependency installation",
+            "Claudexor runtime seed fetch",
+            "Chromium installation",
+            "WebKit installation",
+            "Managed repo bundle build",
+            "PyInstaller build",
+        ):
+            assert f'Invoke-NativeChecked "{description}"' in src
+
     def test_playwright_install_chromium_present(self):
         src = _read("build_windows.ps1")
         assert "playwright install --only-shell chromium" in src
@@ -966,6 +984,20 @@ def test_cross_platform_build_scripts_are_present():
     assert (_REPO_PATH / "scripts" / "pyi_rth_pythonnet.py").exists()
 
 
+def test_release_builds_embed_the_exact_claudexor_runtime_seed():
+    for name in ("build.sh", "build_linux.sh", "build_windows.ps1"):
+        source = _pkg_read(name)
+        fetch_pos = source.find("scripts/fetch_claudexor_runtime.py")
+        pyinstaller_pos = _find_pyinstaller_cmd_pos(source)
+        assert fetch_pos != -1, f"{name} must fetch the reviewed Claudexor runtime seed"
+        assert pyinstaller_pos != -1
+        assert fetch_pos < pyinstaller_pos, f"{name} must fetch Claudexor before PyInstaller"
+
+    spec = _pkg_read("Ouroboros.spec")
+    assert "('claudexor-runtime', 'claudexor-runtime')" in spec
+    assert "/claudexor-runtime/" in _pkg_read(".gitignore")
+
+
 def test_build_sh_supports_unsigned_macos_release():
     build_source = _pkg_read("build.sh")
     assert 'OUROBOROS_SIGN' in build_source
@@ -1011,3 +1043,11 @@ def test_ci_build_job_exports_release_tag_and_fetches_full_history():
     assert "OUROBOROS_RELEASE_TAG: ${{ github.ref_name }}" in workflow
     assert "OUROBOROS_MANAGED_SOURCE_BRANCH: ouroboros" in workflow
     assert "fetch-depth: 0" in workflow
+
+
+def test_ci_release_smokes_the_exact_embedded_claudexor_archive_on_all_platforms():
+    workflow = _ci_workflow()
+    assert workflow.count("fetch_claudexor_runtime.py --verify-only") == 3
+    assert workflow.count("scripts/claudexor_platform_smoke.py") == 3
+    assert workflow.count("--managed-runtime --lane fixture") == 3
+    assert "embedded_claudexor_runtime" in workflow

@@ -26,6 +26,23 @@ from ouroboros.tool_capabilities import (
 NANNY_TOOLS = {"delegate_start", "delegate_wait", "delegate_cancel"}
 
 
+@pytest.fixture(autouse=True)
+def _owned_gateway_uses_each_test_transport(monkeypatch):
+    """Keep transport fixtures below the new lifecycle seam.
+
+    Runtime delivery has its own focused suite; this module supplies a fake
+    gateway per case and should keep exercising nanny/transport behavior.
+    """
+    from ouroboros import claudexor_daemon
+    from ouroboros.gateways import claudexor as gateway_module
+
+    monkeypatch.setattr(
+        claudexor_daemon,
+        "ensure_owned_gateway",
+        lambda: gateway_module.ClaudexorGateway(),
+    )
+
+
 # -- 3.1 the narrow setting key ------------------------------------------------
 
 
@@ -335,6 +352,26 @@ def test_the_daemon_token_is_never_returned_to_callers():
 
     with _gateway(handler) as gateway:
         assert "secret-token" not in json.dumps(gateway.quota_snapshots())
+
+
+def test_managed_secret_write_uses_the_non_journaled_control_route():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"name": "anthropic", "stored": True})
+
+    with _gateway(handler) as gateway:
+        receipt = gateway.set_secret("anthropic", "test-value")
+
+    assert seen == {
+        "method": "POST",
+        "path": "/v2/secrets",
+        "body": {"name": "anthropic", "value": "test-value"},
+    }
+    assert receipt == {"name": "anthropic", "stored": True}
 
 
 def test_a_per_request_bound_reaches_httpx_and_absence_is_not_an_unbounded_call():
@@ -2595,6 +2632,12 @@ def test_a_retry_testifies_about_the_stored_invocation_not_the_current_config(
     assert removals == [], "an unknown original outcome must keep its project"
     monkeypatch.undo()
     monkeypatch.setattr(gw, "ClaudexorGateway", _fresh)
+    from ouroboros import claudexor_daemon
+    monkeypatch.setattr(
+        claudexor_daemon,
+        "ensure_owned_gateway",
+        lambda: gw.ClaudexorGateway(),
+    )
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "route-b=model-new:high")
 
     # 3. The real retry: health is asked about the STORED route (the current route-b

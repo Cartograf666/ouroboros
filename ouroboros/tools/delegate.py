@@ -890,7 +890,8 @@ def _validated_invocation(drive: Any, retry_token: str, task_id: str,
 
 def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = None,
                     retry_of: Optional[str] = None) -> str:
-    from ouroboros.gateways.claudexor import ClaudexorGateway, ClaudexorUnavailable
+    from ouroboros.claudexor_daemon import ensure_owned_gateway
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.subagents import (
         DelegatedRunShape, DelegationRoute, get_subagent_harness,
         resolve_subagent_executor, route_health,
@@ -982,13 +983,12 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
 
     access = authority.access
     try:
-        gateway = ClaudexorGateway()
+        gateway = ensure_owned_gateway()
     except ClaudexorUnavailable as exc:
         resolution = resolve_subagent_executor("harness", route=route, unavailable_reason=exc.code)
         return _fail("delegate_start", exc.code, str(exc), executor=resolution.executor)
 
     try:
-        gateway.handshake()
         # Health is asked about the whole SHAPE, so the same reader that refuses a route
         # which cannot write also refuses an ENGINE that cannot confine a delegated
         # harness's HOME. Both come back here as a typed blocker; neither can degrade

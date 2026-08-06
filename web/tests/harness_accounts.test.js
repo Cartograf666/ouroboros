@@ -10,6 +10,7 @@ import {
     accountRows,
     attachFallbackDue,
     confirmLoginLive,
+    daemonStatusLine,
     deviceCodeDisclosure,
     failureText,
     jobStateSummary,
@@ -21,9 +22,52 @@ import {
     pollResponseApplies,
     preserveCardFocus,
     quotaSummary,
+    runtimeActionLabel,
     submitLoginInput,
     verificationBadge,
 } from '../modules/harness_accounts.js';
+
+test('managed runtime keeps one contextual Connect intent across install, repair, and update', () => {
+    const payload = (runtime, daemon = {}) => ({ daemon: { state: 'not_provisioned', runtime, ...daemon } });
+
+    // The owner-locked dictionary is exactly four labels, independent of the
+    // connected state: Connect | Install & connect | Update & connect | Fix & connect.
+    assert.equal(runtimeActionLabel(payload({ state: 'missing' })), 'Install & connect');
+    assert.equal(runtimeActionLabel(payload({ state: 'error' })), 'Fix & connect');
+    assert.equal(runtimeActionLabel(payload({ state: 'update_available' })), 'Update & connect');
+    assert.equal(runtimeActionLabel(payload({ state: 'ready' })), 'Connect');
+
+    assert.ok(daemonStatusLine(payload({ state: 'missing' })).text.includes('installs Claudexor'));
+    assert.ok(daemonStatusLine(payload({ state: 'ready', version: '3.3.7' })).text.includes('3.3.7 is ready'));
+    assert.ok(daemonStatusLine(payload({ state: 'installing', target_version: '3.3.7' })).text.includes('Claudexor 3.3.7'));
+    const staged = daemonStatusLine(payload(
+        { state: 'update_staged', staged_version: '3.3.7' },
+        { state: 'running', engine_version: '3.2.1' },
+    ));
+    assert.equal(staged.tone, 'warn');
+    assert.ok(staged.text.includes('3.3.7 is ready'));
+    assert.ok(staged.text.includes('Engine 3.2.1 keeps running'));
+    const repair = daemonStatusLine(payload({ state: 'error', last_error: 'checksum mismatch' }));
+    assert.equal(repair.tone, 'error');
+    assert.ok(repair.text.includes('Connect retries automatically'));
+});
+
+test('the login card explains foreground runtime preparation and retries the same intent', () => {
+    const preparing = loginCardHtml({
+        harness: 'claude', profile: '', job: null, preparingRuntime: true,
+        error: '', verdict: null, confirming: false,
+    });
+    assert.ok(preparing.includes('Installing or checking Claudexor…'));
+    assert.ok(!preparing.includes('data-login-retry'));
+
+    const failed = loginCardHtml({
+        harness: 'claude', profile: '', job: null, preparingRuntime: false,
+        error: 'checksum mismatch', verdict: null, confirming: false,
+    });
+    assert.ok(failed.includes('checksum mismatch'));
+    assert.ok(failed.includes('data-login-retry'));
+    assert.ok(!failed.includes('Installing or checking Claudexor…'));
+});
 
 // GOLDEN fixture: the real /v2/credential-profiles body, produced by PARSING a
 // sample through Claudexor's own Zod ControlCredentialProfilesResponse schema

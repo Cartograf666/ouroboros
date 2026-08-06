@@ -259,8 +259,7 @@ def _build_login_request(harness: str, profile_id: str, transport: str,
 
 
 def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
-    from ouroboros.claudexor_daemon import attach_login_command, get_owned_daemon
-    from ouroboros.gateways.claudexor import ClaudexorGateway
+    from ouroboros.claudexor_daemon import attach_login_command, ensure_owned_gateway
 
     harness = str(body.get("harness") or "").strip()
     if not harness:
@@ -273,9 +272,7 @@ def _login_create(body: Dict[str, Any]) -> Dict[str, Any]:
     # Provisioning moment: the FIRST login action is what spawns the owned
     # daemon (and thereby flips default discovery to it) — an owner action,
     # never a boot-time side effect.
-    endpoint = get_owned_daemon().ensure_running()
-    with ClaudexorGateway(endpoint) as gateway:
-        gateway.handshake()
+    with ensure_owned_gateway() as gateway:
         # Capability, not folklore: the engine's own route catalog says whether
         # it hosts claude/cursor logins itself (disclosure-driven, 3.3.7). A
         # catalog read failure fails CLOSED onto the attach fallback — it works
