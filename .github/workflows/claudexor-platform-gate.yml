@@ -198,7 +198,10 @@ jobs:
             secret_name: anthropic
             secret_env: ANTHROPIC_API_KEY
           - harness: codex
-            model: gpt-5.4-mini
+            # The mini lane twice returned a clean successful answer without
+            # performing the one-word edit, even after the bounded retry.
+            # Keep low effort, but use the full tool-capable model for a gate.
+            model: gpt-5.4
             secret_name: openai
             secret_env: OPENAI_API_KEY
     runs-on: ${{ matrix.os }}
@@ -242,6 +245,26 @@ jobs:
             codex)  npm install -g @openai/codex ;;
             *) echo "unknown harness ${{ matrix.harness }}" >&2; exit 1 ;;
           esac
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            global_root="$(cygpath -u "$(npm root -g)")"
+            case "${{ matrix.harness }}" in
+              claude)
+                native_bin="$(find "$global_root/@anthropic-ai/claude-code/bin" \
+                  -maxdepth 1 -type f -iname 'claude.exe' -print -quit)"
+                override=CLAUDEXOR_CLAUDE_BIN
+                ;;
+              codex)
+                native_bin="$(find "$global_root/@openai/codex" \
+                  -type f -iname 'codex.exe' -print -quit)"
+                override=CLAUDEXOR_CODEX_BIN
+                ;;
+            esac
+            test -n "$native_bin" && test -f "$native_bin"
+            "$native_bin" --version
+            # Modern Node deliberately refuses .cmd through spawn without a
+            # shell. Pin the package-native executable instead of an npm shim.
+            echo "$override=$(cygpath -w "$native_bin")" >> "$GITHUB_ENV"
+          fi
       - name: Require the API key
         # A missing secret is a hard red, not a skip: a lane that quietly passes
         # without credentials is the dishonest green this gate exists to avoid.
