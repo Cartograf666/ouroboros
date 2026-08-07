@@ -103,6 +103,40 @@ def test_live_retry_seed_comparison_normalizes_windows_crlf(tmp_path):
     assert smoke.live_seed_is_unchanged(tmp_path)
 
 
+def test_poll_retries_one_windows_git_atomic_object_race(monkeypatch):
+    class GitRaceError(Exception):
+        code = "ENOENT"
+
+    class Gateway:
+        calls = 0
+
+        def get_run(self, _run_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise GitRaceError(
+                    r"ENOENT: lstat 'C:\r\reviews\w\.git\objects\e5\tmp_obj_x'"
+                )
+            return {"summary": {"state": "succeeded"}}
+
+    gateway = Gateway()
+    monkeypatch.setattr(smoke.time, "sleep", lambda _seconds: None)
+    assert smoke.poll_to_terminal(gateway, "run-1", 30)["summary"]["state"] == "succeeded"
+    assert gateway.calls == 2
+
+
+def test_poll_does_not_retry_an_unrelated_enoent(monkeypatch):
+    class OtherError(Exception):
+        code = "ENOENT"
+
+    class Gateway:
+        def get_run(self, _run_id):
+            raise OtherError("ENOENT: missing final/answer.md")
+
+    monkeypatch.setattr(smoke.time, "sleep", lambda _seconds: None)
+    with pytest.raises(OtherError):
+        smoke.poll_to_terminal(Gateway(), "run-1", 30)
+
+
 @pytest.mark.parametrize(
     ("lane", "attempt", "mutated", "seed_unchanged"),
     [

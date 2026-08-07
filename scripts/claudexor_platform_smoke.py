@@ -269,8 +269,25 @@ def build_request(lane: str, harness: str, model: str, effort: str,
 def poll_to_terminal(gateway: Any, run_id: str, budget_sec: int) -> Dict[str, Any]:
     deadline = time.monotonic() + budget_sec
     last_state = ""
+    transient_git_object_races = 0
     while True:
-        detail = gateway.get_run(run_id)
+        try:
+            detail = gateway.get_run(run_id)
+        except Exception as exc:
+            if (
+                transient_git_object_races < 3
+                and _is_transient_git_object_enoent(exc)
+                and time.monotonic() < deadline
+            ):
+                transient_git_object_races += 1
+                print(
+                    f"[smoke] transient Git object race while polling {run_id}; "
+                    f"retry {transient_git_object_races}/3",
+                    flush=True,
+                )
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+            raise
         summary = detail.get("summary") if isinstance(detail.get("summary"), dict) else {}
         state = str(summary.get("state") or "")
         if state != last_state:
@@ -285,6 +302,17 @@ def poll_to_terminal(gateway: Any, run_id: str, budget_sec: int) -> Dict[str, An
                 run_id=run_id, state=state,
             )
         time.sleep(POLL_INTERVAL_SEC)
+
+
+def _is_transient_git_object_enoent(exc: Exception) -> bool:
+    """Recognize only Git's disappearing atomic-object scratch path."""
+    detail = str(exc).replace("\\", "/").lower()
+    code = str(getattr(exc, "code", "") or "").upper()
+    return (
+        (code == "ENOENT" or "enoent" in detail)
+        and "/.git/objects/" in detail
+        and "/tmp_obj_" in detail
+    )
 
 
 def containment_report(cx: Any, run_dir: str) -> Dict[str, Any]:

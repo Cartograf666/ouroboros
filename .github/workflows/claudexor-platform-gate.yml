@@ -52,6 +52,9 @@
 # unreachable daemon, a run that never terminates, a primary artifact that cannot
 # be read to EOF and tied to the run's own claim, or a child that produced no edit
 # after the one narrowly eligible live retry are all hard failures with a named reason.
+# Polling tolerates only the Windows Git atomic-object race where a `.git/objects/*/
+# tmp_obj_*` scratch name disappears between readdir/lstat (at most three reads);
+# every other control-plane error remains immediately red.
 #
 # A HOST WITH NO OS BOUNDARY IS NOT A FAILURE. Only macOS has a kernel mechanism;
 # the owner has ruled out kernel boundaries elsewhere. Off macOS a delegated run gets
