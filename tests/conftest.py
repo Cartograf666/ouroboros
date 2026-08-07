@@ -16,6 +16,9 @@ import pytest
 
 
 _PYTEST_DATA_DIR = None
+# Repo root for a live-DATA run, which has no pytest data dir to hang it off. Created lazily
+# so the hermetic lane never leaves an unused temp dir behind (see pytest_sessionfinish).
+_PYTEST_REPO_FALLBACK = None
 if os.environ.get("OUROBOROS_ALLOW_LIVE_DATA_TESTS") != "1":
     _LIVE_DATA_ROOT = (
         os.environ.get("OUROBOROS_TEST_LIVE_DATA_ROOT")
@@ -84,8 +87,34 @@ def _restore_pytest_child_isolation() -> None:
         _PYTEST_POPEN_PATCHED = False
 
 
+def _bind_pytest_repo_root() -> None:
+    """Point git_ops.REPO_DIR away from the operator's live checkout.
+
+    Unbound, git_ops.REPO_DIR (no env fallback) sends
+    update_merge._update_tx_marker_path() at the LIVE repo's .git, so a staged managed merge
+    blocks the whole suite through the registry guard. An empty dir with no .git makes the
+    strict read `absent` — the honest allow. Direct assignment: init() would also rewrite
+    BRANCH_DEV/BRANCH_STABLE.
+
+    Keyed on the REPO opt-in (OUROBOROS_ALLOW_LIVE_REPO_TESTS, the same switch git_ops's own
+    destructive-git fuse reads), NOT on the DATA opt-in: they are separate switches, and a run
+    that opts into live DATA has not opted into reading the live repo's update transaction.
+    """
+    if os.environ.get("OUROBOROS_ALLOW_LIVE_REPO_TESTS") == "1":
+        return
+    from supervisor import git_ops
+
+    global _PYTEST_REPO_FALLBACK
+    if _PYTEST_DATA_DIR is None and _PYTEST_REPO_FALLBACK is None:
+        _PYTEST_REPO_FALLBACK = pathlib.Path(tempfile.mkdtemp(prefix="ouroboros-pytest-repo-"))
+    repo_root = (_PYTEST_DATA_DIR or _PYTEST_REPO_FALLBACK) / "repo"
+    git_ops.REPO_DIR = repo_root.resolve(strict=False)
+    git_ops.REPO_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def _bind_pytest_runtime_roots() -> None:
     """Rebind modules that may have been imported before conftest set the env."""
+    _bind_pytest_repo_root()
     if _PYTEST_DATA_DIR is None:
         return
     root = _PYTEST_DATA_DIR.resolve(strict=False)
@@ -210,6 +239,8 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     # Per-process temp data dir (unique mkdtemp per controller/worker) — clean on EVERY process.
     if _PYTEST_DATA_DIR is not None:
         shutil.rmtree(_PYTEST_DATA_DIR, ignore_errors=True)
+    if _PYTEST_REPO_FALLBACK is not None:
+        shutil.rmtree(_PYTEST_REPO_FALLBACK, ignore_errors=True)
 
 
 def pytest_unconfigure(config):  # noqa: ARG001
