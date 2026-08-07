@@ -112,6 +112,13 @@ def _bind_pytest_repo_root() -> None:
     git_ops.REPO_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def git_ops_repo_root() -> pathlib.Path:
+    """The repo root this pytest session binds git_ops (and worker children) to."""
+    from supervisor import git_ops
+
+    return git_ops.REPO_DIR
+
+
 def _bind_pytest_runtime_roots() -> None:
     """Rebind modules that may have been imported before conftest set the env."""
     _bind_pytest_repo_root()
@@ -126,6 +133,10 @@ def _bind_pytest_runtime_roots() -> None:
     state.init(root, state.TOTAL_BUDGET_LIMIT)
     queue.init(root, queue.SOFT_TIMEOUT_SEC, queue.HARD_TIMEOUT_SEC)
     workers.DRIVE_ROOT = root
+    # spawn_workers hands str(workers.REPO_DIR) to every child, and the child binds git_ops to
+    # it — so leaving this at the live default would send workers started BY A TEST back at the
+    # operator's checkout, undoing the isolation above.
+    workers.REPO_DIR = git_ops_repo_root()
 
 
 def _mock_pollution_files(root: pathlib.Path) -> set[pathlib.Path]:
