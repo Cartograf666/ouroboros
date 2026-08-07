@@ -53,8 +53,11 @@ recorded, so both outcomes are legible and neither is a refusal.
 FAILS LOUDLY, NEVER SKIPS. Every refusal on the way — an absent seam, an engine
 below the delegated-marker floor, an unreachable daemon, a run that never reaches a
 terminal state, a child that produced no edit — exits non-zero with a named reason.
-There is deliberately no "harness unavailable, skipping" branch: the whole point of
-the gate is to notice when the delegated path stops working on a platform.
+The live lane permits one second model attempt only when the first run succeeded,
+its primary artifact was read to EOF, and the README stayed byte-identical; a second
+no-edit result is still hard red. There is deliberately no "harness unavailable,
+skipping" branch: the whole point of the gate is to notice when the delegated path
+stops working on a platform.
 
 Usage:
     python scripts/claudexor_platform_smoke.py --managed-runtime --lane fixture
@@ -389,6 +392,13 @@ def mutation_evidence(lane: str, root: pathlib.Path) -> Tuple[bool, str]:
     return True, f"{README_NAME} was edited and contains {LIVE_EXPECT_TOKEN!r}"
 
 
+def should_retry_live_no_mutation(
+    lane: str, attempt: int, mutated: bool, seed_unchanged: bool,
+) -> bool:
+    """Allow exactly one retry for a successful live run that made no edit."""
+    return lane == "live" and attempt == 1 and not mutated and seed_unchanged
+
+
 def graceful_stop_managed_runtime(
     command: List[str], config_dir: pathlib.Path, version: str, build_sha: str
 ) -> Dict[str, Any]:
@@ -470,11 +480,17 @@ def _limits_block(lane: str) -> List[str]:
         "prove anything about the lane this check names.",
     )
     if lane == "live":
-        lines.append(
+        lines += [
             "- The request sent here differs from the production request in exactly one "
             "other field: `authPreference: \"api_key\"` where production sends "
-            "`\"subscription\"`."
-        )
+            "`\"subscription\"`.",
+            "- A live model gets **one bounded second attempt** only when its first run "
+            "reached success, its primary artifact was read to EOF, and the README "
+            "remained byte-identical to the seed. Both attempts use the same repo and "
+            "request with fresh idempotency keys. A second no-edit result is still a "
+            "hard failure; routing, auth, engine, process, artifact, and timeout failures "
+            "are never retried.",
+        ]
     else:
         lines += [
             "- **No model and no credentials were involved.** The `fake-*` harness is a "
@@ -558,7 +574,9 @@ def run_smoke(args: argparse.Namespace) -> Dict[str, Any]:
         gateway = cx.ClaudexorGateway(endpoint)
     root: Optional[pathlib.Path] = None
     owned_project = ""
-    run_id = ""
+    run_ids: List[str] = []
+    facts["run_ids"] = run_ids
+    facts["attempts"] = []
     gateway_closed = False
     try:
         body = gateway.handshake()  # enforces the TRANSPORT floor, raises if below
@@ -607,43 +625,73 @@ def run_smoke(args: argparse.Namespace) -> Dict[str, Any]:
         owned_project = gateway.register_project(str(root))
         facts["project_id"] = owned_project
 
-        handle = gateway.start_run(request, idempotency_key=uuid.uuid4().hex)
-        run_id = str(handle.get("runId") or handle.get("jobId") or "")
-        if not run_id:
-            raise SmokeFailure(
-                "queued_without_run_id",
-                f"Claudexor returned a queued handle with no run id: {handle!r}",
+        attempt = 1
+        while True:
+            attempt_facts: Dict[str, Any] = {"attempt": attempt}
+            facts["attempts"].append(attempt_facts)
+            handle = gateway.start_run(request, idempotency_key=uuid.uuid4().hex)
+            run_id = str(handle.get("runId") or handle.get("jobId") or "")
+            if not run_id:
+                raise SmokeFailure(
+                    "queued_without_run_id",
+                    f"Claudexor returned a queued handle with no run id: {handle!r}",
+                )
+            run_ids.append(run_id)
+            attempt_facts["run_id"] = run_id
+            facts["run_id"] = run_id
+
+            detail = poll_to_terminal(
+                gateway, run_id, args.max_seconds + args.grace_seconds,
             )
-        facts["run_id"] = run_id
+            summary = detail.get("summary") if isinstance(detail.get("summary"), dict) else {}
+            state = str(summary.get("state") or "")
+            run_dir = str(summary.get("runDir") or "")
+            attempt_facts["state"] = facts["state"] = state
+            attempt_facts["run_dir"] = facts["run_dir"] = run_dir or "(none)"
 
-        detail = poll_to_terminal(gateway, run_id, args.max_seconds + args.grace_seconds)
-        summary = detail.get("summary") if isinstance(detail.get("summary"), dict) else {}
-        state = str(summary.get("state") or "")
-        facts["state"] = state
-        run_dir = str(summary.get("runDir") or "")
-        facts["run_dir"] = run_dir or "(none)"
+            # Applied facts are reported per attempt. A host with no mechanism is
+            # disclosed, never refused.
+            containment = containment_report(cx, run_dir)
+            attempt_facts["containment"] = facts["containment"] = containment
 
-        # The applied-containment facts, read from the run's own artifacts. Reported
-        # whatever they say: a host with no mechanism is disclosed, never refused.
-        facts["containment"] = containment_report(cx, run_dir)
+            if state != SUCCESS_STATE:
+                failure = summary.get("failure")
+                raise SmokeFailure(
+                    "run_not_successful",
+                    f"the run reached terminal state {state!r}: "
+                    f"{json.dumps(failure, ensure_ascii=False)[:400]}",
+                    **facts,
+                )
 
-        if state != SUCCESS_STATE:
-            failure = summary.get("failure")
-            raise SmokeFailure(
-                "run_not_successful",
-                f"the run reached terminal state {state!r}: "
-                f"{json.dumps(failure, ensure_ascii=False)[:400]}",
-                **facts,
+            # D7 for this gate: retry eligibility is considered only after the result
+            # has been read to EOF and tied to the run's own size/preview claim.
+            artifact = read_primary_artifact_to_eof(gateway, run_id, detail)
+            attempt_facts["primary_artifact"] = facts["primary_artifact"] = artifact
+
+            mutated, why = mutation_evidence(args.lane, root)
+            attempt_facts["mutation_evidence"] = facts["mutation_evidence"] = why
+            attempt_facts["mutated"] = mutated
+            seed_unchanged = (
+                args.lane == "live"
+                and confined_child(root, README_NAME).read_bytes()
+                == README_SEED.encode("utf-8")
             )
-
-        # D7 for this gate: the result exists only after the primary artifact has
-        # been read to EOF and tied to the run's own size/preview claim.
-        facts["primary_artifact"] = read_primary_artifact_to_eof(gateway, run_id, detail)
-
-        mutated, why = mutation_evidence(args.lane, root)
-        facts["mutation_evidence"] = why
-        if not mutated:
-            raise SmokeFailure("no_mutation", why, **facts)
+            if should_retry_live_no_mutation(
+                args.lane, attempt, mutated, seed_unchanged,
+            ):
+                attempt_facts["outcome"] = "retryable_no_mutation"
+                print(
+                    "[smoke] successful live run made no edit; using the one "
+                    "bounded model-output retry",
+                    flush=True,
+                )
+                attempt += 1
+                continue
+            if not mutated:
+                attempt_facts["outcome"] = "no_mutation"
+                raise SmokeFailure("no_mutation", why, **facts)
+            attempt_facts["outcome"] = "mutated"
+            break
         if owned_daemon is not None:
             if owned_project:
                 gateway.remove_project(owned_project)
@@ -671,11 +719,12 @@ def run_smoke(args: argparse.Namespace) -> Dict[str, Any]:
             getattr(exc, "code", "claudexor_unavailable"), str(exc), **facts,
         ) from exc
     finally:
-        if run_id:
-            try:
-                gateway.cancel_run(run_id, reason="smoke teardown")
-            except Exception:  # already terminal in the happy path
-                pass
+        if not gateway_closed:
+            for started_run_id in run_ids:
+                try:
+                    gateway.cancel_run(started_run_id, reason="smoke teardown")
+                except Exception:  # already terminal in the happy path
+                    pass
         if owned_project:
             try:
                 gateway.remove_project(owned_project)

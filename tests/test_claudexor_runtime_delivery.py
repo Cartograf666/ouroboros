@@ -241,6 +241,11 @@ def test_seed_install_uses_bundled_node_and_records_real_source(tmp_path, monkey
     monkeypatch.setattr(platform, "bundled_resource_bases", lambda: [tmp_path / "bundle"])
     monkeypatch.setattr(
         platform,
+        "embedded_node_candidates",
+        lambda base: [pathlib.Path(base) / "node-standalone" / "bin" / "node"],
+    )
+    monkeypatch.setattr(
+        platform,
         "probe_node_version",
         lambda candidate: NODE_VERSION if candidate == str(node) else "",
     )
@@ -289,6 +294,11 @@ def test_clean_source_install_fetches_exact_managed_node_in_the_same_ensure(
     monkeypatch.setattr(platform, "node_distribution_platform", lambda: "linux-x64")
     monkeypatch.setattr(
         platform,
+        "embedded_node_candidates",
+        lambda base: [pathlib.Path(base) / "node-standalone" / "bin" / "node"],
+    )
+    monkeypatch.setattr(
+        platform,
         "probe_node_version",
         lambda candidate: NODE_VERSION if pathlib.Path(candidate).is_file() else "",
     )
@@ -305,7 +315,7 @@ def test_clean_source_install_fetches_exact_managed_node_in_the_same_ensure(
     command = manager.ensure()
 
     assert pathlib.Path(command[0]).is_relative_to(runtime.managed_runtime_root())
-    assert command[0].endswith("node-standalone/bin/node")
+    assert pathlib.Path(command[0]).parts[-3:] == ("node-standalone", "bin", "node")
     assert not (source_root / "node-standalone").exists()
     metadata = json.loads(
         (
@@ -472,6 +482,11 @@ def test_failed_candidate_probe_preserves_existing_target(tmp_path, monkeypatch)
     import ouroboros.platform_layer as platform
 
     monkeypatch.setattr(platform, "bundled_resource_bases", lambda: [tmp_path / "bundle"])
+    monkeypatch.setattr(
+        platform,
+        "embedded_node_candidates",
+        lambda base: [pathlib.Path(base) / "node-standalone" / "bin" / "node"],
+    )
     node = tmp_path / "bundle" / "node-standalone" / "bin" / "node"
     node.parent.mkdir(parents=True)
     node.write_text("fixture\n", encoding="utf-8")

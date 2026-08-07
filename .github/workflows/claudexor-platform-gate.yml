@@ -35,10 +35,14 @@
 #             local pre-release run are for.
 #
 #   live    — a real harness on an explicit API key, editing a README at low effort on
-#             a weak model (the owner's own test rule, plan §4.10 answer 84). Token
-#             cost is pennies; the real price is minutes and flakiness — vendor CLI
-#             installs across three OSes, cold daemons, and someone else's rate limits. Paying that
-#             on every push would make PR feedback on the seam hostage to vendor
+#             a weak model (the owner's own test rule, plan §4.10 answer 84). If a
+#             successful run's artifact reaches EOF but the README remains exactly
+#             unchanged, the same request gets ONE second model attempt with a fresh
+#             idempotency key; a second no-edit result stays red. No routing, auth,
+#             engine, process, artifact, or timeout failure is retried. Token cost is
+#             pennies; the real price is minutes and flakiness — vendor CLI installs
+#             across three OSes, cold daemons, and someone else's rate limits. Paying
+#             that on every push would make PR feedback on the seam hostage to vendor
 #             availability, which is the same trade this repository already made for
 #             `integration-test` in ci.yml. So it runs where the other paid lanes run:
 #             ouroboros-stable, manual dispatch, and tags.
@@ -47,7 +51,7 @@
 # anywhere below. An absent seam, an engine below the delegated-marker floor, an
 # unreachable daemon, a run that never terminates, a primary artifact that cannot
 # be read to EOF and tied to the run's own claim, or a child that produced no edit
-# are all hard failures with a named reason.
+# after the one narrowly eligible live retry are all hard failures with a named reason.
 #
 # A HOST WITH NO OS BOUNDARY IS NOT A FAILURE. Only macOS has a kernel mechanism;
 # the owner has ruled out kernel boundaries elsewhere. Off macOS a delegated run gets

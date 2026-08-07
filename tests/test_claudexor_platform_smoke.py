@@ -96,6 +96,134 @@ def test_the_asked_edit_is_evidence(tmp_path):
     assert ok
 
 
+@pytest.mark.parametrize(
+    ("lane", "attempt", "mutated", "seed_unchanged"),
+    [
+        (lane, attempt, mutated, seed_unchanged)
+        for lane in ("fixture", "live")
+        for attempt in (1, 2)
+        for mutated in (False, True)
+        for seed_unchanged in (False, True)
+    ],
+)
+def test_live_no_mutation_retry_truth_table(
+        lane, attempt, mutated, seed_unchanged):
+    expected = (
+        lane == "live" and attempt == 1 and not mutated and seed_unchanged
+    )
+    assert smoke.should_retry_live_no_mutation(
+        lane, attempt, mutated, seed_unchanged
+    ) is expected
+
+
+@pytest.mark.parametrize(("lane", "expected_attempts"), [("fixture", 1), ("live", 2)])
+def test_smoke_retry_budget_and_final_no_mutation_are_strict(
+        tmp_path, monkeypatch, lane, expected_attempts):
+    root = tmp_path / lane
+    root.mkdir()
+    (root / smoke.README_NAME).write_text(smoke.README_SEED, encoding="utf-8")
+
+    class FakeGateway:
+        engine_version = "9.9.9"
+
+        def __init__(self):
+            self.requests = []
+            self.keys = []
+            self.removed = []
+            self.cancelled = []
+            self.closed = 0
+
+        def handshake(self):
+            return {"protocolMajor": 3, "engine": {"sha": "a" * 40}}
+
+        def register_project(self, path):
+            assert path == str(root)
+            return "project-1"
+
+        def start_run(self, request, idempotency_key):
+            self.requests.append(request)
+            self.keys.append(idempotency_key)
+            return {"runId": f"run-{len(self.requests)}"}
+
+        def get_run(self, run_id):
+            return {
+                "summary": {"state": "succeeded", "runDir": f"/runs/{run_id}"},
+                "primaryOutput": {
+                    "kind": "answer", "path": "final/answer.md",
+                    "text": "ok", "bytes": 2,
+                },
+            }
+
+        def get_run_artifact(self, run_id, path):
+            return b"ok"
+
+        def cancel_run(self, run_id, reason):
+            self.cancelled.append((run_id, reason))
+
+        def remove_project(self, project_id):
+            self.removed.append(project_id)
+
+        def close(self):
+            self.closed += 1
+
+    gateway = FakeGateway()
+
+    class FakeUnavailable(Exception):
+        pass
+
+    class FakeCx:
+        ClaudexorUnavailable = FakeUnavailable
+
+        @staticmethod
+        def discover_daemon():
+            return smoke.argparse.Namespace(host="127.0.0.1", port=7777)
+
+        @staticmethod
+        def ClaudexorGateway(endpoint):
+            return gateway
+
+        @staticmethod
+        def engine_at_least(actual, floor):
+            return True
+
+    request = {"prompt": "same request"}
+    monkeypatch.setattr(smoke, "load_seam", lambda: FakeCx)
+    monkeypatch.setattr(smoke, "seed_fixture_repo", lambda: root)
+    monkeypatch.setattr(smoke, "build_request", lambda *args: request)
+    monkeypatch.setattr(smoke, "containment_report", lambda *args: {})
+    args = smoke.argparse.Namespace(
+        lane=lane,
+        harness="fake-implement" if lane == "fixture" else "codex",
+        model="" if lane == "fixture" else "gpt-test",
+        effort="" if lane == "fixture" else "low",
+        max_seconds=10,
+        grace_seconds=1,
+        secret_env="",
+        secret_name="",
+        managed_runtime=False,
+    )
+
+    with pytest.raises(smoke.SmokeFailure) as excinfo:
+        smoke.run_smoke(args)
+
+    assert excinfo.value.code == "no_mutation"
+    assert len(gateway.requests) == expected_attempts
+    assert all(sent is request for sent in gateway.requests)
+    assert len(gateway.keys) == expected_attempts
+    assert len(set(gateway.keys)) == expected_attempts
+    assert excinfo.value.facts["run_ids"] == [
+        f"run-{attempt}" for attempt in range(1, expected_attempts + 1)
+    ]
+    attempts = excinfo.value.facts["attempts"]
+    assert [item["run_id"] for item in attempts] == excinfo.value.facts["run_ids"]
+    assert [item["outcome"] for item in attempts] == (
+        ["no_mutation"] if lane == "fixture"
+        else ["retryable_no_mutation", "no_mutation"]
+    )
+    assert gateway.removed == ["project-1"]
+    assert gateway.closed == 1
+
+
 def test_managed_smoke_stops_the_serving_identity_with_the_same_home(
     tmp_path, monkeypatch
 ):
@@ -153,6 +281,13 @@ def test_every_lane_states_that_subscriptions_are_not_covered():
 def test_the_live_lane_names_the_one_field_that_differs_from_production():
     text = "\n".join(smoke._limits_block("live"))
     assert "authPreference" in text and "api_key" in text and "subscription" in text
+
+
+def test_the_live_lane_discloses_the_bounded_no_edit_retry():
+    text = "\n".join(smoke._limits_block("live")).lower()
+    assert "one bounded second attempt" in text
+    assert "second no-edit result is still a hard failure" in text
+    assert "never retried" in text
 
 
 def test_the_fixture_lane_says_no_model_and_no_child_process():
