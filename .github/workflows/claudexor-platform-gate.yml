@@ -184,7 +184,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        # Both keys the owner named, each on its own harness — 3 x 2 = 6 jobs.
+        # Claude runs on all three hosts. Codex workspace-write is currently
+        # vendor-broken on native Windows (effectively read-only) and Ubuntu
+        # 24.04 GitHub runners (vendored bwrap/AppArmor RTM_NEWADDR refusal),
+        # so Codex's honest live mutation proof remains macOS-only. The fixture
+        # lane still proves the managed runtime on all three platforms.
         # `harness` MUST be an axis rather than an `include`-only key: an include whose
         # keys are absent from the base matrix is merged into every combination, so two
         # such entries would collapse into one harness (the last one) instead of
@@ -208,6 +212,11 @@ jobs:
             effort: medium
             secret_name: openai
             secret_env: OPENAI_API_KEY
+        exclude:
+          - os: ubuntu-latest
+            harness: codex
+          - os: windows-latest
+            harness: codex
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:

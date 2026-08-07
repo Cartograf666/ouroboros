@@ -345,6 +345,9 @@ def test_three_os_gate_installs_the_reviewed_runtime_instead_of_floating_npm():
     assert "model: gpt-5.4" in workflow
     assert "effort: medium" in workflow
     assert '--effort "${{ matrix.effort }}"' in workflow
+    assert "- os: ubuntu-latest\n            harness: codex" in workflow
+    assert "- os: windows-latest\n            harness: codex" in workflow
+    assert "vendor-broken on native Windows" in workflow
 
 
 # -- the request shape (needs the seam) ----------------------------------------

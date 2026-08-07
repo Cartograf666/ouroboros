@@ -517,6 +517,11 @@ def test_atomic_promote_mid_failure_restores_the_displaced_target(tmp_path, monk
     import ouroboros.platform_layer as platform
 
     monkeypatch.setattr(platform, "bundled_resource_bases", lambda: [tmp_path / "bundle"])
+    monkeypatch.setattr(
+        platform,
+        "embedded_node_candidates",
+        lambda base: [pathlib.Path(base) / "node-standalone" / "bin" / "node"],
+    )
     node = tmp_path / "bundle" / "node-standalone" / "bin" / "node"
     node.parent.mkdir(parents=True)
     node.write_text("fixture\n", encoding="utf-8")
