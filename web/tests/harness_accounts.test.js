@@ -13,6 +13,7 @@ import {
     daemonStatusLine,
     deviceCodeDisclosure,
     failureText,
+    jobDetail,
     jobStateSummary,
     loginCardFace,
     loginCardHtml,
@@ -586,6 +587,175 @@ test('an exhausted re-check says the sign-in is UNCONFIRMED, never that it faile
         verdict: { kind: 'failure', reason: 'launch_failed' } }), 0);
     assert.ok(failed.includes(failureText('launch_failed')));
     assert.ok(!failed.includes(UNCONFIRMED_TEXT));
+});
+
+test("a settled non-success verdict carries the engine's own explanation", () => {
+    // The masking bug the owner hit: a codex login ended `auth_not_ready` and
+    // the card showed only the fixed UNCONFIRMED_TEXT ("check the account row
+    // above"), which reads as "wait a moment" — while the daemon had already
+    // settled it terminally and said why. That sentence was in the snapshot
+    // the card was holding and reached no reader; the two verdict texts are
+    // fixed constants, so nothing else could ever carry it.
+    const message = 'codex native session was not ready before the verification'
+        + ' deadline: native Codex session is not logged in';
+    // The POLL envelope NESTS the job, which is where the field really lands.
+    const nested = cardWithUrl('https://a.example/b', {
+        job: { job: { state: 'failed', phase: 'completed', message } },
+        verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' },
+    });
+    const unconfirmed = loginCardHtml(nested, 0);
+    assert.ok(unconfirmed.includes('data-login-detail'));
+    assert.ok(unconfirmed.includes(message));
+    // The verdict wording itself is unchanged — this is additive.
+    assert.ok(unconfirmed.includes(UNCONFIRMED_TEXT));
+
+    // A typed failure gets it too: its reason is a category, not a sentence.
+    assert.ok(loginCardHtml({ ...nested, verdict: { kind: 'failure', reason: 'launch_failed' } }, 0)
+        .includes('data-login-detail'));
+
+    // Never beside "Connected." (a stale message must not contradict success),
+    // and never while the job is unsettled (the status line owns the card).
+    assert.ok(!loginCardHtml({ ...nested, verdict: { kind: 'success', reason: '' } }, 0)
+        .includes('data-login-detail'));
+    assert.ok(!loginCardHtml({ ...nested, verdict: null }, 0).includes('data-login-detail'));
+    assert.ok(!loginCardHtml({ ...nested, confirming: true, verdict: null }, 0)
+        .includes('data-login-detail'));
+
+    // Engine-supplied text is escaped like every other disclosure on this card.
+    const hostile = loginCardHtml(cardWithUrl('https://a.example/b', {
+        job: { job: { state: 'failed', message: '<img src=x onerror=alert(1)>' } },
+        verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' },
+    }), 0);
+    assert.ok(!hostile.includes('<img'));
+    assert.ok(hostile.includes('&lt;img'));
+
+    // jobDetail itself: both levels, trimmed, and total over junk.
+    assert.equal(jobDetail({ message: '  hi  ' }), 'hi');
+    assert.equal(jobDetail({ job: { message: 'deep' } }), 'deep');
+    assert.equal(jobDetail({ message: '   ', job: { message: 'deep' } }), 'deep');
+    assert.equal(jobDetail({ message: 42 }), '');
+    assert.equal(jobDetail({}), '');
+    assert.equal(jobDetail(null), '');
+});
+
+test("the engine explanation reaches the card from EITHER envelope level", () => {
+    // The dual-level read is asserted on jobDetail() above, but the RENDER path
+    // was only ever exercised with the POLL envelope ({job:{...}}). CREATE
+    // answers a BARE ControlSetupJob, and the login card holds whichever of the
+    // two last landed on it — `startLogin` writes `data.job` from the create
+    // answer, and the poll tick overwrites it later. So a regression that
+    // reached only one level would leave the other silently mute.
+    const message = 'native Codex session is not logged in';
+    const levels = {
+        create_bare_job: { state: 'failed', phase: 'completed', message },
+        poll_envelope: { job: { state: 'failed', phase: 'completed', message } },
+    };
+    for (const [label, job] of Object.entries(levels)) {
+        const html = loginCardHtml(cardWithUrl('https://a.example/b', {
+            job, verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' },
+        }), 0);
+        assert.ok(html.includes('data-login-detail'), label);
+        assert.ok(html.includes(message), label);
+    }
+    // Precedence when BOTH levels speak: the top level wins. Not a preference —
+    // the poll writes the envelope it received, so the outer value is the fresher
+    // reading of the two and must not be shadowed by a stale nested one.
+    assert.equal(jobDetail({ message: 'outer', job: { message: 'inner' } }), 'outer');
+});
+
+test("the engine explanation is escaped in full and never truncated", () => {
+    // Untrusted external text on an owner-facing surface, so two separate
+    // properties. ESCAPING: the existing suite asserts `<img …>` only, while the
+    // house helper escapes six characters — an unescaped `&` or quote is the same
+    // class of defect one character over, and this line sits inside an element
+    // whose attributes are built by the same interpolation.
+    const hostile = `Tom & Jerry's "quoted" <b>bold</b> \`tick\``;
+    const html = loginCardHtml(cardWithUrl('https://a.example/b', {
+        job: { job: { state: 'failed', message: hostile } },
+        verdict: { kind: 'failure', reason: 'launch_failed' },
+    }), 0);
+    for (const raw of ['&', '<', '>', '"', "'", '`']) {
+        // Each hostile character reaches the DOM only in escaped form: the raw
+        // one may still appear as HTML the card itself wrote (its own tags), so
+        // the assertion is on the escaped entity being present…
+        assert.ok(html.includes({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;',
+        }[raw]), raw);
+    }
+    // …and on no fragment of the payload surviving as live markup.
+    assert.ok(!html.includes('<b>bold</b>'));
+    assert.ok(html.includes('&lt;b&gt;bold&lt;/b&gt;'));
+
+    // NO TRUNCATION (BIBLE P1): this is the only place a settled login says WHY,
+    // so a long engine sentence must arrive whole. The daemon's real ones already
+    // chain a cause onto a summary; nothing bounds their length.
+    const long = `${'the daemon explained at length: '.repeat(80)}end.`;
+    const longHtml = loginCardHtml(cardWithUrl('https://a.example/b', {
+        job: { job: { state: 'failed', message: long } },
+        verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' },
+    }), 0);
+    assert.ok(longHtml.includes(long));
+    assert.ok(!longHtml.includes('…]'));   // no omission marker of any house shape
+});
+
+test('a settled failure with NO engine sentence renders the verdict alone', () => {
+    // The absence path, in the render surface rather than only on jobDetail():
+    // most settled jobs carry no `message` at all, so the common case must add
+    // no empty element and — the specific hazard of interpolating an optional
+    // field — no stringified `undefined`/`null` where a sentence would go.
+    for (const job of [
+        { job: { state: 'failed', phase: 'completed' } },          // absent
+        { job: { state: 'failed', message: '' } },                 // empty
+        { job: { state: 'failed', message: '   ' } },              // whitespace
+        { job: { state: 'failed', message: null } },               // explicit null
+    ]) {
+        const html = loginCardHtml(cardWithUrl('https://a.example/b', {
+            job, verdict: { kind: 'unconfirmed', reason: 'auth_not_ready' },
+        }), 0);
+        assert.ok(!html.includes('data-login-detail'), JSON.stringify(job));
+        assert.ok(!html.includes('undefined'), JSON.stringify(job));
+        assert.ok(!html.includes('null'), JSON.stringify(job));
+        // The verdict itself is untouched by the missing detail.
+        assert.ok(html.includes(UNCONFIRMED_TEXT), JSON.stringify(job));
+    }
+});
+
+test('the verify-race incident, composed end to end: recheck runs out and the card still says why', async () => {
+    // The owner's actual incident shape. Its three steps are each asserted
+    // above in isolation, which is exactly how the defect survived: every part
+    // worked and the composition still rendered only a fixed constant. This
+    // walks the same steps the settle path walks, in order, on one job.
+    //
+    // (settleVerdict itself is not exported — it re-renders the live DOM — so
+    // this composes the exported steps rather than executing that function. It
+    // pins the CHAIN, not settleVerdict's own wiring; that remains untested.)
+    const message = 'codex native session was not ready before the verification'
+        + ' deadline: native Codex session is not logged in';
+    const job = { job: { state: 'failed', phase: 'completed', message, outcome: { reason: 'auth_not_ready' } } };
+
+    // 1. The job settled failed, but on a reason a verification race fabricates.
+    const verdict = loginVerdict(job);
+    assert.equal(verdict.kind, 'recheck');
+    assert.equal(verdict.reason, 'auth_not_ready');
+
+    // 2. The bounded live re-check never sees the row appear.
+    const cold = { profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: false }], profiles: [] } };
+    const check = await confirmLoginLive('codex', '', {
+        fetchImpl: async () => fakeResponse(200, cold),
+        attempts: 2, delayMs: 1, sleepImpl: async () => {},
+    });
+    assert.equal(check.confirmed, false);
+
+    // 3. So the card takes the unconfirmed verdict — and BOTH halves land: the
+    //    honest "unknown" wording AND the daemon's own sentence. Before the fix
+    //    step 3 produced the constant alone, which reads as "wait a moment" for
+    //    a job the daemon had already settled terminally.
+    const html = loginCardHtml(cardWithUrl('https://a.example/b', {
+        job, verdict: check.confirmed ? { kind: 'success', reason: '' } : { kind: 'unconfirmed', reason: verdict.reason },
+    }), 0);
+    assert.ok(html.includes(UNCONFIRMED_TEXT));
+    assert.ok(html.includes(message));
+    assert.ok(!html.includes('Sign-in failed'));
 });
 
 test('a poll answer applies only to the job it was captured for, and only while unsettled', () => {
