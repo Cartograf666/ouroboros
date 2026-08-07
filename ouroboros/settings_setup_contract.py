@@ -317,7 +317,16 @@ def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, st
     runtime_mode = raw_runtime_mode.lower() if raw_runtime_mode else _string(current_settings.get("OUROBOROS_RUNTIME_MODE")) or str(SETTINGS_DEFAULTS["OUROBOROS_RUNTIME_MODE"])
 
     for field in _PROVIDER_FIELDS:
-        value = keys[field["settingKey"]]
+        setting_key = field["settingKey"]
+        value = keys[setting_key]
+        # Only a credential the owner authored in THIS payload is length-checked.
+        # build_initial_setup_state prefills every provider field from disk, so a
+        # stored value the owner never touched arrives here unchanged; rejecting it
+        # deadlocks the wizard, because the rejection discards the WHOLE payload —
+        # including the replacement key typed in the same form. The value that
+        # triggers the error then becomes the one value that can never be replaced.
+        if value == _string(current_settings.get(setting_key)):
+            continue
         if (
             value
             and (field.get("inputType") or "password") == "password"
