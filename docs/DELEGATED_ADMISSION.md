@@ -206,8 +206,16 @@ older than 3.3.2 put no applied facts on `attemptFailureRecord` at all). A missi
 collapses to "no boundary", because the consequence there is a DISCLOSURE. Each silence is read
 in the direction whose failure mode is recoverable.
 
-**A recorded home INSIDE the operator's own home is still a breach** — that is a recorded
-false, not a silence, and it is cancelled as a containment fault.
+**A recorded home INSIDE the operator's own home is a breach only without a proven
+boundary** (refined 2026-08-07 by the first live delegated agent run). The engine roots
+every scoped home under its own runtime dir, which lives under `$HOME` on every host it
+supports — so a nested scoped home accompanied by a PROVEN OS boundary
+(`confinement_mechanism` + `confinement_verified_denied_path`, read as one fact) is the
+engine's ordinary layout, not a fault; the any-depth spatial rule alone cancelled a run
+whose verified DENIED path was the daemon token directory itself. Two shapes stay
+cancelled as containment faults: a home EQUAL to the operator's own (the claim is the
+lie, whatever boundary sits beside it), and a nested home with NO proven boundary (the
+token stays reachable by a relative walk).
 
 Where no boundary was applied, the fact is written LOUDLY into three places (AGENTS.md
 "Disclose instead of forbid"):

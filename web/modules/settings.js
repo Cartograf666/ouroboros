@@ -72,6 +72,17 @@ function applyCheckboxValue(id, value) {
     byId(id).checked = isTruthySetting(value);
 }
 
+function syncHeavyModelPlaceholder() {
+    // Owner decision: an empty Heavy slot legally inherits Main, so the empty
+    // field names the model it actually resolves to instead of looking unset.
+    // Display-only — nothing here writes settings.
+    const heavy = byId('s-model-heavy');
+    const main = byId('s-model');
+    if (!heavy || !main) return;
+    const mainValue = String(main.value || '').trim();
+    heavy.placeholder = mainValue ? `inherits Main (${mainValue})` : 'inherits Main';
+}
+
 function isTruthySetting(value) {
     const normalized = String(value ?? '').trim().toLowerCase();
     return value === true || ['true', '1', 'yes', 'on'].includes(normalized);
@@ -519,6 +530,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             applyInputValue(slot.settingsInputId, s[slot.settingKey]);
             if (slot.settingsToggleId) applyCheckboxValue(slot.settingsToggleId, s[`USE_LOCAL_${slot.slot.toUpperCase()}`]);
         });
+        syncHeavyModelPlaceholder();
         applyCheckboxValue('s-auto-grant-reviewed-skills', s.OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS);
         // Owner-facing mutative-subagents control is explicit On/Off. Legacy empty
         // settings still display their effective runtime-mode default.
@@ -1053,6 +1065,16 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         closeSettingsModelPickers(picker);
         renderSettingsModelPicker(input);
     });
+
+    // Keep the Heavy inherits-Main hint live while Main is edited (typed
+    // 'input') or picked from the catalog dropdown (dispatched 'change').
+    for (const eventType of ['input', 'change']) {
+        page.addEventListener(eventType, (event) => {
+            if (event.target instanceof Element && event.target.id === 's-model') {
+                syncHeavyModelPlaceholder();
+            }
+        });
+    }
 
     page.addEventListener('mousedown', (event) => {
         const item = event.target instanceof Element

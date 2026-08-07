@@ -275,6 +275,26 @@ def poll_bound(seconds_left: float) -> float:
     return min(_READ_TIMEOUT_SEC, max(SHORT_POLL_TIMEOUT_SEC, float(seconds_left)))
 
 
+def is_transient_git_object_race(exc: Exception) -> bool:
+    """Recognize ONLY Git's disappearing atomic-object scratch path.
+
+    The engine's run reader loses a race against Git renaming ``.git/objects/…/
+    tmp_obj_*`` into place and answers one poll with an ENOENT naming that scratch
+    path — a fact about a file that existed a moment ago and exists again a moment
+    later. The CI platform gate learned to retry exactly this shape (938094a9) while
+    the production poll kept propagating it, so CI could pass on an engine whose
+    live ``delegate_wait`` still failed. The matcher is deliberately this narrow:
+    any other ENOENT, or the same errno on any other path, stays a real failure.
+    """
+    detail = str(exc).replace("\\", "/").lower()
+    code = str(getattr(exc, "code", "") or "").upper()
+    return (
+        (code == "ENOENT" or "enoent" in detail)
+        and "/.git/objects/" in detail
+        and "/tmp_obj_" in detail
+    )
+
+
 def bounded_poll(gateway: Any, run_id: str, seconds_left: float) -> Dict[str, Any]:
     """One poll that may not ask for longer than the window has left.
 
@@ -293,8 +313,19 @@ def bounded_poll(gateway: Any, run_id: str, seconds_left: float) -> Dict[str, An
     1800s you asked to wait", after 3.0s of wall; before any advance, a 503 came back as
     ``no_progress`` over a full window with a note inviting a `delegate_cancel` of a live
     run because the transport had blipped). Only the LAST poll may expire instead.
+
+    One exception to the propagation rule, matched as narrowly as it occurs: the
+    engine's transient Git atomic-object race (see ``is_transient_git_object_race``)
+    gets ONE immediate re-read while the window still has time — it is a lie about a
+    file mid-rename, not a daemon that stopped answering.
     """
-    return gateway.get_run(run_id, timeout_sec=poll_bound(seconds_left))
+    try:
+        return gateway.get_run(run_id, timeout_sec=poll_bound(seconds_left))
+    except Exception as exc:
+        if seconds_left > 0 and is_transient_git_object_race(exc):
+            log.debug("transient Git object race on poll of %s; one re-read", run_id)
+            return gateway.get_run(run_id, timeout_sec=poll_bound(seconds_left))
+        raise
 
 
 def expiring_poll(gateway: Any, run_id: str) -> Optional[Dict[str, Any]]:

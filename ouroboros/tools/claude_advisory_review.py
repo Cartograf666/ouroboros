@@ -632,8 +632,8 @@ def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContex
 
     from ouroboros.delegate_custody import custody_root
     from ouroboros.review_execution import (
-        REVIEW_SESSION_OUTPUT_SCHEMA,
         SessionInvocation,
+        review_session_output_schema,
         run_delegated_review_session,
     )
 
@@ -670,7 +670,7 @@ def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContex
                 # session slots ask for it (D19): a review surface that never asks can
                 # only reach its verdict through extraction, paying a light-model call
                 # and a capability delta for what the route may support natively.
-                output_schema=REVIEW_SESSION_OUTPUT_SCHEMA,
+                output_schema=review_session_output_schema("advisory_review"),
             ),
         )
     except Exception as exc:
@@ -679,9 +679,27 @@ def _run_advisory_delegated(prompt: str, repo_dir: pathlib.Path, ctx: ToolContex
             usage={}, error=f"{type(exc).__name__}: {exc}", stderr_tail="",
         ), ""
     spend_final = facts["spend"] if (facts["spend"] is not None and not facts["spend_estimated"]) else None
+    result_text = str(facts["text"] or "")
+    if facts.get("conformance") == "passed":
+        # A schema-conformant session answers with the SESSION envelope
+        # ({"findings": [...]}) while every advisory consumer downstream — the
+        # strict parser, the clean-verdict sentinel, the fallback gate — reads the
+        # advisory's own ARRAY contract. Unwrap the trusted envelope here (D19's
+        # schema-first ordering), so a clean {"findings": []} lands as the bare
+        # "[]" the contract calls clean instead of as a paid extraction and a
+        # parse_failure. Non-conformant output keeps its narrative path unchanged.
+        from ouroboros.review_execution import _findings_array
+
+        try:
+            payload = json.loads(result_text.strip())
+        except (TypeError, ValueError):
+            payload = None
+        findings = _findings_array(payload)
+        if findings is not None:
+            result_text = "[]" if not findings else json.dumps(findings, ensure_ascii=False)
     return SimpleNamespace(
         success=True,
-        result_text=facts["text"],
+        result_text=result_text,
         session_id=facts["run_id"],
         cost_usd=0.0,  # settled by delegate_custody; never re-emitted here
         usage={

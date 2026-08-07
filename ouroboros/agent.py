@@ -326,10 +326,16 @@ def capability_delta_prompt_block(dispatch: Optional[SubagentDispatch]) -> str:
         return ""
     delta = dispatch.delta.as_dict()
     parts: list[str] = []
-    if delta.get("reduced"):
+    disclosures = capability_delta_disclosures(delta) if delta.get("reduced") else []
+    if disclosures:
+        # `reduced` with NO disclosable axis is the executor-only case (an `auto`
+        # fallback the axis renderer deliberately keeps out of this list) — that
+        # fact reaches the child through `dispatch_executor_note` beside this
+        # block, so rendering "BELOW what your parent asked for:" over an empty
+        # list here told the child nothing and read as a broken sentence.
         parts.append(
             "You are running BELOW what your parent asked for: "
-            + "; ".join(capability_delta_disclosures(delta))
+            + "; ".join(disclosures)
             + f" ({delta.get('reason') or 'unspecified'}). Do the work anyway, but say "
             "so in blockers if the gap actually limited your answer — do not quietly "
             "return a weaker result as if it were full strength."
@@ -841,6 +847,16 @@ class OuroborosAgent:
         )
         if _exec_note:
             messages.append({"role": "user", "content": _exec_note})
+        # The nanny postcondition's input fact for the loop's finalization seam:
+        # THIS task was dispatched onto the delegated substrate. Reset per
+        # dispatch — the worker's ctx outlives tasks, a stale latch would mute
+        # the nudge for the next one.
+        self.tools._ctx._nanny_route_dispatched = bool(
+            dispatch is not None
+            and dispatch.executor_resolution is not None
+            and dispatch.executor_resolution.executor == "harness"
+        )
+        self.tools._ctx._nanny_finalization_injected = False
 
         budget_remaining = None
         budget_accounting_status = "available"

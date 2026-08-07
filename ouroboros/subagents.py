@@ -176,8 +176,15 @@ def parse_subagent_harness(value: Any) -> DelegationRoute | None:
     raw = str(value or "").strip()
     if not raw or raw.lower() == "off":
         return None
-    route_id, _, tail = raw.partition("=")
-    model, _, effort = tail.partition(":")
+    if "=" in raw:
+        route_id, _, tail = raw.partition("=")
+        model, _, effort = tail.partition(":")
+    else:
+        # `harness:effort` is legal grammar — the model bracket is optional, the
+        # effort one is not tied to it. Splitting on `=` first made the WHOLE
+        # string the route id, which then failed at dispatch as an unknown route.
+        route_id, _, effort = raw.partition(":")
+        model = ""
     route_id = route_id.strip()
     if not route_id:
         return None
@@ -192,10 +199,20 @@ def get_subagent_harness() -> DelegationRoute | None:
     identity, and letting it into that sweep would poison credential planning,
     pricing, and bench provenance.
     """
-    return parse_subagent_harness(
+    raw = str(
         os.environ.get("OUROBOROS_SUBAGENT_HARNESS", "")
         or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_HARNESS", "")
-    )
+    ).strip()
+    route = parse_subagent_harness(raw)
+    if route is None and raw and raw.lower() != "off":
+        # A non-empty value that parses to nothing ("=opus") is a typo, not a
+        # decision — silently equal to "never configured" it moved ALL delegation
+        # onto metered API children with no trace. Say so where the operator looks.
+        log.warning(
+            "OUROBOROS_SUBAGENT_HARNESS is set but unparseable (%r) — "
+            "delegation is OFF until it reads harness[=model][:effort]", raw,
+        )
+    return route
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +359,9 @@ def resolve_subagent_executor(
     return SubagentExecutorResolution(executor, "harness", route, "harness_ready")
 
 
-def route_health(gateway: Any, route_id: str, shape: DelegatedRunShape) -> tuple[str, str]:
+def route_health(
+    gateway: Any, route_id: str, shape: DelegatedRunShape, *, route_model: str = "",
+) -> tuple[str, str]:
     """Return ``(unavailable_reason, reset_at)`` for a route about to run ``shape``.
 
     One reader, so the answer the DISPATCHER acts on and the answer the nanny's own
@@ -350,6 +369,12 @@ def route_health(gateway: Any, route_id: str, shape: DelegatedRunShape) -> tuple
     is asked about the SHAPE, not about a route in the abstract: a route that can only
     read is not a usable substrate for a child that must write, and an ENGINE that
     would reject the delegated marker outright is not a usable substrate for one either.
+
+    ``route_model`` is the route's pinned model (``DelegationRoute.model``): quota
+    windows scoped to OTHER models must not take this route offline, so exhaustion is
+    judged against the model the run would actually use. A full-window exhaustion that
+    names no reset instant still reports ``subscription_window_exhausted`` — as the
+    REASON with an empty ``reset_at``, since an unknown healing time is not health.
     """
     from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
     from ouroboros.gateways.claudexor import engine_at_least
@@ -391,54 +416,89 @@ def route_health(gateway: Any, route_id: str, shape: DelegatedRunShape) -> tuple
         CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION,
     ):
         return "engine_rejects_delegated_marker", ""
-    return "", _exhausted_window_reset_at(gateway, route_id)
+    exhausted, reset_at = _exhausted_window(gateway, route_id, route_model)
+    if exhausted and not reset_at:
+        # Spent with no named healing instant: still spent. The old shape carried
+        # exhaustion ONLY in a non-empty reset, so a window the harness reports as
+        # fully used but undated read back as a healthy route and the child was
+        # dispatched onto a substrate that was going to refuse it.
+        return "subscription_window_exhausted", ""
+    return "", reset_at
 
 
-def _exhausted_window_reset_at(gateway: Any, route_id: str) -> str:
-    """Reset instant for a route whose EVERY credential profile is spent ('' otherwise).
+def _model_scope_matches(route_model: str, applies_to_models: Any) -> bool:
+    """Does a quota constraint's model scope cover the route's pinned model?
+
+    An empty/absent scope is a GLOBAL window — it always applies. An unpinned route
+    (no model in ``OUROBOROS_SUBAGENT_HARNESS``) can land on any model, so every
+    scoped window applies to it too. Otherwise the scope's aliases are matched by
+    case-insensitive containment either way ("opus" ↔ "claude-opus-5"): the harness
+    names windows by its own alias vocabulary, which this module must not enumerate.
+    """
+    aliases = [str(a).strip().lower() for a in (applies_to_models or []) if str(a).strip()]
+    if not aliases:
+        return True
+    model = str(route_model or "").strip().lower()
+    if not model:
+        return True
+    return any(a == model or a in model or model in a for a in aliases)
+
+
+def _exhausted_window(gateway: Any, route_id: str, route_model: str = "") -> tuple[bool, str]:
+    """``(exhausted, reset_at)`` for a route judged against its OWN model.
 
     A window counts as spent when the harness reports it fully used or explicitly
-    cooling down. Stale snapshots are ignored — an old reading must not block a lane.
+    cooling down AND its model scope covers the route's model — a window scoped to a
+    model this route never uses (the live incident: a Fable-only weekly window taking
+    an opus-pinned route offline for days) is someone else's exhaustion, not this
+    route's. Stale snapshots are ignored — an old reading must not block a lane.
 
-    ANY LIVE SNAPSHOT MEANS THE LANE IS USABLE (D28). A harness commonly fronts several
-    credential profiles, each reporting its own snapshot; answering with a blocker as
-    soon as ONE of them was spent took the whole harness offline while its siblings were
-    live — an outage invented out of a healthy substrate, and `harness` is a PIN, so the
-    caller was refused rather than re-routed. Only when NO fresh snapshot of this route
-    has room left is there something to wait for, and then the honest instant is the
-    EARLIEST, because the first window to heal makes the harness usable again.
+    ANY LIVE SNAPSHOT MEANS THE LANE IS USABLE (D28). And exhaustion needs POSITIVE
+    evidence for the WHOLE route: a profile whose quota could not be read at all
+    (absent — a 429 on the usage endpoint, a failed refresh) is UNKNOWN, not spent,
+    so it fail-opens the route: the daemon owns rotation and answers a genuinely
+    empty route with its own typed refusal at start time, which costs nothing here.
+    Only when every readable profile is spent and none is unreadable is there
+    something to wait for; the honest instant is the EARLIEST named reset (possibly
+    none — spent windows are not obliged to carry one).
 
-    A snapshot with a spent constraint counts as spent even if another of ITS OWN
-    constraints has room: a 5-hour window at 100% blocks that profile now, whatever its
-    weekly window says. WHICH profile a run lands on is Claudexor's business — rotation
-    stays there and no profile identity is interpreted here (a profile-keyed version of
-    this predicate was written and then removed: an executed mutant proved the bucketing
-    changed no answer this function can give, and dead structure on a readiness path is
-    the premature abstraction P7 forbids).
+    A snapshot with an applicable spent constraint counts as spent even if another of
+    ITS OWN constraints has room: a 5-hour window at 100% blocks that profile now,
+    whatever its weekly window says. WHICH profile a run lands on is Claudexor's
+    business — rotation stays there and no profile identity is interpreted here.
     """
-    spent: List[str] = []
+    resets: List[str] = []
     any_live = False
+    any_spent = False
     for snapshot in gateway.quota_snapshots():
         subject = snapshot.get("subject") if isinstance(snapshot.get("subject"), dict) else {}
         if str(subject.get("harness") or "") != route_id:
             continue
         if str(snapshot.get("freshness") or "") != "fresh":
             continue
-        resets = [
+        spent_here = [
             (str(c.get("cooldown_until") or "") or str(c.get("resets_at") or ""))
             for c in (snapshot.get("constraints") or [])
-            if isinstance(c, dict) and (
-                bool(c.get("cooldown_until"))
-                or (isinstance(c.get("used_ratio"), (int, float))
-                    and float(c.get("used_ratio")) >= 1.0))
+            if isinstance(c, dict)
+            and (bool(c.get("cooldown_until"))
+                 or (isinstance(c.get("used_ratio"), (int, float))
+                     and float(c.get("used_ratio")) >= 1.0))
+            and _model_scope_matches(route_model, c.get("applies_to_models"))
         ]
-        if resets:
-            spent.extend(reset for reset in resets if reset)
+        if spent_here:
+            any_spent = True
+            resets.extend(reset for reset in spent_here if reset)
         else:
             any_live = True
-    if any_live or not spent:
-        return ""
-    return min(spent)
+    if any_live or not any_spent:
+        return False, ""
+    absences = getattr(gateway, "quota_absences", None)
+    if callable(absences):
+        for row in absences() or []:
+            subject = row.get("subject") if isinstance(row, dict) else None
+            if isinstance(subject, dict) and str(subject.get("harness") or "") == route_id:
+                return False, ""
+    return True, min(resets) if resets else ""
 
 
 def probe_subagent_executor(
@@ -461,7 +521,9 @@ def probe_subagent_executor(
     gateway = None
     try:
         gateway = ensure_owned_gateway()
-        unavailable, reset_at = route_health(gateway, route.route_id, run_shape)
+        unavailable, reset_at = route_health(
+            gateway, route.route_id, run_shape, route_model=route.model,
+        )
     except ClaudexorUnavailable as exc:
         return resolve_subagent_executor(
             requested, route=route, unavailable_reason=exc.code,

@@ -384,6 +384,18 @@ class ClaudexorGateway:
         snapshots = body.get("snapshots") if isinstance(body, dict) else None
         return [row for row in (snapshots or []) if isinstance(row, dict)]
 
+    def quota_absences(self) -> List[Dict[str, Any]]:
+        """Profiles whose quota could NOT be read (a 429/failed refresh, no login).
+
+        A separate reader on purpose: exhaustion needs POSITIVE evidence, and an
+        absence is the typed record that evidence is missing for a profile — the
+        route-health predicate treats any absence on a route as "unknown, so
+        usable" rather than letting the readable minority speak for the whole route.
+        """
+        body = self._request("GET", "/v2/quota")
+        absences = body.get("absences") if isinstance(body, dict) else None
+        return [row for row in (absences or []) if isinstance(row, dict)]
+
     def register_project(self, root: str) -> str:
         """Register a run root and return its project id (idempotent per root).
 

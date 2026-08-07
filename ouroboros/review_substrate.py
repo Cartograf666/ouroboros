@@ -898,7 +898,9 @@ def reviewer_slots(
     ]
 
 
-def scope_reviewer_slots(models: List[str] | None = None, *, effort: str = "medium") -> List[ReviewSlot]:
+def scope_reviewer_slots(
+    models: List[str] | None = None, *, effort: str | None = None,
+) -> List[ReviewSlot]:
     """The configured scope-reviewer rows — the single owner of scope-slot identity.
 
     Both scope surfaces read their ids from here: the substrate call that produces
@@ -910,7 +912,16 @@ def scope_reviewer_slots(models: List[str] | None = None, *, effort: str = "medi
     With no explicit ``models`` the rows come from the reviewer-slot SSOT
     (6.1): stable owner ids, per-row route/target/effort. An explicit list
     keeps the historical positional behavior for callers that rebuild one row.
+
+    An omitted ``effort`` resolves to the configured scope-review effort: the
+    legacy path used to take this parameter's old literal default instead,
+    silently running the BLOCKING reviewer below configured strength (the
+    downgrade class the owner forbade).
     """
+    if effort is None:
+        from ouroboros.config import resolve_effort
+
+        effort = resolve_effort("scope_review")
     if models is None:
         from ouroboros.reviewer_slot_config import structured_scope_review_slots
 

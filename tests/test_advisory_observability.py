@@ -989,7 +989,7 @@ class TestLLMFallbackExtraction:
         """The delegated advisory asks for the structured verdict like every other
         review session, trusts it only on outputConformance == "passed", and emits the
         same three capability deltas the substrate emits."""
-        from ouroboros.review_execution import REVIEW_SESSION_OUTPUT_SCHEMA
+        from ouroboros.review_execution import review_session_output_schema
 
         asked = {}
 
@@ -1015,7 +1015,10 @@ class TestLLMFallbackExtraction:
         finally:
             rx.run_delegated_review_session = original
 
-        assert asked["output_schema"] == REVIEW_SESSION_OUTPUT_SCHEMA
+        # The advisory surface asks the clean-capable shared schema: its ordinary
+        # mode's required clean verdict is the empty array (scope alone is floored).
+        assert asked["output_schema"] == review_session_output_schema("advisory_review")
+        assert "minItems" not in asked["output_schema"]["properties"]["findings"]
         usage = result.usage
         assert usage["schema_asked"] is True
         # Reported but NOT conformed => not trusted.
@@ -1024,6 +1027,50 @@ class TestLLMFallbackExtraction:
         reasons = {d["reason"] for d in usage["capability_delta"]}
         assert reasons == {"schema_not_conformed_on_effective_route",
                            "session_ran_off_pinned_route"}, reasons
+
+    def test_delegated_advisory_unwraps_a_conformant_clean_envelope(self):
+        """A schema-conformant session answers with the SESSION envelope
+        ({"findings": [...]}) while every advisory consumer downstream reads the
+        advisory's own ARRAY contract — so a clean {"findings": []} used to land as
+        a paid extraction and then a parse_failure. Conformance-trusted envelopes
+        unwrap to the array shape: clean becomes the bare "[]" sentinel the
+        contract calls clean, findings become the bare array."""
+        import ouroboros.review_execution as rx
+
+        def runner_for(text, conformance):
+            def fake_runner(**kwargs):
+                return {
+                    "text": text, "run_id": "run-9", "route_id": "r", "model": "m",
+                    "spend": None, "spend_estimated": False, "settlement": {},
+                    "schema_asked": True, "conformance": conformance,
+                    "effective_route_ids": ["r"],
+                }
+            return fake_runner
+
+        cases = [
+            # (session text, conformance, expected result_text)
+            (json.dumps({"findings": []}), "passed", "[]"),
+            (json.dumps({"findings": [{"item": "i", "verdict": "FAIL",
+                                       "severity": "critical", "reason": "x"}]}),
+             "passed",
+             json.dumps([{"item": "i", "verdict": "FAIL",
+                          "severity": "critical", "reason": "x"}],
+                        ensure_ascii=False)),
+            # NOT conformed: the narrative path is untouched, whatever the shape.
+            (json.dumps({"findings": []}), "failed", json.dumps({"findings": []})),
+        ]
+        original = rx.run_delegated_review_session
+        try:
+            for text, conformance, expected in cases:
+                rx.run_delegated_review_session = runner_for(text, conformance)
+                result, _model = self.mod._run_advisory_delegated(
+                    "prompt", pathlib.Path("/tmp"), self._make_ctx(),
+                )
+                assert result.result_text == expected, (text, conformance)
+        finally:
+            rx.run_delegated_review_session = original
+        # And the unwrapped clean shape IS the contract's clean verdict.
+        assert self.mod._is_clean_verdict("[]") is True
 
     def test_resolve_fallback_model_no_env_uses_config_default(self, monkeypatch):
         """When OUROBOROS_MODEL_LIGHT is unset, the fallback model falls back to Main

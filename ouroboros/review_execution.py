@@ -385,7 +385,18 @@ def review_session_route() -> Any:
     """
     from ouroboros.subagents import get_subagent_harness, parse_subagent_harness
 
-    return parse_subagent_harness(os.environ.get(REVIEW_SESSION_ROUTE_ENV, "")) or get_subagent_harness()
+    raw = str(os.environ.get(REVIEW_SESSION_ROUTE_ENV, "")).strip()
+    route = parse_subagent_harness(raw)
+    if route is None and raw and raw.lower() != "off":
+        # Same silent-typo class as the subagent key's reader: a non-empty value
+        # that parses to nothing would quietly re-route review sessions onto the
+        # subagent route as if the review key were never set.
+        log.warning(
+            "%s is set but unparseable (%r) — review sessions fall back to the "
+            "subagent route until it reads harness[=model][:effort]",
+            REVIEW_SESSION_ROUTE_ENV, raw,
+        )
+    return route or get_subagent_harness()
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +430,28 @@ REVIEW_SESSION_OUTPUT_SCHEMA: Dict[str, Any] = {
         },
     },
 }
+
+
+def review_session_output_schema(surface: str) -> Dict[str, Any]:
+    """The session verdict schema, shaped to the SURFACE's own clean contract.
+
+    The shared schema admits ``{"findings": []}`` — the honest clean verdict for a
+    TRIAD or ordinary ADVISORY reviewer (both canonicalize the empty array to ``[]``,
+    their sentinel clean shape). But scope's coverage contract requires all eight
+    checklist rows, PASS rows included — so for scope the one shape the schema
+    explicitly blessed was a schema-conformant answer that could only ever land as
+    ``parse_failure`` and block the commit. The floor rides the schema itself so a
+    conforming engine refuses the empty answer while the session can still
+    regenerate, instead of the gate discovering it after the run. Advisory keeps the
+    clean-capable shared schema: its checklist mode is coverage-checked downstream
+    by ``_check_expected_items``, never by starving the schema of the clean verdict
+    its ordinary mode is contractually required to produce.
+    """
+    if surface != "scope_review":
+        return REVIEW_SESSION_OUTPUT_SCHEMA
+    shaped = json.loads(json.dumps(REVIEW_SESSION_OUTPUT_SCHEMA))
+    shaped["properties"]["findings"]["minItems"] = 1
+    return shaped
 
 _UNEXTRACTABLE = "UNEXTRACTABLE"
 
@@ -799,7 +832,9 @@ def run_delegated_review_session(
     try:
         # Health is asked about the route actually being run: on a retry that is the
         # STORED invocation's route, not whatever the environment names today.
-        unavailable, reset_at = route_health(gateway, route.route_id, shape)
+        unavailable, reset_at = route_health(
+            gateway, route.route_id, shape, route_model=route.model,
+        )
         if unavailable:
             raise ReviewRouteUnavailable(f"delegated review route unavailable: {unavailable}")
         if reset_at:
@@ -1224,7 +1259,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 slot_id=slot.slot_id,
                 timeout_sec=float(slot.timeout_sec or 300),
                 logical_key_extra=(self.assignment.call_id,),
-                output_schema=REVIEW_SESSION_OUTPUT_SCHEMA,
+                output_schema=review_session_output_schema(request.surface),
                 session_route=self._session_route(),
                 retry_state=self._retry_state,
             ),

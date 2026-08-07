@@ -1104,10 +1104,21 @@ def _reconcile_each(drive_root: Any, runs: List[RunCustody],
     """
     if not runs and not pending:
         return []
-    from ouroboros.gateways.claudexor import ClaudexorGateway, ClaudexorUnavailable
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
+    if gateway_factory is None:
+        # The startup sweep REAPS the previous generation's owned daemon right before
+        # calling here, so a bare discovery-only gateway always found a corpse and the
+        # whole reconciliation silently no-opped on every restart — open runs stayed
+        # unsettled until the next delegate_start happened to revive the daemon. The
+        # ensure path starts our own daemon when there is real work to reconcile
+        # (never on the empty early-return above), and as a side effect activates a
+        # staged runtime update the old always-running daemon could never adopt.
+        from ouroboros.claudexor_daemon import ensure_owned_gateway
+
+        gateway_factory = ensure_owned_gateway
     try:
-        gateway = (gateway_factory or ClaudexorGateway)()
+        gateway = gateway_factory()
         gateway.handshake()
     except ClaudexorUnavailable:
         log.debug("delegated-run reconciliation skipped: transport unavailable", exc_info=True)

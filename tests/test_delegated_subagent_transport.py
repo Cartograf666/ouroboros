@@ -57,9 +57,36 @@ def test_subagent_harness_key_stays_out_of_the_model_key_sweep():
     ("codex", subagents.DelegationRoute("codex", "", "")),
     ("codex=gpt-5.4-mini", subagents.DelegationRoute("codex", "gpt-5.4-mini", "")),
     ("codex=gpt-5.4-mini:low", subagents.DelegationRoute("codex", "gpt-5.4-mini", "low")),
+    # The documented grammar is harness[=model][:effort] — the effort bracket is
+    # not tied to the model one. Splitting on `=` first made the whole string the
+    # route id, which then failed at dispatch as an unknown route.
+    ("claude:high", subagents.DelegationRoute("claude", "", "high")),
+    # A typo with an empty head is "no route", not a route named "=opus".
+    ("=opus", None),
+    ("=model:high", None),
 ])
 def test_route_parsing_is_opaque(raw, expected):
     assert subagents.parse_subagent_harness(raw) == expected
+
+
+def test_an_unparseable_configured_route_is_disclosed_not_silent(monkeypatch, caplog):
+    """A non-empty OUROBOROS_SUBAGENT_HARNESS that parses to nothing ("=opus") used
+    to be silently identical to "never configured" — ALL delegation moved onto
+    metered API children with no trace anywhere the operator looks."""
+    import logging
+
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "=opus")
+    with caplog.at_level(logging.WARNING, logger="ouroboros.subagents"):
+        assert subagents.get_subagent_harness() is None
+    assert any("unparseable" in r.message for r in caplog.records)
+
+    # The two legitimate "no route" spellings stay silent.
+    for quiet in ("", "off"):
+        caplog.clear()
+        monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", quiet)
+        with caplog.at_level(logging.WARNING, logger="ouroboros.subagents"):
+            assert subagents.get_subagent_harness() is None
+        assert not caplog.records
 
 
 def test_an_explicit_off_is_a_decision_an_empty_value_is_not(monkeypatch):
@@ -585,46 +612,154 @@ def test_one_exhausted_credential_profile_does_not_take_the_harness_offline():
     heal makes the harness usable again. The reader groups by `subject.harness` and
     deliberately never interprets `subject.subject_id`: WHICH profile a run lands on
     stays Claudexor's business, so no rotation moves into Ouroboros."""
-    from ouroboros.subagents import _exhausted_window_reset_at
+    from ouroboros.subagents import _exhausted_window
 
     def _snap(profile, *, spent, reset="2026-08-03T12:00:00Z", harness="some-route",
-              freshness="fresh"):
+              freshness="fresh", applies=None):
         # `subject_id` is the REAL QuotaSubject key for a credential profile
         # (packages/schema/src/quota.ts; the object is `.strict()`, so the `profile`
         # this fixture used to invent would be rejected by the engine's own parser).
         constraint = ({"used_ratio": 1.0, "resets_at": reset} if spent
                       else {"used_ratio": 0.4, "resets_at": reset})
+        if applies is not None:
+            constraint["applies_to_models"] = applies
         return {"subject": {"harness": harness, "subject_id": profile},
                 "freshness": freshness, "constraints": [constraint]}
 
     class _Quota:
-        def __init__(self, snaps): self._snaps = snaps
+        def __init__(self, snaps, absences=None):
+            self._snaps, self._absences = snaps, absences
         def quota_snapshots(self): return self._snaps
+        def quota_absences(self): return self._absences or []
 
     # ONE of two profiles spent: the harness is still usable, so no blocker at all.
     mixed = _Quota([_snap("acct-a", spent=True, reset="2026-08-03T10:00:00Z"),
                     _snap("acct-b", spent=False)])
-    assert _exhausted_window_reset_at(mixed, "some-route") == ""
+    assert _exhausted_window(mixed, "some-route") == (False, "")
 
     # ALL profiles spent: a blocker, at the EARLIEST reset (the first one to heal).
     both = _Quota([_snap("acct-a", spent=True, reset="2026-08-03T12:00:00Z"),
                    _snap("acct-b", spent=True, reset="2026-08-03T10:00:00Z")])
-    assert _exhausted_window_reset_at(both, "some-route") == "2026-08-03T10:00:00Z"
+    assert _exhausted_window(both, "some-route") == (True, "2026-08-03T10:00:00Z")
 
     # A single-profile harness (no profile field at all) behaves exactly as before.
     single = _Quota([{"subject": {"harness": "some-route"}, "freshness": "fresh",
                       "constraints": [{"used_ratio": 1.0, "resets_at": "2026-08-03T09:00:00Z"}]}])
-    assert _exhausted_window_reset_at(single, "some-route") == "2026-08-03T09:00:00Z"
+    assert _exhausted_window(single, "some-route") == (True, "2026-08-03T09:00:00Z")
 
     # Another harness's exhaustion is not ours, and a STALE snapshot never blocks.
     other = _Quota([_snap("acct-a", spent=True, harness="other-route")])
-    assert _exhausted_window_reset_at(other, "some-route") == ""
+    assert _exhausted_window(other, "some-route") == (False, "")
     stale = _Quota([_snap("acct-a", spent=True, freshness="stale")])
-    assert _exhausted_window_reset_at(stale, "some-route") == ""
+    assert _exhausted_window(stale, "some-route") == (False, "")
 
     # And the live sibling wins even when the spent one is listed second.
     reordered = _Quota([_snap("acct-b", spent=False), _snap("acct-a", spent=True)])
-    assert _exhausted_window_reset_at(reordered, "some-route") == ""
+    assert _exhausted_window(reordered, "some-route") == (False, "")
+
+
+def test_a_model_scoped_window_does_not_block_a_route_pinned_to_another_model():
+    """The live incident (2026-08-06): the claude route was pinned to opus, its ONE
+    readable profile carried `weekly_scoped:Fable used_ratio=1.0` next to a healthy
+    five-hour window, and the whole route read as spent until the Fable weekly reset —
+    $82 of metered spend for a subscription that was free for opus the entire time.
+    A window scoped to models this route never uses is someone else's exhaustion."""
+    from ouroboros.subagents import _exhausted_window
+
+    fable_scoped = {"subject": {"harness": "some-route", "subject_id": "acct"},
+                    "freshness": "fresh",
+                    "constraints": [
+                        {"used_ratio": 0.0, "resets_at": "2026-08-07T00:00:00Z"},
+                        {"used_ratio": 1.0, "resets_at": "2026-08-11T00:00:00Z",
+                         "applies_to_models": ["fable", "claude-fable-5", "best"]},
+                    ]}
+
+    class _Quota:
+        def __init__(self, snaps, absences=None):
+            self._snaps, self._absences = snaps, absences
+        def quota_snapshots(self): return self._snaps
+        def quota_absences(self): return self._absences or []
+
+    quota = _Quota([fable_scoped])
+    # Pinned to opus: the Fable weekly window does not apply, the route is usable.
+    assert _exhausted_window(quota, "some-route", "opus") == (False, "")
+    # Pinned to fable (either alias direction): the scoped window DOES apply, and the
+    # profile's healthy sibling constraint does not rescue it (a spent window blocks
+    # its own profile whatever the other windows say).
+    assert _exhausted_window(quota, "some-route", "fable") == (True, "2026-08-11T00:00:00Z")
+    assert _exhausted_window(quota, "some-route", "claude-fable-5") == (True, "2026-08-11T00:00:00Z")
+    # No model pin: any scoped window may apply to whatever model the run lands on.
+    assert _exhausted_window(quota, "some-route", "") == (True, "2026-08-11T00:00:00Z")
+
+
+def test_a_spent_window_with_no_reset_instant_is_still_spent():
+    """The inverse defect (three reviewers independently): a fully-used window whose
+    constraint named neither `resets_at` nor `cooldown_until` produced no collectable
+    reset, and the old single-string contract could only express exhaustion AS a
+    reset — so a positively spent route read back as healthy and D28's loud fallback
+    never fired. Exhaustion and its healing instant are separate facts now."""
+    from ouroboros.subagents import _exhausted_window, route_health, delegated_run_shape
+
+    undated = {"subject": {"harness": "some-route", "subject_id": "acct"},
+               "freshness": "fresh", "constraints": [{"used_ratio": 1.0}]}
+
+    class _Quota:
+        def __init__(self, snaps): self._snaps = snaps
+        def quota_snapshots(self): return self._snaps
+        def quota_absences(self): return []
+
+    assert _exhausted_window(_Quota([undated]), "some-route") == (True, "")
+
+    # And through the ONE health reader: an undated exhaustion still reaches the rule
+    # table as `subscription_window_exhausted`, as the REASON with an empty reset.
+    class _Gateway(_Quota):
+        engine_version = "9.9.9"
+        def agent_capabilities(self):
+            return {"harnesses": [{"id": "some-route", "enabled": True, "status": "ok",
+                                   "accessProfilesSupported": ["readonly"]}]}
+
+    unavailable, reset_at = route_health(
+        _Gateway([undated]), "some-route", delegated_run_shape(False))
+    assert (unavailable, reset_at) == ("subscription_window_exhausted", "")
+
+
+def test_an_unreadable_profile_keeps_the_route_usable():
+    """Exhaustion needs POSITIVE evidence for the WHOLE route. A profile whose quota
+    endpoint answered 429 (or whose refresh failed) is an ABSENCE — unknown, not
+    spent — so the readable-but-spent minority must not speak for the route: the
+    daemon owns rotation and refuses typed at start time if the route is truly empty.
+    (The live incident's second layer: the backup account's usage endpoint kept
+    429-ing, so the one readable profile's Fable window silenced the whole harness.)"""
+    from ouroboros.subagents import _exhausted_window
+
+    spent = {"subject": {"harness": "some-route", "subject_id": "acct-a"},
+             "freshness": "fresh",
+             "constraints": [{"used_ratio": 1.0, "resets_at": "2026-08-11T00:00:00Z"}]}
+    absence = {"subject": {"harness": "some-route", "subject_id": "acct-b"},
+               "reason": "refresh_failed", "detail": "oauth/usage responded 429"}
+    foreign_absence = {"subject": {"harness": "other-route", "subject_id": "acct-x"},
+                       "reason": "refresh_failed", "detail": "oauth/usage responded 429"}
+
+    class _Quota:
+        def __init__(self, snaps, absences=None):
+            self._snaps, self._absences = snaps, absences
+        def quota_snapshots(self): return self._snaps
+        def quota_absences(self): return self._absences or []
+
+    # An absence on THIS route fail-opens it; a foreign route's absence changes nothing.
+    assert _exhausted_window(_Quota([spent], [absence]), "some-route") == (False, "")
+    assert _exhausted_window(
+        _Quota([spent], [foreign_absence]), "some-route"
+    ) == (True, "2026-08-11T00:00:00Z")
+
+    # A gateway with no absence reader at all (test stubs, older fakes) keeps the
+    # plain positive-evidence answer.
+    class _NoAbsences:
+        def __init__(self, snaps): self._snaps = snaps
+        def quota_snapshots(self): return self._snaps
+
+    assert _exhausted_window(
+        _NoAbsences([spent]), "some-route") == (True, "2026-08-11T00:00:00Z")
 
 
 # One row of the rule table per case, resolved through the REAL dispatch entry point
@@ -2118,17 +2253,30 @@ def test_asking_for_a_scoped_home_is_not_evidence_that_one_was_applied(tmp_path,
     assert out["status"] == "progress", out
     assert cancelled == {}
 
-    # (e) P34P1.5: a HOME NESTED inside the operator's own home. The check was equality
-    # ONLY, so `$HOME/tmp/harness` passed as isolated — while DELEGATED_ADMISSION.md §8
-    # calls exactly that a breach, and rightly: `~/.claudexor/v3/daemon/token` is still
-    # reachable by a relative walk from there, which is the whole /v2 control API.
+    # (e) P34P1.5, refined by the 2026-08-07 live incident: a HOME NESTED inside the
+    # operator's own home is a breach ONLY without a proven OS boundary. A bare
+    # `$HOME/tmp/harness` keeps `~/.claudexor/v3/daemon/token` reachable by a relative
+    # walk (DELEGATED_ADMISSION.md §8) — but the engine ROOTS every scoped home under
+    # its runtime dir, which lives under $HOME on every host it supports, so the
+    # spatial rule alone cancelled every real delegated agent run ever started, one of
+    # them provably seatbelt-confined with the daemon directory as its verified DENIED
+    # path. mechanism=None models the boundary-less engine record.
     for nested in (home / "tmp" / "harness", home / "sub", home / "a" / "b" / "c"):
         nested.mkdir(parents=True, exist_ok=True)
         cancelled = _isolation_stub(monkeypatch, run_dir=run_dir)
-        _write_attempt(run_dir, isolated=True, home_dir=str(nested))
+        _write_attempt(run_dir, isolated=True, home_dir=str(nested), mechanism=None)
         out = _waiting(tmp_path, monkeypatch)
         assert out["reason"] == "home_isolation_not_applied", (nested, out)
         assert cancelled["reason"] == "home_isolation_not_applied"
+
+    # ...while the SAME nested home WITH the proven boundary (the engine's own layout,
+    # exactly the live run the old rule cancelled) is left alone.
+    nested = home / ".claudexor-runtime" / "projects" / "x" / "home"
+    nested.mkdir(parents=True, exist_ok=True)
+    cancelled = _isolation_stub(monkeypatch, run_dir=run_dir)
+    _write_attempt(run_dir, isolated=True, home_dir=str(nested))  # proven seatbelt
+    out = _waiting(tmp_path, monkeypatch)
+    assert out["status"] == "progress" and cancelled == {}, out
 
     # ...and a SIBLING of the operator home is still legitimately scoped: the fix must
     # not turn "shares a parent directory" into a breach.
@@ -5582,3 +5730,89 @@ def test_the_standing_tail_is_adopted_as_history_only_for_a_caught_up_caller():
     behind = WindowObservations()
     behind.observe_baseline(detail, 4)
     assert [row["title"] for row in behind.record(detail, 12, 1).events] == a
+
+
+def test_reconciliation_default_transport_is_the_ensured_owned_daemon(tmp_path, monkeypatch):
+    """Regression (v6.89.0): the startup sweep reaps the previous generation's owned
+    daemon and THEN reconciled through a bare discovery-only gateway — which always
+    found the corpse it had just made, so every restart's reconciliation silently
+    no-opped and open runs stayed unsettled until the next delegate_start. With real
+    work to reconcile, the default transport must be the ENSURE path (which also
+    adopts a staged runtime update the old always-running daemon never could)."""
+    from ouroboros import delegate_custody as dc
+
+    dc.record_started(tmp_path, dc.RunCustody(
+        run_id="run-orphan", task_id="t-gone", route_id="r", model="m",
+        ledger_root=str(tmp_path)))
+    dc._CUSTODY.clear()
+
+    ensured = []
+
+    class _EnsuredGateway:
+        def handshake(self): return {}
+        def get_run(self, run_id, timeout_sec=None):
+            return {"state": "cancelled", "summary": {"state": "cancelled"}}
+        def cancel_run(self, run_id): return {}
+        def close(self): pass
+
+    def _fake_ensure():
+        ensured.append(True)
+        return _EnsuredGateway()
+
+    monkeypatch.setattr(
+        "ouroboros.claudexor_daemon.ensure_owned_gateway", _fake_ensure)
+    dc.reconcile_orphaned_runs(tmp_path, set())
+    assert ensured, "the default gateway factory must go through ensure_owned_gateway"
+
+    # And with NOTHING to reconcile the daemon is never started at all: the empty
+    # early-return keeps the ordinary idle restart free of a daemon spawn.
+    ensured.clear()
+    empty = tmp_path / "empty-drive"
+    empty.mkdir()
+    assert dc.reconcile_orphaned_runs(empty, set()) == []
+    assert not ensured
+
+
+def test_bounded_poll_retries_the_git_atomic_object_race_once():
+    """The CI gate learned to tolerate the engine's transient Git atomic-object
+    ENOENT (938094a9) while the production poll kept propagating it — so CI could
+    pass on an engine whose live delegate_wait still failed. One immediate re-read,
+    only for exactly that shape, only while the window has time left."""
+    from ouroboros.delegate_progress import bounded_poll, is_transient_git_object_race
+
+    class _RaceOnce:
+        def __init__(self):
+            self.calls = 0
+        def get_run(self, run_id, timeout_sec=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError(
+                    "ENOENT: no such file or directory, open "
+                    "'/x/.git/objects/ab/tmp_obj_h4x'")
+            return {"state": "running"}
+
+    gw = _RaceOnce()
+    assert bounded_poll(gw, "run-1", 60.0) == {"state": "running"}
+    assert gw.calls == 2
+
+    # A spent window does not retry (the expiring poll owns that path), and any
+    # OTHER failure propagates untouched on the first read.
+    gw2 = _RaceOnce()
+    try:
+        bounded_poll(gw2, "run-1", 0.0)
+        raised = False
+    except RuntimeError:
+        raised = True
+    assert raised and gw2.calls == 1
+
+    class _RealFailure:
+        def get_run(self, run_id, timeout_sec=None):
+            raise RuntimeError("ENOENT: no such file or directory, open '/x/data/config.json'")
+
+    try:
+        bounded_poll(_RealFailure(), "run-1", 60.0)
+        raised = False
+    except RuntimeError:
+        raised = True
+    assert raised
+    assert not is_transient_git_object_race(RuntimeError("connection refused"))

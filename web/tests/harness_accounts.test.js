@@ -20,8 +20,10 @@ import {
     loginInputSupport,
     loginStatusLine,
     loginVerdict,
+    normalizeProfileName,
     pollResponseApplies,
     preserveCardFocus,
+    promptProfileName,
     quotaSummary,
     runtimeActionLabel,
     submitLoginInput,
@@ -178,6 +180,123 @@ test('a named profile\'s exhausted window is never reported as the default accou
     const namedRow = quotaSummary(snapshots, 'codex', 'koshak');
     assert.equal(namedRow.exhausted, true);
     assert.equal(namedRow.resetsAt, '2026-08-04T00:00:00Z');
+});
+
+test('a model-scoped window never paints the whole account exhausted — it is a compact note', () => {
+    // The daemon schema's own words (@claudexor/schema quota.ts): a non-null
+    // applies_to_models is a per-model cap, and "a model-specific cap never
+    // cools a different model on the same subject". Painting the whole account
+    // "window exhausted" off one is the same class of misreport as the
+    // wildcard-subject bug above — a block reported that will not happen.
+    const subject = { harness: 'claude', subject_id: 'abstractdl' };
+    const mixed = quotaSummary([{
+        subject, freshness: 'fresh',
+        constraints: [
+            { id: 'fable-window', label: 'Fable window', applies_to_models: ['claude-fable-5'],
+              used_ratio: 1.0, resets_at: '2026-08-08T00:00:00Z' },
+            { applies_to_models: null, used_ratio: 0.4 },
+        ],
+    }], 'claude', 'abstractdl');
+    assert.equal(mixed.exhausted, false);
+    // The account bar stays the GLOBAL window's; the spent scope is still said.
+    assert.equal(mixed.label, '40% of window used · Fable window spent');
+
+    // Scoped-only spent (cooldown, no ratio): the note IS the label, no red.
+    const scopedOnly = quotaSummary([{
+        subject, freshness: 'fresh',
+        constraints: [{ id: 'fable-window', label: 'Fable window',
+            applies_to_models: ['claude-fable-5'], cooldown_until: '2026-08-08T00:00:00Z', used_ratio: null }],
+    }], 'claude', 'abstractdl');
+    assert.equal(scopedOnly.exhausted, false);
+    assert.equal(scopedOnly.label, 'Fable window spent');
+
+    // A scoped window that is merely busy says nothing at account level.
+    assert.deepEqual(quotaSummary([{
+        subject, freshness: 'fresh',
+        constraints: [{ label: 'Fable window', applies_to_models: ['claude-fable-5'], used_ratio: 0.8 }],
+    }], 'claude', 'abstractdl'), { label: '', exhausted: false, resetsAt: '' });
+
+    // A GLOBAL window (applies_to_models null/omitted = every model) keeps the
+    // account-level exhausted behavior exactly as before.
+    const global = quotaSummary([{
+        subject, freshness: 'fresh',
+        constraints: [{ applies_to_models: null, used_ratio: 1.0, resets_at: '2026-08-08T00:00:00Z' }],
+    }], 'claude', 'abstractdl');
+    assert.equal(global.exhausted, true);
+    assert.ok(global.label.startsWith('window exhausted'));
+
+    // Without a label, the note falls back to the constraint id, then models.
+    assert.equal(quotaSummary([{
+        subject, freshness: 'fresh',
+        constraints: [{ id: 'fable_5h', applies_to_models: ['claude-fable-5'], used_ratio: 1.0 }],
+    }], 'claude', 'abstractdl').label, 'fable_5h spent');
+});
+
+// ---------------------------------------------------------------------------
+// Add account: pywebview's WKWebView implements no window.prompt (it answers
+// null silently), so the flow runs on the in-house input dialog.
+// ---------------------------------------------------------------------------
+
+test('Add account never touches window.prompt and asks through the in-house dialog', async () => {
+    // REGRESSION guard for the dead desktop button: the module must not call
+    // window.prompt at all — under pywebview it is a silent no-op. (The call
+    // form, so a comment may still name the hazard.)
+    const source = readFileSync(new URL('../modules/harness_accounts.js', import.meta.url), 'utf8');
+    assert.ok(!/window\s*\.\s*prompt\s*\(/.test(source));
+    assert.ok(source.includes("from './confirm_dialog.js'"));
+
+    // An already-valid name asks exactly once, for TEXT input.
+    const calls = [];
+    const name = await promptProfileName({ dialogImpl: async (options) => {
+        calls.push(options);
+        return { confirmed: true, value: 'backup' };
+    } });
+    assert.equal(name, 'backup');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].input, true);
+    // The alphabet is stated up front, so normalization is never a surprise.
+    assert.ok(calls[0].body.includes('anything else becomes "-"'));
+
+    // Cancel, and a name that normalizes to nothing, are quiet no-ops.
+    assert.equal(await promptProfileName({ dialogImpl: async () => ({ confirmed: false, value: 'x' }) }), '');
+    assert.equal(await promptProfileName({ dialogImpl: async () => ({ confirmed: true, value: '   ' }) }), '');
+});
+
+test('a name normalization would change is shown back, editable, BEFORE any login starts', async () => {
+    // The owner types "Работа": the profile alphabet turns that into "------",
+    // and starting a login under that name silently is exactly the trap the
+    // prompt() flow had. The dialog re-opens with the normalized name visible
+    // AND editable; only an explicit confirm of a stable name proceeds.
+    const rounds = [];
+    const answers = [
+        { confirmed: true, value: 'Работа' },
+        { confirmed: true, value: 'work-2' },
+    ];
+    const name = await promptProfileName({ dialogImpl: async (options) => {
+        rounds.push(options);
+        return answers[rounds.length - 1];
+    } });
+    assert.equal(name, 'work-2');
+    assert.equal(rounds.length, 2);
+    assert.ok(rounds[1].body.includes('"Работа" will be saved as "------"'));
+    assert.equal(rounds[1].initialValue, '------');
+
+    // Accepting the shown normalized name as-is also works (one extra round).
+    const folds = [];
+    const folded = await promptProfileName({ dialogImpl: async (options) => {
+        folds.push(options);
+        return { confirmed: true, value: folds.length === 1 ? 'Work' : options.initialValue };
+    } });
+    assert.equal(folded, 'work');
+    assert.equal(folds.length, 2);
+    assert.equal(folds[1].initialValue, 'work');
+
+    // The normalization itself, pinned.
+    assert.equal(normalizeProfileName(' Work '), 'work');
+    assert.equal(normalizeProfileName('Работа'), '------');
+    assert.equal(normalizeProfileName('a b/c'), 'a-b-c');
+    assert.equal(normalizeProfileName('ok_name-1'), 'ok_name-1');
+    assert.equal(normalizeProfileName(''), '');
 });
 
 test('the device-code disclosure is found wherever the snapshot nests it', () => {

@@ -4859,6 +4859,20 @@ def _forced_final_answer(
     router_result = _forced_swarm_router_result(ctx, llm_trace, reason_code)
     if router_result is not None:
         return router_result
+    tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+    if (getattr(tools_ctx, "_nanny_route_dispatched", False)
+            and not any(str(c.get("tool") or "") == "delegate_start"
+                        for c in (llm_trace.get("tool_calls") or [])
+                        if isinstance(c, dict))):
+        # The nanny postcondition's forced-path half: a forced finalization may not
+        # re-loop (that is its whole point), so the substrate fact rides the one
+        # final prompt instead — the child can still SAY why delegation never
+        # happened, and the parent still sees the decision instead of silence.
+        prompt += (
+            "\nNOTE: this task was dispatched onto the delegated substrate "
+            "(executor=harness) and made no delegate_start calls — the work ran on "
+            "metered API tokens. State why in your answer."
+        )
     _append_or_merge_user_message(ctx.messages, prompt)
     extracted = ""
     for attempt in range(2):
@@ -5157,6 +5171,32 @@ def _maybe_inject_finalization_nudges(
     run_llm_loop to keep it under the method size gate."""
     if drive_root is None:
         return False
+    if (getattr(tools._ctx, "_nanny_route_dispatched", False)
+            and not getattr(tools._ctx, "_nanny_finalization_injected", False)
+            and not any(str(c.get("tool") or "") == "delegate_start"
+                        for c in (llm_trace.get("tool_calls") or [])
+                        if isinstance(c, dict))):
+        # Nanny postcondition (owner decision, 2026-08-07): a child dispatched onto
+        # the delegated substrate must not finalize as if that decision never
+        # existed. One structural fact (zero delegate_start calls in this task's
+        # trace), one re-loop; the child stays free to delegate now OR to finalize
+        # with a stated typed reason — never a hard gate on its judgment (P5).
+        tools._ctx._nanny_finalization_injected = True
+        _nanny_msg = (
+            "⚠️ NANNY_DID_NOT_DELEGATE: this task was dispatched onto the delegated "
+            "substrate (executor=harness), but you are finalizing with ZERO "
+            "delegate_start calls — the work would end up billed to metered API "
+            "tokens the parent asked to avoid. Either delegate the remaining work "
+            "now (delegate_start / delegate_wait), or finalize with an explicit "
+            "statement of WHY delegation was not used (route refused, work shape "
+            "unsuited, deadline) so your parent sees the substrate decision."
+        )
+        if content and content.strip():
+            messages.append({"role": "assistant", "content": content})
+        _append_or_merge_user_message(messages, f"[SYSTEM REMINDER]\n{_nanny_msg}")
+        emit_progress(_nanny_msg)
+        llm_trace["reasoning_notes"].append(_nanny_msg)
+        return True
     finalization_msg = _skill_finalization_message(drive_root, llm_trace)
     if finalization_msg and not getattr(tools._ctx, "_skill_finalization_injected", False):
         tools._ctx._skill_finalization_injected = True

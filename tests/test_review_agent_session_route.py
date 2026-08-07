@@ -883,6 +883,22 @@ def test_scope_rows_carry_their_configured_routes(monkeypatch):
     assert rows[0].slot_id == "scope_slot_1" and rows[1].slot_id == "scope_slot_2"
 
 
+def test_scope_rows_default_to_the_configured_scope_review_effort(monkeypatch):
+    """Regression (v6.89.0): with no structured reviewer slots, the legacy path took
+    this function's old literal default ("medium") instead of the owner's configured
+    OUROBOROS_EFFORT_SCOPE_REVIEW — the BLOCKING constitutional scope reviewer
+    silently ran below its configured reasoning strength on every stock install."""
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.delenv(SCOPE_REVIEW_ROUTES_ENV, raising=False)
+    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_MODELS", "some/model")
+    monkeypatch.delenv("OUROBOROS_EFFORT_SCOPE_REVIEW", raising=False)
+    assert [row.effort for row in scope_reviewer_slots()] == ["high"]  # config default
+    monkeypatch.setenv("OUROBOROS_EFFORT_SCOPE_REVIEW", "xhigh")
+    assert [row.effort for row in scope_reviewer_slots()] == ["xhigh"]
+    # An explicit effort still wins for callers that rebuild one positional row.
+    assert [row.effort for row in scope_reviewer_slots(["m"], effort="low")] == ["low"]
+
+
 def _persisted_response_payloads(drive_root):
     """Every persisted review response payload under ``drive_root``."""
     import gzip
@@ -1485,3 +1501,26 @@ def test_a_retrieving_row_can_actually_reach_sourced_evidence(tmp_path, monkeypa
                         base_url=ack_route["base_url"], window_tokens=SESSION_WINDOW_FLOOR)
     after = scope_window("codex=gpt-5.6-sol", session=True)
     assert session_window_is_authoritative(after.window_tokens, after.status) is True
+
+
+def test_session_schema_floor_matches_each_surfaces_clean_contract():
+    """`{"findings": []}` is the honest clean verdict for a TRIAD session, but on
+    scope (eight mandatory rows) and advisory (empty checklist rejected by design)
+    it is a schema-conformant answer that can only land as parse_failure and block
+    the commit. The floor rides the schema so a conforming engine refuses the empty
+    answer up front while the session can still regenerate."""
+    from ouroboros.review_execution import (
+        REVIEW_SESSION_OUTPUT_SCHEMA,
+        review_session_output_schema,
+    )
+
+    assert review_session_output_schema("commit_review") is REVIEW_SESSION_OUTPUT_SCHEMA
+    # Advisory keeps the clean-capable shared schema: its ORDINARY mode's required
+    # clean verdict is exactly the empty array, so a floor would starve it of the
+    # one answer its contract demands (checklist coverage is checked downstream).
+    assert review_session_output_schema("advisory_review") is REVIEW_SESSION_OUTPUT_SCHEMA
+    assert "minItems" not in REVIEW_SESSION_OUTPUT_SCHEMA["properties"]["findings"]
+    shaped = review_session_output_schema("scope_review")
+    assert shaped["properties"]["findings"]["minItems"] == 1
+    # A shaped copy, never a mutation of the shared schema.
+    assert "minItems" not in REVIEW_SESSION_OUTPUT_SCHEMA["properties"]["findings"]

@@ -94,7 +94,14 @@ def execute_panic_stop(
     panic_exit_code: int,
     log: Any,
 ) -> None:
-    """Full emergency stop: kill everything, write panic flag, hard-exit."""
+    """Full emergency stop: kill everything, write panic flag, hard-exit.
+
+    Known limit (disclosed residual): an ATTACHED Claudexor daemon — one this
+    process did not spawn — is left alive, because ``get_owned_daemon().stop()``
+    only ever kills a self-started daemon's process group (delegated harness
+    runs die with that group); cross-generation cleanup of a stale owned daemon
+    belongs to the process-custody reaper at the next manual start.
+    """
     log.critical("PANIC STOP initiated.")
     try:
         consciousness.stop()
@@ -144,6 +151,17 @@ def execute_panic_stop(
         from ouroboros.local_model import get_manager
 
         get_manager().stop_server()
+    except Exception:
+        pass
+
+    # Owned Claudexor daemon: panic is instant and hard, so no network run-cancel
+    # calls — stop() kills the self-spawned daemon's whole process group, taking
+    # the delegated harness runs (its children) down with it. Attached daemons
+    # are never killed (see docstring residual).
+    try:
+        from ouroboros.claudexor_daemon import get_owned_daemon
+
+        get_owned_daemon().stop()
     except Exception:
         pass
 

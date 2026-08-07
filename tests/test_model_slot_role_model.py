@@ -1429,3 +1429,29 @@ def test_a_stored_auto_parent_lane_is_the_lane_of_record_not_the_cheapest(monkey
     assert res.model == "provider::main"
     # The fall-through itself: an unknown lane is "no lane on record", not Light.
     assert subagents._lane_model("code") == "provider::main"
+
+
+def test_prompt_block_omits_the_broken_below_phrase_on_an_executor_only_delta():
+    """reduced=True with NO disclosable axis is the auto-fallback case (the axis
+    renderer deliberately keeps a non-pinned executor out of the list): the block
+    used to render "You are running BELOW what your parent asked for: " over an
+    empty list — a broken sentence duplicating dispatch_executor_note's job."""
+    from types import SimpleNamespace
+
+    from ouroboros.agent import capability_delta_prompt_block
+
+    class _Delta:
+        def as_dict(self):
+            return {
+                "requested_lane": "auto", "resolved_lane": "main",
+                "effective_lane": "main", "derived_effort": "",
+                "effective_effort": "", "requested_executor": "auto",
+                "effective_executor": "native",
+                "reason": "subscription_window_exhausted",
+                "reduced": True, "legacy_note": "",
+            }
+
+    block = capability_delta_prompt_block(
+        SimpleNamespace(delta=_Delta(), executor_resolution=None))
+    assert "BELOW what your parent asked" not in block
+    assert block == ""  # nothing else to say either: the executor note owns it

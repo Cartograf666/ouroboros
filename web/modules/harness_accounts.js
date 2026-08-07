@@ -21,6 +21,7 @@
 // Pure helpers up top are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
+import { openConfirmDialog } from './confirm_dialog.js';
 import { escapeHtmlAttr as escapeHtml, safeExternalHrefAttr } from './utils.js';
 
 const POLL_MS = 5000;
@@ -78,10 +79,23 @@ export function quotaSummary(snapshots, harnessId, subjectId = '') {
     // entirely when the cooling one reported no ratio at all.
     let exhausted = false;
     let exhaustedResetsAt = '';
+    const scopedSpent = [];
     for (const snap of rows) {
         for (const constraint of snap.constraints || []) {
             const used = Number(constraint.used_ratio);
             const spent = Boolean(constraint.cooldown_until) || (Number.isFinite(used) && used >= 1.0);
+            const models = Array.isArray(constraint.applies_to_models)
+                ? constraint.applies_to_models.filter(Boolean) : [];
+            if (models.length) {
+                // A non-null applies_to_models is a PER-MODEL cap — the daemon
+                // schema's own words: "a model-specific cap never cools a
+                // different model on the same subject" (@claudexor/schema
+                // quota.ts). So it must never paint the whole account
+                // exhausted, and its ratio is not the account's bar: a spent
+                // scope becomes a compact note beside the account label.
+                if (spent) scopedSpent.push(String(constraint.label || constraint.id || models.join(', ')));
+                continue;
+            }
             if (spent && !exhausted) {
                 exhausted = true;
                 exhaustedResetsAt = String(constraint.cooldown_until || constraint.resets_at || '');
@@ -92,15 +106,16 @@ export function quotaSummary(snapshots, harnessId, subjectId = '') {
             }
         }
     }
-    if (!worst && !exhausted) return { label: '', exhausted: false, resetsAt: '' };
-    const percent = worst ? Math.min(100, Math.round(worst.used * 100)) : 100;
+    const note = scopedSpent.length ? `${[...new Set(scopedSpent)].join(', ')} spent` : '';
+    if (!worst && !exhausted && !note) return { label: '', exhausted: false, resetsAt: '' };
     const resetsAt = exhausted ? (exhaustedResetsAt || worst?.resetsAt || '') : (worst?.resetsAt || '');
+    const base = exhausted
+        ? `window exhausted — resets ${resetsAt || 'soon'}`
+        : (worst ? `${Math.min(100, Math.round(worst.used * 100))}% of window used` : '');
     return {
         exhausted,
         resetsAt,
-        label: exhausted
-            ? `window exhausted — resets ${resetsAt || 'soon'}`
-            : `${percent}% of window used`,
+        label: [base, note].filter(Boolean).join(' · '),
     };
 }
 
@@ -383,6 +398,34 @@ export function accountRows(payload) {
     return rows.filter((row) => row.harness);
 }
 
+export function normalizeProfileName(raw) {
+    // The profile-id alphabet the login request accepts: lowercased, and every
+    // character outside it becomes '-'.
+    return String(raw || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+}
+
+export async function promptProfileName({ dialogImpl = openConfirmDialog } = {}) {
+    // pywebview's WKWebView implements no window.prompt — it answers null
+    // silently, so the old prompt()-based Add-account flow was a dead button on
+    // the desktop app. The in-house input dialog asks instead, and it loops
+    // until the typed name already IS its normalized form: a name that
+    // normalization would change ("Работа" → "------", "Work" → "work") is
+    // shown back, editable, BEFORE any login starts — never rewritten silently.
+    let initialValue = '';
+    let body = 'Name for the additional account (e.g. work, backup).'
+        + ' Lowercase letters, digits, "-" and "_" — anything else becomes "-".';
+    for (;;) {
+        const answer = await dialogImpl({ title: 'Add account', body, input: true, initialValue });
+        if (!answer?.confirmed) return '';
+        const raw = String(answer.value || '').trim();
+        const normalized = normalizeProfileName(raw);
+        if (!normalized) return '';
+        if (normalized === raw) return normalized;
+        initialValue = normalized;
+        body = `"${raw}" will be saved as "${normalized}" — edit the name or continue.`;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DOM section.
 // ---------------------------------------------------------------------------
@@ -544,11 +587,12 @@ function renderRows() {
         });
     });
     host.querySelectorAll('[data-harness-add-profile]').forEach((button) => {
-        button.addEventListener('click', () => {
-            const row = button.closest('[data-harness]');
-            const profile = (window.prompt('Name for the additional account (e.g. work, backup):') || '')
-                .trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
-            if (profile) startLogin(row?.dataset.harness, profile);
+        button.addEventListener('click', async () => {
+            // Captured before the await: the 5-second status poll replaces the
+            // rows while the dialog is open, detaching this button's row.
+            const harness = button.closest('[data-harness]')?.dataset.harness;
+            const profile = await promptProfileName();
+            if (profile) startLogin(harness, profile);
         });
     });
     renderLoginCard();
