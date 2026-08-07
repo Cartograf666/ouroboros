@@ -640,10 +640,13 @@ def test_wizard_is_not_deadlocked_by_a_short_key_already_on_disk():
     untouched field posts the stored value back. Rejecting it discards the WHOLE
     payload — including the replacement typed in the same form — which makes the
     offending value the one value the wizard can never overwrite.
+
+    The stored fixture deliberately carries ONLY the short key: a stored
+    OPENAI_COMPATIBLE_BASE_URL would make has_startup_ready_provider() true and
+    the wizard would never open for this install in the first place.
     """
     stored = {
         "OPENAI_COMPATIBLE_API_KEY": "ollama",
-        "OPENAI_COMPATIBLE_BASE_URL": "http://127.0.0.1:4000/v1",
     }
 
     # 1. An unrelated change saves even though the short key rides along untouched.
@@ -676,3 +679,17 @@ def test_wizard_still_rejects_shortening_a_stored_key():
 
     assert prepared == {}
     assert error == "OpenAI API key looks too short."
+
+
+def test_onboarding_frontend_exempts_unchanged_prefilled_keys_from_length_check():
+    """The client-side mirror of the length check carries the same authorship rule.
+
+    validateProvidersStep() runs the identical <10 rule against state prefilled
+    from disk and blocks Next/Save BEFORE the payload reaches the server, so the
+    server-side exemption alone leaves the wizard deadlocked. The JS must skip
+    the length check for a value equal to its INITIAL_STATE prefill — and only
+    for that value, so a newly typed short key is still rejected client-side.
+    """
+    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
+
+    assert "value.length < 10 && value !== trim(INITIAL_STATE[field.stateKey])" in source
