@@ -195,13 +195,17 @@ jobs:
           # Weak model + low effort, per the owner's test rule (plan §4.10, answer 84).
           - harness: claude
             model: claude-haiku-4-5
+            effort: low
             secret_name: anthropic
             secret_env: ANTHROPIC_API_KEY
           - harness: codex
             # The mini lane twice returned a clean successful answer without
             # performing the one-word edit, even after the bounded retry.
-            # Keep low effort, but use the full tool-capable model for a gate.
+            # Use the full tool-capable model for a strict mutation gate.
             model: gpt-5.4
+            # Two successful low-effort runs returned prose without the edit;
+            # medium is still cheap but reliable enough for a strict tool gate.
+            effort: medium
             secret_name: openai
             secret_env: OPENAI_API_KEY
     runs-on: ${{ matrix.os }}
@@ -287,7 +291,7 @@ jobs:
             --lane live \
             --harness "${{ matrix.harness }}" \
             --model "${{ matrix.model }}" \
-            --effort low \
+            --effort "${{ matrix.effort }}" \
             --secret-name "${{ matrix.secret_name }}" \
             --secret-env "${{ matrix.secret_env }}" \
             --max-seconds 900

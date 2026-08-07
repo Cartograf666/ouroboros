@@ -96,6 +96,13 @@ def test_the_asked_edit_is_evidence(tmp_path):
     assert ok
 
 
+def test_live_retry_seed_comparison_normalizes_windows_crlf(tmp_path):
+    (tmp_path / smoke.README_NAME).write_bytes(
+        smoke.README_SEED.replace("\n", "\r\n").encode("utf-8")
+    )
+    assert smoke.live_seed_is_unchanged(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("lane", "attempt", "mutated", "seed_unchanged"),
     [
@@ -336,6 +343,8 @@ def test_three_os_gate_installs_the_reviewed_runtime_instead_of_floating_npm():
     assert "cygpath -w" in workflow
     assert "gpt-5.4-mini" not in workflow
     assert "model: gpt-5.4" in workflow
+    assert "effort: medium" in workflow
+    assert '--effort "${{ matrix.effort }}"' in workflow
 
 
 # -- the request shape (needs the seam) ----------------------------------------

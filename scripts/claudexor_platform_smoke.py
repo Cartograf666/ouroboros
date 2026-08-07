@@ -107,8 +107,10 @@ pending
 # The owner's own test rule (plan §4.10, his answer 84): "put low effort and weak
 # models for tests. Give some simple task like editing a readme."
 LIVE_PROMPT = (
-    "Edit " + README_NAME + " in this repository: replace the single word `pending` "
+    "Use your filesystem tools now; do not merely explain or print a patch. Edit "
+    + README_NAME + " in this repository: replace the single word `pending` "
     "under the `## Status` heading with the single word `done`. Change nothing else. "
+    "Read the file back and verify that exact edit before answering. "
     "Do not create files, do not commit, do not run tests."
 )
 LIVE_EXPECT_TOKEN = "done"
@@ -399,6 +401,16 @@ def should_retry_live_no_mutation(
     return lane == "live" and attempt == 1 and not mutated and seed_unchanged
 
 
+def live_seed_is_unchanged(root: pathlib.Path) -> bool:
+    """Compare text, not host-specific newline bytes (CRLF vs LF)."""
+    return (
+        confined_child(root, README_NAME).read_text(
+            encoding="utf-8", errors="replace",
+        )
+        == README_SEED
+    )
+
+
 def graceful_stop_managed_runtime(
     command: List[str], config_dir: pathlib.Path, version: str, build_sha: str
 ) -> Dict[str, Any]:
@@ -671,10 +683,12 @@ def run_smoke(args: argparse.Namespace) -> Dict[str, Any]:
             mutated, why = mutation_evidence(args.lane, root)
             attempt_facts["mutation_evidence"] = facts["mutation_evidence"] = why
             attempt_facts["mutated"] = mutated
+            # Use the same text semantics as mutation_evidence. On Windows,
+            # write_text materializes CRLF bytes while read_text normalizes them;
+            # a raw-byte comparison would incorrectly suppress the one retry.
             seed_unchanged = (
                 args.lane == "live"
-                and confined_child(root, README_NAME).read_bytes()
-                == README_SEED.encode("utf-8")
+                and live_seed_is_unchanged(root)
             )
             if should_retry_live_no_mutation(
                 args.lane, attempt, mutated, seed_unchanged,
@@ -689,6 +703,11 @@ def run_smoke(args: argparse.Namespace) -> Dict[str, Any]:
                 continue
             if not mutated:
                 attempt_facts["outcome"] = "no_mutation"
+                attempt_facts["answer_preview"] = str(
+                    detail.get("primaryOutput", {}).get("text", "")
+                    if isinstance(detail.get("primaryOutput"), dict)
+                    else ""
+                )[:1_000]
                 raise SmokeFailure("no_mutation", why, **facts)
             attempt_facts["outcome"] = "mutated"
             break
