@@ -1018,30 +1018,131 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
         )
 
 
+# In-flight latch for off-loop coop checkpoints: one commit run per root at a
+# time. A re-trigger after completion is safe (the helper no-ops on a clean
+# tree), so this is concurrency control, not a permanent phase marker.
+_COOP_CHECKPOINT_INFLIGHT: set = set()
+_COOP_CHECKPOINT_LOCK = threading.Lock()
+
+
+def _spawn_coop_checkpoint(
+    ctx: Any, root_tid: str, *, title: str, trigger: str,
+) -> Optional[threading.Thread]:
+    """Run the coop checkpoint-commit OFF the event-drain thread.
+
+    ``checkpoint_commit_coop_roots`` is a chain of bounded (60s each) git
+    subprocesses — inline in the drain loop it is the WS3 starvation class, so
+    the handlers only DETECT and enqueue. The bounded daemon thread
+    RE-VALIDATES quiescence right before the git mutation (a racing tree
+    member admitted between detect and run must win), reuses the v6.58.0
+    helper verbatim (projects-root-only boundary, sensitive-file unstage,
+    fail-soft per root), and appends loud receipts — including a loud-fail
+    receipt on an unexpected error, because a silent skip here is exactly the
+    uncommitted-pile class this call closes. Returns the thread (tests join
+    it); duplicate triggers while one run is in flight are dropped."""
+    root_tid = str(root_tid or "").strip()
+    if not root_tid:
+        return None
+    with _COOP_CHECKPOINT_LOCK:
+        if root_tid in _COOP_CHECKPOINT_INFLIGHT:
+            return None
+        _COOP_CHECKPOINT_INFLIGHT.add(root_tid)
+
+    def _run() -> None:
+        try:
+            from ouroboros.coop_checkpoint import checkpoint_commit_coop_roots
+
+            live = _active_subagent_count(root_tid, ctx.PENDING, ctx.RUNNING) > 0
+            receipts = checkpoint_commit_coop_roots(
+                ctx.DRIVE_ROOT, root_tid, title=title, has_live_tree_tasks=live,
+            )
+            for receipt in receipts:
+                if receipt.get("committed") or receipt.get("error") or receipt.get("skipped_sensitive"):
+                    append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", {
+                        "ts": utc_now_iso(), "type": "coop_checkpoint_commit",
+                        "task_id": root_tid, "trigger": trigger, **receipt,
+                    })
+        except Exception as exc:
+            try:
+                append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", {
+                    "ts": utc_now_iso(), "type": "coop_checkpoint_commit",
+                    "task_id": root_tid, "trigger": trigger,
+                    "committed": False, "error": f"{type(exc).__name__}: {exc}",
+                })
+            except Exception:
+                log.warning("coop checkpoint receipt write failed for %s", root_tid, exc_info=True)
+        finally:
+            with _COOP_CHECKPOINT_LOCK:
+                _COOP_CHECKPOINT_INFLIGHT.discard(root_tid)
+
+    thread = threading.Thread(
+        target=_run, name=f"coop-checkpoint-{root_tid[:12]}", daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def _checkpoint_coop_roots_on_root_done(ctx: Any, task: Dict[str, Any], task_id: str) -> None:
     """v6.58.0 (2.4B): when the ROOT of a task tree finalizes, checkpoint-commit any
     dirty host-minted genesis/coop tree its children built in — durable history instead
     of an uncommitted pile. Only projects-root trees, never owner-attached folders;
-    skipped while sibling tree tasks are still live; credential-shaped files excluded
-    (disclosed); fail-soft per root. Never raises."""
+    credential-shaped files excluded (disclosed); fail-soft per root. Never raises.
+    v6.91: detection only — the git work runs off the event-drain thread, and a tree
+    still holding live members is left to the quiescence trigger
+    (``_maybe_checkpoint_coop_on_tree_quiescence``) instead of being skipped forever
+    (a budget-dead root ALWAYS terminalizes before its children, which used to leave
+    every such pile uncommitted)."""
     try:
-        from ouroboros.coop_checkpoint import checkpoint_commit_coop_roots
-
         root_tid = str(task.get("root_task_id") or task.get("id") or task_id or "")
-        live = _active_subagent_count(root_tid, ctx.PENDING, ctx.RUNNING) > 0
-        receipts = checkpoint_commit_coop_roots(
-            ctx.DRIVE_ROOT, root_tid,
+        if not root_tid:
+            return
+        if _active_subagent_count(root_tid, ctx.PENDING, ctx.RUNNING) > 0:
+            return  # live members: the last child's terminal event re-triggers
+        _spawn_coop_checkpoint(
+            ctx, root_tid,
             title=str(task.get("title") or task.get("suggested_name") or ""),
-            has_live_tree_tasks=live,
+            trigger="root_done",
         )
-        for receipt in receipts:
-            if receipt.get("committed") or receipt.get("error") or receipt.get("skipped_sensitive"):
-                append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", {
-                    "ts": utc_now_iso(), "type": "coop_checkpoint_commit",
-                    "task_id": root_tid, **receipt,
-                })
     except Exception:
         log.debug("coop checkpoint-commit failed for %s", task_id, exc_info=True)
+
+
+def _maybe_checkpoint_coop_on_tree_quiescence(ctx: Any, task: Dict[str, Any], task_id: str) -> None:
+    """v6.91: re-run the coop checkpoint when the LAST live subtree member
+    terminalizes under an already-terminal root.
+
+    A root-scope budget death always kills the root FIRST (children die 20-90s
+    later on their own next dispatch), so the root-done checkpoint saw live
+    tree tasks and never ran again — wave1's coop tree still held only its
+    genesis commit two days later. Called AFTER ``_finish_task_done_dispatch``
+    removed this terminal child from RUNNING (before that, the finishing child
+    itself still counts live and "zero live" is never true). Detection only;
+    the git work runs off-loop via ``_spawn_coop_checkpoint``. Never raises."""
+    try:
+        root_tid = str(task.get("root_task_id") or "").strip()
+        if not root_tid or root_tid == str(task_id or ""):
+            return
+        if _active_subagent_count(root_tid, ctx.PENDING, ctx.RUNNING) > 0:
+            return
+        if root_tid in ctx.RUNNING:
+            return
+        for row in ctx.PENDING:
+            if isinstance(row, dict) and str(row.get("id") or "") == root_tid:
+                return
+        from ouroboros.task_status import SETTLED_STATUSES
+
+        root_result = load_task_result(ctx.DRIVE_ROOT, root_tid) or {}
+        # Truly settled roots only: a cancel_requested root still has a
+        # cancellation custody in flight — its own terminal event re-triggers.
+        if str(root_result.get("status") or "").strip().lower() not in SETTLED_STATUSES:
+            return
+        _spawn_coop_checkpoint(
+            ctx, root_tid,
+            title=str(root_result.get("title") or ""),
+            trigger="tree_quiescence",
+        )
+    except Exception:
+        log.debug("coop quiescence checkpoint failed for %s", task_id, exc_info=True)
 
 
 def _authoritative_terminal_cost(
@@ -1549,6 +1650,12 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
         final_task_result=final_task_result,
         task_done_event=task_done_event,
     )
+
+    # v6.91 tree-quiescence coop checkpoint: MUST run after the dispatch
+    # bookkeeping above removed this terminal child from RUNNING, or the
+    # finishing child still counts live and "zero live members" is never true.
+    if task_id and str(task.get("delegation_role") or "") == "subagent":
+        _maybe_checkpoint_coop_on_tree_quiescence(ctx, task, str(task_id))
 
 
 def _handle_task_metrics(evt: Dict[str, Any], ctx: Any) -> None:

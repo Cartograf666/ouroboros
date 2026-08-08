@@ -579,6 +579,182 @@ def test_wait_for_tasks_rejected_duplicate_carries_duplicate_of(tmp_path):
     assert "cost_usd" in dupe
 
 
+# --- v6.91 wait terminality: cancel_requested is a latch, not a settled record
+
+
+def test_wait_for_effective_tasks_keeps_polling_cancel_requested(tmp_path):
+    """The cancel-INTENT latch is not settled: the worker may still be exiting
+    and the supervisor finalizes to `cancelled` shortly after. Returning
+    "completed after 0.0s" here (pre-v6.91 FINAL_STATUSES) disagreed with the
+    acceptance fence's SETTLED_STATUSES quiescence and looped the parent on the
+    gap (wave3's $1.64 endgame loop). The wait stays bounded by its timeout."""
+    from ouroboros.task_results import STATUS_CANCEL_REQUESTED, STATUS_CANCELLED, write_task_result
+    from ouroboros.task_status import wait_for_effective_tasks
+
+    write_task_result(tmp_path, "cancelling1", STATUS_CANCEL_REQUESTED, result="cancel pending")
+
+    waited = wait_for_effective_tasks(tmp_path, ["cancelling1"], timeout_sec=0)
+    assert waited["all_terminal"] is False
+    assert waited["timed_out"] is True
+    # The latch is reported as ITSELF — a known live state, never terminal/unknown.
+    assert waited["live_child_status"]["cancelling1"] == STATUS_CANCEL_REQUESTED
+
+    # Once the supervisor settles it, the same wait completes normally.
+    write_task_result(tmp_path, "cancelling1", STATUS_CANCELLED, result="cancelled")
+    waited = wait_for_effective_tasks(tmp_path, ["cancelling1"], timeout_sec=0)
+    assert waited["all_terminal"] is True
+
+
+def test_wait_task_does_not_claim_completion_on_cancel_requested(tmp_path):
+    from ouroboros.task_results import STATUS_CANCEL_REQUESTED, write_task_result
+    from ouroboros.tools.control import _wait_for_task
+
+    write_task_result(tmp_path, "cancelling2", STATUS_CANCEL_REQUESTED, result="cancel pending")
+
+    output = _wait_for_task(SimpleNamespace(drive_root=tmp_path), "cancelling2", timeout_sec=0)
+    assert output.startswith("Task wait timed out")
+    assert not output.startswith("Task wait completed")
+
+
+# --- v6.91 wait_tasks typed unknown ids + children roster ---------------------
+
+
+def test_wait_for_tasks_flags_unknown_ids_and_attaches_children_roster(tmp_path):
+    import json as _json
+
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _wait_for_tasks
+
+    # A READABLE queue snapshot that does not know the phantom: a MISSING
+    # snapshot fail-softs to "known" (never brand a real child unknown on an
+    # unreadable surface), so the unknown verdict needs all surfaces present.
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(
+        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
+    )
+    write_task_result(
+        tmp_path,
+        "realchild1",
+        STATUS_COMPLETED,
+        result="real child finished",
+        cost_usd=0.55,
+        parent_task_id="waitparent1",
+        root_task_id="waitparent1",
+        delegation_role="subagent",
+    )
+
+    ctx = SimpleNamespace(
+        drive_root=tmp_path,
+        task_id="waitparent1",
+        task_metadata={"root_task_id": "waitparent1"},
+    )
+    payload = json.loads(_wait_for_tasks(ctx, ["realchild1", "phantomid9"], timeout_sec=0))
+
+    # The phantom id gets a TYPED marker row, not a silent empty projection.
+    phantom = payload["tasks"]["phantomid9"]
+    assert phantom["unknown_task_id"] is True
+    assert "not yet registered or never scheduled" in phantom["note"]
+    assert payload["unknown_task_ids"] == ["phantomid9"]
+
+    # The real child still projects the normal compact row.
+    real = payload["tasks"]["realchild1"]
+    assert real["status"] == STATUS_COMPLETED
+    assert "unknown_task_id" not in real
+
+    # The repair surface: the ACTUAL direct children, compact v6.71.2 field set
+    # only — no result/trace envelope fields, absent accounting projects null.
+    roster = payload["children_roster"]
+    assert [row["task_id"] for row in roster] == ["realchild1"]
+    assert set(roster[0]) == {"task_id", "status", "cost_usd", "child_result_sha256", "outcome_axes"}
+    assert roster[0]["cost_usd"] == 0.55
+
+
+def test_wait_for_tasks_phantom_only_set_short_circuits_the_window(tmp_path, monkeypatch):
+    """A wait set in which NOTHING was ever minted ends after the registration
+    grace instead of blocking the whole requested window — and says so."""
+    import json as _json
+
+    from ouroboros.tools import control
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(
+        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
+    )
+    monkeypatch.setattr(control, "_UNMINTED_WAIT_GRACE_SEC", 0.1)
+
+    ctx = SimpleNamespace(drive_root=tmp_path, task_id="waitparent3", task_metadata={})
+    started = time.monotonic()
+    payload = json.loads(control._wait_for_tasks(ctx, ["phantomid7", "phantomid8"], timeout_sec=600))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 30, "phantom-only wait must not block for the requested window"
+    short = payload["wait_short_circuited"]
+    assert short["reason"] == "all_task_ids_unminted"
+    assert short["requested_timeout_sec"] == 600.0
+    assert sorted(payload["unknown_task_ids"]) == ["phantomid7", "phantomid8"]
+
+
+def test_wait_for_tasks_id_minted_during_grace_keeps_waiting(tmp_path, monkeypatch):
+    """The grace is for the registration race: an id that becomes real during it
+    is a genuine child, so the wait resumes with the remaining window."""
+    import json as _json
+
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools import control
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(
+        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
+    )
+    monkeypatch.setattr(control, "_UNMINTED_WAIT_GRACE_SEC", 0.1)
+
+    real_calls = {"n": 0}
+    original = control._unminted_wait_ids
+
+    def _mint_after_grace(ctx, drive_root, task_ids):
+        real_calls["n"] += 1
+        if real_calls["n"] > 1:
+            # The child registered during the grace window.
+            write_task_result(
+                tmp_path, "latechild1", STATUS_COMPLETED, result="registered late",
+                parent_task_id="waitparent4", root_task_id="waitparent4",
+                delegation_role="subagent",
+            )
+        return original(ctx, drive_root, task_ids)
+
+    monkeypatch.setattr(control, "_unminted_wait_ids", _mint_after_grace)
+    ctx = SimpleNamespace(drive_root=tmp_path, task_id="waitparent4", task_metadata={})
+    payload = json.loads(control._wait_for_tasks(ctx, ["latechild1"], timeout_sec=5))
+
+    assert "wait_short_circuited" not in payload
+    assert payload["timeout_sec"] == 5.0
+    assert payload["tasks"]["latechild1"]["status"] == STATUS_COMPLETED
+
+
+def test_wait_for_tasks_queue_scheduled_id_is_not_unknown(tmp_path):
+    """An id with a queue-snapshot row but no task result yet is a REAL child
+    (just-scheduled), never a phantom — and without unknowns the roster is not
+    attached (the compact batch stays compact, v6.71.2)."""
+    import json as _json
+
+    from ouroboros.tools.control import _wait_for_tasks
+
+    snapshot = {"pending": [{"id": "queuedonly1", "task": {}}], "running": []}
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(_json.dumps(snapshot), encoding="utf-8")
+
+    ctx = SimpleNamespace(drive_root=tmp_path, task_id="waitparent2", task_metadata={})
+    payload = json.loads(_wait_for_tasks(ctx, ["queuedonly1"], timeout_sec=0))
+
+    assert "unknown_task_ids" not in payload
+    assert "children_roster" not in payload
+    assert "unknown_task_id" not in payload["tasks"]["queuedonly1"]
+
+
 def test_recent_tasks_includes_outcome_contract_and_ledger(tmp_path):
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
     from ouroboros.tools.recent_tasks import _handle_recent_tasks

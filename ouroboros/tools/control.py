@@ -2063,13 +2063,102 @@ def _count_live_sibling_children(ctx: ToolContext, status_drive_root: Path, *, e
         return 0
 
 
+# Registration-race grace for a wait set in which NOTHING was minted (v6.91):
+# "not YET registered" is a real state for a child scheduled moments ago, so a
+# phantom-only wait still polls — but only for this long, instead of blocking
+# the parent for the whole requested window on ids that exist nowhere.
+_UNMINTED_WAIT_GRACE_SEC = 30.0
+
+
+def _unminted_wait_ids(ctx: ToolContext, status_drive_root: Path, task_ids: List[str]) -> List[str]:
+    """Ids with no trace on ANY surface this tree mints ids through: no task
+    result, no queue-snapshot row, and no tree-ledger row naming them (v6.91).
+
+    wave2's root blocked 900s slices on three hallucinated ids that wait_tasks
+    silently polled as 'unknown' — while the real lead was missing from the wait
+    set. The typed marker (plus the actual children roster) lets the parent
+    repair its wait set instead of starving on phantoms. Fail-soft per probe: an
+    unreadable surface treats the id as KNOWN — a real child must never be
+    branded unknown on an I/O error."""
+    from ouroboros.task_status import _load_queue_snapshot, _queue_task_status
+
+    try:
+        snapshot = _load_queue_snapshot(status_drive_root)
+    except Exception:
+        snapshot = {"_snapshot_invalid": True}
+    ledger_ids: set = set()
+    try:
+        from ouroboros.task_tree_ledger import tree_ledger_rows
+        from ouroboros.tools.task_tree import tree_root_id
+
+        for row in tree_ledger_rows(tree_root_id(ctx)):
+            for key in ("task_id", "child_task_id", "parent_task_id"):
+                value = str(row.get(key) or "").strip()
+                if value:
+                    ledger_ids.add(value)
+    except Exception:
+        pass
+    unknown: List[str] = []
+    for tid in task_ids:
+        try:
+            if load_effective_task_result(status_drive_root, tid):
+                continue
+            queue_status, _ = _queue_task_status(snapshot, tid)
+            if queue_status:  # running/scheduled row, or "unknown" on a missing snapshot (fail-soft)
+                continue
+            if tid in ledger_ids:
+                continue
+        except Exception:
+            continue  # unreadable surface: treat as known
+        unknown.append(tid)
+    return unknown
+
+
+def _children_roster_projection(
+    ctx: ToolContext, status_drive_root: Path, *, limit: int = 30,
+) -> List[Dict[str, Any]]:
+    """This parent's DIRECT children in the v6.71.2 compact field set (task_id/
+    status/cost_usd/sha/outcome_axes) — never result envelopes; missing
+    accounting projects null, never a confirmed-looking $0. Fail-soft: []."""
+    from ouroboros.task_status import find_child_tasks
+    from ouroboros.tools.join_ledger import _child_result_sha256
+
+    my_id = str(getattr(ctx, "task_id", "") or "").strip()
+    if not my_id:
+        return []
+    try:
+        rows = find_child_tasks(
+            status_drive_root, parent_task_id=my_id, root_task_id="",
+            exclude_task_id=my_id, scope="direct",
+        )
+    except Exception:
+        return []
+    roster: List[Dict[str, Any]] = []
+    for row in rows[: max(1, int(limit))]:
+        if not isinstance(row, dict):
+            continue
+        roster.append({
+            "task_id": str(row.get("task_id") or row.get("id") or ""),
+            "status": row.get("status"),
+            "cost_usd": row.get("cost_usd"),
+            "child_result_sha256": _child_result_sha256(row),
+            "outcome_axes": normalize_outcome_axes(row),
+        })
+    return roster
+
+
 def _wait_for_tasks(
     ctx: ToolContext,
     task_ids: List[str],
     timeout_sec: int = 600,
     mode: str = "all_terminal",
 ) -> str:
-    """Wait for multiple subtasks and return a compact structural projection per child."""
+    """Wait for multiple subtasks and return a compact structural projection per child.
+
+    A wait set whose ids were ALL unminted at entry ends after the registration
+    grace instead of the full requested window (disclosed as
+    ``wait_short_circuited``); any id that turns real during the grace makes it
+    an ordinary wait again, with the remaining window intact."""
     if not isinstance(task_ids, list) or not task_ids:
         return "⚠️ TOOL_ARG_ERROR (wait_tasks): task_ids must be a non-empty list."
     from ouroboros.config import MAX_ACTIVE_SUBAGENTS_HARD_CAP
@@ -2096,13 +2185,59 @@ def _wait_for_tasks(
         return "⚠️ TOOL_ARG_ERROR (wait_tasks): mode must be all_terminal or any_terminal."
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
+    # Typed unknown-id detection (v6.91): flagged ids KEEP polling — "not YET
+    # registered" is a real state for a just-scheduled child — but a phantom id
+    # is disclosed instead of silently starving the wait (wave2: three
+    # hallucinated ids blocked 900s slices while the real lead went unwaited).
+    entry_unknown_ids = _unminted_wait_ids(ctx, status_drive_root, normalized_ids)
+    # One beacon cursor for the whole wait, so a two-phase window cannot skip an
+    # attention beacon emitted during its first phase.
+    _wait_since = utc_now_iso()
+    # A wait set in which EVERY id is unminted cannot be satisfied by waiting —
+    # nothing was ever scheduled to terminate. Spend only the registration-race
+    # grace on it (wave1's root blocked its whole window on three hallucinated
+    # ids), then re-probe; the moment any id turns real this becomes an ordinary
+    # wait and gets the rest of the requested window.
+    _phantom_only = bool(entry_unknown_ids) and len(entry_unknown_ids) == len(normalized_ids)
+    first_window = min(float(timeout), _UNMINTED_WAIT_GRACE_SEC) if _phantom_only else float(timeout)
     waited = wait_for_effective_tasks(
-        status_drive_root, normalized_ids, timeout_sec=timeout, mode=normalized_mode,
-        on_poll=_wait_attention_poll(ctx, utc_now_iso()), poll_interval_sec=2.0,
+        status_drive_root, normalized_ids, timeout_sec=first_window, mode=normalized_mode,
+        on_poll=_wait_attention_poll(ctx, _wait_since), poll_interval_sec=2.0,
     )
+    if _phantom_only and first_window < float(timeout) and waited.get("early_return") is None:
+        entry_unknown_ids = _unminted_wait_ids(ctx, status_drive_root, normalized_ids)
+        if len(entry_unknown_ids) < len(normalized_ids):
+            elapsed = float(waited.get("elapsed_sec") or 0.0)
+            resumed = wait_for_effective_tasks(
+                status_drive_root, normalized_ids,
+                timeout_sec=max(0.0, float(timeout) - elapsed), mode=normalized_mode,
+                on_poll=_wait_attention_poll(ctx, _wait_since), poll_interval_sec=2.0,
+            )
+            resumed["elapsed_sec"] = float(resumed.get("elapsed_sec") or 0.0) + elapsed
+            resumed["timeout_sec"] = float(timeout)
+            waited = resumed
+        else:
+            # Disclosed, not silent: the wait ended early and says why.
+            waited["wait_short_circuited"] = {
+                "reason": "all_task_ids_unminted",
+                "requested_timeout_sec": float(timeout),
+                "waited_sec": round(float(waited.get("elapsed_sec") or 0.0), 1),
+                "note": (
+                    "Every requested task_id was unminted at entry and still unminted after "
+                    f"the {int(_UNMINTED_WAIT_GRACE_SEC)}s registration grace, so the wait "
+                    "returned instead of blocking for the full timeout. Fix the wait set from "
+                    "children_roster / your schedule_subagent results, then wait again."
+                ),
+            }
     tasks = waited.get("tasks")
     if isinstance(tasks, dict):
         from ouroboros.tools.join_ledger import _child_result_sha256
+
+        # Re-probe the entry-time unknowns once: an id minted mid-wait (queue
+        # row or result appeared) is a real child, not a phantom.
+        unknown_ids = [tid for tid in entry_unknown_ids if not tasks.get(tid)]
+        if unknown_ids:
+            unknown_ids = _unminted_wait_ids(ctx, status_drive_root, unknown_ids)
 
         # Compact STRUCTURAL projection (v6.71.2): the full public_task_result
         # envelope duplicated forensics (trace_refs, loop_outcome internals,
@@ -2114,6 +2249,20 @@ def _wait_for_tasks(
         # truncation. Single-task wait_task/get_task_result stay full.
         public_tasks: Dict[str, Any] = {}
         for tid, data in tasks.items():
+            if str(tid) in unknown_ids:
+                public_tasks[str(tid)] = {
+                    "task_id": str(tid),
+                    "status": None,
+                    "unknown_task_id": True,
+                    "note": (
+                        "UNKNOWN_TASK_ID: not yet registered or never scheduled — no task "
+                        "result, no queue row, and no tree-ledger row names this id in this "
+                        "tree. Check it against your schedule_subagent results / the "
+                        "children_roster below; an all_terminal wait cannot complete while "
+                        "it stays unscheduled."
+                    ),
+                }
+                continue
             if not isinstance(data, dict):
                 public_tasks[str(tid)] = data
                 continue
@@ -2143,6 +2292,12 @@ def _wait_for_tasks(
             "<task_id>.json, addressable by child_result_sha256; get_task_result "
             "returns the full result text plus trace/outcome summaries."
         )
+        if unknown_ids:
+            waited["unknown_task_ids"] = unknown_ids
+            # The repair surface: the ACTUAL direct children, compact v6.71.2
+            # field set only (never envelopes), so the parent can fix its wait
+            # set instead of re-polling phantoms.
+            waited["children_roster"] = _children_roster_projection(ctx, status_drive_root)
     return json.dumps(waited, ensure_ascii=False, indent=2)
 
 
@@ -2412,7 +2567,7 @@ def get_tools() -> List[ToolEntry]:
         }, _wait_for_task, timeout_sec=7200),
         ToolEntry("wait_tasks", {
             "name": "wait_tasks",
-            "description": "Wait for MULTIPLE subtasks at once and return a compact structural projection per child (task_id, status, cost_usd, child_result_sha256, outcome_axes, result, trace_summary, capability_delta when the child has something to disclose, duplicate_of) — the right tool to ABSORB a batch of independent children you scheduled in one burst. The full per-child envelope stays on disk in task_results/<task_id>.json (child_result_sha256 pins the exact result you saw; get_task_result returns the full result text plus trace/outcome summaries). With mode=any_terminal it returns as soon as the FIRST child finishes (handle it, then call again for the rest) instead of blocking serially. The JSON also includes live_child_status (running/scheduled/terminal per child) and may early_return (before all terminal) on a child tree_note blocker/question/interface_contract/delegation_constraint beacon so you can steer or override mid-flight.",
+            "description": "Wait for MULTIPLE subtasks at once and return a compact structural projection per child (task_id, status, cost_usd, child_result_sha256, outcome_axes, result, trace_summary, capability_delta when the child has something to disclose, duplicate_of) — the right tool to ABSORB a batch of independent children you scheduled in one burst. The full per-child envelope stays on disk in task_results/<task_id>.json (child_result_sha256 pins the exact result you saw; get_task_result returns the full result text plus trace/outcome summaries). With mode=any_terminal it returns as soon as the FIRST child finishes (handle it, then call again for the rest) instead of blocking serially. The JSON also includes live_child_status (running/scheduled/terminal per child) and may early_return (before all terminal) on a child tree_note blocker/question/interface_contract/delegation_constraint beacon so you can steer or override mid-flight. An id no surface of this tree ever minted (no task result, no queue row, no tree-ledger row) is flagged unknown_task_id — 'not yet registered or never scheduled' — and unknown_task_ids + a compact children_roster of your ACTUAL direct children are attached so you can repair the wait set instead of re-polling phantoms.",
             "parameters": {"type": "object", "required": ["task_ids"], "properties": {
                 "task_ids": {"type": "array", "items": {"type": "string"}, "description": "Task IDs returned by schedule_subagent."},
                 "timeout_sec": {"type": "integer", "default": 600, "description": "Maximum seconds to wait (default 600)."},

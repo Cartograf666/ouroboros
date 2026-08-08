@@ -174,14 +174,15 @@ def normalize_budget_profile(value: Any) -> Dict[str, Any]:
 
     ``cost_hard_stop_pct`` (v6.56.0, additive): the in-task cost hard-stop as a
     percentage of the budget remaining at task start. None -> the historical
-    default (50: force-finalize once the task has spent half the remaining
+    default (50: the global component of the stop is half the remaining
     budget). 0 -> NO in-task cost stop at all — the deadline/rounds axes and the
     global between-task budget gate remain the only bounds, and cost milestones
     become informational against the start snapshot. The ceiling is resolved in
-    ``task_pacing.resolve_cost_ceiling_usd`` (0 maps to no ceiling, never a $0
-    ceiling). A MALFORMED value (negative / non-numeric / a ``0<v<1`` fraction)
-    maps to None (the 50% default), NOT to 0 — it must not silently disable the
-    stop (see ``_opt_cost_hard_stop_pct``).
+    ``task_pacing.resolve_cost_ceiling`` (typed; 0 maps to the ``disabled``
+    state, never a $0 ceiling; a per-task root cap contributes a second
+    min-component). A MALFORMED value (negative / non-numeric / a ``0<v<1``
+    fraction) maps to None (the 50% default), NOT to 0 — it must not silently
+    disable the stop (see ``_opt_cost_hard_stop_pct``).
     """
     v = value if isinstance(value, Mapping) else {}
     policy = str(v.get("improvement_policy") or "").strip().lower()

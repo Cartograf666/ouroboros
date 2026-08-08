@@ -221,3 +221,78 @@ def test_api_state_marks_accounting_unavailable_without_legacy_zero(tmp_path, mo
     assert payload["accounting"]["accounted_usd"] is None
     assert payload["accounting"]["remaining_known_usd"] is None
     assert payload["accounting"]["error_code"] == "ledger_unavailable"
+
+
+# --- v6.91 root task-detail cost_breakdown view ------------------------------
+
+
+def _settled_attempt(root, *, task_id, cost, category="task"):
+    attempt = _attempt(root, reservation_usd=cost, task_id=task_id, category=category)
+    ua.mark_dispatched(attempt)
+    ua.settle_attempt(
+        attempt,
+        {"prompt_tokens": 10, "completion_tokens": 5},
+        cost_usd=cost,
+        cost_final=True,
+    )
+    return attempt
+
+
+def _seed_tree_accounting(root):
+    """Root own spend + child spend + one disclosed-free and one undisclosed
+    delegated session — the submarine 'where did the money go' shape."""
+    _settled_attempt(root, task_id="root-1", cost=0.30)
+    _settled_attempt(root, task_id="child-1", cost=0.50)
+    ua.record_subscription_session(
+        "session-free", drive_root=root, route="claudexor/claude",
+        task_id="child-1", root_task_id="root-1", spend_usd=0.0,
+    )
+    ua.record_subscription_session(
+        "session-undisclosed", drive_root=root, route="claudexor/codex",
+        task_id="child-1", root_task_id="root-1", spend_usd=None,
+    )
+
+
+def test_usage_breakdown_delegated_axis_is_a_filter_not_a_new_sum(tmp_path, monkeypatch):
+    root = _data_root(tmp_path, monkeypatch)
+    _seed_tree_accounting(root)
+
+    breakdown = ua.usage_breakdown(root, root_task_id="root-1")
+    delegated = breakdown["delegated"]
+    # The delegated bucket is the SAME subscription rows already counted in the
+    # top-level summary (sessions axis), filtered by execution kind.
+    assert delegated["subscription_sessions"] == 2
+    assert breakdown["subscription_sessions"] == 2
+    assert delegated["settled_usd"] == 0.0  # disclosed-free session
+    assert delegated["unknown_unmetered"] == 1  # undisclosed spend, never $0
+    assert delegated["physical_calls"] == 0  # sessions are not provider sends
+
+
+def test_task_detail_cost_breakdown_view_for_root(tmp_path, monkeypatch):
+    from ouroboros.gateway.tasks import _task_cost_breakdown_view
+
+    root = _data_root(tmp_path, monkeypatch)
+    _seed_tree_accounting(root)
+
+    view = _task_cost_breakdown_view(root, {"task_id": "root-1", "root_task_id": "root-1"})
+    assert view is not None
+    assert view["own_usd"] == 0.30
+    assert view["children_usd"] == 0.50  # subtree minus own — the by-hand subtraction, formalized
+    assert view["delegated_disclosed_usd"] == 0.0
+    assert view["subscription_sessions"] == 2
+    assert view["unknown_unmetered"] == 1
+    assert view["cost_final"] is False  # the undisclosed session keeps finality honest
+    assert view["authority"] == "physical_attempt_ledger"
+
+
+def test_task_detail_cost_breakdown_view_only_for_roots_and_fails_soft(tmp_path, monkeypatch):
+    from ouroboros.gateway.tasks import _task_cost_breakdown_view
+
+    root = _data_root(tmp_path, monkeypatch)
+    _seed_tree_accounting(root)
+    # Non-root: subtree math is not ledger-attributable mid-tree — omitted.
+    assert _task_cost_breakdown_view(root, {"task_id": "child-1", "root_task_id": "root-1"}) is None
+    # Unreadable ledger: absent view, never a confident $0 object.
+    (root / ua.LEDGER_REL).write_text("not-json\n{}\n", encoding="utf-8")
+    view = _task_cost_breakdown_view(root, {"task_id": "root-1", "root_task_id": "root-1"})
+    assert view is None or view.get("cost_final") is False

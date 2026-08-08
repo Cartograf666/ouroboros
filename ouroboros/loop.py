@@ -344,23 +344,27 @@ def _swarm_handoff_attempt(ctx: Any) -> Dict[str, Any]:
 def _check_budget_limits(
     ctx: "_RoundLimitContext",
     budget_remaining_usd: Optional[float],
-    cost_ceiling_usd: Optional[float] = None,
+    cost_ceiling: Optional["task_pacing.CostCeiling"] = None,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
     """Return a final-response tuple when budget limits require stopping.
 
-    ``cost_ceiling_usd`` is the in-task hard-stop resolved ONCE at loop start
-    from ``task_contract.budget_profile.cost_hard_stop_pct``
-    (``task_pacing.resolve_cost_ceiling_usd``); None means no in-task cost stop
-    — the global budget-exhaustion gate below still applies."""
-    if budget_remaining_usd is None:
-        return None
+    ``cost_ceiling`` is the typed in-task stop resolved ONCE at loop start
+    (``task_pacing.resolve_cost_ceiling``). Only an ``active`` ceiling stops
+    here; ``exhausted_soft_land`` fires at the top of the round in the loop.
+    The deciding spend is the root subtree's ledger-accounted number when a
+    root cap exists (the fence counts the TREE, not own calls); own cost is
+    the DISCLOSED fallback and the diagnostic. Unknown spend never becomes $0.
 
+    The two axes are INDEPENDENT (v6.91 fix): ``budget_remaining_usd`` None
+    means only that no finite GLOBAL budget exists (TOTAL_BUDGET unset — the
+    GAIA-shaped run), which must not silence a live per-task ROOT CAP. A task
+    with neither a global budget nor a root cap resolves to a ``disabled``
+    ceiling and the whole cost axis stays silent, as before."""
     accumulated_usage = ctx.accumulated_usage
-    messages = ctx.messages
     raw_task_cost = accumulated_usage.get("cost")
     task_cost = float(raw_task_cost) if raw_task_cost is not None else None
 
-    if budget_remaining_usd <= 0:
+    if budget_remaining_usd is not None and budget_remaining_usd <= 0:
         finish_reason = "🚫 Task rejected. Total budget exhausted. Please increase TOTAL_BUDGET in settings."
         accumulated_usage["execution_status"] = "failed"
         accumulated_usage["reason_code"] = "budget_exhausted"
@@ -387,21 +391,52 @@ def _check_budget_limits(
             fallback_text=finish_reason,
             reason_code="budget_exhausted",
         )
+    # The pre-v6.91 per-task soft "[COST NOTE]" is gone: since v6.64.0 the same
+    # settings key hard-fences the whole TREE at the ledger, so an own-cost note
+    # keyed to it could never fire before the fence (proven live: silent through
+    # two tree deaths). The v6.56.0 latched milestones are the designed nudge.
 
-    from ouroboros.config import SETTINGS_DEFAULTS as _DEFAULTS
-    _per_task_default = str(_DEFAULTS["OUROBOROS_PER_TASK_COST_USD"])
-    per_task_limit = float(os.environ.get("OUROBOROS_PER_TASK_COST_USD", _per_task_default) or _per_task_default)
-    if task_cost is not None and task_cost >= per_task_limit and ctx.round_idx % 10 == 0:
-        _append_or_merge_user_message(
-            messages,
-            f"[COST NOTE] Task spent ${task_cost:.3f}, which is at or above the per-task soft threshold of ${per_task_limit:.2f}. Continue only if the expected value still justifies the cost.",
+    if cost_ceiling is None or cost_ceiling.state != task_pacing.COST_CEILING_ACTIVE:
+        return None
+    tree_info = _loop_tree_accounting(
+        refresh=True, max_age_sec=_TREE_ACCOUNTING_MAX_STALE_SEC,
+    )
+    tree_cost = tree_info.get("accounted_usd") if isinstance(tree_info, dict) else None
+    deciding, spend_basis = task_pacing.resolve_deciding_spend(
+        tree_cost_usd=tree_cost,
+        task_cost_usd=task_cost,
+        root_cap_usd=cost_ceiling.root_cap_usd,
+    )
+    ceiling_usd = cost_ceiling.ceiling_usd
+    if deciding is not None and ceiling_usd is not None and deciding > ceiling_usd:
+        if spend_basis == task_pacing.SPEND_BASIS_TREE:
+            spent_text = (
+                f"Task tree spent ${deciding:.3f} (ledger-accounted incl. in-flight holds, "
+                f"subagents included; own calls ${task_cost:.3f})"
+                if task_cost is not None
+                else f"Task tree spent ${deciding:.3f} (ledger-accounted incl. in-flight holds)"
+            )
+        elif spend_basis == task_pacing.SPEND_BASIS_OWN_TREE_UNKNOWN:
+            # Stopping on a disclosed lower bound beats not stopping at all, but
+            # the substitution is stated, never silent (BIBLE P1).
+            spent_text = (
+                f"Task spent ${deciding:.3f} on its OWN calls (the tree-accounted total "
+                "is unavailable right now, so subagent spend is not included — this is a "
+                "lower bound)"
+            )
+        else:
+            spent_text = f"Task spent ${deciding:.3f}"
+        cap_text = (
+            f"; the hard tree cap is ${cost_ceiling.root_cap_usd:.2f}"
+            if cost_ceiling.root_cap_usd is not None else ""
         )
-
-    if cost_ceiling_usd is not None and task_cost is not None and task_cost > cost_ceiling_usd:
         finish_reason = (
-            f"Task spent ${task_cost:.3f} (over the in-task cost ceiling ${cost_ceiling_usd:.2f} "
-            f"of remaining ${budget_remaining_usd:.2f}). Budget exhausted."
+            f"{spent_text}, over the in-task cost ceiling ${ceiling_usd:.2f}{cap_text}. "
+            "Budget exhausted."
         )
+        # The basis rides the usage record too, so a later reader can tell a
+        # tree-decided stop from an own-cost stand-in without parsing prose.
+        accumulated_usage["cost_stop_spend_basis"] = spend_basis
         return _forced_final_answer(
             ctx,
             prompt=(
@@ -418,12 +453,110 @@ def _check_budget_limits(
     return None
 
 
-def _resolve_task_cost_ceiling(ctx: Any, budget_remaining_usd: Optional[float]) -> Optional[float]:
-    """The in-task cost hard-stop, resolved ONCE at loop start from the start-of-
-    task budget snapshot + task_contract.budget_profile (cost_hard_stop_pct
-    None -> the historical 50%-of-remaining stop, 0 -> no in-task stop)."""
-    return task_pacing.resolve_cost_ceiling_usd(
-        budget_remaining_usd, task_pacing.resolve_budget_profile(ctx),
+def _resolve_task_cost_ceiling(
+    ctx: Any, budget_remaining_usd: Optional[float],
+) -> "task_pacing.CostCeiling":
+    """The typed in-task cost stop, resolved ONCE at loop start.
+
+    The root cap comes from the bound usage scope — the SAME
+    ``OUROBOROS_PER_TASK_COST_USD``-derived value the ledger fence enforces
+    (agent.py wires it as ``UsageScope.root_limit_usd``), so the graceful stop
+    and the fence can never disagree about the cap."""
+    root_cap = None
+    try:
+        from ouroboros.usage_accounting import current_usage_scope
+
+        scope = current_usage_scope()
+        root_cap = getattr(scope, "root_limit_usd", None) if scope is not None else None
+    except Exception:
+        log.debug("Usage scope unavailable for cost ceiling resolution", exc_info=True)
+    return task_pacing.resolve_cost_ceiling(
+        budget_remaining_usd,
+        task_pacing.resolve_budget_profile(ctx),
+        root_cap_usd=root_cap,
+    )
+
+
+# Bounded staleness for the two DECIDING cost surfaces (the ceiling check and
+# the milestone note). The free stash is refreshed by every dispatch under this
+# root, so in a fast loop it is at most one round old and this costs zero reads.
+# But ONE round can block for 900s inside wait_tasks while children spend — the
+# exact shape both dead waves had — and the pacing refresh only covers deadline-
+# less tasks, so a round that outlives this bound pays for exactly one real
+# projection read. Still never a per-round read (see the usage_accounting
+# telemetry note and the e4a87344 contention class).
+_TREE_ACCOUNTING_MAX_STALE_SEC = 120.0
+
+
+def _loop_tree_accounting(
+    *, refresh: bool, max_age_sec: float = 30.0,
+) -> Optional[Dict[str, Any]]:
+    """The root subtree's accounted spend for the CURRENT task's tree (nullable).
+
+    Reads the reserve-time scope telemetry for free; ``refresh=True`` may
+    perform one real ledger projection read when the stash is older than
+    ``max_age_sec``. Callers: loop start / the 600s pacing note / the 15-round
+    checkpoint (already cache-breaking surfaces, small max_age), and the two
+    DECIDING surfaces (ceiling check + milestone note) with the wider
+    ``_TREE_ACCOUNTING_MAX_STALE_SEC`` bound — which costs nothing while rounds
+    are shorter than the bound, since every dispatch refreshes the stash. Never
+    an unconditional per-round read (usage_accounting telemetry notes,
+    e4a87344). Only meaningful under a root cap; returns None otherwise
+    (unknown is represented, never $0)."""
+    try:
+        from ouroboros.usage_accounting import (
+            current_usage_scope,
+            last_root_accounting,
+            refresh_root_accounting,
+        )
+
+        scope = current_usage_scope()
+        if scope is None or not scope.root_task_id or scope.root_limit_usd is None:
+            return None
+        if refresh:
+            return refresh_root_accounting(
+                scope.drive_root, scope.root_task_id, max_age_sec=max_age_sec,
+            )
+        return last_root_accounting(scope.root_task_id)
+    except Exception:
+        log.debug("Tree accounting telemetry unavailable", exc_info=True)
+        return None
+
+
+def _soft_land_exhausted_ceiling(
+    limit_ctx: "_RoundLimitContext",
+    cost_ceiling: "task_pacing.CostCeiling",
+) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """Typed soft landing (v6.91): a root cap at or below the planning margin
+    leaves no working room — enter the existing graceful best-effort wrap-up
+    BEFORE spending a work round; never run uncapped (the pre-typed shape
+    resolved this to the same None as "unlimited"). The ledger fence stays the
+    untouched backstop. Returns the forced-final tuple, or None when the
+    ceiling is not in the ``exhausted_soft_land`` state."""
+    if cost_ceiling.state != task_pacing.COST_CEILING_EXHAUSTED_SOFT_LAND:
+        return None
+    cap_text = (
+        f"${cost_ceiling.root_cap_usd:.2f}"
+        if cost_ceiling.root_cap_usd is not None else "the per-task tree cap"
+    )
+    margin_text = (
+        f"${cost_ceiling.planning_margin_usd:.2f}"
+        if cost_ceiling.planning_margin_usd is not None else "the wrap-up planning margin"
+    )
+    soft_land_reason = (
+        f"Per-task tree cap {cap_text} leaves no working room above the "
+        f"wrap-up planning margin ({margin_text}). Budget exhausted."
+    )
+    return _forced_final_answer(
+        limit_ctx,
+        prompt=(
+            f"[BUDGET LIMIT] {soft_land_reason} Produce your best final answer "
+            "NOW from the verified work so far; clearly mark anything unverified "
+            "or incomplete. An honest best-effort result is the expected outcome "
+            "here, not a failure."
+        ),
+        fallback_text=soft_land_reason,
+        reason_code="budget_exhausted",
     )
 
 
@@ -2759,12 +2892,31 @@ def _maybe_inject_self_check(
     cost_text = f"${task_cost:.2f}" if task_cost is not None else "unknown"
     checkpoint_num = round_idx // REMINDER_INTERVAL
 
+    # Tree spend under a root cap (v6.91): the checkpoint is an already
+    # cache-breaking user turn, so it is one of the RARE surfaces allowed to
+    # carry a live ledger number (DEVELOPMENT cache_friendliness item 22). The
+    # fence counts the whole tree, so own cost alone hid two tree deaths.
+    tree_line = ""
+    tree_accounted: Optional[float] = None
+    tree_cap: Optional[float] = None
+    tree_info = _loop_tree_accounting(refresh=True, max_age_sec=30.0)
+    if isinstance(tree_info, dict) and tree_info.get("accounted_usd") is not None:
+        tree_accounted = float(tree_info["accounted_usd"])
+        raw_cap = tree_info.get("root_limit_usd")
+        tree_cap = float(raw_cap) if raw_cap is not None else None
+        cap_text = f" of ${tree_cap:.2f} hard tree cap" if tree_cap is not None else ""
+        tree_line = (
+            f"Task tree spend: ~${tree_accounted:.2f}{cap_text} "
+            "(ledger-accounted incl. in-flight holds, subagents included)\n"
+        )
+
     tool_trace = _build_recent_tool_trace(messages)
 
     reminder = (
         f"[CHECKPOINT {checkpoint_num} — round {round_idx}/{max_rounds}]\n"
         f"Context: ~{ctx_tokens} tokens | Cost so far: {cost_text} | "
         f"Rounds remaining: {max_rounds - round_idx}\n"
+        f"{tree_line}"
     )
     if tool_trace:
         reminder += f"\n{tool_trace}\n"
@@ -2788,13 +2940,17 @@ def _maybe_inject_self_check(
         f"~{ctx_tokens} tokens, {cost_text} spent"
     )
 
-    _emit_checkpoint_event(event_queue, task_id, drive_logs, {
+    checkpoint_payload: Dict[str, Any] = {
         "checkpoint_number": checkpoint_num,
         "round": round_idx,
         "max_rounds": max_rounds,
         "context_tokens": ctx_tokens,
         "task_cost": task_cost,
-    })
+    }
+    if tree_accounted is not None:
+        checkpoint_payload["tree_accounted_usd"] = round(tree_accounted, 4)
+        checkpoint_payload["tree_cap_usd"] = round(tree_cap, 4) if tree_cap is not None else None
+    _emit_checkpoint_event(event_queue, task_id, drive_logs, checkpoint_payload)
 
     return True
 
@@ -2814,6 +2970,9 @@ def _maybe_inject_time_budget_milestone(
     appends the note and emits the checkpoint event."""
     note = task_pacing.build_time_budget_note(
         tools._ctx, round_idx=round_idx, accumulated_usage=accumulated_usage,
+        # A real ledger read happens ONLY when the pacing note actually fires
+        # (per 600s bucket) — the note is a cache-breaking user turn already.
+        tree_cost_provider=lambda: _loop_tree_accounting(refresh=True, max_age_sec=30.0),
     )
     if note is None:
         return False
@@ -2827,19 +2986,35 @@ def _maybe_inject_cost_budget_milestone(
     tools: ToolRegistry,
     *,
     budget_remaining_usd: Optional[float],
-    cost_ceiling_usd: Optional[float],
+    cost_ceiling: Optional["task_pacing.CostCeiling"],
     accumulated_usage: Optional[Dict[str, Any]],
     event_queue: Optional[queue.Queue] = None,
     task_id: str = "",
     drive_logs: Optional[pathlib.Path] = None,
 ) -> bool:
     """Thin transport over the task_pacing cost axis (v6.56.0): content,
-    thresholds, and latch state live in ouroboros/task_pacing.py."""
+    thresholds, and latch state live in ouroboros/task_pacing.py. The deciding
+    spend under a root cap is the tree-accounted stash (free read; refreshed by
+    every dispatch) with a bounded staleness cap — never a per-round ledger
+    read, see ``_TREE_ACCOUNTING_MAX_STALE_SEC``."""
+    ceiling_usd = (
+        cost_ceiling.ceiling_usd
+        if cost_ceiling is not None and cost_ceiling.state == task_pacing.COST_CEILING_ACTIVE
+        else None
+    )
+    tree_info = _loop_tree_accounting(
+        refresh=True, max_age_sec=_TREE_ACCOUNTING_MAX_STALE_SEC,
+    )
+    tree_cost = tree_info.get("accounted_usd") if isinstance(tree_info, dict) else None
     note = task_pacing.build_cost_budget_note(
         tools._ctx,
         start_remaining_usd=budget_remaining_usd,
-        cost_ceiling_usd=cost_ceiling_usd,
+        cost_ceiling_usd=ceiling_usd,
         task_cost=(accumulated_usage or {}).get("cost"),
+        tree_cost_usd=tree_cost,
+        # Whether a tree cap exists at all decides if own cost is the complete
+        # picture or a disclosed lower bound (task_pacing.resolve_deciding_spend).
+        root_cap_usd=(cost_ceiling.root_cap_usd if cost_ceiling is not None else None),
     )
     if note is None:
         return False
@@ -2860,7 +3035,7 @@ def _inject_round_checkpoints(
     task_id: str,
     drive_logs: Optional[pathlib.Path],
     budget_remaining_usd: Optional[float] = None,
-    cost_ceiling_usd: Optional[float] = None,
+    cost_ceiling: Optional["task_pacing.CostCeiling"] = None,
 ) -> bool:
     """Inject the per-round self-check and the time-budget / intrinsic-pacing
     milestone AFTER owner messages, so the checkpoint is the LLM-call tail (a
@@ -2876,7 +3051,7 @@ def _inject_round_checkpoints(
     )
     cost_budget = _maybe_inject_cost_budget_milestone(
         messages, tools,
-        budget_remaining_usd=budget_remaining_usd, cost_ceiling_usd=cost_ceiling_usd,
+        budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling,
         accumulated_usage=accumulated_usage,
         event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
     )
@@ -5915,7 +6090,12 @@ def run_llm_loop(
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {}
     max_retries = 3
-    cost_ceiling_usd = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)
+    cost_ceiling = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)
+    if cost_ceiling.root_cap_usd is not None:
+        # Loop-start seed (one rare ledger read): a resumed/late-started member
+        # of a spending tree must see the real tree number before its first
+        # pacing surface, not a process-local empty stash.
+        _loop_tree_accounting(refresh=True, max_age_sec=0.0)
     from ouroboros.tools import tool_discovery as _td
     _td.set_registry(tools)
 
@@ -6021,10 +6201,18 @@ def run_llm_loop(
                 _merge_finalization_trace(llm_trace, forced_trace)
                 return text, accumulated_usage, llm_trace
 
+            # Typed soft landing (v6.91): the ledger fence stays the untouched
+            # backstop; an exhausted ceiling wraps up BEFORE spending a round.
+            _soft_land = _soft_land_exhausted_ceiling(limit_ctx, cost_ceiling)
+            if _soft_land is not None:
+                text, accumulated_usage, forced_trace = _soft_land
+                _merge_finalization_trace(llm_trace, forced_trace)
+                return text, accumulated_usage, llm_trace
+
             _checkpoint_injected = _inject_round_checkpoints(
                 round_idx=round_idx, max_rounds=MAX_ROUNDS, messages=messages, accumulated_usage=accumulated_usage,
                 emit_progress=emit_progress, tools=tools, event_queue=event_queue, task_id=task_id,
-                drive_logs=drive_logs, budget_remaining_usd=budget_remaining_usd, cost_ceiling_usd=cost_ceiling_usd)
+                drive_logs=drive_logs, budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling)
 
             messages, _compaction_usage = _run_round_compaction(
                 messages,
@@ -6141,7 +6329,7 @@ def run_llm_loop(
             budget_result = _check_budget_limits(
                 limit_ctx,
                 budget_remaining_usd,
-                cost_ceiling_usd=cost_ceiling_usd,
+                cost_ceiling=cost_ceiling,
             )
             if budget_result is not None:
                 text, accumulated_usage, budget_trace = budget_result
