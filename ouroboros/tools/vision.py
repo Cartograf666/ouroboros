@@ -317,10 +317,16 @@ def _resolve_vlm_model(client: Any, requested_model: str = "", *, ctx: Any = Non
 
 
 def _allowed_file_roots(ctx: Any = None) -> List["pathlib.Path"]:
-    """Roots a VLM file_path may be read from: the uploads dir PLUS — same trust
-    boundary the agent already has via read_file/run_command — the ACTIVE task
-    workspace, so it can analyze a screenshot it just produced. Never arbitrary
-    filesystem paths (no exfiltration surface the agent doesn't already hold)."""
+    """Roots a VLM file_path may be read from: the uploads dir + skill state PLUS
+    every resource root the ACTIVE PROFILE can already read via read_file — the
+    SAME trust boundary (derived from the ONE ``_POLICY`` matrix,
+    ``profile_readable_root_paths``, instead of a hand-maintained private list
+    that drifted: view_image could not see subagent_projects/deliverables while
+    verify could — the wave3 r8/r9 copy-shuffle). Widens nothing beyond what
+    read_file already reads; view_image stays image-only with a fail-closed MIME
+    sniff + size cap, and a path admitted only through the user_files home root
+    still clears the user_files secret/runtime guards
+    (``_user_files_only_admission_block``). Never arbitrary filesystem paths."""
     import pathlib
     data_dir = os.environ.get("OUROBOROS_DATA_DIR", "")
     if data_dir:
@@ -338,17 +344,49 @@ def _allowed_file_roots(ctx: Any = None) -> List["pathlib.Path"]:
             roots.append(pathlib.Path(active_repo_dir_for(ctx)).expanduser().resolve())
         except Exception:
             pass
-        # C3: the active task's first-class artifact roots (artifact_store +
-        # task_drive) are the SAME trust boundary the agent already holds via
-        # read_file/run_command — so a screenshot it just registered as an artifact
-        # is readable too. Never arbitrary paths (no new exfiltration surface).
-        for _root in ("artifact_store", "task_drive"):
-            try:
-                from ouroboros.tool_access import resource_root_path
-                roots.append(pathlib.Path(resource_root_path(ctx, _root)).expanduser().resolve())
-            except Exception:
-                pass
+        try:
+            from ouroboros.tool_access import profile_readable_root_paths
+            roots.extend(path for _label, path in profile_readable_root_paths(ctx))
+        except Exception:
+            # Fail-soft to the historical fixed set (artifact roots) so a
+            # matrix-resolution hiccup never blinds the tool entirely.
+            for _root in ("artifact_store", "task_drive"):
+                try:
+                    from ouroboros.tool_access import resource_root_path
+                    roots.append(pathlib.Path(resource_root_path(ctx, _root)).expanduser().resolve())
+                except Exception:
+                    pass
     return roots
+
+
+def _user_files_only_admission_block(ctx: Any, fp: "pathlib.Path") -> str:
+    """When ``fp`` is admitted ONLY through the user_files home root (not by any
+    narrower root such as the workspace/artifact/task/orchestrator roots), the
+    user_files confinement guards still apply — the same secret/credential/
+    runtime-overlap rules read_file enforces on that root. Empty = no objection."""
+    try:
+        from ouroboros.tool_access import (
+            profile_readable_root_paths,
+            resource_root_path,
+            user_files_path_block_reason,
+        )
+        import pathlib as _pl
+
+        try:
+            home = _pl.Path(resource_root_path(ctx, "user_files")).resolve(strict=False)
+        except Exception:
+            return ""  # profile has no user_files root — nothing to guard here
+        if not _path_is_under(fp, home):
+            return ""
+        for label, root in profile_readable_root_paths(ctx):
+            if label != "user_files" and _path_is_under(fp, root):
+                return ""  # admitted by a narrower root in its own right
+        reason = user_files_path_block_reason(ctx, fp)
+        if reason:
+            return f"⚠️ USER_FILES_PATH_BLOCKED: user_files path blocked: {reason}"
+    except Exception:
+        return ""
+    return ""
 
 
 def _load_local_image_payload(ctx: ToolContext, file_path: str) -> Tuple[Optional[Dict[str, str]], str]:
@@ -366,9 +404,13 @@ def _load_local_image_payload(ctx: ToolContext, file_path: str) -> Tuple[Optiona
     if not any(_path_is_under(fp, root) for root in allowed):
         return None, (
             f"⚠️ file_path must be inside the uploads directory, the skill-state tree "
-            f"(state/skills), the active task workspace, or the task's "
-            f"artifact_store/task_drive. Resolved path: {fp}. Use read_file for other paths."
+            f"(state/skills), or a resource root this profile can read "
+            f"(workspace / artifact_store / task_drive / subagent_projects / "
+            f"deliverables / user files). Resolved path: {fp}. Use read_file for other paths."
         )
+    _uf_block = _user_files_only_admission_block(ctx, fp)
+    if _uf_block:
+        return None, _uf_block
     # Honor the task protected-artifact policy: a workspace file may still be a
     # black-box protected artifact whose bytes must not be read (same contract as
     # read_file / query_code — block_reason_for_path with operation "read_bytes").

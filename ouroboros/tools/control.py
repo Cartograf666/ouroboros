@@ -200,6 +200,7 @@ def _finalize_schedule_emission(
     root_task_id: str,
     emitted_modes: List[str],
     write_surface: str = "",
+    coop_shared_tree: str = "",
 ) -> str:
     """Record the scheduled wave, emit swarm_fanout telemetry, and build the
     tool-result string. Extracted from _schedule_task to keep that function
@@ -210,7 +211,11 @@ def _finalize_schedule_emission(
     child inside the scheduling call — an answer about live availability, given
     before the child was queued, let alone started. The reduction now reaches the
     parent where it can act on it: in `[SUBTASK_OUTCOME]`, when it reads the answer
-    and decides how far to trust it."""
+    and decides how far to trust it. ``coop_shared_tree`` is the ONE exception by
+    design: the host-minted shared coop tree is a SCHEDULE-TIME fact (the parent's
+    effective write_root input, not a dispatch-time resolution), and withholding it
+    forced every wave to rediscover its own tree by trial and error (the submarine
+    waves' 'user_files path blocked' loop)."""
     worker_note = " (live queue emission requested)" if any(m == "live" for m in emitted_modes) else ""
     try:
         _record_scheduled_subagent(ctx, {
@@ -250,10 +255,23 @@ def _finalize_schedule_emission(
             predicted_subagent_profile(write_surface=write_surface))
     except Exception:
         pass
+    coop_note = ""
+    if str(coop_shared_tree or "").strip():
+        try:
+            import pathlib as _pl
+
+            _tree = _pl.Path(coop_shared_tree)
+            coop_note = (
+                f"\nshared coop tree: {_tree} — children write there "
+                "(write_surface=external_workspace); you read it via "
+                f"root=subagent_projects, path={_tree.name!r}/…"
+            )
+        except Exception:
+            coop_note = f"\nshared coop tree: {coop_shared_tree}"
     return (
         f"Subagent request queued {task_ids[0]}: {objective} "
         f"(requested_lane={requested_model_lane})"
-        f"{worker_note}{slot_note}{profile_note}"
+        f"{worker_note}{slot_note}{profile_note}{coop_note}"
     )
 
 
@@ -1125,15 +1143,17 @@ def _build_acting_constraint(
             "⚠️ TOOL_ARG_ERROR (schedule_subagent): write_surface must be one of "
             f"{allowed} (or omit it for a read-only subagent)."
         )
-    if not get_allow_mutative_subagents():
+    if not get_allow_mutative_subagents(write_surface):
         return (
-            "⚠️ MUTATIVE_SUBAGENTS_DISABLED: the OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS toggle "
-            "is not enabled. That toggle is the master gate: an explicit owner true/false "
-            "overrides the runtime-mode default, and runtime mode only sets the default when "
-            "the toggle is empty (default ON in advanced/pro, OFF in light). Schedule a "
-            "read-only subagent (omit write_surface), or have the owner enable "
-            "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS. Note: light blocks only self-repo/control-plane "
-            "writes (write_surface=self_worktree), not user/task/project deliverables."
+            "⚠️ MUTATIVE_SUBAGENTS_DISABLED: acting children with "
+            f"write_surface={write_surface!r} are disabled here. "
+            "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is the master gate: an explicit owner "
+            "true/false applies to every surface; when it is empty the runtime mode "
+            "decides — advanced/pro allow every surface, light allows the external "
+            "build surfaces (external_workspace, genesis — they write outside the "
+            "Ouroboros runtime) and keeps self_worktree (a checkout of the live body) "
+            "off. Schedule a read-only subagent (omit write_surface), use an external "
+            "surface, or have the owner enable the toggle."
         )
     grants: List[str] = []
     if isinstance(external_tool_grants, (list, tuple)):
@@ -1769,6 +1789,13 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         root_task_id=root_task_id_seed or current_task_id,
         emitted_modes=emitted_modes,
         write_surface=requested_surface,
+        # Host-minted shared coop tree only (a caller-supplied write_root is the
+        # parent's own knowledge already).
+        coop_shared_tree=(
+            effective_write_root
+            if effective_write_root and effective_write_root != str(params.get("write_root", "") or "")
+            else ""
+        ),
     )
 
 

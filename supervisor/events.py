@@ -2149,19 +2149,24 @@ def _resolve_subagent_constraint(
     req = requested_constraint if isinstance(requested_constraint, dict) else {}
     if str(req.get("mode") or "") != ACTING_SUBAGENT_MODE:
         return readonly, workspace_root, workspace_mode, ""
+    surface = str(req.get("surface") or "").strip().lower()
+    if surface not in VALID_WRITE_SURFACES:
+        return readonly, workspace_root, workspace_mode, f"Subagent rejected: invalid acting write_surface {surface!r}."
+    # SURFACE-AWARE master gate (Q4 sandbox unwind): the surface is validated
+    # first so the unset-toggle default can key on it — light allows the
+    # external build surfaces (external_workspace/genesis), never self_worktree.
     try:
         from ouroboros.config import get_allow_mutative_subagents
-        allowed = bool(get_allow_mutative_subagents())
+        allowed = bool(get_allow_mutative_subagents(surface))
     except Exception:
         allowed = False
     if not allowed:
         return readonly, workspace_root, workspace_mode, (
-            "Subagent rejected: mutative (acting) subagents are disabled in this runtime mode "
-            "(OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS). Reschedule read-only or enable the toggle."
+            f"Subagent rejected: acting subagents with write_surface={surface!r} are disabled "
+            "here (OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS; unset in light allows only "
+            "external_workspace/genesis). Reschedule read-only, use an external surface, or "
+            "enable the toggle."
         )
-    surface = str(req.get("surface") or "").strip().lower()
-    if surface not in VALID_WRITE_SURFACES:
-        return readonly, workspace_root, workspace_mode, f"Subagent rejected: invalid acting write_surface {surface!r}."
     grants = [str(g).strip() for g in (req.get("external_tool_grants") or []) if str(g).strip()]
     constraint = {
         "mode": ACTING_SUBAGENT_MODE,

@@ -136,8 +136,11 @@ Not every layer is required for every operation. Simple cases (e.g., `read_file`
   the system repo while contextual repo tools resolve against the active
   workspace through `ToolContext.active_repo_dir()`.
 - Workspace-mode tasks must use an explicit allowlist, reject system-repo/data
-  overlap, require a git worktree root, and return patch artifacts instead of
-  committing in the target repository.
+  overlap, require a git worktree root, and capture patch artifacts against the
+  preflight git base. Task-local git INCLUDING commits inside the workspace is
+  allowed — the v5.29 "no commits in external repositories" doctrine was
+  reversed in v6.27 ("full git is legitimate task work"); only git targeting
+  the Ouroboros runtime is blocked.
 - Workspace parent/headless tasks may call `task_acceptance_review`. For roots
   in auto/required mode, this call only records evidence for the single
   host-owned acceptance panel; it makes no reviewer-model call and returns no
@@ -536,7 +539,7 @@ Concrete requirements:
 
 | Flow | BIBLE.md | ARCHITECTURE.md | DEVELOPMENT.md |
 |------|----------|-----------------|----------------|
-| Main task context (`context.py`) | ✅ full (tier-0) | ✅ full for self-body tasks in max; navigation map for low, for external/headless/workspace tasks, and (v6.30.0) for evolution cycles — unless self-body docs are explicitly required (task field or contract) | ✅ full for self-body/runnable repo tasks (incl. evolution); external/headless/workspace tasks get an on-demand pointer unless the contract explicitly requires self-body docs |
+| Main task context (`context.py`) | ✅ full (tier-0) | ✅ full in max for EVERY task class — self-body, project tasks (folder or not), evolution, external/headless/workspace surfaces; navigation map in low (D-ARCH, owner 2026-08-08: architecture.md is the capability/tools/access map — without it the agent cannot reason about HOW to work effectively; context economy comes from dropping DEVELOPMENT.md, never ARCHITECTURE) | ✅ full for self-body/self-mod work (incl. evolution) — MODE-INDEPENDENT. D-DEV (owner 2026-08-08): DEVELOPMENT.md is the self-engineering handbook, so it loads exactly when the work targets Ouroboros's own body, and the signal is the ACTIVE REPO BINDING (`not _task_uses_external_context`) — a path fact, never a guess from message text (P5). The external-surface class (bound workspace incl. an auto-provisioned genesis tree, subagent, api/cli/scheduled) gets the visible on-demand pointer; a direct-chat turn in a PROJECT ROOM binds no workspace and KEEPS the handbook; `workspace="none"` keeps it; `context_requires_development`/`context_requires_self_body_docs` always win |
 | Triad review (`tools/review.py`) | ✅ via preamble | ✅ via `load_governance_doc` | ✅ via `load_governance_doc` |
 | ↳ Anti-thrashing (v4.35.1) | — | — | Open obligations loaded from `review_state` via `load_state(drive_root)` + `make_repo_key(repo_dir)`, injected unconditionally into `_build_review_history_section` prompt context. Same mechanism in `scope_review.py::_build_scope_prompt` (best-effort when `drive_root` available). |
 | Background consciousness (`consciousness.py`) | ✅ full | ✅ full (max) / navigation map (low) | — (not yet required) |
@@ -1011,6 +1014,7 @@ Before every commit, verify the following:
 - `run_script` temporary files are created under the active workspace when the task is workspace/executor-backed, then removed after execution. Do not run workspace scripts from the system repo temp path; relative imports, generated files, and toolchain discovery must observe the same cwd the user requested.
 - Declared process outputs may be files or directories. Directory outputs are copied to the canonical artifact store as a bounded manifest plus zip archive; hidden/control/credential-shaped files, excessive file counts, and excessive byte sizes fail closed instead of leaking through artifact registration.
 - In external workspace mode, light-mode self-repo dirty checks snapshot the system repo, not the active workspace. Task-local git operations inside the external workspace are allowed when the task requires them; Ouroboros repo/data paths remain structurally protected, and workspace patch artifacts are captured against the preflight git base.
+- The DEFAULT (non-workspace) shell lane carries the SAME target-aware git policy in every runtime mode including light (Q4=A sandbox unwind): mutating git is blocked only when it targets the Ouroboros runtime (system repo / any data drive — bidirectional, casefold, symlink-resolved containment; `commit_reviewed` is the remedy for self-repo changes), read-only git works everywhere including at the system repo, `allowed_resources.network=false` still fences network git subcommands, and acting `self_worktree` children keep the strict no-commit policy. `git init`/`commit`/`push` in `~/projects`, `/tmp`, an attached project folder, or a host-minted coop tree is legitimate task work, not a violation.
 - `claude_code_edit` is RETIRED (D10, owner-approved migration, phase 6.4): the SDK edit gateway's job moved to the delegated coding path — a mutating subagent (`schedule_subagent`) whose nanny drives the session with `delegate_start`/`delegate_wait`/`delegate_cancel`, on the owner's subscription when a harness route is configured. Compatibility is one-way and permanent: a saved task contract carrying `disabled_tools=["claude_code_edit"]` also withholds the successor `delegate_start` (registry `_disabled_tools`), and the frozen `GET /api/claude-code/status` + `POST /api/claude-code/install` endpoints stay — the Claude runtime still powers the api-route advisory review. Do not resurrect the tool name.
 - Do not recommend `runtime_data/uploads`, skill payloads, or owner state directories as generic artifact transport.
 
@@ -1060,7 +1064,10 @@ Before every commit, verify the following:
   execution rejects forbidden calls even when invoked manually.
 - Mutative ("acting") subagents (`task_constraint.mode="acting_subagent"`) are
   opt-in via `schedule_subagent(write_surface=...)` plus the master toggle
-  `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS` (default ON in advanced/pro, OFF in light).
+  `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS` (explicit owner value applies to every
+  surface; unset default is SURFACE-AWARE: every surface ON in advanced/pro,
+  light allows `external_workspace`/`genesis` — they build outside the Ouroboros
+  runtime — and keeps `self_worktree` OFF).
   `active_tool_profile` must fail closed: an invalid/missing surface, or a
   delegated subagent with a broken constraint, resolves to read-only — never to
   `self_modification`/`operator_control`. Acting children write only inside their
