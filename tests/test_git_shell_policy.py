@@ -155,6 +155,108 @@ def test_init_clone_targeting_the_runtime_still_blocked(cmd):
     assert _violation(cmd, cwd=str(REPO)), cmd
 
 
+@pytest.mark.parametrize("cmd", [
+    pytest.param("git init -b main /tmp/proj", id="init_split_branch_flag"),
+    pytest.param("git init --initial-branch=main /tmp/proj", id="init_glued_branch_flag"),
+    pytest.param("git init --template /tmp/tpl /tmp/proj", id="init_split_template_flag"),
+    pytest.param("git clone --depth 1 https://example.com/x.git /tmp/proj", id="clone_split_depth"),
+    pytest.param("git clone -b main https://example.com/x.git /tmp/proj", id="clone_split_branch"),
+    pytest.param("git clone -o upstream https://example.com/x.git /tmp/proj", id="clone_split_origin"),
+    pytest.param("git clone -j 4 https://example.com/x.git /tmp/proj", id="clone_split_jobs"),
+    pytest.param("git clone --filter blob:none https://example.com/x.git /tmp/proj", id="clone_split_filter"),
+    pytest.param("git clone --reference /tmp/ref https://example.com/x.git /tmp/proj", id="clone_split_reference"),
+])
+def test_destination_is_parsed_through_value_taking_flags(cmd):
+    """The Q4=A headline capability for its COMMONEST spellings. Positional index
+    arithmetic over a diff/branch/tag flag table knew nothing about init/clone's own
+    value-taking flags, so `git init -b main /tmp/proj` resolved destination='main'
+    and `git clone --depth 1 <url> /tmp/proj` resolved destination='<url>' — both
+    relative, both joined onto the default lane's cwd, which IS the system repo."""
+    assert _violation(cmd, cwd=str(REPO)) == "", cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    pytest.param("git init -b main repo/newtree", id="init_relative_destination_into_repo"),
+    pytest.param("git init --initial-branch=main data/newtree", id="init_glued_flag_relative_into_data"),
+    pytest.param("git clone --depth 1 https://example.com/x.git repo/newtree", id="clone_relative_into_repo"),
+    pytest.param("git clone -b main https://example.com/x.git data/newtree", id="clone_relative_into_data"),
+])
+def test_relative_destination_into_the_runtime_is_blocked(cmd):
+    """Mirror of the mis-parse: with an explicit destination the argument scan was
+    narrowed to `--flag=<path>` forms and ABSOLUTE paths, so a RELATIVE destination
+    pointing back INTO the runtime was never resolved. Relative candidates in that
+    branch must be canonicalized like everywhere else."""
+    assert _violation(cmd, cwd="/Users/anton/Ouroboros"), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    pytest.param("git clone -b feature/x https://example.com/x.git /tmp/proj", id="clone_split_slash_branch"),
+    pytest.param("git clone --branch=feature/x https://example.com/x.git /tmp/proj", id="clone_glued_slash_branch"),
+    pytest.param("git init --initial-branch=feature/x /tmp/proj", id="init_glued_slash_branch"),
+    pytest.param("git clone --revision refs/heads/x https://example.com/x.git /tmp/proj", id="clone_split_slash_revision"),
+])
+def test_nonpath_flag_values_with_slashes_are_not_resolved_as_paths(cmd):
+    """A hierarchical ref (`feature/x`, `refs/heads/x`) is path-SHAPED but is a
+    NAME to git. The destination-branch argument scan resolved it under the
+    effective base — from the default lane's system-repo cwd that lands inside
+    the runtime, false-blocking the Q4=A headline spelling with an idiomatic
+    branch name."""
+    assert _violation(cmd, cwd=str(REPO)) == "", cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    pytest.param("git clone -b feature/x https://example.com/x.git repo/newtree", id="slash_branch_does_not_hide_bad_destination"),
+    pytest.param("git init --separate-git-dir repo/x /tmp/proj", id="split_separate_git_dir_relative_into_runtime"),
+    pytest.param("git init --separate-git-dir repo /tmp/proj", id="split_separate_git_dir_bare_name_into_runtime"),
+    pytest.param("git init --separate-git-dir=repo /tmp/proj", id="glued_separate_git_dir_bare_name_into_runtime"),
+    pytest.param("git clone --reference repo https://example.com/x.git /tmp/proj", id="split_reference_relative_into_runtime"),
+])
+def test_nonpath_value_skip_does_not_weaken_containment(cmd):
+    """The skip covers only values git reads as names/numbers: the destination
+    itself and every PATH-taking flag value (`--separate-git-dir`, `--reference`,
+    `--template`) keep meeting the containment scan — by the FLAG's documented
+    type, so even a BARE name (`--separate-git-dir repo` from the runtime's
+    parent, which the path-SHAPE test alone would skip) is resolved and judged."""
+    assert _violation(cmd, cwd="/Users/anton/Ouroboros"), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    pytest.param("git init -b main", id="init_branch_flag_no_destination"),
+    pytest.param("git clone --depth 1 /tmp/src", id="clone_local_source_no_destination"),
+])
+def test_flagged_init_clone_without_a_destination_keeps_the_cwd_check(cmd):
+    """A flag VALUE left among the positionals is not a destination: `git init -b
+    main` and `git clone <src>` both mutate the CWD, so the cwd containment check
+    must still run (the default lane's cwd IS the system repo)."""
+    assert _violation(cmd, cwd=str(REPO)), cmd
+
+
+# --- read-only git that WRITES (the `--output` diff option) --------------------
+
+@pytest.mark.parametrize("cmd", [
+    pytest.param("git log --output=/Users/anton/Ouroboros/data/settings.json", id="log_output_into_data"),
+    pytest.param("git diff --output=/Users/anton/Ouroboros/repo/BIBLE.md", id="diff_output_into_repo"),
+    pytest.param("git show --output /Users/anton/Ouroboros/data/settings.json", id="show_split_output_into_data"),
+    pytest.param("git -C /tmp/x log --output=/Users/anton/Ouroboros/data/logs/chat.jsonl", id="minusC_output_into_data"),
+])
+def test_readonly_git_cannot_write_into_the_runtime_via_output(cmd):
+    """`log`/`show`/`diff` all accept the diff option `--output=<file>` and TRUNCATE
+    it (measured against real git). The read-only exemption skipped the whole target
+    block, so a "read-only" git could overwrite settings.json / any repo file."""
+    assert _violation(cmd, cwd="/tmp/ws"), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    pytest.param("git log --output=/tmp/history.txt", id="output_to_scratch"),
+    pytest.param("git diff --output=report.diff", id="output_relative_inside_workspace"),
+])
+def test_readonly_git_output_outside_the_runtime_stays_allowed(cmd):
+    """The mutation lands at the FILE, not at the cwd — judging the cwd instead
+    would refuse `git log --output=/tmp/x` from the default lane's system-repo cwd."""
+    assert _violation(cmd, cwd="/tmp/ws") == "", cmd
+    assert _violation("git log --output=/tmp/history.txt", cwd=str(REPO)) == ""
+
+
 def test_relative_argument_symlinked_into_the_runtime_is_blocked():
     """A relative arg with no `..` was skipped on the assumption that a plain
     descend from a safe base cannot reach a protected root. A SYMLINK breaks that
@@ -189,9 +291,34 @@ def test_relative_argument_symlinked_into_the_runtime_is_blocked():
     pytest.param("cat /etc/passwd", False, id="not_git_at_all"),
     pytest.param("sh -c 'git commit -m x'", False, id="mut_nested_shell"),
     pytest.param("", False, id="empty"),
+    # A read-only-looking invocation that WRITES a file is not read-only: the diff
+    # option `--output=<file>` truncates it, so it must meet the runtime/secret guard.
+    pytest.param("git log --output=/tmp/x.txt", False, id="output_flag_writes"),
+    pytest.param("git diff --output /tmp/x.txt", False, id="output_flag_split_writes"),
+    # ... and one that READS ARBITRARY FILES is not repo inspection either:
+    # `git diff --no-index /dev/null <secret>` PRINTS the file (measured).
+    pytest.param("git diff --no-index /dev/null /Users/anton/Ouroboros/data/settings.json", False, id="no_index_reads_any_file"),
+    # `-o` must NOT be read as an output flag: for this family it means something
+    # else entirely (`git ls-files -o` == --others) and matching it would refuse an
+    # ordinary untracked-file listing.
+    pytest.param("git ls-files -o", True, id="ls_files_others_is_not_an_output_flag"),
+    # `--output-indicator-new=<char>` is not a file either.
+    pytest.param("git diff --output-indicator-new=X", True, id="output_indicator_is_not_a_file"),
+    # `pushd`/`popd` are as neutral as `cd`: they read and write nothing.
+    pytest.param("pushd /Users/anton/Ouroboros/repo && git log", True, id="ro_pushd_then_git"),
 ])
 def test_is_readonly_git_command(cmd, expected):
     """ALL-or-nothing per segment: this is what lets read-only git through the
     external-workspace runtime-read guard WITHOUT opening a shell bypass for the
     secret/credential surface."""
     assert policy.is_readonly_git_command(cmd) is expected, cmd
+
+
+def test_pushd_moves_the_segment_walker_base_like_cd():
+    """Only `cd` moved the walker's base, so `pushd <runtime> && git commit` was
+    judged against the ORIGINAL base while the shell had actually chdir'd into the
+    runtime. At base the default lane blanket-blocked mutating git, so the flip is
+    what opens this; `popd` restores the pushed base."""
+    assert _violation("pushd /Users/anton/Ouroboros/repo && git commit -am x", cwd="/tmp/ws")
+    assert _violation("pushd /tmp/proj && git commit -am x", cwd=str(REPO)) == ""
+    assert _violation("pushd /tmp/proj && popd && git commit -am x", cwd=str(REPO))

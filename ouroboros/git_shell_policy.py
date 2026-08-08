@@ -137,14 +137,62 @@ def _git_tag_readonly(args: list[str]) -> bool:
     return read_hint or not positionals
 
 
+def _git_subcommand_is_readonly(subcmd: str, args: list[str]) -> bool:
+    """The subcommand alone reads and never writes (before flags are considered)."""
+    if subcmd in GIT_READONLY_SUBCOMMANDS:
+        return True
+    if subcmd == "branch":
+        return _git_branch_readonly(args)
+    if subcmd == "tag":
+        return _git_tag_readonly(args)
+    return False
+
+
+def _git_output_file_args(args: list[str]) -> list[str]:
+    """Values of git's ``--output=<file>`` diff option, which TRUNCATES and writes
+    <file>. ``log``/``show``/``diff`` all accept it (measured against real git:
+    ``git log -1 --output=<file>`` replaced the file's contents), so a subcommand
+    from the read-only set carrying it is NOT a read-only invocation.
+
+    ``-o`` is deliberately NOT matched: in this family it means something else
+    entirely (``git ls-files -o`` == ``--others``), and matching it would refuse an
+    ordinary untracked-file listing. ``--output-indicator-new=<char>`` and its
+    siblings are not files, which is why the glued form is matched on ``--output=``
+    rather than on the ``--output`` prefix."""
+    values: list[str] = []
+    idx = 0
+    while idx < len(args):
+        text = str(args[idx])
+        if text == "--output" and idx + 1 < len(args):
+            values.append(str(args[idx + 1]))
+            idx += 2
+            continue
+        if text.startswith("--output="):
+            values.append(text.split("=", 1)[1])
+        idx += 1
+    return values
+
+
+def _git_reads_arbitrary_files(args: list[str]) -> bool:
+    """``--no-index`` turns ``git diff``/``git grep`` into a general FILE reader:
+    ``git diff --no-index /dev/null <data>/settings.json`` prints the file verbatim
+    (measured). It writes nothing, so it is not a mutation — but it is not repo
+    inspection either, and must not ride the runtime/secret read-guard exemption.
+    Disclosed residual: git IMPLIES ``--no-index`` when it runs outside a work tree,
+    and that spelling is not classified here (no shell-parser arms race)."""
+    return any(str(arg) == "--no-index" for arg in args)
+
+
 def _git_invocation_block_reason(parts: list[str], *, allow_network: bool = True) -> str:
     subcmd, args = _git_subcommand_and_args(parts)
-    if not subcmd or subcmd in GIT_READONLY_SUBCOMMANDS:
+    if not subcmd:
         return ""
-    if subcmd == "branch" and _git_branch_readonly(args):
-        return ""
-    if subcmd == "tag" and _git_tag_readonly(args):
-        return ""
+    if _git_subcommand_is_readonly(subcmd, args):
+        # A read-only SUBCOMMAND carrying a file-WRITING flag is not a read-only
+        # invocation: `git log|show|diff --output=<file>` truncates <file>. Judged
+        # here, in the one classifier every consumer asks, so the exemption key and
+        # both target resolvers get the same honest answer.
+        return f"git {subcmd} --output" if _git_output_file_args(args) else ""
     if subcmd == "ls-remote":
         return "" if allow_network else "task_contract.allowed_resources.network=false blocks git ls-remote"
     return f"git {subcmd}"
@@ -159,23 +207,102 @@ def _git_invocation_block_reason(parts: list[str], *, allow_network: bool = True
 # explicit destination (`git init`, `git clone <url>`) the cwd IS the target and
 # the working-directory check applies as before.
 _GIT_DESTINATION_SUBCOMMANDS = frozenset({"init", "clone"})
+# SPLIT-form (`-b main`) options of init/clone that consume the next token. The
+# glued form (`--initial-branch=main`) needs no table. This is a CAPABILITY aid,
+# never a safety boundary: an option missing from it merely leaves its value among
+# the positionals, where the path-SHAPE test below decides — and a value that does
+# not look like a path leaves the cwd as the judged target (the conservative
+# answer), while one that does is resolved and containment-checked like any path.
+_GIT_DESTINATION_VALUE_FLAGS = frozenset({
+    "-b", "--initial-branch", "--branch", "-o", "--origin", "-u", "--upload-pack",
+    "-c", "--config", "--depth", "--reference", "--reference-if-able", "--template",
+    "--separate-git-dir", "--object-format", "--ref-format", "--filter", "-j",
+    "--jobs", "--shallow-since", "--shallow-exclude", "--server-option",
+    "--bundle-uri", "--revision",
+})
+# The subset whose value git interprets as something OTHER than a filesystem
+# path: a branch/remote/ref name, a number, a filter spec, a config pair. A
+# hierarchical ref (`-b feature/x`) is indistinguishable from a relative path by
+# SHAPE, so without this the destination-branch argument scan resolved it under
+# the effective base — a false block for the Q4=A headline spelling `git clone -b
+# feature/x <url> ~/projects/x` from the default lane's system-repo cwd. Values
+# of the PATH-taking flags (`--template`, `--reference`, `--separate-git-dir`,
+# `--bundle-uri`, `--upload-pack`) are deliberately NOT here: those genuinely
+# name filesystem paths and must keep meeting the containment scan.
+_GIT_DESTINATION_NONPATH_VALUE_FLAGS = frozenset({
+    "-b", "--initial-branch", "--branch", "-o", "--origin", "-c", "--config",
+    "--depth", "-j", "--jobs", "--filter", "--object-format", "--ref-format",
+    "--shallow-since", "--shallow-exclude", "--server-option", "--revision",
+})
+
+
+def _git_remote_url(token: str) -> bool:
+    """The token names a REMOTE (``scheme://host/path``, ``user@host:path``) rather
+    than a local path. Structural, not a scheme list: a ``://`` separator, or a
+    colon appearing before any path separator. A Windows drive spelling (``C:\\x``)
+    is a local path, not a remote."""
+    text = str(token or "")
+    if not text or text.startswith("-"):
+        return False
+    if "://" in text:
+        return True
+    if len(text) > 2 and text[1] == ":" and text[0].isalpha() and text[2] in "\\/":
+        return False  # C:\proj / C:/proj
+    head = text.split("/", 1)[0]
+    return ":" in head and not text.startswith(("/", ".", "~"))
+
+
+def _git_path_shaped(token: str) -> bool:
+    """The token names a filesystem path rather than a flag, a branch/remote name,
+    a URL or an option spec (``blob:none``). Used where the effective base may
+    ITSELF be a runtime root: joining a non-path token onto it would resolve
+    "inside the runtime" and refuse the whole invocation."""
+    text = str(token or "")
+    if not text or text.startswith("-") or _git_remote_url(text):
+        return False
+    if text in (".", "..") or text.startswith("~"):
+        return True
+    return "/" in text or os.sep in text or _shell_path(text).is_absolute()
+
+
+def _git_destination_positionals(subcmd: str, args: list[str]) -> list[str]:
+    """Operands of init/clone with known split-form option VALUES consumed."""
+    positionals: list[str] = []
+    skip = False
+    for arg in args:
+        text = str(arg)
+        if skip:
+            skip = False
+            continue
+        if text.startswith("-"):
+            skip = text in _GIT_DESTINATION_VALUE_FLAGS
+            continue
+        positionals.append(text)
+    return positionals
 
 
 def _git_explicit_destination(subcmd: str, args: list[str]) -> str:
     """The destination path of `init`/`clone`, or "" when the cwd is the target.
 
-    Positional-only: flags and their values are skipped, and for `clone` the FIRST
-    positional is the source (a URL or path) — the destination is the second."""
+    Judged STRUCTURALLY, not by positional index arithmetic over a flag table that
+    knows nothing about these two subcommands: the destination is the LAST operand,
+    and only when it looks like a path. A leftover option value (`-b main`), a bare
+    directory name (`git init proj`, which lands INSIDE the cwd) and `git clone
+    <src>` with no destination all answer "" — the cwd is then the target and the
+    working-directory containment check runs, which is the conservative answer."""
     if subcmd not in _GIT_DESTINATION_SUBCOMMANDS:
         return ""
-    value_indexes = _git_option_value_flags(args)
-    positionals = [
-        str(arg) for idx, arg in enumerate(args)
-        if not str(arg).startswith("-") and idx not in value_indexes
-    ]
+    positionals = _git_destination_positionals(subcmd, args)
+    if not positionals or not _git_path_shaped(positionals[-1]):
+        return ""
     if subcmd == "init":
-        return positionals[0] if positionals else ""
-    return positionals[1] if len(positionals) > 1 else ""
+        return positionals[-1]
+    # clone: the first URL-or-path operand is the SOURCE. A destination exists only
+    # when an operand FOLLOWS it — `git clone /tmp/src` clones into <cwd>/src.
+    for idx, token in enumerate(positionals):
+        if _git_remote_url(token) or _git_path_shaped(token):
+            return positionals[-1] if idx < len(positionals) - 1 else ""
+    return ""
 
 
 def is_readonly_git_command(raw_cmd: Any) -> bool:
@@ -190,13 +317,20 @@ def is_readonly_git_command(raw_cmd: Any) -> bool:
     Network-reaching read-only git (``ls-remote``) is unaffected here: the network
     fence is enforced by ``external_workspace_git_violation``, which runs first.
 
-    ``cd`` counts as neutral: it reads and writes nothing, so `cd <repo> && git log`
-    is the same read-only inspection as `git -C <repo> log` and must not be refused
-    for spelling it differently. Disclosed residual: git reached through a
-    transparent wrapper (``nice``/``xargs``) or from inside interpreter code is not
-    recognised as a git segment, so such a command still meets the full guard and is
-    refused when it names a runtime path — deliberately not chased with a shell
-    parser arms race (BIBLE P5)."""
+    Two flag families are NOT read-only however read-only their subcommand looks,
+    and both were measured against real git: ``--output=<file>`` (log/show/diff)
+    TRUNCATES and writes <file>, and ``--no-index`` (diff/grep) prints ANY file on
+    the host — `git diff --no-index /dev/null <data>/settings.json` dumps the
+    credentials. Neither may ride this exemption; both then meet the ordinary
+    runtime/secret guard, which refuses them only when they name a protected path.
+
+    ``cd``/``pushd``/``popd`` count as neutral: they read and write nothing, so `cd
+    <repo> && git log` is the same read-only inspection as `git -C <repo> log` and
+    must not be refused for spelling it differently. Disclosed residual: git reached
+    through a transparent wrapper (``nice``/``xargs``) or from inside interpreter
+    code is not recognised as a git segment, so such a command still meets the full
+    guard and is refused when it names a runtime path — deliberately not chased with
+    a shell parser arms race (BIBLE P5)."""
     segments = shell_segments(raw_cmd)
     if not segments:
         return False
@@ -208,7 +342,7 @@ def is_readonly_git_command(raw_cmd: Any) -> bool:
         if not command:
             return False
         name = pathlib.PurePath(str(command[0]).strip("`'\"")).name.lower()
-        if name == "cd":
+        if name in {"cd", "pushd", "popd"}:
             continue
         if name in {"bash", "sh", "zsh"}:
             inline = shell_command_string(command)
@@ -220,6 +354,8 @@ def is_readonly_git_command(raw_cmd: Any) -> bool:
             return False
         # allow_network=True so this answers ONLY "does this invocation mutate?".
         if _git_invocation_block_reason(command, allow_network=True):
+            return False
+        if _git_reads_arbitrary_files(_git_subcommand_and_args(command)[1]):
             return False
         saw_git = True
     return saw_git
@@ -280,6 +416,36 @@ def _shell_path(text: str) -> pathlib.Path:
     return pathlib.Path(os.path.expandvars(str(text or ""))).expanduser()
 
 
+def _resolve_shell_arg(value: str, base_dir: pathlib.Path) -> pathlib.Path:
+    target = _shell_path(value)
+    if not target.is_absolute():
+        target = base_dir / target
+    return target.resolve(strict=False)
+
+
+def _git_effective_base(invocation: list[str], base: pathlib.Path) -> pathlib.Path:
+    """The directory git actually works in: global `-C <path>` flags (before the
+    subcommand) CHDIR sequentially BEFORE git does anything, so the EFFECTIVE
+    working directory — not the shell cwd — is what an invocation targets. Chained
+    so `git -C /tmp/proj commit` from a runtime cwd (the default lane's default cwd
+    IS the system repo) stays allowed, while `git -C <runtime> commit` from anywhere
+    hits the same containment check. `-C` AFTER the subcommand is subcommand syntax
+    (`git commit -C <commit>` reuses a message) and is not a path."""
+    effective_base = base
+    idx = 1
+    while idx < len(invocation):
+        part = str(invocation[idx])
+        if part == "-C" and idx + 1 < len(invocation):
+            effective_base = _resolve_shell_arg(str(invocation[idx + 1]), effective_base)
+            idx += 2
+            continue
+        if part.startswith("-"):
+            idx += 2 if part in ("-c", "--git-dir", "--work-tree") else 1
+            continue
+        break  # the subcommand
+    return effective_base
+
+
 def external_workspace_git_violation(
     raw_cmd: Any,
     *,
@@ -329,13 +495,9 @@ def external_workspace_git_violation(
                 return str(root)
         return ""
 
-    def _resolve(value: str, base_dir: pathlib.Path) -> pathlib.Path:
-        target = _shell_path(value)
-        if not target.is_absolute():
-            target = base_dir / target
-        return target.resolve(strict=False)
-
+    _resolve = _resolve_shell_arg
     current_base = base
+    dir_stack: list[pathlib.Path] = []
     # GIT_DIR/GIT_WORK_TREE exported in EARLIER segments (or inherited from an
     # enclosing shell that carried them into this `sh -c ...`).
     session_env: dict[str, str] = {
@@ -383,48 +545,49 @@ def external_workspace_git_violation(
                     if key in ("GIT_DIR", "GIT_WORK_TREE"):
                         session_env[key] = value
             continue
-        if cmd_name == "cd" and len(command) >= 2:
+        # `pushd` chdirs exactly like `cd` (and remembers where it came from), so a
+        # walker that tracks only `cd` judges a later git segment against the
+        # ORIGINAL base while the shell has really moved into the runtime. `pushd`
+        # with a rotation/flag operand (`pushd +1`, `pushd -n`) leaves the base
+        # alone — the conservative answer, and the disclosed residual.
+        if cmd_name in {"cd", "pushd"} and len(command) >= 2 and not str(command[1]).startswith(("-", "+")):
+            if cmd_name == "pushd":
+                dir_stack.append(current_base)
             target = _shell_path(str(command[1]))
             current_base = target if target.is_absolute() else (current_base / target)
             current_base = current_base.resolve(strict=False)
             continue
+        if cmd_name == "popd" and dir_stack:
+            current_base = dir_stack.pop()
+            continue
         if cmd_name != "git":
             continue
         invocation = command
+        _subcmd, _sub_args = _git_subcommand_and_args(invocation)
+        _output_files = _git_output_file_args(_sub_args)
         # READ-ONLY git is never target-checked: `git status`/`log`/`diff` at the
         # system repo is the vcs_status-equivalent inspection lane, and blocking
         # it is the recorded false-block class (v4.5.1; f14baf8f). Classification
         # deliberately probes with allow_network=True so it answers ONLY "does
         # this invocation mutate?" — the contract's network fence is enforced
         # separately at the tail, for read-only and mutating git alike.
-        if _git_invocation_block_reason(invocation, allow_network=True):
-            # Global `-C <path>` flags (before the subcommand) CHDIR sequentially
-            # BEFORE git does anything: the EFFECTIVE working directory — not the
-            # shell cwd — is what a mutating invocation targets. Chain them so
-            # `git -C /tmp/proj commit` from a runtime cwd (the default lane's
-            # default cwd IS the system repo) stays allowed, while
-            # `git -C <runtime> commit` from anywhere hits the same containment
-            # check. `-C` AFTER the subcommand is subcommand syntax (e.g.
-            # `git commit -C <commit>` reuses a message) and is not a path.
-            effective_base = current_base
-            j = 1
-            while j < len(invocation):
-                part = str(invocation[j])
-                if part == "-C" and j + 1 < len(invocation):
-                    effective_base = _resolve(str(invocation[j + 1]), effective_base)
-                    j += 2
-                    continue
-                if part.startswith("-"):
-                    j += 2 if part in ("-c", "--git-dir", "--work-tree") else 1
-                    continue
-                break  # the subcommand
+        if _output_files and _git_subcommand_is_readonly(_subcmd, _sub_args):
+            # `git log|show|diff --output=<file>` READS the repository (allowed in
+            # every lane, at a runtime target too) and WRITES <file>. The mutation
+            # lands at the FILE, exactly like init/clone's destination — so judge
+            # the file and never the cwd, or `git log --output=/tmp/x` from the
+            # default lane's system-repo cwd becomes a false block.
+            for value in _output_files:
+                if _protected_label(_resolve(value, _git_effective_base(invocation, current_base))):
+                    return "git invocation writes into the Ouroboros runtime"
+        elif _git_invocation_block_reason(invocation, allow_network=True):
+            effective_base = _git_effective_base(invocation, current_base)
             # `git init <dir>` / `git clone <url> <dir>` mutate the DESTINATION, not
             # the working directory, so for those the destination — never the cwd —
             # is what containment must judge. Without this, the default lane (whose
             # default cwd IS the system repo) refused `git init ~/projects/foo`,
             # contradicting the owner contract that mutating git is free in every
             # lane and mode OUTSIDE the runtime roots.
-            _subcmd, _sub_args = _git_subcommand_and_args(invocation)
             destination = _git_explicit_destination(_subcmd, _sub_args)
             if destination:
                 if _protected_label(_resolve(destination, effective_base)):
@@ -469,22 +632,45 @@ def external_workspace_git_violation(
                 if _protected_label(target):
                     return "git invocation targets the Ouroboros runtime"
             # When the cwd check was skipped (init/clone with a destination) the base
-            # may itself BE a runtime root, so resolving every bare relative token
-            # under it would refuse the whole invocation — `clone`, a branch name and
-            # the remote URL all resolve "inside the runtime" there. Narrow the scan
-            # to the tokens that genuinely name a path: `--flag=<path>` forms (this is
-            # what keeps `git init --separate-git-dir=<runtime> /tmp/x` blocked) and
-            # absolute paths. Every other invocation keeps the full argument scan.
-            scan_args = invocation[1:]
-            if destination:
-                scan_args = [
-                    a for a in scan_args
-                    if (str(a).startswith("--") and "=" in str(a)) or _shell_path(str(a)).is_absolute()
-                ]
-            for arg in scan_args:
+            # may itself BE a runtime root, so resolving every bare token under it
+            # would refuse the whole invocation — the subcommand word, a branch name
+            # and the remote URL all resolve "inside the runtime" there. Skip the
+            # tokens that do not NAME a path (flags, URLs, `blob:none`, a bare branch
+            # name) instead of skipping every relative one: dropping relatives left
+            # the mirror hole, where a relative destination pointing back INTO the
+            # runtime (`git clone --depth 1 <url> repo/newtree` from ~/Ouroboros) was
+            # never resolved. Every other invocation keeps the full argument scan.
+            skip_value = False
+            pending_path_value = False
+            for arg in invocation[1:]:
                 text = str(arg)
+                if skip_value:
+                    skip_value = False
+                    continue
+                is_path_value = pending_path_value
+                pending_path_value = False
+                if not is_path_value and destination and text.startswith("-"):
+                    # Option VALUES are classified by the FLAG's documented type,
+                    # not by the token's shape: `-b feature/x` is a ref name to
+                    # git (resolving it under a runtime base is the slash-branch
+                    # false block), while `--separate-git-dir repo` is a PATH to
+                    # git even as a bare name (the shape test would let it slip
+                    # the scan from the runtime's parent directory).
+                    flag = text.split("=", 1)[0]
+                    if flag in _GIT_DESTINATION_NONPATH_VALUE_FLAGS:
+                        skip_value = "=" not in text
+                        continue
+                    if flag in _GIT_DESTINATION_VALUE_FLAGS:
+                        if "=" in text:
+                            text = text.split("=", 1)[1]
+                            is_path_value = True
+                        else:
+                            pending_path_value = True
+                            continue
                 if "=" in text and text.startswith("--"):
                     text = text.split("=", 1)[1]
+                if destination and not is_path_value and not _git_path_shaped(text):
+                    continue
                 candidate = _shell_path(text)
                 if not candidate.is_absolute():
                     # Relative args resolve under the effective base and are ALWAYS
