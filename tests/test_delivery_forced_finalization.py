@@ -1196,8 +1196,9 @@ def test_orphan_label_keeps_cancelled_lifecycle_and_terminal_result(monkeypatch,
 def test_orphan_note_names_claimed_but_failed_disposition(monkeypatch, tmp_path):
     """W2: a child whose disposition row exists on the blackboard but no longer
     binds the current result was READ and decided — the forced orphan note says
-    'integrated claimed, disposition write failed (stale result hash…)' instead
-    of the misleading 'unread'."""
+    so instead of the misleading 'unread'. It says only what the ledger PROVES:
+    the row exists, so the write did NOT fail; the binding to the current result
+    is what is missing."""
     import ouroboros.loop as loop
     from ouroboros.tools.join_ledger import _child_result_sha256
 
@@ -1218,9 +1219,22 @@ def test_orphan_note_names_claimed_but_failed_disposition(monkeypatch, tmp_path)
 
     note = loop._forced_orphan_note(SimpleNamespace())
 
-    assert "integrated claimed, disposition write failed" in note
-    assert "stale result hash" in note
+    assert "integrated recorded for an EARLIER result hash" in note
+    assert "the current result is not bound" in note
     assert "child1 [completed;" in note
+    # The row's existence disproves a failed write; the note must not claim one.
+    assert "write failed" not in note
+
+    # Same row, hash STILL matching: the write plainly succeeded and bound, so the
+    # honest gap is the projection this round, not the ledger.
+    monkeypatch.setattr(
+        loop,
+        "_claimed_child_dispositions",
+        lambda _ctx: {"child1": ("integrated", _child_result_sha256(child))},
+    )
+    bound_note = loop._forced_orphan_note(SimpleNamespace())
+    assert "recorded for this exact result hash" in bound_note
+    assert "write failed" not in bound_note
 
 
 def test_claimed_child_dispositions_reads_the_blackboard(tmp_path):

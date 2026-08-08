@@ -4169,22 +4169,28 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
             tid = str(c.get("task_id") or c.get("id") or "?")
             st = str(c.get("status") or "?").strip().lower()
             lifecycle = "running" if st not in FINAL_STATUSES else st
-            # W2: a child whose LATEST blackboard decision row claims a disposition
-            # that no longer binds the current result was READ and decided — the
-            # write failed to close it (usually the child changed after the
-            # decision). Say that instead of the misleading "unread".
+            # W2: a child whose LATEST blackboard decision row names a disposition
+            # that no longer binds the current result was READ and decided — say
+            # that instead of the misleading "unread". Say only what the ledger
+            # PROVES: the row EXISTS, so the write did NOT fail; what failed is the
+            # binding to the result standing now. (The pre-audit wording claimed a
+            # failed write, which the presence of the row disproves.)
             claim = claimed.get(tid)
             if claim is not None:
                 disposition, row_sha = claim
                 from ouroboros.tools.join_ledger import _child_result_sha256
 
-                reason = (
-                    "stale result hash — the child changed after the decision; "
-                    "re-inspect and re-submit the current hash"
-                    if _child_result_sha256(c) != row_sha
-                    else "row did not bind"
-                )
-                return f"{tid} [{lifecycle}; {disposition} claimed, disposition write failed ({reason})]"
+                if _child_result_sha256(c) != row_sha:
+                    detail = (
+                        f"{disposition} recorded for an EARLIER result hash; the current "
+                        "result is not bound — re-inspect and re-submit the current hash"
+                    )
+                else:
+                    detail = (
+                        f"{disposition} recorded for this exact result hash but not carried "
+                        "by this round's disposition projection — re-submit to close it"
+                    )
+                return f"{tid} [{lifecycle}; {detail}]"
             terminal = str(c.get("child_status") or "").strip().lower()
             if terminal and terminal != st:
                 return f"{tid} [{lifecycle}; terminal_result={terminal}]"
