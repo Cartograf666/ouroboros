@@ -879,8 +879,8 @@ def _promote_chat_to_task(
         source_confirmation = f" [{detail}]" if detail else ""
         response = (
             f"OK: task {tid}{scope_note} accepted and durably scheduled ({mode}).{source_confirmation} "
-            "The conversation lane stays free; the owner sees a live task card and can "
-            "steer the running task from chat. Use wait_task/get_task_result if its result "
+            "The task now runs independently, and follow-up chat can steer it. "
+            "Use wait_task/get_task_result if its result "
             "is needed in this conversation."
         )
         return _finish_swarm_handoff(ctx, evt, response, status="scheduled")
@@ -2513,12 +2513,12 @@ def _wait_for_tasks(
 # 300-line function gate; v6.70.0 added the ground-truth-probe contract).
 _PROMOTE_CHAT_DESCRIPTION = (
     "Promote real work out of this conversation into a supervised pooled task "
-    "with a live card (the conversation lane stays free for the owner). Use it "
+    "while the conversation remains available. Use it "
     "whenever a chat request needs tools/files/multi-step work rather than a "
     "conversational answer. Before framing the objective around an EXISTING artifact "
     "('check/fix/extend the X skill/file'), ground-truth its existence with one cheap probe "
     "first (skills: list_skills; files: list_files) — memory of past work is not evidence "
-    "the referent still exists. Always give a short `title` (the card's name). To "
+    "the referent still exists. Always give a short, human-readable task `title`. To "
     "CREATE A NEW NAMED PROJECT and do the work there (owner asked to 'create a "
     "project called X and …'), set `project_name` — the project is created now "
     "and this task runs inside it (my own judgment: the owner's phrasing is intent, "
@@ -2528,8 +2528,8 @@ _PROMOTE_CHAT_DESCRIPTION = (
     "`workspace_root` points at a working folder. A project-scoped task inherits "
     "the project's working folder as its ACTIVE WORKSPACE by default (its file/"
     "shell/git tools operate there, not on the Ouroboros repo); pass "
-    "workspace='none' for a folder-less task. Owner follow-ups reach the "
-    "running task via its mailbox. Report creation only when this tool returns "
+    "workspace='none' for a folder-less task. Owner follow-ups can steer the "
+    "running task. Report creation only when this tool returns "
     "OK; PROMOTE_REJECTED or PROMOTE_UNCONFIRMED means the task must not be "
     "claimed as created, and UNCONFIRMED must not be retried automatically."
 )
@@ -2561,7 +2561,7 @@ def get_tools() -> List[ToolEntry]:
                 "type": "object",
                 "properties": {
                     "objective": {"type": "string", "description": "What the task must accomplish."},
-                    "title": {"type": "string", "description": "A short human name for this task/card (<=80 chars, e.g. 'Tic-tac-toe game'). Reused as the project name if the owner later turns the card into a project — so coin a clean, concise one.", "default": ""},
+                    "title": {"type": "string", "description": "A short human-readable task name (<=80 chars, e.g. 'Tic-tac-toe game'). Reused as the project name if the owner later turns the task into a project — so coin a clean, concise one.", "default": ""},
                     "project_name": {"type": "string", "description": "Set ONLY to create a brand-new NAMED project now and run this task inside it (e.g. 'airi research'). The display name; a filesystem id is derived from it.", "default": ""},
                     "expected_output": {"type": "string", "description": "What done looks like.", "default": ""},
                     "project_id": {"type": "string", "description": "Optional EXISTING project scope (filesystem-clean id).", "default": ""},
