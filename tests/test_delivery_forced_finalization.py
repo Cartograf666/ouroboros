@@ -1192,6 +1192,66 @@ def test_orphan_label_keeps_cancelled_lifecycle_and_terminal_result(monkeypatch,
 
     assert "child1 [cancelled; terminal_result=completed]" in note
 
+
+def test_orphan_note_names_claimed_but_failed_disposition(monkeypatch, tmp_path):
+    """W2: a child whose disposition row exists on the blackboard but no longer
+    binds the current result was READ and decided — the forced orphan note says
+    'integrated claimed, disposition write failed (stale result hash…)' instead
+    of the misleading 'unread'."""
+    import ouroboros.loop as loop
+    from ouroboros.tools.join_ledger import _child_result_sha256
+
+    child = {
+        "task_id": "child1",
+        "status": "completed",
+        "result": "new result the parent has not re-hashed",
+    }
+    monkeypatch.setattr(loop, "_direct_child_results", lambda _ctx: [dict(child)])
+    monkeypatch.setattr(loop, "_child_disposition_state", lambda _child: "")
+    stale_sha = "0" * 64
+    assert _child_result_sha256(child) != stale_sha
+    monkeypatch.setattr(
+        loop,
+        "_claimed_child_dispositions",
+        lambda _ctx: {"child1": ("integrated", stale_sha)},
+    )
+
+    note = loop._forced_orphan_note(SimpleNamespace())
+
+    assert "integrated claimed, disposition write failed" in note
+    assert "stale result hash" in note
+    assert "child1 [completed;" in note
+
+
+def test_claimed_child_dispositions_reads_the_blackboard(tmp_path):
+    from ouroboros.task_tree_ledger import tree_ledger_append
+    import ouroboros.loop as loop
+
+    tree_ledger_append(
+        "root1", "decision", "integrated after review",
+        task_id="parent1", role="orchestrator",
+        payload={
+            "type": "child_result_disposition", "child_task_id": "child1",
+            "disposition": "integrated", "child_result_sha256": "a" * 64,
+        },
+        allow_child_result_disposition=True,
+        data_root=tmp_path,
+    )
+    # A plain decision note (no typed payload) and another parent's row are ignored.
+    tree_ledger_append(
+        "root1", "decision", "plain note", task_id="parent1", data_root=tmp_path,
+    )
+    ctx = SimpleNamespace(
+        status_drive_root=tmp_path, drive_root=tmp_path,
+        root_task_id="root1", task_id="parent1",
+    )
+
+    claims = loop._claimed_child_dispositions(ctx)
+
+    assert claims == {"child1": ("integrated", "a" * 64)}
+    # Fail-soft on junk context.
+    assert loop._claimed_child_dispositions(SimpleNamespace()) == {}
+
 # ---------------------------------------------------------------------------
 # Typed acceptance-bypass records on forced rails (W2): every forced exit that
 # owed an acceptance panel stamps {finalized_unaccepted, acceptance_bypassed_<rail>}

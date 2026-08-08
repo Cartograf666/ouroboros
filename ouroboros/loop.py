@@ -4151,6 +4151,7 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
         from ouroboros.task_status import FINAL_STATUSES
 
         children = _direct_child_results(ctx)
+        claimed = _claimed_child_dispositions(ctx)
 
         def _undecided(c: Dict[str, Any]) -> bool:
             if _child_disposition_state(c) in {
@@ -4168,6 +4169,22 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
             tid = str(c.get("task_id") or c.get("id") or "?")
             st = str(c.get("status") or "?").strip().lower()
             lifecycle = "running" if st not in FINAL_STATUSES else st
+            # W2: a child whose LATEST blackboard decision row claims a disposition
+            # that no longer binds the current result was READ and decided — the
+            # write failed to close it (usually the child changed after the
+            # decision). Say that instead of the misleading "unread".
+            claim = claimed.get(tid)
+            if claim is not None:
+                disposition, row_sha = claim
+                from ouroboros.tools.join_ledger import _child_result_sha256
+
+                reason = (
+                    "stale result hash — the child changed after the decision; "
+                    "re-inspect and re-submit the current hash"
+                    if _child_result_sha256(c) != row_sha
+                    else "row did not bind"
+                )
+                return f"{tid} [{lifecycle}; {disposition} claimed, disposition write failed ({reason})]"
             terminal = str(c.get("child_status") or "").strip().lower()
             if terminal and terminal != st:
                 return f"{tid} [{lifecycle}; terminal_result={terminal}]"
@@ -4198,6 +4215,43 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
         return "".join(notes)
     except Exception:
         return ""
+
+
+def _claimed_child_dispositions(ctx: _RoundLimitContext) -> Dict[str, tuple]:
+    """task_id -> (disposition, row_sha) from THIS parent's latest blackboard
+    decision rows (W2). Consulted only for children the disposition projection
+    left undecided: a row that exists but no longer binds is audit evidence of a
+    claimed-but-failed disposition write, and the forced orphan note must say so
+    instead of calling the child unread. Pure read, never raises."""
+    try:
+        from ouroboros.task_tree_ledger import CHILD_RESULT_DISPOSITION_TYPE, tree_ledger_rows
+
+        status_root = (
+            getattr(ctx, "status_drive_root", None)
+            or getattr(ctx, "drive_root", None)
+        )
+        root_id = str(getattr(ctx, "root_task_id", "") or getattr(ctx, "task_id", "") or "")
+        parent_id = str(getattr(ctx, "task_id", "") or "")
+        if status_root is None or not root_id or not parent_id:
+            return {}
+        claims: Dict[str, tuple] = {}
+        for row in tree_ledger_rows(root_id, data_root=pathlib.Path(status_root)):
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            if (
+                str(row.get("kind") or "") == "decision"
+                and str(payload.get("type") or "") == CHILD_RESULT_DISPOSITION_TYPE
+                and str(row.get("task_id") or "") == parent_id
+                and str(payload.get("child_task_id") or "")
+            ):
+                # Later rows win: the ledger is append-only and the newest decision
+                # is the one whose failure to bind is worth naming.
+                claims[str(payload["child_task_id"])] = (
+                    str(payload.get("disposition") or ""),
+                    str(payload.get("child_result_sha256") or ""),
+                )
+        return claims
+    except Exception:
+        return {}
 
 
 def _undispositioned_children(ctx: _RoundLimitContext) -> list[Dict[str, Any]]:
