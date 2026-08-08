@@ -98,9 +98,19 @@ _OPEN_OBLIGATION = {
     "status": "open", "disposition": "",
 }
 
+# The clean-pass fixture carries supported criteria WITH evidence_refs: the
+# evidence condition is unconditional since D-Q5 deleted the constant-true
+# require_criterion_evidence knob (production panels always ran it True, so a
+# real clean PASS always looked exactly like this).
 _CLEAN_PASS = dict(
     aggregate="PASS",
-    actors=[_actor("s0", "PASS", {"verdict": "PASS", "outcome_tier": "solved"})],
+    actors=[_actor("s0", "PASS", {
+        "verdict": "PASS", "outcome_tier": "solved",
+        "criteria_used": [{
+            "criterion": "deliverable is verified", "status": "supported",
+            "evidence_refs": ["verification_summary"],
+        }],
+    })],
 )
 # A PASS whose `solved` claim lacks supported criterion evidence: NOT clean, yet the
 # capsule has nothing actionable (no findings, no dissent, solved tier) — the A14 branch.
@@ -358,6 +368,44 @@ def test_supersede_paths_request_a_revision_with_their_own_reason(tmp_path):
              "reason": REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE},
             "not_eligible", False,
         ),
+        # Forced-rail bypass reasons (closed enum) ride the SAME (status, reason,
+        # eligibility) key — an eligible panel bypassed by a rail is never clean.
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_budget_exhausted"},
+            "eligible", True,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_round_limit"},
+            "eligible", True,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_deadline"},
+            "eligible", True,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_provider_unavailable"},
+            "eligible", True,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_children_unabsorbed"},
+            "eligible", True,
+        ),
+        # Bypass reason without eligibility (unknown / not_eligible) never degrades.
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_budget_exhausted"},
+            "not_eligible", False,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_budget_exhausted"},
+            "unknown", False,
+        ),
     ],
 )
 def test_deadline_reserve_degradation_keys_on_status_plus_reason(decision, eligibility, degrades):
@@ -371,14 +419,24 @@ def test_deadline_reserve_degradation_keys_on_status_plus_reason(decision, eligi
         },
     )
     axes = outcome["outcome_axes"]
+    is_deadline_reserve = (
+        decision["reason"] == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+    )
     if degrades:
         assert axes["execution"]["status"] == "degraded"
-        assert axes["execution"]["reason_code"] == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+        # The typed reason itself is the degradation reason_code — deadline-reserve
+        # keeps its historical token, a forced-rail bypass carries its own.
+        assert axes["execution"]["reason_code"] == decision["reason"]
         assert axes["objective"]["status"] == "degraded"
-        assert axes["objective"]["source"] == "task_acceptance_deadline_reserve"
+        assert axes["objective"]["source"] == (
+            "task_acceptance_deadline_reserve"
+            if is_deadline_reserve else "task_acceptance_forced_bypass"
+        )
     else:
         assert axes["execution"]["status"] == "ok"
-        assert axes["objective"].get("source") != "task_acceptance_deadline_reserve"
+        assert axes["objective"].get("source") not in {
+            "task_acceptance_deadline_reserve", "task_acceptance_forced_bypass",
+        }
 
 
 def test_acceptance_projection_carries_the_typed_reason():

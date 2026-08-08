@@ -352,6 +352,33 @@ def _accept_verification_summary(receipts: list) -> Dict[str, Any]:
     }
 
 
+def _accept_effective_claims(
+    ctx: Any, contract: Dict[str, Any], drive_root: Any, task_id: str,
+) -> tuple[list, str]:
+    """Effective claims + provenance for the packet, via the ONE pure seam
+    (contracts.task_contract.effective_acceptance_claims): ingress-contract claims
+    first, the CLOSED plan wave's frozen claims only when ingress is empty. The
+    plan-state lookup mirrors plan_task's own state location (budget_drive_root
+    first) and is FAIL-SOFT — a claims lookup must never break packet building."""
+    from ouroboros.contracts.task_contract import effective_acceptance_claims
+
+    claims, source = effective_acceptance_claims(contract)
+    if claims:
+        return claims, source
+    root = getattr(ctx, "budget_drive_root", None) or drive_root
+    if not root or not str(task_id or ""):
+        return [], ""
+    try:
+        from ouroboros.task_results import closed_plan_review_wave, load_plan_review_state
+
+        wave = closed_plan_review_wave(
+            load_plan_review_state(pathlib.Path(str(root)), str(task_id))
+        )
+    except Exception:
+        return [], ""
+    return effective_acceptance_claims(contract, wave)
+
+
 def _accept_claim_support_refs(contract: Dict[str, Any], receipts: list) -> list[Dict[str, Any]]:
     """Host-built support references for acceptance claims.
 
@@ -429,6 +456,160 @@ def _accept_claim_support_refs(contract: Dict[str, Any], receipts: list) -> list
             "support_status": "supported" if supported else ("declared_only" if declared_only else ("linked_failed" if refs else "missing")),
         })
     return out
+
+
+# D-Q5 non-resolving basis kinds: the ref NAMES a real packet entry, but that
+# entry is not host-attested support. Kept as a CLOSED set beside the vocabulary
+# so the disclosure row can say WHICH entry was named (never a bare "") while the
+# clean gate still refuses to count it as resolved evidence.
+CLAIM_ID_UNSUPPORTED = "claim_id_unsupported"
+NON_RESOLVING_BASIS_KINDS = frozenset({CLAIM_ID_UNSUPPORTED})
+
+# D-Q5 fail-closed row: the host could not resolve this panel's refs at all. It
+# carries the SAME `supported_evidence_resolves=False` the clean gate already
+# reads for an unresolved ref, so a broken resolver degrades the clean bit
+# instead of authorizing it. `criterion="*"` marks it as panel-wide, not a
+# reviewer-named criterion.
+_RESOLUTION_UNAVAILABLE_ROW = {
+    "criterion": "*",
+    "refs": [],
+    "supported_evidence_resolves": False,
+    "resolution_status": "host_resolution_unavailable",
+}
+
+
+def acceptance_evidence_ref_vocabulary(evidence: Any) -> Dict[str, str]:
+    """The enumerable canonical exhibit keys of ONE already-built packet (D-Q5).
+
+    Maps each valid reviewer ``evidence_ref`` string to its CLOSED basis kind
+    (claim_id | claim_id_unsupported | obligation_id | artifact |
+    verification_receipt | packet_section — a closed table per ref kind, like
+    ``IDENTITY_KINDS``). Pure derivation over the packet dict: no filesystem
+    reads, no re-execution (a machine comparison must never become a read oracle
+    — v6.61.1). ``verification_receipts[i]`` ids are POSITIONAL within this packet
+    build and are never compared across panels. Specific ids are registered before
+    generic section names so a claim id can never be shadowed by a same-named
+    section.
+
+    A claim id is EVIDENCE only through the host's own support table: the plan's
+    binding is "claim id → host receipt identity when claims exist". So a claim
+    resolves iff ``acceptance_support_refs`` (host_attested, built from the SAME
+    claim set in this build) reports ``support_status == "supported"`` for it —
+    i.e. a linked receipt actually passed. A claim that is only DECLARED, whose
+    receipt failed, that has no receipt, or whose support table is absent
+    altogether registers as ``claim_id_unsupported`` and cannot support a
+    criterion: otherwise a reviewer citing a bare claim id would certify a clean
+    PASS out of the task's own restated intent, which is precisely the fabricated
+    -evidence hole D-Q5 exists to close."""
+    ev = evidence if isinstance(evidence, dict) else {}
+    vocab: Dict[str, str] = {}
+    contract = ev.get("task_contract") if isinstance(ev.get("task_contract"), dict) else {}
+    supported_claim_ids = {
+        str(row.get("criterion_id") or "").strip()
+        for row in (ev.get("acceptance_support_refs") or [])
+        if isinstance(row, dict) and str(row.get("support_status") or "") == "supported"
+    }
+    for claim in contract.get("acceptance_claims") or []:
+        if isinstance(claim, dict) and str(claim.get("id") or "").strip():
+            claim_id = str(claim["id"]).strip()
+            vocab.setdefault(
+                claim_id,
+                "claim_id" if claim_id in supported_claim_ids else CLAIM_ID_UNSUPPORTED,
+            )
+    for obligation in ev.get("acceptance_obligations") or []:
+        if isinstance(obligation, dict) and str(obligation.get("id") or "").strip():
+            vocab.setdefault(str(obligation["id"]).strip(), "obligation_id")
+    for artifact in ev.get("artifacts") or []:
+        if isinstance(artifact, dict) and str(artifact.get("name") or "").strip():
+            vocab.setdefault(str(artifact["name"]).strip(), "artifact")
+    summary = ev.get("verification_summary") if isinstance(ev.get("verification_summary"), dict) else {}
+    try:
+        receipt_count = max(0, int(summary.get("count") or 0))
+    except (TypeError, ValueError):
+        receipt_count = 0
+    for idx in range(receipt_count):
+        vocab.setdefault(f"verification_receipts[{idx}]", "verification_receipt")
+    for key in ev:
+        if not str(key).startswith("__"):
+            vocab.setdefault(str(key), "packet_section")
+    return vocab
+
+
+def resolve_criteria_evidence_refs(criteria: Any, vocabulary: Dict[str, str]) -> list:
+    """EXACT-membership resolution of reviewer ``evidence_refs`` for SUPPORTED
+    criteria (D-Q5). No substring/fuzzy matching — a non-injective comparison
+    lets a fabricated ref 'resolve' against an unrelated exhibit (the v6.78
+    lossy-identity lesson). Returns disclosure rows ONLY for supported criteria
+    carrying at least one unresolved ref; each row names the deciding basis for
+    every ref (rounds-6/7 rule: whatever decides is what is reported) plus
+    ``supported_evidence_resolves`` — whether at least ONE ref resolved, which is
+    all ``task_acceptance_is_clean`` consumes. A basis in
+    ``NON_RESOLVING_BASIS_KINDS`` (today: a claim id with no host-attested
+    supporting receipt) is DISCLOSED by name but does not resolve. Never touches
+    parse validity, quorum, or verdicts (the v6.71.1 starvation class stays
+    closed)."""
+    rows: list = []
+    for item in criteria if isinstance(criteria, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status") or "").strip().lower() != "supported":
+            continue
+        raw = item.get("evidence_refs")
+        refs = raw if isinstance(raw, list) else ([raw] if raw else [])
+        projected = []
+        resolved_any = False
+        unresolved_count = 0
+        for ref in refs:
+            text = str(ref or "").strip()
+            basis = vocabulary.get(text, "") if text else ""
+            if basis and basis not in NON_RESOLVING_BASIS_KINDS:
+                resolved_any = True
+            else:
+                unresolved_count += 1
+            projected.append({"ref": text[:200], "resolved_as": basis})
+        if unresolved_count:
+            rows.append({
+                "criterion": str(item.get("criterion") or "")[:300],
+                "refs": projected,
+                "supported_evidence_resolves": resolved_any,
+            })
+    return rows
+
+
+def annotate_criteria_evidence_resolution(actors: Any, evidence: Any) -> None:
+    """Stamp per-actor ``criteria_refs_unresolved`` disclosure rows in place (D-Q5).
+
+    Runs ONCE per acceptance panel over actor dict rows; a fully-resolving actor
+    gets NO annotation (the common clean path is byte-identical). The annotation
+    feeds ONLY ``task_acceptance_is_clean`` and disclosure — never parse validity,
+    never quorum, never a verdict.
+
+    TOTAL and fail-CLOSED. An annotation that did not run may never be read as
+    "everything resolved": the absence of a row is what authorizes the clean bit,
+    so a resolver failure that left the rows off would silently certify evidence
+    nobody checked. Any failure therefore stamps the typed
+    ``host_resolution_unavailable`` row on EVERY actor, landing on the same
+    clean-bit rail as an unresolved ref — never a verdict, never a veto."""
+    unavailable = False
+    try:
+        vocabulary = acceptance_evidence_ref_vocabulary(evidence)
+    except Exception:
+        log.warning("acceptance evidence-ref vocabulary unavailable", exc_info=True)
+        vocabulary, unavailable = {}, True
+    for actor in actors if isinstance(actors, list) else []:
+        if not isinstance(actor, dict):
+            continue
+        try:
+            if unavailable:
+                actor["criteria_refs_unresolved"] = [dict(_RESOLUTION_UNAVAILABLE_ROW)]
+                continue
+            parsed = actor.get("parsed") if isinstance(actor.get("parsed"), dict) else {}
+            rows = resolve_criteria_evidence_refs(parsed.get("criteria_used"), vocabulary)
+            if rows:
+                actor["criteria_refs_unresolved"] = rows
+        except Exception:
+            log.warning("acceptance evidence-ref resolution failed for one actor", exc_info=True)
+            actor["criteria_refs_unresolved"] = [dict(_RESOLUTION_UNAVAILABLE_ROW)]
 
 
 def _accept_trajectory(tool_calls: list) -> tuple:
@@ -756,6 +937,12 @@ def build_task_acceptance_evidence(
         ev["agent_supplied"] = redact_projection(a).value
         prov["agent_supplied"] = "agent_supplied"
     contract = _accept_task_contract(ctx)
+    # W2: resolve the claims that bind this task through the ONE seam — ingress
+    # first, plan-frozen only when ingress is empty. The packet VIEW carries them;
+    # the durable/live contract is never mutated.
+    claims, claims_source = _accept_effective_claims(ctx, contract, drive_root, task_id)
+    if claims_source == "plan_review":
+        contract = {**contract, "acceptance_claims": claims}
     receipts = read_verification_receipts(drive_root, task_id) if (drive_root is not None and task_id) else []
     owner_directives = _accept_owner_directives(ctx, drive_root, task_id)
     if owner_directives:
@@ -767,6 +954,9 @@ def build_task_acceptance_evidence(
         # Structural (key-aware) redaction of the full contract before it enters the prompt.
         ev["task_contract"] = redact_projection(contract).value
         prov["task_contract"] = "host_attested"
+        if claims_source:
+            ev["acceptance_claims_source"] = claims_source
+            prov["acceptance_claims_source"] = "host_attested"
         support_refs = _accept_claim_support_refs(contract, receipts)
         if support_refs:
             ev["acceptance_support_refs"] = redact_projection(support_refs).value

@@ -16,7 +16,7 @@ import logging
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
 from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
-from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
+from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
@@ -1357,6 +1357,9 @@ ACCEPTANCE_DECISION_REASONS = (
     "fence_reopen_failed",
     "infra_failure",
     REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE,
+    # Forced-rail acceptance bypass (closed set, outcomes.py SSOT): stamped by
+    # `_record_forced_acceptance_bypass` when the panel was owed but a rail fired.
+    *sorted(ACCEPTANCE_BYPASS_REASONS),
     ACCEPTANCE_REASON_UNSPECIFIED,
 )
 
@@ -1754,7 +1757,6 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
             "min_successful_slots": adaptive_quorum(len(slots)),
             "fail_closed_on_errors": True,
             "classify_outcome_tier": True,
-            "require_criterion_evidence": True,
             "max_physical_attempts_per_actor": 2,
         },
         task_id=ctx.task_id,
@@ -3925,6 +3927,87 @@ def _degrade_retained_delivery_candidate(
     return candidate
 
 
+def _record_forced_acceptance_bypass(
+    ctx: _RoundLimitContext,
+    llm_trace: Dict[str, Any],
+    reason_code: str,
+) -> None:
+    """Typed acceptance-bypass record on a forced rail — a LEDGER write, never a gate.
+
+    The acceptance panel's only launch site is the voluntary no-tool finalization, so
+    every forced exit used to leave the review axis at {skipped, not_eligible,
+    run_count:0} — indistinguishable from "no panel warranted". This stamps the
+    terminal truth instead: the eligibility predicate is evaluated PURE against the
+    live trace (no fence begin, no subtree-quiescence wait, no panel, no model round,
+    no prompt text — forced exits are the v6.29 honesty/salvage shelf and stay
+    byte-identical in behavior), and an OWED-but-bypassed panel lands as
+    ``finalized_unaccepted`` with a closed-enum reason (`ACCEPTANCE_BYPASS_REASON_BY_RAIL`,
+    the v6.54.4 deadline-reserve precedent generalized; v6.74.4 filed follow-up).
+    Reason tokens stay ledger-only (v6.61.4 token-parroting class). Never raises —
+    the salvage lane has priority over this record.
+    """
+    rail_reason = ACCEPTANCE_BYPASS_REASON_BY_RAIL.get(str(reason_code or ""))
+    if rail_reason is None:
+        return
+    # A rail that deliberately cleared the failure state (a confirmed swarm routing
+    # handoff) terminalized nothing reviewable here — the admitted managed task gets
+    # its own acceptance lifecycle.
+    if not str(ctx.accumulated_usage.get("reason_code") or ""):
+        return
+    tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+    if tools_ctx is None:
+        return
+    # A host decision already recorded (panel ran, pacing skip, supersede) wins;
+    # the bypass record exists only for the nothing-was-written shape.
+    if isinstance(llm_trace.get("acceptance_decision"), dict) and llm_trace.get("acceptance_decision"):
+        return
+    if getattr(tools_ctx, "_task_acceptance_reviewed", False):
+        return
+    trigger = f"bypassed_{reason_code}"
+    try:
+        from ouroboros.task_results import resolve_task_lineage
+
+        meta = getattr(tools_ctx, "task_metadata", {})
+        meta = meta if isinstance(meta, dict) else {}
+        lineage = resolve_task_lineage(
+            str(ctx.task_id or getattr(tools_ctx, "task_id", "") or ""),
+            metadata=meta,
+            root_task_id=getattr(tools_ctx, "root_task_id", None),
+            parent_task_id=getattr(tools_ctx, "parent_task_id", None),
+            delegation_role=getattr(tools_ctx, "delegation_role", None),
+            original_task_id=getattr(tools_ctx, "original_task_id", None),
+            timeout_retry_from=getattr(tools_ctx, "timeout_retry_from", None),
+        )
+        eligible, probe_trigger = _task_acceptance_eligible(
+            get_task_review_mode(),
+            llm_trace,
+            bool(getattr(tools_ctx, "is_direct_chat", False)),
+            is_root_task=bool(lineage["is_root_task"]),
+            is_ephemeral_turn=bool(getattr(tools_ctx, "is_ephemeral_turn", False)),
+            task_contract=(
+                tools_ctx.task_contract
+                if isinstance(getattr(tools_ctx, "task_contract", None), dict)
+                else {}
+            ),
+        )
+    except Exception:
+        # A mid-round dying trace may not support the probe; record the honest
+        # unknown instead of crashing the salvage path.
+        log.debug("Forced acceptance-bypass eligibility probe failed", exc_info=True)
+        llm_trace["review_decision"] = {"eligibility": "unknown", "trigger": trigger}
+        return
+    if not eligible:
+        # Explicitly "no panel warranted" — now distinguishable from "not evaluated".
+        llm_trace["review_decision"] = {"eligibility": "not_eligible", "trigger": probe_trigger}
+        return
+    llm_trace["review_decision"] = {"eligibility": "eligible", "trigger": trigger}
+    _set_acceptance_decision(llm_trace, {
+        "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+        "reason": rail_reason,
+        "source": "forced_finalization",
+    })
+
+
 def _record_forced_finalization(
     ctx: _RoundLimitContext,
     llm_trace: Dict[str, Any],
@@ -3938,6 +4021,10 @@ def _record_forced_finalization(
     # have been refreshed, so every forced return exposes the same terminal
     # child-result truth to the outcome reducer.
     _project_child_result_dispositions(ctx, llm_trace)
+    # Common terminal recorder = the ONE seam covering both the LLM-seam forced
+    # answer (`_forced_final_answer`) and the no-spend host-fallback fence path
+    # (`_handle_budget_exceeded` -> `_forced_fallback_result`).
+    _record_forced_acceptance_bypass(ctx, llm_trace, reason_code)
     binding = dict(candidate.acceptance_binding or {}) if candidate is not None else {}
     tools = getattr(ctx, "tools", None)
     current_fingerprint = str(
@@ -4239,6 +4326,7 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
         from ouroboros.task_status import FINAL_STATUSES
 
         children = _direct_child_results(ctx)
+        claimed = _claimed_child_dispositions(ctx)
 
         def _undecided(c: Dict[str, Any]) -> bool:
             if _child_disposition_state(c) in {
@@ -4256,6 +4344,28 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
             tid = str(c.get("task_id") or c.get("id") or "?")
             st = str(c.get("status") or "?").strip().lower()
             lifecycle = "running" if st not in FINAL_STATUSES else st
+            # W2: a child whose LATEST blackboard decision row names a disposition
+            # that no longer binds the current result was READ and decided — say
+            # that instead of the misleading "unread". Say only what the ledger
+            # PROVES: the row EXISTS, so the write did NOT fail; what failed is the
+            # binding to the result standing now. (The pre-audit wording claimed a
+            # failed write, which the presence of the row disproves.)
+            claim = claimed.get(tid)
+            if claim is not None:
+                disposition, row_sha = claim
+                from ouroboros.tools.join_ledger import _child_result_sha256
+
+                if _child_result_sha256(c) != row_sha:
+                    detail = (
+                        f"{disposition} recorded for an EARLIER result hash; the current "
+                        "result is not bound — re-inspect and re-submit the current hash"
+                    )
+                else:
+                    detail = (
+                        f"{disposition} recorded for this exact result hash but not carried "
+                        "by this round's disposition projection — re-submit to close it"
+                    )
+                return f"{tid} [{lifecycle}; {detail}]"
             terminal = str(c.get("child_status") or "").strip().lower()
             if terminal and terminal != st:
                 return f"{tid} [{lifecycle}; terminal_result={terminal}]"
@@ -4286,6 +4396,43 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
         return "".join(notes)
     except Exception:
         return ""
+
+
+def _claimed_child_dispositions(ctx: _RoundLimitContext) -> Dict[str, tuple]:
+    """task_id -> (disposition, row_sha) from THIS parent's latest blackboard
+    decision rows (W2). Consulted only for children the disposition projection
+    left undecided: a row that exists but no longer binds is audit evidence of a
+    claimed-but-failed disposition write, and the forced orphan note must say so
+    instead of calling the child unread. Pure read, never raises."""
+    try:
+        from ouroboros.task_tree_ledger import CHILD_RESULT_DISPOSITION_TYPE, tree_ledger_rows
+
+        status_root = (
+            getattr(ctx, "status_drive_root", None)
+            or getattr(ctx, "drive_root", None)
+        )
+        root_id = str(getattr(ctx, "root_task_id", "") or getattr(ctx, "task_id", "") or "")
+        parent_id = str(getattr(ctx, "task_id", "") or "")
+        if status_root is None or not root_id or not parent_id:
+            return {}
+        claims: Dict[str, tuple] = {}
+        for row in tree_ledger_rows(root_id, data_root=pathlib.Path(status_root)):
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            if (
+                str(row.get("kind") or "") == "decision"
+                and str(payload.get("type") or "") == CHILD_RESULT_DISPOSITION_TYPE
+                and str(row.get("task_id") or "") == parent_id
+                and str(payload.get("child_task_id") or "")
+            ):
+                # Later rows win: the ledger is append-only and the newest decision
+                # is the one whose failure to bind is worth naming.
+                claims[str(payload["child_task_id"])] = (
+                    str(payload.get("disposition") or ""),
+                    str(payload.get("child_result_sha256") or ""),
+                )
+        return claims
+    except Exception:
+        return {}
 
 
 def _undispositioned_children(ctx: _RoundLimitContext) -> list[Dict[str, Any]]:

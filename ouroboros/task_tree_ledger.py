@@ -60,33 +60,65 @@ def tree_ledger_path(
     return root / "task_trees" / validate_task_id(root_id) / "blackboard.jsonl"
 
 
+def child_result_disposition_violations(payload: Any) -> list[str]:
+    """EVERY violated constraint of the typed child-disposition row, in ONE pass.
+
+    Returns [] when the payload is valid. The aggregated list exists because the
+    old one-error-per-round shape cost a live parent 9 paid rounds discovering
+    the constraints serially (W2). The key set stays CLOSED and a malformed
+    payload stays an atomic no-op — unknown keys are rejected, never silently
+    ignored (a silently-dropped key would swallow future typed fields), and
+    nothing is truncated on the caller's behalf."""
+    if not isinstance(payload, dict):
+        return ["payload must be a JSON object"]
+    violations: list[str] = []
+    unknown = sorted(set(payload) - _CHILD_RESULT_DISPOSITION_FIELDS)
+    missing = sorted(_CHILD_RESULT_DISPOSITION_FIELDS - set(payload))
+    if unknown:
+        violations.append(
+            f"unknown key(s) {', '.join(unknown)} (the key set is CLOSED: exactly "
+            "type, child_task_id, disposition, child_result_sha256)"
+        )
+    if missing:
+        violations.append(f"missing key(s): {', '.join(missing)}")
+    if "type" not in missing and str(payload.get("type") or "") != CHILD_RESULT_DISPOSITION_TYPE:
+        violations.append(f"type must be exactly '{CHILD_RESULT_DISPOSITION_TYPE}'")
+    if "child_task_id" not in missing:
+        try:
+            validate_task_id(payload.get("child_task_id"))
+        except ValueError:
+            violations.append("child_task_id must be a valid task id")
+    if "disposition" not in missing:
+        disposition = str(payload.get("disposition") or "").strip().lower()
+        if disposition not in CHILD_RESULT_DISPOSITIONS:
+            violations.append(
+                f"disposition must be one of {'|'.join(sorted(CHILD_RESULT_DISPOSITIONS))}"
+            )
+    if "child_result_sha256" not in missing:
+        sha = str(payload.get("child_result_sha256") or "").strip().lower()
+        if len(sha) != 64 or any(ch not in "0123456789abcdef" for ch in sha):
+            violations.append(
+                "child_result_sha256 must be the 64-char hex sha of the child result "
+                "you actually read (from [SUBTASK_OUTCOME]/get_task_result)"
+            )
+    return violations
+
+
 def normalize_child_result_disposition_payload(payload: Any) -> Dict[str, str] | None:
     """Validate the one typed child-disposition row shape.
 
     The task-tree row is the sole durable authority. Consumers deliberately
     ignore malformed rows instead of interpreting free text or task-result
-    compatibility fields as a decision.
-    """
-
-    if not isinstance(payload, dict) or set(payload) != _CHILD_RESULT_DISPOSITION_FIELDS:
-        return None
-    if str(payload.get("type") or "") != CHILD_RESULT_DISPOSITION_TYPE:
-        return None
-    try:
-        child_task_id = validate_task_id(payload.get("child_task_id"))
-    except ValueError:
-        return None
-    disposition = str(payload.get("disposition") or "").strip().lower()
-    if disposition not in CHILD_RESULT_DISPOSITIONS:
-        return None
-    result_sha256 = str(payload.get("child_result_sha256") or "").strip().lower()
-    if len(result_sha256) != 64 or any(ch not in "0123456789abcdef" for ch in result_sha256):
+    compatibility fields as a decision. Validity derives from
+    ``child_result_disposition_violations`` so the normalizer and the aggregated
+    diagnostics can never disagree."""
+    if child_result_disposition_violations(payload):
         return None
     return {
         "type": CHILD_RESULT_DISPOSITION_TYPE,
-        "child_task_id": child_task_id,
-        "disposition": disposition,
-        "child_result_sha256": result_sha256,
+        "child_task_id": validate_task_id(payload.get("child_task_id")),
+        "disposition": str(payload.get("disposition") or "").strip().lower(),
+        "child_result_sha256": str(payload.get("child_result_sha256") or "").strip().lower(),
     }
 
 

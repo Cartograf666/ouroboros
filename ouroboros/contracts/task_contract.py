@@ -283,6 +283,36 @@ def normalize_acceptance_claims(value: Any) -> list[Dict[str, str]]:
     return out
 
 
+def effective_acceptance_claims(
+    task: Mapping[str, Any] | None,
+    closed_plan_wave: Mapping[str, Any] | None = None,
+) -> tuple[list[Dict[str, str]], str]:
+    """The claims that bind a task, with provenance — the ONE seam the
+    acceptance-evidence builder and the child-contract builder both read (W2).
+
+    Ingress-contract claims win (adapter/gateway/parent-authored — already in the
+    built contract); the CLOSED plan wave's frozen claims apply ONLY when ingress
+    is empty. PURE: no I/O and no contract mutation — the running task contract is
+    never rebuilt mid-task; plan-frozen claims live in ``plan_review_state``
+    (``task_results.closed_plan_review_wave``) and are resolved at READ time.
+    Returns ``(claims, source)`` with source ``ingress_contract`` |
+    ``plan_review`` | ``""`` (no claims anywhere)."""
+    task = task if isinstance(task, Mapping) else {}
+    contract = (
+        task.get("task_contract")
+        if isinstance(task.get("task_contract"), Mapping)
+        else task
+    )
+    ingress = normalize_acceptance_claims(contract.get("acceptance_claims"))
+    if ingress:
+        return ingress, "ingress_contract"
+    wave = closed_plan_wave if isinstance(closed_plan_wave, Mapping) else {}
+    plan_claims = normalize_acceptance_claims(wave.get("acceptance_claims"))
+    if plan_claims:
+        return plan_claims, "plan_review"
+    return [], ""
+
+
 def normalize_resource_policy(value: Any) -> Dict[str, Any]:
     if not isinstance(value, Mapping):
         return {}
@@ -405,9 +435,19 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         "objective": objective,
         "expected_output": expected_output,
         "constraints": constraints,
-        "success_criteria": list(merged.get("success_criteria") or [])
-        if isinstance(merged.get("success_criteria"), list)
-        else [],
+        # (W2) success_criteria is an INPUT ALIAS: it already feeds
+        # normalize_acceptance_claims above when no claims were given, so once
+        # acceptance_claims is populated the raw list is NOT double-persisted —
+        # one concept, one carrier. Historical records keep their stored shape
+        # untouched (no normalizer, v6.78 precedent); readers tolerate both
+        # shapes (the eligibility probe checks both keys).
+        "success_criteria": []
+        if acceptance_claims
+        else (
+            list(merged.get("success_criteria") or [])
+            if isinstance(merged.get("success_criteria"), list)
+            else []
+        ),
         "acceptance_claims": acceptance_claims,
         "allowed_resources": allowed_resources,
         "resource_policy": resource_policy,
@@ -463,4 +503,4 @@ def attach_task_contract(task: Dict[str, Any]) -> Dict[str, Any]:
     return task
 
 
-__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_answer_protocol", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_disabled_tools", "normalize_resource_policy"]
+__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "effective_acceptance_claims", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_answer_protocol", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_disabled_tools", "normalize_resource_policy"]

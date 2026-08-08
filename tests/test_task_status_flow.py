@@ -427,6 +427,42 @@ def test_get_task_result_returns_full_completed_output(tmp_path):
     assert "[BEGIN_SUBTASK_OUTPUT]" in output
 
 
+def test_get_task_result_carries_bounded_per_receipt_rows(tmp_path):
+    """W2: the FULL single-child handoff (get_task_result/wait_task) shows WHICH
+    checks passed as bounded identity rows — newest first, hard cap 10, exact
+    omitted count — while the wait_tasks batch projection stays counts-compact."""
+    import json as _json
+
+    from ouroboros.outcomes import append_verification_receipt
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _get_task_result
+
+    write_task_result(tmp_path, "abc123", STATUS_COMPLETED, result="done", cost_usd=0.1)
+    for idx in range(12):
+        append_verification_receipt(tmp_path, "abc123", {
+            "status": "pass" if idx else "fail",
+            "check": f"pytest tests/x{idx}.py",
+            "criterion_id": f"claim_{idx}",
+        })
+
+    output = _get_task_result(SimpleNamespace(drive_root=tmp_path), "abc123")
+    summary = _json.loads(
+        output.split("[SUBTASK_OUTCOME]\n", 1)[1].split("\n[/SUBTASK_OUTCOME]", 1)[0]
+    )
+
+    rows = summary["verification_receipts"]
+    assert len(rows) == 10                                   # hard cap
+    assert summary["verification_receipts_omitted"] == 2     # disclosed, exact
+    assert rows[0]["criterion_id"] == "claim_11"             # newest first
+    assert rows[0]["status"] == "pass"
+    assert "check" in rows[0] and "reconciliation_identity" in rows[0]
+    # No receipts -> no rows key at all (the wave1 zero-receipt shape stays visible
+    # through the ledger counts, not an empty list).
+    write_task_result(tmp_path, "noreceipts", STATUS_COMPLETED, result="done")
+    bare = _get_task_result(SimpleNamespace(drive_root=tmp_path), "noreceipts")
+    assert "verification_receipts_omitted" not in bare
+
+
 def test_get_task_result_uses_child_terminal_over_stale_parent(tmp_path):
     from ouroboros.task_results import STATUS_COMPLETED, STATUS_SCHEDULED, write_task_result
     from ouroboros.tools.control import _get_task_result
