@@ -1278,3 +1278,50 @@ def test_health_invariants_come_first_in_background_consciousness_context(tmp_pa
 
     text = bg._build_context()
     assert text.index("## Health Invariants") < text.index("## Drive state")
+
+
+def test_drive_state_section_is_typed_projection_with_pointer(tmp_path):
+    """W3 adjacent (a): the Drive state section projects the fields the agent
+    reasons about and NAMES the omitted internal caches with an on-demand
+    pointer (P1: disclosed omission) instead of dumping state.json wholesale —
+    the budget narrative stays with the usage-accounting authority in the
+    Runtime section."""
+    import json
+
+    from ouroboros.context import _drive_state_section
+
+    class FakeEnv:
+        def drive_path(self, p):
+            return tmp_path / p
+
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "state.json").write_text(json.dumps({
+        "session_id": "abc123",
+        "current_branch": "ouroboros",
+        "evolution_mode_enabled": False,
+        "budget_drift_alert": True,
+        "budget_drift_pct": 48.05,
+        "spent_usd": 1699.3,
+        "managed_update_cache": {"latest_sha": "x" * 40, "latest_message": "big"},
+        "usage_accounting": {"settled_usd": 1633.1},
+        "openrouter_last_check_call": 5750,
+    }), encoding="utf-8")
+
+    section = _drive_state_section(FakeEnv())
+
+    assert section.startswith("## Drive state")
+    assert '"session_id": "abc123"' in section
+    assert '"budget_drift_alert": true' in section
+    # Internal caches / duplicated spend narrative are OMITTED but NAMED.
+    assert '"managed_update_cache"' not in section
+    assert '"usage_accounting"' not in section
+    assert '"spent_usd"' not in section
+    for named in ("managed_update_cache", "usage_accounting", "spent_usd", "openrouter_last_check_call"):
+        assert named in section  # named in the omission note
+    assert "read_file(root='runtime_data', path='state/state.json')" in section
+
+    # Missing/empty file: still a valid section, no omission note needed.
+    (tmp_path / "state" / "state.json").unlink()
+    empty = _drive_state_section(FakeEnv())
+    assert empty.startswith("## Drive state")
+    assert "read_file" not in empty
