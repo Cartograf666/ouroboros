@@ -1784,16 +1784,34 @@ class ToolRegistry:
                     git_protected_roots.append(pathlib.Path(str(_meta.get(_k))))
         return git_protected_roots
 
-    def _external_workspace_git_block(self, raw_cmd: Any, args: Dict[str, Any]) -> Optional[str]:
+    def _resolved_shell_cwd(self, args: Dict[str, Any]) -> Any:
+        """The command's working directory, resolved ONCE through the cwd SSOT.
+
+        Returns a ``pathlib.Path``, or the typed cwd-block MESSAGE (a ``str``) when
+        resolution fails. Every guard downstream takes this canonical path instead
+        of re-resolving — or, worse, string-joining the raw cwd label onto a root,
+        which is the D1 regression class (v6.74.0)."""
+        raw_cwd = str(args.get("cwd") or "")
+        operation = "service" if str(args.get("__tool_name") or "") == "start_service" else "shell"
+        try:
+            work_dir, _cwd_root, _allowed = resolve_shell_cwd(self._ctx, raw_cwd, operation=operation)
+        except Exception as exc:
+            return shell_cwd_block_message(self._ctx, raw_cwd, operation=operation, error=exc)
+        return pathlib.Path(work_dir)
+
+    def _external_workspace_git_block(self, raw_cmd: Any, work_dir: pathlib.Path) -> Optional[str]:
         from ouroboros.git_shell_policy import external_workspace_git_violation
 
         # External-workspace git is no longer confined to the active workspace
         # (host scratch is legitimate); only the enumerated runtime roots are
-        # protected.
+        # protected. ``work_dir`` is the ALREADY-RESOLVED cwd from the one
+        # resolve_shell_cwd call in _shell_git_and_runtime_block — passing it as
+        # the base with cwd="" keeps the D1 rule (resolve once, through the SSOT,
+        # never re-join a raw cwd label onto a root).
         git_violation = external_workspace_git_violation(
             raw_cmd,
-            active_root=active_repo_dir_for(self._ctx),
-            cwd=str(args.get("cwd") or ""),
+            active_root=work_dir,
+            cwd="",
             protected_roots=self._git_protected_roots(),
             allow_network=_resource_allowed(self._ctx, "network"),
         )
@@ -1884,7 +1902,10 @@ class ToolRegistry:
                     allowed_paths.append(rp)
         return protected_texts, allowed_texts, protected_paths, allowed_paths
 
-    def _external_shell_runtime_or_secret_block(self, raw_cmd: Any, cmd_path_lower: str, args: Dict[str, Any]) -> Optional[str]:
+    def _external_shell_runtime_or_secret_block(
+        self, raw_cmd: Any, cmd_path_lower: str, args: Dict[str, Any],
+        work_dir: Optional[pathlib.Path] = None,
+    ) -> Optional[str]:
         """External-workspace shell guard for READ and write commands alike: block any
         command that targets the Ouroboros runtime (system repo / any data drive) or an
         owner credential path. read_file/user_files already enforce this; raw shell
@@ -1921,10 +1942,14 @@ class ToolRegistry:
             ):
                 return _BLOCK
         # (2) path-token resolution (relative -> cwd, ~ -> home, symlinks canonicalized).
-        try:
-            work_dir, _r, _a = resolve_shell_cwd(self._ctx, str((args or {}).get("cwd") or ""))
-        except Exception as exc:
-            return shell_cwd_block_message(self._ctx, str((args or {}).get("cwd") or ""), operation="shell", error=exc)
+        # The cwd is resolved ONCE per safety check by the caller (D1); resolve here
+        # only when this guard is used standalone.
+        if work_dir is None:
+            try:
+                resolved_cwd, _r, _a = resolve_shell_cwd(self._ctx, str((args or {}).get("cwd") or ""))
+            except Exception as exc:
+                return shell_cwd_block_message(self._ctx, str((args or {}).get("cwd") or ""), operation="shell", error=exc)
+            work_dir = pathlib.Path(resolved_cwd)
         work_dir = pathlib.Path(work_dir)
 
         def _within(child: pathlib.Path, parent: pathlib.Path) -> bool:
@@ -2258,14 +2283,32 @@ class ToolRegistry:
         runtime is protected (Q4=A unwind, 2026-08-08) — while raw non-git shell
         in external workspaces still cannot read the runtime/secrets;
         self_worktree keeps the strict read-only git policy."""
+        from ouroboros.git_shell_policy import is_readonly_git_command
+
         if workspace_mode and not acting_self_worktree:
-            if git_block := self._external_workspace_git_block(raw_cmd, args):
+            work_dir = self._resolved_shell_cwd(args)
+            if isinstance(work_dir, str):  # a cwd block message, not a path
+                return work_dir
+            if git_block := self._external_workspace_git_block(raw_cmd, work_dir):
                 return git_block
             # Even READ-only, non-git shell (cat/head/grep/python -c open(...)) must
             # not reach the runtime or secrets — close the raw-shell bypass of the
             # user_files path guard (scoped to top-level external tasks).
-            if is_external_workspace(self._ctx):
-                if ext_block := self._external_shell_runtime_or_secret_block(raw_cmd, cmd_path_lower, args):
+            #
+            # READ-ONLY GIT IS EXEMPT (owner contract, Q4=A: "read-only everywhere",
+            # and the f14baf8f false-block class). `git -C <system repo> status|log|
+            # diff|show|rev-parse` is the vcs_status-equivalent inspection lane; the
+            # runtime-read guard was catching it by path token and refusing it with a
+            # WORKSPACE_SHELL_BLOCKED that named the wrong reason. The marginal
+            # escalation is nil — the same history is already readable through the
+            # gated read_file this very message points the agent at — while the
+            # SECRET/credential surface is untouched: the exemption is ALL-or-nothing
+            # per segment, so `git status && cat <data>/settings.json` is not exempt,
+            # and every non-git shell still meets the full guard.
+            if is_external_workspace(self._ctx) and not is_readonly_git_command(raw_cmd):
+                if ext_block := self._external_shell_runtime_or_secret_block(
+                    raw_cmd, cmd_path_lower, args, work_dir=work_dir
+                ):
                     return ext_block
             return None
         if workspace_mode:
@@ -2322,20 +2365,14 @@ class ToolRegistry:
         # system-repo dirtiness tripwire stays as the backstop.
         if "git" not in cmd_path_lower:
             return None
-        operation = "service" if str(args.get("__tool_name") or "") == "start_service" else "shell"
-        try:
-            work_dir, _cwd_root, _allowed = resolve_shell_cwd(
-                self._ctx, str(args.get("cwd") or ""), operation=operation,
-            )
-        except Exception as exc:
-            return shell_cwd_block_message(
-                self._ctx, str(args.get("cwd") or ""), operation=operation, error=exc,
-            )
+        work_dir = self._resolved_shell_cwd(args)
+        if isinstance(work_dir, str):  # a cwd block message, not a path
+            return work_dir
         from ouroboros.git_shell_policy import external_workspace_git_violation
 
         git_violation = external_workspace_git_violation(
             raw_cmd,
-            active_root=pathlib.Path(work_dir),
+            active_root=work_dir,
             cwd="",
             protected_roots=self._git_protected_roots(),
             allow_network=_resource_allowed(self._ctx, "network"),

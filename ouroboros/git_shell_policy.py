@@ -150,6 +150,81 @@ def _git_invocation_block_reason(parts: list[str], *, allow_network: bool = True
     return f"git {subcmd}"
 
 
+# Subcommands whose mutation lands at an EXPLICIT DESTINATION path, leaving the
+# working directory untouched: `git init <dir>` and `git clone <url> <dir>` create
+# a NEW repository at <dir>. Checking such an invocation against its cwd is a pure
+# false block — and a load-bearing one, because the DEFAULT (non-workspace) lane's
+# default cwd IS the system repo, so `git init ~/projects/foo` from direct chat or
+# light mode was refused even though nothing in the runtime was touched. With no
+# explicit destination (`git init`, `git clone <url>`) the cwd IS the target and
+# the working-directory check applies as before.
+_GIT_DESTINATION_SUBCOMMANDS = frozenset({"init", "clone"})
+
+
+def _git_explicit_destination(subcmd: str, args: list[str]) -> str:
+    """The destination path of `init`/`clone`, or "" when the cwd is the target.
+
+    Positional-only: flags and their values are skipped, and for `clone` the FIRST
+    positional is the source (a URL or path) — the destination is the second."""
+    if subcmd not in _GIT_DESTINATION_SUBCOMMANDS:
+        return ""
+    value_indexes = _git_option_value_flags(args)
+    positionals = [
+        str(arg) for idx, arg in enumerate(args)
+        if not str(arg).startswith("-") and idx not in value_indexes
+    ]
+    if subcmd == "init":
+        return positionals[0] if positionals else ""
+    return positionals[1] if len(positionals) > 1 else ""
+
+
+def is_readonly_git_command(raw_cmd: Any) -> bool:
+    """True when EVERY segment of ``raw_cmd`` is a READ-ONLY git invocation.
+
+    The exemption key for the external-workspace runtime-read guard: read-only git
+    (status/log/diff/show/rev-parse/branch- and tag-listing) is allowed in every
+    lane INCLUDING at a runtime target, which is the owner contract and the
+    recorded false-block class (f14baf8f). Deliberately ALL-or-nothing per segment,
+    so a compound command that merely starts with git — `git status && cat
+    <data>/settings.json` — is NOT exempt and still meets the runtime-read guard.
+    Network-reaching read-only git (``ls-remote``) is unaffected here: the network
+    fence is enforced by ``external_workspace_git_violation``, which runs first.
+
+    ``cd`` counts as neutral: it reads and writes nothing, so `cd <repo> && git log`
+    is the same read-only inspection as `git -C <repo> log` and must not be refused
+    for spelling it differently. Disclosed residual: git reached through a
+    transparent wrapper (``nice``/``xargs``) or from inside interpreter code is not
+    recognised as a git segment, so such a command still meets the full guard and is
+    refused when it names a runtime path — deliberately not chased with a shell
+    parser arms race (BIBLE P5)."""
+    segments = shell_segments(raw_cmd)
+    if not segments:
+        return False
+    saw_git = False
+    for segment in segments:
+        if not segment:
+            continue
+        _env, command = collect_leading_env(segment)
+        if not command:
+            return False
+        name = pathlib.PurePath(str(command[0]).strip("`'\"")).name.lower()
+        if name == "cd":
+            continue
+        if name in {"bash", "sh", "zsh"}:
+            inline = shell_command_string(command)
+            if not inline or not is_readonly_git_command(inline):
+                return False
+            saw_git = True
+            continue
+        if name != "git":
+            return False
+        # allow_network=True so this answers ONLY "does this invocation mutate?".
+        if _git_invocation_block_reason(command, allow_network=True):
+            return False
+        saw_git = True
+    return saw_git
+
+
 def run_shell_git_block_reason(raw_cmd: Any, *, allow_network: bool = True) -> str:
     argv = strip_leading_env_assignments(unwrap_env_argv(shell_argv(raw_cmd)))
     if not argv:
@@ -343,9 +418,21 @@ def external_workspace_git_violation(
                     j += 2 if part in ("-c", "--git-dir", "--work-tree") else 1
                     continue
                 break  # the subcommand
-            for root in roots:
-                if _overlaps_protected(effective_base, root):
-                    return "git working directory targets the Ouroboros runtime"
+            # `git init <dir>` / `git clone <url> <dir>` mutate the DESTINATION, not
+            # the working directory, so for those the destination — never the cwd —
+            # is what containment must judge. Without this, the default lane (whose
+            # default cwd IS the system repo) refused `git init ~/projects/foo`,
+            # contradicting the owner contract that mutating git is free in every
+            # lane and mode OUTSIDE the runtime roots.
+            _subcmd, _sub_args = _git_subcommand_and_args(invocation)
+            destination = _git_explicit_destination(_subcmd, _sub_args)
+            if destination:
+                if _protected_label(_resolve(destination, effective_base)):
+                    return "git invocation targets the Ouroboros runtime"
+            else:
+                for root in roots:
+                    if _overlaps_protected(effective_base, root):
+                        return "git working directory targets the Ouroboros runtime"
             # Git is legitimate task work in host scratch (a repo under /tmp, a
             # /build tree, a sibling checkout), so the cwd is NOT confined to the
             # declared active workspace — only the Ouroboros runtime roots above
@@ -381,18 +468,32 @@ def external_workspace_git_violation(
                 target = _resolve(value, effective_base)
                 if _protected_label(target):
                     return "git invocation targets the Ouroboros runtime"
-            for arg in invocation[1:]:
+            # When the cwd check was skipped (init/clone with a destination) the base
+            # may itself BE a runtime root, so resolving every bare relative token
+            # under it would refuse the whole invocation — `clone`, a branch name and
+            # the remote URL all resolve "inside the runtime" there. Narrow the scan
+            # to the tokens that genuinely name a path: `--flag=<path>` forms (this is
+            # what keeps `git init --separate-git-dir=<runtime> /tmp/x` blocked) and
+            # absolute paths. Every other invocation keeps the full argument scan.
+            scan_args = invocation[1:]
+            if destination:
+                scan_args = [
+                    a for a in scan_args
+                    if (str(a).startswith("--") and "=" in str(a)) or _shell_path(str(a)).is_absolute()
+                ]
+            for arg in scan_args:
                 text = str(arg)
                 if "=" in text and text.startswith("--"):
                     text = text.split("=", 1)[1]
                 candidate = _shell_path(text)
                 if not candidate.is_absolute():
-                    # Relative args resolve under the effective base; a
-                    # non-runtime base can only escape toward the runtime by
-                    # ".."-climbing (a plain descend from a base that passed the
-                    # bidirectional check cannot reach a protected root).
-                    if ".." not in candidate.parts:
-                        continue
+                    # Relative args resolve under the effective base and are ALWAYS
+                    # canonicalized. The former ".."-only shortcut assumed a plain
+                    # descend cannot reach a protected root — untrue through a
+                    # SYMLINK (`ln -s <runtime> ./p && git -C /tmp/x init ./p`),
+                    # which resolve() follows. This branch only runs once the base
+                    # itself passed containment, so a plain descend still resolves
+                    # outside the runtime and nothing new is refused.
                     candidate = (effective_base / candidate).resolve(strict=False)
                 if _protected_label(candidate):
                     return "git invocation targets the Ouroboros runtime"

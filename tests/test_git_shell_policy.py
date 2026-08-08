@@ -118,3 +118,80 @@ def test_legitimate_workspace_git_is_allowed(cmd):
 
 def test_clone_allowed_when_network_enabled():
     assert not _violation("git clone https://example.com/x.git", allow_network=True)
+
+
+# --- destination-aware init/clone (the default lane's cwd IS the system repo) ---
+
+@pytest.mark.parametrize("cmd", [
+    pytest.param("git init /tmp/proj", id="init_positional_destination_outside"),
+    pytest.param("git init --bare /tmp/proj.git", id="init_bare_destination_outside"),
+    pytest.param("git clone https://example.com/x.git /tmp/proj", id="clone_url_destination_outside"),
+    pytest.param("git clone git@github.com:o/x.git /tmp/proj", id="clone_scp_url_destination_outside"),
+])
+def test_init_clone_with_outside_destination_allowed_from_runtime_cwd(cmd):
+    """`git init <dir>` / `git clone <url> <dir>` mutate the DESTINATION, not the
+    working directory. The default (non-workspace) lane's default cwd IS the system
+    repo, so judging these against the cwd refused `git init ~/projects/foo` from
+    direct chat and light mode — contradicting the owner contract that mutating git
+    is free OUTSIDE the runtime in every lane and mode."""
+    assert _violation(cmd, cwd=str(REPO)) == "", cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    pytest.param("git init", id="init_no_destination_at_runtime_cwd"),
+    pytest.param("git clone https://example.com/x.git", id="clone_no_destination_at_runtime_cwd"),
+    pytest.param("git init /Users/anton/Ouroboros/repo/sub", id="init_destination_inside_runtime"),
+    pytest.param("git init /Users/anton/Ouroboros", id="init_destination_is_runtime_ancestor"),
+    pytest.param("git clone https://example.com/x.git /Users/anton/Ouroboros/data/x", id="clone_destination_inside_data"),
+    pytest.param(
+        "git init --separate-git-dir=/Users/anton/Ouroboros/repo/x /tmp/proj",
+        id="init_separate_git_dir_into_runtime",
+    ),
+])
+def test_init_clone_targeting_the_runtime_still_blocked(cmd):
+    """With NO explicit destination the cwd IS the target, and an explicit
+    destination (or a `--flag=<path>` retarget) inside/over a runtime root stays
+    blocked — the unwind frees the tree, never the runtime."""
+    assert _violation(cmd, cwd=str(REPO)), cmd
+
+
+def test_relative_argument_symlinked_into_the_runtime_is_blocked():
+    """A relative arg with no `..` was skipped on the assumption that a plain
+    descend from a safe base cannot reach a protected root. A SYMLINK breaks that
+    assumption, and resolve() follows it."""
+    import os
+    import tempfile
+
+    base = pathlib.Path(tempfile.mkdtemp()).resolve()
+    runtime = base / "runtime"
+    runtime.mkdir()
+    tree = base / "tree"
+    tree.mkdir()
+    os.symlink(runtime, tree / "link")
+    violation = policy.external_workspace_git_violation(
+        "git init ./link", active_root=tree, cwd="", protected_roots=[runtime], allow_network=True,
+    )
+    assert violation, "a symlinked relative destination must not bypass containment"
+
+
+# --- read-only git classification (the runtime-read guard's exemption key) -----
+
+@pytest.mark.parametrize("cmd,expected", [
+    pytest.param("git status", True, id="ro_status"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo log", True, id="ro_minusC_runtime_log"),
+    pytest.param("git log; git diff", True, id="ro_two_git_segments"),
+    pytest.param("cd /Users/anton/Ouroboros/repo && git status", True, id="ro_cd_then_git"),
+    pytest.param("git branch -l", True, id="ro_branch_list"),
+    pytest.param("sh -c 'git log'", True, id="ro_nested_shell"),
+    pytest.param("git commit -m x", False, id="mut_commit"),
+    pytest.param("git branch -D x", False, id="mut_branch_delete"),
+    pytest.param("git status && cat /Users/anton/Ouroboros/data/settings.json", False, id="mixed_git_and_cat"),
+    pytest.param("cat /etc/passwd", False, id="not_git_at_all"),
+    pytest.param("sh -c 'git commit -m x'", False, id="mut_nested_shell"),
+    pytest.param("", False, id="empty"),
+])
+def test_is_readonly_git_command(cmd, expected):
+    """ALL-or-nothing per segment: this is what lets read-only git through the
+    external-workspace runtime-read guard WITHOUT opening a shell bypass for the
+    secret/credential surface."""
+    assert policy.is_readonly_git_command(cmd) is expected, cmd
