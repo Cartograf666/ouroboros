@@ -5906,3 +5906,61 @@ def test_subscription_window_exhausted_beacon_wakes_the_waiting_parent(tmp_path,
     _record_executor_resolution(child_logs, {"id": "childbeacon2", "parent_task_id": "parentroot1",
                                              "root_task_id": "parentroot1"}, healthy)
     assert len(ledger_mod.tree_ledger_attention_after("parentroot1", "")) == 1
+
+
+def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_path):
+    """W3 adjacent (d): a project registration is shared by every run delegated
+    into it — while siblings are unsettled, only the LOWEST-run_id sharer keeps
+    attempting the removal (one honest, disclosed retry lane; the deterministic
+    tie-break means some sharer always attempts, so deferral cannot deadlock);
+    the rest defer QUIETLY: no doomed daemon call, no PROJECT_RETIRE_FAILED
+    spam (the submarine wave-2 retire loop). The daemon's refusal text rides
+    the failure row as `reason`."""
+    import json as _json
+
+    import ouroboros.delegate_custody as dc
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    class _RefusingGateway:
+        def __init__(self):
+            self.removals = []
+            self.refuse = True
+
+        def remove_project(self, pid):
+            self.removals.append(pid)
+            if self.refuse:
+                raise ClaudexorUnavailable("project_busy", "project has live runs", status_code=409)
+
+    gateway = _RefusingGateway()
+    for rid, tid in (("run-aa", "t-1"), ("run-bb", "t-2")):
+        dc.record_started(tmp_path, dc.RunCustody(
+            run_id=rid, task_id=tid, route_id="r", model="m",
+            project_id="prj-shared", project_owned=True, ledger_root=str(tmp_path)))
+    dc._CUSTODY.clear()
+
+    # Non-canonical sharer (higher run_id): quiet deferral — no call, no row.
+    custody_b = dc.replay(tmp_path)["run-bb"]
+    dc.retire_project(tmp_path, gateway, custody_b)
+    assert gateway.removals == []
+    assert "delegate_run_project_retire_failed" not in _event_types(tmp_path)
+    assert custody_b.project_owned is True
+
+    # Canonical sharer (lowest run_id): attempts, and the refusal text is typed.
+    custody_a = dc.replay(tmp_path)["run-aa"]
+    dc.retire_project(tmp_path, gateway, custody_a)
+    assert gateway.removals == ["prj-shared"]
+    rows = [
+        _json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    failed = [r for r in rows if r.get("type") == "delegate_run_project_retire_failed"]
+    assert len(failed) == 1
+    assert "live runs" in str(failed[0].get("reason"))
+
+    # Once the daemon accepts, the canonical sharer discharges the registration.
+    gateway.refuse = False
+    dc.retire_project(tmp_path, gateway, custody_a)
+    assert custody_a.project_owned is False
+    assert "delegate_run_project_retired" in _event_types(tmp_path)
+    dc._CUSTODY.clear()
