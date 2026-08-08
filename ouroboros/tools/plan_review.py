@@ -225,15 +225,13 @@ def get_tools():
                                     "type": "array",
                                     "items": {"type": "string"},
                                     "description": (
-                                        "Optional pre-work acceptance claims: concrete, checkable "
-                                        "statements of what 'done' means for this plan (plain strings). "
-                                        "They enter the plan fingerprint when set, reviewers see them "
-                                        "beside the goal, and the claims of the CLOSED plan bind task "
-                                        "acceptance (ids claim_1..N in list order — link "
-                                        "verify_and_record receipts to them via criterion_id). Keep the "
-                                        "list stable across re-plans (append-only edits) so receipt "
-                                        "links survive. Omit the field unless you can state real "
-                                        "checks; empty/blank values are treated as absent."
+                                        "Optional pre-work acceptance claims: concrete, checkable statements of "
+                                        "what 'done' means (plain strings). They enter the plan fingerprint when "
+                                        "set, reviewers see them beside the goal, and the CLOSED plan's claims "
+                                        "bind task acceptance (ids claim_1..N in list order — link "
+                                        "verify_and_record receipts via criterion_id). Keep the list stable "
+                                        "across re-plans (append-only) so receipt links survive; omit unless "
+                                        "you can state real checks — empty/blank values are treated as absent."
                                     ),
                                 },
                             },
@@ -729,10 +727,7 @@ def _start_planning_swarm(
                 _cap = 3
             _desired = 2 if context_level in {"broad", "constitutional"} or len(files_to_touch or []) > 3 else 1
             roles = [f"planning-scout-{idx + 1}" for idx in range(max(1, min(int(_cap or 1), _desired)))]
-            scope_claims = (
-                request.scope.get("acceptance_claims")
-                if isinstance(request.scope, dict) else None
-            )
+            scope_claims = request.scope.get("acceptance_claims") if isinstance(request.scope, dict) else None
             wave, created = reserve_plan_review_wave(
                 root, parent_id, fingerprint=fingerprint, plan_text_hash=plan_text_fingerprint(plan),
                 scout_roles=roles, cutoff_at=(_planning_now() + timedelta(seconds=max_wait)).isoformat(),
