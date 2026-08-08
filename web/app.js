@@ -191,6 +191,11 @@ document.addEventListener('click', (event) => {
 navDrawerBackdrop?.addEventListener('click', () => setMobileDrawerOpen(false));
 hydrateNavIcons();
 
+// perf2 P4.2: non-zero while openProjectPanel is building/painting a panel —
+// Main's chat instance defers its first hydration to it (bounded upper limit
+// lives in chat.js), so a fast project open never competes with Main replay.
+let projectPanelOpeningSince = 0;
+
 const ctx = {
     ws,
     state,
@@ -198,6 +203,7 @@ const ctx = {
     showPage,
     openSettingsTab,
     openDashboardTab,
+    isProjectOpening: () => projectPanelOpeningSince > 0,
     setBeforePageLeave: (handler) => {
         if (typeof handler !== 'function') return () => {};
         beforePageLeaveHandlers.push(handler);
@@ -260,45 +266,52 @@ async function openProjectPanel(project, { closeDrawer = true } = {}) {
         closeProjectPanel();
         return;
     }
-    const movedToChat = await showPage('chat', { closeProject: false, closeDrawer: false });
-    if (movedToChat === false) return;
-    navState.activeProjectId = project.id;
-    projectPanelTitle.textContent = project.name || project.id;
-    // One live panel: every OTHER project instance is destroyed (or hidden and
-    // marked when it holds pending work) before the target is created/shown.
-    for (const pid of [...projectInstances.keys()]) {
-        if (pid !== project.id) destroyProjectInstance(pid);
+    // perf2 P4.2: signal chat.js that a panel open is in flight so Main's
+    // deferred first hydration yields the CPU to this build/paint.
+    projectPanelOpeningSince = Date.now();
+    try {
+        const movedToChat = await showPage('chat', { closeProject: false, closeDrawer: false });
+        if (movedToChat === false) return;
+        navState.activeProjectId = project.id;
+        projectPanelTitle.textContent = project.name || project.id;
+        // One live panel: every OTHER project instance is destroyed (or hidden and
+        // marked when it holds pending work) before the target is created/shown.
+        for (const pid of [...projectInstances.keys()]) {
+            if (pid !== project.id) destroyProjectInstance(pid);
+        }
+        let inst = projectInstances.get(project.id);
+        if (!inst) {
+            inst = createChatInstance({
+                ...ctx,
+                chatId: Number(project.chat_id) || 1,
+                projectId: project.id,
+                idPrefix: `pchat-${project.id}`,
+                mountEl: projectPanelBody,
+                asPanel: true,
+                title: project.name || project.id,
+                initialScrollState: projectScrollStash.get(project.id) || null,
+            });
+            projectScrollStash.delete(project.id);
+            projectInstances.set(project.id, inst);
+        }
+        // A reopened pending-work survivor is live again.
+        delete inst.page.dataset.pendingWork;
+        for (const [pid, other] of projectInstances) {
+            other.page.hidden = pid !== project.id;
+            if (pid !== project.id) other.cancelHistoryPaint?.();
+        }
+        if (closeDrawer) navState.mobileDrawerOpen = false;
+        syncNavigationState();
+        // Restore this thread's scroll instead of leaving it at the top (P7). Runs
+        // after the panel is shown so the column has real geometry to scroll.
+        inst.restoreScrollPosition?.();
+        // ACK only the exact revision whose history was fetched and painted. chat.js
+        // owns the paint receipt; an already-painted instance skips the forced
+        // refetch — the server clamps the ACK, so no repaint is needed.
+        await acknowledgeProjectAfterPaint(project, inst, { forcePaint: !inst.hasPaintedHistory?.() });
+    } finally {
+        projectPanelOpeningSince = 0;
     }
-    let inst = projectInstances.get(project.id);
-    if (!inst) {
-        inst = createChatInstance({
-            ...ctx,
-            chatId: Number(project.chat_id) || 1,
-            projectId: project.id,
-            idPrefix: `pchat-${project.id}`,
-            mountEl: projectPanelBody,
-            asPanel: true,
-            title: project.name || project.id,
-            initialScrollState: projectScrollStash.get(project.id) || null,
-        });
-        projectScrollStash.delete(project.id);
-        projectInstances.set(project.id, inst);
-    }
-    // A reopened pending-work survivor is live again.
-    delete inst.page.dataset.pendingWork;
-    for (const [pid, other] of projectInstances) {
-        other.page.hidden = pid !== project.id;
-        if (pid !== project.id) other.cancelHistoryPaint?.();
-    }
-    if (closeDrawer) navState.mobileDrawerOpen = false;
-    syncNavigationState();
-    // Restore this thread's scroll instead of leaving it at the top (P7). Runs
-    // after the panel is shown so the column has real geometry to scroll.
-    inst.restoreScrollPosition?.();
-    // ACK only the exact revision whose history was fetched and painted. chat.js
-    // owns the paint receipt; an already-painted instance skips the forced
-    // refetch — the server clamps the ACK, so no repaint is needed.
-    await acknowledgeProjectAfterPaint(project, inst, { forcePaint: !inst.hasPaintedHistory?.() });
 }
 
 // A Project can receive a new visible revision while its panel remains open.
