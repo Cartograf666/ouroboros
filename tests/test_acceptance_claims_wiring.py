@@ -219,6 +219,37 @@ def test_schedule_subagent_rejects_malformed_claims(tmp_path):
         assert "TOOL_ARG_ERROR (schedule_subagent): acceptance_claims" in result
 
 
+def test_success_criteria_is_an_input_alias_not_a_second_carrier():
+    from ouroboros.contracts.task_contract import build_task_contract
+
+    # Criteria given only as success_criteria arrive normalized into claims.
+    aliased = build_task_contract({"task_contract": {"success_criteria": ["report delivered"]}})
+    assert [c["claim"] for c in aliased["acceptance_claims"]] == ["report delivered"]
+    assert aliased["success_criteria"] == []
+
+    # Real claims win; the alias list is still not double-persisted.
+    both = build_task_contract({"task_contract": {
+        "success_criteria": ["alias criterion"],
+        "acceptance_claims": ["real claim"],
+    }})
+    assert [c["claim"] for c in both["acceptance_claims"]] == ["real claim"]
+    assert both["success_criteria"] == []
+
+    # No criteria anywhere: both carriers empty, exactly as before.
+    empty = build_task_contract({"task_contract": {}})
+    assert empty["acceptance_claims"] == []
+    assert empty["success_criteria"] == []
+
+    # Explicit empty claims beside a criteria list keep the single-carrier rule:
+    # claims stay empty and the raw list persists alone (no double carrier).
+    explicit_empty = build_task_contract({"task_contract": {
+        "success_criteria": ["kept criterion"],
+        "acceptance_claims": [],
+    }})
+    assert explicit_empty["acceptance_claims"] == []
+    assert explicit_empty["success_criteria"] == ["kept criterion"]
+
+
 def test_packet_open_plan_wave_binds_no_claims():
     from ouroboros.task_results import (
         STATUS_RUNNING,

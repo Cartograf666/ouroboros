@@ -434,9 +434,19 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         "objective": objective,
         "expected_output": expected_output,
         "constraints": constraints,
-        "success_criteria": list(merged.get("success_criteria") or [])
-        if isinstance(merged.get("success_criteria"), list)
-        else [],
+        # (W2) success_criteria is an INPUT ALIAS: it already feeds
+        # normalize_acceptance_claims above when no claims were given, so once
+        # acceptance_claims is populated the raw list is NOT double-persisted —
+        # one concept, one carrier. Historical records keep their stored shape
+        # untouched (no normalizer, v6.78 precedent); readers tolerate both
+        # shapes (the eligibility probe checks both keys).
+        "success_criteria": []
+        if acceptance_claims
+        else (
+            list(merged.get("success_criteria") or [])
+            if isinstance(merged.get("success_criteria"), list)
+            else []
+        ),
         "acceptance_claims": acceptance_claims,
         "allowed_resources": allowed_resources,
         "resource_policy": resource_policy,
