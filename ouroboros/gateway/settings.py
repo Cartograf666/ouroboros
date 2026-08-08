@@ -894,7 +894,7 @@ def _apply_max_context_auto_downgrade(
     # the auto-low is marked DERIVED: the OWNER's selection keeps scope review ON.
     current["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "true"
     os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "true"
-    # Typed attribution row: leaving ZERO events.jsonl rows got this blamed on the OWNER.
+    # Typed attribution row (zero rows got blamed on the OWNER); pre-save: a failed save leaves it env-only-true.
     try:
         route = _active_main_route(current)
         append_jsonl(pathlib.Path(DATA_DIR) / "logs" / "events.jsonl", {

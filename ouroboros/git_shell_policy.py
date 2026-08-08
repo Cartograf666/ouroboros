@@ -63,7 +63,7 @@ _TAG_READONLY_FLAGS = frozenset({
 # (any ref positional falls through to it) and `exists`/`list` also only read;
 # `expire`/`delete`/`drop` rewrite or remove reflog entries.
 _REMOTE_READONLY_MODES = frozenset({"show", "get-url"})
-_REFLOG_MUTATING_MODES = frozenset({"expire", "delete", "drop"})
+_REFLOG_MUTATING_MODES = frozenset({"expire", "delete", "drop", "write"})
 
 
 def _git_subcommand_and_args(cmd_parts: list[str]) -> tuple[str, list[str]]:

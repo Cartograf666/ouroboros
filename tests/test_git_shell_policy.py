@@ -54,6 +54,10 @@ BLOCKED_CASES = [
     pytest.param("git -C /Users/anton/Ouroboros/repo reflog expire --expire=now --all", id="reflog_expire_runtime"),
     pytest.param("git -C /Users/anton/Ouroboros/repo reflog delete HEAD@{1}", id="reflog_delete_runtime"),
     pytest.param("git -C /Users/anton/Ouroboros/repo reflog drop --all", id="reflog_drop_runtime"),
+    pytest.param(
+        "git -C /Users/anton/Ouroboros/repo reflog write refs/heads/x 0000000 1111111 msg",
+        id="reflog_write_runtime",
+    ),
     pytest.param("cd /Users/anton/Ouroboros/repo && git reflog expire --all", id="reflog_expire_cd_runtime"),
     # `git remote` verbs mutate config/refs; flags BEFORE the verb still dispatch
     # (measured: `git remote -v add origin <url>` ADDS the remote), so the verb is
