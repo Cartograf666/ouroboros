@@ -100,11 +100,17 @@ def get_pricing(
         return dict(rows)
 
 
-def estimate_cost_optional(model: str, prompt_tokens: int, completion_tokens: int,
+def estimate_cost_optional(model: str, prompt_tokens: int, completion_tokens: int, *,
                            cache_usage: Optional[Dict[str, Any]] = None,
                            allow_live_fetch: bool = True,
                            provider: Optional[str] = None) -> Optional[float]:
     """Estimate cost from exact provider/model data, preserving unknown as None.
+
+    ``cache_usage`` and everything after it are KEYWORD-ONLY: the 4th slot used
+    to be a positional ``cached_tokens: int``, and a stale positional caller
+    would otherwise be silently coerced through the isinstance guard to ``{}``,
+    dropping cache accounting invisibly. Keyword-only makes such a caller a
+    loud ``TypeError`` instead.
 
     ``cache_usage`` folds the prompt-cache facts into one mapping (the <8-parameter
     contract; keys are the usage-row field names, all optional):

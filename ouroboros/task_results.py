@@ -935,15 +935,21 @@ def plan_review_wave(state: Dict[str, Any], fingerprint: str) -> Optional[Dict[s
 
 def _bounded_wave_acceptance_claims(acceptance_claims: Any) -> Dict[str, Any]:
     """Bounded per-wave claims copy, only-when-set; an over-cap tail is DISCLOSED
-    (acceptance_claims_omitted), never silently dropped (BIBLE P1)."""
+    (acceptance_claims_omitted), never silently dropped (BIBLE P1).
+
+    Claim text is frozen byte-for-byte apart from the disclosed truncation bound:
+    the review panel sees ``normalize_plan_scope`` output (per-item strip, internal
+    whitespace PRESERVED), so a lossy rewrite here — the historical
+    ``" ".join(split())`` — made acceptance bind DIFFERENT text than the panel
+    reviewed (an exact-output claim quoting code/spacing changed meaning)."""
     from ouroboros.utils import truncate_review_artifact
 
     cleaned = [
-        " ".join(str(item).split()).strip()
+        str(item).strip()
         for item in (acceptance_claims if isinstance(acceptance_claims, list) else [])
     ]
     bounded = [
-        truncate_review_artifact(item, limit=600).replace("\n", " ")
+        truncate_review_artifact(item, limit=600)
         for item in cleaned if item
     ]
     if not bounded:

@@ -633,15 +633,24 @@ never runs `plan_task`, steers an existing task, or publishes the work inline.
 **Context mode (low / max).** The owner-selected `OUROBOROS_CONTEXT_MODE`
 (layout SSOT: `ouroboros/context_layout.py`) tiers the *reference-doc* layer of
 the agent's own context (main task context, background consciousness, deep
-self-review). In `max`, self-body tasks inline ARCHITECTURE.md and DEVELOPMENT.md
-in full. External/headless/workspace tasks receive ARCHITECTURE.md as a lossless
-navigation map and DEVELOPMENT.md as an on-demand pointer unless their
-`task_contract` explicitly requires self-body docs. In `low` (for ~200K / local
-models), ARCHITECTURE.md is a lossless **navigation map** (every section + line
-range; full sections read on demand via `read_file`), and DEVELOPMENT.md stays
-full for runnable repo/self-body task contexts unless a structured caller
-explicitly sets `context_requires_development=false` (then a visible on-demand
-pointer is used). README.md and CHECKLISTS.md are not inlined in the agent
+self-review). ARCHITECTURE.md follows the owner mode alone (D-ARCH, owner
+2026-08-08): in `max` it is ALWAYS inlined in full for EVERY task class —
+self-body, project work (with or without a folder), evolution, and
+external/headless/workspace/delegated surfaces — because it is Ouroboros's
+capability/tools/access map; in `low` (for ~200K / local models) it is a
+lossless **navigation map** (every section + line range; full sections read on
+demand via `read_file`). There is no per-task ARCHITECTURE downgrade in `max`.
+DEVELOPMENT.md (the self-engineering handbook) is chosen MODE-INDEPENDENTLY
+from the ACTIVE REPO BINDING (D-DEV, owner 2026-08-08): it is inlined in full
+iff the task's active repo is the system repo — `not
+_task_uses_external_context(task)` in `ouroboros/context.py`, i.e. whenever
+Ouroboros works on its own code, regardless of task class — and is a visible
+on-demand pointer for the external-surface class (a bound workspace, a
+subagent, or an api/cli/scheduled surface: work on ANOTHER codebase). An
+explicit `context_requires_development` on the task wins, and self-body task
+classes (explicit `context_requires_self_body_docs`, or
+evolution/deep_self_review/review types) always keep the handbook full.
+README.md and CHECKLISTS.md are not inlined in the agent
 context in either mode (README is user-facing; reviewers load their own
 CHECKLISTS copy). The tier-0 protected core — SYSTEM.md, BIBLE.md,
 identity, scratchpad, knowledge index, recent dialogue — is ALWAYS full in every

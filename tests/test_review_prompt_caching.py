@@ -493,7 +493,11 @@ def test_global_ttl_docstrings_name_every_consumer():
         for p in (repo / "ouroboros").rglob("*.py")
         if p.name != "config.py" and call.search(p.read_text(encoding="utf-8"))
     )
-    assert consumers == ["ouroboros/llm.py", "ouroboros/tools/review_helpers.py"], consumers
+    assert consumers == [
+        "ouroboros/llm.py",
+        "ouroboros/tools/review_helpers.py",
+        "ouroboros/usage_accounting.py",
+    ], consumers
 
     finalizer_doc = LLMClient._normalize_payload_cache_ttl.__doc__ or ""
     assert "only here" not in finalizer_doc.lower(), (
@@ -502,7 +506,7 @@ def test_global_ttl_docstrings_name_every_consumer():
     )
     assert "cached_prompt_blocks" in finalizer_doc  # names the other reader
     resolver_doc = resolve_prompt_cache_ttl.__doc__ or ""
-    for name in ("_normalize_payload_cache_ttl", "cached_prompt_blocks"):
+    for name in ("_normalize_payload_cache_ttl", "cached_prompt_blocks", "_reservation_cost"):
         assert name in resolver_doc, f"config's docstring omits the {name} consumer"
 
 

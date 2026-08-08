@@ -196,10 +196,16 @@ def normalize_budget_profile(value: Any) -> Dict[str, Any]:
 
 
 def _bounded_claim_text(value: Any, limit: int = 600) -> str:
+    """Strip + disclosed truncation ONLY — internal whitespace is preserved.
+
+    This is the read-time binder for acceptance claims (ingress and plan-wave
+    alike); a lossy ``" ".join(split())`` here rewrote exact-output claims
+    (quoted code/expected spacing) between review and binding — the same
+    collapsed-quoted-whitespace class the receipt module bans outright."""
     from ouroboros.utils import truncate_review_artifact
 
-    text = " ".join(str(value or "").split()).strip()
-    return truncate_review_artifact(text, limit=limit).replace("\n", " ")
+    text = str(value or "").strip()
+    return truncate_review_artifact(text, limit=limit)
 
 
 _ANSWER_PROTOCOLS = ("", "final_answer_line")

@@ -1516,7 +1516,8 @@ def build_review_context(env: Any) -> str:
         if retired:
             lines.append(f"- {len(retired)} settled continuation(s) archived out of context "
                          "(durable under state/review_continuations/archived/): "
-                         + ", ".join(retired[:5]) + ("…" if len(retired) > 5 else ""))
+                         + ", ".join(retired[:5])
+                         + (f" (+{len(retired) - 5} more)" if len(retired) > 5 else ""))
         scoped_continuations = [
             item for item in continuations
             if item.repo_key in ("", repo_key, _LEGACY_CURRENT_REPO_KEY)

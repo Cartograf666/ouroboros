@@ -162,6 +162,37 @@ def test_finalized_payload_marks_last_sorted_tool_for_cache(monkeypatch):
     assert kwargs["tools"][-1]["cache_control"] == {"type": "ephemeral"}
 
 
+def test_attempt_request_carries_the_payloads_applied_cache_ttl():
+    """G3-5: the reservation must price the cache-write tier of the exact
+    candidate payload being sent — the applied wire TTL rides AttemptRequest so
+    usage_accounting._reservation_cost never re-invents a second TTL authority."""
+    from ouroboros.llm import _attempt_request
+
+    target = {
+        "provider": "anthropic",
+        "resolved_model": "anthropic/claude-test",
+        "usage_model": "anthropic/claude-test",
+    }
+    marker = {"type": "ephemeral", "ttl": "5m"}
+    payload = {
+        "model": "anthropic/claude-test",
+        "max_tokens": 128,
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": "hi", "cache_control": marker}],
+        }],
+    }
+    assert _attempt_request(target, payload).prompt_cache_ttl == "5m"
+    marker["ttl"] = "1h"
+    assert _attempt_request(target, payload).prompt_cache_ttl == "1h"
+    del marker["ttl"]  # bare marker = provider default tier
+    assert _attempt_request(target, payload).prompt_cache_ttl == "default"
+    del payload["messages"][0]["content"][0]["cache_control"]
+    # Marker-free payload: nothing is written to cache at all, so the base
+    # write tier is already a safe conservative bound (never the extended 1h).
+    assert _attempt_request(target, payload).prompt_cache_ttl == "default"
+
+
 def test_build_memory_sections_partition_modes():
     from ouroboros.context import build_memory_sections
 

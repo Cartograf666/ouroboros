@@ -595,11 +595,11 @@ def resolve_prompt_cache_ttl() -> str:
     """The owner-configured global prompt-cache TTL ('default' | '5m' | '1h').
 
     Validated like ``resolve_effort``: an unknown value falls back to the shipped default.
-    Consumed ONLY by the send-time cache finalizer (``llm.LLMClient._normalize_payload_cache_ttl``)
-    and by ``review_helpers.cached_prompt_blocks`` (whose marker the finalizer would stamp to the
-    same value anyway) — never by per-builder marking sites (docs/DEVELOPMENT.md cache-friendliness
-    invariant).
-    """
+    Consumed ONLY by the finalizer (``llm.LLMClient._normalize_payload_cache_ttl``), by
+    ``review_helpers.cached_prompt_blocks`` (its marker gets stamped to the same value anyway),
+    and by ``usage_accounting._reservation_cost`` as the payload-free admission fallback
+    (payload-carrying sites use the finalizer's applied TTL) — never by per-builder marking
+    sites (docs/DEVELOPMENT.md cache-friendliness invariant)."""
     default = str(SETTINGS_DEFAULTS["OUROBOROS_PROMPT_CACHE_TTL"])
     raw = str(os.environ.get("OUROBOROS_PROMPT_CACHE_TTL", default) or "").strip().lower()
     return raw if raw in PROMPT_CACHE_TTL_SCALE else default

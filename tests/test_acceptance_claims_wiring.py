@@ -250,6 +250,41 @@ def test_success_criteria_is_an_input_alias_not_a_second_carrier():
     assert explicit_empty["success_criteria"] == ["kept criterion"]
 
 
+def test_wave_freeze_and_bind_preserve_reviewed_claim_whitespace():
+    """G3-6: the review panel sees ``normalize_plan_scope`` output — per-item strip
+    with internal whitespace PRESERVED. The frozen wave copy and the read-time
+    binder must carry that text byte-for-byte (apart from the DISCLOSED truncation
+    bound); the historical ``" ".join(split())`` rewrite made acceptance bind an
+    exact-output claim DIFFERENT from what the panel reviewed."""
+    from ouroboros.task_results import (
+        _bounded_wave_acceptance_claims,
+        closed_plan_review_wave,
+        load_plan_review_state,
+    )
+    from ouroboros.tools.review_synthesis import normalize_plan_scope
+
+    raw = "stdout is exactly:\n    def f():\n        return  'a  b'"
+    reviewed = normalize_plan_scope({"acceptance_claims": [f"  {raw}  "]})[
+        "acceptance_claims"
+    ]
+    assert reviewed == [raw]  # the panel-reviewed surface preserves internal whitespace
+
+    dr = Path(tempfile.mkdtemp())
+    _close_green_wave(dr, "acc", "a" * 64, reviewed)
+    wave = closed_plan_review_wave(load_plan_review_state(dr, "acc"))
+    assert wave["acceptance_claims"] == [raw]  # frozen byte-for-byte (validator round-trip)
+
+    claims, source = effective_acceptance_claims({"acceptance_claims": []}, wave)
+    assert source == "plan_review"
+    assert [c["claim"] for c in claims] == [raw]  # bound text == reviewed text
+
+    # Over-cap claims keep a byte-exact prefix plus the DISCLOSED marker.
+    long_claim = "line with    significant\tspacing\n" * 40
+    bounded = _bounded_wave_acceptance_claims([long_claim])["acceptance_claims"][0]
+    assert bounded.startswith(long_claim.strip()[:600])
+    assert "OMISSION NOTE" in bounded
+
+
 def test_packet_open_plan_wave_binds_no_claims():
     from ouroboros.task_results import (
         STATUS_RUNNING,

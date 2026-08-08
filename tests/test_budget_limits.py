@@ -601,6 +601,50 @@ class TestTreeFedDecidingValue:
         _text, usage, _ = result
         assert usage["cost_stop_spend_basis"] == task_pacing.SPEND_BASIS_TREE
 
+    def test_current_inflight_reservation_participates_in_the_stop(self, tmp_path, monkeypatch):
+        """G3-4 regression: the stash the loop trusts for 120s must include the
+        reservation of the call currently in flight, not the pre-append sum.
+        The pre-fix shape: a tree near its cap reserved+settled one more call,
+        the loop still saw the pre-call number, and the hard ledger fence fired
+        on the next send before the graceful wrap-up ever ran. Here the ceiling
+        check stops on the un-settled hold alone, with zero fresh ledger reads."""
+        from ouroboros import usage_accounting
+        from ouroboros.usage_accounting import AttemptRequest, UsageScope, usage_scope
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("per-round ledger read")
+
+        monkeypatch.setattr(usage_accounting, "usage_projection", _boom)
+        llm = MagicMock()
+        llm.chat.return_value = ({"content": "done"}, {"prompt_tokens": 1, "completion_tokens": 1})
+        args = _make_args(
+            budget_remaining_usd=1900.0,
+            accumulated_usage={"cost": 0.5},
+            cost_ceiling=task_pacing.resolve_cost_ceiling(
+                1900.0, normalize_budget_profile(None), root_cap_usd=100.0,
+            ),
+            llm=llm,
+            drive_logs=tmp_path,
+        )
+        scope = UsageScope(
+            drive_root=tmp_path, task_id="root-inflight", root_task_id="root-inflight",
+            global_limit_usd=1900.0, root_limit_usd=100.0,
+        )
+        with usage_scope(scope):
+            usage_accounting.reserve_attempt(AttemptRequest(
+                model="test/model", provider="openrouter",
+                reservation_usd=99.5, drive_root=tmp_path,
+            ))
+            # The attempt is still in flight (never settled) — its hold alone
+            # must already be visible to the deciding surface.
+            entry = usage_accounting.last_root_accounting("root-inflight")
+            assert entry is not None and entry["accounted_usd"] == 99.5
+            result = _check_budget_limits(**args)
+        assert result is not None
+        _text, usage, _ = result
+        assert usage.get("reason_code") == "budget_exhausted"
+        assert usage["cost_stop_spend_basis"] == task_pacing.SPEND_BASIS_TREE
+
 
 class TestRootAccountingTelemetry:
     def test_stash_roundtrip_and_age(self):
@@ -658,8 +702,44 @@ class TestRootAccountingTelemetry:
             ))
         entry = usage_accounting.last_root_accounting("rroot")
         assert entry is not None
-        assert entry["accounted_usd"] == 0.0  # measured pre-attempt sum, fresh tree
+        # Post-append sum on a fresh tree: the local-provider hold is $0.00.
+        assert entry["accounted_usd"] == 0.0
         assert entry["root_limit_usd"] == 50.0
+
+    def test_stash_tracks_reserve_settle_and_release_transitions(self, tmp_path):
+        """G3-4: the stash follows every ledger transition in this process —
+        reserve includes the fresh hold, settle replaces the hold with the real
+        cost, release drops it — so the loop's 120s-trusted snapshot can never
+        lag one call behind the fence."""
+        from ouroboros import usage_accounting
+        from ouroboros.usage_accounting import AttemptRequest, UsageScope, usage_scope
+
+        def _stashed():
+            entry = usage_accounting.last_root_accounting("root-transitions")
+            assert entry is not None
+            return entry["accounted_usd"]
+
+        scope = UsageScope(
+            drive_root=tmp_path, task_id="root-transitions", root_task_id="root-transitions",
+            global_limit_usd=100.0, root_limit_usd=50.0,
+        )
+        with usage_scope(scope):
+            first = usage_accounting.reserve_attempt(AttemptRequest(
+                model="test/model", provider="openrouter",
+                reservation_usd=2.5, drive_root=tmp_path,
+            ))
+            assert _stashed() == 2.5  # the in-flight hold itself
+            usage_accounting.mark_dispatched(first)
+            assert _stashed() == 2.5  # dispatch moves buckets, not the sum
+            usage_accounting.settle_attempt(first, cost_usd=1.0, cost_final=True)
+            assert _stashed() == 1.0  # settled cost replaced the hold
+            second = usage_accounting.reserve_attempt(AttemptRequest(
+                model="test/model", provider="openrouter",
+                reservation_usd=3.0, drive_root=tmp_path,
+            ))
+            assert _stashed() == 4.0  # settled + the new hold
+            usage_accounting.release_attempt(second, "not_dispatched")
+            assert _stashed() == 1.0  # released hold no longer counts
 
 
 # --- v6.56.0 cost axis: latched milestones + wrap-up (task_pacing content) ---

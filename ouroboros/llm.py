@@ -184,6 +184,28 @@ def _estimate_message_chars(messages: List[Dict[str, Any]]) -> int:
     return total
 
 
+def _applied_payload_cache_ttl(payload: Dict[str, Any]) -> Optional[str]:
+    """Strongest cache TTL carried by THIS exact candidate payload.
+
+    Same reporting rule as the send-time finalizer's return value
+    (``_normalize_payload_cache_ttl``: 1h > 5m > bare markers = "default";
+    None when the payload carries no markers). Read per candidate rather than
+    plumbed from the finalizer because the retry ladder can strip markers
+    (``_retry_without_prompt_cache_parameter``) after the finalizer ran — the
+    reservation must price the payload actually being sent, not the original.
+    """
+    breakpoints = LLMClient._payload_cache_breakpoints(payload)
+    ttls = {
+        str((holder.get("cache_control") or {}).get("ttl") or "").strip().lower()
+        for holder in breakpoints
+    }
+    if "1h" in ttls:
+        return "1h"
+    if "5m" in ttls:
+        return "5m"
+    return "default" if breakpoints else None
+
+
 def _attempt_request(
     target: Dict[str, Any],
     payload: Dict[str, Any],
@@ -223,6 +245,11 @@ def _attempt_request(
         prompt_tokens_estimate=max(0, prompt_chars // 4),
         max_completion_tokens=int(payload.get("max_completion_tokens") or payload.get("max_tokens") or 0),
         source=str(request_source or ""),
+        # The APPLIED wire TTL for reservation pricing (G3-5): a payload whose
+        # markers say 5m/default must not be admission-priced at the extended 1h
+        # write tier. A marker-free payload writes nothing to cache at all, so
+        # "default" (the base write tier) is already a safe upper bound for it.
+        prompt_cache_ttl=_applied_payload_cache_ttl(payload) or "default",
     )
 
 
