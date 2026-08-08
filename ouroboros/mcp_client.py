@@ -5,9 +5,8 @@ through ToolRegistry as provider-safe ``mcp_<server>__<tool>`` names, and each
 call opens a fresh session. Secrets, server descriptions/results, and obvious
 metadata SSRF targets are handled defensively because MCP servers are external.
 
-Supported transports: ``streamable_http``, ``sse``, ``stdio``.
-For ``stdio``: set ``transport`` to ``"stdio"``, provide ``command``
-(executable path) and optional ``args`` (list of arguments) instead of ``url``.
+For ``stdio``, ``command`` is an executable and ``args`` is passed as an exact
+list. No shell, custom environment, or working directory is involved.
 """
 
 from __future__ import annotations
@@ -29,9 +28,9 @@ log = logging.getLogger(__name__)
 
 try:  # pragma: no cover - import guard exercised by tests via monkeypatch
     from mcp import ClientSession  # type: ignore
-    from mcp.client.streamable_http import streamablehttp_client  # type: ignore
     from mcp.client.sse import sse_client  # type: ignore
-    from mcp.client.stdio import stdio_client, StdioServerParameters  # type: ignore
+    from mcp.client.stdio import StdioServerParameters, stdio_client  # type: ignore
+    from mcp.client.streamable_http import streamablehttp_client  # type: ignore
 
     _MCP_SDK_AVAILABLE = True
     _MCP_SDK_IMPORT_ERROR: Optional[str] = None
@@ -215,6 +214,27 @@ def _validate_auth_token(value: str) -> str:
     return text
 
 
+def _validate_stdio_command(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("MCP stdio command must be a string")
+    command = value.strip()
+    if not command:
+        raise ValueError("MCP stdio command is required")
+    if _CONTROL_CHARS_RE.search(command):
+        raise ValueError("MCP stdio command must not contain control characters")
+    return command
+
+
+def _validate_stdio_args(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError("MCP stdio args must be a list of strings")
+    if any("\x00" in item for item in value):
+        raise ValueError("MCP stdio args must not contain NUL characters")
+    return list(value)
+
+
 def _coerce_str_list(value: Any) -> List[str]:
     if value in (None, "", [], ()):
         return []
@@ -242,24 +262,17 @@ def normalize_server_config(raw: Dict[str, Any]) -> Optional[MCPServerConfig]:
 
     try:
         if transport == "stdio":
-            url = str(raw.get("url") or "")
-            command = str(raw.get("command") or raw.get("cmd") or "").strip()
-            args_raw = raw.get("args") or raw.get("arguments") or []
-            if isinstance(args_raw, str):
-                args = [a.strip() for a in args_raw.split() if a.strip()]
-            elif isinstance(args_raw, (list, tuple)):
-                args = [str(a) for a in args_raw]
-            else:
-                args = []
-            if not command:
-                log.warning("stdio MCP server %r: command is required", raw_id)
-                return None
+            url = ""
+            command = _validate_stdio_command(raw.get("command"))
+            args = _validate_stdio_args(raw.get("args"))
+            auth_header = "Authorization"
+            auth_token = ""
         else:
             url = _validate_url(raw.get("url") or "")
             command = ""
             args = []
-        auth_header = _validate_auth_header(raw.get("auth_header") or "Authorization")
-        auth_token = _validate_auth_token(raw.get("auth_token") or "")
+            auth_header = _validate_auth_header(raw.get("auth_header") or "Authorization")
+            auth_token = _validate_auth_token(raw.get("auth_token") or "")
     except ValueError as exc:
         log.warning("Dropping invalid MCP server config %r: %s", raw_id, exc)
         return None
@@ -310,21 +323,19 @@ def redact_servers_for_status(configs: List[MCPServerConfig]) -> List[Dict[str, 
     """Return UI-safe server configs with auth tokens masked."""
     out: List[Dict[str, Any]] = []
     for cfg in configs:
-        entry = {
-            "id": cfg.id,
-            "name": cfg.name,
-            "enabled": cfg.enabled,
-            "transport": cfg.transport,
-            "url": cfg.url,
-            "auth_header": cfg.auth_header,
-            "auth_token": _mask_token(cfg.auth_token),
-            "auth_configured": cfg.has_auth(),
-            "allowed_tools": list(cfg.allowed_tools),
-        }
-        if cfg.transport == "stdio":
-            entry["command"] = cfg.command
-            entry["args"] = list(cfg.args)
-        out.append(entry)
+        out.append(
+            {
+                "id": cfg.id,
+                "name": cfg.name,
+                "enabled": cfg.enabled,
+                "transport": cfg.transport,
+                "url": cfg.url,
+                "auth_header": cfg.auth_header,
+                "auth_token": _mask_token(cfg.auth_token),
+                "auth_configured": cfg.has_auth(),
+                "allowed_tools": list(cfg.allowed_tools),
+            }
+        )
     return out
 
 
@@ -399,16 +410,27 @@ def _wrap_schema_text_fields(value: Any) -> Any:
 # Async transport.
 
 
+def _transport_factory(cfg: MCPServerConfig):
+    if cfg.transport == "streamable_http":
+        headers = {cfg.auth_header: cfg.auth_token} if cfg.has_auth() else {}
+        return streamablehttp_client(cfg.url, headers=headers)
+    if cfg.transport == "sse":
+        headers = {cfg.auth_header: cfg.auth_token} if cfg.has_auth() else {}
+        return sse_client(cfg.url, headers=headers)
+    if cfg.transport == "stdio":
+        # Leaving env/cwd unset uses the SDK's small cross-platform default
+        # environment and its context-managed process shutdown sequence.
+        params = StdioServerParameters(command=cfg.command, args=list(cfg.args))
+        return stdio_client(params)
+    raise RuntimeError(f"Unsupported transport: {cfg.transport!r}")
+
+
 async def _list_tools_async(cfg: MCPServerConfig, *, timeout_sec: int) -> List[Dict[str, Any]]:
     """Connect to ``cfg`` and return raw tools; errors surface to status."""
     if not _MCP_SDK_AVAILABLE:
         raise RuntimeError(
             "MCP client SDK not installed. Add `mcp>=1.6` to the runtime."
         )
-    headers = {}
-    if cfg.has_auth():
-        headers[cfg.auth_header] = cfg.auth_token
-
     async def _do_with_session(session_factory) -> List[Dict[str, Any]]:
         async with session_factory as transport_ctx:
             # Both transports yield read/write streams.
@@ -431,19 +453,9 @@ async def _list_tools_async(cfg: MCPServerConfig, *, timeout_sec: int) -> List[D
                     )
                 return tools_raw
 
-    if cfg.transport == "streamable_http":
-        factory = streamablehttp_client(cfg.url, headers=headers)
-    elif cfg.transport == "sse":
-        factory = sse_client(cfg.url, headers=headers)
-    elif cfg.transport == "stdio":
-        server_params = StdioServerParameters(
-            command=cfg.command, args=list(cfg.args)
-        )
-        factory = stdio_client(server_params)
-    else:  # pragma: no cover - guarded by parse_servers
-        raise RuntimeError(f"Unsupported transport: {cfg.transport!r}")
-
-    return await asyncio.wait_for(_do_with_session(factory), timeout=timeout_sec)
+    return await asyncio.wait_for(
+        _do_with_session(_transport_factory(cfg)), timeout=timeout_sec
+    )
 
 
 async def _call_tool_async(
@@ -454,23 +466,8 @@ async def _call_tool_async(
         raise RuntimeError(
             "MCP client SDK not installed. Add `mcp>=1.6` to the runtime."
         )
-    headers = {}
-    if cfg.has_auth():
-        headers[cfg.auth_header] = cfg.auth_token
-
     async def _do() -> str:
-        if cfg.transport == "streamable_http":
-            factory = streamablehttp_client(cfg.url, headers=headers)
-        elif cfg.transport == "sse":
-            factory = sse_client(cfg.url, headers=headers)
-        elif cfg.transport == "stdio":
-            server_params = StdioServerParameters(
-                command=cfg.command, args=list(cfg.args)
-            )
-            factory = stdio_client(server_params)
-        else:
-            factory = sse_client(cfg.url, headers=headers)
-        async with factory as transport_ctx:
+        async with _transport_factory(cfg) as transport_ctx:
             streams = transport_ctx
             if isinstance(streams, tuple):
                 read, write = streams[0], streams[1]
@@ -695,32 +692,30 @@ class MCPManager:
             servers: List[Dict[str, Any]] = []
             for runtime in self._servers.values():
                 cfg = runtime.config
-                entry = {
-                    "id": cfg.id,
-                    "name": cfg.name,
-                    "enabled": cfg.enabled,
-                    "transport": cfg.transport,
-                    "url": cfg.url,
-                    "auth_header": cfg.auth_header,
-                    "auth_configured": cfg.has_auth(),
-                    "allowed_tools": list(cfg.allowed_tools),
-                    "tool_count": len(runtime.tools),
-                    "tools": [
-                        {
-                            "name": tool.raw_name,
-                            "prefixed_name": tool.prefixed_name,
-                            "description": _redact_error_text(tool.description, cfg),
-                        }
-                        for tool in runtime.tools
-                    ],
-                    "last_error": runtime.last_error,
-                    "last_refreshed": runtime.last_refreshed,
-                    "last_attempted": runtime.last_attempted,
-                }
-                if cfg.transport == "stdio":
-                    entry["command"] = cfg.command
-                    entry["args"] = list(cfg.args)
-                servers.append(entry)
+                servers.append(
+                    {
+                        "id": cfg.id,
+                        "name": cfg.name,
+                        "enabled": cfg.enabled,
+                        "transport": cfg.transport,
+                        "url": cfg.url,
+                        "auth_header": cfg.auth_header,
+                        "auth_configured": cfg.has_auth(),
+                        "allowed_tools": list(cfg.allowed_tools),
+                        "tool_count": len(runtime.tools),
+                        "tools": [
+                            {
+                                "name": tool.raw_name,
+                                "prefixed_name": tool.prefixed_name,
+                                "description": _redact_error_text(tool.description, cfg),
+                            }
+                            for tool in runtime.tools
+                        ],
+                        "last_error": runtime.last_error,
+                        "last_refreshed": runtime.last_refreshed,
+                        "last_attempted": runtime.last_attempted,
+                    }
+                )
             return {
                 "enabled": self._enabled,
                 "sdk_available": _MCP_SDK_AVAILABLE,
@@ -842,7 +837,10 @@ class MCPManager:
         if cfg is None:
             return {
                 "ok": False,
-                "error": "Invalid MCP server config (missing id/url, unsupported transport, or denied URL).",
+                "error": (
+                    "Invalid MCP server config (missing id/url/command, unsupported "
+                    "transport, or invalid transport fields)."
+                ),
             }
         timeout = self._tool_timeout_sec
         try:

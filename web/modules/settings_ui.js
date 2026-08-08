@@ -660,7 +660,7 @@ export function renderSettingsPage() {
                                 <h3>MCP Servers</h3>
                                 <div class="settings-section-copy">
                                     External Model Context Protocol tool servers. MCP is a base-runtime client:
-                                    it borrows tools from trusted HTTP/SSE servers and exposes them as non-core
+                                    it borrows tools from trusted HTTP/SSE servers or local stdio processes and exposes them as non-core
                                     <code>mcp_&lt;server&gt;__&lt;tool&gt;</code> tools after refresh. Changes are hot-reloadable.
                                     Treat server descriptions and results as untrusted third-party data.
                                 </div>
