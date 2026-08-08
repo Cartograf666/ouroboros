@@ -612,7 +612,14 @@ the durable record and its `subagent_envelope`; the child's own prompt (a
 telling it to say so in `blockers` if the gap limited its answer — it used to be
 composed into the child's text at ENQUEUE time, which is before the fact exists); and
 the `[SUBTASK_OUTCOME]` payload the parent reads when it collects the child's ANSWER,
-which is the moment it decides whether to trust a weaker result. The
+which is the moment it decides whether to trust a weaker result. (W2) On the FULL
+single-child handoff (`get_task_result`/`wait_task` — already uncapped surfaces) that
+payload also carries bounded per-receipt rows of the child's `verify_and_record`
+receipts — status plus the shared `receipt_identity_projection` identity, newest
+first, hard cap 10 with the exact omitted count via `disclosed_list_projection` — so
+a parent absorbs a child on receipt-level green/red instead of prose; the
+`wait_tasks` BATCH projection deliberately stays counts-compact (the v6.17.0 birth
+shape and the v6.71.2 measured compaction, 694K→25K). The
 `schedule_subagent` result deliberately carries none of it and states the REQUEST
 instead: nothing is resolved when it is written. A pending child's queue snapshot
 carries only intent (including `parent_model_lane`, without which a resumed child

@@ -53,7 +53,7 @@ from ouroboros.subagents import (
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE
 from ouroboros.tool_policy import swarm_router_turn
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso, run_cmd
+from ouroboros.utils import append_jsonl, atomic_write_json, truncate_review_artifact, utc_now_iso, run_cmd
 
 log = logging.getLogger(__name__)
 
@@ -275,7 +275,7 @@ def disclosable_capability_delta(data: Dict[str, Any]) -> Dict[str, Any]:
     return delta if (delta.get("reduced") or delta.get("legacy_note")) else {}
 
 
-def _subtask_outcome_summary(data: Dict[str, Any]) -> str:
+def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None) -> str:
     ledger = data.get("verification_ledger") if isinstance(data.get("verification_ledger"), dict) else {}
     summary: Dict[str, Any] = {
         "outcome_axes": normalize_outcome_axes(data),
@@ -293,6 +293,29 @@ def _subtask_outcome_summary(data: Dict[str, Any]) -> str:
             "summary": ledger.get("summary") if isinstance(ledger.get("summary"), dict) else {},
             "entry_count": len(ledger.get("entries") or []) if isinstance(ledger.get("entries"), list) else 0,
         }
+    if receipts:
+        # W2: bounded per-receipt rows for the FULL single-child handoff ONLY
+        # (get_task_result/wait_task — already uncapped surfaces): which checks
+        # passed, not just counts, so a parent can absorb a child on receipt-level
+        # green/red instead of prose. The wait_tasks BATCH projection deliberately
+        # stays counts-compact (v6.17.0 birth shape + v6.71.2 measured compaction,
+        # 694K->25K). Rows render through the SSOT identity projection + disclosed
+        # bound (hard cap, exact omitted count) — newest first, oldest omitted.
+        from ouroboros._outcome_receipts import disclosed_list_projection, receipt_identity_projection
+
+        def _receipt_row(receipt: Any) -> Any:
+            if not isinstance(receipt, dict):
+                return truncate_review_artifact(str(receipt), limit=200)
+            row = {"status": str(receipt.get("status") or "")}
+            if "matched" in receipt:
+                row["matched"] = receipt.get("matched")
+            row.update(receipt_identity_projection(receipt, check_cap=200))
+            return row
+
+        summary.update(disclosed_list_projection(
+            list(reversed([r for r in receipts if isinstance(r, dict)])),
+            key="verification_receipts", limit=10, item=_receipt_row,
+        ))
     return json.dumps(summary, ensure_ascii=False, indent=2, default=str)
 
 
@@ -1996,7 +2019,13 @@ def _get_task_result(ctx: ToolContext, task_id: str) -> str:
     result = data.get("result", "")
     cost = data.get("cost_usd", 0)
     trace = data.get("trace_summary", "")
-    outcome_summary = _subtask_outcome_summary(data)
+    try:
+        from ouroboros.outcomes import read_verification_receipts
+
+        receipts = read_verification_receipts(status_drive_root, task_id)
+    except Exception:
+        receipts = []
+    outcome_summary = _subtask_outcome_summary(data, receipts=receipts)
     from ouroboros.tools.join_ledger import _child_result_sha256
 
     child_result_sha256 = _child_result_sha256(data)
