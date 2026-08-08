@@ -259,26 +259,20 @@ def cached_prompt_blocks(stable_text: str, dynamic_text: str = "", *, ttl: str |
     (llm._copy_messages_with_cache_policy) — the block structure is portable.
 
     ``ttl=None`` (every review call site) projects the owner's global
-    ``OUROBOROS_PROMPT_CACHE_TTL``: the former module constant ``REVIEW_CACHE_TTL='1h'``
-    collapsed into that setting (owner decision 2026-08-08 Q2=A — an honest global
-    override, so an owner-selected '5m' really lowers the review lanes too), whose
-    shipped default keeps the 1h review economics. 'default' emits the bare marker
-    (provider default tier). An explicit ``ttl`` argument remains a deliberate
-    caller decision — the send-time finalizer still stamps the global over it on
-    the Anthropic-normalizing family whenever the global names a tier.
+    ``OUROBOROS_PROMPT_CACHE_TTL`` — the former ``REVIEW_CACHE_TTL='1h'`` constant
+    collapsed into that setting (owner decision 2026-08-08 Q2=A: an HONEST global
+    override, so '5m' really lowers review lanes; the shipped '1h' default keeps
+    the review economics; 'default' emits the bare marker). An explicit ``ttl``
+    stays a caller decision — the send-time finalizer still stamps the global
+    over it on the Anthropic-normalizing family whenever it names a tier.
     """
     if ttl is None:
         from ouroboros.config import resolve_prompt_cache_ttl
-
         ttl = resolve_prompt_cache_ttl()
     cache_control: dict = {"type": "ephemeral"}
     if ttl in ("5m", "1h"):
         cache_control["ttl"] = ttl
-    blocks: list = [{
-        "type": "text",
-        "text": stable_text,
-        "cache_control": cache_control,
-    }]
+    blocks: list = [{"type": "text", "text": stable_text, "cache_control": cache_control}]
     if str(dynamic_text or "").strip():
         blocks.append({"type": "text", "text": dynamic_text})
     return blocks

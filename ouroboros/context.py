@@ -1344,54 +1344,25 @@ def _build_installed_skills_section(env: Any, *, max_lines: int = 100) -> str:
     return "\n".join(lines)
 
 
-# Drive-state fields the agent actually REASONS about: session identity,
-# evolution/cognition flags, and the budget-drift alert numbers (health
-# invariants render the WARNING line; the raw pct stays useful beside it).
-# Everything else in state.json is either an internal cache
-# (managed_update_cache, openrouter_* counters) or a spend narrative that
-# build_runtime_section already renders from the usage-accounting authority —
-# injecting a second copy invited divergence, and any one cache growing
-# silently re-ballooned every round's prompt.
-_DRIVE_STATE_PROJECTION_KEYS = (
-    "session_id",
-    "current_branch",
-    "current_sha",
-    "evolution_mode_enabled",
-    "evolution_owner_stopped",
-    "evolution_cycle",
-    "evolution_consecutive_failures",
-    "last_evolution_task_at",
-    "bg_consciousness_enabled",
-    "post_task_autostop",
-    "budget_drift_pct",
-    "budget_drift_alert",
-    "last_owner_message_at",
-)
-
-
 def _drive_state_section(env: Any) -> str:
-    """Typed projection of ``state/state.json`` + an on-demand pointer.
-
-    P1: a DISCLOSED omission, never silent truncation — the omitted keys are
-    named and the full file stays one read away.
-    """
+    """Typed projection of ``state/state.json`` + an on-demand pointer. Keys =
+    what the agent REASONS about; the rest is internal caches or a second spend
+    narrative build_runtime_section already renders from the usage-accounting
+    authority. P1: disclosed omission — keys NAMED, full file one read away."""
+    keys = ("session_id", "current_branch", "current_sha", "evolution_mode_enabled",
+            "evolution_owner_stopped", "evolution_cycle", "evolution_consecutive_failures",
+            "last_evolution_task_at", "bg_consciousness_enabled", "post_task_autostop",
+            "budget_drift_pct", "budget_drift_alert", "last_owner_message_at")
     raw = read_json_dict(env.drive_path("state/state.json")) or {}
-    projected = {k: raw[k] for k in _DRIVE_STATE_PROJECTION_KEYS if k in raw}
+    projected = {k: raw[k] for k in keys if k in raw}
     omitted = sorted(set(raw) - set(projected))
-    note = (
-        "Projection of state/state.json (spend/budget facts live in the Runtime "
-        "section, from the usage-accounting authority)."
-    )
-    if omitted:
-        note += (
-            " Omitted keys: " + ", ".join(omitted) + ". Full file: "
-            "read_file(root='runtime_data', path='state/state.json')."
-        )
-    return (
-        "## Drive state\n\n"
-        + json.dumps(projected, ensure_ascii=False, indent=1, sort_keys=True, default=str)
-        + "\n\n" + note
-    )
+    note = ("Projection of state/state.json (spend/budget facts live in the Runtime "
+            "section, from the usage-accounting authority)."
+            + ((" Omitted keys: " + ", ".join(omitted) + ". Full file: "
+                "read_file(root='runtime_data', path='state/state.json').") if omitted else ""))
+    return ("## Drive state\n\n"
+            + json.dumps(projected, ensure_ascii=False, indent=1, sort_keys=True, default=str)
+            + "\n\n" + note)
 
 
 def _capture_context_core(

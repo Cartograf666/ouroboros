@@ -1424,20 +1424,14 @@ def build_review_context(env: Any) -> str:
             load_state,
             make_repo_key,
         )
-        from ouroboros.task_continuation import (
-            list_review_continuations,
-            retire_settled_continuations,
-        )
+        from ouroboros.task_continuation import list_review_continuations, retire_settled_continuations
         from ouroboros.task_results import load_task_result
         from ouroboros.task_status import SETTLED_STATUSES
 
         state = load_state(pathlib.Path(env.drive_root))
-
-        def _continuation_settled(task_id: str) -> bool:
-            status = str((load_task_result(env.drive_root, task_id) or {}).get("status") or "")
-            return status.strip().lower() in SETTLED_STATUSES
-
-        retired = retire_settled_continuations(env.drive_root, is_settled=_continuation_settled)
+        retired = retire_settled_continuations(env.drive_root, is_settled=lambda tid: str(
+            (load_task_result(env.drive_root, tid) or {}).get("status") or ""
+        ).strip().lower() in SETTLED_STATUSES)
         continuations, corrupt = list_review_continuations(env.drive_root)
         repo_dir = pathlib.Path(env.repo_dir)
         repo_key = make_repo_key(repo_dir)
@@ -1519,11 +1513,9 @@ def build_review_context(env: Any) -> str:
             lines.append("- open_obligations=0")
 
         if retired:
-            lines.append(
-                f"- {len(retired)} settled continuation(s) archived out of context "
-                "(durable under state/review_continuations/archived/): "
-                + ", ".join(retired[:5]) + ("…" if len(retired) > 5 else "")
-            )
+            lines.append(f"- {len(retired)} settled continuation(s) archived out of context "
+                         "(durable under state/review_continuations/archived/): "
+                         + ", ".join(retired[:5]) + ("…" if len(retired) > 5 else ""))
         scoped_continuations = [
             item for item in continuations
             if item.repo_key in ("", repo_key, _LEGACY_CURRENT_REPO_KEY)
