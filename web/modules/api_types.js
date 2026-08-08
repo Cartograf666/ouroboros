@@ -61,6 +61,43 @@
  */
 
 /**
+ * The wizard payload plus two DECLARATIONS about the onboarding run. Settings
+ * keys ride through unchanged (open shape); neither flag is authority — the
+ * server re-proves fresh-install status and re-reads the live account state.
+ * @typedef {Object} OnboardingCompleteRequest
+ * @property {boolean=} subscriptionsConnected
+ * @property {boolean=} skipSubscriptionPresets
+ */
+
+/**
+ * @typedef {Object} OnboardingPresetProjection
+ * @property {boolean} applied
+ * @property {string} reason  // not_requested | not_install_time | skipped_by_owner | applied
+ * @property {string[]} harnesses
+ * @property {Object} receipt  // per-seat resolution record; {} when nothing was applied
+ */
+
+/**
+ * @typedef {Object} OnboardingCompleteResponse
+ * @property {boolean} ok
+ * @property {string} status
+ * @property {string} runtime_mode
+ * @property {boolean} restart_required
+ * @property {OnboardingPresetProjection} preset
+ */
+
+/**
+ * 503 from POST /api/onboarding/complete: NOTHING was persisted, the wizard
+ * stays open, and `can_skip` means "finish without agent defaults" will work.
+ * @typedef {Object} OnboardingPresetFailureResponse
+ * @property {string} error
+ * @property {string} code
+ * @property {string} detail
+ * @property {boolean} can_skip
+ * @property {boolean} saved
+ */
+
+/**
  * @typedef {Object} ChatInbound
  * @property {"chat"} type
  * @property {string} content

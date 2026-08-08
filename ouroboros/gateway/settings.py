@@ -10,7 +10,7 @@ import pathlib
 import re
 import socket
 import sys
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
@@ -20,7 +20,6 @@ from ouroboros.config import (
     SETTINGS_DEFAULTS as _SETTINGS_DEFAULTS,
     apply_settings_to_env as _apply_settings_to_env,
     load_settings,
-    save_settings,
 )
 from ouroboros.gateway._helpers import json_error, json_exception, request_drive_root
 from ouroboros.onboarding_wizard import build_onboarding_html
@@ -288,6 +287,12 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
             # flows ONLY through the dedicated audited owner endpoint
             # (api_owner_safety_mode); save_settings additionally ratchets lowering.
             "OUROBOROS_SAFETY_MODE",
+            # The install-time subscription-preset marker is written ONCE, by
+            # POST /api/onboarding/complete, beside the preset it records. A
+            # generic save must neither author it (that would fake an applied
+            # preset) nor clear it (that would re-arm install-time behaviour on
+            # an install that already completed onboarding).
+            "OUROBOROS_SUBSCRIPTION_PRESET_VERSION",
         }:
             continue
         if key not in body:
@@ -364,12 +369,17 @@ def _owner_audit(request: Request, action: str, payload: Dict[str, Any]) -> None
 _CONTEXT_MODE_KEYS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW")
 
 
+class SettingsPreconditionFailed(RuntimeError):
+    """A locked-in precondition refused the write; nothing was persisted."""
+
+
 def _owner_write_settings(
     settings: Dict[str, Any],
     *,
     authored_keys: Sequence[str] = (),
     allow_context_lowering: bool = False,
     allow_safety_lowering: bool = False,
+    precondition: Optional[Callable[[], str]] = None,
 ) -> None:
     """Write owner-controlled settings without applying the runtime-mode ratchet.
 
@@ -377,7 +387,12 @@ def _owner_write_settings(
     ``config.prepare_settings_for_persist``, the single point both persisting writers pass through.
     An endpoint that genuinely authors a disk-authored key (context mode, safety mode, the derived
     auto-low flag) must name it in ``authored_keys`` — otherwise a POST about an unrelated key would
-    author a mode decision out of the defaults merge that ``_owner_read_settings_raw`` performs."""
+    author a mode decision out of the defaults merge that ``_owner_read_settings_raw`` performs.
+
+    ``precondition`` (optional) is re-evaluated INSIDE the settings lock, after it is held and
+    immediately before the write. An install-time transaction must prove its eligibility against
+    the state it is about to overwrite, not against a read taken before a multi-second daemon call;
+    a non-empty return value aborts with ``SettingsPreconditionFailed`` and writes nothing."""
     from ouroboros import config as _config
 
     _config._guard_live_settings_write()
@@ -387,6 +402,10 @@ def _owner_write_settings(
     _config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     fd = _config._acquire_settings_lock()
     try:
+        if precondition is not None:
+            refusal = str(precondition() or "")
+            if refusal:
+                raise SettingsPreconditionFailed(refusal)
         atomic_write_json(_config.SETTINGS_PATH, to_write, trailing_newline=False)
     finally:
         _config._release_settings_lock(fd)
@@ -1186,9 +1205,17 @@ async def api_settings_get(request: Request) -> JSONResponse:
 
 
 async def api_onboarding(request: Request) -> Response:
-    settings, provider_defaults_changed, _provider_default_keys = apply_runtime_provider_defaults(load_settings())
-    if provider_defaults_changed:
-        save_settings(settings, allow_elevation=True)
+    """The blocking first-run overlay — a pure READ (D-8).
+
+    Normalization still runs, but only to shape what the wizard DISPLAYS. It is
+    deliberately not persisted here: a GET must never be the first author of
+    settings.json. Doing so created the file before the owner had answered
+    anything, which (a) silently disqualified the fresh-install latch the
+    install-time preset and the ``light`` safety default both depend on, and
+    (b) made a page load the author of provider defaults the owner never saw.
+    The save paths (POST /api/settings, POST /api/onboarding/complete, the
+    desktop wizard bridge) keep the same normalization and persist it."""
+    settings, _changed, _keys = apply_runtime_provider_defaults(load_settings())
     if has_startup_ready_provider(settings):
         return Response(status_code=204)
     return HTMLResponse(build_onboarding_html(settings, host_mode="web"))

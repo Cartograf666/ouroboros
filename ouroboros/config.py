@@ -204,6 +204,12 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # Pre-commit review: comma-separated provider-tagged model list
     "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.6-luna,google/gemini-3.6-flash,anthropic/claude-sonnet-5",
     "OUROBOROS_REVIEWER_SLOTS": "",  # structured slot SSOT (reviewer_slot_config.py); "" = legacy comma keys
+    # One-shot INSTALL-TIME marker: which generation of the agent
+    # subscription preset (subscription_install_presets.py) this install
+    # received. Written only by POST /api/onboarding/complete; the generic
+    # settings save cannot author it (owner-only merge skip), and its ABSENCE
+    # authorizes nothing — every pre-preset install lacks it too.
+    "OUROBOROS_SUBSCRIPTION_PRESET_VERSION": "",
     # Pre-commit review enforcement: advisory | blocking
     "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
     # Auto-grant reviewed-skill requests by default; grants stay bound to the
