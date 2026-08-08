@@ -127,20 +127,27 @@ def _check_has_exit_masking(argv: List[str]) -> tuple[bool, list[str]]:
     return bool(ordered), ordered
 
 
-def _within_readonly_orchestrator_root(ctx: ToolContext, candidate: pathlib.Path) -> bool:
-    """True when ``candidate`` resolves inside a read-only orchestrator root
-    (``subagent_projects`` = the durable genesis/coop projects tree, or
-    ``deliverables`` = the unnamed-deliverables container). A parent orchestrating
-    child tasks legitimately needs to CONFIRM a child's deliverable EXISTS there —
-    an existence/size observation only, never a content read — so an
-    artifact_observation over those roots is not out-of-scope (v6.57.0). The
-    read-only trust boundary is preserved: this permits observation, never reads."""
-    from ouroboros.tool_access import path_is_relative_to, resource_root_path
+_OBSERVABLE_EXTRA_ROOTS = ("subagent_projects", "deliverables", "artifact_store", "task_drive")
 
-    for root_name in ("subagent_projects", "deliverables"):
-        try:
-            root = pathlib.Path(resource_root_path(ctx, root_name)).resolve(strict=False)
-        except Exception:
+
+def _within_readonly_orchestrator_root(ctx: ToolContext, candidate: pathlib.Path) -> bool:
+    """True when ``candidate`` resolves inside an observation-sanctioned resource
+    root beyond the active workspace: the read-only orchestrator roots
+    (``subagent_projects`` = the durable genesis/coop projects tree,
+    ``deliverables`` = the unnamed-deliverables container) plus — derived from the
+    ONE ``_POLICY`` matrix, not a private list (wave3 r24: verify refused the very
+    ``artifact_store`` path the agent had just registered, forcing a Deliverables
+    copy-shuffle) — the task's own ``artifact_store``/``task_drive``. Each root
+    counts ONLY when the active profile can already read it per the matrix
+    (``profile_readable_root_paths``), so this widens observation to nothing the
+    profile cannot already ``read_file``. Deliberately NOT widened to
+    ``system_repo``/``runtime_data``: existence-observation of the control plane
+    stays out of scope (anti-cheat boundary). An existence/size observation only,
+    never a content read."""
+    from ouroboros.tool_access import path_is_relative_to, profile_readable_root_paths
+
+    for label, root in profile_readable_root_paths(ctx):
+        if label not in _OBSERVABLE_EXTRA_ROOTS:
             continue
         if candidate == root or path_is_relative_to(candidate, root):
             return True
@@ -538,7 +545,8 @@ def _verify_and_record(
             return (
                 "verify_and_record [artifact_observation] REFUSED_OUT_OF_SCOPE: "
                 f"{detail}. Not a failure — the path is outside the observable roots "
-                "(active workspace / subagent_projects / deliverables). Receipt recorded."
+                "(active workspace / subagent_projects / deliverables / "
+                "artifact_store / task_drive). Receipt recorded."
             )
         verdict = "OBSERVED" if obs_status == "observed" else "FAIL"
         return f"verify_and_record [artifact_observation] {verdict}: {detail}. Host-attested receipt recorded."

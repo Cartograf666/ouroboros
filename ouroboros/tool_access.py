@@ -570,6 +570,32 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
     return result
 
 
+def profile_readable_root_paths(ctx: Any) -> list[tuple[str, pathlib.Path]]:
+    """Resolved ``(label, path)`` pairs for every resource root the ACTIVE
+    profile can already READ via ``read_file`` (the ``_POLICY`` 'read' verb).
+
+    The consistency SSOT for read-side tools that need "where may I look"
+    (view_image, verify_and_record artifact observation): deriving from the ONE
+    matrix instead of hand-maintaining private per-tool root lists is what kills
+    the copy-shuffle class (three tools, three disagreeing lists — wave3 r8/r24).
+    Widens nothing: every returned root is one the profile already reads through
+    read_file. ``skill_payload`` is omitted (its path needs bucket/skill args);
+    per-root resolution is fail-soft."""
+    out: list[tuple[str, pathlib.Path]] = []
+    try:
+        policy = _POLICY.get(active_tool_profile(ctx), {})
+    except Exception:
+        return out
+    for root, ops in sorted(policy.items()):
+        if "read" not in ops or root == "skill_payload":
+            continue
+        try:
+            out.append((root, pathlib.Path(resource_root_path(ctx, root)).resolve(strict=False)))
+        except Exception:
+            continue
+    return out
+
+
 def shell_cwd_block_message(ctx: Any, cwd: str = "", *, operation: Operation = "shell", error: Exception | None = None) -> str:
     """Actionable fail-closed message for process cwd resolution failures."""
 

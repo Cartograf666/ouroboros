@@ -428,3 +428,34 @@ def test_skill_review_history_persists_single_reviewer_marker(tmp_path):
     )
     rec = _json.loads(_review_history_path(tmp_path, "demo").read_text(encoding="utf-8").strip().splitlines()[-1])
     assert rec.get("single_reviewer_no_diversity") is True
+
+
+def test_vlm_allowed_roots_derive_from_policy_matrix(tmp_path, monkeypatch):
+    """view_image roots come from the ONE Tool API matrix (wave3 r8/r9: the
+    private list could not see subagent_projects, forcing a copy-shuffle into
+    artifact_store before viewing a coop-tree render)."""
+    from ouroboros.tools import vision
+
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROJECTS_ROOT", str(projects))
+    ctx = SimpleNamespace(repo_dir=tmp_path / "repo", drive_root=str(tmp_path / "data"))
+    roots = vision._allowed_file_roots(ctx)
+    assert any(str(projects) == str(r) for r in roots)
+
+
+def test_vlm_user_files_admission_keeps_secret_guard(tmp_path, monkeypatch):
+    """A path admitted ONLY through the user_files home root still clears the
+    user_files secret/credential guards — deriving roots from the matrix widens
+    reach, never the secret boundary."""
+    from ouroboros.tools import vision
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    img = home / "token.png"  # credential-like NAME under home
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    ctx = SimpleNamespace(repo_dir=tmp_path / "repo", drive_root=str(tmp_path / "data"))
+    payload, err = vision._load_local_image_payload(ctx, str(img))
+    assert payload is None
+    assert "USER_FILES_PATH_BLOCKED" in err and "credential-like" in err
