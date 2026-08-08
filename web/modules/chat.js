@@ -3019,7 +3019,9 @@ export function createChatInstance({
         }
         historySyncPromise = (async () => {
             try {
-                const resp = await apiFetch(`/api/chat/history?limit=1000${isMain ? '' : `&chat_id=${chatId}`}`, { cache: 'no-store' });
+                // Default request sends NO quota params — the server's window
+                // constants govern the first-load window (perf2 P3).
+                const resp = await apiFetch(`/api/chat/history${isMain ? '' : `?chat_id=${chatId}`}`, { cache: 'no-store' });
                 if (!resp.ok) {
                     lastHistorySyncSucceeded = false;
                     return false;

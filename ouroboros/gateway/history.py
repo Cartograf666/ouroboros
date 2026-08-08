@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import pathlib
 from typing import Any, Callable, Dict, Optional
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
-from ouroboros.gateway._helpers import read_rotated_jsonl_entries
+from ouroboros.gateway._helpers import _TAIL_WINDOW_START_BYTES, read_rotated_jsonl_entries
 from ouroboros.task_results import TASK_COST_META_FIELDS as _TASK_COST_META_FIELDS
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.utils import utc_now_iso
@@ -23,6 +24,22 @@ log = logging.getLogger(__name__)
 # response (realistically 1-3 per project; the cap keeps the endpoint's
 # bounded-row contract honest even against pathological binding state).
 _ORIGIN_SYNTH_CAP = 10
+
+# Default per-type quotas for the /api/chat/history window (perf2 P3,
+# owner-approved 150/60/300). The web client's default request sends NO quota
+# params, so these constants ARE the UI's effective first-load window. The
+# explicit-quota caps (1500/600) are unchanged: a "Load older" escalation asks
+# for a bigger window with explicit n_human/n_progress.
+_DEFAULT_N_HUMAN = 150
+_DEFAULT_N_PROGRESS = 60
+_MAX_N_HUMAN = 1500
+_MAX_N_PROGRESS = 600
+# Bound subagent lineage so a huge swarm fan-out can't balloon the response.
+_LINEAGE_CAP = 300
+# Mirror of read_rotated_jsonl_entries' max_archives default: the rotated
+# backfill never consults more than this many newest archive segments, so a
+# quota the newest segments cannot satisfy is an "archive_floor" truncation.
+_ARCHIVE_BACKFILL_CAP = 3
 
 _ACCOUNTING_SUMMARY_FIELDS = (
     "settled_usd",
@@ -132,16 +149,18 @@ def _compat_cost_groups(
     return dict(sorted(result.items(), key=lambda item: item[1]["cost"], reverse=True))
 
 
-async def _project_history_context(
+def _project_history_context(
     data_dir: pathlib.Path,
     thread_id: int,
 ) -> tuple[set[int], list[dict], Dict[str, Any], Dict[str, int]]:
-    """Load the read-only Project history lenses off the event loop.
+    """Load the read-only Project history lenses (synchronous).
 
-    The task->project-chat bindings map is preloaded ONCE per request (v6.90.x
-    P2): `_bound_project_chat` previously re-read state/project_task_bindings.json
-    for every uncached (task, parent, root) lineage key — up to three file reads
-    per history row."""
+    Runs inside the endpoint's single ``asyncio.to_thread`` assembly call
+    (perf2 P3), so the loads stay off the event loop without per-load thread
+    hops. The task->project-chat bindings map is preloaded ONCE per request
+    (v6.90.x P2): `_bound_project_chat` previously re-read
+    state/project_task_bindings.json for every uncached (task, parent, root)
+    lineage key — up to three file reads per history row."""
     try:
         from ouroboros.projects_registry import reserved_project_chat_ids
 
@@ -153,19 +172,19 @@ async def _project_history_context(
         try:
             from ouroboros.project_dialogue import source_refs_for_project
 
-            source_refs = await asyncio.to_thread(source_refs_for_project, data_dir, thread_id)
+            source_refs = source_refs_for_project(data_dir, thread_id)
         except Exception:
             log.debug("Failed to load canonical Project source refs", exc_info=True)
     try:
         from ouroboros.project_dialogue import latest_chat_annotations
 
-        annotations = await asyncio.to_thread(latest_chat_annotations, data_dir)
+        annotations = latest_chat_annotations(data_dir)
     except Exception:
         annotations = {}
     try:
         from ouroboros.projects_registry import all_task_bindings
 
-        bindings_by_task = await asyncio.to_thread(all_task_bindings, data_dir)
+        bindings_by_task = all_task_bindings(data_dir)
     except Exception:
         bindings_by_task = {}
     return project_chat_ids, source_refs, annotations, bindings_by_task
@@ -351,6 +370,14 @@ def _read_chat_history_entries(live, adir, want, row_matches_thread):
     a window-doubled byte tail (``read_rotated_jsonl_entries``), so the endpoint
     is O(window), not O(whole live file).
     """
+    return read_rotated_jsonl_entries(
+        live, adir, "chat", want, _chat_quota_predicate(row_matches_thread)
+    )
+
+
+def _chat_quota_predicate(row_matches_thread):
+    """Human-row quota predicate shared by the rotated chat read and the
+    window-truncation accounting (must equal the render loop's filter)."""
 
     def _counts_toward_thread(e):
         if not isinstance(e, dict):
@@ -365,7 +392,7 @@ def _read_chat_history_entries(live, adir, want, row_matches_thread):
             ec = 1
         return row_matches_thread(ec, e)
 
-    return read_rotated_jsonl_entries(live, adir, "chat", want, _counts_toward_thread)
+    return _counts_toward_thread
 
 
 def _read_progress_history_entries(live, adir, want, counts_toward_quota):
@@ -406,9 +433,34 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
             rec[key] = entry[key]
 
 
+def _load_terminal_result(
+    data_dir: pathlib.Path,
+    task_id: str,
+    cache: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Effective task result for history projection, cached per request.
+
+    Status/cost projection only — a history GET must never copy artifacts or
+    claim disposition hashes (materialize contract). The cache is shared
+    between the pre-floor lineage terminal-truth pass (perf2 P3 variant A) and
+    ``_annotate_terminal_task_truth``, so each task_results file is read at
+    most once per request."""
+    if task_id in cache:
+        return cache[task_id]
+    try:
+        from ouroboros.task_status import load_effective_task_result
+
+        result = load_effective_task_result(data_dir, task_id, materialize_artifacts=False)
+    except Exception:
+        result = None
+    cache[task_id] = result or {}
+    return cache[task_id]
+
+
 def _annotate_terminal_task_truth(
     combined: list[Dict[str, Any]],
     data_dir: pathlib.Path,
+    result_cache: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
     """Project bounded terminal truth onto the card rows that survive history replay.
 
@@ -417,11 +469,15 @@ def _annotate_terminal_task_truth(
     history. Intended behavior change: terminal truth (cost/axes/review) lands on
     the latest IN-WINDOW progress row / the in-window summary row — previously it
     was anchored to the globally-latest row and to summary rows that the quota may
-    then have evicted, leaving the surviving in-window card without the truth."""
+    then have evicted, leaving the surviving in-window card without the truth.
+
+    ``result_cache`` (task_id -> effective result) lets the endpoint share the
+    task_results reads already performed by the pre-floor lineage pass."""
 
     try:
-        from ouroboros.task_status import FINAL_STATUSES, load_effective_task_result
+        from ouroboros.task_status import FINAL_STATUSES
 
+        cache = result_cache if result_cache is not None else {}
         progress_task_ids = {
             str(message.get("task_id") or "")
             for message in combined
@@ -437,15 +493,7 @@ def _annotate_terminal_task_truth(
         terminal_truth_by_task: Dict[str, Dict[str, Any]] = {}
         suggested_name_by_task: Dict[str, str] = {}
         for task_id in progress_task_ids | summary_task_ids:
-            try:
-                # Status/cost projection only — a history GET must never copy
-                # artifacts or claim disposition hashes (materialize contract).
-                result = load_effective_task_result(
-                    data_dir, task_id, materialize_artifacts=False
-                )
-            except Exception:
-                result = None
-            result = result or {}
+            result = _load_terminal_result(data_dir, task_id, cache)
             status = str(result.get("status") or "")
             if status in FINAL_STATUSES:
                 terminal_status_by_task[task_id] = status
@@ -496,8 +544,402 @@ def _annotate_terminal_task_truth(
         log.debug("Failed to annotate terminal task status in history: %s", exc)
 
 
+def _stream_truncation_cause(
+    filtered_rows: int,
+    quota: int,
+    live_size: int,
+    archives_total: int,
+) -> Optional[str]:
+    """Truncation cause for one log stream's window, or ``None`` when complete.
+
+    ``filtered_rows`` counts the rows returned by the rotated reader that
+    satisfy the stream's quota predicate. The reader stops as soon as the
+    quota is met, so:
+
+    - more filtered rows than the quota -> the tail slice dropped rows
+      ("quota");
+    - exactly quota rows -> complete only when the whole stream provably fit
+      in the first live byte window with no archives; otherwise older unread
+      rows may exist behind the reader's quota stop ("quota");
+    - fewer rows than the quota -> the live file was fully parsed and up to
+      ``_ARCHIVE_BACKFILL_CAP`` newest archives were consulted, so archive
+      segments beyond that cap are the only possible loss ("archive_floor").
+    """
+    if filtered_rows > quota:
+        return "quota"
+    if filtered_rows == quota and filtered_rows > 0:
+        if archives_total == 0 and live_size <= _TAIL_WINDOW_START_BYTES:
+            return None
+        return "quota"
+    if archives_total > _ARCHIVE_BACKFILL_CAP:
+        return "archive_floor"
+    return None
+
+
+def _live_log_size(path: pathlib.Path) -> int:
+    try:
+        return pathlib.Path(path).stat().st_size
+    except OSError:
+        return 0
+
+
+def _archive_segment_count(archive_dir: pathlib.Path, prefix: str) -> int:
+    try:
+        return sum(1 for _ in pathlib.Path(archive_dir).glob(f"{prefix}_*.jsonl"))
+    except Exception:
+        return 0
+
+
+def _assemble_history_response(
+    data_dir: pathlib.Path,
+    thread_id: int,
+    n_human: int,
+    n_progress: int,
+) -> bytes:
+    """Assemble the complete /api/chat/history payload as serialized JSON bytes.
+
+    perf2 P3: the WHOLE pipeline — project-context loads, both rotation-aware
+    log reads, both transform loops, quota slicing, the lineage floor/cap,
+    terminal-truth annotation, origin fallback, and the JSON encode — runs
+    synchronously inside the endpoint's single ``asyncio.to_thread`` call, so
+    none of it executes on the event loop.
+    """
+    project_chat_ids, project_source_refs, chat_annotations, bindings_by_task = (
+        _project_history_context(data_dir, thread_id)
+    )
+
+    def _bound_project_chat(task_id: str, parent_task_id: str = "", root_task_id: str = "") -> int:
+        # Resolve by LINEAGE (own binding -> parent -> root) so a subagent's rows
+        # classify into its root's project thread (only the root is bound).
+        # Same semantics as projects_registry.project_chat_for_task_tree, served
+        # from the ONE bindings map preloaded per request (no per-row file reads).
+        for candidate in (task_id, parent_task_id, root_task_id):
+            tid = str(candidate or "").strip()
+            if tid and bindings_by_task.get(tid):
+                return int(bindings_by_task[tid])
+        return 0
+
+    def _row_matches_thread(entry_chat: int, entry: Optional[dict] = None) -> bool:
+        # A post-hoc bound task keeps its original (main) chat_id on its rows
+        # but belongs to a project — classify by the durable LINEAGE binding too.
+        bound_chat = (
+            _bound_project_chat(
+                str(entry.get("task_id") or ""),
+                str(entry.get("parent_task_id") or ""),
+                str(entry.get("root_task_id") or ""),
+            ) if isinstance(entry, dict) else 0
+        )
+        if thread_id in project_chat_ids:
+            if bound_chat == thread_id:
+                return True
+            if isinstance(entry, dict) and _matches_project_source(entry, project_source_refs):
+                return True
+            return entry_chat == thread_id
+        # Main / non-project view: everything that is NOT another project. A
+        # bound task's rows are project-owned, so mirror only its sanitized
+        # progress/task_summary and exclude its raw chat (same as a native
+        # project row), never leak raw project chat into the штаб.
+        if entry_chat in project_chat_ids or bound_chat > 0:
+            if not isinstance(entry, dict):
+                return False
+            return bool(entry.get("is_progress")) or str(entry.get("type") or "") == "task_summary"
+        return entry_chat not in project_chat_ids
+
+    combined: list = []
+
+    chat_path = data_dir / "logs" / "chat.jsonl"
+    archive_dir = data_dir / "archive"
+    chat_quota_rows = 0
+    _chat_counts_toward_quota = _chat_quota_predicate(_row_matches_thread)
+    try:
+        # Rotation-aware archive backfill lives in the module-level
+        # _read_chat_history_entries helper (endpoint's thread filter threaded in).
+        _chat_entries = _read_chat_history_entries(
+            chat_path, archive_dir, n_human, _row_matches_thread
+        )
+        # Window accounting for the response's truncation metadata: how many
+        # read rows satisfy the SAME quota predicate the reader stopped on.
+        chat_quota_rows = sum(
+            1 for entry in _chat_entries if _chat_counts_toward_quota(entry)
+        )
+        for entry in _chat_entries:
+            # Skip A2A virtual chat_ids so A2A task traffic does not appear in human chat history.
+            if is_a2a_chat_id(entry.get("chat_id", 1)):
+                continue
+            try:
+                entry_chat = int(entry.get("chat_id", 1) or 1)
+            except (TypeError, ValueError):
+                entry_chat = 1
+            if not _row_matches_thread(entry_chat, entry):
+                continue
+            direction = str(entry.get("direction", "")).lower()
+            role = {"in": "user", "out": "assistant", "system": "system"}.get(direction)
+            if role is None:
+                continue
+            rec = {
+                "text": str(entry.get("text", "")),
+                "role": role,
+                "ts": str(entry.get("ts", "")),
+                "is_progress": False,
+                "system_type": str(entry.get("type", "")),
+                "markdown": str(entry.get("format", "")).lower() == "markdown",
+                "source": str(entry.get("source", "")),
+                "sender_label": str(entry.get("sender_label", "")),
+                "sender_session_id": str(entry.get("sender_session_id", "")),
+                "client_message_id": str(entry.get("client_message_id", "")),
+                "task_id": str(entry.get("task_id", "")),
+                "telegram_chat_id": int(entry.get("telegram_chat_id") or 0),
+            }
+            annotation = _user_annotation(role, rec["client_message_id"], chat_annotations)
+            if annotation is not None:
+                rec["chat_annotation"] = annotation
+            # Delivered document rows carry lightweight media metadata (no
+            # base64); surface a msg_type + download_url so the frontend
+            # rebuilds the file bubble on reload instead of a bare text line.
+            if entry.get("type") == "document":
+                rec["msg_type"] = "document"
+                rec["filename"] = str(entry.get("filename") or "file")
+                rec["mime"] = str(entry.get("mime") or "application/octet-stream")
+                rec["download_url"] = str(entry.get("download_url") or "")
+                rec["caption"] = str(entry.get("caption") or "")
+            _copy_task_summary_metadata(rec, entry)
+            combined.append(rec)
+    except Exception as exc:
+        log.warning("Failed to read chat history: %s", exc)
+
+    progress_path = data_dir / "logs" / "progress.jsonl"
+
+    def _progress_counts_toward_quota(entry) -> bool:
+        # A row satisfies the n_progress quota only if it survives the render
+        # filter below (A2A + thread + non-empty text) AND is NOT subagent
+        # lineage — lineage rows ride on top of the quota, so counting them
+        # here would let a swarm's lifecycle burst stop the tail read before
+        # the window holds n_progress ordinary telemetry rows.
+        if not isinstance(entry, dict):
+            return False
+        if is_a2a_chat_id(entry.get("chat_id", 1)):
+            return False
+        try:
+            entry_chat = int(entry.get("chat_id", 1) or 1)
+        except (TypeError, ValueError):
+            entry_chat = 1
+        if not _row_matches_thread(entry_chat, {"is_progress": True, **entry}):
+            return False
+        if not str(entry.get("content", entry.get("text", ""))):
+            return False
+        if str(entry.get("delegation_role") or "").lower() == "subagent" or entry.get("subagent_event"):
+            return False
+        return True
+
+    progress_quota_rows = 0
+    try:
+        _progress_entries = _read_progress_history_entries(
+            progress_path,
+            archive_dir,
+            n_progress,
+            _progress_counts_toward_quota,
+        )
+        progress_quota_rows = sum(
+            1 for entry in _progress_entries if _progress_counts_toward_quota(entry)
+        )
+        for entry in _progress_entries:
+            # Skip A2A virtual chat_ids.
+            if is_a2a_chat_id(entry.get("chat_id", 1)):
+                continue
+            try:
+                entry_chat = int(entry.get("chat_id", 1) or 1)
+            except (TypeError, ValueError):
+                entry_chat = 1
+            if not _row_matches_thread(entry_chat, {"is_progress": True, **entry}):
+                continue
+            text = str(entry.get("content", entry.get("text", "")))
+            if not text:
+                continue
+            rec = {
+                "text": text,
+                "role": "assistant",
+                "ts": str(entry.get("ts", "")),
+                "is_progress": True,
+                "markdown": str(entry.get("format", "")).lower() == "markdown",
+                "task_id": str(entry.get("task_id", "")),
+            }
+            if isinstance(entry.get("lifecycle"), dict):
+                rec["lifecycle"] = dict(entry.get("lifecycle") or {})
+            for field in _PROGRESS_META_FIELDS:
+                if field in entry:
+                    rec[field] = entry[field]
+            combined.append(rec)
+    except Exception as exc:
+        log.warning("Failed to read progress log: %s", exc)
+
+    try:
+        from ouroboros.skill_lifecycle_queue import queue_snapshot
+
+        active = queue_snapshot().get("active")
+        if isinstance(active, dict) and active.get("status") == "running":
+            label = "stale" if active.get("stale") else "running"
+            detail = active.get("error") or active.get("message") or active.get("status") or ""
+            text = (
+                f"Skill {active.get('kind') or 'operation'}: `{active.get('target') or 'skill'}`"
+                f" — {label}{f' — {detail}' if detail else ''}"
+            )
+            lifecycle = dict(active)
+            lifecycle["phase"] = label
+            combined.append({
+                "text": text,
+                "role": "assistant",
+                "ts": utc_now_iso(),
+                "is_progress": True,
+                "markdown": False,
+                "task_id": str(active.get("chat_task_id") or ""),
+                "lifecycle": lifecycle,
+                "lifecycle_virtual": True,
+            })
+    except Exception as exc:
+        log.debug("Failed to synthesize active lifecycle history: %s", exc)
+
+    # Tail human conversation and progress telemetry with SEPARATE quotas so a
+    # burst of progress messages can never push the user's real conversation out
+    # (the previous single combined[-limit:] tail). Subagent lineage is kept on
+    # top of the progress quota so a flood can't evict a RECENT child's lifecycle
+    # events (the client rebuilds child-card lineage from them) — but only WITHIN
+    # the recent telemetry window: resurrecting an old finished swarm's child
+    # events would recreate an orphaned "Working" parent card whose own terminal
+    # row has already aged out of the window.
+    def _is_subagent_lineage(m: dict) -> bool:
+        # Only true SUBAGENT lifecycle (delegation_role 'subagent' or any
+        # subagent_event) is lineage-critical. delegation_role can also be
+        # 'root', which must NOT bypass the progress quota.
+        return str(m.get("delegation_role") or "").lower() == "subagent" or bool(m.get("subagent_event"))
+
+    # NOTE: guard 0 explicitly — Python's list[-0:] is list[0:] (the WHOLE list),
+    # so a `[-quota:]` slice with quota==0 would leak everything, not nothing.
+    human = sorted((m for m in combined if not m.get("is_progress")), key=lambda m: m.get("ts", ""))
+    progress = sorted((m for m in combined if m.get("is_progress")), key=lambda m: m.get("ts", ""))
+    human_tail = human[-n_human:] if n_human > 0 else []
+    # MAJOR review fix: the n_human slice also drops direction:"system" rows
+    # (e.g. the per-task task_summary), which the reader's in/out quota
+    # predicate does NOT count — so the stream cause alone could report a
+    # "complete" window while the slice silently cut system rows. Any actual
+    # drop by this slice is a "quota" truncation, independent of direction.
+    human_rows_dropped = len(human) > len(human_tail)
+    # v6.73.0 retention-proof origin projection: a Project's start message is
+    # synthesized from the binding's own source_text when its canonical row is
+    # not among the rows ACTUALLY EMITTED (rotated past the archive window OR
+    # pruned by the n_human tail). Post-quota, identity-deduped, hard-capped
+    # with a disclosed omission note (helper below the endpoint factory).
+    if thread_id in project_chat_ids and n_human > 0:
+        try:
+            synthesized = _origin_fallback_rows(data_dir, thread_id, list(human_tail))
+            if synthesized:
+                human_tail = sorted(
+                    human_tail + synthesized, key=lambda m: m.get("ts", "")
+                )
+        except Exception:
+            log.debug("Project origin fallback synthesis failed", exc_info=True)
+    other = [m for m in progress if not _is_subagent_lineage(m)]
+    other_tail = other[-n_progress:] if n_progress > 0 else []
+    # Recency floor = oldest retained telemetry row. Drop lineage older than it so
+    # long-finished swarms don't re-materialise as stuck "Working" parent cards.
+    floor = str(other_tail[0].get("ts") or "") if other_tail else ""
+    lineage_rows = [m for m in progress if _is_subagent_lineage(m)]
+    # perf2 P3 variant A (owner decision 2026-08-09): a QUIET but still-ACTIVE
+    # child must survive the recency floor — its card is reproducible only from
+    # these lineage rows. Terminal truth for the lineage task ids of the READ
+    # window is resolved BEFORE the floor/cap slice; the same cache then feeds
+    # _annotate_terminal_task_truth after the slice, so each task_results file
+    # is read at most once per request. The floor keeps dropping rows of
+    # terminal/unknown children (anti-zombie preserved), and the effective-
+    # status orphan guard resolves a long-dead raw "running" child as failed,
+    # i.e. terminal, so it cannot pin its lineage forever.
+    result_cache: Dict[str, Dict[str, Any]] = {}
+    active_children: set = set()
+    if floor and lineage_rows:
+        try:
+            from ouroboros.task_status import FINAL_STATUSES
+
+            for task_id in {str(m.get("task_id") or "") for m in lineage_rows if m.get("task_id")}:
+                status = str(
+                    _load_terminal_result(data_dir, task_id, result_cache).get("status") or ""
+                )
+                if status and status not in FINAL_STATUSES:
+                    active_children.add(task_id)
+        except Exception as exc:
+            log.debug("Failed to resolve pre-floor lineage terminal truth: %s", exc)
+    lineage = [
+        m for m in lineage_rows
+        if not floor
+        or str(m.get("ts") or "") >= floor
+        or str(m.get("task_id") or "") in active_children
+    ]
+    # The cap stays a suffix slice applied AFTER the floor: an active child with
+    # more rows than the cap keeps its newest rows, so its card stays alive.
+    lineage_truncated = len(lineage) > _LINEAGE_CAP
+    if lineage_truncated:
+        lineage = lineage[-_LINEAGE_CAP:]  # keep the most recent lineage events
+    progress_tail = lineage + other_tail
+    messages = sorted(human_tail + progress_tail, key=lambda m: m.get("ts", ""))
+
+    # Annotate progress messages whose task already reached a terminal (or
+    # cancel-intent) status on disk. Tasks torn down by crash storm, hard
+    # timeout, or cancellation emit a live task_done but never write a
+    # task_summary, so on reload/reconnect the client would otherwise replay
+    # their progress and re-inflate a "Working" spinner that never resolves.
+    # Runs AFTER the quota slice — on the rows actually emitted — so the
+    # response pays only for in-window task ids and the truth always lands on
+    # a row the client will see (see _annotate_terminal_task_truth).
+    _annotate_terminal_task_truth(messages, data_dir, result_cache=result_cache)
+
+    # Background consciousness writes no task_result, so its progress would
+    # otherwise replay as a perpetual "thinking" card after reload. Mark its
+    # most recent IN-WINDOW progress entry terminal; a fresh live event
+    # re-activates the card if a new cycle starts. (Structured signal,
+    # consumed by log_events.js.)
+    try:
+        bg_msgs = [
+            m for m in messages
+            if m.get("is_progress") and str(m.get("task_id") or "") == "bg-consciousness"
+        ]
+        if bg_msgs:
+            latest = max(bg_msgs, key=lambda m: str(m.get("ts") or ""))
+            latest["task_terminal_status"] = "done"
+    except Exception as exc:
+        log.debug("Failed to annotate bg-consciousness terminal status: %s", exc)
+
+    # Additive window metadata (perf2 P3; frozen contract extended explicitly):
+    # the reader learns WHETHER this window is the complete reachable history
+    # and WHAT bounded it — the quota tail slice ("quota"), the bounded archive
+    # backfill ("archive_floor"), or the lineage cap ("lineage_cap"). The
+    # client gates its "Load older" affordance on this instead of guessing;
+    # no existing field changes meaning.
+    truncated_by: list[str] = []
+    for cause in (
+        "quota" if human_rows_dropped else None,
+        _stream_truncation_cause(
+            chat_quota_rows, n_human, _live_log_size(chat_path),
+            _archive_segment_count(archive_dir, "chat"),
+        ),
+        _stream_truncation_cause(
+            progress_quota_rows, n_progress, _live_log_size(progress_path),
+            _archive_segment_count(archive_dir, "progress"),
+        ),
+        "lineage_cap" if lineage_truncated else None,
+    ):
+        if cause and cause not in truncated_by:
+            truncated_by.append(cause)
+    payload = {
+        "messages": messages,
+        "window": {"complete": not truncated_by, "truncated_by": truncated_by},
+    }
+    # Same rendering options as starlette's JSONResponse — serialized here so
+    # the encode of a large payload also happens off the event loop.
+    return json.dumps(
+        payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    ).encode("utf-8")
+
+
 def make_chat_history_endpoint(data_dir: pathlib.Path):
-    async def api_chat_history(request: Request) -> JSONResponse:
+    async def api_chat_history(request: Request) -> Response:
         """Return recent chat, system, and progress messages merged chronologically."""
         def _int_param(name: str, default: int, cap: int) -> int:
             try:
@@ -506,10 +948,12 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
                 return default
 
         # Separate per-type quotas so a burst of progress/telemetry can never evict
-        # the user's real conversation from a single combined tail. (`limit` is still
-        # accepted for backward-compat but no longer governs the slice.)
-        n_human = _int_param("n_human", 750, 1500)
-        n_progress = _int_param("n_progress", 300, 600)
+        # the user's real conversation from a single combined tail. Defaults are
+        # the module-level window constants — the web client's default request
+        # sends no quota params. (`limit` is still accepted for backward-compat
+        # but no longer governs the slice.)
+        n_human = _int_param("n_human", _DEFAULT_N_HUMAN, _MAX_N_HUMAN)
+        n_progress = _int_param("n_progress", _DEFAULT_N_PROGRESS, _MAX_N_PROGRESS)
         # Multi-project thread filter (v6.32.0): each chat fetches its own
         # history. Default 1 = main chat (legacy rows without chat_id are main).
         # The filter only PARTITIONS when the requested thread is a registered
@@ -517,266 +961,11 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
         # external-transport mirror) it keeps the historic behavior of showing
         # every non-project, non-A2A row so transport conversations stay visible.
         thread_id = _int_param("chat_id", 1, 2**31 - 1) or 1
-        project_chat_ids, project_source_refs, chat_annotations, bindings_by_task = (
-            await _project_history_context(data_dir, thread_id)
+        # ONE thread hop for the whole assembly (perf2 P3): reads, transforms,
+        # slicing, annotation, and the JSON encode all run off the event loop.
+        body = await asyncio.to_thread(
+            _assemble_history_response, data_dir, thread_id, n_human, n_progress
         )
-
-        def _bound_project_chat(task_id: str, parent_task_id: str = "", root_task_id: str = "") -> int:
-            # Resolve by LINEAGE (own binding -> parent -> root) so a subagent's rows
-            # classify into its root's project thread (only the root is bound).
-            # Same semantics as projects_registry.project_chat_for_task_tree, served
-            # from the ONE bindings map preloaded per request (no per-row file reads).
-            for candidate in (task_id, parent_task_id, root_task_id):
-                tid = str(candidate or "").strip()
-                if tid and bindings_by_task.get(tid):
-                    return int(bindings_by_task[tid])
-            return 0
-
-        def _row_matches_thread(entry_chat: int, entry: Optional[dict] = None) -> bool:
-            # A post-hoc bound task keeps its original (main) chat_id on its rows
-            # but belongs to a project — classify by the durable LINEAGE binding too.
-            bound_chat = (
-                _bound_project_chat(
-                    str(entry.get("task_id") or ""),
-                    str(entry.get("parent_task_id") or ""),
-                    str(entry.get("root_task_id") or ""),
-                ) if isinstance(entry, dict) else 0
-            )
-            if thread_id in project_chat_ids:
-                if bound_chat == thread_id:
-                    return True
-                if isinstance(entry, dict) and _matches_project_source(entry, project_source_refs):
-                    return True
-                return entry_chat == thread_id
-            # Main / non-project view: everything that is NOT another project. A
-            # bound task's rows are project-owned, so mirror only its sanitized
-            # progress/task_summary and exclude its raw chat (same as a native
-            # project row), never leak raw project chat into the штаб.
-            if entry_chat in project_chat_ids or bound_chat > 0:
-                if not isinstance(entry, dict):
-                    return False
-                return bool(entry.get("is_progress")) or str(entry.get("type") or "") == "task_summary"
-            return entry_chat not in project_chat_ids
-
-        combined: list = []
-
-        chat_path = data_dir / "logs" / "chat.jsonl"
-        archive_dir = data_dir / "archive"
-        try:
-            # WS4: parse the jsonl off the event loop so a large history can't block
-            # the loop. Rotation-aware archive backfill lives in the module-level
-            # _read_chat_history_entries helper (endpoint's thread filter threaded in).
-            _chat_entries = await asyncio.to_thread(
-                _read_chat_history_entries, chat_path, archive_dir, n_human, _row_matches_thread
-            )
-            for entry in _chat_entries:
-                # Skip A2A virtual chat_ids so A2A task traffic does not appear in human chat history.
-                if is_a2a_chat_id(entry.get("chat_id", 1)):
-                    continue
-                try:
-                    entry_chat = int(entry.get("chat_id", 1) or 1)
-                except (TypeError, ValueError):
-                    entry_chat = 1
-                if not _row_matches_thread(entry_chat, entry):
-                    continue
-                direction = str(entry.get("direction", "")).lower()
-                role = {"in": "user", "out": "assistant", "system": "system"}.get(direction)
-                if role is None:
-                    continue
-                rec = {
-                    "text": str(entry.get("text", "")),
-                    "role": role,
-                    "ts": str(entry.get("ts", "")),
-                    "is_progress": False,
-                    "system_type": str(entry.get("type", "")),
-                    "markdown": str(entry.get("format", "")).lower() == "markdown",
-                    "source": str(entry.get("source", "")),
-                    "sender_label": str(entry.get("sender_label", "")),
-                    "sender_session_id": str(entry.get("sender_session_id", "")),
-                    "client_message_id": str(entry.get("client_message_id", "")),
-                    "task_id": str(entry.get("task_id", "")),
-                    "telegram_chat_id": int(entry.get("telegram_chat_id") or 0),
-                }
-                annotation = _user_annotation(role, rec["client_message_id"], chat_annotations)
-                if annotation is not None:
-                    rec["chat_annotation"] = annotation
-                # Delivered document rows carry lightweight media metadata (no
-                # base64); surface a msg_type + download_url so the frontend
-                # rebuilds the file bubble on reload instead of a bare text line.
-                if entry.get("type") == "document":
-                    rec["msg_type"] = "document"
-                    rec["filename"] = str(entry.get("filename") or "file")
-                    rec["mime"] = str(entry.get("mime") or "application/octet-stream")
-                    rec["download_url"] = str(entry.get("download_url") or "")
-                    rec["caption"] = str(entry.get("caption") or "")
-                _copy_task_summary_metadata(rec, entry)
-                combined.append(rec)
-        except Exception as exc:
-            log.warning("Failed to read chat history: %s", exc)
-
-        progress_path = data_dir / "logs" / "progress.jsonl"
-
-        def _progress_counts_toward_quota(entry) -> bool:
-            # A row satisfies the n_progress quota only if it survives the render
-            # filter below (A2A + thread + non-empty text) AND is NOT subagent
-            # lineage — lineage rows ride on top of the quota, so counting them
-            # here would let a swarm's lifecycle burst stop the tail read before
-            # the window holds n_progress ordinary telemetry rows.
-            if not isinstance(entry, dict):
-                return False
-            if is_a2a_chat_id(entry.get("chat_id", 1)):
-                return False
-            try:
-                entry_chat = int(entry.get("chat_id", 1) or 1)
-            except (TypeError, ValueError):
-                entry_chat = 1
-            if not _row_matches_thread(entry_chat, {"is_progress": True, **entry}):
-                return False
-            if not str(entry.get("content", entry.get("text", ""))):
-                return False
-            if str(entry.get("delegation_role") or "").lower() == "subagent" or entry.get("subagent_event"):
-                return False
-            return True
-
-        try:
-            _progress_entries = await asyncio.to_thread(
-                _read_progress_history_entries,
-                progress_path,
-                archive_dir,
-                n_progress,
-                _progress_counts_toward_quota,
-            )
-            for entry in _progress_entries:
-                # Skip A2A virtual chat_ids.
-                if is_a2a_chat_id(entry.get("chat_id", 1)):
-                    continue
-                try:
-                    entry_chat = int(entry.get("chat_id", 1) or 1)
-                except (TypeError, ValueError):
-                    entry_chat = 1
-                if not _row_matches_thread(entry_chat, {"is_progress": True, **entry}):
-                    continue
-                text = str(entry.get("content", entry.get("text", "")))
-                if not text:
-                    continue
-                rec = {
-                    "text": text,
-                    "role": "assistant",
-                    "ts": str(entry.get("ts", "")),
-                    "is_progress": True,
-                    "markdown": str(entry.get("format", "")).lower() == "markdown",
-                    "task_id": str(entry.get("task_id", "")),
-                }
-                if isinstance(entry.get("lifecycle"), dict):
-                    rec["lifecycle"] = dict(entry.get("lifecycle") or {})
-                for field in _PROGRESS_META_FIELDS:
-                    if field in entry:
-                        rec[field] = entry[field]
-                combined.append(rec)
-        except Exception as exc:
-            log.warning("Failed to read progress log: %s", exc)
-
-        try:
-            from ouroboros.skill_lifecycle_queue import queue_snapshot
-
-            active = queue_snapshot().get("active")
-            if isinstance(active, dict) and active.get("status") == "running":
-                label = "stale" if active.get("stale") else "running"
-                detail = active.get("error") or active.get("message") or active.get("status") or ""
-                text = (
-                    f"Skill {active.get('kind') or 'operation'}: `{active.get('target') or 'skill'}`"
-                    f" — {label}{f' — {detail}' if detail else ''}"
-                )
-                lifecycle = dict(active)
-                lifecycle["phase"] = label
-                combined.append({
-                    "text": text,
-                    "role": "assistant",
-                    "ts": utc_now_iso(),
-                    "is_progress": True,
-                    "markdown": False,
-                    "task_id": str(active.get("chat_task_id") or ""),
-                    "lifecycle": lifecycle,
-                    "lifecycle_virtual": True,
-                })
-        except Exception as exc:
-            log.debug("Failed to synthesize active lifecycle history: %s", exc)
-
-        # Tail human conversation and progress telemetry with SEPARATE quotas so a
-        # burst of progress messages can never push the user's real conversation out
-        # (the previous single combined[-limit:] tail). Subagent lineage is kept on
-        # top of the progress quota so a flood can't evict a RECENT child's lifecycle
-        # events (the client rebuilds child-card lineage from them) — but only WITHIN
-        # the recent telemetry window: resurrecting an old finished swarm's child
-        # events would recreate an orphaned "Working" parent card whose own terminal
-        # row has already aged out of the window.
-        def _is_subagent_lineage(m: dict) -> bool:
-            # Only true SUBAGENT lifecycle (delegation_role 'subagent' or any
-            # subagent_event) is lineage-critical. delegation_role can also be
-            # 'root', which must NOT bypass the progress quota.
-            return str(m.get("delegation_role") or "").lower() == "subagent" or bool(m.get("subagent_event"))
-
-        # NOTE: guard 0 explicitly — Python's list[-0:] is list[0:] (the WHOLE list),
-        # so a `[-quota:]` slice with quota==0 would leak everything, not nothing.
-        lineage_cap = 1000  # bound lineage so a huge swarm fan-out can't balloon the response
-        human = sorted((m for m in combined if not m.get("is_progress")), key=lambda m: m.get("ts", ""))
-        progress = sorted((m for m in combined if m.get("is_progress")), key=lambda m: m.get("ts", ""))
-        human_tail = human[-n_human:] if n_human > 0 else []
-        # v6.73.0 retention-proof origin projection: a Project's start message is
-        # synthesized from the binding's own source_text when its canonical row is
-        # not among the rows ACTUALLY EMITTED (rotated past the archive window OR
-        # pruned by the n_human tail). Post-quota, identity-deduped, hard-capped
-        # with a disclosed omission note (helper below the endpoint factory).
-        if thread_id in project_chat_ids and n_human > 0:
-            try:
-                synthesized = await asyncio.to_thread(
-                    _origin_fallback_rows, data_dir, thread_id, list(human_tail)
-                )
-                if synthesized:
-                    human_tail = sorted(
-                        human_tail + synthesized, key=lambda m: m.get("ts", "")
-                    )
-            except Exception:
-                log.debug("Project origin fallback synthesis failed", exc_info=True)
-        other = [m for m in progress if not _is_subagent_lineage(m)]
-        other_tail = other[-n_progress:] if n_progress > 0 else []
-        # Recency floor = oldest retained telemetry row. Drop lineage older than it so
-        # long-finished swarms don't re-materialise as stuck "Working" parent cards.
-        floor = str(other_tail[0].get("ts") or "") if other_tail else ""
-        lineage = [
-            m for m in progress
-            if _is_subagent_lineage(m) and (not floor or str(m.get("ts") or "") >= floor)
-        ]
-        if len(lineage) > lineage_cap:
-            lineage = lineage[-lineage_cap:]  # keep the most recent lineage events
-        progress_tail = lineage + other_tail
-        messages = sorted(human_tail + progress_tail, key=lambda m: m.get("ts", ""))
-
-        # Annotate progress messages whose task already reached a terminal (or
-        # cancel-intent) status on disk. Tasks torn down by crash storm, hard
-        # timeout, or cancellation emit a live task_done but never write a
-        # task_summary, so on reload/reconnect the client would otherwise replay
-        # their progress and re-inflate a "Working" spinner that never resolves.
-        # Runs AFTER the quota slice — on the rows actually emitted — so the
-        # response pays only for in-window task ids and the truth always lands on
-        # a row the client will see (see _annotate_terminal_task_truth).
-        _annotate_terminal_task_truth(messages, data_dir)
-
-        # Background consciousness writes no task_result, so its progress would
-        # otherwise replay as a perpetual "thinking" card after reload. Mark its
-        # most recent IN-WINDOW progress entry terminal; a fresh live event
-        # re-activates the card if a new cycle starts. (Structured signal,
-        # consumed by log_events.js.)
-        try:
-            bg_msgs = [
-                m for m in messages
-                if m.get("is_progress") and str(m.get("task_id") or "") == "bg-consciousness"
-            ]
-            if bg_msgs:
-                latest = max(bg_msgs, key=lambda m: str(m.get("ts") or ""))
-                latest["task_terminal_status"] = "done"
-        except Exception as exc:
-            log.debug("Failed to annotate bg-consciousness terminal status: %s", exc)
-        return JSONResponse({"messages": messages})
+        return Response(content=body, media_type="application/json")
 
     return api_chat_history
