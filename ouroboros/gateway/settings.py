@@ -899,6 +899,26 @@ def _apply_max_context_auto_downgrade(
     # and scope review stays ON. Context sizing is unchanged.
     current["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "true"
     os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "true"
+    # Typed durable attribution (W3 adjacent (e)): the submarine forensics
+    # mis-attributed this exact narrowing to the owner because the downgrade
+    # left ZERO rows in events.jsonl — the owner's later low->low POST was the
+    # only visible actor. The response notice is transient; the ledger row is
+    # what forensics joins on.
+    try:
+        route = _active_main_route(current)
+        append_jsonl(pathlib.Path(DATA_DIR) / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(),
+            "type": "context_mode_auto_downgraded",
+            "actor": "system_auto_low",
+            "from_mode": "max",
+            "to_mode": "low",
+            "reason": str(block.get("error") or "route_window_unverified"),
+            "provider": str(route.get("provider") or ""),
+            "model": str(route.get("model") or ""),
+            "use_local": bool(route.get("use_local")),
+        })
+    except Exception:
+        log.debug("Failed to record context auto-downgrade event", exc_info=True)
     return (
         str(block.get("error") or "")
         + " Context mode switched to Low. To use Max with this model, confirm it "
