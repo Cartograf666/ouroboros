@@ -131,11 +131,14 @@ def test_sanitize_chat_completion_tools_drops_overlong_names():
     assert [tool["function"]["name"] for tool in sanitized] == ["a" * 64]
 
 
-def test_finalized_payload_marks_last_sorted_tool_for_cache():
+def test_finalized_payload_marks_last_sorted_tool_for_cache(monkeypatch):
     """v6.77.0: the marker is placed once, by the send-time payload finalizer (the two
-    per-builder copies are gone), still on the LAST tool of the deterministic sort."""
+    per-builder copies are gone), still on the LAST tool of the deterministic sort.
+    Pinned under the explicit 'default' global TTL — the global-override stamping has
+    its own goldens in test_review_prompt_caching.py."""
     from ouroboros.llm import LLMClient
 
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "default")
     client = LLMClient()
     target = client._resolve_remote_target("anthropic/claude-sonnet-4.6")
     kwargs = client._build_remote_kwargs(

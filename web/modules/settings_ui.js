@@ -453,6 +453,28 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
+                        <h3>Prompt Cache TTL</h3>
+                        <div class="settings-section-copy">
+                            How long provider prompt caches keep this agent's stable context warm (Anthropic-family routes; other providers manage caching implicitly).
+                            <code>1h</code> keeps the large stable prefix cached across long waits and review cycles &mdash; cache writes bill at 2&times; base input instead of 1.25&times;, but one wait longer than 5 minutes already pays that back on big contexts.
+                            <code>5m</code> is the provider default tier as an explicit value; <code>Default</code> sends bare markers (provider default, callers may still declare their own TTL).
+                            One honest global: it applies to every lane, including review and safety prompts.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label>Prompt Cache TTL</label>
+                            <input id="s-prompt-cache-ttl" type="hidden" value="1h">
+                            ${renderSegmentedField({
+                                target: 's-prompt-cache-ttl',
+                                options: [
+                                    { value: 'default', label: 'Default' },
+                                    { value: '5m', label: '5m' },
+                                    { value: '1h', label: '1h' },
+                                ],
+                            })}
+                        </div>
+                    </div>
+
+                    <div class="form-section">
                         <h3>Safety Supervisor</h3>
                         <div class="settings-section-copy">
                             Coverage of the LLM safety-supervisor layer (a separate axis from Runtime Mode).

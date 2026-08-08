@@ -608,6 +608,11 @@ def _normalize_usage_cost(
             int(usage.get("cache_write_tokens") or 0),
             usage.get("prompt_cache_ttl"),
             provider=provider,
+            cache_write_tokens_by_ttl=(
+                usage.get("cache_write_tokens_by_ttl")
+                if isinstance(usage.get("cache_write_tokens_by_ttl"), dict)
+                else None
+            ),
         )
     usage["cost"] = cost
     cost_estimated = bool(usage.get("cost_estimated")) or (cost is not None and not provider_reported_cost)
