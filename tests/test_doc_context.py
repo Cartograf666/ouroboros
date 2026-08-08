@@ -5,11 +5,15 @@ Doc matrix (D-ARCH unification, owner 2026-08-08):
        (self-body, project tasks with or without a folder, evolution, external
        surfaces); navigation map in low. It is Ouroboros's capability/tools/
        access map — never dropped per-task in max.
-  DEVELOPMENT is MODE-INDEPENDENT per task class: full for self-body/self-mod/
-       evolution work; on-demand pointer for PROJECT tasks (project_id set,
-       folder irrelevant) and the external/headless/delegated surface class;
-       explicit context_requires_development / context_requires_self_body_docs
-       win.
+  DEVELOPMENT is MODE-INDEPENDENT per task class, keyed by D-DEV (owner
+       2026-08-08) on the ACTIVE REPO BINDING — the handbook loads exactly when
+       the work targets Ouroboros's own body, a path fact and never a guess from
+       message text (P5). On-demand pointer for the EXTERNAL-SURFACE class (a
+       bound workspace incl. an auto-provisioned genesis tree, a subagent, an
+       api/cli/scheduled surface); full for everything still bound to the system
+       repo — including a direct-chat turn in a PROJECT ROOM, which binds no
+       workspace. Project MEMBERSHIP is deliberately NOT the signal. Explicit
+       context_requires_development / context_requires_self_body_docs win.
   README/CHECKLISTS: on-demand pointer in all modes.
 SYSTEM + BIBLE are tier-0 and always full.
 """
@@ -168,38 +172,69 @@ def test_max_mode_evolution_task_keeps_arch_and_development_full():
     assert "## DEVELOPMENT.md" in low_text
 
 
-def test_project_tasks_drop_development_but_keep_arch_per_mode():
-    """D-ARCH: DEVELOPMENT is NOT inlined for PROJECT tasks (project_id set;
-    folder irrelevant) in EITHER mode; ARCHITECTURE follows the owner mode
-    (full in max — the capability map — nav map in low)."""
-    # File-less project (the submarine shape: project_id, no workspace).
-    fileless_max = _build_system_text({"project_id": "proj_sub"}, context_mode="max")
-    assert _ARCH_BODY_SENTINEL in fileless_max  # ARCH full in max
-    assert "## DEVELOPMENT.md" not in fileless_max
-    assert "DEVELOPMENT.md" in fileless_max  # named in the on-demand pointer
-
-    fileless_low = _build_system_text({"project_id": "proj_sub"}, context_mode="low")
-    assert "navigation map" in fileless_low
-    assert _ARCH_BODY_SENTINEL not in fileless_low
-    assert "## DEVELOPMENT.md" not in fileless_low
-
-    # Folder-ful project task (workspace bound) — same DEV drop, ARCH per mode.
+def test_development_keys_on_the_repo_binding_not_project_membership():
+    """D-DEV (owner 2026-08-08): the handbook loads iff the work targets
+    Ouroboros's own body, and the structural signal is the ACTIVE REPO BINDING —
+    NOT `project_id`. ARCHITECTURE is unaffected and follows the owner mode alone
+    (D-ARCH): full in max for every class, navigation map in low."""
+    # A project task with a BOUND workspace (this is what a promoted project task
+    # is since Q10=A auto-provisions a genesis tree) works on ANOTHER codebase.
     folder_max = _build_system_text(
         {"project_id": "proj_sub", "workspace_root": "/tmp/proj-tree", "workspace_mode": "external"},
         context_mode="max",
     )
-    assert _ARCH_BODY_SENTINEL in folder_max
+    assert _ARCH_BODY_SENTINEL in folder_max  # ARCH full in max, always
     assert "## DEVELOPMENT.md" not in folder_max
+    assert "DEVELOPMENT.md" in folder_max  # named in the on-demand pointer
 
-    # Explicit per-task overrides still win.
+    # A direct-chat turn in a PROJECT ROOM binds no workspace: still Ouroboros's
+    # own body, so it KEEPS the handbook. This is the case the project_id-keyed
+    # draft got wrong.
+    room_chat_max = _build_system_text(
+        {"project_id": "proj_sub", "_is_direct_chat": True}, context_mode="max"
+    )
+    assert _ARCH_BODY_SENTINEL in room_chat_max
+    assert "## DEVELOPMENT.md" in room_chat_max
+    room_chat_low = _build_system_text(
+        {"project_id": "proj_sub", "_is_direct_chat": True}, context_mode="low"
+    )
+    assert "navigation map" in room_chat_low
+    assert _ARCH_BODY_SENTINEL not in room_chat_low
+    assert "## DEVELOPMENT.md" in room_chat_low
+
+    # workspace="none" binds nothing -> the task is not external -> keeps it.
+    opt_out = _build_system_text(
+        {"project_id": "proj_sub", "workspace": "none"}, context_mode="max"
+    )
+    assert "## DEVELOPMENT.md" in opt_out
+
+    # Evolution / self-body keep it through the self-body branch even in a room.
+    evolution = _build_system_text(
+        {"project_id": "proj_sub", "type": "evolution"}, context_mode="max"
+    )
+    assert "## DEVELOPMENT.md" in evolution
+
+    # Explicit per-task overrides still win in BOTH directions.
     explicit_dev = _build_system_text(
-        {"project_id": "proj_sub", "context_requires_development": True}, context_mode="max"
+        {
+            "project_id": "proj_sub", "workspace_root": "/tmp/proj-tree",
+            "workspace_mode": "external", "context_requires_development": True,
+        },
+        context_mode="max",
     )
     assert "## DEVELOPMENT.md" in explicit_dev
     explicit_self_body = _build_system_text(
-        {"project_id": "proj_sub", "context_requires_self_body_docs": True}, context_mode="max"
+        {
+            "project_id": "proj_sub", "workspace_root": "/tmp/proj-tree",
+            "workspace_mode": "external", "context_requires_self_body_docs": True,
+        },
+        context_mode="max",
     )
     assert "## DEVELOPMENT.md" in explicit_self_body
+    explicit_off = _build_system_text(
+        {"project_id": "proj_sub", "context_requires_development": False}, context_mode="max"
+    )
+    assert "## DEVELOPMENT.md" not in explicit_off
 
 
 def test_readme_and_checklists_are_on_demand_pointer_in_both_modes():

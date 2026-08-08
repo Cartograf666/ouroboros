@@ -21,9 +21,18 @@ Owner's motivation (recorded so it is not lost): architecture.md is Ouroboros's
 capability/tools/access map; it stays resident in max even for project/evolution
 work because without it the agent cannot reason about HOW to work effectively —
 context economy comes from dropping DEVELOPMENT.md for project work, never
-ARCHITECTURE. DEVELOPMENT.md inclusion is the caller's per-task decision
-(``context.py`` derives it from self-body/project/external-surface facts) and is
+ARCHITECTURE. DEVELOPMENT.md inclusion is the caller's per-task decision and is
 deliberately decoupled from the mode.
+
+D-DEV (owner decision, 2026-08-08) fixes what that per-task decision keys on:
+DEVELOPMENT.md is the self-engineering handbook, so it loads exactly when the
+work targets Ouroboros's own body — and the signal is the ACTIVE REPO BINDING, a
+path fact, never a guess from message text (P5). ``context.py`` derives it from
+``not _task_uses_external_context(task)``: a bound workspace, a subagent, or an
+api/cli/scheduled surface means another codebase and gets the pointer, while a
+direct-chat turn in a PROJECT ROOM with no workspace bound keeps the handbook.
+Project MEMBERSHIP is deliberately not the signal — an id in a room does not mean
+the work left Ouroboros's body.
 
 The TIER-0 protected core (SYSTEM, BIBLE, identity, scratchpad, knowledge index,
 recent dialogue) is ALWAYS full in every mode (BIBLE P1 cognitive-horizon / P4)

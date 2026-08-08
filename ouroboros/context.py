@@ -1057,21 +1057,36 @@ def _capture_context_core(
     #
     # DEVELOPMENT.md (the self-engineering handbook) is what adapts, MODE-
     # INDEPENDENTLY — the doc decision is deliberately DECOUPLED from workspace
-    # binding (binding a workspace fixes paths/tool profile/lease, it must not
-    # drag the capability map out of context in max):
+    # binding for ARCHITECTURE (binding a workspace fixes paths/tool profile/
+    # lease, it must not drag the capability map out of context in max).
+    #
+    # D-DEV (owner decision, 2026-08-08). OWNER'S MOTIVATION, recorded here so it
+    # is not lost: "DEVELOPMENT.md is the self-engineering handbook; it loads
+    # exactly when the work targets Ouroboros's own body — the signal is the repo
+    # binding, a path fact, never a guess from message text (P5)."
+    #
+    # The structural signal is therefore the ACTIVE REPO BINDING —
+    # `not _task_uses_external_context(task)`: no workspace bound, not a subagent,
+    # not an api/cli/scheduled surface — and NOT project membership. An earlier
+    # draft also dropped the handbook whenever `resolve_project_id` returned an id,
+    # which silently took it away from a DIRECT-CHAT turn in a project room even
+    # though that turn is still working on Ouroboros's own body with no workspace
+    # bound. Order:
     #   1. an explicit context_requires_development on the task wins;
     #   2. self-body work keeps it full (explicit context_requires_self_body_docs
     #      or evolution/deep_self_review/review task types);
-    #   3. PROJECT tasks (project_id set; folder irrelevant) and the external/
-    #      headless/delegated surface class (v6.17.0) — which work on OTHER
-    #      codebases — get the on-demand pointer;
+    #   3. the external-surface class — a bound workspace (including a project
+    #      task's auto-provisioned genesis tree), a subagent, or an api/cli/
+    #      scheduled surface — works on ANOTHER codebase and gets the on-demand
+    #      pointer. `workspace="none"` binds no workspace, so such a task is not
+    #      external and keeps the handbook (its own territory);
     #   4. everything else keeps the existing type/direct-chat semantics.
     explicit_dev = task.get("context_requires_development")
     if explicit_dev is not None:
         docs_need_development = normalize_bool(explicit_dev)
     elif _task_requires_self_body_docs(task):
         docs_need_development = True
-    elif resolve_project_id(task) or _task_uses_external_context(task):
+    elif _task_uses_external_context(task):
         docs_need_development = False
     else:
         docs_need_development = _task_requires_development_context(task)
