@@ -633,7 +633,65 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     # working_dir (workspace="none" on the event opts out); a SET-but-broken
     # working_dir fails LOUDLY here — never a silent workspace-less task that would
     # resolve to the self_modification profile over the system repo.
-    from ouroboros.workspace_admission import bounded_workspace_preflight, compose_workspace_block, resolve_room_workspace
+    from ouroboros.workspace_admission import (
+        WORKSPACE_NONE,
+        bounded_workspace_preflight,
+        compose_workspace_block,
+        resolve_room_workspace,
+    )
+
+    # Q10=A (owner, 2026-08-08): a project promoted with NO working folder gets one
+    # AUTO-PROVISIONED via the existing ensure_project_workspace seam (an idempotent
+    # standalone git repo under the durable subagent_projects root — passes the same
+    # validate_workspace_root SSOT below). This binds the task's real tree as its
+    # active workspace, fixing path/cwd confinement, the external tool profile and
+    # the one-writer lease for the file-less project class (the submarine shape).
+    # STRICTLY empty-only: a NON-EMPTY working_dir — valid or broken — is never
+    # blind-ensured over (a broken one must LOUD-FAIL through resolve_room_workspace,
+    # the v6.58.0 invariant, not be papered over with a fresh empty repo). The
+    # workspace="none" sentinel still opts out entirely. Docs are NOT part of this
+    # decision: since D-ARCH (2026-08-08) the doc matrix keys on project membership
+    # and the owner mode, so binding a workspace here never drags ARCHITECTURE.md
+    # out of a max context.
+    if (
+        pid
+        and not str(evt.get("workspace_root") or "").strip()
+        and str(evt.get("workspace") or "").strip().lower() != WORKSPACE_NONE
+    ):
+        provisioned_now = ""
+        try:
+            from ouroboros.projects_registry import get_project as _get_project_entry
+
+            _existing_wd = str((_get_project_entry(DRIVE_ROOT, pid) or {}).get("working_dir") or "").strip()
+        except Exception:
+            # Registry read failure: do NOT provision (a blind ensure here could
+            # mint a fresh empty repo over a project whose working_dir merely
+            # failed to load). resolve_room_workspace re-reads and decides.
+            _existing_wd = "unreadable"
+            log.warning("promote: project working_dir lookup failed for %s", pid, exc_info=True)
+        if not _existing_wd:
+            try:
+                from ouroboros.projects_registry import ensure_project_workspace
+
+                provisioned_now = str(ensure_project_workspace(DRIVE_ROOT, pid, REPO_DIR) or "")
+            except Exception:
+                provisioned_now = ""
+                log.warning("promote: workspace auto-provisioning raised for %s", pid, exc_info=True)
+            if not provisioned_now:
+                # Bind-or-fail (v6.58.0): falling through to a workspace-less
+                # self_modification-profile task over the system repo is exactly
+                # the silent degradation the admission SSOT exists to kill.
+                _fail_promoted_task_loudly(
+                    ctx, task,
+                    f"project {pid!r} has no working folder and auto-provisioning one failed; "
+                    "see the supervisor log (ensure_project_workspace)",
+                )
+                return {
+                    "status": "needs_manual_target",
+                    "reason": "workspace_provisioning_failed",
+                    "task_id": tid,
+                }
+            task.setdefault("metadata", {})["workspace_autoprovisioned"] = True
 
     resolved_ws, ws_error = resolve_room_workspace(
         drive_root=DRIVE_ROOT,

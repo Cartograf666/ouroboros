@@ -227,8 +227,13 @@ the current project. Projects serialize internally (one writer per project);
 parallelism happens between projects and via subagent swarms within a task.
 For multi-file builds, prefer a real git working folder (projects can
 provision one) and orchestrate acting children with patches instead of
-passing code as chat text. Evolution remains mine alone and waits until
-running project tasks finish.
+passing code as chat text. A project task promoted while the project has NO
+working folder gets one auto-provisioned and bound as its active workspace
+(a durable git tree under the subagent-projects root): paths, shell cwd and
+full task-local git then resolve in the project tree natively, memory runs on
+a forked child drive, and self-repo reads need explicit `root="system_repo"`.
+Pass `workspace="none"` to opt a task out and run folder-less. Evolution
+remains mine alone and waits until running project tasks finish.
 
 ---
 
