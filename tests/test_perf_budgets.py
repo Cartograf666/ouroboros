@@ -273,7 +273,9 @@ def test_sse_follow_tick_reads_only_appended_bytes_and_zero_artifact_work(
     data = tmp_path / "data"
     (data / "logs").mkdir(parents=True)
     (data / "state").mkdir(parents=True)
-    with (data / "logs" / "progress.jsonl").open("w", encoding="utf-8") as handle:
+    # newline="\n": Windows text-mode would translate \n -> \r\n on disk,
+    # desynchronizing the byte-offset math below from len(line.encode()).
+    with (data / "logs" / "progress.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
         for i in range(50):
             handle.write(json.dumps({
                 "ts": f"2026-08-08T00:00:{i:02d}Z", "content": f"step-{i}", "task_id": "t1",
@@ -299,7 +301,7 @@ def test_sse_follow_tick_reads_only_appended_bytes_and_zero_artifact_work(
     artifact_counters = _install_artifact_counters(monkeypatch)
 
     appended_bytes = 0
-    with (data / "logs" / "progress.jsonl").open("a", encoding="utf-8") as handle:
+    with (data / "logs" / "progress.jsonl").open("a", encoding="utf-8", newline="\n") as handle:
         for i in range(3):
             line = json.dumps({
                 "ts": f"2026-08-08T00:01:{i:02d}Z", "content": f"late-{i}", "task_id": "t1",
