@@ -280,13 +280,12 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC": 200,
     "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES": 1,
     "OUROBOROS_ACCEPTANCE_RESERVE_PCT": 5,
-    # Prompt-cache TTL, one honest GLOBAL override (owner decision 2026-08-08, batch #2
-    # Q2=A): applied to EVERY cache_control breakpoint on the Anthropic-normalizing
-    # family — main loop, review lanes, safety supervisor alike — at the ONE send-time
-    # finalizer (llm._normalize_payload_cache_ttl). 'default' = bare markers (provider
-    # default 5m tier); '5m'/'1h' = the explicit Anthropic ephemeral tiers ('1h' bills
-    # cache writes at the documented 2x-vs-1.25x ratio). Non-Anthropic wire formats are
-    # a NO-OP by construction (Gemini documents no ttl field — the v5.30.0 outage class).
+    # Prompt-cache TTL, one honest GLOBAL override (owner decision 2026-08-08, batch #2 Q2=A): applied to
+    # EVERY cache_control breakpoint on the Anthropic-normalizing family — main loop, review lanes, safety
+    # supervisor alike — at the ONE send-time finalizer (llm._normalize_payload_cache_ttl). 'default' = bare
+    # markers (provider default 5m tier); '5m'/'1h' = the explicit Anthropic ephemeral tiers ('1h' bills cache
+    # writes at the documented 2x-vs-1.25x ratio). Non-Anthropic wire formats are a NO-OP by construction
+    # (Gemini documents no ttl field — the v5.30.0 outage class).
     "OUROBOROS_PROMPT_CACHE_TTL": "1h",
     # Reasoning effort per task type: none | low | medium | high
     "OUROBOROS_EFFORT_TASK": "medium",
@@ -586,22 +585,20 @@ def resolve_effort(task_type: str) -> str:
     return raw if raw in EFFORT_SCALE else default
 
 
-# Prompt-cache TTL scale (owner decision 2026-08-08): 'default' = bare markers
-# (provider default tier), '5m'/'1h' = the two documented Anthropic ephemeral
-# tiers. Deliberately NO 'auto' (a dead value until an adaptive design exists)
-# and NO '24h' (Anthropic would clamp it — a value that mostly lies).
+# Prompt-cache TTL scale (owner decision 2026-08-08): 'default' = bare markers (provider default tier),
+# '5m'/'1h' = the two documented Anthropic ephemeral tiers. Deliberately NO 'auto' (a dead value until an
+# adaptive design exists) and NO '24h' (Anthropic would clamp it — a value that mostly lies).
 PROMPT_CACHE_TTL_SCALE: tuple[str, ...] = ("default", "5m", "1h")
 
 
 def resolve_prompt_cache_ttl() -> str:
     """The owner-configured global prompt-cache TTL ('default' | '5m' | '1h').
 
-    Validated like ``resolve_effort``: an unknown value falls back to the shipped
-    default. Consumed ONLY by the send-time cache finalizer
-    (``llm.LLMClient._normalize_payload_cache_ttl``) and by
-    ``review_helpers.cached_prompt_blocks`` (whose marker the finalizer would stamp
-    to the same value anyway) — never by per-builder marking sites
-    (docs/DEVELOPMENT.md cache-friendliness invariant).
+    Validated like ``resolve_effort``: an unknown value falls back to the shipped default.
+    Consumed ONLY by the send-time cache finalizer (``llm.LLMClient._normalize_payload_cache_ttl``)
+    and by ``review_helpers.cached_prompt_blocks`` (whose marker the finalizer would stamp to the
+    same value anyway) — never by per-builder marking sites (docs/DEVELOPMENT.md cache-friendliness
+    invariant).
     """
     default = str(SETTINGS_DEFAULTS["OUROBOROS_PROMPT_CACHE_TTL"])
     raw = str(os.environ.get("OUROBOROS_PROMPT_CACHE_TTL", default) or "").strip().lower()

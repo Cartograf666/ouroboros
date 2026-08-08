@@ -729,6 +729,8 @@ def test_forced_model_call_rebinds_latest_child_result_and_suffix(tmp_path, monk
 def test_production_budget_wrapup_routes_through_delivery_candidate(tmp_path, monkeypatch):
     import hashlib
 
+    from ouroboros import task_pacing
+
     loop, registry, ctx, trace = _forced_test_context(
         tmp_path, usage={"cost": 5.0},
     )
@@ -741,7 +743,9 @@ def test_production_budget_wrapup_routes_through_delivery_candidate(tmp_path, mo
     result = loop._check_budget_limits(
         ctx,
         budget_remaining_usd=8.0,
-        cost_ceiling_usd=4.0,
+        cost_ceiling=task_pacing.CostCeiling(
+            state=task_pacing.COST_CEILING_ACTIVE, ceiling_usd=4.0,
+        ),
     )
 
     assert result is not None
@@ -757,6 +761,7 @@ def test_production_budget_wrapup_propagates_budget_exceeded(tmp_path, monkeypat
     import pytest
 
     import ouroboros.usage_accounting as accounting
+    from ouroboros import task_pacing
 
     loop, _registry, ctx, trace = _forced_test_context(
         tmp_path, usage={"cost": 5.0},
@@ -772,7 +777,9 @@ def test_production_budget_wrapup_propagates_budget_exceeded(tmp_path, monkeypat
         loop._check_budget_limits(
             ctx,
             budget_remaining_usd=8.0,
-            cost_ceiling_usd=4.0,
+            cost_ceiling=task_pacing.CostCeiling(
+                state=task_pacing.COST_CEILING_ACTIVE, ceiling_usd=4.0,
+            ),
         )
 
 

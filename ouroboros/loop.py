@@ -3516,6 +3516,33 @@ class _RoundLimitContext:
     forced_service_evidence_fingerprint: str = ""
 
 
+def _account_compaction_usage(
+    accumulated_usage: Dict[str, Any],
+    compaction_usage: Dict[str, Any],
+    event_queue: Optional[queue.Queue],
+    task_id: str,
+) -> None:
+    """Fold a compaction pass's usage into the loop totals and emit its llm_usage
+    event (light-model lane). Extracted verbatim from ``run_llm_loop`` for the
+    300-line function gate; behavior unchanged."""
+    add_usage(accumulated_usage, compaction_usage)
+    _cm = get_light_model()
+    _cc = (
+        float(compaction_usage["cost"])
+        if compaction_usage.get("cost") is not None
+        else estimate_cost_optional(
+            _cm,
+            int(compaction_usage.get("prompt_tokens") or 0),
+            int(compaction_usage.get("completion_tokens") or 0),
+            int(compaction_usage.get("cached_tokens") or 0),
+            int(compaction_usage.get("cache_write_tokens") or 0),
+            compaction_usage.get("prompt_cache_ttl"),
+            provider=str(compaction_usage.get("provider") or "openrouter"),
+        )
+    )
+    emit_llm_usage_event(event_queue, task_id, _cm, compaction_usage, _cc, "compaction")
+
+
 def _handle_round_limit(ctx: _RoundLimitContext) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     finish_reason = f"⚠️ Task exceeded MAX_ROUNDS ({ctx.max_rounds}). Consider decomposing into subtasks via schedule_subagent."
     prompt = (
@@ -6507,22 +6534,7 @@ def run_llm_loop(
                 tools._ctx.messages = messages
             limit_ctx.messages = messages  # WA2: provider-death finalize must salvage the COMPACTED transcript
             if _compaction_usage:
-                add_usage(accumulated_usage, _compaction_usage)
-                _cm = get_light_model()
-                _cc = (
-                    float(_compaction_usage["cost"])
-                    if _compaction_usage.get("cost") is not None
-                    else estimate_cost_optional(
-                        _cm,
-                        int(_compaction_usage.get("prompt_tokens") or 0),
-                        int(_compaction_usage.get("completion_tokens") or 0),
-                        int(_compaction_usage.get("cached_tokens") or 0),
-                        int(_compaction_usage.get("cache_write_tokens") or 0),
-                        _compaction_usage.get("prompt_cache_ttl"),
-                        provider=str(_compaction_usage.get("provider") or "openrouter"),
-                    )
-                )
-                emit_llm_usage_event(event_queue, task_id, _cm, _compaction_usage, _cc, "compaction")
+                _account_compaction_usage(accumulated_usage, _compaction_usage, event_queue, task_id)
 
             seal_task_transcript(messages)
 
