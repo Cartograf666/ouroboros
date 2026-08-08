@@ -73,6 +73,10 @@ class _CompactionRoundContext:
     checkpoint_injected: bool
     emit_progress: Callable[[str], None]
     active_model: str = ""
+    # The round's LIVE tool-schema list (the same object enable_tools appends to).
+    # Sent on the wire beside `messages`, so the necessity measure must count it;
+    # optional so existing constructions stay valid (schemas absent => 0 tokens).
+    tool_schemas: Optional[List[Dict[str, Any]]] = None
 
 
 def _estimate_messages_chars(messages: List[Dict[str, Any]]) -> int:
@@ -3152,11 +3156,16 @@ def _run_round_compaction(
     #
     # NECESSITY vs UTILITY (the submarine thrash fix). NECESSITY — should we
     # compact at all? — is TOTAL calibrated pressure: the frozen frame (system
-    # blocks, tools, protected/kept rounds) counts toward the provider window even
-    # though no pass can shrink it, and the char budget is compared in CALIBRATED
-    # real tokens (main_loop_token_density: neutral 1.0 cold, measured supersedes
-    # — never the review-pack cold-conservative value, which would demote fresh
-    # installs; the v6.80→v6.81 oscillation). UTILITY — can a pass help, and when
+    # blocks, TOOL SCHEMAS, protected/kept rounds) counts toward the provider
+    # window even though no pass can shrink it. "Total" is literal: the schemas
+    # travel beside `messages` on the wire (~148K chars on the submarine traces),
+    # so a transcript-only measure would let the trigger fire a whole tool
+    # envelope late — they are added through the context_fit token seam
+    # (tool_schema_tokens), never re-estimated here. The char budget is compared
+    # in CALIBRATED real tokens (main_loop_token_density: neutral 1.0 cold,
+    # measured supersedes — never the review-pack cold-conservative value, which
+    # would demote fresh installs; the v6.80→v6.81 oscillation).
+    # UTILITY — can a pass help, and when
     # should it refire? — is the COMPACTABLE region only (the transcript beyond
     # the frozen frame): a pass that could NOT get below the trigger arms a
     # hysteresis, one loud disclosure replaces the per-round light-model call +
@@ -3165,11 +3174,16 @@ def _run_round_compaction(
     # when the region grows ~20% or after N rounds. The reactive provider-overflow
     # low-retry net (one-shot, loop exit path) is deliberately untouched.
     emergency_chars = LOW_EMERGENCY_COMPACTION_CHARS if ctx.active_context_mode == "low" else EMERGENCY_COMPACTION_CHARS
-    from ouroboros.context_fit import main_loop_token_density
+    from ouroboros.context_fit import main_loop_token_density, tool_schema_tokens
 
     density = main_loop_token_density(ctx.drive_root, ctx.active_model)
     threshold_real_tokens = emergency_chars / 4.0  # the token budget the char constant documents
-    pressure_real_tokens = (_estimate_messages_chars(messages) / 4.0) * density
+    schema_tokens = tool_schema_tokens(ctx.tool_schemas)
+
+    def _total_pressure(msgs: List[Dict[str, Any]]) -> float:
+        return (_estimate_messages_chars(msgs) / 4.0 + schema_tokens) * density
+
+    pressure_real_tokens = _total_pressure(messages)
     if pressure_real_tokens > threshold_real_tokens:
         usage_state = getattr(ctx.tools._ctx, "_accumulated_usage", None)
         usage_state = usage_state if isinstance(usage_state, dict) else {}
@@ -3204,7 +3218,7 @@ def _run_round_compaction(
                 drive_root=ctx.drive_root,
                 task_id=ctx.task_id,
             )
-            after_real_tokens = (_estimate_messages_chars(messages) / 4.0) * density
+            after_real_tokens = _total_pressure(messages)
             if after_real_tokens > threshold_real_tokens:
                 spans_after = _tool_round_spans(messages)
                 region_after = _estimate_messages_chars(messages[spans_after[0][0]:]) if spans_after else 0
@@ -3227,6 +3241,7 @@ def _run_round_compaction(
                     "calibrated_real_tokens": int(after_real_tokens),
                     "threshold_real_tokens": int(threshold_real_tokens),
                     "compactable_region_chars": region_after,
+                    "tool_schema_tokens": int(schema_tokens),
                     "token_density": round(float(density), 3),
                 })
             return messages, usage
@@ -6110,6 +6125,7 @@ def run_llm_loop(
                     checkpoint_injected=_checkpoint_injected,
                     emit_progress=emit_progress,
                     active_model=active_model,
+                    tool_schemas=tool_schemas,
                 ),
             )
             if tools._ctx.messages is not messages:

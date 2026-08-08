@@ -96,12 +96,10 @@ class ContextFitPlan:
     ) -> int:
         """Calibrated physical prompt projection after schemas are available."""
         projection = self.projection(mode)
-        tool_tokens = (
-            estimate_tokens(json.dumps(tools, ensure_ascii=False, sort_keys=True, default=str))
-            if tools
-            else 0
+        return int(
+            (projection.estimated_tokens + tool_schema_tokens(tools))
+            * projection.calibration_ratio
         )
-        return int((projection.estimated_tokens + tool_tokens) * projection.calibration_ratio)
 
     def initial_mode_with_tools(self, tools: Optional[List[Dict[str, Any]]]) -> str:
         from ouroboros.capability_evidence import is_known
@@ -165,6 +163,19 @@ def _render_context_system_content(
     ]
 
 
+def tool_schema_tokens(tools: Optional[List[Dict[str, Any]]]) -> int:
+    """chars/4 estimate of the TOOL-SCHEMA segment of a prompt.
+
+    One seam for every consumer that has to account for the schemas: they are sent
+    on the wire beside ``messages``, so any measure built from the transcript alone
+    silently omits them (~148K chars / ~37K tokens on the submarine traces — enough
+    to make an emergency-compaction trigger fire a whole tool envelope late).
+    """
+    if not tools:
+        return 0
+    return estimate_tokens(json.dumps(tools, ensure_ascii=False, sort_keys=True, default=str))
+
+
 def estimate_context_prompt_tokens(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]] = None,
@@ -190,10 +201,7 @@ def estimate_context_prompt_tokens(
             total += estimate_tokens(
                 json.dumps(msg["tool_calls"], ensure_ascii=False, default=str)
             )
-    if tools:
-        total += estimate_tokens(
-            json.dumps(tools, ensure_ascii=False, sort_keys=True, default=str)
-        )
+    total += tool_schema_tokens(tools)
     return max(0, int(total))
 
 

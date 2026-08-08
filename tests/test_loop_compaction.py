@@ -188,6 +188,57 @@ def test_emergency_compaction_necessity_uses_calibrated_density(monkeypatch, tmp
     assert calls == []
 
 
+def test_emergency_compaction_necessity_counts_tool_schemas(monkeypatch, tmp_path):
+    """NECESSITY is TOTAL pressure: the tool schemas travel beside `messages` on
+    the wire, so they must count. A transcript just under the trigger plus a big
+    schema envelope is over it — the submarine class where compaction fired a
+    whole tool envelope (~148K chars) late."""
+    from ouroboros import context_fit, loop
+
+    calls = []
+    monkeypatch.setattr(
+        loop, "_persist_compaction_checkpoint",
+        lambda m, **k: calls.append(("checkpoint", k["reason"])) or True,
+    )
+    monkeypatch.setattr(
+        loop, "compact_tool_history_llm",
+        lambda m, keep_recent, **k: (calls.append(("compact", keep_recent)) or (m, None)),
+    )
+    monkeypatch.setattr(context_fit, "main_loop_token_density", lambda _dr, _m: 1.0)
+    # 1.19M chars ≈ 297.5K tokens: just UNDER the 1.2M-char (300K-token) max trigger.
+    monkeypatch.setattr(loop, "_estimate_messages_chars", lambda _m: 1_190_000)
+
+    messages = []
+    for i in range(8):
+        messages.append({
+            "role": "assistant", "content": f"r{i}",
+            "tool_calls": [{"id": f"c{i}", "function": {"name": "x", "arguments": "{}"}}],
+        })
+        messages.append({"role": "tool", "tool_call_id": f"c{i}", "content": "ok"})
+
+    def _ctx(schemas):
+        return loop._CompactionRoundContext(
+            tools=SimpleNamespace(_ctx=SimpleNamespace(_pending_compaction=None, _accumulated_usage={})),
+            drive_root=tmp_path, drive_logs=tmp_path / "logs", task_id="task-schemas",
+            round_idx=3, event_queue=None, active_use_local=False,
+            active_context_mode="max", checkpoint_injected=False,
+            emit_progress=lambda _msg: None, tool_schemas=schemas,
+        )
+
+    loop._run_round_compaction(messages, _ctx(None))
+    assert calls == []  # transcript alone stays under the trigger
+
+    # ~40K tokens of schemas (the submarine envelope) push the TOTAL over it.
+    schemas = [
+        {"type": "function", "function": {"name": f"tool_{i}", "description": "d" * 4000,
+                                          "parameters": {"type": "object"}}}
+        for i in range(40)
+    ]
+    assert context_fit.tool_schema_tokens(schemas) > 30_000
+    loop._run_round_compaction(messages, _ctx(schemas))
+    assert ("checkpoint", "emergency_context_size") in calls
+
+
 def test_emergency_compaction_hysteresis_suppresses_futile_refire(monkeypatch, tmp_path):
     """UTILITY/rearm: a pass that could not get below the trigger arms a
     hysteresis — no per-round refire (no light-model call, no cache-destroying
