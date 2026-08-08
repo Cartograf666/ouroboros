@@ -1,4 +1,4 @@
-# Ouroboros v6.90.3 — Architecture & Reference
+# Ouroboros v6.91.0 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -834,12 +834,68 @@ finalization states.
    - Monitors subprocess; restarts on exit code 42 (restart signal)
   - First-run wizard (shared desktop/web onboarding for multi-key and optional local setup)
    - **Graceful shutdown with orphan cleanup** (see Shutdown section below)
+   - Linux browser fallback: with no usable GUI backend it serves the same UI through the default browser (see "Linux browser fallback" below)
 
 2. **server.py** — self-editable inner server. Can be modified by the agent.
    - Starlette app with HTTP API + WebSocket
    - Runs supervisor in a background thread
    - Supervisor manages worker pool, task queue, message routing
    - Local model lifecycle endpoints extracted to `ouroboros/gateway/models.py`
+
+### Linux browser fallback (headless launcher mode)
+
+On Linux only, `launcher.py` probes pywebview's own backend selector
+(`webview.guilib.initialize()` — the backend-selection SSOT, honoring
+`PYWEBVIEW_GUI` and desktop-session detection) once at the top of `main()`.
+pywebview picks its backend lazily inside `webview.start()`, so on a Linux host
+without GTK/QT bindings `import webview` succeeds and the process would
+otherwise crash later at whichever window site runs first. Importing a backend
+is not the same as HAVING a display, so the probe then asks whether a display
+actually exists (`_display_ready`): `initialize()` only imports the module and
+calls `gtk.Application.new()`, while the first real display access happens
+later inside `webview.start()`, where `BrowserView.__init__` consumes
+`Gdk.Display.get_default()` — so a box WITH gi/GTK bindings but WITHOUT a
+display (ssh session, headless server carrying the system gi) used to pass the
+import probe and crash at the first window, the exact crash this mode exists to
+prevent. The display check is the session environment first
+(`DISPLAY`/`WAYLAND_DISPLAY`, decisive for every backend) and then, for GTK,
+the backend's own `Gdk.Display.get_default()`, which answers `None` rather than
+raising when the named display is dead. Disclosed residual: a Qt backend is
+judged on the environment alone — asking Qt means constructing a
+`QGuiApplication`, which ABORTS the process when its platform plugin cannot
+load, i.e. the probe would cause the crash it is meant to detect; pywebview
+selects GTK before Qt on Linux, so the deep check covers the default path. When
+the probe
+fails, the launcher enters browser mode instead of crashing: it starts and
+supervises `server.py` exactly as usual, prints the bound URL, best-effort
+opens the default browser at it (best-effort: the browser is the owner's own
+application, deliberately outside process custody and launcher teardown — the
+Emergency-Stop subprocess-tree invariant governs the agent's tree, not the
+owner's browser, so a stdlib-resolved console browser may outlive the
+launcher), and the same web UI is served over the
+loopback port. A fresh install onboards through the established
+`/api/onboarding` blocking web overlay (the Docker/web path) instead of the
+desktop wizard window; the wizard function simply reports "not completed" and
+startup continues. Pre-server terminal cases stay terminal: a second instance
+just prints the running URL, and a missing git or a server that never becomes
+healthy print the cause (with log paths) and exit nonzero. Shutdown is
+SIGINT/SIGTERM: the handler only sets the shutdown event, and a keep-alive
+loop on the main thread performs the normal teardown (stop agent → orphan
+sweep → pid-lock release) with a clean exit. That loop also watches the
+lifecycle thread's liveness, because the crash fuse ends that thread without
+setting the shutdown event — that death runs the same teardown but exits
+nonzero. The handlers are installed in `main()` BEFORE the lifecycle thread
+spawns `server.py` (via `platform_layer.install_shutdown_signal_handlers` —
+the signal surface lives behind the platform layer), and the readiness wait
+aborts into the same teardown when the event is set, so a signal anywhere in
+the startup window still tears down cleanly. Disclosed residual (pre-existing
+on every platform, tracked as an issue, NOT specific to this mode): spawn
+admission is not atomic with the shutdown event — a signal landing in the
+sub-second interval while `start_agent` is between `Popen` and publishing the
+child can still leave that just-spawned server running after the launcher
+exits. The panic path is unaffected (the lifecycle thread does its own
+cleanup and `os._exit`), as is the restart-42 path; macOS and Windows never
+run the probe and are completely untouched.
 
 ### Data layout (`~/Ouroboros/`)
 
@@ -973,6 +1029,8 @@ launcher.py main()
   └── webview.start()           → Open PyWebView window at the port from data/state/server_port
 ```
 
+On Linux with no importable pywebview GUI backend, the final step serves the UI through the default browser instead of a PyWebView window — see "Linux browser fallback" (§1, Two-process model).
+
 On macOS/Linux the launcher starts `server.py` in its own session/process
 group and persists a verified `data/state/server_process.json` record
 (pid, pgid, server path, repo path, port, timestamp). Startup preflight
@@ -987,6 +1045,7 @@ Shown when `settings.json` does not contain any supported remote provider key an
 
 - Existing OpenRouter, OpenAI, OpenAI-compatible, Cloud.ru, MiniMax, GigaChat, Anthropic, or local-model-source settings skip the wizard automatically.
 - The wizard is shared between desktop and web: one HTML/CSS/JS onboarding flow is rendered directly in pywebview for desktop and injected into a blocking web overlay for Docker/browser runs.
+- On headless Linux (no GUI backend) the desktop wizard window is skipped and the same onboarding is served through the blocking web overlay in the browser — see "Linux browser fallback" (§1, Two-process model).
 - The wizard is multi-step and provider-aware: it starts with a single access step that accepts multiple remote keys plus optional local-model setup, then shows visible model defaults, a dedicated review-mode step, a dedicated budget step, and the final summary before save.
 - The wizard keeps the access step compact with responsive two-column field grids on normal desktop widths; mobile/narrow windows fall back to one column. Rarely used provider fields (Cloud.ru, the MiniMax key/region pair, plus the OpenAI-compatible URL/key pair) sit in a collapsed "More options" group that auto-opens when any of its fields already carries a value; collapsed inputs stay mounted in the DOM so validation and payload build always see them.
 - When an Anthropic key is present (including an unsaved key typed into the current wizard step), onboarding shows the Claude runtime status with `Repair Runtime` and `Skip for now` options without falsely warning that no Anthropic key exists.
@@ -2800,6 +2859,8 @@ processes. No zombies, no workers lingering in background.**
    d. multiprocessing.active_children() → SIGKILL each
 4. release_pid_lock()               ← delete ~/Ouroboros/ouroboros.pid
 ```
+
+In the Linux browser-fallback mode the same steps 1–4 run from the headless keep-alive loop after SIGINT/SIGTERM (or after a lifecycle-thread death without a shutdown request, which exits nonzero) — see "Linux browser fallback" (§1, Two-process model).
 
 Inside `server.py` ordinary lifespan shutdown relies on graceful uvicorn
 teardown for the Host Service listener; it does **not** blindly kill

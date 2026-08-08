@@ -9,7 +9,7 @@
 [![Linux](https://img.shields.io/badge/Linux-x86__64-orange.svg)](https://github.com/razzant/ouroboros/releases)
 [![Windows](https://img.shields.io/badge/Windows-x64-blue.svg)](https://github.com/razzant/ouroboros/releases)
 [![OuroborosHub](https://img.shields.io/badge/OuroborosHub-skills%20marketplace-8A2BE2.svg)](https://github.com/razzant/OuroborosHub)
-[![Version 6.90.3](https://img.shields.io/badge/version-6.90.3-green.svg)](VERSION)
+[![Version 6.91.0](https://img.shields.io/badge/version-6.91.0-green.svg)](VERSION)
 
 Ouroboros is an open-source, general-purpose AI agent whose identity, durable memory, and history continue across tasks and restarts. It works on external projects, coordinates a live swarm of specialist agents, and can rewrite the implementation it runs on, including its code, architecture, prompts, tools, and dependencies. Reflection can also change how it understands itself without severing that continuity.
 
@@ -38,15 +38,19 @@ To run tasks, configure at least one supported remote provider API key or a loca
 
 Prerelease artifacts stay on their tag pages; `/releases/latest` points to the latest stable release. If bundled browser tools on Linux need host libraries, run `./Ouroboros/python-standalone/bin/python3 -m playwright install-deps chromium webkit`. See the [full install and verification guide](https://ouroboros-agent.ai/install/) for source setup and release proof files.
 
-Claudexor, the engine behind subscription-backed delegated coding and review,
-needs no separate install. Release artifacts carry the exact reviewed engine
-archive; source checkouts fetch that same pinned archive on first use. Connect
-in **Providers → Harness Accounts** installs or repairs it in the foreground,
-and delegated work does the same lazily. If that checkout or an older package
-lacks the exact tested Node, the same action obtains its review-bound official
-archive too. A newer pinned engine is staged while the current daemon keeps
-running, then activates on its next natural start. This also covers upgrades
-from older Ouroboros versions that did not bundle Claudexor.
+Use your existing **Codex, Claude Code, or Cursor subscriptions** for
+delegated coding and review — Ouroboros drives them through
+[Claudexor](https://github.com/razzant/claudexor), its bundled multi-harness
+engine. Connect accounts in **Providers → Harness Accounts**; no separate
+install is needed. Works on macOS and Linux. Release artifacts carry the exact
+reviewed engine archive; source checkouts fetch that same pinned archive on
+first use. Connecting an account installs or repairs the engine in the
+foreground, and delegated work does the same lazily. If that checkout or an
+older package lacks the exact tested Node, the same action obtains its
+review-bound official archive too. A newer pinned engine is staged while the
+current daemon keeps running, then activates on its next natural start. This
+also covers upgrades from older Ouroboros versions that did not bundle
+Claudexor.
 
 ---
 
@@ -298,6 +302,7 @@ and integration work.
 
 | Version | Date | Description |
 |---------|------|-------------|
+| 6.91.0 | 2026-08-08 | **feat: the Linux binary boots into the browser when no desktop webview backend exists.** Instead of dying with `WebViewException` on every GTK/QT-less Linux box, the launcher probes the pywebview backend AND whether a display actually exists (Linux-only probe; zero new code runs on macOS/Windows) — importing GTK is not the same as having a display, so an ssh session on a box carrying the system gi bindings gets browser mode instead of the crash (a Qt-selected backend is judged on the session environment alone — probing Qt would itself crash a display-less process; disclosed residual, documented in ARCHITECTURE), installs SIGINT/SIGTERM shutdown handlers BEFORE the lifecycle thread spawns the server (via the new `platform_layer.install_shutdown_signal_handlers` — the signal surface stays behind the platform layer), prints the URL, opens the default browser without blocking, and keeps the process alive while the server lifecycle runs — first-run onboarding included, served by the existing web overlay; a shutdown signal during startup aborts the readiness wait into the same clean teardown. Headless boxes get a clear message instead of a crash. README now leads its integrations story with subscription-powered delegation: use existing Codex, Claude Code, or Cursor subscriptions through the bundled [Claudexor](https://github.com/razzant/claudexor) engine. |
 | 6.90.3 | 2026-08-08 | **fix: every native browser dialog is replaced by the in-app dialog, and the harness-accounts panel stops polling a dead daemon forever.** All 21 `window.prompt`/`confirm`/`alert` sites across `web/modules` migrate to the in-app `openConfirmDialog` (a new single-button alert mode included), fixing the two dead `window.prompt` sites on the macOS desktop shell — marketplace version updates and evolution campaign objectives silently returned null there — while preserving each site's contract (empty update version = latest, evolution cancel = do NOT start, `/panic` confirm keeps panic working — its complete confirm-and-send flow is node-tested through the injectable `confirmAndSendPanic`). A static CI gate bans the native dialog trio from `web/modules` so the class stays closed. Harness Accounts now fetches immediately on page show (no 5-second «Checking daemon…»), re-checks on tab/page activation, and login polling backs off (6→30s cap) and gives up honestly into the existing unconfirmed verdict after 10 consecutive failures instead of polling a dead daemon forever. Deleting every reviewer-slot row and saving now surfaces the backend's 400 («needs at least one slot») instead of pretending success while saving nothing. |
 | 6.90.2 | 2026-08-08 | **fix: the commit gate asks whether the advisory lane is actually available — route- and slot-aware — not whether an Anthropic key exists.** The bypass test is now route- and slot-aware: a DISABLED advisory slot with a key present used to silently drop the compensating hermetic pytest (neither advisory nor tests ran before triad+scope), and a keyless DELEGATED advisory route — which does run, on the owner's subscription — used to be mislabelled `bypassed` and pay a duplicate full test run every commit. The gate reads the CURRENT advisory availability, not the stored advisory record's status — an owner-accepted residual disclosed at the gate. A malformed reviewer-slot configuration fails CLOSED into that preflight, and the parser now raises its documented `ValueError` for a non-dict advisory route instead of an `AttributeError` that escaped every fail-closed handler. Skill review's optional advisory pre-review now asks the same availability question (still fail-open), so a DISABLED advisory slot no longer dispatches — and no longer spends — review budget the owner switched off. A malformed structured reviewer-slot config also stops being silent where it mattered: plan review returns a typed unavailable result and skill review returns `pending` with the row-precise parse error, instead of quietly running the shipped default panel; task acceptance keeps reading the projected legacy/default panel by owner decision, and the architecture map now says so rather than claiming the refusal is universal. Delegated review-session custody rows carry root/parent task lineage, so a run recovered by restart reconciliation settles its spend on the real root instead of charging the reviewing task as its own. Also unblocks the commit gate on any machine running Ouroboros: the managed-update writer-fence ORDER test reached the operator's LIVE process ledger (the fence's custody step reads an import-time `DRIVE_ROOT` that an isolated `OUROBOROS_DATA_DIR` does not rebind), so it failed on a stale ledger entry and could have killed a ledgered task/session service that happened to be running. |
 | 6.90.1 | 2026-08-07 | **fix: the managed Claudexor runtime pin moves to 3.3.11 — model-scoped quota availability at the source.** The engine now projects a typed per-snapshot `availability` on `/v2/quota` that judges exhaustion against the requested model, so a window scoped to other models (the Fable-only weekly cap behind the v6.90.0 incident) is disclosed as a `model_scoped_exhaustion` instead of reading as a dead profile. Ouroboros keeps its own positive-evidence aggregation for now — the two agree on the incident shape and the migration to the daemon's projection is tracked separately. Pin bytes verified against the published release. |
