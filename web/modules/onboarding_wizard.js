@@ -550,7 +550,7 @@
             ['Review mode', reviewLabel(state.reviewEnforcement)],
             ['Runtime mode', runtimeModeLabel(state.runtimeMode)],
             ['Total budget', formatUsd(state.totalBudget)],
-            ['Per-task soft threshold', formatUsd(state.perTaskCostUsd)],
+            ['Per-task cost cap', formatUsd(state.perTaskCostUsd)],
             ['Main', trim(state.mainModel)],
             ['Heavy', trim(state.heavyModel) || '(uses Main)'],
             ['Light', trim(state.lightModel) || '(uses Main)'],

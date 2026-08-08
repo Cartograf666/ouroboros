@@ -20,6 +20,7 @@ import logging
 import os
 import pathlib
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple
@@ -63,9 +64,11 @@ __all__ = (
     "UsageAccountingError", "UsageLedgerCorrupt", "UsageScope", "capture_attempt_ids",
     "current_usage_scope",
     "ensure_legacy_imported", "execute_physical_attempt", "execute_physical_attempt_async",
+    "last_root_accounting",
     "mark_dispatched", "mark_unresolved", "physical_attempt_limit",
     "record_subscription_session",
-    "record_unmetered_external_dispatch", "release_attempt", "reserve_attempt", "settle_attempt",
+    "record_unmetered_external_dispatch", "refresh_root_accounting",
+    "release_attempt", "reserve_attempt", "settle_attempt",
     "usage_breakdown", "usage_from_response", "usage_projection", "usage_scope",
     "review_wave_admission",
 )
@@ -78,6 +81,93 @@ _ATTEMPT_COLLECTOR: contextvars.ContextVar[Optional[list[str]]] = contextvars.Co
 _PHYSICAL_LIMIT: contextvars.ContextVar[Optional["_AttemptLimit"]] = contextvars.ContextVar(
     "ouroboros_physical_attempt_limit", default=None
 )
+
+# --- Root-subtree accounted telemetry (v6.91) -------------------------------
+# The loop's in-task cost stop must compare its ceiling against the TREE's
+# accounted spend (the number the fence enforces), but a per-round
+# ``usage_projection`` read would re-create the O(ledger)-under-lock contention
+# that burned 137 concurrent tasks (e4a87344). ``reserve_attempt`` ALREADY
+# computes the root subtree sum inside the lock on every dispatch, so it is
+# stashed here (process-local, newest-wins) and read for free; rare read points
+# (loop start, the 600s pacing note, the 15-round checkpoint) may force one
+# real projection read via ``refresh_root_accounting`` when the stash is stale
+# — e.g. a parent that sat 900s inside ``wait_tasks`` while children spent.
+# Unknown stays None end-to-end; nothing here is a second monetary authority.
+_ROOT_ACCOUNTING_TELEMETRY: Dict[str, Dict[str, Any]] = {}
+_ROOT_ACCOUNTING_TELEMETRY_LOCK = threading.Lock()
+_ROOT_ACCOUNTING_TELEMETRY_CAP = 64
+
+
+def _stash_root_accounting(
+    root_task_id: str,
+    accounted_usd: Optional[float],
+    root_limit_usd: Optional[float],
+) -> None:
+    root_task_id = str(root_task_id or "").strip()
+    if not root_task_id:
+        return
+    with _ROOT_ACCOUNTING_TELEMETRY_LOCK:
+        if (
+            root_task_id not in _ROOT_ACCOUNTING_TELEMETRY
+            and len(_ROOT_ACCOUNTING_TELEMETRY) >= _ROOT_ACCOUNTING_TELEMETRY_CAP
+        ):
+            oldest = min(
+                _ROOT_ACCOUNTING_TELEMETRY,
+                key=lambda key: _ROOT_ACCOUNTING_TELEMETRY[key]["updated_monotonic"],
+            )
+            _ROOT_ACCOUNTING_TELEMETRY.pop(oldest, None)
+        _ROOT_ACCOUNTING_TELEMETRY[root_task_id] = {
+            "accounted_usd": None if accounted_usd is None else float(accounted_usd),
+            "root_limit_usd": None if root_limit_usd is None else float(root_limit_usd),
+            "updated_monotonic": time.monotonic(),
+        }
+
+
+def last_root_accounting(root_task_id: str) -> Optional[Dict[str, Any]]:
+    """The most recent root-subtree accounted snapshot seen by THIS process.
+
+    Zero I/O: refreshed as a byproduct of every ``reserve_attempt`` under this
+    root (so it is at most one dispatch stale while the task is actively
+    calling models). Returns ``{"accounted_usd", "root_limit_usd", "age_sec"}``
+    or None when no dispatch under the root has been reserved here yet."""
+    with _ROOT_ACCOUNTING_TELEMETRY_LOCK:
+        entry = _ROOT_ACCOUNTING_TELEMETRY.get(str(root_task_id or "").strip())
+        if entry is None:
+            return None
+        entry = dict(entry)
+    entry["age_sec"] = max(0.0, time.monotonic() - entry.pop("updated_monotonic"))
+    return entry
+
+
+def refresh_root_accounting(
+    drive_root: pathlib.Path | str | None,
+    root_task_id: str,
+    *,
+    max_age_sec: float = 0.0,
+) -> Optional[Dict[str, Any]]:
+    """Return the root-subtree accounted snapshot, re-reading the ledger only
+    when the stash is missing or older than ``max_age_sec``.
+
+    This is the RARE read path (loop start / pacing / checkpoint — never per
+    round; see the telemetry comment above). Fail-soft: a failed read returns
+    the stale stash (with its honest ``age_sec``) or None — never a fake $0."""
+    root_task_id = str(root_task_id or "").strip()
+    if not root_task_id:
+        return None
+    cached = last_root_accounting(root_task_id)
+    if cached is not None and max_age_sec > 0 and cached["age_sec"] <= max_age_sec:
+        return cached
+    try:
+        projection = usage_projection(drive_root, root_task_id=root_task_id)
+        _stash_root_accounting(
+            root_task_id,
+            _number(projection.get("accounted_usd")),
+            _number(projection.get("limit_usd")),
+        )
+        return last_root_accounting(root_task_id)
+    except Exception:
+        log.debug("root accounting refresh failed for %s", root_task_id, exc_info=True)
+        return cached
 
 
 class BudgetExceeded(UsageAccountingError):
@@ -654,6 +744,12 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
             root_rows = [row for row in finals if str(row.get("root_task_id") or "") == scope.root_task_id]
             root_accounted = float(_summary(root_rows)["accounted_usd"])
             root_limit = max(0.0, float(scope.root_limit_usd))
+            # Scope telemetry piggyback (v6.91): the subtree sum is already in
+            # hand — stash the MEASURED pre-this-attempt value (never a
+            # speculative one: on the refusal path below no row is appended) so
+            # the loop's pacing and ceiling checks read the tree number with
+            # zero new ledger reads. At most one dispatch stale by design.
+            _stash_root_accounting(scope.root_task_id, root_accounted, root_limit)
             if root_limit <= 0 or root_accounted >= root_limit - 1e-9 or (
                 bound is not None and root_accounted + bound > root_limit + 1e-9
             ):

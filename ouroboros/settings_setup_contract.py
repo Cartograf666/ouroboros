@@ -123,9 +123,9 @@ _BUDGET_FIELDS = [
         "settingKey": "OUROBOROS_PER_TASK_COST_USD",
         "inputId": "per-task-budget",
         "settingsInputId": "s-settings-per-task-cost",
-        "title": "Per-task soft threshold",
+        "title": "Per-task cost cap",
         "label": "Per-task Cost Cap (USD)",
-        "note": "This does not hard-stop the task. It injects a budget reminder when one task starts getting expensive.",
+        "note": "Hard cap over one task's WHOLE tree, subagents included: further model calls are refused and the task is force-stopped once the tree's accounted spend reaches this (a graceful wrap-up fires just before).",
         "default": float(SETTINGS_DEFAULTS.get("OUROBOROS_PER_TASK_COST_USD", 20.0)),
         "min": "0.01",
         "step": "any",
@@ -158,7 +158,7 @@ def parse_budget_setting(
 ) -> Tuple[float | None, str | None]:
     """Parse one shared budget setting for onboarding and Settings saves."""
     field = _BUDGET_FIELDS_BY_KEY[key]
-    name = "Budget" if key == "TOTAL_BUDGET" else "Per-task soft threshold"
+    name = "Budget" if key == "TOTAL_BUDGET" else "Per-task cost cap"
     if raw_value is None or raw_value == "":
         if use_default_for_blank:
             raw_value = field["default"]
