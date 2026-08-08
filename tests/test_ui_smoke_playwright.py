@@ -167,6 +167,105 @@ def test_ui_projects_sidebar_unread_and_keyboard_menu(direct_server_with_data):
         raise
 
 
+@pytest.mark.ui_browser
+def test_ui_smoke_project_panel_lifecycle_does_not_leak(direct_server_with_data):
+    """Open/close cycles keep one live panel, flat ws listeners, and flat DOM.
+
+    P3 lifecycle concrete: closing or switching a project DESTROYS its chat
+    instance (disposing every ws.on subscription, the ResizeObserver, the
+    window/document listeners, and all timers), so repeated open/close cycles
+    cannot accumulate hidden panels, listeners, or DOM nodes. Panels marked
+    data-pending-work (staged attachments / in-flight upload) are the one
+    sanctioned exception and are excluded from the live-panel count.
+    """
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    from ouroboros.projects_registry import create_project
+
+    url = direct_server_with_data["url"]
+    data_dir = direct_server_with_data["data_dir"]
+    project_ids = [f"leak-{idx}" for idx in range(1, 4)]
+    for idx, project_id in enumerate(project_ids, start=1):
+        create_project(data_dir, project_id, name=f"Leak project {idx}")
+
+    # window.__ouroWs is the loopback debug hook app.js exposes for exactly
+    # this count; the module-scoped ws is unreachable from page.evaluate.
+    count_listeners = """() => {
+        const ws = window.__ouroWs;
+        return Object.values(ws.listeners).reduce((total, set) => total + set.size, 0);
+    }"""
+    live_panels = """() => [...document.querySelectorAll('.chat-instance-panel')]
+        .filter((panel) => panel.dataset.pendingWork !== '1').length"""
+    dom_count = "() => document.getElementsByTagName('*').length"
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                for project_id in project_ids:
+                    page.wait_for_selector(
+                        f'.nav-project-row[data-project-id="{project_id}"]', timeout=30_000
+                    )
+
+                def open_project(project_id):
+                    page.click(f'.nav-project-row[data-project-id="{project_id}"]')
+                    page.wait_for_selector("#project-panel:not([hidden])", timeout=30_000)
+                    page.wait_for_selector(
+                        f'[id="panel-pchat-{project_id}"]:not([hidden])', timeout=30_000
+                    )
+
+                def close_project():
+                    page.click("#project-panel-close")
+                    page.wait_for_function(
+                        "() => !document.getElementById('project-panel')"
+                        ".classList.contains('open')",
+                        timeout=30_000,
+                    )
+
+                # Baseline AFTER one full open/close cycle so one-time lazy
+                # registrations cannot masquerade as leaks.
+                open_project(project_ids[0])
+                close_project()
+                listeners_baseline = page.evaluate(count_listeners)
+                dom_baseline = page.evaluate(dom_count)
+                assert listeners_baseline > 0
+
+                # Small slack for churn outside the panel (badges, toasts);
+                # a leaked panel or card timeline is hundreds of nodes.
+                dom_slack = 30
+                for project_id in project_ids:
+                    open_project(project_id)
+                    assert page.evaluate(live_panels) <= 1
+                    close_project()
+                    assert page.evaluate(live_panels) == 0
+                    # Every cycle returns to the baseline: no monotonic growth.
+                    cycle_dom = page.evaluate(dom_count)
+                    assert cycle_dom <= dom_baseline + dom_slack, (dom_baseline, cycle_dom)
+                    assert page.evaluate(count_listeners) == listeners_baseline
+
+                # Direct project-to-project switch (no explicit close) also
+                # destroys the previous instance: one live panel, ever.
+                open_project(project_ids[0])
+                open_project(project_ids[1])
+                assert page.evaluate(live_panels) == 1
+                close_project()
+                assert page.evaluate(live_panels) == 0
+
+                assert page.evaluate(count_listeners) == listeners_baseline
+                final_dom = page.evaluate(dom_count)
+                assert final_dom <= dom_baseline + dom_slack, (dom_baseline, final_dom)
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
 def _run_docker_ui_assertions(url: str) -> None:
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
