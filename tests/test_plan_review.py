@@ -3082,6 +3082,42 @@ class TestPlanReviewIntentAndDisposition(unittest.TestCase):
         self.assertNotEqual(fp, scoped)
         self.assertNotEqual(fp, with_tests)
 
+    def test_acceptance_claims_normalize_only_when_set(self):
+        """Vacuous claims == absent (v6.65.1/.2 lesson: no min-constraints), and the
+        key enters the normalized scope — hence the fingerprint — only when non-empty
+        (v6.61.0 plan_class only-when-set precedent: historical fingerprints stay valid)."""
+        from ouroboros.tools.review_synthesis import normalize_plan_scope
+
+        populated = normalize_plan_scope(
+            {"acceptance_claims": [" game boots ", "", "   ", "score persists"]}
+        )
+        self.assertEqual(populated["acceptance_claims"], ["game boots", "score persists"])
+        for vacuous in ({}, {"acceptance_claims": []}, {"acceptance_claims": ["", "  "]}):
+            self.assertNotIn("acceptance_claims", normalize_plan_scope(vacuous))
+        with self.assertRaises(ValueError):
+            normalize_plan_scope({"acceptance_claims": "game boots"})
+        with self.assertRaises(ValueError):
+            normalize_plan_scope({"acceptance_claims": [{"claim": "x"}]})
+
+    def test_acceptance_claims_change_fingerprint_only_when_set(self):
+        import ouroboros.tools.plan_review as pr
+
+        base = dict(
+            plan="P",
+            goal="G",
+            files_to_touch=[],
+            context_level="minimal",
+            context_notes="",
+            plan_class="self_mod",
+        )
+        fp = pr._plan_request_fingerprint(**base)
+        vacuous = pr._plan_request_fingerprint(**base, scope={"acceptance_claims": []})
+        claimed = pr._plan_request_fingerprint(
+            **base, scope={"acceptance_claims": ["game boots"]}
+        )
+        self.assertEqual(fp, vacuous)
+        self.assertNotEqual(fp, claimed)
+
     def test_reviewer_prompt_is_generative_without_numeric_issue_quota(self):
         import ouroboros.tools.plan_review as pr
 
