@@ -165,6 +165,16 @@ def test_sse_survives_mid_stream_rotation_without_loss_or_duplicates(tmp_path):
 
 def test_sse_discovers_late_spawned_child_root(tmp_path):
     data = _seed_running_task(tmp_path, task_id="p1", progress_rows=1)
+    # A row in the PARENT's progress log that matches the lineage only via
+    # subagent_task_id, written (and consumed) BEFORE the child is discovered
+    # (P2 review, fix 3): only the filter-growth re-merge can recover it.
+    with (data / "logs" / "progress.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "ts": "2026-01-01T00:02:30Z",
+            "content": "pre-spawn-lineage",
+            "task_id": "",
+            "subagent_task_id": "c1",
+        }) + "\n")
     child_drive = tmp_path / "childdrive"
     fired = {"spawned": False, "finalized": False}
 
@@ -199,6 +209,8 @@ def test_sse_discovers_late_spawned_child_root(tmp_path):
 
     child_rows = [e for e in events if (e.get("data") or {}).get("content") == "child-step"]
     assert len(child_rows) == 1  # the late child's log joined at offset 0
+    lineage_rows = [e for e in events if (e.get("data") or {}).get("content") == "pre-spawn-lineage"]
+    assert len(lineage_rows) == 1  # recovered by the filter-growth re-merge (fix 3)
     seqs = [e["seq"] for e in events]
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
     assert events[-1]["data"]["status"] == "completed"
@@ -206,7 +218,9 @@ def test_sse_discovers_late_spawned_child_root(tmp_path):
 
 def test_iter_task_events_reads_progress_archive_chain(tmp_path):
     """The initial replay is archive-aware: rotated progress rows precede live
-    rows in the merged, seq-numbered order."""
+    rows in the merged, seq-numbered order. The result ts is the task's creation
+    floor (P2 review, fix 4), so it must predate the task's own rows — the
+    task_result row therefore sorts first here."""
     data = tmp_path / "data"
     (data / "logs").mkdir(parents=True)
     (data / "archive").mkdir()
@@ -218,11 +232,189 @@ def test_iter_task_events_reads_progress_archive_chain(tmp_path):
         json.dumps({"ts": "2026-01-01T00:01:30Z", "content": "live", "task_id": "t1"}) + "\n",
         encoding="utf-8",
     )
-    write_task_result(data, "t1", "completed", result="done", ts="2026-01-01T00:02:00Z")
+    write_task_result(data, "t1", "completed", result="done", ts="2026-01-01T00:00:10Z")
 
     events = iter_task_events(data, "t1")
 
     progress = [e for e in events if e["type"] == "progress"]
     assert [(e["data"]["content"]) for e in progress] == ["archived", "live"]
     assert [e["seq"] for e in events] == list(range(1, len(events) + 1))
+    assert events[0]["type"] == "task_result"
+
+
+def test_sse_archive_floor_skips_archives_predating_task_creation(tmp_path):
+    """Fix 4: an archive whose rotation stamp predates the watched task's raw
+    creation ts is never read (bounds the glob to the task lifetime); archives
+    stamped after creation are still consulted."""
+    data = tmp_path / "data"
+    (data / "logs").mkdir(parents=True)
+    (data / "archive").mkdir()
+    # Ancient archive rotated before the task existed — even a task_id-colliding
+    # row inside it must not be read.
+    (data / "archive" / "progress_20251231T000000.jsonl").write_text(
+        json.dumps({"ts": "2025-12-31T00:00:00Z", "content": "ancient", "task_id": "t1"}) + "\n",
+        encoding="utf-8",
+    )
+    (data / "archive" / "progress_20260101T000200.jsonl").write_text(
+        json.dumps({"ts": "2026-01-01T00:01:30Z", "content": "recent-archived", "task_id": "t1"}) + "\n",
+        encoding="utf-8",
+    )
+    (data / "logs" / "progress.jsonl").write_text(
+        json.dumps({"ts": "2026-01-01T00:02:30Z", "content": "live-row", "task_id": "t1"}) + "\n",
+        encoding="utf-8",
+    )
+    write_task_result(data, "t1", "running", result="working", ts="2026-01-01T00:01:00Z")
+
+    events = iter_task_events(data, "t1")
+
+    contents = [(e.get("data") or {}).get("content") for e in events if e["type"] == "progress"]
+    assert contents == ["recent-archived", "live-row"]  # "ancient" skipped
+
+
+def test_sse_rotation_stash_consumed_keeps_new_live_offset(tmp_path):
+    """Fix 2: when the inode flip was observed BEFORE the archive became visible
+    (offset stashed, new live file partially consumed), the later archive tick
+    must keep the current live offset/ino — resetting to 0 would re-emit the
+    already-consumed rows of the new live file."""
+    from ouroboros.gateway.tasks import _TaskEventFollower
+
+    data = _seed_running_task(tmp_path)
+    live = data / "logs" / "progress.jsonl"
+    follower = _TaskEventFollower(data, "t1")
+    follower.full_merge()  # consumes step-0/step-1
+
+    # An unconsumed row lands, then the live file is replaced while its archive
+    # is NOT yet visible (moved aside), and the new live file starts.
+    _append_progress(data, "t1", "pre-rotation", "2026-01-01T00:02:00Z")
+    side = tmp_path / "rotated_aside.jsonl"
+    os.replace(live, side)
+    live.touch()
+    _append_progress(data, "t1", "post-rotation-1", "2026-01-01T00:02:01Z")
+
+    rows, _ = follower.poll()  # stash tick: consumes part of the NEW live file
+    assert [(r.get("data") or {}).get("content") for r in rows if r["type"] == "progress"] == [
+        "post-rotation-1"
+    ]
+
+    # The archive becomes visible; more rows land on the new live file.
+    (data / "archive").mkdir(exist_ok=True)
+    os.replace(side, data / "archive" / "progress_20260101T000201.jsonl")
+    _append_progress(data, "t1", "post-rotation-2", "2026-01-01T00:02:02Z")
+
+    rows, _ = follower.poll()
+    contents = [(r.get("data") or {}).get("content") for r in rows if r["type"] == "progress"]
+    # The archive suffix and the new live delta — and NO duplicate of the
+    # already-consumed post-rotation-1.
+    assert contents == ["pre-rotation", "post-rotation-2"]
+
+
+def test_sse_older_ts_append_triggers_full_remerge_without_losing_newer_rows(tmp_path):
+    """Fix 7a: a mid-stream row with an OLDER ts than the emitted tail forces the
+    full re-merge; strictly-newer rows are still delivered exactly once,
+    duplicates of already-emitted rows are tolerated, seq stays monotonic, and
+    the backdated row itself is dropped for this stream (disclosed cursor
+    parity — a from-zero replay recovers it)."""
+    data = _seed_running_task(tmp_path)
+    fired = {"appended": False, "finalized": False}
+
+    def on_event(event, events):
+        if not fired["appended"] and len(events) >= 3:
+            _append_progress(data, "t1", "backdated", "2026-01-01T00:00:30Z")
+            _append_progress(data, "t1", "fresh", "2026-01-01T00:02:00Z")
+            fired["appended"] = True
+        if fired["appended"] and not fired["finalized"] and any(
+            (e.get("data") or {}).get("content") == "fresh" for e in events
+        ):
+            _finalize(data, "t1")
+            fired["finalized"] = True
+
+    response = asyncio.run(api_task_events(_request(data, "t1")))
+    events = asyncio.run(_consume(response, on_event))
+
+    contents = [(e.get("data") or {}).get("content") for e in events if e["type"] == "progress"]
+    assert contents.count("fresh") == 1
+    assert "backdated" not in contents  # sorts before the cursor: dropped, not duplicated
+    assert contents.count("step-0") >= 1 and contents.count("step-1") >= 1
+    seqs = [e["seq"] for e in events]
+    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+    assert events[-1]["data"]["status"] == "completed"
+
+
+def test_sse_double_rotation_between_ticks_delivers_all_rows_once(tmp_path):
+    """Fix 7b: two rotations between ticks — the first new archive is read from
+    the consumed offset, the second fully, the new live file from 0; every row
+    arrives exactly once."""
+    data = _seed_running_task(tmp_path)
+    live = data / "logs" / "progress.jsonl"
+    fired = {"rotated": False, "finalized": False}
+
+    def on_event(event, events):
+        if not fired["rotated"] and len(events) >= 3:
+            archive_dir = data / "archive"
+            archive_dir.mkdir(exist_ok=True)
+            _append_progress(data, "t1", "rot1-row", "2026-01-01T00:02:00Z")
+            os.replace(live, archive_dir / "progress_20260101T000200.jsonl")
+            live.touch()
+            _append_progress(data, "t1", "rot2-row", "2026-01-01T00:02:01Z")
+            os.replace(live, archive_dir / "progress_20260101T000201.jsonl")
+            live.touch()
+            _append_progress(data, "t1", "post-row", "2026-01-01T00:02:02Z")
+            fired["rotated"] = True
+        if fired["rotated"] and not fired["finalized"] and any(
+            (e.get("data") or {}).get("content") == "post-row" for e in events
+        ):
+            _finalize(data, "t1")
+            fired["finalized"] = True
+
+    response = asyncio.run(api_task_events(_request(data, "t1")))
+    events = asyncio.run(_consume(response, on_event))
+
+    contents = [(e.get("data") or {}).get("content") for e in events if e["type"] == "progress"]
+    assert contents == ["step-0", "step-1", "rot1-row", "rot2-row", "post-row"]
+    seqs = [e["seq"] for e in events]
+    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+    assert events[-1]["data"]["status"] == "completed"
+
+
+def test_sse_terminal_merge_row_uses_one_materializing_read(tmp_path, monkeypatch):
+    """Fix 5: the terminal task_result row emitted through the merge path is
+    replaced with exactly ONE materializing (True) read at emission time; every
+    other effective read in the stream stays a False projection."""
+    import ouroboros.gateway.tasks as tasks_mod
+
+    data = _seed_running_task(tmp_path, progress_rows=1)
+    _finalize(data, "t1")
+    real = tasks_mod.load_effective_task_result
+    flags = []
+
+    def spy(drive_root, task_id, **kw):
+        flags.append(kw.get("materialize_artifacts", True))
+        return real(drive_root, task_id, **kw)
+
+    monkeypatch.setattr(tasks_mod, "load_effective_task_result", spy)
+
+    response = asyncio.run(api_task_events(_request(data, "t1", wait=0)))
+    events = asyncio.run(_consume(response))
+
     assert events[-1]["type"] == "task_result"
+    assert events[-1]["data"]["status"] == "completed"
+    assert flags.count(True) == 1  # the sanctioned terminal-emission read
+    assert flags[-1] is True  # ...and it happens at emission, after the projections
+
+
+def test_sse_stream_on_running_task_does_zero_artifact_work(tmp_path, monkeypatch):
+    """The SSE replay/follow reads are False projections: no artifact collection
+    or copy may run while the task is not terminal (materialize_artifacts
+    contract; the one True read is reserved for terminal emission)."""
+    import ouroboros.artifacts as artifacts_mod
+
+    data = _seed_running_task(tmp_path)
+    calls = []
+    monkeypatch.setattr(artifacts_mod, "collect_task_artifact_records", lambda *a, **k: calls.append("collect") or [])
+    monkeypatch.setattr(artifacts_mod, "copy_file_to_task_artifacts", lambda *a, **k: calls.append("copy") or {})
+
+    response = asyncio.run(api_task_events(_request(data, "t1", wait=0)))
+    events = asyncio.run(_consume(response))
+
+    assert any(e["type"] == "progress" for e in events)
+    assert calls == []

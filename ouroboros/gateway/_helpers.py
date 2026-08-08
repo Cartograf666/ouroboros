@@ -36,8 +36,9 @@ def read_rotated_jsonl_entries(
     full pass, never an infinite loop. Rotated ``archive/<prefix>_*.jsonl``
     segments are then backfilled newest-first until the quota is met, bounded to
     ``max_archives`` files, and everything is reassembled chronologically
-    (oldest chosen archive -> live window). A rotation changes granularity,
-    never coverage (BIBLE P1: no silent loss)."""
+    (oldest chosen archive -> live window). The backfill is bounded to the
+    ``max_archives`` newest archives: older segments are NOT consulted by this
+    reader (they stay durable on disk for full-history consumers)."""
     live = pathlib.Path(live)
     try:
         size = live.stat().st_size

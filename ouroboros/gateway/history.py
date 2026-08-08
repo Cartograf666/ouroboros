@@ -379,7 +379,9 @@ def _read_progress_history_entries(live, adir, want, counts_toward_quota):
     condition by construction: the lineage recency floor is the ts of the oldest
     retained non-lineage row, which the >=want stop guarantees to be inside the
     returned window, and every lineage row at-or-after it is newer, hence also
-    in-window."""
+    in-window. That guarantee assumes progress rows are appended with
+    non-decreasing ts (the writers share one host clock); a backdated
+    out-of-order row older than the floor can fall outside the lineage window."""
     return read_rotated_jsonl_entries(live, adir, "progress", want, counts_toward_quota)
 
 

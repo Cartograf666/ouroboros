@@ -431,6 +431,8 @@ def effective_task_result(
     rebase (``copy_file_to_task_artifacts``), ``collect_task_artifact_records``
     scans, and the task-tree ``_project_child_result_disposition`` hash lookup — is
     skipped, and the projection never carries sha-bearing/disposition claims.
+    ``artifacts`` on a False row are the raw admission-time recorded entries,
+    not the merged/rebased set a materializing read would produce.
     Read-only display surfaces (chat history annotation, ``api_tasks_list``, the
     SSE follow loop, ``api_logs_tail`` discovery) pass ``False``; every consumer
     that participates in the child-result sha economy or artifact durability

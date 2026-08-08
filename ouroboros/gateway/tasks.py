@@ -936,9 +936,12 @@ async def api_task_events(request: Request) -> StreamingResponse:
                 refreshed = True  # full_merge reloaded the result projection
             else:
                 new_rows, advanced = await asyncio.to_thread(follower.poll)
-                if new_rows and tail_key is not None and _event_sort_key(new_rows[0]) <= tail_key:
-                    # New rows interleave with already-emitted history: ONE full
-                    # re-merge, resume emission from the cursor.
+                interleaved = bool(new_rows) and tail_key is not None and _event_sort_key(new_rows[0]) <= tail_key
+                if interleaved or follower.filter_grew:
+                    # New rows interleave with already-emitted history, or a new
+                    # child id joined the lineage filter (rows matching only via
+                    # subagent_task_id may sit in already-consumed bytes): ONE
+                    # full re-merge, resume emission from the cursor.
                     rows = await asyncio.to_thread(follower.full_merge)
                     pending = [row for row in rows if int(row.get("seq") or 0) > cursor]
                     if rows:
@@ -956,6 +959,18 @@ async def api_task_events(request: Request) -> StreamingResponse:
                 if str(event.get("type") or "") == "task_result":
                     data = event.get("data") if isinstance(event.get("data"), dict) else {}
                     if str(data.get("status") or "").lower() in FINAL_STATUSES:
+                        if not emitted_final:
+                            # ONE materializing read at terminal emission (P2
+                            # review, fix 5): the merged rows are status/cost
+                            # projections, but watching a task to completion
+                            # must still deliver the artifact-bearing terminal
+                            # payload (and run its read-repair rebase) exactly
+                            # once per stream.
+                            full = await asyncio.to_thread(
+                                load_effective_task_result, drive_root, task_id
+                            )
+                            if full:
+                                event["data"] = public_task_result(full)
                         emitted_final = True
                 yield _sse(event, event_id=cursor)
             # Recompute the terminal projection only when something moved: log
@@ -999,6 +1014,18 @@ _ROTATED_LOG_PREFIXES = {"progress": "progress", "chat": "chat"}
 
 def _event_sort_key(item: Dict[str, Any]) -> tuple:
     return (str(item.get("ts") or ""), str(item.get("source") or ""), int(item.get("line") or 0))
+
+
+def _compact_ts_stamp(ts: str) -> str:
+    """ISO-ish timestamp -> archive-stamp form (YYYYMMDDTHHMMSS), or "" if unusable."""
+    stamp = ts.strip().replace("-", "").replace(":", "")
+    return stamp[:15] if len(stamp) >= 15 and stamp[8:9] == "T" else ""
+
+
+def _archive_stamp_predates(name: str, prefix: str, floor: str) -> bool:
+    """True when ``<prefix>_<stamp>[_N].jsonl`` was rotated strictly before ``floor``."""
+    stamp = name[len(prefix) + 1:].split(".", 1)[0].split("_", 1)[0]
+    return len(stamp) == 15 and stamp < floor
 
 
 def _read_live_jsonl_entries(path: pathlib.Path, offset: int) -> tuple[List[Dict[str, Any]], int, Optional[int]]:
@@ -1046,7 +1073,10 @@ class _TaskEventFollower:
     beyond the old offset before continuing on the new live file at offset 0.
     All effective-result reads here are status/cost projections
     (``materialize_artifacts=False``) — the SSE loop must never copy artifacts
-    or make disposition/sha claims on a 0.5s tick."""
+    or make disposition/sha claims on a 0.5s tick. The single sanctioned
+    exception lives in the stream's emit loop, not here: the terminal
+    ``task_result`` emission performs one materializing read (see
+    ``api_task_events``)."""
 
     def __init__(self, drive_root: pathlib.Path, task_id: str) -> None:
         self.drive_root = pathlib.Path(drive_root)
@@ -1056,7 +1086,14 @@ class _TaskEventFollower:
         self.logs: Dict[tuple, Dict[str, Any]] = {}
         self.result: Dict[str, Any] = {}
         self.suppress_task_done = False
+        self.filter_grew = False
         self._queue_snapshot_mtime: Any = None
+        # Archive floor (P2 review, fix 4): the RAW result's ts is the first
+        # write's timestamp (creation/admission — no production writer passes an
+        # explicit ts), so an archive whose rotation stamp predates it cannot
+        # contain this task's rows. Empty floor = no bound (fail open).
+        raw = load_task_result(self.drive_root, task_id) or {}
+        self._created_floor = _compact_ts_stamp(str(raw.get("created_at") or raw.get("ts") or ""))
 
     def refresh_result(self) -> None:
         self.result = load_effective_task_result(
@@ -1099,6 +1136,12 @@ class _TaskEventFollower:
             if child_id and child_id not in self.task_filter_ids:
                 self.task_filter_ids.add(child_id)
                 changed = True
+                # A new FILTER ID over already-consumed bytes is lossy: rows
+                # matching only via subagent_task_id were filtered out when
+                # those bytes were read, so only a full re-merge recovers them
+                # (new ROOTS are fine — their logs join at offset 0). The
+                # stream checks this flag after every poll; full_merge resets it.
+                self.filter_grew = True
             child_root = str(
                 child_row.get("child_drive_root")
                 or child_row.get("headless_child_drive_root")
@@ -1136,6 +1179,16 @@ class _TaskEventFollower:
                 )
             except OSError:
                 archive_paths = []
+            if self._created_floor:
+                # An archive rotated before the watched task existed cannot
+                # contain its rows (an archive's rows predate its rotation
+                # stamp), so skip it: bounds the per-tick/merge archive work to
+                # the task's lifetime instead of O(system age). Removes no
+                # matching rows and touches no cursor positions by construction.
+                archive_paths = [
+                    path for path in archive_paths
+                    if not _archive_stamp_predates(path.name, prefix, self._created_floor)
+                ]
             known = set(state["archives"])
             new_archives = [p for p in archive_paths if p.name not in known]
             if new_archives:
@@ -1144,13 +1197,21 @@ class _TaskEventFollower:
                 # offset (or the offset stashed when the inode flip was observed
                 # before the archive became visible), the rest fully, then
                 # continue on the new live file from 0.
+                had_stash = "rotated_offset" in state
                 start = state.pop("rotated_offset", state["offset"])
                 for index, path in enumerate(new_archives):
                     got, _, _ = _read_live_jsonl_entries(path, start if index == 0 else 0)
                     entries.extend(got)
                     state["archives"].append(path.name)
-                state["offset"] = 0
-                state["ino"] = None
+                if not (had_stash and len(new_archives) == 1):
+                    # No stash: offset/ino still describe the OLD live file (now
+                    # the archive), so restart on the new live file from 0.
+                    # With a consumed stash and exactly one new archive, the
+                    # recorded offset/ino already track the NEW live file the
+                    # follower partially consumed on the stash tick — resetting
+                    # to 0 would re-emit those rows (P2 review, fix 2).
+                    state["offset"] = 0
+                    state["ino"] = None
         try:
             live_stat = live.stat()
         except OSError:
@@ -1219,6 +1280,7 @@ class _TaskEventFollower:
         rows.sort(key=_event_sort_key)
         for idx, row in enumerate(rows, 1):
             row["seq"] = idx
+        self.filter_grew = False  # the merge above read every consumed byte anew
         return rows
 
     def poll(self) -> tuple[List[Dict[str, Any]], bool]:
@@ -1271,12 +1333,6 @@ def _event_from_log_entry(source: str, line_no: int, entry: Dict[str, Any], root
 def _sse(event: Dict[str, Any], *, event_id: int) -> str:
     payload = json.dumps(event, ensure_ascii=False)
     return f"id: {event_id}\nevent: task_event\ndata: {payload}\n\n"
-
-
-def _is_task_final(drive_root: pathlib.Path, task_id: str) -> bool:
-    # SSE tick check: status projection only (materialize_artifacts contract).
-    result = load_effective_task_result(drive_root, task_id, materialize_artifacts=False)
-    return str(result.get("status") or "").lower() in FINAL_STATUSES
 
 
 def _resolve_workspace_root(
