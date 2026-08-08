@@ -253,3 +253,46 @@ def test_harbor_agent_prefix_installs_imageio_ffmpeg():
     src = (pathlib.Path(__file__).resolve().parents[1]
            / "devtools" / "benchmarks" / "terminal_bench" / "harbor_installed_agent.py").read_text(encoding="utf-8")
     assert "pip install imageio-ffmpeg" in src
+
+
+def test_media_user_files_admission_keeps_secret_guard(tmp_path, monkeypatch):
+    """SC-6 read_file parity: media inherits vision._allowed_file_roots, which
+    (matrix-derived) admits the user_files home — so a path admitted ONLY through
+    that root must still clear the user_files secret/credential guards, exactly
+    as read_file and view_image do. Before the shared _read_file_parity_block,
+    ocr_pdf admitted credential-like home paths read_file refuses."""
+    from types import SimpleNamespace
+    from ouroboros.tools.media import _resolve_local_file
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    doc = home / "token.pdf"  # credential-like NAME under home
+    doc.write_bytes(b"%PDF-1.4 fake")
+    ctx = SimpleNamespace(repo_dir=tmp_path / "repo", drive_root=str(tmp_path / "data"))
+    fp, err = _resolve_local_file(ctx, str(doc), max_bytes=10**7)
+    assert fp is None
+    assert "USER_FILES_PATH_BLOCKED" in err and "credential-like" in err
+
+
+def test_media_restricted_subagent_secret_data_path_blocked(tmp_path):
+    """SC-6 read_file parity: a restricted (read-only/acting) subagent cannot
+    read secret/owner-control data paths via read_file; ocr_pdf/extract_video_frames
+    must not admit them either now that the whole runtime-data drive is an
+    admission root."""
+    from types import SimpleNamespace
+    from ouroboros.tools.media import _resolve_local_file
+
+    data = tmp_path / "data"
+    secret_dir = data / "credentials"
+    secret_dir.mkdir(parents=True)
+    doc = secret_dir / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.4 fake")
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path / "repo",
+        drive_root=str(data),
+        task_constraint={"mode": "local_readonly_subagent"},
+    )
+    fp, err = _resolve_local_file(ctx, str(doc), max_bytes=10**7)
+    assert fp is None
+    assert "PATH_BLOCKED" in err and "secret or owner-control" in err

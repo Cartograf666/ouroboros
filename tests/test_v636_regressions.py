@@ -459,3 +459,43 @@ def test_vlm_user_files_admission_keeps_secret_guard(tmp_path, monkeypatch):
     payload, err = vision._load_local_image_payload(ctx, str(img))
     assert payload is None
     assert "USER_FILES_PATH_BLOCKED" in err and "credential-like" in err
+
+
+def test_vlm_restricted_subagent_secret_data_path_blocked(tmp_path, monkeypatch):
+    """SC-6 read_file parity: deriving admission roots from the profile matrix
+    admitted the WHOLE runtime-data drive, but read_file additionally denies
+    restricted subagents its secret/owner-control paths (_data_read /
+    _local_readonly_resource_block). view_image/vlm_query must apply the same
+    per-path rule, or a read-only child could view an image read_file refuses."""
+    from ouroboros.tools import vision
+
+    data = tmp_path / "data"
+    secret_dir = data / "auth"
+    secret_dir.mkdir(parents=True)
+    img = secret_dir / "cap.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path / "repo",
+        drive_root=str(data),
+        task_constraint={"mode": "local_readonly_subagent"},
+    )
+    payload, err = vision._load_local_image_payload(ctx, str(img))
+    assert payload is None
+    assert "PATH_BLOCKED" in err and "secret or owner-control" in err
+
+
+def test_vlm_project_store_guard_applies(tmp_path):
+    """SC-6 read_file parity: the per-project facts store (projects/<id>/) is
+    reachable only via the project-scoped knowledge tools — read_file denies it
+    for EVERY profile, so the matrix-derived runtime_data admission must too."""
+    from ouroboros.tools import vision
+
+    data = tmp_path / "data"
+    store = data / "projects" / "p1"
+    store.mkdir(parents=True)
+    img = store / "img.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    ctx = SimpleNamespace(repo_dir=tmp_path / "repo", drive_root=str(data))
+    payload, err = vision._load_local_image_payload(ctx, str(img))
+    assert payload is None
+    assert "ACCESS_DENIED" in err and "projects/<id>/" in err

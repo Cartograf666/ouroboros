@@ -48,6 +48,20 @@ BLOCKED_CASES = [
     # Casefold containment: APFS/NTFS are case-insensitive, so a re-cased spelling
     # of a protected root is the SAME directory there.
     pytest.param("git -C /users/anton/ouroboros/REPO reset --hard", id="casefold_minusC_reset"),
+    # `reflog` was in GIT_READONLY_SUBCOMMANDS unconditionally, so its MUTATING
+    # verbs (`expire`/`delete`/`drop` rewrite or remove reflog entries) skipped
+    # the target checks and were PERMITTED against the runtime (SC-10).
+    pytest.param("git -C /Users/anton/Ouroboros/repo reflog expire --expire=now --all", id="reflog_expire_runtime"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo reflog delete HEAD@{1}", id="reflog_delete_runtime"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo reflog drop --all", id="reflog_drop_runtime"),
+    pytest.param("cd /Users/anton/Ouroboros/repo && git reflog expire --all", id="reflog_expire_cd_runtime"),
+    # `git remote` verbs mutate config/refs; flags BEFORE the verb still dispatch
+    # (measured: `git remote -v add origin <url>` ADDS the remote), so the verb is
+    # the first non-flag token — `-v` must not read the whole invocation as a listing.
+    pytest.param("git -C /Users/anton/Ouroboros/repo remote add origin https://example.com/x.git", id="remote_add_runtime"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo remote -v add origin https://example.com/x.git", id="remote_verbose_add_runtime"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo remote set-url origin https://example.com/x.git", id="remote_set_url_runtime"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo remote prune origin", id="remote_prune_runtime"),
 ]
 
 
@@ -64,6 +78,37 @@ def test_network_fence_applies_to_readonly_git_too():
     # ls-remote is read-only for TARGET purposes but still reaches the network:
     # the contract fence must hold independently of the read-only carve-out.
     assert _violation("git ls-remote https://example.com/x.git", allow_network=False)
+    # The same per-subcommand fence covers the read-only `remote` forms (`remote
+    # show` without `-n` contacts the remote) — in the external resolver's tail
+    # AND in the classifier the self_worktree lane asks directly.
+    assert _violation("git remote show origin", allow_network=False)
+    assert policy.run_shell_git_block_reason(
+        "git remote show origin", allow_network=False
+    ).startswith("task_contract.allowed_resources")
+    assert policy.run_shell_git_block_reason("git remote show origin", allow_network=True) == ""
+
+
+def test_tag_verify_readonly_does_not_loosen_tag_mutations():
+    """Moving `-v`/`--verify` to the read-only set must not weaken the rest of
+    the tag table: creation, delete and sign forms stay mutating at the runtime."""
+    repo = str(REPO)
+    assert _violation("git tag v1.0.0", cwd=repo)
+    assert _violation("git tag -d v1.0.0", cwd=repo)
+    assert _violation("git tag -s v1.0.0 -m x", cwd=repo)
+    assert _violation("git tag -f -v v1.0.0", cwd=repo)  # -f still mutates
+
+
+def test_self_worktree_lane_classifies_the_same_modes():
+    """The strict self_worktree lane funnels through the same classifier: the
+    read-only verb forms pass, the mutating verbs keep the blanket block."""
+    assert policy.run_shell_git_block_reason("git remote -v") == ""
+    assert policy.run_shell_git_block_reason("git tag -v v1.0.0") == ""
+    assert policy.run_shell_git_block_reason("git reflog show HEAD") == ""
+    assert policy.run_shell_git_block_reason("git reflog expire --all") == "git reflog"
+    assert policy.run_shell_git_block_reason("git remote add origin https://e.com/x.git") == "git remote"
+    ws_kwargs = dict(active_root=WS, cwd=str(WS))
+    assert policy.workspace_git_safety_violation("git remote -v", **ws_kwargs) == ""
+    assert policy.workspace_git_safety_violation("git reflog delete HEAD@{1}", **ws_kwargs)
 
 
 # --- legitimate git that MUST stay allowed -----------------------------------
@@ -83,6 +128,25 @@ ALLOWED_CASES = [
     pytest.param("cd /Users/anton/Ouroboros/repo && git status", id="readonly_cd_repo_status"),
     pytest.param("cd /Users/anton/Ouroboros/repo && git diff", id="readonly_cd_repo_diff"),
     pytest.param("git -C /Users/anton/Ouroboros/repo branch -l", id="readonly_branch_list_repo"),
+    # Read-only forms of the verb-dispatched subcommands stay allowed at a runtime
+    # target too — the SYSTEM.md contract ("read-only git works everywhere"). These
+    # were refused before the mode parse: `remote` had no read-only classifier at
+    # all, and `tag -v/--verify` (signature check, writes nothing) sat in the
+    # mutating flag set (SC-7).
+    pytest.param("git -C /Users/anton/Ouroboros/repo remote -v", id="readonly_remote_verbose_repo"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo remote", id="readonly_remote_bare_repo"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo remote show origin", id="readonly_remote_show_repo"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo remote get-url origin", id="readonly_remote_get_url_repo"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo tag -v v1.0.0", id="readonly_tag_verify_short_repo"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo tag --verify v1.0.0", id="readonly_tag_verify_long_repo"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo reflog", id="readonly_reflog_bare_repo"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo reflog show HEAD", id="readonly_reflog_show_repo"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo reflog exists refs/heads/main", id="readonly_reflog_exists_repo"),
+    # ... while the MUTATING verbs remain free OUTSIDE the runtime (target-aware,
+    # not subcommand-blanket): the same spellings blocked above at the repo.
+    pytest.param("git remote add origin https://example.com/x.git", id="remote_add_outside_runtime"),
+    pytest.param("git reflog expire --expire=now --all", id="reflog_expire_outside_runtime"),
+    pytest.param("git tag -d v1.0.0", id="tag_delete_outside_runtime"),
 ]
 
 
@@ -306,6 +370,24 @@ def test_relative_argument_symlinked_into_the_runtime_is_blocked():
     pytest.param("git diff --output-indicator-new=X", True, id="output_indicator_is_not_a_file"),
     # `pushd`/`popd` are as neutral as `cd`: they read and write nothing.
     pytest.param("pushd /Users/anton/Ouroboros/repo && git log", True, id="ro_pushd_then_git"),
+    # Verb-dispatched subcommands: the read-only MODES carry the exemption key,
+    # the mutating verbs never do. `git remote -v add ...` really ADDS (measured),
+    # so the verb is the first non-flag token, not args[0].
+    pytest.param("git remote -v", True, id="ro_remote_verbose"),
+    pytest.param("git remote show origin", True, id="ro_remote_show"),
+    pytest.param("git remote get-url origin", True, id="ro_remote_get_url"),
+    pytest.param("git remote add origin https://example.com/x.git", False, id="mut_remote_add"),
+    pytest.param("git remote -v add origin https://example.com/x.git", False, id="mut_remote_verbose_add"),
+    pytest.param("git tag -v v1.0.0", True, id="ro_tag_verify_short"),
+    pytest.param("git tag --verify v1.0.0", True, id="ro_tag_verify_long"),
+    pytest.param("git tag v1.0.0", False, id="mut_tag_create"),
+    pytest.param("git tag -s v1.0.0 -m x", False, id="mut_tag_sign"),
+    pytest.param("git reflog", True, id="ro_reflog_bare"),
+    pytest.param("git reflog show HEAD", True, id="ro_reflog_show"),
+    pytest.param("git reflog exists refs/heads/main", True, id="ro_reflog_exists"),
+    pytest.param("git reflog expire --expire=now --all", False, id="mut_reflog_expire"),
+    pytest.param("git reflog delete HEAD@{1}", False, id="mut_reflog_delete"),
+    pytest.param("git reflog drop --all", False, id="mut_reflog_drop"),
 ])
 def test_is_readonly_git_command(cmd, expected):
     """ALL-or-nothing per segment: this is what lets read-only git through the

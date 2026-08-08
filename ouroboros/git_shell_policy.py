@@ -18,9 +18,13 @@ from ouroboros.utils import safe_relpath
 
 GIT_READONLY_SUBCOMMANDS = frozenset([
     "status", "diff", "log", "show", "ls-files", "describe", "rev-parse",
-    "cat-file", "shortlog", "version", "help", "blame", "grep", "reflog",
+    "cat-file", "shortlog", "version", "help", "blame", "grep",
     "for-each-ref", "rev-list", "show-ref",
 ])
+# NOT here: multi-mode subcommands (`branch`, `tag`, `reflog`, `remote`) are
+# mode-parsed in _git_subcommand_is_readonly — an unconditional entry would
+# classify `git reflog expire`/`git remote add` as read-only and skip the
+# target checks (the SC-10 hole: reflog sat in this set unconditionally).
 # Subcommands that reach the network (gated by allowed_resources.network in
 # external workspaces, where local git is otherwise unrestricted).
 GIT_NETWORK_SUBCOMMANDS = frozenset([
@@ -40,15 +44,26 @@ _BRANCH_READONLY_FLAGS = frozenset({
     "--column", "--no-column", "--abbrev", "--no-abbrev", "--ignore-case",
 })
 _TAG_MUTATING_FLAGS = frozenset({
-    "-a", "-s", "-u", "-d", "-v", "-f", "-m", "-F",
-    "--annotate", "--sign", "--local-user", "--delete", "--verify",
+    "-a", "-s", "-u", "-d", "-f", "-m", "-F",
+    "--annotate", "--sign", "--local-user", "--delete",
     "--force", "--message", "--file", "--cleanup", "--create-reflog",
 })
+# `-v`/`--verify` checks a tag's GPG signature and writes nothing — it is
+# read-only inspection, not mutation (it sat in the mutating set, refusing
+# `git tag -v <tag>` at a runtime target against the SYSTEM.md contract).
 _TAG_READONLY_FLAGS = frozenset({
-    "-l", "--list", "-n", "--sort", "--format", "--points-at",
+    "-l", "--list", "-n", "-v", "--verify", "--sort", "--format", "--points-at",
     "--contains", "--merged", "--no-merged", "--column", "--no-column",
     "--ignore-case", "--color", "--no-color",
 })
+# `git remote` and `git reflog` are VERB-dispatched: the first non-flag token
+# selects the mode. remote: bare listing (`git remote`, `git remote -v`) and
+# `show`/`get-url` only read; every other verb (add/remove/rename/set-url/
+# set-head/set-branches/prune/update) mutates. reflog: the default is `show`
+# (any ref positional falls through to it) and `exists`/`list` also only read;
+# `expire`/`delete`/`drop` rewrite or remove reflog entries.
+_REMOTE_READONLY_MODES = frozenset({"show", "get-url"})
+_REFLOG_MUTATING_MODES = frozenset({"expire", "delete", "drop"})
 
 
 def _git_subcommand_and_args(cmd_parts: list[str]) -> tuple[str, list[str]]:
@@ -119,7 +134,7 @@ def _git_tag_readonly(args: list[str]) -> bool:
     for idx, arg in enumerate(args):
         if idx in value_indexes:
             continue
-        if arg in _TAG_MUTATING_FLAGS or _short_flag_chars(arg) & set("asudvfmF"):
+        if arg in _TAG_MUTATING_FLAGS or _short_flag_chars(arg) & set("asudfmF"):
             return False
         if arg.startswith("--") and "=" in arg:
             flag = arg.split("=", 1)[0]
@@ -137,6 +152,37 @@ def _git_tag_readonly(args: list[str]) -> bool:
     return read_hint or not positionals
 
 
+def _git_verb_mode(args: list[str]) -> str:
+    """The dispatch verb of a verb-dispatched subcommand: the first non-flag
+    token, NOT ``args[0]`` — flags before the verb still dispatch (measured:
+    ``git remote -v add origin <url>`` ADDS the remote), so judging ``args[0]``
+    alone would read that spelling as a bare listing."""
+    for arg in args:
+        text = str(arg)
+        if not text.startswith("-"):
+            return text.lower()
+    return ""
+
+
+def _git_remote_readonly(args: list[str]) -> bool:
+    """Bare ``git remote`` / ``git remote -v`` lists and ``show``/``get-url``
+    inspect — none of them writes, so all are read-only inspection. Every other
+    verb mutates config/refs and stays target-checked; the network dimension
+    (``remote show`` without ``-n`` contacts the remote) is enforced separately
+    by the per-subcommand network fence, never by this mutation classifier."""
+    verb = _git_verb_mode(args)
+    return not verb or verb in _REMOTE_READONLY_MODES
+
+
+def _git_reflog_readonly(args: list[str]) -> bool:
+    """``git reflog`` defaults to ``show`` and any non-verb token falls through
+    to it as a revision (measured: ``git reflog --all expire`` errors as
+    "ambiguous argument", it does NOT expire), so only the explicit mutating
+    verbs — ``expire``/``delete``/``drop`` — are mutations. Everything else
+    (bare, ``show``, ``exists``, ``list``, a ref positional) only reads."""
+    return _git_verb_mode(args) not in _REFLOG_MUTATING_MODES
+
+
 def _git_subcommand_is_readonly(subcmd: str, args: list[str]) -> bool:
     """The subcommand alone reads and never writes (before flags are considered)."""
     if subcmd in GIT_READONLY_SUBCOMMANDS:
@@ -145,6 +191,10 @@ def _git_subcommand_is_readonly(subcmd: str, args: list[str]) -> bool:
         return _git_branch_readonly(args)
     if subcmd == "tag":
         return _git_tag_readonly(args)
+    if subcmd == "reflog":
+        return _git_reflog_readonly(args)
+    if subcmd == "remote":
+        return _git_remote_readonly(args)
     return False
 
 
@@ -192,7 +242,16 @@ def _git_invocation_block_reason(parts: list[str], *, allow_network: bool = True
         # invocation: `git log|show|diff --output=<file>` truncates <file>. Judged
         # here, in the one classifier every consumer asks, so the exemption key and
         # both target resolvers get the same honest answer.
-        return f"git {subcmd} --output" if _git_output_file_args(args) else ""
+        if _git_output_file_args(args):
+            return f"git {subcmd} --output"
+        if subcmd in GIT_NETWORK_SUBCOMMANDS and not allow_network:
+            # Read-only inspection can still reach the network (`git remote show`
+            # without `-n` contacts the remote): the contract fence is enforced
+            # per-subcommand in every lane, read-only or not — the ls-remote
+            # precedent, and the same coarse rule the external resolver's tail
+            # applies. Only `remote` currently sits in both sets.
+            return f"task_contract.allowed_resources.network=false blocks git {subcmd}"
+        return ""
     if subcmd == "ls-remote":
         return "" if allow_network else "task_contract.allowed_resources.network=false blocks git ls-remote"
     return f"git {subcmd}"

@@ -276,7 +276,9 @@ def test_spawned_checkpoint_revalidation_survives_a_racing_running_pop(tmp_path,
 
 
 @pytest.mark.serial
-def test_inflight_latch_drops_duplicate_trigger(tmp_path):
+def test_inflight_latch_defers_duplicate_trigger_for_replay(tmp_path):
+    """A trigger hitting the latch mid-flight is not lost: it is remembered
+    (per root, last-wins) for a single replay after the run completes."""
     from supervisor import events
 
     data = tmp_path / "data"
@@ -285,10 +287,84 @@ def test_inflight_latch_drops_duplicate_trigger(tmp_path):
     with events._COOP_CHECKPOINT_LOCK:
         events._COOP_CHECKPOINT_INFLIGHT.add("rootZ")
     try:
-        assert events._spawn_coop_checkpoint(ctx, "rootZ", title="", trigger="root_done") is None
+        assert events._spawn_coop_checkpoint(ctx, "rootZ", title="t", trigger="root_done") is None
+        with events._COOP_CHECKPOINT_LOCK:
+            assert events._COOP_CHECKPOINT_DROPPED.get("rootZ") == {
+                "title": "t", "trigger": "root_done",
+            }
     finally:
         with events._COOP_CHECKPOINT_LOCK:
             events._COOP_CHECKPOINT_INFLIGHT.discard("rootZ")
+            events._COOP_CHECKPOINT_DROPPED.pop("rootZ", None)
+
+
+@pytest.mark.serial
+def test_dropped_quiescence_trigger_is_replayed_after_latch_clear(tmp_path, monkeypatch):
+    """G4-4 regression — the lost-trigger interleaving:
+
+    1. an earlier trigger spawns the off-loop worker; it samples liveness and
+       sees the LAST child still live, so the helper skips the commit;
+    2. that child terminalizes and its ``tree_quiescence`` trigger fires while
+       the latch is still held — before the fix it was dropped outright;
+    3. the worker clears the latch having committed nothing, and no further
+       tree event exists: the quiescence commit never happened.
+
+    The fix replays the dropped trigger once after the latch clears; the
+    replayed run re-validates liveness (now zero) and commits."""
+    import threading as _threading
+    import time
+
+    import ouroboros.coop_checkpoint as coop
+    from supervisor import events
+
+    data = tmp_path / "data"
+    (data / "logs").mkdir(parents=True)
+    # ONE shared ctx, as in production: the drain thread mutates RUNNING live.
+    ctx = _ctx(data, running={"lastchild": {"task": _subagent_task("lastchild", "rootQ")}})
+
+    first_call_entered = _threading.Event()
+    release_first_call = _threading.Event()
+    calls = []
+
+    def _fake_commit(drive_root, root_tid, *, title="", has_live_tree_tasks=False):
+        calls.append(has_live_tree_tasks)
+        if len(calls) == 1:
+            first_call_entered.set()
+            release_first_call.wait(timeout=30)
+        return []
+
+    monkeypatch.setattr(coop, "checkpoint_commit_coop_roots", _fake_commit)
+
+    t1 = events._spawn_coop_checkpoint(ctx, "rootQ", title="wave", trigger="root_done")
+    assert t1 is not None
+    assert first_call_entered.wait(timeout=30)
+    assert calls == [True]  # worker sampled the last child while it was live
+
+    # The last child terminalizes NOW: the drain thread pops it from RUNNING and
+    # its quiescence trigger hits the still-held latch.
+    ctx.RUNNING.clear()
+    assert events._spawn_coop_checkpoint(
+        ctx, "rootQ", title="wave", trigger="tree_quiescence",
+    ) is None
+
+    release_first_call.set()
+    t1.join(timeout=30)
+
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        with events._COOP_CHECKPOINT_LOCK:
+            busy = (
+                "rootQ" in events._COOP_CHECKPOINT_INFLIGHT
+                # getattr: on pre-fix code the memo does not exist — let the
+                # semantic assert below report the lost trigger instead.
+                or "rootQ" in getattr(events, "_COOP_CHECKPOINT_DROPPED", {})
+            )
+        if not busy and len(calls) >= 2:
+            break
+        time.sleep(0.02)
+    assert calls == [True, False], (
+        "dropped tree_quiescence trigger was not replayed after the latch cleared"
+    )
 
 
 def test_root_done_path_defers_to_quiescence_when_children_live(tmp_path, monkeypatch):

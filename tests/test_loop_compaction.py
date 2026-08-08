@@ -464,3 +464,69 @@ def test_compaction_floor_blocks_rearm_only_while_the_frame_carries_the_pressure
     small = {"_compaction_hysteresis": {"round": 4, "region_chars": 120_000}}
     loop._run_round_compaction(_transcript(40_000, 6), _ctx(5, small))
     assert calls == ["checkpoint", "compact"]
+
+
+def test_compaction_floor_counts_protected_old_rounds(monkeypatch, tmp_path):
+    """The floor must count older spans the COMPACTOR itself refuses to summarize
+    (`_round_has_protected_content` — shared predicate, one SSOT). Omitting them
+    forecast a reachable trigger no pass can reach: a transcript dominated by an
+    old ⚠️-protected round then bought a futile summarizer pass + full-transcript
+    rewrite on every 1.2x region growth — the exact recurring-futile-pass class
+    the hysteresis exists to kill."""
+    from ouroboros import context_fit, loop
+
+    calls, progress = [], []
+    monkeypatch.setattr(
+        loop, "_persist_compaction_checkpoint",
+        lambda m, **k: calls.append("checkpoint") or True,
+    )
+    monkeypatch.setattr(
+        loop, "compact_tool_history_llm",
+        lambda m, keep_recent, **k: (calls.append("compact") or (m, None)),
+    )
+    monkeypatch.setattr(context_fit, "main_loop_token_density", lambda _dr, _m: 1.0)
+
+    def _transcript(protected):
+        head = "⚠️ COMPACTION-PROTECTED review evidence\n" if protected else ""
+        out = [
+            {"role": "system", "content": "F" * 40_000},
+            {"role": "assistant", "content": "r0",
+             "tool_calls": [{"id": "h0", "function": {"name": "x", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "h0", "content": head + "P" * 500_000},
+        ]
+        for i in range(1, 6):
+            out.append({
+                "role": "assistant", "content": f"r{i}",
+                "tool_calls": [{"id": f"h{i}", "function": {"name": "x", "arguments": "{}"}}],
+            })
+            out.append({"role": "tool", "tool_call_id": f"h{i}", "content": "R" * 60_000})
+        return out
+
+    # Floor accounting: the protected old span is part of the irreducible floor
+    # (frame 40K + protected 500K + kept tail), and ONLY protection adds it.
+    prot_msgs = _transcript(True)
+    plain_msgs = _transcript(False)
+    prot_floor = loop._compaction_floor_chars(prot_msgs, loop._tool_round_spans(prot_msgs))
+    plain_floor = loop._compaction_floor_chars(plain_msgs, loop._tool_round_spans(plain_msgs))
+    assert prot_floor - plain_floor >= 500_000
+
+    def _ctx(state):
+        return loop._CompactionRoundContext(
+            tools=SimpleNamespace(_ctx=SimpleNamespace(_pending_compaction=None, _accumulated_usage=state)),
+            drive_root=tmp_path, drive_logs=tmp_path / "logs", task_id="task-prot",
+            round_idx=5, event_queue=None, active_use_local=False,
+            active_context_mode="low", checkpoint_injected=True,
+            emit_progress=progress.append,
+        )
+
+    # Armed + region grown past the bar: the protected round keeps the floor over
+    # the 100K-token low trigger, so early rearm must NOT fire. Pre-fix the floor
+    # omitted it (forecast ~85K tokens) and re-ran a futile pass here.
+    armed = {"_compaction_hysteresis": {"round": 4, "region_chars": 120_000}}
+    loop._run_round_compaction(_transcript(True), _ctx(armed))
+    assert calls == []
+
+    # Same shape unprotected: the pass CAN drop the old round, so growth rearms.
+    small = {"_compaction_hysteresis": {"round": 4, "region_chars": 120_000}}
+    loop._run_round_compaction(_transcript(False), _ctx(small))
+    assert calls == ["checkpoint", "compact"]

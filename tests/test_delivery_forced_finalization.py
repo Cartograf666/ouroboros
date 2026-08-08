@@ -1369,6 +1369,65 @@ def test_forced_bypass_never_overwrites_an_existing_host_decision(tmp_path, monk
     assert decision.get("source", "") != "forced_finalization"
 
 
+def test_forced_bypass_stamps_over_deferred_agent_stance(tmp_path, monkeypatch):
+    """A root task_acceptance_review DEFERRED to the host leaves a STATUS-LESS
+    agent-stance dict in acceptance_decision (`source` + `agent_disposition`/
+    `agent_rationale` — the P4.1 merge in `process_tool_results`). That is
+    evidence, not a host decision: a forced rail after it must still stamp
+    finalized_unaccepted with the typed rail reason (pre-fix the recorder
+    early-returned on ANY non-empty dict, so the bypass went unrecorded exactly
+    when the panel was still owed), and the agent stance is carried forward."""
+    from ouroboros.loop_tool_execution import process_tool_results
+
+    loop, _registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    deferred_payload = json.dumps({
+        "status": "deferred_to_host_acceptance",
+        "authoritative": False,
+        "agent_decision": {
+            "disposition": "pass",
+            "rationale": "agent stance recorded before the host panel",
+            "source": "agent_task_acceptance_review_tool",
+        },
+    })
+    process_tool_results(
+        [{
+            "fn_name": "task_acceptance_review",
+            "is_error": False,
+            "result": deferred_payload,
+            "tool_call_id": "tc1",
+            "args_for_log": {},
+        }],
+        [],
+        trace,
+        lambda _msg: None,
+    )
+    # The production writer's exact shape: agent stance only, no canonical status.
+    assert trace["acceptance_decision"]["agent_disposition"] == "pass"
+    assert "status" not in trace["acceptance_decision"]
+    monkeypatch.setattr(
+        loop,
+        "call_llm_with_retry",
+        lambda *_args, **_kwargs: (
+            {"role": "assistant", "content": "Best answer before the round limit."},
+            0.0,
+        ),
+    )
+
+    _text, _usage, returned_trace = loop._handle_round_limit(limit_ctx)
+
+    assert returned_trace["review_decision"] == {
+        "eligibility": "eligible",
+        "trigger": "bypassed_round_limit",
+    }
+    decision = returned_trace["acceptance_decision"]
+    assert decision["status"] == "finalized_unaccepted"
+    assert decision["reason"] == "acceptance_bypassed_round_limit"
+    assert decision["source"] == "forced_finalization"
+    # Carried forward, never overwritten (the `_set_acceptance_decision` contract).
+    assert decision["agent_disposition"] == "pass"
+    assert decision["agent_rationale"] == "agent stance recorded before the host panel"
+
+
 def test_forced_bypass_records_not_eligible_for_child_tasks(tmp_path, monkeypatch):
     loop, registry, limit_ctx, _trace = _forced_test_context(tmp_path)
     registry._ctx.task_metadata = {

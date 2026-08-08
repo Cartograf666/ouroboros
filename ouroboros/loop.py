@@ -27,7 +27,7 @@ from ouroboros.context_budget import (
     EMERGENCY_COMPACTION_CHARS,
     LOW_EMERGENCY_COMPACTION_CHARS,
 )
-from ouroboros.context_compaction import _tool_round_spans, compact_tool_history_llm
+from ouroboros.context_compaction import _round_has_protected_content, _tool_round_spans, compact_tool_history_llm
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.utils import estimate_tokens, truncate_review_artifact
 from ouroboros.usage_accounting import BudgetExceeded
@@ -3323,23 +3323,34 @@ def _emergency_keep_recent(span_count: int) -> int:
 def _compaction_floor_chars(messages: List[Dict[str, Any]], spans: List[Tuple[int, int]]) -> int:
     """Smallest transcript an emergency pass could leave behind.
 
-    The pass can only replace the spans OLDER than ``_emergency_keep_recent``;
-    the frozen frame (everything before the first tool round) and the kept spans
-    survive untouched, and the summaries it writes only ADD to that. So this is a
-    true lower bound: when the floor is already over the trigger, NO pass can get
-    under it and no amount of transcript growth changes that — only a smaller
-    FRAME (a mode change or a context rebuild) can. That is what makes the
-    hysteresis rearm criterion honest: measuring "can a pass help?" on the
-    compactable region alone rearmed on growth the pass itself created (the pass
-    collapses the region to the kept spans, so the very next tool round cleared
-    the growth bar and the pass refired every round — the submarine thrash).
+    The pass can only replace the spans OLDER than ``_emergency_keep_recent``
+    that carry no protected content; the frozen frame (everything before the
+    first tool round), the kept spans AND the protected older spans (the
+    compactor's ``_round_has_protected_content`` skips them raw — same predicate
+    here, one SSOT) survive untouched, and the summaries it writes only ADD to
+    that. So this is a true lower bound: when the floor is already over the
+    trigger, NO pass can get under it and no amount of transcript growth changes
+    that — only a smaller FRAME (a mode change or a context rebuild) can. That
+    is what makes the hysteresis rearm criterion honest: measuring "can a pass
+    help?" on the compactable region alone rearmed on growth the pass itself
+    created (the pass collapses the region to the kept spans, so the very next
+    tool round cleared the growth bar and the pass refired every round — the
+    submarine thrash). Omitting the protected spans was the same lie one layer
+    down: a transcript dominated by an old protected round forecast a reachable
+    trigger the pass could never reach, so every 1.2x region growth bought
+    another futile summarizer pass + cache-destroying rewrite.
     """
     if not spans:
         return _estimate_messages_chars(messages)
     keep = _emergency_keep_recent(len(spans))
     frame = messages[: spans[0][0]]
     kept = messages[spans[-keep][0]:]
-    return _estimate_messages_chars(frame) + _estimate_messages_chars(kept)
+    protected = sum(
+        _estimate_messages_chars(messages[start:end + 1])
+        for start, end in spans[:-keep]
+        if _round_has_protected_content(messages, start, end)
+    )
+    return _estimate_messages_chars(frame) + protected + _estimate_messages_chars(kept)
 
 
 @dataclass
@@ -3391,8 +3402,8 @@ def _arm_compaction_hysteresis(
         "⚠️ Emergency compaction cannot help: calibrated context "
         f"≈{pressure_real_tokens / 1000:.0f}K real tokens exceeds the "
         f"≈{threshold_real_tokens / 1000:.0f}K trigger, but the frozen frame (system "
-        "blocks + tool schemas) is what carries it and cannot be compacted. Further "
-        f"passes suppressed until {rearm_clause}."
+        "blocks + tool schemas) plus the protected/kept rounds carry it and cannot "
+        f"be compacted. Further passes suppressed until {rearm_clause}."
     )
     _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
         "checkpoint_kind": "compaction_hysteresis_armed",
@@ -4200,8 +4211,16 @@ def _record_forced_acceptance_bypass(
     if tools_ctx is None:
         return
     # A host decision already recorded (panel ran, pacing skip, supersede) wins;
-    # the bypass record exists only for the nothing-was-written shape.
-    if isinstance(llm_trace.get("acceptance_decision"), dict) and llm_trace.get("acceptance_decision"):
+    # the bypass record exists only for the no-host-verdict shape. "Host decision"
+    # means a canonical status (`_set_acceptance_decision` fails closed to one) —
+    # NOT the status-less agent-stance dict `process_tool_results` merges when a
+    # root task's task_acceptance_review is deferred to the host (`source` +
+    # `agent_disposition`/`agent_rationale` only): treating that as a decision
+    # left the forced bypass unrecorded exactly when the panel was still owed.
+    # The stamp below flows through `_set_acceptance_decision`, which carries the
+    # agent stance forward rather than overwriting it.
+    decision = llm_trace.get("acceptance_decision")
+    if isinstance(decision, dict) and str(decision.get("status") or "") in ACCEPTANCE_DECISION_STATUSES:
         return
     if getattr(tools_ctx, "_task_acceptance_reviewed", False):
         return

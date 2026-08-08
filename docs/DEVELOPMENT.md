@@ -647,9 +647,14 @@ _task_uses_external_context(task)` in `ouroboros/context.py`, i.e. whenever
 Ouroboros works on its own code, regardless of task class — and is a visible
 on-demand pointer for the external-surface class (a bound workspace, a
 subagent, or an api/cli/scheduled surface: work on ANOTHER codebase). An
-explicit `context_requires_development` on the task wins, and self-body task
-classes (explicit `context_requires_self_body_docs`, or
-evolution/deep_self_review/review types) always keep the handbook full.
+explicit `context_requires_development` on the task wins — an INTERNAL
+task-dict override for structured in-process callers; it is deliberately NOT a
+`POST /api/tasks` body field (the task API drops unknown keys). A task-API
+caller that needs the full handbook passes `context_requires_self_body_docs`
+(which the API does thread through), or the agent reads the doc via the visible
+on-demand pointer. Self-body task classes (explicit
+`context_requires_self_body_docs`, or evolution/deep_self_review/review types)
+always keep the handbook full.
 README.md and CHECKLISTS.md are not inlined in the agent
 context in either mode (README is user-facing; reviewers load their own
 CHECKLISTS copy). The tier-0 protected core — SYSTEM.md, BIBLE.md,

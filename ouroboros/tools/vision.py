@@ -389,6 +389,82 @@ def _user_files_only_admission_block(ctx: Any, fp: "pathlib.Path") -> str:
     return ""
 
 
+def _read_file_parity_block(ctx: Any, fp: "pathlib.Path") -> str:
+    """Per-path guards mirroring the read_file stack on the matrix-derived roots
+    (SC-6). Deriving admission roots from ``profile_readable_root_paths``
+    admitted the user_files home, the WHOLE runtime-data drive, and system_repo
+    — roots where read_file enforces per-path rules BEYOND root membership: the
+    user_files secret/runtime confinement, the restricted-subagent
+    secret/owner-control denials, and the project-store guard. Root admission
+    alone would let an image/PDF/video path in where read_file refuses it. ONE
+    helper shared by vision (view_image / vlm_query) and media (ocr_pdf /
+    extract_video_frames) so the two consumers cannot drift. Empty = no
+    objection. Each guard is best-effort (the same fail-soft stance the
+    existing admission guards take); the root confinement stays the floor."""
+    block = _user_files_only_admission_block(ctx, fp)
+    if block:
+        return block
+    if ctx is None:
+        return ""
+    import pathlib as _pl
+    restricted = False
+    try:
+        from ouroboros.tools.core import is_restricted_subagent_profile
+        restricted = bool(is_restricted_subagent_profile(ctx))
+    except Exception:
+        restricted = False
+    raw_drive = str(getattr(ctx, "drive_root", "") or "").strip()
+    if raw_drive:
+        try:
+            data_root = _pl.Path(raw_drive).expanduser().resolve(strict=False)
+            rel = _pl.Path(fp).resolve(strict=False).relative_to(data_root).as_posix()
+        except Exception:
+            rel = ""
+        if rel:
+            try:
+                from ouroboros.project_facts import project_store_access_block
+                reason = project_store_access_block(rel)
+                if reason:
+                    return str(reason)
+            except Exception:
+                pass
+            if restricted:
+                try:
+                    from ouroboros.tools.core import (
+                        _is_skill_owner_state_target,
+                        _is_subagent_secret_data_path,
+                        is_skill_owner_state_alias,
+                    )
+                    if (
+                        _is_subagent_secret_data_path(rel)
+                        or _is_skill_owner_state_target(fp, data_root)
+                        or is_skill_owner_state_alias(fp, data_root)
+                    ):
+                        return "⚠️ PATH_BLOCKED: this subagent cannot access secret or owner-control data files."
+                except Exception:
+                    pass
+    if restricted:
+        try:
+            from ouroboros.tools.core import _is_subagent_secret_repo_target
+            from ouroboros.tools.registry import active_repo_dir_for
+            repo_roots = []
+            try:
+                repo_roots.append(_pl.Path(active_repo_dir_for(ctx)).expanduser().resolve(strict=False))
+            except Exception:
+                pass
+            try:
+                from ouroboros.tool_access import resource_root_path
+                repo_roots.append(_pl.Path(resource_root_path(ctx, "system_repo")).expanduser().resolve(strict=False))
+            except Exception:
+                pass
+            for repo_root in repo_roots:
+                if _path_is_under(fp, repo_root) and _is_subagent_secret_repo_target(fp, repo_root):
+                    return "⚠️ PATH_BLOCKED: this subagent cannot access repo secret or control paths."
+        except Exception:
+            pass
+    return ""
+
+
 def _load_local_image_payload(ctx: ToolContext, file_path: str) -> Tuple[Optional[Dict[str, str]], str]:
     """Validate a LOCAL image path against the SAME trust boundary the agent already
     holds via read_file/run_command (allowed roots + protected-artifact read_bytes
@@ -408,9 +484,9 @@ def _load_local_image_payload(ctx: ToolContext, file_path: str) -> Tuple[Optiona
             f"(workspace / artifact_store / task_drive / subagent_projects / "
             f"deliverables / user files). Resolved path: {fp}. Use read_file for other paths."
         )
-    _uf_block = _user_files_only_admission_block(ctx, fp)
-    if _uf_block:
-        return None, _uf_block
+    _pp_block = _read_file_parity_block(ctx, fp)
+    if _pp_block:
+        return None, _pp_block
     # Honor the task protected-artifact policy: a workspace file may still be a
     # black-box protected artifact whose bytes must not be read (same contract as
     # read_file / query_code — block_reason_for_path with operation "read_bytes").

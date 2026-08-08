@@ -1020,8 +1020,14 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
 
 # In-flight latch for off-loop coop checkpoints: one commit run per root at a
 # time. A re-trigger after completion is safe (the helper no-ops on a clean
-# tree), so this is concurrency control, not a permanent phase marker.
+# tree), so this is concurrency control, not a permanent phase marker. A
+# trigger arriving WHILE a run is in flight cannot simply be dropped: the
+# in-flight worker may have already sampled liveness and seen the (then-live)
+# last child, so it will skip the commit — and the dropped trigger was the
+# last one there is. Such triggers are remembered per root and replayed once
+# after the latch clears; the replayed run revalidates liveness itself.
 _COOP_CHECKPOINT_INFLIGHT: set = set()
+_COOP_CHECKPOINT_DROPPED: Dict[str, Dict[str, str]] = {}
 _COOP_CHECKPOINT_LOCK = threading.Lock()
 
 
@@ -1039,12 +1045,16 @@ def _spawn_coop_checkpoint(
     fail-soft per root), and appends loud receipts — including a loud-fail
     receipt on an unexpected error, because a silent skip here is exactly the
     uncommitted-pile class this call closes. Returns the thread (tests join
-    it); duplicate triggers while one run is in flight are dropped."""
+    it); a trigger arriving while one run is in flight is remembered and
+    replayed once after that run completes (see the latch comment above —
+    dropping it outright loses the tree's LAST quiescence trigger when the
+    in-flight worker sampled the finishing child as still live)."""
     root_tid = str(root_tid or "").strip()
     if not root_tid:
         return None
     with _COOP_CHECKPOINT_LOCK:
         if root_tid in _COOP_CHECKPOINT_INFLIGHT:
+            _COOP_CHECKPOINT_DROPPED[root_tid] = {"title": title, "trigger": trigger}
             return None
         _COOP_CHECKPOINT_INFLIGHT.add(root_tid)
 
@@ -1084,6 +1094,18 @@ def _spawn_coop_checkpoint(
         finally:
             with _COOP_CHECKPOINT_LOCK:
                 _COOP_CHECKPOINT_INFLIGHT.discard(root_tid)
+                dropped = _COOP_CHECKPOINT_DROPPED.pop(root_tid, None)
+            if dropped is not None:
+                # Replay the trigger that hit the latch mid-flight: this run may
+                # have sampled the finishing child as live and skipped the
+                # commit, and that trigger was the tree's last. The replayed
+                # run re-validates liveness, so a spurious replay no-ops; a
+                # replay happens only when a real trigger was dropped, so the
+                # chain terminates with the finite trigger events.
+                _spawn_coop_checkpoint(
+                    ctx, root_tid,
+                    title=dropped["title"], trigger=dropped["trigger"],
+                )
 
     thread = threading.Thread(
         target=_run, name=f"coop-checkpoint-{root_tid[:12]}", daemon=True,
