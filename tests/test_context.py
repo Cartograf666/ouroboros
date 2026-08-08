@@ -364,6 +364,93 @@ class TestAdditionalHealthInvariantCoverage:
         assert "2026-04-14-test" in result
 
 
+def _grow_file(path, size: int) -> None:
+    """Create a file whose st_size is exactly `size` without writing `size` bytes."""
+    import os
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+    os.truncate(path, size)
+
+
+def _grow_ledger(path, size: int) -> None:
+    """Grow a synthetic usage ledger WITHOUT triggering tail quarantine.
+
+    build_health_invariants reads the ledger (budget-drift check) BEFORE the
+    hot-store stat. A single torn tail row would be QUARANTINED there — the
+    substrate ftruncates the file — shrinking st_size before the check under
+    test runs. Corruption BEFORE the tail instead raises UsageLedgerCorrupt
+    without mutating the file, degrading the budget check to its established
+    "COST ACCOUNTING UNAVAILABLE" path while st_size stays exactly `size`.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = b"not json\n"
+    path.write_bytes(row * (size // len(row)) + b"x" * (size % len(row)))
+
+
+class TestHotStoreGrowthInvariant:
+    def test_progress_growth_warns_above_threshold(self, tmp_path):
+        from ouroboros.context_budget import PROGRESS_LOG_WARN_BYTES
+
+        env = _make_health_env(tmp_path)
+        _grow_file(tmp_path / "logs" / "progress.jsonl", PROGRESS_LOG_WARN_BYTES + 1)
+
+        result = build_health_invariants(env)
+        assert "HOT STORE GROWTH" in result
+        assert "logs/progress.jsonl" in result
+        assert "rotation" in result  # remediation pointer
+
+    def test_exactly_at_threshold_stays_silent(self, tmp_path):
+        from ouroboros.context_budget import PROGRESS_LOG_WARN_BYTES
+
+        env = _make_health_env(tmp_path)
+        _grow_file(tmp_path / "logs" / "progress.jsonl", PROGRESS_LOG_WARN_BYTES)
+
+        result = build_health_invariants(env)
+        assert "HOT STORE GROWTH" not in result
+
+    def test_ledger_growth_warns_with_lock_remediation(self, tmp_path):
+        from ouroboros.context_budget import USAGE_LEDGER_WARN_BYTES
+
+        env = _make_health_env(tmp_path)
+        _grow_ledger(tmp_path / "state" / "usage_attempts.jsonl", USAGE_LEDGER_WARN_BYTES + 1)
+
+        result = build_health_invariants(env)
+        assert "HOT STORE GROWTH" in result
+        assert "state/usage_attempts.jsonl" in result
+        assert "monetary lock" in result
+
+    def test_events_and_tools_thresholds_are_generous_but_live(self, tmp_path):
+        from ouroboros.context_budget import EVENTS_LOG_WARN_BYTES, TOOLS_LOG_WARN_BYTES
+
+        env = _make_health_env(tmp_path)
+        _grow_file(tmp_path / "logs" / "events.jsonl", EVENTS_LOG_WARN_BYTES + 1)
+        _grow_file(tmp_path / "logs" / "tools.jsonl", TOOLS_LOG_WARN_BYTES + 1)
+
+        result = build_health_invariants(env)
+        assert result.count("HOT STORE GROWTH") == 2
+        assert "logs/events.jsonl" in result
+        assert "logs/tools.jsonl" in result
+
+    def test_isolated_benchmark_sentinel_suppresses_warnings(self, tmp_path):
+        from supervisor.state import ISOLATED_BENCHMARK_SENTINEL
+        from ouroboros.context_budget import PROGRESS_LOG_WARN_BYTES, USAGE_LEDGER_WARN_BYTES
+
+        env = _make_health_env(tmp_path)
+        _grow_file(tmp_path / "logs" / "progress.jsonl", PROGRESS_LOG_WARN_BYTES + 1)
+        _grow_ledger(tmp_path / "state" / "usage_attempts.jsonl", USAGE_LEDGER_WARN_BYTES + 1)
+        (tmp_path / ISOLATED_BENCHMARK_SENTINEL).write_text("isolated\n", encoding="utf-8")
+
+        result = build_health_invariants(env)
+        assert "HOT STORE GROWTH" not in result
+
+    def test_absent_stores_stay_silent(self, tmp_path):
+        env = _make_health_env(tmp_path)
+
+        result = build_health_invariants(env)
+        assert "HOT STORE GROWTH" not in result
+
+
 class TestAdvisoryReviewStatusInContext:
     """Tests that advisory review status appears in LLM context when runs exist."""
 

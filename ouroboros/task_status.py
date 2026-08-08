@@ -149,6 +149,21 @@ def _child_drive_candidates(result: Dict[str, Any]) -> List[pathlib.Path]:
     return paths
 
 
+# Legacy mirrored disposition/sha fields stripped from every effective read; the
+# typed task-tree ledger row is the sole disposition authority (re-projected below
+# only on full `materialize_artifacts=True` reads).
+_CHILD_DISPOSITION_FIELDS = (
+    "child_result_disposition",
+    "child_result_disposition_sha256",
+    "child_result_disposition_reason",
+    "child_result_disposition_source",
+    "child_result_disposition_beacon_state",
+    "child_result_disposition_beacon_sha256",
+    "parent_decision_child_result_sha256",
+    "terminal_child_result_snapshot",
+)
+
+
 def _project_child_result_disposition(
     drive_root: pathlib.Path,
     result: Dict[str, Any],
@@ -161,16 +176,7 @@ def _project_child_result_disposition(
     """
 
     projected = dict(result)
-    for field in (
-        "child_result_disposition",
-        "child_result_disposition_sha256",
-        "child_result_disposition_reason",
-        "child_result_disposition_source",
-        "child_result_disposition_beacon_state",
-        "child_result_disposition_beacon_sha256",
-        "parent_decision_child_result_sha256",
-        "terminal_child_result_snapshot",
-    ):
+    for field in _CHILD_DISPOSITION_FIELDS:
         projected.pop(field, None)
     try:
         from ouroboros.task_tree_ledger import child_result_disposition_row
@@ -336,12 +342,21 @@ def _merge_queue_status(current_status: str, queue_status: str) -> str:
     return queued
 
 
-def load_effective_task_result(drive_root: pathlib.Path, task_id: str) -> Dict[str, Any]:
+def load_effective_task_result(
+    drive_root: pathlib.Path,
+    task_id: str,
+    *,
+    materialize_artifacts: bool = True,
+) -> Dict[str, Any]:
     try:
         tid = validate_task_id(task_id)
     except ValueError:
         return {}
-    return effective_task_result(drive_root, load_task_result(drive_root, tid) or {})
+    return effective_task_result(
+        drive_root,
+        load_task_result(drive_root, tid) or {},
+        materialize_artifacts=materialize_artifacts,
+    )
 
 
 def reconcile_orphaned_running_tasks(drive_root: Any) -> int:
@@ -402,8 +417,28 @@ def reconcile_orphaned_running_tasks(drive_root: Any) -> int:
     return healed
 
 
-def effective_task_result(drive_root: pathlib.Path, result: Dict[str, Any], *, _seen: frozenset[str] = frozenset()) -> Dict[str, Any]:
-    """Merge parent result, child-drive result, and active queue state."""
+def effective_task_result(
+    drive_root: pathlib.Path,
+    result: Dict[str, Any],
+    *,
+    materialize_artifacts: bool = True,
+    _seen: frozenset[str] = frozenset(),
+) -> Dict[str, Any]:
+    """Merge parent result, child-drive result, and active queue state.
+
+    ``materialize_artifacts=False`` yields a "status/cost projection only" read
+    (v6.90.x P2): the entire artifact block — including the mutating child-artifact
+    rebase (``copy_file_to_task_artifacts``), ``collect_task_artifact_records``
+    scans, and the task-tree ``_project_child_result_disposition`` hash lookup — is
+    skipped, and the projection never carries sha-bearing/disposition claims.
+    ``artifacts`` on a False row are the raw admission-time recorded entries,
+    not the merged/rebased set a materializing read would produce.
+    Read-only display surfaces (chat history annotation, ``api_tasks_list``, the
+    SSE follow loop, ``api_logs_tail`` discovery) pass ``False``; every consumer
+    that participates in the child-result sha economy or artifact durability
+    (join_ledger, wait_*/get_task_result, api_task_get/artifact, reconcile, prune)
+    keeps the ``True`` default.
+    """
 
     if not result:
         return {}
@@ -417,6 +452,7 @@ def effective_task_result(drive_root: pathlib.Path, result: Dict[str, Any], *, _
             effective_retry = effective_task_result(
                 pathlib.Path(drive_root),
                 retry_result,
+                materialize_artifacts=materialize_artifacts,
                 _seen=frozenset(set(_seen) | {task_id}),
             )
             if effective_retry:
@@ -538,6 +574,15 @@ def effective_task_result(drive_root: pathlib.Path, result: Dict[str, Any], *, _
                         bundle,
                         "task interrupted before artifact finalization",
                     )
+    if not materialize_artifacts:
+        # Status/cost projection only: skip the whole artifact block (incl. the
+        # mutating child-artifact rebase and collect_task_artifact_records file
+        # scans) AND the disposition hash lookup. Strip the legacy mirrored
+        # fields so a False row never carries sha-bearing/disposition claims.
+        projected = dict(merged)
+        for field in _CHILD_DISPOSITION_FIELDS:
+            projected.pop(field, None)
+        return projected
     try:
         from ouroboros.artifacts import (
             collect_task_artifact_records,
@@ -691,6 +736,7 @@ def find_child_tasks(
     root_task_id: str = "",
     exclude_task_id: str = "",
     scope: str = "subtree",
+    materialize_artifacts: bool = True,
 ) -> List[Dict[str, Any]]:
     """Collect a task's subagent children.
 
@@ -711,7 +757,12 @@ def find_child_tasks(
     excluded = str(exclude_task_id or "").strip()
     direct_only = str(scope or "subtree").strip().lower() == "direct"
     rows: Dict[str, Dict[str, Any]] = {}
-    for row in (effective_task_result(pathlib.Path(drive_root), item) for item in list_task_results(pathlib.Path(drive_root))):
+    for row in (
+        effective_task_result(
+            pathlib.Path(drive_root), item, materialize_artifacts=materialize_artifacts
+        )
+        for item in list_task_results(pathlib.Path(drive_root))
+    ):
         tid = str(row.get("task_id") or "")
         if not tid or tid == excluded:
             continue

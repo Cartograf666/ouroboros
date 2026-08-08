@@ -493,6 +493,7 @@ Derived from P7 (Minimalism): entire codebase fits in one context window.
 
 - Module target: ~1000 lines. Crossing that line is P7 pressure and should trigger extraction or an explicit justification.
 - Module hard gate: 1600 lines for non-grandfathered modules in `tests/test_smoke.py`. Grandfathered (`GRANDFATHERED_OVERSIZED_MODULES` in `ouroboros/review.py`): `llm.py`, `claude_advisory_review.py`, `review_state.py`, `server.py`, temporary v5.7.1 debt `git.py`, and temporary v6.15/v6.16 debt `extension_loader.py` (OOP extension parity plus worker->server companion reconcile crossed the gate; the registry-coupled `PluginAPIImpl`/loader split is the deferred follow-up), and v6.20.0 acting-subagents debt `registry.py` / `events.py` (the acting authority/gating grew the tool dispatcher and the supervisor schedule handler past the 1600 gate; extracting their safety-critical dispatch/event internals is the deferred follow-up), v6.33.0 reliability debt `loop.py` / `shell.py` / `core.py` (deadline-aware finalization, the brace-group `sh -c` hint, single-file search, and the re-read-awareness nudge crossed three hot tool/loop modules whose helpers are tightly coupled to internals — a clean split fights the function-size gate and risks import cycles, so it is tracked debt), and v6.50.0 reconciliation-layer debt `control.py` / `workers.py` (typed schedule admission, cap serialization, and parent-side advisory reconciliation grew the existing scheduling surfaces; splitting before the new contract stabilizes would add indirection around the critical path), and v6.63.0 skill-payload debt `skills/unix_computer_use/plugin.py` (the OSWorld remote osworld_http/ssh_macos backends — connection registry, remote screenshot/input/exec translation, fail-closed guards — grew the skill past the gate; extracting the remote translation layer into a sibling payload module is the deferred follow-up; this entry is repo-path-qualified so a future skill's `plugin.py` is not silently exempted) — split deferred until each surface stabilises. The authoritative grandfathered set is `GRANDFATHERED_OVERSIZED_MODULES` in `ouroboros/review.py`.
+- The module target and hard gate also apply to `web/**/*.js` (perf/lifecycle sprint): the same constants, the same `GRANDFATHERED_OVERSIZED_MODULES` register (current JS debt: `web/modules/chat.js`, keyed by repo-relative path), and the same two consumers (`tests/test_smoke.py::test_no_oversized_modules` and `codebase_health` via `ouroboros/review.py::is_gated_js_module`). Vendored/minified payloads (`_VENDORED_SUFFIXES`/`_VENDORED_NAMES`) and `web/tests/` are excluded. Honest disclosure: the JS gate is LINE-COUNT ONLY — there is no function-length scan for JS (the function gates below stay Python-only).
 - Method target: <150 lines. Crossing that line is a decomposition signal, not an automatic failure by itself.
 - Method hard gate: 300 lines in `tests/test_smoke.py`.
 - Runtime-code function-count hard gate: enforced by `tests/test_smoke.py` against the value defined in `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` (single source of truth — bump the constant when adding a feature with an explicit comment justifying the increase). Tracked `devtools/` operator code is excluded from this runtime health gate, but touched `devtools/` files are still fully reviewed. Precedent (2026-06-10, owner decision): the first consolidation paydown removed ~60 dead/duplicate/trivial-wrapper functions and the cap moved to 3500 with deliberate headroom — the gate exists to force acknowledged growth, not to sit at zero slack and churn on every small fix.
@@ -521,6 +522,75 @@ DI container, numeric score, AST analyzer, or a new review pass. A SOLID or
 minimalism finding must name the exact symbol or authority, the concrete
 duplication or coupling, and a smaller alternative that still satisfies the
 contract. Diff size, line count, and file count alone are not findings.
+
+### Invariant: Projection over replay (hot readers of growing stores)
+
+A reader that runs per INTERACTION — an HTTP request, a WS/SSE message, a poll
+tick, a task turn — must not replay a growing store to produce its answer.
+Interactive read cost must be O(response), achieved through a maintained
+projection, a cursor, rotation, or a bounded tail — never a full-history scan
+filtered down to the answer.
+
+- **Per interaction is the unit.** Work that runs once per boot or per explicit
+  owner action may scan history; work on a request/message/poll-tick/task-turn
+  path may not. A scan that is cheap today is not the point — every growing
+  store crosses the threshold eventually, and the reader degrades exactly when
+  the system is most used.
+- **Storage-agnostic.** JSONL logs, SQLite tables, JSON snapshots — any store:
+  a full-table read filtered in code IS a replay (a `SELECT *` narrowed in
+  Python is the same failure as parsing a whole JSONL file for its tail). This
+  includes unbounded collections INSIDE snapshot/state files: a "snapshot" that
+  accretes an unbounded list re-reads its entire history on every load.
+- **Passive GET.** Read handlers perform no NEW steady-state durable writes.
+  Exactly two named exceptions exist: (1) substrate-owned integrity repair
+  performed under the substrate's own lock (the usage-ledger torn-tail
+  quarantine in `ouroboros/usage_ledger.py`), and (2) one-time idempotent
+  migrations guarded by a durable watermark (the legacy usage import). Anything
+  else that "just materializes a bit of state" on a GET is a mutation hiding on
+  a read path.
+- **House precedents — reuse these shapes instead of inventing new ones:**
+  chat log rotation with archive-aware readers
+  (`supervisor/state.py::rotate_chat_log_if_needed`); the compact
+  `containment_faults.jsonl` projection maintained beside an unbounded event
+  log (`ouroboros/delegate_custody.py`); dialogue-block consolidation — the P1
+  "infinite horizon, variable granularity" reader; and the passive-GET contract
+  of `gateway/control.py::api_update_status`.
+
+Enforcement: Repo Commit Checklist item 24 (advisory) triggers on diffs that
+add or change an endpoint/poller/subscription/timer or read a growing store;
+the hot-store growth health invariant
+(`agent_startup_checks.py::hot_store_growth_notes`, surfaced by
+`context.py::build_health_invariants`, thresholds justified in
+`ouroboros/context_budget.py`) is the deterministic runtime tripwire. A change
+that introduces a new append-only store read on an interactive path must
+enroll that store in the `ouroboros/context_budget.py` threshold table (with a
+justified constant) in the same commit — an unenrolled hot store is invisible
+to the tripwire.
+
+### Invariant: UI resources carry a disposer
+
+Every long-lived acquisition in `web/` returns or records a disposer, and a UI
+instance owns a `destroy()` that releases everything the instance acquired.
+The resource kinds this covers:
+
+- WS subscriptions (`ws.on(...)`)
+- `document`/`window` event listeners
+- observers (`ResizeObserver`, `MutationObserver`, `IntersectionObserver`)
+- timers (`setInterval`, long-lived `setTimeout` chains)
+- `requestAnimationFrame` loops
+- `EventSource` / streaming connections
+
+An instance that can be closed, hidden, or replaced (project chat panels are
+the canonical case) must be destroyable without leaving any acquisition
+behind; "hide the DOM node, keep the handlers" is the leak shape this
+invariant forbids. Late async continuations check a `destroyed` flag before
+touching state or re-arming loops.
+
+Enforcement (honest disclosure): the deterministic leak test runs in the
+release-tier `ui_browser` lane, not at commit tier; commit-tier coverage is
+the advisory Repo Commit Checklist item 24. The class is closed
+deterministically for the instrumented surfaces and advisorily for future
+ones.
 
 ---
 
@@ -783,8 +853,9 @@ degradation ladder — full atlas → compact atlas (durable `context_manifest`
 keeps full per-file coverage) → a `required` artifact the atlas cannot fit is a
 FAILURE TO ASSEMBLE (typed `budget_omitted` row naming artifact and reason,
 `required_artifact_omitted` pack status, no review of the remainder), which the
-ladder answers by shrinking the fixed part and retrying → the largest touched files degrade to
-diff-only with an explicit `TOUCHED FILE BUDGET DEGRADATION NOTE` (their full
+ladder answers by shrinking the fixed part and retrying → touched files degrade to
+diff-only, freely degradable ones first and largest-first within each tier (an artifact owed in
+full is reached only after the `-U0` rung), with an explicit `TOUCHED FILE BUDGET DEGRADATION NOTE` (their full
 changes stay visible in the staged diff, and those paths are DECLARED to the
 atlas via `diff_only_included`, so the durable coverage row records the dropped
 snapshot rather than claiming the file is fully in the prompt; legal only for

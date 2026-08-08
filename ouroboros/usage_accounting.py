@@ -35,15 +35,18 @@ from ouroboros.pricing import estimate_cost_optional
 from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
     LEDGER_REL,
     QUARANTINE_REL,
+    LedgerResumeState,
     UsageAccountingError,
     UsageLedgerCorrupt,
     _append_bytes_fsync,
     _append_rows_locked,
     _drive_root,
     _final_rows,
+    _ledger_resume_state,
     _locked,
     _named_lock,
     _number,
+    _read_new_records_locked,
     _read_records_locked,
     # Re-exported although THIS module no longer reads it: the terminal-state set is
     # part of the substrate's vocabulary, and a policy function that terminalizes an
@@ -315,6 +318,62 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
     return request, scope
 
 
+@dataclass
+class _LedgerRowsMemo:
+    """In-process cache of one drive root's per-attempt FINAL rows.
+
+    Holds only the ``_final_rows`` dict (one row per attempt, first-occurrence
+    order) plus the resume fingerprint — O(final rows), not O(ledger rows);
+    superseded transition rows are not retained."""
+
+    resume: LedgerResumeState
+    final_rows: Dict[str, Dict[str, Any]]
+
+
+# Read-side memo per RESOLVED drive root. Populated and advanced only under the
+# cross-process ledger lock; the module lock guards the dict itself. Write paths
+# (reserve/_transition/settle/import) never touch it — their own full locked
+# reads stay the monetary authority, and the stat + seq-continuity check on the
+# next read is what makes a stale memo impossible to serve, so correctness never
+# depends on any writer remembering to invalidate.
+_ROWS_MEMO: Dict[str, _LedgerRowsMemo] = {}
+_ROWS_MEMO_LOCK = threading.Lock()
+
+
+def _memoized_final_rows(root: pathlib.Path) -> list:
+    """Validated final rows for display projections, resumed incrementally.
+
+    Cold (or whenever the resume fingerprint is rejected — file replacement,
+    size shrink, same-size rewrite, seq discontinuity, a non-row-aligned tail,
+    structural corruption) this is one
+    full ``_read_records_locked`` replay, which owns quarantine. Warm, it parses
+    only the bytes appended since the previous read. The file lock is taken via
+    the module-global ``_locked`` at call time (tests monkeypatch that name).
+    Returned row dicts are shared read-only snapshots; row ORDER matches a
+    from-scratch ``_final_rows`` exactly (first-occurrence order, updates in
+    place), so aggregation over them is bit-identical to a fresh replay.
+    """
+    key = str(pathlib.Path(root).resolve(strict=False))
+    with _locked(root):
+        with _ROWS_MEMO_LOCK:
+            memo = _ROWS_MEMO.get(key)
+        advanced = _read_new_records_locked(root, memo.resume) if memo is not None else None
+        if advanced is None:
+            records = _read_records_locked(root)
+            memo = _LedgerRowsMemo(
+                resume=_ledger_resume_state(root, records),
+                final_rows=_final_rows(records),
+            )
+        else:
+            new_records, new_resume = advanced
+            for row in new_records:
+                memo.final_rows[str(row["attempt_id"])] = row
+            memo.resume = new_resume
+        with _ROWS_MEMO_LOCK:
+            _ROWS_MEMO[key] = memo
+        return list(memo.final_rows.values())
+
+
 def usage_projection(
     drive_root: pathlib.Path | str | None = None,
     *,
@@ -323,8 +382,7 @@ def usage_projection(
 ) -> Dict[str, Any]:
     """Return a replayed global projection, or one root/subtree projection."""
     root = _drive_root(drive_root)
-    with _locked(root):
-        final = list(_final_rows(_read_records_locked(root)).values())
+    final = _memoized_final_rows(root)
     integrity_degraded = (root / QUARANTINE_REL).is_file()
     if root_task_id:
         final = [row for row in final if str(row.get("root_task_id") or "") == root_task_id]
@@ -366,8 +424,7 @@ def usage_breakdown(
 ) -> Dict[str, Any]:
     """Read-only physical-call/token/cost buckets from validated ledger finals."""
     root = _drive_root(drive_root)
-    with _locked(root):
-        rows = list(_final_rows(_read_records_locked(root)).values())
+    rows = _memoized_final_rows(root)
     integrity_degraded = (root / QUARANTINE_REL).is_file()
     if root_task_id:
         rows = [row for row in rows if str(row.get("root_task_id") or "") == root_task_id]

@@ -1266,6 +1266,32 @@ def _current_custody_session_id() -> str:
         return ""
 
 
+def _bind_worker_repo_root(repo_dir: str, drive_root: str = "") -> None:
+    """Point git_ops' roots at the repo and data dir this worker was told to serve.
+
+    ``git_ops.REPO_DIR`` is a module global with no env fallback, and ``git_ops.init()`` is never
+    called at boot, so a worker inherits the hardcoded ``~/Ouroboros/repo`` default. Under the
+    spawn start method (macOS/Windows) the child re-imports the module and gets that default even
+    when it serves a checkout somewhere else — and ``update_merge._update_tx_marker_path()``
+    resolves through it, so the worker's managed-update tool gate would read ANOTHER repo's
+    transaction. Bind it from the ``repo_dir`` this worker already receives.
+
+    ``DRIVE_ROOT`` moves with it: the same re-import leaves it on the default data dir, so a
+    worker serving a custom install would write git_ops' rescue snapshots and logs under an
+    unrelated home directory. Both values are handed to this process; the branch names and
+    REMOTE_URL are NOT, which is also why this is a direct assignment rather than
+    ``git_ops.init()`` — init() would overwrite them with its own defaults, silently retargeting
+    an install whose branches differ. They keep whatever the child imported.
+    """
+    import pathlib as _pl
+
+    from supervisor import git_ops as _git_ops
+
+    _git_ops.REPO_DIR = _pl.Path(repo_dir)
+    if drive_root:
+        _git_ops.DRIVE_ROOT = _pl.Path(drive_root)
+
+
 def _prepare_worker_task_runtime() -> None:
     """Load the managed-update authorization path before a live merge can conflict."""
     import supervisor.update_merge  # noqa: F401
@@ -1280,6 +1306,9 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     # fork-safety guard (no _scproxy/SCDynamicStoreCopyProxies on the child side
     # of fork) and a clean default for spawned workers too.
     _os.environ["OUROBOROS_IN_WORKER"] = "1"
+    # Before ANY import that resolves the update-tx marker through git_ops (see
+    # _bind_worker_repo_root): a spawned child would otherwise gate on the hardcoded default repo.
+    _bind_worker_repo_root(repo_dir, drive_root)
     # Adopt the server's custody session id. Under the 'spawn' start method this
     # process re-imported process_custody and minted a fresh _SESSION_ID; without
     # adopting the server's id, every service/process this worker records looks
