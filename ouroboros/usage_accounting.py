@@ -541,6 +541,16 @@ def usage_breakdown(
         "by_category": by_category,
         "by_task": by_task,
         "by_root": by_root,
+        # Execution-axis filter (v6.91): the delegated (subscription-harness)
+        # rows only — a VIEW over the same rows for "where did the money go"
+        # readers, never a third monetary sum or authority. Disclosed-free
+        # sessions settle at $0 here; undisclosed spend stays in `unknown`.
+        "delegated": _with_integrity(
+            _breakdown_bucket(
+                [row for row in rows if str(row.get("kind") or "") == "subscription_session"]
+            ),
+            integrity_degraded,
+        ),
         # Legacy call-count metadata and monetary delta stay explicit; neither
         # is fabricated into a model/provider/category identity.
         "unattributed": {
