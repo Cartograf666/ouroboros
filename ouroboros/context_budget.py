@@ -23,7 +23,23 @@ from __future__ import annotations
 
 # Main-loop emergency tool-history compaction trigger (~300K tokens at chars/4).
 # Remote routine compaction stays off by design; this is the overflow backstop.
+# NECESSITY is judged on this budget in CALIBRATED real tokens (chars/4 × the
+# main-loop measured density, neutral 1.0 cold): on a ~1.7×-dense Claude route
+# the raw-char form silently meant ~500K real tokens, engaging only deep into
+# the task and then thrashing (see the hysteresis constants below).
 EMERGENCY_COMPACTION_CHARS = 1_200_000
+
+# Emergency-compaction hysteresis (the necessity-vs-utility split). NECESSITY
+# (compact at all?) is total calibrated pressure — the frozen frame (system
+# blocks + tools + protected/kept rounds) counts toward the provider window.
+# UTILITY (can a pass help?) is the COMPACTABLE region only: after a pass that
+# could NOT get the context below the trigger (the frame alone exceeds it —
+# the submarine wave3 shape: 35/35 rounds fired, each pass a light-model call
+# plus a transcript rewrite that collapsed the prompt cache to the static
+# floor), further passes are suppressed until the compactable transcript grows
+# by this factor or this many rounds pass, whichever is first.
+COMPACTION_HYSTERESIS_REGION_GROWTH = 1.2
+COMPACTION_HYSTERESIS_ROUNDS = 10
 
 # Background-consciousness assembled-context guards. P1: fail fast, never
 # silently truncate cognitive artifacts.

@@ -21,7 +21,12 @@ from ouroboros.observability import new_call_id, persist_call
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context import build_user_content, estimate_context_prompt_tokens
-from ouroboros.context_budget import EMERGENCY_COMPACTION_CHARS, LOW_EMERGENCY_COMPACTION_CHARS
+from ouroboros.context_budget import (
+    COMPACTION_HYSTERESIS_REGION_GROWTH,
+    COMPACTION_HYSTERESIS_ROUNDS,
+    EMERGENCY_COMPACTION_CHARS,
+    LOW_EMERGENCY_COMPACTION_CHARS,
+)
 from ouroboros.context_compaction import _tool_round_spans, compact_tool_history_llm
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.utils import estimate_tokens, truncate_review_artifact
@@ -3144,27 +3149,87 @@ def _run_round_compaction(
     # compaction; max => 1.2M-char emergency-only (cache-friendly). No per-model
     # window table; the reactive provider-overflow detector (context.py) drops the
     # agent to low mode if a route's real window turns out smaller than assumed.
+    #
+    # NECESSITY vs UTILITY (the submarine thrash fix). NECESSITY — should we
+    # compact at all? — is TOTAL calibrated pressure: the frozen frame (system
+    # blocks, tools, protected/kept rounds) counts toward the provider window even
+    # though no pass can shrink it, and the char budget is compared in CALIBRATED
+    # real tokens (main_loop_token_density: neutral 1.0 cold, measured supersedes
+    # — never the review-pack cold-conservative value, which would demote fresh
+    # installs; the v6.80→v6.81 oscillation). UTILITY — can a pass help, and when
+    # should it refire? — is the COMPACTABLE region only (the transcript beyond
+    # the frozen frame): a pass that could NOT get below the trigger arms a
+    # hysteresis, one loud disclosure replaces the per-round light-model call +
+    # cache-destroying rewrite (wave3: 35/35 rounds fired because the LOW trigger
+    # sits below the irreducible low-mode frame), and the trigger re-arms only
+    # when the region grows ~20% or after N rounds. The reactive provider-overflow
+    # low-retry net (one-shot, loop exit path) is deliberately untouched.
     emergency_chars = LOW_EMERGENCY_COMPACTION_CHARS if ctx.active_context_mode == "low" else EMERGENCY_COMPACTION_CHARS
-    if _estimate_messages_chars(messages) > emergency_chars:
+    from ouroboros.context_fit import main_loop_token_density
+
+    density = main_loop_token_density(ctx.drive_root, ctx.active_model)
+    threshold_real_tokens = emergency_chars / 4.0  # the token budget the char constant documents
+    pressure_real_tokens = (_estimate_messages_chars(messages) / 4.0) * density
+    if pressure_real_tokens > threshold_real_tokens:
+        usage_state = getattr(ctx.tools._ctx, "_accumulated_usage", None)
+        usage_state = usage_state if isinstance(usage_state, dict) else {}
+        spans = _tool_round_spans(messages)
+        region_chars = _estimate_messages_chars(messages[spans[0][0]:]) if spans else 0
+        hysteresis = usage_state.get("_compaction_hysteresis")
+        if isinstance(hysteresis, dict):
+            armed_region = int(hysteresis.get("region_chars") or 0)
+            armed_round = int(hysteresis.get("round") or 0)
+            if (
+                region_chars < armed_region * COMPACTION_HYSTERESIS_REGION_GROWTH
+                and (ctx.round_idx - armed_round) < COMPACTION_HYSTERESIS_ROUNDS
+            ):
+                return messages, None  # armed: a pass cannot help yet (disclosed once, on arming)
+            usage_state.pop("_compaction_hysteresis", None)
         # keep_recent must stay BELOW the current span count or the compactor
         # no-ops (len(spans) <= keep_recent returns as-is): a transcript over
         # the emergency byte threshold with only ~50 huge rounds previously
         # never compacted at all. Halve the history (floor 6), but ALWAYS
         # clamp below the span count so even 2-6 huge rounds compact; with a
         # single round there is nothing older to summarize.
-        span_count = len(_tool_round_spans(messages))
+        span_count = len(spans)
         emergency_keep_recent = min(50, max(6, span_count // 2), max(1, span_count - 1))
         if _persist_compaction_checkpoint(
             messages, drive_root=ctx.drive_root, drive_logs=ctx.drive_logs, task_id=ctx.task_id,
             reason="emergency_context_size", keep_recent=emergency_keep_recent,
             round_idx=ctx.round_idx, event_queue=ctx.event_queue,
         ):
-            return compact_tool_history_llm(
+            messages, usage = compact_tool_history_llm(
                 messages,
                 keep_recent=emergency_keep_recent,
                 drive_root=ctx.drive_root,
                 task_id=ctx.task_id,
             )
+            after_real_tokens = (_estimate_messages_chars(messages) / 4.0) * density
+            if after_real_tokens > threshold_real_tokens:
+                spans_after = _tool_round_spans(messages)
+                region_after = _estimate_messages_chars(messages[spans_after[0][0]:]) if spans_after else 0
+                usage_state["_compaction_hysteresis"] = {
+                    "round": ctx.round_idx,
+                    "region_chars": region_after,
+                }
+                ctx.emit_progress(
+                    "⚠️ Emergency compaction was futile: calibrated context "
+                    f"≈{after_real_tokens / 1000:.0f}K real tokens still exceeds the "
+                    f"≈{threshold_real_tokens / 1000:.0f}K trigger (the frozen frame cannot be "
+                    "compacted). Further passes suppressed until the compactable transcript "
+                    f"grows ≥{COMPACTION_HYSTERESIS_REGION_GROWTH:.1f}x or "
+                    f"{COMPACTION_HYSTERESIS_ROUNDS} rounds pass."
+                )
+                _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+                    "checkpoint_kind": "compaction_hysteresis_armed",
+                    "round": ctx.round_idx,
+                    "reason": "emergency_pass_futile",
+                    "calibrated_real_tokens": int(after_real_tokens),
+                    "threshold_real_tokens": int(threshold_real_tokens),
+                    "compactable_region_chars": region_after,
+                    "token_density": round(float(density), 3),
+                })
+            return messages, usage
         ctx.emit_progress("⚠️ Emergency compaction skipped: forensic checkpoint could not be persisted.")
         return messages, None
 

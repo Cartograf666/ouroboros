@@ -197,6 +197,30 @@ def estimate_context_prompt_tokens(
     return max(0, int(total))
 
 
+def main_loop_token_density(drive_root: Any, model: str) -> float:
+    """MAIN-LOOP calibrated token density: neutral 1.0 cold, measured supersedes.
+
+    The baseline `_route_calibration_ratio` starts from, exposed as its own SSOT so
+    the emergency-compaction necessity trigger and the fit projections share ONE
+    policy. DELIBERATELY NOT ``capability_evidence.resolve_token_density`` — that is
+    the review-pack COLD-CONSERVATIVE value, which on an empty observation store
+    (every fresh install and isolated benchmark server) would silently narrow the
+    main loop's horizon on a guess (the v6.80.0 → v6.81.0 oscillation; BIBLE P1).
+    Only a MEASURED density for this exact model identity may raise it above 1.0.
+    """
+    baseline = 1.0
+    try:
+        from ouroboros.capability_evidence import get_token_density
+        from ouroboros.provider_models import normalize_model_identity
+
+        measured = get_token_density(drive_root, normalize_model_identity(str(model or "")))
+        if measured > 0:
+            baseline = measured
+    except Exception:
+        log.debug("Measured token density unavailable", exc_info=True)
+    return baseline
+
+
 def _route_calibration_ratio(
     drive_root: pathlib.Path,
     route_fp: str,
@@ -225,17 +249,7 @@ def _route_calibration_ratio(
     fresh evidence store; the first successful send records this model's density, after
     which the projection is measured rather than guessed.
     """
-    baseline = 1.0
-    try:
-        from ouroboros.capability_evidence import get_token_density
-        from ouroboros.provider_models import normalize_model_identity
-
-        measured = get_token_density(drive_root, normalize_model_identity(str(model or "")))
-        if measured > 0:
-            baseline = measured
-    except Exception:
-        log.debug("Measured token density unavailable for context fit", exc_info=True)
-    ratios = [float(baseline)]
+    ratios = [float(main_loop_token_density(drive_root, model))]
     try:
         events_path = pathlib.Path(drive_root) / "logs" / "events.jsonl"
         for event in iter_jsonl_objects(
