@@ -2063,6 +2063,13 @@ def _count_live_sibling_children(ctx: ToolContext, status_drive_root: Path, *, e
         return 0
 
 
+# Registration-race grace for a wait set in which NOTHING was minted (v6.91):
+# "not YET registered" is a real state for a child scheduled moments ago, so a
+# phantom-only wait still polls — but only for this long, instead of blocking
+# the parent for the whole requested window on ids that exist nowhere.
+_UNMINTED_WAIT_GRACE_SEC = 30.0
+
+
 def _unminted_wait_ids(ctx: ToolContext, status_drive_root: Path, task_ids: List[str]) -> List[str]:
     """Ids with no trace on ANY surface this tree mints ids through: no task
     result, no queue-snapshot row, and no tree-ledger row naming them (v6.91).
@@ -2146,7 +2153,12 @@ def _wait_for_tasks(
     timeout_sec: int = 600,
     mode: str = "all_terminal",
 ) -> str:
-    """Wait for multiple subtasks and return a compact structural projection per child."""
+    """Wait for multiple subtasks and return a compact structural projection per child.
+
+    A wait set whose ids were ALL unminted at entry ends after the registration
+    grace instead of the full requested window (disclosed as
+    ``wait_short_circuited``); any id that turns real during the grace makes it
+    an ordinary wait again, with the remaining window intact."""
     if not isinstance(task_ids, list) or not task_ids:
         return "⚠️ TOOL_ARG_ERROR (wait_tasks): task_ids must be a non-empty list."
     from ouroboros.config import MAX_ACTIVE_SUBAGENTS_HARD_CAP
@@ -2178,10 +2190,45 @@ def _wait_for_tasks(
     # is disclosed instead of silently starving the wait (wave2: three
     # hallucinated ids blocked 900s slices while the real lead went unwaited).
     entry_unknown_ids = _unminted_wait_ids(ctx, status_drive_root, normalized_ids)
+    # One beacon cursor for the whole wait, so a two-phase window cannot skip an
+    # attention beacon emitted during its first phase.
+    _wait_since = utc_now_iso()
+    # A wait set in which EVERY id is unminted cannot be satisfied by waiting —
+    # nothing was ever scheduled to terminate. Spend only the registration-race
+    # grace on it (wave1's root blocked its whole window on three hallucinated
+    # ids), then re-probe; the moment any id turns real this becomes an ordinary
+    # wait and gets the rest of the requested window.
+    _phantom_only = bool(entry_unknown_ids) and len(entry_unknown_ids) == len(normalized_ids)
+    first_window = min(float(timeout), _UNMINTED_WAIT_GRACE_SEC) if _phantom_only else float(timeout)
     waited = wait_for_effective_tasks(
-        status_drive_root, normalized_ids, timeout_sec=timeout, mode=normalized_mode,
-        on_poll=_wait_attention_poll(ctx, utc_now_iso()), poll_interval_sec=2.0,
+        status_drive_root, normalized_ids, timeout_sec=first_window, mode=normalized_mode,
+        on_poll=_wait_attention_poll(ctx, _wait_since), poll_interval_sec=2.0,
     )
+    if _phantom_only and first_window < float(timeout) and waited.get("early_return") is None:
+        entry_unknown_ids = _unminted_wait_ids(ctx, status_drive_root, normalized_ids)
+        if len(entry_unknown_ids) < len(normalized_ids):
+            elapsed = float(waited.get("elapsed_sec") or 0.0)
+            resumed = wait_for_effective_tasks(
+                status_drive_root, normalized_ids,
+                timeout_sec=max(0.0, float(timeout) - elapsed), mode=normalized_mode,
+                on_poll=_wait_attention_poll(ctx, _wait_since), poll_interval_sec=2.0,
+            )
+            resumed["elapsed_sec"] = float(resumed.get("elapsed_sec") or 0.0) + elapsed
+            resumed["timeout_sec"] = float(timeout)
+            waited = resumed
+        else:
+            # Disclosed, not silent: the wait ended early and says why.
+            waited["wait_short_circuited"] = {
+                "reason": "all_task_ids_unminted",
+                "requested_timeout_sec": float(timeout),
+                "waited_sec": round(float(waited.get("elapsed_sec") or 0.0), 1),
+                "note": (
+                    "Every requested task_id was unminted at entry and still unminted after "
+                    f"the {int(_UNMINTED_WAIT_GRACE_SEC)}s registration grace, so the wait "
+                    "returned instead of blocking for the full timeout. Fix the wait set from "
+                    "children_roster / your schedule_subagent results, then wait again."
+                ),
+            }
     tasks = waited.get("tasks")
     if isinstance(tasks, dict):
         from ouroboros.tools.join_ledger import _child_result_sha256

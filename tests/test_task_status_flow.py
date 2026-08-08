@@ -670,6 +670,70 @@ def test_wait_for_tasks_flags_unknown_ids_and_attaches_children_roster(tmp_path)
     assert roster[0]["cost_usd"] == 0.55
 
 
+def test_wait_for_tasks_phantom_only_set_short_circuits_the_window(tmp_path, monkeypatch):
+    """A wait set in which NOTHING was ever minted ends after the registration
+    grace instead of blocking the whole requested window — and says so."""
+    import json as _json
+
+    from ouroboros.tools import control
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(
+        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
+    )
+    monkeypatch.setattr(control, "_UNMINTED_WAIT_GRACE_SEC", 0.1)
+
+    ctx = SimpleNamespace(drive_root=tmp_path, task_id="waitparent3", task_metadata={})
+    started = time.monotonic()
+    payload = json.loads(control._wait_for_tasks(ctx, ["phantomid7", "phantomid8"], timeout_sec=600))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 30, "phantom-only wait must not block for the requested window"
+    short = payload["wait_short_circuited"]
+    assert short["reason"] == "all_task_ids_unminted"
+    assert short["requested_timeout_sec"] == 600.0
+    assert sorted(payload["unknown_task_ids"]) == ["phantomid7", "phantomid8"]
+
+
+def test_wait_for_tasks_id_minted_during_grace_keeps_waiting(tmp_path, monkeypatch):
+    """The grace is for the registration race: an id that becomes real during it
+    is a genuine child, so the wait resumes with the remaining window."""
+    import json as _json
+
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools import control
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(
+        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
+    )
+    monkeypatch.setattr(control, "_UNMINTED_WAIT_GRACE_SEC", 0.1)
+
+    real_calls = {"n": 0}
+    original = control._unminted_wait_ids
+
+    def _mint_after_grace(ctx, drive_root, task_ids):
+        real_calls["n"] += 1
+        if real_calls["n"] > 1:
+            # The child registered during the grace window.
+            write_task_result(
+                tmp_path, "latechild1", STATUS_COMPLETED, result="registered late",
+                parent_task_id="waitparent4", root_task_id="waitparent4",
+                delegation_role="subagent",
+            )
+        return original(ctx, drive_root, task_ids)
+
+    monkeypatch.setattr(control, "_unminted_wait_ids", _mint_after_grace)
+    ctx = SimpleNamespace(drive_root=tmp_path, task_id="waitparent4", task_metadata={})
+    payload = json.loads(control._wait_for_tasks(ctx, ["latechild1"], timeout_sec=5))
+
+    assert "wait_short_circuited" not in payload
+    assert payload["timeout_sec"] == 5.0
+    assert payload["tasks"]["latechild1"]["status"] == STATUS_COMPLETED
+
+
 def test_wait_for_tasks_queue_scheduled_id_is_not_unknown(tmp_path):
     """An id with a queue-snapshot row but no task result yet is a REAL child
     (just-scheduled), never a phantom — and without unknowns the roster is not

@@ -680,9 +680,14 @@ yet registered or never scheduled"; the id keeps polling — a just-scheduled
 child is a real state), attaching `unknown_task_ids` plus a compact
 `children_roster` of the caller's ACTUAL direct children (v6.71.2 field set,
 never envelopes) so the parent repairs its wait set instead of starving on
-phantoms (wave2 blocked 900s slices on three hallucinated ids). A missing/
-unreadable probe surface treats the id as known — a real child is never
-branded unknown on an I/O error.
+phantoms (wave2 blocked 900s slices on three hallucinated ids). When EVERY
+requested id is unminted the wait cannot be satisfied by waiting at all, so it
+polls only for the registration-race grace (`_UNMINTED_WAIT_GRACE_SEC`, 30s)
+and returns with a disclosed `wait_short_circuited` block naming the requested
+timeout — but if any id turns real during the grace it becomes an ordinary wait
+again and spends the rest of the requested window. A missing/unreadable probe
+surface treats the id as known — a real child is never branded unknown on an
+I/O error.
 
 A burst of `schedule_subagent` calls emitted in ONE tool-call round runs in the
 existing tool ThreadPool instead of sequentially (`schedule_subagent` is in
