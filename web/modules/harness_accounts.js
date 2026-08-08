@@ -456,6 +456,13 @@ export async function promptProfileName({ dialogImpl = openConfirmDialog } = {})
 
 const state = {
     payload: null,
+    // A status read is in flight. Only reads BEFORE the first settle repaint on
+    // it (see refreshStatus): once anything has been said, a silent refresh
+    // beats churn — and beats flickering muted↔error against a failing endpoint.
+    statusChecking: false,
+    statusEverSettled: false,
+    // The live read, shared by every caller (single-flight; see refreshStatus).
+    statusInFlight: null,
     // { harness, profile, jobId, job, attachCommand, error, startedAtMs,
     //   engineDegraded, inputValue, inputBusy, inputSent, inputError,
     //   verdict, confirming, advancedOpen }
@@ -493,11 +500,18 @@ export function runtimeActionLabel(payload) {
     return 'Connect';
 }
 
-export function daemonStatusLine(payload) {
+export function daemonStatusLine(payload, { checking = false } = {}) {
     const daemon = payload?.daemon || {};
     const runtime = daemon.runtime || {};
     const runtimeState = String(runtime.state || '');
     const status = String(daemon.state || 'unknown');
+    // Nothing read yet and a read in flight: SAY so, and say what it costs. The
+    // daemon re-probes every coding-agent CLI on each read, so first paint is
+    // tens of seconds — and an unexplained silent panel reads as "broken", not
+    // as "loading" (owner report, 2026-08-08).
+    if (checking && !daemon.state) {
+        return { tone: 'muted', text: 'Checking Claudexor… the first read probes each coding-agent CLI and can take a minute or more.' };
+    }
     if (daemon.ownership_problem) {
         return { tone: 'error', text: `This daemon home is not managed from here: ${daemon.ownership_problem}` };
     }
@@ -525,7 +539,20 @@ export function daemonStatusLine(payload) {
         return { tone: 'muted', text: 'No accounts connected yet. Connect installs Claudexor and starts Ouroboros’s own agent daemon automatically.' };
     }
     if (status === 'stale') {
-        return { tone: 'warn', text: 'Daemon home exists but the daemon is not answering; the next login restarts it.' };
+        // NOT a warning: the daemon is LAZY by design (the status read never
+        // spawns it), so "home exists, nothing answering" is the ordinary idle
+        // state, not a fault. Lead with what is true and what happens next; a
+        // genuine RUNTIME fault renders through the `error` branch above.
+        // Disclosed residual (both review lenses, 2026-08-08): `stale` is also
+        // what a CRASHED daemon lands in — the state machine cannot tell the two
+        // apart (the detail lives only in last_error, which the warn-toned line
+        // never showed either), so the only thing a crash loses here is the
+        // alarming tone. The sentence stays true for it: ensure_running restarts
+        // a dead daemon on the next login or delegated run, and a crash mid-run
+        // surfaces through that run's own typed failure, not this panel. Hence
+        // no "yet" — that word would claim it had never started.
+        const version = runtime.version ? ` ${runtime.version}` : '';
+        return { tone: 'muted', text: `Claudexor${version} is installed; the agent daemon is not running. It starts automatically on the next login or delegated run.` };
     }
     if (status === 'foreign_daemon') {
         return { tone: 'warn', text: 'Another daemon answered on the stale port (not ours — left untouched). The next login restarts our own daemon on a fresh port.' };
@@ -582,7 +609,9 @@ function renderRows() {
     const statusEl = document.getElementById('harness-daemon-status');
     if (!host || !statusEl) return;
     const payload = state.payload || {};
-    const line = daemonStatusLine(payload);
+    const line = daemonStatusLine(payload, {
+        checking: state.statusChecking && !state.statusEverSettled,
+    });
     statusEl.textContent = line.text;
     statusEl.dataset.tone = line.tone;
     const rows = accountRows(payload);
@@ -1103,7 +1132,7 @@ function stopJobPolling() {
     state.jobTimer = 0;
 }
 
-export async function refreshStatus({ force = false } = {}) {
+export async function refreshStatus({ force = false, fetchImpl = apiFetch } = {}) {
     // Poll only while the section is actually on screen. Each tick fans out to four
     // daemon round-trips, and the interval started at app load and never stopped —
     // so every page in the app paid for them (`.page` is display:none when inactive,
@@ -1118,12 +1147,32 @@ export async function refreshStatus({ force = false } = {}) {
         hidden: document.hidden,
         force,
     })) return;
-    try {
-        const resp = await apiFetch('/api/claudexor/status', { cache: 'no-store' });
-        const data = await resp.json().catch(() => ({}));
-        if (resp.ok) state.payload = data;
-    } catch (err) { /* transient; next poll retries */ }
-    renderRows();
+    // SINGLE-FLIGHT. The 5s interval outlives a read that takes tens of seconds,
+    // and each read fans out to four CLI-probing daemon GETs — unguarded, a
+    // visible panel stacks ~6 reads (~24 concurrent probes) against the very
+    // daemon whose slowness this is meant to relieve, and the first response to
+    // land clears the flag while later ones are still running. Callers share the
+    // live read; the interval's next tick starts the next one.
+    if (state.statusInFlight) return state.statusInFlight;
+    state.statusChecking = true;
+    // Repaint BEFORE the request only until the first read SETTLES (success or
+    // failure) — with anything already said, a per-poll repaint is churn, and
+    // against a persistently failing endpoint it flickers muted↔error every tick.
+    if (!state.statusEverSettled) renderRows();
+    state.statusInFlight = (async () => {
+        try {
+            const resp = await fetchImpl('/api/claudexor/status', { cache: 'no-store' });
+            const data = await resp.json().catch(() => ({}));
+            if (resp.ok) state.payload = data;
+        } catch (err) { /* transient; next poll retries */
+        } finally {
+            state.statusChecking = false;
+            state.statusEverSettled = true;
+            state.statusInFlight = null;
+        }
+        renderRows();
+    })();
+    return state.statusInFlight;
 }
 
 // #125: wake the visibility-gated refresh the moment the section can actually

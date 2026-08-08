@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
 from starlette.requests import Request
@@ -142,13 +143,27 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
         with ClaudexorGateway(endpoint) as gateway:
             gateway.handshake()
             payload["daemon"]["engine_version"] = gateway.engine_version
-            catalog = gateway.agent_capabilities()
+            # The catalog, manifest, profile and quota reads are INDEPENDENT GETs
+            # over one thread-safe httpx client, and each costs SECONDS daemon-side
+            # (it probes the real coding-agent CLIs on every read: binary, version,
+            # login state). Serialized, the panel waited for their SUM — ~23s on a
+            # warm daemon with nothing on screen; fanned out it waits for the
+            # slowest. Failure semantics are deliberately unchanged: the results are
+            # read back in the ORIGINAL order, so a catalog/profile/quota refusal
+            # still surfaces as the typed unreachable state below, and a manifest
+            # refusal still fails OPEN.
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                catalog_call = pool.submit(gateway.agent_capabilities)
+                manifests_call = pool.submit(gateway.harnesses)
+                profiles_call = pool.submit(gateway.credential_profiles)
+                quota_call = pool.submit(gateway.quota_snapshots)
+            catalog = catalog_call.result()
             # Account surfaces show only harnesses with a login concept. On a
             # transient manifest-read failure — or a successful read with zero
             # readable manifests (the helper answers None) — fail OPEN
             # (no filter): a blip must not blank the panel.
             try:
-                capable = _login_capable_harness_ids(gateway.harnesses())
+                capable = _login_capable_harness_ids(manifests_call.result())
             except ClaudexorUnavailable:
                 capable = None
             rows: List[Dict[str, Any]] = []
@@ -175,7 +190,7 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                         projected["models_error"] = exc.code
                 rows.append(projected)
             payload["harnesses"] = rows
-            profiles = gateway.credential_profiles()
+            profiles = profiles_call.result()
             accounts = profiles.get("harnessAccounts") if isinstance(profiles, dict) else None
             if capable is not None and isinstance(accounts, list):
                 # The daemon emits a native pseudo-row for EVERY adapter,
@@ -206,7 +221,7 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                     and str(w["profile"].get("harness_id") or "") in (capable | vouched)
                 ]
             payload["profiles"] = profiles
-            payload["quota"] = gateway.quota_snapshots()
+            payload["quota"] = quota_call.result()
     except ClaudexorUnavailable as exc:
         payload["daemon"]["state"] = "unreachable"
         payload["daemon"]["last_error"] = f"{exc.code}: {exc}"

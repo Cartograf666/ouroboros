@@ -11,6 +11,7 @@ import {
     attachFallbackDue,
     confirmLoginLive,
     daemonStatusLine,
+    refreshStatus,
     deviceCodeDisclosure,
     failureText,
     jobDetail,
@@ -55,6 +56,32 @@ test('managed runtime keeps one contextual Connect intent across install, repair
     const repair = daemonStatusLine(payload({ state: 'error', last_error: 'checksum mismatch' }));
     assert.equal(repair.tone, 'error');
     assert.ok(repair.text.includes('Connect retries automatically'));
+});
+
+test('a slow first read says it is checking, and an idle daemon is not dressed as a fault', () => {
+    // Owner report (2026-08-08): the panel sat silent for tens of seconds and then
+    // showed a WARN line about the daemon "not answering" — indistinguishable from
+    // breakage. Both faces are pinned: the in-flight first read announces itself
+    // with its real cost, and the ordinary idle daemon reads as installed-and-lazy.
+    const checking = daemonStatusLine({}, { checking: true });
+    assert.equal(checking.tone, 'muted');
+    assert.ok(checking.text.includes('Checking Claudexor'));
+    assert.ok(/minute/.test(checking.text), 'the honest cost of the first read is stated');
+
+    // Once ANY daemon state is known the checking line steps aside — a stable
+    // line beats a flicker on every 5s poll.
+    const known = daemonStatusLine(
+        { daemon: { state: 'running', engine_version: '3.3.13', runtime: {} } },
+        { checking: true },
+    );
+    assert.equal(known.tone, 'ok');
+    assert.ok(known.text.includes('3.3.13'));
+
+    const idle = daemonStatusLine({ daemon: { state: 'stale', runtime: { state: 'ready', version: '3.3.13' } } });
+    assert.equal(idle.tone, 'muted', 'a lazy daemon is not a warning');
+    assert.ok(idle.text.includes('3.3.13 is installed'));
+    assert.ok(/starts automatically/.test(idle.text), 'the line says what happens next');
+    assert.ok(!/not answering/.test(idle.text), 'no fault language for the ordinary idle state');
 });
 
 test('the login card explains foreground runtime preparation and retries the same intent', () => {
@@ -1011,4 +1038,69 @@ test('loginSettleProven: only a TERMINAL job snapshot proves the settle — an u
     assert.equal(loginSettleProven({ job: { state: 'succeeded' } }), true);
     assert.equal(loginSettleProven({ job: { state: 'failed' } }), true);
     assert.equal(loginSettleProven({ job: { state: 'cancelled' } }), true);
+});
+
+
+// The wiring of the loading state, not just its wording: a revert that deletes
+// the flag plumbing (keeping daemonStatusLine intact) must go RED here.
+function stubStatusDom() {
+    const host = { offsetParent: {}, innerHTML: '', querySelectorAll: () => [] };
+    const statusEl = { textContent: '', dataset: {} };
+    const lines = [];
+    const el = {
+        'harness-accounts-rows': host,
+        'harness-daemon-status': new Proxy(statusEl, {
+            set(target, key, value) {
+                if (key === 'textContent') lines.push(value);
+                target[key] = value;
+                return true;
+            },
+        }),
+        'harness-login-card': null,
+    };
+    globalThis.document = { getElementById: (id) => el[id] ?? null, hidden: false };
+    return { lines };
+}
+
+test('the status poll is single-flight and announces the first read before it lands', async () => {
+    const previousDocument = globalThis.document;
+    const { lines } = stubStatusDom();
+    try {
+        let started = 0;
+        let release = null;
+        const gate = new Promise((resolve) => { release = resolve; });
+        const fetchImpl = async () => {
+            started += 1;
+            await gate;
+            return { ok: true, json: async () => ({ daemon: { state: 'running', engine_version: '3.3.13', runtime: {} } }) };
+        };
+
+        const first = refreshStatus({ force: true, fetchImpl });
+        // Painted BEFORE the response: the panel says it is checking, muted.
+        assert.ok(lines.some((line) => line.includes('Checking Claudexor')),
+            'the first read announces itself before it lands');
+
+        // Every caller while one read is live SHARES it — the 5s interval must not
+        // stack reads over a request that takes tens of seconds (each fans out to
+        // four CLI-probing daemon GETs).
+        const joined = [refreshStatus({ force: true, fetchImpl }), refreshStatus({ fetchImpl })];
+        assert.equal(started, 1, 'overlapping polls did not start a second read');
+
+        release();
+        await Promise.all([first, ...joined]);
+        assert.equal(started, 1, 'the shared read served every caller');
+        assert.ok(lines.at(-1).includes('3.3.13'), 'the settled read replaces the checking line');
+
+        // After the first settle the checking line never returns: a stable line
+        // beats flickering muted<->error on every tick.
+        lines.length = 0;
+        const fourth = refreshStatus({ force: true, fetchImpl });
+        assert.equal(started, 2, 'a settled read releases the single-flight slot');
+        assert.ok(!lines.some((line) => line.includes('Checking Claudexor')),
+            'no pre-request repaint once anything has been said');
+        release();
+        await fourth;
+    } finally {
+        globalThis.document = previousDocument;
+    }
 });

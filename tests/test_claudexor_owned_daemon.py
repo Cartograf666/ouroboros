@@ -1335,3 +1335,122 @@ def test_spawn_env_never_leaves_an_empty_path_component(monkeypatch, tmp_path):
         f"({env[path_key]!r}); on POSIX that is the current working directory"
     )
     assert components[0] == str(pathlib.Path(sys.executable).parent)
+
+
+def test_status_payload_fans_out_the_independent_daemon_reads(monkeypatch, tmp_path):
+    """The four catalog/manifest/profile/quota GETs run CONCURRENTLY.
+
+    Each costs seconds daemon-side (it re-probes the coding-agent CLIs on every
+    read), so serialized they made the Providers panel wait for their SUM — ~23s
+    on a warm daemon, with nothing on screen (owner report, 2026-08-08).
+
+    The pin is a rendezvous, not a stopwatch: all four reads must meet at one
+    barrier before any returns, which only a genuine fan-out can do. Serialized
+    code times out at the barrier instead of failing on a wall-clock margin no
+    loaded CI machine can honor (review lens, 2026-08-08).
+    """
+    import threading
+
+    from ouroboros.gateway.claudexor_accounts import _status_payload
+    from ouroboros.gateways import claudexor as gw
+
+    rendezvous = threading.Barrier(4, timeout=10)
+
+    class FakeDaemon:
+        def status_dict(self):
+            return {"state": "running"}
+
+    class FakeGateway:
+        engine_version = "3.3.13"
+
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self, **_kw):
+            return {}
+
+        def agent_capabilities(self):
+            rendezvous.wait()
+            return {"harnesses": [{"id": "codex", "displayName": "Codex CLI",
+                                   "status": "ok", "enabled": True}]}
+
+        def harnesses(self):
+            rendezvous.wait()
+            return [{"id": "codex", "manifest": {"capability_profile": {"auth": {
+                "supported_sources": ["native_session"]}}}}]
+
+        def credential_profiles(self):
+            rendezvous.wait()
+            return {"profiles": [], "harnessAccounts": []}
+
+        def quota_snapshots(self):
+            rendezvous.wait()
+            return [{"subject": {"harness": "codex"}}]
+
+    monkeypatch.setattr(owned, "get_owned_daemon", lambda: FakeDaemon())
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
+
+    # Serialized, the first read blocks forever waiting for siblings that never
+    # start: the barrier breaks and the call raises instead of quietly passing.
+    payload = _status_payload(include_models=False)
+
+    assert [h["id"] for h in payload["harnesses"]] == ["codex"]
+    assert payload["quota"] and payload["profiles"] == {"profiles": [], "harnessAccounts": []}
+
+
+def test_status_payload_keeps_typed_unreachable_when_a_fanned_out_read_refuses(monkeypatch, tmp_path):
+    """Concurrency must not change WHAT a refusal means: a catalog read that
+    raises still lands as the typed unreachable daemon state, not a half-filled
+    panel that looks healthy."""
+    from ouroboros.gateway.claudexor_accounts import _status_payload
+    from ouroboros.gateways import claudexor as gw
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    class FakeDaemon:
+        def status_dict(self):
+            return {"state": "running"}
+
+    class FakeGateway:
+        engine_version = "3.3.13"
+
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self, **_kw):
+            return {}
+
+        def agent_capabilities(self):
+            raise ClaudexorUnavailable("daemon_unreachable", "gone mid-read")
+
+        def harnesses(self):
+            return []
+
+        def credential_profiles(self):
+            return {}
+
+        def quota_snapshots(self):
+            return []
+
+    monkeypatch.setattr(owned, "get_owned_daemon", lambda: FakeDaemon())
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
+
+    payload = _status_payload(include_models=False)
+    assert payload["daemon"]["state"] == "unreachable"
+    assert "daemon_unreachable" in payload["daemon"]["last_error"]
+    assert payload["harnesses"] == []
