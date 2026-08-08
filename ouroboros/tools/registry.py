@@ -2302,9 +2302,13 @@ class ToolRegistry:
             # WORKSPACE_SHELL_BLOCKED that named the wrong reason. The marginal
             # escalation is nil — the same history is already readable through the
             # gated read_file this very message points the agent at — while the
-            # SECRET/credential surface is untouched: the exemption is ALL-or-nothing
-            # per segment, so `git status && cat <data>/settings.json` is not exempt,
-            # and every non-git shell still meets the full guard.
+            # SECRET/credential surface stays closed because the exemption is
+            # ALL-or-nothing per segment (`git status && cat <data>/settings.json`
+            # is not exempt; every non-git shell still meets the full guard) AND
+            # write-aware: `is_readonly_git_command` refuses the key to a read-only
+            # subcommand carrying the file-truncating `--output=<file>` diff option
+            # or `--no-index` (which reads arbitrary host files), so neither a
+            # runtime write nor a settings.json dump can ride "read-only git".
             if is_external_workspace(self._ctx) and not is_readonly_git_command(raw_cmd):
                 if ext_block := self._external_shell_runtime_or_secret_block(
                     raw_cmd, cmd_path_lower, args, work_dir=work_dir
