@@ -2194,7 +2194,8 @@ function-length scan), excluding `web/tests/` and vendored/minified payloads;
 `web/modules/chat.js` is the registered grandfathered JS debt (rel-path-keyed).
 The same sprint added a deterministic hot-store growth health invariant:
 `agent_startup_checks.py::hot_store_growth_notes` (surfaced in every task
-context by `context.py::build_health_invariants`) stats `logs/events.jsonl`,
+context by `context.py::build_health_invariants` and reported once per worker
+boot as the `hot_store_growth` check in `verify_system_state`) stats `logs/events.jsonl`,
 `logs/tools.jsonl`, `logs/progress.jsonl`, and `state/usage_attempts.jsonl`
 against justified byte thresholds in `ouroboros/context_budget.py` and emits a
 WARNING with a remediation pointer; isolated benchmark data roots (the

@@ -512,6 +512,14 @@ def verify_system_state(env: Any, git_sha: str) -> None:
     checks["stray_server_processes"], issue_count = check_stray_server_processes(env)
     issues += issue_count
 
+    # Boot-time surfacing of the same probe context.py::build_health_invariants
+    # reuses per task turn (benchmark-sentinel suppression lives in the probe).
+    growth_notes = hot_store_growth_notes(env)
+    checks["hot_store_growth"] = (
+        {"status": "warning", "notes": growth_notes} if growth_notes else {"status": "ok"}
+    )
+    issues += 1 if growth_notes else 0
+
     # Reconcile stale hung reviewed attempts left by abrupt process death
     try:
         import pathlib

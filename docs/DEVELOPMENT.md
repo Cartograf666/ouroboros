@@ -558,7 +558,11 @@ add or change an endpoint/poller/subscription/timer or read a growing store;
 the hot-store growth health invariant
 (`agent_startup_checks.py::hot_store_growth_notes`, surfaced by
 `context.py::build_health_invariants`, thresholds justified in
-`ouroboros/context_budget.py`) is the deterministic runtime tripwire.
+`ouroboros/context_budget.py`) is the deterministic runtime tripwire. A change
+that introduces a new append-only store read on an interactive path must
+enroll that store in the `ouroboros/context_budget.py` threshold table (with a
+justified constant) in the same commit — an unenrolled hot store is invisible
+to the tripwire.
 
 ### Invariant: UI resources carry a disposer
 
