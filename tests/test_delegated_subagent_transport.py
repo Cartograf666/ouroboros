@@ -5816,3 +5816,93 @@ def test_bounded_poll_retries_the_git_atomic_object_race_once():
         raised = True
     assert raised
     assert not is_transient_git_object_race(RuntimeError("connection refused"))
+
+
+def test_executor_resolution_row_also_lands_in_canonical_events(tmp_path):
+    """W3 adjacent (c): a delegated child's forked drive is pruned with the task,
+    so the subagent_executor_resolved row must ALSO land in the canonical
+    events.jsonl (the accounting root the task already carries). The root
+    agent's own drive IS canonical — no duplicate row there."""
+    import json
+    from types import SimpleNamespace
+
+    from ouroboros.agent import _record_executor_resolution
+
+    child_logs = tmp_path / "child_drive" / "logs"
+    canonical = tmp_path / "data"
+    child_logs.mkdir(parents=True)
+    (canonical / "logs").mkdir(parents=True)
+
+    dispatch = SimpleNamespace(executor_resolution=SimpleNamespace(
+        requested="auto", executor="native",
+        reason=SUBSCRIPTION_WINDOW_EXHAUSTED, reset_at="2030-01-01T00:00:00Z", route=None,
+    ))
+    task = {"id": "child1", "budget_drive_root": str(canonical)}
+    _record_executor_resolution(child_logs, task, dispatch)
+
+    def _rows(path):
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    child_rows = _rows(child_logs / "events.jsonl")
+    canon_rows = _rows(canonical / "logs" / "events.jsonl")
+    assert len(child_rows) == 1 and len(canon_rows) == 1
+    assert canon_rows[0]["type"] == "subagent_executor_resolved"
+    assert canon_rows[0]["reason"] == SUBSCRIPTION_WINDOW_EXHAUSTED
+    assert canon_rows[0]["reset_at"] == "2030-01-01T00:00:00Z"
+
+    # Same drive (the root agent): exactly one row, no self-duplicate.
+    root_task = {"id": "root1", "budget_drive_root": str(canonical)}
+    _record_executor_resolution(canonical / "logs", root_task, dispatch)
+    canon_rows = _rows(canonical / "logs" / "events.jsonl")
+    assert len([r for r in canon_rows if r["task_id"] == "root1"]) == 1
+
+
+def test_subscription_window_exhausted_beacon_wakes_the_waiting_parent(tmp_path, monkeypatch):
+    """W3 adjacent (c): the D28 spent-window resolution appends a typed ADVISORY
+    delegation_constraint to the task-tree ledger (reset_at + child id), riding
+    the attention channel the wait tools already early-wake on — and the
+    enforcement reducer skips it (advisory = disclosure, not a gate)."""
+    from types import SimpleNamespace
+
+    from ouroboros import task_tree_ledger as ledger_mod
+    from ouroboros.agent import _record_executor_resolution
+    from ouroboros.tools.control_delegation import effective_delegation_budget
+
+    monkeypatch.setattr(ledger_mod, "DATA_DIR", tmp_path)
+    child_logs = tmp_path / "child_drive" / "logs"
+    child_logs.mkdir(parents=True)
+
+    dispatch = SimpleNamespace(executor_resolution=SimpleNamespace(
+        requested="auto", executor="native",
+        reason=SUBSCRIPTION_WINDOW_EXHAUSTED, reset_at="2030-01-01T00:00:00Z", route=None,
+    ))
+    task = {"id": "childbeacon1", "parent_task_id": "parentroot1", "root_task_id": "parentroot1"}
+    _record_executor_resolution(child_logs, task, dispatch)
+
+    beacons = ledger_mod.tree_ledger_attention_after("parentroot1", "")
+    assert len(beacons) == 1
+    row = beacons[0]
+    assert row["kind"] == "delegation_constraint"
+    assert row["needs_parent_attention"] is True
+    payload = row["payload"]
+    assert payload["advisory"] is True
+    assert payload["reset_at"] == "2030-01-01T00:00:00Z"
+    assert payload["child_task_id"] == "childbeacon1"
+    assert payload["reason"] == SUBSCRIPTION_WINDOW_EXHAUSTED
+
+    # Advisory: the schedule-time enforcement reducer must NOT gate on it.
+    decision = effective_delegation_budget(
+        {}, missing_capabilities=[],
+        unresolved_constraints=ledger_mod.open_delegation_constraints("parentroot1"),
+        write_surface="", role="researcher", requested_lane="", intended_lane="light",
+        active_child_count=0,
+    )
+    assert decision.ok
+
+    # A healthy (non-exhausted) resolution appends NO beacon.
+    healthy = SimpleNamespace(executor_resolution=SimpleNamespace(
+        requested="auto", executor="harness", reason="harness_ready", reset_at="", route=None,
+    ))
+    _record_executor_resolution(child_logs, {"id": "childbeacon2", "parent_task_id": "parentroot1",
+                                             "root_task_id": "parentroot1"}, healthy)
+    assert len(ledger_mod.tree_ledger_attention_after("parentroot1", "")) == 1

@@ -212,6 +212,71 @@ def tree_ledger_append(
     return f"OK: task-tree ledger[{rid}] += {kind_norm} entry ({len(body)} chars)."
 
 
+def record_subscription_window_exhausted(
+    root_id: str,
+    *,
+    child_task_id: str,
+    reset_at: str = "",
+    route: str = "",
+    executor: str = "",
+    data_root: pathlib.Path | None = None,
+) -> bool:
+    """Host-written ADVISORY ``delegation_constraint`` beacon for D28 exhaustion.
+
+    When a child's substrate resolution lands on ``subscription_window_exhausted``
+    (every plan window of the delegated route is spent — the child fell back to
+    metered tokens under ``auto`` or blocked under a ``harness`` pin), the parent
+    used to learn it only at absorption, typically AFTER blocking a full
+    wait_tasks window and after sibling fan-out kept scheduling onto the spent
+    route. This row rides the EXISTING attention channel — the kind is in
+    ``ATTENTION_KINDS``, so ``tree_ledger_attention_after`` (the wait tools'
+    early-wake poll) surfaces it mid-wait. ``advisory=True`` keeps it a
+    disclosure: the enforcement reducer (``effective_delegation_budget``) skips
+    advisory rows by contract, so nothing is gated — the woken parent decides
+    (wait for reset_at, accept metered spend, or reshape the fan-out).
+    Fail-soft: returns False on any write problem, never raises into dispatch.
+    """
+    try:
+        rid = validate_task_id(root_id)
+        child = validate_task_id(child_task_id)
+    except ValueError:
+        return False
+    reset = str(reset_at or "").strip()
+    text = (
+        f"Delegated substrate window exhausted for child {child}: every plan window of "
+        f"route {route or '?'} is spent"
+        + (f" (resets at {reset})" if reset else " (no reset instant reported)")
+        + f"; the child runs executor={executor or '?'}."
+    )
+    seed = "|".join([rid, child, "subscription_window_exhausted", reset])
+    row = {
+        "ts": utc_now_iso(),
+        "kind": DELEGATION_CONSTRAINT_KIND,
+        "text": text,
+        "task_id": child,
+        "role": "system",
+        "needs_parent_attention": True,
+        "payload": {
+            "constraint_id": "dc_" + sha256(seed.encode("utf-8")).hexdigest()[:16],
+            "directive": "halt_fanout",
+            "scope": {"route": str(route or ""), "executor": str(executor or "")},
+            "rationale": text[:1000],
+            "created_by": child,
+            "advisory": True,
+            "reason": "subscription_window_exhausted",
+            "reset_at": reset,
+            "child_task_id": child,
+        },
+    }
+    try:
+        path = tree_ledger_path(rid, data_root=data_root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return bool(append_jsonl(path, row))
+    except Exception:
+        log.debug("Failed to append subscription-window-exhausted beacon for %s", rid, exc_info=True)
+        return False
+
+
 def tree_ledger_rows(
     root_id: str,
     *,
@@ -353,6 +418,7 @@ __all__ = [
     "CHILD_RESULT_DISPOSITIONS",
     "normalize_child_result_disposition_payload",
     "child_result_disposition_row",
+    "record_subscription_window_exhausted",
     "tree_ledger_path",
     "tree_ledger_append",
     "tree_ledger_rows",
