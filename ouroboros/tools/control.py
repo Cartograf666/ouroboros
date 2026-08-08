@@ -2076,6 +2076,22 @@ def _get_task_result(ctx: ToolContext, task_id: str) -> str:
         from ouroboros.outcomes import read_verification_receipts
 
         receipts = read_verification_receipts(status_drive_root, task_id)
+        if not receipts:
+            # Pre-copy-back window: the effective read above already serves a child's
+            # self-finalized result straight off its ISOLATED drive before the
+            # supervisor's task_done copy-back publishes verification_receipts.jsonl
+            # to the canonical root (headless._publish_child_verification_receipts).
+            # Fall back to the child drive recorded on that result (same candidate
+            # SSOT the effective read used) so the W2 receipt rows are never silently
+            # absent in the window the parent most often absorbs the child in.
+            from ouroboros.task_status import _child_drive_candidates
+
+            for child_drive in _child_drive_candidates(data):
+                if Path(child_drive) == status_drive_root:
+                    continue
+                receipts = read_verification_receipts(child_drive, task_id)
+                if receipts:
+                    break
     except Exception:
         receipts = []
     outcome_summary = _subtask_outcome_summary(data, receipts=receipts)

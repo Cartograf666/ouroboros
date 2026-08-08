@@ -579,8 +579,11 @@ def profile_readable_root_paths(ctx: Any) -> list[tuple[str, pathlib.Path]]:
     matrix instead of hand-maintaining private per-tool root lists is what kills
     the copy-shuffle class (three tools, three disagreeing lists — wave3 r8/r24).
     Widens nothing: every returned root is one the profile already reads through
-    read_file. ``skill_payload`` is omitted (its path needs bucket/skill args);
-    per-root resolution is fail-soft."""
+    read_file. It CAN, however, narrow a consumer that previously trusted a root
+    unconditionally — verify's orchestrator roots did; the disclosed delta lives
+    at ``tools/verify.py::_within_readonly_orchestrator_root``. ``skill_payload``
+    is omitted (its path needs bucket/skill args); per-root resolution is
+    fail-soft."""
     out: list[tuple[str, pathlib.Path]] = []
     try:
         policy = _POLICY.get(active_tool_profile(ctx), {})

@@ -583,7 +583,7 @@ export function renderSettingsPage() {
                             <div class="form-field">
                                 <label>Per-Cycle Budget Reserve (USD)</label>
                                 <input id="s-evo-budget" placeholder="0">
-                                <div class="settings-inline-note">Minimum remaining global budget required to start a post-task cycle. <code>0</code> = rely on the normal gates. Running cycles still inherit the global per-task soft cap and the supervisor's reserved-budget floor.</div>
+                                <div class="settings-inline-note">Minimum remaining global budget required to start a post-task cycle. <code>0</code> = rely on the normal gates. Running cycles still inherit the global per-task hard cost cap and the supervisor's reserved-budget floor.</div>
                             </div>
                         </div>
                         <div class="form-field">
@@ -766,7 +766,7 @@ export function renderSettingsPage() {
                                 <input id="s-total-budget" type="number" min="0.01" step="any" value="10.0">
                             </div>
                             <div class="form-field">
-                                <label>Per-Task Soft Threshold (USD)</label>
+                                <label>Per-Task Cost Cap (USD)</label>
                                 <input id="s-settings-per-task-cost" type="number" min="0.01" step="any" value="20.0">
                             </div>
                         </div>

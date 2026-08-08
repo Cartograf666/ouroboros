@@ -495,6 +495,124 @@ def test_get_task_result_carries_bounded_per_receipt_rows(tmp_path):
     assert "verification_receipts_omitted" not in bare
 
 
+def _receipt_rows_of(output):
+    import json as _json
+
+    summary = _json.loads(
+        output.split("[SUBTASK_OUTCOME]\n", 1)[1].split("\n[/SUBTASK_OUTCOME]", 1)[0]
+    )
+    return summary.get("verification_receipts")
+
+
+def test_child_finalization_publishes_receipts_to_canonical_root(tmp_path):
+    """S3 seam (a): every real schedule_subagent child runs memory_mode forked|empty
+    on an ISOLATED drive, so verify_and_record writes its receipts under the CHILD
+    drive while the parent-side W2 reader resolves them against the canonical root.
+    Child finalization (headless.copy_child_task_result) must publish
+    verification_receipts.jsonl to the canonical root alongside the artifact rebase
+    — WITHOUT any parent read in between (the opportunistic effective-read artifact
+    sync must not be the only carrier: it dies with the child drive, which the
+    cancel path and the startup prune both delete)."""
+    from ouroboros.headless import copy_child_task_result, prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
+    from ouroboros.task_results import STATUS_COMPLETED, STATUS_SCHEDULED, write_task_result
+    from ouroboros.tools.control import _get_task_result
+
+    tid = "childsplit"
+    child_drive = prepare_task_drive(tmp_path, tid, "forked")
+    assert child_drive == tmp_path / "state" / "headless_tasks" / tid / "data"
+
+    # Parent-side scheduled record (the shape schedule_subagent writes); the child
+    # self-finalizes and records receipts ONLY on its isolated drive.
+    write_task_result(
+        tmp_path, tid, STATUS_SCHEDULED,
+        drive_root=str(child_drive), child_drive_root=str(child_drive),
+    )
+    write_task_result(child_drive, tid, STATUS_COMPLETED, result="child split done", cost_usd=0.2)
+    append_verification_receipt(child_drive, tid, {
+        "status": "fail", "check": "pytest tests/red.py", "criterion_id": "claim_red",
+    })
+    append_verification_receipt(child_drive, tid, {
+        "status": "pass", "check": "pytest tests/green.py", "criterion_id": "claim_green",
+    })
+    assert read_verification_receipts(tmp_path, tid) == []
+
+    # Finalization copy-back publishes the receipts file to the canonical root
+    # (no parent-side read has happened yet — the publish alone must carry them).
+    copied = copy_child_task_result(tmp_path, {"id": tid, "drive_root": str(child_drive)})
+    assert copied is not None
+    canonical = read_verification_receipts(tmp_path, tid)
+    assert [r["criterion_id"] for r in canonical] == ["claim_red", "claim_green"]
+
+    # Durability: the receipts survive child-drive pruning (retention GC / the
+    # cancel path delete the drive; the canonical copy is the durable record).
+    import shutil as _shutil
+
+    _shutil.rmtree(child_drive)
+    rows = _receipt_rows_of(_get_task_result(SimpleNamespace(drive_root=tmp_path), tid))
+    assert rows is not None and len(rows) == 2
+    assert rows[0]["criterion_id"] == "claim_red"
+    assert rows[0]["outstanding"] == "unreconciled_failed"
+
+
+def test_child_receipt_republish_is_idempotent_refresh(tmp_path):
+    """S3 seam (a) re-entry: copy_child_task_result runs more than once per child
+    (task_done + reaper/cancel re-checks). The publish is a whole-file refresh of
+    the append-only child store — newer child receipts land, nothing duplicates."""
+    from ouroboros.headless import copy_child_task_result, prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+
+    tid = "childagain"
+    child_drive = prepare_task_drive(tmp_path, tid, "forked")
+    write_task_result(child_drive, tid, STATUS_COMPLETED, result="done")
+    append_verification_receipt(child_drive, tid, {
+        "status": "fail", "check": "pytest tests/red.py", "criterion_id": "claim_red",
+    })
+    task = {"id": tid, "drive_root": str(child_drive)}
+    copy_child_task_result(tmp_path, task)
+    copy_child_task_result(tmp_path, task)  # re-entry: no duplication
+    assert [r["criterion_id"] for r in read_verification_receipts(tmp_path, tid)] == ["claim_red"]
+
+    append_verification_receipt(child_drive, tid, {
+        "status": "pass", "check": "pytest tests/red.py", "criterion_id": "claim_red",
+    })
+    copy_child_task_result(tmp_path, task)
+    assert [r["criterion_id"] for r in read_verification_receipts(tmp_path, tid)] == [
+        "claim_red", "claim_red",
+    ]
+
+
+def test_get_task_result_falls_back_to_child_drive_receipts(tmp_path):
+    """S3 seam (b): before ANY canonical copy exists (child still running, or
+    self-finalized but the supervisor copy-back / effective-read sync has not
+    landed), _get_task_result falls back to the child drive recorded on the
+    result, so the W2 rows are never silently absent in the window the parent
+    most often absorbs the child in."""
+    from ouroboros.headless import prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
+    from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
+    from ouroboros.tools.control import _get_task_result
+
+    tid = "childlive"
+    child_drive = prepare_task_drive(tmp_path, tid, "forked")
+    write_task_result(
+        tmp_path, tid, STATUS_SCHEDULED,
+        drive_root=str(child_drive), child_drive_root=str(child_drive),
+    )
+    # The child has recorded receipts but NO result yet (still running): nothing
+    # exists canonically and the effective read has no child result to sync from.
+    append_verification_receipt(child_drive, tid, {
+        "status": "fail", "check": "pytest tests/red.py", "criterion_id": "claim_red",
+    })
+    assert read_verification_receipts(tmp_path, tid) == []
+
+    rows = _receipt_rows_of(_get_task_result(SimpleNamespace(drive_root=tmp_path), tid))
+    assert rows is not None and len(rows) == 1
+    assert rows[0]["criterion_id"] == "claim_red"
+    assert rows[0]["outstanding"] == "unreconciled_failed"
+
+
 def test_get_task_result_uses_child_terminal_over_stale_parent(tmp_path):
     from ouroboros.task_results import STATUS_COMPLETED, STATUS_SCHEDULED, write_task_result
     from ouroboros.tools.control import _get_task_result
