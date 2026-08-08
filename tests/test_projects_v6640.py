@@ -202,8 +202,8 @@ def test_project_sidebar_and_menu_static_contracts():
 
     assert "chatAnnotation: msg.chat_annotation || null" in chat
     annotation_handler = chat[
-        chat.index("ws.on('message_annotation'"):
-        chat.index("ws.on('log'")
+        chat.index("onWs('message_annotation'"):
+        chat.index("onWs('log'")
     ]
     assert "updateMessageAnnotation" in annotation_handler
     assert "addMessage(" not in annotation_handler
@@ -229,7 +229,7 @@ def test_project_main_mirror_never_creates_second_unread_static_contract():
 
     unread_fn = chat[
         chat.index("function incrementUnreadIfNeeded"):
-        chat.index("ws.on('typing'")
+        chat.index("onWs('typing'")
     ]
     project_guard = unread_fn.index("if (isKnownProjectFrame(msg)) return;")
     increment = unread_fn.index("state.unreadCount++;")
@@ -240,7 +240,7 @@ def test_project_main_mirror_never_creates_second_unread_static_contract():
     # the original frame so the Project-origin guard can classify it.
     fanout = chat[
         chat.index("const isProjectMirrorFrame"):
-        chat.index("ws.on('message_annotation'")
+        chat.index("onWs('message_annotation'")
     ]
     assert "mirrorProject && isProjectMirrorFrame(msg)" in fanout
     assert "appendTaskSummaryToLiveCard(msg);" in fanout
@@ -421,8 +421,8 @@ def test_ephemeral_decision_web_frames_never_create_task_card_or_second_receipt(
     assert logs.index("showContextFitToast(evt);") < logs.index("registerEphemeralDecisionFrame(evt)")
 
     fanout = chat[
-        chat.index("ws.on('chat'"):
-        chat.index("ws.on('message_annotation'")
+        chat.index("onWs('chat'"):
+        chat.index("onWs('message_annotation'")
     ]
     # Inline ephemeral answers are not blanket-suppressed. Typed routing turns
     # retain any non-empty final answer while their progress/card stays hidden.
