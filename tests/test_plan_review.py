@@ -121,6 +121,113 @@ def test_new_canonical_attempt_does_not_fall_back_to_old_closed_review():
     assert decision["status"] == "open"
 
 
+def test_closed_plan_review_wave_resolution():
+    from ouroboros.task_results import closed_plan_review_wave
+
+    closed = _force_plan_gate_state("closed")
+    closed["waves"][0]["acceptance_claims"] = ["game boots", "score persists"]
+    wave = closed_plan_review_wave(closed)
+    assert wave is not None
+    assert wave["acceptance_claims"] == ["game boots", "score persists"]
+
+    # Open (non-closed) review yields no authority.
+    assert closed_plan_review_wave(_force_plan_gate_state("open")) is None
+    assert closed_plan_review_wave(_force_plan_gate_state("absent")) is None
+    assert closed_plan_review_wave(None) is None
+
+    # A newer canonical attempt supersedes the old closed wave (no stale-GREEN revival).
+    superseded = _force_plan_gate_state("closed")
+    superseded["current_attempt"] = {"fingerprint": "b" * 64, "status": "open", "reason": ""}
+    assert closed_plan_review_wave(superseded) is None
+
+    # Disposition-closed REVIEW_REQUIRED counts as closed authority too.
+    disposed = _force_plan_gate_state("closed")
+    disposed["waves"][0]["review"]["aggregate_signal"] = "REVIEW_REQUIRED"
+    assert closed_plan_review_wave(disposed) is not None
+
+    # Pending evidence is not integrated authority.
+    pending = _force_plan_gate_state("closed")
+    pending["waves"][0]["review_evidence_status"] = "pending"
+    assert closed_plan_review_wave(pending) is None
+
+
+def test_wave_freezes_bounded_acceptance_claims(tmp_path):
+    from ouroboros.task_results import (
+        STATUS_RUNNING,
+        load_plan_review_state,
+        reserve_plan_review_wave,
+        write_task_result,
+    )
+
+    write_task_result(tmp_path, "root1", STATUS_RUNNING, result="running")
+    fingerprint = "c" * 64
+    long_claim = "x" * 2_000
+    wave, created = reserve_plan_review_wave(
+        tmp_path,
+        "root1",
+        fingerprint=fingerprint,
+        plan_text_hash="d" * 64,
+        scout_roles=[],
+        cutoff_at="2026-08-08T00:00:00+00:00",
+        acceptance_claims=["game boots", "  ", long_claim] + [f"claim {i}" for i in range(30)],
+    )
+    assert created
+    stored = wave["acceptance_claims"]
+    assert stored[0] == "game boots"
+    assert "OMISSION NOTE" in stored[1]  # long claim bounded with a disclosed marker
+    assert len(stored) == 24
+    assert wave["acceptance_claims_omitted"] == 8  # 32 non-blank - 24 cap
+    # The persisted state round-trips through the validator.
+    state = load_plan_review_state(tmp_path, "root1")
+    assert state["waves"][0]["acceptance_claims"] == stored
+
+    # Vacuous claims stay ABSENT on the wave (only-when-set).
+    wave2, _ = reserve_plan_review_wave(
+        tmp_path,
+        "root1",
+        fingerprint="e" * 64,
+        plan_text_hash="d" * 64,
+        scout_roles=[],
+        cutoff_at="2026-08-08T00:00:00+00:00",
+        acceptance_claims=["", "   "],
+    )
+    assert "acceptance_claims" not in wave2
+    assert "acceptance_claims_omitted" not in wave2
+
+
+def test_plan_review_state_validator_rejects_malformed_wave_claims(tmp_path):
+    from ouroboros.task_results import _validated_plan_review_state
+
+    def _state(**wave_extra):
+        return {
+            "schema_version": 1,
+            "current_attempt": {},
+            "latest_review_fingerprint": "",
+            "waves": [{
+                "request_fingerprint": "a" * 64,
+                "plan_text_hash": "b" * 64,
+                "created_at": "2026-08-08T00:00:00+00:00",
+                "scout_cutoff_at": "2026-08-08T00:00:00+00:00",
+                "phase": "scheduling",
+                "intended_scouts": [],
+                "included_task_ids": [],
+                "omissions": [],
+                "consumed_task_ids": [],
+                "disposition_warnings": [],
+                **wave_extra,
+            }],
+        }
+
+    assert _validated_plan_review_state(_state(acceptance_claims=["ok"]))
+    for bad in ([], [""], ["x" * 900], "not-a-list", ["ok"] * 25):
+        with pytest.raises(ValueError):
+            _validated_plan_review_state(_state(acceptance_claims=bad))
+    with pytest.raises(ValueError):
+        _validated_plan_review_state(_state(acceptance_claims=["ok"], acceptance_claims_omitted=-1))
+    with pytest.raises(ValueError):
+        _validated_plan_review_state(_state(acceptance_claims=["ok"], acceptance_claims_omitted=True))
+
+
 def test_invalid_new_plan_attempts_do_not_reuse_old_green(tmp_path):
     import ouroboros.tools.plan_review as pr
     from ouroboros.task_results import (
