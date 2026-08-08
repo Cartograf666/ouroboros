@@ -322,4 +322,8 @@ def test_media_split_drive_child_canonical_owner_state_blocked(tmp_path, monkeyp
     )
     fp, err = _resolve_local_file(ctx, str(owner_state), max_bytes=10**7)
     assert fp is None
-    assert "PATH_BLOCKED" in err and "secret or owner-control" in err
+    # Both refusals are correct: POSIX hits the restricted-subagent secret/
+    # owner-control denial; Windows path-shape hits the earlier workspace-
+    # overlap user_files denial first. Blocked-by-a-typed-path-guard is the pin.
+    assert "PATH_BLOCKED" in err
+    assert ("secret or owner-control" in err) or ("overlaps the Ouroboros repo/runtime workspace" in err)

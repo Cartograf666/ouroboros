@@ -1035,7 +1035,8 @@ def test_finalize_schedule_emission_surfaces_coop_tree_path():
         "write_surface": "external_workspace",
         "coop_shared_tree": "/tmp/projects/coop_abc123",
     })
-    assert "shared coop tree: /tmp/projects/coop_abc123" in out
+    # Windows renders the tree path with os separators — pin label + tree name.
+    assert "shared coop tree: " in out and "coop_abc123" in out
     assert "root=subagent_projects" in out
     assert "coop_abc123" in out
     assert "effective_lane=" not in out  # request-only doctrine intact
