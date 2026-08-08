@@ -1367,26 +1367,46 @@ def _capture_context_core(
 
     memory.ensure_files()
 
-    docs_need_development = _task_requires_development_context(task)
-    force_low_docs = False
-    if _task_uses_external_context(task) and not _task_requires_self_body_docs(task):
-        force_low_docs = True
-        docs_need_development = False
-    elif (
-        str(task.get("type") or "").strip().lower() == "evolution"
-        and _explicit_self_body_docs_flag(task) is not True
-    ):
-        # Evolution cycles are long multi-round code tasks: serve ARCHITECTURE as
-        # the lossless navigation map (sections read on demand) instead of ~45K
-        # always-resident tokens, but keep the engineering handbook inline. An
-        # explicit context_requires_self_body_docs=true (task field or contract)
-        # keeps the full docs.
-        force_low_docs = True
+    from ouroboros.project_facts import resolve_project_id
+
+    # ------------------------------------------------------------------ #
+    # Reference-doc forms (D-ARCH unification, owner decision 2026-08-08).
+    #
+    # ARCHITECTURE.md follows the OWNER CONTEXT MODE alone: full-resident in
+    # max for EVERY task class — self-body, PROJECT tasks (with or without a
+    # folder), evolution, external/headless/delegated surfaces — and the
+    # lossless navigation map in low. OWNER'S MOTIVATION (recorded verbatim-in-
+    # spirit so it is not lost): architecture.md is Ouroboros's capability/
+    # tools/access map; it stays resident in max even for project/evolution
+    # work because without it the agent cannot reason about HOW to work
+    # effectively — context economy comes from dropping DEVELOPMENT.md for
+    # project work, never ARCHITECTURE. This removed the former max-mode
+    # ARCH→nav-map downgrade for the external-surface class (v6.17.0) and for
+    # evolution (v6.30.0); in low mode ARCH stays the nav map (the cheap mode).
+    #
+    # DEVELOPMENT.md (the self-engineering handbook) is what adapts, MODE-
+    # INDEPENDENTLY — the doc decision is deliberately DECOUPLED from workspace
+    # binding (binding a workspace fixes paths/tool profile/lease, it must not
+    # drag the capability map out of context in max):
+    #   1. an explicit context_requires_development on the task wins;
+    #   2. self-body work keeps it full (explicit context_requires_self_body_docs
+    #      or evolution/deep_self_review/review task types);
+    #   3. PROJECT tasks (project_id set; folder irrelevant) and the external/
+    #      headless/delegated surface class (v6.17.0) — which work on OTHER
+    #      codebases — get the on-demand pointer;
+    #   4. everything else keeps the existing type/direct-chat semantics.
+    explicit_dev = task.get("context_requires_development")
+    if explicit_dev is not None:
+        docs_need_development = normalize_bool(explicit_dev)
+    elif _task_requires_self_body_docs(task):
         docs_need_development = True
+    elif resolve_project_id(task) or _task_uses_external_context(task):
+        docs_need_development = False
+    else:
+        docs_need_development = _task_requires_development_context(task)
 
     semi_stable_parts = []
     semi_stable_parts.extend(build_memory_sections(memory, partition="stable"))
-    from ouroboros.project_facts import resolve_project_id
 
     semi_stable_parts.extend(build_knowledge_sections(env, project_id=resolve_project_id(task)))
 
@@ -1475,7 +1495,6 @@ def _capture_context_core(
             build_user_content(task), ensure_ascii=False, sort_keys=True,
         ),
         docs_need_development=docs_need_development,
-        force_low_docs=force_low_docs,
     )
 
 

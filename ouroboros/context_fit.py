@@ -128,7 +128,6 @@ class ContextCore:
     dynamic_text: str
     user_content_json: str
     docs_need_development: bool
-    force_low_docs: bool
 
 
 def _render_context_system_content(
@@ -137,13 +136,17 @@ def _render_context_system_content(
     *,
     mode: str,
 ) -> List[Dict[str, Any]]:
-    docs_mode = "low" if core.force_low_docs else mode
+    # D-ARCH (owner, 2026-08-08): the reference-doc form follows the RENDERED
+    # mode directly — ARCHITECTURE is full in max for every task class and the
+    # nav map in low; DEVELOPMENT inclusion is the caller's mode-independent
+    # decision carried on the core (the former per-task force_low_docs lever is
+    # gone: workspace binding no longer shapes the docs).
     static_parts = [core.base_prompt, "## BIBLE.md\n\n" + core.bible_md]
     static_parts.extend(
         reference_doc_sections(
             env,
-            context_mode=docs_mode,
-            is_code_task=core.docs_need_development,
+            context_mode=mode,
+            include_development=core.docs_need_development,
             architecture_text=core.architecture_md,
             development_text=core.development_md,
         )
@@ -397,7 +400,6 @@ def build_context_fit_plan(
             "dynamic_text": core.dynamic_text,
             "user_content": user_content,
             "docs_need_development": core.docs_need_development,
-            "force_low_docs": core.force_low_docs,
         },
         ensure_ascii=False,
         sort_keys=True,

@@ -1,12 +1,16 @@
 """Tests for the low/max reference-doc layout in the always-on agent context.
 
-Doc matrix (matrix B):
-  max: self-body tasks get ARCHITECTURE full + DEVELOPMENT full; external
-       headless/workspace tasks get navigation/on-demand unless explicitly
-       requesting self-body docs; README/CHECKLISTS on-demand pointer.
-  low: ARCHITECTURE nav-map; DEVELOPMENT full on runnable task contexts;
-       pointer only when a structured caller declares no development context is needed;
-       README/CHECKLISTS on-demand pointer.
+Doc matrix (D-ARCH unification, owner 2026-08-08):
+  ARCHITECTURE follows the OWNER MODE alone: full in max for EVERY task class
+       (self-body, project tasks with or without a folder, evolution, external
+       surfaces); navigation map in low. It is Ouroboros's capability/tools/
+       access map — never dropped per-task in max.
+  DEVELOPMENT is MODE-INDEPENDENT per task class: full for self-body/self-mod/
+       evolution work; on-demand pointer for PROJECT tasks (project_id set,
+       folder irrelevant) and the external/headless/delegated surface class;
+       explicit context_requires_development / context_requires_self_body_docs
+       win.
+  README/CHECKLISTS: on-demand pointer in all modes.
 SYSTEM + BIBLE are tier-0 and always full.
 """
 
@@ -78,7 +82,10 @@ def test_max_mode_inlines_architecture_and_development_in_full():
     assert "## DEVELOPMENT.md" in text
 
 
-def test_max_mode_external_workspace_uses_navigation_docs_unless_self_body_requested():
+def test_max_mode_external_workspace_keeps_arch_full_but_drops_development():
+    """D-ARCH: ARCHITECTURE is full-resident in max for EVERY class, including
+    the external-surface class; DEVELOPMENT (the self-engineering handbook)
+    is the on-demand pointer there — external work targets OTHER codebases."""
     from ouroboros.contracts.task_contract import build_task_contract
 
     external = _build_system_text(
@@ -90,23 +97,11 @@ def test_max_mode_external_workspace_uses_navigation_docs_unless_self_body_reque
         },
         context_mode="max",
     )
-    assert "navigation map" in external
-    assert _ARCH_BODY_SENTINEL not in external
-    assert "## DEVELOPMENT.md" not in external
-    assert "DEVELOPMENT.md" in external
-
-    external_false = _build_system_text(
-        {
-            "workspace_root": "/tmp/example-workspace",
-            "workspace_mode": "external",
-            "actor_id": "cli",
-            "metadata": {"source": "cli"},
-            "context_requires_self_body_docs": "false",
-        },
-        context_mode="max",
-    )
-    assert "navigation map" in external_false
-    assert _ARCH_BODY_SENTINEL not in external_false
+    assert "## ARCHITECTURE.md" in external
+    assert _ARCH_BODY_SENTINEL in external  # capability map stays resident
+    assert "navigation map" not in external
+    assert "## DEVELOPMENT.md" not in external  # handbook is the pointer
+    assert "DEVELOPMENT.md" in external  # ...but visibly named (P1)
 
     self_body = _build_system_text(
         {
@@ -118,9 +113,8 @@ def test_max_mode_external_workspace_uses_navigation_docs_unless_self_body_reque
         },
         context_mode="max",
     )
-    assert "## ARCHITECTURE.md" in self_body
     assert _ARCH_BODY_SENTINEL in self_body
-    assert "## DEVELOPMENT.md" in self_body
+    assert "## DEVELOPMENT.md" in self_body  # explicit self-body keeps DEV full
 
     contract = build_task_contract({
         "id": "task-docs",
@@ -138,31 +132,74 @@ def test_max_mode_external_workspace_uses_navigation_docs_unless_self_body_reque
     assert contract_false["context_requires_self_body_docs"] is False
 
 
-def test_max_mode_evolution_task_uses_nav_map_but_keeps_development_full():
-    """Evolution cycles are long multi-round code tasks: ARCHITECTURE is served
-    as the lossless nav map (sections on demand) instead of ~45K resident
-    tokens, while the engineering handbook stays inline."""
+def test_low_mode_external_workspace_gets_nav_arch_and_dev_pointer():
+    external = _build_system_text(
+        {
+            "workspace_root": "/tmp/example-workspace",
+            "workspace_mode": "external",
+            "actor_id": "cli",
+            "metadata": {"source": "cli"},
+        },
+        context_mode="low",
+    )
+    assert "navigation map" in external
+    assert _ARCH_BODY_SENTINEL not in external
+    assert "## DEVELOPMENT.md" not in external
+
+
+def test_max_mode_evolution_task_keeps_arch_and_development_full():
+    """D-ARCH (owner, 2026-08-08): evolution gets the FULL capability map in
+    max ('и эволюции тоже её класть нужно') — the v6.30.0 nav-map downgrade is
+    removed — and keeps the engineering handbook inline."""
     text = _build_system_text({"type": "evolution"}, context_mode="max")
-    assert "navigation map" in text
-    assert _ARCH_BODY_SENTINEL not in text
-    assert "Section A" in text and "Section B" in text  # index lists all sections
+    assert "## ARCHITECTURE.md" in text
+    assert _ARCH_BODY_SENTINEL in text
+    assert "navigation map" not in text
     assert "## DEVELOPMENT.md" in text  # handbook still full
 
     # Deep self-review keeps the full self-body docs (unchanged).
     review_text = _build_system_text({"type": "deep_self_review"}, context_mode="max")
     assert _ARCH_BODY_SENTINEL in review_text
 
-    # Explicit self-body-docs request wins — via the task field...
-    explicit_text = _build_system_text(
-        {"type": "evolution", "context_requires_self_body_docs": True}, context_mode="max"
-    )
-    assert _ARCH_BODY_SENTINEL in explicit_text
-    # ...and via the task contract.
-    contract_text = _build_system_text(
-        {"type": "evolution", "task_contract": {"context_requires_self_body_docs": "true"}},
+    # In low mode evolution stays on the cheap form: nav ARCH + full DEV.
+    low_text = _build_system_text({"type": "evolution"}, context_mode="low")
+    assert "navigation map" in low_text
+    assert _ARCH_BODY_SENTINEL not in low_text
+    assert "## DEVELOPMENT.md" in low_text
+
+
+def test_project_tasks_drop_development_but_keep_arch_per_mode():
+    """D-ARCH: DEVELOPMENT is NOT inlined for PROJECT tasks (project_id set;
+    folder irrelevant) in EITHER mode; ARCHITECTURE follows the owner mode
+    (full in max — the capability map — nav map in low)."""
+    # File-less project (the submarine shape: project_id, no workspace).
+    fileless_max = _build_system_text({"project_id": "proj_sub"}, context_mode="max")
+    assert _ARCH_BODY_SENTINEL in fileless_max  # ARCH full in max
+    assert "## DEVELOPMENT.md" not in fileless_max
+    assert "DEVELOPMENT.md" in fileless_max  # named in the on-demand pointer
+
+    fileless_low = _build_system_text({"project_id": "proj_sub"}, context_mode="low")
+    assert "navigation map" in fileless_low
+    assert _ARCH_BODY_SENTINEL not in fileless_low
+    assert "## DEVELOPMENT.md" not in fileless_low
+
+    # Folder-ful project task (workspace bound) — same DEV drop, ARCH per mode.
+    folder_max = _build_system_text(
+        {"project_id": "proj_sub", "workspace_root": "/tmp/proj-tree", "workspace_mode": "external"},
         context_mode="max",
     )
-    assert _ARCH_BODY_SENTINEL in contract_text
+    assert _ARCH_BODY_SENTINEL in folder_max
+    assert "## DEVELOPMENT.md" not in folder_max
+
+    # Explicit per-task overrides still win.
+    explicit_dev = _build_system_text(
+        {"project_id": "proj_sub", "context_requires_development": True}, context_mode="max"
+    )
+    assert "## DEVELOPMENT.md" in explicit_dev
+    explicit_self_body = _build_system_text(
+        {"project_id": "proj_sub", "context_requires_self_body_docs": True}, context_mode="max"
+    )
+    assert "## DEVELOPMENT.md" in explicit_self_body
 
 
 def test_readme_and_checklists_are_on_demand_pointer_in_both_modes():
