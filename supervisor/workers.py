@@ -628,6 +628,88 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
                 "reason": "project_registration_failed",
                 "task_id": tid,
             }
+    # Workspace admission (v6.58.0 SSOT + the Q10=A auto-provision) lives in one
+    # helper so this entry point stays readable and under the method gate.
+    workspace_outcome = _admit_promoted_workspace(evt, ctx, task, pid=pid, tid=tid)
+    if workspace_outcome is not None:
+        return workspace_outcome
+    attachment_uploads = (
+        evt.get("attachment_uploads") if isinstance(evt.get("attachment_uploads"), list) else []
+    )
+    if attachment_uploads:
+        try:
+            from ouroboros.artifacts import stage_task_attachments
+            from ouroboros.gateway.tasks import _render_attachment_lines
+
+            attachment_root = pathlib.Path(str(task.get("drive_root") or DRIVE_ROOT))
+            manifest = stage_task_attachments(attachment_root, tid, attachment_uploads)
+            rendered = _render_attachment_lines(manifest)
+            if rendered:
+                task["text"] = f"{task['text']}\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]"
+                task["attachment_images"] = [item for item in manifest if item.get("is_image")]
+        except Exception:
+            log.warning("promote: attachment staging failed for %s", tid, exc_info=True)
+    attach_task_contract(task)
+    admitted = ctx.enqueue_task(task)
+    if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
+        return {
+            "status": "needs_manual_target",
+            "reason": str(admitted.get("_admission_blocked") or "admission_fence"),
+            "project_lifecycle": str(admitted.get("_project_lifecycle") or ""),
+            "task_id": tid,
+        }
+    # A positive promote confirmation is allowed only after the durable queue
+    # projection exists.  The event handler writes the scheduled task result
+    # after the routing receipt; keeping that last step outside this function
+    # makes the result itself the cross-process admission receipt.
+    persist_snapshot = getattr(ctx, "persist_queue_snapshot", None)
+    if not callable(persist_snapshot):
+        return {
+            "status": "needs_manual_target",
+            "reason": "queue_snapshot_persist_unavailable",
+            "task_id": tid,
+            "admission_started": True,
+        }
+    try:
+        if persist_snapshot(reason="promote_chat_to_task") is False:
+            return {
+                "status": "needs_manual_target",
+                "reason": "queue_snapshot_persist_failed",
+                "task_id": tid,
+                "admission_started": True,
+            }
+    except Exception:
+        log.warning("promote: queue snapshot persist failed for %s", tid, exc_info=True)
+        return {
+            "status": "needs_manual_target",
+            "reason": "queue_snapshot_persist_failed",
+            "task_id": tid,
+            "admission_started": True,
+        }
+    # v6.82 (P5) disclosed residual: a PROMOTED root carries the host-attested
+    # `cancelable` marker from its first RUNNING relay, not from enqueue — the
+    # promote path emits no owner-facing progress frame of its own, and minting a
+    # marker-only bubble would either add chat noise or bypass the canonical
+    # message seam (tests/test_heartbeat_presentation.py). While it is still
+    # PENDING the Dashboard Activity row cancels it; the card action appears once
+    # it starts.
+    outcome = {"status": "scheduled", "task_id": tid}
+    if effective_pid:
+        outcome["project_id"] = effective_pid
+    if source_note:
+        outcome["source_note"] = source_note
+    return outcome
+
+
+def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid: str) -> Optional[dict]:
+    """Bind the promoted task's active workspace, or return a failure outcome.
+
+    Extracted verbatim from ``promote_chat_to_task`` (v6.90.x submarine unwind) to
+    keep that function under the hard method gate; the admission SEQUENCE is
+    unchanged. Returns ``None`` when the task was bound (or legitimately has no
+    workspace) and mutates ``task`` in place; returns a ``needs_manual_target``
+    outcome dict when admission must fail LOUDLY.
+    """
     # v6.58.0 (slice 1) — the promote path admits a workspace through the SAME SSOT
     # as /api/tasks. A task born in a project ROOM defaults to the room's registered
     # working_dir (workspace="none" on the event opts out); a SET-but-broken
@@ -749,72 +831,7 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
             )
             + "[END_HEADLESS_WORKSPACE]"
         )
-    attachment_uploads = (
-        evt.get("attachment_uploads") if isinstance(evt.get("attachment_uploads"), list) else []
-    )
-    if attachment_uploads:
-        try:
-            from ouroboros.artifacts import stage_task_attachments
-            from ouroboros.gateway.tasks import _render_attachment_lines
-
-            attachment_root = pathlib.Path(str(task.get("drive_root") or DRIVE_ROOT))
-            manifest = stage_task_attachments(attachment_root, tid, attachment_uploads)
-            rendered = _render_attachment_lines(manifest)
-            if rendered:
-                task["text"] = f"{task['text']}\n\n[ATTACHMENTS]\n{rendered}\n[END_ATTACHMENTS]"
-                task["attachment_images"] = [item for item in manifest if item.get("is_image")]
-        except Exception:
-            log.warning("promote: attachment staging failed for %s", tid, exc_info=True)
-    attach_task_contract(task)
-    admitted = ctx.enqueue_task(task)
-    if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
-        return {
-            "status": "needs_manual_target",
-            "reason": str(admitted.get("_admission_blocked") or "admission_fence"),
-            "project_lifecycle": str(admitted.get("_project_lifecycle") or ""),
-            "task_id": tid,
-        }
-    # A positive promote confirmation is allowed only after the durable queue
-    # projection exists.  The event handler writes the scheduled task result
-    # after the routing receipt; keeping that last step outside this function
-    # makes the result itself the cross-process admission receipt.
-    persist_snapshot = getattr(ctx, "persist_queue_snapshot", None)
-    if not callable(persist_snapshot):
-        return {
-            "status": "needs_manual_target",
-            "reason": "queue_snapshot_persist_unavailable",
-            "task_id": tid,
-            "admission_started": True,
-        }
-    try:
-        if persist_snapshot(reason="promote_chat_to_task") is False:
-            return {
-                "status": "needs_manual_target",
-                "reason": "queue_snapshot_persist_failed",
-                "task_id": tid,
-                "admission_started": True,
-            }
-    except Exception:
-        log.warning("promote: queue snapshot persist failed for %s", tid, exc_info=True)
-        return {
-            "status": "needs_manual_target",
-            "reason": "queue_snapshot_persist_failed",
-            "task_id": tid,
-            "admission_started": True,
-        }
-    # v6.82 (P5) disclosed residual: a PROMOTED root carries the host-attested
-    # `cancelable` marker from its first RUNNING relay, not from enqueue — the
-    # promote path emits no owner-facing progress frame of its own, and minting a
-    # marker-only bubble would either add chat noise or bypass the canonical
-    # message seam (tests/test_heartbeat_presentation.py). While it is still
-    # PENDING the Dashboard Activity row cancels it; the card action appears once
-    # it starts.
-    outcome = {"status": "scheduled", "task_id": tid}
-    if effective_pid:
-        outcome["project_id"] = effective_pid
-    if source_note:
-        outcome["source_note"] = source_note
-    return outcome
+    return None
 
 
 def _fail_promoted_task_loudly(ctx: Any, task: dict, ws_error: str) -> None:
