@@ -217,6 +217,69 @@ def test_malformed_tagged_payloads_have_zero_mutation(tmp_path):
     assert tree_ledger_rows("parent1", data_root=tmp_path) == []
 
 
+def test_malformed_disposition_names_every_violation_in_one_reply(tmp_path):
+    """W2: aggregated diagnostics — the old one-error-per-round shape cost a live
+    parent 9 paid rounds discovering the constraints serially. One malformed call
+    now returns EVERY violated constraint plus a correct example, and stays an
+    atomic no-op (no truncation, no superset-key acceptance)."""
+    from ouroboros.task_tree_ledger import tree_ledger_rows
+    from ouroboros.tools.task_tree import _tree_note
+
+    _write_child(tmp_path)
+    bad = {
+        "type": "child_result_disposition",
+        "child_task_id": "child1",
+        "disposition": "absorbed",          # not in the enum
+        "child_result_sha256": "0" * 63,     # not 64-hex
+        "supports_claims": ["claim_1"],      # unknown key: rejected, never ignored
+    }
+    result = _tree_note(_parent_ctx(tmp_path), "decision", "x" * 501, payload=bad)
+
+    assert result.count("CHILD_RESULT_DISPOSITION_INVALID") == 1
+    for fragment in (
+        "unknown key(s) supports_claims",
+        "disposition must be one of",
+        "child_result_sha256 must be the 64-char hex sha",
+        "at most 500 characters",
+        "Correct example",
+        "atomic no-op",
+    ):
+        assert fragment in result, fragment
+    assert tree_ledger_rows("parent1", data_root=tmp_path) == []
+
+    # A valid payload with a MISSING rationale also gets the aggregated shape.
+    from ouroboros.task_status import load_effective_task_result
+    from ouroboros.tools.join_ledger import _child_result_sha256
+
+    digest = _child_result_sha256(load_effective_task_result(tmp_path, "child1"))
+    no_reason = _tree_note(
+        _parent_ctx(tmp_path), "decision", "  ", payload=_payload("child1", "integrated", digest),
+    )
+    assert "tree_note text is required as the rationale" in no_reason
+    assert "Correct example" in no_reason
+
+
+def test_disposition_violations_helper_is_the_normalizer_authority():
+    from ouroboros.task_tree_ledger import (
+        child_result_disposition_violations,
+        normalize_child_result_disposition_payload,
+    )
+
+    good = _payload("child1", "integrated", "a" * 64)
+    assert child_result_disposition_violations(good) == []
+    assert normalize_child_result_disposition_payload(good) is not None
+    for bad in (
+        None,
+        "text",
+        {**good, "extra": 1},
+        {**good, "disposition": "unknown"},
+        {**good, "child_result_sha256": "xyz"},
+        {"type": "child_result_disposition"},
+    ):
+        assert child_result_disposition_violations(bad), bad
+        assert normalize_child_result_disposition_payload(bad) is None
+
+
 def test_non_child_lineage_is_rejected_without_a_row(tmp_path):
     from ouroboros.task_results import load_task_result, write_task_result
     from ouroboros.task_status import load_effective_task_result
