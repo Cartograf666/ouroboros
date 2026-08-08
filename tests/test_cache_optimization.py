@@ -235,6 +235,58 @@ def test_llm_round_event_exposes_cache_hit_rate(tmp_path):
     assert llm_round["prompt_cache_ttl"] == "default"
 
 
+def test_llm_round_event_flags_cache_cold_restart_with_gap(tmp_path):
+    """W3 telemetry: a later round that re-wrote (almost) the whole prompt is a
+    cold restart — flagged from the round's own facts, with the gap since the
+    previous successful round. No dollar accumulator (counterfactual)."""
+    import json
+
+    from ouroboros.loop_llm_call import call_llm_with_retry
+
+    class _LLM:
+        def __init__(self, cached, written):
+            self.cached, self.written = cached, written
+
+        def chat(self, **kwargs):
+            return {"content": "ok"}, {
+                "provider": "openrouter",
+                "resolved_model": "anthropic/claude-sonnet-4.6",
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "cached_tokens": self.cached,
+                "cache_write_tokens": self.written,
+                "prompt_cache_ttl": "1h",
+                "cost": 0.1,
+            }
+
+    usage = {}
+
+    def _round(llm, round_idx):
+        call_llm_with_retry(
+            llm, [{"role": "user", "content": "hi"}], "anthropic/claude-sonnet-4.6",
+            None, "medium", 1, tmp_path, "task-cold", round_idx, None, usage, "task", False,
+        )
+
+    _round(_LLM(900, 50), 1)
+    _round(_LLM(0, 950), 2)
+
+    rounds = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip() and json.loads(line).get("type") == "llm_round"
+    ]
+    assert [r["round"] for r in rounds] == [1, 2]
+    first, second = rounds
+    assert first["cache_cold_restart"] is False  # round 1 always writes; not a RE-start
+    assert first["gap_since_prev_round_sec"] is None
+    assert second["cache_cold_restart"] is True
+    assert isinstance(second["gap_since_prev_round_sec"], float)
+    assert second["gap_since_prev_round_sec"] >= 0.0
+    # The applied TTL fact is recorded for the wait-tool disclosure to read.
+    assert usage["_last_prompt_cache_ttl"] == "1h"
+    assert "cache_cold_restart_cost_usd" not in usage
+
+
 def test_llm_round_event_zero_prompt_tokens_reports_zero_hit_rate(tmp_path):
     from ouroboros.loop_llm_call import call_llm_with_retry
 

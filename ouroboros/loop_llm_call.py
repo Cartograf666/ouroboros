@@ -976,6 +976,27 @@ def call_llm_with_retry(
             cache_write_tokens = int(usage.get("cache_write_tokens") or 0)
             prompt_cache_ttl = str(usage.get("prompt_cache_ttl") or "")
             cache_hit_rate = (cached_tokens / prompt_tokens) if prompt_tokens > 0 else 0.0
+            # Cold-restart telemetry — FACTS of this round only (no dollar
+            # counterfactuals): a later round whose prompt was almost entirely
+            # re-written is a provider-cache expiry/invalidation made structurally
+            # visible, and the gap since the previous successful round is the
+            # datum that separates a TTL expiry (long wait) from a prefix rewrite.
+            _prev_round_finished = accumulated_usage.get("_last_llm_round_finished_monotonic")
+            gap_since_prev_round_sec = (
+                round(max(0.0, time.monotonic() - float(_prev_round_finished)), 1)
+                if isinstance(_prev_round_finished, (int, float))
+                else None
+            )
+            cache_cold_restart = bool(
+                round_idx > 1
+                and prompt_tokens > 0
+                and cached_tokens < 0.2 * prompt_tokens
+                and cache_write_tokens > 0.5 * prompt_tokens
+            )
+            accumulated_usage["_last_llm_round_finished_monotonic"] = time.monotonic()
+            # The APPLIED TTL of this task's latest send — the recorded fact the
+            # wait-tool cache-horizon disclosure reads (one place, never re-derived).
+            accumulated_usage["_last_prompt_cache_ttl"] = prompt_cache_ttl
             _round_event = {
                 "ts": utc_now_iso(), "type": "llm_round",
                 "task_id": task_id,
@@ -993,6 +1014,8 @@ def call_llm_with_retry(
                 "cache_write_tokens": cache_write_tokens,
                 "prompt_cache_ttl": prompt_cache_ttl,
                 "cache_hit_rate": cache_hit_rate,
+                "cache_cold_restart": cache_cold_restart,
+                "gap_since_prev_round_sec": gap_since_prev_round_sec,
                 "cost_usd": cost,
                 **_context_fit_event_fields(accumulated_usage),
                 "request_ref": request_ref.get("manifest_ref") if request_ref else None,
