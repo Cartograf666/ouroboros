@@ -881,6 +881,30 @@ def test_disposition_without_task_id_returns_typed_state_error(tmp_path):
     assert not (tmp_path / "task_results").exists()
 
 
+def test_malformed_reviewer_slots_block_plan_review_before_any_dispatch(tmp_path, monkeypatch):
+    """#116: a malformed OUROBOROS_REVIEWER_SLOTS must refuse plan review loudly
+    (typed retryable unavailability, precise parse error in the message) BEFORE
+    any scout or reviewer dispatch — never run the panel on the silently
+    projected default models."""
+    import ouroboros.tools.plan_review as pr
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", "{broken")
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "plan-slot-config"
+    with (
+        patch.object(pr, "_get_review_models",
+                     side_effect=AssertionError("no reviewer dispatch")),
+        patch.object(pr, "_start_planning_swarm",
+                     side_effect=AssertionError("no scout dispatch")),
+    ):
+        result = pr._handle_plan_task(ctx, plan="P", goal="G", context_level="minimal")
+
+    assert "Invalid reviewer-slot configuration blocks plan review" in result
+    assert "not valid JSON" in result
+    assert "Fix Reviewer Slots in Settings" in result
+
+
 def _contract_review_text(signal: str) -> str:
     findings = [] if signal == "GREEN" else [{
         "id": "material-finding",

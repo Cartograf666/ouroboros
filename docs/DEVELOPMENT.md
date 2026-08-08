@@ -1826,6 +1826,26 @@ debt, not an automatic release blocker, when the diff does not add or worsen tha
 style usage. Prefer paying them down opportunistically instead of expanding the
 scope of unrelated UI work.
 
+### No native browser dialogs in web/modules (v6.90.3)
+
+`window.prompt`, `window.confirm`, and `window.alert` are BANNED in `web/modules`.
+The pywebview desktop shells implement them inconsistently — the macOS cocoa shell
+has no prompt delegate at all, so `window.prompt` silently returns `null` and the
+flow dies without any visible error — and native dialogs are unstyled, untestable,
+and block the event loop. Every dialog goes through
+`web/modules/confirm_dialog.js::openConfirmDialog`:
+
+- confirm mode resolves a strict boolean (`true` only on the confirm button);
+- `input: true` resolves `{confirmed, value}` (empty `value` on cancel);
+- `alert: true` renders a single OK-style button — Escape/backdrop/Close resolve
+  `false`, which alert callers treat as "seen".
+
+Cancel, backdrop, Escape, the header Close, and being superseded by a newer dialog
+all resolve as a NON-confirm. Critical controls gate on the strict result (see
+`chat.js::confirmAndSendPanic`). Enforced by the quick-CI static gate
+`tests/test_web_dialogs_static.py`; the desktop pywebview bridge paths in
+`settings.js` are host-side dialogs, not `window.*` calls, and stay as they are.
+
 ### Declarative widget UI
 
 Extension widgets should prefer host-owned declarative render schemas.
