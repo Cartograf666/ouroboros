@@ -1,4 +1,4 @@
-# Ouroboros v6.90.2 — Architecture & Reference
+# Ouroboros v6.90.3 — Architecture & Reference
 
 This file is NOT a changelog. Version history lives in README.md, git tags, and commit log.
 
@@ -1205,6 +1205,7 @@ A left `#primary-sidebar` of ROWS (`.nav-row`, not an icon rail): Chat (Main), a
 - `web/modules/ui_helpers.js` centralizes tone badges, age labels, inline status, host-bridge downloads, and the safe field renderer/value collector shared by Widgets and Settings (Settings retains its narrow route/component contract).
 - `web/modules/skill_card_renderer.js` renders installed Skills cards from shared lifecycle/review/grant state.
 - `web/modules/update_status.js` (v6.41.0) renders the main-screen Update pill + the staged auto/assisted/manual dialog; `web/modules/activity.js` (v6.41.0) renders the Dashboard Activity subtab (cron schedules, running/queued tasks, background consciousness) with direct mechanical controls. Both use the shared `.btn` button system.
+- `web/modules/confirm_dialog.js` (v6.90.3) is the ONE dialog authority for every prompt/confirm/alert in `web/modules`: confirm mode resolves a strict boolean, `input` mode resolves `{confirmed, value}`, `alert` mode renders a single OK-style button; cancel/backdrop/Escape/Close (and being superseded by a newer dialog) always resolve as a non-confirm. Native `window.prompt`/`confirm`/`alert` are banned — pywebview shells implement them inconsistently (the macOS cocoa shell has no prompt delegate, so `window.prompt` silently returns null in the desktop app) — enforced by the quick-CI static gate `tests/test_web_dialogs_static.py`; the canonical authoring rule lives in `docs/DEVELOPMENT.md` («No native browser dialogs in web/modules»). Critical controls gate on the strict result: the Panic button's whole confirm-and-send flow is the node-tested `chat.js::confirmAndSendPanic`.
 - `web/modules/toast.js`, `masonry.js`, and CSS tokens in `style.css` keep cards/notifications/layout consistent without a build system.
 
 Rationale: frontend work should not require understanding supervisor, worker, marketplace, extension, MCP, local-model, and settings internals at once. The Gateway Boundary and API client keep browser code pointed at one explicit contract.

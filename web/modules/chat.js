@@ -268,6 +268,43 @@ export function projectCollapsedActivity({
 // module scope so cancelRunEligibility shares the same truth as the card layer).
 export const REUSABLE_TASK_IDS = new Set(['bg-consciousness', 'active']);
 
+/**
+ * /panic gate (v6.90.3, CRITICAL CONTROL): pure decision helper between the
+ * confirm dialog's resolution and sending the panic command. Panic fires on an
+ * EXPLICIT boolean-true confirm and on nothing else — cancel, backdrop,
+ * Escape, and a dialog API drift that starts resolving objects (the input
+ * mode's `{confirmed, value}` shape) all read as "do not fire". Node-tested.
+ */
+export function shouldFirePanic(dialogResult) {
+    return dialogResult === true;
+}
+
+/**
+ * /panic action (v6.90.3, CRITICAL CONTROL): the COMPLETE confirm-and-send
+ * flow behind the header's Panic button, with injectable deps so the node
+ * suite drives the REAL production path — dialog options, the strict
+ * shouldFirePanic gate, and the exact outbound command — not just the boolean
+ * helper. The header action passes the real openConfirmDialog and ws; a
+ * broken await, option drift, or command typo here fails the node test
+ * instead of leaving the live button silently inert.
+ * Fires exactly one {type:'command', cmd:'/panic'} on an explicit confirm;
+ * cancel/backdrop/Escape (false) send NOTHING.
+ */
+export async function confirmAndSendPanic(deps) {
+    const decision = await deps.openConfirmDialog({
+        title: 'Panic — stop all workers',
+        body: 'Kill all workers immediately?',
+        confirmLabel: 'Kill all workers',
+        cancelLabel: 'Keep running',
+        danger: true,
+    });
+    if (shouldFirePanic(decision)) {
+        deps.ws.send({ type: 'command', cmd: '/panic' });
+        return true;
+    }
+    return false;
+}
+
 // v6.82 (P5): terminal card phases. 'cancelled' is a first-class terminal phase
 // so a force-cancelled root resolves its card instead of re-inflating.
 export function isTerminalTaskPhase(phase = '', terminal = false) {
@@ -3499,13 +3536,15 @@ export function createChatInstance({
                 // Offer a plain, model-scoped confirmation (kept until the model changes).
                 const ack = payload?.needs_ack;
                 if (next === 'max' && ack && ack.model) {
-                    const ok = window.confirm(
-                        `${payload.error || 'Max context mode needs a confirmed 1M-token window.'}\n\n` +
-                        `Confirm that this model supports a 1,000,000-token context window?\n` +
-                        `  provider: ${ack.provider || '(default)'}\n  model: ${ack.model}\n` +
-                        `  base_url: ${ack.base_url || '(default)'}\n\n` +
-                        `This applies only to this exact model/provider and is removed if you change it.`
-                    );
+                    const ok = await openConfirmDialog({
+                        title: 'Confirm 1M-token context window',
+                        body: `${payload.error || 'Max context mode needs a confirmed 1M-token window.'}\n\n` +
+                            `Confirm that this model supports a 1,000,000-token context window?\n` +
+                            `provider: ${ack.provider || '(default)'}\nmodel: ${ack.model}\n` +
+                            `base_url: ${ack.base_url || '(default)'}\n\n` +
+                            `This applies only to this exact model/provider and is removed if you change it.`,
+                        confirmLabel: 'Confirm window',
+                    });
                     if (ok) {
                         const ackResp = await apiFetch('/api/owner/capability-ack', {
                             method: 'POST',
@@ -3695,7 +3734,7 @@ export function createChatInstance({
         saveInputDraft();
     });
 
-    headerActions?.addEventListener('click', (event) => {
+    headerActions?.addEventListener('click', async (event) => {
         const button = event.target.closest('[data-chat-command]');
         if (!button) return;
         button.closest('details')?.removeAttribute('open');
@@ -3720,8 +3759,14 @@ export function createChatInstance({
             ws.send({ type: 'command', cmd: '/restart' });
             return;
         }
-        if (command === 'panic' && confirm('Kill all workers immediately?')) {
-            ws.send({ type: 'command', cmd: '/panic' });
+        if (command === 'panic') {
+            // CRITICAL CONTROL: the whole confirm-and-send flow lives in the
+            // node-tested confirmAndSendPanic (dialog options + strict
+            // shouldFirePanic gate + the exact /panic command); this handler
+            // only injects the real deps. Manual check on release: click
+            // Panic → dialog → "Kill all workers" sends /panic;
+            // Cancel/Escape/backdrop send nothing.
+            await confirmAndSendPanic({ openConfirmDialog, ws });
         }
     });
 

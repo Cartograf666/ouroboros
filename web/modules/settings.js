@@ -10,6 +10,7 @@ import {
     reloadSubagentsSection,
 } from './subagents_settings.js';
 import { initHarnessAccounts } from './harness_accounts.js';
+import { openConfirmDialog } from './confirm_dialog.js';
 import { SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
 import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
@@ -773,9 +774,15 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         if (nextMode === currentMode) {
             return bridge ? await bridge(nextMode) : await apiClient.ownerRuntimeMode(nextMode);
         }
+        // Only the browser-side confirm is migrated to the in-house dialog; the
+        // desktop pywebview bridge path above stays exactly as it was.
         const result = bridge
             ? await bridge(nextMode)
-            : (confirm(`Change Ouroboros runtime mode from ${currentMode} to ${nextMode}? The change takes effect after restart.`)
+            : ((await openConfirmDialog({
+                title: 'Change runtime mode',
+                body: `Change Ouroboros runtime mode from ${currentMode} to ${nextMode}? The change takes effect after restart.`,
+                confirmLabel: 'Change mode',
+            }))
                 ? await apiClient.ownerRuntimeMode(nextMode)
                 : { ok: false, error: 'Runtime mode change cancelled.' });
         if (!result || result.ok !== true) {
@@ -791,9 +798,14 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         const currentEnabled = isTruthySetting(currentSettings?.OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS);
         if (nextEnabled === currentEnabled) return null;
         const bridge = window.pywebview?.api?.request_auto_grant_reviewed_skills_change;
+        // Browser-side confirm only; the pywebview bridge path stays untouched.
         const result = bridge
             ? await bridge(nextEnabled)
-            : (confirm(`${nextEnabled ? 'Enable' : 'Disable'} reviewed-skill auto-grant? It only applies after a fresh executable review for the current content hash.`)
+            : ((await openConfirmDialog({
+                title: 'Reviewed-skill auto-grant',
+                body: `${nextEnabled ? 'Enable' : 'Disable'} reviewed-skill auto-grant? It only applies after a fresh executable review for the current content hash.`,
+                confirmLabel: nextEnabled ? 'Enable' : 'Disable',
+            }))
                 ? await apiClient.ownerAutoGrant(nextEnabled)
                 : { ok: false, error: 'Reviewed-skill auto-grant change cancelled.' });
         if (!result || result.ok !== true) {
@@ -812,11 +824,14 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         if (next === current) return null;
         const lowering = (_SAFETY_MODE_RANK[next] ?? 2) < (_SAFETY_MODE_RANK[current] ?? 2);
         if (lowering) {
-            const ok = window.confirm(
-                `Lower the LLM safety supervisor from ${current} to ${next}?\n\n` +
-                `The deterministic sandbox, protected-path policy, and light-mode guards STAY ON in every mode. ` +
-                `Only the LLM safety-check layer is reduced, and every waved-through check is logged as an audit event.`
-            );
+            const ok = await openConfirmDialog({
+                title: 'Lower safety supervisor',
+                body: `Lower the LLM safety supervisor from ${current} to ${next}?\n\n` +
+                    `The deterministic sandbox, protected-path policy, and light-mode guards STAY ON in every mode. ` +
+                    `Only the LLM safety-check layer is reduced, and every waved-through check is logged as an audit event.`,
+                confirmLabel: 'Lower safety mode',
+                danger: true,
+            });
             if (!ok) throw new Error('Safety mode change was not confirmed.');
         }
         const result = await apiClient.ownerSafetyMode(next);
@@ -875,15 +890,17 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 : (notice?.needs_ack?.evidence?.stale
                     ? `${seen} tokens from an EXPIRED reading the provider could not re-confirm`
                     : `${seen} tokens`);
-            const confirmed = window.confirm(
-                `Scope review is fail-closed unless its reviewer's ${floorText}-token context `
-                + `window is currently known, and this route reports ${reading}.\n\n`
-                + `Confirm that this reviewer supports a ${floorText}-token context window?\n`
-                + `  provider: ${ack.provider || '(default)'}\n  model: ${ack.model}\n`
-                + `  base_url: ${ack.base_url || '(default)'}\n\n`
-                + 'This applies only to this exact model/provider. Answering No leaves scope '
-                + 'review blocking commits on this route.'
-            );
+            const confirmed = await openConfirmDialog({
+                title: 'Confirm scope-reviewer context window',
+                body: `Scope review is fail-closed unless its reviewer's ${floorText}-token context `
+                    + `window is currently known, and this route reports ${reading}.\n\n`
+                    + `Confirm that this reviewer supports a ${floorText}-token context window?\n`
+                    + `provider: ${ack.provider || '(default)'}\nmodel: ${ack.model}\n`
+                    + `base_url: ${ack.base_url || '(default)'}\n\n`
+                    + 'This applies only to this exact model/provider. Cancelling leaves scope '
+                    + 'review blocking commits on this route.',
+                confirmLabel: 'Confirm window',
+            });
             if (!confirmed) continue;
             await apiClient.ownerCapabilityAck({
                 provider: ack.provider, model: ack.model, base_url: ack.base_url,
@@ -921,13 +938,15 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             if (!(next === 'max' && ack && ack.model)) {
                 throw e;
             }
-            const confirmed = window.confirm(
-                `${(e.body && e.body.error) || 'Max context mode needs a confirmed 1M-token window.'}\n\n` +
-                `Confirm that this model supports a 1,000,000-token context window?\n` +
-                `  provider: ${ack.provider || '(default)'}\n  model: ${ack.model}\n` +
-                `  base_url: ${ack.base_url || '(default)'}\n\n` +
-                `This applies only to this exact model/provider and is removed if you change it.`
-            );
+            const confirmed = await openConfirmDialog({
+                title: 'Confirm 1M-token context window',
+                body: `${(e.body && e.body.error) || 'Max context mode needs a confirmed 1M-token window.'}\n\n` +
+                    `Confirm that this model supports a 1,000,000-token context window?\n` +
+                    `provider: ${ack.provider || '(default)'}\nmodel: ${ack.model}\n` +
+                    `base_url: ${ack.base_url || '(default)'}\n\n` +
+                    `This applies only to this exact model/provider and is removed if you change it.`,
+                confirmLabel: 'Confirm window',
+            });
             if (!confirmed) {
                 throw new Error('Max context mode was not confirmed.');
             }
@@ -950,9 +969,18 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     reloadSettingsWithFeedback();
 
     if (typeof setBeforePageLeave === 'function') {
-        setBeforePageLeave(({ from }) => {
+        // app.js showPage() awaits every beforePageLeave handler, so the async
+        // dialog is legal here. Rapid double-navigation cannot double-fire the
+        // discard: opening a second dialog resolves the first as false (stay),
+        // so at most one confirmed leave runs discardUnsavedSettingsDraft().
+        setBeforePageLeave(async ({ from }) => {
             if (from !== 'settings' || !settingsDirty) return true;
-            const leave = confirm('You have unsaved settings changes. Discard them and leave Settings?');
+            const leave = await openConfirmDialog({
+                title: 'Unsaved settings',
+                body: 'You have unsaved settings changes. Discard them and leave Settings?',
+                confirmLabel: 'Discard and leave',
+                cancelLabel: 'Stay',
+            });
             if (leave) discardUnsavedSettingsDraft();
             return leave;
         });
@@ -1278,12 +1306,29 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     });
 
     byId('btn-reset').addEventListener('click', async () => {
-        if (!confirm('This will delete all runtime data (state, memory, logs, settings) and restart.\nThe repo (agent code) will be preserved.\nYou will need to re-enter your provider settings.\n\nContinue?')) return;
+        const confirmedReset = await openConfirmDialog({
+            title: 'Reset runtime data',
+            body: 'This will delete all runtime data (state, memory, logs, settings) and restart.\nThe repo (agent code) will be preserved.\nYou will need to re-enter your provider settings.\n\nContinue?',
+            confirmLabel: 'Delete and restart',
+            danger: true,
+        });
+        if (!confirmedReset) return;
         try {
             const res = await apiFetch('/api/reset', { method: 'POST' });
             const data = await res.json();
-            if (data.status === 'ok') alert('Deleted: ' + (data.deleted.join(', ') || 'nothing') + '\nRestarting...');
-            else alert('Error: ' + (data.error || 'unknown'));
+            if (data.status === 'ok') {
+                await openConfirmDialog({
+                    title: 'Reset complete',
+                    body: 'Deleted: ' + (data.deleted.join(', ') || 'nothing') + '\nRestarting...',
+                    alert: true,
+                });
+            } else {
+                await openConfirmDialog({
+                    title: 'Reset failed',
+                    body: 'Error: ' + (data.error || 'unknown'),
+                    alert: true,
+                });
+            }
         } catch (e) {
             showToast('Reset failed: ' + e.message, 'error');
         }
