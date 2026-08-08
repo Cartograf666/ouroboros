@@ -1,4 +1,32 @@
 (() => {
+    // Self-contained IIFE mirrors of harness_accounts.js; SSOT drift is tested.
+    // The wizard cannot import (it is a plain IIFE), so the two rules it needs
+    // are restated here and pinned against the real exports in the web tests.
+    //
+    // 1. Was the account store actually READ? An empty list under a lazily
+    //    started daemon means "never asked", not "no accounts" — the wizard
+    //    used to announce "No accounts connected yet" on an idle machine.
+    function claudexorAccountsRead(payload) {
+        const state = String(payload?.reads?.accounts || '');
+        if (state === 'ok' || state === 'not_read' || state === 'failed') return state;
+        return String(payload?.daemon?.state || '') === 'running' ? 'ok' : 'not_read';  // legacy
+    }
+
+    // 2. What counts as CONNECTED — the same predicate the accounts panel and
+    //    delegation apply: a row whose verification passed. Native logins count
+    //    (a native codex session used to read as "0 accounts connected"), and a
+    //    signed-out named profile does not.
+    function countConnectedAccounts(payload) {
+        const natives = Array.isArray(payload?.profiles?.harnessAccounts)
+            ? payload.profiles.harnessAccounts : [];
+        const wrappers = Array.isArray(payload?.profiles?.profiles)
+            ? payload.profiles.profiles : [];
+        let n = 0;
+        for (const row of natives) if (row && row.native_login_detected) n += 1;
+        for (const w of wrappers) if (String(w?.status?.verification || '') === 'passed') n += 1;
+        return n;
+    }
+
     // Self-contained IIFE mirror of utils.escapeHtmlAttr; SSOT drift is tested.
     function escapeHtml(value) {
         return String(value ?? '')
@@ -516,11 +544,20 @@
         if (HOST_MODE === 'desktop' || state.harnessCardSkipped) return;
         try {
             const data = await apiRequest('/api/claudexor/status', { cache: 'no-store' });
-            const daemonState = String(data?.daemon?.state || '');
-            const profiles = Array.isArray(data?.profiles?.profiles) ? data.profiles.profiles.length : 0;
-            state.harnessAccountsLine = daemonState === 'running'
-                ? `${profiles} account${profiles === 1 ? '' : 's'} connected. Manage them in Settings → Providers → Harness Accounts.`
-                : 'No accounts connected yet. Connect them any time in Settings → Providers → Harness Accounts.';
+            // Two lies lived in one line. (1) A non-running daemon was reported
+            // as "no accounts" although nothing had been read — the daemon is
+            // lazy, so that is the ORDINARY idle state. (2) Even with the daemon
+            // alive it counted only NAMED profiles, so a native codex login read
+            // as "0 accounts connected". Both now go through the same shared
+            // predicates the accounts panel and delegation use.
+            const read = claudexorAccountsRead(data);
+            const n = countConnectedAccounts(data);
+            const unknownWhy = read === 'not_read'
+                ? 'Accounts not checked yet — the agent daemon is not running.'
+                : 'Accounts not checked — the daemon did not answer.';
+            state.harnessAccountsLine = read === 'ok'
+                ? `${n} account${n === 1 ? '' : 's'} connected. Manage them in Settings → Providers → Harness Accounts.`
+                : `${unknownWhy} Manage them in Settings → Providers → Harness Accounts.`;
         } catch (error) {
             state.harnessAccountsLine = 'Connect accounts any time in Settings → Providers → Harness Accounts.';
         }

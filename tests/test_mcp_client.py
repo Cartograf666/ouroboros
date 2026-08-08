@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import pytest
 
 from ouroboros import mcp_client
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -149,6 +150,8 @@ def test_normalize_server_config_minimal():
     assert cfg is not None
     assert cfg.id == "github"
     assert cfg.transport == "streamable_http"
+    assert cfg.command == ""
+    assert cfg.args == []
     assert cfg.auth_header == "Authorization"
     assert cfg.auth_token == ""
     assert cfg.allowed_tools == []
@@ -159,6 +162,43 @@ def test_normalize_server_config_rejects_unsupported_transport():
         {"id": "x", "url": "https://e.example/mcp", "transport": "websocket"}
     )
     assert cfg is None
+
+
+def test_normalize_server_config_accepts_exact_stdio_argv():
+    cfg = mcp_client.normalize_server_config(
+        {
+            "id": "filesystem",
+            "name": "Filesystem",
+            "enabled": True,
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path with spaces"],
+            "url": "https://ignored.example/mcp",
+            "auth_token": "ignored-secret",
+        }
+    )
+    assert cfg is not None
+    assert cfg.transport == "stdio"
+    assert cfg.command == "npx"
+    assert cfg.args == ["-y", "@modelcontextprotocol/server-filesystem", "/path with spaces"]
+    assert cfg.url == ""
+    assert cfg.has_auth() is False
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"command": ""},
+        {"command": "bad\ncommand"},
+        {"command": "npx", "args": "-y package"},
+        {"command": "npx", "args": ["ok", 1]},
+        {"command": "npx", "args": ["bad\x00arg"]},
+    ],
+)
+def test_normalize_server_config_rejects_invalid_stdio_fields(overrides):
+    raw = {"id": "local", "transport": "stdio", "command": "npx", "args": []}
+    raw.update(overrides)
+    assert mcp_client.normalize_server_config(raw) is None
 
 
 def test_normalize_server_config_rejects_invalid_url():
@@ -199,6 +239,69 @@ def test_redact_servers_for_status_masks_tokens():
     redacted = mcp_client.redact_servers_for_status([cfg])
     assert redacted[0]["auth_configured"] is True
     assert "real-token" not in redacted[0]["auth_token"]
+
+
+def test_stdio_transport_passes_exact_argv_without_env_or_cwd(monkeypatch):
+    params_seen = []
+    sessions = []
+
+    class Params:
+        def __init__(self, *, command, args):
+            params_seen.append({"command": command, "args": list(args)})
+
+    @asynccontextmanager
+    async def fake_stdio(params):
+        yield "read-stream", "write-stream"
+
+    class Session:
+        def __init__(self, read, write):
+            sessions.append((read, write))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def list_tools(self):
+            return SimpleNamespace(
+                tools=[SimpleNamespace(name="ping", description="Ping", inputSchema={})]
+            )
+
+        async def call_tool(self, name, arguments):
+            assert name == "ping"
+            assert arguments == {"value": "hello"}
+            return SimpleNamespace(content=[SimpleNamespace(text="pong")], isError=False)
+
+    monkeypatch.setattr(mcp_client, "_MCP_SDK_AVAILABLE", True)
+    monkeypatch.setattr(mcp_client, "StdioServerParameters", Params)
+    monkeypatch.setattr(mcp_client, "stdio_client", fake_stdio)
+    monkeypatch.setattr(mcp_client, "ClientSession", Session)
+
+    cfg = mcp_client.normalize_server_config(
+        {
+            "id": "local",
+            "transport": "stdio",
+            "command": "python3",
+            "args": ["server.py", "value with spaces"],
+        }
+    )
+    assert cfg is not None
+    tools = asyncio.run(mcp_client._list_tools_async(cfg, timeout_sec=2))
+    result = asyncio.run(
+        mcp_client._call_tool_async(cfg, "ping", {"value": "hello"}, timeout_sec=2)
+    )
+
+    assert tools == [{"name": "ping", "description": "Ping", "input_schema": {}}]
+    assert result == "pong"
+    assert params_seen == [
+        {"command": "python3", "args": ["server.py", "value with spaces"]},
+        {"command": "python3", "args": ["server.py", "value with spaces"]},
+    ]
+    assert sessions == [("read-stream", "write-stream"), ("read-stream", "write-stream")]
 
 
 # ---------------------------------------------------------------------------

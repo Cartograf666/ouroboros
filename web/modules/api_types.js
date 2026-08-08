@@ -495,6 +495,36 @@
  */
 
 /**
+ * PROVENANCE for each independent facet of GET /api/claudexor/status. An empty
+ * collection cannot say whether the daemon was ASKED: the owned Claudexor daemon
+ * starts lazily, so an idle machine served empty lists that every consumer read
+ * as "no account connected" while real accounts sat in the agent home.
+ * "ok" — read, the matching collection is AUTHORITATIVE (empty means empty);
+ * "not_read" — never asked (no live daemon); "failed" — asked, no answer.
+ * Facets are independent: one fanned-out read can fail while its siblings land.
+ * @typedef {"ok"|"not_read"|"failed"} ClaudexorReadState
+ */
+
+/**
+ * @typedef {Object} ClaudexorStatusReads
+ * @property {ClaudexorReadState} catalog
+ * @property {ClaudexorReadState} accounts
+ * @property {ClaudexorReadState} quota
+ */
+
+/**
+ * @typedef {Object} ClaudexorStatusResponse
+ * @property {Object=} daemon
+ * @property {string=} config_dir
+ * @property {Array<Object>=} harnesses
+ * @property {Object=} profiles
+ * @property {Array<Object>=} quota
+ * @property {ClaudexorStatusReads=} reads
+ * @property {Object=} subagent_last_delegation
+ * @property {string=} error
+ */
+
+/**
  * @typedef {Object} ScheduledTasksResponse
  * @property {number} schema_version
  * @property {Object[]} tasks

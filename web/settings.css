@@ -221,6 +221,7 @@
 
 .settings-shell .form-field input,
 .settings-shell .form-field select,
+.settings-shell .form-field textarea,
 .model-picker input {
     width: 100%;
     min-width: 0;
@@ -236,6 +237,7 @@
 }
 
 .settings-shell .form-field input::placeholder,
+.settings-shell .form-field textarea::placeholder,
 .secret-input::placeholder,
 .model-picker input::placeholder {
     color: rgba(255, 255, 255, 0.24);
@@ -243,9 +245,15 @@
 
 .settings-shell .form-field input:focus,
 .settings-shell .form-field select:focus,
+.settings-shell .form-field textarea:focus,
 .model-picker input:focus {
     border-color: var(--focus-accent-border);
     box-shadow: 0 0 0 3px var(--focus-accent-ring);
+}
+
+.settings-shell .form-field textarea {
+    min-height: 84px;
+    resize: vertical;
 }
 
 .settings-shell .form-field select {

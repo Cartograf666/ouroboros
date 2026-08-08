@@ -76,7 +76,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── usage_ledger.py      ← Durable append-only ledger SUBSTRATE the line above is built on: cross-process locking, atomic append+fsync, row/transition validation, torn-tail quarantine. One-way seam — accounting imports it, it never imports accounting
       ├── delegate_custody.py ← Durable custody for delegated (Claudexor) runs: the SSOT is the `delegate_run_*` rows in the canonical event log, plus ONE compact projection beside it — `<drive_root>/logs/containment_faults.jsonl`, an append-only file holding containment incidents only, because the event log grows without bound and a tail-bounded scan let an UNRESOLVED fault fall out of the health invariants once later traffic buried its row; incidents are rare, so a full read of that file stays cheap forever and the event-log rows remain the forensic record, replayed into OWNED/FOREIGN/UNKNOWN ownership that survives a worker restart, a per-intention invocation id that rides the wire as the `Idempotency-Key` (the deterministic per-logical-start hash is only the pending-invocation LOOKUP identity, and reuse happens only via the explicit `retry_of` token), atomic settlement (idempotent ledger row + owned-registration retirement, `settled` only when both landed), the typed cancel vocabulary (confirmed | requested | failed | containment_fault_run_may_still_be_live) with durable containment faults that ride the health invariants, and orphan reconciliation on the same owner-is-gone predicate `process_custody` uses; one `daemon_says_absent` predicate decides everywhere that a 404 is the daemon ANSWERING the resource is gone (close the run, discharge the registration) rather than a failure to find out
       ├── llm.py               ← Multi-provider LLM routing (OpenRouter/OpenAI/compatible/Cloud.ru/MiniMax/GigaChat/Anthropic) with adaptive request-parameter normalization for provider capabilities/rejections
-      ├── mcp_client.py        ← HTTP/SSE MCP client manager: parses MCP_SERVERS, validates URLs/auth headers, masks tokens, normalizes external tool names as mcp_<server>__<tool>, refreshes tool lists, and dispatches calls through the guarded Python mcp SDK import
+      ├── mcp_client.py        ← HTTP/SSE/stdio MCP client manager: parses MCP_SERVERS, validates transport fields, masks tokens, normalizes external tool names as mcp_<server>__<tool>, refreshes tool lists, and dispatches calls through the guarded Python mcp SDK import
       ├── safety.py            ← Policy-based LLM safety check
       ├── consciousness.py     ← Background thinking loop (with progress emission)
       ├── consolidator.py      ← Block-wise dialogue consolidation (dialogue_blocks.json). (v6.73.0) The consolidation cursor is GENERATION-AWARE: on a chat.jsonl rotation the stored `chat_log_signature` locates its generation in the ordered `archive/chat_*.jsonl` chain and consolidation continues over `archives[i:]+live` (per-segment signature discipline), so the pre-rotation tail is never dropped; an unfindable generation (manual deletion/corruption) appends an explicit durable `[MEMORY GAP]` block instead of a silent offset reset
@@ -196,7 +196,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── extensions.py    ← extensions/skills HTTP surface (GET /api/extensions, GET /api/extensions/<skill>/manifest, ALL /api/extensions/<skill>/<rest:path>, POST /api/skills/<skill>/toggle, POST /api/skills/<skill>/delete, POST /api/skills/<skill>/review, POST /api/skills/<skill>/grants)
       │   ├── marketplace.py   ← ClawHub + OuroborosHub HTTP surface
       │   ├── mcp.py           ← MCP Settings API surface backed by the shared MCPManager
-      │   ├── claudexor_accounts.py ← (D30) Harness Accounts HTTP surface: THREE thin proxies of the owned daemon's account truth (GET /api/claudexor/status[?include=models] — side-effect-free daemon/runtime state + harness catalog + credential profiles with both honest verification statuses + quota windows; POST /api/claudexor/login — one Connect intent that foreground-installs/repairs/updates the exact managed runtime, starts or attaches the owned daemon, then continues its setup job; GET/DELETE /api/claudexor/login/{job_id} — snapshot with the transient device-code disclosure / cancel). Zero auth logic on this side; the browser never sees the daemon token. The fallback login card is a copy-paste `claudexor setup attach …` command for the user's own terminal — no in-app terminal exists. The snapshot proxy is a VERBATIM pass-through, and that is load-bearing for the card: a `failed` job whose reason is a verification race is judged `recheck` (codex clears its auth store when a login STARTS, so a probe in that window lies), but when the bounded re-check runs out the card's verdict text is a fixed CONSTANT, so the engine's own `message` is the only thing that can say WHY. `harness_accounts.jobDetail()` reads it at both envelope levels and renders it beside a settled non-success verdict only — escaped, never beside "Connected." where a stale message would contradict the outcome, never while the job is pending (the live status line owns the card then), and never truncated (BIBLE P1: this is an owner-facing surface)
+      │   ├── claudexor_accounts.py ← (D30) Harness Accounts HTTP surface: FOUR thin proxies of the owned daemon's account truth (GET /api/claudexor/status[?include=models] — side-effect-free daemon/runtime state, each facet stamped with its read state so an unread store is never rendered as an empty one; POST /api/claudexor/wake — the OWNER-initiated daemon start behind the panel's Refresh button, the only path that may spawn from this surface (no poll ever does) + harness catalog + credential profiles with both honest verification statuses + quota windows; POST /api/claudexor/login — one Connect intent that foreground-installs/repairs/updates the exact managed runtime, starts or attaches the owned daemon, then continues its setup job; GET/DELETE /api/claudexor/login/{job_id} — snapshot with the transient device-code disclosure / cancel). Zero auth logic on this side; the browser never sees the daemon token. The fallback login card is a copy-paste `claudexor setup attach …` command for the user's own terminal — no in-app terminal exists. The snapshot proxy is a VERBATIM pass-through, and that is load-bearing for the card: a `failed` job whose reason is a verification race is judged `recheck` (codex clears its auth store when a login STARTS, so a probe in that window lies), but when the bounded re-check runs out the card's verdict text is a fixed CONSTANT, so the engine's own `message` is the only thing that can say WHY. `harness_accounts.jobDetail()` reads it at both envelope levels and renders it beside a settled non-success verdict only — escaped, never beside "Connected." where a stale message would contradict the outcome, never while the job is pending (the live status line owns the card then), and never truncated (BIBLE P1: this is an owner-facing surface)
       │   ├── host_service.py  ← Loopback-only Host Service API for reviewed skill callbacks
       │   ├── history.py       ← Chat history + cost breakdown endpoint factories
       │   ├── projects.py      ← Multi-project CRUD surface (v6.32.0): GET /api/projects, POST /api/projects, POST /api/projects/from-task (bind an existing task to a new project). (v6.33.0 removed the /sleep + /wake status endpoints.)
@@ -257,9 +257,13 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       group-suicides when the parent dies. Panic layers (`_active_subprocesses`,
       port sweeps, Windows Job Objects) are unchanged complements.
 
-# Build & CI (not part of runtime)
+# Build, CI & public metadata (not part of runtime)
 .github/workflows/ci.yml     ← Five-tier CI (quick / full / integration / skill smoke / build+release)
 .github/workflows/claudexor-platform-gate.yml ← 3-OS delegated-execution gate: fixture lane (fake harness, offline, $0) + live lane on explicit API keys (subscription auth deliberately out of CI — verified by a live local run, D26)
+.github/workflows/scorecard.yml ← OpenSSF Scorecard on `main` pushes and weekly; full action SHA pins, read-only defaults, OIDC result publication, and SARIF artifact/code-scanning upload
+CODE_OF_CONDUCT.md            ← Contributor Covenant 3.0 community rules and private moderator contact
+CITATION.cff                  ← Machine-readable software citation; Anton is the cited author and Ouroboros's contribution is acknowledged
+docs/benchmarks/evidence.json ← Release-bound non-GAIA projection of public benchmark claims and immutable evidence links; README remains the claim SSOT
 scripts/claudexor_platform_smoke.py ← the platform gate's smoke runner (daemon boot, one delegated no-edit/edit task, containment report)
 scripts/fetch_claudexor_runtime.py  ← release-build fetcher for the pinned managed Claudexor runtime archive (claudexor_runtime_pin.json is the SSOT)
 build.sh                      ← macOS build (PyInstaller → .dmg)
@@ -678,6 +682,7 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | POST | `/api/settings` | `gateway.settings.api_settings_post` |
 | GET | `/api/reviewer-slots` | `gateway.settings.api_reviewer_slots` |
 | GET | `/api/claudexor/status` | `gateway.claudexor_accounts.api_claudexor_status` |
+| POST | `/api/claudexor/wake` | `gateway.claudexor_accounts.api_claudexor_wake` |
 | POST | `/api/claudexor/login` | `gateway.claudexor_accounts.api_claudexor_login` |
 | GET | `/api/claudexor/login/{job_id}` | `gateway.claudexor_accounts.api_claudexor_login_job` |
 | DELETE | `/api/claudexor/login/{job_id}` | `gateway.claudexor_accounts.api_claudexor_login_job` |
@@ -1261,6 +1266,32 @@ subagent scheduler and is deliberately absent from `provider_models.MODEL_SETTIN
 A session-only route is not an API model identity; letting it into that sweep would
 poison credential planning, pricing, and provenance.
 
+**Subscription-first (owner decision, 2026-08-09 — strengthen, never narrow).** With no
+explicit owner choice, delegation turns ON by itself as soon as ONE connected account
+exists, and a native/local session counts: `verification_source: local_store` means the
+login material was detected on disk, not re-proved against the vendor this second, and
+that is deliberately enough (`subagents_settings.connectedHarnesses`). A review pass
+proposed gating the default on vendor-level verification; the owner declined it outright
+— Ouroboros should prefer a subscription over the API budget, and that gate would leave
+delegation off on exactly the machines whose subscriptions are sitting right there. The
+UI still shows the weaker provenance honestly ("local session — not verified live"); it
+just does not withhold the default. `web/tests/subagents_settings.test.js` fails if a
+later change narrows the rule.
+
+**Read provenance on the accounts surface.** `GET /api/claudexor/status` carries a
+`reads` block (`ClaudexorStatusReads`: `catalog` / `accounts` / `quota`, each `ok` |
+`not_read` | `failed`) because the owned daemon starts LAZILY: an idle machine used to
+serve empty collections under a 200, and every consumer read that as "no account
+connected" while real accounts sat in the agent home. `ok` makes the matching collection
+authoritative (empty means empty); `not_read` means nothing was asked; `failed` means the
+answer did not arrive. Facets are independent — one fanned-out read can fail while its
+siblings land — and the rule lives in ONE reader
+(`harness_accounts.facetReadState`) that every importing consumer uses. Two
+surfaces cannot import it and restate it instead: the onboarding wizard is a
+plain IIFE (its mirror is drift-tested in `tests/test_web_utils_ssot.py`), and
+the reviewer-slot row builders take the state as a parameter rather than reading
+the payload themselves. Those are the only restatements, and both are pinned.
+
 ### Git and commit review
 
 `tools/git.py` owns repository writes, staging, reviewed commit, rollback or restore, tags, push, and CI follow-up. File-edit tools validate their own atomic write shape; `mutation_attribution.py` captures the root-task baseline and projects only the clean-at-baseline system-repository delta. A changed pre-existing dirty path, stale or missing baseline, or failed scan blocks automatic staging. `commit_reviewed(paths=None)` stages only that attributed candidate, explicit paths must be a subset, and an empty candidate returns `GIT_NO_ATTRIBUTED_CHANGES`; managed update transactions keep their separate typed whole-tree authority.
@@ -1575,7 +1606,7 @@ Bundled native skills and editable marketplace/user payloads occupy separate pay
 
 ### MCP and browser-facing external tools
 
-`mcp_client.py` owns configured HTTP/SSE MCP discovery and invocation. When MCP is enabled, successfully discovered tools join the selected initial capability envelope. Discovery failure produces an explicit capability omission through `list_available_tools`; it never silently removes an expected surface. Remote descriptions and results are untrusted data, and every call still crosses registry, resource, safety, timeout, and result-handling policy.
+`mcp_client.py` owns configured HTTP/SSE and local stdio MCP discovery and invocation. HTTP/SSE entries validate URLs and auth headers. Stdio entries pass one executable `command` and an exact string `args` list directly to the MCP SDK, without a shell, custom environment, or custom working directory; the SDK context owns process shutdown. Settings shows URL/auth fields for HTTP/SSE and command plus one-argument-per-line args for stdio. When MCP is enabled, successfully discovered tools join the selected initial capability envelope. Discovery failure produces an explicit capability omission through `list_available_tools`; it never silently removes an expected surface. Descriptions and results remain untrusted data, and every call still crosses registry, resource, safety, timeout, and result-handling policy.
 
 Browser tools are stateful and thread-sticky because Playwright sessions and greenlets have affinity; they cannot be scheduled as ordinary parallel stateless calls. Chromium is the default. WebKit and device descriptors are targeted tools for a real Safari/iOS risk, not a universal acceptance matrix and not a claim that a narrow Chromium viewport is Safari-equivalent. First-party PR helpers are normal built-ins, but their mutating operations remain subject to workspace, runtime-mode, local-readonly, heal-mode, credential, and reviewed-publication authority.
 
@@ -1746,8 +1777,8 @@ Runtime floors:
 | OUROBOROS_CONTEXT_MODE | max | Owner-selected context horizon: `max` or `low`. Ordinary Main calls build deterministic route-calibrated projections from one immutable core; an unknown route tries Max (never a silent 200K fallback), and a confirmed overflow may retry the same model once with task-local Low without mutating this global setting. Since v6.80.0 this key is ALSO the single control over BIBLE P3 scope-review applicability (`max`: blocking ≥1M scope gate; `low`: whole-repository scope review declaredly not performed, typed skip row recorded) — an owner policy coupling, not a structural limit; the triad's blocking staged-diff review is unaffected in both modes. Plain `/api/settings` POST drops this key; owner endpoints/CLI control it. |
 | OUROBOROS_RUNTIME_MODE | advanced | Three-layer refactor axis: `light`, `advanced`, or `pro`. Orthogonal to `OUROBOROS_REVIEW_ENFORCEMENT`. Clamped via `normalize_runtime_mode` on both save and read paths. `light` is a compatibility/self-modification guard: it blocks repo-mutation tools at the `ToolRegistry.execute` gate, mutative direct git through `run_command`, shallow argv writer commands with explicit repo-local targets, and post-execution repo dirtiness from `run_command` (`LIGHT_MODE_REPO_WRITE_BLOCKED`, no automatic rollback). It also refuses runtime_mode self-elevation through the owner chokepoints (`save_settings`, `_data_write` settings.json block, `/api/settings` POST drop). Reviewed + enabled skills (script + extension) execute in light. `advanced` can evolve the application layer but blocks protected core/contract/release paths. `pro` may edit those protected surfaces directly, but committing them still requires the normal triad + scope review gate, whose blocking/advisory behavior follows `OUROBOROS_REVIEW_ENFORCEMENT`. Runtime mode is owner-only: desktop uses native confirmation, while web uses `/api/owner/runtime-mode` to persist the next-boot value; neither mutates the current boot baseline. |
 | OUROBOROS_SKILLS_REPO_PATH | "" | Local checkout path for the external skills/extensions repo. Consumed by `ouroboros.skill_loader.discover_skills` (Phase 3); accepts absolute paths or `~`-prefixed paths; `get_skills_repo_path` expands `~` at read time. Ouroboros never clones/pulls this directory. |
-| MCP_ENABLED | false | Optional. Enables the base-runtime HTTP/SSE MCP tool client. |
-| MCP_SERVERS | [] | List of MCP server config dicts persisted in settings.json; not propagated through env. |
+| MCP_ENABLED | false | Optional. Enables the base-runtime HTTP/SSE/stdio MCP tool client. |
+| MCP_SERVERS | [] | List of MCP server config dicts persisted in settings.json; HTTP/SSE use `url` and optional auth, while stdio uses `command` plus an exact string `args` list. Not propagated through env. |
 | MCP_TOOL_TIMEOUT_SEC | 60 | Per-tool timeout for MCP discovery and tool calls. |
 | OUROBOROS_HUB_CATALOG_URL | `https://raw.githubusercontent.com/razzant/OuroborosHub/main/catalog.json` | Official static skill catalog. The client fetches only this JSON automatically; selected skill installs download the catalog-listed files and verify sha256. |
 | OUROBOROS_SCOPE_REVIEW_MODEL | openai/gpt-5.6-terra | Legacy singular fallback for `OUROBOROS_SCOPE_REVIEW_MODELS`; kept for existing settings files |
@@ -1807,9 +1838,11 @@ Claude Runtime Status appears when an Anthropic key exists or when backend/runti
 
 The local `ouroboros-stable` ref also remains a recovery fallback maintained by explicit promotion; that local role does not select the official QA feed. Colab seeds it from the already validated shared Stable release when possible and otherwise from the selected validated channel, then leaves it pinned until promotion. Launcher metadata describes bootstrap provenance only. Runtime status, preflight, Colab bootstrap, and apply resolve the selected channel and exact fetched SHA themselves, so an older frozen launcher cannot silently redirect updates. Stable additionally requires the shared plain release tag; QA and Development do not use version comparison as an admission gate.
 
-CI has five roles: fork-safe quick checks with no provider secrets; the full cross-platform matrix; provider integration when secrets exist; official-skill install, preflight, review, dependency, and keyless execution smoke; and tag-triggered build/release. Secret-bearing skill review runs before any step that imports downloaded plugin code, and a missing required key is red rather than skipped. Release jobs build the three platform artifacts, verify final archives, produce checksums, SBOMs and source-bound attestations, and recheck the remote annotated tag against the event SHA before draft creation and publication.
+The main CI workflow has five roles: fork-safe quick checks with no provider secrets; the full cross-platform matrix; provider integration when secrets exist; official-skill install, preflight, review, dependency, and keyless execution smoke; and tag-triggered build/release. Secret-bearing skill review runs before any step that imports downloaded plugin code, and a missing required key is red rather than skipped. Release jobs build the three platform artifacts, verify final archives, produce checksums, SBOMs and source-bound attestations, and recheck the remote annotated tag against the event SHA before draft creation and publication.
 
 Quick pull-request jobs are read-only and never use `pull_request_target`. The live catalog skill lane is intentionally a release dependency: it proves that the published payloads still install on this runtime, while keeping provider credentials out of every process that imports payload code. This external-service dependency is an explicit owner trade-off rather than an accidental source of flaky authority.
+
+The separate Scorecard workflow runs on `main` pushes and weekly. It pins every action by full commit SHA, defaults permissions to read-only, and adds only `security-events: write` and `id-token: write` for SARIF upload and OpenSSF publication. `CODE_OF_CONDUCT.md` owns community rules and reporting; `CITATION.cff` owns citation metadata; `docs/benchmarks/evidence.json` is a historical, release-bound non-GAIA projection of public benchmark claims and immutable evidence links. README remains the claim SSOT.
 
 ### Build scripts
 

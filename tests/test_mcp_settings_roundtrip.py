@@ -65,6 +65,35 @@ def test_settings_round_trip_preserves_servers_list(_isolate_settings):
     assert loaded["MCP_SERVERS"][0]["auth_token"] == "Bearer secret"
 
 
+def test_settings_round_trip_preserves_stdio_command_and_exact_args(_isolate_settings):
+    cfg = _isolate_settings
+    server = {
+        "id": "filesystem",
+        "name": "Filesystem",
+        "enabled": True,
+        "transport": "stdio",
+        "url": "",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path with spaces"],
+        "auth_header": "Authorization",
+        "auth_token": "",
+        "allowed_tools": ["read_file"],
+    }
+    payload = dict(cfg.SETTINGS_DEFAULTS)
+    payload["MCP_ENABLED"] = True
+    payload["MCP_SERVERS"] = [server]
+    cfg.save_settings(payload, allow_elevation=True)
+
+    loaded = cfg.load_settings()["MCP_SERVERS"][0]
+    assert loaded["transport"] == "stdio"
+    assert loaded["command"] == "npx"
+    assert loaded["args"] == [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/path with spaces",
+    ]
+
+
 def test_get_mcp_servers_returns_list_of_dicts(_isolate_settings):
     cfg = _isolate_settings
     payload = dict(cfg.SETTINGS_DEFAULTS)

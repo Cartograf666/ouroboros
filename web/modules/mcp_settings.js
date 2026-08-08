@@ -5,6 +5,7 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 const TRANSPORTS = [
     { value: 'streamable_http', label: 'Streamable HTTP' },
     { value: 'sse', label: 'SSE (Server-Sent Events)' },
+    { value: 'stdio', label: 'Local process (stdio)' },
 ];
 
 let mcpServers = [];
@@ -26,6 +27,8 @@ function emptyServer() {
         enabled: false,
         transport: 'streamable_http',
         url: '',
+        command: '',
+        args: [],
         auth_header: 'Authorization',
         auth_token: '',
         allowed_tools: [],
@@ -47,6 +50,9 @@ function renderServerCard(server, index) {
     const name = String(server.name ?? '');
     const transport = String(server.transport ?? 'streamable_http');
     const url = String(server.url ?? '');
+    const command = String(server.command ?? '');
+    const args = Array.isArray(server.args) ? server.args.map(String) : [];
+    const isStdio = transport === 'stdio';
     const authHeader = String(server.auth_header ?? 'Authorization');
     const authToken = String(server.auth_token ?? '');
     const enabled = server.enabled === true || server.enabled === 'True' || server.enabled === 'true';
@@ -120,10 +126,20 @@ function renderServerCard(server, index) {
                     <select data-mcp-field="transport">${transportOptions}</select>
                 </div>
                 <div class="form-field">
-                    <label>Server URL</label>
-                    <input type="text" data-mcp-field="url" value="${escapeHtml(url)}" placeholder="https://example.com/mcp" autocomplete="off" spellcheck="false">
+                    <label>${isStdio ? 'Command' : 'Server URL'}</label>
+                    ${isStdio
+                        ? `<input type="text" data-mcp-field="command" value="${escapeHtml(command)}" placeholder="npx" autocomplete="off" spellcheck="false">`
+                        : `<input type="text" data-mcp-field="url" value="${escapeHtml(url)}" placeholder="https://example.com/mcp" autocomplete="off" spellcheck="false">`}
                 </div>
             </div>
+            ${isStdio ? `
+            <div class="form-row">
+                <div class="form-field">
+                    <label>Arguments (one per line)</label>
+                    <textarea data-mcp-field="args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/path/to/folder" autocomplete="off" spellcheck="false">${escapeHtml(args.join('\n'))}</textarea>
+                    <span class="muted">Each line is passed as one argument. Ouroboros does not use a shell.</span>
+                </div>
+            </div>` : `
             <div class="form-grid two">
                 <div class="form-field">
                     <label>Auth header</label>
@@ -137,7 +153,7 @@ function renderServerCard(server, index) {
                         <button type="button" class="settings-ghost-btn" data-mcp-token-clear>Clear</button>
                     </div>
                 </div>
-            </div>
+            </div>`}
             <div class="form-row">
                 <div class="form-field">
                     <label>Allowed tools (optional, comma-separated)</label>
@@ -177,6 +193,10 @@ function bindCardEvents(card) {
                     .split(',')
                     .map((s) => s.trim())
                     .filter(Boolean);
+            } else if (field === 'args') {
+                server.args = String(input.value || '')
+                    .split(/\r?\n/)
+                    .filter((value) => value.length > 0);
             } else if (field === 'auth_token') {
                 if (looksMasked(input.value)) {
                     mcpDirtyTokens.delete(`${idx}`);
@@ -187,6 +207,7 @@ function bindCardEvents(card) {
             } else {
                 server[field] = input.value;
             }
+            if (field === 'transport') renderAll();
             notifyChanged();
         });
         input.addEventListener('change', () => {
@@ -401,6 +422,8 @@ export function applyMcpSettings(settings) {
         enabled: Boolean(s.enabled),
         transport: String(s.transport ?? 'streamable_http'),
         url: String(s.url ?? ''),
+        command: String(s.command ?? ''),
+        args: Array.isArray(s.args) ? s.args.map(String) : [],
         auth_header: String(s.auth_header ?? 'Authorization'),
         auth_token: String(s.auth_token ?? ''),
         allowed_tools: Array.isArray(s.allowed_tools) ? s.allowed_tools.map(String) : [],
@@ -419,16 +442,24 @@ export function collectMcpSettings() {
     const out = {
         MCP_ENABLED: Boolean(enabled),
         MCP_TOOL_TIMEOUT_SEC: timeout,
-        MCP_SERVERS: mcpServers.map((s) => ({
-            id: String(s.id || '').trim(),
-            name: String(s.name || '').trim(),
-            enabled: Boolean(s.enabled),
-            transport: String(s.transport || 'streamable_http'),
-            url: String(s.url || '').trim(),
-            auth_header: String(s.auth_header || 'Authorization').trim() || 'Authorization',
-            auth_token: String(s.auth_token || ''),
-            allowed_tools: Array.isArray(s.allowed_tools) ? s.allowed_tools.map(String) : [],
-        })),
+        MCP_SERVERS: mcpServers.map((s) => {
+            const transport = String(s.transport || 'streamable_http');
+            const isStdio = transport === 'stdio';
+            return {
+                id: String(s.id || '').trim(),
+                name: String(s.name || '').trim(),
+                enabled: Boolean(s.enabled),
+                transport,
+                url: isStdio ? '' : String(s.url || '').trim(),
+                command: isStdio ? String(s.command || '').trim() : '',
+                args: isStdio && Array.isArray(s.args) ? s.args.map(String) : [],
+                auth_header: isStdio
+                    ? 'Authorization'
+                    : (String(s.auth_header || 'Authorization').trim() || 'Authorization'),
+                auth_token: isStdio ? '' : String(s.auth_token || ''),
+                allowed_tools: Array.isArray(s.allowed_tools) ? s.allowed_tools.map(String) : [],
+            };
+        }),
     };
     return out;
 }

@@ -1454,3 +1454,175 @@ def test_status_payload_keeps_typed_unreachable_when_a_fanned_out_read_refuses(m
     assert payload["daemon"]["state"] == "unreachable"
     assert "daemon_unreachable" in payload["daemon"]["last_error"]
     assert payload["harnesses"] == []
+
+
+def _reads_probe(monkeypatch, tmp_path, daemon_state, failing_facet=""):
+    """Drive _status_payload with one facet optionally refusing."""
+    from ouroboros.gateway.claudexor_accounts import _status_payload
+    from ouroboros.gateways import claudexor as gw
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    class FakeDaemon:
+        def status_dict(self):
+            return {"state": daemon_state}
+
+    def refuse_if(name):
+        if failing_facet == name:
+            raise ClaudexorUnavailable("daemon_unreachable", f"{name} refused")
+
+    class FakeGateway:
+        engine_version = "3.3.13"
+
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self, **_kw):
+            return {}
+
+        def agent_capabilities(self):
+            refuse_if("catalog")
+            return {"harnesses": [{"id": "codex", "displayName": "Codex CLI",
+                                   "status": "ok", "enabled": True}]}
+
+        def harnesses(self):
+            return [{"id": "codex", "manifest": {"capability_profile": {"auth": {
+                "supported_sources": ["native_session"]}}}}]
+
+        def credential_profiles(self):
+            refuse_if("accounts")
+            return {"profiles": [], "harnessAccounts": []}
+
+        def quota_snapshots(self):
+            refuse_if("quota")
+            return []
+
+    monkeypatch.setattr(owned, "get_owned_daemon", lambda: FakeDaemon())
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
+    return _status_payload(include_models=False)
+
+
+@pytest.mark.parametrize("daemon_state", ["not_provisioned", "stale", "foreign_daemon"])
+def test_status_payload_marks_every_facet_unread_when_the_daemon_is_not_running(
+    monkeypatch, tmp_path, daemon_state
+):
+    """A lazily-started daemon is the ORDINARY idle state, so this is the path the
+    owner actually sees. Empty collections here mean "never asked" — the panel
+    printed "no account connected" for three harnesses while two claude profiles,
+    a cursor profile and two native sessions sat on disk (owner report,
+    2026-08-08). The payload must SAY it was not read (BIBLE P1: a gap is a gap)."""
+    payload = _reads_probe(monkeypatch, tmp_path, daemon_state)
+
+    assert payload["reads"] == {
+        "catalog": "not_read", "accounts": "not_read", "quota": "not_read",
+    }
+    assert payload["harnesses"] == [] and payload["profiles"] == {}
+
+
+def test_status_payload_marks_facets_ok_when_the_daemon_answered(monkeypatch, tmp_path):
+    """The other half of the contract: after a successful read an EMPTY collection
+    is authoritative — it really does mean "no account" — otherwise the honest
+    hedge would never step aside and the panel could never say anything."""
+    payload = _reads_probe(monkeypatch, tmp_path, "running")
+
+    assert payload["reads"] == {"catalog": "ok", "accounts": "ok", "quota": "ok"}
+    assert [h["id"] for h in payload["harnesses"]] == ["codex"]
+
+
+@pytest.mark.parametrize("failing", ["catalog", "accounts", "quota"])
+def test_status_payload_classifies_each_fanned_out_facet_independently(
+    monkeypatch, tmp_path, failing
+):
+    """ORDER-INDEPENDENCE. The facets are read concurrently, so a sibling's refusal
+    must never downgrade a facet whose own read landed — and the verdict must not
+    depend on which `.result()` the code happened to touch first. Consuming them
+    in sequence used to report `accounts` as unread whenever `catalog` raised."""
+    payload = _reads_probe(monkeypatch, tmp_path, "running", failing_facet=failing)
+
+    expected = {"catalog": "ok", "accounts": "ok", "quota": "ok"}
+    expected[failing] = "failed"
+    assert payload["reads"] == expected
+    # The refusal is still disclosed on the daemon, and the surviving facets keep
+    # their payload instead of blanking the whole panel.
+    assert payload["daemon"]["state"] == "unreachable"
+    assert "daemon_unreachable" in payload["daemon"]["last_error"]
+    if failing != "catalog":
+        assert [h["id"] for h in payload["harnesses"]] == ["codex"]
+
+
+def test_status_payload_reads_block_matches_the_declared_gateway_contract(monkeypatch, tmp_path):
+    """PRODUCER pin: the wire always carries the full `reads` block with the exact
+    keys the frozen gateway contract declares, so a consumer may key on it without
+    defensive guessing."""
+    from typing import get_type_hints
+
+    from ouroboros.gateway.contracts import ClaudexorStatusReads
+
+    payload = _reads_probe(monkeypatch, tmp_path, "running")
+
+    assert set(payload["reads"]) == set(get_type_hints(ClaudexorStatusReads))
+    assert set(payload["reads"].values()) <= {"ok", "not_read", "failed"}
+
+
+def test_wake_endpoint_starts_the_daemon_and_returns_the_fresh_reading(monkeypatch, tmp_path):
+    """The owner-initiated start behind the panel's Refresh button.
+
+    The status GET is side-effect-free by contract, which leaves Refresh unable
+    to do anything about a sleeping daemon — an owner who just wants to SEE
+    their accounts had to start a login job or a delegated run. This endpoint is
+    that missing action: it ensures the daemon, then answers with the reading it
+    just made possible.
+    """
+    import asyncio
+
+    from ouroboros.gateway import claudexor_accounts as accounts
+
+    started = {"n": 0}
+
+    class FakeGateway:
+        def close(self):
+            pass
+
+    def fake_ensure():
+        started["n"] += 1
+        return FakeGateway()
+
+    monkeypatch.setattr("ouroboros.claudexor_daemon.ensure_owned_gateway", fake_ensure)
+    monkeypatch.setattr(accounts, "_status_payload",
+                        lambda include_models: {"daemon": {"state": "running"},
+                                                "reads": {"catalog": "ok", "accounts": "ok", "quota": "ok"}})
+
+    response = asyncio.run(accounts.api_claudexor_wake(object()))
+
+    assert started["n"] == 1, "the wake must actually ensure the daemon"
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    assert body["daemon"]["state"] == "running"
+    assert body["reads"]["accounts"] == "ok", "the answer is the POST-wake reading"
+
+
+def test_wake_endpoint_discloses_a_typed_refusal_instead_of_a_generic_error(monkeypatch, tmp_path):
+    """A cold machine can refuse for reasons the owner can act on (no binary, a
+    foreign daemon home). That reason must reach the panel as a typed 503 — the
+    button says why it could not start, rather than returning silently to idle."""
+    import asyncio
+
+    from ouroboros.gateway import claudexor_accounts as accounts
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    def refuse():
+        raise ClaudexorUnavailable("claudexord_not_installed", "no managed binary")
+
+    monkeypatch.setattr("ouroboros.claudexor_daemon.ensure_owned_gateway", refuse)
+
+    response = asyncio.run(accounts.api_claudexor_wake(object()))
+
+    assert response.status_code == 503
+    assert "claudexord_not_installed" in json.loads(response.body)["error"]

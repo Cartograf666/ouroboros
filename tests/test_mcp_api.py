@@ -32,7 +32,9 @@ class _FakeTransport:
         self.call_calls = []
 
     async def list_tools(self, cfg, timeout):
-        self.list_calls.append((cfg.id, cfg.url, cfg.auth_token, timeout))
+        self.list_calls.append(
+            (cfg.id, cfg.url, cfg.auth_token, timeout, cfg.command, list(cfg.args))
+        )
         return list(self.response)
 
     async def call_tool(self, cfg, name, arguments, timeout):
@@ -161,6 +163,44 @@ def test_test_endpoint_with_inline_server(tmp_path, monkeypatch):
         assert data["ok"] is True
         assert data["tool_count"] == 1
         assert data["tools"][0]["name"] == "hello"
+    finally:
+        _stop(patches)
+
+
+def test_test_endpoint_accepts_inline_stdio_server(tmp_path, monkeypatch):
+    fake = _FakeTransport([
+        {"name": "hello", "description": "Say hi", "input_schema": {}},
+    ])
+    _wire_singleton(fake)
+    mcp_client.reconfigure_from_settings({
+        "MCP_ENABLED": True,
+        "MCP_TOOL_TIMEOUT_SEC": 10,
+        "MCP_SERVERS": [],
+    })
+    client, patches = _make_client(tmp_path, monkeypatch)
+    try:
+        with patch("ouroboros.gateway.mcp.load_settings", return_value={
+            "MCP_ENABLED": True,
+            "MCP_TOOL_TIMEOUT_SEC": 10,
+            "MCP_SERVERS": [],
+        }):
+            _wire_singleton(fake)
+            resp = client.post(
+                "/api/mcp/test",
+                json={"server": {
+                    "id": "local",
+                    "transport": "stdio",
+                    "command": "python3",
+                    "args": ["server.py", "value with spaces"],
+                }},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        assert fake.list_calls[-1][1:3] == ("", "")
+        assert fake.list_calls[-1][4:] == (
+            "python3",
+            ["server.py", "value with spaces"],
+        )
     finally:
         _stop(patches)
 

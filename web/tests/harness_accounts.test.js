@@ -11,6 +11,11 @@ import {
     attachFallbackDue,
     confirmLoginLive,
     daemonStatusLine,
+    facetReadState,
+    accountsKnown,
+    unknownAccountsNote,
+    refreshActionLabel,
+    wakeDaemon,
     refreshStatus,
     deviceCodeDisclosure,
     failureText,
@@ -1100,6 +1105,122 @@ test('the status poll is single-flight and announces the first read before it la
             'no pre-request repaint once anything has been said');
         release();
         await fourth;
+    } finally {
+        globalThis.document = previousDocument;
+    }
+});
+
+test('an unread facet is never rendered as an authoritative empty', () => {
+    // THE bug the owner caught: three harnesses labelled "no account connected"
+    // while two claude profiles, a cursor profile and two native sessions sat in
+    // the agent home — the daemon is lazy, so nothing had been read.
+    const idle = { reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' },
+                   daemon: { state: 'stale', runtime: { state: 'ready', version: '3.3.13' } } };
+    assert.equal(facetReadState(idle, 'accounts'), 'not_read');
+    assert.equal(accountsKnown(idle), false);
+    assert.match(unknownAccountsNote(idle), /not checked/i);
+    assert.match(unknownAccountsNote(idle), /not running/i);
+
+    // A read that ANSWERED makes emptiness authoritative — otherwise the hedge
+    // could never step aside and the panel could never say anything at all.
+    const read = { reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' }, daemon: { state: 'running' } };
+    assert.equal(accountsKnown(read), true);
+    assert.equal(unknownAccountsNote(read), '');
+
+    // Facets are INDEPENDENT: reviewer slots read the catalog, so an accounts
+    // failure must not blank a catalog that landed.
+    const partial = { reads: { catalog: 'ok', accounts: 'failed', quota: 'ok' }, daemon: { state: 'unreachable' } };
+    assert.equal(facetReadState(partial, 'catalog'), 'ok');
+    assert.equal(facetReadState(partial, 'accounts'), 'failed');
+    // A refused read is NOT "the daemon is not running" — it was running and one
+    // endpoint died; saying otherwise would be a second lie.
+    assert.ok(!/not running/i.test(unknownAccountsNote(partial)));
+
+    // LEGACY payload (older backend / older fixture): the daemon state carried
+    // exactly this fact, so consumers keep working without the block.
+    assert.equal(facetReadState({ daemon: { state: 'running' } }, 'accounts'), 'ok');
+    assert.equal(facetReadState({ daemon: { state: 'stale' } }, 'accounts'), 'not_read');
+    // A request that never completed outranks whatever the last payload said.
+    assert.equal(facetReadState(read, 'accounts', { transportError: 'HTTP 500' }), 'transport');
+});
+
+test('the Refresh button tells the truth about what it does, and wakes the daemon once', async () => {
+    // With the daemon asleep a plain re-read returns the same nothing forever
+    // (status never spawns), so there the button is an explicit owner start and
+    // its label says so. Live, it stays a plain re-read.
+    assert.equal(refreshActionLabel({ daemon: { state: 'running' } }), 'Refresh');
+    assert.match(refreshActionLabel({ daemon: { state: 'stale' } }), /starts the agent daemon/i);
+
+    const previousDocument = globalThis.document;
+    const { lines } = stubStatusDom();
+    try {
+        let started = 0;
+        let release = null;
+        const gate = new Promise((resolve) => { release = resolve; });
+        const fetchImpl = async (url, opts) => {
+            assert.equal(url, '/api/claudexor/wake');
+            assert.equal(opts?.method, 'POST');
+            started += 1;
+            await gate;
+            return { ok: true, json: async () => ({
+                daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
+                reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+            }) };
+        };
+
+        const first = wakeDaemon({ fetchImpl });
+        // A cold runtime install takes real time; a second click must not start
+        // a second provisioning.
+        const second = wakeDaemon({ fetchImpl });
+        assert.equal(started, 1, 'the wake is single-flighted');
+
+        release();
+        await Promise.all([first, second]);
+        assert.ok(lines.at(-1).includes('3.3.13'), 'the woken daemon replaces the line');
+    } finally {
+        globalThis.document = previousDocument;
+    }
+});
+
+test('a failed refresh keeps the last reading but stops calling it current', () => {
+    // The MIRROR of the false absence, and the owner has not seen it yet: a
+    // swallowed failure used to leave "Claudexor ready" and green badges
+    // standing indefinitely after the endpoint died.
+    const live = { daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
+                   reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } };
+    const fresh = daemonStatusLine(live, {});
+    assert.equal(fresh.tone, 'ok');
+
+    const stale = daemonStatusLine(live, { transportError: 'HTTP 502' });
+    assert.equal(stale.tone, 'warn');
+    assert.match(stale.text, /last reading/i);
+    assert.match(stale.text, /502/);
+    assert.ok(!/Claudexor ready/.test(stale.text), 'no health claim from a failed read');
+});
+
+test('a failed status request marks the view stale, and a failed wake is never silent', async () => {
+    // Both halves of the WIRING (the pure-helper tests above pass even if the
+    // plumbing is reverted): refreshStatus must record the transport failure,
+    // and wakeDaemon must surface an error the owner asked for by clicking.
+    const previousDocument = globalThis.document;
+    const { lines } = stubStatusDom();
+    try {
+        const okOnce = async () => ({ ok: true, json: async () => ({
+            daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
+            reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+        }) });
+        await refreshStatus({ force: true, fetchImpl: okOnce });
+        assert.ok(lines.at(-1).includes('3.3.13'), 'a good read renders the live line');
+
+        await refreshStatus({ force: true, fetchImpl: async () => ({ ok: false, status: 502, json: async () => ({}) }) });
+        assert.match(lines.at(-1), /last reading/i, 'a failed read stops claiming current truth');
+        assert.match(lines.at(-1), /502/);
+
+        // A wake the owner pressed that refuses (typed 503, or a 404 from an
+        // older backend) must SAY so instead of silently returning to idle.
+        await wakeDaemon({ fetchImpl: async () => ({ ok: false, status: 503, json: async () => ({ error: 'claudexord_not_installed: no binary' }) }) });
+        assert.match(lines.at(-1), /Could not start the agent daemon/i);
+        assert.match(lines.at(-1), /claudexord_not_installed/);
     } finally {
         globalThis.document = previousDocument;
     }

@@ -18,6 +18,7 @@
 // Pure helpers live at the top and are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
+import { facetReadState } from './harness_accounts.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -76,7 +77,7 @@ export function splitSessionTarget(target) {
     return { harness: raw.slice(0, eq), model: raw.slice(eq + 1) };
 }
 
-export function routeChoiceGroups({ harnesses = [], currentChoice = '' } = {}) {
+export function routeChoiceGroups({ harnesses = [], currentChoice = '', catalogRead = 'ok' } = {}) {
     const sessionValues = (harnesses || [])
         .filter((h) => h && h.id)
         .map((h) => ({
@@ -91,9 +92,14 @@ export function routeChoiceGroups({ harnesses = [], currentChoice = '' } = {}) {
     // the row as the first choice — same rule as profileOptionsFor.
     const savedChoice = String(currentChoice || '');
     if (savedChoice.startsWith('session:') && !sessionValues.some((o) => o.value === savedChoice)) {
+        // "(not in discovery)" is a VERDICT — it says we looked and did not find
+        // it. When the catalog was never read (idle daemon) or the read failed,
+        // we did not look at all, and the owner's saved route is almost
+        // certainly still there.
+        const suffix = catalogRead === 'ok' ? 'not in discovery' : 'not checked';
         sessionValues.push({
             value: savedChoice,
-            label: `${savedChoice.slice('session:'.length)} (not in discovery)`,
+            label: `${savedChoice.slice('session:'.length)} (${suffix})`,
         });
     }
     const groups = [{ label: 'API', options: [{ value: API_ROUTE_CHOICE, label: 'API model' }] }];
@@ -106,7 +112,17 @@ export function routeChoiceGroups({ harnesses = [], currentChoice = '' } = {}) {
         ? { label: 'Coding agents — subscriptions', options: sessionValues }
         : { label: 'Coding agents — subscriptions', options: [{
             value: '', disabled: true,
-            label: 'None available — sign in under Providers → Harness Accounts',
+            // Emptiness only means "none available" when the catalog was
+            // actually READ. With a lazily-started daemon idle, this list is
+            // simply unknown — announcing absence sent the owner to sign in
+            // for accounts that were already there. The REASON matters too:
+            // "the daemon is not running" is a second lie when it IS running
+            // and this one read failed.
+            label: catalogRead === 'ok'
+                ? 'None available — sign in under Providers → Harness Accounts'
+                : (catalogRead === 'not_read'
+                    ? 'Not checked yet — the agent daemon is not running'
+                    : 'Not checked — the last read did not complete'),
         }] });
     return groups;
 }
@@ -198,7 +214,7 @@ function lastRunMetaTitle(entry) {
     return `UI projection of capability_delta (D22) — ran as ${route}${ts ? ` at ${ts}` : ''}`;
 }
 
-export function sessionModelOptions(harness, currentModel) {
+export function sessionModelOptions(harness, currentModel, { modelsRead = '' } = {}) {
     // The ONE model-options fragment for a session row's model select (triad,
     // scope, advisory, and the Subagents section import it too). "Engine
     // default model" is the empty tail; a SAVED model discovery no longer
@@ -209,12 +225,17 @@ export function sessionModelOptions(harness, currentModel) {
     const options = [{ value: '', label: 'Engine default model' },
         ...models.map((m) => ({ value: String(m.id || m.value || m), label: String(m.id || m.label || m) }))];
     if (currentModel && !options.some((o) => o.value === currentModel)) {
-        options.push({ value: currentModel, label: `${currentModel} (not in discovery)` });
+        // The backend already discloses a failed per-harness model read
+        // (`models_error`); calling the pin "not in discovery" then states a
+        // search result we never obtained.
+        const unread = modelsRead || (harness && harness.models_error ? 'failed' : '');
+        options.push({ value: currentModel,
+            label: `${currentModel} (${unread ? 'not checked' : 'not in discovery'})` });
     }
     return options;
 }
 
-export function profileOptionsFor(profiles, savedPin) {
+export function profileOptionsFor(profiles, savedPin, { accountsRead = 'ok' } = {}) {
     // Mirrors the model list's own rule: a SAVED pin the daemon no longer discovers
     // (account signed out, daemon down, profile renamed) matched no option, so the
     // select fell back to its first entry and redrew the row as "automatic rotation".
@@ -223,7 +244,8 @@ export function profileOptionsFor(profiles, savedPin) {
     const options = [{ value: '', label: 'Account: automatic rotation' },
         ...(profiles || []).map((p) => ({ value: p, label: `Account: ${p} (pinned)` }))];
     if (savedPin && !options.some((o) => o.value === savedPin)) {
-        options.push({ value: savedPin, label: `Account: ${savedPin} (not in discovery)` });
+        const suffix = accountsRead === 'ok' ? 'not in discovery' : 'not checked';
+        options.push({ value: savedPin, label: `Account: ${savedPin} (${suffix})` });
     }
     return options;
 }
@@ -361,13 +383,14 @@ function effortSelectHtml(attrs, selected, surfaceDefault) {
 
 function rowHtml(row, group) {
     const choice = encodeRouteChoice(row);
-    const groups = routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice });
+    const groups = routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice, catalogRead: state.catalogRead || 'ok' });
     const session = row.route.kind === ROUTE_KIND_SESSION;
     const split = session ? splitSessionTarget(row.route.target_id) : { harness: '', model: '' };
     const harness = session ? harnessesById()[split.harness] : null;
     const modelOptions = sessionModelOptions(harness, split.model);
     const profiles = session ? (state.profilesByHarness[split.harness] || []) : [];
-    const profileOptions = profileOptionsFor(profiles, row.route.profile_id);
+    const profileOptions = profileOptionsFor(profiles, row.route.profile_id,
+        { accountsRead: state.catalogRead || 'ok' });
     const last = state.lastExecutions[row.slot_id];
     const lastText = last ? describeLastExecution(last) : '';
     // ONE quiet meta line per row (owner feedback): the delivery badge and the
@@ -404,7 +427,7 @@ function advisoryHtml() {
     // the API entry read as stray next to the labeled subscriptions group.
     const groups = [
         { label: 'API', options: [{ value: API_ROUTE_CHOICE, label: 'Claude (Anthropic API key)' }] },
-        ...routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice }).slice(1),
+        ...routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice, catalogRead: state.catalogRead || 'ok' }).slice(1),
     ];
     // Session branch: the SAME model-options fragment the triad rows use —
     // rewriting it here would lose the "(not in discovery)" guard and let a
@@ -414,7 +437,9 @@ function advisoryHtml() {
     // the OpenRouter catalog ids the datalist suggests.
     const modelOptions = session ? sessionModelOptions(harnessesById()[split.harness], split.model) : [];
     const profiles = session ? (state.profilesByHarness[split.harness] || []) : [];
-    const profileOptions = session ? profileOptionsFor(profiles, advisory.route?.profile_id) : [];
+    const profileOptions = session
+        ? profileOptionsFor(profiles, advisory.route?.profile_id, { accountsRead: state.catalogRead || 'ok' })
+        : [];
     const last = state.lastExecutions.advisory_slot_1;
     const lastText = last ? describeLastExecution(last) : '';
     const metaParts = [capabilityBadge({ route: advisory.route || {} }, harnessesById())];
@@ -611,11 +636,18 @@ export async function reloadReviewerSlots() {
     try {
         const resp = await apiFetch('/api/claudexor/status?include=models', { cache: 'no-store' });
         const data = await resp.json().catch(() => ({}));
+        // A non-OK response is a FAILED read, not an empty catalog — it used to
+        // fall straight through and blank the subscriptions group. Kept separate
+        // from `loadError` so a Claudexor outage never blocks saving an
+        // API-routed reviewer slot.
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
         state.harnesses = Array.isArray(data.harnesses) ? data.harnesses : [];
         state.profilesByHarness = indexProfilesByHarness(data);
+        state.catalogRead = facetReadState(data, 'catalog');
     } catch (error) {
         state.harnesses = [];
         state.profilesByHarness = {};
+        state.catalogRead = 'transport';
     }
     renderRows();
 }
