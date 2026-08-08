@@ -128,6 +128,76 @@ def clear_review_continuation(drive_root: Any, task_id: str) -> bool:
     return False
 
 
+_ARCHIVED_DIR_NAME = "archived"
+
+# A continuation of a SETTLED task younger than this stays in context: it is the
+# designed cross-task resume pointer (the owning task died with the commit still
+# blocked; a follow-up picks it up from the Review Continuity section). Older
+# than this, un-resumed, it is history riding into every new task's prompt.
+RETIRE_SETTLED_CONTINUATION_AFTER_DAYS = 7
+
+
+def archived_continuation_dir(drive_root: Any) -> pathlib.Path:
+    path = continuation_dir(drive_root) / _ARCHIVED_DIR_NAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _continuation_age_days(item: ReviewContinuation) -> float:
+    import datetime as _dt
+
+    ts = str(item.updated_ts or item.created_ts or "").strip()
+    if not ts:
+        return float("inf")  # undatable record: old by construction
+    try:
+        then = _dt.datetime.fromisoformat(ts)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=_dt.timezone.utc)
+        return (_dt.datetime.now(tz=_dt.timezone.utc) - then).total_seconds() / 86400.0
+    except ValueError:
+        return float("inf")
+
+
+def retire_settled_continuations(
+    drive_root: Any,
+    *,
+    is_settled: Any,
+    min_age_days: float = RETIRE_SETTLED_CONTINUATION_AFTER_DAYS,
+) -> List[str]:
+    """Archive continuations whose owning task SETTLED and that sat un-resumed.
+
+    A continuation exists so a follow-up can resume a blocked/interrupted review
+    — so a FRESH record of a settled task stays. But nothing clears the file
+    when a different task later lands the same work, so stale records rode into
+    every new task's Review Continuity section indefinitely (live: Aug-5 records
+    injected for days). Retirement MOVES a settled-and-older-than-``min_age_days``
+    file to ``state/review_continuations/archived/`` — durable, never deleted
+    (P1) — and returns the retired task_ids. ``is_settled(task_id) -> bool`` is
+    supplied by the caller so this module stays free of task-result imports; any
+    error leaves the continuation in place (fail-open: context noise over lost
+    review state).
+    """
+    retired: List[str] = []
+    for path in sorted(continuation_dir(drive_root).glob("*.json")):
+        task_id = path.stem
+        try:
+            item = load_review_continuation(drive_root, task_id)
+            if item is None or _continuation_age_days(item) < min_age_days:
+                continue
+            if not is_settled(task_id):
+                continue
+            target = archived_continuation_dir(drive_root) / path.name
+            if target.exists():
+                target = target.with_name(f"{path.stem}.{_safe_ts_token(utc_now_iso())}.json")
+            path.rename(target)
+            retired.append(task_id)
+        except ContinuationCorruptError:
+            continue  # the corrupt-quarantine path owns malformed files
+        except Exception:
+            continue
+    return retired
+
+
 def build_review_continuation(
     task: Dict[str, Any],
     attempt: Any,
