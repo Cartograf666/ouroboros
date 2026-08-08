@@ -34,12 +34,20 @@ BLOCKED_CASES = [
     pytest.param("GIT_WORK_TREE=/Users/anton/Ouroboros/repo git checkout .", id="env_work_tree"),
     pytest.param("cd /tmp/ws;git -C /Users/anton/Ouroboros/repo reset --hard", id="glued_semicolon_cd_minusC"),
     pytest.param("cd /tmp/ws\ngit -C /Users/anton/Ouroboros/repo reset --hard", id="newline_cd_minusC"),
-    pytest.param("git -C /Users/anton/Ouroboros/repo status", id="direct_minusC_repo"),
-    pytest.param("git --git-dir=/Users/anton/Ouroboros/repo/.git log", id="git_dir_flag_repo"),
-    pytest.param("git --work-tree=/Users/anton/Ouroboros/data status", id="work_tree_flag_data"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo commit -m x", id="direct_minusC_repo_commit"),
+    pytest.param("git --git-dir=/Users/anton/Ouroboros/repo/.git reset --hard", id="git_dir_flag_repo_reset"),
+    pytest.param("git --work-tree=/Users/anton/Ouroboros/data checkout .", id="work_tree_flag_data_checkout"),
     pytest.param("sh -c 'git -C /Users/anton/Ouroboros/repo reset --hard'", id="nested_sh_c"),
     pytest.param("true && git -C /Users/anton/Ouroboros/repo clean -fd", id="glued_and_minusC"),
-    pytest.param("cd /Users/anton/Ouroboros/repo && git status", id="cd_into_repo_then_git"),
+    pytest.param("cd /Users/anton/Ouroboros/repo && git commit -am x", id="cd_into_repo_then_commit"),
+    # Bidirectional containment: an ANCESTOR target puts repo/ and data/ inside a
+    # task-created work tree even though the target CONTAINS the protected roots.
+    pytest.param("git -C /Users/anton/Ouroboros init", id="ancestor_init"),
+    pytest.param("cd /Users/anton/Ouroboros && git add -A", id="ancestor_cwd_add"),
+    pytest.param("git init /Users/anton", id="home_ancestor_init_arg"),
+    # Casefold containment: APFS/NTFS are case-insensitive, so a re-cased spelling
+    # of a protected root is the SAME directory there.
+    pytest.param("git -C /users/anton/ouroboros/REPO reset --hard", id="casefold_minusC_reset"),
 ]
 
 
@@ -52,7 +60,13 @@ def test_network_subcommand_blocked_when_network_disabled():
     assert _violation("git clone https://example.com/x.git", allow_network=False)
 
 
-# --- legitimate external-workspace git that MUST stay allowed ---------------
+def test_network_fence_applies_to_readonly_git_too():
+    # ls-remote is read-only for TARGET purposes but still reaches the network:
+    # the contract fence must hold independently of the read-only carve-out.
+    assert _violation("git ls-remote https://example.com/x.git", allow_network=False)
+
+
+# --- legitimate git that MUST stay allowed -----------------------------------
 
 ALLOWED_CASES = [
     pytest.param("git status", id="status"),
@@ -62,6 +76,13 @@ ALLOWED_CASES = [
     pytest.param("git -C /tmp/ws/sub status", id="minusC_inside_workspace"),
     pytest.param("echo 'git -C /Users/anton/Ouroboros/repo' > note.txt", id="echo_mentions_git_not_a_git_cmd"),
     pytest.param("grep -r 'git reset' .", id="grep_mentions_git"),
+    # READ-ONLY git stays allowed even AT a runtime target (v4.5.1 / f14baf8f
+    # false-block line): inspection is the vcs_status-equivalent lane.
+    pytest.param("git -C /Users/anton/Ouroboros/repo status", id="readonly_minusC_repo_status"),
+    pytest.param("git --git-dir=/Users/anton/Ouroboros/repo/.git log", id="readonly_git_dir_log"),
+    pytest.param("cd /Users/anton/Ouroboros/repo && git status", id="readonly_cd_repo_status"),
+    pytest.param("cd /Users/anton/Ouroboros/repo && git diff", id="readonly_cd_repo_diff"),
+    pytest.param("git -C /Users/anton/Ouroboros/repo branch -l", id="readonly_branch_list_repo"),
 ]
 
 

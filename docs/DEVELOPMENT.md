@@ -136,8 +136,11 @@ Not every layer is required for every operation. Simple cases (e.g., `read_file`
   the system repo while contextual repo tools resolve against the active
   workspace through `ToolContext.active_repo_dir()`.
 - Workspace-mode tasks must use an explicit allowlist, reject system-repo/data
-  overlap, require a git worktree root, and return patch artifacts instead of
-  committing in the target repository.
+  overlap, require a git worktree root, and capture patch artifacts against the
+  preflight git base. Task-local git INCLUDING commits inside the workspace is
+  allowed — the v5.29 "no commits in external repositories" doctrine was
+  reversed in v6.27 ("full git is legitimate task work"); only git targeting
+  the Ouroboros runtime is blocked.
 - Workspace parent/headless tasks may call `task_acceptance_review`. For roots
   in auto/required mode, this call only records evidence for the single
   host-owned acceptance panel; it makes no reviewer-model call and returns no
@@ -1011,6 +1014,7 @@ Before every commit, verify the following:
 - `run_script` temporary files are created under the active workspace when the task is workspace/executor-backed, then removed after execution. Do not run workspace scripts from the system repo temp path; relative imports, generated files, and toolchain discovery must observe the same cwd the user requested.
 - Declared process outputs may be files or directories. Directory outputs are copied to the canonical artifact store as a bounded manifest plus zip archive; hidden/control/credential-shaped files, excessive file counts, and excessive byte sizes fail closed instead of leaking through artifact registration.
 - In external workspace mode, light-mode self-repo dirty checks snapshot the system repo, not the active workspace. Task-local git operations inside the external workspace are allowed when the task requires them; Ouroboros repo/data paths remain structurally protected, and workspace patch artifacts are captured against the preflight git base.
+- The DEFAULT (non-workspace) shell lane carries the SAME target-aware git policy in every runtime mode including light (Q4=A sandbox unwind): mutating git is blocked only when it targets the Ouroboros runtime (system repo / any data drive — bidirectional, casefold, symlink-resolved containment; `commit_reviewed` is the remedy for self-repo changes), read-only git works everywhere including at the system repo, `allowed_resources.network=false` still fences network git subcommands, and acting `self_worktree` children keep the strict no-commit policy. `git init`/`commit`/`push` in `~/projects`, `/tmp`, an attached project folder, or a host-minted coop tree is legitimate task work, not a violation.
 - `claude_code_edit` is RETIRED (D10, owner-approved migration, phase 6.4): the SDK edit gateway's job moved to the delegated coding path — a mutating subagent (`schedule_subagent`) whose nanny drives the session with `delegate_start`/`delegate_wait`/`delegate_cancel`, on the owner's subscription when a harness route is configured. Compatibility is one-way and permanent: a saved task contract carrying `disabled_tools=["claude_code_edit"]` also withholds the successor `delegate_start` (registry `_disabled_tools`), and the frozen `GET /api/claude-code/status` + `POST /api/claude-code/install` endpoints stay — the Claude runtime still powers the api-route advisory review. Do not resurrect the tool name.
 - Do not recommend `runtime_data/uploads`, skill payloads, or owner state directories as generic artifact transport.
 

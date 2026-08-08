@@ -174,12 +174,31 @@ def _resolve_workspace_shell_cwd(active_root: pathlib.Path, cwd: str = "") -> pa
     return root
 
 
-def _resolves_into(target: pathlib.Path, root: pathlib.Path) -> bool:
+def _casefold_relative_to(target: pathlib.Path, root: pathlib.Path) -> bool:
+    """Symlink-resolved, case-insensitive "target is under root" (prefix compare
+    on resolved parts). Casefold is unconditional — the same conservative trade
+    the admission/user_files guards make (``tool_access.paths_overlap_casefold``):
+    APFS/NTFS are case-insensitive, so ``/users/anton/ouroboros/REPO`` and the
+    real repo are ONE directory there, and a case-sensitive compare is a bypass."""
     try:
-        target.resolve(strict=False).relative_to(pathlib.Path(root).resolve(strict=False))
-        return True
-    except Exception:
+        target_parts = pathlib.Path(target).resolve(strict=False).parts
+        root_parts = pathlib.Path(root).resolve(strict=False).parts
+    except (OSError, ValueError):
         return False
+    if len(target_parts) < len(root_parts):
+        return False
+    return tuple(part.casefold() for part in target_parts[: len(root_parts)]) == tuple(
+        part.casefold() for part in root_parts
+    )
+
+
+def _overlaps_protected(target: pathlib.Path, root: pathlib.Path) -> bool:
+    """BIDIRECTIONAL containment: the target inside the protected root, OR the
+    protected root inside the target. One direction alone lets an ANCESTOR
+    target through — ``git -C ~/Ouroboros init`` puts repo/ and data/ inside a
+    task-created work tree even though the target contains (rather than is
+    contained by) every protected root."""
+    return _casefold_relative_to(target, root) or _casefold_relative_to(root, target)
 
 
 def _shell_path(text: str) -> pathlib.Path:
@@ -195,18 +214,33 @@ def external_workspace_git_violation(
     allow_network: bool = True,
     inherited_env: "dict[str, str] | None" = None,
 ) -> str:
-    """Git policy for EXTERNAL workspaces: full git is legitimate task work.
+    """Target-aware git policy: full git is legitimate task work.
 
     Tasks routinely need `git clone`, `git checkout`, `git commit`, even a real
-    `git push` to a task-local remote. The deterministic guard therefore only
-    protects what actually needs protecting:
+    `git push` to a task-local remote. Since the Q4=A unwind (2026-08-08) this is
+    the ONE resolver for external workspaces AND the default (non-workspace)
+    shell lane — direct chat, light mode, self_modification-profile tasks — so
+    the deterministic guard only protects what actually needs protecting:
 
-    - no git invocation may target the Ouroboros system repo or data drive
-      (via cwd, `-C`, `--git-dir`, `--work-tree`, or an absolute path argument);
-    - network-reaching subcommands respect ``allowed_resources.network``.
+    - no MUTATING git invocation may target the Ouroboros runtime (system repo
+      or any data drive) via cwd, `-C`, `--git-dir`, `--work-tree`, `GIT_DIR`/
+      `GIT_WORK_TREE` env, or a path argument. Containment is bidirectional
+      (an ancestor target such as ``git -C ~/Ouroboros init`` is a violation
+      too), casefold, and symlink-resolved;
+    - READ-ONLY git (status/log/diff/show/rev-parse/branch- and tag-listing)
+      stays allowed EVERYWHERE, including at a runtime target — blocking it is
+      the recorded false-block class (v4.5.1, f14baf8f);
+    - network-reaching subcommands respect ``allowed_resources.network`` in
+      every lane, read-only or not.
 
     Everything else stays allowed here; the LLM safety layer still reviews the
-    command for genuinely dangerous intent.
+    command for genuinely dangerous intent. Disclosed residuals (deliberately
+    NOT chased — no shell-parser arms race): git launched through a transparent
+    wrapper (``nice``/``xargs``/``time``) or from inside interpreter code is not
+    a per-segment ``git`` command and is not classified here (the pre-flip text
+    classifier never saw the interpreter form either); `-c alias.*=...`/
+    ``include.path`` config indirection is not parsed — only the explicit
+    cwd/flag/env/argument target vectors above are resolved.
     """
     roots = [pathlib.Path(p) for p in (protected_roots or [])]
     base = _resolve_workspace_shell_cwd(pathlib.Path(active_root), cwd)
@@ -216,7 +250,7 @@ def external_workspace_git_violation(
 
     def _protected_label(target: pathlib.Path) -> str:
         for root in roots:
-            if _resolves_into(target, root):
+            if _overlaps_protected(target, root):
                 return str(root)
         return ""
 
@@ -281,56 +315,63 @@ def external_workspace_git_violation(
             continue
         if cmd_name != "git":
             continue
-        for root in roots:
-            if _resolves_into(current_base, root):
-                return "git working directory targets the Ouroboros runtime"
-        # External-workspace git is legitimate task work in host scratch (a repo
-        # under /tmp, a /build tree, a sibling checkout), so the cwd is NOT
-        # confined to the declared active workspace — only the Ouroboros runtime
-        # roots above are protected (per this function's contract).
-        # GIT_DIR / GIT_WORK_TREE environment retargeting (this segment runs git).
-        # Merge env exported in earlier segments; segment-local wins.
-        effective_env = {**session_env, **env_assigns}
-        for var in ("GIT_DIR", "GIT_WORK_TREE"):
-            val = effective_env.get(var)
-            if not val:
-                continue
-            target = _resolve(val, current_base)
-            if _protected_label(target):
-                return f"git invocation targets the Ouroboros runtime via {var}"
         invocation = command
-        j = 1
-        while j < len(invocation):
-            part = str(invocation[j])
-            value = ""
-            if part in {"-C", "--git-dir", "--work-tree"} and j + 1 < len(invocation):
-                value = str(invocation[j + 1])
-                j += 2
-            elif part.startswith("--git-dir=") or part.startswith("--work-tree="):
-                value = part.split("=", 1)[1]
-                j += 1
-            elif part == "-c":
-                j += 2
-            else:
-                j += 1
-            if not value:
-                continue
-            target = _resolve(value, current_base)
-            if _protected_label(target):
-                return "git invocation targets the Ouroboros runtime"
-        for arg in invocation[1:]:
-            text = str(arg)
-            if "=" in text and text.startswith("--"):
-                text = text.split("=", 1)[1]
-            candidate = _shell_path(text)
-            if not candidate.is_absolute():
-                # Relative args resolve under the workspace cwd; the workspace
-                # cannot overlap the runtime, so only ".."-climbing can escape.
-                if ".." not in candidate.parts:
+        # READ-ONLY git is never target-checked: `git status`/`log`/`diff` at the
+        # system repo is the vcs_status-equivalent inspection lane, and blocking
+        # it is the recorded false-block class (v4.5.1; f14baf8f). Classification
+        # deliberately probes with allow_network=True so it answers ONLY "does
+        # this invocation mutate?" — the contract's network fence is enforced
+        # separately at the tail, for read-only and mutating git alike.
+        if _git_invocation_block_reason(invocation, allow_network=True):
+            for root in roots:
+                if _overlaps_protected(current_base, root):
+                    return "git working directory targets the Ouroboros runtime"
+            # Git is legitimate task work in host scratch (a repo under /tmp, a
+            # /build tree, a sibling checkout), so the cwd is NOT confined to the
+            # declared active workspace — only the Ouroboros runtime roots above
+            # are protected (per this function's contract).
+            # GIT_DIR / GIT_WORK_TREE environment retargeting (this segment runs
+            # git). Merge env exported in earlier segments; segment-local wins.
+            effective_env = {**session_env, **env_assigns}
+            for var in ("GIT_DIR", "GIT_WORK_TREE"):
+                val = effective_env.get(var)
+                if not val:
                     continue
-                candidate = (current_base / candidate).resolve(strict=False)
-            if _protected_label(candidate):
-                return "git invocation targets the Ouroboros runtime"
+                target = _resolve(val, current_base)
+                if _protected_label(target):
+                    return f"git invocation targets the Ouroboros runtime via {var}"
+            j = 1
+            while j < len(invocation):
+                part = str(invocation[j])
+                value = ""
+                if part in {"-C", "--git-dir", "--work-tree"} and j + 1 < len(invocation):
+                    value = str(invocation[j + 1])
+                    j += 2
+                elif part.startswith("--git-dir=") or part.startswith("--work-tree="):
+                    value = part.split("=", 1)[1]
+                    j += 1
+                elif part == "-c":
+                    j += 2
+                else:
+                    j += 1
+                if not value:
+                    continue
+                target = _resolve(value, current_base)
+                if _protected_label(target):
+                    return "git invocation targets the Ouroboros runtime"
+            for arg in invocation[1:]:
+                text = str(arg)
+                if "=" in text and text.startswith("--"):
+                    text = text.split("=", 1)[1]
+                candidate = _shell_path(text)
+                if not candidate.is_absolute():
+                    # Relative args resolve under the cwd; a non-runtime cwd can
+                    # only escape toward the runtime by ".."-climbing.
+                    if ".." not in candidate.parts:
+                        continue
+                    candidate = (current_base / candidate).resolve(strict=False)
+                if _protected_label(candidate):
+                    return "git invocation targets the Ouroboros runtime"
         if not allow_network:
             subcmd, _ = _git_subcommand_and_args(invocation)
             if subcmd in GIT_NETWORK_SUBCOMMANDS:
