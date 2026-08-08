@@ -440,7 +440,7 @@ def _resolve_workspace_shell_cwd(active_root: pathlib.Path, cwd: str = "") -> pa
     root = pathlib.Path(active_root).resolve(strict=False)
     if cwd and str(cwd).strip() not in ("", ".", "./"):
         raw = pathlib.Path(str(cwd)).expanduser()
-        return raw.resolve(strict=False) if raw.is_absolute() else (root / safe_relpath(str(cwd))).resolve(strict=False)
+        return raw.resolve(strict=False) if _rooted(raw) else (root / safe_relpath(str(cwd))).resolve(strict=False)
     return root
 
 
@@ -475,9 +475,20 @@ def _shell_path(text: str) -> pathlib.Path:
     return pathlib.Path(os.path.expandvars(str(text or ""))).expanduser()
 
 
+def _rooted(path: pathlib.Path) -> bool:
+    """True for any path the shell/git resolves from a filesystem ROOT, not the cwd.
+
+    On Windows ``Path('/Users/x').is_absolute()`` is False (root, no drive) while
+    git and cmd resolve it from the CURRENT DRIVE's root — joining it under the
+    workspace base instead silently un-protects a runtime target spelled
+    POSIX-style (the windows temp-under-$HOME confinement class). Anchor presence
+    is the honest cross-OS shape test; on POSIX it equals ``is_absolute()``."""
+    return path.is_absolute() or bool(path.anchor)
+
+
 def _resolve_shell_arg(value: str, base_dir: pathlib.Path) -> pathlib.Path:
     target = _shell_path(value)
-    if not target.is_absolute():
+    if not _rooted(target):
         target = base_dir / target
     return target.resolve(strict=False)
 
@@ -613,7 +624,7 @@ def external_workspace_git_violation(
             if cmd_name == "pushd":
                 dir_stack.append(current_base)
             target = _shell_path(str(command[1]))
-            current_base = target if target.is_absolute() else (current_base / target)
+            current_base = target if _rooted(target) else (current_base / target)
             current_base = current_base.resolve(strict=False)
             continue
         if cmd_name == "popd" and dir_stack:
@@ -731,7 +742,7 @@ def external_workspace_git_violation(
                 if destination and not is_path_value and not _git_path_shaped(text):
                     continue
                 candidate = _shell_path(text)
-                if not candidate.is_absolute():
+                if not _rooted(candidate):
                     # Relative args resolve under the effective base and are ALWAYS
                     # canonicalized. The former ".."-only shortcut assumed a plain
                     # descend cannot reach a protected root — untrue through a
@@ -787,7 +798,7 @@ def workspace_git_safety_violation(
                 saw_root_selector = True
                 try:
                     target = pathlib.Path(parts[j + 1])
-                    if not target.is_absolute():
+                    if not _rooted(target):
                         target = base / target
                     target.resolve(strict=False).relative_to(root)
                 except Exception:
@@ -799,7 +810,7 @@ def workspace_git_safety_violation(
                 value = part.split("=", 1)[1]
                 try:
                     target = pathlib.Path(value)
-                    if not target.is_absolute():
+                    if not _rooted(target):
                         target = base / target
                     target.resolve(strict=False).relative_to(root)
                 except Exception:
