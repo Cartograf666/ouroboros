@@ -1234,40 +1234,102 @@
             syncCurrentStepActionState();
         }
 
-    async function saveWizardPayload(payload) {
-        if (HOST_MODE === 'web') {
-            const runtimeMode = trim(state.runtimeMode) || 'advanced';
-            await apiRequest('/api/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-            });
-            const runtimeResult = await apiRequest('/api/owner/runtime-mode', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ mode: runtimeMode }),
-            });
+    // --- Completion ---------------------------------------------------------
+    // The wizard runs against a live gateway on every host, so completion has one
+    // shape: persist, then tell whichever shell embeds this page that setup is
+    // done. Only the announcement differs (embedded frame / desktop setup window
+    // / plain browser tab).
+
+    const ONBOARDING_COMPLETE_ENDPOINT = '/api/onboarding/complete';
+
+    function announceCompletion(result) {
+        const restartRequired = Boolean(result?.restart_required);
+        const runtimeMode = trim(result?.runtime_mode) || trim(state.runtimeMode) || 'advanced';
+        if (window.parent && window.parent !== window) {
             // Target our own origin explicitly (paired with the receiver's
             // origin check) instead of broadcasting to any embedding page.
-            const _targetOrigin = window.location.origin === 'null'
+            const targetOrigin = window.location.origin === 'null'
                 ? (window.parent?.location?.origin ?? '*')
                 : window.location.origin;
-            window.parent?.postMessage({
+            window.parent.postMessage({
                 type: 'ouroboros:onboarding-complete',
-                restart_required: Boolean(runtimeResult?.restart_required),
-                runtime_mode: runtimeResult?.runtime_mode || runtimeMode,
-            }, _targetOrigin);
-            if (!window.parent || window.parent === window) {
-                window.location.replace('/');
-            }
-            return 'ok';
+                restart_required: restartRequired,
+                runtime_mode: runtimeMode,
+            }, targetOrigin);
+            return;
         }
-        if (!window.pywebview?.api?.save_wizard) {
-            throw new Error('Desktop onboarding bridge is unavailable.');
+        if (window.pywebview?.api?.onboarding_finished) {
+            // Desktop setup window: the launcher owns both this window and the
+            // managed server process, so it closes the window and recycles the
+            // server itself instead of asking the owner to restart the app.
+            window.pywebview.api.onboarding_finished({
+                ok: true,
+                restart_required: restartRequired,
+                runtime_mode: runtimeMode,
+            });
+            return;
         }
+        window.location.replace('/');
+    }
+
+    async function completeOnboardingAtomically(payload) {
+        // SEAM (D-8): one atomic completion — server-side fresh-install proof,
+        // structural provider gate, optional agent-preset compilation, a single
+        // persist, then supervisor start. Until that endpoint ships, an absent
+        // route answers 404/405 here and the caller keeps today's behaviour
+        // rather than breaking first-run.
+        const response = await fetch(ONBOARDING_COMPLETE_ENDPOINT, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        if (response.status === 404 || response.status === 405) return null;
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        return data && typeof data === 'object' ? data : {};
+    }
+
+    async function saveWizardThroughDesktopBridge(payload) {
+        // LEGACY FALLBACK, retained only until the atomic endpoint above ships:
+        // it is the one path that may author the fresh-install `light` safety
+        // coverage, which the generic settings endpoint must never be able to do.
         const result = await window.pywebview.api.save_wizard(payload);
         if (result !== 'ok') throw new Error(result || 'Failed to save onboarding settings.');
-        return result;
+        // The launcher wrote settings.json behind the running server's back, so
+        // the managed process has to be recycled before it can adopt them.
+        return { ok: true, restart_required: true };
+    }
+
+    async function saveWizardThroughSettingsPair(payload) {
+        // LEGACY FALLBACK: today's two-write web path (generic settings save,
+        // then the dedicated owner runtime-mode write).
+        const runtimeMode = trim(state.runtimeMode) || 'advanced';
+        await apiRequest('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const runtimeResult = await apiRequest('/api/owner/runtime-mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: runtimeMode }),
+        });
+        return {
+            ok: true,
+            restart_required: Boolean(runtimeResult?.restart_required),
+            runtime_mode: runtimeResult?.runtime_mode || runtimeMode,
+        };
+    }
+
+    async function saveWizardPayload(payload) {
+        let result = await completeOnboardingAtomically(payload);
+        if (!result) {
+            result = window.pywebview?.api?.save_wizard
+                ? await saveWizardThroughDesktopBridge(payload)
+                : await saveWizardThroughSettingsPair(payload);
+        }
+        announceCompletion(result);
+        return 'ok';
     }
 
     async function saveWizard() {

@@ -757,7 +757,12 @@ def test_a_fresh_local_first_install_still_authors_safety_light(tmp_path, monkey
     assert (changed and settings_path.exists()), "an existing install still persists it"
     assert wizard_authors_safety_light() is False
 
-    # ...and launcher.py really implements that decision (source pin: the flow
-    # runs inside a webview callback no unit test can drive).
-    src = (cfg.pathlib.Path(__file__).parent.parent / "launcher.py").read_text()
-    assert "if provider_defaults_changed and _settings_path.exists():" in src
+    # ...and both pre-onboarding normalizers really implement that decision.
+    # The server joins the launcher here: it now starts BEFORE first-run
+    # onboarding, so its own boot normalization could create the file just as
+    # easily (behavioural coverage: tests/test_onboarding_host.py).
+    repo = cfg.pathlib.Path(__file__).parent.parent
+    launcher_host = (repo / "ouroboros" / "launcher_onboarding.py").read_text()
+    server_src = (repo / "server.py").read_text()
+    assert "if provider_defaults_changed and _settings_path.exists():" in launcher_host
+    assert "if provider_defaults_changed and _settings_path.exists():" in server_src

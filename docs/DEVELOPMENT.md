@@ -996,6 +996,11 @@ Before every commit, verify the following:
   window size it should not force scrolling merely because the access step has
   several provider fields; use responsive two-column field grids where width
   allows and keep step copy short.
+- There is ONE wizard host: the `GET /onboarding` page, served by the gateway
+  and loaded as an ES module from `/static`. The desktop setup window opens that
+  URL after the managed server is healthy, and the blocking overlay frames it.
+  Do not reintroduce a pre-server or inlined copy: a step that cannot call
+  `/api/*` or import `web/modules/*` is the defect this host removed.
 - Onboarding and Settings share the setup contract. If a key is typed in the
   current unsaved wizard payload, UI diagnostics must account for that in-memory
   value instead of warning from stale saved settings alone.

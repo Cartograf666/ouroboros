@@ -3,7 +3,7 @@ function removeOverlay() {
     document.getElementById('onboarding-overlay')?.remove();
 }
 
-function mountOverlay(html) {
+function mountOverlay() {
     removeOverlay();
     const overlay = document.createElement('div');
     overlay.id = 'onboarding-overlay';
@@ -16,7 +16,10 @@ function mountOverlay(html) {
         <iframe class="onboarding-frame" title="Ouroboros Setup" sandbox="allow-same-origin allow-scripts allow-forms"></iframe>
     `;
     const frame = overlay.querySelector('.onboarding-frame');
-    if (frame) frame.srcdoc = html;
+    // ONE onboarding host: frame the real /onboarding page rather than an
+    // inlined srcdoc document. A srcdoc string cannot import web/modules/*,
+    // and the wizard's steps need those ordinary ES modules.
+    if (frame) frame.src = '/onboarding';
     document.body.appendChild(overlay);
 }
 
@@ -73,11 +76,13 @@ export async function initOnboardingOverlay() {
     window.addEventListener('message', handleMessage);
 
     try {
+        // Readiness probe only: 204 means the install is structurally configured
+        // and no blocking overlay is due. The wizard itself is served by the
+        // /onboarding page the frame loads.
         const response = await apiFetch('/api/onboarding', { cache: 'no-store' });
         if (response.status === 204) return;
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const html = await response.text();
-        if (html.trim()) mountOverlay(html);
+        mountOverlay();
     } catch (error) {
         console.error('Failed to load onboarding overlay:', error);
     }

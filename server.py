@@ -2245,7 +2245,17 @@ async def lifespan(app):
     )
 
     settings, provider_defaults_changed, _provider_default_keys = apply_runtime_provider_defaults(load_settings())
-    if provider_defaults_changed:
+    # Persist the boot normalization only for an install that ALREADY has a
+    # settings file. Creating it here would make the server — which now starts
+    # BEFORE first-run onboarding on every host — the author of the first bytes
+    # of settings.json, and every fresh-install proof is gated on that file being
+    # absent until the owner's own onboarding save (the wizard's `light` safety
+    # coverage, install-time agent presets). Nothing is lost: the values are
+    # applied in-process below, and the completion save persists the same
+    # normalization. Mirror of launcher._prepare_first_run_settings.
+    from ouroboros.config import SETTINGS_PATH as _settings_path
+
+    if provider_defaults_changed and _settings_path.exists():
         save_settings(settings, allow_elevation=True)
     _apply_settings_to_env(settings)
     # Pin boot-time runtime-mode after env apply; save_settings compares to this owner baseline.

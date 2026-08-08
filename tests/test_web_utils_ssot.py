@@ -136,11 +136,24 @@ def test_ouroboroshub_uses_shared_fetch_json():
     assert "async function fetchJson(" not in src
 
 
-def test_onboarding_wizard_remains_inline_iife_without_imports():
-    """The onboarding wizard is inlined into a classic script, not loaded as an ES module."""
+def test_onboarding_wizard_is_loaded_as_an_es_module():
+    """The wizard is served from /static as a real ES module.
+
+    It used to be inlined into a classic ``<script>`` inside a self-contained
+    document, which is why it could never import ordinary ``web/modules/*``
+    code. Any import it grows must resolve to a real sibling module — the page
+    is served from ``/onboarding``, so a bare relative specifier resolves
+    against the SCRIPT url, not the document.
+    """
+    import re
+
+    template = (REPO_ROOT / "web" / "onboarding_template.html").read_text(encoding="utf-8")
+    assert '<script type="module" src="/static/modules/onboarding_wizard.js"></script>' in template
+
     src = _read("onboarding_wizard.js")
-    assert src.startswith("(() => {")
-    assert "\nimport " not in src
+    for specifier in re.findall(r"^\s*import\s.*?from\s+'([^']+)';", src, re.M):
+        assert specifier.startswith("./"), f"non-relative wizard import: {specifier}"
+        assert (REPO_ROOT / "web" / "modules" / specifier[2:]).is_file(), specifier
 
 
 def test_accent_tokens_have_concrete_rgba_values():
