@@ -318,60 +318,19 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
     return request, scope
 
 
-@dataclass
-class _LedgerRowsMemo:
-    """In-process cache of one drive root's per-attempt FINAL rows.
-
-    Holds only the ``_final_rows`` dict (one row per attempt, first-occurrence
-    order) plus the resume fingerprint — O(final rows), not O(ledger rows);
-    superseded transition rows are not retained."""
-
-    resume: LedgerResumeState
-    final_rows: Dict[str, Dict[str, Any]]
-
-
-# Read-side memo per RESOLVED drive root. Populated and advanced only under the
-# cross-process ledger lock; the module lock guards the dict itself. Write paths
-# (reserve/_transition/settle/import) never touch it — their own full locked
-# reads stay the monetary authority, and the stat + seq-continuity check on the
-# next read is what makes a stale memo impossible to serve, so correctness never
-# depends on any writer remembering to invalidate.
-_ROWS_MEMO: Dict[str, _LedgerRowsMemo] = {}
-_ROWS_MEMO_LOCK = threading.Lock()
-
-
-def _memoized_final_rows(root: pathlib.Path) -> list:
-    """Validated final rows for display projections, resumed incrementally.
-
-    Cold (or whenever the resume fingerprint is rejected — file replacement,
-    size shrink, same-size rewrite, seq discontinuity, a non-row-aligned tail,
-    structural corruption) this is one
-    full ``_read_records_locked`` replay, which owns quarantine. Warm, it parses
-    only the bytes appended since the previous read. The file lock is taken via
-    the module-global ``_locked`` at call time (tests monkeypatch that name).
-    Returned row dicts are shared read-only snapshots; row ORDER matches a
-    from-scratch ``_final_rows`` exactly (first-occurrence order, updates in
-    place), so aggregation over them is bit-identical to a fresh replay.
-    """
-    key = str(pathlib.Path(root).resolve(strict=False))
-    with _locked(root):
-        with _ROWS_MEMO_LOCK:
-            memo = _ROWS_MEMO.get(key)
-        advanced = _read_new_records_locked(root, memo.resume) if memo is not None else None
-        if advanced is None:
-            records = _read_records_locked(root)
-            memo = _LedgerRowsMemo(
-                resume=_ledger_resume_state(root, records),
-                final_rows=_final_rows(records),
-            )
-        else:
-            new_records, new_resume = advanced
-            for row in new_records:
-                memo.final_rows[str(row["attempt_id"])] = row
-            memo.resume = new_resume
-        with _ROWS_MEMO_LOCK:
-            _ROWS_MEMO[key] = memo
-        return list(memo.final_rows.values())
+# The read-side rows memo and the fingerprint-keyed render cache live in
+# ouroboros/_usage_rows_memo.py (extracted for the module-size gate, same
+# precedent as _usage_rows.py). The implementation resolves `_locked` /
+# `_read_records_locked` back through THIS namespace at call time, so the
+# historical monkeypatch sites keep governing display reads unchanged; the
+# names are re-bound here so tests keep addressing `ua._ROWS_MEMO` etc.
+from ouroboros._usage_rows_memo import (  # noqa: F401,E402  (re-exported seam)
+    _LedgerRowsMemo,
+    _ROWS_MEMO,
+    _ROWS_MEMO_LOCK,
+    _memoized_final_rows,
+    _render_cached,
+)
 
 
 def usage_projection(
@@ -379,17 +338,31 @@ def usage_projection(
     *,
     root_task_id: str = "",
     global_limit_usd: Optional[float] = None,
+    include_roots: bool = True,
 ) -> Dict[str, Any]:
-    """Return a replayed global projection, or one root/subtree projection."""
+    """Return a replayed global projection, or one root/subtree projection.
+
+    ``include_roots=False`` skips building the per-root ``by_root`` map for
+    hot-path readers that never consume it (``/api/state``); the slim result
+    still carries ``limit_usd``/``remaining_known_usd`` — the two fields
+    ``budget_remaining`` consumes. The default keeps the full contract."""
     root = _drive_root(drive_root)
-    final = _memoized_final_rows(root)
-    integrity_degraded = (root / QUARANTINE_REL).is_file()
+    # Every configuration input is resolved BEFORE the key is built: the
+    # TOTAL_BUDGET env read happens per call (hot-reload and tests change it
+    # without touching the ledger), so a cached render can never outlive it.
+    # The integrity bit is stat'ed and appended to the key by _render_cached,
+    # after the row read that may itself quarantine a torn tail.
     if root_task_id:
-        final = [row for row in final if str(row.get("root_task_id") or "") == root_task_id]
-        limits = [_number(row.get("root_limit_usd")) for row in final]
-        known_limits = [value for value in limits if value is not None]
-        result = _with_limit(_summary(final), min(known_limits) if known_limits else None)
-        return _with_integrity(result, integrity_degraded)
+        cache_key = ("usage_projection", root_task_id, "", None, True)
+
+        def render_root(final: list, integrity_degraded: bool) -> Dict[str, Any]:
+            rows = [row for row in final if str(row.get("root_task_id") or "") == root_task_id]
+            limits = [_number(row.get("root_limit_usd")) for row in rows]
+            known_limits = [value for value in limits if value is not None]
+            result = _with_limit(_summary(rows), min(known_limits) if known_limits else None)
+            return _with_integrity(result, integrity_degraded)
+
+        return _render_cached(root, cache_key, render_root)
     if global_limit_usd is not None:
         configured_limit = max(0.0, float(global_limit_usd))
     else:
@@ -397,23 +370,38 @@ def usage_projection(
             configured_limit = float(os.environ.get("TOTAL_BUDGET", "10") or 0.0)
         except (TypeError, ValueError):
             configured_limit = 10.0
-    result = (
-        _with_limit(_summary(final), configured_limit)
-        if global_limit_usd is not None or configured_limit > 0
-        else _summary(final)
+    apply_limit = global_limit_usd is not None or configured_limit > 0
+    cache_key = (
+        "usage_projection", "", "",
+        configured_limit if apply_limit else None,
+        include_roots,
     )
-    root_ids = sorted({str(row.get("root_task_id") or "") for row in final if row.get("root_task_id")})
-    result["by_root"] = {}
-    for rid in root_ids:
-        root_rows = [row for row in final if str(row.get("root_task_id") or "") == rid]
-        known_limits = [
-            value for value in (_number(row.get("root_limit_usd")) for row in root_rows) if value is not None
-        ]
-        result["by_root"][rid] = _with_integrity(
-            _with_limit(_summary(root_rows), min(known_limits) if known_limits else None),
-            integrity_degraded,
+
+    def render_global(final: list, integrity_degraded: bool) -> Dict[str, Any]:
+        result = (
+            _with_limit(_summary(final), configured_limit) if apply_limit else _summary(final)
         )
-    return _with_integrity(result, integrity_degraded)
+        if include_roots:
+            grouped_rows: Dict[str, list] = {}
+            for row in final:
+                rid = str(row.get("root_task_id") or "")
+                if rid:
+                    grouped_rows.setdefault(rid, []).append(row)
+            result["by_root"] = {}
+            for rid in sorted(grouped_rows):
+                root_rows = grouped_rows[rid]
+                known_limits = [
+                    value
+                    for value in (_number(row.get("root_limit_usd")) for row in root_rows)
+                    if value is not None
+                ]
+                result["by_root"][rid] = _with_integrity(
+                    _with_limit(_summary(root_rows), min(known_limits) if known_limits else None),
+                    integrity_degraded,
+                )
+        return _with_integrity(result, integrity_degraded)
+
+    return _render_cached(root, cache_key, render_global)
 
 
 def usage_breakdown(
@@ -424,66 +412,70 @@ def usage_breakdown(
 ) -> Dict[str, Any]:
     """Read-only physical-call/token/cost buckets from validated ledger finals."""
     root = _drive_root(drive_root)
-    rows = _memoized_final_rows(root)
-    integrity_degraded = (root / QUARANTINE_REL).is_file()
-    if root_task_id:
-        rows = [row for row in rows if str(row.get("root_task_id") or "") == root_task_id]
-    if task_id:
-        rows = [row for row in rows if str(row.get("task_id") or "") == task_id]
+    cache_key = ("usage_breakdown", root_task_id, task_id, None, True)
 
-    def grouped(field: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        groups: Dict[str, list[Dict[str, Any]]] = {}
-        unattributed: list[Dict[str, Any]] = []
-        for row in rows:
-            key = str(row.get(field) or "")
-            if str(row.get("kind") or "") in {"legacy_metadata", "legacy_delta"} or not key:
-                unattributed.append(row)
-            else:
-                groups.setdefault(key, []).append(row)
-        return (
-            {key: _breakdown_bucket(groups[key]) for key in sorted(groups)},
-            _breakdown_bucket(unattributed),
-        )
+    def render(final: list, integrity_degraded: bool) -> Dict[str, Any]:
+        rows = final
+        if root_task_id:
+            rows = [row for row in rows if str(row.get("root_task_id") or "") == root_task_id]
+        if task_id:
+            rows = [row for row in rows if str(row.get("task_id") or "") == task_id]
 
-    by_model, model_unattributed = grouped("model")
-    by_provider, provider_unattributed = grouped("provider")
-    by_category, category_unattributed = grouped("category")
-    by_task, task_unattributed = grouped("task_id")
-    by_root, root_unattributed = grouped("root_task_id")
+        def grouped(field: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+            groups: Dict[str, list[Dict[str, Any]]] = {}
+            unattributed: list[Dict[str, Any]] = []
+            for row in rows:
+                key = str(row.get(field) or "")
+                if str(row.get("kind") or "") in {"legacy_metadata", "legacy_delta"} or not key:
+                    unattributed.append(row)
+                else:
+                    groups.setdefault(key, []).append(row)
+            return (
+                {key: _breakdown_bucket(groups[key]) for key in sorted(groups)},
+                _breakdown_bucket(unattributed),
+            )
 
-    result = {
-        **_with_integrity(_breakdown_bucket(rows), integrity_degraded),
-        "by_model": by_model,
-        "by_provider": by_provider,
-        "by_category": by_category,
-        "by_task": by_task,
-        "by_root": by_root,
-        # Execution-axis filter (v6.91): the delegated (subscription-harness) rows
-        # only — a VIEW over the same rows for "where did the money go" readers,
-        # never a third monetary sum or authority. Disclosed-free sessions settle
-        # at $0 here; undisclosed spend stays in `unknown`.
-        "delegated": _with_integrity(
-            _breakdown_bucket([row for row in rows if str(row.get("kind") or "") == "subscription_session"]),
-            integrity_degraded,
-        ),
-        # Legacy call-count metadata and monetary delta stay explicit; neither
-        # is fabricated into a model/provider/category identity.
-        "unattributed": {
-            "model": model_unattributed,
-            "provider": provider_unattributed,
-            "category": category_unattributed,
-            "task": task_unattributed,
-            "root": root_unattributed,
-        },
-    }
-    if integrity_degraded:
-        for grouped_buckets in (
-            by_model, by_provider, by_category, by_task, by_root,
-            result["unattributed"],
-        ):
-            for bucket in grouped_buckets.values():
-                _with_integrity(bucket, True)
-    return result
+        by_model, model_unattributed = grouped("model")
+        by_provider, provider_unattributed = grouped("provider")
+        by_category, category_unattributed = grouped("category")
+        by_task, task_unattributed = grouped("task_id")
+        by_root, root_unattributed = grouped("root_task_id")
+
+        result = {
+            **_with_integrity(_breakdown_bucket(rows), integrity_degraded),
+            "by_model": by_model,
+            "by_provider": by_provider,
+            "by_category": by_category,
+            "by_task": by_task,
+            "by_root": by_root,
+            # Execution-axis filter (v6.91): the delegated (subscription-harness) rows
+            # only — a VIEW over the same rows for "where did the money go" readers,
+            # never a third monetary sum or authority. Disclosed-free sessions settle
+            # at $0 here; undisclosed spend stays in `unknown`.
+            "delegated": _with_integrity(
+                _breakdown_bucket([row for row in rows if str(row.get("kind") or "") == "subscription_session"]),
+                integrity_degraded,
+            ),
+            # Legacy call-count metadata and monetary delta stay explicit; neither
+            # is fabricated into a model/provider/category identity.
+            "unattributed": {
+                "model": model_unattributed,
+                "provider": provider_unattributed,
+                "category": category_unattributed,
+                "task": task_unattributed,
+                "root": root_unattributed,
+            },
+        }
+        if integrity_degraded:
+            for grouped_buckets in (
+                by_model, by_provider, by_category, by_task, by_root,
+                result["unattributed"],
+            ):
+                for bucket in grouped_buckets.values():
+                    _with_integrity(bucket, True)
+        return result
+
+    return _render_cached(root, cache_key, render)
 
 
 def _reservation_cost(request: AttemptRequest) -> Optional[float]:
