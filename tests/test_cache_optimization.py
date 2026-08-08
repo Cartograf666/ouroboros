@@ -322,3 +322,78 @@ def test_llm_round_event_zero_prompt_tokens_reports_zero_hit_rate(tmp_path):
     lines = [line for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     llm_round = next(__import__("json").loads(line) for line in lines if __import__("json").loads(line).get("type") == "llm_round")
     assert llm_round["cache_hit_rate"] == 0.0
+
+
+def test_cache_ttl_seconds_units_conversion():
+    """cache_ttl_seconds converts a RECORDED applied TTL to a wall-clock horizon —
+    'default' = the bare-marker provider tier (5m on the Anthropic family) — and
+    invents nothing for empty/unknown values (a marker-less route records no TTL)."""
+    from ouroboros.llm import cache_ttl_seconds
+
+    assert cache_ttl_seconds("5m") == 300
+    assert cache_ttl_seconds("1h") == 3600
+    assert cache_ttl_seconds("default") == 300
+    assert cache_ttl_seconds("") is None
+    assert cache_ttl_seconds(None) is None
+    assert cache_ttl_seconds("24h") is None
+    assert cache_ttl_seconds(" 1H ") == 3600
+
+
+def test_cache_horizon_note_reads_recorded_ttl_only():
+    """W3 wait-tool disclosure: one factual line when the wait outlived the APPLIED
+    cache horizon; silent below the horizon, silent without a recorded fact, and
+    NO token-count predictions in the text."""
+    from types import SimpleNamespace
+
+    from ouroboros.tools.control import cache_horizon_note
+
+    ctx = SimpleNamespace(_accumulated_usage={"_last_prompt_cache_ttl": "default"})
+    note = cache_horizon_note(ctx, 301.0)
+    assert "cache horizon" in note
+    assert "may be cold" in note
+    assert "token" not in note.lower()  # facts only, no re-write predictions
+    assert cache_horizon_note(ctx, 299.0) == ""
+
+    ctx_1h = SimpleNamespace(_accumulated_usage={"_last_prompt_cache_ttl": "1h"})
+    assert cache_horizon_note(ctx_1h, 900.0) == ""
+    assert "1h" in cache_horizon_note(ctx_1h, 3601.0)
+
+    # No recorded fact (no cached send yet / non-cache route) -> no invented horizon.
+    assert cache_horizon_note(SimpleNamespace(_accumulated_usage={}), 9999.0) == ""
+    assert cache_horizon_note(SimpleNamespace(), 9999.0) == ""
+    assert cache_horizon_note(ctx, None) == ""
+
+
+def test_wait_for_task_appends_cache_horizon_note(tmp_path, monkeypatch):
+    """The wait tools surface the disclosure through their real result paths."""
+    import json
+    from types import SimpleNamespace
+
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools import control as control_mod
+
+    write_task_result(tmp_path, "child42", STATUS_COMPLETED, result="done")
+
+    def _instant_wait(*args, **kwargs):
+        return {"all_terminal": True, "elapsed_sec": 720.0, "tasks": {}}
+
+    monkeypatch.setattr(control_mod, "wait_for_effective_tasks", _instant_wait)
+    ctx = SimpleNamespace(
+        drive_root=tmp_path,
+        _accumulated_usage={"_last_prompt_cache_ttl": "default"},
+    )
+    out = control_mod._wait_for_task(ctx, "child42", timeout_sec=0)
+    assert "cache horizon" in out and "may be cold" in out
+
+    batch = json.loads(control_mod._wait_for_tasks(ctx, ["child42"], timeout_sec=0))
+    assert "cache horizon" in str(batch.get("cache_horizon_note"))
+
+    # Below the horizon the line is absent on both paths.
+    def _fast_wait(*args, **kwargs):
+        return {"all_terminal": True, "elapsed_sec": 10.0, "tasks": {}}
+
+    monkeypatch.setattr(control_mod, "wait_for_effective_tasks", _fast_wait)
+    assert "cache horizon" not in control_mod._wait_for_task(ctx, "child42", timeout_sec=0)
+    assert "cache_horizon_note" not in json.loads(
+        control_mod._wait_for_tasks(ctx, ["child42"], timeout_sec=0)
+    )
