@@ -1101,15 +1101,17 @@ def _build_acting_constraint(
             "⚠️ TOOL_ARG_ERROR (schedule_subagent): write_surface must be one of "
             f"{allowed} (or omit it for a read-only subagent)."
         )
-    if not get_allow_mutative_subagents():
+    if not get_allow_mutative_subagents(write_surface):
         return (
-            "⚠️ MUTATIVE_SUBAGENTS_DISABLED: the OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS toggle "
-            "is not enabled. That toggle is the master gate: an explicit owner true/false "
-            "overrides the runtime-mode default, and runtime mode only sets the default when "
-            "the toggle is empty (default ON in advanced/pro, OFF in light). Schedule a "
-            "read-only subagent (omit write_surface), or have the owner enable "
-            "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS. Note: light blocks only self-repo/control-plane "
-            "writes (write_surface=self_worktree), not user/task/project deliverables."
+            "⚠️ MUTATIVE_SUBAGENTS_DISABLED: acting children with "
+            f"write_surface={write_surface!r} are disabled here. "
+            "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is the master gate: an explicit owner "
+            "true/false applies to every surface; when it is empty the runtime mode "
+            "decides — advanced/pro allow every surface, light allows the external "
+            "build surfaces (external_workspace, genesis — they write outside the "
+            "Ouroboros runtime) and keeps self_worktree (a checkout of the live body) "
+            "off. Schedule a read-only subagent (omit write_surface), use an external "
+            "surface, or have the owner enable the toggle."
         )
     grants: List[str] = []
     if isinstance(external_tool_grants, (list, tuple)):

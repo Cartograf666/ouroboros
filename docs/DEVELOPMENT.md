@@ -1064,7 +1064,10 @@ Before every commit, verify the following:
   execution rejects forbidden calls even when invoked manually.
 - Mutative ("acting") subagents (`task_constraint.mode="acting_subagent"`) are
   opt-in via `schedule_subagent(write_surface=...)` plus the master toggle
-  `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS` (default ON in advanced/pro, OFF in light).
+  `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS` (explicit owner value applies to every
+  surface; unset default is SURFACE-AWARE: every surface ON in advanced/pro,
+  light allows `external_workspace`/`genesis` — they build outside the Ouroboros
+  runtime — and keeps `self_worktree` OFF).
   `active_tool_profile` must fail closed: an invalid/missing surface, or a
   delegated subagent with a broken constraint, resolves to read-only — never to
   `self_modification`/`operator_control`. Acting children write only inside their

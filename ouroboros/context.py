@@ -386,6 +386,9 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
 
         runtime_data["capabilities"] = {
             "allow_mutative_subagents": bool(get_allow_mutative_subagents()),
+            "mutative_subagent_surfaces": sorted(
+                s for s in VALID_WRITE_SURFACES if get_allow_mutative_subagents(s)
+            ),
             "write_surfaces": sorted(VALID_WRITE_SURFACES),
             "web_search_backend": os.environ.get("OUROBOROS_WEBSEARCH_BACKEND", "auto"),
             "main_web_search": {
@@ -393,12 +396,13 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
                 "engine": os.environ.get("OUROBOROS_MAIN_WEB_SEARCH_ENGINE", "auto"),
             },
             "note": (
-                "allow_mutative_subagents is the MASTER gate (the owner toggle overrides the "
-                "runtime-mode default; runtime mode only sets the default when the toggle is "
-                "empty). light blocks ONLY Ouroboros self-repo/control-plane mutation "
-                "(write_surface=self_worktree), NOT user/task/project deliverables: acting "
-                "subagents with write_surface=external_workspace or genesis remain valid in "
-                "light. Read THIS value before declaring you cannot spawn acting subagents."
+                "allow_mutative_subagents is the MASTER gate (an explicit owner toggle "
+                "applies to every surface; when it is empty the runtime mode decides, "
+                "SURFACE-AWARE: advanced/pro allow every surface, light allows "
+                "external_workspace/genesis — they build outside the Ouroboros runtime — "
+                "and keeps self_worktree off). mutative_subagent_surfaces lists what is "
+                "actually schedulable RIGHT NOW. Read THIS before declaring you cannot "
+                "spawn acting subagents."
             ),
         }
         if ctx is not None:

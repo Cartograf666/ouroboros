@@ -729,8 +729,11 @@ silently orphaning paid child work.
 
 Subagents may also be **mutative ("acting")** when the parent passes
 `write_surface` to `schedule_subagent` and the master toggle
-`OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS` allows it (default ON in advanced/pro, OFF
-in light; owner-controlled). Acting children carry
+`OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS` allows it (owner-controlled; an explicit
+value applies to every surface, and the unset default is SURFACE-AWARE: every
+surface ON in advanced/pro, while light allows `external_workspace`/`genesis` —
+they build outside the Ouroboros runtime — and keeps `self_worktree` OFF).
+Acting children carry
 `task_constraint.mode="acting_subagent"` with a machine-enforced authority
 envelope (`surface`, `write_root`, `base_sha`, `protected_paths_grant`,
 `external_tool_grants`, `parent_only_commit`, `return_kind`). They may write, run
@@ -2598,7 +2601,7 @@ Runtime floors:
 | OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT | 6 | Active subagent cap per root task — readonly or acting (hard max 500 = `config.MAX_ACTIVE_SUBAGENTS_HARD_CAP`, shared with the supervisor reject/reservation gates and the `wait_tasks` id cap; decided trade-off: at ~500 children the `wait_tasks` compact projection can hit the disclosed 15K tool-result truncation — chunked waits + `get_task_result` are the follow-up path, and the O(n²) active-tree scans are accepted with no perf work) |
 | OUROBOROS_MAX_SUBAGENT_DEPTH | 2 | Nested subagent depth cap (hard max 10, min 0; **0 disables delegation entirely**, including plan_task's planning scouts — root tasks still run) |
 | OUROBOROS_DISABLE_MANAGED_UPDATES | (unset) | Operator/stand lever, environment only (never a settings key). `1` makes `git_ops.safe_restart` skip the checkout while still syncing deps and running the import test, so a stand pinned to one sha keeps it across bootstrap, owner restart and agent restart. Explicit owner version changes (Update / Rollback) call `checkout_and_reset` directly and still apply. |
-| OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS | (empty) | Allow mutative (acting) subagents. Empty = follow runtime mode (ON in advanced/pro, OFF in light); explicit true/false overrides. Owner-controlled. Settings exposes explicit On/Off only, in Models → Subagents beside the delegation route; the empty runtime-default state is backend/default behavior, not a third owner-facing mode. |
+| OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS | (empty) | Allow mutative (acting) subagents. Empty = follow runtime mode, SURFACE-AWARE: every surface ON in advanced/pro; light allows `external_workspace`/`genesis` (they build outside the Ouroboros runtime) and keeps `self_worktree` OFF. Explicit true/false overrides for every surface. Owner-controlled. Settings exposes explicit On/Off only, in Models → Subagents beside the delegation route; the empty runtime-default state is backend/default behavior, not a third owner-facing mode. |
 | OUROBOROS_SUBAGENT_WORKTREE_ROOT | (empty) | Filesystem root for acting self_worktree checkouts; empty = ~/Ouroboros/subagent_worktrees (kept outside repo/ and data/) |
 | OUROBOROS_SUBAGENT_PROJECTS_ROOT | (empty) | Durable root for genesis ("from scratch") subagent projects; empty = ~/Ouroboros/projects (outside repo/ and data/). Never age-pruned. |
 | OUROBOROS_SUBAGENT_HARNESS | (empty) | (v6.87.8) OPAQUE Claudexor route for delegated subagents, spelled `harness[=model][:effort]`. The `=model` tail is the OWNER'S default model for delegated runs, picked in Settings → Models → Subagents from engine discovery (empty tail = engine default; a hand-written `:effort` remainder rides through verbatim); the applied model comes back on the run summary and is disclosed in the nanny payload plus the `data/state/subagent_last_delegation.json` receipt — a requested≠applied pair is an advisory `session_route_resolves_its_own_model` delta, never a failure. Empty = delegation off (native children) AND undecided, so Settings → Models → Subagents offers the connected-subscription default; the literal `off` is the same runtime behavior stated as an owner decision, which that default leaves alone. Read ONLY by the subagent scheduler and deliberately NOT in `provider_models.MODEL_SETTING_KEYS`: a session-only route is not an API model identity, and admitting it there would poison credential planning, pricing, and bench provenance. |

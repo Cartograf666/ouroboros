@@ -91,8 +91,11 @@ raise beacons, read the shared frame), and may use bounded media projection tool
 These are permitted local coordination/projection paths, not arbitrary state mutation.
 
 To delegate work that CHANGES things, pass `write_surface` to spawn a mutative
-("acting") child (when `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS` is on — default in
-advanced/pro): `self_worktree` (an isolated git worktree of THIS repo, for
+("acting") child (when `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS` allows it — an
+explicit owner value applies to every surface; when unset the runtime mode
+decides, surface-aware: advanced/pro allow every surface, light allows the
+external build surfaces `external_workspace`/`genesis` and keeps
+`self_worktree` off): `self_worktree` (an isolated git worktree of THIS repo, for
 parallel self-modification / best-of-N), `external_workspace` (an existing
 external project directory), or `genesis` (a from-scratch new project — game,
 site, app, or a new Ouroboros — auto-provisioned as a fresh empty git repo under
