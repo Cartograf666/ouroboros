@@ -1051,8 +1051,18 @@ def _spawn_coop_checkpoint(
     def _run() -> None:
         try:
             from ouroboros.coop_checkpoint import checkpoint_commit_coop_roots
+            from supervisor.queue import _queue_lock
 
-            live = _active_subagent_count(root_tid, ctx.PENDING, ctx.RUNNING) > 0
+            # OFF the drain thread, PENDING/RUNNING are live containers other
+            # threads mutate (the drain's own pop, queue admission, the worker
+            # reaper). Iterating them unlocked raises "dictionary changed size
+            # during iteration", which the except below would turn into a
+            # loud-fail receipt and NO commit — killing the last trigger and
+            # leaving the pile uncommitted, the exact defect this closes. The
+            # re-validation is O(live tasks) with no I/O, so it takes the lock;
+            # the git chain stays outside it.
+            with _queue_lock:
+                live = _active_subagent_count(root_tid, list(ctx.PENDING), dict(ctx.RUNNING)) > 0
             receipts = checkpoint_commit_coop_roots(
                 ctx.DRIVE_ROOT, root_tid, title=title, has_live_tree_tasks=live,
             )

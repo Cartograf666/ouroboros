@@ -413,7 +413,18 @@ def resolve_cost_ceiling(
     deliberately NOT pct-scaled (pct applies to the global axis only; scaling
     the owner's chosen cap would silently halve it). The ceiling is
     min(available components); NEVER a computed $0 — a root cap at or below the
-    margin resolves to ``exhausted_soft_land`` instead."""
+    margin resolves to ``exhausted_soft_land`` instead.
+
+    Stated plainly rather than implied: the ``room <= 0`` bail is the owner's
+    "$0 ceiling" rule EXACTLY, no wider. A cap just ABOVE the margin therefore
+    yields a real but tiny ceiling — ``root_cap_usd = COST_PLANNING_MARGIN_USD
+    + 0.01`` gives ``ceiling_usd == 0.01``, which the first round's spend
+    crosses — so a positive ``ceiling_usd`` is not by itself a promise of
+    working room. Both numbers are disclosed on the carrier (``ceiling_usd``,
+    ``root_cap_usd``, ``planning_margin_usd``) and printed in the stop text, so
+    a reader sees the tiny ceiling instead of inferring a healthy one. Widening
+    the bail into a minimum-room FLOOR would move caps the owner deliberately
+    allows into immediate soft-land; that is an owner call, not a code one."""
     try:
         pct = profile.get("cost_hard_stop_pct")
         if pct is None:
@@ -453,7 +464,11 @@ def resolve_cost_ceiling(
             return CostCeiling(state=COST_CEILING_DISABLED, basis="no_finite_budget")
         return CostCeiling(
             state=COST_CEILING_ACTIVE,
-            ceiling_usd=min(components),  # min of positive components: never $0
+            # Min of strictly-positive components, so never a computed $0 — but a
+            # cap just above the margin makes this legitimately TINY (cap $3.01 ->
+            # $0.01), which is a stop-after-the-first-spend ceiling, not headroom.
+            # Documented in the docstring and pinned in test_budget_limits.
+            ceiling_usd=min(components),
             root_cap_usd=cap,
             planning_margin_usd=margin,
             basis="min(" + ", ".join(basis_parts) + ")",
@@ -461,6 +476,40 @@ def resolve_cost_ceiling(
     except Exception:
         log.warning("Cost ceiling resolution failed; axis stays silent", exc_info=True)
         return CostCeiling(state=COST_CEILING_UNKNOWN, basis="resolve_error")
+
+
+def _cost_checkpoint(
+    kind: str,
+    *,
+    deciding: float,
+    task_cost: Optional[float],
+    base: float,
+    hard_stop: bool,
+    spend_basis: str,
+    **extra: Any,
+) -> Dict[str, Any]:
+    """The cost checkpoint payload, with ONE meaning per key name.
+
+    ``task_cost_usd`` has meant THIS task's own accumulated cost since v6.56.0
+    and still does — ``loop.py``'s ``_acceptance_loop_rails`` publishes the same
+    name with the same meaning, and the rails line renders it as "$X spent this
+    task". v6.91 briefly published the tree-accounted DECIDING number under that
+    name, so the same key silently changed axis across a version boundary and
+    every historical log reader would have been quietly re-pointed. The deciding
+    number now rides its own honest name instead, and both are always present so
+    no reader has to infer which axis a value came from (``spend_basis`` says
+    which one the crossing used)."""
+    return {
+        "checkpoint_kind": kind,
+        **extra,
+        "deciding_spend_usd": round(float(deciding), 4),
+        "task_cost_usd": round(float(task_cost), 4) if task_cost is not None else None,
+        "base_usd": round(float(base), 4),
+        "hard_stop": hard_stop,
+        # Always present: a reader must be able to tell a tree number from an
+        # own-cost stand-in without inferring it from a missing key.
+        "spend_basis": spend_basis,
+    }
 
 
 def build_cost_budget_note(
@@ -545,18 +594,11 @@ def build_cost_budget_note(
             "to a verifiable result; if a passing artifact or service already exists, prefer "
             "preserving and verifying it over speculative improvements." + _tree_tail
         )
-        checkpoint = {
-            "checkpoint_kind": "cost_budget_milestone",
-            "milestone": selected_label,
-            "task_cost_usd": round(float(deciding), 4),
-            "base_usd": round(float(base), 4),
-            "hard_stop": hard_stop,
-            # Always present: a reader must be able to tell a tree number from an
-            # own-cost stand-in without inferring it from a missing key.
-            "spend_basis": spend_basis,
-        }
-        if tree_basis:
-            checkpoint["own_cost_usd"] = round(float(task_cost), 4) if task_cost is not None else None
+        checkpoint = _cost_checkpoint(
+            "cost_budget_milestone", deciding=deciding, task_cost=task_cost,
+            base=base, hard_stop=hard_stop, spend_basis=spend_basis,
+            milestone=selected_label,
+        )
         return PacingNote(text=text, checkpoint=checkpoint)
     if spent_fraction >= _COST_WRAPUP_SPENT_FRACTION and not getattr(ctx, "_cost_wrapup_seen", False):
         ctx._cost_wrapup_seen = True
@@ -583,15 +625,10 @@ def build_cost_budget_note(
             "Start converging: prefer completing and verifying the current best path over "
             "opening new ones." + _tree_tail + _marker_tail
         )
-        checkpoint = {
-            "checkpoint_kind": "cost_budget_wrapup",
-            "task_cost_usd": round(float(deciding), 4),
-            "base_usd": round(float(base), 4),
-            "hard_stop": hard_stop,
-            "spend_basis": spend_basis,
-        }
-        if tree_basis:
-            checkpoint["own_cost_usd"] = round(float(task_cost), 4) if task_cost is not None else None
+        checkpoint = _cost_checkpoint(
+            "cost_budget_wrapup", deciding=deciding, task_cost=task_cost,
+            base=base, hard_stop=hard_stop, spend_basis=spend_basis,
+        )
         return PacingNote(text=text, checkpoint=checkpoint)
     return None
 

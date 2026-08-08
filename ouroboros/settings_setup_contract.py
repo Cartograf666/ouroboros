@@ -13,6 +13,7 @@ from ouroboros.provider_models import (
     MINIMAX_REGION_ENDPOINTS,
     OPENAI_DIRECT_DEFAULTS,
 )
+from ouroboros.task_pacing import COST_PLANNING_MARGIN_USD
 
 
 def _rows(keys: tuple[str, ...], specs: tuple[tuple[Any, ...], ...]) -> list[dict]:
@@ -125,7 +126,18 @@ _BUDGET_FIELDS = [
         "settingsInputId": "s-settings-per-task-cost",
         "title": "Per-task cost cap",
         "label": "Per-task Cost Cap (USD)",
-        "note": "Hard cap over one task's WHOLE tree, subagents included: further model calls are refused and the task is force-stopped once the tree's accounted spend reaches this (a graceful wrap-up fires just before).",
+        # The wrap-up sentence is only true above the planning margin: a cap at
+        # or below it resolves to `exhausted_soft_land`, which force-finalizes at
+        # the TOP of round 0 — no work rounds at all. The field still accepts
+        # such a cap (owner power stays), so the note states the consequence
+        # instead of the setting silently meaning something else.
+        "note": (
+            "Hard cap over one task's WHOLE tree, subagents included: further model calls are "
+            "refused and the task is force-stopped once the tree's accounted spend reaches this "
+            "(a graceful wrap-up fires just before). The wrap-up itself needs about "
+            f"${COST_PLANNING_MARGIN_USD:.2f} of room, so a cap at or below that finalizes the "
+            "task immediately instead of running any work rounds."
+        ),
         "default": float(SETTINGS_DEFAULTS.get("OUROBOROS_PER_TASK_COST_USD", 20.0)),
         "min": "0.01",
         "step": "any",

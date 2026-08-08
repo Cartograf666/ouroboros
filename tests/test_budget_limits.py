@@ -267,6 +267,41 @@ class TestCostCeilingResolution:
         ceiling = task_pacing.resolve_cost_ceiling(1000.0, profile, root_cap_usd=just_above)
         assert ceiling.state == task_pacing.COST_CEILING_ACTIVE
         assert ceiling.ceiling_usd is not None and ceiling.ceiling_usd > 0
+        # The boundary is MEASURED, not implied: `> 0` alone reads as "there is
+        # working room", but the bail is exactly the owner's `room <= 0` rule, so
+        # a cap one cent above the margin buys exactly one cent of ceiling — a
+        # stop-on-the-first-spend ceiling. Widening this into a minimum-room floor
+        # would move caps the owner deliberately allows into immediate soft-land,
+        # which is an owner decision; pinning the number keeps it visible instead.
+        assert round(ceiling.ceiling_usd, 6) == 0.01
+        assert ceiling.root_cap_usd == just_above
+        assert ceiling.planning_margin_usd == task_pacing.COST_PLANNING_MARGIN_USD
+        at_margin = task_pacing.resolve_cost_ceiling(
+            1000.0, profile, root_cap_usd=task_pacing.COST_PLANNING_MARGIN_USD,
+        )
+        assert at_margin.state == task_pacing.COST_CEILING_EXHAUSTED_SOFT_LAND
+
+    def test_per_task_cap_setting_note_states_the_immediate_finalization(self):
+        """The owner-facing note must not promise a wrap-up a small cap cannot get.
+
+        The field still accepts a cap below the wrap-up margin (owner power is
+        preserved), but such a cap resolves to `exhausted_soft_land`, which the
+        loop turns into a forced final answer at the TOP of round 0 — zero work
+        rounds. The note said only "a graceful wrap-up fires just before"."""
+        from ouroboros.settings_setup_contract import build_setup_contract
+
+        fields = {
+            str(field.get("settingKey")): field
+            for field in build_setup_contract().get("budgetFields", [])
+        }
+        note = str(fields["OUROBOROS_PER_TASK_COST_USD"]["note"])
+        assert f"${task_pacing.COST_PLANNING_MARGIN_USD:.2f}" in note
+        assert "finalizes the task immediately" in note
+        # A cap at the documented boundary really does behave that way.
+        assert task_pacing.resolve_cost_ceiling(
+            1000.0, normalize_budget_profile(None),
+            root_cap_usd=task_pacing.COST_PLANNING_MARGIN_USD,
+        ).state == task_pacing.COST_CEILING_EXHAUSTED_SOFT_LAND
 
     def test_planning_margin_is_absolute_not_pct(self):
         """The margin must not scale with the cap (a pct reserve amputated the
@@ -692,8 +727,44 @@ class TestCostMilestones:
         assert "in-flight holds" in note.text
         assert "own calls ~$41.00" in note.text
         assert note.checkpoint["spend_basis"] == "tree_accounted"
-        assert note.checkpoint["task_cost_usd"] == 50.0
-        assert note.checkpoint["own_cost_usd"] == 41.0
+        # The deciding (tree) number and this task's own cost are BOTH recorded,
+        # each under the name that means it — see the meaning-stability pin below.
+        assert note.checkpoint["deciding_spend_usd"] == 50.0
+        assert note.checkpoint["task_cost_usd"] == 41.0
+
+    def test_checkpoint_key_meanings_are_stable_across_the_version_boundary(self):
+        """`task_cost_usd` means THIS task's own cost, on every branch.
+
+        v6.91 published the tree-accounted deciding number under that name, so
+        the key silently changed axis: a log reader (and `loop.py`'s
+        `_acceptance_loop_rails`, which publishes the same name meaning own cost
+        and renders it as "$X spent this task") would have read tree spend as own
+        spend with no way to tell. Both numbers are now always present under
+        names that mean what they say."""
+        cases = (
+            # kind, task_cost (own), tree_cost_usd, expected basis
+            ("cost_budget_milestone", 41.0, 50.0, task_pacing.SPEND_BASIS_TREE),
+            ("cost_budget_milestone", 50.0, None, task_pacing.SPEND_BASIS_OWN_NO_TREE_CAP),
+            ("cost_budget_wrapup", 41.0, 90.0, task_pacing.SPEND_BASIS_TREE),
+            ("cost_budget_wrapup", 90.0, None, task_pacing.SPEND_BASIS_OWN_NO_TREE_CAP),
+        )
+        for kind, own, tree, expect_basis in cases:
+            ctx = SimpleNamespace()
+            if kind == "cost_budget_wrapup":
+                ctx._cost_budget_milestones_seen = {"50%", "25%", "10%"}
+            note = task_pacing.build_cost_budget_note(
+                ctx, start_remaining_usd=200.0, cost_ceiling_usd=97.0,
+                task_cost=own, tree_cost_usd=tree,
+            )
+            assert note is not None and note.checkpoint["checkpoint_kind"] == kind
+            cp = note.checkpoint
+            assert cp["spend_basis"] == expect_basis
+            assert cp["task_cost_usd"] == own, (
+                f"{kind}: task_cost_usd must stay this task's OWN cost"
+            )
+            # Present on EVERY branch, so no reader infers the axis from a
+            # missing key.
+            assert cp["deciding_spend_usd"] == (tree if tree is not None else own)
 
     def test_own_cost_alone_would_not_have_crossed(self):
         """The wave1/2 blindness pin: own $41 of a $97 ceiling fires nothing,

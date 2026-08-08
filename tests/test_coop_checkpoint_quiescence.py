@@ -222,6 +222,60 @@ def test_spawned_checkpoint_revalidates_quiescence_before_git(tmp_path, monkeypa
 
 
 @pytest.mark.serial
+def test_spawned_checkpoint_revalidation_survives_a_racing_running_pop(tmp_path, monkeypatch):
+    """The off-loop re-validation must read PENDING/RUNNING under the queue lock.
+
+    Off the drain thread those are LIVE containers that the drain's own
+    ``ctx.RUNNING.pop`` (supervisor/events.py, under ``_queue_lock``), queue
+    admission and the worker reaper all mutate. Counting them unlocked raises
+    ``RuntimeError: dictionary changed size during iteration``, which the body's
+    broad ``except`` converts into a loud-fail receipt and returns WITHOUT
+    committing — and since this trigger fires on the LAST live tree member it is
+    the last trigger there is, so the coop pile stays uncommitted: exactly the
+    defect the off-loop move exists to close.
+    """
+    import ouroboros.coop_checkpoint as coop
+    from supervisor import events
+    from supervisor.queue import _queue_lock
+
+    data = tmp_path / "data"
+    (data / "logs").mkdir(parents=True)
+    running = {f"sib{i}": {"task": _subagent_task(f"sib{i}", "rootR")} for i in range(6)}
+    ctx = _ctx(data, running=running)
+    observed: dict = {}
+    real_predicate = events._is_active_subagent_task
+
+    def _racing_predicate(task, root_task_id):
+        # Model a racing pop landing mid-count, as the drain thread does.
+        observed.setdefault("lock_held", _queue_lock._is_owned())
+        if ctx.RUNNING:
+            ctx.RUNNING.pop(next(iter(ctx.RUNNING)), None)
+        return real_predicate(task, root_task_id)
+
+    def _fake_commit(drive_root, root_tid, *, title="", has_live_tree_tasks=False):
+        observed["live"] = has_live_tree_tasks
+        return [{"committed": True, "root": str(root_tid)}]
+
+    monkeypatch.setattr(events, "_is_active_subagent_task", _racing_predicate)
+    monkeypatch.setattr(coop, "checkpoint_commit_coop_roots", _fake_commit)
+    thread = events._spawn_coop_checkpoint(ctx, "rootR", title="", trigger="tree_quiescence")
+    assert thread is not None
+    thread.join(timeout=30)
+
+    # The convention every other RUNNING reader in supervisor/events.py follows.
+    assert observed.get("lock_held") is True, "re-validation must hold supervisor.queue._queue_lock"
+    rows = [
+        json.loads(line)
+        for line in (data / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    receipts = [r for r in rows if r.get("type") == "coop_checkpoint_commit"]
+    assert receipts, "the racing pop aborted the run before any commit"
+    assert receipts[-1].get("committed") is True
+    assert not receipts[-1].get("error")  # not the loud-fail receipt
+
+
+@pytest.mark.serial
 def test_inflight_latch_drops_duplicate_trigger(tmp_path):
     from supervisor import events
 
