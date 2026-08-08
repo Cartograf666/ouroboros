@@ -4,14 +4,28 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
-    ATTACH_FALLBACK_MS,
-    UNCONFIRMED_TEXT,
     accountLoginConfirmed,
     accountRows,
-    attachFallbackDue,
-    confirmLoginLive,
+} from '../modules/claudexor_status_store.js';
+import {
+    bareRowStatusText,
     daemonStatusLine,
-    refreshStatus,
+    normalizeProfileName,
+    promptProfileName,
+    quotaSummary,
+    runtimeActionLabel,
+    sectionStatusLine,
+    verificationBadge,
+} from '../modules/harness_accounts.js';
+// The login machinery moved to the shared controller module (phase 2) so the
+// onboarding wizard can mount the same flow; the assertions below are
+// unchanged, which is what makes the extraction behavior-preserving.
+import {
+    ATTACH_FALLBACK_MS,
+    UNCONFIRMED_TEXT,
+    attachFallbackDue,
+    cancelLoginJob,
+    confirmLoginLive,
     deviceCodeDisclosure,
     failureText,
     jobDetail,
@@ -19,19 +33,13 @@ import {
     loginCardFace,
     loginCardHtml,
     loginInputSupport,
+    loginSettleProven,
     loginStatusLine,
     loginVerdict,
-    normalizeProfileName,
     pollResponseApplies,
     preserveCardFocus,
-    promptProfileName,
-    quotaSummary,
-    runtimeActionLabel,
     submitLoginInput,
-    verificationBadge,
-    cancelLoginJob,
-    loginSettleProven,
-} from '../modules/harness_accounts.js';
+} from '../modules/harness_login_cards.js';
 
 test('managed runtime keeps one contextual Connect intent across install, repair, and update', () => {
     const payload = (runtime, daemon = {}) => ({ daemon: { state: 'not_provisioned', runtime, ...daemon } });
@@ -618,7 +626,7 @@ test('confirmLoginLive re-polls live account status briefly instead of trusting 
     let polls = 0;
     const slept = [];
     const confirmed = await confirmLoginLive('codex', '', {
-        fetchImpl: async () => fakeResponse(200, ++polls >= 2 ? warm : cold),
+        readStatus: async () => (++polls >= 2 ? warm : cold),
         attempts: 4, delayMs: 7, sleepImpl: async (ms) => { slept.push(ms); },
     });
     assert.equal(confirmed.confirmed, true);
@@ -630,7 +638,7 @@ test('confirmLoginLive re-polls live account status briefly instead of trusting 
     // the caller can render the rows it actually saw.
     let coldPolls = 0;
     const unconfirmed = await confirmLoginLive('codex', '', {
-        fetchImpl: async () => { coldPolls += 1; return fakeResponse(200, cold); },
+        readStatus: async () => { coldPolls += 1; return cold; },
         attempts: 3, delayMs: 1, sleepImpl: async () => {},
     });
     assert.equal(unconfirmed.confirmed, false);
@@ -639,7 +647,7 @@ test('confirmLoginLive re-polls live account status briefly instead of trusting 
 
     // A card closed mid-check aborts without a verdict.
     const stale = await confirmLoginLive('codex', '', {
-        fetchImpl: async () => fakeResponse(200, cold),
+        readStatus: async () => cold,
         attempts: 3, delayMs: 1, sleepImpl: async () => {}, isStale: () => true,
     });
     assert.equal(stale.stale, true);
@@ -1009,14 +1017,15 @@ test('cancelLoginJob reports gone only on ok/404/410; failures and network death
 });
 
 test('startLogin centralizes the C7 guard: cancel-or-refuse BEFORE the new login POST', () => {
-    // ESM keeps startLogin internal state untestable directly; pin the control
-    // flow at the source level (same source-based technique as the HTML pins
-    // in this file): the guard must sit inside startLogin ahead of the POST,
-    // and a failed cancellation must return without starting a second job.
-    const src = readFileSync(fileURLToPath(new URL('../modules/harness_accounts.js', import.meta.url)), 'utf8');
-    const fn = src.slice(src.indexOf('async function startLogin'));
-    const guardAt = fn.indexOf('cancelLoginJob(prev.jobId)');
-    const postAt = fn.indexOf("apiFetch('/api/claudexor/login'");
+    // ESM keeps the controller's internal state untestable directly; pin the
+    // control flow at the source level (same source-based technique as the HTML
+    // pins in this file): the guard must sit inside the locked start ahead of
+    // the POST, and a failed cancellation must return without starting a second
+    // job. The flow moved to harness_login_cards.js in phase 2; the RULE did not.
+    const src = readFileSync(fileURLToPath(new URL('../modules/harness_login_cards.js', import.meta.url)), 'utf8');
+    const fn = src.slice(src.indexOf('async function _startLocked'));
+    const guardAt = fn.indexOf('cancelLoginJob(prev.jobId');
+    const postAt = fn.indexOf("fetchImpl('/api/claudexor/login'");
     assert.ok(guardAt > -1, 'startLogin must call cancelLoginJob for a live previous job');
     assert.ok(postAt > -1);
     assert.ok(guardAt < postAt, 'the C7 guard must run before the new login POST');
@@ -1040,67 +1049,34 @@ test('loginSettleProven: only a TERMINAL job snapshot proves the settle — an u
     assert.equal(loginSettleProven({ job: { state: 'cancelled' } }), true);
 });
 
+test('a harness with no row only says "no account connected" once the store was READ', () => {
+    // BIBLE P1 at the pixel: the owner's panel declared three harnesses empty
+    // while two claude profiles, a cursor profile and two native sessions sat
+    // in the agent home — a lazy daemon had simply never been asked.
+    assert.equal(bareRowStatusText('ok'), 'no account connected');
+    assert.match(bareRowStatusText('not_read'), /not checked/);
+    assert.match(bareRowStatusText('not_read'), /daemon is not running/);
+    assert.match(bareRowStatusText('failed'), /did not answer/);
+    assert.match(bareRowStatusText('transport'), /request did not complete/);
+    assert.equal(bareRowStatusText('unread'), 'checking…');
+    // Each gap is its OWN sentence — collapsing them would re-create the lie.
+    const gaps = ['not_read', 'failed', 'transport'].map(bareRowStatusText);
+    assert.equal(new Set(gaps).size, 3);
+});
 
-// The wiring of the loading state, not just its wording: a revert that deletes
-// the flag plumbing (keeping daemonStatusLine intact) must go RED here.
-function stubStatusDom() {
-    const host = { offsetParent: {}, innerHTML: '', querySelectorAll: () => [] };
-    const statusEl = { textContent: '', dataset: {} };
-    const lines = [];
-    const el = {
-        'harness-accounts-rows': host,
-        'harness-daemon-status': new Proxy(statusEl, {
-            set(target, key, value) {
-                if (key === 'textContent') lines.push(value);
-                target[key] = value;
-                return true;
-            },
-        }),
-        'harness-login-card': null,
-    };
-    globalThis.document = { getElementById: (id) => el[id] ?? null, hidden: false };
-    return { lines };
-}
-
-test('the status poll is single-flight and announces the first read before it lands', async () => {
-    const previousDocument = globalThis.document;
-    const { lines } = stubStatusDom();
-    try {
-        let started = 0;
-        let release = null;
-        const gate = new Promise((resolve) => { release = resolve; });
-        const fetchImpl = async () => {
-            started += 1;
-            await gate;
-            return { ok: true, json: async () => ({ daemon: { state: 'running', engine_version: '3.3.13', runtime: {} } }) };
-        };
-
-        const first = refreshStatus({ force: true, fetchImpl });
-        // Painted BEFORE the response: the panel says it is checking, muted.
-        assert.ok(lines.some((line) => line.includes('Checking Claudexor')),
-            'the first read announces itself before it lands');
-
-        // Every caller while one read is live SHARES it — the 5s interval must not
-        // stack reads over a request that takes tens of seconds (each fans out to
-        // four CLI-probing daemon GETs).
-        const joined = [refreshStatus({ force: true, fetchImpl }), refreshStatus({ fetchImpl })];
-        assert.equal(started, 1, 'overlapping polls did not start a second read');
-
-        release();
-        await Promise.all([first, ...joined]);
-        assert.equal(started, 1, 'the shared read served every caller');
-        assert.ok(lines.at(-1).includes('3.3.13'), 'the settled read replaces the checking line');
-
-        // After the first settle the checking line never returns: a stable line
-        // beats flickering muted<->error on every tick.
-        lines.length = 0;
-        const fourth = refreshStatus({ force: true, fetchImpl });
-        assert.equal(started, 2, 'a settled read releases the single-flight slot');
-        assert.ok(!lines.some((line) => line.includes('Checking Claudexor')),
-            'no pre-request repaint once anything has been said');
-        release();
-        await fourth;
-    } finally {
-        globalThis.document = previousDocument;
-    }
+test('the section line reports a REFUSED account read instead of "Claudexor ready"', () => {
+    // A running daemon whose account read died would otherwise print the green
+    // lifecycle line over a list that was never delivered.
+    const fakeStore = (facetState, error = '') => ({
+        facet: () => facetState,
+        error,
+        snapshot: { daemon: { state: 'running', engine_version: '3.3.13', runtime: {} } },
+        loading: false,
+        everSettled: true,
+        unavailableNote: () => ({ tone: 'warn', text: 'the daemon did not answer this read', action: null }),
+    });
+    assert.match(sectionStatusLine(fakeStore('failed')).text, /did not answer/);
+    assert.match(sectionStatusLine(fakeStore('transport', 'net')).text, /did not answer/);
+    // A healthy read keeps the existing lifecycle sentence, unchanged.
+    assert.match(sectionStatusLine(fakeStore('ok')).text, /Claudexor ready/);
 });

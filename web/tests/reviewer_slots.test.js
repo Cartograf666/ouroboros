@@ -19,6 +19,7 @@ import {
     splitSessionTarget,
 } from '../modules/reviewer_slots.js';
 
+
 test('a saved account pin survives a discovery list that no longer contains it', () => {
     // The select's value must EXIST as an option or the browser silently selects the
     // first one — "automatic rotation" — so a row pinned to one account redrew as
@@ -248,4 +249,69 @@ test('the runs-as line shows APPLIED account/access and honest absence for an un
     // An api row keeps its sent-model-is-applied-model reading with no noise.
     const api = describeLastExecution({ effective: { route: 'api_chat', model: 'openai/x' } });
     assert.ok(api.includes('openai/x') && !api.includes('not disclosed'));
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2: a row may only be labeled "(not in discovery)" after a SUCCESSFUL
+// discovery. With the daemon stopped (or the endpoint unreachable) the backend
+// answers `harnesses: []` by construction, and this page used to stamp that
+// label onto every saved row while explaining nothing — the exact screen the
+// owner reported (2026-08-08). The saved option itself must survive either
+// way: that guard is what stops the next Save from erasing the pin.
+// ---------------------------------------------------------------------------
+
+test('an unread facet never accuses a saved row of being undiscovered', () => {
+    // Same empty discovery, two different worlds.
+    const discoveredMiss = routeChoiceGroups({ harnesses: [], currentChoice: 'session:codex' });
+    assert.match(discoveredMiss[1].options[0].label, /not in discovery/);
+
+    const cannotAsk = routeChoiceGroups({ harnesses: [], currentChoice: 'session:codex', catalogKnown: false });
+    assert.equal(cannotAsk[1].options[0].value, 'session:codex', 'the saved option SURVIVES');
+    assert.equal(cannotAsk[1].options[0].label, 'codex', 'but nothing is claimed about it');
+    assert.doesNotMatch(JSON.stringify(cannotAsk), /not in discovery/);
+    // The empty-group placeholder stops promising a sign-in that would not help.
+    const emptyGroup = routeChoiceGroups({ harnesses: [], catalogKnown: false })[1].options[0];
+    assert.doesNotMatch(emptyGroup.label, /sign in under Providers/);
+});
+
+test('the model and account pins survive a daemon-down save without the undiscovered label', () => {
+    const models = sessionModelOptions({ models: [] }, 'gpt-5.6-sol', { catalogKnown: false });
+    assert.deepEqual(models.map((o) => o.value), ['', 'gpt-5.6-sol'], 'the pin keeps its option');
+    assert.equal(models[1].label, 'gpt-5.6-sol');
+    assert.match(sessionModelOptions({ models: [] }, 'gpt-5.6-sol')[1].label, /not in discovery/);
+
+    const pins = profileOptionsFor([], 'koshak', { accountsKnown: false });
+    assert.deepEqual(pins.map((o) => o.value), ['', 'koshak']);
+    assert.match(pins[1].label, /pinned/);
+    assert.doesNotMatch(pins[1].label, /not in discovery/);
+    assert.match(profileOptionsFor([], 'koshak')[1].label, /not in discovery/);
+
+    // …and the pin still reaches the save payload unchanged, which is the
+    // whole point of keeping the option (a Save with the daemon down must not
+    // silently widen which account a reviewer may spend).
+    const row = { slot_id: 'triad_a', route: { kind: ROUTE_KIND_SESSION, target_id: 'codex=gpt-5.6-sol', profile_id: 'koshak' } };
+    const saved = JSON.parse(buildReviewerSlotsSetting({ triad: [row], scope: [], advisory: {} }));
+    assert.deepEqual(saved.triad[0].route, { kind: ROUTE_KIND_SESSION, target_id: 'codex=gpt-5.6-sol', profile_id: 'koshak' });
+});
+
+test('the delivery badge does not claim "route not discovered" when nobody could be asked', () => {
+    const row = { route: { kind: ROUTE_KIND_SESSION, target_id: 'codex' } };
+    assert.match(capabilityBadge(row, {}), /route not discovered/);
+    assert.doesNotMatch(capabilityBadge(row, {}, { catalogKnown: false }), /not discovered/);
+    assert.match(capabilityBadge(row, {}, { catalogKnown: false }), /agent session/);
+});
+
+test('facets are independent: an unread ACCOUNT store does not silence the CATALOG verdict', () => {
+    // The concrete mislabel a single global verdict produces: the harness
+    // catalog was read fine and genuinely no longer lists `claude`, while the
+    // credential-profile read never happened. The route option must keep its
+    // earned "(not in discovery)" and the account pin must NOT be given one.
+    const groups = routeChoiceGroups({
+        harnesses: [{ id: 'codex' }], currentChoice: 'session:claude', catalogKnown: true,
+    });
+    assert.match(groups[1].options.at(-1).label, /not in discovery/);
+
+    const pins = profileOptionsFor([], 'koshak', { accountsKnown: false });
+    assert.doesNotMatch(pins[1].label, /not in discovery/);
+    assert.deepEqual(pins.map((o) => o.value), ['', 'koshak']);
 });
