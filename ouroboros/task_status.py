@@ -607,6 +607,19 @@ def wait_for_effective_tasks(
     poll_interval_sec: float = 0.5,
     on_poll: Optional[Callable[[Dict[str, Any], Dict[str, bool]], Any]] = None,
 ) -> Dict[str, Any]:
+    """Poll effective task results until the wait ``mode`` is satisfied.
+
+    Terminality here is ``SETTLED_STATUSES`` — deliberately NOT ``FINAL_STATUSES``
+    (v6.91): ``cancel_requested`` is a cancel-INTENT latch (the worker may still
+    be exiting; the supervisor finalizes it to ``cancelled`` shortly after), and
+    a wait loop's job is to surface the FINAL record. Treating the latch as
+    terminal returned "completed after 0.0s" with a non-final envelope while the
+    acceptance fence (which already reads ``SETTLED_STATUSES``) correctly refused
+    quiescence — the two definitions disagreed and the parent looped on the gap
+    (wave3: a $1.64 endgame loop re-waiting the same child). The wait stays
+    bounded by ``timeout_sec`` either way, and ``live_child_status`` reports the
+    latch honestly instead of collapsing it to terminal/unknown. The global
+    taxonomy is untouched: handoff-reminder consumers keep ``FINAL_STATUSES``."""
     ids = []
     for item in task_ids:
         try:
@@ -622,7 +635,7 @@ def wait_for_effective_tasks(
     early: Any = None
     while True:
         results = {tid: load_effective_task_result(pathlib.Path(drive_root), tid) for tid in ids}
-        terminal = {tid: str(data.get("status") or "").strip().lower() in FINAL_STATUSES for tid, data in results.items()}
+        terminal = {tid: str(data.get("status") or "").strip().lower() in SETTLED_STATUSES for tid, data in results.items()}
         if mode == "any_terminal" and any(terminal.values()):
             break
         if mode != "any_terminal" and all(terminal.values()):
@@ -647,7 +660,7 @@ def wait_for_effective_tasks(
         "timeout_sec": float(timeout_sec or 0),
         "elapsed_sec": max(0.0, time.monotonic() - start),
         "timed_out": timed_out,
-        "all_terminal": all(str(data.get("status") or "").strip().lower() in FINAL_STATUSES for data in results.values()) if ids else True,
+        "all_terminal": all(str(data.get("status") or "").strip().lower() in SETTLED_STATUSES for data in results.values()) if ids else True,
         "tasks": results,
     }
     if early is not None:
@@ -659,7 +672,12 @@ def wait_for_effective_tasks(
         live: Dict[str, str] = {}
         for tid in ids:
             _st, _ = _queue_task_status(_snap, tid)
-            live[tid] = _st or ("terminal" if str((results.get(tid) or {}).get("status") or "").strip().lower() in FINAL_STATUSES else "unknown")
+            eff_status = str((results.get(tid) or {}).get("status") or "").strip().lower()
+            if _st in ("", "unknown") and eff_status == STATUS_CANCEL_REQUESTED:
+                # The cancel-intent latch is a real, known state — report it as
+                # itself, never as terminal (the settle is pending) or unknown.
+                _st = STATUS_CANCEL_REQUESTED
+            live[tid] = _st or ("terminal" if eff_status in SETTLED_STATUSES else "unknown")
         out["live_child_status"] = live
     except Exception:
         pass

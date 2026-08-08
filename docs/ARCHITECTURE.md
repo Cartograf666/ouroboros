@@ -665,6 +665,25 @@ stay on disk in `task_results/<id>.json`, addressable by
 `get_task_result` returns the full result text plus trace/outcome summaries. The wait envelope itself (all_terminal / timed_out /
 elapsed_sec / live_child_status / early_return) is unchanged.
 
+Wait terminality is `SETTLED_STATUSES` (v6.91): `cancel_requested` is a
+cancel-INTENT latch — the worker may still be exiting and the supervisor
+finalizes it moments later — so `wait_for_effective_tasks` keeps polling
+(bounded by its timeout) instead of returning "completed after 0.0s" with a
+non-final record; the acceptance fence reads the same set, so the two can no
+longer disagree (the wave3 endgame loop re-waited the same child on that gap).
+`live_child_status` reports the latch as itself, never terminal/unknown; the
+global taxonomy is untouched (`FINAL_STATUSES` keeps the latch for handoff
+reminders). `wait_tasks` also cross-checks each id against every surface this
+tree mints ids through — task results, the queue snapshot, the tree ledger —
+and flags an id known to none of them as a typed `unknown_task_id` row ("not
+yet registered or never scheduled"; the id keeps polling — a just-scheduled
+child is a real state), attaching `unknown_task_ids` plus a compact
+`children_roster` of the caller's ACTUAL direct children (v6.71.2 field set,
+never envelopes) so the parent repairs its wait set instead of starving on
+phantoms (wave2 blocked 900s slices on three hallucinated ids). A missing/
+unreadable probe surface treats the id as known — a real child is never
+branded unknown on an I/O error.
+
 A burst of `schedule_subagent` calls emitted in ONE tool-call round runs in the
 existing tool ThreadPool instead of sequentially (`schedule_subagent` is in
 `tool_capabilities.PARALLEL_SAFE_ENQUEUE_TOOLS`); a process-local lock in
