@@ -1278,3 +1278,140 @@ def test_health_invariants_come_first_in_background_consciousness_context(tmp_pa
 
     text = bg._build_context()
     assert text.index("## Health Invariants") < text.index("## Drive state")
+
+
+def test_drive_state_section_is_typed_projection_with_pointer(tmp_path):
+    """W3 adjacent (a): the Drive state section projects the fields the agent
+    reasons about and NAMES the omitted internal caches with an on-demand
+    pointer (P1: disclosed omission) instead of dumping state.json wholesale —
+    the budget narrative stays with the usage-accounting authority in the
+    Runtime section."""
+    import json
+
+    from ouroboros.context import _drive_state_section
+
+    class FakeEnv:
+        def drive_path(self, p):
+            return tmp_path / p
+
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "state.json").write_text(json.dumps({
+        "session_id": "abc123",
+        "current_branch": "ouroboros",
+        "evolution_mode_enabled": False,
+        "budget_drift_alert": True,
+        "budget_drift_pct": 48.05,
+        "spent_usd": 1699.3,
+        "managed_update_cache": {"latest_sha": "x" * 40, "latest_message": "big"},
+        "usage_accounting": {"settled_usd": 1633.1},
+        "openrouter_last_check_call": 5750,
+    }), encoding="utf-8")
+
+    section = _drive_state_section(FakeEnv())
+
+    assert section.startswith("## Drive state")
+    assert '"session_id": "abc123"' in section
+    assert '"budget_drift_alert": true' in section
+    # Internal caches / duplicated spend narrative are OMITTED but NAMED.
+    assert '"managed_update_cache"' not in section
+    assert '"usage_accounting"' not in section
+    assert '"spent_usd"' not in section
+    for named in ("managed_update_cache", "usage_accounting", "spent_usd", "openrouter_last_check_call"):
+        assert named in section  # named in the omission note
+    assert "read_file(root='runtime_data', path='state/state.json')" in section
+
+    # Missing/empty file: still a valid section, no omission note needed.
+    (tmp_path / "state" / "state.json").unlink()
+    empty = _drive_state_section(FakeEnv())
+    assert empty.startswith("## Drive state")
+    assert "read_file" not in empty
+
+
+def test_review_ledger_caps_runs_and_attempts_with_omission_notes(tmp_path):
+    """W3 adjacent (b): the historical review ledger rides into EVERY task's
+    context — cap runs/attempts at the 5 most recent with EXPLICIT omission
+    notes (the continuation pattern) and truncate commit messages; the full
+    ledger stays behind review_status."""
+    from ouroboros.review_state import (
+        AdvisoryReviewState,
+        AdvisoryRunRecord,
+        CommitAttemptRecord,
+        format_status_section,
+    )
+
+    state = AdvisoryReviewState()
+    long_msg = "feat: " + ("y" * 2000)
+    for i in range(8):
+        state.add_run(AdvisoryRunRecord(
+            snapshot_hash=f"hash{i:04d}00000000",
+            commit_message=long_msg if i == 7 else f"commit {i}",
+            status="fresh",
+            ts=f"2026-01-0{i + 1}T00:00:00",
+        ))
+    for i in range(8):
+        state.record_attempt(CommitAttemptRecord(
+            status="succeeded",
+            commit_message=f"attempt commit {i}",
+            ts=f"2026-01-0{i + 1}T01:00:00",
+            attempt=i + 1,
+        ))
+
+    section = format_status_section(state)
+
+    assert "3 older advisory run(s) omitted" in section
+    assert "3 older attempt(s) omitted" in section
+    assert "review_status" in section
+    assert "hash0007" in section       # newest kept
+    assert "hash0000" not in section   # oldest omitted
+    assert "attempt commit 7" in section
+    assert "attempt commit 0" not in section
+    # The 2000-char commit message is display-truncated with the explicit notice.
+    assert "y" * 2000 not in section
+    assert "truncated at 300 chars" in section
+
+
+def test_settled_continuations_retire_after_age_window(tmp_path):
+    """W3 adjacent (b): a continuation whose owning task SETTLED and that sat
+    un-resumed past the age window is archived (durable move, never deleted);
+    fresh settled records stay — they are the designed cross-task resume
+    pointer."""
+    from ouroboros.task_continuation import (
+        ReviewContinuation,
+        archived_continuation_dir,
+        continuation_path,
+        list_review_continuations,
+        retire_settled_continuations,
+        save_review_continuation,
+    )
+
+    old = save_review_continuation(tmp_path, ReviewContinuation(
+        task_id="oldtask", source="commit_blocked", stage="review"))
+    # Age the record past the window (rewrite the stored timestamps).
+    import json as _json
+    path = continuation_path(tmp_path, "oldtask")
+    data = _json.loads(path.read_text(encoding="utf-8"))
+    data["created_ts"] = data["updated_ts"] = "2026-01-01T00:00:00+00:00"
+    path.write_text(_json.dumps(data), encoding="utf-8")
+
+    save_review_continuation(tmp_path, ReviewContinuation(
+        task_id="freshtask", source="commit_blocked", stage="review"))
+
+    settled = {"oldtask": True, "freshtask": True, "runningtask": False}
+    retired = retire_settled_continuations(tmp_path, is_settled=lambda tid: settled.get(tid, False))
+
+    assert retired == ["oldtask"]
+    assert not continuation_path(tmp_path, "oldtask").exists()
+    assert (archived_continuation_dir(tmp_path) / "oldtask.json").exists()  # durable, not deleted
+    remaining, _corrupt = list_review_continuations(tmp_path)
+    assert [c.task_id for c in remaining] == ["freshtask"]
+
+    # An old continuation of a NON-settled task stays put.
+    save_review_continuation(tmp_path, ReviewContinuation(
+        task_id="runningtask", source="commit_blocked", stage="review"))
+    path = continuation_path(tmp_path, "runningtask")
+    data = _json.loads(path.read_text(encoding="utf-8"))
+    data["created_ts"] = data["updated_ts"] = "2026-01-01T00:00:00+00:00"
+    path.write_text(_json.dumps(data), encoding="utf-8")
+    assert retire_settled_continuations(tmp_path, is_settled=lambda tid: settled.get(tid, False)) == []
+    assert continuation_path(tmp_path, "runningtask").exists()
+    assert old.task_id == "oldtask"

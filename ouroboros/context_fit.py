@@ -96,12 +96,10 @@ class ContextFitPlan:
     ) -> int:
         """Calibrated physical prompt projection after schemas are available."""
         projection = self.projection(mode)
-        tool_tokens = (
-            estimate_tokens(json.dumps(tools, ensure_ascii=False, sort_keys=True, default=str))
-            if tools
-            else 0
+        return int(
+            (projection.estimated_tokens + tool_schema_tokens(tools))
+            * projection.calibration_ratio
         )
-        return int((projection.estimated_tokens + tool_tokens) * projection.calibration_ratio)
 
     def initial_mode_with_tools(self, tools: Optional[List[Dict[str, Any]]]) -> str:
         from ouroboros.capability_evidence import is_known
@@ -165,6 +163,19 @@ def _render_context_system_content(
     ]
 
 
+def tool_schema_tokens(tools: Optional[List[Dict[str, Any]]]) -> int:
+    """chars/4 estimate of the TOOL-SCHEMA segment of a prompt.
+
+    One seam for every consumer that has to account for the schemas: they are sent
+    on the wire beside ``messages``, so any measure built from the transcript alone
+    silently omits them (~148K chars / ~37K tokens on the submarine traces — enough
+    to make an emergency-compaction trigger fire a whole tool envelope late).
+    """
+    if not tools:
+        return 0
+    return estimate_tokens(json.dumps(tools, ensure_ascii=False, sort_keys=True, default=str))
+
+
 def estimate_context_prompt_tokens(
     messages: List[Dict[str, Any]],
     tools: Optional[List[Dict[str, Any]]] = None,
@@ -190,11 +201,32 @@ def estimate_context_prompt_tokens(
             total += estimate_tokens(
                 json.dumps(msg["tool_calls"], ensure_ascii=False, default=str)
             )
-    if tools:
-        total += estimate_tokens(
-            json.dumps(tools, ensure_ascii=False, sort_keys=True, default=str)
-        )
+    total += tool_schema_tokens(tools)
     return max(0, int(total))
+
+
+def main_loop_token_density(drive_root: Any, model: str) -> float:
+    """MAIN-LOOP calibrated token density: neutral 1.0 cold, measured supersedes.
+
+    The baseline `_route_calibration_ratio` starts from, exposed as its own SSOT so
+    the emergency-compaction necessity trigger and the fit projections share ONE
+    policy. DELIBERATELY NOT ``capability_evidence.resolve_token_density`` — that is
+    the review-pack COLD-CONSERVATIVE value, which on an empty observation store
+    (every fresh install and isolated benchmark server) would silently narrow the
+    main loop's horizon on a guess (the v6.80.0 → v6.81.0 oscillation; BIBLE P1).
+    Only a MEASURED density for this exact model identity may raise it above 1.0.
+    """
+    baseline = 1.0
+    try:
+        from ouroboros.capability_evidence import get_token_density
+        from ouroboros.provider_models import normalize_model_identity
+
+        measured = get_token_density(drive_root, normalize_model_identity(str(model or "")))
+        if measured > 0:
+            baseline = measured
+    except Exception:
+        log.debug("Measured token density unavailable", exc_info=True)
+    return baseline
 
 
 def _route_calibration_ratio(
@@ -225,17 +257,7 @@ def _route_calibration_ratio(
     fresh evidence store; the first successful send records this model's density, after
     which the projection is measured rather than guessed.
     """
-    baseline = 1.0
-    try:
-        from ouroboros.capability_evidence import get_token_density
-        from ouroboros.provider_models import normalize_model_identity
-
-        measured = get_token_density(drive_root, normalize_model_identity(str(model or "")))
-        if measured > 0:
-            baseline = measured
-    except Exception:
-        log.debug("Measured token density unavailable for context fit", exc_info=True)
-    ratios = [float(baseline)]
+    ratios = [float(main_loop_token_density(drive_root, model))]
     try:
         events_path = pathlib.Path(drive_root) / "logs" / "events.jsonl"
         for event in iter_jsonl_objects(

@@ -39,6 +39,28 @@ _FALSE_LIKE_ENV_VALUES = {"", "0", "false", "no", "off"}
 # passed through by OpenRouter). Anything else is normalized to the bare marker.
 _VALID_CACHE_TTLS = frozenset({"5m", "1h"})
 
+# Wall-clock horizon of an APPLIED prompt-cache TTL, keyed by the value the
+# send-time finalizer REPORTS into usage metadata. ONLY the two NAMED tiers have
+# a horizon: they were stamped on the wire, so the number is the recorded fact
+# itself. This is a units conversion — deliberately NOT a route-level predictor
+# that could disagree with the payload after route-filter/promotion/cap.
+_CACHE_TTL_SECONDS = {"5m": 300, "1h": 3600}
+
+
+def cache_ttl_seconds(applied_ttl: Any) -> Optional[int]:
+    """Seconds of provider cache lifetime for a RECORDED applied TTL, else None.
+
+    ``None`` for empty/unknown AND for ``"default"``. ``"default"`` records one
+    fact only — a BARE ephemeral marker went out — and a bare marker names no
+    tier: the finalizer reports it for any payload carrying markers, including
+    routes it never normalizes (a Gemini send keeps bare markers and reports
+    ``"default"``, and Gemini/OpenAI/Grok/DeepSeek retention is implicit and
+    provider-defined, not 5 minutes). Turning that into "300s" would be the
+    second TTL truth this design forbids — a predictor derived from a route the
+    recorded fact does not carry. Readers therefore stay SILENT on a bare
+    marker; silence beats a fabricated horizon (BIBLE P1)."""
+    return _CACHE_TTL_SECONDS.get(str(applied_ttl or "").strip().lower())
+
 
 def supports_message_cache_control(model: str) -> bool:
     """Providers whose OpenRouter route honors message-level cache_control breakpoints.
@@ -2136,6 +2158,17 @@ class LLMClient:
         never caller-owned messages/tools, the canonical transcript, or a route that cannot
         carry these markers (``_route_normalizes_cache_breakpoints``). "1h" wins over
         "default" so pricing bills the extended-tier write multiplier.
+
+        The owner's global TTL (``config.resolve_prompt_cache_ttl``, owner decision
+        2026-08-08 Q2=A) is consumed HERE and only here: when it names an explicit tier
+        ('5m'/'1h') it is stamped onto EVERY existing breakpoint of this family —
+        including caller-declared review/safety prefixes, which is what makes it an
+        HONEST override rather than a floor — before the promotion rule runs, so
+        ordering stays legal by construction (the 176567b every-call-400 class).
+        'default' keeps the pre-setting behavior byte-for-byte: bare markers stay bare
+        and a caller-declared ttl stands. It never CREATES a marker (the d32f703d
+        empty-block 400 class), and non-Anthropic wire formats are untouched (the
+        v5.30.0 Gemini ttl-field class).
         """
         breakpoints = self._payload_cache_breakpoints(payload)
         note: Optional[Dict[str, Any]] = None
@@ -2158,14 +2191,25 @@ class LLMClient:
                 breakpoints = breakpoints[:self._MAX_CACHE_BREAKPOINTS]
                 note = {"declared": declared, "kept": len(breakpoints),
                         "dropped": declared - len(breakpoints)}
+            from ouroboros.config import resolve_prompt_cache_ttl
+
+            global_ttl = resolve_prompt_cache_ttl()
+            if global_ttl in _VALID_CACHE_TTLS:
+                for holder in breakpoints:
+                    holder["cache_control"]["ttl"] = global_ttl
             if any(str(b["cache_control"].get("ttl") or "") == "1h" for b in breakpoints):
                 for holder in breakpoints:
                     holder["cache_control"]["ttl"] = "1h"
         if not hasattr(self, "_cache_breakpoint_tls"):
             self._cache_breakpoint_tls = threading.local()
         self._cache_breakpoint_tls.pending = note
+        # Report the strongest APPLIED TTL — the value that flows into usage metadata
+        # (llm_usage/llm_round events) and prices the write tier. Readers consume this
+        # recorded fact; nothing re-derives an "effective TTL" from the route.
         if any(str(b["cache_control"].get("ttl") or "") == "1h" for b in breakpoints):
             return "1h"
+        if any(str(b["cache_control"].get("ttl") or "") == "5m" for b in breakpoints):
+            return "5m"
         return "default" if breakpoints else None
 
     def _pop_cache_breakpoint_disclosure(self) -> Optional[Dict[str, Any]]:
@@ -2902,6 +2946,31 @@ class LLMClient:
             return {"type": "tool", "name": tool_choice}
         return None
 
+    @staticmethod
+    def _cache_write_split(raw_usage: Dict[str, Any]) -> Dict[str, int]:
+        """Anthropic's per-tier cache-write counters, when the provider reports them.
+
+        With the extended (1h) tier live, ``usage.cache_creation`` splits
+        ``cache_creation_input_tokens`` into ``ephemeral_5m_input_tokens`` /
+        ``ephemeral_1h_input_tokens`` — a 1h request can legitimately produce BOTH
+        (e.g. a server-tool block cached at the default tier beside the 1h prefix),
+        and pricing must bill only the genuine 1h share at the extended ratio.
+        Empty dict when the provider reported no split (older shapes) — the caller
+        then bills every write at the reported tier, never a loosened ratio.
+        """
+        split = raw_usage.get("cache_creation") if isinstance(raw_usage, dict) else None
+        if not isinstance(split, dict):
+            return {}
+        out: Dict[str, int] = {}
+        for tier, key in (("5m", "ephemeral_5m_input_tokens"), ("1h", "ephemeral_1h_input_tokens")):
+            try:
+                value = int(split.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                out[tier] = value
+        return out
+
     def _normalize_anthropic_response(
         self,
         resp_dict: Dict[str, Any],
@@ -2948,6 +3017,9 @@ class LLMClient:
         }
         if prompt_cache_ttl:
             usage["prompt_cache_ttl"] = prompt_cache_ttl
+        write_split = self._cache_write_split(raw_usage)
+        if write_split:
+            usage["cache_write_tokens_by_ttl"] = write_split
         if usage["prompt_tokens"] or usage["completion_tokens"]:
             from ouroboros.pricing import estimate_cost_optional
 
@@ -2959,6 +3031,7 @@ class LLMClient:
                 usage["cache_write_tokens"],
                 usage.get("prompt_cache_ttl"),
                 provider="anthropic",
+                cache_write_tokens_by_ttl=write_split or None,
             )
             if estimated_cost is not None:
                 usage["cost"] = estimated_cost
@@ -3719,6 +3792,10 @@ class LLMClient:
         usage["resolved_model"] = str(target.get("usage_model") or target.get("resolved_model") or "")
         if prompt_cache_ttl and not usage.get("prompt_cache_ttl"):
             usage["prompt_cache_ttl"] = prompt_cache_ttl
+        # Anthropic's per-tier write split, when the route passed it through.
+        _write_split = self._cache_write_split(usage)
+        if _write_split and not usage.get("cache_write_tokens_by_ttl"):
+            usage["cache_write_tokens_by_ttl"] = _write_split
         if usage.get("cost") is None and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
             from ouroboros.pricing import estimate_cost_optional
 
@@ -3731,6 +3808,11 @@ class LLMClient:
                 usage.get("prompt_cache_ttl"),
                 allow_live_fetch=not skip_cost_fetch,
                 provider=usage["provider"],
+                cache_write_tokens_by_ttl=(
+                    usage.get("cache_write_tokens_by_ttl")
+                    if isinstance(usage.get("cache_write_tokens_by_ttl"), dict)
+                    else None
+                ),
             )
             if estimated_cost is not None:
                 usage["cost"] = estimated_cost

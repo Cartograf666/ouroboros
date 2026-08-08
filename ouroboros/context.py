@@ -1363,6 +1363,27 @@ def _build_installed_skills_section(env: Any, *, max_lines: int = 100) -> str:
     return "\n".join(lines)
 
 
+def _drive_state_section(env: Any) -> str:
+    """Typed projection of ``state/state.json`` + an on-demand pointer. Keys =
+    what the agent REASONS about; the rest is internal caches or a second spend
+    narrative build_runtime_section already renders from the usage-accounting
+    authority. P1: disclosed omission — keys NAMED, full file one read away."""
+    keys = ("session_id", "current_branch", "current_sha", "evolution_mode_enabled",
+            "evolution_owner_stopped", "evolution_cycle", "evolution_consecutive_failures",
+            "last_evolution_task_at", "bg_consciousness_enabled", "post_task_autostop",
+            "budget_drift_pct", "budget_drift_alert", "last_owner_message_at")
+    raw = read_json_dict(env.drive_path("state/state.json")) or {}
+    projected = {k: raw[k] for k in keys if k in raw}
+    omitted = sorted(set(raw) - set(projected))
+    note = ("Projection of state/state.json (spend/budget facts live in the Runtime "
+            "section, from the usage-accounting authority)."
+            + ((" Omitted keys: " + ", ".join(omitted) + ". Full file: "
+                "read_file(root='runtime_data', path='state/state.json').") if omitted else ""))
+    return ("## Drive state\n\n"
+            + json.dumps(projected, ensure_ascii=False, indent=1, sort_keys=True, default=str)
+            + "\n\n" + note)
+
+
 def _capture_context_core(
     env: Any,
     memory: Memory,
@@ -1378,7 +1399,6 @@ def _capture_context_core(
     bible_md = safe_read(env.repo_path("BIBLE.md"))
     architecture_md = safe_read(env.repo_path("docs/ARCHITECTURE.md"))
     development_md = safe_read(env.repo_path("docs/DEVELOPMENT.md"))
-    state_json = safe_read(env.drive_path("state/state.json"), fallback="{}")
 
     memory.ensure_files()
 
@@ -1432,7 +1452,7 @@ def _capture_context_core(
     if installed_skills:
         dynamic_parts.append(installed_skills)
     dynamic_parts.extend([
-        "## Drive state\n\n" + state_json,
+        _drive_state_section(env),
         build_runtime_section(env, task, ctx=ctx),
         (
             "## Task Contract Discipline\n\n"

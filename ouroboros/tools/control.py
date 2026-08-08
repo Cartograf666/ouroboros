@@ -2078,6 +2078,43 @@ def _wait_attention_poll(ctx: ToolContext, after_ts: str) -> Callable[..., Any]:
     return _hook
 
 
+def cache_horizon_note(ctx: Any, elapsed_sec: Any) -> str:
+    """One factual line when a blocking wait outlived the APPLIED prompt-cache TTL.
+
+    Reads the RECORDED fact of this task's latest send — ``_last_prompt_cache_ttl``
+    in the loop's accumulated usage (published on the tool ctx), converted by
+    ``llm.cache_ttl_seconds`` — never a route-level prediction (a second predictor
+    can disagree with the payload after route-filter/promotion/cap). Empty string
+    when the horizon is unknown or not yet elapsed. UNKNOWN covers three cases,
+    all silent: no cached send recorded, a route that carries no markers at all,
+    and a send whose markers were BARE (reported ``"default"``) — a bare marker
+    names no tier, so its horizon is the provider's business and inventing one
+    would mislead the agent into re-planning its waits around a number nobody
+    established. Only the explicitly stamped ``5m``/``1h`` tiers speak here.
+    Deliberately NO token-count predictions: the submarine forensics showed the
+    fact ("the wait outlived the cache") is what changes the agent's next decision
+    (batch waits, longer single windows), while "~X tokens will re-write" is a
+    counterfactual — the next send may reroute, compact, or still hit a live cache.
+    """
+    try:
+        elapsed = float(elapsed_sec)
+    except (TypeError, ValueError):
+        return ""
+    usage = getattr(ctx, "_accumulated_usage", None)
+    if not isinstance(usage, dict):
+        return ""
+    applied_ttl = str(usage.get("_last_prompt_cache_ttl") or "").strip()
+    from ouroboros.llm import cache_ttl_seconds
+
+    horizon = cache_ttl_seconds(applied_ttl)
+    if horizon is None or elapsed <= horizon:
+        return ""
+    return (
+        f"⚠️ configured prompt-cache horizon ({applied_ttl}, {horizon}s) elapsed during "
+        f"this wait ({elapsed:.0f}s); the next model send may be cold."
+    )
+
+
 def _wait_for_task(ctx: ToolContext, task_id: str, timeout_sec: int = 180) -> str:
     """Wait for a subtask to reach a terminal status."""
     try:
@@ -2110,6 +2147,9 @@ def _wait_for_task(ctx: ToolContext, task_id: str, timeout_sec: int = 180) -> st
             f"\n\n[ADVISORY] {other_live} other child(ren) still running/scheduled — consider "
             "wait_tasks(any_terminal) to absorb whichever finishes first instead of waiting one at a time."
         )
+    horizon_note = cache_horizon_note(ctx, waited.get("elapsed_sec"))
+    if horizon_note:
+        extra += f"\n\n{horizon_note}"
     return f"{header} after {waited.get('elapsed_sec', 0):.1f}s.{extra}\n\n{_get_task_result(ctx, tid)}"
 
 
@@ -2373,6 +2413,9 @@ def _wait_for_tasks(
             # field set only (never envelopes), so the parent can fix its wait
             # set instead of re-polling phantoms.
             waited["children_roster"] = _children_roster_projection(ctx, status_drive_root)
+    horizon_note = cache_horizon_note(ctx, waited.get("elapsed_sec"))
+    if horizon_note:
+        waited["cache_horizon_note"] = horizon_note
     return json.dumps(waited, ensure_ascii=False, indent=2)
 
 

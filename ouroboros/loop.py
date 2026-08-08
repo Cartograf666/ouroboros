@@ -21,7 +21,12 @@ from ouroboros.observability import new_call_id, persist_call
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context import build_user_content, estimate_context_prompt_tokens
-from ouroboros.context_budget import EMERGENCY_COMPACTION_CHARS, LOW_EMERGENCY_COMPACTION_CHARS
+from ouroboros.context_budget import (
+    COMPACTION_HYSTERESIS_REGION_GROWTH,
+    COMPACTION_HYSTERESIS_ROUNDS,
+    EMERGENCY_COMPACTION_CHARS,
+    LOW_EMERGENCY_COMPACTION_CHARS,
+)
 from ouroboros.context_compaction import _tool_round_spans, compact_tool_history_llm
 from ouroboros.deadline_utils import parse_deadline_ts, utc_now
 from ouroboros.utils import estimate_tokens, truncate_review_artifact
@@ -68,6 +73,10 @@ class _CompactionRoundContext:
     checkpoint_injected: bool
     emit_progress: Callable[[str], None]
     active_model: str = ""
+    # The round's LIVE tool-schema list (the same object enable_tools appends to).
+    # Sent on the wire beside `messages`, so the necessity measure must count it;
+    # optional so existing constructions stay valid (schemas absent => 0 tokens).
+    tool_schemas: Optional[List[Dict[str, Any]]] = None
 
 
 def _estimate_messages_chars(messages: List[Dict[str, Any]]) -> int:
@@ -3284,6 +3293,48 @@ def _drain_incoming_messages(
     return controls
 
 
+def _arm_compaction_hysteresis(
+    ctx: _CompactionRoundContext,
+    usage_state: Dict[str, Any],
+    pressure_real_tokens: float,
+    threshold_real_tokens: float,
+    region_chars: int,
+    schema_tokens: int,
+    density: float,
+    *,
+    reason: str = "nothing_compactable",
+) -> None:
+    """Suppress emergency compaction until the COMPACTABLE region can help again.
+
+    Two ways a pass fails to earn its cost, both armed here so the disclosure is
+    identical: it ran and could not bring total pressure under the trigger
+    (``emergency_pass_futile``), or the transcript holds under two tool rounds so
+    the compactor would structurally no-op (``nothing_compactable``). One loud
+    line plus a typed checkpoint event, then silence until the region grows or
+    the round window passes — never a silent stop (BIBLE P1).
+    """
+    usage_state["_compaction_hysteresis"] = {"round": ctx.round_idx, "region_chars": region_chars}
+    ctx.emit_progress(
+        "⚠️ Emergency compaction cannot help: calibrated context "
+        f"≈{pressure_real_tokens / 1000:.0f}K real tokens exceeds the "
+        f"≈{threshold_real_tokens / 1000:.0f}K trigger, but the frozen frame (system "
+        "blocks + tool schemas) is what carries it and cannot be compacted. Further "
+        f"passes suppressed until the compactable transcript grows "
+        f"≥{COMPACTION_HYSTERESIS_REGION_GROWTH:.1f}x or "
+        f"{COMPACTION_HYSTERESIS_ROUNDS} rounds pass."
+    )
+    _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+        "checkpoint_kind": "compaction_hysteresis_armed",
+        "round": ctx.round_idx,
+        "reason": reason,
+        "calibrated_real_tokens": int(pressure_real_tokens),
+        "threshold_real_tokens": int(threshold_real_tokens),
+        "compactable_region_chars": int(region_chars),
+        "tool_schema_tokens": int(schema_tokens),
+        "token_density": round(float(density), 3),
+    })
+
+
 def _run_round_compaction(
     messages: List[Dict[str, Any]],
     ctx: _CompactionRoundContext,
@@ -3321,27 +3372,96 @@ def _run_round_compaction(
     # compaction; max => 1.2M-char emergency-only (cache-friendly). No per-model
     # window table; the reactive provider-overflow detector (context.py) drops the
     # agent to low mode if a route's real window turns out smaller than assumed.
+    #
+    # NECESSITY vs UTILITY (the submarine thrash fix). NECESSITY — should we
+    # compact at all? — is TOTAL calibrated pressure: the frozen frame (system
+    # blocks, TOOL SCHEMAS, protected/kept rounds) counts toward the provider
+    # window even though no pass can shrink it. "Total" is literal: the schemas
+    # travel beside `messages` on the wire (~148K chars on the submarine traces),
+    # so a transcript-only measure would let the trigger fire a whole tool
+    # envelope late — they are added through the context_fit token seam
+    # (tool_schema_tokens), never re-estimated here. The char budget is compared
+    # in CALIBRATED real tokens (main_loop_token_density: neutral 1.0 cold,
+    # measured supersedes — never the review-pack cold-conservative value, which
+    # would demote fresh installs; the v6.80→v6.81 oscillation).
+    # UTILITY — can a pass help, and when
+    # should it refire? — is the COMPACTABLE region only (the transcript beyond
+    # the frozen frame): a pass that could NOT get below the trigger arms a
+    # hysteresis, one loud disclosure replaces the per-round light-model call +
+    # cache-destroying rewrite (wave3: 35/35 rounds fired because the LOW trigger
+    # sits below the irreducible low-mode frame), and the trigger re-arms only
+    # when the region grows ~20% or after N rounds. The reactive provider-overflow
+    # low-retry net (one-shot, loop exit path) is deliberately untouched.
     emergency_chars = LOW_EMERGENCY_COMPACTION_CHARS if ctx.active_context_mode == "low" else EMERGENCY_COMPACTION_CHARS
-    if _estimate_messages_chars(messages) > emergency_chars:
+    from ouroboros.context_fit import main_loop_token_density, tool_schema_tokens
+
+    density = main_loop_token_density(ctx.drive_root, ctx.active_model)
+    threshold_real_tokens = emergency_chars / 4.0  # the token budget the char constant documents
+    schema_tokens = tool_schema_tokens(ctx.tool_schemas)
+
+    def _total_pressure(msgs: List[Dict[str, Any]]) -> float:
+        return (_estimate_messages_chars(msgs) / 4.0 + schema_tokens) * density
+
+    pressure_real_tokens = _total_pressure(messages)
+    if pressure_real_tokens > threshold_real_tokens:
+        usage_state = getattr(ctx.tools._ctx, "_accumulated_usage", None)
+        usage_state = usage_state if isinstance(usage_state, dict) else {}
+        spans = _tool_round_spans(messages)
+        region_chars = _estimate_messages_chars(messages[spans[0][0]:]) if spans else 0
+        hysteresis = usage_state.get("_compaction_hysteresis")
+        if isinstance(hysteresis, dict):
+            armed_region = int(hysteresis.get("region_chars") or 0)
+            armed_round = int(hysteresis.get("round") or 0)
+            # `armed_region + 1` is the floor that makes an EMPTY armed region
+            # behave: a 20%-growth test on zero is `0 < 0`, which never
+            # suppresses, so an over-threshold frame with nothing compactable
+            # re-fired every single round — the exact thrash this arm exists to
+            # stop, just with an empty transcript instead of a full one.
+            grow_to = max(armed_region * COMPACTION_HYSTERESIS_REGION_GROWTH, armed_region + 1)
+            if (
+                region_chars < grow_to
+                and (ctx.round_idx - armed_round) < COMPACTION_HYSTERESIS_ROUNDS
+            ):
+                return messages, None  # armed: a pass cannot help yet (disclosed once, on arming)
+            usage_state.pop("_compaction_hysteresis", None)
         # keep_recent must stay BELOW the current span count or the compactor
         # no-ops (len(spans) <= keep_recent returns as-is): a transcript over
         # the emergency byte threshold with only ~50 huge rounds previously
         # never compacted at all. Halve the history (floor 6), but ALWAYS
         # clamp below the span count so even 2-6 huge rounds compact; with a
         # single round there is nothing older to summarize.
-        span_count = len(_tool_round_spans(messages))
+        span_count = len(spans)
+        if span_count < 2:
+            # Necessity is real, but the transcript holds at most ONE tool round:
+            # the compactor's `len(spans) <= keep_recent` gate makes the pass a
+            # structural no-op (keep_recent floors at 1). Running it anyway bought
+            # nothing and wrote a forensic checkpoint every round while the frozen
+            # frame alone sat over the trigger — a low-mode task can enter its
+            # first rounds already there. Arm the hysteresis instead: same
+            # disclosure, no per-round work.
+            _arm_compaction_hysteresis(ctx, usage_state, pressure_real_tokens,
+                                       threshold_real_tokens, region_chars, schema_tokens, density)
+            return messages, None
         emergency_keep_recent = min(50, max(6, span_count // 2), max(1, span_count - 1))
         if _persist_compaction_checkpoint(
             messages, drive_root=ctx.drive_root, drive_logs=ctx.drive_logs, task_id=ctx.task_id,
             reason="emergency_context_size", keep_recent=emergency_keep_recent,
             round_idx=ctx.round_idx, event_queue=ctx.event_queue,
         ):
-            return compact_tool_history_llm(
+            messages, usage = compact_tool_history_llm(
                 messages,
                 keep_recent=emergency_keep_recent,
                 drive_root=ctx.drive_root,
                 task_id=ctx.task_id,
             )
+            after_real_tokens = _total_pressure(messages)
+            if after_real_tokens > threshold_real_tokens:
+                spans_after = _tool_round_spans(messages)
+                region_after = _estimate_messages_chars(messages[spans_after[0][0]:]) if spans_after else 0
+                _arm_compaction_hysteresis(ctx, usage_state, after_real_tokens,
+                                           threshold_real_tokens, region_after, schema_tokens,
+                                           density, reason="emergency_pass_futile")
+            return messages, usage
         ctx.emit_progress("⚠️ Emergency compaction skipped: forensic checkpoint could not be persisted.")
         return messages, None
 
@@ -6236,6 +6356,11 @@ def run_llm_loop(
         )
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {}
+    # Published as a live reference so blocking tools (wait_task/wait_tasks/
+    # delegate_wait) can read RECORDED per-send facts — e.g. the APPLIED
+    # prompt-cache TTL (`_last_prompt_cache_ttl`) behind the cache-horizon
+    # disclosure — without a second, route-derived predictor.
+    tools._ctx._accumulated_usage = accumulated_usage
     max_retries = 3
     cost_ceiling = _resolve_task_cost_ceiling(ctx, budget_remaining_usd)
     if cost_ceiling.root_cap_usd is not None:
@@ -6375,6 +6500,7 @@ def run_llm_loop(
                     checkpoint_injected=_checkpoint_injected,
                     emit_progress=emit_progress,
                     active_model=active_model,
+                    tool_schemas=tool_schemas,
                 ),
             )
             if tools._ctx.messages is not messages:
