@@ -299,7 +299,8 @@ def test_every_host_acceptance_writer_emits_a_canonical_status_and_typed_reason(
         i for i, line in enumerate(src)
         if "_set_acceptance_decision(" in line and not line.lstrip().startswith("def ")
     ]
-    assert len(starts) == 16, f"writer inventory changed: {len(starts)} call sites"
+    # 17th writer: the forced-rail acceptance-bypass recorder (typed, closed-enum reason).
+    assert len(starts) == 17, f"writer inventory changed: {len(starts)} call sites"
     allowed_status = {
         "ACCEPTANCE_ACCEPTED", "ACCEPTANCE_REVISION_REQUESTED",
         "ACCEPTANCE_FINALIZED_UNACCEPTED",

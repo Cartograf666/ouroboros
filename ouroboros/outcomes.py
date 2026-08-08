@@ -89,6 +89,22 @@ REASON_DELIVERY_CONTROL_DEGRADED = "delivery_control_degraded"
 REASON_CHILD_RESULTS_DEFERRED = "child_results_deferred"
 REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE = "review_skipped_deadline_reserve"
 
+# CLOSED mapping: forced-finalization rail (the loop's typed reason_code) -> typed
+# acceptance-bypass reason, stamped by the loop's common forced-finalization recorder
+# when the panel was OWED (eligible) but a rail ended the task first. Both deadline
+# rails collapse to ONE reason; an unmapped rail stamps nothing — the enum stays finite
+# and no call site may mint a reason by concatenation (ledger vocabulary only, never
+# agent-visible text — the v6.61.4 token-parroting class).
+ACCEPTANCE_BYPASS_REASON_BY_RAIL = {
+    "budget_exhausted": "acceptance_bypassed_budget_exhausted",
+    "round_limit": "acceptance_bypassed_round_limit",
+    "finalization_grace": "acceptance_bypassed_deadline",
+    "deadline_local": "acceptance_bypassed_deadline",
+    "provider_unavailable": "acceptance_bypassed_provider_unavailable",
+    "children_unabsorbed": "acceptance_bypassed_children_unabsorbed",
+}
+ACCEPTANCE_BYPASS_REASONS = frozenset(ACCEPTANCE_BYPASS_REASON_BY_RAIL.values())
+
 # v6.78.0 (owner Q23=B): the HOST acceptance decision has exactly three owner-facing
 # states, each carrying a typed `reason` drawn from facts the host already computed
 # (dialogue_status, pass_reason, panel/degraded reasons, the pacing launch reason).
@@ -354,10 +370,7 @@ def latest_unreconciled_failed_receipt(receipts: List[Dict[str, Any]]) -> Option
     — never a single latest-pointer, which a newer red would let erase an older still-red
     one. Shared SSOT by the finalize nudge and the acceptance verification_summary so the
     reconciliation rule lives in one place."""
-    return _outcome_receipts.latest_unreconciled_failed(
-        receipts,
-        _RECEIPT_RED_RECONCILING_STATUSES,
-    )
+    return _outcome_receipts.latest_unreconciled_failed(receipts, _RECEIPT_RED_RECONCILING_STATUSES)
 
 
 def latest_unreconciled_failed_verification(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
@@ -380,10 +393,7 @@ def latest_unreconciled_masked_pass(receipts: List[Dict[str, Any]]) -> Optional[
     so a cleanly reconciled newer masked check no longer takes an older one with it.
     FLAG-driven (typed receipt field); advisory only. Shared SSOT by the finalize nudge and
     the acceptance verification_summary."""
-    return _outcome_receipts.latest_unreconciled_masked(
-        receipts,
-        _RECEIPT_RED_RECONCILING_STATUSES,
-    )
+    return _outcome_receipts.latest_unreconciled_masked(receipts, _RECEIPT_RED_RECONCILING_STATUSES)
 
 
 def latest_unreconciled_masked_verification(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
@@ -533,7 +543,6 @@ def reviewable_effect_projection(llm_trace: Dict[str, Any]) -> List[Dict[str, An
 
 def turn_has_reviewable_effects(llm_trace: Dict[str, Any]) -> bool:
     """True when the shared structured projection contains a real effect."""
-
     return bool(reviewable_effect_projection(llm_trace))
 
 
@@ -548,6 +557,23 @@ def _user_file_basenames(args: Dict[str, Any]) -> set[str]:
         for candidate in candidates
         if str(candidate or "").strip()
     }
+
+
+def _call_target_signature(args: Dict[str, Any]) -> tuple[str, set[str]]:
+    """One canonical (target_key, target_paths) signature of a tool call's target args —
+    shared by the failed call and the later-recovery scan so the two can never diverge."""
+    parts: List[tuple[str, Any]] = []
+    paths: set[str] = set()
+    for key in ("root", "path", "cwd", "cmd", "script", "name", "outputs"):
+        if key not in args:
+            continue
+        value = args.get(key)
+        parts.append((key, value))
+        if key in {"path", "cwd"} and value:
+            paths.add(str(value))
+        if key == "outputs" and isinstance(value, list):
+            paths.update(str(part) for part in value if str(part or "").strip())
+    return json.dumps(parts, sort_keys=True, default=str), paths
 
 
 def _tool_error_record(item: Dict[str, Any], *, recovered_by: int | None = None) -> Dict[str, Any]:
@@ -627,18 +653,7 @@ def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str,
                 recovered_items.append(_tool_error_record(item))
             continue
         args = item.get("args") if isinstance(item.get("args"), dict) else {}
-        target_parts = []
-        target_paths = set()
-        for key in ("root", "path", "cwd", "cmd", "script", "name", "outputs"):
-            if key not in args:
-                continue
-            value = args.get(key)
-            target_parts.append((key, value))
-            if key in {"path", "cwd"} and value:
-                target_paths.add(str(value))
-            if key == "outputs" and isinstance(value, list):
-                target_paths.update(str(part) for part in value if str(part or "").strip())
-        target_key = json.dumps(target_parts, sort_keys=True, default=str)
+        target_key, target_paths = _call_target_signature(args)
         recovered_by: int | None = None
         for later_idx, later in enumerate(calls[idx + 1:], start=idx + 2):
             if later.get("is_error"):
@@ -648,18 +663,8 @@ def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str,
             if later_status not in {"", "ok", "ok_autocorrected"}:
                 continue
             later_args = later.get("args") if isinstance(later.get("args"), dict) else {}
-            later_parts = []
-            later_paths = set()
-            for key in ("root", "path", "cwd", "cmd", "script", "name", "outputs"):
-                if key not in later_args:
-                    continue
-                value = later_args.get(key)
-                later_parts.append((key, value))
-                if key in {"path", "cwd"} and value:
-                    later_paths.add(str(value))
-                if key == "outputs" and isinstance(value, list):
-                    later_paths.update(str(part) for part in value if str(part or "").strip())
-            same_target = later_tool == tool and target_key == json.dumps(later_parts, sort_keys=True, default=str)
+            later_key, later_paths = _call_target_signature(later_args)
+            same_target = later_tool == tool and target_key == later_key
             same_path = bool(target_paths and later_paths and target_paths.intersection(later_paths))
             # Read the TYPED artifact-registration flag captured from the full result at
             # execution time (loop_tool_execution), not a substring of the (truncatable)
@@ -733,13 +738,10 @@ def _extract_outcome_tiers(runs: List[Dict[str, Any]]) -> List[str]:
 
 def _aggregate_outcome_tier(tiers: List[str]) -> str:
     """Worst-tier-wins aggregation: blocked > best_effort > solved."""
-    if not tiers:
-        return ""
-    if OUTCOME_TIER_BLOCKED in tiers:
-        return OUTCOME_TIER_BLOCKED
-    if OUTCOME_TIER_BEST_EFFORT in tiers:
-        return OUTCOME_TIER_BEST_EFFORT
-    return OUTCOME_TIER_SOLVED
+    for tier in (OUTCOME_TIER_BLOCKED, OUTCOME_TIER_BEST_EFFORT):
+        if tier in tiers:
+            return tier
+    return OUTCOME_TIER_SOLVED if tiers else ""
 
 
 def _acceptance_decision_projection(acceptance_decision: Dict[str, Any]) -> Dict[str, Any]:
@@ -1016,6 +1018,17 @@ def public_task_result(result: Dict[str, Any], *, include_outcome_axes: bool = T
     return public
 
 
+# INFRA-failure host-fallback text prefixes: (prefix, failure kind, default reason_code).
+_INFRA_TEXT_PREFIXES = (
+    ("⚠️ Failed to get a response", "provider", REASON_PROVIDER_FAILURE),
+    ("⚠️ All models are down", "provider", REASON_PROVIDER_FAILURE),
+    ("⚠️ Error during processing:", "runtime", REASON_TASK_EXCEPTION),
+    ("❌ Deep self-review unavailable:", "runtime", REASON_DEEP_SELF_REVIEW_UNAVAILABLE),
+    ("⚠️ Deep self-review error:", "runtime", REASON_DEEP_SELF_REVIEW_ERROR),
+    ("❌ Deep self-review failed:", "runtime", REASON_DEEP_SELF_REVIEW_ERROR),
+)
+
+
 def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     """Return a typed LoopOutcome-compatible dict."""
 
@@ -1042,11 +1055,16 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     mutation_attribution = _trace_mapping(llm_trace, "mutation_attribution")
     # v6.78.0: keyed on the CANONICAL status plus the typed reason (before the
     # three-state collapse the reason literal WAS the status). Missing this pairing
-    # would silently stop degrading an eligible-but-skipped panel — a false green.
-    acceptance_review_skipped_deadline_reserve = (
+    # would silently stop degrading an eligible-but-skipped panel — a false green;
+    # keying on the status alone would degrade honest capsule_spent finalizations.
+    # The forced-rail bypass reasons (ACCEPTANCE_BYPASS_REASONS) ride the same key.
+    _acceptance_reason = str(acceptance_decision.get("reason") or "")
+    acceptance_review_skipped_eligible = (
         str(acceptance_decision.get("status") or "") == ACCEPTANCE_FINALIZED_UNACCEPTED
-        and str(acceptance_decision.get("reason") or "")
-        == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+        and (
+            _acceptance_reason == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+            or _acceptance_reason in ACCEPTANCE_BYPASS_REASONS
+        )
         and str(review_decision.get("eligibility") or "") == "eligible"
     )
     disposition_projection = _trace_mapping(llm_trace, "child_result_dispositions")
@@ -1105,22 +1123,12 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         execution_status = EXECUTION_FAILED
         reason_code = REASON_EMPTY_FINAL_TEXT
         failure = {"kind": "agent", "reason_code": reason_code}
-    elif text.lstrip().startswith("⚠️ Failed to get a response") or text.lstrip().startswith("⚠️ All models are down"):
+    elif (_infra := next(
+        (row for row in _INFRA_TEXT_PREFIXES if text.lstrip().startswith(row[0])), None,
+    )) is not None:
         execution_status = EXECUTION_INFRA_FAILED
-        reason_code = usage_reason or REASON_PROVIDER_FAILURE
-        failure = {"kind": "provider", "reason_code": reason_code}
-    elif text.lstrip().startswith("⚠️ Error during processing:"):
-        execution_status = EXECUTION_INFRA_FAILED
-        reason_code = usage_reason or REASON_TASK_EXCEPTION
-        failure = {"kind": "runtime", "reason_code": reason_code}
-    elif text.lstrip().startswith("❌ Deep self-review unavailable:"):
-        execution_status = EXECUTION_INFRA_FAILED
-        reason_code = usage_reason or REASON_DEEP_SELF_REVIEW_UNAVAILABLE
-        failure = {"kind": "runtime", "reason_code": reason_code}
-    elif text.lstrip().startswith("⚠️ Deep self-review error:") or text.lstrip().startswith("❌ Deep self-review failed:"):
-        execution_status = EXECUTION_INFRA_FAILED
-        reason_code = usage_reason or REASON_DEEP_SELF_REVIEW_ERROR
-        failure = {"kind": "runtime", "reason_code": reason_code}
+        reason_code = usage_reason or _infra[2]
+        failure = {"kind": _infra[1], "reason_code": reason_code}
     elif delivery_candidate.get("degraded") and not deferred_child_suffix:
         execution_status = EXECUTION_DEGRADED
         reason_code = usage_reason or REASON_DELIVERY_CONTROL_DEGRADED
@@ -1150,11 +1158,11 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "tool_errors": tool_errors[:20],
         }
 
-    # A deadline-skipped eligible panel is not a verdict, but cannot remain clean;
+    # A skipped-or-bypassed eligible panel is not a verdict, but cannot remain clean;
     # preserve stronger classifications and degrade only the false-green remainder.
-    if acceptance_review_skipped_deadline_reserve and execution_status == EXECUTION_OK:
+    if acceptance_review_skipped_eligible and execution_status == EXECUTION_OK:
         execution_status = EXECUTION_DEGRADED
-        reason_code = REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+        reason_code = _acceptance_reason
         failure = {
             "kind": "task_acceptance",
             "reason_code": reason_code,
@@ -1182,12 +1190,16 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "source": "delivery_finalization_control",
         })
     if (
-        acceptance_review_skipped_deadline_reserve
+        acceptance_review_skipped_eligible
         and objective.get("status") == OBJECTIVE_NOT_EVALUATED
     ):
         objective.update({
             "status": OBJECTIVE_DEGRADED,
-            "source": "task_acceptance_deadline_reserve",
+            "source": (
+                "task_acceptance_deadline_reserve"
+                if _acceptance_reason == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+                else "task_acceptance_forced_bypass"
+            ),
         })
     # Mutation attribution is evidence for the reviewing panels (attached to the
     # failure-evidence projection below), deliberately never a structural veto.
@@ -1283,33 +1295,23 @@ def collect_trace_refs(usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict
     execution_id = str(usage.get("execution_id") or "").strip()
     if execution_id:
         refs["execution_id"] = execution_id
-    llm_refs = []
-    for item in usage.get("llm_call_refs") or []:
-        if not isinstance(item, dict):
-            continue
-        llm_refs.append({
-            "llm_call_id": item.get("llm_call_id"),
-            "execution_id": item.get("execution_id"),
-            "round_id": item.get("round_id"),
-            "round": item.get("round"),
-            "request_ref": item.get("request_ref"),
-            "response_ref": item.get("response_ref"),
-            "model": item.get("model"),
-            "resolved_model": item.get("resolved_model"),
-            "provider": item.get("provider"),
-        })
+    llm_refs = [
+        {key: item.get(key) for key in (
+            "llm_call_id", "execution_id", "round_id", "round", "request_ref",
+            "response_ref", "model", "resolved_model", "provider",
+        )}
+        for item in usage.get("llm_call_refs") or []
+        if isinstance(item, dict)
+    ]
     if llm_refs:
         refs["llm_call_refs"] = llm_refs
     tool_refs = []
     for item in llm_trace.get("tool_calls") or []:
         if isinstance(item, dict) and item.get("trace_ref"):
             trace = item.get("trace_ref") if isinstance(item.get("trace_ref"), dict) else {}
-            tool_refs.append({
-                "call_id": trace.get("call_id"),
-                "manifest_ref": trace.get("manifest_ref"),
-                "redacted_projection_ref": trace.get("redacted_projection_ref"),
-                "redaction": trace.get("redaction"),
-            })
+            tool_refs.append({key: trace.get(key) for key in (
+                "call_id", "manifest_ref", "redacted_projection_ref", "redaction",
+            )})
     if tool_refs:
         refs["tool_call_refs"] = tool_refs
     return refs

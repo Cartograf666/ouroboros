@@ -16,7 +16,7 @@ import logging
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
 from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum, get_context_mode, get_light_model, get_review_enforcement, get_task_review_mode, resolve_effort
-from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
+from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, reviewable_effect_projection, should_nudge_verification, turn_has_reviewable_effects
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.tool_policy import CAPABILITY_OMISSION_HEADER, format_capability_omissions, initial_tool_schemas, list_non_core_tools, swarm_router_turn
 from ouroboros.tools.registry import ToolRegistry
@@ -1224,6 +1224,9 @@ ACCEPTANCE_DECISION_REASONS = (
     "fence_reopen_failed",
     "infra_failure",
     REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE,
+    # Forced-rail acceptance bypass (closed set, outcomes.py SSOT): stamped by
+    # `_record_forced_acceptance_bypass` when the panel was owed but a rail fired.
+    *sorted(ACCEPTANCE_BYPASS_REASONS),
     ACCEPTANCE_REASON_UNSPECIFIED,
 )
 
@@ -3750,6 +3753,87 @@ def _degrade_retained_delivery_candidate(
     return candidate
 
 
+def _record_forced_acceptance_bypass(
+    ctx: _RoundLimitContext,
+    llm_trace: Dict[str, Any],
+    reason_code: str,
+) -> None:
+    """Typed acceptance-bypass record on a forced rail — a LEDGER write, never a gate.
+
+    The acceptance panel's only launch site is the voluntary no-tool finalization, so
+    every forced exit used to leave the review axis at {skipped, not_eligible,
+    run_count:0} — indistinguishable from "no panel warranted". This stamps the
+    terminal truth instead: the eligibility predicate is evaluated PURE against the
+    live trace (no fence begin, no subtree-quiescence wait, no panel, no model round,
+    no prompt text — forced exits are the v6.29 honesty/salvage shelf and stay
+    byte-identical in behavior), and an OWED-but-bypassed panel lands as
+    ``finalized_unaccepted`` with a closed-enum reason (`ACCEPTANCE_BYPASS_REASON_BY_RAIL`,
+    the v6.54.4 deadline-reserve precedent generalized; v6.74.4 filed follow-up).
+    Reason tokens stay ledger-only (v6.61.4 token-parroting class). Never raises —
+    the salvage lane has priority over this record.
+    """
+    rail_reason = ACCEPTANCE_BYPASS_REASON_BY_RAIL.get(str(reason_code or ""))
+    if rail_reason is None:
+        return
+    # A rail that deliberately cleared the failure state (a confirmed swarm routing
+    # handoff) terminalized nothing reviewable here — the admitted managed task gets
+    # its own acceptance lifecycle.
+    if not str(ctx.accumulated_usage.get("reason_code") or ""):
+        return
+    tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+    if tools_ctx is None:
+        return
+    # A host decision already recorded (panel ran, pacing skip, supersede) wins;
+    # the bypass record exists only for the nothing-was-written shape.
+    if isinstance(llm_trace.get("acceptance_decision"), dict) and llm_trace.get("acceptance_decision"):
+        return
+    if getattr(tools_ctx, "_task_acceptance_reviewed", False):
+        return
+    trigger = f"bypassed_{reason_code}"
+    try:
+        from ouroboros.task_results import resolve_task_lineage
+
+        meta = getattr(tools_ctx, "task_metadata", {})
+        meta = meta if isinstance(meta, dict) else {}
+        lineage = resolve_task_lineage(
+            str(ctx.task_id or getattr(tools_ctx, "task_id", "") or ""),
+            metadata=meta,
+            root_task_id=getattr(tools_ctx, "root_task_id", None),
+            parent_task_id=getattr(tools_ctx, "parent_task_id", None),
+            delegation_role=getattr(tools_ctx, "delegation_role", None),
+            original_task_id=getattr(tools_ctx, "original_task_id", None),
+            timeout_retry_from=getattr(tools_ctx, "timeout_retry_from", None),
+        )
+        eligible, probe_trigger = _task_acceptance_eligible(
+            get_task_review_mode(),
+            llm_trace,
+            bool(getattr(tools_ctx, "is_direct_chat", False)),
+            is_root_task=bool(lineage["is_root_task"]),
+            is_ephemeral_turn=bool(getattr(tools_ctx, "is_ephemeral_turn", False)),
+            task_contract=(
+                tools_ctx.task_contract
+                if isinstance(getattr(tools_ctx, "task_contract", None), dict)
+                else {}
+            ),
+        )
+    except Exception:
+        # A mid-round dying trace may not support the probe; record the honest
+        # unknown instead of crashing the salvage path.
+        log.debug("Forced acceptance-bypass eligibility probe failed", exc_info=True)
+        llm_trace["review_decision"] = {"eligibility": "unknown", "trigger": trigger}
+        return
+    if not eligible:
+        # Explicitly "no panel warranted" — now distinguishable from "not evaluated".
+        llm_trace["review_decision"] = {"eligibility": "not_eligible", "trigger": probe_trigger}
+        return
+    llm_trace["review_decision"] = {"eligibility": "eligible", "trigger": trigger}
+    _set_acceptance_decision(llm_trace, {
+        "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+        "reason": rail_reason,
+        "source": "forced_finalization",
+    })
+
+
 def _record_forced_finalization(
     ctx: _RoundLimitContext,
     llm_trace: Dict[str, Any],
@@ -3763,6 +3847,10 @@ def _record_forced_finalization(
     # have been refreshed, so every forced return exposes the same terminal
     # child-result truth to the outcome reducer.
     _project_child_result_dispositions(ctx, llm_trace)
+    # Common terminal recorder = the ONE seam covering both the LLM-seam forced
+    # answer (`_forced_final_answer`) and the no-spend host-fallback fence path
+    # (`_handle_budget_exceeded` -> `_forced_fallback_result`).
+    _record_forced_acceptance_bypass(ctx, llm_trace, reason_code)
     binding = dict(candidate.acceptance_binding or {}) if candidate is not None else {}
     tools = getattr(ctx, "tools", None)
     current_fingerprint = str(
