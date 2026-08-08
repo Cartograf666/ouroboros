@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use Ouroboros in research, please cite it using the metadata below."
+title: "Ouroboros"
+type: software
+authors:
+  - family-names: "Razzhigaev"
+    given-names: "Anton"
+repository-code: "https://github.com/razzant/ouroboros"
+url: "https://ouroboros-agent.ai/"
+license: MIT
+abstract: >-
+  Ouroboros is an open-source, general-purpose AI agent with persistent
+  identity, durable memory, and a self-modifying codebase. It can work on
+  external projects, coordinate specialist agents, and evolve its
+  implementation through reviewed Git history. The Ouroboros agent contributed
+  to the design, implementation, and review of the software.
+keywords:
+  - artificial intelligence
+  - AI agents
+  - self-modifying systems
+  - persistent memory
+  - multi-agent systems
