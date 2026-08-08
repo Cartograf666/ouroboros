@@ -878,6 +878,20 @@ VACUOUS_CLAIMS_NOTE = (
     "means for this plan."
 )
 
+def vacuous_acceptance_claims(scope: object) -> bool:
+    """True when the raw scope CARRIES an acceptance_claims key that normalizes to
+    absent (None / [] / blank strings) — the caller appends VACUOUS_CLAIMS_NOTE so
+    the treatment is disclosed, never an error (the v6.65.1/.2 lesson)."""
+    if not isinstance(scope, dict) or "acceptance_claims" not in scope:
+        return False
+    value = scope.get("acceptance_claims")
+    if value is None:
+        return True
+    if not isinstance(value, list):
+        return False  # shape errors surface through normalize_plan_scope instead
+    return not any(isinstance(item, str) and item.strip() for item in value)
+
+
 def vacuous_review_disposition(value: object) -> bool:
     """True for a schema-shaped but semantically empty disposition: models routinely
     fill an optional object param with an empty default instead of omitting it. An

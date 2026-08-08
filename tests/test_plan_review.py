@@ -2938,6 +2938,24 @@ class TestPlanReviewToolRegistration(unittest.TestCase):
         self.assertEqual(tool.schema["parameters"]["required"], [])
         self.assertIn("review_disposition ONLY", tool.schema["description"])
         self.assertNotIn("auto", params["context_level"].get("enum", []))
+        claims = params["scope"]["properties"]["acceptance_claims"]
+        self.assertEqual(claims["type"], "array")
+        self.assertEqual(claims["items"], {"type": "string"})
+        # No min-constraints by design (v6.65.1/.2: they shape placeholder junk).
+        self.assertNotIn("minItems", claims)
+        self.assertNotIn("minLength", claims.get("items", {}))
+
+    def test_vacuous_acceptance_claims_detection(self):
+        from ouroboros.tools.review_synthesis import vacuous_acceptance_claims
+
+        self.assertTrue(vacuous_acceptance_claims({"acceptance_claims": []}))
+        self.assertTrue(vacuous_acceptance_claims({"acceptance_claims": ["", "  "]}))
+        self.assertTrue(vacuous_acceptance_claims({"acceptance_claims": None}))
+        self.assertFalse(vacuous_acceptance_claims({"acceptance_claims": ["game boots"]}))
+        self.assertFalse(vacuous_acceptance_claims({"in_scope": ["x"]}))
+        self.assertFalse(vacuous_acceptance_claims(None))
+        # Shape errors are normalize_plan_scope's job, not the vacuous note's.
+        self.assertFalse(vacuous_acceptance_claims({"acceptance_claims": "game boots"}))
 
     def test_public_registry_rejects_unknown_plan_task_arguments(self):
         import tempfile

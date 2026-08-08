@@ -61,8 +61,10 @@ from ouroboros.tools.review_helpers import (
 from ouroboros.tools.review_synthesis import (
     emit_plan_review_usage as _emit_plan_review_usage,  # noqa: F401 — test-compat re-export
     PLAN_REVIEW_CONTROL_PREFIX,
+    VACUOUS_CLAIMS_NOTE as _VACUOUS_CLAIMS_NOTE,
     VACUOUS_DISPOSITION_NOTE as _VACUOUS_DISPOSITION_NOTE,
     addressable_plan_findings,
+    vacuous_acceptance_claims as _vacuous_acceptance_claims,
     vacuous_review_disposition as _vacuous_review_disposition,
     all_planning_tasks_terminal as _all_planning_tasks_known_terminal,
     assemble_plan_raw_results as _assemble_plan_raw_results,
@@ -211,7 +213,7 @@ def get_tools():
                             "description": (
                                 "Optional structured intent boundary shown beside the goal: what is in scope, "
                                 "mandatory invariants, non-goals, the existing seam selected for extension, "
-                                "and explicitly rejected expansions."
+                                "explicitly rejected expansions, and optional pre-work acceptance claims."
                             ),
                             "properties": {
                                 "in_scope": {"type": "array", "items": {"type": "string"}},
@@ -219,6 +221,21 @@ def get_tools():
                                 "non_goals": {"type": "array", "items": {"type": "string"}},
                                 "selected_seam": {"type": "string"},
                                 "rejected_expansions": {"type": "array", "items": {"type": "string"}},
+                                "acceptance_claims": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": (
+                                        "Optional pre-work acceptance claims: concrete, checkable "
+                                        "statements of what 'done' means for this plan (plain strings). "
+                                        "They enter the plan fingerprint when set, reviewers see them "
+                                        "beside the goal, and the claims of the CLOSED plan bind task "
+                                        "acceptance (ids claim_1..N in list order — link "
+                                        "verify_and_record receipts to them via criterion_id). Keep the "
+                                        "list stable across re-plans (append-only edits) so receipt "
+                                        "links survive. Omit the field unless you can state real "
+                                        "checks; empty/blank values are treated as absent."
+                                    ),
+                                },
                             },
                         },
                         "review_disposition": {
@@ -336,6 +353,8 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
             )
         if isinstance(result, str) and vacuous_disposition:
             result += _VACUOUS_DISPOSITION_NOTE
+        if isinstance(result, str) and _vacuous_acceptance_claims(params.get("scope")):
+            result += _VACUOUS_CLAIMS_NOTE
         return result
     except (concurrent.futures.TimeoutError, asyncio.TimeoutError):
         return _plan_unavailable(
