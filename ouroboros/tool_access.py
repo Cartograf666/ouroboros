@@ -762,6 +762,48 @@ def workspace_mode_block_reason(ctx: Any) -> str:
     return ""
 
 
+def _subagent_projects_read_hint(
+    ctx: Any,
+    resolved: pathlib.Path,
+    hard_protected_roots: list[pathlib.Path],
+) -> str:
+    """A targeted refusal for a user_files path that actually lives inside the
+    subagent-projects area: name root=subagent_projects with the exact relative
+    path instead of steering the model at roots that cannot reach the target.
+    Empty when the target is not there, the active profile cannot read that root,
+    or the projects root is misconfigured to overlap a HARD drive (never steer a
+    read at the control plane)."""
+    try:
+        profile_policy = _POLICY.get(active_tool_profile(ctx), {})
+        if "read" not in profile_policy.get("subagent_projects", set()):
+            return ""
+        projects_root = resource_root_path(ctx, "subagent_projects")
+        if any(
+            path_is_relative_to(projects_root, hard) or _path_is_relative_to_casefold(projects_root, hard)
+            for hard in hard_protected_roots
+        ):
+            return ""
+        if not (
+            path_is_relative_to(resolved, projects_root)
+            or _path_is_relative_to_casefold(resolved, projects_root)
+        ):
+            return ""
+        try:
+            rel = str(resolved.relative_to(projects_root))
+        except ValueError:
+            rel = os.path.relpath(str(resolved), str(projects_root))
+        rel = rel if rel not in ("", ".") else "."
+        return (
+            "this path is inside root=subagent_projects (the durable child-project "
+            f"area); read it via root=subagent_projects, path={rel!r} "
+            "(read/list/search only — no write/shell there by design: children "
+            "write via write_surface=external_workspace, and the host "
+            "checkpoint-commits dirty coop trees at root finalization)"
+        )
+    except Exception:
+        return ""
+
+
 def user_files_path_block_reason(
     ctx: Any,
     candidate: pathlib.Path,
@@ -833,6 +875,17 @@ def user_files_path_block_reason(
             if overlaps_protected or (
                 not allow_protected_descendants and contains_protected
             ):
+                # Name the root that ACTUALLY contains the target (the v6.54.3
+                # shell_cwd_block_message lesson applied to this surface): the
+                # subagent-projects area lives under the SOFT ~/Ouroboros parent,
+                # so every coop-tree read used to get a message naming four roots
+                # that cannot reach it while omitting the one that can. MESSAGE
+                # ONLY — subagent_projects stays a read-only root (no user_files
+                # write carve-out), and a target inside a HARD drive never takes
+                # this branch.
+                projects_hint = _subagent_projects_read_hint(ctx, resolved, hard_protected_roots)
+                if projects_hint:
+                    return projects_hint
                 return (
                     "path overlaps the Ouroboros repo/runtime workspace; use "
                     "root=active_workspace, root=task_drive, root=artifact_store, "
@@ -866,6 +919,17 @@ def user_files_path_block_reason(
         return "path name is credential-like"
 
     return ""
+
+
+class UserFilesPathBlockedError(ValueError):
+    """Typed user_files confinement refusal (a POLICY denial, not an I/O failure).
+
+    Subclasses ``ValueError`` so every existing generic handler keeps working;
+    the read-surface wrappers (read_file/list_files/search_code) render it with
+    the typed ``⚠️ USER_FILES_PATH_BLOCKED`` prefix so the outcome axis can
+    partition it into ``execution.policy_denials`` (v6.57.0) instead of the
+    generic ``error`` status that falsely degraded a shipped task to
+    ``tool_failure`` (the submarine wave-3 incident)."""
 
 
 def resolve_user_file_path(
@@ -924,7 +988,7 @@ def resolve_user_file_path(
                 except (OSError, ValueError):
                     inside_deliverables = False
             if not inside_home and not inside_deliverables:
-                raise ValueError(
+                raise UserFilesPathBlockedError(
                     "user_files path blocked: absolute path "
                     f"{raw_text!r} is outside the user_files home ({home_resolved}). "
                     "Use root='active_workspace' for workspace paths, or a "
@@ -965,7 +1029,7 @@ def resolve_user_file_path(
         allow_protected_descendants=allow_protected_descendants,
     )
     if reason:
-        raise ValueError(f"user_files path blocked: {reason}")
+        raise UserFilesPathBlockedError(f"user_files path blocked: {reason}")
     return candidate
 
 

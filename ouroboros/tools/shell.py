@@ -1206,9 +1206,14 @@ def _run_shell(
             )
         undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(ctx, cmd, outputs, scratch_abs=scratch_abs, command_start_ts=_command_start_ts)
         if undeclared_user_outputs:
+            # DISTINCT prefix from the real registration failure below: the command
+            # SUCCEEDED (exit_code=0) and this is a declaration NUDGE, so its typed
+            # status lands in the v6.57.0 policy-denial partition instead of
+            # degrading execution to tool_failure (the submarine wave-3 incident:
+            # a moot nudge on an already-registered artifact fed the failure record).
             return (
                 autocorrect_note
-                + "⚠️ ARTIFACT_OUTPUT_ERROR: command appears to write user_files outputs "
+                + "⚠️ ARTIFACT_OUTPUT_UNDECLARED: command appears to write user_files outputs "
                 "without declaring outputs=[...]. Declare generated user-visible files so "
                 "they are copied into the task artifact store before claiming completion. "
                 f"Paths: {', '.join(undeclared_user_outputs[:5])}.\n\n"
@@ -1444,8 +1449,10 @@ def _run_script(
     )
     audit_note = ""
     if undeclared_user_outputs:
+        # Same declaration NUDGE class as run_command's (typed apart from the
+        # real declared-output failures — see ARTIFACT_OUTPUT_UNDECLARED there).
         audit_note = (
-            "⚠️ ARTIFACT_OUTPUT_ERROR: run_script wrote user_files without declaring outputs: "
+            "⚠️ ARTIFACT_OUTPUT_UNDECLARED: run_script wrote user_files without declaring outputs: "
             + ", ".join(undeclared_user_outputs)
             + ". Re-run with outputs=[...] or write the canonical deliverable via root=artifact_store."
         )

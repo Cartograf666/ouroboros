@@ -103,6 +103,7 @@ ACCEPTANCE_DECISION_STATUSES = (
 
 _BLOCKING_TOOL_STATUSES = frozenset({
     "artifact_output_error",
+    "artifact_output_undeclared",
     "blocked",
     "claude_code_error",
     "cwd_blocked",
@@ -128,6 +129,7 @@ _BLOCKING_TOOL_STATUSES = frozenset({
     "skill_state_blocked",
     "timeout",
     "unavailable",
+    "user_files_path_blocked",
     "violation",
     "workspace_blocked",
     "write_file_blocked",
@@ -156,6 +158,11 @@ _RECOVERY_TOOL_NAMES = frozenset({
 # security-boundary hits (`safety_violation`, `violation`) are intentionally EXCLUDED
 # and stay real failures.
 _POLICY_DENIAL_STATUSES = frozenset({
+    # v6.90.x (submarine unwind): the three confinement surfaces that leaked past
+    # the partition as generic errors are now typed — the user_files path block on
+    # READ tools, and the exit_code=0 undeclared-outputs NUDGE (split from the real
+    # artifact_output_error registration failure, which stays a genuine failure).
+    "artifact_output_undeclared",
     "blocked",
     "cwd_blocked",
     "data_blocked",
@@ -173,6 +180,7 @@ _POLICY_DENIAL_STATUSES = frozenset({
     "skill_payload_blocked",
     "skill_payload_control_blocked",
     "skill_state_blocked",
+    "user_files_path_blocked",
     "workspace_blocked",
     "write_file_blocked",
 })
@@ -666,7 +674,7 @@ def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str,
             # trace preview — the same typed signal turn_has_reviewable_effects uses, so
             # the marker is never re-derived from prose on this layer (C9.5).
             artifact_registered = bool(later.get("artifact_registered"))
-            if status == "artifact_output_error":
+            if status in ("artifact_output_error", "artifact_output_undeclared"):
                 recovered = artifact_registered and (same_path or not target_paths)
             else:
                 recovered = same_target or (artifact_registered and same_path)

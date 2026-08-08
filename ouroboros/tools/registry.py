@@ -2610,6 +2610,22 @@ class ToolRegistry:
         )
         record_python_resolution(self._ctx, python_resolution)
         if python_resolution is not None and python_resolution.error_reason:
+            if python_resolution.error_reason == "cwd_resolution_failed":
+                # The failure is the CWD CONFINEMENT policy, not interpreter
+                # provenance: python argv is resolved pre-dispatch, so without
+                # this the same bad cwd that gets the self-healing
+                # SHELL_CWD_BLOCKED root list from a non-python command got an
+                # opaque interpreter message naming nothing (submarine waves
+                # 1/3, `python3 -m http.server` in a coop tree). Emit the ONE
+                # canonical cwd message (label=path root list); the
+                # python_interpreter_resolution trace above keeps the true
+                # reason, and the typed SHELL_CWD_BLOCKED status lands in the
+                # policy-denial family instead of degrading execution.
+                return args, python_resolution, shell_cwd_block_message(
+                    self._ctx,
+                    str((args or {}).get("cwd") or ""),
+                    operation="service" if name == "start_service" else "shell",
+                )
             return args, python_resolution, (
                 "⚠️ PYTHON_INTERPRETER_UNAVAILABLE: Ouroboros could not prove "
                 "the target interpreter for this launch surface "
