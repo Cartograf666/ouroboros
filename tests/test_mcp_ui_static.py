@@ -45,6 +45,7 @@ def test_settings_ui_has_mcp_section(settings_ui_source: str) -> None:
     assert 'id="btn-mcp-refresh-all"' in settings_ui_source
     assert 'id="mcp-servers-list"' in settings_ui_source
     assert 'id="mcp-global-status"' in settings_ui_source
+    assert "local stdio processes" in settings_ui_source
 
 
 def test_settings_ui_mcp_section_sits_in_advanced_panel(settings_ui_source: str) -> None:
@@ -83,9 +84,13 @@ def test_mcp_module_drops_masked_token_in_test_payload(mcp_source: str) -> None:
     assert "server_id: sid, server: { ...server }" in mcp_source
 
 
-def test_mcp_module_supports_two_transports(mcp_source: str) -> None:
+def test_mcp_module_supports_http_sse_and_stdio(mcp_source: str) -> None:
     assert "streamable_http" in mcp_source
     assert "sse" in mcp_source
+    assert "stdio" in mcp_source
+    assert "data-mcp-field=\"command\"" in mcp_source
+    assert "data-mcp-field=\"args\"" in mcp_source
+    assert "does not use a shell" in mcp_source
 
 
 def test_mcp_module_renders_status_classes(mcp_source: str) -> None:
@@ -109,6 +114,7 @@ def test_mcp_css_defines_required_classes(settings_css: str) -> None:
     assert ".mcp-server-card" in settings_css
     assert ".mcp-server-status-ok" in settings_css
     assert ".mcp-server-status-danger" in settings_css
+    assert ".settings-shell .form-field textarea" in settings_css
 
 
 def test_settings_ui_mcp_section_describes_hot_reload(settings_ui_source: str) -> None:

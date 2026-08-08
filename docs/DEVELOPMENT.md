@@ -1332,17 +1332,20 @@ host state, never in extension manifests.
 
 ## MCP Client Integration
 
-The base runtime is an optional client for trusted HTTP/SSE MCP servers; it is
-not an MCP server. `ouroboros/mcp_client.py` owns server parsing, URL/header
-validation, auth masking, provider-safe tool names, discovery, timeout, and
-result normalization. Settings carry only `MCP_ENABLED`, `MCP_TOOL_TIMEOUT_SEC`,
-and structured `MCP_SERVERS`; tokens never appear in status responses.
+The base runtime is an optional client for trusted HTTP/SSE and local stdio MCP
+servers; it is not an MCP server. `ouroboros/mcp_client.py` owns server parsing,
+transport-specific validation, auth masking, provider-safe tool names,
+discovery, timeout, and result normalization. Settings carry only `MCP_ENABLED`,
+`MCP_TOOL_TIMEOUT_SEC`, and structured `MCP_SERVERS`; tokens never appear in
+status responses.
 
 MCP descriptions/results are untrusted data, not policy. Enabled tools join the
 initial capability envelope, still pass runtime safety, and remain unavailable
 in repair/heal contexts. Discovery failure becomes a visible capability
-omission. Adding stdio, resources, prompts, or server behavior is a separate
-architecture change, not a hidden extension of this client.
+omission. Stdio accepts one executable command and an exact string argument
+list, uses no shell, custom environment, or custom working directory, and
+relies on the SDK context for teardown. Resources, prompts, and MCP server
+behavior remain separate architecture changes.
 
 ## Gateway Boundary Pattern
 
