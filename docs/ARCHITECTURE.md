@@ -2183,6 +2183,20 @@ the number elsewhere). These gates caught externally merged PRs that bypassed
 the in-process review path — they are the last deterministic line of the immune
 system, so weakening them requires the owner's explicit decision.
 
+The module-size gate also covers `web/**/*.js` (perf/lifecycle sprint) via the
+SSOT predicate `ouroboros/review.py::is_gated_js_module`, shared by both
+consumers (the smoke gate and `codebase_health`): line-count only (no JS
+function-length scan), excluding `web/tests/` and vendored/minified payloads;
+`web/modules/chat.js` is the registered grandfathered JS debt (rel-path-keyed).
+The same sprint added a deterministic hot-store growth health invariant:
+`agent_startup_checks.py::hot_store_growth_notes` (surfaced in every task
+context by `context.py::build_health_invariants`) stats `logs/events.jsonl`,
+`logs/tools.jsonl`, `logs/progress.jsonl`, and `state/usage_attempts.jsonl`
+against justified byte thresholds in `ouroboros/context_budget.py` and emits a
+WARNING with a remediation pointer; isolated benchmark data roots (the
+`.ouroboros_isolated_benchmark` sentinel) suppress it so throwaway bench runs
+do not carry a perpetual warning in every task context.
+
 The shared hard prompt-size SSOT is `REVIEW_PROMPT_TOKEN_BUDGET = 920_000` in
 `ouroboros/tools/review_helpers.py`. `review_context_atlas.py` targets 850K
 estimated total prompt tokens for scope review, plan review, and deep

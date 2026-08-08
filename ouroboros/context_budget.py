@@ -79,3 +79,27 @@ SCRATCHPAD_SECTION_BUDGET_CHARS = 90_000
 SCRATCHPAD_BLOAT_WARN_CHARS = 50_000
 # Block-storage consolidation trigger (consolidator compresses oldest blocks).
 SCRATCHPAD_CONSOLIDATION_THRESHOLD_CHARS = 30_000
+
+# --- Hot-store growth thresholds (health invariant; bytes) -------------------
+# Deterministic tripwires for the append-only stores whose interactive readers
+# degrade with file size (BIBLE P2: the class was caught by the owner, not by
+# any instrument — these thresholds are the instrument). Same family as
+# SCRATCHPAD_BLOAT_WARN_CHARS above: a health-invariant WARNING, not a gate.
+#
+# Ledger: measured evidence in ouroboros/usage_ledger.py::_locked — a ~20MB
+# usage_attempts.jsonl costs ~0.5s per full re-read UNDER THE MONETARY LOCK,
+# starving concurrent workers (the 2026-07-23 lock-timeout incident). Warn at
+# exactly that measured degradation point.
+USAGE_LEDGER_WARN_BYTES = 20_000_000
+# events/tools logs have no rotation and no per-request reader on the hot path
+# today (health scans are tail-bounded); the thresholds are deliberately
+# generous — they exist to flag runaway growth long before a full read of the
+# file becomes a seconds-scale operation, not to nag normal accumulation.
+EVENTS_LOG_WARN_BYTES = 100_000_000
+TOOLS_LOG_WARN_BYTES = 100_000_000
+# progress.jsonl is expected to be ROTATION-BOUNDED (the chat.jsonl rotation
+# pattern, 800KB cap in supervisor/state.py::rotate_chat_log_if_needed,
+# generalized to progress by the perf/lifecycle sprint). 8MB = 10x that cap:
+# this warning fires only if rotation is broken or missing — a deliberate
+# regression tripwire, not a size preference.
+PROGRESS_LOG_WARN_BYTES = 8_000_000
