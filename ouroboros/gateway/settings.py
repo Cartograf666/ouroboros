@@ -21,6 +21,10 @@ from ouroboros.config import (
     load_settings,
 )
 from ouroboros.config import ENDPOINT_AUTHORED_SETTINGS as _ENDPOINT_AUTHORED_SETTINGS
+from ouroboros.secret_masking import (
+    MASKED_SECRET_SETTING_KEYS,
+    looks_masked_secret as _looks_masked_secret,
+)
 from ouroboros.gateway._helpers import json_error, json_exception, request_drive_root
 from ouroboros.gateway.owner_settings import (
     CommitBoundary,
@@ -52,6 +56,9 @@ from ouroboros.utils import append_jsonl, utc_now_iso
 log = logging.getLogger(__name__)
 DEFAULT_PORT = int(os.environ.get("OUROBOROS_SERVER_PORT", "8765"))
 
+# The masker below and the read-side repair in config.load_settings must agree on
+# which keys are secrets, so the list has one home.
+_SECRET_SETTING_KEYS = MASKED_SECRET_SETTING_KEYS
 _CUSTOM_SECRET_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
 
 def _get_lan_ip() -> str:
@@ -137,9 +144,6 @@ def _mask_password_class(value: Any) -> str:
 def _mask_secret_value(value: Any) -> str:
     text = str(value or "")
     return text[:8] + "..." if len(text) > 8 else "***"
-
-
-from ouroboros.mcp_client import looks_masked_secret as _looks_masked_secret
 
 
 def _mask_mcp_servers_payload(servers: Any) -> list:
@@ -295,10 +299,10 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
             continue
         if key not in body:
             continue
-        # A mask means "keep the stored secret", so with nothing stored it is
-        # DROPPED: a client echoing back what it was served (the wizard does
-        # exactly that) must not be able to write the marker in as a credential.
-        if key in SECRET_SETTING_KEYS and _looks_masked_secret(body[key]):
+        # A placeholder means "field untouched", never a new secret — and never a
+        # credential worth persisting even when nothing is stored yet. Clearing
+        # stays explicit: the UI sends "" for its Clear action.
+        if key in _SECRET_SETTING_KEYS and _looks_masked_secret(body[key]):
             continue
         merged[key] = body[key]
     for key, value in body.items():

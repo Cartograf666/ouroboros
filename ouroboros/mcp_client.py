@@ -346,9 +346,9 @@ def _mask_token(value: str) -> str:
     return text[:4] + "..." if len(text) > 4 else "***"
 
 
-def looks_masked_secret(value: Any) -> bool:
-    text = str(value or "").strip()
-    return text in ("***", "***set***") or text.endswith("...")
+# Re-exported so MCP callers and the Settings API share one mask contract; the
+# definition lives with the settings layer that produces the placeholder.
+from ouroboros.secret_masking import looks_masked_secret as looks_masked_secret  # noqa: E402
 
 
 def _redact_error_text(text: Any, cfg: Optional[MCPServerConfig] = None) -> str:
