@@ -532,6 +532,19 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
         for root in ("active_workspace", "system_repo"):
             if root in policy:
                 light_gated_roots.append(root)
+    # label=resolved-path pairs for every root the profile can see (the v6.54.3
+    # shell_cwd_block_message lesson applied to the context digest: a bare label
+    # left the model guessing absolute paths and re-tripping the same block).
+    # skill_payload is omitted (its path needs bucket/skill args); per-root
+    # resolution is fail-soft so one unresolvable root never hides the rest.
+    root_paths: dict[str, str] = {}
+    for _root_label in sorted(policy):
+        if _root_label == "skill_payload":
+            continue
+        try:
+            root_paths[_root_label] = str(resource_root_path(ctx, _root_label))
+        except Exception:
+            continue
     result = {
         "profile": profile,
         "writable_roots": writable_roots,
@@ -540,6 +553,7 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
         # not a behavioral gate — subagents used to infer invisibility only by
         # absence and then burned rounds re-probing blocked roots.
         "invisible_roots": sorted(_ALL_ROOTS - set(policy)),
+        "root_paths": root_paths,
         "default_shell_cwd": shell_roots[0][0] if shell_roots else "",
         "allowed_shell_cwd_roots": [label for label, _root in shell_roots],
         "default_service_cwd": service_roots[0][0] if service_roots else "",
