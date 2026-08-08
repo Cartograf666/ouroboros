@@ -2147,6 +2147,17 @@ def cache_horizon_note(ctx: Any, elapsed_sec: Any) -> str:
     fact ("the wait outlived the cache") is what changes the agent's next decision
     (batch waits, longer single windows), while "~X tokens will re-write" is a
     counterfactual — the next send may reroute, compact, or still hit a live cache.
+
+    REACHABILITY, honestly (each wait tool clamps its own window, so "all three
+    wait tools carry the line" is a capability, not a per-configuration promise):
+    at the shipped default TTL ``1h`` (3600s horizon) only ``wait_tasks`` (7200s
+    clamp) can genuinely emit it; ``wait_task`` clamps at exactly 3600s and can
+    only cross by a poll overshoot of a couple of seconds, and ``delegate_wait``
+    clamps at ``config.DELEGATE_WAIT_CEILING_SEC`` (2100s) and cannot cross at all.
+    At ``5m`` all three emit it. Pinned by
+    tests/test_cache_optimization.py::test_cache_horizon_reachability_matches_the_wait_clamps —
+    the call sites stay on all three because the tier is an owner setting, not a
+    constant, and a wait tool that silently could not disclose would be worse.
     """
     try:
         elapsed = float(elapsed_sec)

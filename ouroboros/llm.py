@@ -2160,7 +2160,13 @@ class LLMClient:
         "default" so pricing bills the extended-tier write multiplier.
 
         The owner's global TTL (``config.resolve_prompt_cache_ttl``, owner decision
-        2026-08-08 Q2=A) is consumed HERE and only here: when it names an explicit tier
+        2026-08-08 Q2=A) has its single WIRE authority here — the one place that decides
+        what every marker on this family actually ships as. It is not the only READER:
+        ``review_helpers.cached_prompt_blocks(ttl=None)`` projects the same setting into
+        the block it owns so a non-normalizing route still carries the owner's tier; on
+        this family the finalizer would stamp that block to the same value anyway, so the
+        two readers cannot diverge on the wire (``config.resolve_prompt_cache_ttl`` names
+        both). When the setting names an explicit tier
         ('5m'/'1h') it is stamped onto EVERY existing breakpoint of this family —
         including caller-declared review/safety prefixes, which is what makes it an
         HONEST override rather than a floor — before the promotion rule runs, so

@@ -285,38 +285,34 @@ def test_emergency_compaction_arms_when_nothing_is_compactable(monkeypatch, tmp_
 
 
 def test_emergency_compaction_hysteresis_suppresses_futile_refire(monkeypatch, tmp_path):
-    """UTILITY/rearm: a pass that could not get below the trigger arms a
-    hysteresis — no per-round refire (no light-model call, no cache-destroying
-    rewrite) until the compactable region grows ~20% or N rounds pass. One loud
-    disclosure on arming."""
-    from ouroboros import context_fit, loop
+    """UTILITY/rearm measured against the REAL compactor in the submarine shape.
+
+    The previous version of this pin stubbed the compactor to return the
+    transcript UNCHANGED — the one shape where the growth bar is hard to cross,
+    so it stayed green while production thrashed. Here only the light-model
+    summarizer is stubbed; `compact_tool_history_llm` really collapses the older
+    spans, which is exactly what used to satisfy the "region grew 1.2x" rearm on
+    the very next tool round. Wave3 shape: low mode (400K trigger), an
+    irreducible ~630K-char frame, and an agent that keeps calling tools.
+
+    Measured on this driver: 34/35 rounds ran a summarizer + full-transcript
+    rewrite before the floor-based rearm, 3/35 after.
+    """
+    from ouroboros import context_compaction, context_fit, loop
     from ouroboros.context_budget import COMPACTION_HYSTERESIS_ROUNDS
 
-    calls = []
-    progress = []
-    monkeypatch.setattr(
-        loop, "_persist_compaction_checkpoint",
-        lambda m, **k: calls.append("checkpoint") or True,
-    )
-    # FUTILE pass: returns the transcript unchanged.
-    monkeypatch.setattr(
-        loop, "compact_tool_history_llm",
-        lambda m, keep_recent, **k: (calls.append("compact") or (m, None)),
-    )
+    summarizer_calls = []
+
+    def _fake_batch(rendered_blocks, *, drive_root, task_id):
+        summarizer_calls.append(len(rendered_blocks))
+        return ({start: "summary" for start, _ in rendered_blocks}, None)
+
+    monkeypatch.setattr(context_compaction, "_summarize_round_batch", _fake_batch)
+    monkeypatch.setattr(loop, "_persist_compaction_checkpoint", lambda m, **k: True)
     monkeypatch.setattr(context_fit, "main_loop_token_density", lambda _dr, _m: 1.0)
-    # Size scales with message count so the compactable region can grow.
-    monkeypatch.setattr(loop, "_estimate_messages_chars", lambda m: len(m) * 100_000)
 
-    def _messages(rounds):
-        out = []
-        for i in range(rounds):
-            out.append({
-                "role": "assistant", "content": f"r{i}",
-                "tool_calls": [{"id": f"h{i}", "function": {"name": "x", "arguments": "{}"}}],
-            })
-            out.append({"role": "tool", "tool_call_id": f"h{i}", "content": "ok"})
-        return out
-
+    progress, events = [], []
+    monkeypatch.setattr(loop, "_emit_checkpoint_event", lambda _q, _t, _l, row: events.append(row))
     state = {}
 
     def _ctx(round_idx):
@@ -324,28 +320,147 @@ def test_emergency_compaction_hysteresis_suppresses_futile_refire(monkeypatch, t
             tools=SimpleNamespace(_ctx=SimpleNamespace(_pending_compaction=None, _accumulated_usage=state)),
             drive_root=tmp_path, drive_logs=tmp_path / "logs", task_id="task-hyst",
             round_idx=round_idx, event_queue=None, active_use_local=False,
-            active_context_mode="max", checkpoint_injected=False,
+            active_context_mode="low", checkpoint_injected=True,
             emit_progress=progress.append,
         )
 
-    # 10 rounds x 2 msgs x 100K = 2M chars > 1.2M: fires, futile, arms.
-    loop._run_round_compaction(_messages(10), _ctx(3))
-    assert calls == ["checkpoint", "compact"]
-    assert "_compaction_hysteresis" in state
+    messages = [
+        {"role": "system", "content": "F" * 630_000},
+        {"role": "user", "content": "solve it"},
+    ]
+    rounds = 35
+    fired = 0
+    for rnd in range(1, rounds + 1):
+        messages = messages + [
+            {"role": "assistant", "content": f"r{rnd}",
+             "tool_calls": [{"id": f"h{rnd}", "function": {"name": "shell", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": f"h{rnd}", "content": "R" * 20_000},
+        ]
+        before = len(summarizer_calls)
+        messages, _usage = loop._run_round_compaction(messages, _ctx(rnd))
+        fired += len(summarizer_calls) > before
+
+    # Pre-fix this was 34/35 (every round after the first). The N-round window is
+    # the only rearm left while the frozen frame alone carries the pressure.
+    assert fired <= (rounds // COMPACTION_HYSTERESIS_ROUNDS) + 1, (
+        f"summarizer/rewrite fired in {fired}/{rounds} rounds — the hysteresis is "
+        "rearming on growth the pass itself created"
+    )
+    assert len(progress) == fired + 1  # one loud line per arm, never per round
     assert any("cannot help" in p and "frozen frame" in p for p in progress)
+    armed = [e for e in events if e["checkpoint_kind"] == "compaction_hysteresis_armed"]
+    assert [e["reason"] for e in armed][0] == "nothing_compactable"
+    assert all(e["frame_bound"] for e in armed)  # the floor, not the region, is the blocker
 
-    # Same region, next round: suppressed (no checkpoint, no light-model call).
-    calls.clear()
-    progress.clear()
-    loop._run_round_compaction(_messages(10), _ctx(4))
+
+def test_emergency_trigger_fire_points_are_pinned(monkeypatch, tmp_path):
+    """The calibrated trigger's real magnitude, per density and tool envelope.
+
+    `EMERGENCY_COMPACTION_CHARS` names 1.2M chars but is compared as a REAL-TOKEN
+    budget, so density and the tool schemas both shrink the transcript the agent
+    may hold. On the production Claude lane (density ~1.7, ~37K schema tokens)
+    max mode fires at ~559K chars — 2.1x earlier than the constant reads. That is
+    the owner's "necessity = total calibrated pressure" decision, but its
+    magnitude must be a pinned, owner-visible number rather than a side effect of
+    a units change: this test binary-searches the REAL decision so any drift is
+    loud (it fails, for instance, if the threshold is density-scaled, which would
+    cancel the calibration and restore the pre-v6.91 char semantics)."""
+    from ouroboros import context_fit, loop
+    from ouroboros.context_budget import EMERGENCY_COMPACTION_CHARS, LOW_EMERGENCY_COMPACTION_CHARS
+
+    monkeypatch.setattr(loop, "_persist_compaction_checkpoint", lambda m, **k: True)
+
+    def _fires(mode, density, schema_tokens, total_chars):
+        fired = []
+        monkeypatch.setattr(
+            loop, "compact_tool_history_llm",
+            lambda m, keep_recent, **k: (fired.append(1) or (m, None)),
+        )
+        monkeypatch.setattr(context_fit, "main_loop_token_density", lambda _dr, _m: density)
+        monkeypatch.setattr(context_fit, "tool_schema_tokens", lambda _s: schema_tokens)
+        per = max(1, total_chars // 6)
+        msgs = []
+        for i in range(6):
+            msgs.append({
+                "role": "assistant", "content": f"r{i}",
+                "tool_calls": [{"id": f"h{i}", "function": {"name": "x", "arguments": "{}"}}],
+            })
+            msgs.append({"role": "tool", "tool_call_id": f"h{i}", "content": "R" * per})
+        loop._run_round_compaction(msgs, loop._CompactionRoundContext(
+            tools=SimpleNamespace(_ctx=SimpleNamespace(_pending_compaction=None, _accumulated_usage={})),
+            drive_root=tmp_path, drive_logs=tmp_path / "logs", task_id="t",
+            round_idx=3, event_queue=None, active_use_local=False,
+            active_context_mode=mode, checkpoint_injected=True,
+            emit_progress=lambda _m: None,
+        ))
+        return bool(fired)
+
+    def _fire_point(mode, density, schema_tokens):
+        lo, hi = 1_000, 4_000_000
+        assert _fires(mode, density, schema_tokens, hi)
+        while hi - lo > 5_000:
+            mid = (lo + hi) // 2
+            if _fires(mode, density, schema_tokens, mid):
+                hi = mid
+            else:
+                lo = mid
+        return hi
+
+    tolerance = 15_000
+    assert abs(_fire_point("max", 1.0, 0) - EMERGENCY_COMPACTION_CHARS) < tolerance
+    assert abs(_fire_point("max", 1.0, 37_000) - 1_055_000) < tolerance
+    assert abs(_fire_point("max", 1.7, 0) - 708_000) < tolerance
+    assert abs(_fire_point("max", 1.7, 37_000) - 559_000) < tolerance
+    assert abs(_fire_point("low", 1.0, 0) - LOW_EMERGENCY_COMPACTION_CHARS) < tolerance
+    assert abs(_fire_point("low", 1.7, 37_000) - 91_000) < tolerance
+
+
+def test_compaction_floor_blocks_rearm_only_while_the_frame_carries_the_pressure(monkeypatch, tmp_path):
+    """The floor gate must not freeze a transcript a pass CAN still rescue.
+
+    Same armed state, two frames: an irreducible frame over the trigger keeps the
+    arm regardless of region growth; a small frame lets the ordinary 1.2x growth
+    bar rearm on the next round."""
+    from ouroboros import context_fit, loop
+
+    calls, progress = [], []
+    monkeypatch.setattr(
+        loop, "_persist_compaction_checkpoint",
+        lambda m, **k: calls.append("checkpoint") or True,
+    )
+    monkeypatch.setattr(
+        loop, "compact_tool_history_llm",
+        lambda m, keep_recent, **k: (calls.append("compact") or (m, None)),
+    )
+    monkeypatch.setattr(context_fit, "main_loop_token_density", lambda _dr, _m: 1.0)
+
+    def _transcript(frame_chars, rounds):
+        out = [{"role": "system", "content": "F" * frame_chars}]
+        for i in range(rounds):
+            out.append({
+                "role": "assistant", "content": f"r{i}",
+                "tool_calls": [{"id": f"h{i}", "function": {"name": "x", "arguments": "{}"}}],
+            })
+            out.append({"role": "tool", "tool_call_id": f"h{i}", "content": "R" * 60_000})
+        return out
+
+    def _ctx(round_idx, state):
+        return loop._CompactionRoundContext(
+            tools=SimpleNamespace(_ctx=SimpleNamespace(_pending_compaction=None, _accumulated_usage=state)),
+            drive_root=tmp_path, drive_logs=tmp_path / "logs", task_id="task-floor",
+            round_idx=round_idx, event_queue=None, active_use_local=False,
+            active_context_mode="low", checkpoint_injected=True,
+            emit_progress=progress.append,
+        )
+
+    armed = {"_compaction_hysteresis": {"round": 4, "region_chars": 120_000}}
+    # Frame alone (~630K chars ≈ 157K real tokens) is over the 100K-token
+    # trigger: no pass can reach it, so the grown region must NOT rearm.
+    loop._run_round_compaction(_transcript(630_000, 6), _ctx(5, armed))
     assert calls == []
-    assert progress == []  # disclosed once, on arming — not per round
 
-    # Region grew >=20% (10 -> 13 rounds = 2.6M >= 2.4M): re-fires.
-    loop._run_round_compaction(_messages(13), _ctx(5))
-    assert calls == ["checkpoint", "compact"]
-
-    # Re-armed by the futile re-fire; N rounds later it re-fires on time alone.
-    calls.clear()
-    loop._run_round_compaction(_messages(13), _ctx(5 + COMPACTION_HYSTERESIS_ROUNDS))
+    # Same armed state, 40K-char frame: the pass CAN get under the trigger once
+    # it drops the older spans, so the ordinary growth bar rearms it.
+    small = {"_compaction_hysteresis": {"round": 4, "region_chars": 120_000}}
+    loop._run_round_compaction(_transcript(40_000, 6), _ctx(5, small))
     assert calls == ["checkpoint", "compact"]

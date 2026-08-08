@@ -473,6 +473,39 @@ def test_global_ttl_never_creates_markers_or_touches_other_routes(monkeypatch):
     assert kwargs == before
 
 
+def test_global_ttl_docstrings_name_every_consumer():
+    """Doc-vs-code pin for the ONE-chokepoint claim (ARCH2 cache-TTL pitfall).
+
+    The finalizer's docstring used to say the global TTL "is consumed HERE and
+    only here" while `review_helpers.cached_prompt_blocks(ttl=None)` reads the
+    same setting — a false sentence that a future reader would take as licence to
+    delete the other reader. Derive the readers from the code and require both
+    docstrings to name them, so the claim cannot drift from the call sites again.
+    """
+    import re
+
+    from ouroboros.config import resolve_prompt_cache_ttl
+
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    call = re.compile(r"resolve_prompt_cache_ttl\(\)")
+    consumers = sorted(
+        p.relative_to(repo).as_posix()
+        for p in (repo / "ouroboros").rglob("*.py")
+        if p.name != "config.py" and call.search(p.read_text(encoding="utf-8"))
+    )
+    assert consumers == ["ouroboros/llm.py", "ouroboros/tools/review_helpers.py"], consumers
+
+    finalizer_doc = LLMClient._normalize_payload_cache_ttl.__doc__ or ""
+    assert "only here" not in finalizer_doc.lower(), (
+        "the finalizer claims exclusive consumption while these modules also read "
+        f"the setting: {consumers}"
+    )
+    assert "cached_prompt_blocks" in finalizer_doc  # names the other reader
+    resolver_doc = resolve_prompt_cache_ttl.__doc__ or ""
+    for name in ("_normalize_payload_cache_ttl", "cached_prompt_blocks"):
+        assert name in resolver_doc, f"config's docstring omits the {name} consumer"
+
+
 def test_cache_write_split_harvested_and_priced_per_tier(monkeypatch):
     """Anthropic reports SEPARATE 5m/1h write counters (`usage.cache_creation`);
     a 1h request whose payload also produced 5m writes must bill only the genuine
@@ -533,6 +566,50 @@ def test_cache_write_split_harvested_and_priced_per_tier(monkeypatch):
         prompt_cache_ttl="1h", allow_live_fetch=False,
     )
     assert full_cost == pytest.approx(1000 * 12.5 * 2.0 / 1.25 / 1_000_000, abs=1e-9)
+
+
+def test_cache_write_split_on_the_openrouter_lane_is_passthrough_dependent(monkeypatch):
+    """The per-tier split on the PRODUCTION route (anthropic/* via OpenRouter).
+
+    The existing golden above covers the direct-Anthropic lane only; the adversarial
+    read was that `_cache_write_split` must return {} on OpenRouter because the dict
+    there is "OpenAI-shaped". It is not a reshaped dict — `_normalize_remote_response`
+    mutates the RAW provider usage in place, so the harvest is passthrough-DEPENDENT,
+    not structurally dead: when the route forwards Anthropic's `cache_creation`
+    sub-object the split is harvested and priced per tier; when it does not, the
+    absent split conservatively bills every write at the reported (extended) tier.
+    Both branches are pinned so a future reader knows which one a live route hit.
+    """
+    client = LLMClient(api_key="unused")
+    target = _openrouter_target("anthropic/claude-fable-5")
+
+    def _resp(usage):
+        return {
+            "id": "gen-1",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": usage,
+        }
+
+    forwarded = {
+        "prompt_tokens": 100, "completion_tokens": 10, "cost": 0.01,
+        "cache_creation": {"ephemeral_5m_input_tokens": 400, "ephemeral_1h_input_tokens": 600},
+    }
+    _msg, usage = client._normalize_remote_response(
+        _resp(forwarded), target, skip_cost_fetch=True, prompt_cache_ttl="1h",
+    )
+    assert usage["cache_write_tokens_by_ttl"] == {"5m": 400, "1h": 600}
+
+    # No passthrough (the OpenAI-shaped body OpenRouter documents): silence, and the
+    # caller's pricing then bills all writes at the reported tier — never a guess.
+    plain = {
+        "prompt_tokens": 100, "completion_tokens": 10, "cost": 0.01,
+        "prompt_tokens_details": {"cached_tokens": 90},
+    }
+    _msg2, usage2 = client._normalize_remote_response(
+        _resp(plain), target, skip_cost_fetch=True, prompt_cache_ttl="1h",
+    )
+    assert "cache_write_tokens_by_ttl" not in usage2
+    assert usage2["prompt_cache_ttl"] == "1h"
 
 
 def test_finalizer_reduces_over_cap_breakpoints_and_discloses_the_reduction(monkeypatch):

@@ -3306,6 +3306,42 @@ def _drain_incoming_messages(
     return controls
 
 
+def _emergency_keep_recent(span_count: int) -> int:
+    """Tool rounds an emergency pass keeps (SSOT for the pass and its forecast).
+
+    Halve the history (floor 6), but ALWAYS clamp BELOW the span count or the
+    compactor no-ops (``len(spans) <= keep_recent`` returns the transcript
+    as-is) — a transcript over the emergency byte threshold with only ~50 huge
+    rounds used to never compact at all. With a single round there is nothing
+    older to summarize. One definition, because ``_compaction_floor_chars``
+    forecasts what this same rule will keep; two copies would let the forecast
+    drift from the pass it predicts.
+    """
+    return min(50, max(6, span_count // 2), max(1, span_count - 1))
+
+
+def _compaction_floor_chars(messages: List[Dict[str, Any]], spans: List[Tuple[int, int]]) -> int:
+    """Smallest transcript an emergency pass could leave behind.
+
+    The pass can only replace the spans OLDER than ``_emergency_keep_recent``;
+    the frozen frame (everything before the first tool round) and the kept spans
+    survive untouched, and the summaries it writes only ADD to that. So this is a
+    true lower bound: when the floor is already over the trigger, NO pass can get
+    under it and no amount of transcript growth changes that — only a smaller
+    FRAME (a mode change or a context rebuild) can. That is what makes the
+    hysteresis rearm criterion honest: measuring "can a pass help?" on the
+    compactable region alone rearmed on growth the pass itself created (the pass
+    collapses the region to the kept spans, so the very next tool round cleared
+    the growth bar and the pass refired every round — the submarine thrash).
+    """
+    if not spans:
+        return _estimate_messages_chars(messages)
+    keep = _emergency_keep_recent(len(spans))
+    frame = messages[: spans[0][0]]
+    kept = messages[spans[-keep][0]:]
+    return _estimate_messages_chars(frame) + _estimate_messages_chars(kept)
+
+
 def _arm_compaction_hysteresis(
     ctx: _CompactionRoundContext,
     usage_state: Dict[str, Any],
@@ -3316,25 +3352,38 @@ def _arm_compaction_hysteresis(
     density: float,
     *,
     reason: str = "nothing_compactable",
+    floor_real_tokens: Optional[float] = None,
 ) -> None:
-    """Suppress emergency compaction until the COMPACTABLE region can help again.
+    """Suppress emergency compaction until a pass can plausibly help again.
 
     Two ways a pass fails to earn its cost, both armed here so the disclosure is
     identical: it ran and could not bring total pressure under the trigger
     (``emergency_pass_futile``), or the transcript holds under two tool rounds so
     the compactor would structurally no-op (``nothing_compactable``). One loud
-    line plus a typed checkpoint event, then silence until the region grows or
+    line plus a typed checkpoint event, then silence until a pass could help or
     the round window passes — never a silent stop (BIBLE P1).
+
+    ``region_chars`` is the region the arming round JUDGED (for a futile pass:
+    the region it actually handled, not the collapsed remainder), so the growth
+    bar means "the transcript climbed back past a size already proven
+    insufficient" rather than "the pass shrank the region, so anything is
+    growth".
     """
     usage_state["_compaction_hysteresis"] = {"round": ctx.round_idx, "region_chars": region_chars}
+    frame_bound = floor_real_tokens is not None and floor_real_tokens > threshold_real_tokens
+    rearm_clause = (
+        f"{COMPACTION_HYSTERESIS_ROUNDS} rounds pass (the frame alone is over the "
+        "trigger, so transcript growth cannot make a pass able to help)"
+        if frame_bound else
+        f"the compactable transcript grows ≥{COMPACTION_HYSTERESIS_REGION_GROWTH:.1f}x or "
+        f"{COMPACTION_HYSTERESIS_ROUNDS} rounds pass"
+    )
     ctx.emit_progress(
         "⚠️ Emergency compaction cannot help: calibrated context "
         f"≈{pressure_real_tokens / 1000:.0f}K real tokens exceeds the "
         f"≈{threshold_real_tokens / 1000:.0f}K trigger, but the frozen frame (system "
         "blocks + tool schemas) is what carries it and cannot be compacted. Further "
-        f"passes suppressed until the compactable transcript grows "
-        f"≥{COMPACTION_HYSTERESIS_REGION_GROWTH:.1f}x or "
-        f"{COMPACTION_HYSTERESIS_ROUNDS} rounds pass."
+        f"passes suppressed until {rearm_clause}."
     )
     _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
         "checkpoint_kind": "compaction_hysteresis_armed",
@@ -3345,6 +3394,8 @@ def _arm_compaction_hysteresis(
         "compactable_region_chars": int(region_chars),
         "tool_schema_tokens": int(schema_tokens),
         "token_density": round(float(density), 3),
+        "floor_real_tokens": None if floor_real_tokens is None else int(floor_real_tokens),
+        "frame_bound": bool(frame_bound),
     })
 
 
@@ -3397,13 +3448,19 @@ def _run_round_compaction(
     # in CALIBRATED real tokens (main_loop_token_density: neutral 1.0 cold,
     # measured supersedes — never the review-pack cold-conservative value, which
     # would demote fresh installs; the v6.80→v6.81 oscillation).
-    # UTILITY — can a pass help, and when
-    # should it refire? — is the COMPACTABLE region only (the transcript beyond
-    # the frozen frame): a pass that could NOT get below the trigger arms a
-    # hysteresis, one loud disclosure replaces the per-round light-model call +
-    # cache-destroying rewrite (wave3: 35/35 rounds fired because the LOW trigger
-    # sits below the irreducible low-mode frame), and the trigger re-arms only
-    # when the region grows ~20% or after N rounds. The reactive provider-overflow
+    # UTILITY — can a pass help, and when should it refire? — is judged on the
+    # FLOOR a pass could reach (frozen frame + the spans it must keep,
+    # `_compaction_floor_chars`), not on the compactable region alone: a pass
+    # that could NOT get below the trigger arms a hysteresis, and one loud
+    # disclosure replaces the per-round light-model call + cache-destroying
+    # rewrite (wave3: 35/35 rounds fired because the LOW trigger sits below the
+    # irreducible low-mode frame). Early rearm (region grew ~20% past the size
+    # already proven insufficient) is admitted ONLY while the floor is under the
+    # trigger — measuring rearm on the region alone let the pass's OWN collapse
+    # of that region clear the growth bar on the very next tool round, so the
+    # thrash survived the first fix (34/35 rounds measured). Above the floor,
+    # only the N-round window refires, which keeps the transcript bounded while
+    # the frame is what carries the pressure. The reactive provider-overflow
     # low-retry net (one-shot, loop exit path) is deliberately untouched.
     emergency_chars = LOW_EMERGENCY_COMPACTION_CHARS if ctx.active_context_mode == "low" else EMERGENCY_COMPACTION_CHARS
     from ouroboros.context_fit import main_loop_token_density, tool_schema_tokens
@@ -3412,8 +3469,11 @@ def _run_round_compaction(
     threshold_real_tokens = emergency_chars / 4.0  # the token budget the char constant documents
     schema_tokens = tool_schema_tokens(ctx.tool_schemas)
 
+    def _pressure(chars: float) -> float:
+        return (chars / 4.0 + schema_tokens) * density
+
     def _total_pressure(msgs: List[Dict[str, Any]]) -> float:
-        return (_estimate_messages_chars(msgs) / 4.0 + schema_tokens) * density
+        return _pressure(_estimate_messages_chars(msgs))
 
     pressure_real_tokens = _total_pressure(messages)
     if pressure_real_tokens > threshold_real_tokens:
@@ -3421,6 +3481,12 @@ def _run_round_compaction(
         usage_state = usage_state if isinstance(usage_state, dict) else {}
         spans = _tool_round_spans(messages)
         region_chars = _estimate_messages_chars(messages[spans[0][0]:]) if spans else 0
+        # Can a pass reach the trigger AT BEST? The floor is frame + kept spans;
+        # summaries only add to it. This is the rearm authority the compactable
+        # region cannot be: the region is exactly what a pass collapses, so
+        # region growth was satisfied by the pass's own output every round.
+        floor_real_tokens = _pressure(_compaction_floor_chars(messages, spans))
+        pass_can_reach_trigger = floor_real_tokens <= threshold_real_tokens
         hysteresis = usage_state.get("_compaction_hysteresis")
         if isinstance(hysteresis, dict):
             armed_region = int(hysteresis.get("region_chars") or 0)
@@ -3431,18 +3497,10 @@ def _run_round_compaction(
             # re-fired every single round — the exact thrash this arm exists to
             # stop, just with an empty transcript instead of a full one.
             grow_to = max(armed_region * COMPACTION_HYSTERESIS_REGION_GROWTH, armed_region + 1)
-            if (
-                region_chars < grow_to
-                and (ctx.round_idx - armed_round) < COMPACTION_HYSTERESIS_ROUNDS
-            ):
+            early_rearm = region_chars >= grow_to and pass_can_reach_trigger
+            if not early_rearm and (ctx.round_idx - armed_round) < COMPACTION_HYSTERESIS_ROUNDS:
                 return messages, None  # armed: a pass cannot help yet (disclosed once, on arming)
             usage_state.pop("_compaction_hysteresis", None)
-        # keep_recent must stay BELOW the current span count or the compactor
-        # no-ops (len(spans) <= keep_recent returns as-is): a transcript over
-        # the emergency byte threshold with only ~50 huge rounds previously
-        # never compacted at all. Halve the history (floor 6), but ALWAYS
-        # clamp below the span count so even 2-6 huge rounds compact; with a
-        # single round there is nothing older to summarize.
         span_count = len(spans)
         if span_count < 2:
             # Necessity is real, but the transcript holds at most ONE tool round:
@@ -3453,9 +3511,10 @@ def _run_round_compaction(
             # first rounds already there. Arm the hysteresis instead: same
             # disclosure, no per-round work.
             _arm_compaction_hysteresis(ctx, usage_state, pressure_real_tokens,
-                                       threshold_real_tokens, region_chars, schema_tokens, density)
+                                       threshold_real_tokens, region_chars, schema_tokens, density,
+                                       floor_real_tokens=floor_real_tokens)
             return messages, None
-        emergency_keep_recent = min(50, max(6, span_count // 2), max(1, span_count - 1))
+        emergency_keep_recent = _emergency_keep_recent(span_count)
         if _persist_compaction_checkpoint(
             messages, drive_root=ctx.drive_root, drive_logs=ctx.drive_logs, task_id=ctx.task_id,
             reason="emergency_context_size", keep_recent=emergency_keep_recent,
@@ -3469,11 +3528,14 @@ def _run_round_compaction(
             )
             after_real_tokens = _total_pressure(messages)
             if after_real_tokens > threshold_real_tokens:
-                spans_after = _tool_round_spans(messages)
-                region_after = _estimate_messages_chars(messages[spans_after[0][0]:]) if spans_after else 0
+                # Arm on the region the pass ALREADY HANDLED (pre-pass), not on
+                # the remainder it just collapsed: the collapsed remainder made
+                # the next tool round clear the 1.2x bar on its own.
                 _arm_compaction_hysteresis(ctx, usage_state, after_real_tokens,
-                                           threshold_real_tokens, region_after, schema_tokens,
-                                           density, reason="emergency_pass_futile")
+                                           threshold_real_tokens, region_chars, schema_tokens,
+                                           density, reason="emergency_pass_futile",
+                                           floor_real_tokens=_pressure(
+                                               _compaction_floor_chars(messages, _tool_round_spans(messages))))
             return messages, usage
         ctx.emit_progress("⚠️ Emergency compaction skipped: forensic checkpoint could not be persisted.")
         return messages, None
