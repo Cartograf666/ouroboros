@@ -435,11 +435,18 @@ class TestTreeFedDecidingValue:
         assert result is not None
         assert usage["cost_stop_spend_basis"] == task_pacing.SPEND_BASIS_OWN_NO_TREE_CAP
 
-    def test_unknown_tree_under_a_root_cap_is_disclosed_not_silent(self, tmp_path):
-        """A root cap exists but the tree number is unavailable this round: the
-        stop still fires on own cost (a usable lower bound), and BOTH the text
-        and the usage record say the substitution happened (BIBLE P1) instead of
-        presenting an own-cost number as if it were the tree."""
+    def test_unknown_tree_under_a_root_cap_is_disclosed_not_silent(self, tmp_path, monkeypatch):
+        """A root cap exists but the tree number is unavailable this round (no
+        stash and the ledger read fails): the stop still fires on own cost (a
+        usable lower bound), and BOTH the text and the usage record say the
+        substitution happened (BIBLE P1) instead of presenting an own-cost
+        number as if it were the tree."""
+        from ouroboros import usage_accounting
+
+        def _unavailable(*args, **kwargs):
+            raise OSError("ledger unreadable")
+
+        monkeypatch.setattr(usage_accounting, "usage_projection", _unavailable)
         llm = MagicMock()
         llm.chat.return_value = ({"content": "done"}, {"prompt_tokens": 1, "completion_tokens": 1})
         ceiling = task_pacing.resolve_cost_ceiling(
@@ -492,6 +499,71 @@ class TestTreeFedDecidingValue:
         assert result is not None
         _text, usage, _ = result
         assert usage.get("reason_code") == "budget_exhausted"
+        assert usage["cost_stop_spend_basis"] == task_pacing.SPEND_BASIS_TREE
+
+    def test_fresh_stash_costs_no_ledger_read(self, tmp_path, monkeypatch):
+        """The deciding surface must not become a per-round ledger read: while
+        rounds are shorter than the staleness bound the free stash (refreshed by
+        every dispatch) answers, and `usage_projection` is never called."""
+        from ouroboros import loop as loop_mod
+        from ouroboros import usage_accounting
+
+        calls = {"n": 0}
+
+        def _boom(*args, **kwargs):
+            calls["n"] += 1
+            raise AssertionError("per-round ledger read")
+
+        monkeypatch.setattr(usage_accounting, "usage_projection", _boom)
+        assert loop_mod._TREE_ACCOUNTING_MAX_STALE_SEC > 0
+        args = _make_args(
+            budget_remaining_usd=1900.0,
+            accumulated_usage={"cost": 1.0},
+            cost_ceiling=task_pacing.resolve_cost_ceiling(
+                1900.0, normalize_budget_profile(None), root_cap_usd=100.0,
+            ),
+            drive_logs=tmp_path,
+        )
+        with self._scoped("root-tree-fresh", 100.0):
+            usage_accounting._stash_root_accounting("root-tree-fresh", 5.0, 100.0)
+            assert _check_budget_limits(**args) is None
+        assert calls["n"] == 0
+
+    def test_stash_older_than_the_bound_is_refreshed_once(self, tmp_path, monkeypatch):
+        """A round that blocks longer than the bound (the 900s wait_tasks shape
+        that killed both waves, during which children spent) pays for exactly
+        one real projection read rather than deciding on a stale number."""
+        from ouroboros import usage_accounting
+
+        llm = MagicMock()
+        llm.chat.return_value = ({"content": "done"}, {"prompt_tokens": 1, "completion_tokens": 1})
+        reads = {"n": 0}
+
+        def _fresh_projection(drive_root, **kwargs):
+            reads["n"] += 1
+            return {"accounted_usd": 98.5, "limit_usd": 100.0}
+
+        monkeypatch.setattr(usage_accounting, "usage_projection", _fresh_projection)
+        args = _make_args(
+            budget_remaining_usd=1900.0,
+            accumulated_usage={"cost": 41.0},
+            cost_ceiling=task_pacing.resolve_cost_ceiling(
+                1900.0, normalize_budget_profile(None), root_cap_usd=100.0,
+            ),
+            llm=llm,
+            drive_logs=tmp_path,
+        )
+        with self._scoped("root-tree-stale", 100.0):
+            # Stash a pre-block number, then age it past the bound.
+            usage_accounting._stash_root_accounting("root-tree-stale", 40.0, 100.0)
+            with usage_accounting._ROOT_ACCOUNTING_TELEMETRY_LOCK:
+                usage_accounting._ROOT_ACCOUNTING_TELEMETRY["root-tree-stale"][
+                    "updated_monotonic"
+                ] -= 10_000.0
+            result = _check_budget_limits(**args)
+        assert reads["n"] == 1
+        assert result is not None
+        _text, usage, _ = result
         assert usage["cost_stop_spend_basis"] == task_pacing.SPEND_BASIS_TREE
 
 

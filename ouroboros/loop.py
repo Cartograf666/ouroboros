@@ -398,7 +398,9 @@ def _check_budget_limits(
 
     if cost_ceiling is None or cost_ceiling.state != task_pacing.COST_CEILING_ACTIVE:
         return None
-    tree_info = _loop_tree_accounting(refresh=False)
+    tree_info = _loop_tree_accounting(
+        refresh=True, max_age_sec=_TREE_ACCOUNTING_MAX_STALE_SEC,
+    )
     tree_cost = tree_info.get("accounted_usd") if isinstance(tree_info, dict) else None
     deciding, spend_basis = task_pacing.resolve_deciding_spend(
         tree_cost_usd=tree_cost,
@@ -475,17 +477,32 @@ def _resolve_task_cost_ceiling(
     )
 
 
+# Bounded staleness for the two DECIDING cost surfaces (the ceiling check and
+# the milestone note). The free stash is refreshed by every dispatch under this
+# root, so in a fast loop it is at most one round old and this costs zero reads.
+# But ONE round can block for 900s inside wait_tasks while children spend — the
+# exact shape both dead waves had — and the pacing refresh only covers deadline-
+# less tasks, so a round that outlives this bound pays for exactly one real
+# projection read. Still never a per-round read (see the usage_accounting
+# telemetry note and the e4a87344 contention class).
+_TREE_ACCOUNTING_MAX_STALE_SEC = 120.0
+
+
 def _loop_tree_accounting(
     *, refresh: bool, max_age_sec: float = 30.0,
 ) -> Optional[Dict[str, Any]]:
     """The root subtree's accounted spend for the CURRENT task's tree (nullable).
 
-    Reads the reserve-time scope telemetry for free; ``refresh=True`` (rare,
-    cache-breaking surfaces only: loop start, the 600s pacing note, the
-    15-round checkpoint — never per round, see usage_accounting telemetry
-    notes) may perform one real ledger projection read when the stash is older
-    than ``max_age_sec``. Only meaningful under a root cap; returns None
-    otherwise (unknown is represented, never $0)."""
+    Reads the reserve-time scope telemetry for free; ``refresh=True`` may
+    perform one real ledger projection read when the stash is older than
+    ``max_age_sec``. Callers: loop start / the 600s pacing note / the 15-round
+    checkpoint (already cache-breaking surfaces, small max_age), and the two
+    DECIDING surfaces (ceiling check + milestone note) with the wider
+    ``_TREE_ACCOUNTING_MAX_STALE_SEC`` bound — which costs nothing while rounds
+    are shorter than the bound, since every dispatch refreshes the stash. Never
+    an unconditional per-round read (usage_accounting telemetry notes,
+    e4a87344). Only meaningful under a root cap; returns None otherwise
+    (unknown is represented, never $0)."""
     try:
         from ouroboros.usage_accounting import (
             current_usage_scope,
@@ -2977,14 +2994,17 @@ def _maybe_inject_cost_budget_milestone(
 ) -> bool:
     """Thin transport over the task_pacing cost axis (v6.56.0): content,
     thresholds, and latch state live in ouroboros/task_pacing.py. The deciding
-    spend under a root cap is the tree-accounted stash (free read; at most one
-    dispatch stale) — never a per-round ledger read."""
+    spend under a root cap is the tree-accounted stash (free read; refreshed by
+    every dispatch) with a bounded staleness cap — never a per-round ledger
+    read, see ``_TREE_ACCOUNTING_MAX_STALE_SEC``."""
     ceiling_usd = (
         cost_ceiling.ceiling_usd
         if cost_ceiling is not None and cost_ceiling.state == task_pacing.COST_CEILING_ACTIVE
         else None
     )
-    tree_info = _loop_tree_accounting(refresh=False)
+    tree_info = _loop_tree_accounting(
+        refresh=True, max_age_sec=_TREE_ACCOUNTING_MAX_STALE_SEC,
+    )
     tree_cost = tree_info.get("accounted_usd") if isinstance(tree_info, dict) else None
     note = task_pacing.build_cost_budget_note(
         tools._ctx,
