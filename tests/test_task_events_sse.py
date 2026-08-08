@@ -402,6 +402,113 @@ def test_sse_terminal_merge_row_uses_one_materializing_read(tmp_path, monkeypatc
     assert flags[-1] is True  # ...and it happens at emission, after the projections
 
 
+def test_sse_torn_child_result_is_retried_and_discovered_next_tick(tmp_path):
+    """Scandir name-diff seen-set rule (P2 wave-1, GPT#6): a name is committed
+    only after a successful read — a torn/mid-write child file is re-read on the
+    next tick and the child is discovered once the write completes."""
+    from ouroboros.gateway.tasks import _TaskEventFollower
+
+    data = _seed_running_task(tmp_path, task_id="p1")
+    follower = _TaskEventFollower(data, "p1")
+    follower.full_merge()
+
+    (data / "task_results" / "c1.json").write_text("{torn", encoding="utf-8")
+    follower.poll()
+    assert "c1" not in follower.task_filter_ids
+    assert "c1.json" not in follower._seen_result_names  # NOT committed
+
+    child_drive = tmp_path / "childdrive"
+    child_drive.mkdir()
+    (data / "task_results" / "c1.json").write_text(
+        json.dumps({
+            "task_id": "c1",
+            "status": "running",
+            "delegation_role": "subagent",
+            "parent_task_id": "p1",
+            "root_task_id": "p1",
+            "child_drive_root": str(child_drive),
+            "ts": OLD_TS,
+        }),
+        encoding="utf-8",
+    )
+    follower.poll()
+
+    assert "c1" in follower.task_filter_ids
+    assert "c1.json" in follower._seen_result_names
+    assert follower.filter_grew  # the stream will run the recovery re-merge
+    assert any(str(root) == str(child_drive) for root in follower.roots)
+
+
+def test_sse_nonlineage_result_names_read_once_then_committed(tmp_path, monkeypatch):
+    """Successfully-read NON-lineage names are committed to the seen-set too,
+    so an unrelated busy store is never re-read on every tick."""
+    import ouroboros.gateway.tasks as gateway_tasks
+
+    data = _seed_running_task(tmp_path, task_id="p1")
+    follower = gateway_tasks._TaskEventFollower(data, "p1")
+    follower.full_merge()
+
+    (data / "task_results" / "other.json").write_text(
+        json.dumps({"task_id": "other", "status": "running", "delegation_role": "root", "ts": OLD_TS}),
+        encoding="utf-8",
+    )
+    reads = []
+    real = gateway_tasks.read_json_dict
+    monkeypatch.setattr(
+        gateway_tasks, "read_json_dict", lambda path: reads.append(str(path)) or real(path)
+    )
+
+    follower.poll()
+    follower.poll()
+    follower.poll()
+
+    other_reads = [path for path in reads if path.endswith("other.json")]
+    assert len(other_reads) == 1  # committed after ONE successful read
+    assert "other" not in follower.task_filter_ids
+
+
+def test_sse_child_discovered_mid_stream_then_reconnect_replays_once(tmp_path):
+    """Reconnect grid: after a child was discovered mid-stream, a fresh stream
+    (fresh follower, from-zero replay) re-discovers the child from scratch and
+    delivers its rows exactly once with monotonic seq."""
+    data = _seed_running_task(tmp_path, task_id="p1", progress_rows=1)
+    child_drive = tmp_path / "childdrive"
+    fired = {"spawned": False, "finalized": False}
+
+    def on_event(event, events):
+        if not fired["spawned"] and len(events) >= 1:
+            (child_drive / "logs").mkdir(parents=True, exist_ok=True)
+            (child_drive / "logs" / "progress.jsonl").write_text(
+                json.dumps({"ts": "2026-01-01T00:03:00Z", "content": "child-step", "task_id": "c1"}) + "\n",
+                encoding="utf-8",
+            )
+            write_task_result(
+                data, "c1", "running",
+                delegation_role="subagent",
+                parent_task_id="p1",
+                root_task_id="p1",
+                child_drive_root=str(child_drive),
+                ts=OLD_TS,
+            )
+            fired["spawned"] = True
+        if fired["spawned"] and not fired["finalized"] and any(
+            (e.get("data") or {}).get("content") == "child-step" for e in events
+        ):
+            _finalize(data, "p1")
+            fired["finalized"] = True
+
+    first = asyncio.run(_consume(asyncio.run(api_task_events(_request(data, "p1"))), on_event))
+    assert any((e.get("data") or {}).get("content") == "child-step" for e in first)
+
+    resumed = asyncio.run(_consume(asyncio.run(api_task_events(_request(data, "p1", wait=0)))))
+
+    child_rows = [e for e in resumed if (e.get("data") or {}).get("content") == "child-step"]
+    assert len(child_rows) == 1
+    seqs = [e["seq"] for e in resumed]
+    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+    assert resumed[-1]["data"]["status"] == "completed"
+
+
 def test_sse_stream_on_running_task_does_zero_artifact_work(tmp_path, monkeypatch):
     """The SSE replay/follow reads are False projections: no artifact collection
     or copy may run while the task is not terminal (materialize_artifacts

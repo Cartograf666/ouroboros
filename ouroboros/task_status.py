@@ -238,7 +238,56 @@ def _queue_task_status(snapshot: Dict[str, Any], task_id: str) -> tuple[str, Dic
     return "", {}
 
 
-def _is_stale_orphan_running_task(drive_root: pathlib.Path, task_id: str, result: Dict[str, Any]) -> bool:
+class _EventsTailIndex:
+    """One lazily-parsed events.jsonl tail shared across a batch of orphan checks.
+
+    ``_is_stale_orphan_running_task`` needs two facts from the same 2MB events
+    tail: the latest event ts per task id and the latest ``worker_boot`` ts.
+    Reading that tail per RUNNING row made a task-list request over N stale
+    running rows pay N full tail parses (v6.9x P2, review fix GPT#8). One index
+    instance parses the tail at most once — and not at all when no caller ever
+    consults it — and answers every row from memory. The instance is scoped to
+    a single request/batch; it is never cached across requests (the tail moves)."""
+
+    def __init__(self, drive_root: pathlib.Path) -> None:
+        self._drive_root = pathlib.Path(drive_root)
+        self._latest_by_task: Optional[Dict[str, float]] = None
+        self._worker_boot = 0.0
+
+    def _ensure_parsed(self) -> None:
+        if self._latest_by_task is not None:
+            return
+        latest: Dict[str, float] = {}
+        for event in iter_jsonl_objects(self._drive_root / "logs" / "events.jsonl", tail_bytes=2_000_000):
+            try:
+                parsed = datetime.fromisoformat(str(event.get("ts") or "").strip().replace("Z", "+00:00"))
+                ev_ts = float((parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp())
+            except Exception:
+                ev_ts = 0.0
+            event_task_id = str(event.get("task_id") or "")
+            if not event_task_id and isinstance(event.get("task"), dict):
+                event_task_id = str((event.get("task") or {}).get("id") or "")
+            if event_task_id:
+                latest[event_task_id] = max(latest.get(event_task_id, 0.0), ev_ts)
+            if str(event.get("type") or "") == "worker_boot":
+                self._worker_boot = max(self._worker_boot, ev_ts)
+        self._latest_by_task = latest
+
+    def latest_event_ts(self, task_id: str) -> float:
+        self._ensure_parsed()
+        return float((self._latest_by_task or {}).get(str(task_id), 0.0))
+
+    def latest_worker_boot(self) -> float:
+        self._ensure_parsed()
+        return self._worker_boot
+
+
+def _is_stale_orphan_running_task(
+    drive_root: pathlib.Path,
+    task_id: str,
+    result: Dict[str, Any],
+    events_index: Optional[_EventsTailIndex] = None,
+) -> bool:
     status = str(result.get("status") or "").lower()
     if status != STATUS_RUNNING:
         return False
@@ -255,21 +304,10 @@ def _is_stale_orphan_running_task(drive_root: pathlib.Path, task_id: str, result
         pass
     if heartbeat and time.time() - heartbeat < _ORPHAN_RUNNING_GRACE_SECONDS:
         return False
-    latest_task_event = heartbeat
-    latest_worker_boot = 0.0
-    for event in iter_jsonl_objects(pathlib.Path(drive_root) / "logs" / "events.jsonl", tail_bytes=2_000_000):
-        try:
-            parsed = datetime.fromisoformat(str(event.get("ts") or "").strip().replace("Z", "+00:00"))
-            ev_ts = float((parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp())
-        except Exception:
-            ev_ts = 0.0
-        event_task_id = str(event.get("task_id") or "")
-        if not event_task_id and isinstance(event.get("task"), dict):
-            event_task_id = str((event.get("task") or {}).get("id") or "")
-        if event_task_id == task_id:
-            latest_task_event = max(latest_task_event, ev_ts)
-        if str(event.get("type") or "") == "worker_boot":
-            latest_worker_boot = max(latest_worker_boot, ev_ts)
+    if events_index is None:
+        events_index = _EventsTailIndex(pathlib.Path(drive_root))
+    latest_task_event = max(heartbeat, events_index.latest_event_ts(task_id))
+    latest_worker_boot = events_index.latest_worker_boot()
     return bool(latest_worker_boot and latest_worker_boot > latest_task_event)
 
 
@@ -423,6 +461,7 @@ def effective_task_result(
     *,
     materialize_artifacts: bool = True,
     _seen: frozenset[str] = frozenset(),
+    _events_index: Optional[_EventsTailIndex] = None,
 ) -> Dict[str, Any]:
     """Merge parent result, child-drive result, and active queue state.
 
@@ -438,6 +477,9 @@ def effective_task_result(
     that participates in the child-result sha economy or artifact durability
     (join_ledger, wait_*/get_task_result, api_task_get/artifact, reconcile, prune)
     keeps the ``True`` default.
+    ``_events_index`` optionally shares ONE parsed events-tail across a batch of
+    rows (the task-list request), so N stale-running rows cost one tail read
+    instead of N; ``None`` keeps the per-call read for single-row callers.
     """
 
     if not result:
@@ -454,6 +496,7 @@ def effective_task_result(
                 retry_result,
                 materialize_artifacts=materialize_artifacts,
                 _seen=frozenset(set(_seen) | {task_id}),
+                _events_index=_events_index,
             )
             if effective_retry:
                 merged_retry = dict(effective_retry)
@@ -556,7 +599,7 @@ def effective_task_result(
                         bundle,
                         "task ended before artifact finalization",
                     )
-            elif _is_stale_orphan_running_task(pathlib.Path(drive_root), task_id, merged):
+            elif _is_stale_orphan_running_task(pathlib.Path(drive_root), task_id, merged, _events_index):
                 merged["status"] = STATUS_FAILED
                 merged["reason_code"] = "orphaned_running_after_worker_restart"
                 merged["outcome_axes"] = infra_failed_axes("orphaned_running_after_worker_restart")

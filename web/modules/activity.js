@@ -104,7 +104,9 @@ export function initActivity({ mount, ws } = {}) {
         mount.innerHTML = '<div class="activity-loading">Loading activity…</div>';
         const [sched, tasks, st] = await Promise.all([
             getJson('/api/schedules'),
-            getJson('/api/tasks?limit=1'),
+            // This view renders only the queue; queue_only skips the whole
+            // task-results scan server-side (v6.9x P2).
+            getJson('/api/tasks?queue_only=1'),
             getJson('/api/state'),
         ]);
         mount.innerHTML = `

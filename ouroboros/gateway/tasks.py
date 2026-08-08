@@ -42,15 +42,17 @@ from ouroboros.task_results import (
     STATUS_SCHEDULED,
     list_task_results,
     load_task_result,
+    task_results_dir,
     validate_task_id,
     write_task_result,
 )
 from ouroboros.task_status import (
     FINAL_STATUSES,
+    _EventsTailIndex,
     effective_task_result,
-    find_child_tasks,
     load_effective_task_result,
 )
+from ouroboros.utils import read_json_dict
 from ouroboros.tool_access import path_is_relative_to, paths_overlap_casefold
 from ouroboros.workspace_preflight import (
     collect_workspace_preflight,
@@ -664,25 +666,144 @@ async def api_tasks_create(request: Request) -> JSONResponse:
     )
 
 
+_TASKS_LIST_DEFAULT_LIMIT = 50
+_TASKS_LIST_MAX_LIMIT = 500
+
+# Bulk evidence fields omitted from LIST rows (v6.9x P2): they are the megabyte
+# carriers of a task summary and have zero code consumers on the list surface
+# (result_index and the UI detail views read them from GET /api/tasks/{id},
+# which keeps the full envelope). `result` stays — pinned by test_headless_cli.
+_LIST_ROW_OMITTED_FIELDS = frozenset({
+    "loop_outcome",
+    "trace_refs",
+    "verification_ledger",
+    "review_evidence",
+    "subagent_envelope",
+})
+
+# Process-wide {(results_dir, filename) -> raw ts} memo for the unfiltered list
+# path. The raw `ts` is CREATION-STABLE (write_task_result sets it on the first
+# write; later updates touch only updated_at), so entries never need
+# invalidation — only deletions are dropped and new names decoded. Keyed by the
+# directory too, so multiple drive roots (tests, child drives) never collide.
+# Concurrency note: worst case a race re-reads a file and stores the identical
+# creation-stable value; no lock needed.
+_RAW_TS_MEMO: Dict[tuple, str] = {}
+
+
+def _compact_list_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact LIST projection: drop the five bulk evidence fields, keep the
+    summary contract (task_id, status, ts/updated_at, result, description/
+    objective/title/role, lineage, project_id, reason_code, artifact_status,
+    workspace fields, the TASK_COST_META_FIELDS, outcome_axes — all preserved
+    because the projection is subtractive, never a whitelist)."""
+    return {key: value for key, value in row.items() if key not in _LIST_ROW_OMITTED_FIELDS}
+
+
+def _raw_sorted_result_names(results_dir: pathlib.Path) -> List[str]:
+    """Result filenames sorted newest-first by RAW creation ts (memoized).
+
+    A row whose file lacks `ts` sorts as minus-infinity (oldest), tie-broken by
+    filename for determinism. A file that fails to parse (torn concurrent
+    write) is excluded from THIS request and left out of the memo, so the next
+    request re-reads it — a torn write can never poison the memo."""
+    try:
+        with os.scandir(results_dir) as entries:
+            names = [entry.name for entry in entries if entry.name.endswith(".json")]
+    except OSError:
+        return []
+    dir_key = str(results_dir)
+    present = set(names)
+    for key in [k for k in list(_RAW_TS_MEMO) if k[0] == dir_key and k[1] not in present]:
+        _RAW_TS_MEMO.pop(key, None)
+    decorated: List[tuple] = []
+    for name in names:
+        key = (dir_key, name)
+        raw_ts = _RAW_TS_MEMO.get(key)
+        if raw_ts is None:
+            data = read_json_dict(results_dir / name)
+            if data is None:
+                continue
+            raw_ts = str(data.get("ts") or "")
+            _RAW_TS_MEMO[key] = raw_ts
+        decorated.append((raw_ts, name))
+    decorated.sort(reverse=True)  # "" (no ts) sorts after every real timestamp
+    return [name for _ts, name in decorated]
+
+
+def _tasks_list_payload(
+    drive_root: pathlib.Path,
+    wanted: set,
+    limit: Optional[int],
+    queue_only: bool,
+) -> Dict[str, Any]:
+    """Assemble the /api/tasks response off the event loop.
+
+    Unfiltered requests slice BEFORE projection (v6.9x P2): sort raw filenames
+    by the creation-stable raw ts, decode/project only the top-`limit` files,
+    then re-sort that slice by EFFECTIVE ts (a child-drive merge can replace ts
+    with the child's). Residual, disclosed: top-N membership is decided on raw
+    ts, so an old task freshly completed through its child can fall outside the
+    slice until its raw file is rewritten. Status-filtered requests keep the
+    full projection path — filtering needs every row's effective status (the
+    child-drive promotion contract pinned by test_headless_cli)."""
+    if queue_only:
+        return {"tasks": [], "queue": _queue_snapshot(drive_root)}
+    # One shared events-tail parse for every stale-running orphan check in this
+    # request (lazy: zero reads when no running row consults it).
+    events_index = _EventsTailIndex(drive_root)
+    # List view is a status/cost projection: never materialize artifacts (no child
+    # rebase copies, no artifact-dir scans, no disposition/sha claims) on a GET list.
+    if wanted:
+        rows = [
+            _compact_list_row(public_task_result(effective_task_result(
+                drive_root, row, materialize_artifacts=False, _events_index=events_index,
+            )))
+            for row in list_task_results(drive_root)
+        ]
+        rows = [row for row in rows if str(row.get("status") or "").lower() in wanted]
+        rows.sort(key=lambda item: str(item.get("ts") or ""), reverse=True)
+        if limit is not None:
+            rows = rows[:limit]
+        return {"tasks": rows, "queue": _queue_snapshot(drive_root)}
+    results_dir = task_results_dir(drive_root, create=False)
+    names = _raw_sorted_result_names(results_dir)
+    if limit is not None:
+        names = names[:limit]
+    rows = []
+    for name in names:
+        raw = read_json_dict(results_dir / name)
+        if raw is None:
+            continue  # vanished/torn between the scandir and this read
+        rows.append(_compact_list_row(public_task_result(effective_task_result(
+            drive_root, raw, materialize_artifacts=False, _events_index=events_index,
+        ))))
+    # Re-sort the slice by effective ts: the child-drive merge may have replaced
+    # ts, and the response order is the displayed order.
+    rows.sort(key=lambda item: str(item.get("ts") or ""), reverse=True)
+    return {"tasks": rows, "queue": _queue_snapshot(drive_root)}
+
+
 async def api_tasks_list(request: Request) -> JSONResponse:
+    """GET /api/tasks — compact list projection plus the queue snapshot.
+
+    ``limit`` defaults to 50 and explicit positive values cap at 500 (both
+    unchanged); ``limit=0`` returns ALL rows (new, v6.9x P2 — previously it
+    coerced to 1). ``queue_only=1`` skips the task-results scan entirely and
+    answers ``{tasks: [], queue}`` — the Activity dashboard consumes only the
+    queue."""
     statuses = [
         item.strip()
         for item in str(request.query_params.get("status") or "").split(",")
         if item.strip()
     ]
-    limit = max(1, min(coerce_int(request.query_params.get("limit"), 50), 500))
+    raw_limit = coerce_int(request.query_params.get("limit"), _TASKS_LIST_DEFAULT_LIMIT)
+    limit = None if raw_limit == 0 else max(1, min(raw_limit, _TASKS_LIST_MAX_LIMIT))
+    queue_only = str(request.query_params.get("queue_only") or "").strip().lower() in {"1", "true", "yes"}
     drive_root = request_drive_root(request)
     wanted = {status.lower() for status in statuses}
-    # List view is a status/cost projection: never materialize artifacts (no child
-    # rebase copies, no artifact-dir scans, no disposition/sha claims) on a GET list.
-    rows = [
-        public_task_result(effective_task_result(drive_root, row, materialize_artifacts=False))
-        for row in list_task_results(drive_root)
-    ]
-    if wanted:
-        rows = [row for row in rows if str(row.get("status") or "").lower() in wanted]
-    rows.sort(key=lambda item: str(item.get("ts") or ""), reverse=True)
-    return JSONResponse({"tasks": rows[:limit], "queue": _queue_snapshot(drive_root)})
+    payload = await asyncio.to_thread(_tasks_list_payload, drive_root, wanted, limit, queue_only)
+    return JSONResponse(payload)
 
 
 def _task_cost_breakdown_view(drive_root: pathlib.Path, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1157,6 +1278,10 @@ class _TaskEventFollower:
         self.suppress_task_done = False
         self.filter_grew = False
         self._queue_snapshot_mtime: Any = None
+        # Child discovery state (v6.9x P2): result filenames already read (and
+        # lineage-classified) by the scandir name-diff in _discover_roots.
+        self._results_dir = task_results_dir(self.drive_root, create=False)
+        self._seen_result_names: set = set()
         # Archive floor (P2 review, fix 4): the RAW result's ts is the first
         # write's timestamp (creation/admission — no production writer passes an
         # explicit ts), so an archive whose rotation stamp predates it cannot
@@ -1185,7 +1310,27 @@ class _TaskEventFollower:
         return changed
 
     def _discover_roots(self) -> bool:
-        """Refresh roots + lineage filter ids; True when something new appeared."""
+        """Refresh roots + lineage filter ids; True when something new appeared.
+
+        Child discovery is a scandir NAME-DIFF over the main root's
+        task_results/ (v6.9x P2). Invariant this relies on: schedule_subagent
+        durably writes the child's ``task_results/<tid>.json`` — already
+        carrying lineage and child_drive_root — into the MAIN data root BEFORE
+        emitting any event and BEFORE the child is enqueued
+        (ouroboros/tools/control.py, the STATUS_REQUESTED write; a failed write
+        means the child was never scheduled). A new child is therefore always
+        visible as a new filename no later than its first log row. Each tick
+        reads ONLY names outside the seen-set; a name is committed to the
+        seen-set ONLY after read_json_dict succeeds (a torn/mid-write file is
+        retried next tick), and successfully-read NON-lineage names are
+        committed too so a busy shared store is not re-read every tick. The
+        lineage match reproduces find_child_tasks' subtree semantics exactly:
+        direct parent OR root equals the watched id, delegation_role ==
+        "subagent", child_drive_root collection, NO recursion (mid-stream
+        grandchildren of a non-root watched task did not match before either).
+        A child missed through a transient failure is recovered by the next
+        tick or, at worst, a client reconnect's full re-merge (at-least-once —
+        pre-existing property)."""
         changed = False
         candidates = [self.drive_root]
         child = str(
@@ -1195,14 +1340,29 @@ class _TaskEventFollower:
         ).strip()
         if child:
             candidates.append(pathlib.Path(child))
-        for child_row in find_child_tasks(
-            self.drive_root,
-            parent_task_id=self.task_id,
-            root_task_id=self.task_id,
-            materialize_artifacts=False,
-        ):
-            child_id = str(child_row.get("task_id") or child_row.get("id") or "").strip()
-            if child_id and child_id not in self.task_filter_ids:
+        try:
+            with os.scandir(self._results_dir) as entries:
+                names = [entry.name for entry in entries if entry.name.endswith(".json")]
+        except OSError:
+            names = []
+        for name in names:
+            if name in self._seen_result_names:
+                continue
+            row = read_json_dict(self._results_dir / name)
+            if row is None:
+                continue  # torn write: not committed, re-read next tick
+            self._seen_result_names.add(name)
+            if str(row.get("delegation_role") or "") != "subagent":
+                continue
+            child_id = str(row.get("task_id") or row.get("id") or "").strip()
+            if not child_id:
+                continue
+            if not (
+                str(row.get("parent_task_id") or "") == self.task_id
+                or str(row.get("root_task_id") or "") == self.task_id
+            ):
+                continue
+            if child_id not in self.task_filter_ids:
                 self.task_filter_ids.add(child_id)
                 changed = True
                 # A new FILTER ID over already-consumed bytes is lossy: rows
@@ -1212,8 +1372,8 @@ class _TaskEventFollower:
                 # stream checks this flag after every poll; full_merge resets it.
                 self.filter_grew = True
             child_root = str(
-                child_row.get("child_drive_root")
-                or child_row.get("headless_child_drive_root")
+                row.get("child_drive_root")
+                or row.get("headless_child_drive_root")
                 or ""
             ).strip()
             if child_root:
@@ -1329,6 +1489,9 @@ class _TaskEventFollower:
         self.logs = {}
         self.roots = []
         self.task_filter_ids = {self.task_id}
+        # Reset the discovery baseline too: the merge below re-reads every
+        # consumed byte, so every result name must be re-read and re-classified.
+        self._seen_result_names = set()
         self.refresh_result()
         self.queue_snapshot_changed()
         self._discover_roots()
