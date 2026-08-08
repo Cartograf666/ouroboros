@@ -299,14 +299,11 @@ _DECISION_TURN_OUTCOME_RULE = (
 )
 
 
-def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) -> str:
-    try:
-        git_branch, git_sha = get_git_info(env.repo_dir)
-    except Exception:
-        log.debug("Failed to get git info for context", exc_info=True)
-        git_branch, git_sha = "unknown", "unknown"
-
-    budget_info = None
+def _runtime_budget_info(env: Any, task: Dict[str, Any]) -> Dict[str, Any]:
+    """Start-of-task budget block: global projection + the STATIC per-task tree cap,
+    written once at task start so the cached prefix stays byte-stable (DEVELOPMENT
+    cache_friendliness item 22); live tree spend rides only the cache-breaking
+    surfaces (checkpoint/pacing/milestones)."""
     try:
         from ouroboros.usage_accounting import usage_projection
 
@@ -324,22 +321,28 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
     except Exception:
         log.error("Budget authority unavailable for runtime context", exc_info=True)
         budget_info = {"status": "unavailable"}
-    # Static per-task tree cap (v6.91): the STATIC value only — written once at
-    # task start, so the cached prefix stays byte-stable (DEVELOPMENT
-    # cache_friendliness item 22). Live tree spend rides only the cache-breaking
-    # surfaces (15-round checkpoint, 600s pacing, latched cost milestones).
     try:
-        _root_cap = float(os.environ.get("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
+        root_cap = float(os.environ.get("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
     except (TypeError, ValueError):
-        _root_cap = 0.0
-    if isinstance(budget_info, dict) and _root_cap > 0:
-        budget_info["per_task_tree_cap_usd"] = _root_cap
+        root_cap = 0.0
+    if root_cap > 0:
+        budget_info["per_task_tree_cap_usd"] = root_cap
         budget_info["per_task_tree_cap_rule"] = (
-            "Hard cap for THIS task's WHOLE tree (own model calls + all subagents), "
-            "enforced by the physical-attempt ledger: dispatches are refused once the "
-            "tree's accounted spend reaches it and the task is force-stopped. Budget "
-            "checkpoints during the task report the live tree number."
+            "Hard cap for THIS task's WHOLE tree (own model calls + all subagents), enforced "
+            "by the physical-attempt ledger: dispatches are refused once the tree's accounted "
+            "spend reaches it and the task is force-stopped. Budget checkpoints during the task report the live tree number."
         )
+    return budget_info
+
+
+def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) -> str:
+    try:
+        git_branch, git_sha = get_git_info(env.repo_dir)
+    except Exception:
+        log.debug("Failed to get git info for context", exc_info=True)
+        git_branch, git_sha = "unknown", "unknown"
+
+    budget_info = _runtime_budget_info(env, task)
 
     try:
         from ouroboros.config import get_runtime_mode

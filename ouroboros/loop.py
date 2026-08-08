@@ -489,6 +489,43 @@ def _loop_tree_accounting(
         return None
 
 
+def _soft_land_exhausted_ceiling(
+    limit_ctx: "_RoundLimitContext",
+    cost_ceiling: "task_pacing.CostCeiling",
+) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """Typed soft landing (v6.91): a root cap at or below the planning margin
+    leaves no working room — enter the existing graceful best-effort wrap-up
+    BEFORE spending a work round; never run uncapped (the pre-typed shape
+    resolved this to the same None as "unlimited"). The ledger fence stays the
+    untouched backstop. Returns the forced-final tuple, or None when the
+    ceiling is not in the ``exhausted_soft_land`` state."""
+    if cost_ceiling.state != task_pacing.COST_CEILING_EXHAUSTED_SOFT_LAND:
+        return None
+    cap_text = (
+        f"${cost_ceiling.root_cap_usd:.2f}"
+        if cost_ceiling.root_cap_usd is not None else "the per-task tree cap"
+    )
+    margin_text = (
+        f"${cost_ceiling.planning_margin_usd:.2f}"
+        if cost_ceiling.planning_margin_usd is not None else "the wrap-up planning margin"
+    )
+    soft_land_reason = (
+        f"Per-task tree cap {cap_text} leaves no working room above the "
+        f"wrap-up planning margin ({margin_text}). Budget exhausted."
+    )
+    return _forced_final_answer(
+        limit_ctx,
+        prompt=(
+            f"[BUDGET LIMIT] {soft_land_reason} Produce your best final answer "
+            "NOW from the verified work so far; clearly mark anything unverified "
+            "or incomplete. An honest best-effort result is the expected outcome "
+            "here, not a failure."
+        ),
+        fallback_text=soft_land_reason,
+        reason_code="budget_exhausted",
+    )
+
+
 def _build_recent_tool_trace(messages: List[Dict[str, Any]], window: int = 15) -> str:
     """Build a compact recent-tool trace for the self-check prompt."""
     all_calls: List[str] = []
@@ -6124,35 +6161,11 @@ def run_llm_loop(
                 _merge_finalization_trace(llm_trace, forced_trace)
                 return text, accumulated_usage, llm_trace
 
-            # Typed soft landing (v6.91): a root cap at or below the planning
-            # margin leaves no working room — enter the existing graceful
-            # best-effort wrap-up BEFORE spending a work round; never run
-            # uncapped (the pre-typed shape resolved this to the same None as
-            # "unlimited"). The ledger fence stays the untouched backstop.
-            if cost_ceiling.state == task_pacing.COST_CEILING_EXHAUSTED_SOFT_LAND:
-                cap_text = (
-                    f"${cost_ceiling.root_cap_usd:.2f}"
-                    if cost_ceiling.root_cap_usd is not None else "the per-task tree cap"
-                )
-                margin_text = (
-                    f"${cost_ceiling.planning_margin_usd:.2f}"
-                    if cost_ceiling.planning_margin_usd is not None else "the wrap-up planning margin"
-                )
-                soft_land_reason = (
-                    f"Per-task tree cap {cap_text} leaves no working room above the "
-                    f"wrap-up planning margin ({margin_text}). Budget exhausted."
-                )
-                text, accumulated_usage, forced_trace = _forced_final_answer(
-                    limit_ctx,
-                    prompt=(
-                        f"[BUDGET LIMIT] {soft_land_reason} Produce your best final answer "
-                        "NOW from the verified work so far; clearly mark anything unverified "
-                        "or incomplete. An honest best-effort result is the expected outcome "
-                        "here, not a failure."
-                    ),
-                    fallback_text=soft_land_reason,
-                    reason_code="budget_exhausted",
-                )
+            # Typed soft landing (v6.91): the ledger fence stays the untouched
+            # backstop; an exhausted ceiling wraps up BEFORE spending a round.
+            _soft_land = _soft_land_exhausted_ceiling(limit_ctx, cost_ceiling)
+            if _soft_land is not None:
+                text, accumulated_usage, forced_trace = _soft_land
                 _merge_finalization_trace(llm_trace, forced_trace)
                 return text, accumulated_usage, llm_trace
 

@@ -86,13 +86,13 @@ _PHYSICAL_LIMIT: contextvars.ContextVar[Optional["_AttemptLimit"]] = contextvars
 # The loop's in-task cost stop must compare its ceiling against the TREE's
 # accounted spend (the number the fence enforces), but a per-round
 # ``usage_projection`` read would re-create the O(ledger)-under-lock contention
-# that burned 137 concurrent tasks (e4a87344). ``reserve_attempt`` ALREADY
-# computes the root subtree sum inside the lock on every dispatch, so it is
-# stashed here (process-local, newest-wins) and read for free; rare read points
-# (loop start, the 600s pacing note, the 15-round checkpoint) may force one
-# real projection read via ``refresh_root_accounting`` when the stash is stale
-# — e.g. a parent that sat 900s inside ``wait_tasks`` while children spent.
-# Unknown stays None end-to-end; nothing here is a second monetary authority.
+# that burned 137 concurrent tasks (e4a87344). ``reserve_attempt`` already
+# computes the root subtree sum inside the lock, so it is stashed here
+# (process-local, newest-wins) and read for free; the rare read points (loop
+# start / 600s pacing / 15-round checkpoint) may force one real projection read
+# via ``refresh_root_accounting`` when the stash is stale — e.g. after a 900s
+# ``wait_tasks`` block while children spent. Unknown stays None end-to-end;
+# nothing here is a second monetary authority.
 _ROOT_ACCOUNTING_TELEMETRY: Dict[str, Dict[str, Any]] = {}
 _ROOT_ACCOUNTING_TELEMETRY_LOCK = threading.Lock()
 _ROOT_ACCOUNTING_TELEMETRY_CAP = 64
@@ -541,14 +541,12 @@ def usage_breakdown(
         "by_category": by_category,
         "by_task": by_task,
         "by_root": by_root,
-        # Execution-axis filter (v6.91): the delegated (subscription-harness)
-        # rows only — a VIEW over the same rows for "where did the money go"
-        # readers, never a third monetary sum or authority. Disclosed-free
-        # sessions settle at $0 here; undisclosed spend stays in `unknown`.
+        # Execution-axis filter (v6.91): the delegated (subscription-harness) rows
+        # only — a VIEW over the same rows for "where did the money go" readers,
+        # never a third monetary sum or authority. Disclosed-free sessions settle
+        # at $0 here; undisclosed spend stays in `unknown`.
         "delegated": _with_integrity(
-            _breakdown_bucket(
-                [row for row in rows if str(row.get("kind") or "") == "subscription_session"]
-            ),
+            _breakdown_bucket([row for row in rows if str(row.get("kind") or "") == "subscription_session"]),
             integrity_degraded,
         ),
         # Legacy call-count metadata and monetary delta stay explicit; neither
