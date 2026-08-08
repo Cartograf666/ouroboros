@@ -1,4 +1,4 @@
-"""Harness Accounts HTTP surface (D30): three THIN proxies, zero auth logic.
+"""Harness Accounts HTTP surface (D30): four THIN proxies, zero auth logic.
 
 Ouroboros's own Claudexor daemon (``claudexor_daemon.py``) owns every account
 fact — profiles, login jobs, device-code custody, the two honest verification
@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List
 
 from starlette.requests import Request
@@ -34,6 +34,11 @@ from starlette.responses import JSONResponse
 from ouroboros.gateway._helpers import json_error, request_json_or
 
 log = logging.getLogger(__name__)
+
+# The three read states of one status facet (see the `reads` block below).
+READ_OK = "ok"
+READ_NOT_READ = "not_read"
+READ_FAILED = "failed"
 
 # An EXPLICIT "daemon" transport is DELIBERATELY not accepted from the
 # browser: on a pre-disclosure engine it is the macOS Terminal.app handoff,
@@ -131,6 +136,20 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
         "harnesses": [],
         "profiles": {},
         "quota": [],
+        # PROVENANCE, per independent facet (BIBLE P1: missing data is a GAP,
+        # never a value). `[]`/`{}` alone cannot say WHETHER the daemon was
+        # asked: the owner's panel printed "no account connected" for three
+        # harnesses while two claude profiles, a cursor profile and two native
+        # sessions sat on disk, simply because a lazily-started daemon had not
+        # been asked. `ok` — this facet was read and its collection is
+        # AUTHORITATIVE (empty means empty); `not_read` — never asked (no live
+        # daemon); `failed` — asked, and the answer did not arrive. Facets are
+        # independent because one fan-out read can fail while its siblings land.
+        "reads": {
+            "catalog": READ_NOT_READ,
+            "accounts": READ_NOT_READ,
+            "quota": READ_NOT_READ,
+        },
         # The Subagents section's «last delegated run» receipt — Ouroboros's
         # own projection, not daemon truth, so it is served even with the
         # daemon down. {} = no delegated run recorded (absence, not a default).
@@ -157,11 +176,31 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                 manifests_call = pool.submit(gateway.harnesses)
                 profiles_call = pool.submit(gateway.credential_profiles)
                 quota_call = pool.submit(gateway.quota_snapshots)
-            catalog = catalog_call.result()
+            # Classify every submitted future INDEPENDENTLY, before consuming
+            # any of them. Reading `.result()` in sequence would make a facet's
+            # verdict depend on which sibling raised first — a catalog failure
+            # would leave `accounts` reported as unread even though its own read
+            # succeeded. Each facet answers only for itself.
+            catalog_outcome = _facet_outcome(catalog_call)
+            profiles_outcome = _facet_outcome(profiles_call)
+            quota_outcome = _facet_outcome(quota_call)
+            payload["reads"] = {
+                "catalog": catalog_outcome[0],
+                "accounts": profiles_outcome[0],
+                "quota": quota_outcome[0],
+            }
+            first_error = next(
+                (outcome[2] for outcome in (catalog_outcome, profiles_outcome, quota_outcome)
+                 if outcome[2] is not None),
+                None,
+            )
+            catalog = catalog_outcome[1] if catalog_outcome[0] == READ_OK else {}
             # Account surfaces show only harnesses with a login concept. On a
             # transient manifest-read failure — or a successful read with zero
             # readable manifests (the helper answers None) — fail OPEN
-            # (no filter): a blip must not blank the panel.
+            # (no filter): a blip must not blank the panel. The manifest read is
+            # deliberately NOT a facet: it is a filter input, and its failure is
+            # already absorbed rather than reported.
             try:
                 capable = _login_capable_harness_ids(manifests_call.result())
             except ClaudexorUnavailable:
@@ -190,7 +229,7 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                         projected["models_error"] = exc.code
                 rows.append(projected)
             payload["harnesses"] = rows
-            profiles = profiles_call.result()
+            profiles = profiles_outcome[1] if profiles_outcome[0] == READ_OK else {}
             accounts = profiles.get("harnessAccounts") if isinstance(profiles, dict) else None
             if capable is not None and isinstance(accounts, list):
                 # The daemon emits a native pseudo-row for EVERY adapter,
@@ -221,11 +260,42 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                     and str(w["profile"].get("harness_id") or "") in (capable | vouched)
                 ]
             payload["profiles"] = profiles
-            payload["quota"] = quota_call.result()
+            payload["quota"] = quota_outcome[1] if quota_outcome[0] == READ_OK else []
+            if first_error is not None:
+                # At least one facet refused while others landed. The daemon is
+                # disclosed as unreachable AND the surviving facets keep their
+                # own `ok` — the panel shows what was genuinely read instead of
+                # blanking, and never presents an unread facet as empty.
+                raise first_error
     except ClaudexorUnavailable as exc:
         payload["daemon"]["state"] = "unreachable"
         payload["daemon"]["last_error"] = f"{exc.code}: {exc}"
+        # A failure BEFORE the fan-out (discovery, handshake) leaves every facet
+        # at its `not_read` default; those never asked stay not_read, and the
+        # ones that were asked and refused are already marked failed above.
     return payload
+
+
+def _facet_outcome(call: "Future") -> tuple:
+    """Classify ONE fanned-out read: (state, value, error).
+
+    Independent by construction — a sibling's exception can never downgrade a
+    facet whose own read landed, and the verdict does not depend on completion
+    or consumption order (the pool has already joined when this runs).
+    """
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    try:
+        value = call.result()
+    except ClaudexorUnavailable as exc:
+        return (READ_FAILED, None, exc)
+    # The transport normalizes a schema-invalid 2xx (null body, wrong envelope,
+    # a missing array) into an empty {} / [] — which would then be published as
+    # an AUTHORITATIVE empty and reproduce the very lie this block exists to
+    # stop. A read whose shape is not what the facet promises is a failed read.
+    if not isinstance(value, (dict, list)):
+        return (READ_FAILED, None, None)
+    return (READ_OK, value, None)
 
 
 async def api_claudexor_status(request: Request) -> JSONResponse:
@@ -237,6 +307,38 @@ async def api_claudexor_status(request: Request) -> JSONResponse:
     except Exception as exc:
         log.exception("api_claudexor_status failed")
         return json_error(f"{type(exc).__name__}: Claudexor status failed")
+
+
+async def api_claudexor_wake(request: Request) -> JSONResponse:
+    """POST /api/claudexor/wake — OWNER-initiated: start the owned daemon, then
+    answer with the freshly read status.
+
+    The status GET stays side-effect-free by contract (and by test), which is
+    right for a 5s poll but leaves the panel's Refresh POWERLESS: the daemon is
+    lazy, so an owner who just wants to SEE their accounts had to start a login
+    job or a delegated run to wake it. This is that missing owner action, and
+    nothing else calls it — no poll, no page load.
+
+    Provisioning cost rides here honestly: a cold runtime install happens inside
+    this request rather than behind a silent GET.
+    """
+    from ouroboros.claudexor_daemon import ensure_owned_gateway
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    def _wake() -> Dict[str, Any]:
+        gateway = ensure_owned_gateway()
+        gateway.close()
+        return _status_payload(include_models=False)
+
+    try:
+        return JSONResponse(await asyncio.to_thread(_wake))
+    except ClaudexorUnavailable as exc:
+        # Typed refusal (missing binary, foreign home, a daemon that never
+        # published a descriptor): the panel keeps its rows and says why.
+        return json_error(f"{exc.code}: {exc}", 503)
+    except Exception as exc:
+        log.exception("api_claudexor_wake failed")
+        return json_error(f"{type(exc).__name__}: Claudexor wake failed")
 
 
 def _build_login_request(harness: str, profile_id: str, transport: str,
@@ -415,4 +517,5 @@ __all__ = [
     "api_claudexor_login",
     "api_claudexor_login_job",
     "api_claudexor_status",
+    "api_claudexor_wake",
 ]

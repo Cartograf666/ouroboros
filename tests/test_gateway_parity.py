@@ -24,6 +24,8 @@ from ouroboros.gateway.contracts import (
     UpdatePreflightResponse,
     UpdateStatusReadyOutbound,
     VideoOutbound,
+    ClaudexorStatusReads,
+    ClaudexorStatusResponse,
 )
 from ouroboros.gateway.router import collect_routes
 
@@ -120,7 +122,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 StateResponse, OwnerScopeReviewFloorResponse, UpdateMergePlan,
                 UpdatePreflightRequest, UpdatePreflightResponse, UpdateApplyRequest,
                 UpdateApplySuccessResponse, UpdateApplyErrorResponse,
-                UpdateStatusReadyOutbound, TaskCostBreakdown, TaskDetailResponse):
+                UpdateStatusReadyOutbound, TaskCostBreakdown, TaskDetailResponse,
+                ClaudexorStatusReads, ClaudexorStatusResponse):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"

@@ -793,6 +793,46 @@ class TaskDetailResponse(TypedDict, total=False):
     error: str
 
 
+ClaudexorReadState = Literal["ok", "not_read", "failed"]
+
+
+class ClaudexorStatusReads(TypedDict):
+    """PROVENANCE for each independent facet of ``GET /api/claudexor/status``.
+
+    An empty collection cannot say whether the daemon was ASKED: the owned
+    Claudexor daemon starts lazily, so an idle machine used to serve empty
+    lists that every consumer read as "no account connected" while real
+    accounts sat in the agent home. Each facet answers only for itself, since
+    one fanned-out read can fail while its siblings land:
+
+    - ``ok`` — read; the matching collection is AUTHORITATIVE (empty means empty)
+    - ``not_read`` — never asked (no live daemon)
+    - ``failed`` — asked, and the answer did not arrive
+
+    Facets map to ``harnesses`` (catalog), ``profiles`` (accounts) and ``quota``.
+    The manifest read behind the login-capability filter is deliberately NOT a
+    facet: its failure is absorbed (fail-open), never reported."""
+
+    catalog: ClaudexorReadState
+    accounts: ClaudexorReadState
+    quota: ClaudexorReadState
+
+
+class ClaudexorStatusResponse(TypedDict, total=False):
+    """``GET /api/claudexor/status`` — owned-daemon lifecycle plus the daemon's
+    own catalog/account/quota truth, each stamped with its read state. Read-only;
+    never spawns the daemon (waking it is the owner-initiated POST)."""
+
+    daemon: Dict[str, Any]
+    config_dir: str
+    harnesses: List[Dict[str, Any]]
+    profiles: Dict[str, Any]
+    quota: List[Dict[str, Any]]
+    reads: ClaudexorStatusReads
+    subagent_last_delegation: Dict[str, Any]
+    error: str
+
+
 class TaskEvent(TypedDict, total=False):
     seq: int
     source: str
@@ -878,6 +918,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/mcp/test",
     "GET /api/reviewer-slots",
     "GET /api/claudexor/status",
+    "POST /api/claudexor/wake",
     "POST /api/claudexor/login",
     "GET /api/claudexor/login/{job_id}",
     "DELETE /api/claudexor/login/{job_id}",
@@ -1005,6 +1046,9 @@ __all__ = [
     "TaskListResponse",
     "TaskCostBreakdown",
     "TaskDetailResponse",
+    "ClaudexorReadState",
+    "ClaudexorStatusReads",
+    "ClaudexorStatusResponse",
     "TaskEvent",
     "TaskCancelResponse",
     "LogTailResponse",

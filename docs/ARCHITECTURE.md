@@ -196,7 +196,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── extensions.py    ← extensions/skills HTTP surface (GET /api/extensions, GET /api/extensions/<skill>/manifest, ALL /api/extensions/<skill>/<rest:path>, POST /api/skills/<skill>/toggle, POST /api/skills/<skill>/delete, POST /api/skills/<skill>/review, POST /api/skills/<skill>/grants)
       │   ├── marketplace.py   ← ClawHub + OuroborosHub HTTP surface
       │   ├── mcp.py           ← MCP Settings API surface backed by the shared MCPManager
-      │   ├── claudexor_accounts.py ← (D30) Harness Accounts HTTP surface: THREE thin proxies of the owned daemon's account truth (GET /api/claudexor/status[?include=models] — side-effect-free daemon/runtime state + harness catalog + credential profiles with both honest verification statuses + quota windows; POST /api/claudexor/login — one Connect intent that foreground-installs/repairs/updates the exact managed runtime, starts or attaches the owned daemon, then continues its setup job; GET/DELETE /api/claudexor/login/{job_id} — snapshot with the transient device-code disclosure / cancel). Zero auth logic on this side; the browser never sees the daemon token. The fallback login card is a copy-paste `claudexor setup attach …` command for the user's own terminal — no in-app terminal exists. The snapshot proxy is a VERBATIM pass-through, and that is load-bearing for the card: a `failed` job whose reason is a verification race is judged `recheck` (codex clears its auth store when a login STARTS, so a probe in that window lies), but when the bounded re-check runs out the card's verdict text is a fixed CONSTANT, so the engine's own `message` is the only thing that can say WHY. `harness_accounts.jobDetail()` reads it at both envelope levels and renders it beside a settled non-success verdict only — escaped, never beside "Connected." where a stale message would contradict the outcome, never while the job is pending (the live status line owns the card then), and never truncated (BIBLE P1: this is an owner-facing surface)
+      │   ├── claudexor_accounts.py ← (D30) Harness Accounts HTTP surface: FOUR thin proxies of the owned daemon's account truth (GET /api/claudexor/status[?include=models] — side-effect-free daemon/runtime state, each facet stamped with its read state so an unread store is never rendered as an empty one; POST /api/claudexor/wake — the OWNER-initiated daemon start behind the panel's Refresh button, the only path that may spawn from this surface (no poll ever does) + harness catalog + credential profiles with both honest verification statuses + quota windows; POST /api/claudexor/login — one Connect intent that foreground-installs/repairs/updates the exact managed runtime, starts or attaches the owned daemon, then continues its setup job; GET/DELETE /api/claudexor/login/{job_id} — snapshot with the transient device-code disclosure / cancel). Zero auth logic on this side; the browser never sees the daemon token. The fallback login card is a copy-paste `claudexor setup attach …` command for the user's own terminal — no in-app terminal exists. The snapshot proxy is a VERBATIM pass-through, and that is load-bearing for the card: a `failed` job whose reason is a verification race is judged `recheck` (codex clears its auth store when a login STARTS, so a probe in that window lies), but when the bounded re-check runs out the card's verdict text is a fixed CONSTANT, so the engine's own `message` is the only thing that can say WHY. `harness_accounts.jobDetail()` reads it at both envelope levels and renders it beside a settled non-success verdict only — escaped, never beside "Connected." where a stale message would contradict the outcome, never while the job is pending (the live status line owns the card then), and never truncated (BIBLE P1: this is an owner-facing surface)
       │   ├── host_service.py  ← Loopback-only Host Service API for reviewed skill callbacks
       │   ├── history.py       ← Chat history + cost breakdown endpoint factories
       │   ├── projects.py      ← Multi-project CRUD surface (v6.32.0): GET /api/projects, POST /api/projects, POST /api/projects/from-task (bind an existing task to a new project). (v6.33.0 removed the /sleep + /wake status endpoints.)
@@ -682,6 +682,7 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | POST | `/api/settings` | `gateway.settings.api_settings_post` |
 | GET | `/api/reviewer-slots` | `gateway.settings.api_reviewer_slots` |
 | GET | `/api/claudexor/status` | `gateway.claudexor_accounts.api_claudexor_status` |
+| POST | `/api/claudexor/wake` | `gateway.claudexor_accounts.api_claudexor_wake` |
 | POST | `/api/claudexor/login` | `gateway.claudexor_accounts.api_claudexor_login` |
 | GET | `/api/claudexor/login/{job_id}` | `gateway.claudexor_accounts.api_claudexor_login_job` |
 | DELETE | `/api/claudexor/login/{job_id}` | `gateway.claudexor_accounts.api_claudexor_login_job` |
@@ -1264,6 +1265,32 @@ Rationale for the narrow setting key: `OUROBOROS_SUBAGENT_HARNESS` is read ONLY 
 subagent scheduler and is deliberately absent from `provider_models.MODEL_SETTING_KEYS`.
 A session-only route is not an API model identity; letting it into that sweep would
 poison credential planning, pricing, and provenance.
+
+**Subscription-first (owner decision, 2026-08-09 — strengthen, never narrow).** With no
+explicit owner choice, delegation turns ON by itself as soon as ONE connected account
+exists, and a native/local session counts: `verification_source: local_store` means the
+login material was detected on disk, not re-proved against the vendor this second, and
+that is deliberately enough (`subagents_settings.connectedHarnesses`). A review pass
+proposed gating the default on vendor-level verification; the owner declined it outright
+— Ouroboros should prefer a subscription over the API budget, and that gate would leave
+delegation off on exactly the machines whose subscriptions are sitting right there. The
+UI still shows the weaker provenance honestly ("local session — not verified live"); it
+just does not withhold the default. `web/tests/subagents_settings.test.js` fails if a
+later change narrows the rule.
+
+**Read provenance on the accounts surface.** `GET /api/claudexor/status` carries a
+`reads` block (`ClaudexorStatusReads`: `catalog` / `accounts` / `quota`, each `ok` |
+`not_read` | `failed`) because the owned daemon starts LAZILY: an idle machine used to
+serve empty collections under a 200, and every consumer read that as "no account
+connected" while real accounts sat in the agent home. `ok` makes the matching collection
+authoritative (empty means empty); `not_read` means nothing was asked; `failed` means the
+answer did not arrive. Facets are independent — one fanned-out read can fail while its
+siblings land — and the rule lives in ONE reader
+(`harness_accounts.facetReadState`) that every importing consumer uses. Two
+surfaces cannot import it and restate it instead: the onboarding wizard is a
+plain IIFE (its mirror is drift-tested in `tests/test_web_utils_ssot.py`), and
+the reviewer-slot row builders take the state as a parameter rather than reading
+the payload themselves. Those are the only restatements, and both are pinned.
 
 ### Git and commit review
 

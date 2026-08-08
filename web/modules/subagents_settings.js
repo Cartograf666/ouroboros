@@ -22,7 +22,7 @@
 // Pure helpers live at the top and are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
-import { accountRows } from './harness_accounts.js';
+import { accountRows, accountsKnown, unknownAccountsNote } from './harness_accounts.js';
 import { renderSegmentedField } from './page_header.js';
 import { sessionModelOptions } from './reviewer_slots.js';
 import { formatRelativeAge } from './ui_helpers.js';
@@ -112,6 +112,17 @@ export function connectedHarnesses(payload) {
     // project 'passed' | ''). A failed/expired verification renders red in the
     // accounts panel; counting it as connected here would let the default-on
     // rule auto-pin a route whose every dispatch falls back to native.
+    //
+    // OWNER DECISION 2026-08-09 — SUBSCRIPTION-FIRST, do NOT narrow this.
+    // A native/local session counts as connected here even though its
+    // verification_source is `local_store` (detected on disk, not re-proved
+    // against the vendor this second), and that is deliberately enough to turn
+    // delegation on by default. A review pass proposed requiring vendor-level
+    // verification before the default fires; the owner declined it outright:
+    // Ouroboros should PREFER subscriptions over the API budget, and demanding
+    // a live vendor probe would leave delegation off on exactly the machines
+    // that have subscriptions sitting right there. Strengthen this bias, never
+    // trade it for caution. `test_subscription_first_default_on_*` guards it.
     const names = {};
     for (const harness of payload?.harnesses || []) {
         const id = String(harness?.id || '');
@@ -152,6 +163,19 @@ export function delegationView({ saved = '', payload = null, statusError = '', e
     }
     const connected = connectedHarnesses(payload);
     const savedHarness = route.harness;
+
+    // UNKNOWN ≠ NONE. A 200 whose account facet was never read (idle lazy
+    // daemon) or refused must not be reported as "no subscription": that verdict
+    // used to run delegation into an API-fallback story while real accounts sat
+    // in the agent home. It is a separate, non-authoring state — see
+    // collectSubagentsSettings, which refuses to author a route from it.
+    if (!accountsKnown(payload)) {
+        const why = unknownAccountsNote(payload);
+        return { state: 'unknown', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
+            note: savedHarness
+                ? `${why}. Delegation stays as you set it (${savedHarness}); nothing is changed until the accounts can be read.`
+                : `${why}. Delegation is unchanged; reopen Settings once the daemon has run.` };
+    }
 
     if (!savedHarness && !connected.length) {
         // Nothing to delegate to, so there is no control to offer. A decided
@@ -355,11 +379,11 @@ export function applySubagentsSettings(settings) {
     renderRows();
 }
 
-export async function reloadSubagentsSection() {
+export async function reloadSubagentsSection({ fetchImpl = apiFetch } = {}) {
     try {
         // ?include=models: the same status payload, plus per-harness model
         // discovery for the default-model select (claudexor_accounts).
-        const resp = await apiFetch('/api/claudexor/status?include=models', { cache: 'no-store' });
+        const resp = await fetchImpl('/api/claudexor/status?include=models', { cache: 'no-store' });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
         state.payload = data;
@@ -385,6 +409,11 @@ export function collectSubagentsSettings() {
     // daemon (same rule as collectReviewerSlots).
     if (!state.loaded || state.statusError) return {};
     const view = currentView();
+    // The same rule for a read that SUCCEEDED at the HTTP level but carried no
+    // account truth (idle lazy daemon, or a refused facet): the transport guard
+    // above cannot see it, the view's harness is empty, and authoring that would
+    // write delegation OFF behind the owner's back on an unrelated Save.
+    if (view.state === 'unknown') return {};
     if (view.state === 'no_subscription') return {};
     return { OUROBOROS_SUBAGENT_HARNESS: composeSubagentRoute(view.harness, view.suffix) };
 }

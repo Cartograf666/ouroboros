@@ -249,3 +249,23 @@ test('the runs-as line shows APPLIED account/access and honest absence for an un
     const api = describeLastExecution({ effective: { route: 'api_chat', model: 'openai/x' } });
     assert.ok(api.includes('openai/x') && !api.includes('not disclosed'));
 });
+
+test('an unread catalog is not "None available", and the reason is not invented', () => {
+    // The subscriptions group used to announce absence whenever the catalog was
+    // empty — including the ordinary idle case, sending the owner to sign in for
+    // accounts already in the agent home.
+    const read = routeChoiceGroups({ harnesses: [], catalogRead: 'ok' });
+    const subs = (g) => g.find((x) => x.label.startsWith('Coding agents')).options[0].label;
+    assert.match(subs(read), /None available/, 'a READ catalog may state absence');
+
+    assert.match(subs(routeChoiceGroups({ harnesses: [], catalogRead: 'not_read' })), /Not checked yet/);
+    assert.match(subs(routeChoiceGroups({ harnesses: [], catalogRead: 'not_read' })), /not running/);
+
+    // A refused or failed read is NOT "the daemon is not running" — it was
+    // running and this read died; saying otherwise is a second lie.
+    for (const state of ['failed', 'transport']) {
+        const label = subs(routeChoiceGroups({ harnesses: [], catalogRead: state }));
+        assert.match(label, /Not checked/);
+        assert.ok(!/not running/.test(label), `${state} must not claim the daemon is down`);
+    }
+});

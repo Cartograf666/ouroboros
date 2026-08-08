@@ -65,6 +65,7 @@ def collect_routes(
         api_claudexor_login,
         api_claudexor_login_job,
         api_claudexor_status,
+        api_claudexor_wake,
     )
     from ouroboros.gateway.settings import api_reviewer_slots
     from ouroboros.gateway.mcp import api_mcp_refresh, api_mcp_status, api_mcp_test
@@ -250,6 +251,7 @@ def collect_routes(
         # daemon's own account surface; zero auth logic on this side.
         Route("/api/reviewer-slots", endpoint=api_reviewer_slots, methods=["GET"]),
         Route("/api/claudexor/status", endpoint=api_claudexor_status, methods=["GET"]),
+        Route("/api/claudexor/wake", endpoint=api_claudexor_wake, methods=["POST"]),
         Route("/api/claudexor/login", endpoint=api_claudexor_login, methods=["POST"]),
         Route(
             "/api/claudexor/login/{job_id}",

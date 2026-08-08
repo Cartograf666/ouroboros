@@ -4,12 +4,14 @@ import test from 'node:test';
 import { accountRows } from '../modules/harness_accounts.js';
 import {
     DELEGATION_OFF,
+    collectSubagentsSettings,
     composeSubagentRoute,
     composeSubagentTail,
     connectedHarnesses,
     delegationView,
     lastDelegationLine,
     parseSubagentRoute,
+    reloadSubagentsSection,
     splitSubagentTail,
 } from '../modules/subagents_settings.js';
 
@@ -325,4 +327,105 @@ test('the last-delegated-run line discloses mismatch and shows absence as absenc
         requested_model: 'sonnet', applied_model: '', run_id: 'r3' });
     assert.ok(bare.includes('model not disclosed'));
     assert.ok(!bare.includes('sonnet'));
+});
+
+test('subscription-first: a local session is enough to turn delegation on by default', () => {
+    // OWNER DECISION 2026-08-09 (guard, not a characterization). A review lens
+    // recommended requiring vendor-level verification before the default-on
+    // rule fires, because a `local_store` session is only detected on disk, not
+    // re-proved against the vendor. The owner DECLINED: Ouroboros prefers
+    // subscriptions over the API budget, and that gate would leave delegation
+    // off on exactly the machines that have a subscription sitting right there.
+    // This test fails if a future change narrows the rule.
+    const nativeOnly = {
+        reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+        daemon: { state: 'running' },
+        harnesses: [{ id: 'codex', display_name: 'Codex CLI' }],
+        profiles: { profiles: [], harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }] },
+    };
+    const connected = connectedHarnesses(nativeOnly);
+    assert.deepEqual(connected.map((c) => c.id), ['codex'],
+        'a detected local session counts as a connected subscription');
+
+    const view = delegationView({ saved: '', payload: nativeOnly });
+    assert.equal(view.state, 'default_on', 'delegation defaults ON from a local session');
+    assert.equal(view.harness, 'codex');
+
+    // The same holds for a NAMED profile whose verification came from the local
+    // store rather than a vendor probe.
+    const localNamed = {
+        reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+        daemon: { state: 'running' },
+        harnesses: [{ id: 'claude', display_name: 'Claude Code' }],
+        profiles: {
+            profiles: [{
+                profile: { harness_id: 'claude', profile_id: 'mironov', kind: 'config_dir_login' },
+                status: { verification: 'passed', verification_source: 'local_store' },
+                identity: {},
+            }],
+            harnessAccounts: [],
+        },
+    };
+    assert.deepEqual(connectedHarnesses(localNamed).map((c) => c.id), ['claude']);
+    assert.equal(delegationView({ saved: '', payload: localNamed }).state, 'default_on');
+});
+
+test('unknown accounts never author the route, and never rename a saved one', () => {
+    // The dangerous half of the false-absence class: a 200 whose account facet
+    // was never read (idle lazy daemon) or refused yields an EMPTY harness list.
+    // Reported as "no subscription" it would (a) tell the owner delegated work
+    // falls back to the API and (b) let an unrelated Save write delegation off.
+    const unread = {
+        reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' },
+        daemon: { state: 'stale' },
+        harnesses: [],
+        profiles: {},
+    };
+    const view = delegationView({ saved: 'codex=gpt-5.6-sol', payload: unread });
+    assert.equal(view.state, 'unknown', 'unread accounts are not "no subscription"');
+    assert.match(view.note, /not checked/i);
+    assert.match(view.note, /codex/, 'the saved route is named as still standing');
+    assert.ok(!/ordinary subagent on the API/i.test(view.note),
+        'never claims delegated work fell back to the API');
+
+    // A refused facet (the daemon answered, this read did not) says so
+    // differently — telling the owner the daemon is not running would be a
+    // second lie when it is running and one endpoint died.
+    const refused = {
+        reads: { catalog: 'ok', accounts: 'failed', quota: 'ok' },
+        daemon: { state: 'unreachable' },
+        harnesses: [{ id: 'codex' }],
+        profiles: {},
+    };
+    assert.equal(delegationView({ saved: '', payload: refused }).state, 'unknown');
+    assert.ok(!/not running/i.test(delegationView({ saved: '', payload: refused }).note));
+});
+
+test('the settings collector itself refuses to author from an unknown read', async () => {
+    // The pure-view test above passes even if the GUARD inside
+    // collectSubagentsSettings is deleted — this drives the REAL reload +
+    // collect path, which is what a Save actually calls.
+    const previousDocument = globalThis.document;
+    globalThis.document = { getElementById: () => null, querySelectorAll: () => [] };
+    try {
+        const respond = (payload) => async () => ({ ok: true, json: async () => payload });
+
+        await reloadSubagentsSection({ fetchImpl: respond({
+            reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' },
+            daemon: { state: 'stale' }, harnesses: [], profiles: {},
+        }) });
+        assert.deepEqual(collectSubagentsSettings(), {},
+            'an unread account store must never author the delegation route');
+
+        await reloadSubagentsSection({ fetchImpl: respond({
+            reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+            daemon: { state: 'running' },
+            harnesses: [{ id: 'codex', display_name: 'Codex' }],
+            profiles: { profiles: [], harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }] },
+        }) });
+        assert.ok('OUROBOROS_SUBAGENT_HARNESS' in collectSubagentsSettings(),
+            'a genuinely read store authors normally');
+    } finally {
+        globalThis.document = previousDocument;
+    }
 });

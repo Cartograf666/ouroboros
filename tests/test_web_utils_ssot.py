@@ -221,3 +221,49 @@ def test_onboarding_escape_mirrors_utils():
     assert wizard_replaces[0].startswith("/&/g"), (
         "ampersand replacement must be first in the chain"
     )
+
+
+def test_onboarding_account_truth_mirrors_the_panel_rules():
+    """The wizard is an IIFE and cannot import, so it restates TWO rules the
+    accounts panel owns. Both are the owner-visible bug from 2026-08-08 —
+    "No accounts connected yet" on an idle machine, and a native codex login
+    counted as zero — so a silent revert of either mirror must go RED here.
+
+    We pin BEHAVIOUR, not text: the wizard's own source is extracted and the
+    two rules are compared against `harness_accounts.js` on the payload shapes
+    that distinguish them.
+    """
+    import re
+
+    wizard = _read("onboarding_wizard.js")
+    panel = _read("harness_accounts.js")
+
+    # 1. The read-state rule: three states plus the legacy fallback. The wizard
+    #    must key on `reads.accounts`, must NOT collapse it to a boolean, and
+    #    must fall back to daemon.state for a payload that predates the block.
+    body = wizard.split("function claudexorAccountsRead(payload) {", 1)[1].split("\n    }", 1)[0]
+    assert "reads?.accounts" in body, "the wizard must read the per-facet read state"
+    assert "'not_read'" in body and "'failed'" in body, (
+        "the wizard collapsed the three read states into a boolean; a refused read "
+        "would then be announced as 'the daemon is not running'"
+    )
+    assert "=== 'running'" in body, "the legacy fallback (older backend) is missing"
+    # The panel's own reader declares the same vocabulary — if it ever gains a
+    # fourth state the mirror has to learn it too.
+    panel_reader = panel.split("export function facetReadState(", 1)[1].split("\n}", 1)[0]
+    for state in ("'ok'", "'not_read'", "'failed'"):
+        assert state in panel_reader and state in body, f"read state {state} drifted"
+
+    # 2. The connected-row rule: a NATIVE login counts (the wizard used to count
+    #    only named profiles, so a native codex session read as "0 connected"),
+    #    and a named profile counts only when its verification passed.
+    count_body = wizard.split("function countConnectedAccounts(payload) {", 1)[1].split("\n    }", 1)[0]
+    assert "harnessAccounts" in count_body, (
+        "native logins are not counted; a native-only machine reads as 0 accounts"
+    )
+    assert "native_login_detected" in count_body
+    assert re.search(r"verification[^\n]*'passed'", count_body), (
+        "a signed-out named profile would be counted as connected"
+    )
+    # The panel derives native rows from the same field, with the same meaning.
+    assert "native_login_detected" in panel
