@@ -258,6 +258,20 @@ def test_project_main_mirror_never_creates_second_unread_static_contract():
     assert "incrementUnreadIfNeeded" not in history
 
 
+def test_chat_ws_subscriptions_flow_through_disposer_helper():
+    """P3 lifecycle: every WS subscription in chat.js must go through the
+    onWs helper so destroy() can release it. A bare ws.on() call would leak
+    a listener past the instance lifetime; the helper's own definition is
+    the single allowed occurrence of `ws.on(`."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    chat = (root / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
+
+    assert "const onWs = (event, fn) => wsDisposers.push(ws.on(event, fn));" in chat
+    assert chat.count("ws.on(") == 1
+
+
 def test_ephemeral_decision_progress_marker_survives_history_replay(tmp_path):
     from ouroboros.gateway.history import make_chat_history_endpoint
 

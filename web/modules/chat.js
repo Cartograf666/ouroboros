@@ -2319,8 +2319,13 @@ export function createChatInstance({
         hideTypingIndicatorOnly();
         const justFinished = record.finished && !wasFinished;
         const drivesComposerStatus = !isBackgroundTaskId(nextGroupId);
-        // P5: a finished card must not keep offering "Cancel run".
-        if (justFinished) syncCancelRunButton(record);
+        // P5: a finished card must not keep offering "Cancel run". A log-channel
+        // task_done terminates the card HERE without passing finishLiveCard, so
+        // the cancelable marker must be dropped on this path too (P3 growth cap).
+        if (justFinished) {
+            cancelableTaskIds.delete(record.groupId);
+            syncCancelRunButton(record);
+        }
         if (record.finished) {
             setLiveCardTypingVisible(record, false);
             markTaskComplete(nextGroupId, summary.phase || 'done');
