@@ -458,23 +458,52 @@ def _accept_claim_support_refs(contract: Dict[str, Any], receipts: list) -> list
     return out
 
 
+# D-Q5 non-resolving basis kinds: the ref NAMES a real packet entry, but that
+# entry is not host-attested support. Kept as a CLOSED set beside the vocabulary
+# so the disclosure row can say WHICH entry was named (never a bare "") while the
+# clean gate still refuses to count it as resolved evidence.
+CLAIM_ID_UNSUPPORTED = "claim_id_unsupported"
+NON_RESOLVING_BASIS_KINDS = frozenset({CLAIM_ID_UNSUPPORTED})
+
+
 def acceptance_evidence_ref_vocabulary(evidence: Any) -> Dict[str, str]:
     """The enumerable canonical exhibit keys of ONE already-built packet (D-Q5).
 
     Maps each valid reviewer ``evidence_ref`` string to its CLOSED basis kind
-    (claim_id | obligation_id | artifact | verification_receipt | packet_section
-    — a closed table per ref kind, like ``IDENTITY_KINDS``). Pure derivation over
-    the packet dict: no filesystem reads, no re-execution (a machine comparison
-    must never become a read oracle — v6.61.1). ``verification_receipts[i]`` ids
-    are POSITIONAL within this packet build and are never compared across panels.
-    Specific ids are registered before generic section names so a claim id can
-    never be shadowed by a same-named section."""
+    (claim_id | claim_id_unsupported | obligation_id | artifact |
+    verification_receipt | packet_section — a closed table per ref kind, like
+    ``IDENTITY_KINDS``). Pure derivation over the packet dict: no filesystem
+    reads, no re-execution (a machine comparison must never become a read oracle
+    — v6.61.1). ``verification_receipts[i]`` ids are POSITIONAL within this packet
+    build and are never compared across panels. Specific ids are registered before
+    generic section names so a claim id can never be shadowed by a same-named
+    section.
+
+    A claim id is EVIDENCE only through the host's own support table: the plan's
+    binding is "claim id → host receipt identity when claims exist". So a claim
+    resolves iff ``acceptance_support_refs`` (host_attested, built from the SAME
+    claim set in this build) reports ``support_status == "supported"`` for it —
+    i.e. a linked receipt actually passed. A claim that is only DECLARED, whose
+    receipt failed, that has no receipt, or whose support table is absent
+    altogether registers as ``claim_id_unsupported`` and cannot support a
+    criterion: otherwise a reviewer citing a bare claim id would certify a clean
+    PASS out of the task's own restated intent, which is precisely the fabricated
+    -evidence hole D-Q5 exists to close."""
     ev = evidence if isinstance(evidence, dict) else {}
     vocab: Dict[str, str] = {}
     contract = ev.get("task_contract") if isinstance(ev.get("task_contract"), dict) else {}
+    supported_claim_ids = {
+        str(row.get("criterion_id") or "").strip()
+        for row in (ev.get("acceptance_support_refs") or [])
+        if isinstance(row, dict) and str(row.get("support_status") or "") == "supported"
+    }
     for claim in contract.get("acceptance_claims") or []:
         if isinstance(claim, dict) and str(claim.get("id") or "").strip():
-            vocab.setdefault(str(claim["id"]).strip(), "claim_id")
+            claim_id = str(claim["id"]).strip()
+            vocab.setdefault(
+                claim_id,
+                "claim_id" if claim_id in supported_claim_ids else CLAIM_ID_UNSUPPORTED,
+            )
     for obligation in ev.get("acceptance_obligations") or []:
         if isinstance(obligation, dict) and str(obligation.get("id") or "").strip():
             vocab.setdefault(str(obligation["id"]).strip(), "obligation_id")
@@ -502,8 +531,11 @@ def resolve_criteria_evidence_refs(criteria: Any, vocabulary: Dict[str, str]) ->
     carrying at least one unresolved ref; each row names the deciding basis for
     every ref (rounds-6/7 rule: whatever decides is what is reported) plus
     ``supported_evidence_resolves`` — whether at least ONE ref resolved, which is
-    all ``task_acceptance_is_clean`` consumes. Never touches parse validity,
-    quorum, or verdicts (the v6.71.1 starvation class stays closed)."""
+    all ``task_acceptance_is_clean`` consumes. A basis in
+    ``NON_RESOLVING_BASIS_KINDS`` (today: a claim id with no host-attested
+    supporting receipt) is DISCLOSED by name but does not resolve. Never touches
+    parse validity, quorum, or verdicts (the v6.71.1 starvation class stays
+    closed)."""
     rows: list = []
     for item in criteria if isinstance(criteria, list) else []:
         if not isinstance(item, dict):
@@ -518,7 +550,7 @@ def resolve_criteria_evidence_refs(criteria: Any, vocabulary: Dict[str, str]) ->
         for ref in refs:
             text = str(ref or "").strip()
             basis = vocabulary.get(text, "") if text else ""
-            if basis:
+            if basis and basis not in NON_RESOLVING_BASIS_KINDS:
                 resolved_any = True
             else:
                 unresolved_count += 1

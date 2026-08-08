@@ -88,7 +88,8 @@ def _render_prompt_parts(request: ReviewRequest, slot: ReviewSlot) -> tuple[str,
         # D-Q5: the host resolves each ref by EXACT match against the packet's
         # enumerable exhibit keys — the vocabulary below is the closed set of forms.
         'each evidence_ref is resolved by EXACT match against the evidence packet, so use these exact forms: '
-        'claim ids from task_contract.acceptance_claims (prefer claim ids whenever claims exist), '
+        'claim ids from task_contract.acceptance_claims (which count as evidence ONLY while '
+        'acceptance_support_refs shows that claim supported by a passing receipt — otherwise cite the exhibit itself), '
         'verification_receipts[i] receipt ids, acceptance_obligations ids, artifact manifest names, '
         'or top-level packet section names — a ref that resolves to nothing cannot support a criterion)'
         if request.surface == "task_acceptance"

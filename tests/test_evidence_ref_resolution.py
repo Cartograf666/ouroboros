@@ -17,8 +17,20 @@ from ouroboros.review_substrate import ReviewRunResult, task_acceptance_is_clean
 _PACKET = {
     "task_contract": {
         "objective": "ship it",
-        "acceptance_claims": [{"id": "claim_1", "claim": "game boots"}],
+        "acceptance_claims": [
+            {"id": "claim_1", "claim": "game boots"},
+            {"id": "claim_2", "claim": "score persists"},
+        ],
     },
+    # Host support table: claim_1 has a PASSING receipt behind it, claim_2 was
+    # only declared. A reviewer may cite claim_1 as evidence; claim_2 names a
+    # real claim but no host-attested support.
+    "acceptance_support_refs": [
+        {"criterion_id": "claim_1", "support_status": "supported",
+         "support_refs": [{"ref": "verification_receipts[0]", "status": "pass"}]},
+        {"criterion_id": "claim_2", "support_status": "declared_only",
+         "support_refs": [{"ref": "verification_receipts[1]", "status": "declared"}]},
+    ],
     "verification_summary": {"count": 2, "failed_count": 0},
     "acceptance_obligations": [{"id": "ob-12ab34cd", "item": "cover edge case"}],
     "artifacts": [{"name": "report/summary.md", "size": 10}],
@@ -48,7 +60,9 @@ def _result(actors):
 
 def test_vocabulary_enumerates_packet_exhibits_exactly():
     vocab = acceptance_evidence_ref_vocabulary(_PACKET)
+    # A claim id is evidence only through the HOST support table.
     assert vocab["claim_1"] == "claim_id"
+    assert vocab["claim_2"] == "claim_id_unsupported"
     assert vocab["ob-12ab34cd"] == "obligation_id"
     assert vocab["report/summary.md"] == "artifact"
     assert vocab["verification_receipts[0]"] == "verification_receipt"
@@ -94,6 +108,44 @@ def test_resolution_discloses_deciding_basis_and_counts_one_resolving_ref():
          {"criterion": "d", "status": "missing", "evidence_refs": ["nonsense"]}],
         vocab,
     ) == []
+
+
+def test_bare_claim_id_without_a_host_receipt_never_resolves():
+    """The fabricated-evidence hole D-Q5 exists to close: a reviewer citing a
+    claim the task itself declared, with no passing receipt behind it, must not
+    buy a release-clean PASS. The disclosure NAMES the claim (it is a real packet
+    entry) instead of pretending the ref was nonsense."""
+    vocab = acceptance_evidence_ref_vocabulary(_PACKET)
+    rows = resolve_criteria_evidence_refs(
+        [{"criterion": "score persists", "status": "supported", "evidence_refs": ["claim_2"]}],
+        vocab,
+    )
+    assert rows[0]["supported_evidence_resolves"] is False
+    assert rows[0]["refs"][0]["resolved_as"] == "claim_id_unsupported"
+    # ...and it demotes only the clean bit, on the existing rail.
+    actor = _actor([{"criterion": "score persists", "status": "supported",
+                     "evidence_refs": ["claim_2"]}])
+    annotate_criteria_evidence_resolution([actor], _PACKET)
+    result = _result([actor])
+    assert task_acceptance_is_clean(result) is False
+    assert result.aggregate_signal == "PASS" and actor["parsed"]["verdict"] == "PASS"
+    # One REAL exhibit alongside the unsupported claim is still enough.
+    assert resolve_criteria_evidence_refs(
+        [{"criterion": "score persists", "status": "supported",
+          "evidence_refs": ["claim_2", "verification_receipts[1]"]}],
+        vocab,
+    )[0]["supported_evidence_resolves"] is True
+
+
+def test_claims_without_a_host_support_table_are_never_self_supporting():
+    """No `acceptance_support_refs` in the packet means the host attested no
+    support at all — claim ids fail CLOSED rather than resolving by default."""
+    packet = {"task_contract": {"acceptance_claims": [{"id": "claim_1", "claim": "boots"}]}}
+    vocab = acceptance_evidence_ref_vocabulary(packet)
+    assert vocab["claim_1"] == "claim_id_unsupported"
+    assert resolve_criteria_evidence_refs(
+        [{"criterion": "c", "status": "supported", "evidence_refs": ["claim_1"]}], vocab,
+    )[0]["supported_evidence_resolves"] is False
 
 
 def test_annotation_marks_only_actors_with_unresolved_refs():

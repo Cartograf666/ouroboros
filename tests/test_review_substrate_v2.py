@@ -1769,12 +1769,15 @@ def test_scope_review_result_preserves_substrate_refs(tmp_path, monkeypatch):
 #                           ensure_ascii=False, sort_keys=True).encode())
 # The two task_acceptance digests (indexes 2-3) were re-pinned DELIBERATELY when
 # D-Q5 added the evidence-ref vocabulary line to the acceptance criteria_key —
-# a one-time cache invalidation of the stable governance segment, done once.
+# a one-time cache invalidation of the stable governance segment — and re-pinned
+# once more when that same line was corrected to state the real claim-id binding
+# (a claim counts only while `acceptance_support_refs` shows it supported).
+# Only the acceptance surface moves: the four non-acceptance digests are unchanged.
 _PRE_SEAM_PROMPT_DIGESTS = [
     "0261c7c7fe477ad7f8901a28bee1ad23905d40c3c62825d2bc406ecd9ca37f82",
     "9cf4de6f66001c3b4cec7fdd3d8552ecf83fc886004a7020e98a4c28c022c4e3",
-    "1987277ac6b99909720331e8434b10e878d3426210cd24efc8a55a32c9f981a3",
-    "682222c02e96f7279da4b1c8cb6d85913dabbffd8de4101c076b6f9b2cfc164f",
+    "e54d9ede838c7c249a40502d732ca1f05364137bae12256c62bba0ef0723ae90",
+    "e20d425dd9288525c35f391c92eb5c0a62331050526c3ebf06eb83c39062acd8",
     "fca0f9401e544e371338f20effa6206db783e7098ff4d11ee2a980ebbe81ecb0",
     "fca0f9401e544e371338f20effa6206db783e7098ff4d11ee2a980ebbe81ecb0",
 ]
