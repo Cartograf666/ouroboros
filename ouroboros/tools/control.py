@@ -188,23 +188,15 @@ def _capability_mismatch_message(selected_profile: str, missing_caps: Any) -> st
     )
 
 
-def _finalize_schedule_emission(
-    ctx: ToolContext,
-    *,
-    task_ids: List[str],
-    requested_model_lane: str,
-    objective: str,
-    role: str,
-    depth: int,
-    parent_task_id: str,
-    root_task_id: str,
-    emitted_modes: List[str],
-    write_surface: str = "",
-    coop_shared_tree: str = "",
-) -> str:
+def _finalize_schedule_emission(ctx: ToolContext, emission: Dict[str, Any]) -> str:
     """Record the scheduled wave, emit swarm_fanout telemetry, and build the
     tool-result string. Extracted from _schedule_task to keep that function
-    within the per-function size budget (P7).
+    within the per-function size budget (P7). The emission facts ride ONE spec
+    dict — the same idiom as ``_validated_schedule_fields`` — keeping the
+    signature inside the <8-parameter contract. Keys: ``task_ids``,
+    ``requested_model_lane``, ``objective``, ``role``, ``depth``,
+    ``parent_task_id``, ``root_task_id``, ``emitted_modes``, plus optional
+    ``write_surface`` and ``coop_shared_tree``.
 
     It reports the REQUEST and nothing else. Until v6.87.28 it also printed an
     `effective_lane=` and a `CAPABILITY_DELTA` line, both produced by resolving the
@@ -216,6 +208,16 @@ def _finalize_schedule_emission(
     effective write_root input, not a dispatch-time resolution), and withholding it
     forced every wave to rediscover its own tree by trial and error (the submarine
     waves' 'user_files path blocked' loop)."""
+    task_ids = list(emission.get("task_ids") or [])
+    requested_model_lane = str(emission.get("requested_model_lane") or "")
+    objective = str(emission.get("objective") or "")
+    role = str(emission.get("role") or "")
+    depth = int(emission.get("depth") or 0)
+    parent_task_id = str(emission.get("parent_task_id") or "")
+    root_task_id = str(emission.get("root_task_id") or "")
+    emitted_modes = list(emission.get("emitted_modes") or [])
+    write_surface = str(emission.get("write_surface") or "")
+    coop_shared_tree = str(emission.get("coop_shared_tree") or "")
     worker_note = " (live queue emission requested)" if any(m == "live" for m in emitted_modes) else ""
     try:
         _record_scheduled_subagent(ctx, {
@@ -1803,25 +1805,24 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         return f"⚠️ SUBTASK_STATUS_ERROR: failed to persist requested status for {tid}; subagent was not scheduled."
 
     emitted_modes: List[str] = [_emit_control_event(ctx, evt)]
-    return _finalize_schedule_emission(
-        ctx,
-        task_ids=task_ids,
-        requested_model_lane=requested_model_lane,
-        objective=objective,
-        role=role,
-        depth=new_depth,
-        parent_task_id=parent_task_id,
-        root_task_id=root_task_id_seed or current_task_id,
-        emitted_modes=emitted_modes,
-        write_surface=requested_surface,
+    return _finalize_schedule_emission(ctx, {
+        "task_ids": task_ids,
+        "requested_model_lane": requested_model_lane,
+        "objective": objective,
+        "role": role,
+        "depth": new_depth,
+        "parent_task_id": parent_task_id,
+        "root_task_id": root_task_id_seed or current_task_id,
+        "emitted_modes": emitted_modes,
+        "write_surface": requested_surface,
         # Host-minted shared coop tree only (a caller-supplied write_root is the
         # parent's own knowledge already).
-        coop_shared_tree=(
+        "coop_shared_tree": (
             effective_write_root
             if effective_write_root and effective_write_root != str(params.get("write_root", "") or "")
             else ""
         ),
-    )
+    })
 
 
 def _request_deep_self_review(ctx: ToolContext, reason: str) -> str:
@@ -2294,25 +2295,32 @@ def _unminted_wait_ids(ctx: ToolContext, status_drive_root: Path, task_ids: List
 
 def _children_roster_projection(
     ctx: ToolContext, status_drive_root: Path, *, limit: int = 30,
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """This parent's DIRECT children in the v6.71.2 compact field set (task_id/
     status/cost_usd/sha/outcome_axes) — never result envelopes; missing
-    accounting projects null, never a confirmed-looking $0. Fail-soft: []."""
+    accounting projects null, never a confirmed-looking $0. The bound is
+    DISCLOSED through the shared ``disclosed_list_projection`` (BIBLE P1): the
+    payload carries ``children_roster`` plus ``children_roster_omitted``, the
+    exact count of real children the cap hid — a silent ``[:limit]`` here could
+    hide the very replacement id this repair surface exists to show. Fail-soft:
+    an empty roster with omitted=0."""
+    from ouroboros._outcome_receipts import disclosed_list_projection
     from ouroboros.task_status import find_child_tasks
     from ouroboros.tools.join_ledger import _child_result_sha256
 
+    empty = {"children_roster": [], "children_roster_omitted": 0}
     my_id = str(getattr(ctx, "task_id", "") or "").strip()
     if not my_id:
-        return []
+        return empty
     try:
         rows = find_child_tasks(
             status_drive_root, parent_task_id=my_id, root_task_id="",
             exclude_task_id=my_id, scope="direct",
         )
     except Exception:
-        return []
+        return empty
     roster: List[Dict[str, Any]] = []
-    for row in rows[: max(1, int(limit))]:
+    for row in rows:
         if not isinstance(row, dict):
             continue
         roster.append({
@@ -2322,7 +2330,9 @@ def _children_roster_projection(
             "child_result_sha256": _child_result_sha256(row),
             "outcome_axes": normalize_outcome_axes(row),
         })
-    return roster
+    return disclosed_list_projection(
+        roster, key="children_roster", limit=max(1, int(limit)), item=lambda entry: entry,
+    )
 
 
 def _wait_for_tasks(
@@ -2474,8 +2484,9 @@ def _wait_for_tasks(
             waited["unknown_task_ids"] = unknown_ids
             # The repair surface: the ACTUAL direct children, compact v6.71.2
             # field set only (never envelopes), so the parent can fix its wait
-            # set instead of re-polling phantoms.
-            waited["children_roster"] = _children_roster_projection(ctx, status_drive_root)
+            # set instead of re-polling phantoms. Carries children_roster plus
+            # the disclosed children_roster_omitted count (never a silent cap).
+            waited.update(_children_roster_projection(ctx, status_drive_root))
     horizon_note = cache_horizon_note(ctx, waited.get("elapsed_sec"))
     if horizon_note:
         waited["cache_horizon_note"] = horizon_note

@@ -553,17 +553,21 @@ def test_cache_write_split_harvested_and_priced_per_tier(monkeypatch):
     table = {"anthropic/claude-fable-5": _P((10.0, 1.0, 12.5, 50.0))}
     monkeypatch.setattr(pricing_mod, "get_pricing", lambda **k: table)
     split_cost = pricing_mod.estimate_cost_optional(
-        "anthropic/claude-fable-5", 1000, 0, cache_write_tokens=1000,
-        prompt_cache_ttl="1h", allow_live_fetch=False,
-        cache_write_tokens_by_ttl={"5m": 400, "1h": 600},
+        "anthropic/claude-fable-5", 1000, 0,
+        cache_usage={
+            "cache_write_tokens": 1000, "prompt_cache_ttl": "1h",
+            "cache_write_tokens_by_ttl": {"5m": 400, "1h": 600},
+        },
+        allow_live_fetch=False,
     )
     # 400 tokens at the catalog (5m) write price + 600 at the 2x/1.25 extended ratio.
     expected = (400 * 12.5 + 600 * 12.5 * 2.0 / 1.25) / 1_000_000
     assert split_cost == pytest.approx(expected, abs=1e-9)
     # Absent split: every write bills the reported tier (the pre-split behavior).
     full_cost = pricing_mod.estimate_cost_optional(
-        "anthropic/claude-fable-5", 1000, 0, cache_write_tokens=1000,
-        prompt_cache_ttl="1h", allow_live_fetch=False,
+        "anthropic/claude-fable-5", 1000, 0,
+        cache_usage={"cache_write_tokens": 1000, "prompt_cache_ttl": "1h"},
+        allow_live_fetch=False,
     )
     assert full_cost == pytest.approx(1000 * 12.5 * 2.0 / 1.25 / 1_000_000, abs=1e-9)
 
@@ -1501,12 +1505,14 @@ def test_extended_ttl_scales_cache_write_estimate(monkeypatch):
     table = {"anthropic/claude-fable-5": _P((10.0, 1.0, 12.5, 50.0))}
     monkeypatch.setattr(pricing_mod, "get_pricing", lambda **k: table)
     base = pricing_mod.estimate_cost_optional(
-        "anthropic/claude-fable-5", 1_000_000, 0, cache_write_tokens=1_000_000,
-        prompt_cache_ttl=None, allow_live_fetch=False,
+        "anthropic/claude-fable-5", 1_000_000, 0,
+        cache_usage={"cache_write_tokens": 1_000_000, "prompt_cache_ttl": None},
+        allow_live_fetch=False,
     )
     extended = pricing_mod.estimate_cost_optional(
-        "anthropic/claude-fable-5", 1_000_000, 0, cache_write_tokens=1_000_000,
-        prompt_cache_ttl="1h", allow_live_fetch=False,
+        "anthropic/claude-fable-5", 1_000_000, 0,
+        cache_usage={"cache_write_tokens": 1_000_000, "prompt_cache_ttl": "1h"},
+        allow_live_fetch=False,
     )
     assert base == pytest.approx(12.5)
     assert extended == pytest.approx(12.5 * 2.0 / 1.25)

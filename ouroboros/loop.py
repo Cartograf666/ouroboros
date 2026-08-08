@@ -3342,17 +3342,28 @@ def _compaction_floor_chars(messages: List[Dict[str, Any]], spans: List[Tuple[in
     return _estimate_messages_chars(frame) + _estimate_messages_chars(kept)
 
 
+@dataclass
+class _HysteresisMeasurement:
+    """The arming round's measured pressure facts, folded into one object (the
+    <8-parameter contract). ``region_chars`` is the region the arming round
+    JUDGED (for a futile pass: the region it actually handled, not the collapsed
+    remainder), so the growth bar means "the transcript climbed back past a size
+    already proven insufficient" rather than "the pass shrank the region, so
+    anything is growth"."""
+    pressure_real_tokens: float
+    threshold_real_tokens: float
+    region_chars: int
+    schema_tokens: int
+    density: float
+    floor_real_tokens: Optional[float] = None
+
+
 def _arm_compaction_hysteresis(
     ctx: _CompactionRoundContext,
     usage_state: Dict[str, Any],
-    pressure_real_tokens: float,
-    threshold_real_tokens: float,
-    region_chars: int,
-    schema_tokens: int,
-    density: float,
+    measurement: _HysteresisMeasurement,
     *,
     reason: str = "nothing_compactable",
-    floor_real_tokens: Optional[float] = None,
 ) -> None:
     """Suppress emergency compaction until a pass can plausibly help again.
 
@@ -3362,13 +3373,11 @@ def _arm_compaction_hysteresis(
     the compactor would structurally no-op (``nothing_compactable``). One loud
     line plus a typed checkpoint event, then silence until a pass could help or
     the round window passes — never a silent stop (BIBLE P1).
-
-    ``region_chars`` is the region the arming round JUDGED (for a futile pass:
-    the region it actually handled, not the collapsed remainder), so the growth
-    bar means "the transcript climbed back past a size already proven
-    insufficient" rather than "the pass shrank the region, so anything is
-    growth".
     """
+    pressure_real_tokens = measurement.pressure_real_tokens
+    threshold_real_tokens = measurement.threshold_real_tokens
+    region_chars = measurement.region_chars
+    floor_real_tokens = measurement.floor_real_tokens
     usage_state["_compaction_hysteresis"] = {"round": ctx.round_idx, "region_chars": region_chars}
     frame_bound = floor_real_tokens is not None and floor_real_tokens > threshold_real_tokens
     rearm_clause = (
@@ -3392,8 +3401,8 @@ def _arm_compaction_hysteresis(
         "calibrated_real_tokens": int(pressure_real_tokens),
         "threshold_real_tokens": int(threshold_real_tokens),
         "compactable_region_chars": int(region_chars),
-        "tool_schema_tokens": int(schema_tokens),
-        "token_density": round(float(density), 3),
+        "tool_schema_tokens": int(measurement.schema_tokens),
+        "token_density": round(float(measurement.density), 3),
         "floor_real_tokens": None if floor_real_tokens is None else int(floor_real_tokens),
         "frame_bound": bool(frame_bound),
     })
@@ -3510,9 +3519,14 @@ def _run_round_compaction(
             # frame alone sat over the trigger — a low-mode task can enter its
             # first rounds already there. Arm the hysteresis instead: same
             # disclosure, no per-round work.
-            _arm_compaction_hysteresis(ctx, usage_state, pressure_real_tokens,
-                                       threshold_real_tokens, region_chars, schema_tokens, density,
-                                       floor_real_tokens=floor_real_tokens)
+            _arm_compaction_hysteresis(ctx, usage_state, _HysteresisMeasurement(
+                pressure_real_tokens=pressure_real_tokens,
+                threshold_real_tokens=threshold_real_tokens,
+                region_chars=region_chars,
+                schema_tokens=schema_tokens,
+                density=density,
+                floor_real_tokens=floor_real_tokens,
+            ))
             return messages, None
         emergency_keep_recent = _emergency_keep_recent(span_count)
         if _persist_compaction_checkpoint(
@@ -3531,11 +3545,15 @@ def _run_round_compaction(
                 # Arm on the region the pass ALREADY HANDLED (pre-pass), not on
                 # the remainder it just collapsed: the collapsed remainder made
                 # the next tool round clear the 1.2x bar on its own.
-                _arm_compaction_hysteresis(ctx, usage_state, after_real_tokens,
-                                           threshold_real_tokens, region_chars, schema_tokens,
-                                           density, reason="emergency_pass_futile",
-                                           floor_real_tokens=_pressure(
-                                               _compaction_floor_chars(messages, _tool_round_spans(messages))))
+                _arm_compaction_hysteresis(ctx, usage_state, _HysteresisMeasurement(
+                    pressure_real_tokens=after_real_tokens,
+                    threshold_real_tokens=threshold_real_tokens,
+                    region_chars=region_chars,
+                    schema_tokens=schema_tokens,
+                    density=density,
+                    floor_real_tokens=_pressure(
+                        _compaction_floor_chars(messages, _tool_round_spans(messages))),
+                ), reason="emergency_pass_futile")
             return messages, usage
         ctx.emit_progress("⚠️ Emergency compaction skipped: forensic checkpoint could not be persisted.")
         return messages, None
@@ -3609,9 +3627,11 @@ def _account_compaction_usage(
             _cm,
             int(compaction_usage.get("prompt_tokens") or 0),
             int(compaction_usage.get("completion_tokens") or 0),
-            int(compaction_usage.get("cached_tokens") or 0),
-            int(compaction_usage.get("cache_write_tokens") or 0),
-            compaction_usage.get("prompt_cache_ttl"),
+            cache_usage={
+                "cached_tokens": int(compaction_usage.get("cached_tokens") or 0),
+                "cache_write_tokens": int(compaction_usage.get("cache_write_tokens") or 0),
+                "prompt_cache_ttl": compaction_usage.get("prompt_cache_ttl"),
+            },
             provider=str(compaction_usage.get("provider") or "openrouter"),
         )
     )

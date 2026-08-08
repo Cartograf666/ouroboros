@@ -352,6 +352,26 @@ def _accept_verification_summary(receipts: list) -> Dict[str, Any]:
     }
 
 
+def _accept_receipt_exhibits(receipts: list) -> list:
+    """Canonical indexed receipt exhibits: one compact host-attested row per receipt,
+    under the SAME global index ``acceptance_support_refs`` cites
+    (``verification_receipts[i]``). The D-Q5 vocabulary enumerates THESE rows — a
+    reviewer can only cite a receipt the packet actually carries, with its status
+    visible, and only a green one resolves (the count-synthesized vocabulary let a
+    red receipt nobody ever saw buy a release-clean PASS)."""
+    from ouroboros._outcome_receipts import receipt_identity_projection
+
+    return [{
+        "ref": f"verification_receipts[{idx}]",
+        "status": str(r.get("status") or ""),
+        "matched": r.get("matched") if "matched" in r else None,
+        "contract_kind": str(r.get("contract_kind") or ""),
+        "criterion_source": str(r.get("criterion_source") or ""),
+        "provenance": "host_attested",
+        **receipt_identity_projection(r, bound=_accept_redact_cap, check_cap=200),
+    } for idx, r in enumerate(x for x in (receipts or []) if isinstance(x, dict))]
+
+
 def _accept_effective_claims(
     ctx: Any, contract: Dict[str, Any], drive_root: Any, task_id: str,
 ) -> tuple[list, str]:
@@ -917,6 +937,12 @@ def build_task_acceptance_evidence(
             prov["acceptance_support_refs"] = "host_attested"
     ev["verification_summary"] = _accept_verification_summary(receipts)
     prov["verification_summary"] = "host_attested"
+    receipt_exhibits = _accept_receipt_exhibits(receipts)
+    if receipt_exhibits:
+        # D-Q5: the indexed exhibit list the receipt-ref vocabulary derives from —
+        # `verification_receipts[i]` must name a row that is HERE, never a bare count.
+        ev["verification_receipts"] = redact_projection(receipt_exhibits).value
+        prov["verification_receipts"] = "host_attested"
     if drive_root is not None and task_id:
         from ouroboros.mutation_attribution import load_mutation_evidence_projection
 

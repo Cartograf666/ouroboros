@@ -1774,13 +1774,15 @@ def test_scope_review_result_preserves_substrate_refs(tmp_path, monkeypatch):
 # (a claim counts only while `acceptance_support_refs` shows it supported), and a
 # THIRD time when section refs were narrowed to host-attested exhibits (the
 # agent's own reasoning_notes/candidate_answers and task_contract stopped
-# resolving, so the prompt must stop advertising them).
+# resolving, so the prompt must stop advertising them), and a FOURTH time when
+# receipt refs started enumerating the packet's verification_receipts exhibit
+# rows (only a green pass/observed receipt resolves, so the prompt says so).
 # Only the acceptance surface moves: the four non-acceptance digests are unchanged.
 _PRE_SEAM_PROMPT_DIGESTS = [
     "0261c7c7fe477ad7f8901a28bee1ad23905d40c3c62825d2bc406ecd9ca37f82",
     "9cf4de6f66001c3b4cec7fdd3d8552ecf83fc886004a7020e98a4c28c022c4e3",
-    "c13193e6525183eb0eeb6be8e06a0be3f28622a5c6ba748321790079efbc6477",
-    "221ab6ad79f3fea28039aea88675b3b8c5bbc64fc282ad7079fcfbad3d03611a",
+    "bc49f3bf1d7273c6cfa3d882dc5738e379f3dcc7af37a15a3686a30f89b8b355",
+    "674971a10ccd95822cf790f5038eaf77824d38996f52c61a30a93f8666a324d3",
     "fca0f9401e544e371338f20effa6206db783e7098ff4d11ee2a980ebbe81ecb0",
     "fca0f9401e544e371338f20effa6206db783e7098ff4d11ee2a980ebbe81ecb0",
 ]

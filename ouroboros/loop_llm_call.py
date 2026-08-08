@@ -604,15 +604,17 @@ def _normalize_usage_cost(
             display_model,
             int(usage.get("prompt_tokens") or 0),
             int(usage.get("completion_tokens") or 0),
-            int(usage.get("cached_tokens") or 0),
-            int(usage.get("cache_write_tokens") or 0),
-            usage.get("prompt_cache_ttl"),
+            cache_usage={
+                "cached_tokens": int(usage.get("cached_tokens") or 0),
+                "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
+                "prompt_cache_ttl": usage.get("prompt_cache_ttl"),
+                "cache_write_tokens_by_ttl": (
+                    usage.get("cache_write_tokens_by_ttl")
+                    if isinstance(usage.get("cache_write_tokens_by_ttl"), dict)
+                    else None
+                ),
+            },
             provider=provider,
-            cache_write_tokens_by_ttl=(
-                usage.get("cache_write_tokens_by_ttl")
-                if isinstance(usage.get("cache_write_tokens_by_ttl"), dict)
-                else None
-            ),
         )
     usage["cost"] = cost
     cost_estimated = bool(usage.get("cost_estimated")) or (cost is not None and not provider_reported_cost)

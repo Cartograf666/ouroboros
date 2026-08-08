@@ -736,6 +736,43 @@ def test_wait_for_tasks_flags_unknown_ids_and_attaches_children_roster(tmp_path)
     assert [row["task_id"] for row in roster] == ["realchild1"]
     assert set(roster[0]) == {"task_id", "status", "cost_usd", "child_result_sha256", "outcome_axes"}
     assert roster[0]["cost_usd"] == 0.55
+    # Nothing was capped away, and the projection SAYS so (BIBLE P1).
+    assert payload["children_roster_omitted"] == 0
+
+
+def test_children_roster_projection_discloses_the_capped_tail(tmp_path):
+    """A parent with MORE direct children than the roster cap: the repair surface
+    stays bounded, but the bound is disclosed — `children_roster_omitted` carries
+    the exact count of real children the cap hid. A silent [:30] here could hide
+    the very replacement id wait_tasks' unknown-id repair exists to surface."""
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _children_roster_projection
+
+    total = 33
+    for idx in range(total):
+        write_task_result(
+            tmp_path,
+            f"bigchild{idx:03d}",
+            STATUS_COMPLETED,
+            result=f"child {idx} finished",
+            parent_task_id="bigparent1",
+            root_task_id="bigparent1",
+            delegation_role="subagent",
+        )
+
+    ctx = SimpleNamespace(
+        drive_root=tmp_path,
+        task_id="bigparent1",
+        task_metadata={"root_task_id": "bigparent1"},
+    )
+    projected = _children_roster_projection(ctx, tmp_path)
+    roster = projected["children_roster"]
+    assert len(roster) == 30  # the cap holds — the surface stays compact
+    assert projected["children_roster_omitted"] == total - 30  # …and is disclosed
+    assert all(
+        set(row) == {"task_id", "status", "cost_usd", "child_result_sha256", "outcome_axes"}
+        for row in roster
+    )
 
 
 def test_wait_for_tasks_phantom_only_set_short_circuits_the_window(tmp_path, monkeypatch):

@@ -3033,11 +3033,13 @@ class LLMClient:
                 usage["resolved_model"],
                 usage["prompt_tokens"],
                 usage["completion_tokens"],
-                usage["cached_tokens"],
-                usage["cache_write_tokens"],
-                usage.get("prompt_cache_ttl"),
+                cache_usage={
+                    "cached_tokens": usage["cached_tokens"],
+                    "cache_write_tokens": usage["cache_write_tokens"],
+                    "prompt_cache_ttl": usage.get("prompt_cache_ttl"),
+                    "cache_write_tokens_by_ttl": write_split or None,
+                },
                 provider="anthropic",
-                cache_write_tokens_by_ttl=write_split or None,
             )
             if estimated_cost is not None:
                 usage["cost"] = estimated_cost
@@ -3809,16 +3811,18 @@ class LLMClient:
                 usage["resolved_model"],
                 int(usage.get("prompt_tokens") or 0),
                 int(usage.get("completion_tokens") or 0),
-                int(usage.get("cached_tokens") or 0),
-                int(usage.get("cache_write_tokens") or 0),
-                usage.get("prompt_cache_ttl"),
+                cache_usage={
+                    "cached_tokens": int(usage.get("cached_tokens") or 0),
+                    "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
+                    "prompt_cache_ttl": usage.get("prompt_cache_ttl"),
+                    "cache_write_tokens_by_ttl": (
+                        usage.get("cache_write_tokens_by_ttl")
+                        if isinstance(usage.get("cache_write_tokens_by_ttl"), dict)
+                        else None
+                    ),
+                },
                 allow_live_fetch=not skip_cost_fetch,
                 provider=usage["provider"],
-                cache_write_tokens_by_ttl=(
-                    usage.get("cache_write_tokens_by_ttl")
-                    if isinstance(usage.get("cache_write_tokens_by_ttl"), dict)
-                    else None
-                ),
             )
             if estimated_cost is not None:
                 usage["cost"] = estimated_cost

@@ -101,20 +101,30 @@ def get_pricing(
 
 
 def estimate_cost_optional(model: str, prompt_tokens: int, completion_tokens: int,
-                           cached_tokens: int = 0, cache_write_tokens: int = 0,
-                           prompt_cache_ttl: Optional[str] = None,
+                           cache_usage: Optional[Dict[str, Any]] = None,
                            allow_live_fetch: bool = True,
-                           provider: Optional[str] = None,
-                           cache_write_tokens_by_ttl: Optional[Dict[str, Any]] = None) -> Optional[float]:
+                           provider: Optional[str] = None) -> Optional[float]:
     """Estimate cost from exact provider/model data, preserving unknown as None.
 
-    ``cache_write_tokens_by_ttl`` is Anthropic's per-tier write split
-    (``usage.cache_creation`` → ``{"5m": n, "1h": n}``), harvested when the provider
-    reports it: on a ``1h`` request whose payload also produced 5m writes (e.g. a
-    server-tool block cached at the default tier beside the 1h prefix) only the
-    genuine 1h share bills the extended-tier ratio. Absent the split, every write
-    bills the reported tier — the pre-split behavior, never a loosened ratio.
+    ``cache_usage`` folds the prompt-cache facts into one mapping (the <8-parameter
+    contract; keys are the usage-row field names, all optional):
+
+    - ``cached_tokens``: prompt tokens served from cache (read tier).
+    - ``cache_write_tokens``: prompt tokens written to cache this call.
+    - ``prompt_cache_ttl``: the requested write tier (``"5m"``/``"1h"``).
+    - ``cache_write_tokens_by_ttl``: Anthropic's per-tier write split
+      (``usage.cache_creation`` → ``{"5m": n, "1h": n}``), harvested when the
+      provider reports it: on a ``1h`` request whose payload also produced 5m
+      writes (e.g. a server-tool block cached at the default tier beside the 1h
+      prefix) only the genuine 1h share bills the extended-tier ratio. Absent the
+      split, every write bills the reported tier — the pre-split behavior, never
+      a loosened ratio.
     """
+    cache_row = cache_usage if isinstance(cache_usage, dict) else {}
+    cached_tokens = int(cache_row.get("cached_tokens") or 0)
+    cache_write_tokens = int(cache_row.get("cache_write_tokens") or 0)
+    prompt_cache_ttl = cache_row.get("prompt_cache_ttl")
+    cache_write_tokens_by_ttl = cache_row.get("cache_write_tokens_by_ttl")
     raw_model = str(model or "").strip()
     normalized = normalize_model_identity(raw_model)
     route = str(provider or provider_for_model(raw_model) or "openrouter").strip().lower()

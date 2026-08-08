@@ -598,8 +598,8 @@ def _reservation_cost(request: AttemptRequest) -> Optional[float]:
         request.model,
         prompt_tokens,
         max(0, int(request.max_completion_tokens or 0)),
-        cache_write_tokens=cache_write_tokens,
-        prompt_cache_ttl="1h" if cache_write_tokens else None,
+        cache_usage={"cache_write_tokens": cache_write_tokens,
+                     "prompt_cache_ttl": "1h" if cache_write_tokens else None},
         allow_live_fetch=True,
         provider=request.provider,
     )
@@ -1155,9 +1155,9 @@ def settle_attempt(
             reservation.model,
             int(normalized.get("prompt_tokens") or normalized.get("input_tokens") or 0),
             int(normalized.get("completion_tokens") or normalized.get("output_tokens") or 0),
-            cached_tokens=int(normalized.get("cached_tokens") or 0),
-            cache_write_tokens=int(normalized.get("cache_write_tokens") or 0),
-            prompt_cache_ttl=str(normalized.get("prompt_cache_ttl") or ""),
+            cache_usage={"cached_tokens": int(normalized.get("cached_tokens") or 0),
+                         "cache_write_tokens": int(normalized.get("cache_write_tokens") or 0),
+                         "prompt_cache_ttl": str(normalized.get("prompt_cache_ttl") or "")},
             allow_live_fetch=False,
             provider=reservation.provider,
         )

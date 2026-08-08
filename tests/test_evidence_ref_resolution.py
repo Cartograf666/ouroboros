@@ -32,6 +32,14 @@ _PACKET = {
          "support_refs": [{"ref": "verification_receipts[1]", "status": "declared"}]},
     ],
     "verification_summary": {"count": 2, "failed_count": 0},
+    # The indexed exhibit rows the receipt-ref vocabulary enumerates (F4): the
+    # SAME global indices acceptance_support_refs cites, status visible per row.
+    "verification_receipts": [
+        {"ref": "verification_receipts[0]", "status": "pass", "matched": True,
+         "provenance": "host_attested", "criterion_id": "claim_1", "check": "pytest -q"},
+        {"ref": "verification_receipts[1]", "status": "declared", "matched": None,
+         "provenance": "host_attested", "criterion_id": "claim_2", "check": ""},
+    ],
     "acceptance_obligations": [{"id": "ob-12ab34cd", "item": "cover edge case"}],
     "artifacts": [{"name": "report/summary.md", "size": 10}],
     "repo_diff": "diff --git ...",
@@ -48,6 +56,7 @@ _PACKET = {
         "task_contract": "host_attested",
         "acceptance_support_refs": "host_attested",
         "verification_summary": "host_attested",
+        "verification_receipts": "host_attested",
         "acceptance_obligations": "host_attested",
         "repo_diff": "host_attested",
         "artifacts": "artifact",
@@ -85,9 +94,13 @@ def test_vocabulary_enumerates_packet_exhibits_exactly():
     assert vocab["claim_2"] == "claim_id_unsupported"
     assert vocab["ob-12ab34cd"] == "obligation_id"
     assert vocab["report/summary.md"] == "artifact"
+    # Receipt refs come from the packet's OWN exhibit rows: the green row
+    # resolves, the declared-only row is disclosed but never counts (F4), and an
+    # index without a row does not exist — count alone mints nothing.
     assert vocab["verification_receipts[0]"] == "verification_receipt"
-    assert vocab["verification_receipts[1]"] == "verification_receipt"
+    assert vocab["verification_receipts[1]"] == "verification_receipt_not_passing"
     assert "verification_receipts[2]" not in vocab
+    assert vocab["verification_receipts"] == "packet_section"  # the exhibit list itself
     assert vocab["repo_diff"] == "packet_section"
     assert vocab["verification_summary"] == "packet_section"
     assert vocab["tool_trajectory"] == "packet_section"   # host-recorded tool results
@@ -168,7 +181,7 @@ def test_resolution_is_exact_match_only_no_fuzzy():
     vocab = acceptance_evidence_ref_vocabulary(_PACKET)
     rows = resolve_criteria_evidence_refs(
         [{"criterion": "game boots", "status": "supported",
-          "evidence_refs": ["verification_receipts", "the SERVE_OK receipt", "repo_dif"]}],
+          "evidence_refs": ["verification_receipt", "the SERVE_OK receipt", "repo_dif"]}],
         vocab,
     )
     # Substrings / near-misses of real keys never resolve (v6.78 lossy-identity lesson).
@@ -181,13 +194,13 @@ def test_resolution_discloses_deciding_basis_and_counts_one_resolving_ref():
     vocab = acceptance_evidence_ref_vocabulary(_PACKET)
     rows = resolve_criteria_evidence_refs(
         [{"criterion": "game boots", "status": "supported",
-          "evidence_refs": ["verification_receipts[1]", "made-up-ref"]}],
+          "evidence_refs": ["verification_receipts[0]", "made-up-ref"]}],
         vocab,
     )
     assert len(rows) == 1
     assert rows[0]["supported_evidence_resolves"] is True  # >=1 ref resolves -> counts
     bases = {ref["ref"]: ref["resolved_as"] for ref in rows[0]["refs"]}
-    assert bases["verification_receipts[1]"] == "verification_receipt"
+    assert bases["verification_receipts[0]"] == "verification_receipt"
     assert bases["made-up-ref"] == ""
     # Fully-resolving criteria produce NO row (common clean path is unannotated),
     # and non-supported criteria are never resolution's business.
@@ -217,12 +230,76 @@ def test_bare_claim_id_without_a_host_receipt_never_resolves():
     result = _result([actor])
     assert task_acceptance_is_clean(result) is False
     assert result.aggregate_signal == "PASS" and actor["parsed"]["verdict"] == "PASS"
-    # One REAL exhibit alongside the unsupported claim is still enough.
+    # One REAL green exhibit alongside the unsupported claim is still enough.
     assert resolve_criteria_evidence_refs(
         [{"criterion": "score persists", "status": "supported",
-          "evidence_refs": ["claim_2", "verification_receipts[1]"]}],
+          "evidence_refs": ["claim_2", "verification_receipts[0]"]}],
         vocab,
     )[0]["supported_evidence_resolves"] is True
+
+
+def test_receipt_index_form_cannot_bypass_the_support_rule():
+    """F4: `claim_2`'s only receipt is declared-only, so the claim id does not
+    resolve — and citing the SAME receipt by its `verification_receipts[1]` index
+    form must not resolve either, or the index is a bypass of the host support
+    rule. The old vocabulary synthesized the index refs from
+    `verification_summary.count` alone, so a red/declared receipt the reviewer
+    never saw bought a release-clean PASS."""
+    vocab = acceptance_evidence_ref_vocabulary(_PACKET)
+    rows = resolve_criteria_evidence_refs(
+        [{"criterion": "score persists", "status": "supported",
+          "evidence_refs": ["verification_receipts[1]"]}], vocab,
+    )
+    assert rows[0]["supported_evidence_resolves"] is False
+    # Disclosed by NAME (a real packet row), never a bare "".
+    assert rows[0]["refs"][0]["resolved_as"] == "verification_receipt_not_passing"
+    # ...and it demotes only the clean bit, on the existing rail.
+    actor = _actor([{"criterion": "score persists", "status": "supported",
+                     "evidence_refs": ["verification_receipts[1]"]}])
+    annotate_criteria_evidence_resolution([actor], _PACKET)
+    result = _result([actor])
+    assert task_acceptance_is_clean(result) is False
+    assert result.aggregate_signal == "PASS" and actor["parsed"]["verdict"] == "PASS"
+
+    # A count alone mints NO receipt vocabulary: the rows must be in the packet.
+    count_only = {
+        "verification_summary": {"count": 3, "failed_count": 3},
+        "__provenance__": {"verification_summary": "host_attested"},
+    }
+    assert not any(
+        key.startswith("verification_receipts[")
+        for key in acceptance_evidence_ref_vocabulary(count_only)
+    )
+
+
+def test_receipt_vocabulary_is_derived_from_the_builder_rows(tmp_path):
+    """Builder → vocabulary pin: build_task_acceptance_evidence carries one
+    host-attested `verification_receipts` row per receipt under the SAME global
+    index acceptance_support_refs cites; a green row resolves, a red row is
+    disclosed by name, and an out-of-packet index does not exist."""
+    from types import SimpleNamespace
+
+    from ouroboros.outcomes import append_verification_receipt
+    from ouroboros.review_evidence import build_task_acceptance_evidence
+
+    append_verification_receipt(tmp_path, "t1", {
+        "status": "fail", "returncode": 1, "check": "pytest -q", "criterion_id": "c_red",
+    })
+    append_verification_receipt(tmp_path, "t1", {
+        "status": "pass", "matched": True, "check": "pytest -q", "criterion_id": "c_green",
+    })
+    ctx = SimpleNamespace(drive_root=str(tmp_path), task_id="t1", task_metadata={}, task_contract={})
+    packet = build_task_acceptance_evidence(
+        ctx, drive_root=tmp_path, task_id="t1", canonical_subject="answer",
+    )
+    rows = packet["verification_receipts"]
+    assert [row["status"] for row in rows] == ["fail", "pass"]
+    assert [row["ref"] for row in rows] == ["verification_receipts[0]", "verification_receipts[1]"]
+    assert packet["__provenance__"]["verification_receipts"] == "host_attested"
+    vocab = acceptance_evidence_ref_vocabulary(packet)
+    assert vocab["verification_receipts[0]"] == "verification_receipt_not_passing"
+    assert vocab["verification_receipts[1]"] == "verification_receipt"
+    assert "verification_receipts[2]" not in vocab
 
 
 def test_claims_without_a_host_support_table_are_never_self_supporting():

@@ -1415,3 +1415,86 @@ def test_settled_continuations_retire_after_age_window(tmp_path):
     assert retire_settled_continuations(tmp_path, is_settled=lambda tid: settled.get(tid, False)) == []
     assert continuation_path(tmp_path, "runningtask").exists()
     assert old.task_id == "oldtask"
+
+
+def test_settled_continuation_with_open_obligations_survives_age_retirement(tmp_path):
+    """A settled FAILED task whose continuation records obligations that are
+    STILL open in the review ledger is genuinely unresolved review work: age
+    must not archive it out of context (P1/P3). A same-age settled sibling with
+    no open markers still retires — the noise-reduction path stays."""
+    import json as _json
+
+    from ouroboros.agent_task_pipeline import build_review_context
+    from ouroboros.review_state import (
+        AdvisoryReviewState,
+        ObligationItem,
+        make_repo_key,
+        save_state,
+    )
+    from ouroboros.task_continuation import (
+        ReviewContinuation,
+        archived_continuation_dir,
+        continuation_path,
+        save_review_continuation,
+    )
+
+    class FakeEnv:
+        def drive_path(self, p):
+            return tmp_path / p
+
+        def repo_path(self, p):
+            return tmp_path / "repo" / p
+
+        @property
+        def repo_dir(self):
+            return tmp_path / "repo"
+
+        @property
+        def drive_root(self):
+            return tmp_path
+
+    env = FakeEnv()
+    (tmp_path / "repo" / ".git").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repo" / "tracked.py").write_text("print('hi')\n", encoding="utf-8")
+    repo_key = make_repo_key(tmp_path / "repo")
+
+    def _aged_continuation(task_id, obligation_ids):
+        save_review_continuation(tmp_path, ReviewContinuation(
+            task_id=task_id, source="commit_blocked", stage="review",
+            block_reason="critical_findings", obligation_ids=obligation_ids))
+        path = continuation_path(tmp_path, task_id)
+        data = _json.loads(path.read_text(encoding="utf-8"))
+        data["created_ts"] = data["updated_ts"] = "2026-01-01T00:00:00+00:00"
+        path.write_text(_json.dumps(data), encoding="utf-8")
+
+    _aged_continuation("unresolvedtask", ["obl-open-1"])
+    _aged_continuation("closedtask", ["obl-long-gone"])
+    task_results = tmp_path / "task_results"
+    task_results.mkdir(parents=True, exist_ok=True)
+    for tid in ("unresolvedtask", "closedtask"):
+        (task_results / f"{tid}.json").write_text(
+            _json.dumps({"id": tid, "status": "failed"}), encoding="utf-8")
+
+    state = AdvisoryReviewState(open_obligations=[
+        ObligationItem(
+            obligation_id="obl-open-1",
+            item="tests_affected",
+            severity="critical",
+            reason="Coverage still missing",
+            source_attempt_ts="2026-01-01T00:00:00+00:00",
+            source_attempt_msg="blocked commit",
+            repo_key=repo_key,
+            fingerprint="finding:tests_affected:abc123",
+        )
+    ])
+    save_state(tmp_path, state)
+
+    dynamic_text = build_review_context(env)
+
+    # Unresolved work survives the age window and stays in cognitive context.
+    assert continuation_path(tmp_path, "unresolvedtask").exists()
+    assert "task=unresolvedtask" in dynamic_text
+    # The provably-closed sibling still rides the age path (durable, disclosed).
+    assert not continuation_path(tmp_path, "closedtask").exists()
+    assert (archived_continuation_dir(tmp_path) / "closedtask.json").exists()
+    assert "closedtask" in dynamic_text  # transient archive disclosure line

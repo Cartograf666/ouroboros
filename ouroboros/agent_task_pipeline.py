@@ -1424,14 +1424,15 @@ def build_review_context(env: Any) -> str:
             load_state,
             make_repo_key,
         )
-        from ouroboros.task_continuation import list_review_continuations, retire_settled_continuations
+        from ouroboros.task_continuation import (
+            list_review_continuations,
+            retire_settled_continuations_for_context,
+        )
         from ouroboros.task_results import load_task_result
-        from ouroboros.task_status import SETTLED_STATUSES
 
         state = load_state(pathlib.Path(env.drive_root))
-        retired = retire_settled_continuations(env.drive_root, is_settled=lambda tid: str(
-            (load_task_result(env.drive_root, tid) or {}).get("status") or ""
-        ).strip().lower() in SETTLED_STATUSES)
+        retired = retire_settled_continuations_for_context(
+            env.drive_root, state, lambda tid: load_task_result(env.drive_root, tid))
         continuations, corrupt = list_review_continuations(env.drive_root)
         repo_dir = pathlib.Path(env.repo_dir)
         repo_key = make_repo_key(repo_dir)

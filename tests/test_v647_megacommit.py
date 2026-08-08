@@ -1023,27 +1023,26 @@ def test_finalize_schedule_emission_surfaces_coop_tree_path():
     from ouroboros.tools.control import _finalize_schedule_emission
 
     ctx = types.SimpleNamespace(task_id="p1", drive_root=Path(tempfile.mkdtemp()))
-    out = _finalize_schedule_emission(
-        ctx,
-        task_ids=["c1"],
-        requested_model_lane="light",
-        objective="build",
-        role="builder",
-        depth=1,
-        parent_task_id="p1",
-        root_task_id="p1",
-        emitted_modes=["live"],
-        write_surface="external_workspace",
-        coop_shared_tree="/tmp/projects/coop_abc123",
-    )
+    out = _finalize_schedule_emission(ctx, {
+        "task_ids": ["c1"],
+        "requested_model_lane": "light",
+        "objective": "build",
+        "role": "builder",
+        "depth": 1,
+        "parent_task_id": "p1",
+        "root_task_id": "p1",
+        "emitted_modes": ["live"],
+        "write_surface": "external_workspace",
+        "coop_shared_tree": "/tmp/projects/coop_abc123",
+    })
     assert "shared coop tree: /tmp/projects/coop_abc123" in out
     assert "root=subagent_projects" in out
     assert "coop_abc123" in out
     assert "effective_lane=" not in out  # request-only doctrine intact
     # Without a minted tree the result is unchanged.
-    out2 = _finalize_schedule_emission(
-        ctx,
-        task_ids=["c2"], requested_model_lane="light", objective="probe", role="scout",
-        depth=1, parent_task_id="p1", root_task_id="p1", emitted_modes=["live"],
-    )
+    out2 = _finalize_schedule_emission(ctx, {
+        "task_ids": ["c2"], "requested_model_lane": "light", "objective": "probe",
+        "role": "scout", "depth": 1, "parent_task_id": "p1", "root_task_id": "p1",
+        "emitted_modes": ["live"],
+    })
     assert "shared coop tree" not in out2

@@ -21,6 +21,12 @@ from typing import Any, Dict
 # so the disclosure row can say WHICH entry was named (never a bare "") while the
 # clean gate still refuses to count it as resolved evidence.
 CLAIM_ID_UNSUPPORTED = "claim_id_unsupported"
+# A receipt row the packet DOES carry whose own status is not a passing one
+# (fail/declared) or whose expectation did not match. The claim-id rule already
+# refuses to count such a receipt through its claim (`support_status !=
+# "supported"`); the `verification_receipts[i]` index form must not be a bypass
+# of the same rule, so the row is DISCLOSED by name and never resolves.
+RECEIPT_NOT_PASSING = "verification_receipt_not_passing"
 # A section the packet itself tags `agent_supplied` (agent_supplied,
 # reasoning_notes, candidate_answers): the agent's OWN prose. Counting it would
 # let a reviewer certify a clean PASS out of the task's own words — the same hole
@@ -36,6 +42,7 @@ DECLARED_INTENT_SECTION = "declared_intent_section"
 UNATTESTED_SECTION = "unattested_section"
 NON_RESOLVING_BASIS_KINDS = frozenset({
     CLAIM_ID_UNSUPPORTED,
+    RECEIPT_NOT_PASSING,
     AGENT_SUPPLIED_SECTION,
     DECLARED_INTENT_SECTION,
     UNATTESTED_SECTION,
@@ -67,14 +74,23 @@ def acceptance_evidence_ref_vocabulary(evidence: Any) -> Dict[str, str]:
 
     Maps each valid reviewer ``evidence_ref`` string to its CLOSED basis kind
     (claim_id | claim_id_unsupported | obligation_id | artifact |
-    verification_receipt | packet_section | agent_supplied_section |
-    declared_intent_section | unattested_section — a closed table per ref kind,
-    like ``IDENTITY_KINDS``). Pure derivation over the packet dict: no filesystem
-    reads, no re-execution (a machine comparison must never become a read oracle
-    — v6.61.1). ``verification_receipts[i]`` ids are POSITIONAL within this packet
-    build and are never compared across panels. Specific ids are registered before
-    generic section names so a claim id can never be shadowed by a same-named
-    section.
+    verification_receipt | verification_receipt_not_passing | packet_section |
+    agent_supplied_section | declared_intent_section | unattested_section — a
+    closed table per ref kind, like ``IDENTITY_KINDS``). Pure derivation over the
+    packet dict: no filesystem reads, no re-execution (a machine comparison must
+    never become a read oracle — v6.61.1). ``verification_receipts[i]`` ids are
+    POSITIONAL within this packet build and are never compared across panels.
+    Specific ids are registered before generic section names so a claim id can
+    never be shadowed by a same-named section.
+
+    A receipt ref enumerates the packet's OWN ``verification_receipts`` exhibit
+    rows — never a bare ``verification_summary.count``, which minted a valid ref
+    for a receipt the packet did not carry and the reviewer could not read. A row
+    resolves only while it is GREEN (status pass/observed and not ``matched is
+    False`` — the same predicate the host support table applies to claims); a
+    red/declared receipt registers as ``verification_receipt_not_passing``,
+    disclosed by name, because the claim-id rule below already refuses that
+    receipt through its claim and the index form must not be a bypass.
 
     A claim id is EVIDENCE only through the host's own support table: the plan's
     binding is "claim id → host receipt identity when claims exist". So a claim
@@ -116,13 +132,18 @@ def acceptance_evidence_ref_vocabulary(evidence: Any) -> Dict[str, str]:
     for artifact in ev.get("artifacts") or []:
         if isinstance(artifact, dict) and str(artifact.get("name") or "").strip():
             vocab.setdefault(str(artifact["name"]).strip(), "artifact")
-    summary = ev.get("verification_summary") if isinstance(ev.get("verification_summary"), dict) else {}
-    try:
-        receipt_count = max(0, int(summary.get("count") or 0))
-    except (TypeError, ValueError):
-        receipt_count = 0
-    for idx in range(receipt_count):
-        vocab.setdefault(f"verification_receipts[{idx}]", "verification_receipt")
+    receipt_rows = ev.get("verification_receipts") if isinstance(ev.get("verification_receipts"), list) else []
+    for row in receipt_rows:
+        if not isinstance(row, dict) or not str(row.get("ref") or "").strip():
+            continue
+        passing = (
+            str(row.get("status") or "") in ("pass", "observed")
+            and row.get("matched") is not False
+        )
+        vocab.setdefault(
+            str(row["ref"]).strip(),
+            "verification_receipt" if passing else RECEIPT_NOT_PASSING,
+        )
     provenance = ev.get("__provenance__") if isinstance(ev.get("__provenance__"), dict) else {}
     for key in ev:
         name = str(key)
