@@ -23,6 +23,7 @@ from ouroboros.config import (
 from ouroboros.headless import prepare_task_drive, task_state_dir
 from ouroboros.contracts.task_contract import (
     build_task_contract,
+    effective_acceptance_claims,
     normalize_allowed_resources,
 )
 from ouroboros.tools.control_delegation import (
@@ -1220,6 +1221,13 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
         str(spec.get("deadline_at") or ""),
         str(parent_contract.get("deadline_at") or "") if isinstance(parent_contract, dict) else "",
     )
+    # The child's claims come from the parent's EXPLICIT acceptance_claims param —
+    # its ingress — through the one effective-claims seam; there is no plan wave at
+    # dispatch. Re-stated below even when EMPTY: omitted means the child has none,
+    # never "inherit the parent's" (the deadline_at spread lesson).
+    child_claims, _claims_source = effective_acceptance_claims(
+        {"acceptance_claims": spec.get("acceptance_claims")}
+    )
     return build_task_contract({
         "id": spec.get("tid"),
         "type": "task",
@@ -1254,7 +1262,15 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
                 # requested child deadline whenever the parent carried one of its own.
                 "deadline_at": narrowed_deadline_at,
                 "delegation_budget": delegation_budget,
-            } if isinstance(parent_contract, dict) else {"delegation_budget": delegation_budget},
+                # Same lesson for the criteria carriers, re-stated even when EMPTY:
+                # without these, the parent's claims/criteria leak into every child and
+                # child verify receipts would "support" claims the child never owned.
+                "acceptance_claims": child_claims,
+                "success_criteria": [],
+            } if isinstance(parent_contract, dict) else {
+                "delegation_budget": delegation_budget,
+                "acceptance_claims": child_claims,
+            },
         },
     })
 
@@ -1363,6 +1379,20 @@ def schedule_subagent_properties() -> Dict[str, Any]:
             "type": "string",
             "description": "Optional ISO-8601 UTC instant after which this child's work is worthless to you (e.g. a scout whose handoff you can only consume inside a narrow window). NARROWING ONLY: the earlier of this and the parent's deadline wins, so it can tighten your own deadline but never extend it. Omit it to simply inherit the parent's.",
         },
+        "acceptance_claims": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Optional concrete, checkable claims of what 'done' means for THIS child "
+                "(plain strings, e.g. 'the collision module rejects overlapping hulls'). "
+                "They become the child contract's acceptance_claims (ids claim_1..N in "
+                "list order) — the child links verify_and_record receipts to them via "
+                "criterion_id, and you see per-claim support at absorption. The child "
+                "NEVER inherits your own claims: omitted means the child has none. Omit "
+                "the field unless you can state real checks; empty/blank values are "
+                "treated as absent."
+            ),
+        },
     }
 
 
@@ -1427,6 +1457,20 @@ def _validated_schedule_fields(params: Dict[str, Any]) -> tuple[Dict[str, Any], 
     expected_output = str(params.get("expected_output") or "").strip()
     if not expected_output:
         return {}, "⚠️ TOOL_ARG_ERROR (schedule_subagent): expected_output is required."
+    raw_claims = params.get("acceptance_claims")
+    if raw_claims is not None and (
+        not isinstance(raw_claims, list)
+        or any(not isinstance(item, str) for item in raw_claims)
+    ):
+        return {}, (
+            "⚠️ TOOL_ARG_ERROR (schedule_subagent): acceptance_claims must be an array "
+            "of plain strings (one checkable claim per entry)."
+        )
+    # Vacuous claims normalize to ABSENT, never an error (the v6.65.1/.2 lesson:
+    # min-constraints shape placeholder junk instead of preventing it).
+    acceptance_claims = [
+        item.strip() for item in (raw_claims or []) if isinstance(item, str) and item.strip()
+    ]
     if memory_mode not in VALID_SUBTASK_MEMORY_MODES:
         allowed = ", ".join(sorted(VALID_SUBTASK_MEMORY_MODES))
         return {}, (
@@ -1440,6 +1484,7 @@ def _validated_schedule_fields(params: Dict[str, Any]) -> tuple[Dict[str, Any], 
         "constraints": str(params.get("constraints") or "").strip(),
         "memory_mode": memory_mode, "may_mutate": params.get("may_mutate", False),
         "model_lane": model_lane, "executor": executor,
+        "acceptance_claims": acceptance_claims,
     }, ""
 
 
@@ -1595,6 +1640,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "allowed_resources": allowed_resources, "parent_contract": parent_contract,
         "parent_task_id": parent_task_id, "root_task_id": root_task_id, "session_id": session_id,
         "child_delegation_budget": child_delegation_budget, "deadline_at": str(deadline_at or ""),
+        "acceptance_claims": fields["acceptance_claims"],
     })
     # The requested-status envelope carries the REQUEST. Its derived half stays
     # empty until dispatch fills it, so a queued child's public description never

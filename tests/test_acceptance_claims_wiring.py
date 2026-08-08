@@ -124,6 +124,101 @@ def test_packet_claims_lookup_is_fail_soft():
     assert not ev["task_contract"].get("acceptance_claims")
 
 
+def test_schedule_subagent_publishes_claims_param_via_ssot():
+    from ouroboros.tools import control
+
+    props = control.schedule_subagent_properties()
+    claims = props["acceptance_claims"]
+    assert claims["type"] == "array"
+    assert claims["items"] == {"type": "string"}
+    # No min-constraints (v6.65.1/.2) and no empty-string enum members (Gemini 400).
+    assert "minItems" not in claims
+    assert "enum" not in claims["items"]
+    # Handler allowed-keys DERIVE from the same mapping (BIBLE P7).
+    assert "acceptance_claims" in control.schedule_subagent_param_names()
+
+
+def test_child_contract_restates_claims_after_parent_spread():
+    from ouroboros.tools.control import _build_child_subagent_contract
+
+    parent_contract = {
+        "acceptance_claims": [{"id": "p1", "claim": "parent-only claim"}],
+        "success_criteria": ["parent criterion"],
+        "deadline_at": "",
+    }
+    base_spec = {
+        "tid": "child1", "objective": "do child work", "expected_output": "a result",
+        "constraints": "", "parent_contract": parent_contract,
+        "parent_task_id": "parent1", "root_task_id": "root1", "session_id": "s1",
+        "child_delegation_budget": None, "deadline_at": "",
+    }
+
+    # No child claims: EMPTY is re-stated — parent claims/criteria never leak.
+    bare = _build_child_subagent_contract(dict(base_spec))
+    assert bare["acceptance_claims"] == []
+    assert bare["success_criteria"] == []
+
+    # Explicit child claims land normalized with positional ids.
+    claimed = _build_child_subagent_contract(
+        {**base_spec, "acceptance_claims": ["module compiles", "tests green"]}
+    )
+    assert [c["claim"] for c in claimed["acceptance_claims"]] == [
+        "module compiles", "tests green",
+    ]
+    assert [c["id"] for c in claimed["acceptance_claims"]] == ["claim_1", "claim_2"]
+    assert claimed["success_criteria"] == []
+
+
+def test_schedule_subagent_claims_end_to_end(tmp_path):
+    import queue
+
+    from ouroboros.tools.control import _schedule_task
+    from ouroboros.tools.registry import ToolContext
+
+    event_queue: queue.Queue = queue.Queue()
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "parent1"
+    ctx.task_depth = 0
+    ctx.current_chat_id = 1
+    ctx.event_queue = event_queue
+    ctx.task_metadata = {
+        "root_task_id": "root1", "session_id": "sess1",
+        "task_contract": {"acceptance_claims": [{"id": "p1", "claim": "parent claim"}]},
+    }
+
+    result = _schedule_task(
+        ctx,
+        objective="Build the collision module",
+        expected_output="A working module",
+        acceptance_claims=["hull overlap is rejected", "  ", ""],
+    )
+
+    assert "TOOL_ARG_ERROR" not in result
+    event = event_queue.get_nowait()
+    contract = event["task_contract"]
+    assert [c["claim"] for c in contract["acceptance_claims"]] == ["hull overlap is rejected"]
+    assert contract["success_criteria"] == []
+
+
+def test_schedule_subagent_rejects_malformed_claims(tmp_path):
+    import queue
+
+    from ouroboros.tools.control import _schedule_task
+    from ouroboros.tools.registry import ToolContext
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    ctx.task_id = "parent1"
+    ctx.task_depth = 0
+    ctx.event_queue = queue.Queue()
+    ctx.task_metadata = {}
+
+    for bad in ("not-a-list", [{"claim": "object"}], [1, 2]):
+        result = _schedule_task(
+            ctx, objective="o", expected_output="e", acceptance_claims=bad,
+        )
+        assert "TOOL_ARG_ERROR (schedule_subagent): acceptance_claims" in result
+
+
 def test_packet_open_plan_wave_binds_no_claims():
     from ouroboros.task_results import (
         STATUS_RUNNING,

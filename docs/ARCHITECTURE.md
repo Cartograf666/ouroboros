@@ -636,7 +636,15 @@ here — the parent contract was located with a type test that let `ToolContext`
 `{}` default shadow the real contract in `task_metadata`, and the `**parent_contract`
 spread into the child's merged contract re-injected the parent's `deadline_at` at higher
 precedence than the narrowed value. Any field deliberately narrowed must be re-stated
-after that spread. For workspace/forked children,
+after that spread. (W2) `schedule_subagent` also exposes optional `acceptance_claims`
+(plain strings, published solely through the `schedule_subagent_properties()` SSOT;
+vacuous values normalize to absent, never an error): they become the CHILD contract's
+`acceptance_claims` (ids `claim_1..N` in list order, `verify_and_record` receipts link
+via `criterion_id`) through the same `effective_acceptance_claims` seam the acceptance
+packet reads. The claims and `success_criteria` carriers are re-stated after the
+`**parent_contract` spread even when EMPTY — omitted means the child has none, never
+"inherit the parent's" — so parent claims cannot leak into children and child receipts
+cannot "support" claims the child never owned. For workspace/forked children,
 `budget_drive_root` is also the canonical status/result root, so parent tools
 read the same child lifecycle records that the supervisor writes.
 Installed skill payloads exist only on the canonical data root, so the
