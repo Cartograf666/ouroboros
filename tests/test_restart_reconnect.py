@@ -40,7 +40,10 @@ def test_chat_marks_pending_messages_until_reconnect():
 def test_chat_resyncs_history_after_reconnect():
     source = _read("web/modules/chat.js")
     assert "async function syncHistory" in source
-    assert "/api/chat/history?limit=1000" in source
+    # perf2 P3: the default history request sends NO quota params — the server's
+    # window constants govern; the dead `?limit=1000` placebo is gone.
+    assert "`/api/chat/history${isMain ? '' : `?chat_id=${chatId}`}`" in source
+    assert "limit=1000" not in source
     assert "cache: 'no-store'" in source
     assert "syncHistory({ includeUser: !historyLoaded, fromReconnect: isReconnect })" in source
     assert "const expectedDisconnect = socketState !== WebSocket.OPEN" in source
