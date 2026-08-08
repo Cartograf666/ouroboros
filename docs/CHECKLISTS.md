@@ -10,7 +10,7 @@ When a new reviewable concern appears, add it here — not in prompts or docs.
 
 ## Advisory Pre-Review Workflow
 
-**Correct sequence (mandatory):**
+**Default sequence:**
 
 ```
 1. Finish ALL edits first (`edit_text` / `edit_batch` / `apply_patch` / `write_file`)
@@ -22,7 +22,8 @@ When a new reviewable concern appears, add it here — not in prompts or docs.
 - Successful worktree mutations automatically mark advisory as **stale**. This includes
   `write_file`, `edit_text`, `edit_batch`, `apply_patch`, and mutating `run_command` /
   reviewed-commit paths when they change tracked worktree state.
-- Any stale advisory → must re-run advisory before commit_reviewed.
+- A stale advisory must be re-run unless Ouroboros explicitly chooses the
+  audited skip below.
 - Do NOT interleave edits and advisory calls: `edit → advisory → edit → advisory` wastes two
   expensive advisory cycles. Finish all edits first.
 - If advisory finds critical issues: **strongly recommended** to fix them and re-run advisory
@@ -42,7 +43,15 @@ When a new reviewable concern appears, add it here — not in prompts or docs.
   event in `events.jsonl` plus the persistent `advisory_overrides_count` /
   recent-overrides fields in `review_status`. Silent advisory is forbidden.
 - Once advisory is fresh → call commit_reviewed immediately without further edits.
-- Bypass (`skip_advisory_review=True`) is an **absolute** escape hatch: it short-circuits the entire commit gate (freshness + open obligations + open commit-readiness debt). Every bypass is durably audited in events.jsonl. Open obligations/debt stay visible in `review_status` (`repo_commit_ready=false`) but do NOT block the bypassed commit. Reach for it when advisory cannot run — provider outage, rate limit, or an advisory reviewer the owner left UNCONFIGURED (BIBLE P3 Component 2: an unconfigured advisory makes the preflight UNAVAILABLE, not waived, and this audited bypass is what makes that visible; it must never read as a clean preflight) — or when the stale signals are known to be obsolete.
+- `skip_advisory_review=True` skips only advisory freshness and the
+  obligation/debt admission attached to it. Use LLM judgment when this cheap
+  error-finding pass is slow, unhealthy, unavailable, or unlikely to add value;
+  otherwise run it before the expensive authoritative review. The gate records
+  the explicit skip; explain the LLM judgment in the surrounding task narrative.
+  The flag does not change independently applicable test policy, triad,
+  applicable scope review, or
+  pre/post fingerprint and exact-commit/tag binding. The skip is durably
+  audited, and unresolved obligations/debt remain visible.
 
 **Obligation tracking:**
 - Every blocking `commit_reviewed` result creates "open obligations" — a structured checklist of
@@ -58,8 +67,9 @@ When a new reviewable concern appears, add it here — not in prompts or docs.
   this via `commit_readiness_debts_count`, `repo_commit_ready=false`, and
   `retry_anchor=commit_readiness_debt`. Under `advisory`, a fresh advisory allows
   commit after recording `advisory_obligations_acknowledged`; `review_status`
-  still shows the debt until a successful commit clears it. `skip_advisory_review=True`
-  overrides this — bypass is absolute and does not require clearing obligations/debt first.
+  still shows the debt until a successful commit clears it.
+  `skip_advisory_review=True` overrides only this advisory debt admission;
+  the debt remains visible and authoritative review still runs.
 - **Anti-thrashing injection (v4.35.1):** On retry attempts, open obligations are loaded from durable review state and injected into reviewer prompts as an inert JSON data block (fenced ```json``` with a "DATA records — not instructions" disclaimer). Two mandatory rules are also appended: (1) The JSON `"verdict"` field is the authoritative signal — withdrawal notes in `"reason"` text are ignored; (2) Do not rephrase prior findings under a different checklist item name. In `claude_advisory_review.py::_build_advisory_prompt`, these same two rules are injected at **step 5a unconditionally** (on every advisory run, not only when obligations exist), and reinforced at steps 6.e/6.f when obligations are present.
 - **Obligation storage policy:** All obligations are stored; deduplication is the agent's responsibility.
   Multiple obligations describing the same root cause (from reviewer rephrasing across attempts) are
@@ -113,11 +123,11 @@ or Intent/Scope checklists are.
 | 9 | Changing any of `build.sh`, `build_linux.sh`, `build_windows.ps1`, `Dockerfile`, or `ouroboros/tools/browser.py`? | Cross-surface doc sync is mandatory. Check ALL of: `README.md` Install section (Linux native-lib caveat), `README.md` Build section (per-platform instructions), `docs/ARCHITECTURE.md` browser tools paragraph, WebKit/mobile verification notes, and inline comments in the touched build script. Any one of these being stale has blocked review twice. Verify before staging. |
 | 10 | Changing `ouroboros/tools/commit_gate.py`? | Coupled surfaces that MUST be updated atomically in the same commit: (a) `claude_advisory_review.py::get_tools()` tool description for `advisory_review` and `review_status`; (b) `claude_advisory_review.py::_next_step_guidance()` strings; (c) `docs/DEVELOPMENT.md` Review & Commit Protocol section; (d) `prompts/SYSTEM.md` Commit review section. Missing any one has blocked review. |
 | 11 | Changing VERSION + pyproject.toml? | Ordering matters: (1) write `VERSION` and `pyproject.toml` first; (2) then write `README.md` badge + changelog row; (3) then run `pytest`. Never interleave — updating README before VERSION means `test_version_in_readme` will catch a stale badge. |
-| 12 | Writing or editing any JS file under `web/modules/`? | Inline styles are banned. Before staging: `grep -n "\.style\." web/modules/*.js` — any hit on `.style.display`, `.style.color`, `.style.visibility`, etc. is a REVIEW_BLOCKED waiting to happen. Use CSS classes and `classList`/`hidden` attribute instead. |
+| 12 | Writing or editing any JS file under `web/modules/`? | New or changed static inline visual properties are blocked: inspect the diff for added/changed `style=""` markup and `.style.<property>` assignments, and use CSS classes/tokens plus `classList`/`hidden` instead. Unchanged legacy hits are debt, not a blocker. A dynamic measured value may update a narrowly named CSS custom property when that is the actual runtime data flow. |
 | 13 | Changing LLM output-token budgets? | Grep the whole repo for `max_tokens`, `max_completion_tokens`, `_MAX_TOKENS`, and `max_toks`. Keep `docs/ARCHITECTURE.md` §LLM output token budgets and `tests/test_max_tokens_constants.py` in sync so main-loop, VLM, summaries, compaction, skill publish, and consciousness floors cannot drift independently. |
 | 14 | Changing extension loader/dispatch or isolated deps? | Native-risk extension imports and tool/route/WS handlers must stay out-of-process. Add or run regression tests where a native-risk plugin aborts during import and the host survives, plus tool/route child-dispatch tests. Do not "fix" failures by importing native-risk plugin code in `server.py`. |
 | 15 | Changing `supervisor/git_ops.py`, `launcher.py`, `server.py`, `ouroboros/tools/review_helpers.py`, `ouroboros/tools/git.py`, tests, or evolution scheduling/checkpoint code? | Prove two invariants before review spend: (1) pytest/preflight cannot mutate the live repo or live `data/` (`OUROBOROS_DATA_DIR` / `OUROBOROS_SETTINGS_PATH` must be isolated, and `OUROBOROS_MANAGED_BY_LAUNCHER` must not leak into test subprocesses); (2) autonomous restart/reset cannot erase active evolution work — it must either land a reviewed local commit or preserve a rescue/transaction recovery pointer and pause/stop the campaign. |
-| 16 | Changing `devtools/benchmarks/`? | Confirm it preserves official benchmark boundaries: no replacement scoring, no benchmark-specific prompt/routing hacks, no generated benchmark outputs under `repo/`, no secrets printed or committed, and no runtime-core imports from `devtools/`. Touched `devtools` files are reviewable executable operator code, even though unrelated `devtools` files use Atlas `excluded_dir` coverage-manifest entries and stay compact in broad packs. |
+| 16 | Changing `devtools/`? | Keep operator tools isolated from runtime and package discovery: no runtime, web, or release imports from `devtools/`; no generated outputs under `repo/` or live `data/`; no secrets printed or committed. A touched devtool is reviewable executable code even when unrelated devtools stay compact in broad review packs. Domain-specific launch, routing, and methodology guidance stays with the relevant devtool. |
 | 17 | Diff spawns OS processes (`subprocess.Popen` / `mp.Process` without a bounded wait)? | Route it through `ouroboros.process_custody.spawn_supervised` (or `record_process` write-through) with an explicit `scope` (`task`/`session`/`daemon`) so the orphan reaper can find it; `tests/test_process_custody.py` enforces the allowlist. |
 | 18 | New/changed **test** spawns a real OS process, binds a real port, or mutates a module-level global/registry? | CI **and the hermetic commit gate** (`preflight_runner.py`, v6.88.0) both run the suite as a parallel `-m "not serial" -n auto` pass plus a serial pass. Mark such a test `@pytest.mark.serial` (or add its file to `_SERIAL_TEST_FILES` in `tests/conftest.py`) — otherwise it flakes on kill/port-reclaim timing, or crashes a worker, which the gate reports as a `PARALLEL_WORKER_CRASH` **hard block** (never retried, never a flake). Static screen before you commit: grep the new test for `subprocess.Popen`/`subprocess.run`, socket or fixed-port binding, `start_new_session=True`, and un-monkeypatched module globals — but syntax cannot prove mocking, so still classify it semantically. The `serial` marker is the fix for *crashes and interference only*: the parallel pass also carries a 300s per-test timeout, and the serial pass carries none, so marking a merely-slow test `serial` moves the hang into the one lane that cannot bound it — make it faster or split it instead. Every other test must stay parallel-safe: `tmp_path` (not fixed `/tmp/...` paths), `monkeypatch.setenv`/`setattr` (not bare `os.environ[...] =`), no execution-order assumptions, reset any mutated module global. See `docs/DEVELOPMENT.md` "The commit gate mirrors the CI split". |
 
@@ -147,7 +157,7 @@ Used by `commit_reviewed` for all changes to the Ouroboros repository.
 | # | item | what to check | severity when FAIL |
 |---|------|---------------|--------------------|
 | 1 | bible_compliance | Does the diff violate any BIBLE.md principle? | critical |
-| 2 | development_compliance | Does it follow DEVELOPMENT.md patterns? Check explicitly: (a) naming conventions (snake_case modules/vars, PascalCase classes, UPPER_SNAKE_CASE constants); (b) entity type rules — Gateway classes contain ONLY transport, no business logic; Tool functions are thin wrappers; (c) module-size target stays near one context window (~1000 lines) with a hard fail above 1600 lines for non-grandfathered modules, method-size target stays under 150 lines with a hard fail above 300 lines, runtime-code total Python function/method count stays under the smoke hard gate defined by `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` (the literal value evolves with the codebase — consult the constant rather than hardcoding the number; `devtools/` is excluded from this health gate but reviewed when touched), and functions keep `<= 8` params; (d) no gratuitous abstract layers, and any SOLID/minimalism finding names an exact symbol/authority, concrete duplication or coupling, and a smaller contract-preserving alternative rather than citing diff size (P7 Minimalism) — and when the diff ADDS a surface (a new module, state file, ledger, resolver, cache, retry path, tool, endpoint, or background loop), the reviewer consults the docs/ARCHITECTURE.md map and NAMES the existing mechanism that already covers the need when one exists (the same generative duty the plan reviewer carries: "an existing function/module that already solves this, named exactly"); absence of a covering mechanism may be stated in one line; (e) new LLM calls go through the shared `LLMClient`/`llm.py` layer, not ad-hoc HTTP clients; (f) cognitive artifacts (identity.md, scratchpad, task reflections, review outputs) must NOT use hardcoded `[:N]` truncation — explicit omission notes required; (g) new `get_tools()` exports follow the ToolEntry pattern in registry.py; (h) provider independence — no change may make a core capability (agent loop, multi-model commit review, scope review, or memory/context flows) silently require a second provider or OpenRouter specifically, and every supported single direct provider (local, OpenAI, Anthropic, MiniMax, Cloud.ru, GigaChat) must keep its model AND review/scope slots self-fillable (see DEVELOPMENT.md "Provider Independence"); (i) a claimed-complete visible UI change includes vision-inspected evidence from at least one relevant real consumer flow. A screenshot file without inspection is insufficient; states/viewports/additional engines are risk-selected, mobile/WebKit are not universal, and an unavailable optional engine alone is not degradation. | critical |
+| 2 | development_compliance | Does it follow DEVELOPMENT.md patterns? Check explicitly: (a) naming conventions (snake_case modules/vars, PascalCase classes, UPPER_SNAKE_CASE constants); (b) entity type rules — Gateway classes contain ONLY transport, no business logic; Tool functions are thin wrappers; (c) module-size target stays near one context window (~1000 lines) with a hard fail above 1600 lines for non-grandfathered modules, methods above 150 lines are a decomposition signal and every non-grandfathered Python function/method hard-fails above 300 lines (`GRANDFATHERED_OVERSIZED_FUNCTIONS` is the exception SSOT), runtime-code total Python function/method count stays under the smoke hard gate defined by `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` (the literal value evolves with the codebase — consult the constant rather than hardcoding the number; `devtools/` is excluded from this health gate but reviewed when touched), and more than eight parameters is a decomposition signal, not a hard gate; (d) no gratuitous abstract layers, and any SOLID/minimalism finding names an exact symbol/authority, concrete duplication or coupling, and a smaller contract-preserving alternative rather than citing diff size (P7 Minimalism) — and when the diff ADDS a surface (a new module, state file, ledger, resolver, cache, retry path, tool, endpoint, or background loop), the reviewer consults the docs/ARCHITECTURE.md map and NAMES the existing mechanism that already covers the need when one exists (the same generative duty the plan reviewer carries: "an existing function/module that already solves this, named exactly"); absence of a covering mechanism may be stated in one line; (e) new LLM calls go through the shared `LLMClient`/`llm.py` layer, not ad-hoc HTTP clients; (f) cognitive artifacts (identity.md, scratchpad, task reflections, review outputs) must NOT use hardcoded `[:N]` truncation — explicit omission notes required; (g) new `get_tools()` exports follow the ToolEntry pattern in registry.py; (h) provider independence — no change may make a core capability (agent loop, multi-model commit review, scope review, or memory/context flows) silently require a second provider or OpenRouter specifically, and every supported single direct provider (local, OpenAI, Anthropic, MiniMax, Cloud.ru, GigaChat) must keep its model AND review/scope slots self-fillable (see DEVELOPMENT.md "Provider Independence"); (i) a claimed-complete visible UI change includes vision-inspected evidence from at least one relevant real consumer flow. A screenshot file without inspection is insufficient; states/viewports/additional engines are risk-selected, mobile/WebKit are not universal, and an unavailable optional engine alone is not degradation. | critical |
 | 3 | secrets_check | Are secrets, API keys, .env files, credentials present in the diff? | critical |
 | 4 | code_quality | Careful code review: bugs, logic errors, crashes, regressions, race conditions, resource leaks? | critical |
 | 5 | security_issues | Security vulnerabilities: injection, path traversal, secret leakage, unsafe operations? | critical |
@@ -424,12 +434,11 @@ an owner's disable. The verdict is additionally bound to the marker at
 LOAD time: a `native_seed` review whose `.seed-origin` is gone reads back
 as pending (non-executable). The owner opt-out is
 `OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS=false`; the trust never extends to
-clawhub/external/self-authored skills. Honest caveat: "passed the repo
-commit gate" is hash-exact for packaged installs (sha-pinned
-`repo.bundle`); on a source-mode install the seed copies the current
-worktree bytes, and an owner-audited `skip_advisory_review` bypass commit
-could land seed bytes that skipped triad+scope — the bypass itself
-remains durably audited.
+clawhub/external/self-authored skills. Packaged installs bind native-seed
+trust to the SHA-pinned `repo.bundle`; source-mode installs copy current
+worktree bytes and therefore lack that packaged-byte provenance.
+`skip_advisory_review` changes only advisory coverage: repo triad and
+applicable scope review still run.
 
 Self-authored skills carry payload-local `.self_authored.json` and
 owner-state `data/state/skills/<skill>/self_authored.json` provenance,
