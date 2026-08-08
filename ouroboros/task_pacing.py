@@ -344,6 +344,36 @@ _WRAPUP_CALL_RESERVATION_BOUND_USD = 1.50
 COST_PLANNING_MARGIN_USD = max(1.0, 2.0 * _WRAPUP_CALL_RESERVATION_BOUND_USD)
 
 
+# Deciding-spend basis vocabulary (v6.91). The tree-accounted number is the
+# authority whenever a root cap exists (the ledger fence counts the TREE); when
+# it is momentarily unavailable the own-cost number still decides — but the
+# substitution is DISCLOSED, never silent (BIBLE P1: represent the gap). Without
+# a root cap there is no tree fence at all, so own cost is complete, not a
+# fallback — the three states are kept distinct for exactly that reason.
+SPEND_BASIS_TREE = "tree_accounted"
+SPEND_BASIS_OWN_TREE_UNKNOWN = "own_fallback_tree_unknown"
+SPEND_BASIS_OWN_NO_TREE_CAP = "own_only_no_tree_cap"
+
+
+def resolve_deciding_spend(
+    *,
+    tree_cost_usd: Optional[float],
+    task_cost_usd: Optional[float],
+    root_cap_usd: Optional[float],
+) -> Tuple[Optional[float], str]:
+    """The spend that decides a cost surface, plus its DISCLOSED basis (SSOT).
+
+    Shared by the loop's ceiling check and the milestone note so the stop and
+    the nudge can never disagree about which number they are reading. Unknown
+    spend stays None end-to-end — it is never coerced to $0."""
+    if tree_cost_usd is not None:
+        return float(tree_cost_usd), SPEND_BASIS_TREE
+    deciding = None if task_cost_usd is None else float(task_cost_usd)
+    if root_cap_usd is not None:
+        return deciding, SPEND_BASIS_OWN_TREE_UNKNOWN
+    return deciding, SPEND_BASIS_OWN_NO_TREE_CAP
+
+
 @dataclass(frozen=True)
 class CostCeiling:
     """Typed in-task cost-stop state, resolved ONCE at loop start.
@@ -440,6 +470,7 @@ def build_cost_budget_note(
     cost_ceiling_usd: Optional[float],
     task_cost: Optional[float],
     tree_cost_usd: Optional[float] = None,
+    root_cap_usd: Optional[float] = None,
 ) -> Optional[PacingNote]:
     """Cost milestone note at 50/25/10% of the in-task cost budget remaining,
     plus a one-shot wrap-up note at ~80% spent. Fires only on crossings (never
@@ -456,12 +487,16 @@ def build_cost_budget_note(
     is the DECIDING spend, because the ledger fence counts the tree, not this
     task's own calls (waves died at tree $84-94 while own showed $41-49).
     ``task_cost`` (own accumulated cost) stays the diagnostic line. Unknown tree
-    spend falls back to own cost and is never coerced to $0."""
+    spend falls back to own cost — never coerced to $0, and never SILENTLY
+    substituted: under a ``root_cap_usd`` the fallback is a lower bound and the
+    note says so (basis vocabulary in ``resolve_deciding_spend``)."""
     base = cost_ceiling_usd if cost_ceiling_usd is not None else start_remaining_usd
-    deciding = tree_cost_usd if tree_cost_usd is not None else task_cost
+    deciding, spend_basis = resolve_deciding_spend(
+        tree_cost_usd=tree_cost_usd, task_cost_usd=task_cost, root_cap_usd=root_cap_usd,
+    )
     if base is None or base <= 0 or deciding is None:
         return None
-    tree_basis = tree_cost_usd is not None
+    tree_basis = spend_basis == SPEND_BASIS_TREE
     spent_fraction = max(0.0, float(deciding)) / base
     fraction_remaining = max(0.0, 1.0 - spent_fraction)
     seen = getattr(ctx, "_cost_budget_milestones_seen", None)
@@ -477,6 +512,12 @@ def build_cost_budget_note(
         spent_line = (
             f"Spent this task tree: ~${deciding:.2f} "
             f"(ledger-accounted incl. in-flight holds, subagents included{own_text})"
+        )
+    elif spend_basis == SPEND_BASIS_OWN_TREE_UNKNOWN:
+        spent_line = (
+            f"Spent this task: ~${deciding:.2f} (OWN calls only — the tree-accounted "
+            "total is unavailable right now, so subagent spend is NOT included; treat "
+            "this as a lower bound against the tree cap)"
         )
     else:
         spent_line = f"Spent this task: ~${deciding:.2f}"
@@ -510,9 +551,11 @@ def build_cost_budget_note(
             "task_cost_usd": round(float(deciding), 4),
             "base_usd": round(float(base), 4),
             "hard_stop": hard_stop,
+            # Always present: a reader must be able to tell a tree number from an
+            # own-cost stand-in without inferring it from a missing key.
+            "spend_basis": spend_basis,
         }
         if tree_basis:
-            checkpoint["spend_basis"] = "tree_accounted"
             checkpoint["own_cost_usd"] = round(float(task_cost), 4) if task_cost is not None else None
         return PacingNote(text=text, checkpoint=checkpoint)
     if spent_fraction >= _COST_WRAPUP_SPENT_FRACTION and not getattr(ctx, "_cost_wrapup_seen", False):
@@ -524,10 +567,15 @@ def build_cost_budget_note(
             if _protocol_marker_phrases(ctx) else ""
         )
         _tree_tail = _TREE_FLUSH_SENTENCE if _workspace_delivery(ctx) else ""
-        _tree_amount = (
-            f"tree-accounted ~${deciding:.2f} of ~${base:.2f}"
-            if tree_basis else f"~${deciding:.2f} of ~${base:.2f}"
-        )
+        if tree_basis:
+            _tree_amount = f"tree-accounted ~${deciding:.2f} of ~${base:.2f}"
+        elif spend_basis == SPEND_BASIS_OWN_TREE_UNKNOWN:
+            _tree_amount = (
+                f"~${deciding:.2f} of ~${base:.2f}, counting OWN calls only — the "
+                "tree-accounted total is unavailable right now, so this is a lower bound"
+            )
+        else:
+            _tree_amount = f"~${deciding:.2f} of ~${base:.2f}"
         text = (
             f"[COST BUDGET — wrap-up]\n"
             f"~{spent_fraction * 100:.0f}% of the {base_kind} is spent "
@@ -540,9 +588,9 @@ def build_cost_budget_note(
             "task_cost_usd": round(float(deciding), 4),
             "base_usd": round(float(base), 4),
             "hard_stop": hard_stop,
+            "spend_basis": spend_basis,
         }
         if tree_basis:
-            checkpoint["spend_basis"] = "tree_accounted"
             checkpoint["own_cost_usd"] = round(float(task_cost), 4) if task_cost is not None else None
         return PacingNote(text=text, checkpoint=checkpoint)
     return None

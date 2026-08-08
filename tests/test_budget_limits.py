@@ -104,9 +104,12 @@ class TestPerTaskSoftNoteRetired:
 class TestGlobalBudgetGuard:
     """Existing global budget percentage checks."""
 
-    def test_none_budget_returns_none(self, tmp_path):
-        """No budget → no checks."""
+    def test_no_global_budget_and_no_root_cap_is_silent(self, tmp_path):
+        """Neither axis finite (GAIA shape, no per-task cap) → the whole cost
+        axis stays silent. Note this is decided by the DISABLED ceiling, not by
+        an early return on the global number — see the root-cap test below."""
         args = _make_args(budget_remaining_usd=None, accumulated_usage={"cost": 100.0}, drive_logs=tmp_path)
+        assert args["cost_ceiling"].state == task_pacing.COST_CEILING_DISABLED
         result = _check_budget_limits(**args)
         assert result is None
 
@@ -411,21 +414,85 @@ class TestTreeFedDecidingValue:
 
     def test_unknown_tree_falls_back_to_own_cost_never_zero(self, tmp_path):
         """No telemetry for this tree → the deciding value falls back to own
-        cost (a real number), never a coerced $0 that would disable the stop."""
+        cost (a real number), never a coerced $0 that would disable the stop.
+
+        No root cap here, so own cost is the COMPLETE picture (there is no tree
+        fence at all) and the basis says exactly that."""
         llm = MagicMock()
         llm.chat.return_value = ({"content": "done"}, {"prompt_tokens": 1, "completion_tokens": 1})
         ceiling = task_pacing.resolve_cost_ceiling(
             10.0, normalize_budget_profile(None),
         )
+        usage = {"cost": 6.0}  # own over the $5 ceiling
         args = _make_args(
             budget_remaining_usd=10.0,
-            accumulated_usage={"cost": 6.0},  # own over the $5 ceiling
+            accumulated_usage=usage,
             cost_ceiling=ceiling,
             llm=llm,
             drive_logs=tmp_path,
         )
         result = _check_budget_limits(**args)
         assert result is not None
+        assert usage["cost_stop_spend_basis"] == task_pacing.SPEND_BASIS_OWN_NO_TREE_CAP
+
+    def test_unknown_tree_under_a_root_cap_is_disclosed_not_silent(self, tmp_path):
+        """A root cap exists but the tree number is unavailable this round: the
+        stop still fires on own cost (a usable lower bound), and BOTH the text
+        and the usage record say the substitution happened (BIBLE P1) instead of
+        presenting an own-cost number as if it were the tree."""
+        llm = MagicMock()
+        llm.chat.return_value = ({"content": "done"}, {"prompt_tokens": 1, "completion_tokens": 1})
+        ceiling = task_pacing.resolve_cost_ceiling(
+            1900.0, normalize_budget_profile(None), root_cap_usd=10.0,
+        )
+        assert ceiling.state == task_pacing.COST_CEILING_ACTIVE
+        usage = {"cost": 9.0}  # over the $10 − margin ceiling
+        args = _make_args(
+            budget_remaining_usd=1900.0,
+            accumulated_usage=usage,
+            cost_ceiling=ceiling,
+            llm=llm,
+            drive_logs=tmp_path,
+        )
+        # No stash for this root id → tree spend genuinely unknown.
+        with self._scoped("root-tree-unknown", 10.0):
+            result = _check_budget_limits(**args)
+        assert result is not None
+        _text, out_usage, _ = result
+        assert out_usage["cost_stop_spend_basis"] == task_pacing.SPEND_BASIS_OWN_TREE_UNKNOWN
+        # The wrap-up prompt the agent actually receives states the basis.
+        prompt_text = "\n".join(
+            str(m.get("content") or "") for m in args["ctx"].messages if isinstance(m, dict)
+        )
+        assert "lower bound" in prompt_text and "OWN calls" in prompt_text
+
+    def test_root_cap_ceiling_fires_without_any_global_budget(self, tmp_path):
+        """The closed class (v6.91 audit): TOTAL_BUDGET unset makes
+        ``budget_remaining_usd`` None, but a live per-task ROOT CAP must still
+        stop the task. The pre-fix guard returned None before ever looking at
+        the ceiling, so a GAIA-shaped run could never soft-land."""
+        from ouroboros import usage_accounting
+
+        llm = MagicMock()
+        llm.chat.return_value = ({"content": "done"}, {"prompt_tokens": 1, "completion_tokens": 1})
+        ceiling = task_pacing.resolve_cost_ceiling(
+            None, normalize_budget_profile(None), root_cap_usd=100.0,
+        )
+        assert ceiling.state == task_pacing.COST_CEILING_ACTIVE
+        args = _make_args(
+            budget_remaining_usd=None,
+            accumulated_usage={"cost": 41.0},
+            cost_ceiling=ceiling,
+            llm=llm,
+            drive_logs=tmp_path,
+        )
+        with self._scoped("root-tree-noglobal", 100.0):
+            usage_accounting._stash_root_accounting("root-tree-noglobal", 98.5, 100.0)
+            result = _check_budget_limits(**args)
+        assert result is not None
+        _text, usage, _ = result
+        assert usage.get("reason_code") == "budget_exhausted"
+        assert usage["cost_stop_spend_basis"] == task_pacing.SPEND_BASIS_TREE
 
 
 class TestRootAccountingTelemetry:
@@ -566,10 +633,54 @@ class TestCostMilestones:
         ) is None
 
     def test_unknown_tree_cost_falls_back_to_own(self):
+        """No root cap → own cost is complete, not a stand-in; the basis is
+        still recorded so a reader never has to infer it from a missing key."""
         ctx = SimpleNamespace()
         note = task_pacing.build_cost_budget_note(
             ctx, start_remaining_usd=20.0, cost_ceiling_usd=10.0,
             task_cost=5.1, tree_cost_usd=None,
         )
         assert note is not None and "Spent this task: ~$5.10" in note.text
-        assert "spend_basis" not in note.checkpoint
+        assert "lower bound" not in note.text
+        assert note.checkpoint["spend_basis"] == task_pacing.SPEND_BASIS_OWN_NO_TREE_CAP
+
+    def test_unknown_tree_cost_under_a_root_cap_is_disclosed(self):
+        """Under a tree cap the own-cost fallback is a LOWER BOUND — say so in
+        the note and in the checkpoint instead of substituting silently."""
+        ctx = SimpleNamespace()
+        note = task_pacing.build_cost_budget_note(
+            ctx, start_remaining_usd=20.0, cost_ceiling_usd=10.0,
+            task_cost=5.1, tree_cost_usd=None, root_cap_usd=13.0,
+        )
+        assert note is not None
+        assert "OWN calls only" in note.text and "lower bound" in note.text
+        assert note.checkpoint["spend_basis"] == task_pacing.SPEND_BASIS_OWN_TREE_UNKNOWN
+
+    def test_wrapup_note_discloses_the_own_cost_fallback(self):
+        """Same disclosure on the ~80% wrap-up note (its own text path)."""
+        ctx = SimpleNamespace()
+        note = task_pacing.build_cost_budget_note(
+            ctx, start_remaining_usd=20.0, cost_ceiling_usd=10.0,
+            task_cost=8.5, tree_cost_usd=None, root_cap_usd=13.0,
+        )
+        # 15% remaining crosses the 25% milestone first; latch it and re-ask.
+        assert note is not None and note.checkpoint["checkpoint_kind"] == "cost_budget_milestone"
+        assert note.checkpoint["spend_basis"] == task_pacing.SPEND_BASIS_OWN_TREE_UNKNOWN
+        fresh = SimpleNamespace()
+        fresh._cost_budget_milestones_seen = {"50%", "25%", "10%"}
+        wrapup = task_pacing.build_cost_budget_note(
+            fresh, start_remaining_usd=20.0, cost_ceiling_usd=10.0,
+            task_cost=8.5, tree_cost_usd=None, root_cap_usd=13.0,
+        )
+        assert wrapup is not None and wrapup.checkpoint["checkpoint_kind"] == "cost_budget_wrapup"
+        assert "lower bound" in wrapup.text
+        assert wrapup.checkpoint["spend_basis"] == task_pacing.SPEND_BASIS_OWN_TREE_UNKNOWN
+
+    def test_resolve_deciding_spend_keeps_unknown_unknown(self):
+        """Unknown spend stays None end-to-end — never a confident $0."""
+        assert task_pacing.resolve_deciding_spend(
+            tree_cost_usd=None, task_cost_usd=None, root_cap_usd=100.0,
+        ) == (None, task_pacing.SPEND_BASIS_OWN_TREE_UNKNOWN)
+        assert task_pacing.resolve_deciding_spend(
+            tree_cost_usd=7.0, task_cost_usd=3.0, root_cap_usd=None,
+        ) == (7.0, task_pacing.SPEND_BASIS_TREE)

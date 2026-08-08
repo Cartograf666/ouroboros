@@ -353,15 +353,18 @@ def _check_budget_limits(
     here; ``exhausted_soft_land`` fires at the top of the round in the loop.
     The deciding spend is the root subtree's ledger-accounted number when a
     root cap exists (the fence counts the TREE, not own calls); own cost is
-    the fallback and the diagnostic. Unknown spend never becomes $0."""
-    if budget_remaining_usd is None:
-        return None
+    the DISCLOSED fallback and the diagnostic. Unknown spend never becomes $0.
 
+    The two axes are INDEPENDENT (v6.91 fix): ``budget_remaining_usd`` None
+    means only that no finite GLOBAL budget exists (TOTAL_BUDGET unset — the
+    GAIA-shaped run), which must not silence a live per-task ROOT CAP. A task
+    with neither a global budget nor a root cap resolves to a ``disabled``
+    ceiling and the whole cost axis stays silent, as before."""
     accumulated_usage = ctx.accumulated_usage
     raw_task_cost = accumulated_usage.get("cost")
     task_cost = float(raw_task_cost) if raw_task_cost is not None else None
 
-    if budget_remaining_usd <= 0:
+    if budget_remaining_usd is not None and budget_remaining_usd <= 0:
         finish_reason = "🚫 Task rejected. Total budget exhausted. Please increase TOTAL_BUDGET in settings."
         accumulated_usage["execution_status"] = "failed"
         accumulated_usage["reason_code"] = "budget_exhausted"
@@ -397,19 +400,30 @@ def _check_budget_limits(
         return None
     tree_info = _loop_tree_accounting(refresh=False)
     tree_cost = tree_info.get("accounted_usd") if isinstance(tree_info, dict) else None
-    deciding = tree_cost if tree_cost is not None else task_cost
+    deciding, spend_basis = task_pacing.resolve_deciding_spend(
+        tree_cost_usd=tree_cost,
+        task_cost_usd=task_cost,
+        root_cap_usd=cost_ceiling.root_cap_usd,
+    )
     ceiling_usd = cost_ceiling.ceiling_usd
     if deciding is not None and ceiling_usd is not None and deciding > ceiling_usd:
-        spent_text = (
-            f"Task tree spent ${deciding:.3f} (ledger-accounted incl. in-flight holds, "
-            f"subagents included; own calls ${task_cost:.3f})"
-            if tree_cost is not None and task_cost is not None
-            else (
-                f"Task tree spent ${deciding:.3f} (ledger-accounted incl. in-flight holds)"
-                if tree_cost is not None
-                else f"Task spent ${deciding:.3f}"
+        if spend_basis == task_pacing.SPEND_BASIS_TREE:
+            spent_text = (
+                f"Task tree spent ${deciding:.3f} (ledger-accounted incl. in-flight holds, "
+                f"subagents included; own calls ${task_cost:.3f})"
+                if task_cost is not None
+                else f"Task tree spent ${deciding:.3f} (ledger-accounted incl. in-flight holds)"
             )
-        )
+        elif spend_basis == task_pacing.SPEND_BASIS_OWN_TREE_UNKNOWN:
+            # Stopping on a disclosed lower bound beats not stopping at all, but
+            # the substitution is stated, never silent (BIBLE P1).
+            spent_text = (
+                f"Task spent ${deciding:.3f} on its OWN calls (the tree-accounted total "
+                "is unavailable right now, so subagent spend is not included — this is a "
+                "lower bound)"
+            )
+        else:
+            spent_text = f"Task spent ${deciding:.3f}"
         cap_text = (
             f"; the hard tree cap is ${cost_ceiling.root_cap_usd:.2f}"
             if cost_ceiling.root_cap_usd is not None else ""
@@ -418,6 +432,9 @@ def _check_budget_limits(
             f"{spent_text}, over the in-task cost ceiling ${ceiling_usd:.2f}{cap_text}. "
             "Budget exhausted."
         )
+        # The basis rides the usage record too, so a later reader can tell a
+        # tree-decided stop from an own-cost stand-in without parsing prose.
+        accumulated_usage["cost_stop_spend_basis"] = spend_basis
         return _forced_final_answer(
             ctx,
             prompt=(
@@ -2975,6 +2992,9 @@ def _maybe_inject_cost_budget_milestone(
         cost_ceiling_usd=ceiling_usd,
         task_cost=(accumulated_usage or {}).get("cost"),
         tree_cost_usd=tree_cost,
+        # Whether a tree cap exists at all decides if own cost is the complete
+        # picture or a disclosed lower bound (task_pacing.resolve_deciding_spend).
+        root_cap_usd=(cost_ceiling.root_cap_usd if cost_ceiling is not None else None),
     )
     if note is None:
         return False
