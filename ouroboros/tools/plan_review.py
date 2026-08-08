@@ -1373,6 +1373,16 @@ async def _run_plan_review_async(
         except (OSError, TimeoutError, ValueError) as exc:
             return f"ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: {exc}"
         return _plan_deadline_skip(ctx, emit=True) or deadline_skip
+    # #116: a malformed structured reviewer-slot config must refuse loudly here
+    # instead of running the panel on the silently projected default models.
+    from ouroboros.reviewer_slot_config import reviewer_slot_config_error
+
+    if err := reviewer_slot_config_error():
+        return _plan_unavailable(
+            ctx,
+            f"ERROR: Invalid reviewer-slot configuration blocks plan review — {err}. "
+            "Fix Reviewer Slots in Settings.",
+            "reviewer_slot_config_invalid")
     if not list(_cfg.get_review_models() or []):
         return _plan_unavailable(
             ctx, "ERROR: No review models configured. Set OUROBOROS_REVIEW_MODELS in settings.",

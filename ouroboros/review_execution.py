@@ -772,11 +772,17 @@ def run_delegated_review_session(
         ClaudexorSubscriptionWindowExhausted, ClaudexorUnavailable,
     )
     from ouroboros.subagents import DelegationRoute, delegated_run_shape, route_health
+    from ouroboros.usage_accounting import current_usage_scope
 
     task_id, surface, slot_id = invocation.task_id, invocation.surface, invocation.slot_id
     timeout_sec, logical_key_extra = invocation.timeout_sec, invocation.logical_key_extra
     output_schema, session_route = invocation.output_schema, invocation.session_route
     instructions, retry_state = invocation.instructions, invocation.retry_state
+    # #112: task-tree lineage for BOTH custody writers, captured once from the
+    # ambient scope; empty when unbound — settlement owns the task_id fallback.
+    _scope = current_usage_scope()
+    root_task_id = str(getattr(_scope, "root_task_id", "") or "")
+    parent_task_id = str(getattr(_scope, "parent_task_id", "") or "")
     shape = delegated_run_shape(False)  # a reviewer reads and answers
     state = retry_state if retry_state is not None else {}
     run_id, run_request, invocation_id = "", None, ""
@@ -894,6 +900,9 @@ def run_delegated_review_session(
                 max_seconds=seconds, request=run_request, project_id=project_id,
                 project_owned=not existing_project, route=route.route_id,
                 surface=surface, slot_id=slot_id,
+                # #112: the request row's lineage is what pending-invocation
+                # recovery replays onto a run this worker never bound.
+                root_task_id=root_task_id, parent_task_id=parent_task_id,
             )
             if not requested:
                 # The POST is CONDITIONAL on the durable request row: a run
@@ -953,6 +962,7 @@ def run_delegated_review_session(
             run_id=run_id, task_id=task_id,
             route_id=route.route_id, model=str(route.model or ""),
             project_id=project_id, project_owned=not existing_project,
+            root_task_id=root_task_id, parent_task_id=parent_task_id,
             ledger_root=str(custody_drive), idempotency_key=key,
             invocation_id=invocation_id or retry_token,
         )
