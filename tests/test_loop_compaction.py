@@ -239,6 +239,51 @@ def test_emergency_compaction_necessity_counts_tool_schemas(monkeypatch, tmp_pat
     assert ("checkpoint", "emergency_context_size") in calls
 
 
+def test_emergency_compaction_arms_when_nothing_is_compactable(monkeypatch, tmp_path):
+    """A frozen frame over the trigger with UNDER two tool rounds: the compactor
+    structurally no-ops (`len(spans) <= keep_recent`), so running it bought nothing
+    and wrote a forensic checkpoint every round. It must arm the hysteresis instead
+    — and the arm has to hold with an EMPTY compactable region, where a 20%-growth
+    test on zero never suppresses."""
+    from ouroboros import context_fit, loop
+    from ouroboros.context_budget import COMPACTION_HYSTERESIS_ROUNDS
+
+    calls, progress, events = [], [], []
+    monkeypatch.setattr(
+        loop, "_persist_compaction_checkpoint",
+        lambda m, **k: calls.append("checkpoint") or True,
+    )
+    monkeypatch.setattr(
+        loop, "compact_tool_history_llm",
+        lambda m, keep_recent, **k: (calls.append("compact") or (m, None)),
+    )
+    monkeypatch.setattr(loop, "_emit_checkpoint_event", lambda _q, _t, _l, row: events.append(row))
+    monkeypatch.setattr(context_fit, "main_loop_token_density", lambda _dr, _m: 1.0)
+    # A low-mode frozen frame (~630K chars) is already over the 400K trigger in the
+    # task's FIRST rounds, before any tool round exists.
+    monkeypatch.setattr(loop, "_estimate_messages_chars", lambda _m: 630_000)
+
+    state = {}
+    frame = [{"role": "system", "content": "frame"}, {"role": "user", "content": "go"}]
+
+    def _ctx(round_idx):
+        return loop._CompactionRoundContext(
+            tools=SimpleNamespace(_ctx=SimpleNamespace(_pending_compaction=None, _accumulated_usage=state)),
+            drive_root=tmp_path, drive_logs=tmp_path / "logs", task_id="task-nc",
+            round_idx=round_idx, event_queue=None, active_use_local=False,
+            active_context_mode="low", checkpoint_injected=True,
+            emit_progress=progress.append,
+        )
+
+    for rnd in range(1, COMPACTION_HYSTERESIS_ROUNDS):
+        loop._run_round_compaction(frame, _ctx(rnd))
+
+    assert calls == []  # no summarizer call, no forensic checkpoint churn
+    assert len(progress) == 1  # disclosed exactly once, not per round
+    assert state["_compaction_hysteresis"] == {"round": 1, "region_chars": 0}
+    assert [e["reason"] for e in events] == ["nothing_compactable"]
+
+
 def test_emergency_compaction_hysteresis_suppresses_futile_refire(monkeypatch, tmp_path):
     """UTILITY/rearm: a pass that could not get below the trigger arms a
     hysteresis — no per-round refire (no light-model call, no cache-destroying
@@ -287,7 +332,7 @@ def test_emergency_compaction_hysteresis_suppresses_futile_refire(monkeypatch, t
     loop._run_round_compaction(_messages(10), _ctx(3))
     assert calls == ["checkpoint", "compact"]
     assert "_compaction_hysteresis" in state
-    assert any("futile" in p for p in progress)
+    assert any("cannot help" in p and "frozen frame" in p for p in progress)
 
     # Same region, next round: suppressed (no checkpoint, no light-model call).
     calls.clear()

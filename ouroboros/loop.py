@@ -3116,6 +3116,48 @@ def _drain_incoming_messages(
     return controls
 
 
+def _arm_compaction_hysteresis(
+    ctx: _CompactionRoundContext,
+    usage_state: Dict[str, Any],
+    pressure_real_tokens: float,
+    threshold_real_tokens: float,
+    region_chars: int,
+    schema_tokens: int,
+    density: float,
+    *,
+    reason: str = "nothing_compactable",
+) -> None:
+    """Suppress emergency compaction until the COMPACTABLE region can help again.
+
+    Two ways a pass fails to earn its cost, both armed here so the disclosure is
+    identical: it ran and could not bring total pressure under the trigger
+    (``emergency_pass_futile``), or the transcript holds under two tool rounds so
+    the compactor would structurally no-op (``nothing_compactable``). One loud
+    line plus a typed checkpoint event, then silence until the region grows or
+    the round window passes — never a silent stop (BIBLE P1).
+    """
+    usage_state["_compaction_hysteresis"] = {"round": ctx.round_idx, "region_chars": region_chars}
+    ctx.emit_progress(
+        "⚠️ Emergency compaction cannot help: calibrated context "
+        f"≈{pressure_real_tokens / 1000:.0f}K real tokens exceeds the "
+        f"≈{threshold_real_tokens / 1000:.0f}K trigger, but the frozen frame (system "
+        "blocks + tool schemas) is what carries it and cannot be compacted. Further "
+        f"passes suppressed until the compactable transcript grows "
+        f"≥{COMPACTION_HYSTERESIS_REGION_GROWTH:.1f}x or "
+        f"{COMPACTION_HYSTERESIS_ROUNDS} rounds pass."
+    )
+    _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+        "checkpoint_kind": "compaction_hysteresis_armed",
+        "round": ctx.round_idx,
+        "reason": reason,
+        "calibrated_real_tokens": int(pressure_real_tokens),
+        "threshold_real_tokens": int(threshold_real_tokens),
+        "compactable_region_chars": int(region_chars),
+        "tool_schema_tokens": int(schema_tokens),
+        "token_density": round(float(density), 3),
+    })
+
+
 def _run_round_compaction(
     messages: List[Dict[str, Any]],
     ctx: _CompactionRoundContext,
@@ -3193,8 +3235,14 @@ def _run_round_compaction(
         if isinstance(hysteresis, dict):
             armed_region = int(hysteresis.get("region_chars") or 0)
             armed_round = int(hysteresis.get("round") or 0)
+            # `armed_region + 1` is the floor that makes an EMPTY armed region
+            # behave: a 20%-growth test on zero is `0 < 0`, which never
+            # suppresses, so an over-threshold frame with nothing compactable
+            # re-fired every single round — the exact thrash this arm exists to
+            # stop, just with an empty transcript instead of a full one.
+            grow_to = max(armed_region * COMPACTION_HYSTERESIS_REGION_GROWTH, armed_region + 1)
             if (
-                region_chars < armed_region * COMPACTION_HYSTERESIS_REGION_GROWTH
+                region_chars < grow_to
                 and (ctx.round_idx - armed_round) < COMPACTION_HYSTERESIS_ROUNDS
             ):
                 return messages, None  # armed: a pass cannot help yet (disclosed once, on arming)
@@ -3206,6 +3254,17 @@ def _run_round_compaction(
         # clamp below the span count so even 2-6 huge rounds compact; with a
         # single round there is nothing older to summarize.
         span_count = len(spans)
+        if span_count < 2:
+            # Necessity is real, but the transcript holds at most ONE tool round:
+            # the compactor's `len(spans) <= keep_recent` gate makes the pass a
+            # structural no-op (keep_recent floors at 1). Running it anyway bought
+            # nothing and wrote a forensic checkpoint every round while the frozen
+            # frame alone sat over the trigger — a low-mode task can enter its
+            # first rounds already there. Arm the hysteresis instead: same
+            # disclosure, no per-round work.
+            _arm_compaction_hysteresis(ctx, usage_state, pressure_real_tokens,
+                                       threshold_real_tokens, region_chars, schema_tokens, density)
+            return messages, None
         emergency_keep_recent = min(50, max(6, span_count // 2), max(1, span_count - 1))
         if _persist_compaction_checkpoint(
             messages, drive_root=ctx.drive_root, drive_logs=ctx.drive_logs, task_id=ctx.task_id,
@@ -3222,28 +3281,9 @@ def _run_round_compaction(
             if after_real_tokens > threshold_real_tokens:
                 spans_after = _tool_round_spans(messages)
                 region_after = _estimate_messages_chars(messages[spans_after[0][0]:]) if spans_after else 0
-                usage_state["_compaction_hysteresis"] = {
-                    "round": ctx.round_idx,
-                    "region_chars": region_after,
-                }
-                ctx.emit_progress(
-                    "⚠️ Emergency compaction was futile: calibrated context "
-                    f"≈{after_real_tokens / 1000:.0f}K real tokens still exceeds the "
-                    f"≈{threshold_real_tokens / 1000:.0f}K trigger (the frozen frame cannot be "
-                    "compacted). Further passes suppressed until the compactable transcript "
-                    f"grows ≥{COMPACTION_HYSTERESIS_REGION_GROWTH:.1f}x or "
-                    f"{COMPACTION_HYSTERESIS_ROUNDS} rounds pass."
-                )
-                _emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
-                    "checkpoint_kind": "compaction_hysteresis_armed",
-                    "round": ctx.round_idx,
-                    "reason": "emergency_pass_futile",
-                    "calibrated_real_tokens": int(after_real_tokens),
-                    "threshold_real_tokens": int(threshold_real_tokens),
-                    "compactable_region_chars": region_after,
-                    "tool_schema_tokens": int(schema_tokens),
-                    "token_density": round(float(density), 3),
-                })
+                _arm_compaction_hysteresis(ctx, usage_state, after_real_tokens,
+                                           threshold_real_tokens, region_after, schema_tokens,
+                                           density, reason="emergency_pass_futile")
             return messages, usage
         ctx.emit_progress("⚠️ Emergency compaction skipped: forensic checkpoint could not be persisted.")
         return messages, None
