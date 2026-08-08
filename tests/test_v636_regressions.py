@@ -499,3 +499,55 @@ def test_vlm_project_store_guard_applies(tmp_path):
     payload, err = vision._load_local_image_payload(ctx, str(img))
     assert payload is None
     assert "ACCESS_DENIED" in err and "projects/<id>/" in err
+
+
+def test_vlm_split_drive_child_canonical_owner_state_blocked(tmp_path, monkeypatch):
+    """G5-3: a forked/empty subagent runs on an ISOLATED child drive, so its
+    ctx.drive_root ≠ the CANONICAL data root. ``_allowed_file_roots`` admits
+    ``<canonical>/state/skills`` off OUROBOROS_DATA_DIR, so a skill owner-state
+    file there passes root admission — but the SC-6 guard anchored ONLY on
+    ctx.drive_root (the child) let ``relative_to`` fail and the restricted-
+    subagent owner-control guard NEVER ran. read_file refuses that path; view_image
+    must too. The guard must anchor on every admitted runtime-data root."""
+    from ouroboros.tools import vision
+
+    canonical = tmp_path / "data"                 # the real/parent drive
+    child = canonical / "state" / "headless_tasks" / "t1" / "data"  # isolated child
+    child.mkdir(parents=True)
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(canonical))
+    owner_state = canonical / "state" / "skills" / "myskill" / "grants.json"
+    owner_state.parent.mkdir(parents=True)
+    # PNG bytes: WITHOUT the fix this file is admitted AND passes the MIME sniff,
+    # so a read-only child would receive the owner-control file's bytes as an image.
+    owner_state.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path / "repo",
+        drive_root=str(child),
+        budget_drive_root=str(canonical),
+        task_constraint={"mode": "local_readonly_subagent"},
+    )
+    payload, err = vision._load_local_image_payload(ctx, str(owner_state))
+    assert payload is None
+    assert "PATH_BLOCKED" in err and "secret or owner-control" in err
+
+
+def test_vlm_split_drive_child_canonical_job_artifact_admitted(tmp_path, monkeypatch):
+    """G5-3 companion: the widened guard-anchor set must NOT over-block. A
+    legitimate skill job output (a screenshot under state/skills/<name>/jobs/...)
+    on the canonical root stays admitted for an orchestrating profile — only the
+    secret/owner-control/project-store paths are refused."""
+    from ouroboros.tools import vision
+
+    import pathlib
+
+    canonical = tmp_path / "data"
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(canonical))
+    shot = canonical / "state" / "skills" / "myskill" / "jobs" / "run1" / "shot.png"
+    shot.parent.mkdir(parents=True)
+    shot.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    # Orchestrating profile (no subagent constraint) — drive_root == canonical.
+    ctx = SimpleNamespace(repo_dir=tmp_path / "repo", drive_root=str(canonical))
+    # Assert the shared parity gate itself is clean (empty = admitted); the later
+    # PIL decode of these placeholder bytes is out of scope for the guard.
+    assert vision._read_file_parity_block(ctx, pathlib.Path(str(shot)).resolve()) == ""
+    assert any(vision._path_is_under(pathlib.Path(str(shot)).resolve(), r) for r in vision._allowed_file_roots(ctx))

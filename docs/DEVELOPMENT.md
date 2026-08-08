@@ -1250,9 +1250,15 @@ Before every commit, verify the following:
   current unsaved wizard payload, UI diagnostics must account for that in-memory
   value instead of warning from stale saved settings alone.
 - Owner switches should expose the semantic choices the owner can actually make.
-  For `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`, Settings presents explicit On/Off;
-  the empty runtime-default state remains a backend/default behavior, not a third
-  owner-facing button.
+  For `OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`, Settings presents Off / Auto / On
+  (SC-4): Auto IS the unset, mode-derived state — it saves the empty value so
+  the surface-aware runtime-mode default keeps deciding. Unset displays as the
+  effective state where a binary label is truthful (advanced/pro = every surface
+  on = "On") and as "Auto" in light, where the surface-aware default
+  (`external_workspace`/`genesis` on, `self_worktree` off) makes both "On" and
+  "Off" false claims. The v6.22.1-era rule that the empty runtime-default must
+  not become a third owner-facing button was valid only while the unset default
+  was binary per mode; the v6.91 surface-aware light default obsoleted it.
 - One capability, one section. Delegation (`OUROBOROS_SUBAGENT_HARNESS`) and the
   write permission (`OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`) share Models → Subagents
   (`web/modules/subagents_settings.js`), beside Reviewer Slots: both answer "where

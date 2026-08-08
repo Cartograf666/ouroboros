@@ -413,36 +413,75 @@ def _read_file_parity_block(ctx: Any, fp: "pathlib.Path") -> str:
         restricted = bool(is_restricted_subagent_profile(ctx))
     except Exception:
         restricted = False
-    raw_drive = str(getattr(ctx, "drive_root", "") or "").strip()
-    if raw_drive:
+    # G5-3: anchor the per-path data guards on EVERY runtime-data root the
+    # admission (``_allowed_file_roots``) could have used, not on ctx.drive_root
+    # alone. ``_allowed_file_roots`` admits ``<canonical>/uploads`` and
+    # ``<canonical>/state/skills`` off ``OUROBOROS_DATA_DIR``, and canonical
+    # resources (installed skill payload state) resolve off ``budget_drive_root``
+    # via ``canonical_data_root``. A forked/empty subagent runs on an ISOLATED
+    # child drive, so its ctx.drive_root ≠ the canonical root; anchoring the
+    # guards on the child drive alone let a canonical-root path (owner skill
+    # state, per-project store) pass ROOT admission while ``relative_to`` failed
+    # and skipped the guards read_file enforces. Mirror the admission's anchor
+    # set so the guard cannot under-reach it. (De-duped; guard blocks under ANY
+    # anchor win — a legitimate uploads/job artifact still resolves clean.)
+    fp_resolved = _pl.Path(fp).resolve(strict=False)
+    data_roots: list["_pl.Path"] = []
+    _seen_roots: set[str] = set()
+
+    def _add_data_root(raw: Any) -> None:
+        text = str(raw or "").strip()
+        if not text:
+            return
         try:
-            data_root = _pl.Path(raw_drive).expanduser().resolve(strict=False)
-            rel = _pl.Path(fp).resolve(strict=False).relative_to(data_root).as_posix()
+            resolved_root = _pl.Path(text).expanduser().resolve(strict=False)
+        except Exception:
+            return
+        key = str(resolved_root)
+        if key not in _seen_roots:
+            _seen_roots.add(key)
+            data_roots.append(resolved_root)
+
+    _add_data_root(getattr(ctx, "drive_root", ""))
+    try:
+        from ouroboros.tool_access import canonical_data_root
+        _add_data_root(canonical_data_root(ctx))
+    except Exception:
+        pass
+    # Same OUROBOROS_DATA_DIR base ``_allowed_file_roots`` derives uploads /
+    # state-skills from, so a canonical admission root always has a matching guard
+    # anchor even when ctx carries no budget_drive_root.
+    _add_data_root(os.environ.get("OUROBOROS_DATA_DIR", "") or _pl.Path("~/Ouroboros/data").expanduser())
+
+    for data_root in data_roots:
+        try:
+            rel = fp_resolved.relative_to(data_root).as_posix()
         except Exception:
             rel = ""
-        if rel:
+        if not rel:
+            continue
+        try:
+            from ouroboros.project_facts import project_store_access_block
+            reason = project_store_access_block(rel)
+            if reason:
+                return str(reason)
+        except Exception:
+            pass
+        if restricted:
             try:
-                from ouroboros.project_facts import project_store_access_block
-                reason = project_store_access_block(rel)
-                if reason:
-                    return str(reason)
+                from ouroboros.tools.core import (
+                    _is_skill_owner_state_target,
+                    _is_subagent_secret_data_path,
+                    is_skill_owner_state_alias,
+                )
+                if (
+                    _is_subagent_secret_data_path(rel)
+                    or _is_skill_owner_state_target(fp, data_root)
+                    or is_skill_owner_state_alias(fp, data_root)
+                ):
+                    return "⚠️ PATH_BLOCKED: this subagent cannot access secret or owner-control data files."
             except Exception:
                 pass
-            if restricted:
-                try:
-                    from ouroboros.tools.core import (
-                        _is_skill_owner_state_target,
-                        _is_subagent_secret_data_path,
-                        is_skill_owner_state_alias,
-                    )
-                    if (
-                        _is_subagent_secret_data_path(rel)
-                        or _is_skill_owner_state_target(fp, data_root)
-                        or is_skill_owner_state_alias(fp, data_root)
-                    ):
-                        return "⚠️ PATH_BLOCKED: this subagent cannot access secret or owner-control data files."
-                except Exception:
-                    pass
     if restricted:
         try:
             from ouroboros.tools.core import _is_subagent_secret_repo_target

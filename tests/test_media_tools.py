@@ -296,3 +296,30 @@ def test_media_restricted_subagent_secret_data_path_blocked(tmp_path):
     fp, err = _resolve_local_file(ctx, str(doc), max_bytes=10**7)
     assert fp is None
     assert "PATH_BLOCKED" in err and "secret or owner-control" in err
+
+
+def test_media_split_drive_child_canonical_owner_state_blocked(tmp_path, monkeypatch):
+    """G5-3: media (ocr_pdf/extract_video_frames) shares _read_file_parity_block,
+    so it must refuse a canonical-root owner-control path for a forked child whose
+    ctx.drive_root is the ISOLATED child drive — the guard can't be anchored on
+    the child drive alone or the canonical <canonical>/state/skills admission
+    (via _allowed_file_roots) skips it."""
+    from types import SimpleNamespace
+    from ouroboros.tools.media import _resolve_local_file
+
+    canonical = tmp_path / "data"
+    child = canonical / "state" / "headless_tasks" / "t1" / "data"
+    child.mkdir(parents=True)
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(canonical))
+    owner_state = canonical / "state" / "skills" / "myskill" / "grants.json"
+    owner_state.parent.mkdir(parents=True)
+    owner_state.write_bytes(b"%PDF-1.4 fake")
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path / "repo",
+        drive_root=str(child),
+        budget_drive_root=str(canonical),
+        task_constraint={"mode": "local_readonly_subagent"},
+    )
+    fp, err = _resolve_local_file(ctx, str(owner_state), max_bytes=10**7)
+    assert fp is None
+    assert "PATH_BLOCKED" in err and "secret or owner-control" in err

@@ -82,7 +82,7 @@ def test_settings_scope_review_effort_round_trips():
 
 def test_settings_mutative_subagents_toggle_round_trips():
     """The owner-facing master switch for mutative ("acting") subagents must exist
-    as an explicit On/Off control wired through the
+    as an owner-facing Off/Auto/On control wired through the
     settings load/save path, not only as a settings.json/env key.
 
     The CARRIER moved: the write permission now sits inside the Subagents section
