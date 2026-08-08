@@ -136,7 +136,7 @@ def test_api_state_money_and_call_count_are_ledger_projections(tmp_path, monkeyp
     monkeypatch.setattr(workers, "WORKERS", {})
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
-    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda: {})
+    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda **_kwargs: {})
     app = types.SimpleNamespace(state=types.SimpleNamespace(
         drive_root=root,
         app_start=0.0,
@@ -190,6 +190,54 @@ def test_cost_breakdown_fails_loudly_when_authoritative_history_is_corrupt(tmp_p
     assert "total_cost" not in payload
 
 
+def test_api_state_passes_projection_only_when_roots_match_and_computation_succeeded(
+    tmp_path, monkeypatch,
+):
+    """De-triplication seam pin: the snapshot receives this request's projection
+    exactly when the request root IS the supervisor root and accounting
+    computed; a foreign root or a failed computation passes NOTHING, so the
+    snapshot's own strict attempt keeps owning the paused-evolution disclosure."""
+    from ouroboros.gateway.state import api_state
+    from supervisor import queue, state, workers
+
+    root = _data_root(tmp_path, monkeypatch)
+    _seed_accounting(root)
+    monkeypatch.setattr(state, "TOTAL_BUDGET_LIMIT", 7.5)
+    monkeypatch.setattr(state, "load_state", lambda: {"current_branch": "ouroboros"})
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "PENDING", [])
+    monkeypatch.setattr(workers, "RUNNING", {})
+    captured: list = []
+    monkeypatch.setattr(
+        queue, "get_evolution_status_snapshot",
+        lambda **kwargs: captured.append(kwargs) or {},
+    )
+
+    def _request():
+        return Request({
+            "type": "http", "method": "GET", "path": "/api/state", "headers": [],
+            "query_string": b"", "scheme": "http", "server": ("test", 80),
+            "client": ("test", 1),
+            "app": types.SimpleNamespace(
+                state=types.SimpleNamespace(drive_root=root, app_start=0.0),
+            ),
+        })
+
+    monkeypatch.setattr(state, "DRIVE_ROOT", str(root))
+    assert asyncio.run(api_state(_request())).status_code == 200
+    assert list(captured[-1]) == ["budget_projection"]
+    assert captured[-1]["budget_projection"]["limit_usd"] == 7.5
+
+    monkeypatch.setattr(state, "DRIVE_ROOT", str(tmp_path / "other-root"))
+    assert asyncio.run(api_state(_request())).status_code == 200
+    assert captured[-1] == {}
+
+    monkeypatch.setattr(state, "DRIVE_ROOT", str(root))
+    (root / ua.LEDGER_REL).write_text("not-json\n{}\n", encoding="utf-8")
+    assert asyncio.run(api_state(_request())).status_code == 200
+    assert captured[-1] == {}
+
+
 def test_api_state_marks_accounting_unavailable_without_legacy_zero(tmp_path, monkeypatch):
     from ouroboros.gateway.state import api_state
     from supervisor import queue, state, workers
@@ -203,7 +251,7 @@ def test_api_state_marks_accounting_unavailable_without_legacy_zero(tmp_path, mo
     monkeypatch.setattr(workers, "WORKERS", {})
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
-    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda: {})
+    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda **_kwargs: {})
     request = Request({
         "type": "http", "method": "GET", "path": "/api/state", "headers": [],
         "query_string": b"", "scheme": "http", "server": ("test", 80),

@@ -285,21 +285,40 @@ def refresh_budget_from_settings(settings: Dict[str, Any]) -> None:
         pass
 
 
-def budget_remaining(st: Dict[str, Any], *, strict: bool = False) -> float:
+def budget_remaining(
+    st: Dict[str, Any],
+    *,
+    strict: bool = False,
+    projection: Optional[Dict[str, Any]] = None,
+) -> float:
     """Return ledger-derived remaining budget in USD.
 
     ``state.json`` is only a compatibility projection.  A corrupt or
     unavailable monetary ledger fails closed while a configured limit is in
     force, so the supervisor cannot dispatch against stale counters.
+
+    ``projection`` is an optional pre-computed global usage projection (same
+    ``global_limit_usd`` and drive root as this function would use itself) so a
+    caller that already replayed the ledger — e.g. ``/api/state`` — does not
+    trigger a second replay. It is accepted only when its ``limit_usd`` equals
+    the limit this function reads itself (``round(max(0.0, total), 6)``, the
+    exact value ``usage_projection`` stamps); a mismatch — e.g. a settings
+    hot-reload between the caller's computation and this call, or a caller
+    passing a projection built for a different limit — falls through to
+    self-computation. Default ``None`` preserves the exact prior behavior,
+    including the strict fail-closed path.
     """
     total = float(TOTAL_BUDGET_LIMIT or 0.0)
     if total <= 0:
         return float('inf')
+    if projection is not None and projection.get("limit_usd") != round(max(0.0, total), 6):
+        projection = None
     try:
-        from ouroboros.usage_accounting import ensure_legacy_imported, usage_projection
+        if projection is None:
+            from ouroboros.usage_accounting import ensure_legacy_imported, usage_projection
 
-        ensure_legacy_imported(DRIVE_ROOT)
-        projection = usage_projection(DRIVE_ROOT, global_limit_usd=total)
+            ensure_legacy_imported(DRIVE_ROOT)
+            projection = usage_projection(DRIVE_ROOT, global_limit_usd=total)
         return float(projection.get("remaining_known_usd") or 0.0)
     except Exception:
         log.exception("Budget ledger unavailable; refusing new model dispatch")
