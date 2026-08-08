@@ -590,23 +590,16 @@ def _archive_segment_count(archive_dir: pathlib.Path, prefix: str) -> int:
         return 0
 
 
-def _assemble_history_response(
-    data_dir: pathlib.Path,
+def _make_thread_filter(
     thread_id: int,
-    n_human: int,
-    n_progress: int,
-) -> bytes:
-    """Assemble the complete /api/chat/history payload as serialized JSON bytes.
+    project_chat_ids: set,
+    project_source_refs: list,
+    bindings_by_task: Dict[str, int],
+):
+    """Build the per-request thread-filter closure (perf2 P3 decomposition).
 
-    perf2 P3: the WHOLE pipeline — project-context loads, both rotation-aware
-    log reads, both transform loops, quota slicing, the lineage floor/cap,
-    terminal-truth annotation, origin fallback, and the JSON encode — runs
-    synchronously inside the endpoint's single ``asyncio.to_thread`` call, so
-    none of it executes on the event loop.
-    """
-    project_chat_ids, project_source_refs, chat_annotations, bindings_by_task = (
-        _project_history_context(data_dir, thread_id)
-    )
+    Returns the ``row_matches_thread`` predicate shared by both stream readers
+    and both transform loops."""
 
     def _bound_project_chat(task_id: str, parent_task_id: str = "", root_task_id: str = "") -> int:
         # Resolve by LINEAGE (own binding -> parent -> root) so a subagent's rows
@@ -645,17 +638,29 @@ def _assemble_history_response(
             return bool(entry.get("is_progress")) or str(entry.get("type") or "") == "task_summary"
         return entry_chat not in project_chat_ids
 
-    combined: list = []
+    return _row_matches_thread
 
-    chat_path = data_dir / "logs" / "chat.jsonl"
-    archive_dir = data_dir / "archive"
+
+def _collect_chat_rows(
+    chat_path: pathlib.Path,
+    archive_dir: pathlib.Path,
+    n_human: int,
+    row_matches_thread,
+    chat_annotations: Dict[str, Any],
+) -> tuple[list, int]:
+    """Read + transform the chat stream.
+
+    Returns ``(rows, quota_row_count)`` — the transformed history records and
+    how many read entries satisfied the reader's quota predicate (feeds the
+    window-truncation metadata)."""
+    combined: list = []
     chat_quota_rows = 0
-    _chat_counts_toward_quota = _chat_quota_predicate(_row_matches_thread)
+    _chat_counts_toward_quota = _chat_quota_predicate(row_matches_thread)
     try:
         # Rotation-aware archive backfill lives in the module-level
         # _read_chat_history_entries helper (endpoint's thread filter threaded in).
         _chat_entries = _read_chat_history_entries(
-            chat_path, archive_dir, n_human, _row_matches_thread
+            chat_path, archive_dir, n_human, row_matches_thread
         )
         # Window accounting for the response's truncation metadata: how many
         # read rows satisfy the SAME quota predicate the reader stopped on.
@@ -670,7 +675,7 @@ def _assemble_history_response(
                 entry_chat = int(entry.get("chat_id", 1) or 1)
             except (TypeError, ValueError):
                 entry_chat = 1
-            if not _row_matches_thread(entry_chat, entry):
+            if not row_matches_thread(entry_chat, entry):
                 continue
             direction = str(entry.get("direction", "")).lower()
             role = {"in": "user", "out": "assistant", "system": "system"}.get(direction)
@@ -706,8 +711,18 @@ def _assemble_history_response(
             combined.append(rec)
     except Exception as exc:
         log.warning("Failed to read chat history: %s", exc)
+    return combined, chat_quota_rows
 
-    progress_path = data_dir / "logs" / "progress.jsonl"
+
+def _collect_progress_rows(
+    progress_path: pathlib.Path,
+    archive_dir: pathlib.Path,
+    n_progress: int,
+    row_matches_thread,
+) -> tuple[list, int]:
+    """Read + transform the progress stream.
+
+    Returns ``(rows, quota_row_count)`` (mirror of ``_collect_chat_rows``)."""
 
     def _progress_counts_toward_quota(entry) -> bool:
         # A row satisfies the n_progress quota only if it survives the render
@@ -723,7 +738,7 @@ def _assemble_history_response(
             entry_chat = int(entry.get("chat_id", 1) or 1)
         except (TypeError, ValueError):
             entry_chat = 1
-        if not _row_matches_thread(entry_chat, {"is_progress": True, **entry}):
+        if not row_matches_thread(entry_chat, {"is_progress": True, **entry}):
             return False
         if not str(entry.get("content", entry.get("text", ""))):
             return False
@@ -731,6 +746,7 @@ def _assemble_history_response(
             return False
         return True
 
+    combined: list = []
     progress_quota_rows = 0
     try:
         _progress_entries = _read_progress_history_entries(
@@ -750,7 +766,7 @@ def _assemble_history_response(
                 entry_chat = int(entry.get("chat_id", 1) or 1)
             except (TypeError, ValueError):
                 entry_chat = 1
-            if not _row_matches_thread(entry_chat, {"is_progress": True, **entry}):
+            if not row_matches_thread(entry_chat, {"is_progress": True, **entry}):
                 continue
             text = str(entry.get("content", entry.get("text", "")))
             if not text:
@@ -771,7 +787,12 @@ def _assemble_history_response(
             combined.append(rec)
     except Exception as exc:
         log.warning("Failed to read progress log: %s", exc)
+    return combined, progress_quota_rows
 
+
+def _active_lifecycle_row() -> Optional[Dict[str, Any]]:
+    """Synthesize the virtual progress row for an in-flight skill-lifecycle
+    operation (or ``None`` when nothing is running)."""
     try:
         from ouroboros.skill_lifecycle_queue import queue_snapshot
 
@@ -785,7 +806,7 @@ def _assemble_history_response(
             )
             lifecycle = dict(active)
             lifecycle["phase"] = label
-            combined.append({
+            return {
                 "text": text,
                 "role": "assistant",
                 "ts": utc_now_iso(),
@@ -794,10 +815,25 @@ def _assemble_history_response(
                 "task_id": str(active.get("chat_task_id") or ""),
                 "lifecycle": lifecycle,
                 "lifecycle_virtual": True,
-            })
+            }
     except Exception as exc:
         log.debug("Failed to synthesize active lifecycle history: %s", exc)
+    return None
 
+
+def _apply_window_quotas(
+    data_dir: pathlib.Path,
+    thread_id: int,
+    project_chat_ids: set,
+    combined: list,
+    n_human: int,
+    n_progress: int,
+) -> tuple[list, Dict[str, Dict[str, Any]], bool, bool]:
+    """Quota slicing, origin fallback, and the lineage floor/cap (perf2 P3).
+
+    Returns ``(messages, result_cache, human_rows_dropped, lineage_truncated)``
+    for the annotation pass and the window metadata.
+    """
     # Tail human conversation and progress telemetry with SEPARATE quotas so a
     # burst of progress messages can never push the user's real conversation out
     # (the previous single combined[-limit:] tail). Subagent lineage is kept on
@@ -879,6 +915,84 @@ def _assemble_history_response(
         lineage = lineage[-_LINEAGE_CAP:]  # keep the most recent lineage events
     progress_tail = lineage + other_tail
     messages = sorted(human_tail + progress_tail, key=lambda m: m.get("ts", ""))
+    return messages, result_cache, human_rows_dropped, lineage_truncated
+
+
+def _window_metadata(
+    chat_quota_rows: int,
+    progress_quota_rows: int,
+    n_human: int,
+    n_progress: int,
+    chat_path: pathlib.Path,
+    progress_path: pathlib.Path,
+    archive_dir: pathlib.Path,
+    human_rows_dropped: bool,
+    lineage_truncated: bool,
+) -> Dict[str, Any]:
+    """Additive window metadata (perf2 P3; frozen contract extended explicitly).
+
+    The reader learns WHETHER this window is the complete reachable history
+    and WHAT bounded it — the quota tail slice ("quota"), the bounded archive
+    backfill ("archive_floor"), or the lineage cap ("lineage_cap"). The client
+    gates its "Load older" affordance on this instead of guessing; no existing
+    field changes meaning."""
+    truncated_by: list[str] = []
+    for cause in (
+        "quota" if human_rows_dropped else None,
+        _stream_truncation_cause(
+            chat_quota_rows, n_human, _live_log_size(chat_path),
+            _archive_segment_count(archive_dir, "chat"),
+        ),
+        _stream_truncation_cause(
+            progress_quota_rows, n_progress, _live_log_size(progress_path),
+            _archive_segment_count(archive_dir, "progress"),
+        ),
+        "lineage_cap" if lineage_truncated else None,
+    ):
+        if cause and cause not in truncated_by:
+            truncated_by.append(cause)
+    return {"complete": not truncated_by, "truncated_by": truncated_by}
+
+
+def _assemble_history_response(
+    data_dir: pathlib.Path,
+    thread_id: int,
+    n_human: int,
+    n_progress: int,
+) -> bytes:
+    """Assemble the complete /api/chat/history payload as serialized JSON bytes.
+
+    perf2 P3: the WHOLE pipeline — project-context loads, both rotation-aware
+    log reads, both transform loops, quota slicing, the lineage floor/cap,
+    terminal-truth annotation, origin fallback, and the JSON encode — runs
+    synchronously inside the endpoint's single ``asyncio.to_thread`` call, so
+    none of it executes on the event loop. (Decomposed into the private
+    single-purpose helpers above; behavior is identical.)
+    """
+    project_chat_ids, project_source_refs, chat_annotations, bindings_by_task = (
+        _project_history_context(data_dir, thread_id)
+    )
+    row_matches_thread = _make_thread_filter(
+        thread_id, project_chat_ids, project_source_refs, bindings_by_task
+    )
+    chat_path = data_dir / "logs" / "chat.jsonl"
+    progress_path = data_dir / "logs" / "progress.jsonl"
+    archive_dir = data_dir / "archive"
+    combined, chat_quota_rows = _collect_chat_rows(
+        chat_path, archive_dir, n_human, row_matches_thread, chat_annotations
+    )
+    progress_rows, progress_quota_rows = _collect_progress_rows(
+        progress_path, archive_dir, n_progress, row_matches_thread
+    )
+    combined.extend(progress_rows)
+    lifecycle_row = _active_lifecycle_row()
+    if lifecycle_row is not None:
+        combined.append(lifecycle_row)
+    messages, result_cache, human_rows_dropped, lineage_truncated = (
+        _apply_window_quotas(
+            data_dir, thread_id, project_chat_ids, combined, n_human, n_progress
+        )
+    )
 
     # Annotate progress messages whose task already reached a terminal (or
     # cancel-intent) status on disk. Tasks torn down by crash storm, hard
@@ -906,30 +1020,13 @@ def _assemble_history_response(
     except Exception as exc:
         log.debug("Failed to annotate bg-consciousness terminal status: %s", exc)
 
-    # Additive window metadata (perf2 P3; frozen contract extended explicitly):
-    # the reader learns WHETHER this window is the complete reachable history
-    # and WHAT bounded it — the quota tail slice ("quota"), the bounded archive
-    # backfill ("archive_floor"), or the lineage cap ("lineage_cap"). The
-    # client gates its "Load older" affordance on this instead of guessing;
-    # no existing field changes meaning.
-    truncated_by: list[str] = []
-    for cause in (
-        "quota" if human_rows_dropped else None,
-        _stream_truncation_cause(
-            chat_quota_rows, n_human, _live_log_size(chat_path),
-            _archive_segment_count(archive_dir, "chat"),
-        ),
-        _stream_truncation_cause(
-            progress_quota_rows, n_progress, _live_log_size(progress_path),
-            _archive_segment_count(archive_dir, "progress"),
-        ),
-        "lineage_cap" if lineage_truncated else None,
-    ):
-        if cause and cause not in truncated_by:
-            truncated_by.append(cause)
     payload = {
         "messages": messages,
-        "window": {"complete": not truncated_by, "truncated_by": truncated_by},
+        "window": _window_metadata(
+            chat_quota_rows, progress_quota_rows, n_human, n_progress,
+            chat_path, progress_path, archive_dir,
+            human_rows_dropped, lineage_truncated,
+        ),
     }
     # Same rendering options as starlette's JSONResponse — serialized here so
     # the encode of a large payload also happens off the event loop.
