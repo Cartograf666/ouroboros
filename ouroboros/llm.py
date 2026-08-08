@@ -39,6 +39,21 @@ _FALSE_LIKE_ENV_VALUES = {"", "0", "false", "no", "off"}
 # passed through by OpenRouter). Anything else is normalized to the bare marker.
 _VALID_CACHE_TTLS = frozenset({"5m", "1h"})
 
+# Wall-clock horizon of an APPLIED prompt-cache TTL, keyed by the value the
+# send-time finalizer REPORTS into usage metadata ("default" = the bare marker,
+# i.e. the provider-default 5m tier on the Anthropic family). This is a units
+# conversion of the recorded fact — deliberately NOT a route-level predictor
+# that could disagree with the payload after route-filter/promotion/cap.
+_CACHE_TTL_SECONDS = {"5m": 300, "1h": 3600, "default": 300}
+
+
+def cache_ttl_seconds(applied_ttl: Any) -> Optional[int]:
+    """Seconds of provider cache lifetime for a RECORDED applied TTL, else None.
+
+    ``None`` for an empty/unknown value (a route without cache markers records
+    no TTL, and an unknown horizon must not be invented for it)."""
+    return _CACHE_TTL_SECONDS.get(str(applied_ttl or "").strip().lower())
+
 
 def supports_message_cache_control(model: str) -> bool:
     """Providers whose OpenRouter route honors message-level cache_control breakpoints.
