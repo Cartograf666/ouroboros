@@ -40,18 +40,25 @@ _FALSE_LIKE_ENV_VALUES = {"", "0", "false", "no", "off"}
 _VALID_CACHE_TTLS = frozenset({"5m", "1h"})
 
 # Wall-clock horizon of an APPLIED prompt-cache TTL, keyed by the value the
-# send-time finalizer REPORTS into usage metadata ("default" = the bare marker,
-# i.e. the provider-default 5m tier on the Anthropic family). This is a units
-# conversion of the recorded fact — deliberately NOT a route-level predictor
+# send-time finalizer REPORTS into usage metadata. ONLY the two NAMED tiers have
+# a horizon: they were stamped on the wire, so the number is the recorded fact
+# itself. This is a units conversion — deliberately NOT a route-level predictor
 # that could disagree with the payload after route-filter/promotion/cap.
-_CACHE_TTL_SECONDS = {"5m": 300, "1h": 3600, "default": 300}
+_CACHE_TTL_SECONDS = {"5m": 300, "1h": 3600}
 
 
 def cache_ttl_seconds(applied_ttl: Any) -> Optional[int]:
     """Seconds of provider cache lifetime for a RECORDED applied TTL, else None.
 
-    ``None`` for an empty/unknown value (a route without cache markers records
-    no TTL, and an unknown horizon must not be invented for it)."""
+    ``None`` for empty/unknown AND for ``"default"``. ``"default"`` records one
+    fact only — a BARE ephemeral marker went out — and a bare marker names no
+    tier: the finalizer reports it for any payload carrying markers, including
+    routes it never normalizes (a Gemini send keeps bare markers and reports
+    ``"default"``, and Gemini/OpenAI/Grok/DeepSeek retention is implicit and
+    provider-defined, not 5 minutes). Turning that into "300s" would be the
+    second TTL truth this design forbids — a predictor derived from a route the
+    recorded fact does not carry. Readers therefore stay SILENT on a bare
+    marker; silence beats a fabricated horizon (BIBLE P1)."""
     return _CACHE_TTL_SECONDS.get(str(applied_ttl or "").strip().lower())
 
 

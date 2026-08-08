@@ -665,6 +665,22 @@ stay on disk in `task_results/<id>.json`, addressable by
 `get_task_result` returns the full result text plus trace/outcome summaries. The wait envelope itself (all_terminal / timed_out /
 elapsed_sec / live_child_status / early_return) is unchanged.
 
+Every blocking wait (`wait_task`, `wait_tasks`, `delegate_wait`) may append ONE
+factual `cache_horizon_note` line: the wait outlived this task's prompt-cache
+horizon, so the next model send may be cold. It is derived ONLY from the RECORDED
+applied TTL of the task's latest send (`_last_prompt_cache_ttl`, published on the
+tool context by the loop and converted by `llm.cache_ttl_seconds`), never from a
+second route-level predictor that could disagree with the payload after
+route-filter/promotion/cap. A horizon exists ONLY for the explicitly stamped
+`5m`/`1h` tiers. A recorded `"default"` means a BARE marker went out and names no
+tier — the finalizer reports it for any marker-carrying payload, including routes
+it never normalizes (a Gemini send keeps bare markers, and Gemini/OpenAI/Grok/
+DeepSeek retention is implicit and provider-defined) — so `default`, empty and
+unknown all stay SILENT rather than assert a horizon nobody established. The line
+carries no token-count prediction: the fact ("the wait outlived the cache") is
+what changes the agent's next decision, while "~X tokens will re-write" is a
+counterfactual the next send can falsify by rerouting or compacting.
+
 A burst of `schedule_subagent` calls emitted in ONE tool-call round runs in the
 existing tool ThreadPool instead of sequentially (`schedule_subagent` is in
 `tool_capabilities.PARALLEL_SAFE_ENQUEUE_TOOLS`); a process-local lock in

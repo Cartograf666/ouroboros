@@ -325,18 +325,49 @@ def test_llm_round_event_zero_prompt_tokens_reports_zero_hit_rate(tmp_path):
 
 
 def test_cache_ttl_seconds_units_conversion():
-    """cache_ttl_seconds converts a RECORDED applied TTL to a wall-clock horizon —
-    'default' = the bare-marker provider tier (5m on the Anthropic family) — and
-    invents nothing for empty/unknown values (a marker-less route records no TTL)."""
+    """cache_ttl_seconds converts a RECORDED applied TTL to a wall-clock horizon for
+    the NAMED tiers only. 'default' records that a BARE marker went out — no tier —
+    so it yields no horizon, exactly like empty/unknown."""
     from ouroboros.llm import cache_ttl_seconds
 
     assert cache_ttl_seconds("5m") == 300
     assert cache_ttl_seconds("1h") == 3600
-    assert cache_ttl_seconds("default") == 300
+    assert cache_ttl_seconds("default") is None
     assert cache_ttl_seconds("") is None
     assert cache_ttl_seconds(None) is None
     assert cache_ttl_seconds("24h") is None
     assert cache_ttl_seconds(" 1H ") == 3600
+
+
+def test_bare_marker_never_yields_an_invented_horizon():
+    """The 'second TTL truth' guard: the finalizer reports 'default' for ANY payload
+    with markers — including routes it never normalizes, where a 5-minute horizon was
+    never established. A bare marker must therefore keep every reader silent."""
+    from types import SimpleNamespace
+
+    from ouroboros.llm import LLMClient, _route_normalizes_cache_breakpoints, cache_ttl_seconds
+    from ouroboros.tools.control import cache_horizon_note
+
+    client = LLMClient.__new__(LLMClient)
+    gemini = {
+        "provider": "openrouter",
+        "resolved_model": "google/gemini-3.6-flash",
+        "supports_openrouter_extensions": True,
+    }
+    payload = {
+        "messages": [{"role": "system", "content": [
+            {"type": "text", "text": "governance", "cache_control": {"type": "ephemeral"}},
+        ]}],
+        "tools": [],
+    }
+    # Gemini keeps BARE markers (its explicit cache documents no ttl field) and is
+    # never normalized — yet the applied-TTL report is still "default".
+    assert _route_normalizes_cache_breakpoints(gemini) is False
+    assert client._normalize_payload_cache_ttl(gemini, payload) == "default"
+    assert cache_ttl_seconds("default") is None
+
+    ctx = SimpleNamespace(_accumulated_usage={"_last_prompt_cache_ttl": "default"})
+    assert cache_horizon_note(ctx, 10_000.0) == ""
 
 
 def test_cache_horizon_note_reads_recorded_ttl_only():
@@ -347,7 +378,7 @@ def test_cache_horizon_note_reads_recorded_ttl_only():
 
     from ouroboros.tools.control import cache_horizon_note
 
-    ctx = SimpleNamespace(_accumulated_usage={"_last_prompt_cache_ttl": "default"})
+    ctx = SimpleNamespace(_accumulated_usage={"_last_prompt_cache_ttl": "5m"})
     note = cache_horizon_note(ctx, 301.0)
     assert "cache horizon" in note
     assert "may be cold" in note
@@ -380,7 +411,7 @@ def test_wait_for_task_appends_cache_horizon_note(tmp_path, monkeypatch):
     monkeypatch.setattr(control_mod, "wait_for_effective_tasks", _instant_wait)
     ctx = SimpleNamespace(
         drive_root=tmp_path,
-        _accumulated_usage={"_last_prompt_cache_ttl": "default"},
+        _accumulated_usage={"_last_prompt_cache_ttl": "5m"},
     )
     out = control_mod._wait_for_task(ctx, "child42", timeout_sec=0)
     assert "cache horizon" in out and "may be cold" in out

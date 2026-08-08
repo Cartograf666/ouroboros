@@ -2010,7 +2010,12 @@ def cache_horizon_note(ctx: Any, elapsed_sec: Any) -> str:
     in the loop's accumulated usage (published on the tool ctx), converted by
     ``llm.cache_ttl_seconds`` — never a route-level prediction (a second predictor
     can disagree with the payload after route-filter/promotion/cap). Empty string
-    when the horizon is unknown (no cached send recorded) or not yet elapsed.
+    when the horizon is unknown or not yet elapsed. UNKNOWN covers three cases,
+    all silent: no cached send recorded, a route that carries no markers at all,
+    and a send whose markers were BARE (reported ``"default"``) — a bare marker
+    names no tier, so its horizon is the provider's business and inventing one
+    would mislead the agent into re-planning its waits around a number nobody
+    established. Only the explicitly stamped ``5m``/``1h`` tiers speak here.
     Deliberately NO token-count predictions: the submarine forensics showed the
     fact ("the wait outlived the cache") is what changes the agent's next decision
     (batch waits, longer single windows), while "~X tokens will re-write" is a
