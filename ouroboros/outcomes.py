@@ -928,6 +928,16 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
 
     # A skipped-or-bypassed eligible panel is not a verdict, but cannot remain clean;
     # preserve stronger classifications and degrade only the false-green remainder.
+    # Honest reachability (measured, not asserted): the FORCED-rail bypass reasons
+    # cannot arrive here on an OK execution — a bypass is stamped only when the rail
+    # already wrote `usage.reason_code`, and every writer of that key also writes
+    # `execution_status='failed'`, so those runs land on the STRONGER failed /
+    # best_effort branches above and the owner-visible bypass rides the review axis
+    # (see test_forced_rail_axes_are_the_production_shape). What this branch actually
+    # decides is the pacing skip (REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE).
+    # The bypass keys stay in the condition as a BACKSTOP, not as a live behaviour
+    # claim: a future rail that bypasses an owed panel without failing the usage must
+    # not be able to come back as a clean green.
     if acceptance_review_skipped_eligible and execution_status == EXECUTION_OK:
         execution_status = EXECUTION_DEGRADED
         reason_code = _acceptance_reason

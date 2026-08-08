@@ -35,7 +35,27 @@ _PACKET = {
     "acceptance_obligations": [{"id": "ob-12ab34cd", "item": "cover edge case"}],
     "artifacts": [{"name": "report/summary.md", "size": 10}],
     "repo_diff": "diff --git ...",
-    "__provenance__": {"task_contract": "host_attested"},
+    "tool_trajectory": [{"tool": "run_command", "status": "ok", "result": "3 passed"}],
+    # The agent's OWN prose sections, exactly as build_task_acceptance_evidence
+    # tags them. Present in essentially every real task.
+    "reasoning_notes": "I believe the feature works.",
+    "candidate_answers": ["the answer"],
+    "agent_supplied": {"agent_decision": {"disposition": "accept"}},
+    # A section the builder emits with no provenance tag (a counter).
+    "tool_trajectory_omitted_leading": 4,
+    # The real packet's provenance table — the ONE authority the vocabulary keys on.
+    "__provenance__": {
+        "task_contract": "host_attested",
+        "acceptance_support_refs": "host_attested",
+        "verification_summary": "host_attested",
+        "acceptance_obligations": "host_attested",
+        "repo_diff": "host_attested",
+        "artifacts": "artifact",
+        "tool_trajectory": "tool_result",
+        "reasoning_notes": "agent_supplied",
+        "candidate_answers": "agent_supplied",
+        "agent_supplied": "agent_supplied",
+    },
 }
 
 
@@ -70,10 +90,78 @@ def test_vocabulary_enumerates_packet_exhibits_exactly():
     assert "verification_receipts[2]" not in vocab
     assert vocab["repo_diff"] == "packet_section"
     assert vocab["verification_summary"] == "packet_section"
+    assert vocab["tool_trajectory"] == "packet_section"   # host-recorded tool results
     assert "__provenance__" not in vocab
     # Robust to junk input.
     assert acceptance_evidence_ref_vocabulary(None) == {}
     assert acceptance_evidence_ref_vocabulary("junk") == {}
+
+
+def test_agent_supplied_and_intent_sections_never_resolve():
+    """The section rule reads the packet's OWN provenance table: only a
+    host-attested exhibit resolves. The agent's own prose (reasoning_notes /
+    candidate_answers / agent_supplied) and the declared-intent container
+    (task_contract, which HOLDS the claims) are disclosed by name and never count
+    — otherwise `evidence_refs: ["reasoning_notes"]` or `["task_contract"]` buys
+    exactly the clean PASS a bare unsupported claim id cannot (D-Q5)."""
+    vocab = acceptance_evidence_ref_vocabulary(_PACKET)
+    assert vocab["reasoning_notes"] == "agent_supplied_section"
+    assert vocab["candidate_answers"] == "agent_supplied_section"
+    assert vocab["agent_supplied"] == "agent_supplied_section"
+    assert vocab["task_contract"] == "declared_intent_section"
+    # No provenance tag at all = unknown attestation = fails closed.
+    assert vocab["tool_trajectory_omitted_leading"] == "unattested_section"
+
+    for ref in ("reasoning_notes", "candidate_answers", "agent_supplied",
+                "task_contract", "tool_trajectory_omitted_leading"):
+        row = resolve_criteria_evidence_refs(
+            [{"criterion": "c", "status": "supported", "evidence_refs": [ref]}], vocab,
+        )[0]
+        assert row["supported_evidence_resolves"] is False, ref
+        # Still DISCLOSED by name — never a bare "" that hides which entry was cited.
+        assert row["refs"][0]["resolved_as"].endswith("_section"), ref
+
+    # ...and it lands on the clean bit only, never the verdict/quorum.
+    actor = _actor([{"criterion": "c", "status": "supported",
+                     "evidence_refs": ["reasoning_notes"]}])
+    annotate_criteria_evidence_resolution([actor], _PACKET)
+    result = _result([actor])
+    assert task_acceptance_is_clean(result) is False
+    assert result.aggregate_signal == "PASS" and actor["parsed"]["verdict"] == "PASS"
+
+    # One real host-attested exhibit alongside the prose is still enough.
+    assert resolve_criteria_evidence_refs(
+        [{"criterion": "c", "status": "supported",
+          "evidence_refs": ["reasoning_notes", "repo_diff"]}], vocab,
+    )[0]["supported_evidence_resolves"] is True
+
+
+def test_section_provenance_is_read_from_the_real_builder_packet(tmp_path):
+    """The provenance tags the vocabulary keys on are the ones
+    build_task_acceptance_evidence actually writes — pinned against the builder,
+    not against a hand-made table."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_evidence import build_task_acceptance_evidence
+
+    ctx = SimpleNamespace(
+        drive_root=str(tmp_path), task_id="t1", task_metadata={},
+        task_contract={"objective": "ship", "acceptance_claims": [{"id": "claim_1", "claim": "boots"}]},
+    )
+    packet = build_task_acceptance_evidence(
+        ctx,
+        llm_trace={"reasoning_notes": ["my own notes"], "candidate_answers": ["a"]},
+        drive_root=tmp_path,
+        task_id="t1",
+        canonical_subject="answer",
+    )
+    vocab = acceptance_evidence_ref_vocabulary(packet)
+    assert packet["__provenance__"]["reasoning_notes"] == "agent_supplied"
+    assert vocab["reasoning_notes"] == "agent_supplied_section"
+    assert vocab["candidate_answers"] == "agent_supplied_section"
+    assert vocab["task_contract"] == "declared_intent_section"
+    assert vocab["repo_diff"] == "packet_section"
+    assert vocab["claim_1"] == "claim_id_unsupported"   # no passing receipt behind it
 
 
 def test_resolution_is_exact_match_only_no_fuzzy():
@@ -175,6 +263,39 @@ def test_clean_gate_demotes_only_the_clean_bit_never_the_verdict():
     assert annotated["parsed"]["verdict"] == "PASS"
 
 
+def test_panel_reason_names_the_unresolved_ref_not_a_satisfied_condition():
+    """`panel_reason` is the shared "one honest reason line naming the REAL
+    blocker". On a D-Q5 demotion every criterion IS supported with refs, so the
+    criteria-support line described a condition that was already satisfied while
+    the deciding fact (an unresolved ref) had no reason text at all."""
+    from ouroboros.review_substrate import panel_reason
+
+    actor = _actor([{"criterion": "c", "status": "supported",
+                     "evidence_refs": ["reasoning_notes", "hallucinated"]}])
+    annotate_criteria_evidence_resolution([actor], _PACKET)
+    reason = panel_reason(_result([actor]))
+
+    assert "does not resolve" in reason
+    assert "reasoning_notes (agent_supplied_section)" in reason
+    assert "hallucinated (no packet entry)" in reason
+    assert "until every criterion is supported" not in reason
+
+    # The panel-wide fail-closed row names itself.
+    unavailable = _actor([{"criterion": "c", "status": "supported", "evidence_refs": ["x"]}],
+                         unresolved_rows=[{"criterion": "*", "refs": [],
+                                           "supported_evidence_resolves": False,
+                                           "resolution_status": "host_resolution_unavailable"}])
+    assert "host_resolution_unavailable" in panel_reason(_result([unavailable]))
+
+    # A non-D-Q5 demotion (unsupported criteria, no annotation) keeps the old line.
+    plain = _actor([{"criterion": "c", "status": "missing", "evidence_refs": []}])
+    assert "until every criterion is supported" in panel_reason(_result([plain]))
+    # ...and a clean panel is untouched.
+    clean = _actor([{"criterion": "c", "status": "supported", "evidence_refs": ["repo_diff"]}])
+    annotate_criteria_evidence_resolution([clean], _PACKET)
+    assert panel_reason(_result([clean])) == "clean acceptance"
+
+
 def test_clean_gate_accepts_partial_resolution_and_historical_rows():
     criteria = [{"criterion": "c", "status": "supported",
                  "evidence_refs": ["verification_receipts[0]", "made-up"]}]
@@ -270,6 +391,10 @@ def test_reviewer_prompt_names_the_ref_vocabulary_once():
     assert "EXACT match" in stable
     assert "verification_receipts[i]" in stable
     assert "task_contract.acceptance_claims" in stable
+    # The prompt must not teach a resolution the host no longer performs: the
+    # agent's own sections and the intent container are named as NOT evidence.
+    assert "HOST-ATTESTED top-level packet section names" in stable
+    assert "reasoning_notes" in stable
     # Non-acceptance surfaces carry no vocabulary line.
     generic = ReviewRequest(surface="commit_review", goal="g", subject="s")
     g_stable, _t, _d = _render_prompt_parts(generic, ReviewSlot("s0", "m"))

@@ -389,6 +389,19 @@ def _check_budget_limits(
                 )
                 if tool_ctx is not None else ""
             )
+            # This early rejection is a forced sink like every other: nothing was
+            # produced, but a queued/headless root still OWED a panel, and returning
+            # here without the record left `eligibility=not_eligible / run_count=0`
+            # — indistinguishable from "no panel was warranted", the exact shape the
+            # typed bypass exists to close. Pure ledger write: no panel, no model
+            # round, no fence (the common recorder is the one seam).
+            _record_forced_finalization(
+                ctx,
+                trace,
+                reason_code="budget_exhausted",
+                source="host_budget_rejection_before_work",
+                candidate=None,
+            )
             return _compose_delivery_suffix(finish_reason, suffix), accumulated_usage, trace
         return _forced_final_answer(
             ctx,
@@ -4497,7 +4510,11 @@ def _forced_orphan_note(ctx: _RoundLimitContext, *, include_terminal: bool = Tru
             # PROVES: the row EXISTS, so the write did NOT fail; what failed is the
             # binding to the result standing now. (The pre-audit wording claimed a
             # failed write, which the presence of the row disproves.)
-            claim = claimed.get(tid)
+            # Scoped to children the projection genuinely left UNDECIDED: a child
+            # the projection DOES carry (deferred / integrated / irrelevant /
+            # discarded / cancelled) is not a failed-binding case, and telling its
+            # owner to "re-submit to close it" would be a false instruction.
+            claim = claimed.get(tid) if not _child_disposition_state(c) else None
             if claim is not None:
                 disposition, row_sha = claim
                 from ouroboros.tools.join_ledger import _child_result_sha256

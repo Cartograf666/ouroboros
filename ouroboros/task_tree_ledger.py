@@ -188,9 +188,13 @@ def tree_ledger_append(
         elif kind_norm == "decision" and allow_child_result_disposition:
             normalized = normalize_child_result_disposition_payload(payload)
             if normalized is None:
+                # ONE diagnostic authority for the closed contract: render the same
+                # aggregated violations `child_result_disposition_violations` gives
+                # the tool surface, instead of a second, weaker one-line message
+                # that could drift away from the constraints actually enforced.
                 return (
-                    "⚠️ CHILD_RESULT_DISPOSITION_INVALID: payload must contain exactly "
-                    "type, child_task_id, disposition, and child_result_sha256."
+                    "⚠️ CHILD_RESULT_DISPOSITION_INVALID: "
+                    + "; ".join(child_result_disposition_violations(payload))
                 )
             # This flag is used only by join_ledger after direct-lineage and
             # current-result validation. Generic tree_note cannot bypass it.

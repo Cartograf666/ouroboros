@@ -91,7 +91,9 @@ def _render_prompt_parts(request: ReviewRequest, slot: ReviewSlot) -> tuple[str,
         'claim ids from task_contract.acceptance_claims (which count as evidence ONLY while '
         'acceptance_support_refs shows that claim supported by a passing receipt — otherwise cite the exhibit itself), '
         'verification_receipts[i] receipt ids, acceptance_obligations ids, artifact manifest names, '
-        'or top-level packet section names — a ref that resolves to nothing cannot support a criterion)'
+        'or HOST-ATTESTED top-level packet section names (the agent-supplied sections — reasoning_notes, '
+        'candidate_answers, agent_supplied — and task_contract itself are NOT evidence: cite the exhibit '
+        'that proves the work instead) — a ref that resolves to nothing cannot support a criterion)'
         if request.surface == "task_acceptance"
         else ""
     )

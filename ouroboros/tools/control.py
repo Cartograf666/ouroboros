@@ -318,21 +318,46 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
         # green/red instead of prose. The wait_tasks BATCH projection deliberately
         # stays counts-compact (v6.17.0 birth shape + v6.71.2 measured compaction,
         # 694K->25K). Rows render through the SSOT identity projection + disclosed
-        # bound (hard cap, exact omitted count) — newest first, oldest omitted.
-        from ouroboros._outcome_receipts import disclosed_list_projection, receipt_identity_projection
+        # bound (hard cap, exact omitted count).
+        #
+        # The bound is OUTSTANDING-FIRST, then newest: a plain newest-10 window let
+        # a child that failed a check early and then produced ten greens hand the
+        # parent an affirmatively all-green list, with the red only implied by a
+        # count. The still-unreconciled SET is this repo's SSOT for exactly that
+        # problem ("a newer red would let a latest-pointer erase an older still-red
+        # one"), so every outstanding red / masked pass is carried first — tagged so
+        # the parent sees WHY it is here — and the rest of the cap is filled with the
+        # newest remaining receipts. The cap and its exact omitted count are unchanged.
+        from ouroboros._outcome_receipts import (
+            disclosed_list_projection,
+            receipt_identity_projection,
+            unreconciled_failed,
+            unreconciled_masked,
+        )
+
+        rows = [r for r in receipts if isinstance(r, dict)]
+        outstanding_kind: Dict[int, str] = {}
+        for _receipt in unreconciled_failed(rows):
+            outstanding_kind[id(_receipt)] = "unreconciled_failed"
+        for _receipt in unreconciled_masked(rows):
+            outstanding_kind.setdefault(id(_receipt), "unreconciled_masked_pass")
+        ordered = [r for r in reversed(rows) if id(r) in outstanding_kind]
+        ordered += [r for r in reversed(rows) if id(r) not in outstanding_kind]
 
         def _receipt_row(receipt: Any) -> Any:
             if not isinstance(receipt, dict):
                 return truncate_review_artifact(str(receipt), limit=200)
             row = {"status": str(receipt.get("status") or "")}
+            outstanding = outstanding_kind.get(id(receipt), "")
+            if outstanding:
+                row["outstanding"] = outstanding
             if "matched" in receipt:
                 row["matched"] = receipt.get("matched")
             row.update(receipt_identity_projection(receipt, check_cap=200))
             return row
 
         summary.update(disclosed_list_projection(
-            list(reversed([r for r in receipts if isinstance(r, dict)])),
-            key="verification_receipts", limit=10, item=_receipt_row,
+            ordered, key="verification_receipts", limit=10, item=_receipt_row,
         ))
     return json.dumps(summary, ensure_ascii=False, indent=2, default=str)
 

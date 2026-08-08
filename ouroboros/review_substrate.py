@@ -603,6 +603,34 @@ def aggregate_dialogue_status(result: Any, *, quorum: int) -> Dict[str, Any]:
     return {"status": status, "votes": votes}
 
 
+def _unresolved_evidence_ref_labels(run: Any) -> List[str]:
+    """The D-Q5 refs a contributing actor cited that did NOT resolve, as
+    ``ref (basis)`` labels (or the panel-wide ``host_resolution_unavailable``).
+
+    Pure read of the deciding detail already recorded on the actor rows, so
+    ``panel_reason`` can name the REAL blocker: on a D-Q5 demotion every criterion
+    IS marked supported with refs, and the criteria-support line would describe a
+    condition that is already satisfied."""
+    from ouroboros.review_evidence_refs import NON_RESOLVING_BASIS_KINDS
+
+    labels: List[str] = []
+    for actor in _contributing_actors(run):
+        for row in (actor.get("criteria_refs_unresolved") or []):
+            if not isinstance(row, dict) or row.get("supported_evidence_resolves"):
+                continue
+            if str(row.get("resolution_status") or ""):
+                labels.append(str(row["resolution_status"]))
+                continue
+            for ref in (row.get("refs") or []):
+                if not isinstance(ref, dict):
+                    continue
+                basis = str(ref.get("resolved_as") or "")
+                if basis and basis not in NON_RESOLVING_BASIS_KINDS:
+                    continue  # this one resolved; it is not the blocker
+                labels.append(f"{str(ref.get('ref') or '?')[:80]} ({basis or 'no packet entry'})")
+    return list(dict.fromkeys(labels))
+
+
 def panel_reason(run: Any) -> str:
     """One honest reason line naming the REAL blocker (v6.74.0, A6); shared by
     the capsule header, the compact projection fallback, and progress lines.
@@ -616,6 +644,16 @@ def panel_reason(run: Any) -> str:
     if aggregate == "PASS":
         if task_acceptance_is_clean(run):
             return "clean acceptance"
+        # A D-Q5 demotion leaves every criterion marked supported WITH refs, so the
+        # criteria-support line below would name a condition that is already
+        # satisfied. Name the ref that actually decided instead.
+        unresolved = _unresolved_evidence_ref_labels(run)
+        if unresolved:
+            more = f" (+{len(unresolved) - 3} more)" if len(unresolved) > 3 else ""
+            return (
+                f"tier={tier or 'unclassified'} — cited evidence does not resolve "
+                f"against the packet: {', '.join(unresolved[:3])}{more}"
+            )
         return (
             f"tier={tier or 'unclassified'} — a PASS is not release-clean until "
             "every criterion is supported"

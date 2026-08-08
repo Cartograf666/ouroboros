@@ -429,8 +429,13 @@ def test_get_task_result_returns_full_completed_output(tmp_path):
 
 def test_get_task_result_carries_bounded_per_receipt_rows(tmp_path):
     """W2: the FULL single-child handoff (get_task_result/wait_task) shows WHICH
-    checks passed as bounded identity rows — newest first, hard cap 10, exact
-    omitted count — while the wait_tasks batch projection stays counts-compact."""
+    checks passed as bounded identity rows — OUTSTANDING first, then newest, hard
+    cap 10, exact omitted count — while the wait_tasks batch projection stays
+    counts-compact.
+
+    The bound must not be able to bury the fact the parent's absorption decision
+    turns on: a child that failed a check early and then produced ten greens for
+    OTHER criteria used to hand up an affirmatively all-green list."""
     import json as _json
 
     from ouroboros.outcomes import append_verification_receipt
@@ -453,9 +458,36 @@ def test_get_task_result_carries_bounded_per_receipt_rows(tmp_path):
     rows = summary["verification_receipts"]
     assert len(rows) == 10                                   # hard cap
     assert summary["verification_receipts_omitted"] == 2     # disclosed, exact
-    assert rows[0]["criterion_id"] == "claim_11"             # newest first
-    assert rows[0]["status"] == "pass"
+    # The still-unreconciled RED is carried FIRST and says why, even though ten
+    # newer greens exist — no green of another criterion clears it.
+    assert rows[0]["criterion_id"] == "claim_0"
+    assert rows[0]["status"] == "fail"
+    assert rows[0]["outstanding"] == "unreconciled_failed"
+    # ...the rest of the cap is the newest remaining receipts, and only the OLDEST
+    # greens are the ones left out.
+    assert [row["criterion_id"] for row in rows[1:]] == [
+        f"claim_{idx}" for idx in range(11, 2, -1)
+    ]
+    assert all("outstanding" not in row for row in rows[1:])
     assert "check" in rows[0] and "reconciliation_identity" in rows[0]
+
+    # A red that a LATER green for the same criterion reconciles is not carried:
+    # the rule is the shared unreconciled-set SSOT, not "always float failures".
+    write_task_result(tmp_path, "closed", STATUS_COMPLETED, result="done", cost_usd=0.1)
+    append_verification_receipt(tmp_path, "closed", {
+        "status": "fail", "check": "pytest tests/a.py", "criterion_id": "claim_a",
+    })
+    for idx in range(11):
+        append_verification_receipt(tmp_path, "closed", {
+            "status": "pass", "check": "pytest tests/a.py", "criterion_id": "claim_a"
+            if idx == 0 else f"claim_b{idx}",
+        })
+    closed = _json.loads(
+        _get_task_result(SimpleNamespace(drive_root=tmp_path), "closed")
+        .split("[SUBTASK_OUTCOME]\n", 1)[1].split("\n[/SUBTASK_OUTCOME]", 1)[0]
+    )
+    assert all("outstanding" not in row for row in closed["verification_receipts"])
+    assert closed["verification_receipts"][0]["criterion_id"] == "claim_b10"
     # No receipts -> no rows key at all (the wave1 zero-receipt shape stays visible
     # through the ledger counts, not an empty list).
     write_task_result(tmp_path, "noreceipts", STATUS_COMPLETED, result="done")

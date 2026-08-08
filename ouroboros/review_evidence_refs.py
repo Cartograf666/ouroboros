@@ -21,7 +21,33 @@ from typing import Any, Dict
 # so the disclosure row can say WHICH entry was named (never a bare "") while the
 # clean gate still refuses to count it as resolved evidence.
 CLAIM_ID_UNSUPPORTED = "claim_id_unsupported"
-NON_RESOLVING_BASIS_KINDS = frozenset({CLAIM_ID_UNSUPPORTED})
+# A section the packet itself tags `agent_supplied` (agent_supplied,
+# reasoning_notes, candidate_answers): the agent's OWN prose. Counting it would
+# let a reviewer certify a clean PASS out of the task's own words — the same hole
+# `claim_id_unsupported` closes, one level up.
+AGENT_SUPPLIED_SECTION = "agent_supplied_section"
+# The declared-intent container. The host attests these ARE the recorded contract
+# — never that the work satisfies it — so naming the section that HOLDS the claims
+# must not become the way around an unsupported claim id.
+DECLARED_INTENT_SECTION = "declared_intent_section"
+# A top-level section with no provenance tag at all (counters, manifests, a packet
+# built outside the acceptance builder). Fail CLOSED: unknown attestation is not
+# attestation.
+UNATTESTED_SECTION = "unattested_section"
+NON_RESOLVING_BASIS_KINDS = frozenset({
+    CLAIM_ID_UNSUPPORTED,
+    AGENT_SUPPLIED_SECTION,
+    DECLARED_INTENT_SECTION,
+    UNATTESTED_SECTION,
+})
+
+# Section provenance tags (``__provenance__`` in the built packet) that make a
+# top-level section a HOST-ATTESTED exhibit: the host's own record of what
+# happened — its collected diff/receipt summary/attribution (`host_attested`),
+# its recording of tool results (`tool_result`), its artifact manifest
+# (`artifact`). Everything else is classified above.
+HOST_ATTESTED_SECTION_PROVENANCE = frozenset({"host_attested", "tool_result", "artifact"})
+DECLARED_INTENT_SECTIONS = frozenset({"task_contract", "acceptance_claims_source"})
 
 # D-Q5 fail-closed row: the host could not resolve this panel's refs at all. It
 # carries the SAME `supported_evidence_resolves=False` the clean gate already
@@ -41,8 +67,9 @@ def acceptance_evidence_ref_vocabulary(evidence: Any) -> Dict[str, str]:
 
     Maps each valid reviewer ``evidence_ref`` string to its CLOSED basis kind
     (claim_id | claim_id_unsupported | obligation_id | artifact |
-    verification_receipt | packet_section — a closed table per ref kind, like
-    ``IDENTITY_KINDS``). Pure derivation over the packet dict: no filesystem
+    verification_receipt | packet_section | agent_supplied_section |
+    declared_intent_section | unattested_section — a closed table per ref kind,
+    like ``IDENTITY_KINDS``). Pure derivation over the packet dict: no filesystem
     reads, no re-execution (a machine comparison must never become a read oracle
     — v6.61.1). ``verification_receipts[i]`` ids are POSITIONAL within this packet
     build and are never compared across panels. Specific ids are registered before
@@ -58,7 +85,16 @@ def acceptance_evidence_ref_vocabulary(evidence: Any) -> Dict[str, str]:
     altogether registers as ``claim_id_unsupported`` and cannot support a
     criterion: otherwise a reviewer citing a bare claim id would certify a clean
     PASS out of the task's own restated intent, which is precisely the fabricated
-    -evidence hole D-Q5 exists to close."""
+    -evidence hole D-Q5 exists to close.
+
+    A top-level SECTION resolves on the same rule, read off the packet's own
+    ``__provenance__`` table: only a HOST-ATTESTED exhibit counts
+    (`host_attested` / `tool_result` / `artifact`). The sections the packet tags
+    `agent_supplied` (reasoning_notes, candidate_answers, agent_supplied), the
+    declared-intent container (`task_contract`, which HOLDS the claims), and any
+    section with no provenance tag are DISCLOSED by name and never resolve —
+    otherwise citing "reasoning_notes" or "task_contract" would buy exactly the
+    clean PASS a bare unsupported claim id cannot."""
     ev = evidence if isinstance(evidence, dict) else {}
     vocab: Dict[str, str] = {}
     contract = ev.get("task_contract") if isinstance(ev.get("task_contract"), dict) else {}
@@ -87,9 +123,21 @@ def acceptance_evidence_ref_vocabulary(evidence: Any) -> Dict[str, str]:
         receipt_count = 0
     for idx in range(receipt_count):
         vocab.setdefault(f"verification_receipts[{idx}]", "verification_receipt")
+    provenance = ev.get("__provenance__") if isinstance(ev.get("__provenance__"), dict) else {}
     for key in ev:
-        if not str(key).startswith("__"):
-            vocab.setdefault(str(key), "packet_section")
+        name = str(key)
+        if name.startswith("__"):
+            continue
+        tag = str(provenance.get(name) or "")
+        if name in DECLARED_INTENT_SECTIONS:
+            basis = DECLARED_INTENT_SECTION
+        elif tag in HOST_ATTESTED_SECTION_PROVENANCE:
+            basis = "packet_section"
+        elif tag == "agent_supplied":
+            basis = AGENT_SUPPLIED_SECTION
+        else:
+            basis = UNATTESTED_SECTION
+        vocab.setdefault(name, basis)
     return vocab
 
 
