@@ -126,6 +126,27 @@ def test_backfill_runs_once_per_process_per_root(tmp_path):
     assert pr.get_reserved_project(data, "late")["thread_activity_seen"] is True
 
 
+def test_transiently_failed_backfill_retries_on_next_reconcile(tmp_path, monkeypatch):
+    """Review-wave fix pin: the once-per-process marker is set only AFTER a
+    successful pass, so a transient failure retries on the next reconcile tick
+    instead of waiting for a process restart."""
+    data = tmp_path / "data"
+    data.mkdir()
+    legacy = pr.create_project(data, "legacy", origin="reconcile")
+    _write_rows(data / "logs" / "chat.jsonl", int(legacy["chat_id"]))
+
+    def _boom(_root):
+        raise OSError("transient bindings read failure")
+
+    monkeypatch.setattr(pr, "_load_bindings", _boom)
+    pr.reconcile_projects(data)  # fails (log.warning), must NOT mark done
+    assert "thread_activity_seen" not in pr.get_reserved_project(data, "legacy")
+
+    monkeypatch.undo()
+    pr.reconcile_projects(data)  # next tick retries without a process restart
+    assert pr.get_reserved_project(data, "legacy")["thread_activity_seen"] is True
+
+
 def test_backfill_skips_projects_already_active_by_derivation(tmp_path, monkeypatch):
     data = tmp_path / "data"
     data.mkdir()

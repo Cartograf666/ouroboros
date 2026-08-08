@@ -720,11 +720,13 @@ def _backfill_thread_activity(drive_root: Any) -> int:
     persists a write-once flag through the registry's own write path
     (``update_project``). This never runs on the GET path, never removes the
     flag, and a scan that finds nothing simply leaves the project inactive.
+    The done-marker is set only AFTER a successful scan/write pass, so a
+    transiently failed backfill retries on the next reconcile tick instead of
+    silently waiting for a process restart.
     """
     key = str(pathlib.Path(drive_root).resolve(strict=False))
     if key in _ACTIVITY_BACKFILL_DONE:
         return 0
-    _ACTIVITY_BACKFILL_DONE.add(key)
     flagged = 0
     try:
         bindings = _load_bindings(drive_root).get("bindings", {})
@@ -758,6 +760,7 @@ def _backfill_thread_activity(drive_root: Any) -> int:
             if cid:
                 candidates[cid] = pid
         if not candidates:
+            _ACTIVITY_BACKFILL_DONE.add(key)
             return 0
         logs_dir = pathlib.Path(drive_root) / "logs"
         archive_dir = pathlib.Path(drive_root) / "archive"
@@ -788,6 +791,7 @@ def _backfill_thread_activity(drive_root: Any) -> int:
                 flagged += 1
         if flagged:
             log.info("Thread-activity backfill: %d legacy project(s) flagged", flagged)
+        _ACTIVITY_BACKFILL_DONE.add(key)
     except Exception:
         log.warning("Thread-activity backfill failed", exc_info=True)
     return flagged

@@ -302,6 +302,35 @@ def test_size_shrink_forces_refold_not_stale_rows(data_root):
     assert projection == _fresh_result(data_root, ua.usage_projection, data_root)
 
 
+def test_newline_less_crash_tail_never_lets_warm_reads_diverge(data_root):
+    """Review-wave regression (GPT probe): a crash-torn final line that is still
+    VALID JSON parses in the full read, but its end is not a row boundary — a
+    later real-API append glues onto the unterminated line, and an incremental
+    resume from that offset would accept the glued-on row while a fresh replay
+    quarantines the whole glued line. The resume fingerprint must refuse a
+    non-row-aligned tail, keeping reads full replays until the tail is repaired.
+    """
+    reservation = ua.reserve_attempt(_request(data_root))
+    ua.release_attempt(reservation)
+    ledger = data_root / ua.LEDGER_REL
+    raw = ledger.read_bytes()
+    assert raw.endswith(b"\n")
+    ledger.write_bytes(raw[:-1])  # crash-torn: final row valid JSON, no newline
+
+    _clear_memo(data_root)
+    warm = ua.usage_projection(data_root)
+    assert warm == _fresh_result(data_root, ua.usage_projection, data_root)
+
+    # A real-API append now glues its first row onto the unterminated line.
+    ua.reserve_attempt(_request(data_root, task_id="glued"))
+
+    warm = ua.usage_projection(data_root)
+    fresh = _fresh_result(data_root, ua.usage_projection, data_root)
+    assert warm == fresh, "warm read after a glued append must match a fresh replay"
+    breakdown = ua.usage_breakdown(data_root)
+    assert breakdown == _fresh_result(data_root, ua.usage_breakdown, data_root)
+
+
 def test_cross_process_append_is_seen_by_the_next_read(data_root):
     reservation = ua.reserve_attempt(_request(data_root))
     ua.release_attempt(reservation)

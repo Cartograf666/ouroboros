@@ -213,10 +213,13 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
 
 @dataclass
 class _LedgerRowsMemo:
-    """In-process cache of one drive root's validated ledger rows."""
+    """In-process cache of one drive root's per-attempt FINAL rows.
+
+    Holds only the ``_final_rows`` dict (one row per attempt, first-occurrence
+    order) plus the resume fingerprint — O(final rows), not O(ledger rows);
+    superseded transition rows are not retained."""
 
     resume: LedgerResumeState
-    records: list
     final_rows: Dict[str, Dict[str, Any]]
 
 
@@ -233,8 +236,9 @@ _ROWS_MEMO_LOCK = threading.Lock()
 def _memoized_final_rows(root: pathlib.Path) -> list:
     """Validated final rows for display projections, resumed incrementally.
 
-    Cold (or whenever the resume fingerprint is rejected — size shrink, seq
-    discontinuity, inode/device/mtime change, structural corruption) this is one
+    Cold (or whenever the resume fingerprint is rejected — file replacement,
+    size shrink, same-size rewrite, seq discontinuity, a non-row-aligned tail,
+    structural corruption) this is one
     full ``_read_records_locked`` replay, which owns quarantine. Warm, it parses
     only the bytes appended since the previous read. The file lock is taken via
     the module-global ``_locked`` at call time (tests monkeypatch that name).
@@ -251,12 +255,10 @@ def _memoized_final_rows(root: pathlib.Path) -> list:
             records = _read_records_locked(root)
             memo = _LedgerRowsMemo(
                 resume=_ledger_resume_state(root, records),
-                records=list(records),
                 final_rows=_final_rows(records),
             )
         else:
             new_records, new_resume = advanced
-            memo.records.extend(new_records)
             for row in new_records:
                 memo.final_rows[str(row["attempt_id"])] = row
             memo.resume = new_resume

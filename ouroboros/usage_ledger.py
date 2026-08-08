@@ -297,7 +297,10 @@ class LedgerResumeState:
     last validated row) and ``st_mtime_ns`` fingerprint the file as it was read
     UNDER THE LOCK; ``row_count`` and the per-attempt last-``states`` map seed
     tail validation so transition rules hold across the resume boundary. A
-    missing ledger is represented as ``st_ino/st_dev = -1`` with ``size = 0``.
+    missing ledger is represented as ``st_ino/st_dev = -1`` with ``size = 0``;
+    ``st_ino/st_dev = -2`` marks a deliberately NON-RESUMABLE fingerprint (the
+    file's tail is not row-aligned), which no real inode ever matches, so every
+    subsequent read stays a full replay.
     """
 
     st_ino: int
@@ -318,10 +321,25 @@ def _ledger_resume_state(
     with the validated content — including any quarantine truncation the read
     itself performed)."""
     states = {str(row.get("attempt_id") or ""): str(row.get("state") or "") for row in records}
+    path = root / LEDGER_REL
     try:
-        stat = os.stat(root / LEDGER_REL)
+        stat = os.stat(path)
     except FileNotFoundError:
         return LedgerResumeState(-1, -1, 0, -1, len(records), states)
+    if stat.st_size > 0:
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(stat.st_size - 1)
+                terminated = handle.read(1) == b"\n"
+        except OSError:
+            terminated = False
+        if not terminated:
+            # A crash-torn final line that is still valid JSON parses in the full
+            # read, but its end is NOT a row boundary: a later append glues onto
+            # the unterminated line, so an incremental resume from this offset
+            # would accept the glued-on row while a fresh replay quarantines the
+            # whole glued line. Refuse to resume until the tail is repaired.
+            return LedgerResumeState(-2, -2, stat.st_size, -1, len(records), states)
     return LedgerResumeState(
         stat.st_ino, stat.st_dev, stat.st_size, stat.st_mtime_ns, len(records), states
     )
