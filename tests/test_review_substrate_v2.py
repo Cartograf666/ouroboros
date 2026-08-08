@@ -149,7 +149,8 @@ class PassNoTierLLM:
 
 class PassWithTierLLM:
     def chat(self, **kwargs):
-        body = {"verdict": "PASS", "outcome_tier": "solved", "completion_coach": "ship", "findings": [], "summary": "ok"}
+        body = {"verdict": "PASS", "outcome_tier": "solved", "completion_coach": "ship",
+                "criteria_used": [{"criterion": "verified", "status": "supported", "evidence_refs": ["verification_summary"]}], "findings": [], "summary": "ok"}
         return {"content": json.dumps(body)}, {}
 
 
@@ -158,7 +159,8 @@ class PassTierNoCoachLLM:
     non-responsive to the required-tier contract (both keys required)."""
 
     def chat(self, **kwargs):
-        body = {"verdict": "PASS", "outcome_tier": "solved", "completion_coach": "", "findings": [], "summary": "ok"}
+        body = {"verdict": "PASS", "outcome_tier": "solved", "completion_coach": "",
+                "criteria_used": [{"criterion": "verified", "status": "supported", "evidence_refs": ["verification_summary"]}], "findings": [], "summary": "ok"}
         return {"content": json.dumps(body)}, {}
 
 
@@ -179,6 +181,8 @@ class PoisonDegradedSlotLLM:
             })}, {}
         return {"content": json.dumps({
             "verdict": "PASS", "outcome_tier": "solved", "completion_coach": "ship it",
+            "criteria_used": [{"criterion": "verified", "status": "supported",
+                               "evidence_refs": ["verification_summary"]}],
             "findings": [], "summary": "ok",
         })}, {}
 
@@ -229,6 +233,8 @@ class ContractDegradedPassLLM:
             })}, {}
         return {"content": json.dumps({
             "verdict": "PASS", "outcome_tier": "solved", "completion_coach": "ship",
+            "criteria_used": [{"criterion": "verified", "status": "supported",
+                               "evidence_refs": ["verification_summary"]}],
             "findings": [], "summary": "ok",
         })}, {}
 
@@ -1068,6 +1074,13 @@ class _MixedPassPassFailLLM:
                 "verdict": "PASS",
                 "outcome_tier": "solved",
                 "completion_coach": "Ship the candidate.",
+                # Production panels always required criteria evidence (the knob was
+                # constant-true and is deleted): a contributing solved PASS carries
+                # supported criteria with refs.
+                "criteria_used": [{
+                    "criterion": "candidate is verified", "status": "supported",
+                    "evidence_refs": ["verification_summary"],
+                }],
                 "findings": [],
                 "summary": "The candidate is ready.",
             }
@@ -1754,11 +1767,14 @@ def test_scope_review_result_preserves_substrate_refs(tmp_path, monkeypatch):
 #     for request, slot in _seam_prompt_cases():
 #         sha256(json.dumps(_request_messages(request, slot),
 #                           ensure_ascii=False, sort_keys=True).encode())
+# The two task_acceptance digests (indexes 2-3) were re-pinned DELIBERATELY when
+# D-Q5 added the evidence-ref vocabulary line to the acceptance criteria_key —
+# a one-time cache invalidation of the stable governance segment, done once.
 _PRE_SEAM_PROMPT_DIGESTS = [
     "0261c7c7fe477ad7f8901a28bee1ad23905d40c3c62825d2bc406ecd9ca37f82",
     "9cf4de6f66001c3b4cec7fdd3d8552ecf83fc886004a7020e98a4c28c022c4e3",
-    "b890f0a6751e9ccf4430623c380b66ad9dddb3516f9ddbb9ebe0b4cac052b1ca",
-    "bc98680f3dc8607c1e214136348783bc215a0dc618379034ff9bb9b03e3950de",
+    "1987277ac6b99909720331e8434b10e878d3426210cd24efc8a55a32c9f981a3",
+    "682222c02e96f7279da4b1c8cb6d85913dabbffd8de4101c076b6f9b2cfc164f",
     "fca0f9401e544e371338f20effa6206db783e7098ff4d11ee2a980ebbe81ecb0",
     "fca0f9401e544e371338f20effa6206db783e7098ff4d11ee2a980ebbe81ecb0",
 ]

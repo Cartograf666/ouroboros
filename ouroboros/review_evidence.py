@@ -458,6 +458,97 @@ def _accept_claim_support_refs(contract: Dict[str, Any], receipts: list) -> list
     return out
 
 
+def acceptance_evidence_ref_vocabulary(evidence: Any) -> Dict[str, str]:
+    """The enumerable canonical exhibit keys of ONE already-built packet (D-Q5).
+
+    Maps each valid reviewer ``evidence_ref`` string to its CLOSED basis kind
+    (claim_id | obligation_id | artifact | verification_receipt | packet_section
+    — a closed table per ref kind, like ``IDENTITY_KINDS``). Pure derivation over
+    the packet dict: no filesystem reads, no re-execution (a machine comparison
+    must never become a read oracle — v6.61.1). ``verification_receipts[i]`` ids
+    are POSITIONAL within this packet build and are never compared across panels.
+    Specific ids are registered before generic section names so a claim id can
+    never be shadowed by a same-named section."""
+    ev = evidence if isinstance(evidence, dict) else {}
+    vocab: Dict[str, str] = {}
+    contract = ev.get("task_contract") if isinstance(ev.get("task_contract"), dict) else {}
+    for claim in contract.get("acceptance_claims") or []:
+        if isinstance(claim, dict) and str(claim.get("id") or "").strip():
+            vocab.setdefault(str(claim["id"]).strip(), "claim_id")
+    for obligation in ev.get("acceptance_obligations") or []:
+        if isinstance(obligation, dict) and str(obligation.get("id") or "").strip():
+            vocab.setdefault(str(obligation["id"]).strip(), "obligation_id")
+    for artifact in ev.get("artifacts") or []:
+        if isinstance(artifact, dict) and str(artifact.get("name") or "").strip():
+            vocab.setdefault(str(artifact["name"]).strip(), "artifact")
+    summary = ev.get("verification_summary") if isinstance(ev.get("verification_summary"), dict) else {}
+    try:
+        receipt_count = max(0, int(summary.get("count") or 0))
+    except (TypeError, ValueError):
+        receipt_count = 0
+    for idx in range(receipt_count):
+        vocab.setdefault(f"verification_receipts[{idx}]", "verification_receipt")
+    for key in ev:
+        if not str(key).startswith("__"):
+            vocab.setdefault(str(key), "packet_section")
+    return vocab
+
+
+def resolve_criteria_evidence_refs(criteria: Any, vocabulary: Dict[str, str]) -> list:
+    """EXACT-membership resolution of reviewer ``evidence_refs`` for SUPPORTED
+    criteria (D-Q5). No substring/fuzzy matching — a non-injective comparison
+    lets a fabricated ref 'resolve' against an unrelated exhibit (the v6.78
+    lossy-identity lesson). Returns disclosure rows ONLY for supported criteria
+    carrying at least one unresolved ref; each row names the deciding basis for
+    every ref (rounds-6/7 rule: whatever decides is what is reported) plus
+    ``supported_evidence_resolves`` — whether at least ONE ref resolved, which is
+    all ``task_acceptance_is_clean`` consumes. Never touches parse validity,
+    quorum, or verdicts (the v6.71.1 starvation class stays closed)."""
+    rows: list = []
+    for item in criteria if isinstance(criteria, list) else []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status") or "").strip().lower() != "supported":
+            continue
+        raw = item.get("evidence_refs")
+        refs = raw if isinstance(raw, list) else ([raw] if raw else [])
+        projected = []
+        resolved_any = False
+        unresolved_count = 0
+        for ref in refs:
+            text = str(ref or "").strip()
+            basis = vocabulary.get(text, "") if text else ""
+            if basis:
+                resolved_any = True
+            else:
+                unresolved_count += 1
+            projected.append({"ref": text[:200], "resolved_as": basis})
+        if unresolved_count:
+            rows.append({
+                "criterion": str(item.get("criterion") or "")[:300],
+                "refs": projected,
+                "supported_evidence_resolves": resolved_any,
+            })
+    return rows
+
+
+def annotate_criteria_evidence_resolution(actors: Any, evidence: Any) -> None:
+    """Stamp per-actor ``criteria_refs_unresolved`` disclosure rows in place (D-Q5).
+
+    Runs ONCE per acceptance panel over actor dict rows; a fully-resolving actor
+    gets NO annotation (the common clean path is byte-identical). The annotation
+    feeds ONLY ``task_acceptance_is_clean`` and disclosure — never parse validity,
+    never quorum, never a verdict."""
+    vocabulary = acceptance_evidence_ref_vocabulary(evidence)
+    for actor in actors if isinstance(actors, list) else []:
+        if not isinstance(actor, dict):
+            continue
+        parsed = actor.get("parsed") if isinstance(actor.get("parsed"), dict) else {}
+        rows = resolve_criteria_evidence_refs(parsed.get("criteria_used"), vocabulary)
+        if rows:
+            actor["criteria_refs_unresolved"] = rows
+
+
 def _accept_trajectory(tool_calls: list) -> tuple:
     """Redacted, per-result-capped projection of the tool-call trajectory (tail-kept) so the
     reviewer can audit HOW the task was solved, not only the final diff. Returns

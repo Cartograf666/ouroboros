@@ -694,7 +694,10 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     solved = rs.ReviewRunResult(
         request={"surface": "task_acceptance"},
         actors=[{"signal": "PASS", "slot_id": "s0",
-                 "parsed": {"outcome_tier": "solved", "completion_coach": "ship it as-is"}}],
+                 "parsed": {"outcome_tier": "solved", "completion_coach": "ship it as-is",
+                            "criteria_used": [{"criterion": "deliverable is verified",
+                                               "status": "supported",
+                                               "evidence_refs": ["verification_summary"]}]}}],
         parsed_findings=[], aggregate_signal="PASS",
     )
     monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: solved)

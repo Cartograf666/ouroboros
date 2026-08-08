@@ -1624,7 +1624,6 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
             "min_successful_slots": adaptive_quorum(len(slots)),
             "fail_closed_on_errors": True,
             "classify_outcome_tier": True,
-            "require_criterion_evidence": True,
             "max_physical_attempts_per_actor": 2,
         },
         task_id=ctx.task_id,

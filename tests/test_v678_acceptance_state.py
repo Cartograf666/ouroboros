@@ -98,9 +98,19 @@ _OPEN_OBLIGATION = {
     "status": "open", "disposition": "",
 }
 
+# The clean-pass fixture carries supported criteria WITH evidence_refs: the
+# evidence condition is unconditional since D-Q5 deleted the constant-true
+# require_criterion_evidence knob (production panels always ran it True, so a
+# real clean PASS always looked exactly like this).
 _CLEAN_PASS = dict(
     aggregate="PASS",
-    actors=[_actor("s0", "PASS", {"verdict": "PASS", "outcome_tier": "solved"})],
+    actors=[_actor("s0", "PASS", {
+        "verdict": "PASS", "outcome_tier": "solved",
+        "criteria_used": [{
+            "criterion": "deliverable is verified", "status": "supported",
+            "evidence_refs": ["verification_summary"],
+        }],
+    })],
 )
 # A PASS whose `solved` claim lacks supported criterion evidence: NOT clean, yet the
 # capsule has nothing actionable (no findings, no dissent, solved tier) — the A14 branch.

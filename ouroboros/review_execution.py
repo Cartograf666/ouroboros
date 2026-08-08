@@ -84,7 +84,13 @@ def _render_prompt_parts(request: ReviewRequest, slot: ReviewSlot) -> tuple[str,
     criteria_key = (
         ', criteria_used (the acceptance criteria you re-derived from the full goal narrative '
         'and checked, as [{criterion, status (supported|missing|partial|rejected), evidence_refs}]; evidence_refs must name concrete '
-        'host-attested receipts/artifacts/tool results for every contributing criterion)'
+        'host-attested receipts/artifacts/tool results for every contributing criterion; '
+        # D-Q5: the host resolves each ref by EXACT match against the packet's
+        # enumerable exhibit keys — the vocabulary below is the closed set of forms.
+        'each evidence_ref is resolved by EXACT match against the evidence packet, so use these exact forms: '
+        'claim ids from task_contract.acceptance_claims (prefer claim ids whenever claims exist), '
+        'verification_receipts[i] receipt ids, acceptance_obligations ids, artifact manifest names, '
+        'or top-level packet section names — a ref that resolves to nothing cannot support a criterion)'
         if request.surface == "task_acceptance"
         else ""
     )
