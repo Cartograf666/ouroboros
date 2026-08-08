@@ -82,12 +82,12 @@ def test_prepare_onboarding_settings_preserves_existing_auto_grant_choice():
     ("TOTAL_BUDGET", -1, "Budget must be greater than zero."),
     ("TOTAL_BUDGET", 0.005, "Budget must be at least 0.01."),
     ("TOTAL_BUDGET", "nan", "Budget must be a number."),
-    ("OUROBOROS_PER_TASK_COST_USD", 0, "Per-task soft threshold must be greater than zero."),
-    ("OUROBOROS_PER_TASK_COST_USD", "0", "Per-task soft threshold must be greater than zero."),
-    ("OUROBOROS_PER_TASK_COST_USD", -1, "Per-task soft threshold must be greater than zero."),
-    ("OUROBOROS_PER_TASK_COST_USD", 0.005, "Per-task soft threshold must be at least 0.01."),
-    ("OUROBOROS_PER_TASK_COST_USD", "nan", "Per-task soft threshold must be a number."),
-    ("OUROBOROS_PER_TASK_COST_USD", False, "Per-task soft threshold must be a number."),
+    ("OUROBOROS_PER_TASK_COST_USD", 0, "Per-task cost cap must be greater than zero."),
+    ("OUROBOROS_PER_TASK_COST_USD", "0", "Per-task cost cap must be greater than zero."),
+    ("OUROBOROS_PER_TASK_COST_USD", -1, "Per-task cost cap must be greater than zero."),
+    ("OUROBOROS_PER_TASK_COST_USD", 0.005, "Per-task cost cap must be at least 0.01."),
+    ("OUROBOROS_PER_TASK_COST_USD", "nan", "Per-task cost cap must be a number."),
+    ("OUROBOROS_PER_TASK_COST_USD", False, "Per-task cost cap must be a number."),
 ])
 def test_prepare_onboarding_settings_rejects_invalid_budget_values(key, value, error):
     payload = _base_payload()

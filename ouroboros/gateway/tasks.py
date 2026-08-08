@@ -685,6 +685,71 @@ async def api_tasks_list(request: Request) -> JSONResponse:
     return JSONResponse({"tasks": rows[:limit], "queue": _queue_snapshot(drive_root)})
 
 
+def _task_cost_breakdown_view(drive_root: pathlib.Path, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Read-side "where did the money go" projection for a ROOT task's detail.
+
+    Computed from the physical-attempt ledger AT READ TIME and never persisted
+    into the task result — the ledger stays the single monetary authority (P7);
+    the stored envelope keeps only its existing own/subtree projections.
+    ``children_usd`` is subtree − own − unattributed (the subtraction every
+    reader had to do by hand); ``delegated`` is a filter over the execution
+    axis (subscription sessions), not a third sum. Unavailable accounting
+    returns None — the field is simply absent, never a confident $0. That
+    covers BOTH an unreadable ledger and a readable one that holds no
+    attributable row for this subtree (empty or legacy-only): ``_summary()``
+    always returns a float for ``accounted_usd``, so "no accounting happened"
+    is decided on the ROW COUNTS, never on the dollar sum being 0.0."""
+    task_id = str(result.get("task_id") or "")
+    root_id = str(result.get("root_task_id") or "") or task_id
+    # Subtree math is ledger-attributable only at the root (child rows carry
+    # the ROOT's id, not every ancestor's); non-root details omit the view.
+    if not task_id or root_id != task_id:
+        return None
+    try:
+        from ouroboros.usage_accounting import usage_breakdown
+
+        breakdown = usage_breakdown(drive_root, root_task_id=root_id)
+    except Exception:
+        log.debug("cost breakdown view unavailable for %s", task_id, exc_info=True)
+        return None
+    subtree = breakdown.get("accounted_usd")
+    counts = breakdown.get("attempt_counts")
+    counts = counts if isinstance(counts, dict) else {}
+    # `metadata_only` is a count of AMBIGUOUS legacy calls carrying no money, so
+    # it can never make a $0 measured; only priced attempt rows or subscription
+    # sessions can. With neither, nothing was accounted for this subtree and the
+    # view is ABSENT — the empty/legacy-ledger case that a `0.0 == measured zero`
+    # reading would have published as `own 0 / children 0 / cost_final true`.
+    priced_rows = sum(int(value or 0) for key, value in counts.items() if key != "metadata_only")
+    sessions = int(breakdown.get("subscription_sessions") or 0)
+    if subtree is None or (priced_rows <= 0 and sessions <= 0):
+        return None
+    own_bucket = (breakdown.get("by_task") or {}).get(task_id)
+    # No rows attributed to the root itself is a MEASURED zero (all spend was
+    # children's), not an unknown — unknowns ride `unknown_unmetered` below.
+    own = float(own_bucket.get("accounted_usd") or 0.0) if isinstance(own_bucket, dict) else 0.0
+    # Money inside this subtree that no task id claims (legacy/blank-task rows)
+    # is DISCLOSED on its own axis instead of being silently folded into the
+    # children's share: own + children + unattributed == subtree.
+    unattributed_bucket = (breakdown.get("unattributed") or {}).get("task")
+    unattributed = (
+        float(unattributed_bucket.get("accounted_usd") or 0.0)
+        if isinstance(unattributed_bucket, dict) else 0.0
+    )
+    delegated = breakdown.get("delegated") if isinstance(breakdown.get("delegated"), dict) else {}
+    return {
+        "own_usd": round(own, 6),
+        "children_usd": round(max(0.0, float(subtree) - own - unattributed), 6),
+        "unattributed_usd": round(unattributed, 6),
+        "delegated_disclosed_usd": round(float(delegated.get("settled_usd") or 0.0), 6),
+        "subscription_sessions": sessions,
+        "unknown_unmetered": breakdown.get("unknown_unmetered"),
+        "non_final_rows": breakdown.get("non_final_rows"),
+        "cost_final": bool(breakdown.get("cost_final")),
+        "authority": "physical_attempt_ledger",
+    }
+
+
 async def api_task_get(request: Request) -> JSONResponse:
     try:
         task_id = validate_task_id(request.path_params.get("task_id"))
@@ -694,7 +759,11 @@ async def api_task_get(request: Request) -> JSONResponse:
     data = load_effective_task_result(drive_root, task_id)
     if not data:
         return json_error("task not found", 404)
-    return JSONResponse(public_task_result(data))
+    payload = public_task_result(data)
+    breakdown_view = _task_cost_breakdown_view(drive_root, data)
+    if breakdown_view is not None:
+        payload["cost_breakdown"] = breakdown_view
+    return JSONResponse(payload)
 
 
 async def api_task_artifact(request: Request):

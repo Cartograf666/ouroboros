@@ -23,7 +23,42 @@ from __future__ import annotations
 
 # Main-loop emergency tool-history compaction trigger (~300K tokens at chars/4).
 # Remote routine compaction stays off by design; this is the overflow backstop.
+# NECESSITY is judged on this budget in CALIBRATED real tokens (chars/4 × the
+# main-loop measured density, neutral 1.0 cold): on a ~1.7×-dense Claude route
+# the raw-char form silently meant ~500K real tokens, engaging only deep into
+# the task and then thrashing (see the hysteresis constants below).
+#
+# THE NUMBER IS A REAL-TOKEN BUDGET, NOT A CHAR COUNT — say the consequence out
+# loud, because it is the opposite of what the name reads like. The comparison is
+# (chars/4 + tool_schema_tokens) × density > CONST/4, so the transcript the agent
+# may hold shrinks with BOTH density and the tool envelope. Measured fire points
+# (tests/test_loop_compaction.py::test_emergency_trigger_fire_points_are_pinned
+# drives the real decision and pins these):
+#   max, density 1.0, no schemas ......... ~1.20M chars  (the constant, verbatim)
+#   max, density 1.0, 37K schema tokens ... ~1.06M chars  (1.14x earlier)
+#   max, density 1.7, no schemas .......... ~708K chars   (1.70x earlier)
+#   max, density 1.7, 37K schema tokens ... ~559K chars   (2.14x earlier)
+#   low, density 1.7, 37K schema tokens ... ~91K chars    (4.40x earlier)
+# The dense Claude lane (the production main loop) is therefore ~2.1x more eager
+# in max mode than the raw constant suggests — deliberate under the v6.91 owner
+# decision "necessity = total calibrated pressure" (an immutable core otherwise
+# overflows the window with no trigger at all), and affordable only because the
+# UTILITY hysteresis below stops a futile pass from refiring every round. If that
+# eagerness ever has to come down, move the CONSTANT with these numbers in hand;
+# do not density-scale the threshold, which would cancel the calibration out.
 EMERGENCY_COMPACTION_CHARS = 1_200_000
+
+# Emergency-compaction hysteresis (the necessity-vs-utility split). NECESSITY
+# (compact at all?) is total calibrated pressure — the frozen frame (system
+# blocks + tools + protected/kept rounds) counts toward the provider window.
+# UTILITY (can a pass help?) is the COMPACTABLE region only: after a pass that
+# could NOT get the context below the trigger (the frame alone exceeds it —
+# the submarine wave3 shape: 35/35 rounds fired, each pass a light-model call
+# plus a transcript rewrite that collapsed the prompt cache to the static
+# floor), further passes are suppressed until the compactable transcript grows
+# by this factor or this many rounds pass, whichever is first.
+COMPACTION_HYSTERESIS_REGION_GROWTH = 1.2
+COMPACTION_HYSTERESIS_ROUNDS = 10
 
 # Background-consciousness assembled-context guards. P1: fail fast, never
 # silently truncate cognitive artifacts.

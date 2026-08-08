@@ -48,6 +48,7 @@ const VALUE_FIELDS = [
     ['s-update-channel', 'OUROBOROS_UPDATE_CHANNEL', 'stable'],
     ['s-context-mode', 'OUROBOROS_CONTEXT_MODE', 'max'], ['s-image-input-mode', 'OUROBOROS_IMAGE_INPUT_MODE', 'auto'],
     ['s-safety-mode', 'OUROBOROS_SAFETY_MODE', 'full'],
+    ['s-prompt-cache-ttl', 'OUROBOROS_PROMPT_CACHE_TTL', '1h'],
 ];
 const _SAFETY_MODE_RANK = { full: 2, light: 1, off: 0 };
 const NUMBER_FIELDS = [
@@ -533,15 +534,21 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
         syncHeavyModelPlaceholder();
         applyCheckboxValue('s-auto-grant-reviewed-skills', s.OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS);
-        // Owner-facing mutative-subagents control is explicit On/Off. Legacy empty
-        // settings still display their effective runtime-mode default.
+        // Owner-facing mutative-subagents control shows the EFFECTIVE state when it
+        // is binary-representable: an explicit value, or unset in advanced/pro
+        // (every acting surface on = "On"). Unset in LIGHT mode is surface-aware
+        // (external_workspace/genesis stay on, self_worktree off — see
+        // config.get_allow_mutative_subagents), so neither Off nor On is truthful
+        // there: it displays as "Auto". Picking Auto saves the empty value
+        // (collectBody maps any non-on/off segment to ''), so the mode default
+        // keeps deciding.
         const rawMutative = String(s.OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS ?? '').trim().toLowerCase();
         const runtimeMode = String(s.OUROBOROS_RUNTIME_MODE || 'advanced').trim().toLowerCase();
         const mutativeInput = byId('s-allow-mutative-subagents');
         mutativeInput.dataset.rawValue = rawMutative;
         delete mutativeInput.dataset.effortTouched;
         mutativeInput.value =
-            ({ true: 'on', false: 'off' }[rawMutative] || (runtimeMode === 'light' ? 'off' : 'on'));
+            ({ true: 'on', false: 'off' }[rawMutative] || (runtimeMode === 'light' ? 'auto' : 'on'));
         // The delegation route lives next to it in Models → Subagents.
         applySubagentsSettings(s);
         // Post-task evolution: one owner-facing selector maps to enable + cadence.

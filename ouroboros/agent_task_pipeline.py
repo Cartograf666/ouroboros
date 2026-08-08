@@ -1424,10 +1424,15 @@ def build_review_context(env: Any) -> str:
             load_state,
             make_repo_key,
         )
-        from ouroboros.task_continuation import list_review_continuations
+        from ouroboros.task_continuation import (
+            list_review_continuations,
+            retire_settled_continuations_for_context,
+        )
         from ouroboros.task_results import load_task_result
 
         state = load_state(pathlib.Path(env.drive_root))
+        retired = retire_settled_continuations_for_context(
+            env.drive_root, state, lambda tid: load_task_result(env.drive_root, tid))
         continuations, corrupt = list_review_continuations(env.drive_root)
         repo_dir = pathlib.Path(env.repo_dir)
         repo_key = make_repo_key(repo_dir)
@@ -1508,6 +1513,11 @@ def build_review_context(env: Any) -> str:
         else:
             lines.append("- open_obligations=0")
 
+        if retired:
+            lines.append(f"- {len(retired)} settled continuation(s) archived out of context "
+                         "(durable under state/review_continuations/archived/): "
+                         + ", ".join(retired[:5])
+                         + (f" (+{len(retired) - 5} more)" if len(retired) > 5 else ""))
         scoped_continuations = [
             item for item in continuations
             if item.repo_key in ("", repo_key, _LEGACY_CURRENT_REPO_KEY)
