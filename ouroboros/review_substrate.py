@@ -46,7 +46,10 @@ from ouroboros.review_execution import (  # noqa: F401  (compat re-exports)
     assert_cache_breakpoint_cap,
     configured_review_routes,
 )
-from ouroboros.triad_review import extract_json_array
+# Reviewer-output JSON extraction lives in ONE place beside the array
+# extractor it falls back to (the fenced-object and verdict parsers were
+# split across two modules for no reason).
+from ouroboros.triad_review import parse_review_findings
 from ouroboros.usage_accounting import (
     UsageAccountingError,
     UsageScope,
@@ -935,64 +938,6 @@ def scope_reviewer_slots(
     )
 
 
-def _extract_fenced_json(text: str) -> Any:
-    """Best-effort parse of a fenced/embedded JSON object or array from model output.
-
-    Reviewers often wrap their verdict in a ```json ... ``` fence; a fenced JSON
-    OBJECT (e.g. {"verdict":"PASS","findings":[]}) would otherwise fail json.loads
-    and be missed by the array-only extractor, producing a false DEGRADED signal.
-    """
-    if "```" not in text:
-        return None
-    for chunk in text.split("```"):
-        candidate = chunk.strip()
-        if candidate.startswith("json"):
-            candidate = candidate[4:].strip()
-        if not candidate:
-            continue
-        try:
-            obj = json.loads(candidate)
-        except Exception:
-            continue
-        if isinstance(obj, (dict, list)):
-            return obj
-    return None
-
-
-def _parse_findings(raw_text: str) -> tuple[Any, List[Dict[str, Any]], str]:
-    text = str(raw_text or "").strip()
-    parsed: Any = None
-    findings: List[Dict[str, Any]] = []
-    signal = "UNKNOWN"
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        parsed = _extract_fenced_json(text)
-        if parsed is None:
-            extracted = extract_json_array(text)
-            if extracted is None:
-                # Keep non-JSON output untruncated; reviewer raw_text is still useful.
-                return None, [], "DEGRADED"
-            parsed = extracted
-    if isinstance(parsed, dict):
-        signal = str(parsed.get("verdict") or parsed.get("status") or "UNKNOWN").upper()
-        raw_findings = parsed.get("findings") or []
-        if isinstance(raw_findings, list):
-            findings = [item for item in raw_findings if isinstance(item, dict)]
-    elif isinstance(parsed, list):
-        findings = [item for item in parsed if isinstance(item, dict)]
-        verdicts = {str(item.get("verdict") or item.get("status") or "").upper() for item in findings}
-        if "FAIL" in verdicts:
-            signal = "FAIL"
-        elif "PASS" in verdicts:
-            signal = "PASS"
-        elif "DEGRADED" in verdicts:
-            signal = "DEGRADED"
-        else:
-            signal = "UNKNOWN"
-    return parsed, findings, signal
-
-
 class ReviewCoordinator:
     def __init__(
         self,
@@ -1163,7 +1108,7 @@ class ReviewCoordinator:
                 actor_errors.append(f"{actor.slot_id}:{actor.error}")
             elif actor.status != "ok":
                 actor_errors.append(f"{actor.slot_id}:{actor.status}")
-            parsed, findings, signal = _parse_findings(actor.raw_text)
+            parsed, findings, signal = parse_review_findings(actor.raw_text)
             actor.parsed = parsed
             actor.signal = signal
             slot = slots_by_id.get(actor.slot_id)
@@ -1478,7 +1423,7 @@ class ReviewCoordinator:
                         if (
                             acceptance_actor
                             and actor_attempt + 1 < actor_attempts
-                            and _parse_findings(raw_text)[0] is None
+                            and parse_review_findings(raw_text)[0] is None
                         ):
                             _prior_msg, _prior_usage, _prior_text = msg, usage, raw_text
                             try:
@@ -1591,10 +1536,12 @@ def run_review_request(
     coordinator = ReviewCoordinator(llm=llm, drive_root=drive_root, usage_ctx=usage_ctx)
     result = coordinator.run(request, reviewer_slots(role_hint=request.surface) if slots is None else slots)
     if request.surface == "task_acceptance":
-        try:  # D-Q5 annotation-only pass: feeds the clean bit + disclosure, never raises into the panel
-            from ouroboros.review_evidence import annotate_criteria_evidence_resolution
+        # D-Q5 annotation-only pass: feeds the clean bit + disclosure, never parse
+        # validity/quorum/verdicts. Called UNGUARDED on purpose — the annotator is
+        # total and fail-CLOSED (a resolver failure stamps the non-clean row), and
+        # `review_evidence` already built this packet, so swallowing an error here
+        # could only turn "the host never checked the refs" into a clean PASS.
+        from ouroboros.review_evidence import annotate_criteria_evidence_resolution
 
-            annotate_criteria_evidence_resolution(result.actors, request.evidence)
-        except Exception:
-            log.debug("evidence-ref resolution annotation failed", exc_info=True)
+        annotate_criteria_evidence_resolution(result.actors, request.evidence)
     return result

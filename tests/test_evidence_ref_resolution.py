@@ -193,6 +193,58 @@ def test_clean_gate_accepts_partial_resolution_and_historical_rows():
     assert task_acceptance_is_clean(_result([historical])) is True
 
 
+def test_resolution_failure_is_fail_closed_never_a_silent_clean_pass():
+    """The ABSENCE of an annotation row is what authorizes the clean bit, so a
+    resolver that did not run must not read as 'everything resolved'. Any failure
+    stamps the panel-wide unavailable row on every actor — landing on the same
+    clean-bit rail as an unresolved ref, never on the verdict."""
+    import ouroboros.review_evidence as review_evidence
+
+    actors = [_actor([{"criterion": "c", "status": "supported",
+                       "evidence_refs": ["verification_receipts[0]"]}])]
+
+    class _Exploding(dict):
+        def get(self, *_a, **_kw):
+            raise RuntimeError("packet read blew up")
+
+    annotate_criteria_evidence_resolution(actors, _Exploding())
+    rows = actors[0]["criteria_refs_unresolved"]
+    assert rows[0]["supported_evidence_resolves"] is False
+    assert rows[0]["resolution_status"] == "host_resolution_unavailable"
+    result = _result(actors)
+    assert task_acceptance_is_clean(result) is False
+    assert result.aggregate_signal == "PASS"           # verdict untouched
+    assert actors[0]["parsed"]["verdict"] == "PASS"
+
+    # A per-actor failure is contained the same way, actor by actor.
+    def _boom(_criteria, _vocab):
+        raise RuntimeError("resolver blew up")
+
+    healthy = [_actor([{"criterion": "c", "status": "supported",
+                        "evidence_refs": ["claim_1"]}])]
+    original = review_evidence.resolve_criteria_evidence_refs
+    review_evidence.resolve_criteria_evidence_refs = _boom
+    try:
+        annotate_criteria_evidence_resolution(healthy, _PACKET)
+    finally:
+        review_evidence.resolve_criteria_evidence_refs = original
+    assert healthy[0]["criteria_refs_unresolved"][0]["supported_evidence_resolves"] is False
+    assert task_acceptance_is_clean(_result(healthy)) is False
+
+
+def test_panel_call_site_does_not_swallow_the_resolution_pass():
+    """review_substrate calls the annotator UNGUARDED: an `except: pass`-shaped
+    guard there could only convert 'the host never checked the refs' into a clean
+    PASS, and the annotator is already total + fail-closed."""
+    import inspect
+
+    from ouroboros.review_substrate import run_review_request
+
+    source = inspect.getsource(run_review_request)
+    call = source.index("annotate_criteria_evidence_resolution(result.actors")
+    assert "try:" not in source[:call]
+
+
 def test_require_criterion_evidence_knob_is_deleted():
     import pathlib
 

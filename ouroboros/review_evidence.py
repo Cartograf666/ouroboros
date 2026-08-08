@@ -465,6 +465,18 @@ def _accept_claim_support_refs(contract: Dict[str, Any], receipts: list) -> list
 CLAIM_ID_UNSUPPORTED = "claim_id_unsupported"
 NON_RESOLVING_BASIS_KINDS = frozenset({CLAIM_ID_UNSUPPORTED})
 
+# D-Q5 fail-closed row: the host could not resolve this panel's refs at all. It
+# carries the SAME `supported_evidence_resolves=False` the clean gate already
+# reads for an unresolved ref, so a broken resolver degrades the clean bit
+# instead of authorizing it. `criterion="*"` marks it as panel-wide, not a
+# reviewer-named criterion.
+_RESOLUTION_UNAVAILABLE_ROW = {
+    "criterion": "*",
+    "refs": [],
+    "supported_evidence_resolves": False,
+    "resolution_status": "host_resolution_unavailable",
+}
+
 
 def acceptance_evidence_ref_vocabulary(evidence: Any) -> Dict[str, str]:
     """The enumerable canonical exhibit keys of ONE already-built packet (D-Q5).
@@ -570,15 +582,34 @@ def annotate_criteria_evidence_resolution(actors: Any, evidence: Any) -> None:
     Runs ONCE per acceptance panel over actor dict rows; a fully-resolving actor
     gets NO annotation (the common clean path is byte-identical). The annotation
     feeds ONLY ``task_acceptance_is_clean`` and disclosure — never parse validity,
-    never quorum, never a verdict."""
-    vocabulary = acceptance_evidence_ref_vocabulary(evidence)
+    never quorum, never a verdict.
+
+    TOTAL and fail-CLOSED. An annotation that did not run may never be read as
+    "everything resolved": the absence of a row is what authorizes the clean bit,
+    so a resolver failure that left the rows off would silently certify evidence
+    nobody checked. Any failure therefore stamps the typed
+    ``host_resolution_unavailable`` row on EVERY actor, landing on the same
+    clean-bit rail as an unresolved ref — never a verdict, never a veto."""
+    unavailable = False
+    try:
+        vocabulary = acceptance_evidence_ref_vocabulary(evidence)
+    except Exception:
+        log.warning("acceptance evidence-ref vocabulary unavailable", exc_info=True)
+        vocabulary, unavailable = {}, True
     for actor in actors if isinstance(actors, list) else []:
         if not isinstance(actor, dict):
             continue
-        parsed = actor.get("parsed") if isinstance(actor.get("parsed"), dict) else {}
-        rows = resolve_criteria_evidence_refs(parsed.get("criteria_used"), vocabulary)
-        if rows:
-            actor["criteria_refs_unresolved"] = rows
+        try:
+            if unavailable:
+                actor["criteria_refs_unresolved"] = [dict(_RESOLUTION_UNAVAILABLE_ROW)]
+                continue
+            parsed = actor.get("parsed") if isinstance(actor.get("parsed"), dict) else {}
+            rows = resolve_criteria_evidence_refs(parsed.get("criteria_used"), vocabulary)
+            if rows:
+                actor["criteria_refs_unresolved"] = rows
+        except Exception:
+            log.warning("acceptance evidence-ref resolution failed for one actor", exc_info=True)
+            actor["criteria_refs_unresolved"] = [dict(_RESOLUTION_UNAVAILABLE_ROW)]
 
 
 def _accept_trajectory(tool_calls: list) -> tuple:
