@@ -11,7 +11,11 @@
   --ui-tone-danger: var(--red);
   --border-strong: rgba(232, 93, 111, 0.35);
   --text: #edf2f7;
-  --muted: rgba(237, 242, 247, 0.62);
+  /* Foregrounds mirrored by value (docs/DESIGN.md); --muted is now an alias so
+     the wizard has one secondary grey. --ghost stays placeholder-only. */
+  --text-meta: rgba(237, 242, 247, 0.68);
+  --text-disabled: rgba(237, 242, 247, 0.38);
+  --muted: var(--text-meta);
   --ghost: rgba(237, 242, 247, 0.28);
   --accent: #e85d6f;
   --accent-2: #fb7185;
@@ -36,6 +40,23 @@
   --tone-ok: var(--green);
   --tone-warn: var(--amber);
   --tone-danger: var(--red);
+  /* Type scale — the same four sizes as style.css, no fifth. */
+  --type-meta: 12px;
+  --type-body: 14px;
+  --type-section: 16px;
+  --type-page: 24px;
+  --line-meta: 1.35;
+  --line-body: 1.5;
+  --line-title: 1.3;
+  /* Status pairs — same roles, same tints as style.css. */
+  --status-ok-fg: #6ee7b7;
+  --status-ok-bg: var(--green-dim);
+  --status-warn-fg: #fcd34d;
+  --status-warn-bg: var(--amber-dim);
+  --status-error-fg: #fca5a5;
+  --status-error-bg: var(--red-dim);
+  --status-neutral-fg: var(--text-meta);
+  --status-neutral-bg: rgba(255, 255, 255, 0.08);
 }
 
 * {
@@ -92,9 +113,11 @@ textarea::placeholder {
   align-items: start;
 }
 
+/* Was a one-off 32px (plus a 28px compact variant); joins the scale. */
 .wizard-title {
   margin: 0 0 4px;
-  font-size: 32px;
+  font-size: var(--type-page);
+  line-height: var(--line-title);
   font-weight: 700;
   letter-spacing: 0;
 }
@@ -103,7 +126,8 @@ textarea::placeholder {
   margin: 0;
   max-width: 760px;
   color: var(--muted);
-  line-height: 1.42;
+  font-size: var(--type-body);
+  line-height: var(--line-body);
 }
 
 .wizard-badge {
@@ -112,7 +136,8 @@ textarea::placeholder {
   border: 1px solid var(--border);
   background: var(--panel-2);
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
   white-space: nowrap;
 }
 
@@ -151,12 +176,12 @@ textarea::placeholder {
   margin-bottom: 0;
   padding: 4px 9px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.07);
-  color: var(--muted);
-  font-size: 10px;
+  background: var(--status-neutral-bg);
+  color: var(--status-neutral-fg);
+  font-size: var(--type-meta);
+  line-height: 1;
   font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.04em;
 }
 
 .wizard-step.active .wizard-step-index {
@@ -166,16 +191,16 @@ textarea::placeholder {
 
 .wizard-step-title {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--type-meta);
   font-weight: 600;
-  line-height: 1.35;
+  line-height: var(--line-meta);
 }
 
 .wizard-step-copy {
   margin: 0;
   color: var(--muted);
-  font-size: 11px;
-  line-height: 1.35;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
 }
 
 @media (max-width: 1100px) {
@@ -215,7 +240,8 @@ textarea::placeholder {
 
 .step-title {
   margin: 0 0 6px;
-  font-size: 24px;
+  font-size: var(--type-page);
+  line-height: var(--line-title);
   font-weight: 700;
 }
 
@@ -223,7 +249,8 @@ textarea::placeholder {
   margin: 0;
   color: var(--muted);
   max-width: 780px;
-  line-height: 1.42;
+  font-size: var(--type-body);
+  line-height: var(--line-body);
 }
 
 .panel-card,
@@ -247,7 +274,10 @@ textarea::placeholder {
 .summary-card h3,
 .wizard-choice h3 {
   margin: 0 0 8px;
-  font-size: 15px;
+  font-size: var(--type-section);
+  line-height: var(--line-title);
+  font-weight: 600;
+  color: var(--text);
 }
 
 .panel-card p,
@@ -256,8 +286,8 @@ textarea::placeholder {
 .field-note {
   margin: 0;
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.42;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
 }
 
 .wizard-inline-note code,
@@ -323,7 +353,8 @@ textarea::placeholder {
   text-align: left;
   cursor: pointer;
   font: inherit;
-  font-size: 12px;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
 }
 
 .wizard-model-suggestion:hover {
@@ -341,21 +372,24 @@ textarea::placeholder {
   gap: 12px;
 }
 
+/* Uppercase micro-label retired (docs/DESIGN.md "Hierarchy rule"). */
 .field label {
-  color: rgba(237, 242, 247, 0.68);
-  font-size: 12px;
+  color: var(--text-meta);
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  text-transform: none;
+  letter-spacing: normal;
 }
 
 .field-clear {
   padding: 0;
   border: none;
   background: transparent;
-  color: rgba(237, 242, 247, 0.48);
+  color: var(--text-meta);
   cursor: pointer;
-  font-size: 11px;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
 }
 
 .field-clear:hover {
@@ -371,6 +405,7 @@ select {
   border: 1px solid var(--border);
   background: rgba(11, 9, 16, 0.72);
   color: var(--text);
+  font-size: var(--type-body);
   outline: none;
 }
 
@@ -455,9 +490,10 @@ select:focus {
   justify-content: center;
   padding: 5px 10px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--muted);
-  font-size: 11px;
+  background: var(--status-neutral-bg);
+  color: var(--status-neutral-fg);
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
   font-weight: 600;
 }
 
@@ -480,25 +516,29 @@ select:focus {
   background: rgba(232, 93, 111, 0.09);
 }
 
+/* Choice-card chip. Only advisory/blocking declared a pair, so the three
+   runtime-mode chips rendered as bare white text; neutral is now the default. */
 .wizard-choice .tone {
   display: inline-flex;
   margin-bottom: 10px;
   padding: 4px 8px;
   border-radius: 999px;
-  font-size: 11px;
+  background: var(--status-neutral-bg);
+  color: var(--status-neutral-fg);
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
   font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  letter-spacing: 0.02em;
 }
 
 .wizard-choice.advisory .tone {
-  background: var(--amber-dim);
-  color: #fbbf24;
+  background: var(--status-warn-bg);
+  color: var(--status-warn-fg);
 }
 
 .wizard-choice.blocking .tone {
-  background: var(--green-dim);
-  color: #6ee7b7;
+  background: var(--status-ok-bg);
+  color: var(--status-ok-fg);
 }
 
 .wizard-runtime-strip {
@@ -510,15 +550,34 @@ select:focus {
 
 .wizard-runtime-status {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
+}
+
+.wizard-runtime-status[data-tone="muted"] {
+  color: var(--status-neutral-fg);
 }
 
 .wizard-runtime-status[data-tone="ok"] {
-  color: var(--ui-tone-ok);
+  color: var(--status-ok-fg);
 }
 
 .wizard-runtime-status[data-tone="error"] {
-  color: var(--ui-tone-danger);
+  color: var(--status-error-fg);
+}
+
+/* Status = dot + text, matching the settings shell. */
+.wizard-runtime-status[data-tone]::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 7px;
+  border-radius: 999px;
+  background: currentColor;
+  vertical-align: middle;
+  position: relative;
+  top: -1px;
 }
 
 .wizard-test-result {
@@ -528,24 +587,24 @@ select:focus {
   border: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(255, 255, 255, 0.03);
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: var(--type-meta);
+  line-height: var(--line-body);
   white-space: pre-wrap;
 }
 
 .wizard-test-result[data-tone="ok"] {
   border-color: rgba(52, 211, 153, 0.22);
-  color: #86efac;
+  color: var(--status-ok-fg);
 }
 
 .wizard-test-result[data-tone="warn"] {
   border-color: rgba(245, 158, 11, 0.18);
-  color: #fcd34d;
+  color: var(--status-warn-fg);
 }
 
 .wizard-test-result[data-tone="error"] {
   border-color: rgba(239, 68, 68, 0.18);
-  color: #fca5a5;
+  color: var(--status-error-fg);
 }
 
 .summary-card {
@@ -554,16 +613,19 @@ select:focus {
   gap: 10px;
 }
 
+/* Key at meta ink, value at primary (docs/DESIGN.md "Hierarchy rule"). */
 .summary-kv {
   display: grid;
   grid-template-columns: 200px minmax(0, 1fr);
   gap: 10px;
-  font-size: 12px;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
+  color: var(--text);
   align-items: start;
 }
 
 .summary-kv strong {
-  color: rgba(237, 242, 247, 0.72);
+  color: var(--text-meta);
   font-weight: 600;
 }
 
@@ -578,8 +640,8 @@ select:focus {
 .footer-copy {
   max-width: 640px;
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.45;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
 }
 
 .btn {
@@ -587,6 +649,7 @@ select:focus {
   border-radius: 12px;
   padding: 10px 14px;
   cursor: pointer;
+  font-size: var(--type-body);
   transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
 }
 
@@ -616,8 +679,9 @@ select:focus {
 
 .wizard-error {
   min-height: 22px;
-  color: #fca5a5;
-  font-size: 12px;
+  color: var(--status-error-fg);
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
 }
 
 @media (max-height: 820px), (max-width: 900px) {
@@ -631,10 +695,8 @@ select:focus {
     align-items: center;
   }
 
-  .wizard-title {
-    font-size: 28px;
-  }
-
+  /* Title shrinks dropped with the one-off sizes they adjusted; hiding the
+     copy below reclaims far more height. */
   .wizard-subtitle,
   .wizard-step-copy,
   .step-copy,
@@ -660,7 +722,6 @@ select:focus {
 
   .step-title {
     margin-bottom: 0;
-    font-size: 22px;
   }
 
   .panel-card,
@@ -709,10 +770,6 @@ select:focus {
 
   .wizard-step-copy {
     display: none;
-  }
-
-  .wizard-step-title {
-    font-size: 12px;
   }
 
   .summary-kv {
