@@ -227,13 +227,13 @@ may not weaken it.
    is blocking under `blocking` enforcement; under owner-chosen
    `advisory` enforcement it still runs in full and every decision that
    blocking would have stopped is loudly and durably recorded.
-2. **Advisory pre-review**: a cheaper preflight on the same snapshot,
-   mandatory before the blocking review; staleness-aware (any
-   worktree-mutating tool invalidates the snapshot). The owner may leave
-   the advisory reviewer unconfigured. That does not make the preflight
-   optional — it makes it UNAVAILABLE, and a commit then rides the audited
-   bypass of the same name below, durably recorded. An unconfigured
-   advisory must never read as a clean preflight.
+2. **Advisory pre-review**: a cheap, staleness-aware preflight on the
+   staged snapshot. It catches omissions before authoritative review, but
+   Ouroboros may skip it by LLM judgment when it is slow, unhealthy,
+   unavailable, or unlikely to add value. The skip is explicit and
+   durably audited; it does not alter any other applicable deterministic
+   or multi-model gate. An unavailable or unconfigured advisory lane is
+   never represented as a clean preflight; it is a disclosed skip or failure.
 3. **Plan review**: multi-model architectural review of plans before
    implementation starts, mandatory for non-trivial or
    direction-changing work.
@@ -244,7 +244,7 @@ may not weaken it.
    data root.
 5. **Deterministic pre-commit gates** and **health invariants**: cheap
    deterministic checks (version sync, data-boundary, changelog cap,
-   advisory snapshot freshness, codebase size) that run before or
+   advisory freshness or audited-skip evidence, codebase size) that run before or
    instead of the expensive LLM review.
 
 ### Modification bounds
@@ -350,13 +350,12 @@ following bounds are constitutional:
   — but never abandoned or replaced wholesale. An immune system without
   durable memory is not immune. These files share the Ship-of-Theseus
   protection of the constitutional core.
-- **Audited bypass only.** An advisory-bypass path, defined in
-  [docs/CHECKLISTS.md](docs/CHECKLISTS.md), is a named exception scoped
-  to cosmetic changes and release-artifact metadata, and to a commit
-  whose advisory reviewer is UNCONFIGURED (Component 2 above) — the
-  preflight is then unavailable, not waived, and the bypass is what
-  makes that visible. Every bypass is durably audited. Silent bypass is
-  forbidden.
+- **Audited advisory skip only.** `skip_advisory_review` waives only
+  advisory freshness and advisory-carried obligations/debt. The choice is
+  LLM-first, not a hardcoded allowlist of change types. Every skip is
+  explicit and durably audited. It cannot waive independently applicable tests,
+  the triad, applicable scope review, staged-fingerprint revalidation, or
+  final commit/tag/SHA binding. Silent skip is forbidden.
 - **Owner-chosen enforcement, loud advisory.** The owner selects review
   enforcement (`blocking` or `advisory`). Advisory enforcement is
   legitimate ONLY while every decision that blocking enforcement would
