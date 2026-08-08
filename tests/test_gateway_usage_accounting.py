@@ -136,7 +136,7 @@ def test_api_state_money_and_call_count_are_ledger_projections(tmp_path, monkeyp
     monkeypatch.setattr(workers, "WORKERS", {})
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
-    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda: {})
+    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda **_kwargs: {})
     app = types.SimpleNamespace(state=types.SimpleNamespace(
         drive_root=root,
         app_start=0.0,
@@ -203,7 +203,7 @@ def test_api_state_marks_accounting_unavailable_without_legacy_zero(tmp_path, mo
     monkeypatch.setattr(workers, "WORKERS", {})
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
-    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda: {})
+    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda **_kwargs: {})
     request = Request({
         "type": "http", "method": "GET", "path": "/api/state", "headers": [],
         "query_string": b"", "scheme": "http", "server": ("test", 80),
