@@ -352,6 +352,33 @@ def _accept_verification_summary(receipts: list) -> Dict[str, Any]:
     }
 
 
+def _accept_effective_claims(
+    ctx: Any, contract: Dict[str, Any], drive_root: Any, task_id: str,
+) -> tuple[list, str]:
+    """Effective claims + provenance for the packet, via the ONE pure seam
+    (contracts.task_contract.effective_acceptance_claims): ingress-contract claims
+    first, the CLOSED plan wave's frozen claims only when ingress is empty. The
+    plan-state lookup mirrors plan_task's own state location (budget_drive_root
+    first) and is FAIL-SOFT — a claims lookup must never break packet building."""
+    from ouroboros.contracts.task_contract import effective_acceptance_claims
+
+    claims, source = effective_acceptance_claims(contract)
+    if claims:
+        return claims, source
+    root = getattr(ctx, "budget_drive_root", None) or drive_root
+    if not root or not str(task_id or ""):
+        return [], ""
+    try:
+        from ouroboros.task_results import closed_plan_review_wave, load_plan_review_state
+
+        wave = closed_plan_review_wave(
+            load_plan_review_state(pathlib.Path(str(root)), str(task_id))
+        )
+    except Exception:
+        return [], ""
+    return effective_acceptance_claims(contract, wave)
+
+
 def _accept_claim_support_refs(contract: Dict[str, Any], receipts: list) -> list[Dict[str, Any]]:
     """Host-built support references for acceptance claims.
 
@@ -756,6 +783,12 @@ def build_task_acceptance_evidence(
         ev["agent_supplied"] = redact_projection(a).value
         prov["agent_supplied"] = "agent_supplied"
     contract = _accept_task_contract(ctx)
+    # W2: resolve the claims that bind this task through the ONE seam — ingress
+    # first, plan-frozen only when ingress is empty. The packet VIEW carries them;
+    # the durable/live contract is never mutated.
+    claims, claims_source = _accept_effective_claims(ctx, contract, drive_root, task_id)
+    if claims_source == "plan_review":
+        contract = {**contract, "acceptance_claims": claims}
     receipts = read_verification_receipts(drive_root, task_id) if (drive_root is not None and task_id) else []
     owner_directives = _accept_owner_directives(ctx, drive_root, task_id)
     if owner_directives:
@@ -767,6 +800,9 @@ def build_task_acceptance_evidence(
         # Structural (key-aware) redaction of the full contract before it enters the prompt.
         ev["task_contract"] = redact_projection(contract).value
         prov["task_contract"] = "host_attested"
+        if claims_source:
+            ev["acceptance_claims_source"] = claims_source
+            prov["acceptance_claims_source"] = "host_attested"
         support_refs = _accept_claim_support_refs(contract, receipts)
         if support_refs:
             ev["acceptance_support_refs"] = redact_projection(support_refs).value
