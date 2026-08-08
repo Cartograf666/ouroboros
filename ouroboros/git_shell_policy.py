@@ -323,8 +323,28 @@ def external_workspace_git_violation(
         # this invocation mutate?" — the contract's network fence is enforced
         # separately at the tail, for read-only and mutating git alike.
         if _git_invocation_block_reason(invocation, allow_network=True):
+            # Global `-C <path>` flags (before the subcommand) CHDIR sequentially
+            # BEFORE git does anything: the EFFECTIVE working directory — not the
+            # shell cwd — is what a mutating invocation targets. Chain them so
+            # `git -C /tmp/proj commit` from a runtime cwd (the default lane's
+            # default cwd IS the system repo) stays allowed, while
+            # `git -C <runtime> commit` from anywhere hits the same containment
+            # check. `-C` AFTER the subcommand is subcommand syntax (e.g.
+            # `git commit -C <commit>` reuses a message) and is not a path.
+            effective_base = current_base
+            j = 1
+            while j < len(invocation):
+                part = str(invocation[j])
+                if part == "-C" and j + 1 < len(invocation):
+                    effective_base = _resolve(str(invocation[j + 1]), effective_base)
+                    j += 2
+                    continue
+                if part.startswith("-"):
+                    j += 2 if part in ("-c", "--git-dir", "--work-tree") else 1
+                    continue
+                break  # the subcommand
             for root in roots:
-                if _overlaps_protected(current_base, root):
+                if _overlaps_protected(effective_base, root):
                     return "git working directory targets the Ouroboros runtime"
             # Git is legitimate task work in host scratch (a repo under /tmp, a
             # /build tree, a sibling checkout), so the cwd is NOT confined to the
@@ -332,31 +352,33 @@ def external_workspace_git_violation(
             # are protected (per this function's contract).
             # GIT_DIR / GIT_WORK_TREE environment retargeting (this segment runs
             # git). Merge env exported in earlier segments; segment-local wins.
+            # Relative values resolve against the post-`-C` effective base — the
+            # cwd git actually sees when it reads the environment.
             effective_env = {**session_env, **env_assigns}
             for var in ("GIT_DIR", "GIT_WORK_TREE"):
                 val = effective_env.get(var)
                 if not val:
                     continue
-                target = _resolve(val, current_base)
+                target = _resolve(val, effective_base)
                 if _protected_label(target):
                     return f"git invocation targets the Ouroboros runtime via {var}"
             j = 1
             while j < len(invocation):
                 part = str(invocation[j])
                 value = ""
-                if part in {"-C", "--git-dir", "--work-tree"} and j + 1 < len(invocation):
+                if part in {"--git-dir", "--work-tree"} and j + 1 < len(invocation):
                     value = str(invocation[j + 1])
                     j += 2
                 elif part.startswith("--git-dir=") or part.startswith("--work-tree="):
                     value = part.split("=", 1)[1]
                     j += 1
-                elif part == "-c":
+                elif part in {"-c", "-C"}:
                     j += 2
                 else:
                     j += 1
                 if not value:
                     continue
-                target = _resolve(value, current_base)
+                target = _resolve(value, effective_base)
                 if _protected_label(target):
                     return "git invocation targets the Ouroboros runtime"
             for arg in invocation[1:]:
@@ -365,11 +387,13 @@ def external_workspace_git_violation(
                     text = text.split("=", 1)[1]
                 candidate = _shell_path(text)
                 if not candidate.is_absolute():
-                    # Relative args resolve under the cwd; a non-runtime cwd can
-                    # only escape toward the runtime by ".."-climbing.
+                    # Relative args resolve under the effective base; a
+                    # non-runtime base can only escape toward the runtime by
+                    # ".."-climbing (a plain descend from a base that passed the
+                    # bidirectional check cannot reach a protected root).
                     if ".." not in candidate.parts:
                         continue
-                    candidate = (current_base / candidate).resolve(strict=False)
+                    candidate = (effective_base / candidate).resolve(strict=False)
                 if _protected_label(candidate):
                     return "git invocation targets the Ouroboros runtime"
         if not allow_network:

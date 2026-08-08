@@ -86,6 +86,31 @@ ALLOWED_CASES = [
 ]
 
 
+@pytest.mark.parametrize("cmd", [
+    pytest.param("git -C /tmp/proj commit -m x", id="minusC_outside_from_runtime_cwd"),
+    pytest.param("git -C /tmp/proj init", id="minusC_outside_init_from_runtime_cwd"),
+    pytest.param("git -C /tmp -C proj add -A", id="chained_minusC_outside_from_runtime_cwd"),
+])
+def test_minusC_retarget_outside_runtime_allowed_from_runtime_cwd(cmd):
+    """Global `-C` chdirs BEFORE git runs: the effective directory — not the
+    shell cwd — is the mutating target. The default (non-workspace) lane's
+    default cwd IS the system repo, so `git -C <outside-tree> ...` from there
+    must stay allowed or the flip re-creates the false-block class."""
+    assert _violation(cmd, cwd=str(REPO)) == ""
+
+
+def test_minusC_into_runtime_still_blocked_from_any_cwd():
+    assert _violation("git -C /Users/anton/Ouroboros/repo commit -m x", cwd="/tmp/ws")
+    # A RELATIVE -C resolves against the shell cwd and is still caught.
+    assert _violation("git -C repo reset --hard", cwd="/Users/anton/Ouroboros")
+
+
+def test_commit_minusC_message_reuse_is_not_a_path():
+    # `git commit -C <commit>` (after the subcommand) reuses a commit message;
+    # it must not be parsed as a path selector.
+    assert _violation("git commit -C HEAD", cwd="/tmp/ws") == ""
+
+
 @pytest.mark.parametrize("cmd", ALLOWED_CASES)
 def test_legitimate_workspace_git_is_allowed(cmd):
     assert not _violation(cmd), f"expected ALLOW for: {cmd!r}"

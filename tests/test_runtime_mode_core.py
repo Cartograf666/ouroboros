@@ -843,6 +843,20 @@ def test_default_lane_allows_readonly_git_at_runtime_cwd(tmp_path, monkeypatch):
     assert "GIT_VIA_SHELL_BLOCKED" not in result
 
 
+def test_default_lane_allows_minusC_retarget_from_default_cwd(tmp_path, monkeypatch):
+    """The default lane's DEFAULT cwd is the system repo; `git -C <outside>` must
+    be judged by its effective (-C) target, not the shell cwd, or the flip
+    re-creates the false-block class it removes."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    reg, _repo, home = _outside_runtime_registry(tmp_path, monkeypatch)
+    result = reg.execute(
+        "run_command",
+        {"cmd": ["git", "-C", str(home / "proj"), "init"]},  # no cwd -> repo default
+    )
+    assert "GIT_VIA_SHELL_BLOCKED" not in result
+    assert "WORKSPACE_GIT_BLOCKED" not in result
+
+
 def test_advanced_mode_blocks_runshell_protected_python_writer(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     reg = _registry(tmp_path)
