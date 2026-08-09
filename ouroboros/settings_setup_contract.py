@@ -152,6 +152,26 @@ _LOCAL_PRESETS: Dict[str, Dict[str, Any]] = {
     "qwen3-32b": {"label": "Qwen3-32B Instruct Q4_K_M", "source": "Qwen/Qwen3-32B-GGUF", "filename": "Qwen3-32B-Q4_K_M.gguf", "contextLength": 32768, "chatFormat": ""},
 }
 
+# Agent SUBSCRIPTION intent (install-time presets, D-3/D-4). These two
+# are NOT settings keys — they are wizard→server declarations about the
+# onboarding run itself, so they are declared here (one setup vocabulary for
+# every host) instead of being invented separately by each caller. The server
+# never trusts the first one as authority for anything but "look at the daemon";
+# what a connected subscription actually IS gets re-read from Claudexor.
+SUBSCRIPTIONS_CONNECTED_FIELD = "subscriptionsConnected"
+SKIP_SUBSCRIPTION_PRESETS_FIELD = "skipSubscriptionPresets"
+
+# The durable "onboarding finished here" fact, written by every completion —
+# including one that connected no subscription and one that skipped the preset.
+# Absence of a working provider is a state an OLD install reaches too, so it
+# cannot be the latch on its own; this key is what closes the window for good.
+ONBOARDING_COMPLETED_KEY = "OUROBOROS_ONBOARDING_COMPLETED_AT"
+
+_SUBSCRIPTION_FIELDS = _rows(("id", "payloadKey", "label", "note"), (
+    ("subscriptions-connected", SUBSCRIPTIONS_CONNECTED_FIELD, "Agent subscription connected", "Set by the wizard when at least one agent account was signed in during onboarding. The server re-reads the live account state before applying anything."),
+    ("skip-subscription-presets", SKIP_SUBSCRIPTION_PRESETS_FIELD, "Finish without agent defaults", "Completes onboarding without moving reviewers and subagents onto the connected subscriptions. Everything stays editable in Settings afterwards."),
+))
+
 _MODEL_SUGGESTIONS = list(dict.fromkeys(("x-ai/grok-4.5", "google/gemini-3.6-flash", "openai/gpt-5.6-terra", "openai/gpt-5.6-sol", "openai/gpt-5.6-luna", "openai::gpt-5.6-terra", "openai::gpt-5.6-sol", "openai::gpt-5.6-luna", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5", "anthropic::claude-sonnet-5", "anthropic::claude-opus-5", "anthropic::claude-opus-4-6", "deepseek/deepseek-v4-pro", "openai-compatible::meta-llama/compatible", "cloudru::zai-org/GLM-4.7", "minimax::MiniMax-M3", "minimax::MiniMax-M2.7")))
 
 
@@ -242,7 +262,22 @@ def build_setup_contract(host_mode: str = "desktop") -> dict:
         "runtimeModes": [dict(item) for item in _RUNTIME_MODES],
         "localRoutingModes": [dict(item) for item in _LOCAL_ROUTING_MODES],
         "budgetFields": [dict(item) for item in _BUDGET_FIELDS],
+        "subscriptionFields": [dict(item) for item in _SUBSCRIPTION_FIELDS],
     }
+
+
+def parse_subscription_intent(data: dict) -> Tuple[bool, bool]:
+    """``(subscriptions_connected, skip_presets)`` from a wizard payload.
+
+    Both default to False, and both are DECLARATIONS, not decisions: the first
+    only tells the server to go look at the live Claudexor account state, and
+    the second is the owner's explicit "finish without agent defaults" escape
+    hatch. Neither can make the server apply a preset an install is not
+    eligible for."""
+    return (
+        _truthy(data.get(SUBSCRIPTIONS_CONNECTED_FIELD)),
+        _truthy(data.get(SKIP_SUBSCRIPTION_PRESETS_FIELD)),
+    )
 
 
 def build_initial_setup_state(settings: dict, host_mode: str = "desktop") -> dict:

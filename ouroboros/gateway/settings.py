@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import pathlib
 import re
 import socket
 import sys
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
@@ -20,9 +19,20 @@ from ouroboros.config import (
     SETTINGS_DEFAULTS as _SETTINGS_DEFAULTS,
     apply_settings_to_env as _apply_settings_to_env,
     load_settings,
-    save_settings,
 )
+from ouroboros.config import ENDPOINT_AUTHORED_SETTINGS as _ENDPOINT_AUTHORED_SETTINGS
 from ouroboros.gateway._helpers import json_error, json_exception, request_drive_root
+from ouroboros.gateway.owner_settings import (
+    CommitBoundary,
+    SettingsLockUnavailable,
+    _CONTEXT_MODE_KEYS,
+    _owner_audit,
+    _owner_read_settings_raw,
+    _owner_write_settings,
+    owner_write_guard,
+    post_commit_failure_response,
+    unsaved_error,
+)
 from ouroboros.onboarding_wizard import build_onboarding_html
 from ouroboros.platform_layer import is_container_env
 from ouroboros.provider_models import MINIMAX_REGION_ENDPOINTS, resolve_minimax_base_url
@@ -36,7 +46,7 @@ from ouroboros.settings_setup_contract import (
     build_setup_contract,
     parse_budget_setting,
 )
-from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso
+from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
 DEFAULT_PORT = int(os.environ.get("OUROBOROS_SERVER_PORT", "8765"))
@@ -288,7 +298,11 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
             # flows ONLY through the dedicated audited owner endpoint
             # (api_owner_safety_mode); save_settings additionally ratchets lowering.
             "OUROBOROS_SAFETY_MODE",
-        }:
+            # The install-time facts join from config's ENDPOINT_AUTHORED_SETTINGS just
+            # below: POST /api/onboarding/complete alone writes them, beside what they
+            # record. This blocks the REQUEST BODY; the same set keeps them off the
+            # environment in both directions, so no other route can author them either.
+        } | _ENDPOINT_AUTHORED_SETTINGS:
             continue
         if key not in body:
             continue
@@ -334,79 +348,6 @@ async def _json_body_or_empty(request: Request) -> Any:
         return {}
 
 
-def _owner_audit(request: Request, action: str, payload: Dict[str, Any]) -> None:
-    try:
-        drive_root = request_drive_root(request)
-    except Exception:
-        drive_root = pathlib.Path(DATA_DIR)
-    try:
-        client = getattr(request, "client", None)
-        append_jsonl(
-            drive_root / "logs" / "events.jsonl",
-            {
-                "ts": utc_now_iso(),
-                "type": "owner_api_action",
-                "action": str(action or ""),
-                "client_host": str(getattr(client, "host", "") or ""),
-                **{
-                    key: value
-                    for key, value in dict(payload or {}).items()
-                    if "key" not in str(key).lower() and "secret" not in str(key).lower()
-                },
-            },
-        )
-    except Exception:
-        log.debug("Failed to write owner API audit event", exc_info=True)
-
-
-# The context mode and its derived authority bit are authored together, by the owner endpoint
-# or by the system auto-downgrade — never by a generic save (see prepare_settings_for_persist).
-_CONTEXT_MODE_KEYS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW")
-
-
-def _owner_write_settings(
-    settings: Dict[str, Any],
-    *,
-    authored_keys: Sequence[str] = (),
-    allow_context_lowering: bool = False,
-    allow_safety_lowering: bool = False,
-) -> None:
-    """Write owner-controlled settings without applying the runtime-mode ratchet.
-
-    Skipping that ONE ratchet is the whole reason this writer exists; everything else comes from
-    ``config.prepare_settings_for_persist``, the single point both persisting writers pass through.
-    An endpoint that genuinely authors a disk-authored key (context mode, safety mode, the derived
-    auto-low flag) must name it in ``authored_keys`` — otherwise a POST about an unrelated key would
-    author a mode decision out of the defaults merge that ``_owner_read_settings_raw`` performs."""
-    from ouroboros import config as _config
-
-    _config._guard_live_settings_write()
-    to_write = _config.prepare_settings_for_persist(
-        dict(settings), authored_keys=authored_keys,
-        allow_context_lowering=allow_context_lowering, allow_safety_lowering=allow_safety_lowering)
-    _config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    fd = _config._acquire_settings_lock()
-    try:
-        atomic_write_json(_config.SETTINGS_PATH, to_write, trailing_newline=False)
-    finally:
-        _config._release_settings_lock(fd)
-
-
-def _owner_read_settings_raw() -> Dict[str, Any]:
-    """Read settings for owner endpoints without applying runtime-mode ratchets."""
-    from ouroboros import config as _config
-
-    merged = dict(_SETTINGS_DEFAULTS)
-    try:
-        if _config.SETTINGS_PATH.exists():
-            raw = json.loads(_config.SETTINGS_PATH.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                merged.update(raw)
-    except Exception:
-        log.debug("Failed to read raw owner settings; using defaults", exc_info=True)
-    return merged
-
-
 def _has_running_agent_tasks() -> bool:
     try:
         from supervisor.workers import PENDING, RUNNING, _get_chat_agent
@@ -440,6 +381,7 @@ def _has_started_agent_tasks() -> bool:
         return False
 
 
+@owner_write_guard
 async def api_owner_runtime_mode(request: Request) -> JSONResponse:
     """Persist the owner-selected runtime mode for the next boot."""
     body = await _json_body_or_empty(request)
@@ -447,7 +389,7 @@ async def api_owner_runtime_mode(request: Request) -> JSONResponse:
 
     raw_mode = str((body or {}).get("mode") or "").strip().lower()
     if raw_mode not in set(_config.VALID_RUNTIME_MODES):
-        return json_error("'mode' must be one of: light, advanced, pro", 400)
+        return unsaved_error("'mode' must be one of: light, advanced, pro", 400)
     old_settings = _owner_read_settings_raw()
     previous_mode = _config.normalize_runtime_mode(old_settings.get("OUROBOROS_RUNTIME_MODE"))
     active_mode = _config.get_runtime_mode()
@@ -477,11 +419,12 @@ async def api_owner_runtime_mode(request: Request) -> JSONResponse:
     })
 
 
+@owner_write_guard
 async def api_owner_auto_grant(request: Request) -> JSONResponse:
     """Persist the owner auto-grant toggle outside generic settings writes."""
     body = await _json_body_or_empty(request)
     if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
-        return json_error("'enabled' must be a boolean", 400)
+        return unsaved_error("'enabled' must be a boolean", 400)
     enabled = bool(body.get("enabled"))
     current = _owner_read_settings_raw()
     current["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"] = "true" if enabled else "false"
@@ -912,6 +855,7 @@ def _apply_max_context_auto_downgrade(
     ), None
 
 
+@owner_write_guard
 async def api_owner_context_mode(request: Request) -> JSONResponse:
     """Persist the owner-selected context mode (low/max).
 
@@ -923,11 +867,11 @@ async def api_owner_context_mode(request: Request) -> JSONResponse:
 
     raw_mode = str((body or {}).get("mode") or "").strip().lower()
     if raw_mode not in set(_config.VALID_CONTEXT_MODES):
-        return json_error("'mode' must be one of: low, max", 400)
+        return unsaved_error("'mode' must be one of: low, max", 400)
     next_mode = _config.normalize_context_mode(raw_mode)
     previous_mode = _config.get_context_mode()
     if previous_mode == "max" and next_mode == "low" and _has_running_agent_tasks():
-        return json_error(
+        return unsaved_error(
             "Context mode can only be lowered while Ouroboros is idle. "
             "Wait until no queued or running work remains, then switch Low/Max.",
             409,
@@ -963,6 +907,7 @@ _SCOPE_REVIEW_FLOOR_DEPRECATION_NOTICE = (
 )
 
 
+@owner_write_guard
 async def api_owner_scope_review_floor(request: Request) -> JSONResponse:
     """Persist the owner-selected P3 scope-review floor (blocking_1m | advisory).
 
@@ -978,7 +923,7 @@ async def api_owner_scope_review_floor(request: Request) -> JSONResponse:
     body = await _json_body_or_empty(request)
     raw = str((body or {}).get("floor") or "").strip().lower()
     if raw not in {"blocking_1m", "advisory"}:
-        return json_error("'floor' must be one of: blocking_1m, advisory", 400)
+        return unsaved_error("'floor' must be one of: blocking_1m, advisory", 400)
     current = _owner_read_settings_raw()
     previous = str(current.get("OUROBOROS_SCOPE_REVIEW_FLOOR") or "blocking_1m").strip().lower()
     current["OUROBOROS_SCOPE_REVIEW_FLOOR"] = raw
@@ -1000,6 +945,7 @@ async def api_owner_scope_review_floor(request: Request) -> JSONResponse:
     })
 
 
+@owner_write_guard
 async def api_owner_safety_mode(request: Request) -> JSONResponse:
     """Persist the owner-selected LLM-safety-supervisor coverage (full | light | off).
 
@@ -1013,7 +959,7 @@ async def api_owner_safety_mode(request: Request) -> JSONResponse:
 
     raw_mode = str((body or {}).get("mode") or "").strip().lower()
     if raw_mode not in set(_config.VALID_SAFETY_MODES):
-        return json_error("'mode' must be one of: full, light, off", 400)
+        return unsaved_error("'mode' must be one of: full, light, off", 400)
     current = _owner_read_settings_raw()
     previous = _config.normalize_safety_mode(current.get("OUROBOROS_SAFETY_MODE"))
     current["OUROBOROS_SAFETY_MODE"] = raw_mode
@@ -1033,7 +979,19 @@ async def api_acknowledge_capability(request: Request) -> JSONResponse:
     window (Capability Evidence: ASSERTED). Auditable and NON-generic — it covers
     only the exact provider+model+base_url+headers/options it was issued for, and
     is invalidated by any route change. CI/headless may supply the same ack via
-    config, but it must carry the same fingerprint (no repo-wide trust flag)."""
+    config, but it must carry the same fingerprint (no repo-wide trust flag).
+
+    NOT an owner SETTINGS write, and deliberately unguarded by
+    ``owner_write_guard``: `record_owner_ack` writes its own route-fingerprinted
+    evidence file and never touches settings.json, so it holds no settings lock
+    and answers no `settings_locked`. It wore the decorator for one release,
+    where it translated exceptions that cannot be raised while implying to every
+    reader that the endpoint was lock-guarded — under a genuinely held lock the
+    five settings writers refused 503 and this one recorded its acknowledgement
+    and answered 200. Widening the settings lock to cover an unrelated ledger
+    would have made the decorator true at the price of coupling a capability ack
+    to whether some settings save is in flight; the decorator was the wrong
+    claim, so the claim went."""
     body = await _json_body_or_empty(request)
     provider = str((body or {}).get("provider") or "").strip()
     model = str((body or {}).get("model") or "").strip()
@@ -1186,9 +1144,17 @@ async def api_settings_get(request: Request) -> JSONResponse:
 
 
 async def api_onboarding(request: Request) -> Response:
-    settings, provider_defaults_changed, _provider_default_keys = apply_runtime_provider_defaults(load_settings())
-    if provider_defaults_changed:
-        save_settings(settings, allow_elevation=True)
+    """The blocking first-run overlay — a pure READ (D-8).
+
+    Normalization still runs, but only to shape what the wizard DISPLAYS. It is
+    deliberately not persisted here: a GET must never be the first author of
+    settings.json. Doing so created the file before the owner had answered
+    anything, which (a) silently disqualified the fresh-install latch the
+    install-time preset and the ``light`` safety default both depend on, and
+    (b) made a page load the author of provider defaults the owner never saw.
+    The save paths (POST /api/settings, POST /api/onboarding/complete, the
+    desktop wizard bridge) keep the same normalization and persist it."""
+    settings, _changed, _keys = apply_runtime_provider_defaults(load_settings())
     if has_startup_ready_provider(settings):
         return Response(status_code=204)
     return HTMLResponse(build_onboarding_html(settings, host_mode="web"))
@@ -1324,17 +1290,21 @@ def _apply_settings_save_side_effects(
 
 
 async def api_settings_post(request: Request) -> JSONResponse:
+    # Everything below the write is a POST-commit step. The broad handler at the
+    # bottom used to answer a failure there with "400, nothing saved" while the
+    # bytes were already on disk; `boundary` is what lets it tell the two apart.
+    boundary = CommitBoundary()
     try:
         body = await request.json()
         if not isinstance(body, dict):
-            return json_error("JSON body must be an object.", 400)
+            return unsaved_error("JSON body must be an object.", 400)
         channel_key = "OUROBOROS_UPDATE_CHANNEL"
         if channel_key in body:
             from ouroboros.update_channels import UPDATE_CHANNEL_BRANCHES
 
             raw_channel = str(body.get(channel_key) or "").strip().lower()
             if raw_channel not in UPDATE_CHANNEL_BRANCHES:
-                return json_error(
+                return unsaved_error(
                     f"{channel_key} must be one of: stable, qa, development.", 400
                 )
             body = dict(body)
@@ -1347,7 +1317,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
             from ouroboros import config as _config
             raw_cadence = str(body.get(cadence_key) or "").strip()
             if raw_cadence and not _config.is_valid_post_task_evolution_cadence(raw_cadence):
-                return json_error(f"{cadence_key} must be one of: off, llm, every_n:<positive int>.", 400)
+                return unsaved_error(f"{cadence_key} must be one of: off, llm, every_n:<positive int>.", 400)
         # Reviewer-slot SSOT (6.1): refuse a malformed structured value with 400;
         # disclose (never block, recommendation A) the all-delegated API fallback
         # (D4) from the INCOMING value. Both live in reviewer_slot_save_check.
@@ -1357,14 +1327,14 @@ async def api_settings_post(request: Request) -> JSONResponse:
             try:
                 _reviewer_fallback_warning = reviewer_slot_save_check(str(body["OUROBOROS_REVIEWER_SLOTS"]))
             except ValueError as exc:
-                return json_error(str(exc), 400)
+                return unsaved_error(str(exc), 400)
         parsed_budget: dict[str, float] = {}
         for budget_key in BUDGET_SETTING_KEYS:
             if budget_key not in body:
                 continue
             budget_value, budget_error = parse_budget_setting(budget_key, body.get(budget_key))
             if budget_error:
-                return json_error(budget_error, 400)
+                return unsaved_error(budget_error, 400)
             if budget_value is not None:
                 parsed_budget[budget_key] = budget_value
         if parsed_budget:
@@ -1389,7 +1359,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
         current = _merge_settings_payload(old_effective_settings, body)
         minimax_region = str(current.get("MINIMAX_REGION") or "").strip().lower()
         if minimax_region and minimax_region not in MINIMAX_REGION_ENDPOINTS:
-            return json_error("MINIMAX_REGION must be global_en or cn_zh.", 400)
+            return unsaved_error("MINIMAX_REGION must be global_en or cn_zh.", 400)
         current["MINIMAX_REGION"] = minimax_region
         # Generic settings saves operate on the current boot baseline. A pending
         # next-boot mode written by /api/owner/runtime-mode is preserved on disk
@@ -1406,7 +1376,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
             trust_unauth = _trust_nonlocal_bind_without_password_enabled()
             allowed_saved_hosts = {"", "127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "::", "[::]"}
             if desired_host and desired_host not in allowed_saved_hosts:
-                return json_error(
+                return unsaved_error(
                     "Server Bind Host in Settings supports localhost or wildcard "
                     "binds only (127.0.0.1 or 0.0.0.0). Specific LAN IP binds "
                     "are manual/env-only so the desktop launcher can keep using "
@@ -1414,7 +1384,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
                     400,
                 )
             if desired_host and not is_loopback_host(desired_host) and not desired_password and not trust_unauth:
-                return json_error(
+                return unsaved_error(
                     "Setting a non-localhost Server Bind Host through the web UI "
                     "requires a Network Password in the same save. For manual "
                     "trusted-lab/Docker setups, stop Ouroboros and edit "
@@ -1433,7 +1403,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
                 and not desired_password
                 and not trust_unauth
             ):
-                return json_error(
+                return unsaved_error(
                     "Cannot clear Network Password while the running server is "
                     "still bound to a non-localhost interface. First save a "
                     "loopback Server Bind Host and restart, then clear the password.",
@@ -1443,7 +1413,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
             log.warning("Could not validate network bind settings", exc_info=True)
         current, provider_defaults_changed, provider_default_keys = apply_runtime_provider_defaults(current)
         if str(current.get("LOCAL_MODEL_SOURCE", "") or "").strip() and not has_startup_ready_provider(current):
-            return json_error("Local-only setups must route at least one model to the local runtime.", 400)
+            return unsaved_error("Local-only setups must route at least one model to the local runtime.", 400)
         # Fail-closed Max narrowing on a model/route change (see the helper): the save
         # always succeeds, but an unverified route drops context sizing to Low, and an
         # unreachable provider is a 503 that does NOT persist the model.
@@ -1451,7 +1421,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
             current, old_effective_settings
         )
         if _max_probe_error:
-            return json_error(_max_probe_error, 503)
+            return unsaved_error(_max_probe_error, 503)
         all_changed = [
             k for k in current
             if str(current.get(k, "") or "") != str(old_effective_settings.get(k, "") or "")
@@ -1479,11 +1449,16 @@ async def api_settings_post(request: Request) -> JSONResponse:
         _owner_write_settings(
             settings_to_save,
             authored_keys=_CONTEXT_MODE_KEYS if _max_downgrade_notice else (),
-            allow_context_lowering=bool(_max_downgrade_notice))
+            allow_context_lowering=bool(_max_downgrade_notice),
+            boundary=boundary)
+        boundary.at("environment projection")
         _apply_settings_to_env(current)
+        boundary.at("supervisor start")
         _start_supervisor_if_needed_for_request(request, current)
 
+        boundary.at("hot-reload")
         _apply_settings_save_side_effects(request, current, old_effective_settings, all_changed)
+        boundary.at("post-save notices")
 
         warnings = []
         if _reviewer_fallback_warning:
@@ -1520,6 +1495,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
         _repo_slug = current.get("GITHUB_REPO", "")
         _gh_token = current.get("GITHUB_TOKEN", "")
         if _gh_token and any(k in all_changed for k in ("GITHUB_REPO", "GITHUB_TOKEN")):
+            boundary.at("GitHub remote configuration")
             from supervisor.git_ops import configure_personal_remote
             remote_ok, remote_msg, resolved_slug = configure_personal_remote(
                 _repo_slug,
@@ -1597,4 +1573,11 @@ async def api_settings_post(request: Request) -> JSONResponse:
                 resp["review_capability_notices"] = _capability_notices
         return JSONResponse(resp)
     except Exception as e:
-        return json_exception(e, 400)
+        if boundary.committed:
+            # The bytes ARE on disk. Reporting this as a failed save would send
+            # the owner looking for changes that landed (BIBLE P1). This branch
+            # comes FIRST so a post-commit lock refusal is not misread as one.
+            return post_commit_failure_response(e, boundary)
+        if isinstance(e, SettingsLockUnavailable):
+            return unsaved_error(str(e), 503, code="settings_locked")
+        return unsaved_error(str(e), 400)

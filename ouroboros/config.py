@@ -204,6 +204,10 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # Pre-commit review: comma-separated provider-tagged model list
     "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.6-luna,google/gemini-3.6-flash,anthropic/claude-sonnet-5",
     "OUROBOROS_REVIEWER_SLOTS": "",  # structured slot SSOT (reviewer_slot_config.py); "" = legacy comma keys
+    # INSTALL-TIME facts: the agent-preset generation this install received, and WHEN onboarding last completed
+    # (recorded on EVERY completion). Endpoint-authored and disk-only — see ENDPOINT_AUTHORED_SETTINGS.
+    "OUROBOROS_SUBSCRIPTION_PRESET_VERSION": "",
+    "OUROBOROS_ONBOARDING_COMPLETED_AT": "",
     # Pre-commit review enforcement: advisory | blocking
     "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
     # Auto-grant reviewed-skill requests by default; grants stay bound to the
@@ -220,17 +224,15 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_RESTART_DRAIN_MAX_SEC": 120,
     # Runtime mode: light | advanced | pro; pro still requires review gates.
     "OUROBOROS_RUNTIME_MODE": "advanced",
-    # Context mode: low | max. Owner-only working-context size profile. max =
-    # full always-on docs + current memory granularity; low = ARCHITECTURE as a
-    # navigation map + deeper memory consolidation, sized for ~200k / local models.
-    # Cognitive-horizon knob (BIBLE P1): the agent cannot lower it (owner-only),
-    # and it never changes model / reasoning-effort / output-token budgets.
+    # Context mode: low | max. Owner-only working-context size profile. max = full always-on docs +
+    # current memory granularity; low = ARCHITECTURE as a navigation map + deeper memory consolidation,
+    # sized for ~200k / local models. Cognitive-horizon knob (BIBLE P1): the agent cannot lower it
+    # (owner-only), and it never changes model / reasoning-effort / output-token budgets.
     "OUROBOROS_CONTEXT_MODE": "max",
-    # Derived system state, never an owner choice (see get_owner_context_mode).
-    # TRI-STATE, fail-CLOSED: "" is UNKNOWN, not "the owner chose low". Only an explicit
-    # "false" (written by api_owner_context_mode alone) makes a stored `low` an owner
-    # declaration, so a pre-v6.80.0 settings.json and an env allowlist forwarding the
-    # mode without this key both leave the BIBLE P3 scope gate ON.
+    # Derived system state, never an owner choice (see get_owner_context_mode). TRI-STATE,
+    # fail-CLOSED: "" is UNKNOWN, not "the owner chose low". Only an explicit "false" (written by
+    # api_owner_context_mode alone) makes a stored `low` an owner declaration, so a pre-v6.80.0
+    # settings.json and an env allowlist forwarding the mode without this key leave P3's gate ON.
     "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "",
     # Optional extra user-managed skills checkout; Ouroboros never clones/pulls it.
     "OUROBOROS_SKILLS_REPO_PATH": "",
@@ -242,20 +244,18 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # Scope review: one or more reviewer slots; enforcement follows OUROBOROS_REVIEW_ENFORCEMENT.
     "OUROBOROS_SCOPE_REVIEW_MODELS": "openai/gpt-5.6-terra",
     "OUROBOROS_SCOPE_REVIEW_MODEL": "openai/gpt-5.6-terra",
-    # DEPRECATED, enforcement-inert (v6.80.0): stored, owner-only (dedicated audited
-    # endpoint), but NOTHING consults it — whether the BIBLE P3 blocking scope review
-    # applies follows owner-only OUROBOROS_CONTEXT_MODE. Degraded opt-in key: removed.
+    # DEPRECATED, enforcement-inert (v6.80.0): stored, owner-only (dedicated audited endpoint), but
+    # NOTHING consults it — whether the BIBLE P3 blocking scope review applies follows owner-only
+    # OUROBOROS_CONTEXT_MODE. Degraded opt-in key: removed.
     "OUROBOROS_SCOPE_REVIEW_FLOOR": "blocking_1m",
     "OUROBOROS_TASK_REVIEW_MODE": "auto",
     # LLM safety-supervisor coverage (owner-only, like runtime/context mode):
-    #   full (shipped default; fail-closed fallbacks land here; a FRESH wizard
-    #                     authors "light") — LLM check on POLICY_CHECK + cond. shell.
-    #   light           — LLM check ONLY on POLICY_CHECK integration tools;
-    #                     POLICY_CHECK_CONDITIONAL shell/verify fall to the
-    #                     deterministic whitelist + registry guards (no LLM).
-    #   off             — no LLM safety calls at all; the deterministic registry
-    #                     sandbox, protected-path policy, and light-mode guards
-    #                     STAY ON. Every non-full mode emits a durable audit event.
+    #   full  (shipped default; fail-closed fallbacks land here; a FRESH wizard authors
+    #          "light") — LLM check on POLICY_CHECK + conditional shell.
+    #   light — LLM check ONLY on POLICY_CHECK integration tools; POLICY_CHECK_CONDITIONAL
+    #           shell/verify fall to the deterministic whitelist + registry guards (no LLM).
+    #   off   — no LLM safety calls at all; the deterministic registry sandbox, protected-path
+    #           policy and light-mode guards STAY ON. Every non-full mode audits durably.
     "OUROBOROS_SAFETY_MODE": "full",
     # Safety-supervisor LLM call shaping (v6.54.3 parse-bug fix): a tight output
     # budget + no reasoning keeps the light model from spending its whole budget on
@@ -332,12 +332,11 @@ CLAUDEXOR_PROTOCOL_MAJOR: int = 3
 # The TRANSPORT floor: the lowest engine that serves the READ-ONLY lane, which sends no
 # `execution` block at all. 3.2.0 schema-accepts every field that lane does send (verified
 # live: the body comes back with only the fake-root error, never a field error), and a
-# read-only run is already scoped by Claudexor's ordinary envelope, so it needs nothing
-# newer. Keeping this floor AT the oldest serving engine is the point: it is what lets an
-# older daemon keep read-only delegation instead of losing the lane entirely, which is the
-# owner's explicit decision. A floor set to the newest daemon anyone happened to be running
-# is not conservative, it is an outage — 3.2.1 here refused the operator's own 3.2.0 engine
-# and took read-only delegation down with it.
+# read-only run is already scoped by Claudexor's ordinary envelope. Keeping the floor AT the
+# oldest serving engine is the owner's explicit decision — it lets an older daemon keep
+# read-only delegation instead of losing the lane; a floor set to the newest daemon anyone
+# happens to run is not conservative, it is an outage (3.2.1 here refused the operator's own
+# 3.2.0 engine and took read-only delegation down with it).
 CLAUDEXOR_MIN_VERSION: str = "3.2.0"
 # The MARKER floor: the oldest engine whose SCHEMA ACCEPTS `execution.delegated`, which is
 # the only delegated-lane question a version can answer honestly. Measured: `RunExecution`
@@ -345,19 +344,18 @@ CLAUDEXOR_MIN_VERSION: str = "3.2.0"
 # the running 3.2.0 daemon, which names `/execution/delegated` in `fieldErrors`) and the run
 # never starts. Refusing here turns a certain failure into a typed one before a token is
 # spent — the only work this number does. It cannot be a probe either: the marker is nested
-# under `execution` and the catalog lists TOP-LEVEL keys, and the one behavioural probe is
+# under `execution` while the catalog lists TOP-LEVEL keys, and the one behavioural probe is
 # to send it, which on an engine that accepts it STARTS THE RUN.
 #
 # It is NOT the floor for a BOUNDARY existing. It used to be, pinned at 3.3.2 (macOS
 # Seatbelt), and a version standing in for "a boundary was applied" lies in both directions:
-# Claudexor's `docs/DELEGATED_CONFINEMENT.md` says the mechanism is macOS-only ("On every
-# other platform `confinement_mechanism` is null, `confinement_verified_denied_path` is null,
-# and `confinement_unavailable_reason` says why"), so a build declares the same number on a host where it
-# applies nothing — and a version describes a BUILD, never what THIS attempt did. That
-# question goes to the attempt record (`gateways.claudexor.attempt_containment`), and a run
-# reporting no mechanism is DISCLOSED, not refused: the child already holds a shell here, so
-# the step to "shell plus token" does not buy a lane-wide refusal (AGENTS.md "Disclose instead
-# of forbid"). Two gates, two questions, no overlap; bands: docs/DELEGATED_ADMISSION.md.
+# Claudexor's `docs/DELEGATED_CONFINEMENT.md` says the mechanism is macOS-only, so a build
+# declares the same number on a host where it applies nothing — and a version describes a
+# BUILD, never what THIS attempt did. That question goes to the attempt record
+# (`gateways.claudexor.attempt_containment`), and a run reporting no mechanism is DISCLOSED,
+# not refused: the child already holds a shell here, so the step to "shell plus token" does
+# not buy a lane-wide refusal (AGENTS.md "Disclose instead of forbid"). Two gates, two
+# questions, no overlap; bands: docs/DELEGATED_ADMISSION.md.
 CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION: str = "3.3.0"
 
 
@@ -486,11 +484,10 @@ VALID_CONTEXT_MODES = ("low", "max")
 # Lower rank = stricter scope. ``save_settings`` refuses agent self-elevation.
 _RUNTIME_MODE_RANK = {"light": 0, "advanced": 1, "pro": 2}
 
-# Boot-time runtime-mode baseline. Pinning the owner-selected mode after
-# settings load prevents an out-of-process settings edit from becoming the new
-# baseline through a later load/save round-trip. The pin is also exported via
-# ``OUROBOROS_BOOT_RUNTIME_MODE`` so fresh subprocess imports inherit the same
-# ratchet; a child can clobber only its own env, not the parent's in-memory pin.
+# Boot-time runtime-mode baseline. Pinning the owner-selected mode after settings load stops an
+# out-of-process settings edit from becoming the new baseline through a later load/save round-trip.
+# The pin is exported via ``OUROBOROS_BOOT_RUNTIME_MODE`` so fresh subprocess imports inherit the
+# same ratchet; a child can clobber only its own env, not the parent's in-memory pin.
 _BOOT_RUNTIME_MODE: Optional[str] = None
 BOOT_RUNTIME_MODE_ENV_KEY = "OUROBOROS_BOOT_RUNTIME_MODE"
 
@@ -1090,6 +1087,11 @@ def _settings_file_value(key: str, default: str) -> str:
 # write BOTH disk and env, so the owner path is unaffected.
 _DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SAFETY_MODE")
 
+# ENDPOINT-AUTHORED, DISK-ONLY: install-time facts POST /api/onboarding/complete alone writes. The ratchets above
+# are disk-authored yet DO project once the file carries them; these never leave disk in EITHER direction — an env
+# timestamp alone closed the onboarding window on a fresh install, and an env marker was then persisted by a save.
+ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_ONBOARDING_COMPLETED_AT"})
+
 
 def _owner_declared_low(value: Any) -> bool:
     """True when the derived auto-downgrade flag reads as an OWNER-authored ``low``
@@ -1255,6 +1257,9 @@ def _settings_lock_path() -> pathlib.Path:
 
 
 def _acquire_settings_lock(timeout: float = 2.0) -> Optional[int]:
+    # None means the lock was NOT taken: every WRITER must abort on it (`save_settings` raises
+    # TimeoutError, `gateway.owner_settings` SettingsLockUnavailable) — writing anyway makes
+    # "atomic" a claim the code does not keep. Only READS may proceed unlocked.
     start = time.time()
     lock_path = _settings_lock_path()
     while time.time() - start < timeout:
@@ -1331,14 +1336,11 @@ def _coerce_setting_value(key: str, value):
 
 
 # Load / Save
-# Setting keys a release DELETED. `load_settings` keeps unrecognized keys so an owner
-# customization is never destroyed by a rename, which means a key removed from
-# SETTINGS_DEFAULTS would otherwise live in an existing data/settings.json forever and
-# keep being served by GET /api/settings as something the runtime no longer honors.
-# Retiring a key is a decision; leaving its ghost to answer for it is not.
+# Setting keys a release DELETED. `load_settings` keeps unrecognized keys so a rename never destroys
+# an owner customization — which would otherwise leave a removed key living in data/settings.json
+# forever, still served by GET /api/settings. Retiring a key is a decision; its ghost is not.
 RETIRED_SETTING_KEYS: tuple[str, ...] = (
-    # v6.87.7: the capability depth cap conflated how DEEP delegation nests with how
-    # STRONG a descendant may be. Depth never rewrites the lane now.
+    # v6.87.7: the depth cap conflated how DEEP delegation nests with how STRONG a descendant is.
     "OUROBOROS_SUBAGENT_CAPABILITY_DEPTH_LIMIT",
 )
 
@@ -1346,48 +1348,54 @@ RETIRED_SETTING_KEYS: tuple[str, ...] = (
 def load_settings() -> dict:
     fd = _acquire_settings_lock()
     try:
-        loaded: dict = {}
-        if SETTINGS_PATH.exists():
-            try:
-                raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-                if isinstance(raw, dict):
-                    loaded = {
-                        key: _coerce_setting_value(key, value) if key in SETTINGS_DEFAULTS else value
-                        for key, value in raw.items()
-                    }
-            except Exception:
-                pass
-        # Rename-alias migration: fold deprecated per-subsystem retention keys into the
-        # unified OUROBOROS_GC_RETENTION_DAYS, then drop the legacy keys. Prefer a CUSTOMIZED
-        # legacy value so a rename never orphans it; an all-defaults file collapses to the
-        # unified default (e.g. service 14->7).
-        from ouroboros.retention import LEGACY_RETENTION_KEYS, pick_legacy_retention_seed
-        if "OUROBOROS_GC_RETENTION_DAYS" not in loaded:
-            seed = pick_legacy_retention_seed(loaded.get)
-            if seed is not None:
-                loaded["OUROBOROS_GC_RETENTION_DAYS"] = seed
-        for _legacy in LEGACY_RETENTION_KEYS:
-            loaded.pop(_legacy, None)
-        for _retired in RETIRED_SETTING_KEYS:
-            loaded.pop(_retired, None)
-        migrate_legacy_slot_keys(loaded)
-        settings = dict(SETTINGS_DEFAULTS)
-        settings.update(loaded)
-        for key in SETTINGS_DEFAULTS:
-            raw_env = os.environ.get(key)
-            if raw_env is None or key in _DISK_AUTHORED_SETTINGS:  # owner ratchets: DISK-authored, never env
-                continue
-            if key == "OUROBOROS_RETURN_REASONING" and raw_env == "":
-                settings[key] = ""
-                continue
-            if raw_env == "":
-                continue
-            if key in loaded and settings.get(key) not in {None, ""}:
-                continue
-            settings[key] = _coerce_setting_value(key, raw_env)
-        return settings
+        return load_settings_lock_held()
     finally:
         _release_settings_lock(fd)
+
+
+def load_settings_lock_held() -> dict:
+    """The same read, for a caller that ALREADY holds the settings lock. The lock is not
+    re-entrant, so a nested ``load_settings()`` burns the full 2s timeout and then reads
+    anyway; a write-path precondition needs the effective settings as of NOW, so it reads here."""
+    loaded: dict = {}
+    if SETTINGS_PATH.exists():
+        try:
+            raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                loaded = {
+                    key: _coerce_setting_value(key, value) if key in SETTINGS_DEFAULTS else value
+                    for key, value in raw.items()
+                }
+        except Exception:
+            pass
+    # Rename-alias migration: fold deprecated per-subsystem retention keys into the unified
+    # OUROBOROS_GC_RETENTION_DAYS, then drop the legacy keys. Prefer a CUSTOMIZED legacy value
+    # so a rename never orphans it; an all-defaults file collapses to the unified default.
+    from ouroboros.retention import LEGACY_RETENTION_KEYS, pick_legacy_retention_seed
+    if "OUROBOROS_GC_RETENTION_DAYS" not in loaded:
+        seed = pick_legacy_retention_seed(loaded.get)
+        if seed is not None:
+            loaded["OUROBOROS_GC_RETENTION_DAYS"] = seed
+    for _legacy in LEGACY_RETENTION_KEYS:
+        loaded.pop(_legacy, None)
+    for _retired in RETIRED_SETTING_KEYS:
+        loaded.pop(_retired, None)
+    migrate_legacy_slot_keys(loaded)
+    settings = dict(SETTINGS_DEFAULTS)
+    settings.update(loaded)
+    for key in SETTINGS_DEFAULTS:
+        raw_env = os.environ.get(key)
+        if raw_env is None or key in _DISK_AUTHORED_SETTINGS or key in ENDPOINT_AUTHORED_SETTINGS:  # DISK-authored
+            continue
+        if key == "OUROBOROS_RETURN_REASONING" and raw_env == "":
+            settings[key] = ""
+            continue
+        if raw_env == "":
+            continue
+        if key in loaded and settings.get(key) not in {None, ""}:
+            continue
+        settings[key] = _coerce_setting_value(key, raw_env)
+    return settings
 
 
 def save_settings(
@@ -1398,14 +1406,12 @@ def save_settings(
 ) -> None:
     """Persist settings and enforce owner-only mode ratchets.
 
-    Elevation above the boot baseline is refused after initialization (``allow_elevation``
-    is then inert to agent-reachable subprocesses; production entry points must call
-    ``initialize_runtime_mode_baseline`` before agent code). Context-mode lowering and
-    clearing the derived auto-low flag likewise require the explicit owner path.
-
-    ``onboarding_safety_default`` is a NARROW boolean authorizing exactly one
-    transition — a FRESH install (no settings file yet) authoring
-    ``OUROBOROS_SAFETY_MODE="light"``; everything else keeps the ratchet."""
+    Elevation above the boot baseline is refused after initialization (``allow_elevation`` is then
+    inert to agent-reachable subprocesses; production entry points must call
+    ``initialize_runtime_mode_baseline`` before agent code). Context-mode lowering and clearing the
+    derived auto-low flag likewise require the explicit owner path.
+    ``onboarding_safety_default`` is a NARROW boolean authorizing exactly one transition —
+    a FRESH install (no settings file yet) authoring ``OUROBOROS_SAFETY_MODE="light"``."""
     _guard_live_settings_write()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     fd = _acquire_settings_lock()
@@ -1422,10 +1428,10 @@ def save_settings(
         settings = prepare_settings_for_persist(
             settings, authored_keys=authored_keys,
             allow_safety_lowering=allow_safety_lowering)
-        # Baseline: the in-process pin, else the STRICTEST of the inherited env pin and disk. The env pin only
-        # exists so a subprocess inherits the parent's ratchet, so it may only TIGHTEN — letting it RAISE the
-        # baseline is the caller-controlled "previous value" hole of _settings_file_value on a fourth key (a
-        # subprocess exporting BOOT_RUNTIME_MODE=pro could otherwise persist its own elevation).
+        # Baseline: the in-process pin, else the STRICTEST of the inherited env pin and disk. The env pin
+        # exists only so a subprocess inherits the parent's ratchet, so it may only TIGHTEN — letting it
+        # RAISE the baseline would be the caller-controlled "previous value" hole of _settings_file_value
+        # on a fourth key (a subprocess exporting BOOT_RUNTIME_MODE=pro persisting its own elevation).
         baseline_pinned_in_process = _BOOT_RUNTIME_MODE is not None
         inherited_baseline = None if baseline_pinned_in_process else _resolve_baseline_from_env()
         baseline_inherited_from_env = inherited_baseline is not None
@@ -1530,28 +1536,22 @@ def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int
     return max(0, parsed)
 
 
-# Settings keys deliberately NOT projected into the environment. Everything else in
-# SETTINGS_DEFAULTS IS exported, by derivation rather than by a parallel hand-kept list:
-# a list maintained beside the defaults drifts silently, and the failure it produces is
-# invisible — settings accept the key, the UI shows it saved, and the consuming module
-# goes on reading os.environ and falling back to its hardcoded constant
-# (OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC sat like that behind a hardcoded 1800). Deriving
-# makes export the DEFAULT for a new key and makes an exclusion a decision someone has to
-# write down here.
+# Settings keys deliberately NOT projected into the environment. Everything else in SETTINGS_DEFAULTS IS
+# exported, by derivation rather than a parallel hand-kept list: such a list drifts silently and the failure
+# is invisible — settings accept the key, the UI shows it saved, and the consumer goes on reading os.environ
+# and falling back to its hardcoded constant (OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC sat like that behind a
+# hardcoded 1800). Deriving makes export the DEFAULT for a new key and an exclusion a decision written here.
 SETTINGS_KEYS_NOT_EXPORTED_TO_ENV = frozenset({
-    # Structured list value: `str(value)` is a Python repr no reader parses back, and
-    # every consumer already reads it from the settings dict (mcp_client.parse_servers,
-    # gateway.mcp), never from the environment.
+    # Structured list value: `str(value)` is a Python repr no reader parses back, and every consumer already reads
+    # it from the settings dict (mcp_client.parse_servers, gateway.mcp), never from the environment.
     "MCP_SERVERS",
-    # ENV IS THE AUTHORITY for the bind host, not settings. `ouroboros server --host
-    # 0.0.0.0` puts the choice in the environment, and both consumers (server.main and
-    # server_control.restart_current_process) deliberately read env BEFORE settings.
-    # Exporting this key stamped the settings value — usually the shipped 127.0.0.1
-    # default, which no owner ever authored — back over that environment, so the operator's
-    # LAN-reachable server silently became loopback at the first self-restart and stayed
-    # there. A default standing in for an absent key is not an owner decision.
+    # ENV IS THE AUTHORITY for the bind host, not settings. `ouroboros server --host 0.0.0.0` puts the choice in
+    # the environment, and both consumers (server.main, server_control.restart_current_process) deliberately read
+    # env BEFORE settings. Exporting this key stamped the settings value — usually the shipped 127.0.0.1 default,
+    # which no owner authored — back over that environment, so the operator's LAN-reachable server silently became
+    # loopback at the first self-restart. A default standing in for an absent key is not a decision.
     "OUROBOROS_SERVER_HOST",
-})
+}) | ENDPOINT_AUTHORED_SETTINGS  # disk-only in BOTH directions (never read from env, never exported to it)
 
 
 def settings_env_keys() -> list:

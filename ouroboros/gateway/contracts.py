@@ -820,6 +820,77 @@ class LogTailResponse(TypedDict, total=False):
     error: str
 
 
+class OnboardingCompleteRequest(TypedDict, total=False):
+    """``POST /api/onboarding/complete`` — the wizard payload plus two
+    DECLARATIONS about the onboarding run itself.
+
+    The settings keys of the shared setup contract ride through unchanged (open
+    shape, same payload the wizard already builds); only the two subscription
+    flags are typed here, because they are not settings. Neither is authority:
+    ``subscriptionsConnected`` only tells the server to read the live
+    agent account state, and the server re-proves fresh-install status
+    on its own before applying anything."""
+
+    subscriptionsConnected: bool
+    skipSubscriptionPresets: bool
+
+
+class OnboardingPresetProjection(TypedDict):
+    """What the install-time agent preset did, on the success envelope.
+
+    ``applied=False`` with a ``reason`` is the normal shape for an install that
+    connected no subscription, opted out, or is no longer in first-run
+    onboarding — absence is reported as absence, never as an empty success."""
+
+    applied: bool
+    reason: str
+    harnesses: list[str]
+    receipt: Dict[str, Any]
+
+
+class OnboardingCompleteResponse(TypedDict):
+    """The ONE success envelope. Settings, the next-boot runtime mode, the
+    fresh-install safety default and the durable completion fact land ATOMICALLY
+    — every success carries all four. The preset keys and their one-shot marker
+    ride the same write only when ``preset.applied`` is true; an ordinary success
+    with ``not_requested``, ``skipped_by_owner`` or ``not_install_time`` persists
+    no preset and no marker, which is the D-4 design, not a partial save."""
+
+    ok: bool
+    status: str
+    runtime_mode: str
+    restart_required: bool
+    preset: OnboardingPresetProjection
+
+
+class SettingsPostCommitFailureResponse(TypedDict):
+    """500 from an owner settings write whose BYTES ALREADY LANDED.
+
+    The distinction the broad handlers used to erase: a failure BEFORE the write
+    is "nothing was saved", a failure AFTER it is "saved, and then this step
+    failed". ``post_commit_failed`` names the step (environment projection,
+    supervisor start, hot-reload…) so the owner knows what to retry — never that
+    the settings themselves need saving again. Shared by ``POST /api/settings``
+    and ``POST /api/onboarding/complete``."""
+
+    error: str
+    status: str
+    saved: bool
+    post_commit_failed: str
+
+
+class OnboardingPresetFailureResponse(TypedDict):
+    """503: the connected agent accounts could not be verified, so
+    NOTHING was persisted. ``can_skip`` tells the wizard the secondary
+    "finish without agent defaults" action will succeed."""
+
+    error: str
+    code: str
+    detail: str
+    can_skip: bool
+    saved: bool
+
+
 # Human/test-visible contract index; routers own executable Route objects.
 HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/health",
@@ -908,6 +979,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/marketplace/ouroboroshub/update/{name}",
     "POST /api/marketplace/ouroboroshub/uninstall/{name}",
     "GET /api/onboarding",
+    "POST /api/onboarding/complete",
     "GET /api/claude-code/status",
     "POST /api/claude-code/install",
     "GET /api/files/list",
@@ -981,6 +1053,11 @@ __all__ = [
     "OwnerContextModeResponse",
     "OwnerScopeReviewFloorResponse",
     "OwnerSafetyModeResponse",
+    "OnboardingCompleteRequest",
+    "OnboardingCompleteResponse",
+    "OnboardingPresetFailureResponse",
+    "OnboardingPresetProjection",
+    "SettingsPostCommitFailureResponse",
     "SkillGrantResponse",
     "SkillDeleteResponse",
     "UiPreferencesResponse",
