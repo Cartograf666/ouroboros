@@ -143,6 +143,26 @@ def test_fork_copies_no_rows_and_auto_names_the_copy(tmp_path, broadcasts):
     assert broadcasts[-1] == ("racer", fork["chat_id"])
 
 
+def test_the_main_chat_is_not_forkable(tmp_path, broadcasts):
+    """A3: the Main chat cannot be forked. It is not a project thread, so no
+    route reaches it — every thread route is scoped to a project id, and the
+    registry answers only for threads of that project."""
+    from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
+    from ouroboros.projects_registry import resolve_chat_binding
+
+    create_project(tmp_path, "racer")
+    client = _client(tmp_path)
+
+    # The Main chat belongs to no project and is no project's thread, so the
+    # fork surface — which is reachable ONLY as project + thread id — has no
+    # spelling that names it.
+    assert resolve_chat_binding(tmp_path, WEB_UI_CHAT_ID) == {}
+    assert client.post("/api/projects//threads/0/fork", json={}).status_code in (404, 405)
+    # Thread #0 of a PROJECT is a legitimate fork source (it is a project
+    # thread, not the Main chat).
+    assert client.post("/api/projects/racer/threads/0/fork", json={}).status_code == 200
+
+
 def test_threads_of_a_fenced_project_are_refused(tmp_path, broadcasts):
     create_project(tmp_path, "racer")
     begin_project_deletion(tmp_path, "racer")
