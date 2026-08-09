@@ -904,11 +904,19 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             })
         except Exception:
             log.debug("api_project_from_task: projects_changed broadcast failed", exc_info=True)
+        # ProjectFromTaskResponse. Both folder facts are TYPED (contract + api_types.js
+        # mirror) because the conversion succeeds either way: an untyped free-text
+        # disclosure no contract described and no client read meant a conversion that
+        # quietly produced a PLACELESS project looked exactly like one that worked.
         payload: dict = {"project": project, "binding": binding}
+        if adopted:
+            payload["working_dir"] = adopted
         if adopt_error:
             # Disclosed, non-fatal (P1): the conversion succeeded, but the folder the
             # task named is no longer adoptable and the owner should hear it rather
-            # than discover a folder-less project later.
+            # than discover a folder-less project later. Logged as well as returned —
+            # a browser that drops the field must not be the only witness.
+            log.warning("api_project_from_task: %s", adopt_error)
             payload["working_dir_error"] = adopt_error
         return JSONResponse(payload)
     except Exception as exc:

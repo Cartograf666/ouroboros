@@ -276,11 +276,15 @@
 /**
  * The typed git_init_required OFFER (A12) — not an error report. Admission raises
  * it BEFORE queueing a file task in a folder that is safe and valid but not tracked
- * by git, and the same object rides the POST /api/tasks 400 body (alongside
- * error_code: 'git_init_required') and the project-room promote outcome. `enables`
+ * by git. It reaches a client as an OBJECT on exactly one surface: the POST
+ * /api/tasks 400 body (alongside error_code: 'git_init_required'). The project-room
+ * promote path carries the same object in its supervisor-internal outcome, but the
+ * halted task's chat message and result carry the reason code plus this object's
+ * message, not its fields. `enables`
  * is the plain-language answer to "what does saying yes buy me" and `offer` names
  * the operation the yes calls (POST /api/projects/{project_id}/init-git). Nothing
- * is initialised in the owner's folder without that answer.
+ * is initialised in the owner's folder without that answer, and Ouroboros never
+ * runs `git init` there itself.
  * @typedef {Object} WorkspaceGitInitDecision
  * @property {'git_init_required'=} decision
  * @property {string=} workspace_root
@@ -336,6 +340,21 @@
  * @property {ProjectEntry=} project
  * @property {string=} working_dir
  * @property {string[]=} init_git_skipped
+ */
+
+/**
+ * POST /api/projects/from-task response — "turn this task into a project".
+ * working_dir is the folder the new project ADOPTED from the converted task (A11:
+ * work already happening somewhere brings its place with it); working_dir_error is
+ * the disclosure when it could not — the folder moved, overlaps the Ouroboros
+ * roots, sits inside another repository, or is one of Ouroboros's own ephemeral
+ * checkouts. The conversion still succeeds, so a client that ignores this field
+ * shows a project that silently has no place.
+ * @typedef {Object} ProjectFromTaskResponse
+ * @property {ProjectEntry=} project
+ * @property {Object=} binding
+ * @property {string=} working_dir
+ * @property {string=} working_dir_error
  */
 
 /**

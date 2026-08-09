@@ -60,6 +60,12 @@ def git_init_decision(workspace_root: Any, *, project_id: str = "") -> dict:
     not tracked by git. It carries its own plain-language reason so every surface
     (gateway 400 body, promote outcome, chat message) says the same honest thing
     about what git buys, and no surface has to invent copy of its own.
+
+    The message names WHO runs the offer, because the agent reads it too. Shell
+    policy permits ``git init`` in an attached project folder (it protects the
+    Ouroboros runtime, not the owner's tree), so a halt message that only said
+    "Ouroboros can start tracking it" invited the agent to execute the owner's yes
+    on its behalf — precisely the auto-init A12 forbids.
     """
     return {
         "decision": GIT_INIT_REQUIRED,
@@ -69,10 +75,10 @@ def git_init_decision(workspace_root: Any, *, project_id: str = "") -> dict:
         "enables": ["diff", "rollback", "branching"],
         "message": (
             f"{workspace_root} is not tracked by git, so file work there cannot be "
-            "diffed, rolled back, or branched. Ouroboros can start tracking it — one "
-            "snapshot commit of what is already in the folder, with credential-shaped "
-            "files deliberately left untracked. Nothing is initialised until you say "
-            "yes: the folder is yours."
+            "diffed, rolled back, or branched. Saying yes runs one snapshot commit of "
+            "what is already in the folder, with credential-shaped files deliberately "
+            "left untracked. Only you can do this — Ouroboros will not run `git init` "
+            "here. Nothing is initialised until you say yes: the folder is yours."
         ),
     }
 
@@ -292,7 +298,9 @@ def compose_workspace_block(
         "Before finalizing, re-read the original task and verify each explicit requirement through the interface/path/format/service the task names; do not treat a weaker surrogate self-test as completion.\n"
         "Final summaries belong in the final answer, not new repo markdown files unless requested.\n"
         "Task-local git is allowed when the task requires it (clone, branch, commit, push to task-local remotes); "
-        "Ouroboros still protects its own repo/data paths. Workspace artifacts are captured against the preflight git base.\n"
+        "Ouroboros still protects its own repo/data paths. One exception: never run `git init` in the owner's "
+        "project folder — only the owner can put their folder under git, through the git_init_required offer. "
+        "Workspace artifacts are captured against the preflight git base.\n"
     )
 
 

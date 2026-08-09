@@ -376,10 +376,12 @@ class WorkspaceGitInitDecision(TypedDict, total=False):
     """The typed ``git_init_required`` OFFER (A12), not an error report.
 
     Raised by ``workspace_admission`` BEFORE a file task is queued in a folder that
-    is safe and valid but not tracked by git, and carried unchanged by every
-    surface: the ``POST /api/tasks`` 400 body (``error_code`` +  ``decision``), the
-    project-room promote outcome, and the chat message that discloses the halted
-    task. ``enables`` is the plain-language answer to "what does saying yes buy me"
+    is safe and valid but not tracked by git. It reaches a CLIENT as an object on
+    exactly ONE surface: the ``POST /api/tasks`` 400 body (``error_code`` +
+    ``decision``). The project-room promote path carries the same object in its
+    supervisor-internal outcome dict, but the halted task's chat message and
+    persisted result carry the reason code and this object's ``message``, not its
+    fields. ``enables`` is the plain-language answer to "what does saying yes buy me"
     — diff, rollback, branching — and ``offer`` names the operation the owner's yes
     calls (``POST /api/projects/{project_id}/init-git``). Nothing is ever
     initialised without that answer.
@@ -447,6 +449,27 @@ class ProjectInitGitResponse(TypedDict, total=False):
     project: ProjectEntry
     working_dir: str
     init_git_skipped: List[str]
+
+
+class ProjectFromTaskResponse(TypedDict, total=False):
+    """``POST /api/projects/from-task`` — the "turn this task into a project" reply.
+
+    ``working_dir`` is the folder the new project ADOPTED from the converted task
+    (A11: a project born from work already happening somewhere inherits that place),
+    and ``working_dir_error`` is the disclosure when it could not: the folder has
+    moved, overlaps the Ouroboros roots, sits inside another repository, or is one
+    of Ouroboros's own ephemeral checkouts. The conversion still succeeds — making
+    the project is its job — which is exactly why the disclosure has to be typed.
+    Untyped it was free text no contract knew about and no client read, so a
+    conversion that quietly produced a PLACELESS project looked identical to one
+    that worked, and the next task in that project provisioned a different empty
+    tree somewhere else.
+    """
+
+    project: ProjectEntry
+    binding: Dict[str, Any]
+    working_dir: str
+    working_dir_error: str
 
 
 class ThreadCreateRequest(TypedDict, total=False):
@@ -1124,6 +1147,7 @@ __all__ = [
     "UpdateStatusReadyOutbound",
     "ProjectCreateRequest",
     "ProjectEntry",
+    "ProjectFromTaskResponse",
     "ProjectInitGitResponse",
     "WorkspaceGitInitDecision",
     "ThreadCreateRequest",

@@ -229,6 +229,11 @@ def test_api_tasks_create_returns_the_typed_git_offer_and_queues_nothing(tmp_pat
     assert decision["offer"] == "init_git"
     assert decision["enables"] == ["diff", "rollback", "branching"]
     assert "not tracked by git" in decision["message"]
+    # The agent reads this same message on the promote path, and shell policy would
+    # NOT stop it from running `git init` in an attached folder — so the message has
+    # to say whose act this is, or "Ouroboros can start tracking it" reads as an
+    # instruction to go and do it (A12).
+    assert "Ouroboros will not run `git init` here" in decision["message"]
     assert enqueued == [], "the task must not be queued while the offer is unanswered"
     assert not (plain / ".git").exists(), "admission must NEVER initialise git itself"
 
@@ -307,6 +312,23 @@ def test_promote_into_an_untracked_room_offers_git_and_does_not_queue(tmp_path, 
     assert get_project(drive, "plainroom")["working_dir"] == str(plain)
     result = json.loads((drive / "task_results" / "untracked1.json").read_text(encoding="utf-8"))
     assert result["reason_code"] == "git_init_required"
+
+
+def test_the_workspace_block_tells_the_agent_not_to_answer_for_the_owner(tmp_path):
+    """The rule goes where the existing rule already lives — the task text's own
+    account of what git work is legitimate — because that is the sentence the agent
+    reads while holding write+shell in the owner's folder. Shell policy permits
+    `git init` there (it protects the Ouroboros runtime, not the owner's tree), so
+    nothing but doctrine stands between the offer and the agent executing it."""
+    from ouroboros.workspace_admission import compose_workspace_block
+
+    block = compose_workspace_block(
+        workspace_root=str(tmp_path), workspace_mode="external",
+        memory_mode="forked", workspace_preflight={},
+    )
+    assert "Task-local git is allowed" in block
+    assert "never run `git init` in the owner's project folder" in block
+    assert "git_init_required" in block
 
 
 def test_promote_workspace_none_opts_out_of_the_git_offer_too(tmp_path, monkeypatch):
@@ -620,6 +642,44 @@ def test_turn_into_project_discloses_a_folder_it_cannot_adopt(tmp_path):
     ))
     assert "Ouroboros system repo" in json.loads(overlapping.body)["working_dir_error"]
     assert str(get_project(data, "repop").get("working_dir") or "") == ""
+
+
+def test_from_task_response_types_both_folder_facts(tmp_path):
+    """`working_dir_error` used to be free text: absent from the contracts, absent
+    from the JS mirror, and read by nobody (the client takes `payload.project`), so
+    a conversion that quietly produced a PLACELESS project was indistinguishable
+    from one that worked. Both folder facts are now declared fields of
+    `ProjectFromTaskResponse`, mirrored in api_types.js and rendered by the client."""
+    import asyncio
+
+    from ouroboros.gateway.contracts import ProjectFromTaskResponse
+    from ouroboros.gateway.projects import api_project_from_task
+
+    assert set(ProjectFromTaskResponse.__annotations__) >= {"working_dir", "working_dir_error"}
+    mirror = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_types.js").read_text(
+        encoding="utf-8"
+    )
+    assert "@typedef {Object} ProjectFromTaskResponse" in mirror
+    client = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "chat.js").read_text(
+        encoding="utf-8"
+    )
+    assert "payload.working_dir_error" in client, "the disclosure must reach the owner"
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    ws = tmp_path / "adopted_site"
+    _init_git_repo(ws)
+    _persist_task_result(data, "t7", description="ship it", workspace_root=str(ws))
+
+    resp = asyncio.run(api_project_from_task(
+        _ProjectsReq({"task_id": "t7", "id": "shipit", "name": "Ship"}, drive_root=data, repo_dir=repo)
+    ))
+    payload = json.loads(resp.body)
+    assert resp.status_code == 200, payload
+    assert payload["working_dir"] == str(ws.resolve())
+    assert "working_dir_error" not in payload
 
 
 def test_turn_into_project_never_replaces_an_existing_project_folder(tmp_path):
