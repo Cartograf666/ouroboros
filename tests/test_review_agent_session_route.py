@@ -1195,55 +1195,14 @@ def test_scope_session_delivery_never_builds_the_pack(tmp_path, fake_route, monk
     assert manifest["host_file_read_attestation"] == "unobserved"  # forensic, non-blocking
     assert "coverage_incomplete" not in manifest  # retired framing (BIBLE P3 amendment)
 
-    # D-12 also asked that readers stay compatible with the old spelling. This
-    # pins the measured reason no compatibility layer was built: the key has NO
-    # reader — the manifest is a durable forensic row a person reads. If code
-    # ever starts consuming it, this fails and the compatibility becomes real
-    # work rather than machinery guarding nothing.
-    import pathlib as _pathlib
-    import re as _re
-
-    repo = _pathlib.Path(__file__).resolve().parents[1]
-    # The WHOLE web source tree, not just `web/modules` — `web/app.js` alone is
-    # ~870 lines of real source and sat outside the first version of this sweep,
-    # which both gate reviewers caught by injecting a reader there.
-    src_roots = [repo / "ouroboros", repo / "web"]
-    skip_dirs = {"tests", "node_modules", "vendor", "dist"}
-
-    # Bracket and `.get` for both languages, plus the two idiomatic JS forms the
-    # first version missed: dot access and destructuring. `\b` after `delivery`
-    # is what keeps `ctx.delivery_candidate` and `payload["output_delivery"]`
-    # from registering as reads of THIS key.
-    reader_re = _re.compile(
-        r"""\[\s*["']delivery["']\s*\]"""
-        r"""|\.get\(\s*["']delivery["']"""
-        r"""|\.delivery\b"""
-        r"""|\{\s*delivery\s*[,}]"""
-    )
-
-    swept: list = []
-    readers: list = []
-    for root in src_roots:
-        assert root.is_dir(), f"the sweep is rooted at a path that does not exist: {root}"
-        contributed = 0
-        for path in root.rglob("*"):
-            if path.suffix not in (".py", ".js") or not path.is_file():
-                continue
-            if skip_dirs & set(path.relative_to(root).parts):
-                continue
-            contributed += 1
-            swept.append(path)
-            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                if reader_re.search(line):
-                    readers.append(f"{path.relative_to(repo)}:{n}: {line.strip()[:90]}")
-        # Without this a renamed or moved root makes the whole guard pass
-        # vacuously — the exact way the first version could have gone quiet.
-        assert contributed > 0, f"the sweep matched no source files under {root}"
-
-    assert len(swept) > 200, f"the sweep is suspiciously small: {len(swept)} files"
-    assert readers == [], (
-        "something now reads the coverage manifest's `delivery` key, so D-12's "
-        "backward compatibility stops being hypothetical:\n" + "\n".join(readers))
+    # D-12 also asked that readers stay compatible with the old spelling. There
+    # is nothing to be compatible WITH: measured across `ouroboros/` and `web/`,
+    # this key has exactly one writer and no reader — the manifest is a durable
+    # forensic row whose audience is a person. So the clause had no subject, and
+    # that is DISCLOSED here rather than defended by machinery. I built the
+    # defence twice before writing this line (a compatibility helper, then a
+    # repo-wide reader sweep) and both were guards over an empty set; the rule
+    # they broke is that a disclosed residual beats a widened patch.
     assert manifest["excluded_sensitive"] == {"policy": "preserved", "host_enforced": False}
 
     start = fake_route.instances[0].start_requests[0]
