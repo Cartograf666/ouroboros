@@ -1,13 +1,18 @@
 import { renderPageHeader, renderSegmentedField, renderTabStrip } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
-import { renderHarnessAccountsSection } from './harness_accounts.js';
+import { renderAgentAccountsSection, renderAgentsServiceBanner } from './harness_accounts.js';
 import { renderReviewerSlotsSection } from './reviewer_slots.js';
 import { renderSubagentsSection } from './subagents_settings.js';
 
+// Reads as a sequence: keys → secrets → which API models → who among the agents
+// does what → behavior → technical. "Agents", not "Coding agents" (D-10): the
+// same subscriptions build presentations and run arbitrary tasks, so the
+// narrower word named only one of their uses.
 const SETTINGS_TABS = [
     { value: 'providers', label: 'Providers' },
     { value: 'secrets', label: 'Secrets' },
     { value: 'models', label: 'Models' },
+    { value: 'agents', label: 'Agents' },
     { value: 'behavior', label: 'Behavior' },
     { value: 'advanced', label: 'Advanced' },
     { value: 'about', label: 'About' },
@@ -283,7 +288,9 @@ export function renderSettingsPage() {
                             ${PROVIDER_CARDS.filter((card) => card.advanced).map(providerSettingsCard).join('')}
                         </div>
                     </details>
-                    ${renderHarnessAccountsSection()}
+                    <!-- Agent accounts moved to the Agents tab (D-10): they are
+                         not a remote API provider, and the owner had to hunt for
+                         the Add-account button under an unrelated row. -->
                     <div class="form-section compact">
                         <h3>Legacy Compatibility</h3>
                         <div class="form-row">
@@ -334,9 +341,10 @@ export function renderSettingsPage() {
                         </div>
                     </div>
 
-                    ${renderReviewerSlotsSection()}
-
-                    ${renderSubagentsSection()}
+                    <!-- Review lanes and Delegation moved to the Agents tab
+                         (D-10): they answer "who does the work", not "which API
+                         model id". One capability, one section — no control here
+                         duplicates one there. -->
 
                     <div class="form-section">
                         <h3>Other Model Slots</h3>
@@ -353,6 +361,21 @@ export function renderSettingsPage() {
                             </div>
                         </div>
                     </div>
+                </section>
+
+                <section class="settings-panel" data-settings-panel="agents">
+                    <div class="settings-section-copy">
+                        The agents Ouroboros delegates to, and what each of them is allowed to do:
+                        the subscription accounts, who reviews commits, and how subagents are run.
+                        API keys stay in Providers; API model ids and effort lanes stay in Models.
+                    </div>
+                    <!-- ONE service banner for the whole tab: the single place a
+                         daemon or runtime problem is explained, instead of the
+                         scattering of "(not in discovery)" the owner reported. -->
+                    ${renderAgentsServiceBanner()}
+                    ${renderAgentAccountsSection()}
+                    ${renderReviewerSlotsSection()}
+                    ${renderSubagentsSection()}
                 </section>
 
                 <section class="settings-panel" data-settings-panel="behavior">
@@ -741,21 +764,15 @@ export function renderSettingsPage() {
 
                     <div class="form-section">
                         <h3>Runtime Limits</h3>
-                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the absolute ceiling, and the reaper. Budget limits control runtime cost thresholds.</div>
+                        <!-- Active Subagents / Root and Subagent Depth moved to
+                             Agents → Delegation (D-10): they bound the agents,
+                             not the process pool. Max Workers stays: it is
+                             runtime worker processes, not an agent setting. -->
+                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the absolute ceiling, and the reaper. Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
                         <div class="form-grid two">
                             <div class="form-field">
                                 <label>Max Workers</label>
                                 <input id="s-workers" type="number" min="1" max="50" value="10">
-                            </div>
-                            <div class="form-field">
-                                <label>Active Subagents / Root</label>
-                                <input id="s-active-subagents" type="number" min="1" max="500" value="6">
-                            </div>
-                            <div class="form-field">
-                                <label>Subagent Depth</label>
-                                <!-- 0 is a real owner choice ("no delegation at all"), honoured
-                                     structurally since v6.79.0 — it must be reachable here. -->
-                                <input id="s-subagent-depth" type="number" min="0" max="10" value="2">
                             </div>
                             <div class="form-field">
                                 <label>Tool Timeout (s)</label>
@@ -773,23 +790,18 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
-                        <h3>Cleanup &amp; Subagent Workspaces</h3>
+                        <h3>Cleanup</h3>
+                        <!-- The two subagent path roots moved to Agents →
+                             Delegation → Advanced (D-10). GC Retention stays: it
+                             governs every disposable runtime artifact, not just
+                             subagent worktrees. -->
                         <div class="settings-section-copy">
-                            <strong>GC Retention</strong> is the single age knob (days) for all disposable runtime artifacts the startup garbage collector removes: acting-subagent worktrees, terminal task drives, and leftover service logs (hard max 365).
-                            The roots are where acting subagents check out a git worktree of this repo or build a from-scratch (<code>genesis</code>) project; both live outside the app repo and data. Genesis projects are durable and never auto-removed. Leave a root blank for the default under <code>~/Ouroboros/</code>.
+                            <strong>GC Retention</strong> is the single age knob (days) for all disposable runtime artifacts the startup garbage collector removes: acting-subagent worktrees, terminal task drives, and leftover service logs (hard max 365). Genesis projects are durable and never auto-removed. Where subagents check out that work is set in <code>Agents</code>.
                         </div>
                         <div class="form-grid two">
                             <div class="form-field">
                                 <label>GC Retention (days)</label>
                                 <input id="s-gc-retention-days" type="number" min="1" max="365" value="7">
-                            </div>
-                            <div class="form-field">
-                                <label>Subagent Worktree Root</label>
-                                <input id="s-subagent-worktree-root" type="text" placeholder="~/Ouroboros/subagent_worktrees">
-                            </div>
-                            <div class="form-field">
-                                <label>Subagent Projects Root (genesis)</label>
-                                <input id="s-subagent-projects-root" type="text" placeholder="~/Ouroboros/projects">
                             </div>
                         </div>
                     </div>

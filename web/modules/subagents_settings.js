@@ -1,15 +1,18 @@
-// Subagents section (Models page, sibling of Reviewer Slots) — the owner-facing
-// face of the delegated-subagent capability.
+// Delegation section (Agents tab, under Review lanes) — the owner-facing face
+// of the delegated-subagent capability, and the ONE place the whole subagent
+// story is configured.
 //
-// Until this section existed the whole capability shipped invisible: delegation
+// Until this section existed the capability shipped invisible: delegation
 // (OUROBOROS_SUBAGENT_HARNESS) and the write permission
 // (OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS) were reachable only by hand-editing
 // settings.json, so the default install ran with delegation off and no control
-// said so.
+// said so. The counts that bound it — how many children per root, how deep the
+// chain — sat two tabs away under Advanced → Runtime Limits, next to process
+// worker counts they have nothing to do with; D-10 moved them here.
 //
-// Shape rules, same house style as Reviewer Slots:
-//  * The harness list comes from the SAME source the Harness Accounts panel
-//    reads (accountRows over /api/claudexor/status) — one catalog path, one
+// Shape rules, same house style as Review lanes:
+//  * The harness list comes from the SAME source the Accounts section reads
+//    (accountRows over /api/claudexor/status) — one catalog path, one
 //    login-capable discriminator, no second inventory.
 //  * The MODEL is the owner's default for delegated runs (owner, 2026-08-04):
 //    the `=model` tail of OUROBOROS_SUBAGENT_HARNESS, picked from the same
@@ -176,9 +179,9 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
         // happen.
         return route.decided
             ? { state: 'no_subscription', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
-                note: 'Delegation is off because you turned it off, and it stays off until you turn it back on. No coding-agent subscription is connected right now; sign one in under Providers → Harness Accounts to make delegation available again.' }
+                note: 'Delegation is off because you turned it off, and it stays off until you turn it back on. No agent subscription is connected right now; connect one under Accounts above to make delegation available again.' }
             : { state: 'no_subscription', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
-                note: 'No coding-agent subscription is connected, so there is nothing to delegate to. Sign one in under Providers → Harness Accounts and delegation turns on by itself.' };
+                note: 'No agent subscription is connected, so there is nothing to delegate to. Connect one under Accounts above and delegation turns on by itself.' };
     }
 
     const defaultOn = !route.decided && connected.length > 0;
@@ -218,13 +221,13 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
     }
 
     let state = 'on';
-    let note = 'The coding runs on this subscription, on the model picked here '
-        + '("Engine default model" leaves the choice to the coding agent); the subagent '
+    let note = 'The delegated work runs on this subscription, on the model picked here '
+        + '("Engine default model" leaves the choice to the agent); the subagent '
         + 'itself still runs on the API to drive and check it. Reasoning effort is still '
         + 'derived from each call.';
     if (!enabled) {
         state = 'off';
-        note = 'Subagents run entirely on the API. Turn this on to send the coding to a connected subscription.';
+        note = 'Subagents run entirely on the API. Turn this on to send their work to a connected subscription.';
     } else if (!connected.some((item) => item.id === harness)) {
         note = `No connected account for ${harness} right now — delegated work runs as an ordinary subagent on the API until it is signed in again.`;
     } else if (!savedHarness) {
@@ -265,16 +268,17 @@ const state = {
 export function renderSubagentsSection() {
     return `
         <div class="form-section" id="subagents-section">
-            <h3>Subagents</h3>
+            <h3>Delegation</h3>
             <div class="settings-section-copy">
-                Where Ouroboros's subagents run. By default a subagent is an ordinary child on your
-                API budget. Delegation hands the coding to a connected coding-agent subscription —
-                that part spends the subscription's window; the subagent itself still runs on the
-                API to drive and check it.
+                Where Ouroboros's subagents run, how many of them there may be, and how far they
+                may write. By default a subagent is an ordinary child on your API budget.
+                Delegation hands its work to a connected agent subscription — that part spends the
+                subscription's window; the subagent itself still runs on the API to drive and
+                check it.
             </div>
             <div id="subagents-rows" class="reviewer-slot-rows"></div>
             <div class="settings-effort-card">
-                <label>Allow Mutative Subagents</label>
+                <label>Allow mutative subagents</label>
                 <input id="s-allow-mutative-subagents" type="hidden" value="on">
                 ${renderSegmentedField({
                     target: 's-allow-mutative-subagents',
@@ -296,6 +300,44 @@ export function renderSubagentsSection() {
                     the agent cannot self-enable it; applies on the next task, no restart.
                 </div>
             </div>
+            <div class="form-grid two">
+                <div class="form-field">
+                    <label>Active subagents per root</label>
+                    <input id="s-active-subagents" type="number" min="1" max="500" value="6">
+                    <div class="settings-inline-note">How many children one root task may run at once.</div>
+                </div>
+                <div class="form-field">
+                    <label>Subagent depth</label>
+                    <!-- 0 is a real owner choice ("no delegation at all"), honoured
+                         structurally since v6.79.0 — it must be reachable here. -->
+                    <input id="s-subagent-depth" type="number" min="0" max="10" value="2">
+                    <div class="settings-inline-note">How deep the chain of subagents may nest. <code>0</code> turns delegation off entirely.</div>
+                </div>
+            </div>
+            <!-- Two paths nobody edits in a normal week, kept out of the way so
+                 the tab stays scannable (the house "More options" pattern). -->
+            <details class="settings-subsection" id="delegation-advanced">
+                <summary>Advanced — where subagents check out their work</summary>
+                <div class="settings-subsection-body">
+                    <div class="form-grid two">
+                        <div class="form-field">
+                            <label>Subagent worktree root</label>
+                            <input id="s-subagent-worktree-root" type="text" placeholder="~/Ouroboros/subagent_worktrees">
+                        </div>
+                        <div class="form-field">
+                            <label>Subagent projects root (genesis)</label>
+                            <input id="s-subagent-projects-root" type="text" placeholder="~/Ouroboros/projects">
+                        </div>
+                    </div>
+                    <div class="settings-inline-note">
+                        Where an acting subagent checks out a git worktree of this repo, or builds a
+                        from-scratch (<code>genesis</code>) project. Both live outside the app repo and
+                        data. Genesis projects are durable and never auto-removed; worktrees are
+                        cleaned by the GC retention setting in Advanced. Leave a root blank for the
+                        default under <code>~/Ouroboros/</code>.
+                    </div>
+                </div>
+            </details>
         </div>
     `;
 }
@@ -337,10 +379,10 @@ function renderRows() {
             <div class="reviewer-slot-controls">
                 <select data-subagent-delegation aria-label="Delegate subagents">
                     <option value="off"${view.enabled ? '' : ' selected'}>Subagents run on the API</option>
-                    <option value="on"${view.enabled ? ' selected' : ''}>Delegate to a coding agent</option>
+                    <option value="on"${view.enabled ? ' selected' : ''}>Delegate to an agent subscription</option>
                 </select>
-                ${view.enabled ? `<select data-subagent-harness aria-label="Coding agent">${options}</select>` : ''}
-                ${view.enabled ? `<select data-subagent-model aria-label="Coding agent model">${modelOptions}</select>` : ''}
+                ${view.enabled ? `<select data-subagent-harness aria-label="Agent">${options}</select>` : ''}
+                ${view.enabled ? `<select data-subagent-model aria-label="Agent model">${modelOptions}</select>` : ''}
             </div>` : ''}
             <div class="reviewer-slot-meta muted">${escapeHtml(view.note)}</div>
             ${lastLine ? `<div class="reviewer-slot-meta muted">${escapeHtml(lastLine)}</div>` : ''}
@@ -396,7 +438,7 @@ function adoptStoreSnapshot() {
     state.payload = state.statusError ? null : state.store.snapshot;
     // "Not read YET" is not "read and found nothing": the pre-request paint
     // must keep saying it is reading, or a connected owner briefly sees
-    // "No coding-agent subscription is connected".
+    // "No agent subscription is connected".
     state.loaded = state.store.everSettled;
 }
 

@@ -18,7 +18,7 @@
 // Pure helpers live at the top and are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
-import { FACET_CATALOG, claudexorStatus } from './claudexor_status_store.js';
+import { claudexorStatus } from './claudexor_status_store.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -98,7 +98,7 @@ export function routeChoiceGroups({ harnesses = [], currentChoice = '', catalogK
             // Provider = the harness name itself; the engine underneath is an
             // implementation detail the row never spells.
             value: `session:${h.id}`,
-            label: `${h.display_name || h.id} (coding agent)`,
+            label: `${h.display_name || h.id} (agent)`,
             disabled: h.status && h.status !== 'ok' && !h.enabled,
         }));
     // A SAVED session route whose harness discovery no longer lists (daemon
@@ -114,16 +114,16 @@ export function routeChoiceGroups({ harnesses = [], currentChoice = '', catalogK
     const groups = [{ label: 'API', options: [{ value: API_ROUTE_CHOICE, label: 'API model' }] }];
     // With no daemon the group used to VANISH, while the section copy above still
     // promised subscription delivery — the owner saw a broken promise and nowhere
-    // to go. Say why it is empty instead of hiding it. Name the DESTINATION by
-    // its tab: Harness Accounts lives in the Providers panel, this row lives in
-    // Models, so "below" pointed at a page that does not contain it.
+    // to go. Say why it is empty instead of hiding it. Accounts now live in the
+    // SAME tab, directly above, so the pointer is finally a place the owner can
+    // reach without leaving the page.
     groups.push(sessionValues.length
-        ? { label: 'Coding agents — subscriptions', options: sessionValues }
-        : { label: 'Coding agents — subscriptions', options: [{
+        ? { label: 'Agents — subscriptions', options: sessionValues }
+        : { label: 'Agents — subscriptions', options: [{
             value: '', disabled: true,
             label: catalogKnown
-                ? 'None available — sign in under Providers → Harness Accounts'
-                : 'Could not be listed — see the note above',
+                ? 'None available — connect one under Accounts above'
+                : 'Could not be listed — see the service banner above',
         }] });
     return groups;
 }
@@ -183,7 +183,7 @@ export function describeLastExecution(entry) {
     // APPLIED facts only: a session run whose telemetry predates the engine
     // receipt shows honest absence, never the requested value as applied.
     // One quiet line (owner feedback): the route is spelled only when it says
-    // more than the row's own delivery badge (which coding agent really ran),
+    // more than the row's own delivery badge (which agent really ran),
     // and the timestamp is humanized — the raw route + ISO instant stay
     // recoverable in the line's tooltip (lastRunMetaTitle).
     const route = String(effective.route || '');
@@ -250,6 +250,36 @@ export function profileOptionsFor(profiles, savedPin, { accountsKnown = true } =
         });
     }
     return options;
+}
+
+export function pinnedAccountWarning({ triad = [], scope = [], advisory = null,
+                                       profilesByHarness = {}, accountsKnown = false } = {}) {
+    // A removed (or signed-out) account must not silently reroute the row that
+    // pinned it. `profileOptionsFor` already keeps such a pin selectable, so
+    // the row itself never changes under the owner — this is the ONE actionable
+    // sentence that says why it now reads "(not in discovery)".
+    //
+    // Only an ACTUALLY READ account list licenses the claim (BIBLE P1): with
+    // the accounts facet unread every pin would look missing, and the tab's
+    // service banner is already saying nobody could be asked.
+    if (!accountsKnown) return '';
+    const missing = [];
+    const rows = [...triad, ...scope, ...(advisory ? [{ ...advisory, slot_id: 'advisory' }] : [])];
+    for (const row of rows) {
+        const route = row?.route || {};
+        if (route.kind !== ROUTE_KIND_SESSION) continue;
+        const pin = String(route.profile_id || '');
+        if (!pin) continue;
+        const harness = splitSessionTarget(route.target_id).harness;
+        if ((profilesByHarness[harness] || []).includes(pin)) continue;
+        const label = `${harness} · ${pin}`;
+        if (!missing.includes(label)) missing.push(label);
+    }
+    if (!missing.length) return '';
+    return `${missing.length === 1 ? 'A review row is' : `${missing.length} review rows are`} `
+        + `pinned to an account the agent service no longer lists (${missing.join(', ')}). `
+        + 'Those rows are shown as-is and will refuse rather than reroute — pick another '
+        + 'account or automatic rotation below, or sign that account back in under Accounts.';
 }
 
 export function capabilityBadge(row, harnessesById, { catalogKnown = true } = {}) {
@@ -319,7 +349,6 @@ const state = {
     // "(not in discovery)" label.
     catalogKnown: false,
     accountsKnown: false,
-    serviceNote: null,
     store: claudexorStatus,
     disposers: [],
     onChange: () => {},
@@ -332,21 +361,20 @@ const advisoryRouteMemory = { api: null, session: null };
 export function renderReviewerSlotsSection() {
     return `
         <div class="form-section" id="reviewer-slots-section">
-            <h3>Reviewer Slots</h3>
+            <h3>Review lanes</h3>
             <div class="settings-section-copy">
                 Who reviews each commit: the triad rows, the scope rows, and one optional advisory
-                pre-reviewer. Each row picks its delivery — an API model, or a coding agent on your
+                pre-reviewer. Each row picks its delivery — an API model, or an agent on your
                 subscription — plus its own reasoning effort.
             </div>
             <div class="settings-inline-note">
-                Coding-agent delivery covers <strong>commit review only</strong>. If every triad or
-                scope row is delegated, plan review, task acceptance and skill review fall back to
-                the shipped default models and spend API budget — keep at least one API row.
+                Commit and scope review run on subscriptions and never fall back to API spend: if
+                every eligible window is exhausted, the review waits for capacity. Plan review, task
+                acceptance and skill review are API-only surfaces today and keep running on the
+                shipped default models.
             </div>
             <div id="reviewer-slots-error" class="ui-status" data-tone="error" hidden></div>
-            <!-- ONE explanation when the coding-agent list could not be read,
-                 instead of decorating every row with "(not in discovery)". -->
-            <div id="reviewer-slots-service" class="settings-inline-status" hidden></div>
+            <div id="reviewer-slots-pins" class="settings-inline-status" data-tone="warn" hidden></div>
             <datalist id="reviewer-api-model-catalog"></datalist>
             <h4 class="reviewer-slots-heading">Triad slots <span class="muted" id="reviewer-triad-limit" title="The commit gate's real ceiling"></span></h4>
             <div id="reviewer-triad-rows" class="reviewer-slot-rows"></div>
@@ -491,16 +519,14 @@ function renderRows() {
                 ? `Could not reach the reviewer-slot settings — ${state.loadError}. Your saved configuration is unchanged; retry when the connection is back.`
                 : '');
     }
-    // The ONE coding-agent-service explanation. It answers a question the
-    // config-error banner above never could: that banner accuses the SAVED
-    // reviewer configuration, while this one says nobody could be asked what
-    // is discoverable — so no row below may be read as missing.
-    const serviceBox = document.getElementById('reviewer-slots-service');
-    if (serviceBox) {
-        const note = state.serviceNote;
-        serviceBox.hidden = !note;
-        serviceBox.textContent = note ? note.text : '';
-        serviceBox.dataset.tone = note ? note.tone : 'muted';
+    // Why the agent service could not be read is the TAB's banner now (one
+    // place, not one per section). What stays here is the fact only this
+    // section knows: a row pinned to an account that is really gone.
+    const pinsBox = document.getElementById('reviewer-slots-pins');
+    if (pinsBox) {
+        const text = pinnedAccountWarning(state);
+        pinsBox.hidden = !text;
+        pinsBox.textContent = text;
     }
     const triadBox = document.getElementById('reviewer-triad-rows');
     const scopeBox = document.getElementById('reviewer-scope-rows');
@@ -674,12 +700,10 @@ export async function reloadReviewerSlots() {
 function adoptStatusSnapshot() {
     // Each facet answers for itself. A never-read catalog and a never-read
     // account store are separate gaps, and neither is evidence that a saved
-    // route or pin no longer exists. The section's ONE note leads with the
-    // catalog (this page's primary subject); a facet that was read keeps its
-    // authoritative list either way.
+    // route or pin no longer exists. The tab's service banner explains the gap
+    // once; a facet that WAS read keeps its authoritative list either way.
     state.catalogKnown = state.store.catalogKnown;
     state.accountsKnown = state.store.accountsKnown;
-    state.serviceNote = state.store.unavailableNote(FACET_CATALOG);
     const snapshot = state.store.snapshot || {};
     state.harnesses = state.catalogKnown && Array.isArray(snapshot.harnesses) ? snapshot.harnesses : [];
     state.profilesByHarness = state.accountsKnown ? indexProfilesByHarness(snapshot) : {};
@@ -701,7 +725,7 @@ export function initReviewerSlots({ onChange, store = claudexorStatus } = {}) {
     state.disposers.push(state.store.subscribe(() => {
         adoptStatusSnapshot();
         const next = JSON.stringify([state.catalogKnown, state.accountsKnown,
-            state.serviceNote?.text || '', state.harnesses, state.profilesByHarness]);
+            state.harnesses, state.profilesByHarness]);
         if (next === signature) return;
         signature = next;
         renderRows();

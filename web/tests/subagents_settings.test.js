@@ -78,7 +78,11 @@ test('with no subscription connected the section explains instead of offering a 
     assert.equal(view.state, 'no_subscription');
     assert.equal(view.enabled, false);
     assert.deepEqual(view.options, []);
-    assert.match(view.note, /Harness Accounts/);
+    // The pointer now names a place on the SAME tab. It used to say
+    // "Providers → Harness Accounts", which was two tabs away from the control
+    // it explained; accounts and delegation live together in Agents (D-10).
+    assert.match(view.note, /Accounts above/);
+    assert.doesNotMatch(view.note, /Providers/);
 });
 
 test('a failed accounts read is not the same sentence as "nothing connected"', () => {
@@ -88,7 +92,7 @@ test('a failed accounts read is not the same sentence as "nothing connected"', (
     assert.equal(view.state, 'unknown');
     assert.equal(view.enabled, false);
     assert.match(view.note, /HTTP 503/);
-    assert.doesNotMatch(view.note, /No coding-agent subscription/);
+    assert.doesNotMatch(view.note, /No agent subscription/);
 });
 
 test('a failed accounts read suppresses the controls even over a saved harness', () => {
@@ -120,12 +124,12 @@ test('a decided "off" is never promised to turn itself back on', () => {
 test('before the accounts have been read the section says it is reading, not "no subscription"', () => {
     // applySubagentsSettings renders immediately while the accounts arrive later:
     // while !loaded the view cannot tell "not read yet" from "read and found
-    // nothing", so a connected owner briefly saw "No coding-agent subscription".
+    // nothing", so a connected owner briefly saw "No agent subscription".
     const view = delegationView({ saved: '', payload: null, loaded: false });
     assert.equal(view.state, 'loading');
     assert.equal(view.enabled, false);
-    assert.match(view.note, /Reading your coding-agent accounts/);
-    assert.doesNotMatch(view.note, /No coding-agent subscription/);
+    assert.match(view.note, /Reading your agent accounts/);
+    assert.doesNotMatch(view.note, /No agent subscription/);
 });
 
 test('the money copy never claims delegation moves the subagent itself off the API', () => {
@@ -138,7 +142,7 @@ test('the money copy never claims delegation moves the subagent itself off the A
     });
     const off = delegationView({ saved: DELEGATION_OFF, payload });
     assert.doesNotMatch(off.note, /instead/);
-    assert.match(off.note, /send the coding to a connected subscription/);
+    assert.match(off.note, /send their work to a connected subscription/);
     const on = delegationView({ saved: 'codex', payload });
     assert.match(on.note, /still runs on the API/);
 });

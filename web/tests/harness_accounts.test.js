@@ -14,7 +14,7 @@ import {
     promptProfileName,
     quotaSummary,
     runtimeActionLabel,
-    sectionStatusLine,
+    serviceBannerLine,
     verificationBadge,
 } from '../modules/harness_accounts.js';
 // The login machinery moved to the shared controller module (phase 2) so the
@@ -129,13 +129,17 @@ test('both verification statuses are honest: vendor is trusted, local is neutral
         verification: 'passed', verification_source: 'vendor', last_verified_at: '2026-08-03T10:00:00Z',
     } });
     assert.equal(vendor.tone, 'ok');
-    assert.ok(vendor.label.startsWith('verified live'));
+    assert.equal(vendor.label, 'Verified live');
+    // The raw ISO instant left the badge entirely (owner: a row must never lead
+    // with a timestamp); accountMetaLine humanizes it on line 2 instead.
+    assert.doesNotMatch(vendor.label, /2026-/);
 
     const local = verificationBadge({ status: { verification: 'passed', verification_source: 'local_store' } });
     assert.equal(local.tone, 'muted');
-    assert.equal(local.label, 'local session — not verified live');
+    // Narrower claim, narrower words — shorter, but "not verified live" stays.
+    assert.equal(local.label, 'Signed in — not verified live');
 
-    assert.equal(verificationBadge({ status: {} }).label, 'not logged in');
+    assert.equal(verificationBadge({ status: {} }).label, 'Not signed in');
     assert.equal(verificationBadge({ status: { verification: 'failed', verification_source: 'vendor' } }).tone, 'error');
 });
 
@@ -147,17 +151,28 @@ test('an exhausted window is shown with its reset time, never hidden', () => {
         subject: { harness: 'codex', subject_id: 'koshak' }, freshness: 'fresh',
         constraints: [{ used_ratio: 1.0, resets_at: '2026-08-04T00:00:00Z' }],
     }];
-    const summary = quotaSummary(snapshots, 'codex', 'koshak');
+    // Owner ask: the limit text compact and understandable. The RESET is
+    // humanized against a fixed now, and the raw instant stays on `resetsAt`.
+    const now = Date.parse('2026-08-03T22:00:00Z');
+    const summary = quotaSummary(snapshots, 'codex', 'koshak', { nowMs: now });
     assert.equal(summary.exhausted, true);
     assert.equal(summary.resetsAt, '2026-08-04T00:00:00Z');
-    assert.ok(summary.label.includes('resets 2026-08-04T00:00:00Z'));
+    assert.equal(summary.label, 'Limit reached · resets in 2h');
+    assert.doesNotMatch(summary.label, /2026-/);
 
     const healthy = quotaSummary([{
         subject: { harness: 'codex' }, freshness: 'fresh', constraints: [{ used_ratio: 0.42 }],
     }], 'codex');
     assert.equal(healthy.exhausted, false);
-    assert.equal(healthy.label, '42% of window used');
-    assert.deepEqual(quotaSummary([], 'codex'), { label: '', exhausted: false, resetsAt: '' });
+    assert.equal(healthy.label, '42% used');
+    // Read, and nothing to say about THIS account: absence stated as absence.
+    assert.deepEqual(quotaSummary([], 'codex'),
+        { label: 'Usage unavailable', exhausted: false, resetsAt: '', tone: 'muted' });
+    // A REFUSED quota read licenses no usage claim at all, while the catalogue
+    // and account facets beside it stay authoritative.
+    assert.equal(quotaSummary([{
+        subject: { harness: 'codex' }, freshness: 'fresh', constraints: [{ used_ratio: 0.42 }],
+    }], 'codex', '', { quotaRead: 'failed' }).label, 'Limits not checked');
 });
 
 test('the card reads a window on the same bar the runtime dispatches on', () => {
@@ -172,7 +187,7 @@ test('the card reads a window on the same bar the runtime dispatches on', () => 
         constraints: [{ used_ratio: 1.0, resets_at: '2026-08-04T00:00:00Z' }],
     }];
     assert.deepEqual(quotaSummary(stale, 'codex', 'koshak'),
-        { label: '', exhausted: false, resetsAt: '' });
+        { label: 'Usage unavailable', exhausted: false, resetsAt: '', tone: 'muted' });
     assert.equal(quotaSummary([{ ...stale[0], freshness: 'unknown' }], 'codex', 'koshak').exhausted, false);
     assert.equal(quotaSummary([{ ...stale[0], freshness: 'fresh' }], 'codex', 'koshak').exhausted, true);
 
@@ -213,7 +228,7 @@ test('a named profile\'s exhausted window is never reported as the default accou
     ];
     const defaultRow = quotaSummary(snapshots, 'codex', '');
     assert.equal(defaultRow.exhausted, false);
-    assert.equal(defaultRow.label, '5% of window used');
+    assert.equal(defaultRow.label, '5% used');
     const namedRow = quotaSummary(snapshots, 'codex', 'koshak');
     assert.equal(namedRow.exhausted, true);
     assert.equal(namedRow.resetsAt, '2026-08-04T00:00:00Z');
@@ -236,7 +251,7 @@ test('a model-scoped window never paints the whole account exhausted — it is a
     }], 'claude', 'abstractdl');
     assert.equal(mixed.exhausted, false);
     // The account bar stays the GLOBAL window's; the spent scope is still said.
-    assert.equal(mixed.label, '40% of window used · Fable window spent');
+    assert.equal(mixed.label, '40% used · Fable window spent');
 
     // Scoped-only spent (cooldown, no ratio): the note IS the label, no red.
     const scopedOnly = quotaSummary([{
@@ -251,7 +266,8 @@ test('a model-scoped window never paints the whole account exhausted — it is a
     assert.deepEqual(quotaSummary([{
         subject, freshness: 'fresh',
         constraints: [{ label: 'Fable window', applies_to_models: ['claude-fable-5'], used_ratio: 0.8 }],
-    }], 'claude', 'abstractdl'), { label: '', exhausted: false, resetsAt: '' });
+    }], 'claude', 'abstractdl'),
+    { label: 'Usage unavailable', exhausted: false, resetsAt: '', tone: 'muted' });
 
     // A GLOBAL window (applies_to_models null/omitted = every model) keeps the
     // account-level exhausted behavior exactly as before.
@@ -260,7 +276,7 @@ test('a model-scoped window never paints the whole account exhausted — it is a
         constraints: [{ applies_to_models: null, used_ratio: 1.0, resets_at: '2026-08-08T00:00:00Z' }],
     }], 'claude', 'abstractdl');
     assert.equal(global.exhausted, true);
-    assert.ok(global.label.startsWith('window exhausted'));
+    assert.ok(global.label.startsWith('Limit reached'));
 
     // Without a label, the note falls back to the constraint id, then models.
     assert.equal(quotaSummary([{
@@ -402,7 +418,7 @@ test('account rows consume the REAL schema shape: array of {profile,status,ident
     const native = rows.find((row) => row.kind === 'native');
     assert.equal(native.harness, 'codex');  // read from harness_id (snake_case), not harnessId
     // A native login detected locally is still only local_store evidence.
-    assert.equal(verificationBadge(native).label, 'local session — not verified live');
+    assert.equal(verificationBadge(native).label, 'Signed in — not verified live');
 
     const profile = rows.find((row) => row.kind === 'profile');
     // Read from the NESTED wrapper.profile.* snake_case fields, not a flat map.
@@ -412,7 +428,7 @@ test('account rows consume the REAL schema shape: array of {profile,status,ident
     assert.equal(profile.identity.email, 'koshak@example.com');
     // The vendor-verified status flows straight through from wrapper.status.
     assert.equal(verificationBadge(profile).tone, 'ok');
-    assert.ok(verificationBadge(profile).label.startsWith('verified live'));
+    assert.equal(verificationBadge(profile).label, 'Verified live');
 });
 
 test('the invented flat camelCase shape yields NOTHING (guards against the regression)', () => {
@@ -446,11 +462,11 @@ test('DTO end-to-end: EMPTY and MULTI-ACCOUNT schema-parsed bodies', () => {
     const byId = Object.fromEntries(rows.filter((r) => r.kind === 'profile')
         .map((r) => [r.profile_id, verificationBadge(r)]));
     assert.equal(byId.koshak.tone, 'ok');                       // vendor-verified
-    assert.equal(byId.backup.label, 'local session — not verified live');
+    assert.equal(byId.backup.label, 'Signed in — not verified live');
     assert.equal(byId.main.tone, 'error');                      // vendor said failed
     // A claude native row with no login shows "not logged in", not a lie.
     const claudeNative = rows.find((r) => r.kind === 'native' && r.harness === 'claude');
-    assert.equal(verificationBadge(claudeNative).label, 'not logged in');
+    assert.equal(verificationBadge(claudeNative).label, 'Not signed in');
 });
 
 test('the attach command is DEMOTED: never a card face, only a due fallback', () => {
@@ -1053,30 +1069,41 @@ test('a harness with no row only says "no account connected" once the store was 
     // BIBLE P1 at the pixel: the owner's panel declared three harnesses empty
     // while two claude profiles, a cursor profile and two native sessions sat
     // in the agent home — a lazy daemon had simply never been asked.
-    assert.equal(bareRowStatusText('ok'), 'no account connected');
-    assert.match(bareRowStatusText('not_read'), /not checked/);
+    assert.equal(bareRowStatusText('ok'), 'No account connected');
+    assert.match(bareRowStatusText('not_read'), /Not checked/);
     assert.match(bareRowStatusText('not_read'), /daemon is not running/);
     assert.match(bareRowStatusText('failed'), /did not answer/);
     assert.match(bareRowStatusText('transport'), /request did not complete/);
-    assert.equal(bareRowStatusText('unread'), 'checking…');
+    assert.equal(bareRowStatusText('unread'), 'Checking…');
     // Each gap is its OWN sentence — collapsing them would re-create the lie.
     const gaps = ['not_read', 'failed', 'transport'].map(bareRowStatusText);
     assert.equal(new Set(gaps).size, 3);
 });
 
-test('the section line reports a REFUSED account read instead of "Claudexor ready"', () => {
+test('the ONE service banner reports a REFUSED read instead of "Claudexor ready"', () => {
     // A running daemon whose account read died would otherwise print the green
     // lifecycle line over a list that was never delivered.
-    const fakeStore = (facetState, error = '') => ({
-        facet: () => facetState,
+    const fakeStore = (reads, error = '') => ({
+        reads,
+        facet: (name) => reads[name],
         error,
         snapshot: { daemon: { state: 'running', engine_version: '3.3.13', runtime: {} } },
         loading: false,
         everSettled: true,
         unavailableNote: () => ({ tone: 'warn', text: 'the daemon did not answer this read', action: null }),
     });
-    assert.match(sectionStatusLine(fakeStore('failed')).text, /did not answer/);
-    assert.match(sectionStatusLine(fakeStore('transport', 'net')).text, /did not answer/);
+    const all = (v) => ({ catalog: v, accounts: v, quota: v });
+    // Every facet gone the same way: ONE sentence, with the subject widened to
+    // the whole tab — naming only the accounts would under-report the gap.
+    assert.match(serviceBannerLine(fakeStore(all('failed'))).text, /did not answer/);
+    assert.match(serviceBannerLine(fakeStore(all('failed'))).text, /agents, accounts and limits/);
+    assert.match(serviceBannerLine(fakeStore(all('transport'), 'net')).text, /Could not read/);
     // A healthy read keeps the existing lifecycle sentence, unchanged.
-    assert.match(sectionStatusLine(fakeStore('ok')).text, /Claudexor ready/);
+    assert.match(serviceBannerLine(fakeStore(all('ok'))).text, /Claudexor ready/);
+
+    // PER FACET, never one global verdict: a refused QUOTA read must not
+    // withdraw the catalogue's and the accounts' authority.
+    const partial = serviceBannerLine(fakeStore({ catalog: 'ok', accounts: 'ok', quota: 'failed' }));
+    assert.match(partial.text, /did not answer/);
+    assert.match(partial.text, /Everything else on this tab was read normally/);
 });

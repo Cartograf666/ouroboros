@@ -411,7 +411,44 @@ async def api_claudexor_login_job(request: Request) -> JSONResponse:
         return json_error(f"{type(exc).__name__}: Claudexor login job {op} failed")
 
 
+def _remove_credential_profile(harness: str, profile_id: str) -> Dict[str, Any]:
+    from ouroboros.claudexor_daemon import owned_config_dir
+    from ouroboros.gateways.claudexor import ClaudexorGateway, discover_daemon_at
+
+    endpoint = discover_daemon_at(owned_config_dir())
+    with ClaudexorGateway(endpoint) as gateway:
+        gateway.handshake()
+        gateway.delete_credential_profile(harness, profile_id)
+    return {"ok": True, "harness": harness, "profile_id": profile_id}
+
+
+async def api_claudexor_credential_profile(request: Request) -> JSONResponse:
+    """DELETE /api/claudexor/credential-profiles/{harness}/{profile_id}.
+
+    A FOURTH thin proxy, same rule as the other three: the daemon owns the
+    account record, so removing one is its own contract
+    (``DELETE /v2/credential-profiles/:harness/:profileId``) and its refusal is
+    the answer. Nothing here touches a vendor credential file — a native CLI
+    login has no route because this process cannot honestly sign it out.
+    """
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    harness = str(request.path_params.get("harness") or "").strip()
+    profile_id = str(request.path_params.get("profile_id") or "").strip()
+    if not harness or not profile_id:
+        return json_error("harness and profile_id are required", 400)
+    try:
+        return JSONResponse(
+            await asyncio.to_thread(_remove_credential_profile, harness, profile_id))
+    except ClaudexorUnavailable as exc:
+        return json_error(f"{exc.code}: {exc}", 503)
+    except Exception as exc:
+        log.exception("api_claudexor_credential_profile failed")
+        return json_error(f"{type(exc).__name__}: Claudexor account removal failed")
+
+
 __all__ = [
+    "api_claudexor_credential_profile",
     "api_claudexor_login",
     "api_claudexor_login_job",
     "api_claudexor_status",

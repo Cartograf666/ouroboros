@@ -882,6 +882,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "GET /api/claudexor/login/{job_id}",
     "DELETE /api/claudexor/login/{job_id}",
     "POST /api/claudexor/login/{job_id}/input",
+    "DELETE /api/claudexor/credential-profiles/{harness}/{profile_id}",
     "GET /api/extensions",
     "GET /api/extensions/{skill}/manifest",
     "GET /api/extensions/{skill}/module/{entry}",

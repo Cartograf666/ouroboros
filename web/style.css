@@ -5919,28 +5919,117 @@ textarea.chat-input {
     color: var(--text-meta);
     margin-top: 6px;
 }
-/* Account rows are purpose-built (identity left, actions right), not the
-   settings key/value grid — .settings-custom-secret-row's 0.65fr/1.35fr
-   columns inverted the proportions and its align-items:end sank the text. */
-.harness-account-row {
+/* ONE service banner for the Agents tab: the single place a daemon/runtime
+   problem is explained, so no row has to carry "(not in discovery)". */
+.agents-service-banner {
+    display: flex;
+    align-items: baseline;
+    padding: 10px 12px;
+    border: 1px solid var(--ui-card-border);
+    border-radius: var(--radius);
+    background: var(--ui-card-bg-soft);
+}
+/* Accounts are grouped by FAMILY, one card each (owner: "все акки клод кода
+   должны быть эквивалентны", "в каждой секции добавить кнопку"). The card
+   header carries the family name, its aggregate status and its OWN Add
+   button — the affordance used to hang off one privileged row. */
+.agent-family-list { display: flex; flex-direction: column; gap: 12px; }
+.agent-family-card {
+    border: 1px solid var(--ui-card-border);
+    border-radius: var(--radius);
+    background: var(--ui-card-bg);
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.agent-family-head {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: 10px;
-    padding: 12px;
-    border: 1px solid var(--ui-card-border);
-    border-radius: var(--radius);
+}
+.agent-family-id { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; min-width: 0; }
+.agent-family-id h4 {
+    margin: 0;
+    font-size: var(--type-section);
+    line-height: var(--line-title);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.agent-family-rows { display: flex; flex-direction: column; gap: 8px; }
+/* Account rows are purpose-built (identity left, actions right), not the
+   settings key/value grid — .settings-custom-secret-row's 0.65fr/1.35fr
+   columns inverted the proportions and its align-items:end sank the text.
+   Two lines: the account and its status on top, muted metadata below, actions
+   docked right across both (docs/DESIGN.md "Account group / row anatomy"). No
+   row is privileged: the default CLI login uses this exact layout. */
+.harness-account-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "main actions" "meta actions";
+    align-items: center;
+    column-gap: 12px;
+    row-gap: 2px;
+    padding: 10px 12px;
+    border: 1px solid var(--divider);
+    border-radius: 8px;
     background: var(--ui-card-bg-soft);
 }
-.harness-account-main { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; flex: 1; }
-.harness-account-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.harness-account-main {
+    grid-area: main;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: baseline;
+    min-width: 0;
+}
+.harness-account-meta {
+    grid-area: meta;
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    min-width: 0;
+}
+.harness-account-actions { grid-area: actions; display: flex; gap: 6px; flex-wrap: wrap; }
 /* Row anatomy: name = the one primary thing (docs/DESIGN.md). */
 .harness-account-main strong {
     font-size: var(--type-body);
     line-height: var(--line-body);
     font-weight: 600;
     color: var(--text-primary);
+}
+/* Status inside a family card or an account row is a meta-sized dot + text, on
+   the tab's own scale — the global .ui-status chrome size belongs to surfaces
+   that have not migrated yet. */
+.agent-family-id .ui-status,
+.harness-account-main .ui-status {
+    display: inline-flex;
+    align-items: center;
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+}
+.agent-family-id .ui-status[data-tone]::before,
+.harness-account-main .ui-status[data-tone]::before {
+    content: "";
+    display: inline-block;
+    flex: 0 0 auto;
+    width: 6px;
+    height: 6px;
+    margin-right: 6px;
+    border-radius: 999px;
+    background: currentColor;
+}
+/* Narrow viewports: the actions column would squeeze the account name to a
+   couple of characters, so the row becomes one column and the buttons drop
+   under the metadata they act on. */
+@media (max-width: 640px) {
+    .harness-account-row {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "main" "meta" "actions";
+        row-gap: 8px;
+    }
+    .agent-family-head { align-items: flex-start; }
 }
 /* Classification chip: neutral pair, never inherited ink (docs/DESIGN.md).
    Also reused by Chat's live executor chip, which keeps its own 10px sizing. */
@@ -5955,7 +6044,12 @@ textarea.chat-input {
     line-height: var(--line-meta);
     letter-spacing: 0.04em;
 }
-.harness-exhausted { opacity: 0.62; }
+/* A spent window is EMPHASIS, not de-emphasis. The row used to be dimmed to
+   0.62 opacity, which greyed out the very sentence that reports the limit and
+   made its still-clickable buttons read as disabled (docs/DESIGN.md: "a control
+   rendered at secondary ink reads as disabled"). A warn tint says the same
+   thing without hiding it. */
+.harness-exhausted { background: var(--status-warn-bg); }
 /* The login card frames itself: .panel-card is an onboarding.css class the
    settings pages never load, so leaning on it rendered a bare, frameless
    card (finding #4). Same ui-card tokens as every other panel surface. */

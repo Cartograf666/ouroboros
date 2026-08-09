@@ -103,14 +103,18 @@ export function shouldPollStatus({
     return Boolean(held || surfaceVisible);
 }
 
-// What each facet is CALLED in a sentence to the owner.
-const FACET_SUBJECT = {
-    [FACET_CATALOG]: 'coding agents',
-    [FACET_ACCOUNTS]: 'coding-agent accounts',
+// What each facet is CALLED in a sentence to the owner. "agent", never "coding
+// agent" (D-10): the same subscriptions run presentations, research and any
+// other task, so the narrower word describes only one of their uses.
+export const FACET_SUBJECT = {
+    [FACET_CATALOG]: 'agents',
+    [FACET_ACCOUNTS]: 'agent accounts',
     [FACET_QUOTA]: 'subscription limits',
 };
 
-export function statusUnavailableNote(readState, { error = '', facet = FACET_ACCOUNTS } = {}) {
+export function statusUnavailableNote(readState, {
+    error = '', facet = FACET_ACCOUNTS, subject = '',
+} = {}) {
     // ONE sentence per read state, shared by every consumer, so the app cannot
     // explain the same gap three different ways. `null` = nothing to say.
     //
@@ -121,7 +125,10 @@ export function statusUnavailableNote(readState, { error = '', facet = FACET_ACC
     // a surface that already renders `note.action` needs no rewrite. Shape:
     // `{ kind, label, run }` — `kind` names the action, `label` is the button
     // text, `run()` performs it and resolves once the store has re-read.
-    const subject = FACET_SUBJECT[facet] || FACET_SUBJECT[FACET_ACCOUNTS];
+    // `subject` overrides the per-facet noun for a caller that speaks for MORE
+    // than one facet — the Agents tab's single banner, when every facet failed
+    // the same way and naming just one of them would under-report the gap.
+    subject = subject || FACET_SUBJECT[facet] || FACET_SUBJECT[FACET_ACCOUNTS];
     if (readState === READ_TRANSPORT) {
         return {
             tone: 'error', action: null,
@@ -288,7 +295,7 @@ export function createClaudexorStatusStore({
         }
         // A hidden page pauses EVERY reason to poll, a held login included:
         // nothing is on screen to update, and the daemon read is expensive
-        // (it re-probes each coding-agent CLI).
+        // (it re-probes each agent CLI).
         return shouldPollStatus({
             hasSubscribers: inner.listeners.size > 0,
             hidden: Boolean(document_ && document_.hidden),

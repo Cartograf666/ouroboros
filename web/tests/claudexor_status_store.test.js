@@ -124,11 +124,14 @@ test('each unavailable read state has ONE shared sentence, and an ok read has no
     // read died would be a second lie.
     assert.equal(new Set([down.text, dead.text, refused.text]).size, 3);
 
-    assert.match(statusUnavailableNote(READ_UNREAD).text, /Reading your coding-agent accounts/);
+    assert.match(statusUnavailableNote(READ_UNREAD).text, /Reading your agent accounts/);
     assert.equal(statusUnavailableNote(READ_OK), null);
 
     // The note names the facet it is about, so three surfaces can share it.
-    assert.match(statusUnavailableNote(READ_NOT_READ, { facet: FACET_CATALOG }).text, /coding agents/);
+    // D-10: the subject is "agents", not "coding agents" — the same
+    // subscriptions build presentations and run arbitrary tasks.
+    assert.match(statusUnavailableNote(READ_NOT_READ, { facet: FACET_CATALOG }).text, /your agents were never checked/);
+    assert.doesNotMatch(statusUnavailableNote(READ_NOT_READ, { facet: FACET_CATALOG }).text, /coding/);
     assert.match(statusUnavailableNote(READ_NOT_READ, { facet: FACET_QUOTA }).text, /subscription limits/);
 
     // The ACTION slot exists and is empty on this branch — an owner action that
