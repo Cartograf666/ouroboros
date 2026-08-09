@@ -1386,6 +1386,13 @@ dock, sticky tab strips) is a **flat darkening gradient with no blur band**:
 2. Its background is a single multi-stop `linear-gradient` from
    `rgba(var(--bg-primary-rgb), …)` at the anchor edge to fully transparent at
    the far edge, so the transcript fades out instead of hitting a hard line.
+   The intermediate stops are anchored to the FAR edge as a fixed length
+   (`calc(100% - 30px)`), never as percentages. This chrome changes height — the
+   chat header wraps from one row (56px) to three (~129px at 375px) — and
+   percentage stops stretch with the box, which is what left the whole wrapped
+   control row sitting over effectively unmasked transcript text. A fixed tail
+   keeps the controls on a solid backdrop at any height and always spends the
+   same distance softening the edge.
 3. **No `backdrop-filter`, and therefore no companion `mask-image`.** The mask
    only ever existed to fade a blur in lockstep; with the blur gone the mask is
    dead weight (`.chat-page-header` pins `mask-image: none` for exactly this
@@ -1395,10 +1402,12 @@ dock, sticky tab strips) is a **flat darkening gradient with no blur band**:
 5. The scrollable surface reserves space for the chrome instead of hiding
    content under it: `#chat-messages` reserves bottom padding through
    `--chat-input-reserve` and top padding through `--chat-header-reserve`, both
-   set from the REAL measured `offsetHeight` by the
-   `updateMessagesPadding()` / `ResizeObserver` pair (mobile adds safe-area on
-   top). `updateMessagesPadding()` preserves scroll stickiness only; it must not
-   mutate DOM padding.
+   set from the REAL measured height by the `updateMessagesPadding()` /
+   `ResizeObserver` pair (mobile adds safe-area on top). The header reserve reads
+   `getBoundingClientRect().height`, not `offsetHeight`: the latter is already
+   rounded down to an integer, so a fractional wrapped header (129.39px at 375px)
+   would reserve one pixel too little. `updateMessagesPadding()` preserves scroll
+   stickiness only; it must not mutate DOM padding.
 
 Do NOT introduce a separate `.chat-bottom-fade` (or analogous overlay) layer.
 A second fade layer compounds the gradient and can produce a visible "double

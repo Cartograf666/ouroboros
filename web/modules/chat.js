@@ -1873,7 +1873,7 @@ export function createChatInstance({
     // One-way conversion (P3): the WHOLE card becomes a calm "project identity"
     // chip. The live task is now owned by the project panel (it's bound there),
     // so the main chat is freed — the card stops being a busy red task and
-    // recolors to the project fuchsia. Plain wording (no "ack"); click opens the panel.
+    // recolors to the project teal. Plain wording (no "ack"); click opens the panel.
     function markCardConverted(record, project) {
         return withStableViewport(() => markCardConvertedMutation(record, project));
     }
@@ -1914,7 +1914,7 @@ export function createChatInstance({
         // (The detached element refs are LEFT intact — nulling them made other
         // terminal paths like finishLiveCard throw on a post-conversion frame.)
         record.finished = true;
-        // Recolor on the next frame so the 250ms fuchsia fade actually animates.
+        // Recolor on the next frame so the 250ms teal fade actually animates.
         requestAnimationFrame(() => record.root.classList.add('is-project'));
         signalChatFreed();  // subtle "this chat is free again" composer cue
     }
@@ -4278,10 +4278,15 @@ export function createChatInstance({
         const preserveStickiness = options.preserveStickiness !== false;
         const shouldStick = preserveStickiness && !_historyRebuildActive && isNearBottom();
         if (pageHeader && messagesDiv) {
-            // The main header wraps to two rows on narrow viewports. Reserve its
-            // REAL rendered height so scrollTop=0 never hides the first message
-            // behind the absolute overlay; project panels have no overlay header.
-            const headerReserve = Math.max(56, Math.ceil(pageHeader.offsetHeight || 0));
+            // The main header wraps to two or three rows on narrow viewports.
+            // Reserve its REAL rendered height so scrollTop=0 never hides the first
+            // message behind the absolute overlay; project panels have no overlay
+            // header. getBoundingClientRect().height, not offsetHeight: offsetHeight
+            // is already rounded DOWN to an integer, so ceil() on it is a no-op and a
+            // fractional header (129.39px at 375px) reserved 129px — a sub-pixel
+            // under-measure that puts the first line's ascender under the fade.
+            const headerBox = pageHeader.getBoundingClientRect().height || pageHeader.offsetHeight || 0;
+            const headerReserve = Math.max(56, Math.ceil(headerBox));
             page.style.setProperty('--chat-header-reserve', `${headerReserve}px`);
         }
         if (inputArea && messagesDiv) {

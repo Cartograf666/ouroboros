@@ -2812,19 +2812,46 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                     "cards => cards.map(card => card.dataset.taskId)"
                 )
                 assert len(rendered_ids) == 11, rendered_ids
+                # Wide-viewport half, re-expressed for the FLAT redesign (owner
+                # decision 28 + the post-rebase addendum): adapt the constants to the
+                # new geometry, never weaken the invariant they protect.
+                #
+                # Redesign geometry, as measured here: the transcript is ONE centred
+                # reading column capped at 760px (`#chat-messages` side padding is
+                # `max(24px, (100% - 760px) / 2)`), and nesting is a FLAT 16px indent
+                # per level (`.chat-subagents` = 14px padding + a 2px rule) which the
+                # per-CARD `@container livecard (max-width: 560px)` query — not the
+                # viewport — flattens once a card actually becomes narrow. So in a
+                # 1100px window this tree renders 760 / 744 / 728px with a uniform 16px
+                # step, and nothing is narrow enough to wrap.
+                #
+                # Upstream's boxed cards measured 622 / 567 / 512px with a 40px indent
+                # per level, which is why it could pin literals: "child-02 must have
+                # flex-wrap:wrap" and "each level must move >= 30px". Both described the
+                # OLD box, not the invariant. The invariant this test exists for — the
+                # one-letter-wide nested-card regression — is: a deeply nested live card
+                # must stay READABLE at depth, and its nesting must stay VISUALLY
+                # DISTINGUISHABLE. That is what the assertions below state directly:
+                # a usable width/title floor at the DEEPEST card in the tree, a
+                # per-level indent that is strictly positive and uniform, and the
+                # unchanged no-sideways-scroll / summary-stays-one-row checks.
+                # (The narrow half above is deliberately byte-unchanged: it is the half
+                # that reproduced the original regression, and it still passes.)
                 wide_facts = wide.evaluate(
                     """() => {
-                        const ids = ['layout-root', 'layout-child-01', 'layout-child-02'];
+                        const ids = ['layout-root', 'layout-child-01', 'layout-child-02', 'layout-child-10'];
                         return ids.map((id) => {
                             const card = document.querySelector(`#page-chat .chat-live-card[data-task-id="${id}"]`);
                             const summary = card.querySelector(':scope > .chat-live-summary-button .chat-live-summary');
                             const main = summary.querySelector('.chat-live-summary-main').getBoundingClientRect();
                             const side = summary.querySelector('.chat-live-summary-side').getBoundingClientRect();
+                            const title = summary.querySelector('[data-live-title]').getBoundingClientRect();
                             const rect = card.getBoundingClientRect();
                             return {
                                 id,
                                 left: rect.left,
                                 width: rect.width,
+                                titleWidth: title.width,
                                 wrap: getComputedStyle(summary).flexWrap,
                                 mainTop: main.top,
                                 mainBottom: main.bottom,
@@ -2836,11 +2863,34 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                         });
                     }"""
                 )
-                assert [card["wrap"] for card in wide_facts] == ["nowrap", "nowrap", "wrap"], wide_facts
-                assert wide_facts[1]["left"] - wide_facts[0]["left"] >= 30, wide_facts
-                assert wide_facts[2]["left"] - wide_facts[1]["left"] >= 30, wide_facts
+                by_id = {card["id"]: card for card in wide_facts}
+                deepest = by_id["layout-child-10"]
+                # Readable at depth: ten levels cost 10 * 16px out of the 760px column,
+                # so the deepest card measures 600px and still gives its title a ~455px
+                # column. The floors are set at 400px / 240px — comfortably below the
+                # measured values, but far above the ~200px / ~60px at which a summary
+                # row starts squeezing its title into a one-word column. They leave room
+                # for the indent token to grow to 36px per level before tripping, and
+                # they fail loudly if nesting ever goes back to compounding a per-level
+                # box inset (upstream's 40px/level would breach the width floor at this
+                # depth).
+                assert deepest["width"] >= 400, wide_facts
+                assert deepest["titleWidth"] >= 240, wide_facts
+                # Nesting stays visually distinguishable: every level is indented by a
+                # real, IDENTICAL step (16px measured; 4px is the smallest step that
+                # still reads as a nesting rule, and the uniformity check is what
+                # catches a level silently collapsing to zero).
+                steps = [
+                    by_id["layout-child-01"]["left"] - by_id["layout-root"]["left"],
+                    by_id["layout-child-02"]["left"] - by_id["layout-child-01"]["left"],
+                    (deepest["left"] - by_id["layout-child-02"]["left"]) / 8,
+                ]
+                assert min(steps) >= 4, (steps, wide_facts)
+                assert max(steps) - min(steps) <= 1, (steps, wide_facts)
                 assert all(card["scroll"] <= card["client"] + 1 for card in wide_facts), wide_facts
-                for card in wide_facts[:2]:
+                # Nothing in this tree is narrow enough to need the wrapping fallback,
+                # so every sampled summary keeps its meta on the title's own row.
+                for card in wide_facts:
                     assert min(card["mainBottom"], card["sideBottom"]) \
                         > max(card["mainTop"], card["sideTop"]), wide_facts
 
