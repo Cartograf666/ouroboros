@@ -1231,6 +1231,15 @@ def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any) ->
     durable projects root (never GC-pruned, isolated from repo/ and data/).
     Returns the absolute path ("" when provisioning failed). File-less
     projects simply never call this.
+
+    The folder is stamped ``provenance="genesis"`` in the SAME write that binds
+    it (A11). Without that stamp the row said only that the project has SOME
+    working_dir, which is what made the auto-provisioned place invisible: the
+    owner asked for a project, a folder appeared somewhere under the durable
+    projects root, and no surface could tell them Ouroboros had made it rather
+    than that they had pointed at it themselves. An existing provenance is never
+    overwritten — how a folder came to be is a historical fact, and this branch
+    only runs when the project had no usable folder at all.
     """
     entry = get_project(drive_root, project_id)
     if entry is None:
@@ -1249,7 +1258,10 @@ def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any) ->
             # recognizable shared root (binding identity stays the task_id). (I, v6.39)
             dir_name=str(entry.get("name") or ""),
         )
-        update_project(drive_root, entry["id"], working_dir=str(handle.path))
+        stamp: Dict[str, Any] = {"working_dir": str(handle.path)}
+        if str(entry.get("provenance") or "").strip() in ("", "none"):
+            stamp["provenance"] = "genesis"
+        update_project(drive_root, entry["id"], **stamp)
         return str(handle.path)
     except Exception:
         log.warning("Project workspace provisioning failed for %s", project_id, exc_info=True)

@@ -322,3 +322,65 @@ def test_init_git_route_keeps_credential_shaped_files_out_of_the_snapshot(tmp_pa
         ["git", "ls-files"], cwd=str(plain), capture_output=True, text=True, check=True
     ).stdout.split()
     assert "app.py" in tracked and ".env" not in tracked
+
+
+# --- an auto-provisioned place is a place the owner can be shown -------------------
+
+def test_autoprovisioned_folder_is_surfaced_as_genesis_not_silently(tmp_path, monkeypatch):
+    """A11: a project always has a place, and the owner can always see WHERE and
+    HOW it got one. The path was already on the row; what was missing was the fact
+    that Ouroboros made the folder rather than the owner pointing at it, which left
+    an auto-provisioned place indistinguishable from an unstamped attach."""
+    import os
+
+    from ouroboros.projects_registry import (
+        create_project,
+        ensure_project_workspace,
+        get_project,
+        projects_summary,
+    )
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROJECTS_ROOT", str(tmp_path / "projects"))
+
+    create_project(data, "novel", name="Novel", origin="owner_ui")
+    assert str(get_project(data, "novel").get("provenance") or "") == ""
+
+    provisioned = ensure_project_workspace(data, "novel", repo)
+    assert provisioned and os.path.isdir(provisioned)
+
+    entry = get_project(data, "novel")
+    assert entry["working_dir"] == provisioned
+    assert entry["provenance"] == "genesis"
+    row = next(p for p in projects_summary(data) if p["id"] == "novel")
+    assert row["working_dir"] == provisioned and row["provenance"] == "genesis"
+
+    # Idempotent: a second call returns the same tree and re-stamps nothing.
+    assert ensure_project_workspace(data, "novel", repo) == provisioned
+    assert get_project(data, "novel")["provenance"] == "genesis"
+
+
+def test_autoprovisioning_never_relabels_an_existing_provenance(tmp_path, monkeypatch):
+    """How a folder came to be is a historical fact. If a project's attached folder
+    has gone missing, provisioning a replacement must not rewrite its history into
+    "Ouroboros made this" — the owner attached something, and that is what happened."""
+    from ouroboros.projects_registry import (
+        create_project,
+        ensure_project_workspace,
+        get_project,
+        update_project,
+    )
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROJECTS_ROOT", str(tmp_path / "projects"))
+
+    create_project(data, "moved", name="Moved", origin="owner_ui")
+    update_project(data, "moved", working_dir=str(tmp_path / "vanished"), provenance="attached")
+    assert ensure_project_workspace(data, "moved", repo)
+    assert get_project(data, "moved")["provenance"] == "attached"
