@@ -1448,8 +1448,9 @@ test('the custody verdict is CONSUMED: a remount is refused while a login may st
 // ---------------------------------------------------------------------------
 
 test('READ_FACETS mirrors the store facet list, so the parity literal cannot drift', () => {
-    // READ_FACETS exists as the LITERAL the backend parity test greps out of
-    // harness_accounts.js (tests/test_gateway_parity.py ↔ ClaudexorStatusReads);
+    // The store's STATUS_FACETS is the literal the backend parity test greps
+    // (tests/test_gateway_parity.py ↔ ClaudexorStatusReads); READ_FACETS is
+    // this module's restatement, welded here so it inherits that transitively;
     // the store's STATUS_FACETS is the one runtime reader. This pin welds the
     // two spellings together.
     assert.deepEqual(READ_FACETS, ['catalog', 'accounts', 'quota']);

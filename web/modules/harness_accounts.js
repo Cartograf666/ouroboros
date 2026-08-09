@@ -230,10 +230,11 @@ export function runtimeActionLabel(payload) {
     return 'Connect';
 }
 
-// The facets the status contract declares, as the LITERAL the backend parity
-// test greps out of this source (tests/test_gateway_parity.py compares it with
-// `ClaudexorStatusReads`). The store's `STATUS_FACETS` is the one runtime
-// reader; a node pin asserts the two spellings can never drift.
+// The facets the status contract declares, restated here for this module's
+// own iteration order. The AUTHORITY is the store's `STATUS_FACETS` — that is
+// the literal tests/test_gateway_parity.py greps and compares with
+// `ClaudexorStatusReads` — and a node pin welds this spelling to the store's,
+// so the two cannot drift and this list inherits the contract transitively.
 export const READ_FACETS = ['catalog', 'accounts', 'quota'];
 
 export function unreadFacets(payload) {
@@ -587,10 +588,10 @@ export function serviceBannerLine(store, { wakeError = '' } = {}) {
     // reported. Provenance is PER FACET, so this line never collapses three
     // independent reads into one verdict where the wire tells it apart: a
     // refused quota read leaves the catalogue and accounts authoritative and
-    // says exactly that. That branch is READY, not yet exercised — no producer
-    // stamps `reads` today (`claudexor_accounts.py` keeps the older semantics
-    // and turns any refusal into one global `unreachable`), so the shape this
-    // line actually renders now is all three facets indeterminate together.
+    // says exactly that. The producer stamps `reads` on every answer
+    // (`claudexor_accounts.py`), so this is the shape the line renders live;
+    // the coarse all-indeterminate rendering remains only for a legacy payload
+    // without the block.
     //
     // Deliberately NOT built on the store's `facetGapClause`, which exists for a
     // surface that LEADS with one facet and must still name the others (the
@@ -651,8 +652,8 @@ export function serviceBannerLine(store, { wakeError = '' } = {}) {
     // distinct way they failed — and let the closing reassurance cover only the
     // facets that genuinely read. Reporting `bad[0]` alone and appending
     // "everything else was read normally" told the owner two of three failures
-    // had landed fine; it is unreachable only until the backend stamps `reads`
-    // per facet, which is exactly what makes a mixed verdict possible.
+    // had landed fine; the backend stamps `reads` per facet on every answer,
+    // which is exactly what makes a mixed verdict possible.
     const sentences = [];
     let tone = 'muted';
     for (const readState of states) {
@@ -671,10 +672,10 @@ export function serviceBannerLine(store, { wakeError = '' } = {}) {
         .map((facet) => FACET_SUBJECT[facet] || facet);
     const tail = readOk.length ? ` Your ${joinSubjects(readOk)} were read normally.` : '';
     // The SAME precedence as the full-gap branch above — the two are one
-    // decision, and fixing only one half of it is how this class survives. A
-    // mixed verdict is unreachable until the backend stamps `reads` per facet,
-    // and on that day a muted "some facets were never asked · the rest read
-    // normally" would swallow a runtime that needs repair.
+    // decision, and fixing only one half of it is how this class survives. The
+    // backend stamps `reads` per facet on every answer, so a mixed verdict is
+    // an ordinary state — and a muted "some facets were never asked · the rest
+    // read normally" must not swallow a runtime that needs repair.
     return faultOutranksReassurance(service, { tone, text: `${sentences.join(' ')}${tail}` });
 }
 

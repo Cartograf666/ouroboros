@@ -655,12 +655,17 @@ export function createClaudexorStatusStore({
             } finally {
                 inner.wakeInFlight = null;
             }
-            if (outcome.ok && !inner.disposed) {
-                notify();
+            if (!inner.disposed) {
+                // Re-arm the poll on EVERY settle, refusal included. A tick
+                // that fired during the POST disarmed itself and joined the
+                // wake; re-arming only on success left a visible panel with no
+                // timer after a refusal — it could never notice the daemon
+                // coming up on its own.
+                if (outcome.ok) notify();
                 armPoll();
                 // A store already upgraded to model discovery must not keep
                 // serving the wake's model-less snapshot: follow up once.
-                if (inner.includeModels) startRead(true);
+                if (outcome.ok && inner.includeModels) startRead(true);
             }
             return outcome;
         })();

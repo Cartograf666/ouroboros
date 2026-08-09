@@ -1,21 +1,21 @@
 {
   "daemon": {
     "state": "unreachable",
+    "engine_version": "3.3.13",
     "runtime": {
       "state": "ready",
-      "version": "3.3.11"
+      "version": "3.3.13"
     },
-    "engine_version": "3.3.11",
-    "last_error": "quota_probe_failed: quota read refused by the daemon"
+    "last_error": "quota_probe_failed: quota read died"
   },
-  "config_dir": "/tmp/fake-claudexor-home",
+  "config_dir": "/tmp/x",
   "harnesses": [
     {
-      "id": "claude",
-      "display_name": "Claude Code",
+      "id": "codex",
+      "display_name": "Codex CLI",
       "status": "ok",
       "enabled": true,
-      "provider_family": "anthropic",
+      "provider_family": "openai",
       "access_profiles_supported": [
         "readonly",
         "workspace_write"
@@ -26,29 +26,42 @@
     "profiles": [
       {
         "profile": {
-          "harness_id": "claude",
+          "harness_id": "codex",
           "profile_id": "koshak",
-          "display_name": "koshak"
+          "enabled": true
         },
         "status": {
           "verification": "passed",
-          "verification_source": "vendor",
-          "last_verified_at": "2026-08-09T09:00:00Z"
+          "verification_source": "vendor"
         },
         "identity": {
           "email": "owner@example.com",
-          "plan": "Max"
+          "plan": "pro"
         }
       }
     ],
     "harnessAccounts": [
       {
-        "harness_id": "claude",
+        "harness_id": "codex",
         "native_login_detected": true,
-        "identity": {}
+        "identity": {
+          "email": "owner@example.com",
+          "plan": "pro"
+        }
       }
     ]
   },
   "quota": [],
-  "subagent_last_delegation": {}
+  "reads": {
+    "catalog": "ok",
+    "accounts": "ok",
+    "quota": "failed"
+  },
+  "subagent_last_delegation": {
+    "ts": "2026-08-08T13:25:18.652941+00:00",
+    "route": "claude",
+    "requested_model": "opus",
+    "applied_model": "opus",
+    "run_id": "run-0c2b54cea35d"
+  }
 }

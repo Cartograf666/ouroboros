@@ -95,10 +95,8 @@ test('a stopped daemon, an unreachable endpoint and a real answer are three DIFF
 });
 
 test('facets are INDEPENDENT: one refused read never downgrades its siblings', () => {
-    // FUTURE-COMPATIBILITY, not today's wire: the per-facet `reads` stamp is
-    // landing from its own branch, and the live producer does NOT emit it yet
-    // (see the golden test below). This pins that the store already prefers a
-    // stamp when it arrives — one read can fail while the others land, and a
+    // TODAY'S wire: the producer stamps per-facet reads unconditionally (see
+    // the golden test below). One read can fail while the others land, and a
     // consumer that collapses them mislabels every row the survivors describe.
     const partial = {
         daemon: { state: 'unreachable', last_error: 'quota read died' },
@@ -226,9 +224,12 @@ test("GOLDEN: today's producer payload, with two reads that SUCCEEDED and one th
     const golden = JSON.parse(readFileSync(
         new URL('./fixtures/status_quota_refused.json', import.meta.url), 'utf8'));
 
-    // What today's wire actually is: NO per-facet stamp, one global state, and
-    // the successful reads' data present beside it.
-    assert.equal('reads' in golden, false, 'the producer does not stamp per-facet reads yet');
+    // Today's wire: a full per-facet stamp beside the survivors' data, and the
+    // aggregate still says `unreachable` — which is exactly why no consumer may
+    // read the aggregate as a per-facet verdict.
+    assert.deepEqual(golden.reads,
+        { catalog: 'ok', accounts: 'ok', quota: 'failed' },
+        'the producer stamps every facet');
     assert.equal(golden.daemon.state, 'unreachable');
     assert.match(golden.daemon.last_error, /quota_probe_failed/);
     assert.equal(golden.harnesses.length, 1, 'the CATALOG read succeeded and is in the payload');
@@ -236,17 +237,17 @@ test("GOLDEN: today's producer payload, with two reads that SUCCEEDED and one th
     assert.deepEqual(golden.quota, [], 'only the quota read refused');
     assert.equal(statusPayloadValid(golden), true, 'and it is a valid status answer');
 
-    // So the client says one coarse thing about the whole answer…
+    // The stamp — and only the stamp — answers per facet: the two reads that
+    // worked stay authoritative, the one that refused is the only accusation.
     assert.deepEqual(readsFor(golden), {
-        catalog: READ_INDETERMINATE, accounts: READ_INDETERMINATE, quota: READ_INDETERMINATE,
+        catalog: READ_OK, accounts: READ_OK, quota: READ_FAILED,
     });
-    // …and never accuses the two reads that worked, nor hangs the quota
-    // probe's error off the account subject.
-    const note = statusUnavailableNote(READ_INDETERMINATE,
-        { facet: FACET_ACCOUNTS, error: golden.daemon.last_error });
+    // The refusal's note never lands on the account subject, and never claims
+    // the daemon is not running (it answered two of three reads).
+    const note = statusUnavailableNote(READ_FAILED,
+        { facet: FACET_QUOTA, error: golden.daemon.last_error });
     assert.doesNotMatch(note.text, /Your agent accounts could not be read/);
     assert.doesNotMatch(note.text, /not running/);
-    assert.match(note.text, /did not finish answering/);
 });
 
 test('a surface renders more than one facet, and the note names the second gap too', () => {
@@ -740,4 +741,35 @@ test('accountRows and accountLoginConfirmed read the wire shape from ONE place',
     assert.equal(accountLoginConfirmed(payload, 'claude', 'work'), true);
     assert.equal(accountLoginConfirmed(payload, 'claude', 'other'), false);
     assert.equal(accountLoginConfirmed({}, 'codex', ''), false);
+});
+
+test('a refused wake does not stop the visible panel from polling', async (t) => {
+    // The poll tick that fires during the POST disarms itself and joins the
+    // wake; re-arming only on success left the panel timerless after a 503 —
+    // it could never notice the daemon coming up on its own, and the owner's
+    // only recovery was another click or a tab switch.
+    const timers = [];
+    const origSet = globalThis.setTimeout; const origClear = globalThis.clearTimeout;
+    globalThis.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
+    globalThis.clearTimeout = () => {};
+    try {
+        const store = createClaudexorStatusStore({
+            fetchImpl: async (url, opts) => {
+                if (opts && opts.method === 'POST') {
+                    return { ok: false, status: 503, json: async () => ({ error: 'claudexord_not_installed' }) };
+                }
+                return { ok: true, json: async () => ({ daemon: { state: 'stale', runtime: {} },
+                    reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } }) };
+            },
+        });
+        const unsub = store.subscribe(() => {}, { visible: () => true });
+        const armedBefore = timers.length;
+        const outcome = await store.wake();
+        assert.equal(outcome.ok, false);
+        assert.ok(timers.length > armedBefore,
+            'no poll timer was re-armed after the refused wake');
+        unsub();
+    } finally {
+        globalThis.setTimeout = origSet; globalThis.clearTimeout = origClear;
+    }
 });

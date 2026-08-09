@@ -486,9 +486,9 @@ test('a partial gap names EVERY facet it lost, and protects only what it kept', 
 
 test('a partial gap obeys the SAME fault precedence as a total one', () => {
     // The full-gap and partial-gap branches are one decision, and fixing only
-    // one half is how this class survives to the next review. A mixed verdict is
-    // unreachable until the backend stamps `reads` per facet — and that is
-    // exactly the change that produces one, at which point a muted "these were
+    // one half is how this class survives to the next review. The backend
+    // stamps `reads` per facet on every answer, so a mixed verdict is an
+    // ordinary state — this is exactly the shape that produces one, at which point a muted "these were
     // never asked · the rest read normally" would quietly swallow a runtime that
     // needs repair.
     const broken = { daemon: { state: 'stale', runtime: { state: 'error', last_error: 'checksum' } } };
