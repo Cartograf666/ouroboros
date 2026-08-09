@@ -3,6 +3,43 @@
 // so node tests can exercise them directly.
 
 /**
+ * perf2 P4 follow-up (double-fetch fix): the debounced post-completion resync
+ * behind chat.js's scheduleHistorySync. Finished transitions REPLAYED by
+ * syncHistory itself (pass 1 suppressed task summaries, pass 2 / terminal-
+ * resolution finishLiveCard) must NOT schedule the resync: those rows just
+ * arrived from the canonical history response, so the 700ms refetch was
+ * re-downloading the whole window after EVERY history load (Main bootstrap,
+ * project open, Load-older, reconnect rebuild). A LIVE completion — a WS
+ * frame arriving outside any replay — must keep scheduling a REAL fetch
+ * [GPT#12]: a lost task_done is healed only by refetching.
+ */
+export function createHistoryResyncScheduler({
+    isReplayActive,
+    run,
+    debounceMs = 700,
+    setTimer = (fn, ms) => setTimeout(fn, ms),
+    clearTimer = (id) => clearTimeout(id),
+}) {
+    let timer = null;
+    return {
+        schedule() {
+            if (isReplayActive()) return false;
+            if (timer != null) clearTimer(timer);
+            timer = setTimer(() => {
+                timer = null;
+                run();
+            }, debounceMs);
+            return true;
+        },
+        cancel() {
+            if (timer == null) return;
+            clearTimer(timer);
+            timer = null;
+        },
+    };
+}
+
+/**
  * Sort key for a top-level timeline node: its stamped `data-ts` epoch, or
  * +Infinity for timestamp-free nodes so they keep the historical "append at
  * the end (before typing)" placement of insertTimelineNode.

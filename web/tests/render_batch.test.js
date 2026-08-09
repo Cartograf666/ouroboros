@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 
 import {
     LOAD_OLDER_QUOTA_STEPS,
+    createHistoryResyncScheduler,
     createRebuildBatch,
     loadOlderControlState,
     nextQuotaEscalation,
@@ -187,6 +188,90 @@ test('rebuild batch runs inside ONE outer withStableViewport with a synchronous 
     assert.match(section, /batch\.mount\(messagesDiv, messagesDiv\.querySelector\('\.typing-bubble'\)\);/);
     assert.match(section, /finalizeRebuildBatch\(batch\);/);
     assert.doesNotMatch(section.slice(0, section.indexOf('finalizeRebuildBatch')), /await /);
+});
+
+// ──────────── replay-time resync suppression (double-fetch fix) ────────────
+
+function makeFakeTimers() {
+    const pending = [];
+    return {
+        pending,
+        setTimer(fn, ms) {
+            const id = { fn, ms };
+            pending.push(id);
+            return id;
+        },
+        clearTimer(id) {
+            const i = pending.indexOf(id);
+            if (i !== -1) pending.splice(i, 1);
+        },
+        fire() {
+            const jobs = pending.splice(0);
+            for (const job of jobs) job.fn();
+        },
+    };
+}
+
+test('a finished transition during a history replay does NOT schedule the resync', () => {
+    const timers = makeFakeTimers();
+    let runs = 0;
+    let replayActive = true;
+    const scheduler = createHistoryResyncScheduler({
+        isReplayActive: () => replayActive,
+        run: () => { runs += 1; },
+        setTimer: timers.setTimer,
+        clearTimer: timers.clearTimer,
+    });
+    assert.equal(scheduler.schedule(), false);
+    assert.equal(timers.pending.length, 0);
+    timers.fire();
+    assert.equal(runs, 0);
+    // The suppression is not sticky: the same scheduler works once the replay ends.
+    replayActive = false;
+    assert.equal(scheduler.schedule(), true);
+});
+
+test('a LIVE finished transition (outside a replay) schedules a real 700ms resync', () => {
+    const timers = makeFakeTimers();
+    let runs = 0;
+    const scheduler = createHistoryResyncScheduler({
+        isReplayActive: () => false,
+        run: () => { runs += 1; },
+        setTimer: timers.setTimer,
+        clearTimer: timers.clearTimer,
+    });
+    assert.equal(scheduler.schedule(), true);
+    assert.equal(timers.pending.length, 1);
+    assert.equal(timers.pending[0].ms, 700);
+    // Re-scheduling debounces: the previous timer is replaced, not stacked.
+    scheduler.schedule();
+    assert.equal(timers.pending.length, 1);
+    timers.fire();
+    assert.equal(runs, 1);
+    // cancel() (instance destroy) clears a pending resync.
+    scheduler.schedule();
+    scheduler.cancel();
+    assert.equal(timers.pending.length, 0);
+});
+
+test('chat.js wires the replay flag around the replay and keeps live callsites intact', () => {
+    // scheduleHistorySync delegates to the scheduler, whose replay gate reads
+    // _historyReplayActive; the flag wraps the whole replay dispatch (both the
+    // rebuildAll batch and the routine branch) and drops in a finally.
+    assert.match(chatSource, /isReplayActive: \(\) => _historyReplayActive,/);
+    const flagUp = chatSource.indexOf('_historyReplayActive = true;');
+    assert.ok(flagUp !== -1);
+    // (search from flagUp: the earlier `let … = false;` declaration also matches)
+    const replaySection = chatSource.slice(flagUp, chatSource.indexOf('_historyReplayActive = false;', flagUp));
+    assert.match(replaySection, /if \(rebuildAll\) \{/);
+    assert.match(replaySection, /applySyncedMessages\(\);/);
+    assert.doesNotMatch(replaySection, /await /);
+    // The LIVE path is untouched: both finished-transition callsites (the
+    // task_done frame in applyLiveCardStateMutation and finishLiveCardMutation)
+    // still call scheduleHistorySync() unconditionally — the replay decision
+    // lives ONLY behind the scheduler's gate.
+    assert.equal((chatSource.match(/scheduleHistorySync\(\);/g) || []).length, 2);
+    assert.doesNotMatch(chatSource, /_historyReplayActive[^\n]*scheduleHistorySync/);
 });
 
 test('the Load-older control is excluded from viewport anchoring like typing', () => {
