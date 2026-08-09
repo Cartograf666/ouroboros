@@ -152,7 +152,7 @@ def _compat_cost_groups(
 def _project_history_context(
     data_dir: pathlib.Path,
     thread_id: int,
-) -> tuple[set[int], list[dict], Dict[str, Any], Dict[str, int]]:
+) -> tuple[set[int], Any, Dict[str, Any], Dict[str, int]]:
     """Load the read-only Project history lenses (synchronous).
 
     Runs inside the endpoint's single ``asyncio.to_thread`` assembly call
@@ -160,21 +160,28 @@ def _project_history_context(
     hops. The task->project-chat bindings map is preloaded ONCE per request
     (v6.90.x P2): `_bound_project_chat` previously re-read
     state/project_task_bindings.json for every uncached (task, parent, root)
-    lineage key — up to three file reads per history row."""
+    lineage key — up to three file reads per history row.
+
+    The per-thread lens is the SHARED ``thread_ancestry_lens`` — the same object
+    ``ouroboros/context.py`` builds for the agent — so a forked thread's history
+    is identical on both surfaces, and its ancestors' source refs travel with
+    it (a fork of a CONVERTED project's thread would otherwise lose the Main
+    origin row the parent projects)."""
     try:
         from ouroboros.projects_registry import reserved_project_chat_ids
 
         project_chat_ids = reserved_project_chat_ids(data_dir)
     except Exception:
         project_chat_ids = set()
-    source_refs: list[dict] = []
-    if thread_id in project_chat_ids:
-        try:
-            from ouroboros.project_dialogue import source_refs_for_project
+    try:
+        from ouroboros.thread_history import thread_ancestry_lens
 
-            source_refs = source_refs_for_project(data_dir, thread_id)
-        except Exception:
-            log.debug("Failed to load canonical Project source refs", exc_info=True)
+        lens = thread_ancestry_lens(data_dir, thread_id)
+    except Exception:
+        log.debug("Failed to build the thread ancestry lens", exc_info=True)
+        from ouroboros.thread_history import ThreadLens
+
+        lens = ThreadLens(chat_id=thread_id, cutoffs={thread_id: ""}, order=[thread_id])
     try:
         from ouroboros.project_dialogue import latest_chat_annotations
 
@@ -187,19 +194,7 @@ def _project_history_context(
         bindings_by_task = all_task_bindings(data_dir)
     except Exception:
         bindings_by_task = {}
-    return project_chat_ids, source_refs, annotations, bindings_by_task
-
-
-def _matches_project_source(entry: Dict[str, Any], source_refs: list[dict]) -> bool:
-    if not source_refs:
-        return False
-    try:
-        from ouroboros.project_dialogue import entry_matches_source_ref
-
-        return entry_matches_source_ref(entry, source_refs)
-    except Exception:
-        log.debug("Project source-ref classification failed", exc_info=True)
-        return False
+    return project_chat_ids, lens, annotations, bindings_by_task
 
 
 def _user_annotation(
@@ -288,17 +283,27 @@ def make_cost_breakdown_endpoint(data_dir: pathlib.Path):
     return api_cost_breakdown
 
 
-def _origin_fallback_rows(data_dir, thread_id: int, human_tail: list) -> list:
+def _origin_fallback_rows(data_dir, lens: Any, human_tail: list) -> list:
     """Binding-backed origin rows for a Project thread (v6.73.0 lens fallback).
 
     Synthesizes a start-message row from the binding's own ``source_text`` for
     every cross-thread origin whose canonical row is NOT among the rows actually
     emitted to the client — identity-deduped (client_message_id, else ts), hard-
     capped at ``_ORIGIN_SYNTH_CAP`` with a DISCLOSED omission note naming the
-    omitted count and the durable full-copy source (BIBLE P1: no silent cut)."""
+    omitted count and the durable full-copy source (BIBLE P1: no silent cut).
+
+    Ancestors are included with their own cutoffs (X4): a fork of a CONVERTED
+    project's thread must still show the Main-chat message that started the
+    project, which is exactly what the parent's binding holds."""
     from ouroboros.project_dialogue import project_origin_rows
 
-    origin_rows = project_origin_rows(data_dir, thread_id)
+    origin_rows: list = []
+    for owner_chat in getattr(lens, "order", []) or []:
+        cutoff = (getattr(lens, "cutoffs", {}) or {}).get(owner_chat, "")
+        for row in project_origin_rows(data_dir, owner_chat):
+            if cutoff and str((row.get("ref") or {}).get("ts") or "") > cutoff:
+                continue
+            origin_rows.append(row)
     if not origin_rows:
         return []
     emitted_ids = {
@@ -593,13 +598,16 @@ def _archive_segment_count(archive_dir: pathlib.Path, prefix: str) -> int:
 def _make_thread_filter(
     thread_id: int,
     project_chat_ids: set,
-    project_source_refs: list,
+    lens: Any,
     bindings_by_task: Dict[str, int],
 ):
     """Build the per-request thread-filter closure (perf2 P3 decomposition).
 
     Returns the ``row_matches_thread`` predicate shared by both stream readers
-    and both transform loops."""
+    and both transform loops. ``lens`` is the shared thread-ancestry lens: for
+    an ordinary thread it admits exactly its own chat, and for a FORK it also
+    admits each ancestor chat up to that ancestor's effective (intersected,
+    inclusive) cutoff."""
 
     def _bound_project_chat(task_id: str, parent_task_id: str = "", root_task_id: str = "") -> int:
         # Resolve by LINEAGE (own binding -> parent -> root) so a subagent's rows
@@ -622,12 +630,13 @@ def _make_thread_filter(
                 str(entry.get("root_task_id") or ""),
             ) if isinstance(entry, dict) else 0
         )
+        entry_ts = str(entry.get("ts") or "") if isinstance(entry, dict) else ""
         if thread_id in project_chat_ids:
-            if bound_chat == thread_id:
+            if bound_chat and lens.admits(bound_chat, entry_ts):
                 return True
-            if isinstance(entry, dict) and _matches_project_source(entry, project_source_refs):
+            if isinstance(entry, dict) and lens.admits_source_ref(entry):
                 return True
-            return entry_chat == thread_id
+            return lens.admits(entry_chat, entry_ts)
         # Main / non-project view: everything that is NOT another project. A
         # bound task's rows are project-owned, so mirror only its sanitized
         # progress/task_summary and exclude its raw chat (same as a native
@@ -825,6 +834,7 @@ def _apply_window_quotas(
     data_dir: pathlib.Path,
     thread_id: int,
     project_chat_ids: set,
+    lens: Any,
     combined: list,
     n_human: int,
     n_progress: int,
@@ -866,7 +876,7 @@ def _apply_window_quotas(
     # with a disclosed omission note (helper below the endpoint factory).
     if thread_id in project_chat_ids and n_human > 0:
         try:
-            synthesized = _origin_fallback_rows(data_dir, thread_id, list(human_tail))
+            synthesized = _origin_fallback_rows(data_dir, lens, list(human_tail))
             if synthesized:
                 human_tail = sorted(
                     human_tail + synthesized, key=lambda m: m.get("ts", "")
@@ -969,11 +979,11 @@ def _assemble_history_response(
     none of it executes on the event loop. (Decomposed into the private
     single-purpose helpers above; behavior is identical.)
     """
-    project_chat_ids, project_source_refs, chat_annotations, bindings_by_task = (
+    project_chat_ids, lens, chat_annotations, bindings_by_task = (
         _project_history_context(data_dir, thread_id)
     )
     row_matches_thread = _make_thread_filter(
-        thread_id, project_chat_ids, project_source_refs, bindings_by_task
+        thread_id, project_chat_ids, lens, bindings_by_task
     )
     chat_path = data_dir / "logs" / "chat.jsonl"
     progress_path = data_dir / "logs" / "progress.jsonl"
@@ -990,7 +1000,7 @@ def _assemble_history_response(
         combined.append(lifecycle_row)
     messages, result_cache, human_rows_dropped, lineage_truncated = (
         _apply_window_quotas(
-            data_dir, thread_id, project_chat_ids, combined, n_human, n_progress
+            data_dir, thread_id, project_chat_ids, lens, combined, n_human, n_progress
         )
     )
 

@@ -868,10 +868,28 @@ def build_recent_sections(
             _bound = all_task_bindings(memory.drive_root)
         except Exception:
             _bound = {}
+        # THE SAME lens gateway/history.py serves the owner: a forked thread's
+        # shared past is defined ONCE (ancestors + intersected inclusive
+        # cutoffs), so the agent and the UI can never see different histories of
+        # the same thread. Source refs are off here — this branch classifies by
+        # chat id and task binding, exactly as before.
+        try:
+            from ouroboros.thread_history import thread_ancestry_lens
+
+            _lens = thread_ancestry_lens(
+                memory.drive_root, thread_chat_id, with_source_refs=False
+            )
+        except Exception:
+            log.debug("Thread ancestry lens unavailable; own thread only", exc_info=True)
+            _lens = None
         recent = memory.read_jsonl_tail("chat.jsonl", _PROJECT_THREAD_SCAN)
         chat_entries = [
             e for e in recent
-            if _entry_chat_id(e) == thread_chat_id
+            if (
+                _lens.admits(_entry_chat_id(e), (e or {}).get("ts"))
+                if _lens is not None
+                else _entry_chat_id(e) == thread_chat_id
+            )
             or _bound.get(str((e or {}).get("task_id") or "")) == thread_chat_id
         ][-_chat_tail:]
     else:
