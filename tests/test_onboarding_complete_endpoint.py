@@ -925,3 +925,119 @@ def test_get_onboarding_read_writes_nothing(monkeypatch, tmp_path):
     assert second.status_code == 200
     assert settings_path.read_bytes() == before_bytes
     assert settings_path.stat().st_mtime_ns == before_mtime
+
+
+# ---------------------------------------------------------------------------
+# The freshness seam: completion derives the WHOLE document from an unlocked
+# read and writes that whole dictionary back, so a concurrent owner write
+# landing in between would be reverted key by key while the owner is told the
+# save succeeded. These drive the real endpoint through the real persist path.
+# ---------------------------------------------------------------------------
+
+_WATCHED = "OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"
+
+
+def _write_concurrently(path, **values):
+    """Another owner write, exactly as a second process would leave the file."""
+    current = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    current.update(values)
+    path.write_text(json.dumps(current, indent=1), encoding="utf-8")
+
+
+def test_a_concurrent_owner_write_is_refused_and_survives(onboarding, monkeypatch):
+    """The defect this seam exists for: the owner flips a setting elsewhere while
+    onboarding is being saved, and the save silently puts it back."""
+    import ouroboros.gateway.onboarding as gw_onboarding
+
+    onboarding.settings_path.write_text(
+        json.dumps({"OPENROUTER_API_KEY": "sk-or-v1-existing", _WATCHED: "true"}, indent=1),
+        encoding="utf-8")
+
+    # Land the concurrent write in the window the fingerprint covers: after this
+    # request read the document, before it takes the lock.
+    real_prepared = gw_onboarding._prepared_settings
+
+    def _prepared_then_interfere(body):
+        result = real_prepared(body)
+        _write_concurrently(onboarding.settings_path, **{_WATCHED: "false"})
+        return result
+
+    monkeypatch.setattr(gw_onboarding, "_prepared_settings", _prepared_then_interfere)
+
+    response = onboarding.client.post("/api/onboarding/complete", json=dict(WIZARD_PAYLOAD))
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["saved"] is False
+    assert body["code"] == "onboarding_state_changed"
+    # The owner's change is still on disk, and onboarding did NOT complete.
+    saved = json.loads(onboarding.settings_path.read_text(encoding="utf-8"))
+    assert saved[_WATCHED] == "false"
+    assert ONBOARDING_COMPLETED_KEY not in saved
+
+
+def test_the_advised_retry_actually_succeeds(onboarding, monkeypatch):
+    """The refusal tells the owner to finish again, so that must work — and it
+    must carry the concurrent value through rather than reverting it."""
+    import ouroboros.gateway.onboarding as gw_onboarding
+
+    onboarding.settings_path.write_text(
+        json.dumps({"OPENROUTER_API_KEY": "sk-or-v1-existing", _WATCHED: "true"}, indent=1),
+        encoding="utf-8")
+
+    real_prepared = gw_onboarding._prepared_settings
+    interfered = {"done": False}
+
+    def _interfere_once(body):
+        result = real_prepared(body)
+        if not interfered["done"]:
+            interfered["done"] = True
+            _write_concurrently(onboarding.settings_path, **{_WATCHED: "false"})
+        return result
+
+    monkeypatch.setattr(gw_onboarding, "_prepared_settings", _interfere_once)
+
+    assert onboarding.client.post(
+        "/api/onboarding/complete", json=dict(WIZARD_PAYLOAD)).status_code == 409
+    second = onboarding.client.post("/api/onboarding/complete", json=dict(WIZARD_PAYLOAD))
+
+    assert second.status_code == 200
+    saved = json.loads(onboarding.settings_path.read_text(encoding="utf-8"))
+    assert saved[_WATCHED] == "false", "the retry must not revert the concurrent change either"
+    assert ONBOARDING_COMPLETED_KEY in saved
+
+
+def test_an_uncontended_save_is_never_refused(onboarding):
+    """The check must not cost the ordinary install anything."""
+    onboarding.settings_path.write_text(
+        json.dumps({"OPENROUTER_API_KEY": "sk-or-v1-existing"}, indent=1), encoding="utf-8")
+
+    response = onboarding.client.post("/api/onboarding/complete", json=dict(WIZARD_PAYLOAD))
+
+    assert response.status_code == 200
+    assert ONBOARDING_COMPLETED_KEY in json.loads(
+        onboarding.settings_path.read_text(encoding="utf-8"))
+
+
+def test_an_unreadable_settings_file_can_never_compare_equal(onboarding):
+    """Fail-OPEN corner, found by the delta review of this very seam: folding
+    every read failure of one exception class into one stable token let a swap
+    between two DIFFERENT unreadable files satisfy the equality check.
+
+    Reachable, because the loader silently falls back to defaults when it cannot
+    read while the atomic rename still lands (the directory stays writable).
+    """
+    import os
+
+    import ouroboros.gateway.onboarding as gw_onboarding
+
+    onboarding.settings_path.write_text(json.dumps({"A": 1}), encoding="utf-8")
+    os.chmod(onboarding.settings_path, 0o000)
+    try:
+        first = gw_onboarding._settings_fingerprint()
+        second = gw_onboarding._settings_fingerprint()
+    finally:
+        os.chmod(onboarding.settings_path, 0o600)
+
+    assert first.startswith("unreadable:") and second.startswith("unreadable:")
+    assert first != second, "an unreadable file must refuse, never satisfy equality"
