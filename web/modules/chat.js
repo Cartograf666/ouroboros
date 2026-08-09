@@ -2163,13 +2163,19 @@ export function createChatInstance({
         return el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
     }
 
-    // perf2 P4.4 (lazy lineage bodies): a COLLAPSED timeline is display:none,
-    // so building its DOM (and rendering its Markdown bodies) during a bulk
-    // replay is pure waste. The data stays complete in record.items; every
-    // timeline DOM writer defers through this guard while collapsed, and the
-    // first setLiveCardExpanded(true) materializes the whole timeline.
+    // perf2 P4.4 (lazy LINEAGE bodies): a collapsed SUBAGENT timeline is
+    // display:none inside its parent's lineage container, so building its DOM
+    // (and rendering its Markdown bodies) during a bulk replay is pure waste.
+    // The data stays complete in record.items; every timeline DOM writer
+    // defers through this guard while collapsed, and the first
+    // setLiveCardExpanded(true) materializes the whole timeline. TOP-LEVEL
+    // cards render eagerly like the pre-P4 baseline: their (CSS-hidden)
+    // collapsed timeline text is part of the feed DOM contract (ui-smoke
+    // chronology asserts collapsed card textContent), and the deep-lineage
+    // fan-out — the actual replay cost — lives in subagent children.
     function deferCollapsedTimeline(record) {
         if (!record) return true;
+        if (!record.isSubagent) return false;
         if (record.root?.dataset?.expanded === '1') return false;
         record._timelineDirty = true;
         return true;
@@ -4112,9 +4118,12 @@ export function createChatInstance({
     // truth (window.complete / truncated_by from P3.2) decides between a
     // quota-escalating refetch button and the honest boundary notice; the
     // container class is excluded from viewport anchoring like .typing-bubble.
+    // The control is mounted ONLY while it has something to show: a
+    // permanently-present (even hidden) node would be an extra top-level feed
+    // child, breaking child-order consumers (ui-smoke chronology pattern) and
+    // diverging from the pre-P4 feed layout on complete windows.
     const loadOlderEl = document.createElement('div');
     loadOlderEl.className = 'chat-load-older';
-    loadOlderEl.hidden = true;
     const loadOlderBtn = document.createElement('button');
     loadOlderBtn.type = 'button';
     loadOlderBtn.className = 'chat-load-older-btn';
@@ -4123,12 +4132,15 @@ export function createChatInstance({
     loadOlderNote.className = 'chat-load-older-note';
     loadOlderNote.hidden = true;
     loadOlderEl.append(loadOlderBtn, loadOlderNote);
-    messagesDiv.prepend(loadOlderEl);
     loadOlderBtn.addEventListener('click', () => { loadOlderHistory(); });
 
     function syncLoadOlderControl() {
         const control = loadOlderControlState(historyWindow, historyQuotaOverride);
-        loadOlderEl.hidden = control.mode === 'hidden';
+        if (control.mode === 'hidden') {
+            loadOlderEl.remove();
+            return;
+        }
+        if (!loadOlderEl.isConnected) messagesDiv.prepend(loadOlderEl);
         loadOlderBtn.hidden = control.mode !== 'button';
         loadOlderBtn.disabled = loadingOlderHistory;
         loadOlderBtn.textContent = loadingOlderHistory

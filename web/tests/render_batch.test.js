@@ -274,6 +274,21 @@ test('chat.js wires the replay flag around the replay and keeps live callsites i
     assert.doesNotMatch(chatSource, /_historyReplayActive[^\n]*scheduleHistorySync/);
 });
 
+test('the Load-older control is mounted ONLY while it has something to show', () => {
+    // A permanently-present (even hidden) control is an extra top-level feed
+    // child that breaks child-order consumers (ui-smoke chronology pattern)
+    // and diverges from the pre-P4 feed layout on complete windows.
+    const fn = chatSource.slice(
+        chatSource.indexOf('function syncLoadOlderControl('),
+        chatSource.indexOf('async function loadOlderHistory('),
+    );
+    assert.match(fn, /if \(control\.mode === 'hidden'\) \{[\s\n]*loadOlderEl\.remove\(\);/);
+    assert.match(fn, /if \(!loadOlderEl\.isConnected\) messagesDiv\.prepend\(loadOlderEl\);/);
+    // The ONLY mount site is the on-demand one inside syncLoadOlderControl —
+    // no unconditional prepend at instance construction.
+    assert.equal((chatSource.match(/messagesDiv\.prepend\(loadOlderEl\);/g) || []).length, 1);
+});
+
 test('the Load-older control is excluded from viewport anchoring like typing', () => {
     // [GPT#13] the anchor must land on the first visible TIMESTAMPED node.
     const fn = chatSource.slice(
