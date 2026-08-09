@@ -3042,7 +3042,9 @@ def test_ui_smoke_v679_subagent_depth_zero_round_trips_through_settings(direct_s
                     page.wait_for_selector('[data-nav-page="settings"]', timeout=30_000)
                     page.click('[data-nav-page="settings"]')
                     page.wait_for_selector("#s-subagent-depth", state="attached", timeout=30_000)
-                    page.click('[data-settings-tab="advanced"]')
+                    # D-10: subagent depth bounds the AGENTS, so it moved out of
+                    # Advanced -> Runtime Limits into Agents -> Delegation.
+                    page.click('[data-settings-tab="agents"]')
                     depth = page.locator("#s-subagent-depth")
                     depth.wait_for(state="visible", timeout=30_000)
                     # Saving is blocked until the settings load succeeds; waiting on the real
@@ -3190,11 +3192,12 @@ def test_ui_owner_context_mode_autolow_and_scope_review_ack(direct_server_with_d
                 assert after["context_mode_auto_low"] is False
 
                 # 2. Scope-review capability notice -> owner confirm -> route-scoped ack.
-                # 6.2: the scope route is a Reviewer Slots row now — pick the
-                # API-model route in the grouped combobox and type the id.
+                # 6.2: the scope route is a review-lane row — pick the API-model
+                # route in the grouped combobox and type the id. D-10 moved the
+                # lanes out of Models into their own Agents tab.
                 page.click('[data-nav-page="settings"]')
                 page.wait_for_selector("#s-context-mode", state="attached", timeout=30_000)
-                page.locator('[data-settings-tab="models"]').click()
+                page.locator('[data-settings-tab="agents"]').click()
                 page.wait_for_selector("#reviewer-slots-section", timeout=30_000)
                 scope_route = page.locator(
                     '#reviewer-scope-rows .reviewer-slot-row [data-slot-route]'
