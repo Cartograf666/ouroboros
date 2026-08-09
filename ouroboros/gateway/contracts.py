@@ -849,8 +849,12 @@ class OnboardingPresetProjection(TypedDict):
 
 
 class OnboardingCompleteResponse(TypedDict):
-    """The ONE success envelope: settings, runtime mode, safety default and the
-    preset marker were all persisted together."""
+    """The ONE success envelope. Settings, the next-boot runtime mode, the
+    fresh-install safety default and the durable completion fact land ATOMICALLY
+    — every success carries all four. The preset keys and their one-shot marker
+    ride the same write only when ``preset.applied`` is true; an ordinary success
+    with ``not_requested``, ``skipped_by_owner`` or ``not_install_time`` persists
+    no preset and no marker, which is the D-4 design, not a partial save."""
 
     ok: bool
     status: str

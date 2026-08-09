@@ -204,10 +204,8 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # Pre-commit review: comma-separated provider-tagged model list
     "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.6-luna,google/gemini-3.6-flash,anthropic/claude-sonnet-5",
     "OUROBOROS_REVIEWER_SLOTS": "",  # structured slot SSOT (reviewer_slot_config.py); "" = legacy comma keys
-    # INSTALL-TIME facts, written only by POST /api/onboarding/complete (a generic settings save
-    # can neither author nor clear them): which agent-preset generation this install received,
-    # and WHEN onboarding last completed — the durable proof that the install-time window is
-    # closed, recorded on EVERY completion, including a skipped or subscription-less one.
+    # INSTALL-TIME facts: the agent-preset generation this install received, and WHEN onboarding last completed
+    # (recorded on EVERY completion). Endpoint-authored and disk-only — see ENDPOINT_AUTHORED_SETTINGS.
     "OUROBOROS_SUBSCRIPTION_PRESET_VERSION": "",
     "OUROBOROS_ONBOARDING_COMPLETED_AT": "",
     # Pre-commit review enforcement: advisory | blocking
@@ -1089,6 +1087,11 @@ def _settings_file_value(key: str, default: str) -> str:
 # write BOTH disk and env, so the owner path is unaffected.
 _DISK_AUTHORED_SETTINGS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SAFETY_MODE")
 
+# ENDPOINT-AUTHORED, DISK-ONLY: install-time facts POST /api/onboarding/complete alone writes. The ratchets above
+# are disk-authored yet DO project once the file carries them; these never leave disk in EITHER direction — an env
+# timestamp alone closed the onboarding window on a fresh install, and an env marker was then persisted by a save.
+ENDPOINT_AUTHORED_SETTINGS = frozenset({"OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "OUROBOROS_ONBOARDING_COMPLETED_AT"})
+
 
 def _owner_declared_low(value: Any) -> bool:
     """True when the derived auto-downgrade flag reads as an OWNER-authored ``low``
@@ -1382,7 +1385,7 @@ def load_settings_lock_held() -> dict:
     settings.update(loaded)
     for key in SETTINGS_DEFAULTS:
         raw_env = os.environ.get(key)
-        if raw_env is None or key in _DISK_AUTHORED_SETTINGS:  # owner ratchets: DISK-authored, never env
+        if raw_env is None or key in _DISK_AUTHORED_SETTINGS or key in ENDPOINT_AUTHORED_SETTINGS:  # DISK-authored
             continue
         if key == "OUROBOROS_RETURN_REASONING" and raw_env == "":
             settings[key] = ""
@@ -1533,25 +1536,22 @@ def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int
     return max(0, parsed)
 
 
-# Settings keys deliberately NOT projected into the environment. Everything else in
-# SETTINGS_DEFAULTS IS exported, by derivation rather than a parallel hand-kept list: such a list
-# drifts silently and the failure is invisible — settings accept the key, the UI shows it saved, and
-# the consumer goes on reading os.environ and falling back to its hardcoded constant
-# (OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC sat like that behind a hardcoded 1800). Deriving makes
-# export the DEFAULT for a new key and an exclusion a decision someone writes down here.
+# Settings keys deliberately NOT projected into the environment. Everything else in SETTINGS_DEFAULTS IS
+# exported, by derivation rather than a parallel hand-kept list: such a list drifts silently and the failure
+# is invisible — settings accept the key, the UI shows it saved, and the consumer goes on reading os.environ
+# and falling back to its hardcoded constant (OUROBOROS_SKILL_LIFECYCLE_TIMEOUT_SEC sat like that behind a
+# hardcoded 1800). Deriving makes export the DEFAULT for a new key and an exclusion a decision written here.
 SETTINGS_KEYS_NOT_EXPORTED_TO_ENV = frozenset({
-    # Structured list value: `str(value)` is a Python repr no reader parses back, and
-    # every consumer already reads it from the settings dict (mcp_client.parse_servers,
-    # gateway.mcp), never from the environment.
+    # Structured list value: `str(value)` is a Python repr no reader parses back, and every consumer already reads
+    # it from the settings dict (mcp_client.parse_servers, gateway.mcp), never from the environment.
     "MCP_SERVERS",
-    # ENV IS THE AUTHORITY for the bind host, not settings. `ouroboros server --host 0.0.0.0` puts
-    # the choice in the environment, and both consumers (server.main and
-    # server_control.restart_current_process) deliberately read env BEFORE settings. Exporting this
-    # key stamped the settings value — usually the shipped 127.0.0.1 default, which no owner
-    # authored — back over that environment, so the operator's LAN-reachable server silently became
+    # ENV IS THE AUTHORITY for the bind host, not settings. `ouroboros server --host 0.0.0.0` puts the choice in
+    # the environment, and both consumers (server.main, server_control.restart_current_process) deliberately read
+    # env BEFORE settings. Exporting this key stamped the settings value — usually the shipped 127.0.0.1 default,
+    # which no owner authored — back over that environment, so the operator's LAN-reachable server silently became
     # loopback at the first self-restart. A default standing in for an absent key is not a decision.
     "OUROBOROS_SERVER_HOST",
-})
+}) | ENDPOINT_AUTHORED_SETTINGS  # disk-only in BOTH directions (never read from env, never exported to it)
 
 
 def settings_env_keys() -> list:

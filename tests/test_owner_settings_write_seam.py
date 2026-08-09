@@ -149,7 +149,13 @@ def test_generic_settings_post_says_saved_when_a_post_commit_step_fails(monkeypa
 
 def test_a_pre_commit_failure_is_still_reported_as_unsaved(monkeypatch, isolated_settings):
     """The other side of the boundary must not drift: a failure BEFORE the write
-    keeps its old, correct answer."""
+    keeps its old, correct answer — and SAYS so.
+
+    The earlier version of this test checked only that the file was absent, which
+    is the one thing the CLIENT cannot see. Once a post-commit failure started
+    answering ``saved=true``, an envelope that merely omits ``saved`` stopped
+    being readable: nothing-was-written and an old/truncated response look
+    identical. So the assertion is on the FIELD, not on the disk."""
     from ouroboros.gateway import settings as settings_mod
 
     app = _settings_app(monkeypatch, isolated_settings)
@@ -159,28 +165,164 @@ def test_a_pre_commit_failure_is_still_reported_as_unsaved(monkeypatch, isolated
 
     assert resp.status_code == 400, resp.text
     assert "before the write" in resp.json()["error"]
+    assert resp.json()["saved"] is False, resp.text
     assert not isolated_settings.exists()
 
 
-def test_owner_endpoints_map_a_contended_lock_to_a_typed_refusal(monkeypatch,
-                                                                 isolated_settings):
-    """The single-decision owner endpoints share the seam and had no handler at
-    all: the refusal reached Starlette as an opaque 500 that said nothing about
-    whether the file changed."""
-    from ouroboros.gateway.settings import api_owner_auto_grant
+@pytest.mark.parametrize("payload", [
+    {"TOTAL_BUDGET": "25", "OUROBOROS_UPDATE_CHANNEL": "not-a-channel"},
+    {"TOTAL_BUDGET": "25", "OUROBOROS_POST_TASK_EVOLUTION_CADENCE": "every_n:0"},
+    {"TOTAL_BUDGET": "not a number"},
+    {"MINIMAX_REGION": "atlantis"},
+])
+def test_every_generic_validation_refusal_says_saved_false(monkeypatch, isolated_settings,
+                                                           payload):
+    """Malformed input is a PRE-commit refusal like any other. Each of these
+    answered a bare ``{"error": ...}``, so the wizard and any API client had to
+    infer "nothing was saved" from the status code."""
+    app = _settings_app(monkeypatch, isolated_settings)
+    resp = TestClient(app).post("/api/settings", json=payload)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["saved"] is False, resp.text
+    assert not isolated_settings.exists()
+
+
+def test_a_malformed_body_says_saved_false(monkeypatch, isolated_settings):
+    app = _settings_app(monkeypatch, isolated_settings)
+    resp = TestClient(app).post("/api/settings", json=["not", "an", "object"])
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["saved"] is False, resp.text
+
+
+# The FIVE single-decision owner endpoints — membership is "calls
+# `_owner_write_settings`", not "wears the decorator". Each entry is the route,
+# the handler name and a payload its own validation accepts.
+_OWNER_SETTINGS_WRITERS = [
+    ("/api/owner/runtime-mode", "api_owner_runtime_mode", {"mode": "pro"}),
+    ("/api/owner/auto-grant", "api_owner_auto_grant", {"enabled": False}),
+    ("/api/owner/context-mode", "api_owner_context_mode", {"mode": "low"}),
+    ("/api/owner/scope-review-floor", "api_owner_scope_review_floor", {"floor": "advisory"}),
+    ("/api/owner/safety-mode", "api_owner_safety_mode", {"mode": "light"}),
+]
+
+
+def _owner_app(handler_name, route, isolated_settings):
+    from ouroboros.gateway import settings as settings_mod
+
+    app = Starlette(routes=[
+        Route(route, endpoint=getattr(settings_mod, handler_name), methods=["POST"])])
+    app.state.drive_root = isolated_settings.parent
+    return app
+
+
+@pytest.mark.parametrize("route,handler_name,payload", _OWNER_SETTINGS_WRITERS)
+def test_owner_endpoints_map_a_contended_lock_to_a_typed_refusal(monkeypatch, isolated_settings,
+                                                                 route, handler_name, payload):
+    """Every single-decision owner endpoint shares the seam, and none of them had
+    a handler at all: the refusal reached Starlette as an opaque 500 that said
+    nothing about whether the file changed. Parametrised over ALL FIVE, so the
+    guard cannot quietly go missing from four of them."""
+    from ouroboros.gateway import settings as settings_mod
 
     monkeypatch.setattr(os, "environ", dict(os.environ))
-    app = Starlette(routes=[
-        Route("/api/owner/auto-grant", endpoint=api_owner_auto_grant, methods=["POST"])])
-    app.state.drive_root = isolated_settings.parent
+    monkeypatch.setattr(settings_mod, "_has_running_agent_tasks", lambda: False, raising=False)
+    app = _owner_app(handler_name, route, isolated_settings)
 
     with _foreign_lock(isolated_settings):
-        resp = TestClient(app).post("/api/owner/auto-grant", json={"enabled": False})
+        resp = TestClient(app).post(route, json=payload)
 
     assert resp.status_code == 503, resp.text
     assert resp.json()["code"] == "settings_locked"
     assert resp.json()["saved"] is False
     assert not isolated_settings.exists()
+
+
+@pytest.mark.parametrize("route,handler_name,_payload", _OWNER_SETTINGS_WRITERS)
+def test_owner_endpoint_validation_refusals_say_saved_false(monkeypatch, isolated_settings,
+                                                            route, handler_name, _payload):
+    """The same field on the same endpoints' PRE-commit validation path."""
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    app = _owner_app(handler_name, route, isolated_settings)
+    resp = TestClient(app).post(route, json={"mode": "?", "enabled": "?", "floor": "?"})
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["saved"] is False, resp.text
+    assert not isolated_settings.exists()
+
+
+def test_the_capability_ack_is_not_a_settings_writer(monkeypatch, isolated_settings, tmp_path):
+    """FINDING 3, decided the smaller way. `api_acknowledge_capability` wore
+    `owner_write_guard` but never calls `_owner_write_settings`: it writes its own
+    route-fingerprinted evidence file. The decorator translated exceptions that
+    cannot be raised while implying the endpoint was lock-guarded — under a
+    genuinely held lock the five writers above refuse 503 and this one records
+    its acknowledgement and answers 200, which is CORRECT and now unclaimed.
+
+    Widening the settings lock to cover an unrelated ledger would have made the
+    decorator true at the price of coupling a capability ack to whether some
+    settings save is in flight. The decorator went instead; this test pins both
+    halves so the count of guarded settings writers stays five."""
+    from ouroboros.gateway import settings as settings_mod
+
+    assert not hasattr(settings_mod.api_acknowledge_capability, "__wrapped__"), (
+        "the capability ack is wearing owner_write_guard again; it writes no settings"
+    )
+
+    app = Starlette(routes=[Route("/api/owner/capability-ack",
+                                  endpoint=settings_mod.api_acknowledge_capability,
+                                  methods=["POST"])])
+    app.state.drive_root = tmp_path / "drive"
+    with _foreign_lock(isolated_settings):
+        resp = TestClient(app).post("/api/owner/capability-ack", json={
+            "provider": "openai", "model": "gpt-5.6-luna", "window_tokens": 1_000_000})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is True
+    assert resp.json()["ack"]["window_tokens"] == 1_000_000
+    assert not isolated_settings.exists(), "a capability ack touched settings.json"
+
+
+def test_the_environment_cannot_author_an_install_time_fact_through_a_generic_save(
+        monkeypatch, isolated_settings):
+    """FINDING 1 at the generic endpoint. The merge skip-list blocks the request
+    BODY, so the reviewer's probe never sent one: it put the preset marker in the
+    ENVIRONMENT. `load_settings` overlaid it, the save carried it through, and an
+    environment-only marker landed on disk as a durable install-time fact."""
+    from ouroboros import config as cfg
+
+    monkeypatch.setenv("OUROBOROS_SUBSCRIPTION_PRESET_VERSION", "1")
+    monkeypatch.setenv("OUROBOROS_ONBOARDING_COMPLETED_AT", "2020-01-01T00:00:00Z")
+    assert cfg.load_settings()["OUROBOROS_SUBSCRIPTION_PRESET_VERSION"] == "", (
+        "the loader read an install-time fact out of the environment")
+
+    app = _settings_app(monkeypatch, isolated_settings)
+    resp = TestClient(app).post("/api/settings", json={"TOTAL_BUDGET": "25"})
+
+    assert resp.status_code == 200, resp.text
+    saved = json.loads(isolated_settings.read_text(encoding="utf-8"))
+    assert not saved.get("OUROBOROS_SUBSCRIPTION_PRESET_VERSION")
+    assert not saved.get("OUROBOROS_ONBOARDING_COMPLETED_AT")
+
+
+def test_install_time_facts_are_never_projected_back_into_the_environment(monkeypatch,
+                                                                          isolated_settings):
+    """The other direction of the same set: exported, they would be read back by
+    the next process that loads settings from a bare environment."""
+    from ouroboros import config as cfg
+
+    for key in cfg.ENDPOINT_AUTHORED_SETTINGS:
+        monkeypatch.delenv(key, raising=False)
+        assert key not in cfg.settings_env_keys()
+
+    cfg.apply_settings_to_env({
+        "OUROBOROS_SUBSCRIPTION_PRESET_VERSION": "1",
+        "OUROBOROS_ONBOARDING_COMPLETED_AT": "2026-08-09T00:00:00Z",
+    })
+
+    for key in cfg.ENDPOINT_AUTHORED_SETTINGS:
+        assert key not in os.environ, f"{key} was projected into the environment"
 
 
 def test_a_lock_held_read_does_not_wait_for_the_lock_it_holds(isolated_settings):

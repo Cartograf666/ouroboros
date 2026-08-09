@@ -40,7 +40,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from ouroboros.gateway._helpers import json_error
 from ouroboros.gateway.owner_settings import (
     CommitBoundary,
     SettingsLockUnavailable,
@@ -48,6 +47,7 @@ from ouroboros.gateway.owner_settings import (
     _owner_audit,
     _owner_write_settings,
     post_commit_failure_response,
+    unsaved_error,
 )
 from ouroboros.server_runtime import (
     apply_runtime_provider_defaults,
@@ -85,9 +85,8 @@ class PresetFailure:
     detail: str
 
     def as_response(self) -> JSONResponse:
-        return json_error(
-            PRESET_UNVERIFIED_MESSAGE, 503,
-            code=self.code, detail=self.detail, can_skip=True, saved=False,
+        return unsaved_error(
+            PRESET_UNVERIFIED_MESSAGE, 503, code=self.code, detail=self.detail, can_skip=True,
         )
 
 
@@ -134,17 +133,41 @@ def _profile_index(profiles: Any) -> Dict[Tuple[str, str], Dict[str, Any]]:
     return index
 
 
+def _profile_seat_verdict(
+    harness: str, profile_id: str, profiles: Dict[Tuple[str, str], Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """Is this named credential profile a SUBSCRIPTION seat? Durable facts only:
+    credential kind, enabled, the doctor probe's presence verdict and vendor
+    verification. None of them is a quota reading."""
+    wrapper = profiles.get((harness, profile_id))
+    if wrapper is None:
+        return False, f"the engine names account {profile_id!r}, which it does not list"
+    profile = wrapper.get("profile") if isinstance(wrapper.get("profile"), dict) else {}
+    status = wrapper.get("status") if isinstance(wrapper.get("status"), dict) else {}
+    credential_kind = str(profile.get("credential_kind") or "")
+    if credential_kind not in _SUBSCRIPTION_CREDENTIAL_KINDS:
+        return False, (f"account {profile_id!r} is an API credential "
+                       f"({credential_kind or 'kind not reported'}), not a subscription")
+    if not profile.get("enabled"):
+        return False, f"account {profile_id!r} is disabled"
+    availability = str(status.get("availability") or "")
+    if availability and availability != "available":
+        return False, f"account {profile_id!r} is {availability}"
+    if str(status.get("verification") or "") != "passed":
+        return False, f"account {profile_id!r} has not verified"
+    return True, f"account {profile_id!r} ({credential_kind})"
+
+
 def _next_up_verdict(
     harness: str, account: Dict[str, Any], profiles: Dict[Tuple[str, str], Dict[str, Any]],
 ) -> Tuple[bool, str]:
-    """Would an UNPINNED run of this harness route through a subscription seat?
+    """Would an UNPINNED run of this harness route through a subscription seat
+    RIGHT NOW? The daemon's own server-computed answer; Ouroboros does not
+    re-derive the rotation (D28), it only judges whether the seat the engine
+    names is a SUBSCRIPTION or an API key.
 
-    ``next_up`` is the daemon's own server-computed answer to "who would an
-    unpinned run use next", derived from enabled profiles + native readiness +
-    quota. Ouroboros reads that answer instead of re-deriving one: the rotation
-    is the engine's (D28), and a second policy here would disagree with it the
-    first time an account changed. The only judgement left is whether the seat
-    the engine names is a SUBSCRIPTION or an API key."""
+    This answers a MOMENT-IN-TIME question — see ``_configured_subscription_seat``
+    for why the install-time preset cannot be decided by it alone."""
     next_up = account.get("next_up") if isinstance(account.get("next_up"), dict) else {}
     kind = str(next_up.get("kind") or "")
     if kind == "none":
@@ -159,38 +182,66 @@ def _next_up_verdict(
             return False, "an unpinned run would route through an API key, not a subscription"
         return True, f"default session ({route or 'route not reported'})"
     if kind == "profile":
-        profile_id = str(next_up.get("profileId") or "")
-        wrapper = profiles.get((harness, profile_id))
-        if wrapper is None:
-            return False, f"the engine names account {profile_id!r}, which it does not list"
-        profile = wrapper.get("profile") if isinstance(wrapper.get("profile"), dict) else {}
-        status = wrapper.get("status") if isinstance(wrapper.get("status"), dict) else {}
-        credential_kind = str(profile.get("credential_kind") or "")
-        if credential_kind not in _SUBSCRIPTION_CREDENTIAL_KINDS:
-            return False, (f"account {profile_id!r} is an API credential "
-                           f"({credential_kind or 'kind not reported'}), not a subscription")
-        if not profile.get("enabled"):
-            return False, f"account {profile_id!r} is disabled"
-        availability = str(status.get("availability") or "")
-        if availability and availability != "available":
-            return False, f"account {profile_id!r} is {availability}"
-        if str(status.get("verification") or "") != "passed":
-            return False, f"account {profile_id!r} has not verified"
-        return True, f"account {profile_id!r} ({credential_kind})"
+        return _profile_seat_verdict(harness, str(next_up.get("profileId") or ""), profiles)
     return False, f"the engine reports an unknown routing state {kind or 'none given'!r}"
+
+
+def _configured_subscription_seat(
+    harness: str, account: Dict[str, Any], profiles: Dict[Tuple[str, str], Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """Is a subscription seat CONFIGURED here — regardless of capacity right now?
+
+    Two questions the engine answers differently, and the preset must not
+    collapse them into one:
+
+    * "who would an unpinned run take right now" is ``next_up``, computed
+      daemon-side from enabled profiles + default readiness + QUOTA (Claudexor
+      INV-135), and documented there as informational — it never gates routing.
+      It is a reading of this hour.
+    * "is a subscription seat configured for this harness" is credential KIND,
+      enabled, present and verified. Those are durable.
+
+    The preset is a once-only install-time decision (D-4) that never runs again,
+    so deciding it on the first question meant an owner who connected Claude and
+    Codex during an hour when the Claude window happened to be spent got a
+    Codex-only preset PERMANENTLY, with no seam left to revisit it. D-3 says an
+    exhausted subscription row stays CONFIGURED and waits for capacity; it never
+    falls back to API spend and it must not silently vanish from the
+    configuration either. Out of capacity is not evidence of not-a-subscription.
+
+    ``next_up`` is still consulted here for the ONE thing only it can answer:
+    whether the default login's EFFECTIVE route is the vendor session or an API
+    key. A harness's ``auth_preference`` can put a key ahead of a session that is
+    signed in, and that IS durable — a seat billing the owner's API key is what
+    D-3 forbids, spent window or not."""
+    next_up = account.get("next_up") if isinstance(account.get("next_up"), dict) else {}
+    if account.get("native_login_detected") and account.get("native_credentials_enabled"):
+        effective_api_key = (str(next_up.get("kind") or "") == "native"
+                             and str(next_up.get("route") or "") == _API_KEY_NATIVE_ROUTE)
+        if not effective_api_key:
+            return True, "signed-in default session"
+    for (row_harness, profile_id) in sorted(profiles):
+        if row_harness != harness:
+            continue
+        ok, evidence = _profile_seat_verdict(harness, profile_id, profiles)
+        if ok:
+            return True, evidence
+    return False, ""
 
 
 def subscription_routable_harnesses(
     snapshot: Dict[str, Any],
 ) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """``(routable, refused)`` — which preset harnesses can actually run a
-    subscription session right now, and why the others cannot.
+    """``(routable, refused)`` — which preset harnesses have a subscription the
+    engine can run on, and why the others do not.
 
-    An account being SIGNED IN is not the question the preset needs answered.
-    The question is whether a subscription session would actually start, and the
-    daemon already answers it: the harness row says whether the harness itself
-    is enabled and runnable, and the per-harness accounts row says which
-    credential an unpinned run would take next. Both come from the engine."""
+    An account being SIGNED IN is not the question, and neither is "would a run
+    start this second". A once-only install-time decision needs the DURABLE one:
+    the harness row must be enabled and runnable, and a subscription seat must be
+    configured for it. The engine's `next_up` answers first, because when it does
+    say yes the receipt records the seat a real run would take; when it says no,
+    a configured seat still counts and the refusal is recorded as a capacity
+    note. Everything the verdict rests on comes from the engine."""
     routable: Dict[str, str] = {}
     refused: Dict[str, str] = {}
     rows = _discovery_rows(snapshot.get("harnesses"))
@@ -217,7 +268,14 @@ def subscription_routable_harnesses(
             refused[harness] = f"the engine reports it {status}"
             continue
         ok, evidence = _next_up_verdict(harness, account, profiles)
-        (routable if ok else refused)[harness] = evidence
+        if ok:
+            routable[harness] = evidence
+            continue
+        seated, seat = _configured_subscription_seat(harness, account, profiles)
+        if seated:
+            routable[harness] = f"{seat}; no capacity right now ({evidence})"
+        else:
+            refused[harness] = evidence
     return routable, refused
 
 
@@ -461,11 +519,11 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
     except Exception:
         body = None
     if not isinstance(body, dict):
-        return json_error("JSON body must be an object.", 400)
+        return unsaved_error("JSON body must be an object.", 400)
 
     old_settings, current, error = _prepared_settings(body)
     if error:
-        return json_error(error, 400)
+        return unsaved_error(error, 400)
 
     subscriptions_connected, skip_presets = parse_subscription_intent(body)
     eligible = preset_eligible(old_settings)
@@ -510,13 +568,13 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
             # onboarding that is already complete (BIBLE P1).
             return post_commit_failure_response(exc, boundary)
         if isinstance(exc, SettingsPreconditionFailed):
-            return json_error(str(exc), 409, code="onboarding_state_changed", saved=False)
+            return unsaved_error(str(exc), 409, code="onboarding_state_changed")
         if isinstance(exc, SettingsLockUnavailable):
-            return json_error(str(exc), 503, code="settings_locked", saved=False, can_skip=True)
+            return unsaved_error(str(exc), 503, code="settings_locked", can_skip=True)
         if isinstance(exc, PermissionError):
-            return json_error(str(exc), 403, saved=False)
+            return unsaved_error(str(exc), 403)
         log.exception("onboarding completion failed")
-        return json_error(f"{type(exc).__name__}: {exc}", 500, saved=False)
+        return unsaved_error(f"{type(exc).__name__}: {exc}", 500)
 
     _owner_audit(request, "onboarding_complete", {
         "runtime_mode": pending_mode,

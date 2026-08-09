@@ -78,6 +78,9 @@
  */
 
 /**
+ * Settings, runtime mode, the fresh-install safety default and the durable
+ * completion fact land atomically on every success. Preset keys and the one-shot
+ * preset marker land only when `preset.applied` is true.
  * @typedef {Object} OnboardingCompleteResponse
  * @property {boolean} ok
  * @property {string} status

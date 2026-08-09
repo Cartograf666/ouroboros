@@ -326,6 +326,79 @@ def test_a_recorded_completion_closes_the_window_even_without_a_settings_file(on
     assert preset_eligible({PRESET_MARKER_KEY: "1"}) is False
 
 
+def test_an_environment_completion_fact_cannot_close_the_install_window(monkeypatch,
+                                                                        onboarding):
+    """FINDING 1 at the onboarding endpoint, exactly as probed.
+
+    The completion fact and the preset marker are supposed to be authored by this
+    endpoint alone, and the request-body merge skip enforced that for the BODY.
+    The environment was still an authority: `load_settings` overlaid an
+    environment timestamp, so on a genuinely FRESH install (no settings.json,
+    connected subscriptions) the endpoint answered `not_install_time`, made ZERO
+    daemon calls, and closed the onboarding window for good without ever
+    installing the presets the owner connected accounts for."""
+    monkeypatch.setenv(ONBOARDING_COMPLETED_KEY, "2020-01-01T00:00:00Z")
+    monkeypatch.setenv(PRESET_MARKER_KEY, "1")
+    assert not onboarding.settings_path.exists()
+
+    response = onboarding.client.post(
+        "/api/onboarding/complete",
+        json={**WIZARD_PAYLOAD, "subscriptionsConnected": True})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["preset"]["reason"] == "applied", body
+    assert body["preset"]["applied"] is True
+    assert onboarding.calls["snapshot"] == 1, "the daemon was never consulted"
+    saved = onboarding.saved()
+    assert saved[PRESET_MARKER_KEY] == "1"
+    # The endpoint's own timestamp, not the environment's.
+    assert saved[ONBOARDING_COMPLETED_KEY] != "2020-01-01T00:00:00Z"
+
+
+def test_onboarding_validation_refusals_say_saved_false(onboarding):
+    """FINDING 2 on this surface: an early validation refusal answered a bare
+    `{"error": ...}`, so a client could not tell it apart from an old envelope."""
+    malformed = onboarding.client.post("/api/onboarding/complete", json=["nope"])
+    assert malformed.status_code == 400, malformed.text
+    assert malformed.json()["saved"] is False, malformed.text
+
+    no_provider = onboarding.client.post(
+        "/api/onboarding/complete",
+        json={"OUROBOROS_RUNTIME_MODE": "advanced", "subscriptionsConnected": True})
+    assert no_provider.status_code == 400, no_provider.text
+    assert no_provider.json()["saved"] is False, no_provider.text
+    assert not onboarding.settings_path.exists()
+
+
+def test_the_wire_contract_does_not_promise_a_marker_every_success_lacks(onboarding):
+    """FINDING 4. A subscription-free completion is an ORDINARY success that
+    persists no preset and no marker (D-4), but both wire contracts said the
+    marker always lands with a successful completion. Behaviour first, then the
+    copy that describes it — a contract a client reads is part of the API."""
+    import pathlib
+
+    from ouroboros.gateway.contracts import OnboardingCompleteResponse
+
+    response = onboarding.client.post("/api/onboarding/complete", json=dict(WIZARD_PAYLOAD))
+    assert response.status_code == 200, response.text
+    assert response.json()["preset"]["applied"] is False
+    saved = onboarding.saved()
+    assert saved[ONBOARDING_COMPLETED_KEY], "the completion fact IS unconditional"
+    # The key rides the defaults merge; what must be absent is a RECORDED generation.
+    assert not saved.get(PRESET_MARKER_KEY), "no preset ran, so no marker may be recorded"
+
+    web = pathlib.Path(__file__).resolve().parent.parent / "web" / "modules"
+    for name, text in (
+        ("contracts.py", OnboardingCompleteResponse.__doc__ or ""),
+        ("api_client.js", (web / "api_client.js").read_text(encoding="utf-8")),
+        ("api_types.js", (web / "api_types.js").read_text(encoding="utf-8")),
+    ):
+        assert "preset.applied" in text or "`preset.applied`" in text, (
+            f"{name} describes the completion envelope without conditioning the preset "
+            "on preset.applied — the marker does not land on every success")
+
+
 def test_generic_settings_save_cannot_author_or_clear_the_completion_fact():
     from ouroboros.gateway.settings import _merge_settings_payload
 
@@ -661,20 +734,100 @@ def test_an_unverified_or_disabled_profile_seat_is_refused():
     assert missing[0] == {} and "does not list" in missing[1]["cursor"]
 
 
-def test_a_signed_in_session_the_engine_will_not_route_is_refused():
-    """`next_up.kind == "none"` is the daemon saying an unpinned run has nothing
-    to route to. Ouroboros does not second-guess it with its own derivation."""
+# The engine's own `next_up` refusal strings (Claudexor
+# `orchestrator/credential-profiles.ts::nextUpIdentity`), copied verbatim.
+_NOT_READY_NOW = ("the default credential is not ready; refresh Accounts or run "
+                  "`claudexor doctor`")
+_ROUTE_UNKNOWN_NOW = ("the default credential route is unknown; refresh Accounts or run "
+                      "`claudexor doctor`")
+
+
+def _no_capacity_now(harness, *, native_login):
+    """A harness whose subscription IS configured and whose CURRENT routing answer
+    is a refusal — the shape of a spent window at the moment of onboarding."""
+    return {"harness_id": harness, "native_credentials_enabled": True,
+            "native_login_detected": native_login,
+            "identity": {"email": "owner@example.com", "plan": "claude_max"}
+                        if native_login else None,
+            "next_up": {"kind": "none",
+                        "reason": _NOT_READY_NOW if native_login else _ROUTE_UNKNOWN_NOW}}
+
+
+def test_a_routing_refusal_now_does_not_delete_a_subscription_from_the_preset():
+    """FINDING 5. `next_up` is the daemon's answer to "who would an unpinned run
+    take RIGHT NOW", computed from enabled profiles + default readiness + QUOTA
+    (Claudexor INV-135), and the engine documents it as informational — it never
+    gates routing. The preset is a once-only install-time decision (D-4) that
+    never runs again, so deciding it on that answer meant an owner who connected
+    Claude and Codex during an hour when the Claude window happened to be spent
+    got a Codex-only preset PERMANENTLY, with no seam left to revisit it. D-3
+    says an exhausted subscription row stays CONFIGURED and waits for capacity.
+
+    Two shapes, both with the engine's verbatim reason strings: a signed-in
+    default session the engine will not route this minute, and a harness whose
+    only seat is a named subscription profile (the default `limit_action: fail`
+    policy never names a profile in `next_up`, so this is the ordinary Cursor
+    account shape)."""
     from ouroboros.gateway.onboarding import subscription_routable_harnesses
 
     routable, refused = subscription_routable_harnesses(_routable_snapshot(
-        [{"harness_id": "claude", "native_credentials_enabled": True,
-          "native_login_detected": True, "identity": None,
-          "next_up": {"kind": "none", "reason": "the default credential is disabled"}}],
-        [_profile("claude", "koshak")],  # a healthy profile the engine did NOT pick
+        [_no_capacity_now("claude", native_login=True),
+         _no_capacity_now("cursor", native_login=False)],
+        [_profile("cursor", "sol-validator")],
     ))
 
-    assert routable == {}
-    assert refused == {"claude": "the default credential is disabled"}
+    assert refused == {}
+    assert set(routable) == {"claude", "cursor"}
+    # The evidence stays honest: the seat, and the engine's own reason beside it.
+    assert routable["claude"] == f"signed-in default session; no capacity right now ({_NOT_READY_NOW})"
+    assert routable["cursor"] == (
+        f"account 'sol-validator' (config_dir_login); no capacity right now ({_ROUTE_UNKNOWN_NOW})")
+
+
+def test_a_seat_with_no_capacity_still_reaches_the_compiled_preset_with_its_models():
+    """The same finding one layer up: the harness must not merely be 'routable',
+    it must survive into the compiled preset with its models resolved — which is
+    what the owner's reviewer and subagent rows are actually written from."""
+    from ouroboros.gateway.onboarding import verified_harness_discoveries
+
+    snapshot = _routable_snapshot(
+        [_no_capacity_now("claude", native_login=True), _native_account("codex")],
+        harnesses=[
+            {"id": "claude", "status": "ok", "enabled": True,
+             "models": [{"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
+                        {"id": "claude-fable-5"}, {"id": "claude-opus-4-6"}]},
+            {"id": "codex", "status": "ok", "enabled": True,
+             "models": [{"id": "gpt-5.6-sol"}, {"id": "gpt-5.6-terra"}, {"id": "gpt-5.5"}]},
+        ],
+    )
+
+    discoveries, failure = verified_harness_discoveries(snapshot)
+
+    assert failure is None
+    assert [d.harness_id for d in discoveries] == ["claude", "codex"]
+    assert "claude-opus-5" in dict((d.harness_id, d.model_ids) for d in discoveries)["claude"]
+
+
+def test_out_of_capacity_never_launders_an_api_key_or_an_unusable_seat():
+    """The round-one finding must not regress through the new fallback: being out
+    of capacity is not evidence of being a subscription. A harness whose only
+    seats are API credentials, disabled or unverified stays refused."""
+    from ouroboros.gateway.onboarding import subscription_routable_harnesses
+
+    # The default login exists, but the harness's auth_preference puts an API key
+    # ahead of it — durable, and exactly what D-3 forbids.
+    api_route = subscription_routable_harnesses(
+        _routable_snapshot([_native_account("codex", route="api_key")],
+                           [_profile("codex", "koshak", kind="api_key")]))
+    # No native login at all; the only named seats are unusable.
+    only_bad_profiles = subscription_routable_harnesses(_routable_snapshot(
+        [_profile_account("cursor", "ghost")],
+        [_profile("cursor", "byok", kind="api_key"),
+         _profile("cursor", "off", enabled=False),
+         _profile("cursor", "new", verification="not_run")]))
+
+    assert api_route[0] == {} and "API key" in api_route[1]["codex"]
+    assert only_bad_profiles[0] == {} and "does not list" in only_bad_profiles[1]["cursor"]
 
 
 def test_no_routable_account_is_a_typed_failure_that_names_the_reason():

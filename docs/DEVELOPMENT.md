@@ -1030,13 +1030,28 @@ Before every commit, verify the following:
   over settings the owner has since edited). Install time is a conjunction of
   three proofs — no recorded completion (`OUROBOROS_ONBOARDING_COMPLETED_AT`,
   written by every completion), no preset generation, no `settings.json` yet —
-  because "no working provider" is a state an old install reaches too.
+  because "no working provider" is a state an old install reaches too. A
+  once-only decision is never taken on a moment-in-time reading: the daemon's
+  `next_up` is quota-derived, so a subscription whose window is spent during
+  onboarding must stay in the preset (D-3), and the seat is resolved from the
+  durable facts — credential kind, enabled, present, verified.
 - Owner settings writes go through `gateway/owner_settings.py`. The settings
   lock is a PRECONDITION of the write, not a hint: `_acquire_settings_lock`
   answers `None` on timeout and a writer that proceeds anyway is unlocked while
   claiming to be atomic. Once the bytes land, the response must say so — carry a
   `CommitBoundary` through the write and report a later failure as that step
-  failing, never as a failed save (BIBLE P1).
+  failing, never as a failed save (BIBLE P1). `saved` is a FIELD on both sides:
+  pre-commit refusals answer through `unsaved_error`, or a client cannot tell
+  "nothing was written" from an envelope that simply predates the field.
+  `owner_write_guard` belongs only on an endpoint that calls
+  `_owner_write_settings`; on any other it translates unraisable exceptions
+  while advertising a lock the endpoint never takes.
+- A setting only an ENDPOINT may author is disk-only in BOTH directions.
+  `config.ENDPOINT_AUTHORED_SETTINGS` is consulted by the loader and by the
+  environment projection, so the value is never read from `os.environ` and never
+  exported back to it; the generic save's merge skip-list reads the same set.
+  Blocking only the request body is not enough — an install-time fact that the
+  environment can supply closes its own window before the endpoint runs.
 - A control the owner cannot use is worse than none. With no coding-agent
   subscription connected the Subagents section says so and points at Providers →
   Harness Accounts instead of rendering a delegation toggle whose every dispatch

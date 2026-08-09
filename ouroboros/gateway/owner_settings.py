@@ -1,10 +1,14 @@
 """The owner-scoped settings WRITE seam — one lock, one commit boundary.
 
-Every owner endpoint that persists settings goes through here: the generic
-``POST /api/settings``, the small single-decision owner endpoints, and the
-atomic ``POST /api/onboarding/complete``. Three invariants live in this module
-because each of them was previously re-implemented (or silently skipped) per
-call site:
+Every owner endpoint that persists SETTINGS goes through here: the generic
+``POST /api/settings``, the FIVE single-decision owner endpoints (runtime mode,
+auto-grant, context mode, scope-review floor, safety mode), and the atomic
+``POST /api/onboarding/complete``. Membership is defined by calling
+``_owner_write_settings``, not by wearing the decorator: the capability-evidence
+acknowledgement writes its own route-fingerprinted ledger and never touches
+settings.json, so it is NOT one of these and holds no settings lock. Four
+invariants live in this module because each of them was previously
+re-implemented (or silently skipped) per call site:
 
 1. **The lock is a precondition, not a hint.** ``_acquire_settings_lock``
    returns ``None`` when it times out; writing anyway made "atomic" a claim the
@@ -19,6 +23,11 @@ call site:
    start, hot-reload side effects) must be reported as its own fact, never as
    "nothing was saved" (BIBLE P1). ``CommitBoundary`` carries that distinction
    from the writer to the response.
+4. **``saved`` is a field on BOTH sides of that boundary.** Once a post-commit
+   failure started answering ``saved=true``, an error envelope that merely omits
+   the field became unreadable — the client cannot tell "nothing was written"
+   from an old or truncated response. ``unsaved_error`` is the one pre-commit
+   refusal shape, and it always carries ``saved=false``.
 """
 
 from __future__ import annotations
@@ -71,6 +80,18 @@ class CommitBoundary:
         self.stage = str(stage or "")
 
 
+def unsaved_error(message: str, status: int = 400, **extra: Any) -> JSONResponse:
+    """A settings write that failed BEFORE the commit. Nothing is on disk.
+
+    The counterpart of ``post_commit_failure_response``, and it exists for the
+    same reason: ``saved`` has to be a FIELD on both sides of the boundary. Once
+    a post-commit failure started answering ``saved=true``, an envelope that
+    merely omits ``saved`` became ambiguous — a client cannot tell "nothing was
+    written" from an older or truncated response. Every pre-commit refusal on an
+    owner settings-write surface goes through here."""
+    return json_error(message, status, saved=False, **extra)
+
+
 def post_commit_failure_response(exc: BaseException, boundary: CommitBoundary) -> JSONResponse:
     """The settings ARE saved and a later step failed. Say both, in that order."""
     stage = boundary.stage or "post-save"
@@ -95,16 +116,21 @@ def owner_write_guard(endpoint: Callable) -> Callable:
 
     Without it a contended lock or a failed precondition leaves the endpoint
     raising into Starlette's 500 handler, which says nothing about whether the
-    file changed. Both refusals persist nothing, so both are safe to retry."""
+    file changed. Both refusals persist nothing, so both are safe to retry.
+
+    Belongs ONLY on an endpoint that actually calls ``_owner_write_settings``.
+    On one that does not, it translates exceptions that cannot be raised, and
+    the decoration itself becomes the claim that the endpoint is lock-guarded —
+    which the next reader (and the last reviewer) will believe."""
 
     @functools.wraps(endpoint)
     async def _guarded(request: Request) -> JSONResponse:
         try:
             return await endpoint(request)
         except SettingsLockUnavailable as exc:
-            return json_error(str(exc), 503, code="settings_locked", saved=False)
+            return unsaved_error(str(exc), 503, code="settings_locked")
         except SettingsPreconditionFailed as exc:
-            return json_error(str(exc), 409, code="settings_precondition_failed", saved=False)
+            return unsaved_error(str(exc), 409, code="settings_precondition_failed")
 
     return _guarded
 
@@ -210,4 +236,5 @@ __all__ = [
     "_owner_write_settings",
     "owner_write_guard",
     "post_commit_failure_response",
+    "unsaved_error",
 ]
