@@ -983,12 +983,10 @@ def emit_task_results(
 
 def _unavailable_cost_fields(error: str) -> Dict[str, Any]:
     """Fail-closed cost projection: ONE shape for both paths that can lose the ledger."""
-    return {
-        "cost_accounting_status": "unavailable", "cost_final": False,
-        "cost_accounting_error": error, "cost_usd": None, "total_rounds": None,
-        "prompt_tokens": None, "completion_tokens": None, "reserved_usd": None,
-        "unresolved_upper_bound_usd": None, "unknown_unmetered": None,
-    }
+    return {"cost_accounting_status": "unavailable", "cost_final": False,
+            "cost_accounting_error": error, "cost_usd": None, "total_rounds": None,
+            "prompt_tokens": None, "completion_tokens": None, "reserved_usd": None,
+            "unresolved_upper_bound_usd": None, "unknown_unmetered": None}
 
 
 def _store_task_result(env: Any, task: Dict[str, Any], text: str,
@@ -1002,10 +1000,9 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
     derived, already-receipt_absent-flagged outcome that also fed the task_eval /
     task_metrics event stream — so the persisted axes match the events exactly and we
     do not derive/flag a second time. It is only re-derived here when called without one.
-    ``result_fields`` carries the cost projection PLUS ``duration_sec`` as one flat
-    bundle, not a tenth parameter (the signature was already at the <8 limit). Elapsed
-    is written by THIS terminal writer only, so cancel/crash results honestly show
-    Unavailable instead of a fabricated 0.
+    ``result_fields`` bundles the cost projection PLUS ``duration_sec`` (not a tenth
+    parameter — the signature was already at the <8 limit); elapsed is written by THIS
+    terminal writer only, so cancel/crash results show Unavailable, never a fake 0.
     """
     try:
         trace_summary = build_trace_summary(llm_trace)

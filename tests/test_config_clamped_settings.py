@@ -1,4 +1,4 @@
-"""`config._clamped_setting` — the shared numeric-setting reader, held to its own docstring.
+"""`config._clamped_number_setting` — the shared numeric-setting reader, held to its docstring.
 
 Every timeout, token budget and pass count in `config.py` goes through this ONE
 helper, so the five rules below are the ones a hand-edited settings file or a stray
@@ -38,7 +38,7 @@ def test_clamped_setting_env_precedence_and_bounds(monkeypatch, key, low, high, 
     assert low <= default <= high, f"{key}: its own default is outside its clamp"
 
     def read():
-        return config._clamped_setting(key, low, high, cast)
+        return config._clamped_number_setting(key, low=low, high=high, cast=cast)
 
     # 1. UNSET -> the declared default, not zero and not the floor.
     monkeypatch.delenv(key, raising=False)

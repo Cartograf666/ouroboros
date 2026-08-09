@@ -5,6 +5,7 @@ import { showToast } from './toast.js';
 import { downloadViaHostBridge, openViaHostBridge } from './ui_helpers.js';
 import { apiClient, apiFetch, cancelTask } from './api_client.js';
 import {
+    compactModel,
     formatReviewProjection,
     getLogTaskGroupId,
     isGroupedTaskEvent,
