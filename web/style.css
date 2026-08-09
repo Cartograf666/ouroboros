@@ -2769,7 +2769,9 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .marketplace-status[data-tone="warn"] { color: var(--status-warn-fg); }
 .ui-status[data-tone="danger"],
 .ui-status[data-tone="error"],
+.settings-inline-status[data-tone="danger"],
 .settings-inline-status[data-tone="error"],
+.settings-test-result[data-tone="danger"],
 .settings-test-result[data-tone="error"],
 .marketplace-status[data-tone="danger"] { color: var(--status-error-fg); }
 /* `muted` is a tone the code emits but no rule named. */
@@ -2779,7 +2781,7 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .marketplace-status[data-tone="muted"] { color: var(--status-neutral-fg); }
 
 /* Status = dot + text (docs/DESIGN.md). Settings shell only. */
-.settings-inline-status[data-tone]::before {
+.settings-inline-status[data-tone]:not(:empty)::before {
     content: "";
     display: inline-block;
     flex: 0 0 auto;

@@ -3,7 +3,7 @@
 The owner's report was "too much small high-contrast white text". Four
 independent causes produced it (docs/DESIGN.md):
 
-1. ``class="muted"`` was written at 100+ call sites while the ONLY rule that
+1. ``class="muted"`` was written at ~50 call sites while the ONLY rule that
    matched it was the scoped ``.marketplace-card-title .muted`` — so muted text
    everywhere else inherited near-white ``--text-primary``;
 2. ``.harness-chip`` / ``.reviewer-slot-meta`` declared a size and no colour,
@@ -159,7 +159,7 @@ def test_no_uppercase_label_pattern_on_migrated_surfaces() -> None:
 
 def test_muted_is_a_global_colour_only_utility() -> None:
     """Root cause #1. `.muted` must resolve globally, and must NOT set a size:
-    its 100+ call sites already sized themselves, so a font-size here would
+    its call sites are sized by their contexts, so a font-size here would
     silently resize all of them."""
     css = _decommented(_read("web/style.css"))
     bodies = [body for selector, body in RULE.findall(css) if selector.strip() == ".muted"]

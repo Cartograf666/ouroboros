@@ -91,7 +91,7 @@ Two failure modes this table exists to prevent, both observed in this codebase:
 ### `.muted`
 
 `.muted` is a **colour-only utility**: `color: var(--text-meta)`, nothing else.
-It must never set `font-size`. It is written at 100+ call sites that already
+It must never set `font-size`. It is written at ~50 call sites that already
 sized themselves, and a size here would silently resize all of them. A scoped
 rule (`.some-context .muted`) still wins on specificity where a surface needs a
 local variant.
