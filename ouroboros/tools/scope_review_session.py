@@ -28,6 +28,28 @@ from ouroboros.tools.review_helpers import (
 )
 from ouroboros.tools.review_synthesis import build_scope_review_prompt
 
+# What the coverage manifest calls this delivery (D-12). The value names the
+# DELIVERY — the reviewer retrieved the surface itself — rather than the wire it
+# arrived on; `agent_session` is the transport's own name in `ReviewRouteKind`,
+# and reusing it made the manifest describe the route twice and the delivery not
+# at all.
+AGENTIC_RETRIEVAL_DELIVERY = "agentic_retrieval"
+# The pre-D-12 spelling. Kept because D-12 required readers to stay compatible
+# with manifests already written, and a durable review row outlives the rename.
+LEGACY_SESSION_DELIVERY = "agent_session"
+
+
+def manifest_delivery_is_agentic_retrieval(manifest: Any) -> bool:
+    """Does this coverage manifest describe the retrieving delivery?
+
+    THE reader every consumer uses, so the compatibility D-12 promised lives in
+    one place instead of each caller remembering both spellings.
+    """
+    if not isinstance(manifest, dict):
+        return False
+    return str(manifest.get("delivery") or "") in (
+        AGENTIC_RETRIEVAL_DELIVERY, LEGACY_SESSION_DELIVERY)
+
 
 def governance_nav_maps(repo_dir: pathlib.Path, doc_paths: Tuple[str, ...]) -> str:
     """The canonical governance docs as navigation maps (5.7).
@@ -143,7 +165,13 @@ def build_scope_session_task(
         critical_calibration=CRITICAL_FINDING_CALIBRATION,
     )
     manifest: Dict[str, Any] = {
-        "delivery": "agent_session",
+        # D-12's ratified spelling. It is deliberately NOT `agent_session`: that
+        # is the TRANSPORT's name (`ReviewRouteKind`), and reusing it here made
+        # the manifest answer "how was this delivered" with the name of the wire
+        # rather than of the delivery. What this field states is that the
+        # reviewer RETRIEVED the surface itself. Readers keep accepting the old
+        # spelling — see `manifest_delivery_is_agentic_retrieval`.
+        "delivery": AGENTIC_RETRIEVAL_DELIVERY,
         "coverage": "agent_retrieval",
         # Non-blocking by construction (D16): forensics, never a gate, and the
         # fixed_overflow ladder does not apply to sessions (5.7).

@@ -1187,10 +1187,23 @@ def test_scope_session_delivery_never_builds_the_pack(tmp_path, fake_route, monk
     assert result.status == "responded"
     assert len(result.parsed_items) == 8
     manifest = result.context_manifest
-    assert manifest["delivery"] == "agent_session"
+    # D-12's ratified spelling: the field names the DELIVERY (the reviewer
+    # retrieved the surface itself), not the transport — `agent_session` is the
+    # route kind's own name, and the manifest used to answer with it.
+    assert manifest["delivery"] == "agentic_retrieval"
     assert manifest["coverage"] == "agent_retrieval"
     assert manifest["host_file_read_attestation"] == "unobserved"  # forensic, non-blocking
     assert "coverage_incomplete" not in manifest  # retired framing (BIBLE P3 amendment)
+
+    # ...and D-12 also required readers to keep accepting what is already
+    # written in durable rows, so the shared reader answers for both spellings
+    # and for neither-of-them.
+    from ouroboros.tools.scope_review_session import manifest_delivery_is_agentic_retrieval
+
+    assert manifest_delivery_is_agentic_retrieval(manifest) is True
+    assert manifest_delivery_is_agentic_retrieval({"delivery": "agent_session"}) is True
+    assert manifest_delivery_is_agentic_retrieval({"delivery": "api_chat"}) is False
+    assert manifest_delivery_is_agentic_retrieval(None) is False
     assert manifest["excluded_sensitive"] == {"policy": "preserved", "host_enforced": False}
 
     start = fake_route.instances[0].start_requests[0]
