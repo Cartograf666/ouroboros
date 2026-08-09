@@ -4,9 +4,19 @@
     --bg-tertiary: #201828;
     --bg-card: rgba(255, 255, 255, 0.06);
     --bg-hover: rgba(255, 255, 255, 0.08);
+    /* Type scale + foreground semantics: docs/DESIGN.md. Four sizes, no fifth. */
+    --type-meta: 12px;
+    --type-body: 14px;
+    --type-section: 16px;
+    --type-page: 24px;
+    --line-meta: 1.35;
+    --line-body: 1.5;
+    --line-title: 1.3;
     --text-primary: #e2e8f0;
     --text-secondary: rgba(255, 255, 255, 0.54);
-    --text-muted: rgba(255, 255, 255, 0.38);
+    --text-meta: rgba(255, 255, 255, 0.68);
+    --text-disabled: rgba(255, 255, 255, 0.38);
+    --text-muted: var(--text-disabled);  /* legacy alias */
     --accent: #c93545;
     --accent-light: #f07a86;
     --accent-dim: rgba(201, 53, 69, 0.15);
@@ -83,6 +93,16 @@
     --tone-ok: var(--green);
     --tone-warn: var(--amber);
     --tone-danger: var(--red);
+    /* Status pairs: fg/bg named together, never derived (docs/DESIGN.md).
+       --tone-* stays the saturated hue for fills; these are for 12px text. */
+    --status-ok-fg: #6ee7b7;
+    --status-ok-bg: var(--green-dim);
+    --status-warn-fg: #fcd34d;
+    --status-warn-bg: var(--amber-dim);
+    --status-error-fg: #fca5a5;
+    --status-error-bg: var(--red-dim);
+    --status-neutral-fg: var(--text-meta);
+    --status-neutral-bg: rgba(255, 255, 255, 0.06);
     --focus-accent-border: rgba(232, 93, 111, 0.4);
     --focus-accent-ring: rgba(232, 93, 111, 0.10);
     --radius-xs: 3px;
@@ -120,6 +140,9 @@
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
+
+/* Color-only utility — never a font-size (docs/DESIGN.md ".muted"). */
+.muted { color: var(--text-meta); }
 
 [hidden] {
     display: none !important;
@@ -2734,13 +2757,43 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     line-height: 1.45;
 }
 
+/* Tone is a STATE and must outrank the `.muted` utility: `#mp-status` carries
+   both classes, so a :where()-wrapped tone (specificity 0) would lose to it. */
 .ui-status[data-tone="ok"],
-:where(.settings-inline-status[data-tone="ok"], .settings-test-result[data-tone="ok"], .marketplace-status[data-tone="ok"]) { color: var(--ui-tone-ok); }
+.settings-inline-status[data-tone="ok"],
+.settings-test-result[data-tone="ok"],
+.marketplace-status[data-tone="ok"] { color: var(--status-ok-fg); }
 .ui-status[data-tone="warn"],
-:where(.settings-inline-status[data-tone="warn"], .settings-test-result[data-tone="warn"], .marketplace-status[data-tone="warn"]) { color: var(--ui-tone-warn); }
+.settings-inline-status[data-tone="warn"],
+.settings-test-result[data-tone="warn"],
+.marketplace-status[data-tone="warn"] { color: var(--status-warn-fg); }
 .ui-status[data-tone="danger"],
 .ui-status[data-tone="error"],
-:where(.settings-inline-status[data-tone="error"], .settings-test-result[data-tone="error"], .marketplace-status[data-tone="danger"]) { color: var(--ui-tone-danger); }
+.settings-inline-status[data-tone="danger"],
+.settings-inline-status[data-tone="error"],
+.settings-test-result[data-tone="danger"],
+.settings-test-result[data-tone="error"],
+.marketplace-status[data-tone="danger"] { color: var(--status-error-fg); }
+/* `muted` is a tone the code emits but no rule named. */
+.ui-status[data-tone="neutral"],
+.ui-status[data-tone="muted"],
+.settings-inline-status[data-tone="muted"],
+.marketplace-status[data-tone="muted"] { color: var(--status-neutral-fg); }
+
+/* Status = dot + text (docs/DESIGN.md). Settings shell only. */
+.settings-inline-status[data-tone]:not(:empty)::before {
+    content: "";
+    display: inline-block;
+    flex: 0 0 auto;
+    width: 6px;
+    height: 6px;
+    margin-right: 7px;
+    border-radius: 999px;
+    background: currentColor;
+    vertical-align: middle;
+    position: relative;
+    top: -1px;
+}
 
 .ui-modal-backdrop,
 :where(.marketplace-modal-backdrop) {
@@ -2893,7 +2946,8 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .form-section { margin-bottom: 24px; }
 
 .form-section h3 {
-    font-size: 16px;
+    font-size: var(--type-section);
+    line-height: var(--line-title);
     font-weight: 600;
     margin-bottom: 12px;
 }
@@ -5819,10 +5873,19 @@ textarea.chat-input {
    Borders read the theme's --divider like every other panel surface. They used
    to name --border, which this dark-only :root never declares, so all three
    rules silently took their literal grey fallback instead of the token. */
+/* === design-system:migrated-begin (harness accounts + reviewer slots) ===
+   Down to the matching end marker: docs/DESIGN.md tokens only, guarded by
+   tests/test_web_typography_static.py. The rest of this file is a later pass. */
 /* Subsection rhythm: the section's flex gap (14px) is the baseline; the small
    negative bottom margins pull a heading and its Add toolbar to 8px from the
    rows they belong to, so heading+rows+toolbar reads as one group. */
-.reviewer-slots-heading { margin: 10px 0 -6px; }
+.reviewer-slots-heading {
+    margin: 10px 0 -6px;
+    font-size: var(--type-body);
+    line-height: var(--line-title);
+    font-weight: 600;
+    color: var(--text-primary);
+}
 .reviewer-slot-rows { display: flex; flex-direction: column; gap: 8px; margin-bottom: -6px; }
 .reviewer-slot-row {
     border: 1px solid var(--divider);
@@ -5852,7 +5915,12 @@ textarea.chat-input {
     width: 14px;
     padding: 0;
 }
-.reviewer-slot-meta { font-size: 12px; margin-top: 6px; }
+.reviewer-slot-meta {
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    color: var(--text-meta);
+    margin-top: 6px;
+}
 /* Account rows are purpose-built (identity left, actions right), not the
    settings key/value grid — .settings-custom-secret-row's 0.65fr/1.35fr
    columns inverted the proportions and its align-items:end sank the text. */
@@ -5869,13 +5937,24 @@ textarea.chat-input {
 }
 .harness-account-main { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; flex: 1; }
 .harness-account-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+/* Row anatomy: name = the one primary thing (docs/DESIGN.md). */
+.harness-account-main strong {
+    font-size: var(--type-body);
+    line-height: var(--line-body);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+/* Classification chip: neutral pair, never inherited ink (docs/DESIGN.md).
+   Also reused by Chat's live executor chip, which keeps its own 10px sizing. */
 .harness-chip {
     display: inline-block;
     padding: 1px 8px;
     border-radius: 999px;
     border: 1px solid var(--divider);
-    font-size: 11px;
-    text-transform: uppercase;
+    background: var(--status-neutral-bg);
+    color: var(--status-neutral-fg);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
     letter-spacing: 0.04em;
 }
 .harness-exhausted { opacity: 0.62; }
@@ -5893,12 +5972,19 @@ textarea.chat-input {
     border-radius: var(--radius);
     background: var(--ui-card-bg);
 }
-.harness-login-card h4 { margin: 0; font-size: 14px; }
-.harness-login-card p { margin: 0; color: var(--text-secondary); font-size: 13px; line-height: 1.5; }
+.harness-login-card h4 {
+    margin: 0;
+    font-size: var(--type-body);
+    line-height: var(--line-title);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.harness-login-card p { margin: 0; color: var(--text-meta); font-size: var(--type-body); line-height: var(--line-body); }
 .harness-device-code p { margin: 4px 0; }
+/* Device code: display size is the point; nearest token, not a one-off 22px. */
 .harness-code {
     font-family: var(--mono, ui-monospace, monospace);
-    font-size: 22px;
+    font-size: var(--type-page);
     letter-spacing: 0.18em;
     padding: 8px 12px;
     border: 1px dashed var(--divider);
@@ -5908,7 +5994,7 @@ textarea.chat-input {
 }
 .harness-attach-command {
     font-family: var(--mono, ui-monospace, monospace);
-    font-size: 12px;
+    font-size: var(--type-meta);
     padding: 8px 10px;
     border-radius: 8px;
     background: var(--surface-control);
@@ -5922,11 +6008,11 @@ textarea.chat-input {
 .harness-signin-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .harness-signin-actions a.btn { text-decoration: none; }
 .harness-code-entry { display: flex; flex-direction: column; gap: 6px; }
-.harness-code-entry label { font-size: 12px; color: var(--text-secondary); }
+.harness-code-entry label { font-size: var(--type-meta); line-height: var(--line-meta); color: var(--text-meta); }
 .harness-code-entry-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .harness-code-entry-row input {
     font-family: var(--mono, ui-monospace, monospace);
-    font-size: 13px;
+    font-size: var(--type-body);
     padding: 6px 10px;
     border: 1px solid var(--ui-card-border);
     border-radius: var(--radius-sm);
@@ -5942,14 +6028,17 @@ textarea.chat-input {
 }
 .harness-advanced summary {
     cursor: pointer;
-    font-size: 12px;
-    color: var(--text-secondary);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    color: var(--text-meta);
 }
 .harness-advanced[open] summary { margin-bottom: 6px; }
 .harness-advanced p { margin: 4px 0; }
+/* === design-system:migrated-end === */
 
 /* Phase 6: per-bubble/subagent executor chip (owner directive: a small chip
-   like Claudexor's, never a promotional badge). Reuses .harness-chip. */
+   like Claudexor's, never a promotional badge). Reuses .harness-chip; keeps its
+   own 10px chat sizing, so it sits outside the marked region above. */
 .chat-live-executor-chip {
     font-size: 10px;
     padding: 0 6px;
