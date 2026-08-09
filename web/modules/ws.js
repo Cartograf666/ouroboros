@@ -155,7 +155,11 @@ export class WS {
             this._clearUiRecoveryTimer();
             this.reconnectDelay = 1000;
             this._startWatchdog(socket);
-            this.emit('open');
+            // perf2 P4 [Gemini#3]: the CLIENT owns reconnect truth. A chat
+            // instance created while the socket was already open would read its
+            // per-instance "seen an open before" flag as false on the next real
+            // reconnect and skip the full rebuild; previouslyConnected cannot.
+            this.emit('open', { previouslyConnected });
             document.getElementById('reconnect-overlay')?.classList.remove('visible');
             this._refreshStateAfterOpen(previouslyConnected);
             this._flushPendingMessages();

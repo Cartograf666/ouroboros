@@ -384,8 +384,12 @@ filtered down to the answer.
   (`supervisor/state.py::rotate_chat_log_if_needed`); the compact
   `containment_faults.jsonl` projection maintained beside an unbounded event
   log (`ouroboros/delegate_custody.py`); dialogue-block consolidation — the P1
-  "infinite horizon, variable granularity" reader; and the passive-GET contract
-  of `gateway/control.py::api_update_status`.
+  "infinite horizon, variable granularity" reader; the passive-GET contract
+  of `gateway/control.py::api_update_status`; and the fingerprint-keyed render
+  cache inside the usage-ledger rows memo (implemented in
+  `ouroboros/_usage_rows_memo.py`, consumed through `usage_accounting`) —
+  a projection cached while its input is unchanged, invalidated only by
+  advance/refold, never by TTL.
 
 Enforcement: Repo Commit Checklist item 24 (advisory) triggers on diffs that
 add or change an endpoint/poller/subscription/timer or read a growing store;

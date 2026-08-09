@@ -14,6 +14,12 @@ import {
     taskTerminalPhase,
 } from './log_events.js';
 import { openConfirmDialog } from './confirm_dialog.js';
+import {
+    createHistoryResyncScheduler,
+    createRebuildBatch,
+    loadOlderControlState,
+    nextQuotaEscalation,
+} from './chat_render_batch.js';
 
 // Row-surface disclosure guard (v6.71.0), pure for node tests: returns the
 // lineKey to toggle for a click landing on `target`, or '' when the click must
@@ -420,6 +426,9 @@ export function createChatInstance({
     ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab,
     chatId = 1, projectId = '', idPrefix = 'chat', mountEl = null,
     asPanel = false, title = 'Chat', initialScrollState = null,
+    // perf2 P4.2: app.js signal "a project panel is opening right now" — Main
+    // defers its first hydration to it (bounded by an unconditional deadline).
+    isProjectOpening = null,
 }) {
     const container = mountEl || document.getElementById('content');
     const chatSessionId = getOrCreateChatSessionId();
@@ -699,6 +708,13 @@ export function createChatInstance({
 
     // Pass 1 builds live cards in memory; pass 2 inserts them in transcript order.
     let _syncPass1Active = false;
+    // perf2 P4 follow-up (double-fetch fix): true while syncHistory replays the
+    // fetched rows into cards — pass 1, pass 2 AND the terminal-resolution
+    // sweep (both the rebuildAll and the routine branch). Finished transitions
+    // raised inside that replay must not schedule the 700ms post-completion
+    // resync: the data just came from the canonical source. The replay block
+    // is fully synchronous, so no live WS frame can ever observe the flag.
+    let _historyReplayActive = false;
 
     const persistedHistory = [];
     const seenMessageKeys = new Set();
@@ -712,6 +728,29 @@ export function createChatInstance({
     let historySyncPromise = null;
     let lastHistorySyncSucceeded = false;
     let historyPaintGeneration = 0;
+    // perf2 P4.1 [GPT#12 + Fable#1]: STICKY single-flight hydration promise.
+    // Unlike historySyncPromise it survives success, so hydration triggers
+    // (bootstrap IIFE, first non-reconnect socket open, refreshHistory without
+    // a new revision) short-circuit instead of refetching. Any FAILED sync
+    // resets it; scheduleHistorySync and the reconnect path never consult it.
+    let initialHydrationPromise = null;
+    // perf2 P4.1 [GPT#17]: the offline bootstrap painted the sessionStorage
+    // fallback and set historyLoaded=true — the first successful sync after
+    // the server comes back must still rebuild the feed from durable history.
+    let offlineBootstrapPainted = false;
+    // perf2 P4.1: highest project revision whose history has been fetched;
+    // refreshHistory only bypasses the sticky promise for a NEWER revision.
+    let lastLoadedHistoryRevision = 0;
+    // perf2 P4.2: one-shot idle gate for Main's deferred first hydration.
+    let hydrationGatePromise = null;
+    // perf2 P4.3: non-null only inside a rebuildAll replay — routes per-row
+    // feed insertion / meta / count / layout / typing / status / persist
+    // through one end-of-batch application. Routine syncs never set it.
+    let _rebuildBatch = null;
+    // perf2 P4.5: server window verdict + the explicit Load-older quotas.
+    let historyWindow = null;
+    let historyQuotaOverride = null;
+    let loadingOlderHistory = false;
     let welcomeShown = false;
     // Per-instance viewport intent. Content growth does not emit a user scroll,
     // so `_savedStick` survives a large live-card mutation that would make a
@@ -747,7 +786,6 @@ export function createChatInstance({
     // "turn into project" conversion can name the project from it (P1).
     let _pendingCardObjective = '';
     let activeLiveGroupId = '';
-    let historySyncTimer = null;
     let pendingReconnectSync = false;  // Set when a fromReconnect sync arrives while one is already in-flight.
     let pendingReconnectBannerText = readPendingReconnectBanner();
 
@@ -924,6 +962,12 @@ export function createChatInstance({
     }
 
     function setStatus(kind, text) {
+        // perf2 P4.3: replay frames write the composer status once per batch
+        // (last write wins), not once per historical frame.
+        if (_rebuildBatch) {
+            _rebuildBatch.status = { kind, text };
+            return;
+        }
         if (!statusBadge) return;
         statusBadge.className = `status-badge ${kind}`;
         statusBadge.textContent = text;
@@ -987,10 +1031,14 @@ export function createChatInstance({
     }
 
     function captureVisibleTimelineAnchor(excludeNode = null) {
+        // The Load-older control is excluded like .typing-bubble [GPT#13]:
+        // anchoring must land on the first visible TIMESTAMPED node, or a
+        // Load-older restore would pin the button itself and drift the view.
         const nodes = Array.from(messagesDiv.children).filter(
             (node) => node !== excludeNode
                 && !excludeNode?.contains?.(node)
                 && !node.classList.contains('typing-bubble')
+                && !node.classList.contains('chat-load-older')
         );
         const messagesRect = messagesDiv.getBoundingClientRect();
         const topNode = nodes.find((item) => {
@@ -1154,6 +1202,15 @@ export function createChatInstance({
 
     function insertMessageNode(node, options = {}) {
         if (!node) return;
+        // perf2 P4.3 (rebuildAll only): collect into the detached batch. One
+        // stable sort + one fragment mount replace per-row chronological
+        // insertion; the end-of-sync anchor restore replaces the per-row
+        // insertedAboveViewport compensation. Routine syncs and live frames
+        // (batch inactive) keep the chronological insertTimelineNode path.
+        if (_rebuildBatch) {
+            _rebuildBatch.collect(node);
+            return;
+        }
         const shouldStick = Boolean(options.forceStick) || isNearBottom();
         const isMounted = node.parentNode === messagesDiv;
         if (isMounted && !options.reorderExisting) {
@@ -1720,6 +1777,12 @@ export function createChatInstance({
             subagentRole: String(options.role || ''),
             subagentsEl: null,
             _anchorOrderDirty: false,
+            // perf2 P4.4: collapsed timelines defer DOM building; the flag says
+            // the rendered timeline DOM is stale relative to record.items.
+            _timelineDirty: false,
+            // perf2 P4.3: last frame's summary meta strings — meta renders from
+            // record state (renderLiveCardMeta), once per card in a batch.
+            _lastFrameMeta: [],
             // Hidden-page layout sync is deferred until page/visibility returns.
             _needsLayoutSync: false,
             // The owner's request that spawned this card (main, non-subagent only),
@@ -1901,6 +1964,8 @@ export function createChatInstance({
         record.lastHumanHeadline = '';
         record.expandedLineKeys.clear();
         record._anchorOrderDirty = false;
+        record._timelineDirty = false;
+        record._lastFrameMeta = [];
         clearStickyCardState(record);
         record.titleEl.textContent = 'Working...';
         record.phaseEl.dataset.phase = 'working';
@@ -1955,6 +2020,9 @@ export function createChatInstance({
         const mutate = () => {
             if (!record?.root) return;
             record.root.dataset.expanded = expanded ? '1' : '0';
+            // perf2 P4.4: first expand materializes a lazily-deferred timeline
+            // (its DOM was skipped while the card was collapsed/display:none).
+            if (expanded && record._timelineDirty) renderLiveCardTimeline(record);
             syncLiveCardToggle(record);
             if (record.root.isConnected) {
                 requestAnimationFrame(() => syncLiveCardLayout(record));
@@ -1985,6 +2053,11 @@ export function createChatInstance({
     }
 
     function updateLiveCardCount(record) {
+        // perf2 P4.3: one count render per card at the end of a replay batch.
+        if (_rebuildBatch) {
+            _rebuildBatch.touch(record);
+            return;
+        }
         if (!record?.countEl) return;
         const bits = [];
         if (record.items.length >= 2) bits.push(`${record.items.length} notes`);
@@ -1995,6 +2068,11 @@ export function createChatInstance({
     }
 
     function syncLiveCardLayout(record) {
+        // perf2 P4.3: one layout sync per card after the batch mount.
+        if (_rebuildBatch) {
+            _rebuildBatch.touch(record);
+            return;
+        }
         if (!record?.root) return;
         // Hidden SPA/browser tabs report zero geometry; defer to avoid collapsed
         // cards. Generalized to panel instances: any visible host counts.
@@ -2085,8 +2163,28 @@ export function createChatInstance({
         return el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
     }
 
+    // perf2 P4.4 (lazy LINEAGE bodies): a collapsed SUBAGENT timeline is
+    // display:none inside its parent's lineage container, so building its DOM
+    // (and rendering its Markdown bodies) during a bulk replay is pure waste.
+    // The data stays complete in record.items; every timeline DOM writer
+    // defers through this guard while collapsed, and the first
+    // setLiveCardExpanded(true) materializes the whole timeline. TOP-LEVEL
+    // cards render eagerly like the pre-P4 baseline: their (CSS-hidden)
+    // collapsed timeline text is part of the feed DOM contract (ui-smoke
+    // chronology asserts collapsed card textContent), and the deep-lineage
+    // fan-out — the actual replay cost — lives in subagent children.
+    function deferCollapsedTimeline(record) {
+        if (!record) return true;
+        if (!record.isSubagent) return false;
+        if (record.root?.dataset?.expanded === '1') return false;
+        record._timelineDirty = true;
+        return true;
+    }
+
     // Full rebuild for initial render and expand/collapse toggles.
     function renderLiveCardTimeline(record) {
+        if (deferCollapsedTimeline(record)) return undefined;
+        record._timelineDirty = false;
         return withStableViewport(() => {
             const el = record.timelineEl;
             const pinned = isTimelinePinnedToBottom(record);
@@ -2135,6 +2233,10 @@ export function createChatInstance({
 
     // Append without disturbing existing DOM nodes.
     function appendTimelineItem(item, record) {
+        if (deferCollapsedTimeline(record)) return;
+        // Expanded but stale (dirty was set while collapsed): patching the
+        // stale DOM would target wrong nodes — materialize from items instead.
+        if (record._timelineDirty) return renderLiveCardTimeline(record);
         const pinned = isTimelinePinnedToBottom(record);
         const wrapper = document.createElement('div');
         wrapper.innerHTML = buildTimelineItemHtml(item, record).trim();
@@ -2149,6 +2251,10 @@ export function createChatInstance({
 
     // Patch the last DOM node for dedup/count bumps.
     function patchLastTimelineItem(item, record) {
+        // perf2 P4.4 [GPT#15]: collapsed → mark dirty and leave; stale
+        // expanded DOM → full materialization instead of a mismatched patch.
+        if (deferCollapsedTimeline(record)) return;
+        if (record._timelineDirty) return renderLiveCardTimeline(record);
         const lastEl = record.timelineEl.lastElementChild;
         if (!lastEl) return renderLiveCardTimeline(record);
         const wrapper = document.createElement('div');
@@ -2159,6 +2265,9 @@ export function createChatInstance({
 
     // Patch a specific timeline node in place (evolving subagent dashboard rows).
     function patchTimelineItemAt(item, record) {
+        // perf2 P4.4 [GPT#15]: same dirty/collapsed discipline as patch-last.
+        if (deferCollapsedTimeline(record)) return;
+        if (record._timelineDirty) return renderLiveCardTimeline(record);
         const key = String(item.lineKey || '').replace(/[^A-Za-z0-9_-]/g, '');
         const el = key ? record.timelineEl.querySelector(`[data-live-line-key="${key}"]`) : null;
         if (!el) return renderLiveCardTimeline(record);
@@ -2169,11 +2278,35 @@ export function createChatInstance({
     }
 
     function scheduleHistorySync() {
-        if (historySyncTimer) clearTimeout(historySyncTimer);
-        historySyncTimer = setTimeout(() => {
-            historySyncTimer = null;
-            syncHistory({ includeUser: false }).catch(() => {});
-        }, 700);
+        historyResyncScheduler.schedule();
+    }
+
+    // perf2 P4 follow-up (double-fetch fix): finished transitions replayed by
+    // syncHistory itself (_historyReplayActive) are dropped by the scheduler —
+    // the rows just arrived from the canonical source, so the 700ms resync was
+    // refetching the whole window after every history load. A LIVE completion
+    // (WS frame outside a replay) still always schedules a REAL fetch [GPT#12].
+    const historyResyncScheduler = createHistoryResyncScheduler({
+        isReplayActive: () => _historyReplayActive,
+        run: () => syncHistory({ includeUser: false }).catch(() => {}),
+    });
+
+    // perf2 P4.3: the ONE meta-line renderer, fed entirely from record state
+    // (sticky executor chip, last frame's meta strings, sticky cost, activity
+    // clock) so a replay batch can render it exactly once per card.
+    function renderLiveCardMeta(record) {
+        if (!record?.metaEl) return;
+        const executorChipHtml = record.executorChip
+            ? `<span class="harness-chip chat-live-executor-chip" title="${escapeHtml(record.executorChip.title || '')}">`
+              + `<span aria-hidden="true">${escapeHtml(record.executorChip.icon || '')}</span> `
+              + `${escapeHtml(record.executorChip.label || '')}</span>`
+            : '';
+        record.metaEl.innerHTML = executorChipHtml + [
+            record.groupId === 'bg-consciousness' ? 'Background thinking' : '',
+            ...(Array.isArray(record._lastFrameMeta) ? record._lastFrameMeta : []),
+            ...((record.costMeta && Array.isArray(record.costMeta.meta)) ? record.costMeta.meta : []),
+            record.latestActivityTs ? `Latest ${record.latestActivityTs}` : '',
+        ].filter(Boolean).map((item) => `<span class="chat-live-meta-text">${escapeHtml(item)}</span>`).join('');
     }
 
     function applyLiveCardState(summary, groupId, ts, dedupeKey = '', options = {}) {
@@ -2331,17 +2464,11 @@ export function createChatInstance({
         // a later costless/quiet frame must not erase the fact that this bubble
         // ran on a harness. Absent fact leaves it absent; no placeholder chip.
         if (summary.executorChip) record.executorChip = summary.executorChip;
-        const executorChipHtml = record.executorChip
-            ? `<span class="harness-chip chat-live-executor-chip" title="${escapeHtml(record.executorChip.title || '')}">`
-              + `<span aria-hidden="true">${escapeHtml(record.executorChip.icon || '')}</span> `
-              + `${escapeHtml(record.executorChip.label || '')}</span>`
-            : '';
-        record.metaEl.innerHTML = executorChipHtml + [
-            nextGroupId === 'bg-consciousness' ? 'Background thinking' : '',
-            ...(Array.isArray(summary.meta) ? summary.meta : []),
-            ...((record.costMeta && Array.isArray(record.costMeta.meta)) ? record.costMeta.meta : []),
-            record.latestActivityTs ? `Latest ${record.latestActivityTs}` : '',
-        ].filter(Boolean).map((item) => `<span class="chat-live-meta-text">${escapeHtml(item)}</span>`).join('');
+        // perf2 P4.3: meta renders from record state — immediately on the live
+        // path, once per card at the end of a rebuildAll replay batch.
+        record._lastFrameMeta = Array.isArray(summary.meta) ? summary.meta : [];
+        if (_rebuildBatch) _rebuildBatch.touch(record);
+        else renderLiveCardMeta(record);
         // Incremental updates; full rebuilds stay limited to toggles.
         const lastItem = record.items[record.items.length - 1];
         if (timelineUpdate === 'append' && lastItem) {
@@ -2856,7 +2983,9 @@ export function createChatInstance({
             if (persistedHistory.length > 200) {
                 persistedHistory.splice(0, persistedHistory.length - 200);
             }
-            persistVisibleHistory();
+            // perf2 P4.3: a rebuildAll replay serializes the sessionStorage
+            // snapshot ONCE at the end of the batch, not per historical row.
+            if (!_rebuildBatch) persistVisibleHistory();
         }
 
         const bubble = document.createElement('div');
@@ -2998,7 +3127,72 @@ export function createChatInstance({
         addMessage('Ouroboros has awakened', 'assistant', false, null, false, { ephemeral: true });
     }
 
-    async function syncHistory({ includeUser = false, fromReconnect = false } = {}) {
+    // perf2 P4.1 [GPT#12 + Fable#1]: sticky single-flight for HYDRATION
+    // triggers ONLY — bootstrap IIFE, the first non-reconnect socket open, and
+    // refreshHistory without a new revision. scheduleHistorySync (the 700ms
+    // post-completion resync) and the reconnect path NEVER short-circuit here:
+    // a lost task_done is healed only by a real refetch (their coalescence is
+    // historySyncPromise). Any failed sync resets the sticky promise so the
+    // next trigger fetches for real.
+    function awaitInitialHydration({ includeUser = false } = {}) {
+        if (initialHydrationPromise) return initialHydrationPromise;
+        initialHydrationPromise = syncHistory({ includeUser });
+        return initialHydrationPromise;
+    }
+
+    // perf2 P4.2: Main's first hydration waits for an idle slot and yields to
+    // an opening project panel, but only within an UNCONDITIONAL upper bound
+    // [GPT#16] — an hour-open panel must not defer hydration forever. Project
+    // instances hydrate immediately. One-shot: live frames rendered before
+    // hydration are rebuilt by the first rebuildAll replay.
+    const MAIN_HYDRATION_MAX_DEFER_MS = 3500;
+    function waitForHydrationWindow() {
+        if (!isMain) return Promise.resolve();
+        if (hydrationGatePromise) return hydrationGatePromise;
+        hydrationGatePromise = new Promise((resolve) => {
+            const deadline = Date.now() + MAIN_HYDRATION_MAX_DEFER_MS;
+            const scheduleIdle = (callback) => (typeof requestIdleCallback === 'function'
+                ? requestIdleCallback(callback, { timeout: 1000 })
+                : setTimeout(callback, 50));
+            const attempt = () => {
+                if (destroyed) {
+                    resolve();
+                    return;
+                }
+                if (Date.now() < deadline
+                    && typeof isProjectOpening === 'function'
+                    && isProjectOpening()) {
+                    setTimeout(attempt, 200);
+                    return;
+                }
+                resolve();
+            };
+            scheduleIdle(attempt);
+        });
+        return hydrationGatePromise;
+    }
+
+    // perf2 P4.3: the deferred per-card finals, applied exactly once after the
+    // batch mount — meta/count/layout per touched card, typing and composer
+    // status once per batch, ONE sessionStorage persist for the whole replay.
+    function finalizeRebuildBatch(batch) {
+        for (const record of batch.touched) {
+            renderLiveCardMeta(record);
+            updateLiveCardCount(record);
+            syncLiveCardLayout(record);
+        }
+        if (batch.typingHidden) hideTypingIndicatorOnly();
+        if (batch.status) {
+            // Post-mount truth: an unfinished mounted foreground card keeps
+            // the composer on "Working..." exactly like the live path, where
+            // hasActiveLiveCard() sees connected roots during replay.
+            if (hasActiveLiveCard()) setStatus('thinking', 'Working...');
+            else setStatus(batch.status.kind, batch.status.text);
+        }
+        persistVisibleHistory();
+    }
+
+    async function syncHistory({ includeUser = false, fromReconnect = false, forceRebuild = false } = {}) {
         if (historySyncPromise) {
             // Preserve reconnect intent so retiredTaskIds is cleared after this sync.
             if (fromReconnect) {
@@ -3019,9 +3213,19 @@ export function createChatInstance({
         }
         historySyncPromise = (async () => {
             try {
-                const resp = await apiFetch(`/api/chat/history?limit=1000${isMain ? '' : `&chat_id=${chatId}`}`, { cache: 'no-store' });
+                // Default request sends NO quota params — the server's window
+                // constants govern the first-load window (perf2 P3). A Load-
+                // older escalation adds explicit n_human/n_progress (perf2 P4).
+                let historyUrl = `/api/chat/history${isMain ? '' : `?chat_id=${chatId}`}`;
+                if (historyQuotaOverride) {
+                    const sep = historyUrl.includes('?') ? '&' : '?';
+                    historyUrl += `${sep}n_human=${historyQuotaOverride.n_human}`
+                        + `&n_progress=${historyQuotaOverride.n_progress}`;
+                }
+                const resp = await apiFetch(historyUrl, { cache: 'no-store' });
                 if (!resp.ok) {
                     lastHistorySyncSucceeded = false;
+                    initialHydrationPromise = null;
                     return false;
                 }
                 const data = await resp.json();
@@ -3029,9 +3233,15 @@ export function createChatInstance({
                 // detached DOM subtree or repopulate the cleared collections.
                 if (destroyed) {
                     lastHistorySyncSucceeded = false;
+                    initialHydrationPromise = null;
                     return false;
                 }
                 const messages = Array.isArray(data.messages) ? data.messages : [];
+                // perf2 P4.5: the server's window verdict (P3.2 additive field)
+                // drives the Load-older button/notice after this sync lands.
+                historyWindow = (data && typeof data.window === 'object' && data.window)
+                    ? data.window
+                    : null;
                 const scrollBeforeSync = {
                     top: messagesDiv.scrollTop,
                     nearBottom: isNearBottom(),
@@ -3040,13 +3250,32 @@ export function createChatInstance({
 
                 // First load/reconnect trusts server history and fully rebuilds the
                 // feed; routine post-completion syncs only fold in new task cards.
-                const rebuildAll = !historyLoaded || fromReconnect;
+                // perf2 P4: a Load-older refetch (forceRebuild) and the first
+                // successful sync after an offline sessionStorage bootstrap
+                // [GPT#17] rebuild fully too.
+                const rebuildAll = !historyLoaded || fromReconnect || forceRebuild
+                    || offlineBootstrapPainted;
                 // On a soft reconnect the module (and its dedupe set) survives, so a
                 // plain re-sync would skip user messages and dedupe-drop every
                 // assistant bubble — the conversation would vanish. Restore user text
-                // and rebuild from durable history whenever we rebuild.
-                const renderUser = includeUser || fromReconnect;
+                // and rebuild from durable history whenever we rebuild. The
+                // offline-bootstrap rebuild clears the fallback-painted bubbles
+                // too, so it must restore user rows even when the trigger came
+                // with includeUser=false (first clean open / 700ms resync).
+                const renderUser = includeUser || fromReconnect || offlineBootstrapPainted;
                 if (!historyLoaded || fromReconnect) retiredTaskIds.clear();
+                // The extra rebuild causes (Load-older / offline bootstrap)
+                // replay everything too, so retirement resets with them.
+                if (rebuildAll) retiredTaskIds.clear();
+
+                // perf2 P4.3: the ENTIRE mutation below (clear -> pass 1 ->
+                // pass 2 -> terminal resolution -> sweep) is one synchronous
+                // closure. On rebuildAll it runs inside ONE outer
+                // withStableViewport with a detached batch collecting the
+                // top-level nodes; NO awaits may occur between the feed
+                // clearing and the batch mount [GPT#14]. The routine path
+                // (rebuildAll=false) calls it directly — unchanged behavior.
+                const applySyncedMessages = () => {
                 if (rebuildAll) {
                     for (const record of liveCardRecords.values()) record.root?.remove();
                     liveCardRecords.clear();
@@ -3221,6 +3450,44 @@ export function createChatInstance({
                         else insertMessageNode(rec.root);
                     }
                 }
+                };  // end applySyncedMessages
+
+                // perf2 P4 follow-up (double-fetch fix): the replay below marks
+                // historical cards finished; those transitions must not
+                // schedule the post-completion resync (the rows just arrived
+                // from this very fetch). The flag spans BOTH branches and is
+                // dropped synchronously, so a real live completion frame can
+                // never land while it is up.
+                _historyReplayActive = true;
+                try {
+                    if (rebuildAll) {
+                        // perf2 P4.3 [GPT#14]: one outer withStableViewport for the
+                        // whole rebuild — inner per-row wrappers collapse on the
+                        // existing _viewportMutationDepth gate, killing the
+                        // per-frame isInstanceVisible/anchor layout storm. One
+                        // stable sort, one fragment mount before typing, then the
+                        // per-card finals and ONE persist. The whole section is
+                        // synchronous: live frames can never observe "records
+                        // cleared, fragment not yet mounted".
+                        _rebuildBatch = createRebuildBatch();
+                        try {
+                            withStableViewport(() => {
+                                applySyncedMessages();
+                                const batch = _rebuildBatch;
+                                _rebuildBatch = null;
+                                batch.mount(messagesDiv, messagesDiv.querySelector('.typing-bubble'));
+                                finalizeRebuildBatch(batch);
+                            });
+                        } finally {
+                            _rebuildBatch = null;
+                        }
+                    } else {
+                        // Routine sync: the old per-row live-DOM path, untouched.
+                        applySyncedMessages();
+                    }
+                } finally {
+                    _historyReplayActive = false;
+                }
 
                 // After first load, unfinished foreground cards still show typing.
                 if (!historyLoaded) {
@@ -3256,6 +3523,14 @@ export function createChatInstance({
                 const wasFirstLoad = !historyLoaded;
                 historyLoaded = true;
                 lastHistorySyncSucceeded = true;
+                // The durable rebuild superseded the offline fallback paint.
+                offlineBootstrapPainted = false;
+                // perf2 P4.1: ANY successful sync leaves the instance hydrated
+                // — later hydration triggers ride this sticky promise.
+                initialHydrationPromise = historySyncPromise;
+                // perf2 P4.5: reflect the server's window verdict in the
+                // Load-older control now that the feed matches this response.
+                syncLoadOlderControl();
                 // A recreated project instance restores its predecessor's stashed
                 // mid-history position on first paint instead of pinning to newest.
                 if (wasFirstLoad && _initialScrollPending) {
@@ -3286,6 +3561,7 @@ export function createChatInstance({
                 return messages.length > 0;
             } catch (err) {
                 lastHistorySyncSucceeded = false;
+                initialHydrationPromise = null;
                 const socketState = ws?.ws?.readyState;
                 const expectedDisconnect = socketState !== WebSocket.OPEN;
                 if (expectedDisconnect && err instanceof TypeError) {
@@ -3309,9 +3585,20 @@ export function createChatInstance({
 
     async function refreshHistory({ revision = 0 } = {}) {
         const generation = ++historyPaintGeneration;
-        await syncHistory({ includeUser: true });
+        const targetRevision = Math.max(0, Number(revision) || 0);
+        // perf2 P4.1: only a NEW revision (or a never-hydrated instance)
+        // forces a real fetch; otherwise the sticky hydration promise answers
+        // and the paint receipt below still runs [GPT#12].
+        if (targetRevision > lastLoadedHistoryRevision || !initialHydrationPromise) {
+            await syncHistory({ includeUser: true });
+        } else {
+            await awaitInitialHydration({ includeUser: true });
+        }
+        if (lastHistorySyncSucceeded && targetRevision > lastLoadedHistoryRevision) {
+            lastLoadedHistoryRevision = targetRevision;
+        }
         if (destroyed || !lastHistorySyncSucceeded || generation !== historyPaintGeneration || page.hidden) {
-            return { painted: false, revision: Number(revision) || 0 };
+            return { painted: false, revision: targetRevision };
         }
         // A successful fetch is not a read acknowledgement until the rebuilt
         // DOM has crossed an actual browser paint while this Project remains
@@ -3322,13 +3609,18 @@ export function createChatInstance({
         await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
         return {
             painted: !destroyed && generation === historyPaintGeneration && !page.hidden,
-            revision: Math.max(0, Number(revision) || 0),
+            revision: targetRevision,
         };
     }
 
     (async () => {
         await loadUiPreferences();
-        if (await syncHistory({ includeUser: true })) return;
+        // perf2 P4.2: Main waits for the (bounded) idle hydration window;
+        // project instances pass straight through. The sticky single-flight
+        // below folds this trigger with the first socket open / refreshHistory.
+        await waitForHydrationWindow();
+        if (destroyed) return;
+        if (await awaitInitialHydration({ includeUser: true })) return;
         try {
             const saved = JSON.parse(sessionStorage.getItem(storeKey(CHAT_STORAGE_KEY)) || '[]');
             for (const msg of saved) {
@@ -3343,6 +3635,11 @@ export function createChatInstance({
             }
         } catch {}
         historyLoaded = true;
+        // GPT#17: this offline fallback sets historyLoaded=true, which would
+        // make the first successful post-outage sync a NON-rebuilding routine
+        // fold over stale sessionStorage bubbles. Flag it so that sync
+        // rebuilds from durable history instead.
+        if (!lastHistorySyncSucceeded) offlineBootstrapPainted = true;
         ensureWelcomeMessage();
     })();
 
@@ -3817,6 +4114,85 @@ export function createChatInstance({
     typingEl.innerHTML = `<div class="typing-dots"><span></span><span></span><span></span></div>`;
     messagesDiv.appendChild(typingEl);
 
+    // perf2 P4.5: "Load older" control at the very top of the feed. Server
+    // truth (window.complete / truncated_by from P3.2) decides between a
+    // quota-escalating refetch button and the honest boundary notice; the
+    // container class is excluded from viewport anchoring like .typing-bubble.
+    // The control is mounted ONLY while it has something to show: a
+    // permanently-present (even hidden) node would be an extra top-level feed
+    // child, breaking child-order consumers (ui-smoke chronology pattern) and
+    // diverging from the pre-P4 feed layout on complete windows.
+    const loadOlderEl = document.createElement('div');
+    loadOlderEl.className = 'chat-load-older';
+    const loadOlderBtn = document.createElement('button');
+    loadOlderBtn.type = 'button';
+    loadOlderBtn.className = 'chat-load-older-btn';
+    loadOlderBtn.textContent = 'Load older messages';
+    const loadOlderNote = document.createElement('span');
+    loadOlderNote.className = 'chat-load-older-note';
+    loadOlderNote.hidden = true;
+    loadOlderEl.append(loadOlderBtn, loadOlderNote);
+    loadOlderBtn.addEventListener('click', () => { loadOlderHistory(); });
+
+    function syncLoadOlderControl() {
+        const control = loadOlderControlState(historyWindow, historyQuotaOverride);
+        if (control.mode === 'hidden') {
+            loadOlderEl.remove();
+            return;
+        }
+        if (!loadOlderEl.isConnected) messagesDiv.prepend(loadOlderEl);
+        loadOlderBtn.hidden = control.mode !== 'button';
+        loadOlderBtn.disabled = loadingOlderHistory;
+        loadOlderBtn.textContent = loadingOlderHistory
+            ? 'Loading…'
+            : (control.mode === 'button' ? control.label : 'Load older messages');
+        loadOlderNote.hidden = control.mode !== 'notice';
+        if (control.mode === 'notice') loadOlderNote.textContent = control.label;
+    }
+
+    async function loadOlderHistory() {
+        if (loadingOlderHistory) return;
+        const next = nextQuotaEscalation(historyQuotaOverride);
+        if (!next) return;
+        loadingOlderHistory = true;
+        syncLoadOlderControl();
+        // Anchor the current first visible timestamped node (the control
+        // itself is excluded from capture, like .typing-bubble) so the reader
+        // does not drift when older rows land above the viewport [GPT#13].
+        const anchor = _savedStick || isNearBottom() ? null : captureVisibleTimelineAnchor();
+        const previousQuota = historyQuotaOverride;
+        historyQuotaOverride = next;
+        try {
+            // Drain EVERY in-flight sync first: coalescing into one would
+            // silently drop forceRebuild and the escalated window, and another
+            // waiter can install a NEW promise right as the previous one
+            // settles — so re-check until the slot is genuinely free. Only
+            // then does syncHistory below start as OUR fetch (its head sees
+            // historySyncPromise === null synchronously).
+            while (historySyncPromise) {
+                try { await historySyncPromise; } catch {}
+                if (destroyed) return;
+            }
+            await syncHistory({ includeUser: true, forceRebuild: true });
+            if (destroyed) return;
+            if (!lastHistorySyncSucceeded) {
+                historyQuotaOverride = previousQuota;
+                return;
+            }
+            // Like the reconnect restore: wait two frames so late card layout
+            // above the anchor cannot move the reader right after this call.
+            await new Promise((resolve) => requestAnimationFrame(
+                () => requestAnimationFrame(resolve)
+            ));
+            if (destroyed) return;
+            if (anchor) restoreVisibleTimelineAnchor(anchor);
+            updateScrollButton();
+        } finally {
+            loadingOlderHistory = false;
+            if (!destroyed) syncLoadOlderControl();
+        }
+    }
+
     function hasActiveLiveCard() {
         return Array.from(liveCardRecords.values()).some(isForegroundLiveCard);
     }
@@ -3830,6 +4206,11 @@ export function createChatInstance({
     }
 
     function hideTypingIndicatorOnly() {
+        // perf2 P4.3: one typing-indicator write per replay batch.
+        if (_rebuildBatch) {
+            _rebuildBatch.typingHidden = true;
+            return;
+        }
         typingEl.style.display = 'none';
     }
 
@@ -4155,19 +4536,33 @@ export function createChatInstance({
 
     let wsHasConnectedOnce = false;
 
-    onWs('open', () => {
+    onWs('open', (msg) => {
         setStatus('online', 'Online');
         refreshHeaderControlState(true);
+        // perf2 P4.1 [Gemini#3]: reconnect truth comes from the ws CLIENT
+        // (previouslyConnected rides the open event) — a project instance
+        // created while the socket was already open must still treat the next
+        // open as a reconnect. The per-instance flag stays only as a fallback
+        // for open events without a payload.
+        const isReconnect = typeof msg?.previouslyConnected === 'boolean'
+            ? msg.previouslyConnected
+            : wsHasConnectedOnce;
         const reconnectBanner =
             pendingReconnectBannerText
-            || (wsHasConnectedOnce ? '♻️ Reconnected' : '');
+            || (isReconnect ? '♻️ Reconnected' : '');
         const shouldClearReconnectParams = Boolean(pendingReconnectBannerText);
         pendingReconnectBannerText = '';
-        const isReconnect = wsHasConnectedOnce;
         wsHasConnectedOnce = true;
         updateMessagesPadding();
         loadUiPreferences()
-            .then(() => syncHistory({ includeUser: !historyLoaded, fromReconnect: isReconnect }))
+            // Reconnect ALWAYS does a real fetch (a lost task_done is healed
+            // only by refetching); the first clean open is a hydration trigger
+            // and rides the sticky single-flight behind Main's idle gate.
+            .then(() => (isReconnect
+                ? syncHistory({ includeUser: !historyLoaded, fromReconnect: isReconnect })
+                : waitForHydrationWindow().then(
+                    () => awaitInitialHydration({ includeUser: !historyLoaded }),
+                )))
             .then((hasMessages) => {
                 if (!hasMessages) ensureWelcomeMessage();
                 if (reconnectBanner) {
@@ -4224,7 +4619,7 @@ export function createChatInstance({
             if (documentKeydownHandler) document.removeEventListener('keydown', documentKeydownHandler);
             chatResizeObserver?.disconnect();
             chatResizeObserver = null;
-            if (historySyncTimer) { clearTimeout(historySyncTimer); historySyncTimer = null; }
+            historyResyncScheduler.cancel();
             if (_chatFreedTimer) { clearTimeout(_chatFreedTimer); _chatFreedTimer = null; }
             for (const taskState of taskUiStates.values()) {
                 if (taskState?.cleanupTimer) clearTimeout(taskState.cleanupTimer);
