@@ -33,6 +33,7 @@ import {
     FACET_ACCOUNTS,
     FACET_CATALOG,
     FACET_QUOTA,
+    FACET_SUBJECT,
     READ_FAILED,
     READ_OK,
     READ_TRANSPORT,
@@ -304,7 +305,12 @@ export function bareRowStatusText(accountsRead) {
     if (accountsRead === READ_UNREAD) return 'Checking…';
     if (accountsRead === READ_TRANSPORT) return 'Not checked — the status request did not complete';
     if (accountsRead === READ_FAILED) return 'Not checked — the daemon did not answer this read';
-    return 'Not checked — the agent daemon is not running';
+    // NOT READ says nobody asked; it does NOT say why. "the agent daemon is not
+    // running" named a cause this row cannot see — a runtime awaiting repair, a
+    // foreign daemon on the stale port and an ownership problem all arrive here
+    // as the same unread facet, and the tab's ONE banner is the place that
+    // explains which of them it is.
+    return 'Not checked — the agent daemon was never asked';
 }
 
 export function familyStatus(rows, { accountsRead = READ_OK } = {}) {
@@ -382,6 +388,16 @@ export function familyActionLabel(group, payload) {
     // (carrying the runtime's install/repair intent); once a family has any
     // account, the button adds a NAMED one — which is what makes the accounts
     // equivalent instead of one-default-plus-extras.
+    //
+    // DISCLOSED RESIDUAL (adversarial review, 2026-08-09): unlike `rowActionLabel`
+    // this deliberately does NOT hand the label to a runtime that needs
+    // installing or repairing. The button's own action is to ASK FOR A NAME and
+    // then start a login — a header reading "Fix & connect" that opens a
+    // name-the-account dialog would misdescribe what the click does, and
+    // dropping the name step would remove the add intent this card exists for.
+    // The repair is a PREREQUISITE, not the destination: the login card
+    // performs it in the foreground and reports it there, and the tab's service
+    // banner already names the fault above.
     return group.rows.length ? 'Add account' : runtimeActionLabel(payload);
 }
 
@@ -396,6 +412,32 @@ export function rowActionLabel(row, payload) {
     return String(row?.status?.verification || '') === 'passed' ? 'Sign in again' : 'Sign in';
 }
 
+// "agents", "agents and limits", "agents, accounts and limits".
+function joinSubjects(names) {
+    const list = names.filter(Boolean);
+    if (list.length <= 1) return list[0] || '';
+    return `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
+}
+
+const TONE_RANK = { ok: 0, muted: 0, warn: 1, error: 2 };
+
+function faultOutranksReassurance(service, note) {
+    // A MUTED note is a reassurance: "nothing below is missing or wrong". It
+    // may not be the last word while the service line has a FAULT to report.
+    // Every settled non-running state — runtime `error`, `foreign_daemon`, an
+    // ownership problem, a recorded daemon `last_error` — leaves all three
+    // facets unread, so the benign note used to be the ONLY sentence the owner
+    // saw while the row buttons beside it offered "Fix & connect". The whole
+    // error/warn vocabulary daemonStatusLine already speaks was unreachable
+    // there. A warn/error note (a refused read, a dead request) is itself a
+    // report and keeps its place.
+    if (!note) return service;
+    if (note.tone === 'muted' && (service.tone === 'error' || service.tone === 'warn')) {
+        return service;
+    }
+    return { tone: note.tone, text: note.text };
+}
+
 export function serviceBannerLine(store) {
     // THE service banner: one place on the tab that explains a daemon/runtime
     // problem, replacing the scattering of "(not in discovery)" the owner
@@ -403,8 +445,8 @@ export function serviceBannerLine(store) {
     // independent reads into one verdict: a refused quota read leaves the
     // catalogue and accounts authoritative and says exactly that.
     const reads = store.reads || {};
-    const bad = [FACET_CATALOG, FACET_ACCOUNTS, FACET_QUOTA]
-        .filter((facet) => reads[facet] !== READ_OK);
+    const facets = [FACET_CATALOG, FACET_ACCOUNTS, FACET_QUOTA];
+    const bad = facets.filter((facet) => reads[facet] !== READ_OK);
     if (!bad.length) {
         return daemonStatusLine(store.snapshot || {}, {
             checking: store.loading && !store.everSettled,
@@ -418,25 +460,47 @@ export function serviceBannerLine(store) {
     if (!store.everSettled) {
         return daemonStatusLine(store.snapshot || {}, { checking: store.loading });
     }
+    const service = daemonStatusLine(store.snapshot || {});
     // All three unread in the same way: ONE sentence about the service, from
     // the shared vocabulary, with the subject widened to the whole tab —
     // naming just the accounts would under-report a gap that also swallowed
-    // the agent catalogue and the limits.
+    // the agent catalogue and the limits. A runtime fault outranks it.
     const states = new Set(bad.map((facet) => reads[facet]));
     if (bad.length === 3 && states.size === 1) {
-        const note = statusUnavailableNote(reads[bad[0]], {
+        return faultOutranksReassurance(service, statusUnavailableNote(reads[bad[0]], {
             error: store.error || '', subject: 'agents, accounts and limits',
-        });
-        if (!note) return daemonStatusLine(store.snapshot || {});
-        return { tone: note.tone, text: note.text };
+        }));
     }
-    // A partial gap: name what could not be read, and protect what could.
-    const note = store.unavailableNote(bad[0]);
-    if (!note) return daemonStatusLine(store.snapshot || {});
-    return {
-        tone: note.tone,
-        text: `${note.text} Everything else on this tab was read normally.`,
-    };
+    // A PARTIAL gap: name EVERY facet that could not be read — one sentence per
+    // distinct way they failed — and let the closing reassurance cover only the
+    // facets that genuinely read. Reporting `bad[0]` alone and appending
+    // "everything else was read normally" told the owner two of three failures
+    // had landed fine; it is unreachable only until the backend stamps `reads`
+    // per facet, which is exactly what makes a mixed verdict possible.
+    const sentences = [];
+    let tone = 'muted';
+    for (const readState of states) {
+        const subjects = bad
+            .filter((facet) => reads[facet] === readState)
+            .map((facet) => FACET_SUBJECT[facet] || facet);
+        const note = statusUnavailableNote(readState, {
+            error: store.error || '', subject: joinSubjects(subjects),
+        });
+        if (!note) continue;
+        sentences.push(note.text);
+        if (TONE_RANK[note.tone] > TONE_RANK[tone]) tone = note.tone;
+    }
+    if (!sentences.length) return service;
+    const readOk = facets
+        .filter((facet) => reads[facet] === READ_OK)
+        .map((facet) => FACET_SUBJECT[facet] || facet);
+    const tail = readOk.length ? ` Your ${joinSubjects(readOk)} were read normally.` : '';
+    // The SAME precedence as the full-gap branch above — the two are one
+    // decision, and fixing only one half of it is how this class survives. A
+    // mixed verdict is unreachable until the backend stamps `reads` per facet,
+    // and on that day a muted "some facets were never asked · the rest read
+    // normally" would swallow a runtime that needs repair.
+    return faultOutranksReassurance(service, { tone, text: `${sentences.join(' ')}${tail}` });
 }
 
 export async function removeAccount(harness, profileId, { fetchImpl = apiFetch } = {}) {

@@ -28,8 +28,8 @@ const MODEL_CARDS = [
     ['Fallback', 'Resilience and degraded path (comma-separated chain).', 's-model-fallback', 's-local-fallback', 'openai/gpt-5.6-luna'],
 ];
 
-// 6.3: Review and Scope Review efforts moved to per-slot dropdowns on the
-// Models page (Reviewer Slots). Behavior keeps the surface-level lanes.
+// 6.3: Review and Scope Review efforts moved to per-slot dropdowns in
+// Agents → Review lanes. Behavior keeps the surface-level lanes.
 const EFFORT_FIELDS = [
     ['s-effort-task', 'Task / Chat', 'medium'],
     ['s-effort-evolution', 'Evolution', 'high'],
@@ -572,7 +572,7 @@ export function renderSettingsPage() {
                         </div>
                     </div>
 
-                    <!-- Allow Mutative Subagents moved to Models → Subagents: one
+                    <!-- Allow Mutative Subagents moved to Agents → Delegation: one
                          subagent story in one place, and two controls over one
                          setting would have carried two drafts. -->
 

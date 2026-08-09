@@ -55,8 +55,49 @@ MOVED_CONTROLS = {
 STAYED_IN_ADVANCED = ("s-workers", "s-gc-retention-days")
 
 
+# The ONE file exempt from the sweeps below, and only while its own phase is in
+# flight: `onboarding_wizard.js` belongs to the onboarding worktree, whose agent
+# is repointing exactly these strings there. The exemption is asserted to still
+# be NEEDED (see the test at the bottom), so it cannot outlive the debt it
+# covers — the day that work merges, this file must drop the entry.
+CROSS_PHASE_PENDING = "onboarding_wizard.js"
+
+
 def _read(name: str) -> str:
     return (MODULES / name).read_text(encoding="utf-8")
+
+
+def _swept_sources(*, with_tests: bool) -> list[tuple[str, str, str]]:
+    """(label, text, line-comment marker) for every source an address can hide in.
+
+    The sweep this file first shipped looked at FOUR modules. That is precisely
+    why a stale pointer survived in ``ouroboros/tools/plan_review.py``, which no
+    sweep was looking at: the owner was told to "Fix Reviewer Slots in Settings"
+    long after the section stopped existing under that name. So the scan is now
+    the whole surface this repo authors, not the files the move happened to touch.
+
+    ``with_tests`` is off for the copy sweep and on for the address sweep. A test
+    asserting that a retired WORD is absent has to spell that word; a test
+    carrying a retired ADDRESS in a comment misdirects its next reader exactly
+    like production code does.
+    """
+    out: list[tuple[str, str, str]] = []
+    groups: list[tuple[list[pathlib.Path], str | None]] = [
+        (sorted((REPO_ROOT / "web" / "modules").glob("*.js")), "//"),
+        (sorted((REPO_ROOT / "web").glob("*.css")), None),
+        (sorted((REPO_ROOT / "ouroboros").rglob("*.py")), "#"),
+        (sorted((REPO_ROOT / "supervisor").rglob("*.py")), "#"),
+    ]
+    if with_tests:
+        groups.append((sorted((REPO_ROOT / "web" / "tests").glob("*.js")), "//"))
+        groups.append((sorted((REPO_ROOT / "tests").glob("*.py")), "#"))
+    for paths, comment in groups:
+        for path in paths:
+            if path.name == CROSS_PHASE_PENDING or path.resolve() == pathlib.Path(__file__).resolve():
+                continue
+            out.append((str(path.relative_to(REPO_ROOT)),
+                        path.read_text(encoding="utf-8"), comment or "\0"))
+    return out
 
 
 def _page_markup() -> str:
@@ -207,15 +248,11 @@ def test_no_owner_facing_coding_agent_copy_remains_on_the_agents_surfaces() -> N
     trademarks, not the generic label.
 
     Scoped to OWNER-FACING copy: comments are skipped, because a comment that
-    explains why the word was retired has to be able to spell it."""
+    explains why the word was retired has to be able to spell it. NOT scoped to
+    the modules this phase happened to edit — a sweep narrowed to the changed
+    files only proves the change, never the rule."""
     offenders: list[str] = []
-    sources = [(f"web/modules/{n}", _read(n), "//") for n in PAGE_SOURCES]
-    sources.append(("web/modules/claudexor_status_store.js",
-                    _read("claudexor_status_store.js"), "//"))
-    sources.append(("ouroboros/reviewer_slot_config.py",
-                    (REPO_ROOT / "ouroboros" / "reviewer_slot_config.py")
-                    .read_text(encoding="utf-8"), "#"))
-    for label, text, comment in sources:
+    for label, text, comment in _swept_sources(with_tests=False):
         for lineno, line in enumerate(text.splitlines(), 1):
             if line.lstrip().startswith(comment):
                 continue
@@ -223,6 +260,69 @@ def test_no_owner_facing_coding_agent_copy_remains_on_the_agents_surfaces() -> N
                 offenders.append(f"{label}:{lineno}: {line.strip()}")
     assert not offenders, (
         "owner-facing copy still says \"coding agent\" (D-10)\n" + "\n".join(offenders))
+
+
+# Every address this phase INVALIDATED, with the place that replaced it. A
+# pointer is not decoration: it is an instruction, and one that names a heading
+# no tab carries wastes the owner's time and quietly claims the feature is
+# missing. Comments count — a developer sent to the Models page for the reviewer
+# rows loses the same minutes the owner does.
+STALE_ADDRESSES = (
+    (r"Reviewer Slots",
+     'the section is called "Review lanes" and lives on the Agents tab (D-10)'),
+    (r"Models[- ]page|Models tab \(Reviewer",
+     "the reviewer rows and the subagent route left the Models page for Agents (D-10)"),
+    (r"Providers\s*(?:→|->)\s*Harness Accounts",
+     "accounts are Agents → Accounts now, grouped per family (D-10)"),
+    (r"Models\s*(?:→|->)\s*(?:Subagents|Reviewer)",
+     "delegation is Agents → Delegation, review rows are Agents → Review lanes (D-10)"),
+)
+
+
+def _stale_address_hits(text: str) -> list[tuple[int, str, str]]:
+    hits: list[tuple[int, str, str]] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        for pattern, correction in STALE_ADDRESSES:
+            if re.search(pattern, line):
+                hits.append((lineno, line.strip(), correction))
+    return hits
+
+
+def test_no_source_still_sends_anyone_to_a_section_this_phase_removed() -> None:
+    """The class the narrow sweep let through.
+
+    D-10 moved Harness Accounts out of Providers and renamed Reviewer Slots, and
+    the addresses that named those places stayed behind — in owner-facing copy
+    (``plan_review`` told the owner to "Fix Reviewer Slots in Settings") and in
+    the comments a maintainer navigates by. Both are wrong in the same way, so
+    both are swept, across every source this repo authors rather than the
+    handful the move touched.
+
+    Historical narration is welcome — but it must describe the old place
+    ("the accounts section under the Providers tab") rather than repeat the dead
+    address verbatim, so a reader searching for a heading finds only live ones.
+    """
+    offenders: list[str] = []
+    for label, text, _comment in _swept_sources(with_tests=True):
+        for lineno, line, correction in _stale_address_hits(text):
+            offenders.append(f"{label}:{lineno}: {line}\n    → {correction}")
+    assert not offenders, (
+        "a stale section address survived the move:\n" + "\n".join(offenders))
+
+
+def test_the_cross_phase_exemption_cannot_outlive_its_debt() -> None:
+    """The one exempt file is exempt because a SIBLING branch is fixing it, not
+    because the rule does not apply there. So the exemption is asserted to still
+    be needed: once the onboarding phase lands its repointing, this test fails
+    and `CROSS_PHASE_PENDING` must be deleted rather than quietly kept forever.
+    """
+    text = _read(CROSS_PHASE_PENDING)
+    pending = _stale_address_hits(text)
+    assert pending, (
+        f"web/modules/{CROSS_PHASE_PENDING} no longer carries a stale address — "
+        "the onboarding phase landed its fix. Delete CROSS_PHASE_PENDING and its "
+        "skip in _swept_sources() so the file is swept like every other."
+    )
 
 
 def test_a_spent_window_is_emphasised_rather_than_dimmed() -> None:

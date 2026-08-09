@@ -15,6 +15,10 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
+    createClaudexorStatusStore,
+    statusUnavailableNote,
+} from '../modules/claudexor_status_store.js';
+import {
     accountGroups,
     accountMetaLine,
     accountName,
@@ -40,6 +44,10 @@ function payload({ harnesses = [], profiles = {}, quota = [], daemon = RUNNING }
 }
 
 function fakeStore(reads, { error = '', snapshot = null } = {}) {
+    // The fake wraps the REAL sentence factory. An invented note ("…for your
+    // quota") let a copy regression pass green: the banner assertions pinned
+    // the fake's words instead of the product's ("…for your subscription
+    // limits"), which is exactly the wording nothing else pins either.
     return {
         reads,
         facet: (name) => reads[name],
@@ -47,10 +55,7 @@ function fakeStore(reads, { error = '', snapshot = null } = {}) {
         snapshot: snapshot || { daemon: RUNNING },
         loading: false,
         everSettled: true,
-        unavailableNote: (facet) => ({
-            tone: 'warn', action: null,
-            text: `The agent daemon did not answer for your ${facet}.`,
-        }),
+        unavailableNote: (facet) => statusUnavailableNote(reads[facet], { error, facet }),
     };
 }
 
@@ -132,6 +137,25 @@ test('"N accounts · rotating" counts only the accounts rotation can actually us
     ];
     assert.deepEqual(familyStatus(mixed, { accountsRead: 'ok' }),
         { tone: 'ok', label: '1 of 2 connected' });
+});
+
+test('the family button keeps its ADD intent even when the runtime needs repair', () => {
+    // DISCLOSED RESIDUAL, pinned so a change to it is deliberate. `rowActionLabel`
+    // hands its label to a broken runtime; this one does not, because the two
+    // buttons DO different things. The family button asks for an account name
+    // and then starts a login — a header reading "Fix & connect" that opens a
+    // name-the-account dialog would misdescribe the click, and dropping the name
+    // step would remove the add intent the card exists for. The repair is a
+    // prerequisite the login card performs and reports in the foreground, and
+    // the service banner above already names the fault.
+    const populated = accountGroups(payload({ profiles: MULTI }), { accountsRead: 'ok' })
+        .find((g) => g.harness === 'codex');
+    const broken = { daemon: { state: 'stale', runtime: { state: 'error' } } };
+    assert.equal(familyActionLabel(populated, broken), 'Add account');
+    assert.equal(rowActionLabel(populated.rows[0], broken), 'Fix & connect');
+    // An EMPTY family has no add intent to protect, so it does carry the runtime.
+    const empty = { rows: [] };
+    assert.equal(familyActionLabel(empty, broken), 'Fix & connect');
 });
 
 test('a row offers what it can actually do, and runtime work outranks it', () => {
@@ -225,9 +249,80 @@ test('the banner is the only place a service problem is explained', () => {
         snapshot: { daemon: { state: 'stale', runtime: { state: 'ready' } } },
     }));
     assert.match(line.text, /agents, accounts and limits/);
-    assert.match(line.text, /agent daemon is not running/);
+    assert.match(line.text, /agent daemon was not asked/);
+    assert.equal(line.tone, 'muted');
     // Healthy: the ordinary lifecycle sentence, unchanged.
     assert.match(serviceBannerLine(fakeStore(ALL('ok'))).text, /Claudexor ready/);
+});
+
+test('a BROKEN service is never reported as "nothing below is missing or wrong"', () => {
+    // The reachable lie: every settled state that is not `running` leaves all
+    // three facets unread, so the benign not-read note used to be the ONLY
+    // sentence on the tab — while the row buttons beside it said "Fix &
+    // connect". The whole error/warn vocabulary daemonStatusLine speaks was
+    // unreachable in exactly the states that need it.
+    const broken = (daemon) => serviceBannerLine(fakeStore(ALL('not_read'), { snapshot: { daemon } }));
+
+    const repair = broken({ state: 'stale', runtime: { state: 'error', last_error: 'checksum mismatch' } });
+    assert.equal(repair.tone, 'error');
+    assert.match(repair.text, /needs repair/);
+    assert.match(repair.text, /checksum mismatch/);
+    assert.doesNotMatch(repair.text, /Nothing below is missing or wrong/);
+
+    const foreign = broken({ state: 'foreign_daemon', runtime: { state: 'ready' } });
+    assert.equal(foreign.tone, 'warn');
+    assert.match(foreign.text, /Another daemon answered/);
+
+    const owned = broken({ state: 'stale', ownership_problem: 'home owned by another install', runtime: {} });
+    assert.equal(owned.tone, 'error');
+    assert.match(owned.text, /not managed from here/);
+
+    const unknown = broken({ state: 'unreachable', last_error: 'connection refused', runtime: {} });
+    assert.equal(unknown.tone, 'error');
+    assert.match(unknown.text, /connection refused/);
+
+    // The IDLE daemon is not a fault: its own muted line has nothing to add
+    // over the reassurance, so the not-read note keeps its place.
+    const idle = broken({ state: 'stale', runtime: { state: 'ready', version: '3.3.13' } });
+    assert.equal(idle.tone, 'muted');
+    assert.match(idle.text, /Nothing below is missing or wrong/);
+
+    // A read that FAILED is itself a report, not a reassurance: it survives a
+    // broken runtime rather than being replaced by it.
+    const refused = serviceBannerLine(fakeStore(ALL('failed'), {
+        snapshot: { daemon: { state: 'stale', runtime: { state: 'error' } } },
+    }));
+    assert.equal(refused.tone, 'warn');
+    assert.match(refused.text, /did not answer/);
+});
+
+test('the REAL store, fed a corrupted runtime, reaches the repair sentence', async () => {
+    // Not a hand-set reads map: the actual payload a broken install serves,
+    // through the actual provenance mapping. This is what makes the case
+    // REACHABLE rather than theoretical — the daemon is not serving, so every
+    // facet honestly lands on "never asked", and the benign sentence used to be
+    // the only thing on the tab while the buttons beside it said "Fix & connect".
+    const body = {
+        daemon: {
+            state: 'stale',
+            runtime: { state: 'error', last_error: 'engine checksum mismatch' },
+        },
+        harnesses: [], profiles: {}, quota: [],
+    };
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => ({ ok: true, json: async () => body }),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    assert.deepEqual(store.reads, { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' });
+
+    const line = serviceBannerLine(store);
+    assert.equal(line.tone, 'error');
+    assert.match(line.text, /Claudexor needs repair: engine checksum mismatch/);
+    assert.doesNotMatch(line.text, /Nothing below is missing or wrong/);
+    // The banner and the controls under it now tell the owner the same story.
+    assert.equal(rowActionLabel({ status: {} }, store.snapshot), 'Fix & connect');
+    store.dispose();
 });
 
 test('the first read in flight states its COST, not a bare "reading…"', () => {
@@ -238,19 +333,85 @@ test('the first read in flight states its COST, not a bare "reading…"', () => 
     const store = {
         reads: ALL('unread'), facet: (n) => ALL('unread')[n], error: '',
         snapshot: null, loading: true, everSettled: false,
-        unavailableNote: () => ({ tone: 'muted', text: 'Reading…', action: null }),
+        unavailableNote: (facet) => statusUnavailableNote('unread', { facet }),
     };
     const line = serviceBannerLine(store);
     assert.match(line.text, /Checking Claudexor/);
     assert.match(line.text, /minute/);
+    // The per-facet sentence the banner deliberately does NOT use here is the
+    // real one, so this stays a choice between two live sentences rather than
+    // between the product's and a stub's.
+    assert.match(store.unavailableNote('catalog').text, /Reading your agents…/);
+    assert.doesNotMatch(line.text, /Reading your/);
 });
 
 test('one refused facet never withdraws the authority of the other two', () => {
     // PER FACET, never a global verdict: with the catalogue and accounts read,
-    // a quota refusal must not read as "the service is down".
+    // a quota refusal must not read as "the service is down". The facet is
+    // named in the PRODUCT's words — "subscription limits", the copy the store
+    // owns — not in a word this test invented for it.
     const line = serviceBannerLine(fakeStore({ catalog: 'ok', accounts: 'ok', quota: 'failed' }));
-    assert.match(line.text, /quota/);
-    assert.match(line.text, /Everything else on this tab was read normally/);
+    assert.equal(line.tone, 'warn');
+    assert.match(line.text, /did not answer for your subscription limits/);
+    assert.match(line.text, /Your agents and agent accounts were read normally/);
+});
+
+test('a partial gap names EVERY facet it lost, and protects only what it kept', () => {
+    // "Everything else on this tab was read normally" was written for one
+    // failure and applied to any number of them: with two facets down it told
+    // the owner one had failed and the other two were fine. Latent only until
+    // the backend stamps `reads` per facet — which is precisely the change that
+    // makes a mixed verdict possible.
+    const two = serviceBannerLine(fakeStore({ catalog: 'ok', accounts: 'failed', quota: 'failed' }));
+    assert.match(two.text, /agent accounts and subscription limits/);
+    assert.match(two.text, /Your agents were read normally/);
+    assert.doesNotMatch(two.text, /Everything else/);
+
+    // DIFFERENT failures are different sentences, and the worst tone wins.
+    const mixed = serviceBannerLine(fakeStore(
+        { catalog: 'ok', accounts: 'transport', quota: 'not_read' },
+        { error: 'HTTP 503' }));
+    assert.equal(mixed.tone, 'error');
+    assert.match(mixed.text, /Could not read your agent accounts \(HTTP 503\)/);
+    assert.match(mixed.text, /your subscription limits were never checked/);
+    assert.match(mixed.text, /Your agents were read normally/);
+
+    // Nothing read OK at all: no reassurance is appended, because there is
+    // nothing left to reassure about.
+    const none = serviceBannerLine(fakeStore(
+        { catalog: 'failed', accounts: 'failed', quota: 'not_read' }));
+    assert.match(none.text, /agents and agent accounts/);
+    assert.match(none.text, /your subscription limits were never checked/);
+    assert.doesNotMatch(none.text, /were read normally/);
+});
+
+test('a partial gap obeys the SAME fault precedence as a total one', () => {
+    // The full-gap and partial-gap branches are one decision, and fixing only
+    // one half is how this class survives to the next review. A mixed verdict is
+    // unreachable until the backend stamps `reads` per facet — and that is
+    // exactly the change that produces one, at which point a muted "these were
+    // never asked · the rest read normally" would quietly swallow a runtime that
+    // needs repair.
+    const broken = { daemon: { state: 'stale', runtime: { state: 'error', last_error: 'checksum' } } };
+
+    const muted = serviceBannerLine(fakeStore(
+        { catalog: 'ok', accounts: 'not_read', quota: 'not_read' }, { snapshot: broken }));
+    assert.equal(muted.tone, 'error');
+    assert.match(muted.text, /needs repair: checksum/);
+
+    // A partial gap that is itself a REPORT still outranks the fault — a
+    // refused read is not a reassurance and must not be replaced by one.
+    const refused = serviceBannerLine(fakeStore(
+        { catalog: 'ok', accounts: 'failed', quota: 'not_read' }, { snapshot: broken }));
+    assert.equal(refused.tone, 'warn');
+    assert.match(refused.text, /did not answer for your agent accounts/);
+    assert.match(refused.text, /Your agents were read normally/);
+
+    // A healthy daemon leaves the partial sentence exactly as it was.
+    const healthy = serviceBannerLine(fakeStore(
+        { catalog: 'ok', accounts: 'not_read', quota: 'not_read' }));
+    assert.equal(healthy.tone, 'muted');
+    assert.match(healthy.text, /agent accounts and subscription limits were never checked/);
 });
 
 // ---------------------------------------------------------------------------

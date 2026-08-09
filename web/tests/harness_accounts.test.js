@@ -6,6 +6,7 @@ import test from 'node:test';
 import {
     accountLoginConfirmed,
     accountRows,
+    statusUnavailableNote,
 } from '../modules/claudexor_status_store.js';
 import {
     bareRowStatusText,
@@ -1071,7 +1072,11 @@ test('a harness with no row only says "no account connected" once the store was 
     // in the agent home — a lazy daemon had simply never been asked.
     assert.equal(bareRowStatusText('ok'), 'No account connected');
     assert.match(bareRowStatusText('not_read'), /Not checked/);
-    assert.match(bareRowStatusText('not_read'), /daemon is not running/);
+    // NOT READ says nobody asked. It may not name a CAUSE the row cannot
+    // see: a runtime awaiting repair and a foreign daemon on the stale port
+    // arrive here as the same unread facet, and the tab's banner owns the why.
+    assert.match(bareRowStatusText('not_read'), /daemon was never asked/);
+    assert.doesNotMatch(bareRowStatusText('not_read'), /is not running/);
     assert.match(bareRowStatusText('failed'), /did not answer/);
     assert.match(bareRowStatusText('transport'), /request did not complete/);
     assert.equal(bareRowStatusText('unread'), 'Checking…');
@@ -1083,6 +1088,8 @@ test('a harness with no row only says "no account connected" once the store was 
 test('the ONE service banner reports a REFUSED read instead of "Claudexor ready"', () => {
     // A running daemon whose account read died would otherwise print the green
     // lifecycle line over a list that was never delivered.
+    // The fake wraps the REAL sentence factory: a fake that invents its own
+    // wording pins the fake, so a copy regression in the product passes green.
     const fakeStore = (reads, error = '') => ({
         reads,
         facet: (name) => reads[name],
@@ -1090,7 +1097,7 @@ test('the ONE service banner reports a REFUSED read instead of "Claudexor ready"
         snapshot: { daemon: { state: 'running', engine_version: '3.3.13', runtime: {} } },
         loading: false,
         everSettled: true,
-        unavailableNote: () => ({ tone: 'warn', text: 'the daemon did not answer this read', action: null }),
+        unavailableNote: (facet) => statusUnavailableNote(reads[facet], { error, facet }),
     });
     const all = (v) => ({ catalog: v, accounts: v, quota: v });
     // Every facet gone the same way: ONE sentence, with the subject widened to
@@ -1104,6 +1111,9 @@ test('the ONE service banner reports a REFUSED read instead of "Claudexor ready"
     // PER FACET, never one global verdict: a refused QUOTA read must not
     // withdraw the catalogue's and the accounts' authority.
     const partial = serviceBannerLine(fakeStore({ catalog: 'ok', accounts: 'ok', quota: 'failed' }));
-    assert.match(partial.text, /did not answer/);
-    assert.match(partial.text, /Everything else on this tab was read normally/);
+    assert.match(partial.text, /did not answer for your subscription limits/);
+    // The reassurance covers the facets that GENUINELY read, named one by one —
+    // "everything else" was written for a single failure and stayed true only
+    // by accident.
+    assert.match(partial.text, /Your agents and agent accounts were read normally/);
 });

@@ -1106,7 +1106,7 @@ def _claude_code_status_payload() -> Dict[str, Any]:
 async def api_reviewer_slots(request: Request) -> JSONResponse:
     """GET /api/reviewer-slots — the effective slot rows plus «выполняется как».
 
-    One read for the Models page: the parsed SSOT rows (structured or the
+    One read for Agents → Review lanes: the parsed SSOT rows (structured or the
     legacy migration view, labeled by ``source``), the real row limits, and
     the D22 last-execution projection keyed by slot_id — what each saved row
     REALLY ran as last time (the UI face of capability_delta). A malformed

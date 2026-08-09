@@ -1528,3 +1528,58 @@ def test_status_payload_keeps_typed_unreachable_when_a_fanned_out_read_refuses(m
     assert payload["daemon"]["state"] == "unreachable"
     assert "daemon_unreachable" in payload["daemon"]["last_error"]
     assert payload["harnesses"] == []
+
+
+# ---------------------------------------------------------------------------
+# The proxy count is a claim, and claims drift.
+# ---------------------------------------------------------------------------
+
+
+def test_the_proxy_count_in_the_docs_matches_the_handlers_that_exist(tmp_path):
+    """The module said "three THIN proxies" while a handler inside it introduced
+    itself as "A FOURTH thin proxy" — a file contradicting itself in the only two
+    places a reader looks first. A hand-counted number in prose cannot be trusted
+    to be re-counted when the fifth one lands, so it is asserted instead.
+
+    ``docs/ARCHITECTURE.md`` carries the same count in its gateway map, and it is
+    checked against the ROUTES rather than the handlers: a proxy the map never
+    names is a proxy nobody discovers from the architecture doc.
+    """
+    import inspect
+    import re
+
+    from ouroboros.gateway import claudexor_accounts as accounts
+
+    words = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+    handlers = sorted(
+        name for name, obj in vars(accounts).items()
+        if name.startswith("api_claudexor_") and inspect.iscoroutinefunction(obj)
+    )
+    expected = words[len(handlers)]
+    docstring = (accounts.__doc__ or "").lower()
+    assert f"{expected} thin proxies" in docstring, (
+        f"{len(handlers)} handlers ({', '.join(handlers)}) but the module docstring "
+        f"does not say \"{expected} THIN proxies\""
+    )
+
+    arch = (pathlib.Path(__file__).resolve().parents[1] / "docs" / "ARCHITECTURE.md") \
+        .read_text(encoding="utf-8")
+    line = next(ln for ln in arch.splitlines() if "claudexor_accounts.py" in ln)
+    assert f"{expected} thin proxies" in line.lower(), (
+        f"the gateway map still counts a different number of claudexor proxies: {line.strip()[:160]}"
+    )
+
+    # Every REGISTERED path is named in that map entry, so a new proxy cannot
+    # land undocumented behind an updated count.
+    from ouroboros.gateway.router import collect_routes
+
+    paths = {
+        route.path for route in collect_routes(data_dir=tmp_path)
+        if getattr(route, "path", "").startswith("/api/claudexor/")
+    }
+    assert paths, "no /api/claudexor/ routes are registered"
+    for path in sorted(paths):
+        # The map spells path params by name, not by their brace form for the
+        # two-segment removal route; compare on the stable prefix.
+        prefix = re.split(r"\{", path)[0].rstrip("/")
+        assert prefix in line, f"{path} is registered but the gateway map never names it"

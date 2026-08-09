@@ -78,9 +78,9 @@ test('with no subscription connected the section explains instead of offering a 
     assert.equal(view.state, 'no_subscription');
     assert.equal(view.enabled, false);
     assert.deepEqual(view.options, []);
-    // The pointer now names a place on the SAME tab. It used to say
-    // "Providers → Harness Accounts", which was two tabs away from the control
-    // it explained; accounts and delegation live together in Agents (D-10).
+    // The pointer now names a place on the SAME tab. It used to send the owner
+    // to the accounts section under the Providers tab, two tabs away from the
+    // control it explained; accounts and delegation live together in Agents (D-10).
     assert.match(view.note, /Accounts above/);
     assert.doesNotMatch(view.note, /Providers/);
 });
@@ -346,7 +346,10 @@ test('a stopped daemon explains itself instead of accusing the saved harness', (
     assert.equal(view.state, 'unknown');
     assert.equal(view.enabled, false);
     assert.deepEqual(view.options, []);
-    assert.match(view.note, /daemon is not running/);
+    // The shared sentence states what the read state establishes — nobody
+    // asked — and never diagnoses a daemon this section cannot see.
+    assert.match(view.note, /daemon was not asked/);
+    assert.doesNotMatch(view.note, /is not running/);
     assert.match(view.note, /saved choices are unchanged/);
     assert.doesNotMatch(view.note, /no account connected/);
     assert.doesNotMatch(view.note, /ordinary subagent on the API/);

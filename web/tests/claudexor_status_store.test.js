@@ -109,7 +109,12 @@ test('a payload WITHOUT the reads block is read legacy-style, per facet', () => 
 
 test('each unavailable read state has ONE shared sentence, and an ok read has none', () => {
     const down = statusUnavailableNote(READ_NOT_READ);
-    assert.match(down.text, /daemon is not running/);
+    // NOT READ = never asked. It is NOT a diagnosis: a runtime that needs
+    // repair, a foreign daemon and an ownership problem all land here, and
+    // once the backend stamps `reads` per facet a RUNNING daemon can leave
+    // one facet unasked. Naming a cause here would be a lie in all four cases.
+    assert.match(down.text, /daemon was not asked/);
+    assert.doesNotMatch(down.text, /is not running/);
     assert.match(down.text, /saved choices are unchanged/);
     assert.doesNotMatch(down.text, /not in discovery/);
 
@@ -211,8 +216,8 @@ test('includeModels is sticky-upgrading: no later read downgrades the shared sna
         fetchImpl: async (url) => { urls.push(url); await gate; return okResponse(RUNNING); },
         doc: fakeDoc(),
     });
-    // The accounts panel's model-less poll is in flight when the Models tab
-    // asks for discovery: the upgrade cannot be served by that request, so ONE
+    // The accounts panel's model-less poll is in flight when the review-lane
+    // rows ask for discovery: the upgrade cannot be served by that request, so ONE
     // follow-up is queued — and every upgrading caller shares it.
     const plain = store.refresh();
     const upgrade = [store.refresh({ includeModels: true }), store.refresh({ includeModels: true })];
@@ -223,7 +228,7 @@ test('includeModels is sticky-upgrading: no later read downgrades the shared sna
     assert.equal(store.includesModels, true);
 
     // Sticky: a later plain refresh KEEPS models rather than downgrading the
-    // snapshot the Models tab depends on.
+    // snapshot the review-lane and delegation selects depend on.
     await store.refresh();
     assert.equal(urls.at(-1), '/api/claudexor/status?include=models');
     assert.equal(store.includesModels, true);

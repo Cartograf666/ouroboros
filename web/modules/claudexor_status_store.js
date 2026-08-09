@@ -1,7 +1,7 @@
 // ONE client-side store over `GET /api/claudexor/status` (phase 2 seam).
 //
 // Three surfaces used to read this endpoint independently — the Harness
-// Accounts panel polled it every 5s, Reviewer Slots fetched it once per
+// Accounts panel polled it every 5s, the review-lanes panel fetched it once per
 // settings load, Subagents fetched it once more — so the app held three
 // copies of the same truth, three failure handlings, and three staleness
 // clocks. Worse, each of them mapped "we could not ask" onto the SAME empty
@@ -138,11 +138,18 @@ export function statusUnavailableNote(readState, {
         };
     }
     if (readState === READ_NOT_READ) {
+        // "NOT ASKED" is what this state actually establishes, and it is the
+        // only cause this sentence may name. Saying "the daemon is not running"
+        // asserted a diagnosis the read state does not carry: a runtime that
+        // needs repair, a foreign daemon on the stale port and an ownership
+        // problem all land here too, and once the backend stamps `reads`
+        // per facet a RUNNING daemon can leave one facet unasked. The banner
+        // above (and only it) explains WHY nobody asked.
         return {
             tone: 'muted', action: null,
-            text: `Ouroboros’s agent daemon is not running, so your ${subject} were never `
+            text: `Ouroboros’s agent daemon was not asked, so your ${subject} were never `
                 + 'checked. Nothing below is missing or wrong — your saved choices are '
-                + 'unchanged, and the daemon starts automatically on the next login or '
+                + 'unchanged, and the daemon is asked again on the next login or '
                 + 'delegated run.',
         };
     }

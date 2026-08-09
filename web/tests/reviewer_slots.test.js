@@ -14,10 +14,40 @@ import {
     encodeRouteChoice,
     mintSlotId,
     profileOptionsFor,
+    renderReviewerSlotsSection,
     routeChoiceGroups,
     sessionModelOptions,
     splitSessionTarget,
 } from '../modules/reviewer_slots.js';
+
+
+test('the standing note states the POLICY, never the current routing', () => {
+    // The section's inline note is STATIC markup: it renders identically for an
+    // owner with three subscriptions and for one with none, whose every row is
+    // an API model. It used to open "Commit and scope review run on
+    // subscriptions and never fall back to API spend", so the second owner read
+    // Settings and believed their commit reviews were spending subscription
+    // windows and would wait for capacity — while in fact they were spending
+    // API budget on the next commit (BIBLE P1). The conditional version of that
+    // claim already exists server-side, emitted only when the configuration
+    // really is all-delegated (`reviewer_slot_config._fallback_warning_text`);
+    // a static copy of it cannot carry the condition, so it must state the rule
+    // instead of the situation.
+    const markup = renderReviewerSlotsSection();
+
+    // The section ships with NO rows — they are painted from the saved setting
+    // at runtime — so this is exactly the markup an all-API owner sees.
+    assert.doesNotMatch(markup, /data-route-kind|session:/,
+        'the static section must not ship a pre-rendered row');
+
+    assert.match(markup, /Rows routed to a subscription never fall back to API spend/);
+    assert.match(markup, /waits for capacity/);
+    // The unconditional claim, in the shapes it could come back as.
+    assert.doesNotMatch(markup, /review runs? on subscriptions/i);
+    assert.doesNotMatch(markup, /reviews? run on your subscription/i);
+    // The API-only surfaces sentence is unconditional AND true, so it stays.
+    assert.match(markup, /API-only surfaces today/);
+});
 
 
 test('a saved account pin survives a discovery list that no longer contains it', () => {

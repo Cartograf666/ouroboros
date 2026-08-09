@@ -30,7 +30,7 @@ const INPUT_FIELDS = [
     ['s-minimax-region', 'MINIMAX_REGION'],
     ['s-server-host', 'OUROBOROS_SERVER_HOST', '127.0.0.1'],
     // 6.1: OUROBOROS_REVIEW_MODELS / OUROBOROS_SCOPE_REVIEW_MODELS are no
-    // longer authored here — the Reviewer Slots section composes the ONE
+    // longer authored here — the Review lanes section composes the ONE
     // structured setting; the comma keys stay a backend-derived projection.
     ['s-deep-self-review-model', 'OUROBOROS_MODEL_DEEP_SELF_REVIEW'], ['s-skills-repo-path', 'OUROBOROS_SKILLS_REPO_PATH'],
     ['s-clawhub-registry-url', 'OUROBOROS_CLAWHUB_REGISTRY_URL'], ['s-websearch-model', 'OUROBOROS_WEBSEARCH_MODEL'], ['s-gh-repo', 'GITHUB_REPO'],
@@ -40,8 +40,8 @@ const INPUT_FIELDS = [
     ['s-evo-objective', 'OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE', ''],
 ];
 const VALUE_FIELDS = [
-    // 6.3: Review / Scope Review efforts are per-slot rows on the Models page
-    // now; their global keys remain backend defaults, no longer UI-authored.
+    // 6.3: Review / Scope Review efforts are per-slot rows in Agents → Review
+    // lanes now; their global keys remain backend defaults, no longer UI-authored.
     ['s-effort-task', 'OUROBOROS_EFFORT_TASK', 'medium'], ['s-effort-evolution', 'OUROBOROS_EFFORT_EVOLUTION', 'high'],
     ['s-effort-consciousness', 'OUROBOROS_EFFORT_CONSCIOUSNESS', 'high'], ['s-effort-deep-self-review', 'OUROBOROS_EFFORT_DEEP_SELF_REVIEW', 'high'],
     ['s-review-enforcement', 'OUROBOROS_REVIEW_ENFORCEMENT', 'advisory'], ['s-task-review-mode', 'OUROBOROS_TASK_REVIEW_MODE', 'auto'], ['s-runtime-mode', 'OUROBOROS_RUNTIME_MODE', 'advanced'],
@@ -549,7 +549,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         delete mutativeInput.dataset.effortTouched;
         mutativeInput.value =
             ({ true: 'on', false: 'off' }[rawMutative] || (runtimeMode === 'light' ? 'auto' : 'on'));
-        // The delegation route lives next to it in Models → Subagents.
+        // The delegation route lives next to it in Agents → Delegation.
         applySubagentsSettings(s);
         // Post-task evolution: one owner-facing selector maps to enable + cadence.
         const evoEnabled =

@@ -240,7 +240,7 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
 }
 
 // ---------------------------------------------------------------------------
-// DOM section (Models page). State is module-local; collect is synchronous.
+// DOM section (Agents → Delegation). State is module-local; collect is synchronous.
 // ---------------------------------------------------------------------------
 
 const state = {

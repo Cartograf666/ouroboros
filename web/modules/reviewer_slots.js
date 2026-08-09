@@ -1,5 +1,7 @@
-// Reviewer slots UI (phase 6.2/6.3, revised per owner finding #6) — the
-// Models-page rows over the ONE structured setting (OUROBOROS_REVIEWER_SLOTS).
+// Review lanes UI (phase 6.2/6.3, revised per owner finding #6) — the rows in
+// Agents → Review lanes over the ONE structured setting
+// (OUROBOROS_REVIEWER_SLOTS; the settings key keeps its name, the section does
+// not — D-10 moved these rows out of the Models tab and renamed them).
 //
 // Shape rules are the owner's:
 //  * The ROUTE select carries routes only: "API model" plus one entry per
@@ -327,7 +329,7 @@ export function advisoryRouteTransition(prev, decoded, memory = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// DOM section (Models page). State is module-local; collect is synchronous.
+// DOM section (Agents → Review lanes). State is module-local; collect is synchronous.
 // ---------------------------------------------------------------------------
 
 const state = {
@@ -368,10 +370,9 @@ export function renderReviewerSlotsSection() {
                 subscription — plus its own reasoning effort.
             </div>
             <div class="settings-inline-note">
-                Commit and scope review run on subscriptions and never fall back to API spend: if
-                every eligible window is exhausted, the review waits for capacity. Plan review, task
-                acceptance and skill review are API-only surfaces today and keep running on the
-                shipped default models.
+                Rows routed to a subscription never fall back to API spend: if every eligible window
+                is exhausted, the review waits for capacity. Plan review, task acceptance and skill
+                review are API-only surfaces today and keep running on the shipped default models.
             </div>
             <div id="reviewer-slots-error" class="ui-status" data-tone="error" hidden></div>
             <div id="reviewer-slots-pins" class="settings-inline-status" data-tone="warn" hidden></div>

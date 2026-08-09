@@ -79,7 +79,8 @@ export function compactModel(model = '') {
 // Phase 6, owner directive #1: «бейдж точно нужен, но не рекламный … что ТУТ
 // бабл \ субагент на codex». A small chip carrying the harness route this bubble
 // or subagent was DISPATCHED to — icon plus the short harness name, in the style
-// of the Harness Accounts rows, never a promotional badge. Dispatch, not receipt:
+// of the agent account rows on the Agents tab, never a promotional badge.
+// Dispatch, not receipt:
 // `executor_route` is resolved once when the work is sent, so the chip says where
 // it was sent, and a landing below that ask is disclosed on `capability_delta`.
 //
