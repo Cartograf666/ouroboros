@@ -139,6 +139,29 @@ def test_create_fork_and_rename_threads(tmp_path):
         fork_thread(tmp_path, "racer", 999)
 
 
+def test_thread_ids_are_never_reused(tmp_path):
+    """A durable high-water mark, not `max(live ids) + 1`. The moment threads
+    become removable, a reused id would mint a chat id the removed thread's
+    history rows still carry — silently merging two conversations."""
+    import json
+
+    create_project(tmp_path, "racer")
+    first = create_thread(tmp_path, "racer", name="one")
+    second = create_thread(tmp_path, "racer", name="two")
+    assert (first["id"], second["id"]) == (1, 2)
+
+    # Simulate a future removal: drop the live rows, keep the persisted mark.
+    path = _registry_path(tmp_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["projects"][0]["thread_seq"] == 2
+    data["projects"][0]["threads"] = []
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    third = create_thread(tmp_path, "racer", name="three")
+    assert third["id"] == 3
+    assert third["chat_id"] not in {first["chat_id"], second["chat_id"]}
+
+
 def test_reserved_chat_ids_and_binding_cover_every_thread(tmp_path):
     create_project(tmp_path, "racer", name="Cyber Racer")
     thread = create_thread(tmp_path, "racer", name="Tuning")

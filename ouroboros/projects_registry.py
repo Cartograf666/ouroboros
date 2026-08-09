@@ -711,16 +711,30 @@ def get_thread(drive_root: Any, project_id: str, thread_id: Any) -> Optional[Dic
     return None
 
 
-def _mint_thread(data: Dict[str, Any], pid: str, existing: List[Dict[str, Any]]) -> tuple:
-    """Pick the next free ``(thread_id, chat_id)`` pair for project ``pid``.
+def _mint_thread(data: Dict[str, Any], entry: Dict[str, Any], existing: List[Dict[str, Any]]) -> tuple:
+    """Pick the next free ``(thread_id, chat_id)`` pair for a project row.
 
     Thread ids are opaque integers, so a chat-id collision is resolved by simply
     walking to the next id (X1's "retry thread ids on collision") — no allocator
     state, no widened hash. Raises when the walk is exhausted, which is a
     registry-wide alarm rather than a routine outcome.
+
+    The high-water mark is persisted as ``thread_seq`` rather than derived from
+    the live rows alone, so a thread id is NEVER reused once handed out. That
+    matters the moment threads become removable: a reused id would mint a chat
+    id a dead thread's history rows still carry, silently merging two
+    conversations. A legacy row has no ``thread_seq`` and falls back to the
+    live maximum, which is correct while nothing has been removed yet.
     """
+    pid = str(entry.get("id") or "")
     reserved = _chat_id_owners(data["projects"])
-    next_id = max((int(row["id"]) for row in existing), default=MAIN_THREAD_ID) + 1
+    try:
+        high_water = max(0, int(entry.get("thread_seq") or 0))
+    except (TypeError, ValueError):
+        high_water = 0
+    next_id = max(
+        high_water, max((int(row["id"]) for row in existing), default=MAIN_THREAD_ID)
+    ) + 1
     for candidate in range(next_id, next_id + _THREAD_ID_MINT_ATTEMPTS):
         chat_id = thread_chat_id(pid, candidate)
         if chat_id not in reserved:
@@ -766,7 +780,7 @@ def create_thread(
         data = _load(drive_root)
         entry = _active_project_row(data, pid)
         threads = _normalize_thread_rows(entry.get("threads"))
-        thread_id, chat_id = _mint_thread(data, pid, threads)
+        thread_id, chat_id = _mint_thread(data, entry, threads)
         row: Dict[str, Any] = {
             "id": thread_id,
             "chat_id": chat_id,
@@ -778,6 +792,8 @@ def create_thread(
             row["fork_of_chat_id"] = int(fork_of_chat_id)
             row["fork_before_ts"] = str(fork_before_ts)
         entry["threads"] = [*threads, row]
+        # Monotonic high-water mark: a thread id is never handed out twice.
+        entry["thread_seq"] = thread_id
         _save(drive_root, data)
         log.info("Project thread created: %s#%s (chat_id=%s)", pid, thread_id, chat_id)
         return dict(row)
