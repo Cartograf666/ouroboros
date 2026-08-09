@@ -57,9 +57,12 @@ THREAD_NAME_MAX = PROJECT_NAME_MAX
 # step is a fresh deterministic pre-image, so exhausting this many is a
 # registry-wide alarm, not a routine outcome.
 _THREAD_ID_MINT_ATTEMPTS = 64
-# Drive roots whose duplicate-chat-id load scan already reported (once per
-# process per root — the scan is an alarm, not a per-read log flood).
+# Registry VERSIONS (path, mtime_ns, size) whose duplicate-chat-id scan already
+# ran — the scan is an alarm, not a per-read log flood, but keying it on the
+# file version means a collision hand-edited in later is still reported. Bounded
+# so a long-lived writer process cannot accumulate one entry per write.
 _DUPLICATE_CHAT_ID_REPORTED: set = set()
+_DUPLICATE_MEMO_MAX = 64
 
 
 @contextmanager
@@ -248,6 +251,8 @@ def _report_duplicate_chat_ids(drive_root: Any, projects: List[Dict[str, Any]]) 
     if key in _DUPLICATE_CHAT_ID_REPORTED:
         return
     clashes = {cid: owners for cid, owners in _chat_id_owners(projects).items() if len(owners) > 1}
+    if len(_DUPLICATE_CHAT_ID_REPORTED) >= _DUPLICATE_MEMO_MAX:
+        _DUPLICATE_CHAT_ID_REPORTED.clear()  # bounded: at worst one extra scan
     _DUPLICATE_CHAT_ID_REPORTED.add(key)
     if not clashes:
         return
