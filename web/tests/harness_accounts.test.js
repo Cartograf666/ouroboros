@@ -6,8 +6,10 @@ import test from 'node:test';
 import {
     accountLoginConfirmed,
     accountRows,
+    createClaudexorStatusStore,
 } from '../modules/claudexor_status_store.js';
 import {
+    accountRowFacts,
     bareRowStatusText,
     daemonStatusLine,
     normalizeProfileName,
@@ -1079,4 +1081,111 @@ test('the section line reports a REFUSED account read instead of "Claudexor read
     assert.match(sectionStatusLine(fakeStore('transport', 'net')).text, /did not answer/);
     // A healthy read keeps the existing lifecycle sentence, unchanged.
     assert.match(sectionStatusLine(fakeStore('ok')).text, /Claudexor ready/);
+});
+
+// ---------------------------------------------------------------------------
+// Per-facet provenance has to reach the PIXELS, not just the banner. This panel
+// renders three reads at once — the rows come from the accounts read, the
+// windows from the quota read, the bare Connect rows from the catalog — and it
+// used to render all three off the retained snapshot while consulting one facet
+// for the sentence above them. After a refused read it said nothing could be
+// listed while a stale row sat below it, still labeled "verified live".
+// ---------------------------------------------------------------------------
+
+function storeWithReads(reads, extra = {}) {
+    // A REAL store over a payload that carries the backend's per-facet stamps,
+    // so the whole chain (wire → facets → copy) is exercised, not a hand-built
+    // double of it.
+    return createClaudexorStatusStore({
+        fetchImpl: async () => ({
+            ok: true,
+            status: 200,
+            json: async () => ({
+                daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
+                config_dir: '/home/agent',
+                harnesses: [{ id: 'codex' }],
+                profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }], profiles: [] },
+                quota: [],
+                reads,
+                ...extra,
+            }),
+        }),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+}
+
+test('the ONE section line names the SECOND gap, instead of dropping it silently', async () => {
+    const quotaDied = storeWithReads({ catalog: 'ok', accounts: 'ok', quota: 'failed' });
+    await quotaDied.refresh();
+    const line = sectionStatusLine(quotaDied);
+    assert.match(line.text, /Claudexor ready/, 'the accounts facet is healthy, so its own line stands');
+    assert.match(line.text, /Subscription limits could not be read/, 'and the refused read is NAMED');
+    assert.match(line.text, /last known/);
+    quotaDied.dispose();
+
+    const catalogDied = storeWithReads({ catalog: 'failed', accounts: 'ok', quota: 'ok' });
+    await catalogDied.refresh();
+    assert.match(sectionStatusLine(catalogDied).text, /Agents could not be read/);
+    catalogDied.dispose();
+
+    const accountsDied = storeWithReads({ catalog: 'ok', accounts: 'failed', quota: 'ok' });
+    await accountsDied.refresh();
+    const accountsLine = sectionStatusLine(accountsDied);
+    assert.match(accountsLine.text, /Your agent accounts could not be read/);
+    assert.doesNotMatch(accountsLine.text, /Claudexor ready/, 'never the green line over an undelivered list');
+    // A daemon that could not be read is NEVER reported as a daemon that is not
+    // running — the live endpoint answers `unreachable` for a single refused
+    // read, and the panel used to print "the agent daemon is not running".
+    assert.doesNotMatch(accountsLine.text, /not running/);
+    accountsDied.dispose();
+
+    // All three read: one sentence, nothing appended.
+    const healthy = storeWithReads({ catalog: 'ok', accounts: 'ok', quota: 'ok' });
+    await healthy.refresh();
+    assert.doesNotMatch(sectionStatusLine(healthy).text, /could not be read/);
+    healthy.dispose();
+
+    // All three in the SAME gap: the leading sentence already covers them.
+    const allDown = storeWithReads({ catalog: 'not_read', accounts: 'not_read', quota: 'not_read' });
+    await allDown.refresh();
+    assert.equal(sectionStatusLine(allDown).text.match(/could not be read/g), null);
+    allDown.dispose();
+});
+
+test('each row projection is gated by ITS OWN facet, and a stale value says it is last known', () => {
+    const row = {
+        harness: 'codex', profile_id: '', kind: 'native', identity: {},
+        status: { verification: 'passed', verification_source: 'vendor', last_verified_at: '2026-08-09' },
+    };
+    const payload = { quota: [{
+        subject: { harness: 'codex', subject_id: '' },
+        freshness: 'fresh',
+        constraints: [{ used_ratio: 1.0, resets_at: '2026-08-09T12:00:00Z' }],
+    }] };
+
+    // Both facets read: exactly today's row.
+    const fresh = accountRowFacts(row, payload, { accountsKnown: true, quotaKnown: true });
+    assert.equal(fresh.badge.tone, 'ok');
+    assert.match(fresh.badge.label, /^verified live/);
+    assert.equal(fresh.quota.exhausted, true);
+    assert.match(fresh.quota.label, /window exhausted/);
+
+    // The QUOTA read refused: the window is memory, so it is labeled and it
+    // stops painting the row red — the reset it promises may already have come.
+    const staleQuota = accountRowFacts(row, payload, { accountsKnown: true, quotaKnown: false });
+    assert.equal(staleQuota.badge.tone, 'ok', 'the accounts facet is untouched by the quota gap');
+    assert.equal(staleQuota.quota.exhausted, false);
+    assert.match(staleQuota.quota.label, /last known/);
+
+    // The ACCOUNTS read refused: the row is memory of an account, so its
+    // verification claim is dated — and the window, read fine, is not.
+    const staleAccount = accountRowFacts(row, payload, { accountsKnown: false, quotaKnown: true });
+    assert.match(staleAccount.badge.label, /last known/);
+    assert.equal(staleAccount.badge.tone, 'muted', 'no green "verified live" over a read that never landed');
+    assert.equal(staleAccount.quota.exhausted, true);
+    assert.doesNotMatch(staleAccount.quota.label, /last known/);
+
+    // The default is the fresh reading, so nothing else changes shape.
+    assert.deepEqual(accountRowFacts(row, payload), fresh);
+    assert.deepEqual(verificationBadge(row), fresh.badge);
 });

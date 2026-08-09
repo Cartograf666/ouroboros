@@ -12,12 +12,16 @@
 
 import {
     FACET_ACCOUNTS,
+    FACET_CATALOG,
+    FACET_QUOTA,
     READ_FAILED,
     READ_OK,
     READ_TRANSPORT,
     READ_UNREAD,
     accountRows,
+    bindStatusSurface,
     claudexorStatus,
+    facetGapClause,
     statusUnavailableNote,
 } from './claudexor_status_store.js';
 import { openConfirmDialog } from './confirm_dialog.js';
@@ -28,7 +32,7 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
 // Pure helpers.
 // ---------------------------------------------------------------------------
 
-export function verificationBadge(profile) {
+export function verificationBadge(profile, { known = true } = {}) {
     // Q2-а: both statuses are shown honestly — vendor-verified is trusted,
     // local-store presence stays labeled "not verified live" in WORDS, but in
     // a NEUTRAL tone (owner finding #2): the engine has no vendor probe for
@@ -39,16 +43,27 @@ export function verificationBadge(profile) {
     const source = String(status.verification_source || '');
     const verification = String(status.verification || '');
     const at = String(status.last_verified_at || '');
-    if (source === 'vendor' && verification === 'passed') {
-        return { tone: 'ok', label: `verified live${at ? ` ${at}` : ''}` };
-    }
-    if (verification === 'passed') {
-        return { tone: 'muted', label: 'local session — not verified live' };
-    }
-    if (verification) {
-        return { tone: 'error', label: `verification ${verification}` };
-    }
-    return { tone: 'muted', label: 'not logged in' };
+    const badge = () => {
+        if (source === 'vendor' && verification === 'passed') {
+            return { tone: 'ok', label: `verified live${at ? ` ${at}` : ''}` };
+        }
+        if (verification === 'passed') {
+            return { tone: 'muted', label: 'local session — not verified live' };
+        }
+        if (verification) {
+            return { tone: 'error', label: `verification ${verification}` };
+        }
+        return { tone: 'muted', label: 'not logged in' };
+    };
+    const value = badge();
+    // `known` = the ACCOUNTS facet was really read. Otherwise this row is the
+    // retained snapshot's memory of an account, and painting a green "verified
+    // live" over a read that never landed is the same lie as the banner's — the
+    // panel used to say nothing could be listed while a stale row sat below it
+    // dressed as verified. The row survives (it is the only Connect affordance
+    // some harnesses have); only its claim is dated.
+    if (known) return value;
+    return { tone: 'muted', label: `${value.label} — last known` };
 }
 
 export function quotaSummary(snapshots, harnessId, subjectId = '') {
@@ -257,13 +272,33 @@ export function renderHarnessAccountsSection() {
     `;
 }
 
-function rowHtml(row, payload) {
-    const badge = verificationBadge(row);
-    const quota = quotaSummary(payload?.quota || [], row.harness, row.profile_id);
-    const identity = [row.identity?.email, row.identity?.plan].filter(Boolean).join(' · ');
-    const name = row.kind === 'native'
-        ? `${row.harness} — default account`
-        : `${row.harness} — ${row.profile_id}`;
+export function accountRowFacts(row, payload, { accountsKnown = true, quotaKnown = true } = {}) {
+    // Each projection is gated by ITS OWN facet: the row is the ACCOUNTS read,
+    // the window is the QUOTA read, and one lands while the other refuses. The
+    // panel used to render both off the retained snapshot regardless, so after
+    // a refused read the banner said nothing could be listed while a stale row
+    // sat underneath it showing "verified live" and a red exhausted window.
+    // Pure, because that rule is the thing worth pinning.
+    const measured = quotaSummary(payload?.quota || [], row.harness, row.profile_id);
+    return {
+        badge: verificationBadge(row, { known: accountsKnown }),
+        // A window nobody could re-read is last known — and never painted red:
+        // the exhausted styling is a claim about RIGHT NOW, and the reset it
+        // promises may already have happened.
+        quota: quotaKnown ? measured : {
+            ...measured,
+            exhausted: false,
+            label: measured.label ? `${measured.label} (last known)` : '',
+        },
+        identity: [row.identity?.email, row.identity?.plan].filter(Boolean).join(' · '),
+        name: row.kind === 'native'
+            ? `${row.harness} — default account`
+            : `${row.harness} — ${row.profile_id}`,
+    };
+}
+
+function rowHtml(row, payload, facets = {}) {
+    const { badge, quota, identity, name } = accountRowFacts(row, payload, facets);
     return `
         <div class="harness-account-row${quota.exhausted ? ' harness-exhausted' : ''}" data-harness="${escapeHtml(row.harness)}" data-profile="${escapeHtml(row.profile_id)}">
             <div class="harness-account-main">
@@ -302,12 +337,22 @@ export function sectionStatusLine(store) {
     // that was never delivered. Every other state is the existing lifecycle
     // line, which already names each not-running daemon state precisely.
     const accounts = store.facet(FACET_ACCOUNTS);
-    if (accounts === READ_TRANSPORT || accounts === READ_FAILED) {
-        return store.unavailableNote(FACET_ACCOUNTS);
-    }
-    return daemonStatusLine(store.snapshot || {}, {
-        checking: store.loading && !store.everSettled,
-    });
+    const base = (accounts === READ_TRANSPORT || accounts === READ_FAILED)
+        ? store.unavailableNote(FACET_ACCOUNTS)
+        : daemonStatusLine(store.snapshot || {}, {
+            checking: store.loading && !store.everSettled,
+        });
+    // …and the ONE line also names the OTHER facets this panel renders. It used
+    // to consult the accounts facet alone while the rows came from the catalog
+    // and the windows from the quota read, so a refused quota read left an
+    // exhausted-window claim on screen under a line that said everything was
+    // fine. A gap in the SAME state as the accounts facet is already covered by
+    // the sentence above and is not repeated.
+    const reads = store.reads || {};
+    const clause = facetGapClause(reads, [FACET_CATALOG, FACET_QUOTA]
+        .filter((facet) => reads[facet] !== accounts));
+    if (!clause) return base;
+    return { ...base, tone: base.tone === 'error' ? 'error' : 'warn', text: `${base.text} ${clause}` };
 }
 
 export function bareRowStatusText(accountsRead) {
@@ -334,7 +379,9 @@ function renderRows() {
     const rows = accountRows(payload);
     const bare = harnessesWithoutRows(payload, rows);
     const bareStatus = bareRowStatusText(state.store.facet(FACET_ACCOUNTS));
-    const parts = rows.map((row) => rowHtml(row, payload));
+    const accountsKnown = state.store.accountsKnown;
+    const quotaKnown = state.store.quotaKnown;
+    const parts = rows.map((row) => rowHtml(row, payload, { accountsKnown, quotaKnown }));
     for (const harness of bare) {
         parts.push(`
             <div class="harness-account-row" data-harness="${escapeHtml(harness)}" data-profile="">
@@ -402,24 +449,15 @@ export function initHarnessAccounts({ store = claudexorStatus } = {}) {
     ensureLoginCard();
     document.getElementById('btn-harness-refresh')
         ?.addEventListener('click', () => state.store.refresh());
-    // The store polls only while THIS surface is on screen: `.page` is
-    // display:none when inactive, which is exactly what offsetParent reports.
-    state.disposers.push(state.store.subscribe(() => renderRows(), {
-        visible: () => document.getElementById('harness-accounts-rows')?.offsetParent != null,
+    // The SHARED surface binding: the visibility predicate that lets this
+    // section keep the poll armed, and the catch-up read when the panel becomes
+    // reachable — one implementation, released by one disposer. It carries no
+    // tab NAME on purpose: this section is moving to another tab in this very
+    // sprint, and a hardcoded 'providers' would have gone quietly dead there.
+    state.disposers.push(bindStatusSurface(state.store, {
+        listener: () => renderRows(),
+        elementId: 'harness-accounts-rows',
     }));
-    // Reaching the panel is not a visibility CHANGE the store can observe, so
-    // the two activation events stay here — and are released with everything
-    // else (DEVELOPMENT.md «UI resources carry a disposer»).
-    const onPageShown = (event) => {
-        if (event?.detail?.page === 'settings') state.store.refresh();
-    };
-    const onSubtabShown = (event) => {
-        if (event?.detail?.tab === 'providers') state.store.refresh();
-    };
-    window.addEventListener('ouro:page-shown', onPageShown);
-    window.addEventListener('ouro:settings-subtab-shown', onSubtabShown);
-    state.disposers.push(() => window.removeEventListener('ouro:page-shown', onPageShown));
-    state.disposers.push(() => window.removeEventListener('ouro:settings-subtab-shown', onSubtabShown));
     state.initialized = true;
     // The first read must not wait for the poll interval: init runs while the
     // page may not be visible yet, and the panel would sit on "Checking

@@ -28,7 +28,9 @@ import {
     READ_TRANSPORT,
     READ_UNREAD,
     accountRows,
+    bindStatusSurface,
     claudexorStatus,
+    facetGapClause,
     statusUnavailableNote,
 } from './claudexor_status_store.js';
 import { renderSegmentedField } from './page_header.js';
@@ -143,12 +145,24 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
     // controls above it (it did: turning delegation off still read "on by
     // default", because the note was computed from the saved value alone).
     const route = parseSubagentRoute(saved);
+    // This section renders TWO facets: the account list decides the whole view,
+    // and the model select rides the CATALOG. Explaining only the accounts left
+    // a catalog gap silently on screen — the model options would quietly narrow
+    // to whatever the last read happened to hold, with nothing saying so. A
+    // catalog in the same state as the accounts facet is already covered by the
+    // sentence that state produces and is not repeated.
+    const accountsState = statusError ? READ_TRANSPORT : String(accountsRead || '');
+    const catalogClause = facetGapClause({ [FACET_CATALOG]: catalogRead },
+        catalogRead === accountsState ? [] : [FACET_CATALOG]);
+    const view = (value) => (catalogClause
+        ? { ...value, note: `${value.note} ${catalogClause}`.trim() }
+        : value);
     if (!loaded) {
         // Not read YET is not "nothing connected": until the accounts arrive the
         // section states only that it is reading (collect() already guards on the
         // same fact, so this renders nothing it would then author).
-        return { state: 'loading', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
-            note: statusUnavailableNote(READ_UNREAD, { facet: FACET_ACCOUNTS }).text };
+        return view({ state: 'loading', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
+            note: statusUnavailableNote(READ_UNREAD, { facet: FACET_ACCOUNTS }).text });
     }
     // This section renders the ACCOUNTS facet, so that facet alone decides the
     // whole view. "Nobody could be asked", "never asked" and "asked and
@@ -158,13 +172,12 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
     // collect() returned {}; and the never-asked case used to fall through to
     // "no account connected for codex right now", a row-level accusation
     // earned only by a read that actually happened.
-    const readState = statusError ? READ_TRANSPORT : String(accountsRead || '');
-    const unavailable = (readState && readState !== READ_OK && readState !== READ_UNREAD)
-        ? statusUnavailableNote(readState, { error: statusError, facet: FACET_ACCOUNTS })
+    const unavailable = (accountsState && accountsState !== READ_OK && accountsState !== READ_UNREAD)
+        ? statusUnavailableNote(accountsState, { error: statusError, facet: FACET_ACCOUNTS })
         : null;
     if (unavailable) {
-        return { state: 'unknown', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
-            note: unavailable.text };
+        return view({ state: 'unknown', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
+            note: unavailable.text });
     }
     const connected = connectedHarnesses(payload);
     const savedHarness = route.harness;
@@ -174,11 +187,11 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
         // `off` is the owner's own answer and never re-defaults, so promising
         // "turns on by itself" over it would announce an override that will not
         // happen.
-        return route.decided
+        return view(route.decided
             ? { state: 'no_subscription', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
                 note: 'Delegation is off because you turned it off, and it stays off until you turn it back on. No coding-agent subscription is connected right now; sign one in under Providers → Harness Accounts to make delegation available again.' }
             : { state: 'no_subscription', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
-                note: 'No coding-agent subscription is connected, so there is nothing to delegate to. Sign one in under Providers → Harness Accounts and delegation turns on by itself.' };
+                note: 'No coding-agent subscription is connected, so there is nothing to delegate to. Sign one in under Providers → Harness Accounts and delegation turns on by itself.' });
     }
 
     const defaultOn = !route.decided && connected.length > 0;
@@ -233,7 +246,7 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
         state = 'default_on';
         note = 'On by default now that a subscription is connected. Save Settings to apply it — until then subagents still run on the API.';
     }
-    return { state, enabled, harness, model, modelOptions, suffix, options, note };
+    return view({ state, enabled, harness, model, modelOptions, suffix, options, note });
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +398,26 @@ export function applySubagentsSettings(settings) {
     renderRows();
 }
 
+export function renderSignature(store) {
+    // Everything this section RENDERS, so a repaint is skipped only when the
+    // pixels would really be identical. The model list was keyed on its LENGTH,
+    // and a swap at equal count (a harness renaming or replacing a model)
+    // therefore left the section showing the model that no longer exists and
+    // never offering the one that does — the select is built from these very
+    // ids. Compare the ids, not how many of them there are.
+    const snapshot = store.snapshot || {};
+    return [
+        store.reads,
+        store.error,
+        connectedHarnesses(snapshot),
+        (snapshot.harnesses || []).map((harness) => [
+            String(harness?.id || ''),
+            (harness?.models || []).map((model) => String(model?.id || model?.value || model || '')),
+        ]),
+        snapshot.subagent_last_delegation || null,
+    ];
+}
+
 function adoptStoreSnapshot() {
     // includeModels: the same status payload, plus per-harness model discovery
     // for the default-model select. The flag is STICKY on the store, so the
@@ -412,20 +445,23 @@ export function initSubagentsSection({ onChange, store = claudexorStatus } = {})
     state.store = store;
     // Stay in sync with the ONE status read: when the daemon comes up while
     // Settings is open, this section stops saying "could not be listed" without
-    // the owner reloading the page. Re-render only on a state change that this
-    // section actually renders — a repaint on every poll tick would drop the
-    // caret out of a control the owner is using.
+    // the owner reloading the page. That needs the SHARED surface binding — a
+    // bare subscribe() carries no visibility predicate, and the store never
+    // polls for a subscriber that cannot say it is on screen, so nothing ever
+    // arrived to react to. Re-render only on a state change that this section
+    // actually renders: a repaint on every poll tick would drop the caret out
+    // of a control the owner is using.
     let signature = '';
-    state.disposers.push(state.store.subscribe(() => {
-        const next = JSON.stringify([
-            state.store.reads, state.store.error,
-            connectedHarnesses(state.store.snapshot || {}),
-            (state.store.snapshot?.harnesses || []).map((h) => [h?.id, (h?.models || []).length]),
-        ]);
-        adoptStoreSnapshot();
-        if (next === signature) return;
-        signature = next;
-        renderRows();
+    state.disposers.push(bindStatusSurface(state.store, {
+        elementId: 'subagents-rows',
+        includeModels: true,
+        listener: () => {
+            const next = JSON.stringify(renderSignature(state.store));
+            adoptStoreSnapshot();
+            if (next === signature) return;
+            signature = next;
+            renderRows();
+        },
     }));
     // The initial load is driven by settings.js loadSettings(), which awaits
     // reloadSubagentsSection() BEFORE taking the clean-draft baseline — otherwise

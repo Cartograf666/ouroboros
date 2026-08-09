@@ -1,4 +1,4 @@
-// Coding-agent login cards — the host-neutral controller + view (phase 2 seam).
+// Agent login cards — the host-neutral controller + view (phase 2 seam).
 //
 // «Красота-сначала»: the login card is LINK-FIRST — the engine disclosures the
 // sign-in URL (and a one-time code for the codex device flow) through the job
@@ -500,6 +500,16 @@ export function preserveCardFocus(host, swap, doc = typeof document === 'undefin
  * @param {Function} [options.fetchImpl]   transport
  * @param {Function} [options.onSettled]   called after a verdict lands / the card closes
  * @returns {object} controller with start/close/render/dispose
+ *
+ * LIFECYCLE CONTRACT (public — two sibling branches mount this):
+ *   * `close()` and `dispose()` both resolve to a BOOLEAN: whether custody of
+ *     the login job was released (the daemon is provably no longer running it).
+ *     `false` means the card kept the job id on purpose, because the cancel
+ *     could not be proven and a second login must not be started beside it.
+ *   * Neither is ever DROPPED. Transitions queue and run in order, so a close
+ *     that arrives during the create POST is applied to the job that POST
+ *     installs — it used to be answered `false` and forgotten, leaving a live
+ *     server-side job nobody ever cancelled.
  */
 export function createLoginCardController({
     host,
@@ -515,7 +525,7 @@ export function createLoginCardController({
     const ctl = {
         active: null,
         jobTimer: 0,
-        transitionBusy: false,
+        transitionChain: Promise.resolve(),
         releaseHold: null,
         disposed: false,
     };
@@ -539,6 +549,11 @@ export function createLoginCardController({
         ctl.jobTimer = 0;
     }
 
+    function clearHost() {
+        const hostEl = getHost();
+        if (hostEl) hostEl.innerHTML = '';
+    }
+
     function render() {
         const hostEl = getHost();
         if (!hostEl) return;
@@ -550,20 +565,22 @@ export function createLoginCardController({
         wireLoginCard(hostEl, active);
     }
 
-    async function withLoginTransition(fn) {
-        // ONE lock for EVERY login lifecycle transition (C7): start AND
-        // dismiss. Each transition is an async section that reads and replaces
+    function withLoginTransition(fn) {
+        // ONE QUEUE for EVERY login lifecycle transition (C7): start, close and
+        // shutdown. Each transition is an async section that reads and replaces
         // ctl.active across awaits (create POST while jobId is still '';
-        // cancel DELETE while a start could run) — serializing only the starts
-        // left the dismiss-vs-start overlap able to drop custody of a live job.
-        if (ctl.transitionBusy) return false;
-        ctl.transitionBusy = true;
-        try {
-            await fn();
-            return true;
-        } finally {
-            ctl.transitionBusy = false;
-        }
+        // cancel DELETE while a start could run), so they must not interleave.
+        //
+        // It used to be a try-LOCK that DROPPED whatever arrived while another
+        // transition ran, and dropping a close is not a small loss: a Close
+        // pressed during the create POST answered "false" and vanished, the
+        // POST then installed a live job, and no DELETE was ever issued — the
+        // daemon kept running a sign-in for a card the owner had dismissed.
+        // Queued instead, every transition runs in order and observes the world
+        // the previous one left, so the close applies to the job it created.
+        const run = ctl.transitionChain.then(() => fn(), () => fn());
+        ctl.transitionChain = run.then(() => {}, () => {});
+        return run;
     }
 
     function wireLoginCard(hostEl, active) {
@@ -600,46 +617,71 @@ export function createLoginCardController({
         hostEl.querySelector('[data-login-dismiss]')?.addEventListener('click', () => close(active));
     }
 
+    async function _closeLocked(expected, { shuttingDown = false } = {}) {
+        // The ONE proven-cancel path. Close and shutdown differ in exactly two
+        // places, both marked below; everything about custody is shared, so a
+        // job can never be released down one path on evidence the other would
+        // have refused.
+        const active = ctl.active;
+        if (!active) {
+            if (shuttingDown) { stopJobPolling(); releaseStatusPolling(); clearHost(); }
+            return true;
+        }
+        if (expected !== undefined && active !== expected) return false;
+        if (active.jobId && !jobStateSummary(active.job || {}).terminal) {
+            // C7: the job id of a possibly-live login is never dropped on an
+            // UNPROVEN cancel — clearing it would let the next start bypass the
+            // serialization guard. The card stays with an honest error until
+            // the daemon confirms the job is gone.
+            const gone = await cancelLoginJob(active.jobId, fetchImpl);
+            // Belt: the queue already excludes concurrent transitions, but an
+            // identity drift across the await must never clear a job this
+            // handler does not own.
+            if (ctl.active !== active) return false;
+            // A poll tick may have settled the job while the DELETE was in
+            // flight: a terminal job needs no cancel, the user asked the card
+            // to close — fall through to the clear instead of freezing a
+            // settled card on a stale cancel error.
+            const settledMeanwhile = loginSettleProven(active);
+            if (!gone && !settledMeanwhile) {
+                active.error = 'Could not cancel this sign-in — it may still be running. '
+                    + 'Try dismissing again once the daemon is reachable.';
+                if (shuttingDown) {
+                    // DIFFERENCE 1: the host is going away either way, so the
+                    // error has no surface left to render on — but custody is
+                    // RETAINED (ctl.active keeps the job id) and the caller is
+                    // told `false`, because the daemon may still be running it.
+                    stopJobPolling();
+                    releaseStatusPolling();
+                    clearHost();
+                } else {
+                    render();
+                }
+                return false;
+            }
+        }
+        stopJobPolling();
+        releaseStatusPolling();
+        ctl.active = null;
+        // DIFFERENCE 2: a shutdown has no card to repaint and no host to notify
+        // — it clears the surface and stays silent.
+        if (shuttingDown) { clearHost(); return true; }
+        render();
+        store?.refresh?.();
+        onSettled();
+        return true;
+    }
+
     /**
      * Close the card, cancelling a still-live job first (C7).
      * @param {object} [expected] when given, a no-op unless it is still the
      *        active job — stale wiring from a rebuilt card must never clear a
      *        job it does not own.
+     * @returns {Promise<boolean>} whether custody was released (see the
+     *        lifecycle contract above): `false` means a live job is still held.
      */
     function close(expected = undefined) {
-        return withLoginTransition(async () => {
-            const active = ctl.active;
-            if (!active) return;
-            if (expected !== undefined && active !== expected) return;
-            if (active.jobId && !jobStateSummary(active.job || {}).terminal) {
-                // C7: the job id of a possibly-live login is never dropped on
-                // an UNPROVEN cancel — clearing it would let the next start
-                // bypass the serialization guard. The card stays with an
-                // honest error until the daemon confirms the job is gone.
-                const gone = await cancelLoginJob(active.jobId, fetchImpl);
-                // Belt: the lock already excludes concurrent transitions, but
-                // an identity drift across the await must never clear a job
-                // this handler does not own.
-                if (ctl.active !== active) return;
-                // A poll tick may have settled the job while the DELETE was in
-                // flight: a terminal job needs no cancel, the user asked the
-                // card to close — fall through to the clear instead of
-                // freezing a settled card on a stale cancel error.
-                const settledMeanwhile = loginSettleProven(active);
-                if (!gone && !settledMeanwhile) {
-                    active.error = 'Could not cancel this sign-in — it may still be running. '
-                        + 'Try dismissing again once the daemon is reachable.';
-                    render();
-                    return;
-                }
-            }
-            stopJobPolling();
-            releaseStatusPolling();
-            ctl.active = null;
-            render();
-            store?.refresh?.();
-            onSettled();
-        });
+        return withLoginTransition(() => _closeLocked(expected));
     }
 
     async function submitCodeFromCard(active) {
@@ -691,6 +733,10 @@ export function createLoginCardController({
     }
 
     async function _startLocked(harness, profile) {
+        // Re-read after the queue wait: a shutdown may have been queued ahead of
+        // this start, and a disposed controller must not create a job nobody
+        // will ever poll or cancel.
+        if (ctl.disposed) return;
         // C7 (plan roast, accepted): a NEW login may start only once the previous
         // job is terminal or PROVABLY cancelled — a second job beside a live one
         // races the daemon and orphans the old job server-side. Centralized HERE
@@ -731,12 +777,19 @@ export function createLoginCardController({
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
             });
-            const data = await resp.json().catch(() => ({}));
+            const data = await resp.json().catch(() => null);
             if (ctl.active !== active) return;
-            if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+            if (!resp.ok) throw new Error(data?.error || `HTTP ${resp.status}`);
+            // A 2xx is not a created job. Without a job id there is nothing to
+            // poll, nothing to cancel and nothing to report: the card used to
+            // accept such an answer and sit "Starting the sign-in…" forever,
+            // with no error and no way out. Fail here instead, where the error
+            // face and its Try again already exist.
+            const jobId = String(data?.job_id || '');
+            if (!jobId) throw new Error('the sign-in service returned no job id');
             active.preparingRuntime = false;
-            active.jobId = String(data.job_id || '');
-            active.job = data.job || {};
+            active.jobId = jobId;
+            active.job = data.job && typeof data.job === 'object' ? data.job : {};
             active.attachCommand = String(data.attach_command || '');
             // An engine that predates the disclosure modes never sends a link;
             // the demoted Advanced fallback may show right away (still collapsed).
@@ -771,19 +824,29 @@ export function createLoginCardController({
             let readOk = false;
             try {
                 const resp = await fetchImpl(`/api/claudexor/login/${encodeURIComponent(active.jobId)}`, { cache: 'no-store' });
-                const data = await resp.json().catch(() => ({}));
+                const data = await resp.json().catch(() => null);
                 // The CREATE answer is the only authority on whether this job has a
                 // copy-paste command: it issues one exactly for a client_pty job,
                 // while the poll route hands one back for every job including the
                 // daemon-transport codex device flow, which must never show it.
-                if (resp.ok) {
-                    snapshot = data.job || null;
+                //
+                // A poll answer without a `job` object is a PROTOCOL failure, not
+                // a healthy read: the route answers {job, attach_command} on every
+                // success, so a 2xx carrying no job tells us nothing about the
+                // login. Counting it as a success reset the failure streak, and a
+                // stream of such answers polled forever — the documented ten-failure
+                // give-up was unreachable, and the card stayed pending for good.
+                const job = data && typeof data.job === 'object' && data.job !== null
+                    && !Array.isArray(data.job) ? data.job : null;
+                if (resp.ok && job) {
+                    snapshot = job;
                     readOk = true;
                 }
             } catch (err) { /* transient poll failure; the chain retries with backoff */ }
             if (!pollResponseApplies(active, ctl.active)) return;
-            // ANY parsed answer (a pending snapshot included) resets the failure
-            // streak — a legitimate multi-minute sign-in must never trip give-up.
+            // ANY answer that CARRIED A JOB (a pending snapshot included) resets the
+            // failure streak — a legitimate multi-minute sign-in must never trip
+            // give-up — and everything else counts toward the same bounded give-up.
             consecutiveFailures = readOk ? 0 : consecutiveFailures + 1;
             if (snapshot) active.job = snapshot;
             if (readOk && active.error) {
@@ -860,11 +923,32 @@ export function createLoginCardController({
         onSettled();
     }
 
+    /**
+     * Shut the controller down: wait for an in-flight transition (a create POST
+     * owns the queue while its job id is still unknown), then run the SAME
+     * proven-cancel path Close uses, and clear the host either way.
+     *
+     * It used to be synchronous and blind: it cleared `ctl.active`, released
+     * the hold and returned — with no DELETE for a live job and the rendered
+     * card still on screen. Both matter beyond Settings, because the onboarding
+     * wizard mounts this controller on a step the owner can cancel mid-login.
+     *
+     * @returns {Promise<boolean>} whether custody was released. `false` = the
+     *        cancel could not be proven, so the job id is deliberately retained
+     *        (readable through `active`) rather than forgotten.
+     */
     function dispose() {
+        if (ctl.disposed) {
+            // Idempotent: a second disposer call must neither re-DELETE nor
+            // wait on anything, and must not answer "released" over a retained
+            // job it never proved gone.
+            stopJobPolling();
+            releaseStatusPolling();
+            return Promise.resolve(!ctl.active);
+        }
+        // Set FIRST: no new start may be queued behind the shutdown.
         ctl.disposed = true;
-        stopJobPolling();
-        releaseStatusPolling();
-        ctl.active = null;
+        return withLoginTransition(() => _closeLocked(undefined, { shuttingDown: true }));
     }
 
     return {

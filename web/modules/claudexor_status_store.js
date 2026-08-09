@@ -29,9 +29,17 @@
 // Only `ok` licenses a row-level "(not in discovery)" claim.
 //
 // Wire contract: the backend stamps `payload.reads = {catalog, accounts,
-// quota}`. A payload WITHOUT that block is read legacy-style — a running
-// daemon meant every facet was read, anything else meant none were — so this
-// store works unchanged on both, and gains precision the day the field lands.
+// quota}`. A payload WITHOUT that block is read legacy-style from the daemon
+// state, so this store works unchanged on both wires and gains precision the
+// day the field lands. Two rules keep the legacy path honest:
+//   * A `reads` block that is PRESENT but not a valid stamp is a protocol
+//     failure, never an excuse to fall back to the global verdict — a partial
+//     `{catalog: ok}` used to make all three facets `ok`, which is the same
+//     collapse in the other direction.
+//   * `unreachable` is NOT `stopped`. The endpoint turns a refusal in ANY of
+//     its fanned-out reads into one global `daemon.state = unreachable`, so
+//     that state means «the status could not be read», and only the states
+//     that genuinely mean a stopped daemon may print the stopped sentence.
 //
 // Polling is a held resource, not a background fact: the store ticks only
 // while it has subscribers, the page is visible, and either some subscriber
@@ -64,18 +72,40 @@ export const STATUS_FACETS = [FACET_CATALOG, FACET_ACCOUNTS, FACET_QUOTA];
 // Pure helpers.
 // ---------------------------------------------------------------------------
 
+// The states a PAYLOAD may stamp. `transport` and `unread` are client-side
+// facts and are never accepted off the wire.
+const WIRE_READ_STATES = new Set([READ_OK, READ_NOT_READ, READ_FAILED]);
+
+// The daemon states that GENUINELY mean the daemon is not running — the only
+// ones the «not running» sentence may be printed for. Everything else that is
+// not `running` (notably `unreachable`, which the endpoint also emits when a
+// RUNNING daemon refused one of the fanned-out reads, plus any state spelling
+// this client does not know) means the status could not be read.
+export const DAEMON_STATES_STOPPED = ['stale', 'not_provisioned', 'foreign_daemon'];
+const STOPPED = new Set(DAEMON_STATES_STOPPED);
+
 export function facetReadState(payload, facet, { transportError = '' } = {}) {
     // The ONE place that decides what an empty collection MEANS, for ONE facet.
     // A request that never arrived outranks whatever the last payload said: the
     // held snapshot describes a past read, never the current one.
     if (transportError) return READ_TRANSPORT;
-    const reads = payload && typeof payload === 'object' ? payload.reads : null;
-    const stamped = reads ? String(reads[facet] || '') : '';
-    if (stamped === READ_OK || stamped === READ_NOT_READ || stamped === READ_FAILED) return stamped;
+    const body = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null;
+    if (body && 'reads' in body) {
+        // The stamp EXISTS, so it — and only it — answers. A malformed or
+        // partial block fails CLOSED: a 2xx is not a promise of meaning, and
+        // guessing from the global verdict is exactly the collapse this store
+        // was extracted to end.
+        const reads = body.reads;
+        const stamped = reads && typeof reads === 'object' && !Array.isArray(reads)
+            ? String(reads[facet] || '') : '';
+        return WIRE_READ_STATES.has(stamped) ? stamped : READ_FAILED;
+    }
     // LEGACY payload (a backend without the `reads` block, or a fixture that
-    // predates it): the daemon state carries exactly this fact — running meant
-    // every facet was read, anything else meant none were.
-    return String(payload?.daemon?.state || '') === 'running' ? READ_OK : READ_NOT_READ;
+    // predates it): the daemon state carries the same fact at coarser
+    // resolution — but only the genuinely-stopped states mean «never asked».
+    const state = String(body?.daemon?.state || '');
+    if (state === 'running') return READ_OK;
+    return STOPPED.has(state) ? READ_NOT_READ : READ_FAILED;
 }
 
 export function readsFor(payload, { transportError = '' } = {}) {
@@ -103,12 +133,34 @@ export function shouldPollStatus({
     return Boolean(held || surfaceVisible);
 }
 
-// What each facet is CALLED in a sentence to the owner.
+// What each facet is CALLED in a sentence to the owner. NOT "coding agents":
+// the owner retired that word for new copy because these agents are used for
+// far more than code (D-10).
 const FACET_SUBJECT = {
-    [FACET_CATALOG]: 'coding agents',
-    [FACET_ACCOUNTS]: 'coding-agent accounts',
+    [FACET_CATALOG]: 'agents',
+    [FACET_ACCOUNTS]: 'agent accounts',
     [FACET_QUOTA]: 'subscription limits',
 };
+
+export function facetGapClause(reads, facets = []) {
+    // ONE clause naming the OTHER facets a surface renders that were not read,
+    // so a surface can explain its primary gap without silently dropping the
+    // second one. Every surface projects more than one facet — the accounts
+    // panel renders rows AND quota, the reviewer rows render the catalog AND
+    // account pins — and a banner that consults a single facet leaves a stale
+    // value on screen dressed as a fresh one. '' when they were all read.
+    const gaps = (facets || []).filter((name) => {
+        const state = reads ? reads[name] : '';
+        return Boolean(state) && state !== READ_OK && state !== READ_UNREAD;
+    });
+    if (!gaps.length) return '';
+    const subjects = gaps.map((name) => FACET_SUBJECT[name] || name);
+    const list = subjects.length > 1
+        ? `${subjects.slice(0, -1).join(', ')} and ${subjects[subjects.length - 1]}`
+        : subjects[0];
+    return `${list.charAt(0).toUpperCase()}${list.slice(1)} could not be read, so anything `
+        + `shown for ${gaps.length > 1 ? 'them' : 'it'} is last known.`;
+}
 
 export function statusUnavailableNote(readState, { error = '', facet = FACET_ACCOUNTS } = {}) {
     // ONE sentence per read state, shared by every consumer, so the app cannot
@@ -140,11 +192,15 @@ export function statusUnavailableNote(readState, { error = '', facet = FACET_ACC
         };
     }
     if (readState === READ_FAILED) {
-        // The daemon IS running and one read refused: telling the owner it is
-        // not running would be a second lie, and its siblings stay authoritative.
+        // The read did not land. That covers a RUNNING daemon refusing this one
+        // read, an `unreachable` answer (which the endpoint also emits when one
+        // fanned-out read of several refused), and a stamp this client cannot
+        // trust. In every one of them telling the owner the daemon is not
+        // running would be a second lie — so the sentence stops at what is
+        // known: the status could not be read. Siblings stay authoritative.
         return {
             tone: 'warn', action: null,
-            text: `The agent daemon did not answer for your ${subject}${error ? ` (${error})` : ''}. `
+            text: `Your ${subject} could not be read${error ? ` (${error})` : ''}. `
                 + 'Nothing below is missing or wrong — your saved choices are unchanged.',
         };
     }
@@ -152,6 +208,18 @@ export function statusUnavailableNote(readState, { error = '', facet = FACET_ACC
         return { tone: 'muted', action: null, text: `Reading your ${subject}…` };
     }
     return null;
+}
+
+export function statusPayloadValid(payload) {
+    // The MINIMUM schema a status answer must satisfy before any facet is
+    // derived from it. A 2xx is a transport fact, not a semantic one: a 200
+    // carrying non-JSON (or an unrelated body) parsed to `{}` and then sailed
+    // through every facet derivation as if the daemon had answered. `daemon`
+    // is unconditional in the endpoint's own payload, so its absence means the
+    // body is not a status answer at all.
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+    const daemon = payload.daemon;
+    return Boolean(daemon) && typeof daemon === 'object' && !Array.isArray(daemon);
 }
 
 export function accountRows(payload) {
@@ -342,9 +410,17 @@ export function createClaudexorStatusStore({
             let error = '';
             try {
                 const resp = await fetchImpl(url, { cache: 'no-store' });
-                const data = await resp.json().catch(() => ({}));
-                if (resp && resp.ok) payload = data;
-                else error = String((data && data.error) || `HTTP ${resp ? resp.status : 'error'}`);
+                const data = await resp.json().catch(() => null);
+                if (!resp || !resp.ok) {
+                    error = String((data && data.error) || `HTTP ${resp ? resp.status : 'error'}`);
+                } else if (statusPayloadValid(data)) {
+                    payload = data;
+                } else {
+                    // A 200 whose body is not a status answer is a PROTOCOL
+                    // failure, not an empty world: deriving facets from it would
+                    // hand every consumer a confident "nothing is connected".
+                    error = 'the status answer could not be understood';
+                }
             } catch (err) {
                 error = String(err?.message || err);
             }
@@ -467,7 +543,17 @@ export function createClaudexorStatusStore({
         get subscriberCount() { return inner.listeners.size; },
         facet,
         unavailableNote(name = FACET_ACCOUNTS) {
-            return statusUnavailableNote(facet(name), { error: inner.error, facet: name });
+            // The detail beside the sentence: a transport error when the request
+            // itself died, otherwise — for a read that did not land — the
+            // daemon's OWN last_error. On a legacy payload that string is the
+            // only explanation of an `unreachable` answer there is, and routing
+            // that state to the shared sentence would otherwise have dropped it.
+            // Deliberately NOT attached to `not_read`: the stopped-daemon line
+            // stays calm on purpose (a crashed daemon also lands in `stale`).
+            const state = facet(name);
+            const detail = inner.error
+                || (state === READ_FAILED ? String(inner.snapshot?.daemon?.last_error || '') : '');
+            return statusUnavailableNote(state, { error: detail, facet: name });
         },
         refresh,
         subscribe,
@@ -478,3 +564,59 @@ export function createClaudexorStatusStore({
 
 // The app-wide instance every UI surface shares.
 export const claudexorStatus = createClaudexorStatusStore();
+
+// The settings shell announces a page and a sub-tab becoming active; reaching a
+// panel is not a visibility CHANGE the store can observe on its own.
+export const SURFACE_ACTIVATION_EVENTS = ['ouro:page-shown', 'ouro:settings-subtab-shown'];
+
+/**
+ * Bind ONE surface to the shared store: a subscription that can actually keep
+ * the poll armed, plus a catch-up read when the surface becomes reachable.
+ *
+ * Deliberately NAME-FREE. The three consumers used to hardcode which tab they
+ * lived on — and two of them supplied neither a visibility predicate nor an
+ * activation hook, so their comments promised "the daemon recovering is picked
+ * up without a reload" while the store never polled for them at all. The rule
+ * here is structural: an element that is on screen (an inactive `.page` /
+ * `.settings-panel` is display:none, which is exactly what `offsetParent`
+ * reports) is a visible surface, wherever the sprint later moves the section.
+ *
+ * @param {object} store the shared status store
+ * @param {object} options
+ * @param {Function} options.listener called with the store view on every settle
+ * @param {string} options.elementId id of the element that IS this surface
+ * @param {boolean} [options.includeModels] the activation read needs discovery
+ * @returns {Function} one disposer releasing the subscription and the listeners
+ */
+export function bindStatusSurface(store, {
+    listener = () => {},
+    elementId = '',
+    includeModels = false,
+    doc = () => (typeof document === 'undefined' ? null : document),
+    win = () => (typeof window === 'undefined' ? null : window),
+    activationEvents = SURFACE_ACTIVATION_EVENTS,
+} = {}) {
+    const getDoc = typeof doc === 'function' ? doc : () => doc;
+    const getWin = typeof win === 'function' ? win : () => win;
+    const visible = () => {
+        if (!elementId) return true;
+        const el = getDoc()?.getElementById?.(elementId);
+        return Boolean(el) && el.offsetParent != null;
+    };
+    const disposers = [store.subscribe(listener, { visible })];
+    const target = getWin();
+    if (target && typeof target.addEventListener === 'function') {
+        // Activation is judged by the SAME predicate, so a tab that is not this
+        // surface's tab costs nothing and this surface needs no name for its own.
+        const onActivated = () => { if (visible()) store.refresh({ includeModels }); };
+        for (const name of activationEvents) {
+            target.addEventListener(name, onActivated);
+            disposers.push(() => target.removeEventListener(name, onActivated));
+        }
+    }
+    return () => {
+        for (const dispose of disposers.splice(0)) {
+            try { dispose(); } catch (err) { /* a broken disposer must not block the rest */ }
+        }
+    };
+}

@@ -18,7 +18,13 @@
 // Pure helpers live at the top and are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
-import { FACET_CATALOG, claudexorStatus } from './claudexor_status_store.js';
+import {
+    FACET_ACCOUNTS,
+    FACET_CATALOG,
+    bindStatusSurface,
+    claudexorStatus,
+    facetGapClause,
+} from './claudexor_status_store.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -671,15 +677,30 @@ export async function reloadReviewerSlots() {
     renderRows();
 }
 
+export function reviewerServiceNote(store) {
+    // The section's ONE note. It LEADS with the catalog (this page's primary
+    // subject: which routes and models exist) and then NAMES the account gap
+    // too, because the rows also render account pins — a silently dropped
+    // second gap left pins on screen with no explanation of why they could not
+    // be checked. A facet in the same state as the catalog is already covered
+    // by the leading sentence and is not repeated.
+    const note = store.unavailableNote(FACET_CATALOG);
+    const reads = store.reads || {};
+    const clause = facetGapClause(reads,
+        reads[FACET_ACCOUNTS] === reads[FACET_CATALOG] ? [] : [FACET_ACCOUNTS]);
+    if (!clause) return note;
+    if (!note) return { tone: 'warn', action: null, text: clause };
+    return { ...note, text: `${note.text} ${clause}` };
+}
+
 function adoptStatusSnapshot() {
     // Each facet answers for itself. A never-read catalog and a never-read
     // account store are separate gaps, and neither is evidence that a saved
-    // route or pin no longer exists. The section's ONE note leads with the
-    // catalog (this page's primary subject); a facet that was read keeps its
+    // route or pin no longer exists. A facet that was read keeps its
     // authoritative list either way.
     state.catalogKnown = state.store.catalogKnown;
     state.accountsKnown = state.store.accountsKnown;
-    state.serviceNote = state.store.unavailableNote(FACET_CATALOG);
+    state.serviceNote = reviewerServiceNote(state.store);
     const snapshot = state.store.snapshot || {};
     state.harnesses = state.catalogKnown && Array.isArray(snapshot.harnesses) ? snapshot.harnesses : [];
     state.profilesByHarness = state.accountsKnown ? indexProfilesByHarness(snapshot) : {};
@@ -694,17 +715,24 @@ export function initReviewerSlots({ onChange, store = claudexorStatus } = {}) {
     // blank derived state.
     adoptStatusSnapshot();
     // Follow the shared read: when the daemon comes up while Settings is open
-    // the rows stop claiming "(not in discovery)" without a page reload. Only
-    // a change this section RENDERS repaints — a repaint on every poll tick
-    // would drop the caret out of the API-model field mid-typing.
+    // the rows stop claiming "(not in discovery)" without a page reload. That
+    // promise needs the SHARED surface binding — a bare subscribe() carries no
+    // visibility predicate, and the store never polls for a subscriber that
+    // cannot say it is on screen, so nothing ever arrived to react to. Only a
+    // change this section RENDERS repaints: a repaint on every poll tick would
+    // drop the caret out of the API-model field mid-typing.
     let signature = '';
-    state.disposers.push(state.store.subscribe(() => {
-        adoptStatusSnapshot();
-        const next = JSON.stringify([state.catalogKnown, state.accountsKnown,
-            state.serviceNote?.text || '', state.harnesses, state.profilesByHarness]);
-        if (next === signature) return;
-        signature = next;
-        renderRows();
+    state.disposers.push(bindStatusSurface(state.store, {
+        elementId: 'reviewer-triad-rows',
+        includeModels: true,
+        listener: () => {
+            adoptStatusSnapshot();
+            const next = JSON.stringify([state.catalogKnown, state.accountsKnown,
+                state.serviceNote?.text || '', state.harnesses, state.profilesByHarness]);
+            if (next === signature) return;
+            signature = next;
+            renderRows();
+        },
     }));
     document.getElementById('btn-add-triad-slot')?.addEventListener('click', () => addRow('triad'));
     document.getElementById('btn-add-scope-slot')?.addEventListener('click', () => addRow('scope'));

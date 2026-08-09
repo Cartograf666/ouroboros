@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { createClaudexorStatusStore } from '../modules/claudexor_status_store.js';
+
 import {
     API_ROUTE_CHOICE,
     ROUTE_KIND_API,
@@ -15,6 +17,7 @@ import {
     mintSlotId,
     profileOptionsFor,
     routeChoiceGroups,
+    reviewerServiceNote,
     sessionModelOptions,
     splitSessionTarget,
 } from '../modules/reviewer_slots.js';
@@ -314,4 +317,47 @@ test('facets are independent: an unread ACCOUNT store does not silence the CATAL
     const pins = profileOptionsFor([], 'koshak', { accountsKnown: false });
     assert.doesNotMatch(pins[1].label, /not in discovery/);
     assert.deepEqual(pins.map((o) => o.value), ['', 'koshak']);
+});
+
+test('the ONE service note explains the catalog gap AND names the account gap', async () => {
+    // This section renders two facets — the route/model lists from the catalog,
+    // the account pins from the credential profiles — but the note consulted the
+    // catalog alone. A refused ACCOUNT read left pins on screen with nothing on
+    // the page saying they could not be checked.
+    const store = (reads) => createClaudexorStatusStore({
+        fetchImpl: async () => ({
+            ok: true,
+            status: 200,
+            json: async () => ({ daemon: { state: 'running' }, harnesses: [], profiles: {}, quota: [], reads }),
+        }),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+
+    const accountsDied = store({ catalog: 'ok', accounts: 'failed', quota: 'ok' });
+    await accountsDied.refresh();
+    const onlyAccounts = reviewerServiceNote(accountsDied);
+    assert.match(onlyAccounts.text, /Agent accounts could not be read/);
+    assert.match(onlyAccounts.text, /last known/);
+    accountsDied.dispose();
+
+    const catalogDied = store({ catalog: 'failed', accounts: 'ok', quota: 'ok' });
+    await catalogDied.refresh();
+    const onlyCatalog = reviewerServiceNote(catalogDied);
+    assert.match(onlyCatalog.text, /Your agents could not be read/);
+    assert.doesNotMatch(onlyCatalog.text, /Agent accounts could not be read/, 'a healthy facet is not accused');
+    // …and a read that merely did not land never claims a stopped daemon.
+    assert.doesNotMatch(onlyCatalog.text, /not running/);
+    catalogDied.dispose();
+
+    const both = store({ catalog: 'not_read', accounts: 'not_read', quota: 'not_read' });
+    await both.refresh();
+    const bothNote = reviewerServiceNote(both);
+    assert.match(bothNote.text, /daemon is not running/);
+    assert.equal(bothNote.text.match(/could not be read/g), null, 'one sentence covers both');
+    both.dispose();
+
+    const healthy = store({ catalog: 'ok', accounts: 'ok', quota: 'ok' });
+    await healthy.refresh();
+    assert.equal(reviewerServiceNote(healthy), null, 'nothing to say when everything was read');
+    healthy.dispose();
 });

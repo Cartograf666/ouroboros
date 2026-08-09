@@ -1,15 +1,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { createClaudexorStatusStore } from '../modules/claudexor_status_store.js';
 import { accountRows } from '../modules/harness_accounts.js';
 import {
     DELEGATION_OFF,
+    applySubagentsSettings,
     composeSubagentRoute,
     composeSubagentTail,
     connectedHarnesses,
     delegationView,
+    destroySubagentsSection,
+    initSubagentsSection,
     lastDelegationLine,
     parseSubagentRoute,
+    reloadSubagentsSection,
+    renderSignature,
     splitSubagentTail,
 } from '../modules/subagents_settings.js';
 
@@ -124,7 +130,7 @@ test('before the accounts have been read the section says it is reading, not "no
     const view = delegationView({ saved: '', payload: null, loaded: false });
     assert.equal(view.state, 'loading');
     assert.equal(view.enabled, false);
-    assert.match(view.note, /Reading your coding-agent accounts/);
+    assert.match(view.note, /Reading your agent accounts/);
     assert.doesNotMatch(view.note, /No coding-agent subscription/);
 });
 
@@ -365,4 +371,115 @@ test('a transport failure and a stopped daemon are not the same sentence', () =>
     assert.match(dead.note, /HTTP 503/);
     assert.doesNotMatch(down.note, /HTTP 503/);
     assert.notEqual(dead.note, down.note);
+});
+
+test('a CATALOG gap is named too, instead of being dropped behind the accounts sentence', () => {
+    // This section renders two facets: the accounts decide the view, the model
+    // select rides the catalog. With the accounts read fine and the catalog
+    // refused, the model list quietly narrowed to whatever the last read held
+    // and the note said nothing at all about it.
+    const payload = statusPayload({
+        harnesses: [{ id: 'codex', display_name: 'Codex CLI', models: [{ id: 'gpt-5.6' }] }],
+        native: [{ harness_id: 'codex', native_login_detected: true }],
+    });
+    const gap = delegationView({ saved: 'codex', payload, accountsRead: 'ok', catalogRead: 'failed' });
+    assert.equal(gap.state, 'on', 'the accounts facet still decides the view');
+    assert.match(gap.note, /Agents could not be read/);
+    assert.match(gap.note, /last known/);
+    // The saved model pin keeps its option and loses only the earned claim.
+    assert.doesNotMatch(JSON.stringify(gap.modelOptions), /not in discovery/);
+
+    // A healthy catalog adds nothing…
+    const clean = delegationView({ saved: 'codex', payload, accountsRead: 'ok', catalogRead: 'ok' });
+    assert.doesNotMatch(clean.note, /could not be read/);
+    // …and a catalog in the SAME state as the accounts facet is already covered
+    // by that sentence — it is not repeated.
+    const both = delegationView({ saved: 'codex', payload: null, accountsRead: 'not_read', catalogRead: 'not_read' });
+    assert.match(both.note, /daemon is not running/);
+    assert.equal(both.note.match(/could not be read/g), null);
+});
+
+// ---------------------------------------------------------------------------
+// The live subscription: what makes the section repaint, and whether it can
+// keep the shared poll armed at all.
+// ---------------------------------------------------------------------------
+
+function fakeSurface() {
+    // The minimum this section's renderRows() touches, plus the offsetParent
+    // that answers "is this surface on screen".
+    const host = { innerHTML: '', offsetParent: {}, querySelector: () => null };
+    const doc = {
+        hidden: false,
+        getElementById: (id) => (id === 'subagents-rows' ? host : null),
+        addEventListener() {}, removeEventListener() {},
+    };
+    const win = { addEventListener() {}, removeEventListener() {} };
+    return { host, doc, win };
+}
+
+test('the repaint signature is keyed on model IDENTITY, not on how many there are', () => {
+    // Pure form of the defect: same count, different model.
+    const store = (models) => ({
+        reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+        error: '',
+        snapshot: {
+            daemon: { state: 'running' },
+            harnesses: [{ id: 'codex', display_name: 'Codex CLI', models }],
+            profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }], profiles: [] },
+        },
+    });
+    const before = JSON.stringify(renderSignature(store([{ id: 'old-model' }])));
+    const after = JSON.stringify(renderSignature(store([{ id: 'new-model' }])));
+    assert.notEqual(before, after, 'a model swapped at equal count must change the signature');
+    assert.equal(before, JSON.stringify(renderSignature(store([{ id: 'old-model' }]))), 'and be stable otherwise');
+});
+
+test('a model swapped at EQUAL count really reaches the pixels', async () => {
+    // The subscriber skipped the repaint because the signature counted models
+    // instead of naming them: the section kept offering the model that no
+    // longer exists and never exposed the one that does — and the select is
+    // built from exactly these ids.
+    const { host, doc, win } = fakeSurface();
+    const priorDoc = globalThis.document;
+    const priorWin = globalThis.window;
+    globalThis.document = doc;
+    globalThis.window = win;
+    let models = [{ id: 'old-model' }];
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => ({
+            ok: true,
+            status: 200,
+            json: async () => ({
+                daemon: { state: 'running' },
+                harnesses: [{ id: 'codex', display_name: 'Codex CLI', models }],
+                profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }], profiles: [] },
+            }),
+        }),
+        doc,
+        pollMs: 5000,
+    });
+    try {
+        initSubagentsSection({ store });
+        applySubagentsSettings({ OUROBOROS_SUBAGENT_HARNESS: '' });
+        await reloadSubagentsSection();
+        assert.ok(host.innerHTML.includes('old-model'), host.innerHTML);
+        // The section's own binding is what keeps the shared read alive: a
+        // subscriber with no visibility predicate could never arm the poll.
+        assert.equal(store.polling, true, 'a visible section keeps the shared poll armed');
+
+        models = [{ id: 'new-model' }];
+        await store.refresh();
+        assert.ok(host.innerHTML.includes('new-model'), `the swap must reach the DOM: ${host.innerHTML}`);
+        assert.ok(!host.innerHTML.includes('old-model'), `and the dead model must go: ${host.innerHTML}`);
+
+        // An unchanged payload still does not repaint (the caret guard).
+        host.innerHTML = 'SENTINEL';
+        await store.refresh();
+        assert.equal(host.innerHTML, 'SENTINEL', 'no repaint when nothing this section renders changed');
+    } finally {
+        destroySubagentsSection();
+        store.dispose();
+        globalThis.document = priorDoc;
+        globalThis.window = priorWin;
+    }
 });

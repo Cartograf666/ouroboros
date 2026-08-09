@@ -10,6 +10,7 @@ import test from 'node:test';
 
 import { createClaudexorStatusStore } from '../modules/claudexor_status_store.js';
 import {
+    JOB_POLL_GIVE_UP_FAILURES,
     LOGIN_CARD_COMPACT,
     createLoginCardController,
     loginCardHtml,
@@ -161,9 +162,15 @@ test('an unconfirmed re-check says unknown, never a hard failure', async (t) => 
     t.mock.timers.reset();
 });
 
-test('dispose stops the job poll, releases the store hold, and clears the card', async (t) => {
+test('dispose CANCELS the live job before releasing custody, and clears the card', async (t) => {
+    // It used to clear ctl.active, release the hold and return — with no DELETE
+    // for a live job and the card still on screen. The wizard mounts this
+    // controller on a step the owner can cancel mid-login, so an orphaned job
+    // kept a sign-in running server-side for a card that no longer existed.
     t.mock.timers.enable({ apis: ['setTimeout'] });
     let jobPolls = 0;
+    const calls = [];
+    let custodyAtDelete = 'never issued';
     const store = createClaudexorStatusStore({
         fetchImpl: async () => json(200, statusPayload(false)),
         doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
@@ -175,8 +182,13 @@ test('dispose stops the job poll, releases the store hold, and clears the card',
         host,
         store,
         fetchImpl: async (url, init = {}) => {
+            calls.push(`${init.method || 'GET'} ${url}`);
             if (url === '/api/claudexor/login' && init.method === 'POST') {
                 return json(200, { job_id: 'job-4', job: { state: 'running' } });
+            }
+            if (init.method === 'DELETE') {
+                custodyAtDelete = ctl.active?.jobId || '';
+                return json(200, {});
             }
             jobPolls += 1;
             return json(200, { job: { state: 'running' } });
@@ -184,15 +196,194 @@ test('dispose stops the job poll, releases the store hold, and clears the card',
     });
     await ctl.start('codex', '');
     assert.equal(store.polling, true);
+    assert.ok(host.innerHTML.includes('Connect codex'), 'the card is on screen before the disposer');
 
-    ctl.dispose();
+    const released = await ctl.dispose();
+    assert.ok(calls.includes('DELETE /api/claudexor/login/job-4'),
+        `the live job must be cancelled: ${calls.join(' | ')}`);
+    assert.equal(custodyAtDelete, 'job-4', 'custody was still held WHEN the DELETE went out');
+    assert.equal(released, true, 'a proven cancel releases custody');
+    assert.equal(ctl.active, null, '…and only then');
     assert.equal(store.polling, false, 'the login hold was released');
+    assert.equal(host.innerHTML, '', 'the disposer cleared the rendered card');
     const before = jobPolls;
     t.mock.timers.tick(60000);
     await flush();
     assert.equal(jobPolls, before, 'no job-poll timer survived the disposer');
     ctl.render();
     assert.equal(host.innerHTML, '', 'a disposed controller renders no card');
+    // Idempotent, and it does not re-DELETE.
+    const deletes = calls.filter((c) => c.startsWith('DELETE')).length;
+    assert.equal(await ctl.dispose(), true);
+    assert.equal(calls.filter((c) => c.startsWith('DELETE')).length, deletes);
+    store.dispose();
+    t.mock.timers.reset();
+});
+
+test('a dispose whose cancel is UNPROVEN keeps the job id instead of forgetting it', async (t) => {
+    // Same rule Close has always had (C7): a 5xx/network death means the daemon
+    // may still be running the login, so custody is retained and the caller is
+    // told so — the surface goes away, the honesty does not.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    store.subscribe(() => {}, { visible: () => false });
+    const host = fakeHost();
+    let jobPolls = 0;
+    const ctl = createLoginCardController({
+        host,
+        store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(200, { job_id: 'job-5', job: { state: 'running' } });
+            }
+            if (init.method === 'DELETE') return json(503, { error: 'daemon unreachable' });
+            jobPolls += 1;
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+    await ctl.start('codex', '');
+
+    const released = await ctl.dispose();
+    assert.equal(released, false, 'an unproven cancel is reported, not swallowed');
+    assert.equal(ctl.active?.jobId, 'job-5', 'the job id is RETAINED — it may still be live');
+    assert.equal(host.innerHTML, '', 'the host is cleared either way');
+    assert.equal(store.polling, false, 'and nothing stays armed');
+    const before = jobPolls;
+    t.mock.timers.tick(60000);
+    await flush();
+    assert.equal(jobPolls, before);
+    store.dispose();
+    t.mock.timers.reset();
+});
+
+test('a Close during the create POST cancels the job that POST installs', async (t) => {
+    // The busy guard DROPPED a transition that arrived while another ran, so
+    // Close answered false and vanished; the create then installed a live job
+    // and no DELETE was ever issued. Transitions queue now: the close is
+    // applied to the job it could not see yet.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const calls = [];
+    let custodyAtDelete = 'never issued';
+    let releaseCreate = null;
+    const createGate = new Promise((resolve) => { releaseCreate = resolve; });
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host,
+        store,
+        fetchImpl: async (url, init = {}) => {
+            calls.push(`${init.method || 'GET'} ${url}`);
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                await createGate;
+                return json(200, { job_id: 'job-after-close', job: { state: 'running' } });
+            }
+            if (init.method === 'DELETE') {
+                custodyAtDelete = ctl.active?.jobId || '';
+                return json(200, {});
+            }
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+    const starting = ctl.start('codex', '');
+    const closing = ctl.close();          // pressed while the create is in flight
+    releaseCreate();
+    await starting;
+    const closed = await closing;
+
+    assert.equal(closed, true, 'the close RAN — it is queued, never dropped');
+    assert.ok(calls.includes('DELETE /api/claudexor/login/job-after-close'),
+        `the job the create installed must be cancelled: ${calls.join(' | ')}`);
+    assert.ok(calls.indexOf('DELETE /api/claudexor/login/job-after-close')
+        > calls.indexOf('POST /api/claudexor/login'), 'the cancel follows the create');
+    assert.equal(custodyAtDelete, 'job-after-close', 'custody was held WHEN the DELETE went out');
+    assert.equal(ctl.active, null, 'and released only after it was proven gone');
+    assert.equal(host.innerHTML, '', 'no card left behind');
+    ctl.dispose();
+    store.dispose();
+    t.mock.timers.reset();
+});
+
+test('a 2xx create with no job id fails loudly instead of waiting forever', async (t) => {
+    // A 200 carrying non-JSON left no job id, no error and a card polling
+    // nothing: "Starting the sign-in…" with no verdict and no way out. A job
+    // id is the minimum a created job must carry — without it there is nothing
+    // to poll and nothing to cancel.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    store.subscribe(() => {}, { visible: () => false });
+    const host = fakeHost();
+    let polls = 0;
+    const ctl = createLoginCardController({
+        host,
+        store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return { ok: true, status: 200, json: async () => { throw new Error('not json'); } };
+            }
+            polls += 1;
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+    await ctl.start('codex', '');
+    assert.ok(host.innerHTML.includes('data-login-retry'), `the error face offers a retry: ${host.innerHTML}`);
+    assert.ok(host.innerHTML.includes('no job id'), host.innerHTML);
+    assert.equal(ctl.active.jobId, '', 'no job id was invented');
+    assert.equal(store.polling, false, 'a failed create releases the status hold');
+    t.mock.timers.tick(60000);
+    await flush();
+    assert.equal(polls, 0, 'nothing is polled for a job that was never created');
+    await ctl.dispose();
+    store.dispose();
+    t.mock.timers.reset();
+});
+
+test('malformed 2xx polls count toward the SAME bounded give-up', async (t) => {
+    // A 2xx carrying no `job` used to RESET the failure streak, so a stream of
+    // them polled forever: twelve malformed answers still left a pending
+    // verdict and another armed timer, and the documented ten-failure give-up
+    // was unreachable.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    store.subscribe(() => {}, { visible: () => false });
+    const host = fakeHost();
+    let polls = 0;
+    const ctl = createLoginCardController({
+        host,
+        store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(200, { job_id: 'job-6', job: { state: 'running' } });
+            }
+            if (init.method === 'DELETE') return json(200, {});
+            polls += 1;
+            return json(200, { ok: true });     // 2xx, no job — meaningless
+        },
+    });
+    await ctl.start('codex', '');
+    for (let i = 0; i < 12; i += 1) { t.mock.timers.tick(30000); await flush(); }
+
+    assert.ok(polls >= JOB_POLL_GIVE_UP_FAILURES, `the chain really polled: ${polls}`);
+    assert.ok(polls <= JOB_POLL_GIVE_UP_FAILURES, `and STOPPED at the documented bound: ${polls}`);
+    assert.ok(host.innerHTML.includes('Could not confirm the sign-in yet'),
+        `an honest unconfirmed verdict, not a forever-pending card: ${host.innerHTML}`);
+    assert.equal(store.polling, false, 'the give-up released the status hold');
+    await ctl.dispose();
     store.dispose();
     t.mock.timers.reset();
 });
