@@ -70,10 +70,17 @@ log = logging.getLogger(__name__)
 # The ONE owner-facing sentence for every way the preset step can fail. The
 # machine-readable ``code`` beside it says which; the copy stays constant so the
 # wizard does not have to translate engine vocabulary.
+#
+# It does NOT assert that accounts were connected. One of the ways this step
+# fails is `no_verified_account`, where live engine authority has just
+# established the opposite of that sentence — the browser's observation was
+# stale, or the account was removed between the Agents step and Save. Nor does
+# it prescribe repairing the engine, because the typed `detail` beside it may
+# simply read "claude: not signed in", which no repair addresses.
 PRESET_UNVERIFIED_MESSAGE = (
-    "The agent accounts were connected, but their models could not be "
-    "verified right now, so nothing was saved. Restart or repair the agent "
-    "engine and try again, or finish without agent defaults."
+    "Agent defaults could not be verified right now, so nothing was saved. "
+    "The detail below says why. Fix that and try again, or finish without "
+    "agent defaults."
 )
 
 
@@ -420,7 +427,7 @@ def _fresh_settings_file() -> bool:
     return wizard_authors_safety_light()
 
 
-def _write_precondition(expect_preset: bool, expect_safety_light: bool):
+def _write_precondition(expect_preset: bool, expect_safety_light: bool, read_fingerprint: str):
     """Re-prove eligibility INSIDE the settings lock, against the state this
     write is about to overwrite.
 
@@ -431,6 +438,18 @@ def _write_precondition(expect_preset: bool, expect_safety_light: bool):
     def _check() -> str:
         from ouroboros.config import SETTINGS_PATH, load_settings_lock_held
 
+        # FRESHNESS FIRST, because it is the one condition that is about the
+        # document rather than about this install's phase. The write that
+        # follows is the WHOLE dictionary derived from an unlocked read, so a
+        # concurrent owner write landing in between would be reverted key by
+        # key while this request answered "saved" (BIBLE P1). Refusing here
+        # keeps the transaction honest: the owner's other change survives and
+        # this one is told, in the seam that already exists for exactly this,
+        # that nothing was written.
+        if _settings_fingerprint() != read_fingerprint:
+            return ("The settings file changed while onboarding was being saved, "
+                    "so this save would have overwritten it; nothing was written. "
+                    "Try finishing again.")
         if expect_safety_light and SETTINGS_PATH.exists():
             return ("A settings file appeared while onboarding was being saved; "
                     "refusing to author the first-install safety default over it.")
@@ -445,6 +464,31 @@ def _write_precondition(expect_preset: bool, expect_safety_light: bool):
 # ---------------------------------------------------------------------------
 # The endpoint.
 # ---------------------------------------------------------------------------
+
+
+def _settings_fingerprint() -> str:
+    """What the settings document looked like at a given instant.
+
+    Completion derives the WHOLE document from an unlocked read and then writes
+    that whole dictionary back. Between the two, another owner write can land —
+    and every key it changed would be silently restored to the value this
+    request read, while the owner is told the save succeeded. The fingerprint
+    turns that into something the locked precondition can notice.
+
+    A digest of the raw bytes, not of a parsed dict: it is the file this write
+    replaces. Absent file and unreadable file are distinct answers, so neither
+    is mistaken for the other.
+    """
+    from hashlib import sha256
+
+    from ouroboros.config import SETTINGS_PATH
+
+    try:
+        return sha256(SETTINGS_PATH.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return "absent"
+    except OSError as exc:
+        return f"unreadable:{type(exc).__name__}"
 
 
 def _prepared_settings(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
@@ -470,7 +514,7 @@ def _prepared_settings(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, 
 
 def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, Any],
              pending_mode: str, safety_light: bool, preset_applied: bool,
-             boundary: CommitBoundary) -> None:
+             boundary: CommitBoundary, read_fingerprint: str) -> None:
     """The ONE write, plus the established post-save seams.
 
     ``boundary`` is committed the instant the bytes land, so the endpoint can
@@ -490,7 +534,7 @@ def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, 
         to_save,
         authored_keys=authored,
         allow_safety_lowering=safety_light,
-        precondition=_write_precondition(preset_applied, safety_light),
+        precondition=_write_precondition(preset_applied, safety_light, read_fingerprint),
         boundary=boundary,
     )
     # The RUNNING process keeps its boot runtime mode; the owner's next-boot
@@ -521,6 +565,12 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
     if not isinstance(body, dict):
         return unsaved_error("JSON body must be an object.", 400)
 
+    # BEFORE the read, not after: if a write lands between the two, the document
+    # this request goes on to derive is NEWER than the fingerprint, the locked
+    # precondition sees the mismatch and refuses. Taken the other way round the
+    # same interleaving would be invisible, and this is the one ordering that
+    # fails closed.
+    read_fingerprint = _settings_fingerprint()
     old_settings, current, error = _prepared_settings(body)
     if error:
         return unsaved_error(error, 400)
@@ -559,7 +609,7 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
     try:
         await asyncio.to_thread(
             _persist, request, old_settings, current, pending_mode, safety_light,
-            preset is not None, boundary,
+            preset is not None, boundary, read_fingerprint,
         )
     except Exception as exc:
         if boundary.committed:
@@ -570,7 +620,13 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
         if isinstance(exc, SettingsPreconditionFailed):
             return unsaved_error(str(exc), 409, code="onboarding_state_changed")
         if isinstance(exc, SettingsLockUnavailable):
-            return unsaved_error(str(exc), 503, code="settings_locked", can_skip=True)
+            # NO `can_skip`. That flag means "there is a different button that
+            # WILL work", and the skip is the same request to the same endpoint,
+            # which takes the same lock — offering it under contention promises
+            # an escape that leads straight back here. `can_skip` belongs to the
+            # preset-verification failures, where finishing without agent
+            # defaults genuinely bypasses the thing that failed.
+            return unsaved_error(str(exc), 503, code="settings_locked")
         if isinstance(exc, PermissionError):
             return unsaved_error(str(exc), 403)
         log.exception("onboarding completion failed")

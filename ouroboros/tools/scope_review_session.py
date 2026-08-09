@@ -188,9 +188,10 @@ def _unproven_window_sentence(scope_model: str, phrase: str) -> str:
     disclosure the owner reads and the reason the commit stopped cannot drift."""
     return (
         f"retrieving scope reviewer {scope_model} has a {phrase}, which does not meet "
-        f"the >={SESSION_WINDOW_FLOOR} SOURCED-evidence floor this lower-assurance "
-        "delivery needs to carry a blocking verdict (BIBLE P3: a window that cannot be "
-        "established by evidence is treated as too small, never assumed adequate)."
+        f"the >={SESSION_WINDOW_FLOOR} SOURCED-evidence floor this owner-declared "
+        "agentic delivery needs to carry a blocking verdict (BIBLE P3: a window that "
+        "cannot be established by evidence is treated as too small, never assumed "
+        "adequate)."
     )
 
 

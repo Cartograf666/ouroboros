@@ -170,7 +170,13 @@ export function readCompletionAnswer({ status = 0, ok = false, parsed = false, d
                 detail: String(body.detail || ''),
                 canSkip: Boolean(body.can_skip),
                 saved: Boolean(body.saved),
-                stage: String(body.stage || ''),
+                // `post_commit_failed` is what the server actually sends (see
+                // the gateway contract); `stage` was a name this reader made up,
+                // so a real post-commit envelope parsed to '' and the owner lost
+                // the one word saying WHICH step failed after their settings had
+                // already landed. Both spellings are read so a stored or proxied
+                // older body is not silently dropped.
+                stage: String(body.post_commit_failed || body.stage || ''),
             },
         };
     }
@@ -520,8 +526,34 @@ export function createAgentsStep({
         store.refresh();
     }
 
-    function dispose() {
-        if (state.disposed) return;
+    /**
+     * Shut the step down and report whether the LOGIN was actually let go.
+     *
+     * The shared controller's disposer is asynchronous and answers a custody
+     * verdict: `false` means the cancel could not be proven, so it deliberately
+     * retains the job id and stays retryable. Settings awaits that verdict; this
+     * step used to call the disposer blind and return `undefined`, which threw
+     * the answer away — and, worse, latched `state.disposed` first, so the one
+     * documented recovery (call the disposer again) was unreachable from here.
+     * A deferred create POST made that visible: completion was announced while
+     * the POST was still in flight, and a cancel that then answered 503 left a
+     * live login job with no owner.
+     *
+     * So: the step only latches itself once custody is genuinely released, and
+     * the caller can await the same Boolean the Settings host already reads.
+     *
+     * @returns {Promise<boolean>} whether the login was released.
+     */
+    async function dispose() {
+        if (state.disposed) return true;
+        const released = await login.dispose();
+        if (!released) {
+            // Custody is still ours. Leave the step usable so the disposer can
+            // be retried against the same retained job, and keep the listeners
+            // that let the retry render — releasing them here would strand the
+            // job exactly as before.
+            return false;
+        }
         state.disposed = true;
         if (state.unsubscribe) state.unsubscribe();
         state.unsubscribe = null;
@@ -530,7 +562,7 @@ export function createAgentsStep({
             document_.removeEventListener('pagehide', state.pageHideBound);
         }
         state.pageHideBound = null;
-        login.dispose();
+        return true;
     }
 
     return {

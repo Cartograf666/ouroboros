@@ -270,6 +270,26 @@ test('a failure AFTER the bytes reached disk never claims nothing was saved', ()
     // And the escape hatch is withdrawn: with bytes on disk, "finish without
     // agent defaults" would be a SECOND write, not an alternative to the first.
     assert.equal(notice.canSkip, false);
+
+    // The `stage` above was hand-built, so it proved the PROSE and not the
+    // reader. This is the envelope `post_commit_failure_response` really sends
+    // — the field is named `post_commit_failed`, and the reader used to look
+    // for `stage`, so a genuine post-commit failure reached the owner with the
+    // one word identifying the failed step silently blanked.
+    const real = readCompletionAnswer({
+        status: 500,
+        ok: false,
+        parsed: true,
+        data: {
+            error: 'Settings were saved to disk, but the supervisor start step failed afterwards: RuntimeError: boom',
+            status: 'saved_with_post_commit_error',
+            saved: true,
+            post_commit_failed: 'supervisor start',
+        },
+    });
+    assert.equal(real.failure.stage, 'supervisor start');
+    assert.equal(real.failure.saved, true);
+    assert.match(completionFailureNotice(real.failure).text, /supervisor start/);
 });
 
 // ---------------------------------------------------------------------------
@@ -388,7 +408,7 @@ test('the step reads the shared store — it never fetches the status endpoint i
     assert.ok(dom.nodes.get('agents-family-list').innerHTML.includes('Codex'));
     assert.match(dom.nodes.get('agents-outcome').textContent, /Codex is connected/);
 
-    step.dispose();
+    assert.equal(await step.dispose(), true);
     assert.equal(store.subscriberCount, 0);
     assert.equal(dom.listeners.length, 0, 'the step must leave no listener behind');
     store.dispose();
@@ -426,7 +446,62 @@ test('Connect starts the login through the shared card controller', async (t) =>
     assert.ok(calls.some(([url, method]) => url === '/api/claudexor/login' && method === 'POST'));
     // The login card renders into the step's own host, never a second surface.
     assert.match(dom.nodes.get('agents-login-host').innerHTML, /harness-login-card/);
-    step.dispose();
+    await step.dispose();
+    store.dispose();
+});
+
+test('a sign-in the daemon will not confirm cancelled keeps its owner', async (t) => {
+    // The shared controller answers a CUSTODY verdict: false means the cancel
+    // could not be proven, so it keeps the job id and stays retryable. Settings
+    // awaits that answer. This step used to call the disposer blind, throw the
+    // answer away, and latch itself disposed first — which made the one
+    // documented recovery (call the disposer again) unreachable and left a live
+    // login job with nobody to cancel it.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let cancels = 0;
+    const fetchImpl = async (url, init) => {
+        const u = String(url);
+        const method = init?.method || 'GET';
+        if (u.startsWith('/api/claudexor/login') && method === 'POST') {
+            return json(200, { job_id: 'j1', job: {} });
+        }
+        if (u.startsWith('/api/claudexor/login') && method === 'DELETE') {
+            cancels += 1;
+            return json(503, { error: 'daemon unreachable' });   // never proven gone
+        }
+        if (u.startsWith('/api/claudexor/login')) return json(200, { job_id: 'j1', job: {} });
+        return json(200, snapshotWith([]));
+    };
+    const store = createClaudexorStatusStore({
+        fetchImpl,
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    const dom = fakeDom();
+    const handlers = [];
+    dom.nodes.get('agents-family-list').buttons = [{
+        getAttribute: () => 'claude',
+        addEventListener: (_type, fn) => handlers.push(fn),
+    }];
+
+    const step = createAgentsStep({ doc: dom.doc, store, fetchImpl });
+    step.mount();
+    await flush();
+    handlers[handlers.length - 1]();
+    await flush();
+
+    // Custody is NOT released, and the step says so rather than reporting a
+    // clean teardown that did not happen.
+    assert.equal(await step.dispose(), false);
+    assert.ok(cancels >= 1, 'the disposer must actually attempt the cancel');
+
+    // ...and it is still retryable against the SAME retained job: a second
+    // disposal runs the same proven-cancel path instead of returning early on a
+    // latched flag.
+    const before = cancels;
+    assert.equal(await step.dispose(), false);
+    assert.ok(cancels > before, 'a retained job must stay cancellable');
+
     store.dispose();
 });
 

@@ -1381,9 +1381,23 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
     async function saveWizardPayload(payload) {
         const result = await completeOnboardingAtomically(payload);
         // Setup is over: release the Agents step's status subscription and its
-        // login-job timer before the shell takes the page away.
-        agentsStep?.dispose();
-        agentsStep = null;
+        // login-job timer before the shell takes the page away. AWAIT it — the
+        // step answers whether the login was genuinely let go, and announcing
+        // completion first would navigate away while a create POST was still in
+        // flight, stranding a live login job with nobody left to cancel it.
+        const released = await agentsStep?.dispose();
+        if (released === false) {
+            // The cancel could not be proven, so the controller kept the job id
+            // and stays retryable. Keep the step rather than dropping the only
+            // handle to that retry, and say so instead of reporting a clean
+            // teardown that did not happen (BIBLE P1). The save itself LANDED,
+            // so completion is still announced: withholding it would be the
+            // larger lie and would send the owner back through onboarding.
+            console.warn('onboarding: a login job could not be confirmed cancelled; '
+                + 'it is retained and the agent engine still owns it.');
+        } else {
+            agentsStep = null;
+        }
         announceCompletion(result);
         return 'ok';
     }

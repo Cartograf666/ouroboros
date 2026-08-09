@@ -788,7 +788,13 @@ async function _init(store) {
         // a SECOND live login — exactly what the custody verdict exists to
         // prevent. Say it where the panel's own status line lives; the next
         // mount re-attempts the cancel (dispose is retryable).
-        const statusEl = document.getElementById('harness-daemon-status');
+        //
+        // That line is the tab's ONE service banner. It used to be
+        // `harness-daemon-status`, a node the Agents tab no longer renders, so
+        // this refusal reached the owner as an empty panel that simply never
+        // mounted. Nothing repaints the banner from under this message: the
+        // store subscription is bound below, after the early return.
+        const statusEl = document.getElementById('agents-service-banner');
         if (statusEl) {
             statusEl.textContent = 'A previous sign-in could not be cancelled and may still be '
                 + 'running, so this panel is holding off. Reopen this page to retry it.';

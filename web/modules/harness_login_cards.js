@@ -744,7 +744,12 @@ export function createLoginCardController({
         // another — so the device link the owner was reading was invalidated
         // the moment it appeared. While a start for the same account is still
         // settling, every caller shares its promise.
-        const key = `${harness} ${profile || ''}`;
+        // The separator is spelled as a source escape rather than written as a
+        // literal NUL byte: one raw NUL makes every ordinary search tool
+        // classify this 53 KB module as binary, and `grep` then answers with
+        // SILENCE instead of "no match", so a reviewer looking for a symbol
+        // in here concludes it does not exist. Same key, same collisions.
+        const key = `${harness}\u0000${profile || ''}`;
         if (ctl.pendingStart && ctl.pendingStart.key === key) return ctl.pendingStart.promise;
         const promise = withLoginTransition(() => _startLocked(harness, profile));
         const clear = () => {

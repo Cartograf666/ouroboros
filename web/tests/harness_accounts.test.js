@@ -1344,8 +1344,12 @@ function fakeElement(id) {
 
 function mountSection() {
     const elements = {};
-    for (const id of ['harness-accounts-rows', 'harness-daemon-status',
-        'harness-login-card', 'btn-harness-refresh']) elements[id] = fakeElement(id);
+    // The ids the Agents tab REALLY renders. `harness-accounts-rows` and
+    // `harness-daemon-status` were the pre-tab markup; building them here let
+    // the refusal below "reach the owner" through a node production no longer
+    // has, so an empty, silently unmounted panel passed as a warning shown.
+    for (const id of ['agents-service-banner', 'harness-login-card',
+        'btn-harness-refresh']) elements[id] = fakeElement(id);
     const doc = {
         hidden: false,
         activeElement: null,
@@ -1408,7 +1412,7 @@ test('the custody verdict is CONSUMED: a remount is refused while a login may st
         assert.equal(creates(), 1, 'no second live login was started beside the first');
         await startLogin('codex', '');
         assert.equal(creates(), 1, 'and a disposed controller still starts nothing');
-        assert.match(elements['harness-daemon-status'].textContent, /could not be cancelled/,
+        assert.match(elements['agents-service-banner'].textContent, /could not be cancelled/,
             'the owner is told why the panel is holding off');
 
         // The daemon comes back: the retained job is cancelled and the section
