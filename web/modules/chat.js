@@ -15,6 +15,7 @@ import {
 } from './log_events.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import {
+    createHistoryResyncScheduler,
     createRebuildBatch,
     loadOlderControlState,
     nextQuotaEscalation,
@@ -707,6 +708,13 @@ export function createChatInstance({
 
     // Pass 1 builds live cards in memory; pass 2 inserts them in transcript order.
     let _syncPass1Active = false;
+    // perf2 P4 follow-up (double-fetch fix): true while syncHistory replays the
+    // fetched rows into cards — pass 1, pass 2 AND the terminal-resolution
+    // sweep (both the rebuildAll and the routine branch). Finished transitions
+    // raised inside that replay must not schedule the 700ms post-completion
+    // resync: the data just came from the canonical source. The replay block
+    // is fully synchronous, so no live WS frame can ever observe the flag.
+    let _historyReplayActive = false;
 
     const persistedHistory = [];
     const seenMessageKeys = new Set();
@@ -778,7 +786,6 @@ export function createChatInstance({
     // "turn into project" conversion can name the project from it (P1).
     let _pendingCardObjective = '';
     let activeLiveGroupId = '';
-    let historySyncTimer = null;
     let pendingReconnectSync = false;  // Set when a fromReconnect sync arrives while one is already in-flight.
     let pendingReconnectBannerText = readPendingReconnectBanner();
 
@@ -2265,12 +2272,18 @@ export function createChatInstance({
     }
 
     function scheduleHistorySync() {
-        if (historySyncTimer) clearTimeout(historySyncTimer);
-        historySyncTimer = setTimeout(() => {
-            historySyncTimer = null;
-            syncHistory({ includeUser: false }).catch(() => {});
-        }, 700);
+        historyResyncScheduler.schedule();
     }
+
+    // perf2 P4 follow-up (double-fetch fix): finished transitions replayed by
+    // syncHistory itself (_historyReplayActive) are dropped by the scheduler —
+    // the rows just arrived from the canonical source, so the 700ms resync was
+    // refetching the whole window after every history load. A LIVE completion
+    // (WS frame outside a replay) still always schedules a REAL fetch [GPT#12].
+    const historyResyncScheduler = createHistoryResyncScheduler({
+        isReplayActive: () => _historyReplayActive,
+        run: () => syncHistory({ includeUser: false }).catch(() => {}),
+    });
 
     // perf2 P4.3: the ONE meta-line renderer, fed entirely from record state
     // (sticky executor chip, last frame's meta strings, sticky cost, activity
@@ -3433,30 +3446,41 @@ export function createChatInstance({
                 }
                 };  // end applySyncedMessages
 
-                if (rebuildAll) {
-                    // perf2 P4.3 [GPT#14]: one outer withStableViewport for the
-                    // whole rebuild — inner per-row wrappers collapse on the
-                    // existing _viewportMutationDepth gate, killing the
-                    // per-frame isInstanceVisible/anchor layout storm. One
-                    // stable sort, one fragment mount before typing, then the
-                    // per-card finals and ONE persist. The whole section is
-                    // synchronous: live frames can never observe "records
-                    // cleared, fragment not yet mounted".
-                    _rebuildBatch = createRebuildBatch();
-                    try {
-                        withStableViewport(() => {
-                            applySyncedMessages();
-                            const batch = _rebuildBatch;
+                // perf2 P4 follow-up (double-fetch fix): the replay below marks
+                // historical cards finished; those transitions must not
+                // schedule the post-completion resync (the rows just arrived
+                // from this very fetch). The flag spans BOTH branches and is
+                // dropped synchronously, so a real live completion frame can
+                // never land while it is up.
+                _historyReplayActive = true;
+                try {
+                    if (rebuildAll) {
+                        // perf2 P4.3 [GPT#14]: one outer withStableViewport for the
+                        // whole rebuild — inner per-row wrappers collapse on the
+                        // existing _viewportMutationDepth gate, killing the
+                        // per-frame isInstanceVisible/anchor layout storm. One
+                        // stable sort, one fragment mount before typing, then the
+                        // per-card finals and ONE persist. The whole section is
+                        // synchronous: live frames can never observe "records
+                        // cleared, fragment not yet mounted".
+                        _rebuildBatch = createRebuildBatch();
+                        try {
+                            withStableViewport(() => {
+                                applySyncedMessages();
+                                const batch = _rebuildBatch;
+                                _rebuildBatch = null;
+                                batch.mount(messagesDiv, messagesDiv.querySelector('.typing-bubble'));
+                                finalizeRebuildBatch(batch);
+                            });
+                        } finally {
                             _rebuildBatch = null;
-                            batch.mount(messagesDiv, messagesDiv.querySelector('.typing-bubble'));
-                            finalizeRebuildBatch(batch);
-                        });
-                    } finally {
-                        _rebuildBatch = null;
+                        }
+                    } else {
+                        // Routine sync: the old per-row live-DOM path, untouched.
+                        applySyncedMessages();
                     }
-                } else {
-                    // Routine sync: the old per-row live-DOM path, untouched.
-                    applySyncedMessages();
+                } finally {
+                    _historyReplayActive = false;
                 }
 
                 // After first load, unfinished foreground cards still show typing.
@@ -4583,7 +4607,7 @@ export function createChatInstance({
             if (documentKeydownHandler) document.removeEventListener('keydown', documentKeydownHandler);
             chatResizeObserver?.disconnect();
             chatResizeObserver = null;
-            if (historySyncTimer) { clearTimeout(historySyncTimer); historySyncTimer = null; }
+            historyResyncScheduler.cancel();
             if (_chatFreedTimer) { clearTimeout(_chatFreedTimer); _chatFreedTimer = null; }
             for (const taskState of taskUiStates.values()) {
                 if (taskState?.cleanupTimer) clearTimeout(taskState.cleanupTimer);
