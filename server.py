@@ -869,36 +869,35 @@ def _project_id_for_registered_chat(ctx: Any, chat_id: int) -> str:
     (task_metadata.project_id) and routed to its panel. This active-only lookup is
     paired with ``_reserved_project_for_chat`` for deleting/tombstoned IDs, so a
     reserved chat cannot be resurrected through ordinary routing.
-    """
-    try:
-        from ouroboros.projects_registry import list_projects
 
-        cid = int(chat_id or 0)
-        for project in list_projects(ctx.DRIVE_ROOT):
-            try:
-                if int(project.get("chat_id") or 0) == cid:
-                    return str(project.get("id") or "").strip()
-            except (TypeError, ValueError):
-                continue
+    Both helpers resolve through the ONE ``resolve_chat_binding`` seam so EVERY
+    thread of a project is recognized, not only thread #0 — comparing a chat id
+    against ``project["chat_id"]`` here is what would misroute a non-primary
+    thread's messages to Main.
+    """
+    from ouroboros.projects_registry import PROJECT_ACTIVE
+
+    binding = _chat_binding(ctx, chat_id)
+    if str(binding.get("lifecycle") or "") != PROJECT_ACTIVE:
+        return ""
+    return str(binding.get("project_id") or "").strip()
+
+
+def _chat_binding(ctx: Any, chat_id: int) -> Dict[str, Any]:
+    """The canonical project/thread binding of ``chat_id`` (``{}`` for Main)."""
+    try:
+        from ouroboros.projects_registry import resolve_chat_binding
+
+        return resolve_chat_binding(ctx.DRIVE_ROOT, chat_id)
     except Exception:
         log.debug("Project chat_id lookup failed", exc_info=True)
-    return ""
+        return {}
 
 
 def _reserved_project_for_chat(ctx: Any, chat_id: int) -> Dict[str, Any]:
-    try:
-        from ouroboros.projects_registry import list_reserved_projects
-
-        cid = int(chat_id or 0)
-        for project in list_reserved_projects(ctx.DRIVE_ROOT):
-            try:
-                if int(project.get("chat_id") or 0) == cid:
-                    return dict(project)
-            except (TypeError, ValueError):
-                continue
-    except Exception:
-        log.debug("Reserved Project chat lookup failed", exc_info=True)
-    return {}
+    binding = _chat_binding(ctx, chat_id)
+    project = binding.get("project")
+    return dict(project) if isinstance(project, dict) else {}
 
 
 def _record_routing_receipt(
