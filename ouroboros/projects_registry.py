@@ -1268,6 +1268,54 @@ def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any) ->
         return ""
 
 
+def adopt_task_workspace(
+    drive_root: Any, project_id: str, workspace_root: Any, *, system_repo_dir: Any
+) -> tuple[str, str]:
+    """Give a project born FROM A TASK the folder that task was already working in.
+
+    A11: a project must have a designated place. Both conversion paths — the UI
+    "turn into project" card and the in-task ``ensure_project_scope`` — used to
+    register a project and drop the task's ``workspace_root`` on the floor, so a
+    project made out of work happening in a real folder came out folder-less and
+    the NEXT task in it auto-provisioned a different, empty tree somewhere else.
+    The task's own folder is the obvious place; nothing else has a better claim.
+
+    Adopting is an ATTACH, so it re-runs the attach guards rather than trusting the
+    task record: the same resolved-realpath checks (exists, real dir, not the home
+    root, disjoint from the Ouroboros repo/data roots), and deliberately NO git
+    requirement (A12 — a plain folder is a legitimate place). An EXISTING
+    working_dir is never overwritten; a project that already has a place keeps it.
+
+    Returns ``(working_dir, error)``. ``error`` is a disclosure, not a failure the
+    caller must abort on: conversion's job is to create the project, and a folder
+    that has since moved is worth reporting rather than either hiding or fatal.
+    """
+    pid = sanitize_project_id(project_id)
+    raw = str(workspace_root or "").strip()
+    if not pid or not raw:
+        return "", ""
+    entry = get_project(drive_root, pid)
+    if entry is None:
+        return "", ""
+    if str(entry.get("working_dir") or "").strip():
+        return str(entry["working_dir"]), ""
+    from ouroboros.project_sources import validate_attach_path
+
+    resolved, error = validate_attach_path(
+        raw, system_repo_dir=system_repo_dir, drive_root=drive_root
+    )
+    if error or resolved is None:
+        return "", f"the task's workspace {raw} was not adopted as the project folder: {error}"
+    updates: Dict[str, Any] = {"working_dir": str(resolved)}
+    if str(entry.get("provenance") or "").strip() in ("", "none"):
+        # The owner chose this folder when they started the work there; the
+        # conversion inherits that grant rather than asking for it a second time.
+        updates["provenance"] = "attached"
+        updates["trusted_at"] = str(entry.get("trusted_at") or "") or utc_now_iso()
+    update_project(drive_root, pid, **updates)
+    return str(resolved), ""
+
+
 def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]]:
     """Compact list for /api/state and the sidebar."""
     out: List[Dict[str, Any]] = []
@@ -1322,6 +1370,7 @@ __all__ = [
     "PROJECT_NAME_MAX",
     "PROJECT_TOMBSTONED",
     "THREAD_NAME_MAX",
+    "adopt_task_workspace",
     "all_task_bindings",
     "begin_project_deletion",
     "bind_task_to_project",

@@ -384,3 +384,146 @@ def test_autoprovisioning_never_relabels_an_existing_provenance(tmp_path, monkey
     update_project(data, "moved", working_dir=str(tmp_path / "vanished"), provenance="attached")
     assert ensure_project_workspace(data, "moved", repo)
     assert get_project(data, "moved")["provenance"] == "attached"
+
+
+# --- a project born from a task inherits that task's folder ------------------------
+
+def _persist_task_result(drive_root: pathlib.Path, task_id: str, **fields) -> None:
+    (drive_root / "task_results").mkdir(parents=True, exist_ok=True)
+    (drive_root / "task_results" / f"{task_id}.json").write_text(
+        json.dumps({"task_id": task_id, "status": "completed", **fields}), encoding="utf-8"
+    )
+
+
+def test_turn_into_project_adopts_the_tasks_working_folder(tmp_path):
+    """A11: converting a card into a project used to drop the folder the task was
+    working in, so the project came out placeless and its NEXT task provisioned a
+    different empty tree — silently moving the work somewhere else."""
+    import asyncio
+
+    from ouroboros.gateway.projects import api_project_from_task
+    from ouroboros.projects_registry import get_project
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    ws = tmp_path / "site"
+    _init_git_repo(ws)
+    _persist_task_result(data, "t1", description="build the site", title="Site build",
+                         workspace_root=str(ws))
+
+    resp = asyncio.run(api_project_from_task(
+        _ProjectsReq({"task_id": "t1", "id": "site", "name": "Site"}, drive_root=data, repo_dir=repo)
+    ))
+    payload = json.loads(resp.body)
+    assert resp.status_code == 200, payload
+    assert payload["project"]["working_dir"] == str(ws.resolve())
+    entry = get_project(data, "site")
+    assert entry["working_dir"] == str(ws.resolve())
+    assert entry["provenance"] == "attached" and entry["trusted_at"]
+
+
+def test_turn_into_project_adopts_an_untracked_folder_too(tmp_path):
+    """A12: the adopted folder is not required to be under git — a plain folder is
+    a legitimate place, and the git question is asked at task admission."""
+    import asyncio
+
+    from ouroboros.gateway.projects import api_project_from_task
+    from ouroboros.projects_registry import get_project
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plain = tmp_path / "notes"
+    plain.mkdir()
+    _persist_task_result(data, "t2", description="sort the notes", workspace_root=str(plain))
+
+    resp = asyncio.run(api_project_from_task(
+        _ProjectsReq({"task_id": "t2", "id": "notes", "name": "Notes"}, drive_root=data, repo_dir=repo)
+    ))
+    assert resp.status_code == 200
+    assert get_project(data, "notes")["working_dir"] == str(plain.resolve())
+    assert not (plain / ".git").exists()
+
+
+def test_turn_into_project_discloses_a_folder_it_cannot_adopt(tmp_path):
+    """The conversion still succeeds — its job is to make the project — but a folder
+    that has moved is REPORTED rather than quietly leaving a placeless project, and a
+    path overlapping the Ouroboros roots is refused by the ordinary attach guards."""
+    import asyncio
+
+    from ouroboros.gateway.projects import api_project_from_task
+    from ouroboros.projects_registry import get_project
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _persist_task_result(data, "t3", description="x", workspace_root=str(tmp_path / "vanished"))
+    _persist_task_result(data, "t4", description="y", workspace_root=str(repo))
+
+    gone = asyncio.run(api_project_from_task(
+        _ProjectsReq({"task_id": "t3", "id": "gonep", "name": "Gone"}, drive_root=data, repo_dir=repo)
+    ))
+    payload = json.loads(gone.body)
+    assert gone.status_code == 200
+    assert "was not adopted" in payload["working_dir_error"]
+    assert str(get_project(data, "gonep").get("working_dir") or "") == ""
+
+    overlapping = asyncio.run(api_project_from_task(
+        _ProjectsReq({"task_id": "t4", "id": "repop", "name": "Repo"}, drive_root=data, repo_dir=repo)
+    ))
+    assert "Ouroboros system repo" in json.loads(overlapping.body)["working_dir_error"]
+    assert str(get_project(data, "repop").get("working_dir") or "") == ""
+
+
+def test_turn_into_project_never_replaces_an_existing_project_folder(tmp_path):
+    """Conversion into an EXISTING project must not repoint that project at the
+    converted task's folder — a project's place is not silently reassigned."""
+    import asyncio
+
+    from ouroboros.gateway.projects import api_project_from_task
+    from ouroboros.projects_registry import create_project, get_project, update_project
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home_folder = tmp_path / "already"
+    _init_git_repo(home_folder)
+    other = tmp_path / "elsewhere"
+    _init_git_repo(other)
+    create_project(data, "keeper", name="Keeper", origin="owner_ui")
+    update_project(data, "keeper", working_dir=str(home_folder), provenance="attached")
+    _persist_task_result(data, "t5", description="z", workspace_root=str(other))
+
+    resp = asyncio.run(api_project_from_task(
+        _ProjectsReq({"task_id": "t5", "id": "keeper", "name": "Keeper"}, drive_root=data, repo_dir=repo)
+    ))
+    assert resp.status_code == 200
+    assert get_project(data, "keeper")["working_dir"] == str(home_folder)
+
+
+def test_ensure_project_scope_adopts_the_running_tasks_folder(tmp_path, monkeypatch):
+    """The in-task sibling of the card conversion: a task that self-scopes mid-run
+    hands its own folder to the project it just created."""
+    import supervisor.workers as workers
+    from ouroboros.projects_registry import get_project
+
+    drive = tmp_path / "data"
+    drive.mkdir()
+    ws = tmp_path / "live_site"
+    _init_git_repo(ws)
+    monkeypatch.setattr(workers, "DRIVE_ROOT", drive)
+    monkeypatch.setattr(workers, "REPO_DIR", tmp_path / "repo")
+
+    ctx = types.SimpleNamespace(
+        RUNNING={"live1": {"task": {"id": "live1", "workspace_root": str(ws)}}},
+        PENDING=[],
+    )
+    workers.ensure_project_scope(
+        {"task_id": "live1", "project_id": "livesite", "project_name": "Live Site"}, ctx
+    )
+    assert get_project(drive, "livesite")["working_dir"] == str(ws.resolve())

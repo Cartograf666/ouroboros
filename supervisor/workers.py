@@ -903,6 +903,21 @@ def _halt_promoted_task_loudly(
         log.debug("promote loud-fail: chat message failed for %s", tid, exc_info=True)
 
 
+def _running_task_workspace(ctx: Any, task_id: str) -> str:
+    """The workspace_root of a LIVE task, read from the supervisor RUNNING map.
+
+    A self-scoping task is by definition still running, so the in-memory record is
+    the authority — its persisted result does not exist yet. Never raises."""
+    try:
+        running = getattr(ctx, "RUNNING", None)
+        row = running.get(task_id) if isinstance(running, dict) else None
+        task = row.get("task") if isinstance(row, dict) else None
+        return str((task or {}).get("workspace_root") or "").strip()
+    except Exception:
+        log.debug("_running_task_workspace failed for %s", task_id, exc_info=True)
+        return ""
+
+
 def ensure_project_scope(evt: dict, ctx: Any) -> None:
     """Create/attach the registry project for an in-task ensure_project_scope call
     and bind the CURRENT (already-running) task to it, then broadcast so the UI moves
@@ -919,6 +934,20 @@ def ensure_project_scope(evt: dict, ctx: Any) -> None:
 
         project = create_project(DRIVE_ROOT, pid, name=name, origin="ensure_project_scope")
         touch_project(DRIVE_ROOT, pid)
+        # A11, mirroring the UI conversion: a task that self-scopes mid-run hands the
+        # new project the folder it is ALREADY working in. Otherwise the project is
+        # born placeless and its next task provisions a different empty tree, which
+        # is the same silent move the card conversion used to make.
+        try:
+            from ouroboros.projects_registry import adopt_task_workspace
+
+            _adopted, _adopt_error = adopt_task_workspace(
+                DRIVE_ROOT, pid, _running_task_workspace(ctx, tid), system_repo_dir=REPO_DIR
+            )
+            if _adopt_error:
+                log.warning("ensure_project_scope: %s", _adopt_error)
+        except Exception:
+            log.debug("ensure_project_scope: workspace adoption failed for %s", pid, exc_info=True)
         try:
             proj_chat = int((project or {}).get("chat_id") or 0)
         except (TypeError, ValueError):

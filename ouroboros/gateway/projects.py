@@ -154,6 +154,25 @@ def _derive_project_name(drive_root: object, task_id: str) -> str:
     return cleaned
 
 
+def _task_workspace_root(drive_root: object, task_id: str) -> str:
+    """The folder a task is (or was) working in — persisted result first, then the
+    live queue snapshot for a conversion clicked mid-flight. Same two sources the
+    name derivation reads, for the same reason: the owner converts a card while the
+    task is still running, when only the snapshot knows. Never raises."""
+    try:
+        from ouroboros.task_results import load_task_result
+
+        result = load_task_result(drive_root, task_id) or {}
+    except Exception:
+        log.debug("_task_workspace_root: load_task_result failed", exc_info=True)
+        result = {}
+    for src in (result, _task_from_live_queue(drive_root, task_id)):
+        value = str((src or {}).get("workspace_root") or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _preset_suggested_name(drive_root: object, task_id: str) -> str:
     """The LLM title the proactive card namer already coined for this task (Cluster B),
     read from the persisted result then the live queue. Reused by turn-into-project so
@@ -734,6 +753,7 @@ async def api_project_from_task(request: Request) -> JSONResponse:
         from ouroboros.project_facts import explicit_project_id_ok, sanitize_project_id
         from ouroboros.projects_registry import (
             PROJECT_NAME_MAX,
+            adopt_task_workspace,
             bind_task_to_project,
             create_project,
             touch_project,
@@ -820,6 +840,17 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             name=project_name,
             origin="task_card",
         )
+        # A11: the new project inherits the folder the converted task was already
+        # working in. Without this the project came out folder-less and its NEXT
+        # task auto-provisioned a different empty tree, silently moving the work.
+        adopted, adopt_error = adopt_task_workspace(
+            drive_root,
+            str(project["id"]),
+            _task_workspace_root(drive_root, task_id),
+            system_repo_dir=request_repo_dir(request),
+        )
+        if adopted:
+            project = dict(project, working_dir=adopted)
         # Scope the live task to its new project's one-writer lane BEFORE the durable
         # bind. The lease + assignment read task["project_id"] from the supervisor's
         # in-memory RUNNING map and PENDING list, NOT the durable bindings — so this
@@ -873,7 +904,13 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             })
         except Exception:
             log.debug("api_project_from_task: projects_changed broadcast failed", exc_info=True)
-        return JSONResponse({"project": project, "binding": binding})
+        payload: dict = {"project": project, "binding": binding}
+        if adopt_error:
+            # Disclosed, non-fatal (P1): the conversion succeeded, but the folder the
+            # task named is no longer adoptable and the owner should hear it rather
+            # than discover a folder-less project later.
+            payload["working_dir_error"] = adopt_error
+        return JSONResponse(payload)
     except Exception as exc:
         return json_exception(exc)
 
