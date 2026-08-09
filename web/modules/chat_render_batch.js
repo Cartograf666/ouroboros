@@ -129,6 +129,13 @@ export function nextQuotaEscalation(current = null) {
  * - notice: nothing more can be loaded from here — the honest boundary text
  *   names BOTH the on-disk archive floor and the subagent lineage cap
  *   [GPT#11], so a short-history user is never told about phantom archives.
+ *
+ * `ancestry_depth` (project threads, T0) is a DIFFERENT boundary: part of a
+ * FORKED thread's shared past was not read at all — the fork chain hit its
+ * depth cap, closed in a cycle, or named an ancestor with no project binding.
+ * A larger quota cannot recover it, and the archive/lineage wording would
+ * misname where the missing conversation is, so it gets its own sentence
+ * (plan A3b: a shared past out of reach is disclosed, never a silent gap).
  */
 export function loadOlderControlState(windowInfo = null, quota = null) {
     if (!windowInfo || typeof windowInfo !== 'object' || windowInfo.complete === true) {
@@ -139,6 +146,13 @@ export function loadOlderControlState(windowInfo = null, quota = null) {
         : [];
     if (causes.includes('quota') && nextQuotaEscalation(quota)) {
         return { mode: 'button', label: 'Load older messages' };
+    }
+    if (causes.includes('ancestry_depth')) {
+        return {
+            mode: 'notice',
+            label: 'Part of this thread’s shared past could not be read: the fork '
+                + 'chain is too deep, or one of its parent threads is unavailable.',
+        };
     }
     return {
         mode: 'notice',

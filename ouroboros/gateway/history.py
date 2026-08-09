@@ -294,13 +294,20 @@ def _origin_fallback_rows(data_dir, lens: Any, human_tail: list) -> list:
 
     Ancestors are included with their own cutoffs (X4): a fork of a CONVERTED
     project's thread must still show the Main-chat message that started the
-    project, which is exactly what the parent's binding holds."""
-    from ouroboros.project_dialogue import project_origin_rows
+    project, which is exactly what the parent's binding holds. Every ancestor's
+    rows come from ONE bucketed bindings read (``origin_rows_by_chat``), deduped
+    on the same identity tuple across the whole chain — asking per ancestor
+    re-read the bindings file once per link and could synthesize one owner
+    message twice."""
+    from ouroboros.project_dialogue import origin_rows_by_chat
 
+    order = list(getattr(lens, "order", []) or [])
+    cutoffs = getattr(lens, "cutoffs", {}) or {}
+    by_chat = origin_rows_by_chat(data_dir, order)
     origin_rows: list = []
-    for owner_chat in getattr(lens, "order", []) or []:
-        cutoff = (getattr(lens, "cutoffs", {}) or {}).get(owner_chat, "")
-        for row in project_origin_rows(data_dir, owner_chat):
+    for owner_chat in order:
+        cutoff = cutoffs.get(owner_chat, "")
+        for row in by_chat.get(owner_chat, ()):
             if cutoff and str((row.get("ref") or {}).get("ts") or "") > cutoff:
                 continue
             origin_rows.append(row)
@@ -607,36 +614,25 @@ def _make_thread_filter(
     and both transform loops. ``lens`` is the shared thread-ancestry lens: for
     an ordinary thread it admits exactly its own chat, and for a FORK it also
     admits each ancestor chat up to that ancestor's effective (intersected,
-    inclusive) cutoff."""
+    inclusive) cutoff.
 
-    def _bound_project_chat(task_id: str, parent_task_id: str = "", root_task_id: str = "") -> int:
-        # Resolve by LINEAGE (own binding -> parent -> root) so a subagent's rows
-        # classify into its root's project thread (only the root is bound).
-        # Same semantics as projects_registry.project_chat_for_task_tree, served
-        # from the ONE bindings map preloaded per request (no per-row file reads).
-        for candidate in (task_id, parent_task_id, root_task_id):
-            tid = str(candidate or "").strip()
-            if tid and bindings_by_task.get(tid):
-                return int(bindings_by_task[tid])
-        return 0
+    The project-thread half of the predicate is the SHARED
+    ``thread_history.admits_row`` / ``bound_chat_for_row`` pair that
+    ``ouroboros/context.py`` uses for the agent's focused view — "does this row
+    belong to the thread" has ONE implementation, not one per surface. The
+    lineage binding walk (own -> parent -> root, so a subagent's rows classify
+    into its ROOT's project thread) lives there too, served from the ONE
+    bindings map preloaded per request."""
+    from ouroboros.thread_history import admits_row, bound_chat_for_row
 
     def _row_matches_thread(entry_chat: int, entry: Optional[dict] = None) -> bool:
         # A post-hoc bound task keeps its original (main) chat_id on its rows
         # but belongs to a project — classify by the durable LINEAGE binding too.
-        bound_chat = (
-            _bound_project_chat(
-                str(entry.get("task_id") or ""),
-                str(entry.get("parent_task_id") or ""),
-                str(entry.get("root_task_id") or ""),
-            ) if isinstance(entry, dict) else 0
-        )
-        entry_ts = str(entry.get("ts") or "") if isinstance(entry, dict) else ""
+        bound_chat = bound_chat_for_row(entry, bindings_by_task)
         if thread_id in project_chat_ids:
-            if bound_chat and lens.admits(bound_chat, entry_ts):
-                return True
-            if isinstance(entry, dict) and lens.admits_source_ref(entry):
-                return True
-            return lens.admits(entry_chat, entry_ts)
+            if isinstance(entry, dict):
+                return admits_row(lens, entry, bound_chat)
+            return lens.admits(entry_chat, "")
         # Main / non-project view: everything that is NOT another project. A
         # bound task's rows are project-owned, so mirror only its sanitized
         # progress/task_summary and exclude its raw chat (same as a native
@@ -938,14 +934,23 @@ def _window_metadata(
     archive_dir: pathlib.Path,
     human_rows_dropped: bool,
     lineage_truncated: bool,
+    lens: Any = None,
 ) -> Dict[str, Any]:
     """Additive window metadata (perf2 P3; frozen contract extended explicitly).
 
     The reader learns WHETHER this window is the complete reachable history
     and WHAT bounded it — the quota tail slice ("quota"), the bounded archive
-    backfill ("archive_floor"), or the lineage cap ("lineage_cap"). The client
-    gates its "Load older" affordance on this instead of guessing; no existing
-    field changes meaning."""
+    backfill ("archive_floor"), the lineage cap ("lineage_cap"), or a bounded
+    fork ANCESTRY ("ancestry_depth"). The client gates its "Load older"
+    affordance on this instead of guessing; no existing field changes meaning.
+
+    ``ancestry_depth`` is the thread-ancestry lens's own ``truncated`` flag:
+    the chain hit ``MAX_ANCESTRY_DEPTH``, closed in a cycle, or named an
+    ancestor with no project binding, so part of the shared past this thread
+    claims was NOT read. The lens set that flag from the start; not threading
+    it here meant the shared past could be cut while the response still called
+    itself complete — a silent gap ARCHITECTURE already promised was
+    disclosed."""
     truncated_by: list[str] = []
     for cause in (
         "quota" if human_rows_dropped else None,
@@ -958,6 +963,7 @@ def _window_metadata(
             _archive_segment_count(archive_dir, "progress"),
         ),
         "lineage_cap" if lineage_truncated else None,
+        "ancestry_depth" if bool(getattr(lens, "truncated", False)) else None,
     ):
         if cause and cause not in truncated_by:
             truncated_by.append(cause)
@@ -1035,7 +1041,7 @@ def _assemble_history_response(
         "window": _window_metadata(
             chat_quota_rows, progress_quota_rows, n_human, n_progress,
             chat_path, progress_path, archive_dir,
-            human_rows_dropped, lineage_truncated,
+            human_rows_dropped, lineage_truncated, lens,
         ),
     }
     # Same rendering options as starlette's JSONResponse — serialized here so

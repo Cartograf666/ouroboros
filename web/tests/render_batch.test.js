@@ -135,6 +135,22 @@ test('load-older control follows the SERVER window verdict', () => {
     // The notice names BOTH boundaries: on-disk archives AND the lineage cap.
     assert.match(floor.label, /archive/i);
     assert.match(floor.label, /lineage/i);
+    // A FORK whose shared past was not fully read is a DIFFERENT boundary: those
+    // rows are not "in the archive", the chain was never followed to them.
+    // Reusing the archive wording would misname where the conversation is (A3b).
+    const ancestry = loadOlderControlState(
+        { complete: false, truncated_by: ['ancestry_depth'] }, null,
+    );
+    assert.equal(ancestry.mode, 'notice');
+    assert.match(ancestry.label, /shared past/i);
+    assert.doesNotMatch(ancestry.label, /archive/i);
+    // Quota headroom still wins: that part of the window IS loadable.
+    assert.equal(
+        loadOlderControlState(
+            { complete: false, truncated_by: ['quota', 'ancestry_depth'] }, null,
+        ).mode,
+        'button',
+    );
 });
 
 // ─────────────── source pins: routine path & sticky boundary ───────────────

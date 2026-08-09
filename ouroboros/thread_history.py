@@ -22,9 +22,26 @@ Semantics pinned by this module:
 * **Lifecycle-blind ancestry.** Ancestors resolve whether they are active,
   archived, deleting or tombstoned. Filtering the chain by liveness would
   silently orphan every fork of a deleted thread.
-* **Bounded and disclosed.** The walk stops at ``MAX_ANCESTRY_DEPTH`` or on a
-  cycle and sets ``truncated`` — the caller discloses it rather than quietly
-  serving a short history.
+* **Project-bound ancestors only.** A cursor is followed ONLY to a chat that
+  ``resolve_chat_binding`` recognises as a project thread. A hand-written
+  ``fork_of_chat_id: 1`` (or any unbound chat) would otherwise pour the WHOLE
+  Main conversation into a project thread's history and into the agent's
+  focused context — silently, on both surfaces. The unreadable ancestor is
+  refused BEFORE it enters the cutoffs, and the refusal is disclosed.
+* **The requesting chat's own present is never bounded.** A cycle that closes
+  back on the chat being read (a self-parent, or A→B→A) must not tighten that
+  chat's own cutoff: a thread would start rejecting the messages it just sent.
+  The cycle is disclosed instead.
+* **Bounded and disclosed.** The walk stops at ``MAX_ANCESTRY_DEPTH``, on a
+  cycle, or at an unbound ancestor and sets ``truncated`` — the caller
+  discloses it (``/api/chat/history`` reports it as the ``ancestry_depth``
+  window cause) rather than quietly serving a short history.
+
+The module also owns the ONE row-classification pair both readers share —
+:func:`bound_chat_for_row` (a post-hoc bound task's owning project chat, by task
+LINEAGE) and :func:`admits_row`. Keeping the lens but re-implementing "does this
+row belong to the thread" per caller is exactly how the UI and the agent drifted
+apart before.
 """
 
 from __future__ import annotations
@@ -112,6 +129,62 @@ class ThreadLens:
         return False
 
 
+def _entry_chat(entry: Any) -> int:
+    """Best-effort ``chat_id`` of a chat.jsonl row.
+
+    A missing/blank id reads as the MAIN chat (1), the same default
+    ``gateway/history.py`` has always applied when it decoded the raw row — the
+    two readers must not disagree about what an unstamped row belongs to.
+    """
+    try:
+        return int((entry or {}).get("chat_id", 1) or 1)
+    except (TypeError, ValueError, AttributeError):
+        return 1
+
+
+def bound_chat_for_row(entry: Any, bindings_by_task: Dict[str, int]) -> int:
+    """The project chat a post-hoc bound task's row belongs to, by LINEAGE.
+
+    A task converted into a project AFTER it started keeps its original (main)
+    ``chat_id`` on every row, so the durable binding is the only truth about
+    ownership — and a subagent's rows carry only the ROOT's binding, hence the
+    own -> parent -> root walk (same semantics as
+    ``projects_registry.project_chat_for_task_tree``, served from ONE preloaded
+    bindings map so no per-row file read happens).
+
+    Both readers MUST use this: resolving the binding differently on the two
+    surfaces is how the agent's context and the owner's history disagreed about
+    a bound task's rows in the first place.
+    """
+    if not isinstance(entry, dict) or not bindings_by_task:
+        return 0
+    for field in ("task_id", "parent_task_id", "root_task_id"):
+        tid = str(entry.get(field) or "").strip()
+        if tid and bindings_by_task.get(tid):
+            try:
+                return int(bindings_by_task[tid])
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def admits_row(lens: "ThreadLens", entry: Any, bound_chat: int = 0) -> bool:
+    """Whether one chat.jsonl row belongs to the thread ``lens`` describes.
+
+    THE shared predicate: a row is in scope when its own chat is admitted
+    within its cutoff, when the project chat its task is BOUND to is admitted
+    (post-hoc conversion — the row keeps a main ``chat_id``), or when the row IS
+    a canonical owner row an in-scope binding references. ``bound_chat`` comes
+    from :func:`bound_chat_for_row`.
+    """
+    ts = str((entry or {}).get("ts") or "") if isinstance(entry, dict) else ""
+    if bound_chat and lens.admits(bound_chat, ts):
+        return True
+    if isinstance(entry, dict) and lens.admits_source_ref(entry):
+        return True
+    return lens.admits(_entry_chat(entry), ts)
+
+
 def _source_refs_by_chat(drive_root: Any, chats: set) -> Dict[int, List[Dict[str, Any]]]:
     """Bucket binding-held source refs by project chat, in ONE bindings read.
 
@@ -154,13 +227,7 @@ def thread_ancestry_lens(
         cid = int(chat_id or 0)
     except (TypeError, ValueError):
         cid = 0
-    try:
-        from ouroboros.projects_registry import resolve_chat_binding
-
-        binding = resolve_chat_binding(drive_root, cid)
-    except Exception:
-        log.debug("thread_ancestry_lens binding lookup failed", exc_info=True)
-        binding = {}
+    binding = _chat_binding(drive_root, cid)
     if not binding:
         return ThreadLens(chat_id=cid, cutoffs={cid: ""} if cid else {}, order=[cid] if cid else [])
 
@@ -186,25 +253,43 @@ def thread_ancestry_lens(
         # Intersection: a descendant can never see more of an ancestor than the
         # link it inherited the view through.
         effective = _min_cutoff(effective, fork_before)
+        if parent_chat == cid:
+            # The cycle closes on the chat being READ. Its own rows are its own
+            # present — bounding them would make the thread reject the messages
+            # it just sent (and the agent working in it lose its newest turn).
+            # Leave the requesting chat unbounded and disclose the cycle.
+            truncated = True
+            log.warning(
+                "Thread ancestry cycles back to the requesting chat %s — walk "
+                "stopped; its own cutoff is left open",
+                cid,
+            )
+            break
         if parent_chat in cutoffs:
-            # A cycle (only reachable through hand-edited state): tighten the
-            # existing bound and stop rather than loop forever.
+            # A cycle among ANCESTORS (only reachable through hand-edited
+            # state): tighten the existing bound and stop rather than loop.
             cutoffs[parent_chat] = _min_cutoff(cutoffs[parent_chat], effective)
             truncated = True
             log.warning("Thread ancestry cycle at chat %s — walk stopped", parent_chat)
             break
+        # Lifecycle-blind by construction: _chat_binding answers for
+        # deleting/tombstoned rows too, so a fork of a deleted thread keeps
+        # reading its shared past (A3a). But an ancestor with NO binding at all
+        # is the Main chat or an external transport — admitting it would pour a
+        # whole foreign conversation into this thread. Refuse BEFORE it enters
+        # the cutoffs, and disclose the refusal.
+        parent_binding = _chat_binding(drive_root, parent_chat)
+        if not parent_binding:
+            truncated = True
+            log.warning(
+                "Thread ancestry of chat %s names chat %s as a parent, but that "
+                "chat has no project binding — ancestor refused",
+                cid, parent_chat,
+            )
+            break
         cutoffs[parent_chat] = effective
         order.append(parent_chat)
-        try:
-            from ouroboros.projects_registry import resolve_chat_binding
-
-            # Lifecycle-blind by construction: resolve_chat_binding answers for
-            # deleting/tombstoned rows too, so a fork of a deleted thread keeps
-            # reading its shared past (A3a).
-            current = resolve_chat_binding(drive_root, parent_chat) or None
-        except Exception:
-            log.debug("thread_ancestry_lens ancestor lookup failed", exc_info=True)
-            current = None
+        current = parent_binding
 
     source_refs = (
         _source_refs_by_chat(drive_root, set(cutoffs)) if with_source_refs else {}
@@ -218,6 +303,19 @@ def thread_ancestry_lens(
         source_refs=source_refs,
         truncated=truncated,
     )
+
+
+def _chat_binding(drive_root: Any, chat_id: int) -> Dict[str, Any]:
+    """``resolve_chat_binding`` with the walk's fail-closed error handling."""
+    if not chat_id:
+        return {}
+    try:
+        from ouroboros.projects_registry import resolve_chat_binding
+
+        return resolve_chat_binding(drive_root, chat_id) or {}
+    except Exception:
+        log.debug("thread_ancestry_lens binding lookup failed", exc_info=True)
+        return {}
 
 
 def _thread_row(binding: Dict[str, Any]) -> Dict[str, Any]:
@@ -247,4 +345,10 @@ def _fork_cursor(thread: Dict[str, Any]) -> tuple:
     return parent, str(thread.get("fork_before_ts") or "")
 
 
-__all__ = ["MAX_ANCESTRY_DEPTH", "ThreadLens", "thread_ancestry_lens"]
+__all__ = [
+    "MAX_ANCESTRY_DEPTH",
+    "ThreadLens",
+    "admits_row",
+    "bound_chat_for_row",
+    "thread_ancestry_lens",
+]

@@ -13,6 +13,7 @@ import json
 
 from ouroboros.project_dialogue import _text_sha256
 from ouroboros.projects_registry import (
+    _registry_path,
     begin_project_deletion,
     bind_task_to_project,
     complete_project_deletion,
@@ -21,6 +22,19 @@ from ouroboros.projects_registry import (
     fork_thread,
 )
 from ouroboros.thread_history import MAX_ANCESTRY_DEPTH, thread_ancestry_lens
+from ouroboros.utils import atomic_write_json, read_json_dict
+
+
+def _rewrite_thread(tmp_path, project_id, thread_id, **fields):
+    """Hand-edit a stored thread row (the only way these states are reachable)."""
+    data = read_json_dict(_registry_path(tmp_path))
+    for entry in data["projects"]:
+        if entry.get("id") != project_id:
+            continue
+        for row in entry.get("threads") or []:
+            if int(row["id"]) == int(thread_id):
+                row.update(fields)
+    atomic_write_json(_registry_path(tmp_path), data)
 
 
 def _rows(tmp_path, rows):
@@ -36,6 +50,43 @@ def _chat_row(chat_id, ts, text, direction="in", **extra):
         "chat_id": chat_id, "ts": ts, "text": text, "direction": direction,
         "client_message_id": f"cm-{text}", **extra,
     }
+
+
+def _agent_chat_section(tmp_path, thread_chat_id):
+    """The '## Recent chat' section the AGENT sees for one thread."""
+    from ouroboros.context import build_recent_sections
+
+    class _Memory:
+        drive_root = tmp_path
+
+        def read_jsonl_tail(self, name, limit):
+            path = tmp_path / "logs" / name
+            if not path.is_file():
+                return []
+            return [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ][-limit:]
+
+        def summarize_chat(self, entries, limit=0):
+            return "\n".join(str(e.get("text") or "") for e in entries)
+
+        def summarize_progress(self, rows, limit=0):
+            return ""
+
+        def summarize_tools(self, rows):
+            return ""
+
+        def summarize_events(self, rows):
+            return ""
+
+        def summarize_supervisor(self, rows):
+            return ""
+
+    sections = build_recent_sections(
+        _Memory(), object(), task_id="", thread_chat_id=thread_chat_id
+    )
+    return next((s for s in sections if s.startswith("## Recent chat")), "")
 
 
 def test_plain_thread_reads_only_itself(tmp_path):
@@ -200,8 +251,6 @@ def test_agent_context_reads_the_same_shared_past(tmp_path, monkeypatch):
     """R4: context.py reads its own raw tail. If the cursor lived only in the
     history endpoint, the agent working IN the fork would see a different
     conversation than the owner reading it."""
-    from ouroboros.context import build_recent_sections
-
     create_project(tmp_path, "racer")
     parent = create_thread(tmp_path, "racer", name="Parent")
     _rows(tmp_path, [_chat_row(parent["chat_id"], "2026-01-01T00:00:00+00:00", "shared-past")])
@@ -211,35 +260,223 @@ def test_agent_context_reads_the_same_shared_past(tmp_path, monkeypatch):
         _chat_row(fork["chat_id"], "2027-01-02T00:00:00+00:00", "fork-own"),
     ])
 
-    class _Memory:
-        drive_root = tmp_path
-
-        def read_jsonl_tail(self, name, limit):
-            path = tmp_path / "logs" / name
-            if not path.is_file():
-                return []
-            return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()][-limit:]
-
-        def summarize_chat(self, entries, limit=0):
-            return "\n".join(str(e.get("text") or "") for e in entries)
-
-        def summarize_progress(self, rows, limit=0):
-            return ""
-
-        def summarize_tools(self, rows):
-            return ""
-
-        def summarize_events(self, rows):
-            return ""
-
-        def summarize_supervisor(self, rows):
-            return ""
-
-    sections = build_recent_sections(
-        _Memory(), object(), task_id="", thread_chat_id=fork["chat_id"]
-    )
-    chat_section = next((s for s in sections if s.startswith("## Recent chat")), "")
+    chat_section = _agent_chat_section(tmp_path, fork["chat_id"])
 
     assert "shared-past" in chat_section
     assert "fork-own" in chat_section
     assert "parent-moved-on" not in chat_section
+
+
+# --------------------------------------------------------------------------- #
+# T0 FIX round: the two surfaces must answer the SAME question
+# --------------------------------------------------------------------------- #
+def test_a_post_hoc_bound_task_lands_in_both_surfaces_identically(tmp_path):
+    """The divergence that refuted this phase's core claim.
+
+    ``context.py`` resolved a post-hoc binding with ``_bound.get(task) ==
+    thread_chat_id`` — the thread's OWN chat, own task id only — while
+    ``gateway/history.py`` routed the same binding through ``lens.admits`` by
+    task LINEAGE. So a task bound to a PARENT thread appeared in the fork's UI
+    history and was invisible to the agent working in that fork, and a subagent
+    row (bound only through its root) was invisible to the agent everywhere.
+    """
+    from ouroboros.gateway.history import _assemble_history_response
+
+    create_project(tmp_path, "racer")
+    parent = create_thread(tmp_path, "racer", name="Parent")
+    bind_task_to_project(
+        tmp_path, "task-9", "racer", parent["chat_id"],
+        origin={"absent": "post_hoc_unresolved"},
+    )
+    # The bound task's rows keep their ORIGINAL main chat_id (that is the whole
+    # point of a post-hoc binding) — one of its own, one of a subagent.
+    _rows(tmp_path, [
+        _chat_row(1, "2026-01-01T00:00:00+00:00", "bound-row", task_id="task-9"),
+        _chat_row(
+            1, "2026-01-01T00:00:01+00:00", "bound-child",
+            task_id="task-9-child", root_task_id="task-9",
+        ),
+    ])
+    fork = fork_thread(tmp_path, "racer", parent["id"])
+    _rows(tmp_path, [
+        _chat_row(1, "2099-01-01T00:00:00+00:00", "bound-after-fork", task_id="task-9"),
+        _chat_row(1, "2026-01-01T00:00:00+00:00", "unbound-main"),
+    ])
+
+    ui = [
+        m["text"]
+        for m in json.loads(_assemble_history_response(tmp_path, fork["chat_id"], 50, 10))["messages"]
+    ]
+    agent = _agent_chat_section(tmp_path, fork["chat_id"])
+
+    for text in ("bound-row", "bound-child"):
+        assert text in ui, f"{text} missing from the owner's history"
+        assert text in agent, f"{text} missing from the agent's context"
+    # ...and both stay bounded by the SAME cutoff and the same ownership rule.
+    for text in ("bound-after-fork", "unbound-main"):
+        assert text not in ui and text not in agent
+
+
+def test_both_surfaces_build_the_lens_with_source_refs(tmp_path):
+    """A converted project's start message lives in Main and is reachable only
+    through the binding's source ref. Building the agent's lens WITHOUT refs
+    while the history endpoint built it WITH them was the second half of the
+    same divergence."""
+    from ouroboros.gateway.history import _assemble_history_response
+
+    project_chat = create_project(tmp_path, "conv")["chat_id"]
+    text = "please turn this into a project"
+    bind_task_to_project(
+        tmp_path, "task-1", "conv", project_chat,
+        origin={
+            "ref": {
+                "chat_id": 1,
+                "client_message_id": "cm-origin",
+                "ts": "2026-01-01T00:00:00+00:00",
+                "text_sha256": _text_sha256(text),
+            },
+            "text": text,
+        },
+    )
+    _rows(tmp_path, [{
+        "chat_id": 1, "ts": "2026-01-01T00:00:00+00:00", "direction": "in",
+        "text": text, "client_message_id": "cm-origin",
+    }])
+    fork = fork_thread(tmp_path, "conv", 0)
+
+    ui = [
+        m["text"]
+        for m in json.loads(_assemble_history_response(tmp_path, fork["chat_id"], 50, 10))["messages"]
+    ]
+    assert text in ui
+    assert text in _agent_chat_section(tmp_path, fork["chat_id"])
+
+
+def test_an_unbound_ancestor_never_enters_the_lens(tmp_path):
+    """A hand-written ``fork_of_chat_id: 1`` would pour the WHOLE Main chat into
+    a project thread's history AND the agent's focused context, silently. The
+    walk refuses an ancestor with no project binding BEFORE it enters the
+    cutoffs, and discloses the refusal."""
+    from ouroboros.gateway.history import _assemble_history_response
+
+    create_project(tmp_path, "racer")
+    thread = create_thread(tmp_path, "racer", name="T")
+    _rewrite_thread(
+        tmp_path, "racer", thread["id"],
+        fork_of_chat_id=1, fork_before_ts="2030-01-01T00:00:00+00:00",
+    )
+    _rows(tmp_path, [
+        _chat_row(1, "2026-01-01T00:00:00+00:00", "private-main-chat"),
+        _chat_row(thread["chat_id"], "2026-01-02T00:00:00+00:00", "own"),
+    ])
+
+    lens = thread_ancestry_lens(tmp_path, thread["chat_id"])
+    assert lens.cutoffs == {thread["chat_id"]: ""}
+    assert lens.admits(1, "2026-01-01T00:00:00+00:00") is False
+    assert lens.truncated is True          # refused, not silently dropped
+
+    payload = json.loads(_assemble_history_response(tmp_path, thread["chat_id"], 50, 10))
+    texts = [m["text"] for m in payload["messages"]]
+    assert "own" in texts and "private-main-chat" not in texts
+    assert "ancestry_depth" in payload["window"]["truncated_by"]
+
+    agent = _agent_chat_section(tmp_path, thread["chat_id"])
+    assert "own" in agent and "private-main-chat" not in agent
+
+
+def test_a_cycle_never_narrows_the_requesting_threads_own_present(tmp_path):
+    """A self-parent (or A->B->A) used to tighten the REQUESTING chat's cutoff,
+    so a thread started rejecting the messages it had just sent."""
+    create_project(tmp_path, "racer")
+    solo = create_thread(tmp_path, "racer", name="Solo")
+    _rewrite_thread(
+        tmp_path, "racer", solo["id"],
+        fork_of_chat_id=solo["chat_id"], fork_before_ts="2020-01-01T00:00:00+00:00",
+    )
+
+    lens = thread_ancestry_lens(tmp_path, solo["chat_id"])
+    assert lens.cutoffs[solo["chat_id"]] == ""                    # unbounded
+    assert lens.admits(solo["chat_id"], "2030-01-01T00:00:00+00:00") is True
+    assert lens.truncated is True
+
+    # ...and the two-hop variant A -> B -> A.
+    a = create_thread(tmp_path, "racer", name="A")
+    b = create_thread(tmp_path, "racer", name="B")
+    _rewrite_thread(tmp_path, "racer", a["id"],
+                    fork_of_chat_id=b["chat_id"], fork_before_ts="2026-01-01T00:00:00+00:00")
+    _rewrite_thread(tmp_path, "racer", b["id"],
+                    fork_of_chat_id=a["chat_id"], fork_before_ts="2020-01-01T00:00:00+00:00")
+
+    looped = thread_ancestry_lens(tmp_path, a["chat_id"])
+    assert looped.cutoffs[a["chat_id"]] == ""
+    assert looped.admits(a["chat_id"], "2030-01-01T00:00:00+00:00") is True
+    assert looped.cutoffs[b["chat_id"]] == "2026-01-01T00:00:00+00:00"
+    assert looped.truncated is True
+
+
+def test_a_bounded_ancestry_is_disclosed_end_to_end(tmp_path, monkeypatch):
+    """ARCHITECTURE promises the ``truncated`` flag is DISCLOSED. It was set by
+    the lens and consumed by nobody: the response still called itself complete
+    while part of the shared past had not been read."""
+    import ouroboros.thread_history as th
+    from ouroboros.gateway.history import _assemble_history_response
+
+    monkeypatch.setattr(th, "MAX_ANCESTRY_DEPTH", 2)
+    create_project(tmp_path, "racer")
+    tip = create_thread(tmp_path, "racer", name="root")
+    for _ in range(4):
+        tip = fork_thread(tmp_path, "racer", tip["id"])
+    _rows(tmp_path, [_chat_row(tip["chat_id"], "2026-01-01T00:00:00+00:00", "own")])
+
+    payload = json.loads(_assemble_history_response(tmp_path, tip["chat_id"], 50, 10))
+    assert payload["window"]["complete"] is False
+    assert "ancestry_depth" in payload["window"]["truncated_by"]
+
+    # An ordinary thread discloses nothing extra.
+    plain = create_thread(tmp_path, "racer", name="Plain")
+    _rows(tmp_path, [_chat_row(plain["chat_id"], "2026-01-03T00:00:00+00:00", "plain")])
+    ok = json.loads(_assemble_history_response(tmp_path, plain["chat_id"], 50, 10))
+    assert "ancestry_depth" not in ok["window"]["truncated_by"]
+
+
+def test_ancestor_origin_rows_come_from_one_bindings_read(tmp_path):
+    """T0-12: the origin fallback asked project_origin_rows per ancestor, so a
+    fork chain re-read state/project_task_bindings.json once per link and could
+    synthesize ONE owner message several times."""
+    import ouroboros.projects_registry as registry
+    from ouroboros.gateway.history import _origin_fallback_rows
+
+    project_chat = create_project(tmp_path, "conv")["chat_id"]
+    text = "start the project"
+    ref = {
+        "chat_id": 1, "client_message_id": "cm-origin",
+        "ts": "2026-01-01T00:00:00+00:00", "text_sha256": _text_sha256(text),
+    }
+    # Two bindings of the SAME owner message, on two chats of the ancestry.
+    bind_task_to_project(tmp_path, "task-1", "conv", project_chat,
+                         origin={"ref": ref, "text": text})
+    child = create_thread(tmp_path, "conv", name="Child")
+    bind_task_to_project(tmp_path, "task-2", "conv", child["chat_id"],
+                         origin={"ref": ref, "text": text})
+    fork = fork_thread(tmp_path, "conv", child["id"])
+    _rewrite_thread(tmp_path, "conv", fork["id"], fork_of_chat_id=child["chat_id"])
+
+    lens = thread_ancestry_lens(tmp_path, fork["chat_id"], with_source_refs=False)
+    assert len(lens.order) >= 2                          # a real chain
+
+    reads = {"n": 0}
+    original = registry.project_task_bindings
+
+    def _counting(*args, **kwargs):
+        reads["n"] += 1
+        return original(*args, **kwargs)
+
+    registry.project_task_bindings = _counting
+    try:
+        synthesized = _origin_fallback_rows(tmp_path, lens, [])
+    finally:
+        registry.project_task_bindings = original
+
+    assert reads["n"] == 1, "one bucketed bindings read for the whole chain"
+    # ONE row despite two ancestor bindings holding the same origin identity.
+    assert [row["text"] for row in synthesized] == [text]

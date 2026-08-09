@@ -868,30 +868,42 @@ def build_recent_sections(
             _bound = all_task_bindings(memory.drive_root)
         except Exception:
             _bound = {}
-        # THE SAME lens gateway/history.py serves the owner: a forked thread's
-        # shared past is defined ONCE (ancestors + intersected inclusive
-        # cutoffs), so the agent and the UI can never see different histories of
-        # the same thread. Source refs are off here — this branch classifies by
-        # chat id and task binding, exactly as before.
+        # THE SAME lens gateway/history.py serves the owner, asked THE SAME
+        # question: a forked thread's shared past is defined ONCE (ancestors +
+        # intersected inclusive cutoffs + the ancestors' binding source refs),
+        # and the row test is the shared thread_history.admits_row /
+        # bound_chat_for_row pair. The post-hoc binding used to be compared
+        # DIRECTLY against this thread's own chat id here while the history
+        # endpoint routed the same binding THROUGH the lens — so a task bound to
+        # a parent thread appeared in a fork's UI history and was invisible to
+        # the agent working in that fork. Both surfaces now resolve the binding
+        # by task LINEAGE and admit it through the lens, and both build the lens
+        # with source refs, so neither can answer from a differently-built lens.
         try:
             from ouroboros.thread_history import thread_ancestry_lens
 
             _lens = thread_ancestry_lens(
-                memory.drive_root, thread_chat_id, with_source_refs=False
+                memory.drive_root, thread_chat_id, with_source_refs=True
             )
         except Exception:
             log.debug("Thread ancestry lens unavailable; own thread only", exc_info=True)
             _lens = None
         recent = memory.read_jsonl_tail("chat.jsonl", _PROJECT_THREAD_SCAN)
-        chat_entries = [
-            e for e in recent
-            if (
-                _lens.admits(_entry_chat_id(e), (e or {}).get("ts"))
-                if _lens is not None
-                else _entry_chat_id(e) == thread_chat_id
-            )
-            or _bound.get(str((e or {}).get("task_id") or "")) == thread_chat_id
-        ][-_chat_tail:]
+        if _lens is not None:
+            from ouroboros.thread_history import admits_row, bound_chat_for_row
+
+            chat_entries = [
+                e for e in recent
+                if admits_row(_lens, e, bound_chat_for_row(e, _bound))
+            ][-_chat_tail:]
+        else:
+            # Lens unavailable (unreadable registry): degrade to this thread's
+            # OWN rows plus its own directly-bound tasks — narrower, never wider.
+            chat_entries = [
+                e for e in recent
+                if _entry_chat_id(e) == thread_chat_id
+                or _bound.get(str((e or {}).get("task_id") or "")) == thread_chat_id
+            ][-_chat_tail:]
     else:
         dialogue_meta = memory.load_dialogue_meta()
         try:
