@@ -105,8 +105,10 @@ simultaneously harder to read and flatter in hierarchy.
 
 **De-emphasise the secondary rather than amplifying the primary.** When
 something needs to stand out, drop the ink around it, do not raise its own. All
-three foregrounds above clear the 4.5:1 floor against `--bg-primary` with room
-to spare; the scale between them is the design.
+Primary (15.9:1) and meta (9.2:1) clear the 4.5:1 floor against `--bg-primary`
+with room to spare. `--text-disabled` is deliberately BELOW it (3.5:1) and is
+therefore reserved for genuinely disabled or incidental content, which WCAG
+exempts; it must never carry meaning a reader has to obtain.
 
 ## 4. Status and chips
 
@@ -124,7 +126,7 @@ derived from whatever generic opacity happens to sit on the element.
   the sentence does not have to shout it in saturated colour and can sit at
   ordinary reading contrast.
 - **Neutral is a real state**, not an absence of one. A classification chip
-  (which coding agent, which family) is neutral: it is a tag, not an alarm.
+  (which agent, which family) is neutral: it is a tag, not an alarm.
   A tone value the code actually emits (`muted`) must have a rule; falling
   through to a default is how chips end up white.
 - Chips are `--type-meta`, not smaller, and are not uppercased.
@@ -149,7 +151,7 @@ derived from whatever generic opacity happens to sit on the element.
 
 ## 6. Account group / row anatomy
 
-For a repeated identity row (a connected coding-agent account, a reviewer slot,
+For a repeated identity row (a connected agent account, a reviewer slot,
 a server entry):
 
 1. **Classification chip** — neutral pair, `--type-meta`.
