@@ -383,6 +383,9 @@ export function renderReviewerSlotsSection() {
                 <button type="button" class="settings-ghost-btn" id="btn-add-triad-slot">Add triad slot</button>
             </div>
             <h4 class="reviewer-slots-heading">Scope slots <span class="muted" id="reviewer-scope-limit" title="The scope pool's real width"></span></h4>
+            <div class="settings-inline-note">An agent row reads the repository with its own read-only tools instead of
+                being handed one assembled pack. Its verdict is authoritative once that agent's context window is
+                confirmed at 200K or more; Ouroboros does not attest which files the agent opened.</div>
             <div id="reviewer-scope-rows" class="reviewer-slot-rows"></div>
             <div class="settings-toolbar">
                 <button type="button" class="settings-ghost-btn" id="btn-add-scope-slot">Add scope slot</button>
