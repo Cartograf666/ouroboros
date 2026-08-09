@@ -3045,33 +3045,68 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                     '.chat-instance-panel .chat-live-card[data-task-id="panel-root"]'
                 )
                 panel_card.wait_for(state="visible", timeout=30_000)
-                panel_facts = panel_card.evaluate(
-                    """card => {
+                read_panel_facts = """card => {
                         const panel = card.closest('.chat-instance-panel');
                         const summary = card.querySelector(':scope > .chat-live-summary-button .chat-live-summary');
                         const main = summary.querySelector('.chat-live-summary-main').getBoundingClientRect();
                         const side = summary.querySelector('.chat-live-summary-side').getBoundingClientRect();
                         const title = summary.querySelector('[data-live-title]').getBoundingClientRect();
+                        const column = card.closest('.chat-messages');
+                        const colStyle = getComputedStyle(column);
                         return {
                             panelWidth: panel.getBoundingClientRect().width,
+                            columnWidth: column.clientWidth
+                                - parseFloat(colStyle.paddingLeft)
+                                - parseFloat(colStyle.paddingRight),
                             cardWidth: card.getBoundingClientRect().width,
                             cardClient: card.clientWidth,
                             cardScroll: card.scrollWidth,
                             titleWidth: title.width,
                             mainBottom: main.bottom,
                             sideTop: side.top,
+                            sideBottom: side.bottom,
+                            mainTop: main.top,
                         };
                     }"""
-                )
+                panel_facts = panel_card.evaluate(read_panel_facts)
                 # Still narrower than the viewport: the card must respond to its
-                # actual consumer width (the centre column) rather than the window.
+                # actual CONSUMER width (the centre column, viewport minus the
+                # sidebar) rather than the window.
                 assert panel_facts["panelWidth"] <= 1100 - 180, panel_facts
-                assert panel_facts["cardWidth"] >= panel_facts["panelWidth"] * 0.9, panel_facts
+                # A thread reads through the SAME centred 760px column as Main Chat
+                # now that it mounts in the centre, so the card fills the COLUMN, not
+                # the whole instance — comparing it to the instance would pin the
+                # narrow rail's edge-to-edge padding that the centre deliberately
+                # dropped.
+                assert panel_facts["columnWidth"] < panel_facts["panelWidth"], panel_facts
+                assert panel_facts["cardWidth"] >= panel_facts["columnWidth"] * 0.9, panel_facts
                 assert panel_facts["cardScroll"] <= panel_facts["cardClient"] + 1, panel_facts
                 assert panel_facts["titleWidth"] >= 180, panel_facts
-                assert panel_facts["sideTop"] >= panel_facts["mainBottom"] - 1, panel_facts
+                # A thread used to mount in a ~440px right rail, so this leg pinned
+                # the WRAPPING fallback (meta below the title). In the centre the
+                # same thread is ~870px wide, where the meta belongs on the title's
+                # own row — asserting the wrap here would now pin a squeeze that no
+                # longer happens. The wrap is still covered, one step below.
+                assert min(panel_facts["mainBottom"], panel_facts["sideBottom"]) \
+                    > max(panel_facts["mainTop"], panel_facts["sideTop"]), panel_facts
                 wide.screenshot(
-                    path=str(data_dir.parent / f"live-card-project-panel-{browser_engine}.png"),
+                    path=str(data_dir.parent / f"live-card-project-thread-{browser_engine}.png"),
+                    full_page=True,
+                )
+
+                # The narrow CONSUMER is now a narrow window. Shrink it and the same
+                # card must fall back to the stacked layout, still without
+                # overflowing — the container query reads the chat column, so the
+                # fallback has to follow the column at whatever width it appears.
+                wide.set_viewport_size({"width": 560, "height": 750})
+                wide.wait_for_timeout(400)
+                narrow_facts = panel_card.evaluate(read_panel_facts)
+                assert narrow_facts["panelWidth"] < panel_facts["panelWidth"], narrow_facts
+                assert narrow_facts["columnWidth"] < panel_facts["columnWidth"], narrow_facts
+                assert narrow_facts["cardScroll"] <= narrow_facts["cardClient"] + 1, narrow_facts
+                assert narrow_facts["sideTop"] >= narrow_facts["mainBottom"] - 1, narrow_facts
+                wide.screenshot(
+                    path=str(data_dir.parent / f"live-card-thread-narrow-{browser_engine}.png"),
                     full_page=True,
                 )
             finally:

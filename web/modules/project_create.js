@@ -288,68 +288,66 @@ export async function openProjectRowMenu(project, { apiClient, anchorEl, onChang
 }
 
 async function runProjectRowAction(action, project, { apiClient, anchorEl, onChanged, maxNameLength }) {
-    {
-        if (action === 'rename') {
-            const res = await openConfirmDialog({
+    if (action === 'rename') {
+        const res = await openConfirmDialog({
+            title: 'Rename project',
+            body: `New name for “${project.name || project.id}”:`,
+            input: true,
+            initialValue: project.name || project.id,
+            confirmLabel: 'Rename',
+        });
+        const newName = res?.confirmed ? String(res.value || '').trim() : '';
+        if (newName.length > maxNameLength) {
+            await openConfirmDialog({
                 title: 'Rename project',
-                body: `New name for “${project.name || project.id}”:`,
-                input: true,
-                initialValue: project.name || project.id,
-                confirmLabel: 'Rename',
+                body: `Project names are limited to ${maxNameLength} characters.`,
+                alert: true,
             });
-            const newName = res?.confirmed ? String(res.value || '').trim() : '';
-            if (newName.length > maxNameLength) {
+        } else if (newName && newName !== project.name) {
+            try { await apiClient.projectUpdate(project.id, newName); onChanged?.(); }
+            catch (e) {
                 await openConfirmDialog({
-                    title: 'Rename project',
-                    body: `Project names are limited to ${maxNameLength} characters.`,
-                    alert: true,
-                });
-            } else if (newName && newName !== project.name) {
-                try { await apiClient.projectUpdate(project.id, newName); onChanged?.(); }
-                catch (e) {
-                    await openConfirmDialog({
-                        title: 'Rename failed',
-                        body: `Rename failed: ${e?.body?.error || e?.message || e}`,
-                        alert: true,
-                    });
-                }
-            }
-            if (anchorEl.isConnected) anchorEl.focus();
-        } else if (action === 'delete') {
-            const ok = await openConfirmDialog({
-                title: 'Delete project',
-                body: `Delete “${project.name || project.id}”? Running work will be cancelled. The Project will be removed from the active UI; its id, chat history, task bindings, memory, and working folder are preserved.`,
-                confirmLabel: 'Delete',
-                danger: true,
-            });
-            if (ok === true) {
-                onChanged?.({ projectId: project.id, lifecycle: 'deleting', optimistic: true });
-                try { await apiClient.projectDelete(project.id); }
-                catch (e) {
-                    await openConfirmDialog({
-                        title: 'Delete did not finish',
-                        body: `Delete did not finish: ${e?.body?.error || e?.message || e}`,
-                        alert: true,
-                    });
-                }
-                finally { onChanged?.({ authoritative: true }); }
-            }
-            if (anchorEl.isConnected) anchorEl.focus();
-        } else if (action === 'fork') {
-            // Thread #0 of a project — NOT the global Main chat, which has no
-            // forkable spelling. The fork stores a cursor into this thread's
-            // rows; nothing is copied and the source is untouched (A3).
-            try {
-                const payload = await apiClient.projectThreadFork(project.id, 0);
-                onChanged?.({ authoritative: true, thread: payload?.thread || null });
-            } catch (e) {
-                await openConfirmDialog({
-                    title: 'Fork failed',
-                    body: `Fork failed: ${e?.body?.error || e?.message || e}`,
+                    title: 'Rename failed',
+                    body: `Rename failed: ${e?.body?.error || e?.message || e}`,
                     alert: true,
                 });
             }
-            if (anchorEl.isConnected) anchorEl.focus();
         }
+        if (anchorEl.isConnected) anchorEl.focus();
+    } else if (action === 'delete') {
+        const ok = await openConfirmDialog({
+            title: 'Delete project',
+            body: `Delete “${project.name || project.id}”? Running work will be cancelled. The Project will be removed from the active UI; its id, chat history, task bindings, memory, and working folder are preserved.`,
+            confirmLabel: 'Delete',
+            danger: true,
+        });
+        if (ok === true) {
+            onChanged?.({ projectId: project.id, lifecycle: 'deleting', optimistic: true });
+            try { await apiClient.projectDelete(project.id); }
+            catch (e) {
+                await openConfirmDialog({
+                    title: 'Delete did not finish',
+                    body: `Delete did not finish: ${e?.body?.error || e?.message || e}`,
+                    alert: true,
+                });
+            }
+            finally { onChanged?.({ authoritative: true }); }
+        }
+        if (anchorEl.isConnected) anchorEl.focus();
+    } else if (action === 'fork') {
+        // Thread #0 of a project — NOT the global Main chat, which has no
+        // forkable spelling. The fork stores a cursor into this thread's
+        // rows; nothing is copied and the source is untouched (A3).
+        try {
+            const payload = await apiClient.projectThreadFork(project.id, 0);
+            onChanged?.({ authoritative: true, thread: payload?.thread || null });
+        } catch (e) {
+            await openConfirmDialog({
+                title: 'Fork failed',
+                body: `Fork failed: ${e?.body?.error || e?.message || e}`,
+                alert: true,
+            });
+        }
+        if (anchorEl.isConnected) anchorEl.focus();
     }
 }

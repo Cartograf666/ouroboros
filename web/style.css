@@ -7318,6 +7318,24 @@ textarea.chat-input {
     padding-bottom: max(12px, env(safe-area-inset-bottom, 0px));
 }
 
+/* A CENTRE-mounted thread is as wide as Main Chat, so it reads with the SAME
+   centred 760px column and the SAME composer gutters. The two rules above are
+   tuned for the narrow right rail the panel used to be; inheriting them here
+   would stretch a thread's transcript to the full centre width while Main Chat
+   beside it stayed readable. These come AFTER (equal specificity, source order
+   decides) and restore the shared reading column. */
+.chat-instance-centre .chat-messages {
+    padding: 20px max(var(--space-5), calc((100% - 760px) / 2));
+    /* No overlay header here (the stage bar is in flow), so no top reserve. */
+    padding-top: var(--space-3);
+    padding-bottom: var(--chat-input-reserve, 108px);
+}
+
+.chat-instance-centre .chat-input-area {
+    padding: 32px max(var(--space-5), calc((100% - 760px) / 2)) var(--space-4);
+    padding-bottom: max(var(--space-4), env(safe-area-inset-bottom, 0px));
+}
+
 /* Project threads hide the GLOBAL controls (evolution/consciousness/restart/
    panic belong to the one agent, not to a project thread; the budget meter
    lives once in the sidebar). */

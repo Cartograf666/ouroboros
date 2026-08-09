@@ -910,13 +910,19 @@ function paintProjectsNav() {
         });
         if (threads) navProjectsList.appendChild(threads);
     }
-    attachProjectReorder(navProjectsList, (ids) => {
-        projectOrder = ids;
-        knownProjectsJson = '';
-        paintProjectsNav();
-        persistSidebarOrder({ project_order: projectOrder });
-    });
 }
+
+// Bound ONCE, not per paint: `#nav-projects-list` is a persistent element, so
+// re-attaching here on every repaint would stack a new set of drag listeners on
+// it each time /api/state changed anything (a thread list is rebuilt from
+// scratch each paint, so its own listeners go with it). The rows are found by
+// selector at drag time, so a rebuilt list needs no rebinding.
+attachProjectReorder(navProjectsList, (ids) => {
+    projectOrder = ids;
+    knownProjectsJson = '';
+    paintProjectsNav();
+    persistSidebarOrder({ project_order: projectOrder });
+});
 
 
 document.getElementById('nav-projects-add')?.addEventListener('click', async (event) => {
