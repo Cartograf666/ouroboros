@@ -318,6 +318,80 @@ def test_a_vouched_login_survives_an_unreadable_manifest(monkeypatch, tmp_path):
     assert [w["profile"]["profile_id"] for w in payload["profiles"]["profiles"]] == ["backup"]
 
 
+def test_account_removal_is_the_engine_contract_and_refuses_out_loud(monkeypatch, tmp_path):
+    """The FIFTH thin proxy: removing a named account is the daemon's own
+    ``DELETE /v2/credential-profiles/:harness/:profileId``.
+
+    Two invariants, one test. Ouroboros deletes NO vendor credential material
+    itself — the whole handler is one forwarded call — and an engine refusal
+    comes back AS a refusal (503), never as a cheerful ok that would leave the
+    owner believing an account is gone while it still rotates."""
+    import asyncio
+
+    from starlette.requests import Request
+
+    from ouroboros.claudexor_daemon import owned_config_dir  # noqa: F401  (patched below)
+    from ouroboros.gateway import claudexor_accounts as accounts
+    from ouroboros.gateways import claudexor as gw
+    import ouroboros.claudexor_daemon as owned
+
+    deleted: list = []
+
+    class FakeGateway:
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self, **_kw):
+            return {}
+
+        def delete_credential_profile(self, harness_id, profile_id):
+            if refuse:
+                raise gw.ClaudexorUnavailable("profile_in_use", "still running work")
+            deleted.append((harness_id, profile_id))
+            return {"ok": True}
+
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _cfg: object())
+
+    def _call(harness, profile_id):
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        request = Request({
+            "type": "http", "method": "DELETE",
+            "path": f"/api/claudexor/credential-profiles/{harness}/{profile_id}",
+            "headers": [], "query_string": b"",
+            "path_params": {"harness": harness, "profile_id": profile_id},
+        }, receive)
+        return asyncio.run(accounts.api_claudexor_credential_profile(request))
+
+    refuse = False
+    ok = _call("codex", "work")
+    assert ok.status_code == 200
+    assert deleted == [("codex", "work")], "the handler forwards and does nothing else"
+
+    refuse = True
+    denied = _call("codex", "work")
+    assert denied.status_code == 503
+    assert b"profile_in_use" in denied.body
+    assert deleted == [("codex", "work")], "a refusal removed nothing"
+
+    # A native CLI login has no profile id, and no route: this process cannot
+    # honestly sign a vendor CLI out, so it refuses at the edge instead of
+    # inventing a deletion.
+    refuse = False
+    bare = _call("codex", "")
+    assert bare.status_code == 400
+    assert b"profile_id" in bare.body
+
+
 def test_login_endpoint_validates_before_any_daemon_work():
     import asyncio
 
@@ -1759,3 +1833,58 @@ def test_wake_endpoint_discloses_a_typed_refusal_instead_of_a_generic_error(monk
 
     assert response.status_code == 503
     assert "claudexord_not_installed" in json.loads(response.body)["error"]
+
+
+# ---------------------------------------------------------------------------
+# The proxy count is a claim, and claims drift.
+# ---------------------------------------------------------------------------
+
+
+def test_the_proxy_count_in_the_docs_matches_the_handlers_that_exist(tmp_path):
+    """The module said "three THIN proxies" while a handler inside it introduced
+    itself as "A FOURTH thin proxy" — a file contradicting itself in the only two
+    places a reader looks first. A hand-counted number in prose cannot be trusted
+    to be re-counted when the fifth one lands, so it is asserted instead.
+
+    ``docs/ARCHITECTURE.md`` carries the same count in its gateway map, and it is
+    checked against the ROUTES rather than the handlers: a proxy the map never
+    names is a proxy nobody discovers from the architecture doc.
+    """
+    import inspect
+    import re
+
+    from ouroboros.gateway import claudexor_accounts as accounts
+
+    words = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+    handlers = sorted(
+        name for name, obj in vars(accounts).items()
+        if name.startswith("api_claudexor_") and inspect.iscoroutinefunction(obj)
+    )
+    expected = words[len(handlers)]
+    docstring = (accounts.__doc__ or "").lower()
+    assert f"{expected} thin proxies" in docstring, (
+        f"{len(handlers)} handlers ({', '.join(handlers)}) but the module docstring "
+        f"does not say \"{expected} THIN proxies\""
+    )
+
+    arch = (pathlib.Path(__file__).resolve().parents[1] / "docs" / "ARCHITECTURE.md") \
+        .read_text(encoding="utf-8")
+    line = next(ln for ln in arch.splitlines() if "claudexor_accounts.py" in ln)
+    assert f"{expected} thin proxies" in line.lower(), (
+        f"the gateway map still counts a different number of claudexor proxies: {line.strip()[:160]}"
+    )
+
+    # Every REGISTERED path is named in that map entry, so a new proxy cannot
+    # land undocumented behind an updated count.
+    from ouroboros.gateway.router import collect_routes
+
+    paths = {
+        route.path for route in collect_routes(data_dir=tmp_path)
+        if getattr(route, "path", "").startswith("/api/claudexor/")
+    }
+    assert paths, "no /api/claudexor/ routes are registered"
+    for path in sorted(paths):
+        # The map spells path params by name, not by their brace form for the
+        # two-segment removal route; compare on the stable prefix.
+        prefix = re.split(r"\{", path)[0].rstrip("/")
+        assert prefix in line, f"{path} is registered but the gateway map never names it"

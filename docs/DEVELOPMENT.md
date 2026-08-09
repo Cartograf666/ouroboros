@@ -657,7 +657,10 @@ pack cannot fit. Freely degradable touched snapshots move to diff-only first,
 largest-first within that tier; an artifact owed in full is reached only after
 the `-U0` rung and cannot buy fit by degrading into an invalid review.
 Owner-selected Low records the distinct BIBLE P3 scope skip; other route or
-assembly failure is not a clean verdict.
+assembly failure is not a clean verdict. An agent-session scope slot delivers by
+retrieval: its verdict is authoritative once its window is sourced at ≥200K, and
+"the host did not observe which files it read" is a provenance disclosure, never
+a missing-authority finding.
 
 The gate is one logical reviewer interaction per API slot. A same-route
 transport or empty-response rail may make one bounded second physical send. A
@@ -1000,6 +1003,11 @@ Before every commit, verify the following:
   window size it should not force scrolling merely because the access step has
   several provider fields; use responsive two-column field grids where width
   allows and keep step copy short.
+- There is ONE wizard host: the `GET /onboarding` page, served by the gateway
+  and loaded as an ES module from `/static`. The desktop setup window opens that
+  URL after the managed server is healthy, and the blocking overlay frames it.
+  Do not reintroduce a pre-server or inlined copy: a step that cannot call
+  `/api/*` or import `web/modules/*` is the defect this host removed.
 - Onboarding and Settings share the setup contract. If a key is typed in the
   current unsaved wizard payload, UI diagnostics must account for that in-memory
   value instead of warning from stale saved settings alone.
@@ -1013,21 +1021,78 @@ Before every commit, verify the following:
   "Off" false claims. The v6.22.1-era rule that the empty runtime-default must
   not become a third owner-facing button was valid only while the unset default
   was binary per mode; the v6.91 surface-aware light default obsoleted it.
-- One capability, one section. Delegation (`OUROBOROS_SUBAGENT_HARNESS`) and the
-  write permission (`OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`) share Models → Subagents
-  (`web/modules/subagents_settings.js`), beside Reviewer Slots: both answer "where
-  and how far do subagents run". Never render a second control over the same
-  settings key — two controls carry two drafts, and the last one collected wins.
+- One capability, one section. The whole subagent story lives in Agents →
+  Delegation (`web/modules/subagents_settings.js`), beside Review lanes: the
+  route (`OUROBOROS_SUBAGENT_HARNESS`), the write permission
+  (`OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`), and the two counts that bound it
+  (`OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT`, `OUROBOROS_MAX_SUBAGENT_DEPTH`),
+  with the two path roots behind a collapsed Advanced disclosure. They all answer
+  "where and how far do subagents run"; `OUROBOROS_MAX_WORKERS` stays in Advanced
+  because it sizes the process pool, not the agents. Never render a second control
+  over the same settings key — two controls carry two drafts, and the last one
+  collected wins, and a MOVE that leaves the old markup behind is exactly how a
+  duplicate appears (`tests/test_agents_tab_static.py` pins each moved id to one
+  occurrence).
   The delegated-run MODEL is the owner's default, authored here as the `=model`
   tail of the same key from engine discovery ("Engine default model" = empty
   tail); reasoning effort stays derived per call, and a hand-written `:effort`
   remainder rides through verbatim with no control over it.
-- A control the owner cannot use is worse than none. With no coding-agent
-  subscription connected the Subagents section says so and points at Providers →
-  Harness Accounts instead of rendering a delegation toggle whose every dispatch
-  would silently fall back to an API child. Harness lists come from the accounts
-  panel's own source (`accountRows` over `/api/claudexor/status`) — one catalog
-  path, one login-capable discriminator.
+- Onboarding completes in ONE transaction, and install-time defaults belong in
+  it. `POST /api/onboarding/complete` persists settings, the next-boot runtime
+  mode, the fresh-install safety default and the agent-subscription preset in a
+  single write; `GET /api/onboarding` normalizes for display but must never
+  persist, because a read that authors `settings.json` destroys the
+  fresh-install latch both install-time behaviours depend on. There is no second
+  completion path on any host — no generic-settings pair, no desktop save bridge
+  — and the client treats only the exact success envelope as a completion: a 2xx
+  whose body will not parse, or lacks `ok`/`runtime_mode`/`restart_required`, is
+  a failure the wizard shows, never a silent success that discards the restart
+  receipt. A failure after the bytes reach disk says so rather than claiming
+  nothing was saved.
+- The onboarding frame is sandboxed WITH popup permission
+  (`allow-popups allow-popups-to-escape-sandbox`). The Agents step's primary
+  action is the agent's own sign-in link in a new tab; a sandbox without those
+  tokens blocks that click silently, and a popup that inherits the sandbox
+  reaches the vendor's OAuth page with neither same-origin nor scripts. Assert
+  this behaviourally, from the login card's own markup — an attribute-string
+  test passes while the click stays broken. Install-time
+  defaults are compiled from LIVE discovery and refuse typed when a model
+  cannot be resolved — never guessed, never half-applied, and never
+  re-derived after onboarding (that would be a second, continuous authority
+  over settings the owner has since edited). Install time is a conjunction of
+  three proofs — no recorded completion (`OUROBOROS_ONBOARDING_COMPLETED_AT`,
+  written by every completion), no preset generation, no `settings.json` yet —
+  because "no working provider" is a state an old install reaches too. A
+  once-only decision is never taken on a moment-in-time reading: the daemon's
+  `next_up` is quota-derived, so a subscription whose window is spent during
+  onboarding must stay in the preset (D-3), and the seat is resolved from the
+  durable facts — credential kind, enabled, present, verified.
+- Owner settings writes go through `gateway/owner_settings.py`. The settings
+  lock is a PRECONDITION of the write, not a hint: `_acquire_settings_lock`
+  answers `None` on timeout and a writer that proceeds anyway is unlocked while
+  claiming to be atomic. Once the bytes land, the response must say so — carry a
+  `CommitBoundary` through the write and report a later failure as that step
+  failing, never as a failed save (BIBLE P1). `saved` is a FIELD on both sides:
+  pre-commit refusals answer through `unsaved_error`, or a client cannot tell
+  "nothing was written" from an envelope that simply predates the field.
+  `owner_write_guard` belongs only on an endpoint that calls
+  `_owner_write_settings`; on any other it translates unraisable exceptions
+  while advertising a lock the endpoint never takes.
+- A setting only an ENDPOINT may author is disk-only in BOTH directions.
+  `config.ENDPOINT_AUTHORED_SETTINGS` is consulted by the loader and by the
+  environment projection, so the value is never read from `os.environ` and never
+  exported back to it; the generic save's merge skip-list reads the same set.
+  Blocking only the request body is not enough — an install-time fact that the
+  environment can supply closes its own window before the endpoint runs.
+- A control the owner cannot use is worse than none. With no agent subscription
+  connected the Delegation section says so and points at Accounts in the same tab
+  instead of rendering a delegation toggle whose every dispatch would silently
+  fall back to an API child. Harness lists come from the accounts panel's own
+  source (`accountRows` over `/api/claudexor/status`) — one catalog path, one
+  login-capable discriminator.
+- Owner-facing copy says "agent", never "coding agent" (D-10, owner verbatim:
+  the same subscriptions build presentations and run arbitrary tasks). Product
+  names — Claude Code, Codex, Cursor — are trademarks and stay as they are.
 
 #### LLM Call Rules
 - [ ] New LLM calls go through the shared `LLMClient` / `llm.py` layer — no ad-hoc HTTP clients or direct provider SDKs outside that layer. **Exception (v5.7.0+):** skill / extension `plugin.py` modules may call providers directly because they have not yet been migrated to a host-mediated `api.invoke_llm(...)` bridge. When that bridge lands, the exception goes away. Runtime callers (anything inside `ouroboros/`) must still use `LLMClient`.
@@ -1280,9 +1345,27 @@ settings state.
 
 ## Design System
 
+> **Authority split — read this first.** `docs/DESIGN.md` defines the **visual
+> and interaction semantics**: the type scale and hierarchy rule, foreground and
+> state colour meaning, status/chip conventions, card and row anatomy, onboarding
+> density, dark-theme contrast. **This section defines the engineering rules that
+> preserve them**: where values may live, which component is the SSOT, what
+> counts as review debt, how a visual change is verified. Changing what a size or
+> colour *means* is a `DESIGN.md` edit; changing how the code is allowed to
+> *express* it is an edit here. Neither file restates the other.
+
 `web/style.css` custom properties and shared component classes are the value
 SSOT. Documentation keeps semantic roles and failure-prevention rules, not a
 copied color/radius/dimension inventory.
+
+Typography and hierarchy are `docs/DESIGN.md`'s call, and the engineering
+consequence is narrow: a text declaration on a migrated surface names a
+`--type-*` size token and a named foreground token. A rule that declares a size
+and no colour is the specific defect that made secondary text inherit
+near-white primary ink across the settings panels;
+`tests/test_web_typography_static.py` keeps that class closed on the migrated
+files. Migrating a new surface and extending that guard to it are the same
+commit.
 
 ### Layout and controls
 

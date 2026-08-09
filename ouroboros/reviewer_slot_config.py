@@ -166,7 +166,7 @@ def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
         raise ValueError(
             f"{REVIEWER_SLOTS_ENV}: {where} session target {target!r} uses '::' — "
             "a delegated row is spelled harness[=model] (owner directive: no "
-            "'::' syntax on coding-agent routes)"
+            "'::' syntax on agent routes)"
         )
     profile = str(route.get("profile_id") or "").strip()
     return ConfiguredReviewerSlot(
@@ -495,17 +495,26 @@ def reviewer_slot_api_fallback_warning(raw: Optional[str] = None) -> str:
 
 
 def _fallback_warning_text(disclosure: Dict[str, Any]) -> str:
-    """The owner-facing all-delegated-fallback sentence, or '' when none."""
+    """The owner-facing all-delegated routing disclosure, or '' when none.
+
+    Deliberately NOT advice. It used to end "keep at least one API reviewer row
+    to avoid the fallback", which told the owner to undo the ratified default
+    (D-3: with a subscription connected, everything that can run on a
+    subscription does, and a triad is never half API and half subscription).
+    What remains true is a routing FACT worth stating once: which surfaces this
+    configuration moved off the API, which ones the API still serves, and which
+    models they will use when they run."""
     if not disclosure:
         return ""
     surfaces = " and ".join(
         {"triad": "commit review", "scope": "scope review"}[g] for g in disclosure)
     models = sorted({m for row in disclosure.values() for m in row})
     return (
-        f"Every {surfaces} row is delegated to a coding agent. Plan review, task "
-        f"acceptance and skill review stay on the API and will fall back to the "
-        f"shipped default models ({', '.join(models)}), spending API budget. "
-        f"Keep at least one API reviewer row to avoid the fallback."
+        f"Every {surfaces} row runs on an agent subscription, so those reviews "
+        f"spend subscription windows instead of API budget and never fall back "
+        f"to API spend. Plan review, task acceptance and skill review are "
+        f"API-only surfaces today: they keep running on the shipped default "
+        f"models ({', '.join(models)})."
     )
 
 

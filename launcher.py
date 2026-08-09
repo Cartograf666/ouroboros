@@ -51,9 +51,11 @@ from ouroboros.launcher_bootstrap import (
     install_deps as _install_deps_impl,
     embedded_python_env,
     sync_existing_repo_from_bundle as _sync_existing_repo_from_bundle_impl,
-    verify_claude_runtime as _verify_claude_runtime,
 )
-from ouroboros.onboarding_wizard import build_onboarding_html, prepare_onboarding_settings
+from ouroboros.launcher_onboarding import (
+    prepare_first_run_settings as _prepare_first_run_settings,
+    present_first_run_onboarding as _present_first_run_onboarding,
+)
 from ouroboros.platform_layer import (
     BUNDLE_DIR_ENV,
     IS_LINUX,
@@ -83,7 +85,6 @@ from ouroboros.platform_layer import (
     terminate_process_tree,
 )
 from ouroboros.utils import atomic_write_json, utc_now_iso
-from ouroboros.server_runtime import apply_runtime_provider_defaults, has_startup_ready_provider
 
 MAX_CRASH_RESTARTS = 5
 CRASH_WINDOW_SEC = 120
@@ -310,6 +311,10 @@ _agent_proc: Optional[subprocess.Popen] = None
 _agent_job: Optional[object] = None
 _agent_lock = threading.Lock()
 _shutdown_event = threading.Event()
+# Set by _request_agent_restart(): the next agent exit is a REQUESTED recycle
+# (first-run configuration adopted), not a crash — same shape as the exit-code-42
+# branch, for the case where the launcher, not the agent, decided the restart.
+_agent_restart_requested = threading.Event()
 _webview_window = None
 # Linux-only browser-fallback flag (#56): set by _detect_headless() when no
 # pywebview GUI backend can initialize. Stays False on macOS/Windows — the
@@ -738,6 +743,15 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
 
         time.sleep(2)
 
+        if _agent_restart_requested.is_set():
+            # Launcher-requested recycle (first-run configuration): deliberate,
+            # so it skips crash accounting exactly like the agent's own code-42
+            # restart. No dependency sync — nothing about the checkout changed.
+            _agent_restart_requested.clear()
+            log.info("Restarting the agent to adopt the saved first-run configuration.")
+            _kill_stale_runtime_ports(port)
+            continue
+
         if exit_code == RESTART_EXIT_CODE:
             log.info("Agent requested restart (exit code 42). Restarting...")
             _sync_existing_repo_from_bundle()
@@ -772,6 +786,38 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
         log.info("Agent crashed. Restarting in 3s...")
         _kill_stale_runtime_ports(port)
         time.sleep(3)
+
+def _request_agent_restart() -> None:
+    """Recycle the managed server so it adopts freshly saved settings.
+
+    The lifecycle loop owns the restart; this flags intent and stops the child.
+    """
+    with _agent_lock:
+        agent_alive = _agent_proc is not None
+    if not agent_alive:
+        # Leaving the flag set would make the NEXT ordinary agent exit look like
+        # a requested restart and skip the crash fuse.
+        log.info("No managed agent to recycle; the next start reads the saved settings.")
+        return
+    _agent_restart_requested.set()
+    stop_agent()
+
+
+def _await_server_ready(port: int, abort_event=None) -> tuple[bool, int]:
+    """Wait for managed-server health; resolve the AUTHORITATIVE bound port.
+
+    The server may rebind on conflict and publish the real port in
+    ``data/state/server_port``; every later consumer (UI URL, onboarding window,
+    teardown sweep) must use that value, not the requested one.
+    """
+    ready = _wait_for_server(port, timeout=15, abort_event=abort_event)
+    actual_port = _read_port_file()
+    if actual_port != port:
+        ready = _wait_for_server(actual_port, timeout=45, abort_event=abort_event)
+    else:
+        ready = ready or _wait_for_server(port, timeout=45, abort_event=abort_event)
+    return ready, actual_port
+
 
 def _load_settings() -> dict:
     return load_settings()
@@ -919,177 +965,6 @@ def _request_skill_key_grant(skill: str, keys: list, confirm_fn) -> dict:
         "extension_reason": extension_reason,
         "load_error": extension_load_error,
     }
-
-
-def _claude_code_status_payload(settings: dict | None = None) -> dict:
-    current_settings = settings or _load_settings()
-    _apply_settings_to_env(current_settings)
-
-    from ouroboros.platform_layer import resolve_claude_runtime
-
-    rt = resolve_claude_runtime()
-    stderr_tail = ""
-    try:
-        from ouroboros.gateways.claude_code import get_last_stderr as _get_last_stderr
-
-        stderr_tail = _get_last_stderr(max_chars=2000)
-    except Exception:
-        pass
-
-    message_map = {
-        "ready": f"Claude runtime ready (SDK {rt.sdk_version}, CLI {rt.cli_version})",
-        "no_api_key": (
-            f"Claude runtime available (SDK {rt.sdk_version}) but ANTHROPIC_API_KEY is not set. Add it in Settings."
-        ),
-        "error": f"Claude runtime error: {rt.error}",
-        "degraded": (
-            f"Claude runtime degraded (SDK {rt.sdk_version}, CLI {'found' if rt.cli_path else 'missing'}). Try Repair."
-        ),
-        "missing": "Claude runtime not available. Use Repair in Settings or reinstall the app.",
-    }
-
-    return {
-        "status": rt.status_label(),
-        "installed": bool(rt.sdk_version),
-        "ready": rt.ready,
-        "busy": False,
-        "version": rt.sdk_version,
-        "cli_version": rt.cli_version,
-        "cli_path": rt.cli_path,
-        "interpreter_path": rt.interpreter_path,
-        "app_managed": rt.app_managed,
-        "legacy_detected": rt.legacy_detected,
-        "legacy_sdk_version": rt.legacy_sdk_version,
-        "api_key_set": rt.api_key_set,
-        "message": message_map.get(rt.status_label(), f"Claude runtime: {rt.status_label()}"),
-        "error": rt.error,
-        "stderr_tail": stderr_tail,
-    }
-
-
-def _run_first_run_wizard() -> bool:
-    """Show setup wizard if no runtime provider or local model is configured."""
-    settings, provider_defaults_changed, _provider_default_keys = apply_runtime_provider_defaults(_load_settings())
-    # Persist the pre-wizard normalization ONLY for an install that already has a
-    # settings file. On a FRESH install this save would CREATE the file before the
-    # wizard runs, and the wizard's safety-light authorship is gated on exactly
-    # that freshness (a local-first launch with LOCAL_MODEL_SOURCE in the
-    # environment reaches here with changed=True and would silently lose Light).
-    # Nothing is dropped: the wizard save persists the same normalized settings.
-    from ouroboros.config import SETTINGS_PATH as _settings_path
-
-    if provider_defaults_changed and _settings_path.exists():
-        _save_settings(settings)
-    _apply_settings_to_env(settings)
-    if has_startup_ready_provider(settings):
-        return True
-
-    if _headless:
-        # Browser mode (#56): the desktop wizard window cannot open, but the
-        # caller's existing "Launching anyway" path continues to server start,
-        # where the ESTABLISHED web-onboarding flow (/api/onboarding + blocking
-        # web overlay + hot supervisor start after save) takes over — the same
-        # path Docker/browser installs already use. No new onboarding code.
-        log.info(
-            "First-run wizard skipped: no GUI backend; onboarding will be "
-            "served in the browser."
-        )
-        print(
-            "No GUI backend (GTK/QT) for the setup wizard; onboarding will be "
-            "served in the browser once Ouroboros starts.",
-            flush=True,
-        )
-        return False
-
-    import webview
-
-    _wizard_done = {"ok": False}
-
-    class WizardApi:
-        def save_wizard(self, data: dict) -> str:
-            prepared_settings, error = prepare_onboarding_settings(data, settings)
-            if error:
-                return error
-            # Rev.3-2 (v6.82.0): a FRESH wizard save explicitly authors the
-            # new-install "light" safety coverage (prepare_onboarding_settings only
-            # adds it when the settings file carries no explicit choice). Name the
-            # key as authored and allow this owner-driven onboarding write past the
-            # full->light ratchet; every other save path keeps the ratchet intact.
-            # The DESKTOP host authors it — the shared validator must not, because
-            # web/Docker onboarding posts the same payload through the non-owner
-            # generic /api/settings path. Eligibility is a fresh install (no
-            # settings file); the persist seam re-proves it under the lock.
-            from ouroboros.settings_setup_contract import wizard_authors_safety_light
-
-            wizard_authors_safety = wizard_authors_safety_light()
-            if wizard_authors_safety:
-                prepared_settings["OUROBOROS_SAFETY_MODE"] = "light"
-            settings.update(prepared_settings)
-            settings.update(apply_runtime_provider_defaults(settings)[0])
-            try:
-                save_settings(
-                    settings,
-                    allow_elevation=True,
-                    onboarding_safety_default=wizard_authors_safety,
-                )
-                _apply_settings_to_env(settings)
-                _wizard_done["ok"] = True
-                for window in webview.windows:
-                    window.destroy()
-                return "ok"
-            except Exception as exc:
-                return f"Failed to save: {exc}"
-
-        def fetch_compatible_models(self, data: dict) -> dict:
-            import urllib.request
-            import urllib.error
-            base_url = str(data.get("baseUrl", "") or "").rstrip("/")
-            api_key = str(data.get("apiKey", "") or "").strip()
-            if not base_url:
-                return {"error": "baseUrl is required"}
-            try:
-                req = urllib.request.Request(
-                    f"{base_url}/models",
-                    headers=({"Authorization": f"Bearer {api_key}"} if api_key else {}),
-                )
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    raw = json.loads(resp.read())
-                raw_models = raw.get("data") or []
-                models = sorted({
-                    str(m.get("id", "") or "").strip()
-                    for m in raw_models if isinstance(m, dict) and m.get("id")
-                })
-                return {"models": models}
-            except Exception as exc:
-                return {"error": str(exc)}
-
-        def claude_code_status(self) -> dict:
-            return _claude_code_status_payload(settings)
-
-        def install_claude_code(self) -> dict:
-            _apply_settings_to_env(settings)
-            repaired = _verify_claude_runtime(_bootstrap_context())
-            payload = _claude_code_status_payload(settings)
-            payload["repaired"] = repaired
-            if not repaired:
-                payload["status"] = "error"
-                payload["ready"] = False
-                payload["busy"] = False
-                payload["message"] = "Claude runtime repair failed."
-                if not payload.get("error"):
-                    payload["error"] = "Failed to install/update claude-agent-sdk in the embedded runtime."
-            return payload
-
-    webview.create_window(
-        "Ouroboros — Setup",
-        html=build_onboarding_html(settings, host_mode="desktop"),
-        js_api=WizardApi(),
-        width=980,
-        height=780,
-        min_size=(840, 640),
-    )
-    webview.start()
-    return _wizard_done["ok"]
 
 
 def _display_ready(backend) -> tuple[bool, str]:
@@ -1359,8 +1234,10 @@ def main():
             "be missing packages (see the pip output above)."
         )
 
-    if not _run_first_run_wizard():
-        log.info("Wizard was closed without saving. Launching anyway (Settings page available).")
+    # D-8: decide here, PRESENT after the gateway is healthy. Everything above
+    # (single-instance lock, Git, managed-repo bootstrap/seed validation) is a
+    # precondition of the server itself and deliberately still precedes it.
+    onboarding_settings, onboarding_required = _prepare_first_run_settings()
 
     global _webview_window
     port = AGENT_SERVER_PORT
@@ -1383,12 +1260,25 @@ def main():
     lifecycle_thread = threading.Thread(target=agent_lifecycle_loop, args=(port,), daemon=True)
     lifecycle_thread.start()
 
-    server_ready = _wait_for_server(port, timeout=15, abort_event=_abort)
-    actual_port = _read_port_file()
-    if actual_port != port:
-        server_ready = _wait_for_server(actual_port, timeout=45, abort_event=_abort)
-    else:
-        server_ready = server_ready or _wait_for_server(port, timeout=45, abort_event=_abort)
+    server_ready, actual_port = _await_server_ready(port, _abort)
+
+    if server_ready and onboarding_required and not _shutdown_event.is_set():
+        # The gateway is live and, with no provider configured, runs WITHOUT a
+        # supervisor — the supported state that lets the wizard reach /api/*.
+        onboarding = _present_first_run_onboarding(
+            onboarding_settings, actual_port, headless=_headless
+        )
+        if not onboarding["saved"]:
+            log.info(
+                "Setup was closed without saving. Launching anyway "
+                "(the blocking onboarding overlay and Settings remain available)."
+            )
+        if onboarding["restart_required"] and not _shutdown_event.is_set():
+            # The completion changed something this process pinned at boot (its
+            # runtime-mode baseline). The launcher owns the process, so it
+            # recycles it instead of leaving the owner with a restart nag.
+            _request_agent_restart()
+            server_ready, actual_port = _await_server_ready(port, _abort)
 
     if _headless and _shutdown_event.is_set():
         # Shutdown during startup: same teardown the keep-alive loop performs

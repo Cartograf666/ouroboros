@@ -90,6 +90,17 @@ export const apiClient = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
     }),
+    /**
+     * Finish first-run onboarding in ONE atomic owner-scoped save (D-8):
+     * settings + runtime mode + safety default + the completion fact land
+     * together, or nothing does. The install-time agent preset and its marker
+     * ride the same write only when the response says `preset.applied` —
+     * `not_requested`, `skipped_by_owner` and `not_install_time` are ordinary
+     * successes that persist no preset.
+     * @param {import('./api_types.js').OnboardingCompleteRequest} payload
+     * @returns {Promise<import('./api_types.js').OnboardingCompleteResponse>}
+     */
+    completeOnboarding: (payload) => jsonPost('/api/onboarding/complete', payload),
     ownerRuntimeMode: (mode) => jsonPost('/api/owner/runtime-mode', { mode }),
     ownerAutoGrant: (enabled) => jsonPost('/api/owner/auto-grant', { enabled: Boolean(enabled) }),
     ownerContextMode: (mode) => jsonPost('/api/owner/context-mode', { mode }),

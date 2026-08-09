@@ -1,28 +1,38 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { createClaudexorStatusStore } from '../modules/claudexor_status_store.js';
 import { accountRows } from '../modules/harness_accounts.js';
 import {
     DELEGATION_OFF,
+    applySubagentsSettings,
     collectSubagentsSettings,
     composeSubagentRoute,
     composeSubagentTail,
     connectedHarnesses,
     delegationView,
+    destroySubagentsSection,
+    initSubagentsSection,
     lastDelegationLine,
     parseSubagentRoute,
     reloadSubagentsSection,
+    renderSignature,
     splitSubagentTail,
 } from '../modules/subagents_settings.js';
 
 // The wire body the Harness Accounts panel really consumes: `profiles` is an
 // array of {profile, status, identity} wrappers and `harnessAccounts` an array
 // of per-harness authority rows (Claudexor credential-profile.ts).
-function statusPayload({ native = [], profiles = [], harnesses = [] } = {}) {
+function statusPayload({ native = [], profiles = [], harnesses = [], quota = [] } = {}) {
+    // Shaped like the producer's own answer — daemon/harnesses/profiles/quota
+    // are unconditional there, and the store now requires all four before it
+    // will derive a facet from a 2xx body.
     return {
         daemon: { state: 'running' },
+        config_dir: '/home/agent',
         harnesses,
         profiles: { harnessAccounts: native, profiles },
+        quota,
     };
 }
 
@@ -75,12 +85,59 @@ test('a FAILED verification is not connected — the same red the accounts panel
     assert.equal(view.enabled, false);
 });
 
+test('subscription-first: a local session is enough to turn delegation on by default', () => {
+    // OWNER DECISION 2026-08-09 (guard, not a characterization). A review lens
+    // recommended requiring vendor-level verification before the default-on
+    // rule fires, because a `local_store` session is only detected on disk, not
+    // re-proved against the vendor. The owner DECLINED: Ouroboros prefers
+    // subscriptions over the API budget, and that gate would leave delegation
+    // off on exactly the machines that have a subscription sitting right there.
+    // This test fails if a future change narrows the rule.
+    const nativeOnly = {
+        reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+        daemon: { state: 'running' },
+        harnesses: [{ id: 'codex', display_name: 'Codex CLI' }],
+        profiles: { profiles: [], harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }] },
+        quota: [],
+    };
+    const connected = connectedHarnesses(nativeOnly);
+    assert.deepEqual(connected.map((c) => c.id), ['codex'],
+        'a detected local session counts as a connected subscription');
+
+    const view = delegationView({ saved: '', payload: nativeOnly });
+    assert.equal(view.state, 'default_on', 'delegation defaults ON from a local session');
+    assert.equal(view.harness, 'codex');
+
+    // The same holds for a NAMED profile whose verification came from the local
+    // store rather than a vendor probe.
+    const localNamed = {
+        reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+        daemon: { state: 'running' },
+        harnesses: [{ id: 'claude', display_name: 'Claude Code' }],
+        profiles: {
+            profiles: [{
+                profile: { harness_id: 'claude', profile_id: 'mironov', kind: 'config_dir_login' },
+                status: { verification: 'passed', verification_source: 'local_store' },
+                identity: {},
+            }],
+            harnessAccounts: [],
+        },
+        quota: [],
+    };
+    assert.deepEqual(connectedHarnesses(localNamed).map((c) => c.id), ['claude']);
+    assert.equal(delegationView({ saved: '', payload: localNamed }).state, 'default_on');
+});
+
 test('with no subscription connected the section explains instead of offering a dead toggle', () => {
     const view = delegationView({ saved: '', payload: statusPayload() });
     assert.equal(view.state, 'no_subscription');
     assert.equal(view.enabled, false);
     assert.deepEqual(view.options, []);
-    assert.match(view.note, /Harness Accounts/);
+    // The pointer now names a place on the SAME tab. It used to send the owner
+    // to the accounts section under the Providers tab, two tabs away from the
+    // control it explained; accounts and delegation live together in Agents (D-10).
+    assert.match(view.note, /Accounts above/);
+    assert.doesNotMatch(view.note, /Providers/);
 });
 
 test('a failed accounts read is not the same sentence as "nothing connected"', () => {
@@ -90,7 +147,7 @@ test('a failed accounts read is not the same sentence as "nothing connected"', (
     assert.equal(view.state, 'unknown');
     assert.equal(view.enabled, false);
     assert.match(view.note, /HTTP 503/);
-    assert.doesNotMatch(view.note, /No coding-agent subscription/);
+    assert.doesNotMatch(view.note, /No agent subscription/);
 });
 
 test('a failed accounts read suppresses the controls even over a saved harness', () => {
@@ -122,12 +179,12 @@ test('a decided "off" is never promised to turn itself back on', () => {
 test('before the accounts have been read the section says it is reading, not "no subscription"', () => {
     // applySubagentsSettings renders immediately while the accounts arrive later:
     // while !loaded the view cannot tell "not read yet" from "read and found
-    // nothing", so a connected owner briefly saw "No coding-agent subscription".
+    // nothing", so a connected owner briefly saw "No agent subscription".
     const view = delegationView({ saved: '', payload: null, loaded: false });
     assert.equal(view.state, 'loading');
     assert.equal(view.enabled, false);
-    assert.match(view.note, /Reading your coding-agent accounts/);
-    assert.doesNotMatch(view.note, /No coding-agent subscription/);
+    assert.match(view.note, /Reading your agent accounts/);
+    assert.doesNotMatch(view.note, /No agent subscription/);
 });
 
 test('the money copy never claims delegation moves the subagent itself off the API', () => {
@@ -140,7 +197,7 @@ test('the money copy never claims delegation moves the subagent itself off the A
     });
     const off = delegationView({ saved: DELEGATION_OFF, payload });
     assert.doesNotMatch(off.note, /instead/);
-    assert.match(off.note, /send the coding to a connected subscription/);
+    assert.match(off.note, /send their work to a connected subscription/);
     const on = delegationView({ saved: 'codex', payload });
     assert.match(on.note, /still runs on the API/);
 });
@@ -287,6 +344,40 @@ test('a saved model missing from discovery keeps a not-in-discovery option', () 
     assert.equal(view.suffix, '=gpt-5.6');
 });
 
+test('a saved delegation model is not called undiscovered before the catalog was read', () => {
+    // Rebased provenance pin (invariant 5): the model select rides the CATALOG
+    // facet, independently of the accounts facet that decides the view. With
+    // the accounts read (so the section is live and shows its controls) and the
+    // catalog unread, the saved pin keeps its option labelled "(not checked)" —
+    // an accusation about a catalog nobody opened stays unearned.
+    const saved = 'codex=gpt-5.6-sol';
+    const unread = delegationView({
+        saved,
+        payload: statusPayload({ native: [{ harness_id: 'codex', native_login_detected: true }] }),
+        accountsRead: 'ok', catalogRead: 'not_read',
+    });
+    assert.equal(unread.state, 'on', 'the accounts facet still decides the view');
+    const unreadPin = (unread.modelOptions || []).find((o) => o.value === 'gpt-5.6-sol');
+    assert.ok(unreadPin, 'the saved model lost its option');
+    assert.match(unreadPin.label, /not checked/);
+    assert.doesNotMatch(unreadPin.label, /not in discovery/);
+    // …and the catalog gap itself is named in the note (subject, not enum).
+    assert.match(unread.note, /Agents were not read/);
+
+    // Read catalog, model genuinely absent → the honest accusation is allowed.
+    const read = delegationView({
+        saved,
+        payload: statusPayload({
+            harnesses: [{ id: 'codex', models: [{ id: 'other-model' }] }],
+            native: [{ harness_id: 'codex', native_login_detected: true }],
+        }),
+        accountsRead: 'ok', catalogRead: 'ok',
+    });
+    const readPin = (read.modelOptions || []).find((o) => o.value === 'gpt-5.6-sol');
+    assert.ok(readPin && /not in discovery/.test(readPin.label),
+        'a read catalog must still be able to say a model is missing');
+});
+
 test('switching the harness resets the model to a visible Engine default', () => {
     // Accepted residual (owner spec): the tail belongs to the harness it was
     // written for, so a switch DROPS it — visibly, before Save, as the
@@ -329,141 +420,227 @@ test('the last-delegated-run line discloses mismatch and shows absence as absenc
     assert.ok(!bare.includes('sonnet'));
 });
 
-test('subscription-first: a local session is enough to turn delegation on by default', () => {
-    // OWNER DECISION 2026-08-09 (guard, not a characterization). A review lens
-    // recommended requiring vendor-level verification before the default-on
-    // rule fires, because a `local_store` session is only detected on disk, not
-    // re-proved against the vendor. The owner DECLINED: Ouroboros prefers
-    // subscriptions over the API budget, and that gate would leave delegation
-    // off on exactly the machines that have a subscription sitting right there.
-    // This test fails if a future change narrows the rule.
-    const nativeOnly = {
-        reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
-        daemon: { state: 'running' },
-        harnesses: [{ id: 'codex', display_name: 'Codex CLI' }],
-        profiles: { profiles: [], harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }] },
-    };
-    const connected = connectedHarnesses(nativeOnly);
-    assert.deepEqual(connected.map((c) => c.id), ['codex'],
-        'a detected local session counts as a connected subscription');
+// ---------------------------------------------------------------------------
+// Phase 2: "we could not ask" and "we asked and the daemon is down" are two
+// different sentences, and NEITHER earns a row-level claim about the owner's
+// saved harness. Before the shared store, a stopped daemon reached this
+// section as a successful read with no harnesses — so a saved route was
+// labeled "(no account connected)" and the note announced an API fallback
+// nobody had established.
+// ---------------------------------------------------------------------------
 
-    const view = delegationView({ saved: '', payload: nativeOnly });
-    assert.equal(view.state, 'default_on', 'delegation defaults ON from a local session');
-    assert.equal(view.harness, 'codex');
-
-    // The same holds for a NAMED profile whose verification came from the local
-    // store rather than a vendor probe.
-    const localNamed = {
-        reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
-        daemon: { state: 'running' },
-        harnesses: [{ id: 'claude', display_name: 'Claude Code' }],
-        profiles: {
-            profiles: [{
-                profile: { harness_id: 'claude', profile_id: 'mironov', kind: 'config_dir_login' },
-                status: { verification: 'passed', verification_source: 'local_store' },
-                identity: {},
-            }],
-            harnessAccounts: [],
-        },
-    };
-    assert.deepEqual(connectedHarnesses(localNamed).map((c) => c.id), ['claude']);
-    assert.equal(delegationView({ saved: '', payload: localNamed }).state, 'default_on');
+test('a stopped daemon explains itself instead of accusing the saved harness', () => {
+    const view = delegationView({ saved: 'codex', payload: { daemon: { state: 'stale' }, harnesses: [] },
+        accountsRead: 'not_read' });
+    assert.equal(view.state, 'unknown');
+    assert.equal(view.enabled, false);
+    assert.deepEqual(view.options, []);
+    // The shared sentence states what the read state establishes — nobody
+    // asked — and never diagnoses a daemon this section cannot see.
+    assert.match(view.note, /daemon was not asked/);
+    assert.doesNotMatch(view.note, /is not running/);
+    assert.match(view.note, /saved choices are unchanged/);
+    assert.doesNotMatch(view.note, /no account connected/);
+    assert.doesNotMatch(view.note, /ordinary subagent on the API/);
 });
 
-test('unknown accounts never author the route, and never rename a saved one', () => {
-    // The dangerous half of the false-absence class: a 200 whose account facet
-    // was never read (idle lazy daemon) or refused yields an EMPTY harness list.
-    // Reported as "no subscription" it would (a) tell the owner delegated work
-    // falls back to the API and (b) let an unrelated Save write delegation off.
-    const unread = {
-        reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' },
-        daemon: { state: 'stale' },
-        harnesses: [],
-        profiles: {},
-    };
-    const view = delegationView({ saved: 'codex=gpt-5.6-sol', payload: unread });
-    assert.equal(view.state, 'unknown', 'unread accounts are not "no subscription"');
-    assert.match(view.note, /not checked/i);
-    assert.match(view.note, /codex/, 'the saved route is named as still standing');
-    assert.ok(!/ordinary subagent on the API/i.test(view.note),
-        'never claims delegated work fell back to the API');
-
-    // A refused facet (the daemon answered, this read did not) says so
-    // differently — telling the owner the daemon is not running would be a
-    // second lie when it is running and one endpoint died.
-    const refused = {
-        reads: { catalog: 'ok', accounts: 'failed', quota: 'ok' },
-        daemon: { state: 'unreachable' },
-        harnesses: [{ id: 'codex' }],
-        profiles: {},
-    };
-    assert.equal(delegationView({ saved: '', payload: refused }).state, 'unknown');
-    assert.ok(!/not running/i.test(delegationView({ saved: '', payload: refused }).note));
+test('a refused accounts read never claims the daemon is not running', () => {
+    // Rebased provenance pin: a per-facet `failed` (or a global `unreachable`)
+    // is a read that did not land — the daemon may well be running, and one
+    // endpoint died. Saying "not running" would be a second lie; saying
+    // "was not asked" would be a third (somebody did ask).
+    const view = delegationView({ saved: '', payload: statusPayload(), accountsRead: 'failed' });
+    assert.equal(view.state, 'unknown');
+    assert.match(view.note, /could not be read/);
+    assert.doesNotMatch(view.note, /not running/);
+    assert.doesNotMatch(view.note, /was not asked/);
 });
 
-test('the settings collector itself refuses to author from an unknown read', async () => {
-    // The pure-view test above passes even if the GUARD inside
-    // collectSubagentsSettings is deleted — this drives the REAL reload +
-    // collect path, which is what a Save actually calls.
-    const previousDocument = globalThis.document;
-    globalThis.document = { getElementById: () => null, querySelectorAll: () => [] };
-    try {
-        const respond = (payload) => async () => ({ ok: true, json: async () => payload });
+test('a fresh read with a genuinely absent harness still says so', () => {
+    // The row-level claim is not deleted — it is now EARNED. A daemon that
+    // answered and simply does not have this account keeps the honest label.
+    const view = delegationView({ saved: 'codex', payload: statusPayload(), accountsRead: 'ok' });
+    assert.match(view.note, /No connected account for codex/);
+    assert.ok(view.options.some((o) => /no account connected/.test(o.label)),
+        'the saved harness keeps its option so a Save cannot re-point delegation');
+});
 
-        await reloadSubagentsSection({ fetchImpl: respond({
-            reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' },
-            daemon: { state: 'stale' }, harnesses: [], profiles: {},
-        }) });
-        assert.deepEqual(collectSubagentsSettings(), {},
-            'an unread account store must never author the delegation route');
+test('a transport failure and a stopped daemon are not the same sentence', () => {
+    const dead = delegationView({ saved: '', payload: null, statusError: 'HTTP 503' });
+    const down = delegationView({ saved: '', payload: null, accountsRead: 'not_read' });
+    assert.equal(dead.state, 'unknown');
+    assert.equal(down.state, 'unknown');
+    assert.match(dead.note, /HTTP 503/);
+    assert.doesNotMatch(down.note, /HTTP 503/);
+    assert.notEqual(dead.note, down.note);
+});
 
-        await reloadSubagentsSection({ fetchImpl: respond({
-            reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+test('a CATALOG gap is named too, instead of being dropped behind the accounts sentence', () => {
+    // This section renders two facets: the accounts decide the view, the model
+    // select rides the catalog. With the accounts read fine and the catalog
+    // refused, the model list quietly narrowed to whatever the last read held
+    // and the note said nothing at all about it.
+    const payload = statusPayload({
+        harnesses: [{ id: 'codex', display_name: 'Codex CLI', models: [{ id: 'gpt-5.6' }] }],
+        native: [{ harness_id: 'codex', native_login_detected: true }],
+    });
+    const gap = delegationView({ saved: 'codex', payload, accountsRead: 'ok', catalogRead: 'failed' });
+    assert.equal(gap.state, 'on', 'the accounts facet still decides the view');
+    assert.match(gap.note, /Agents were not read/);
+    assert.match(gap.note, /last known/);
+    // The saved model pin keeps its option and loses only the earned claim.
+    assert.doesNotMatch(JSON.stringify(gap.modelOptions), /not in discovery/);
+
+    // A healthy catalog adds nothing…
+    const clean = delegationView({ saved: 'codex', payload, accountsRead: 'ok', catalogRead: 'ok' });
+    assert.doesNotMatch(clean.note, /were not read/);
+    // …and a catalog in the SAME state as the accounts facet is STILL named:
+    // equal state is not equal subject, and the accounts sentence says nothing
+    // about agent discovery. Dropping it left the model select unexplained.
+    const both = delegationView({ saved: 'codex', payload: null, accountsRead: 'not_read', catalogRead: 'not_read' });
+    assert.match(both.note, /daemon was not asked/);
+    assert.match(both.note, /Agents were not read/);
+    assert.equal(both.note.match(/could not be read/g), null);
+});
+
+// ---------------------------------------------------------------------------
+// The live subscription: what makes the section repaint, and whether it can
+// keep the shared poll armed at all.
+// ---------------------------------------------------------------------------
+
+function fakeSurface() {
+    // The minimum this section's renderRows() touches, plus the offsetParent
+    // that answers "is this surface on screen".
+    const host = { innerHTML: '', offsetParent: {}, querySelector: () => null };
+    const doc = {
+        hidden: false,
+        getElementById: (id) => (id === 'subagents-rows' ? host : null),
+        addEventListener() {}, removeEventListener() {},
+    };
+    const win = { addEventListener() {}, removeEventListener() {} };
+    return { host, doc, win };
+}
+
+test('the repaint signature is keyed on model IDENTITY, not on how many there are', () => {
+    // Pure form of the defect: same count, different model.
+    const store = (models) => ({
+        reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+        error: '',
+        snapshot: {
             daemon: { state: 'running' },
-            harnesses: [{ id: 'codex', display_name: 'Codex' }],
-            profiles: { profiles: [], harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }] },
-        }) });
-        assert.ok('OUROBOROS_SUBAGENT_HARNESS' in collectSubagentsSettings(),
-            'a genuinely read store authors normally');
+            harnesses: [{ id: 'codex', display_name: 'Codex CLI', models }],
+            profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }], profiles: [] },
+        },
+    });
+    const before = JSON.stringify(renderSignature(store([{ id: 'old-model' }])));
+    const after = JSON.stringify(renderSignature(store([{ id: 'new-model' }])));
+    assert.notEqual(before, after, 'a model swapped at equal count must change the signature');
+    assert.equal(before, JSON.stringify(renderSignature(store([{ id: 'old-model' }]))), 'and be stable otherwise');
+});
+
+test('a model swapped at EQUAL count really reaches the pixels', async () => {
+    // The subscriber skipped the repaint because the signature counted models
+    // instead of naming them: the section kept offering the model that no
+    // longer exists and never exposed the one that does — and the select is
+    // built from exactly these ids.
+    const { host, doc, win } = fakeSurface();
+    const priorDoc = globalThis.document;
+    const priorWin = globalThis.window;
+    globalThis.document = doc;
+    globalThis.window = win;
+    let models = [{ id: 'old-model' }];
+    let modelsError = '';
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => ({
+            ok: true,
+            status: 200,
+            json: async () => statusPayload({
+                harnesses: [{
+                    id: 'codex', display_name: 'Codex CLI', models,
+                    ...(modelsError ? { models_error: modelsError } : {}),
+                }],
+                native: [{ harness_id: 'codex', native_login_detected: true }],
+            }),
+        }),
+        doc,
+        pollMs: 5000,
+    });
+    try {
+        initSubagentsSection({ store });
+        applySubagentsSettings({ OUROBOROS_SUBAGENT_HARNESS: '' });
+        await reloadSubagentsSection();
+        assert.ok(host.innerHTML.includes('old-model'), host.innerHTML);
+        // The section's own binding is what keeps the shared read alive: a
+        // subscriber with no visibility predicate could never arm the poll.
+        assert.equal(store.polling, true, 'a visible section keeps the shared poll armed');
+
+        models = [{ id: 'new-model' }];
+        await store.refresh();
+        assert.ok(host.innerHTML.includes('new-model'), `the swap must reach the DOM: ${host.innerHTML}`);
+        assert.ok(!host.innerHTML.includes('old-model'), `and the dead model must go: ${host.innerHTML}`);
+
+        // An unchanged payload still does not repaint (the caret guard).
+        host.innerHTML = 'SENTINEL';
+        await store.refresh();
+        assert.equal(host.innerHTML, 'SENTINEL', 'no repaint when nothing this section renders changed');
+
+        // The typed model-read gap is rendered too, so its ARRIVAL and its
+        // clearing must both repaint — the list itself can stay identical
+        // across a refused probe, and the signature saw only the list.
+        modelsError = 'models_probe_failed';
+        await store.refresh();
+        assert.ok(host.innerHTML.includes('could not be read'),
+            `the model-read gap must reach the DOM: ${host.innerHTML}`);
+        modelsError = '';
+        await store.refresh();
+        assert.ok(!host.innerHTML.includes('could not be read'),
+            `and a later successful probe must clear it: ${host.innerHTML}`);
     } finally {
-        globalThis.document = previousDocument;
+        destroySubagentsSection();
+        store.dispose();
+        globalThis.document = priorDoc;
+        globalThis.window = priorWin;
     }
 });
 
-test('a saved delegation model is not called undiscovered before the catalog was read', () => {
-    // Third restatement of the same rule (the panel and the reviewer rows were
-    // the first two). This one built a synthetic harness object and threw away
-    // both `models_error` and the catalog read state, so a saved model was
-    // labelled "(not in discovery)" on an idle daemon — an accusation about a
-    // catalog nobody had opened.
-    const saved = 'codex=gpt-5.6-sol';
-    const unread = delegationView({
-        saved,
-        // The INDEPENDENT-facet window: the accounts landed (so the section is
-        // live and shows its controls), the catalog did not.
-        payload: {
-            daemon: { state: 'running' },
-            reads: { catalog: 'not_read', accounts: 'ok', quota: 'ok' },
-            harnesses: [],
-            profiles: { profiles: [], harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }] },
-        },
+test('the settings collector itself refuses to author from an unknown read', async () => {
+    // Rebased provenance pin: the pure-view tests above pass even if the GUARD
+    // inside collectSubagentsSettings is deleted — this drives the REAL
+    // store-backed reload + collect path, which is what a Save actually calls.
+    // An unread account facet (idle lazy daemon) yields an empty harness list
+    // on a 2xx; authoring from it would write delegation OFF behind the
+    // owner's back on an unrelated Save.
+    const { doc, win } = fakeSurface();
+    const priorDoc = globalThis.document;
+    const priorWin = globalThis.window;
+    globalThis.document = doc;
+    globalThis.window = win;
+    let payload = {
+        reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' },
+        daemon: { state: 'stale' }, harnesses: [], profiles: {}, quota: [],
+    };
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => ({ ok: true, status: 200, json: async () => payload }),
+        doc,
     });
-    const unreadPin = (unread.modelOptions || []).find((o) => o.value === 'gpt-5.6-sol');
-    assert.ok(unreadPin, 'the saved model lost its option');
-    assert.match(unreadPin.label, /not checked/);
-    assert.ok(!/not in discovery/.test(unreadPin.label));
+    try {
+        initSubagentsSection({ store });
+        applySubagentsSettings({ OUROBOROS_SUBAGENT_HARNESS: '' });
+        await reloadSubagentsSection();
+        assert.deepEqual(collectSubagentsSettings(), {},
+            'an unread account store must never author the delegation route');
 
-    // Read catalog, model genuinely absent -> the honest accusation is allowed.
-    const read = delegationView({
-        saved,
-        payload: {
-            daemon: { state: 'running' },
-            reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
-            harnesses: [{ id: 'codex', models: [{ id: 'other-model' }] }],
-            profiles: { profiles: [], harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }] },
-        },
-    });
-    const readPin = (read.modelOptions || []).find((o) => o.value === 'gpt-5.6-sol');
-    assert.ok(readPin && /not in discovery/.test(readPin.label),
-        'a read catalog must still be able to say a model is missing');
+        payload = statusPayload({
+            harnesses: [{ id: 'codex', display_name: 'Codex' }],
+            native: [{ harness_id: 'codex', native_login_detected: true }],
+        });
+        await reloadSubagentsSection();
+        assert.ok('OUROBOROS_SUBAGENT_HARNESS' in collectSubagentsSettings(),
+            'a genuinely read store authors normally');
+    } finally {
+        destroySubagentsSection();
+        store.dispose();
+        globalThis.document = priorDoc;
+        globalThis.window = priorWin;
+    }
 });

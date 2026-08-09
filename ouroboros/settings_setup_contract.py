@@ -48,6 +48,12 @@ for _profile_defaults in _MODEL_DEFAULTS.values():
 
 _STEPS = _rows(("id", "title", "railCopy", "copy", "footer"), (
     ("providers", "Add your access", "Keys + local", "Fill at least one remote key or a local model source. The next step adapts to what you configured here.", "Paste only what you already have. OpenRouter, direct provider keys, and an optional local model can coexist."),
+    # SKIPPABLE by design and placed right after access, because it is the step
+    # that explains what the access already bought and what an agent plan adds
+    # on top of it. It never blocks completion (D-1). Named "agents", never
+    # "coding agents" (D-10): these agents build presentations and run ordinary
+    # tasks too.
+    ("agents", "Connect your agents", "Optional", "Optional. Ouroboros already runs on the access you just added. Signing in to an agent plan moves delegated subagents and commit review onto that plan instead of per-call API spend.", "Skippable. Connect, add, or change agent accounts any time in Settings → Agents."),
     ("models", "Choose models", "model slots", "Review the visible model defaults derived from your current setup, then edit anything you want before launch.", "Plain openai/... or anthropic/... remains router-style. Direct values use openai::... and anthropic::...."),
     ("review_mode", "Choose review mode", "Advisory vs blocking", "Decide how strict pre-commit review should be before Ouroboros starts modifying itself.", "Pick both review enforcement and the initial runtime mode before Ouroboros starts."),
     ("budget", "Set your budget", "Session limits", "Budget is its own step because it directly shapes how far Ouroboros can go in one session and in a single task.", "Total budget is global. Per-task cost cap is a hard cap over one task's whole tree, subagents included: the task wraps up gracefully just before the ledger fence force-stops it."),
@@ -68,6 +74,31 @@ _PROVIDER_FIELDS = _rows(("id", "stateKey", "settingKey", "settingsInputId", "la
     ("openai-compatible-url", "compatibleBaseUrl", "OPENAI_COMPATIBLE_BASE_URL", "s-compatible-url", "OpenAI-compatible Base URL", "http://localhost:11434/v1", "Base URL for your OpenAI-compatible endpoint (e.g. Ollama, LM Studio, vLLM). Required when using openai-compatible:: models.", "url", "more"),
     ("openai-compatible-key", "compatibleApiKey", "OPENAI_COMPATIBLE_API_KEY", "s-compatible-key", "OpenAI-compatible API Key", "Leave empty for no auth", "API key for the endpoint. Leave empty if your server does not require authentication.", "password", "more"),
 ))
+
+# Every settings key whose VALUE is a credential. ONE authority: /api/settings
+# masking, the generic settings merge, and the onboarding bootstrap all read it
+# from here, so a new provider cannot be secret on one surface and plaintext on
+# another. It lives in the setup contract because that is the lowest layer all
+# three already depend on.
+SECRET_SETTING_KEYS = frozenset({
+    "OPENROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_COMPATIBLE_API_KEY",
+    "CLOUDRU_FOUNDATION_MODELS_API_KEY",
+    "GIGACHAT_CREDENTIALS",
+    "GIGACHAT_PASSWORD",
+    "ANTHROPIC_API_KEY",
+    "MINIMAX_API_KEY",
+    "GITHUB_TOKEN",
+    "OUROBOROS_NETWORK_PASSWORD",
+})
+
+# What a configured credential looks like once it leaves the server. It is a
+# MARKER, not a redaction of the value: no prefix, no length, nothing that
+# narrows a guess. Deliberately the same token /api/settings already round-trips
+# for password-class secrets (``looks_masked_secret``), so every save path
+# rehydrates it through the rule it already has instead of a second one.
+CONFIGURED_SECRET_PLACEHOLDER = "***set***"
 
 _PROFILE_SPECS = {
     "openrouter": ("OpenRouter", "OpenRouter is present, so the next step keeps router-style defaults while still saving any extra direct keys you paste here.", "OpenRouter-style routing remains active. Unprefixed provider IDs like openai/gpt-5.6-terra or anthropic/claude-sonnet-5 continue to route through OpenRouter."),
@@ -152,6 +183,26 @@ _LOCAL_PRESETS: Dict[str, Dict[str, Any]] = {
     "qwen3-32b": {"label": "Qwen3-32B Instruct Q4_K_M", "source": "Qwen/Qwen3-32B-GGUF", "filename": "Qwen3-32B-Q4_K_M.gguf", "contextLength": 32768, "chatFormat": ""},
 }
 
+# Agent SUBSCRIPTION intent (install-time presets, D-3/D-4). These two
+# are NOT settings keys — they are wizard→server declarations about the
+# onboarding run itself, so they are declared here (one setup vocabulary for
+# every host) instead of being invented separately by each caller. The server
+# never trusts the first one as authority for anything but "look at the daemon";
+# what a connected subscription actually IS gets re-read from Claudexor.
+SUBSCRIPTIONS_CONNECTED_FIELD = "subscriptionsConnected"
+SKIP_SUBSCRIPTION_PRESETS_FIELD = "skipSubscriptionPresets"
+
+# The durable "onboarding finished here" fact, written by every completion —
+# including one that connected no subscription and one that skipped the preset.
+# Absence of a working provider is a state an OLD install reaches too, so it
+# cannot be the latch on its own; this key is what closes the window for good.
+ONBOARDING_COMPLETED_KEY = "OUROBOROS_ONBOARDING_COMPLETED_AT"
+
+_SUBSCRIPTION_FIELDS = _rows(("id", "payloadKey", "label", "note"), (
+    ("subscriptions-connected", SUBSCRIPTIONS_CONNECTED_FIELD, "Agent subscription connected", "Set by the wizard when at least one agent account was signed in during onboarding. The server re-reads the live account state before applying anything."),
+    ("skip-subscription-presets", SKIP_SUBSCRIPTION_PRESETS_FIELD, "Finish without agent defaults", "Completes onboarding without moving reviewers and subagents onto the connected subscriptions. Everything stays editable in Settings afterwards."),
+))
+
 _MODEL_SUGGESTIONS = list(dict.fromkeys(("x-ai/grok-4.5", "google/gemini-3.6-flash", "openai/gpt-5.6-terra", "openai/gpt-5.6-sol", "openai/gpt-5.6-luna", "openai::gpt-5.6-terra", "openai::gpt-5.6-sol", "openai::gpt-5.6-luna", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5", "anthropic::claude-sonnet-5", "anthropic::claude-opus-5", "anthropic::claude-opus-4-6", "deepseek/deepseek-v4-pro", "openai-compatible::meta-llama/compatible", "cloudru::zai-org/GLM-4.7", "minimax::MiniMax-M3", "minimax::MiniMax-M2.7")))
 
 
@@ -190,6 +241,31 @@ def parse_budget_setting(
     if min_value > 0 and value < min_value:
         return None, f"{name} must be at least {field['min']}."
     return value, None
+
+
+def secret_provider_setting_keys() -> frozenset:
+    """Provider fields whose stored value must never leave the server verbatim.
+
+    The union of the canonical secret keys and every password-typed provider
+    field, so the rule holds for a field added on either side: a new credential
+    listed in ``SECRET_SETTING_KEYS`` is covered even if someone renders it as a
+    text input, and a new password input is covered before anyone remembers to
+    add its key to the canonical set.
+    """
+    return frozenset(
+        field["settingKey"]
+        for field in _PROVIDER_FIELDS
+        if field["settingKey"] in SECRET_SETTING_KEYS
+        or (field.get("inputType") or "password") == "password"
+    )
+
+
+def _is_secret_placeholder(value: str) -> bool:
+    # Imported lazily: the predicate's home is the MCP client, and the launcher
+    # imports this contract long before any MCP machinery is wanted.
+    from ouroboros.mcp_client import looks_masked_secret
+
+    return looks_masked_secret(value)
 
 
 def derive_provider_profile(settings: dict) -> str:
@@ -242,7 +318,22 @@ def build_setup_contract(host_mode: str = "desktop") -> dict:
         "runtimeModes": [dict(item) for item in _RUNTIME_MODES],
         "localRoutingModes": [dict(item) for item in _LOCAL_ROUTING_MODES],
         "budgetFields": [dict(item) for item in _BUDGET_FIELDS],
+        "subscriptionFields": [dict(item) for item in _SUBSCRIPTION_FIELDS],
     }
+
+
+def parse_subscription_intent(data: dict) -> Tuple[bool, bool]:
+    """``(subscriptions_connected, skip_presets)`` from a wizard payload.
+
+    Both default to False, and both are DECLARATIONS, not decisions: the first
+    only tells the server to go look at the live Claudexor account state, and
+    the second is the owner's explicit "finish without agent defaults" escape
+    hatch. Neither can make the server apply a preset an install is not
+    eligible for."""
+    return (
+        _truthy(data.get(SUBSCRIPTIONS_CONNECTED_FIELD)),
+        _truthy(data.get(SKIP_SUBSCRIPTION_PRESETS_FIELD)),
+    )
 
 
 def build_initial_setup_state(settings: dict, host_mode: str = "desktop") -> dict:
@@ -281,7 +372,21 @@ def build_initial_setup_state(settings: dict, host_mode: str = "desktop") -> dic
         "localChatFormat": _string(settings.get("LOCAL_MODEL_CHAT_FORMAT")),
         "localRoutingMode": derive_local_routing_mode(settings),
     }
-    state.update({field["stateKey"]: _string(settings.get(field["settingKey"])) for field in _PROVIDER_FIELDS})
+    # A credential is reported as CONFIGURED, never handed back. The onboarding
+    # page is served by an unauthenticated GET on every host, and on a supported
+    # non-loopback bind without a network password that page is retrievable by
+    # anyone on the LAN — so the bootstrap must carry the same "configured or
+    # not" fact /api/settings carries, and nothing more. The wizard needs only
+    # that fact: which providers are already set up.
+    secret_keys = secret_provider_setting_keys()
+    state.update({
+        field["stateKey"]: (
+            CONFIGURED_SECRET_PLACEHOLDER
+            if field["settingKey"] in secret_keys and _string(settings.get(field["settingKey"]))
+            else _string(settings.get(field["settingKey"]))
+        )
+        for field in _PROVIDER_FIELDS
+    })
     state.update(budget_state)
     state.update({slot["stateKey"]: _string(settings.get(slot["settingKey"])) or defaults[slot["slot"]] for slot in _MODEL_SLOTS})
     return state
@@ -296,6 +401,9 @@ def build_setup_bootstrap(settings: dict, host_mode: str = "desktop") -> dict:
         "modelDefaults": {key: dict(value) for key, value in _MODEL_DEFAULTS.items()},
         "localPresets": {key: dict(value) for key, value in _LOCAL_PRESETS.items()},
         "modelSuggestions": list(_MODEL_SUGGESTIONS),
+        # The wizard must recognize its own "already configured" marker without
+        # hardcoding it: a prefilled credential field holds this string, not a key.
+        "secretPlaceholder": CONFIGURED_SECRET_PLACEHOLDER,
         "contract": build_setup_contract(normalized_host),
         "initialState": build_initial_setup_state(settings, normalized_host),
     }
@@ -319,7 +427,21 @@ def wizard_authors_safety_light() -> bool:
 
 
 def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, str | None]:
-    keys = {field["settingKey"]: _string(data.get(field["settingKey"])) for field in _PROVIDER_FIELDS}
+    secret_keys = secret_provider_setting_keys()
+    keys: Dict[str, str] = {}
+    for field in _PROVIDER_FIELDS:
+        setting_key = field["settingKey"]
+        value = _string(data.get(setting_key))
+        # An untouched credential field posts back the marker it was prefilled
+        # with. It means "keep the stored secret" and NEVER "store this string":
+        # resolving it to the stored value here — before the length check, the
+        # has-remote gate and the prepared merge — is what keeps the marker out
+        # of settings.json on every host, since every save path (the atomic
+        # completion endpoint, the desktop bridge) shares this validator. With
+        # nothing stored the marker resolves to empty, so it cannot become a key.
+        if setting_key in secret_keys and _is_secret_placeholder(value):
+            value = _string(current_settings.get(setting_key))
+        keys[setting_key] = value
     local_source = _string(data.get("LOCAL_MODEL_SOURCE"))
     local_filename = _string(data.get("LOCAL_MODEL_FILENAME"))
     local_chat_format = _string(data.get("LOCAL_MODEL_CHAT_FORMAT"))

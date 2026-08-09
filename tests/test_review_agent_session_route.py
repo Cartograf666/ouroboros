@@ -1159,7 +1159,7 @@ def test_scope_session_delivery_never_builds_the_pack(tmp_path, fake_route, monk
     """5.2 on scope: a delegated scope row goes out as a compact session task —
     checklist, contract and intent context intact (5.3), retrieval pointers and
     nav maps (5.7) instead of the assembled diff/touched/atlas pack — and the
-    coverage manifest is forensics, not a gate (5.6): coverage_incomplete rides
+    coverage manifest is forensics, not a gate (5.6): host_file_read_attestation rides
     as a non-blocking fact on a run that PASSES.
 
     The row is given SOURCED window evidence so it clears the session authority
@@ -1187,9 +1187,22 @@ def test_scope_session_delivery_never_builds_the_pack(tmp_path, fake_route, monk
     assert result.status == "responded"
     assert len(result.parsed_items) == 8
     manifest = result.context_manifest
-    assert manifest["delivery"] == "agent_session"
+    # D-12's ratified spelling: the field names the DELIVERY (the reviewer
+    # retrieved the surface itself), not the transport — `agent_session` is the
+    # route kind's own name, and the manifest used to answer with it.
+    assert manifest["delivery"] == "agentic_retrieval"
     assert manifest["coverage"] == "agent_retrieval"
-    assert manifest["coverage_incomplete"] is True  # forensic, visibly non-blocking
+    assert manifest["host_file_read_attestation"] == "unobserved"  # forensic, non-blocking
+    assert "coverage_incomplete" not in manifest  # retired framing (BIBLE P3 amendment)
+
+    # D-12 also asked that readers stay compatible with the old spelling. There
+    # is nothing to be compatible WITH: measured across `ouroboros/` and `web/`,
+    # this key has exactly one writer and no reader — the manifest is a durable
+    # forensic row whose audience is a person. So the clause had no subject, and
+    # that is DISCLOSED here rather than defended by machinery. I built the
+    # defence twice before writing this line (a compatibility helper, then a
+    # repo-wide reader sweep) and both were guards over an empty set; the rule
+    # they broke is that a disclosed residual beats a widened patch.
     assert manifest["excluded_sensitive"] == {"policy": "preserved", "host_enforced": False}
 
     start = fake_route.instances[0].start_requests[0]
@@ -1256,7 +1269,7 @@ def test_session_scope_without_sourced_window_evidence_is_advisory_only(
 
     The previous shape skipped `_apply_scope_authority` for `agent_session`
     entirely — a session verdict gated commits with NO window test at all, while
-    its own manifest recorded coverage_incomplete/host_enforced=False.
+    its own manifest recorded host_file_read_attestation/host_enforced=False.
 
     Two facts live in one result and are easy to conflate: the findings are
     demoted to ADVISORY (an unestablished window cannot certify a verdict), and

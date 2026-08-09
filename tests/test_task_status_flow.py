@@ -2008,7 +2008,10 @@ def test_settings_ui_carries_a_configured_zero_subagent_depth():
     (without which the flag is inert)."""
     root = pathlib.Path(__file__).resolve().parents[1]
     settings_js = (root / "web" / "modules" / "settings.js").read_text(encoding="utf-8")
-    settings_ui = (root / "web" / "modules" / "settings_ui.js").read_text(encoding="utf-8")
+    # The input moved from Advanced -> Runtime Limits to Agents -> Delegation
+    # (D-10): the counts bound the agents, not the process pool. Same invariant,
+    # new address.
+    settings_ui = (root / "web" / "modules" / "subagents_settings.js").read_text(encoding="utf-8")
     assert 'id="s-subagent-depth" type="number" min="0"' in settings_ui
     # The 4th tuple element is the falsy-tolerant flag consumed by the load path below.
     assert "['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 2, true]" in settings_js

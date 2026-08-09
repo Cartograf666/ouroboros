@@ -1,0 +1,226 @@
+"""Static guard: the typography scale holds on the surfaces that adopted it.
+
+The owner's report was "too much small high-contrast white text". Four
+independent causes produced it (docs/DESIGN.md):
+
+1. ``class="muted"`` was written at ~50 call sites while the ONLY rule that
+   matched it was the scoped ``.marketplace-card-title .muted`` — so muted text
+   everywhere else inherited near-white ``--text-primary``;
+2. ``.harness-chip`` / ``.reviewer-slot-meta`` declared a size and no colour,
+   inheriting the same primary ink;
+3. field labels were 12px UPPERCASE at a hand-written ``rgba(255,255,255,.68)``,
+   repeated dozens of times per panel;
+4. there was no scale at all — every size was a literal px, across three
+   mutually inconsistent grey families.
+
+This guard keeps that class closed on the **migrated** surfaces only. It is
+deliberately NOT a sweep of the historical stylesheet: ``web/style.css`` is
+~6000 lines of unmigrated chat/skills/marketplace/widget rules whose literals
+are a later pass, and a guard that fails on all of them would be turned off.
+The migrated slice of ``style.css`` is delimited in the file itself by
+``design-system:migrated-begin`` / ``design-system:migrated-end`` markers, so
+migrating a new surface means moving a marker (or adding a file below) in the
+same commit that migrates it.
+
+Pattern follows ``tests/test_web_dialogs_static.py``: read the sources, assert
+the structural fact, no browser needed.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import re
+
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+WEB = REPO_ROOT / "web"
+
+BEGIN_MARKER = "design-system:migrated-begin"
+END_MARKER = "design-system:migrated-end"
+
+# The four sizes, the three line heights, the two named foregrounds, and the
+# four status pairs. The scale is closed: a fifth size token is a design change
+# that goes through docs/DESIGN.md, not a stylesheet edit.
+TYPE_TOKENS = ("--type-meta", "--type-body", "--type-section", "--type-page")
+LINE_TOKENS = ("--line-meta", "--line-body", "--line-title")
+FOREGROUND_TOKENS = ("--text-meta", "--text-disabled")
+STATUS_TOKENS = (
+    "--status-ok-fg", "--status-ok-bg",
+    "--status-warn-fg", "--status-warn-bg",
+    "--status-error-fg", "--status-error-bg",
+    "--status-neutral-fg", "--status-neutral-bg",
+)
+
+TINY_FONT_SIZE = re.compile(r"font-size\s*:\s*(?:10|11)px")
+UPPERCASE = re.compile(r"text-transform\s*:\s*uppercase")
+# Innermost rule blocks only: the body pattern forbids braces, so an @media
+# wrapper cannot match as a selector and the rules nested inside it are matched
+# individually. No CSS parser needed for a structural ban.
+RULE = re.compile(r"([^{}]+)\{([^{}]*)\}")
+COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+
+def _read(rel: str) -> str:
+    return (REPO_ROOT / rel).read_text(encoding="utf-8")
+
+
+def _decommented(css: str) -> str:
+    """Blank out ``/* ... */`` while preserving line numbers.
+
+    Comments must go before anything is matched: these stylesheets carry long
+    rationale comments that name the very selectors, sizes and rgba() literals
+    the rules below them retired, and every one of those mentions would read as
+    both a bogus violation and — worse — a bogus selector attached to the next
+    real rule."""
+    return COMMENT.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), css)
+
+
+def _migrated_style_region(raw: bool = False) -> str:
+    """The marked harness-accounts + reviewer-slots slice of style.css."""
+    css = _read("web/style.css")
+    start = css.index(BEGIN_MARKER)
+    end = css.index(END_MARKER, start + len(BEGIN_MARKER))
+    return css[start:end] if raw else _decommented(css[start:end])
+
+
+def _migrated_sources() -> dict[str, str]:
+    return {
+        "web/settings.css": _decommented(_read("web/settings.css")),
+        "web/onboarding.css": _decommented(_read("web/onboarding.css")),
+        "web/style.css (migrated region)": _migrated_style_region(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# The scale itself
+# ---------------------------------------------------------------------------
+
+
+def test_type_scale_tokens_are_declared_once_in_the_root_block() -> None:
+    css = _decommented(_read("web/style.css"))
+    root = css[: css.index("\n}")]
+    assert root.lstrip().startswith(":root"), "expected :root to open web/style.css"
+    for token in TYPE_TOKENS + LINE_TOKENS + FOREGROUND_TOKENS + STATUS_TOKENS:
+        assert f"{token}:" in root, f"{token} missing from web/style.css :root"
+    # Exactly four sizes: a fifth --type-* token means the scale grew without a
+    # docs/DESIGN.md decision.
+    declared = set(re.findall(r"(--type-[a-z]+)\s*:", root))
+    assert declared == set(TYPE_TOKENS), (
+        "the type scale is closed at four sizes (docs/DESIGN.md 'Type scale'); "
+        f"found {sorted(declared)}"
+    )
+
+
+def test_onboarding_mirrors_the_scale_by_value() -> None:
+    """onboarding.css is INLINED into a standalone first-run page and cannot
+    import style.css, so it must carry the same tokens itself or every wizard
+    rule that names one silently resolves to nothing."""
+    css = _read("web/onboarding.css")
+    for token in TYPE_TOKENS + LINE_TOKENS + FOREGROUND_TOKENS + STATUS_TOKENS:
+        assert f"{token}:" in css, f"{token} missing from web/onboarding.css :root"
+
+
+def test_no_tiny_raw_font_sizes_on_migrated_surfaces() -> None:
+    violations: list[str] = []
+    for label, source in _migrated_sources().items():
+        for lineno, line in enumerate(source.splitlines(), 1):
+            if TINY_FONT_SIZE.search(line):
+                violations.append(f"{label}:{lineno}: {line.strip()}")
+    assert not violations, (
+        "Raw 10px/11px text is retired on migrated surfaces: below 12px this "
+        "dark theme forces a choice between illegible and glaring, and glaring "
+        "is what the owner reported. Use var(--type-meta) (docs/DESIGN.md "
+        "'Type scale').\n" + "\n".join(violations)
+    )
+
+
+def test_no_uppercase_label_pattern_on_migrated_surfaces() -> None:
+    violations: list[str] = []
+    for label, source in _migrated_sources().items():
+        for selector, body in RULE.findall(source):
+            if "label" not in selector.lower():
+                continue
+            if UPPERCASE.search(body):
+                violations.append(f"{label}: {' '.join(selector.split())}")
+    assert not violations, (
+        "The 12px UPPERCASE label pattern is retired on migrated surfaces "
+        "(docs/DESIGN.md 'Hierarchy rule'): all-caps at a small size costs "
+        "legibility, widens every label, and a panel that repeats it dozens of "
+        "times makes the labels out-shout the values they describe. Author the "
+        "string in sentence case instead of manufacturing caps in CSS.\n"
+        + "\n".join(violations)
+    )
+
+
+# ---------------------------------------------------------------------------
+# The four root causes, pinned individually
+# ---------------------------------------------------------------------------
+
+
+def test_muted_is_a_global_colour_only_utility() -> None:
+    """Root cause #1. `.muted` must resolve globally, and must NOT set a size:
+    its call sites are sized by their contexts, so a font-size here would
+    silently resize all of them."""
+    css = _decommented(_read("web/style.css"))
+    bodies = [body for selector, body in RULE.findall(css) if selector.strip() == ".muted"]
+    assert bodies, "no global `.muted` rule in web/style.css"
+    declarations = [
+        part.split(":", 1)[0].strip()
+        for body in bodies
+        for part in body.split(";")
+        if part.strip()
+    ]
+    assert declarations == ["color"], (
+        "`.muted` is a colour-only utility (docs/DESIGN.md '.muted'); it "
+        f"declares {declarations}"
+    )
+    assert any("var(--text-meta)" in body for body in bodies)
+
+
+def test_chips_and_meta_lines_declare_their_own_foreground() -> None:
+    """Root cause #2. A rule that declares a size and no colour inherits
+    near-white --text-primary — invisible in the CSS, loudest on screen."""
+    region = _migrated_style_region()
+    for selector in (".harness-chip", ".reviewer-slot-meta", ".harness-account-main strong"):
+        bodies = [
+            body for sel, body in RULE.findall(region) if sel.strip() == selector
+        ]
+        assert bodies, f"{selector} missing from the migrated region of web/style.css"
+        assert any("color:" in body for body in bodies), (
+            f"{selector} declares no colour, so it inherits --text-primary "
+            "(docs/DESIGN.md 'Status and chips')"
+        )
+
+
+def test_settings_field_labels_use_the_named_meta_foreground() -> None:
+    """Root cause #3. The hand-written rgba(255,255,255,0.68) is now the named
+    --text-meta, in both stylesheets that carried a copy of it."""
+    for rel in ("web/settings.css", "web/onboarding.css"):
+        css = _read(rel)
+        assert "rgba(255, 255, 255, 0.68)" not in css
+        assert "rgba(237, 242, 247, 0.68)" not in css.replace(
+            "--text-meta: rgba(237, 242, 247, 0.68)", ""
+        )
+        assert "var(--text-meta)" in css, f"{rel} never names --text-meta"
+
+
+def test_migrated_region_markers_do_not_swallow_unmigrated_surfaces() -> None:
+    """Root cause #4's guard rail: the scoping must stay honest in BOTH
+    directions. The region has to actually contain the migrated rules, and it
+    must not creep over neighbours that still carry their historical literals —
+    `.chat-live-executor-chip` sits immediately after the end marker and keeps
+    its 10px chat sizing until Chat gets its own pass."""
+    region = _migrated_style_region(raw=True)
+    assert ".reviewer-slots-heading" in region
+    assert ".harness-account-row" in region
+    assert ".chat-live-executor-chip" not in region
+    css = _read("web/style.css")
+    assert css.count(BEGIN_MARKER) == 1
+    assert css.count(END_MARKER) == 1, (
+        "the end marker must appear exactly once — a second mention (even "
+        "inside a comment) silently truncates the guarded region"
+    )
+    # NOTE: deliberately NOT asserting that debt still exists out there. A guard
+    # that fails when someone independently improves an unmigrated surface would
+    # punish exactly the work it wants. The markers' own uniqueness (above) is
+    # what proves the region is really scoped.

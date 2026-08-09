@@ -1,55 +1,19 @@
+// The wizard is served as a real ES module (`GET /onboarding`), so it uses the
+// SPA's shared helpers directly instead of carrying private copies that could
+// drift from them (the escaping is a security contract, and the request wrapper
+// is the gateway boundary) — and the Agents step imports the SAME login
+// machinery and the SAME status store the rest of the app uses.
+import { fetchJson } from './api_client.js';
+import {
+    agentsStepHtml,
+    completionFailureNotice,
+    createAgentsStep,
+    familyLabels,
+    readCompletionAnswer,
+} from './onboarding_agents_step.js';
+import { escapeHtmlAttr as escapeHtml } from './utils.js';
+
 (() => {
-    // Self-contained IIFE mirrors of harness_accounts.js. The pin in
-    // tests/test_web_utils_ssot.py compares these against the real exports
-    // rule by rule; it is a structural pin, not a behavioural one, so a
-    // rewrite that keeps the shape can still drift. (The wizard is a plain
-    // IIFE inside a page module and cannot import, which is why the two rules
-    // it needs are restated at all.)
-    //
-    // 1. Was the account store actually READ? An empty list under a lazily
-    //    started daemon means "never asked", not "no accounts" — the wizard
-    //    used to announce "No accounts connected yet" on an idle machine.
-    function claudexorAccountsRead(payload) {
-        const hasBlock = payload !== null && typeof payload === 'object'
-            && Object.prototype.hasOwnProperty.call(payload, 'reads');
-        if (hasBlock) {
-            const reads = payload.reads;
-            if (!reads || typeof reads !== 'object') return 'failed';
-            const state = String(reads.accounts || '');
-            if (state === 'ok' || state === 'not_read' || state === 'failed') return state;
-            return 'failed';   // block present, facet unknown => never authoritative
-        }
-        // Legacy payload with no read block AT ALL: the daemon state is the
-        // only signal there is.
-        return String(payload?.daemon?.state || '') === 'running' ? 'ok' : 'not_read';
-    }
-
-    // 2. What counts as CONNECTED — the same predicate the accounts panel and
-    //    delegation apply: a row whose verification passed. Native logins count
-    //    (a native codex session used to read as "0 accounts connected"), and a
-    //    signed-out named profile does not.
-    function countConnectedAccounts(payload) {
-        const natives = Array.isArray(payload?.profiles?.harnessAccounts)
-            ? payload.profiles.harnessAccounts : [];
-        const wrappers = Array.isArray(payload?.profiles?.profiles)
-            ? payload.profiles.profiles : [];
-        let n = 0;
-        for (const row of natives) if (row && row.native_login_detected) n += 1;
-        for (const w of wrappers) if (String(w?.status?.verification || '') === 'passed') n += 1;
-        return n;
-    }
-
-    // Self-contained IIFE mirror of utils.escapeHtmlAttr; SSOT drift is tested.
-    function escapeHtml(value) {
-        return String(value ?? '')
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;')
-            .replace(/`/g, '&#96;');
-    }
-
         const bootstrap = window.__OURO_ONBOARDING_BOOTSTRAP__ || {};
         const SETUP_CONTRACT = bootstrap.contract || {};
         const HOST_MODE = bootstrap.hostMode || 'desktop';
@@ -58,6 +22,11 @@
         const STEP_META = Object.fromEntries((SETUP_CONTRACT.steps || []).map((step) => [step.id, step]));
         const PROVIDER_FIELDS = SETUP_CONTRACT.providerFields || [];
         const PROVIDER_PROFILES = SETUP_CONTRACT.providerProfiles || {};
+        // Bounded, because completion must not hang on an engine that is down:
+        // three tries over ~1.2s converts a blip into a proven cancel, and
+        // anything longer stops being a blip.
+        const LOGIN_RELEASE_RETRIES = 2;
+        const LOGIN_RELEASE_RETRY_MS = 600;
         const MODEL_SLOTS = SETUP_CONTRACT.modelSlots || [];
         const REVIEW_MODES = SETUP_CONTRACT.reviewModes || [];
         const RUNTIME_MODES = SETUP_CONTRACT.runtimeModes || [];
@@ -74,6 +43,10 @@
         const LOCAL_PRESETS = bootstrap.localPresets || {};
         const MODEL_SUGGESTIONS = bootstrap.modelSuggestions || [];
         const INITIAL_STATE = bootstrap.initialState || {};
+        // What a stored credential looks like in INITIAL_STATE: a marker saying
+        // "configured", not the secret. Posting it back means "leave it alone";
+        // the shared server-side validator resolves it to the stored value.
+        const SECRET_PLACEHOLDER = bootstrap.secretPlaceholder || '';
         const root = document.getElementById('root');
 
     const state = Object.assign({
@@ -97,10 +70,20 @@
         claudeCliTone: 'muted',
         claudeCliError: '',
         claudeCliDismissed: false,
+        // Agents step: what the step OBSERVED (never a guess), the owner's
+        // explicit "finish without agent defaults" choice, and the typed reason
+        // a completion attempt refused to write the preset.
+        agentsConnected: [],
+        skipSubscriptionPresets: false,
+        presetFailure: null,
+        // Set once completion SUCCEEDED but the receipt says the saved runtime
+        // mode needs a restart, in the one shell that cannot restart anything.
+        completedRestartMode: '',
     }, INITIAL_STATE);
 
     let localStatusPollStarted = false;
     let claudeCliPollStarted = false;
+    let agentsStep = null;
 
     function trim(value) {
         return String(value || '').trim();
@@ -130,8 +113,18 @@
         return moreProviderFields().some((field) => trim(state[field.stateKey]).length > 0);
     }
 
+    // A credential prefilled from disk arrives as SECRET_PLACEHOLDER, never as
+    // the value, so "is this configured?" can no longer be answered by length.
+    // The length rule stays for what the owner types here: it is the client
+    // mirror of the server's too-short check.
+    function isConfiguredCredential(value) {
+        const text = trim(value);
+        if (!text) return false;
+        return text === SECRET_PLACEHOLDER || text.length >= 10;
+    }
+
     function hasAnthropicKeyConfigured() {
-        return trim(state.anthropicKey).length >= 10;
+        return isConfiguredCredential(state.anthropicKey);
     }
 
     function shouldShowClaudeCliCta() {
@@ -150,7 +143,7 @@
         function detectProviderProfile() {
             const configured = Object.fromEntries(PROVIDER_FIELDS.map((field) => [
                 field.settingKey,
-                trim(state[field.stateKey]).length >= 10,
+                isConfiguredCredential(state[field.stateKey]),
             ]));
             const hasOpenrouter = configured.OPENROUTER_API_KEY;
             const hasCompatible = trim(state.compatibleBaseUrl).length > 0;
@@ -322,6 +315,10 @@
     }
 
     function validateCurrentStep() {
+        // 'agents' is deliberately absent from this list: the step is SKIPPABLE
+        // and can never block completion. A subscription is an amplifier, never
+        // an admission gate (D-1) — the launch requirement was already met on
+        // the access step.
         if (state.currentStep === 'providers') return validateProvidersStep();
         if (state.currentStep === 'models') return validateModelsStep();
         if (state.currentStep === 'review_mode') return validateReviewStep();
@@ -352,14 +349,7 @@
         render();
     }
 
-    async function apiRequest(url, init = {}) {
-        const response = await fetch(url, init);
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok) {
-            throw new Error(data.error || `HTTP ${response.status}`);
-        }
-        return data;
-    }
+    const apiRequest = fetchJson;
 
     function applyClaudeCliStatus(payload = {}) {
         const ready = Boolean(payload.ready);
@@ -528,60 +518,6 @@
         `;
     }
 
-    function renderHarnessAccountsCard() {
-        // D30: skippable coding-agent-accounts card. On the desktop first-run
-        // the wizard runs BEFORE the server exists, so the card degrades to a
-        // Settings pointer; on web it shows the live account count. The full
-        // login flows (device-code card, terminal-command fallback) live in
-        // Settings → Providers → Harness Accounts — never a terminal in-app.
-        if (state.harnessCardSkipped) return '';
-        const liveLine = HOST_MODE === 'desktop'
-            ? 'Available after launch: open Settings → Providers → Harness Accounts.'
-            : escapeHtml(state.harnessAccountsLine || 'Checking connected accounts…');
-        return `
-            <div class="panel-card" id="wizard-harness-card">
-                <h3>Coding-agent subscriptions (optional)</h3>
-                <p>Run delegated subagents and reviewers on your Codex CLI / Claude Code / Cursor
-                subscriptions instead of API tokens. Accounts are connected to Ouroboros's own
-                agent home — your personal logins are never imported.</p>
-                <div class="wizard-runtime-strip">
-                    <span class="wizard-runtime-status">${liveLine}</span>
-                    <button type="button" class="btn btn-secondary" id="wizard-harness-skip">Skip for now</button>
-                </div>
-            </div>
-        `;
-    }
-
-    async function refreshHarnessAccountsLine() {
-        if (HOST_MODE === 'desktop' || state.harnessCardSkipped) return;
-        try {
-            const data = await apiRequest('/api/claudexor/status', { cache: 'no-store' });
-            // Two lies lived in one line. (1) A non-running daemon was reported
-            // as "no accounts" although nothing had been read — the daemon is
-            // lazy, so that is the ORDINARY idle state. (2) Even with the daemon
-            // alive it counted only NAMED profiles, so a native codex login read
-            // as "0 accounts connected". Both now go through the same shared
-            // predicates the accounts panel and delegation use.
-            const read = claudexorAccountsRead(data);
-            const n = countConnectedAccounts(data);
-            // `not_read` normally means the daemon never ran — but a discovery
-            // or handshake failure BEFORE the fan-out leaves every facet
-            // untouched while the daemon reports `unreachable`. Blaming a
-            // daemon that is running would be a second false statement.
-            const asleep = String(data?.daemon?.state || '') !== 'unreachable';
-            const unknownWhy = read === 'not_read' && asleep
-                ? 'Accounts not checked yet — the agent daemon is not running.'
-                : 'Accounts not checked — the daemon did not answer.';
-            state.harnessAccountsLine = read === 'ok'
-                ? `${n} account${n === 1 ? '' : 's'} connected. Manage them in Settings → Providers → Harness Accounts.`
-                : `${unknownWhy} Manage them in Settings → Providers → Harness Accounts.`;
-        } catch (error) {
-            state.harnessAccountsLine = 'Connect accounts any time in Settings → Providers → Harness Accounts.';
-        }
-        const card = document.querySelector('#wizard-harness-card .wizard-runtime-status');
-        if (card) card.textContent = state.harnessAccountsLine;
-    }
-
     function renderClaudeCliControls() {
         return `
             <div class="panel-card" id="wizard-claude-card"${shouldShowClaudeCliCta() ? '' : ' hidden'}>
@@ -623,10 +559,28 @@
                 ['Local routing', localRoutingLabel(state.localRoutingMode)],
             );
         }
+        rows.push(['Agents', agentsSummaryValue()]);
         if (trim(state.skillsRepoPath)) {
             rows.push(['Skills repo', trim(state.skillsRepoPath)]);
         }
         return rows;
+    }
+
+    function agentsSummaryValue() {
+        // Through the step's own snapshot, so this line and the Agents step one
+        // screen earlier spell a family the same way. Without it the summary
+        // fell back to the bootstrap names and quietly undid an engine rename.
+        const labels = familyLabels(state.agentsConnected, agentsStep?.snapshot);
+        if (!labels.length) return 'none connected (API access only)';
+        if (state.skipSubscriptionPresets) return `${labels.join(', ')} (finishing without agent defaults)`;
+        return `${labels.join(', ')} — will run commit review and delegated subagents`;
+    }
+
+    function shouldOfferPresetSkip() {
+        // The endpoint's own escape hatch, surfaced exactly when it can change
+        // the outcome: something is connected to move onto, or a completion
+        // attempt already refused the preset and said the skip is available.
+        return state.agentsConnected.length > 0 || Boolean(state.presetFailure);
     }
 
         function providerKeyField({ id, label, placeholder, value, note, inputType }) {
@@ -693,7 +647,6 @@
                 </div>
             </details>
             ${renderClaudeCliControls()}
-            ${renderHarnessAccountsCard()}
             <details class="wizard-collapse" data-collapse="local-model" ${localSourceOpen ? 'open' : ''}>
                 <summary>
                     <span>Local model settings</span>
@@ -726,6 +679,33 @@
                 </div>
             </details>
         `;
+    }
+
+    function renderAgentsStep() {
+        // SKIPPABLE by construction: `validateCurrentStep` returns '' for this
+        // step, so Continue is never disabled and no field here can block
+        // finishing. An agent plan is an amplifier, never an admission gate.
+        return `
+            <div class="step-header">
+                <div>
+                    <h2 class="step-title">${escapeHtml(STEP_META.agents.title)}</h2>
+                    <p class="step-copy">${escapeHtml(STEP_META.agents.copy)}</p>
+                </div>
+            </div>
+            ${agentsStepHtml()}
+        `;
+    }
+
+    function bindAgentsStep() {
+        if (!agentsStep) {
+            agentsStep = createAgentsStep({
+                isVisible: () => state.currentStep === 'agents',
+                onChange: (connected) => { state.agentsConnected = connected; },
+            });
+        }
+        agentsStep.setSkipPresets(state.skipSubscriptionPresets);
+        agentsStep.mount();
+        syncCurrentStepActionState();
     }
 
     function modelSuggestionField({ id, label, value, note }) {
@@ -865,8 +845,30 @@
         `;
     }
 
+    function renderRestartRequiredScreen() {
+        return `
+            <div class="step-header">
+                <div>
+                    <h2 class="step-title">Setup saved — restart to apply it</h2>
+                    <p class="step-copy">Everything you entered is on disk. One choice needs a fresh start before it is live.</p>
+                </div>
+            </div>
+            <div class="panel-card">
+                <h3>Runtime mode takes effect at the next boot</h3>
+                <p>Ouroboros saved <code>${escapeHtml(state.completedRestartMode)}</code> as the runtime mode for the next boot, but this
+                process is still running the mode it started with. Restart Ouroboros to run in the mode you chose.
+                Opening the app now works — it simply runs in the previous mode until you do.</p>
+                <div class="wizard-runtime-strip">
+                    <button type="button" class="btn btn-primary" id="open-app-btn">Open Ouroboros in the current mode</button>
+                </div>
+            </div>
+        `;
+    }
+
     function renderStepContent() {
+        if (state.completedRestartMode) return renderRestartRequiredScreen();
         if (state.currentStep === 'providers') return renderProvidersStep();
+        if (state.currentStep === 'agents') return renderAgentsStep();
         if (state.currentStep === 'models') return renderModelsStep();
         if (state.currentStep === 'review_mode') return renderReviewModeStep();
         if (state.currentStep === 'budget') return renderBudgetStep();
@@ -906,14 +908,19 @@
                 <div class="wizard-steps">${stepCards()}</div>
                 <div class="wizard-content">
                     ${renderStepContent()}
+                    ${state.completedRestartMode ? '' : `
                     <div class="wizard-footer">
                         <div class="footer-copy">${escapeHtml(meta.footer)}</div>
                         <div class="footer-actions">
                             <button class="btn btn-secondary" id="back-btn" type="button" ${index === 0 || state.saving ? 'disabled' : ''}>Back</button>
+                            ${state.currentStep === 'summary' && shouldOfferPresetSkip() ? `
+                                <button class="btn btn-secondary" id="skip-presets-btn" type="button" ${state.saving ? 'disabled' : ''}>Finish without agent defaults</button>
+                            ` : ''}
                             <button class="btn btn-primary" id="next-btn" type="button" ${nextButtonShouldBeDisabled() ? 'disabled' : ''}>${escapeHtml(nextLabel)}</button>
                         </div>
                     </div>
                     <div class="wizard-error">${escapeHtml(state.error)}</div>
+                    `}
                 </div>
             </div>
         `;
@@ -1107,12 +1114,6 @@
             state.claudeCliDismissed = true;
             syncClaudeCliVisibility();
         });
-        document.getElementById('wizard-harness-skip')?.addEventListener('click', () => {
-            state.harnessCardSkipped = true;
-            const card = document.getElementById('wizard-harness-card');
-            if (card) card.hidden = true;
-        });
-        refreshHarnessAccountsLine();
         if (shouldShowClaudeCliCta()) {
             startClaudeCliStatusPolling();
             updateClaudeCliStatus();
@@ -1288,43 +1289,139 @@
             syncCurrentStepActionState();
         }
 
-    async function saveWizardPayload(payload) {
-        if (HOST_MODE === 'web') {
-            const runtimeMode = trim(state.runtimeMode) || 'advanced';
-            await apiRequest('/api/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-            });
-            const runtimeResult = await apiRequest('/api/owner/runtime-mode', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ mode: runtimeMode }),
-            });
+    // --- Completion ---------------------------------------------------------
+    // ONE completion path on every host (D-8). The wizard runs against a live
+    // gateway everywhere, so it posts the single atomic transaction and then
+    // tells whichever shell embeds this page that setup is done; only the
+    // announcement differs (embedded frame / desktop setup window / browser tab).
+    //
+    // The two legacy fallbacks are GONE. `POST /api/settings` + `POST
+    // /api/owner/runtime-mode` was the pair whose failure between the two writes
+    // left providers saved and runtime mode not, and the desktop `save_wizard`
+    // bridge existed only to author the fresh-install `light` safety coverage
+    // that the endpoint now authors itself, on its own server-side freshness
+    // proof. Keeping either as a "not deployed yet" hedge meant a first run
+    // could still silently take a non-atomic path.
+
+    const ONBOARDING_COMPLETE_ENDPOINT = '/api/onboarding/complete';
+
+    function announceCompletion(result) {
+        const restartRequired = Boolean(result?.restart_required);
+        const runtimeMode = trim(result?.runtime_mode) || trim(state.runtimeMode) || 'advanced';
+        if (window.parent && window.parent !== window) {
             // Target our own origin explicitly (paired with the receiver's
             // origin check) instead of broadcasting to any embedding page.
-            const _targetOrigin = window.location.origin === 'null'
+            const targetOrigin = window.location.origin === 'null'
                 ? (window.parent?.location?.origin ?? '*')
                 : window.location.origin;
-            window.parent?.postMessage({
+            window.parent.postMessage({
                 type: 'ouroboros:onboarding-complete',
-                restart_required: Boolean(runtimeResult?.restart_required),
-                runtime_mode: runtimeResult?.runtime_mode || runtimeMode,
-            }, _targetOrigin);
-            if (!window.parent || window.parent === window) {
-                window.location.replace('/');
-            }
-            return 'ok';
+                restart_required: restartRequired,
+                runtime_mode: runtimeMode,
+            }, targetOrigin);
+            return;
         }
-        if (!window.pywebview?.api?.save_wizard) {
-            throw new Error('Desktop onboarding bridge is unavailable.');
+        if (window.pywebview?.api?.onboarding_finished) {
+            // Desktop setup window: the launcher owns both this window and the
+            // managed server process, so it closes the window and recycles the
+            // server itself instead of asking the owner to restart the app.
+            window.pywebview.api.onboarding_finished({
+                ok: true,
+                restart_required: restartRequired,
+                runtime_mode: runtimeMode,
+            });
+            return;
         }
-        const result = await window.pywebview.api.save_wizard(payload);
-        if (result !== 'ok') throw new Error(result || 'Failed to save onboarding settings.');
-        return result;
+        // PLAIN BROWSER TAB. Nothing here owns the server process, so a receipt
+        // that says a restart is required cannot be discharged by navigating —
+        // and redirecting anyway drops the owner into an app running a runtime
+        // mode DIFFERENT from the one they just chose, with nothing on screen
+        // saying so. The other two shells each show this (the overlay's restart
+        // card, the launcher's own recycle); this one used to be the only place
+        // the flag was silently thrown away.
+        if (restartRequired) {
+            showBrowserRestartRequired(runtimeMode);
+            return;
+        }
+        window.location.replace('/');
     }
 
-    async function saveWizard() {
+    function showBrowserRestartRequired(runtimeMode) {
+        state.saving = false;
+        state.completedRestartMode = trim(runtimeMode) || 'advanced';
+        render();
+    }
+
+    async function completeOnboardingAtomically(payload) {
+        // The atomic completion (D-8): server-side fresh-install proof, the
+        // structural provider gate, optional agent-preset compilation, a single
+        // persist, then supervisor start.
+        const response = await fetch(ONBOARDING_COMPLETE_ENDPOINT, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        // A body that will not parse is UNKNOWN, not empty. Substituting `{}`
+        // made a 200 carrying HTML (a proxy error page, a login redirect) look
+        // like a completion, and `{}` being truthy meant the caller announced
+        // success with `restart_required` silently gone.
+        let data = null;
+        let parsed = true;
+        try {
+            data = await response.json();
+        } catch (err) {
+            parsed = false;
+        }
+        if (!data || typeof data !== 'object') { data = {}; parsed = false; }
+        // ONE reader for both answers (typed refusal and success envelope); the
+        // branches live in onboarding_agents_step.js so every one is node-tested.
+        const answer = readCompletionAnswer({
+            status: response.status, ok: response.ok, parsed, data,
+        });
+        if (answer.failure) {
+            const error = new Error(answer.failure.message);
+            Object.assign(error, answer.failure);
+            throw error;
+        }
+        return answer.receipt;
+    }
+
+    async function saveWizardPayload(payload) {
+        const result = await completeOnboardingAtomically(payload);
+        // Setup is over: release the Agents step's status subscription and its
+        // login-job timer before the shell takes the page away. AWAIT it — the
+        // step answers whether the login was genuinely let go, and announcing
+        // completion first would navigate away while a create POST was still in
+        // flight, stranding a live login job with nobody left to cancel it.
+        // The disposer is retryable by contract, and this is the LAST moment it
+        // can run: announceCompletion takes the page away, and with the page
+        // goes the only client that knows the job id. So a refused release is
+        // retried a bounded number of times before giving up — which is what
+        // turns the realistic cause (a daemon blip during the DELETE) into a
+        // proven cancel instead of an orphan.
+        let released = await agentsStep?.dispose();
+        for (let attempt = 0; released === false && attempt < LOGIN_RELEASE_RETRIES; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, LOGIN_RELEASE_RETRY_MS));
+            released = await agentsStep?.dispose();
+        }
+        if (released === false) {
+            // Still unproven. The controller kept the job id, but nothing here
+            // can act on it once the page is gone, so this is a DISCLOSED
+            // residual rather than a handled one: the engine owns that job and
+            // settles it on its own. Completion is still announced, because the
+            // save LANDED — withholding it would be the larger lie and would
+            // send the owner back through an onboarding that is already done.
+            console.warn('onboarding: a sign-in could not be confirmed cancelled after '
+                + `${LOGIN_RELEASE_RETRIES + 1} attempts; the agent engine still owns that job `
+                + 'and will settle it.');
+        } else {
+            agentsStep = null;
+        }
+        announceCompletion(result);
+        return 'ok';
+    }
+
+    async function saveWizard({ skipPresets = false } = {}) {
         const providersError = validateProvidersStep();
         const modelsError = validateModelsStep();
         const reviewError = validateReviewStep();
@@ -1334,10 +1431,16 @@
             render();
             return;
         }
+            if (skipPresets) state.skipSubscriptionPresets = true;
             state.saving = true;
             state.error = '';
             render();
             const payload = {
+                // What this step OBSERVED, plus the owner's explicit escape
+                // hatch. Neither is authority: the endpoint re-reads live
+                // account state and re-proves install-time eligibility.
+                subscriptionsConnected: state.agentsConnected.length > 0,
+                skipSubscriptionPresets: state.skipSubscriptionPresets,
                 ...Object.fromEntries(PROVIDER_FIELDS.map((field) => [field.settingKey, trim(state[field.stateKey])])),
                 ...Object.fromEntries(BUDGET_FIELDS.map((field) => [field.settingKey, Number(state[field.stateKey] || 0)])),
                 OUROBOROS_REVIEW_ENFORCEMENT: trim(state.reviewEnforcement) || 'advisory',
@@ -1354,20 +1457,35 @@
         try {
             await saveWizardPayload(payload);
         } catch (error) {
+            // The wizard STAYS OPEN with the real reason. A typed preset refusal
+            // wrote nothing, so the offered escape is honest: finish without the
+            // agent defaults and keep everything editable in Settings.
+            const notice = completionFailureNotice(error);
             state.saving = false;
-            state.error = String(error?.message || error || 'Failed to save onboarding settings.');
+            state.presetFailure = notice.canSkip ? { code: notice.code } : null;
+            state.error = notice.text;
             render();
         }
     }
 
     function bindEvents() {
+        if (state.completedRestartMode) {
+            document.getElementById('open-app-btn')?.addEventListener('click', () => {
+                window.location.replace('/');
+            });
+            return;
+        }
         bindClearButtons();
         document.getElementById('back-btn')?.addEventListener('click', previousStep);
         document.getElementById('next-btn')?.addEventListener('click', () => {
             if (state.currentStep === 'summary') saveWizard();
             else nextStep();
         });
+        document.getElementById('skip-presets-btn')?.addEventListener('click', () => {
+            saveWizard({ skipPresets: true });
+        });
         if (state.currentStep === 'providers') bindProvidersStep();
+        if (state.currentStep === 'agents') bindAgentsStep();
         if (state.currentStep === 'models') bindModelsStep();
         if (state.currentStep === 'review_mode') bindReviewModeStep();
         if (state.currentStep === 'budget') bindBudgetStep();

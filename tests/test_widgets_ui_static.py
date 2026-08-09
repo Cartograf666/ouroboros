@@ -281,10 +281,15 @@ def test_widgets_responsive_design_system_styles_are_host_owned():
     assert "content: attr(data-label);" in style
     assert ".widget-kanban-move" in style
     assert ".widget-kanban-col.is-empty" in style
-    narrow = style.rsplit("@media (max-width: 640px) {", 1)[1]
-    assert ".widget-kanban-col.is-empty" in narrow
-    assert "min-height: 0;" in narrow
-    assert "padding-block: 8px;" in narrow
+    # The widget narrow block is found by its CONTENT, not by being the last
+    # `@media (max-width: 640px)` in the file. Position was never the fact under
+    # test, and any surface that later adds its own 640px block (the Agents tab's
+    # account rows did) would silently steal this assertion and fail it.
+    blocks = style.split("@media (max-width: 640px) {")[1:]
+    narrow = [b for b in blocks if ".widget-kanban-col.is-empty" in b]
+    assert narrow, "no @media (max-width: 640px) block carries the widget kanban rules"
+    assert any("min-height: 0;" in b for b in narrow)
+    assert any("padding-block: 8px;" in b for b in narrow)
     assert ".widget-group-components > * { margin-top: 0; }" in style
     assert "repeat(auto-fit, minmax(min(220px, 100%), 1fr))" in style
     assert ".widget-group-grid > .widget-group-components > :is(" in style

@@ -9,8 +9,13 @@ from ouroboros.gateway.contracts import (
     WS_MESSAGE_TYPES,
     ChatInbound,
     ChatOutbound,
+    OnboardingCompleteRequest,
+    OnboardingCompleteResponse,
+    OnboardingPresetFailureResponse,
+    OnboardingPresetProjection,
     OwnerScopeReviewFloorResponse,
     PhotoOutbound,
+    SettingsPostCommitFailureResponse,
     SkillDeleteResponse,
     SkillLifecycleQueueResponse,
     StateResponse,
@@ -109,12 +114,20 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "UpdateApplySuccessResponse",
         "UpdateApplyErrorResponse",
         "UpdateStatusReadyOutbound",
+        "OnboardingCompleteRequest",
+        "OnboardingPresetProjection",
+        "OnboardingCompleteResponse",
+        "OnboardingPresetFailureResponse",
+        "SettingsPostCommitFailureResponse",
     ):
         assert re.search(rf"@typedef \{{Object\}} {name}\b", text), f"api_types.js missing {name}"
     api_client = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_client.js").read_text(
         encoding="utf-8"
     )
     assert "openAICompatibleModels" in api_client
+    # D-8: the wizard's ONE atomic completion call must exist on the browser client.
+    assert "completeOnboarding" in api_client
+    assert "'/api/onboarding/complete'" in api_client
     # v6.80.0: the two contracts extended this release join the FIELD-level parity list. The name-level
     # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
     # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
@@ -123,29 +136,43 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 UpdatePreflightRequest, UpdatePreflightResponse, UpdateApplyRequest,
                 UpdateApplySuccessResponse, UpdateApplyErrorResponse,
                 UpdateStatusReadyOutbound, TaskCostBreakdown, TaskDetailResponse,
+                OnboardingCompleteRequest, OnboardingPresetProjection,
+                OnboardingCompleteResponse, OnboardingPresetFailureResponse,
+                SettingsPostCommitFailureResponse,
                 ClaudexorStatusReads, ClaudexorStatusResponse):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
-    # The panel's own list of facets. `daemonAnswered` iterates it to decide
-    # whether the daemon answered anything at all, so a facet added to the
-    # contract but not here would be INVISIBLE to that predicate: a payload in
-    # which only the new facet landed would read as total silence, and the panel
-    # would print a dead-daemon verdict over data the daemon had just handed
-    # over. The name-level and field-level loops above cannot see this — they
-    # compare Python against the browser's typedef, never against the module
-    # that consumes it.
-    accounts_js = (pathlib.Path(__file__).resolve().parent.parent
-                   / "web" / "modules" / "harness_accounts.js").read_text(encoding="utf-8")
-    facets = re.search(r"export const READ_FACETS = \[([^\]]*)\]", accounts_js)
-    assert facets, "harness_accounts.js no longer declares READ_FACETS"
+    # The client's own list of facets. The shared status store is the ONE reader
+    # of the `reads` block (`facetReadState`), and STATUS_FACETS is the list its
+    # per-facet map and every "did the daemon answer anything at all?" predicate
+    # iterate — so a facet added to the contract but not there would be
+    # INVISIBLE to those consumers: a payload in which only the new facet landed
+    # would read as total silence, and a surface would print a dead-daemon
+    # verdict over data the daemon had just handed over. The name-level and
+    # field-level loops above cannot see this — they compare Python against the
+    # browser's typedef, never against the module that consumes it.
+    store_js = (pathlib.Path(__file__).resolve().parent.parent
+                / "web" / "modules" / "claudexor_status_store.js").read_text(encoding="utf-8")
+    facets = re.search(r"export const STATUS_FACETS = \[([^\]]*)\]", store_js)
+    assert facets, "claudexor_status_store.js no longer declares STATUS_FACETS"
     # Strip comments inside the literal first: a facet name mentioned in a
     # comment there would otherwise satisfy this check while the exported array
-    # — the thing `daemonAnswered` iterates — never grew.
+    # — the thing every consumer iterates — never grew. The array is composed of
+    # named constants (FACET_CATALOG, …), so each identifier is resolved to the
+    # string its `const` declaration binds; a bare string literal counts as-is.
     literal = re.sub(r"/\*.*?\*/", "", re.sub(r"//[^\n]*", "", facets.group(1)), flags=re.S)
-    assert set(re.findall(r"'([^']+)'", literal)) == set(
+    declared: set[str] = set()
+    for token in re.findall(r"'[^']*'|[A-Za-z_$][A-Za-z0-9_$]*", literal):
+        if token.startswith("'"):
+            declared.add(token.strip("'"))
+            continue
+        binding = re.search(rf"const {re.escape(token)} = '([^']+)'", store_js)
+        assert binding, f"STATUS_FACETS references {token}, whose string binding was not found"
+        declared.add(binding.group(1))
+    assert declared == set(
         get_type_hints(ClaudexorStatusReads, include_extras=True)
-    ), "READ_FACETS drifted from ClaudexorStatusReads; daemonAnswered would go blind to a facet"
+    ), "STATUS_FACETS drifted from ClaudexorStatusReads; the store's per-facet reads would go blind to a facet"
 
     assert UpdatePreflightResponse.__required_keys__ == frozenset({"merge_plan"})
     assert re.search(r"@property \{'auto_merge'\|'assisted'\|'manual'\|'replace'\} strategy\b", text)

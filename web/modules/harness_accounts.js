@@ -1,86 +1,131 @@
-// Harness Accounts (D30) — the Providers-tab section over the owned Claudexor
-// daemon's account surface, MCP-card style: one row per account, two HONEST
-// verification statuses, quota with a resets_at timer, login cards.
+// Agent accounts (D30, regrouped in the Agents tab) — the owner-facing surface
+// over the owned Claudexor daemon's account truth.
 //
-// «Красота-сначала»: the login card is LINK-FIRST — the engine disclosures the
-// sign-in URL (and a one-time code for the codex device flow) through the job
-// snapshot's transient overlay, and the card renders "Open sign-in link" +
-// copy affordances + a live state line. A job that also accepts user input
-// (the claude OAuth paste-code, disclosure flow `oauth_url_input`) shows an
-// ALWAYS-VISIBLE code entry: claude's CLI only asks for the code when the
-// browser cannot reach its localhost callback (e.g. another device), so the
-// field cannot depend on a prompt this UI cannot observe — the input is
-// OPTIONAL by design (the callback may complete on its own). The copy-paste
-// `claudexor setup attach …` command survives ONLY as a collapsed Advanced
-// affordance for engines that predate the disclosure modes or jobs whose link
-// never arrives — never the primary UI. No terminal panel exists in this UI,
-// and none may be added. Shape selection keys on the disclosure's typed FLOW
-// (url-only `oauth_url`/`chatgpt` vs `oauth_url_input`; 3.3.7 final
-// contract) — no harness-name branches, no boolean sidecar.
+// The shape is the owner's (2026-08-08): "все акки клод кода должны быть
+// эквивалентны", "позиции кнопок нелогичные… в каждой секции добавить кнопку",
+// "текст про лимиты компактнее и понятнее". So:
+//
+//  * ONE CARD PER FAMILY (Claude Code / Codex / Cursor). The family name and
+//    its aggregate status sit in the card header, and that card owns its own
+//    Add-account button — the button used to hang off the native row, which is
+//    why adding a Codex account meant hunting for a control under an unrelated
+//    line.
+//  * ROWS ARE EQUIVALENT. The default CLI login is a row like any other; being
+//    native is a CAPTION on its metadata line, never a different layout, never
+//    extra chrome. Rotation treats every connected account of a family the
+//    same, and the UI now says so by looking the same.
+//  * TWO LINES PER ROW. Line 1 is the one primary thing (the account) plus its
+//    status; line 2 is muted metadata in human words — "38% used · resets in
+//    2h", never a raw ISO instant.
+//  * REMOVAL goes through the ENGINE's own contract (DELETE
+//    /api/claudexor/credential-profiles/…). A native CLI login has no removal
+//    button: that account belongs to the vendor's CLI, and a simulated
+//    sign-out would claim an effect this app cannot have.
+//
+// The status payload comes from the SHARED store (`claudexor_status_store.js`)
+// — this section owns no poll — and the login card is the SHARED controller
+// (`harness_login_cards.js`), so the onboarding wizard mounts the same flow.
+//
+// PROVENANCE IS PER FACET (the store's rule) and it OUTRANKS the aggregate:
+// `daemon.state` can say `unreachable` while two of the three fanned-out reads
+// landed, so no sentence here judges the daemon off the aggregate alone —
+// `daemonAnswered` below is the one predicate, and the status line asks the
+// facets before it repeats any runtime claim ("keeps running", "ready").
 //
 // Pure helpers up top are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
+import {
+    FACET_ACCOUNTS,
+    FACET_CATALOG,
+    FACET_QUOTA,
+    FACET_SUBJECT,
+    READ_FAILED,
+    READ_INDETERMINATE,
+    READ_OK,
+    READ_TRANSPORT,
+    READ_UNREAD,
+    STATUS_FACETS,
+    accountRows,
+    bindStatusSurface,
+    claudexorStatus,
+    facetReadState,
+    familyLabel,
+    readsFor,
+} from './claudexor_status_store.js';
 import { openConfirmDialog } from './confirm_dialog.js';
-import { escapeHtmlAttr as escapeHtml, safeExternalHrefAttr } from './utils.js';
-
-const POLL_MS = 5000;
-const JOB_POLL_MS = 3000;
-export const JOB_POLL_MAX_DELAY_MS = 30000;
-export const JOB_POLL_GIVE_UP_FAILURES = 10;
+import { createLoginCardController } from './harness_login_cards.js';
+import { formatRelativeAge } from './ui_helpers.js';
+import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
 // ---------------------------------------------------------------------------
 // Pure helpers.
 // ---------------------------------------------------------------------------
 
-// #125: the status refresh is visibility-gated (each tick fans out to four
-// daemon round-trips), but a FORCED refresh — first load, the Refresh button,
-// the poll give-up — always runs. Pure so the gate is node-tested.
-export function shouldSkipStatusRefresh({ hostVisible = false, hidden = false, force = false } = {}) {
-    if (force) return false;
-    return !hostVisible || Boolean(hidden);
-}
-
-// #125: job-poll pacing over CONSECUTIVE failures (a successful read — any
-// parsed snapshot, pending included — resets the counter): 3s while healthy,
-// exponential backoff 6/12/24/30…s capped at 30s while the daemon is not
-// answering, and after 10 consecutive failures the chain gives up (~4 min)
-// instead of hammering a dead daemon forever.
-export function nextJobPollDelay(consecutiveFailures) {
-    const failures = Math.max(0, Number(consecutiveFailures) || 0);
-    if (failures >= JOB_POLL_GIVE_UP_FAILURES) return { delayMs: 0, giveUp: true };
-    return {
-        delayMs: Math.min(JOB_POLL_MS * 2 ** failures, JOB_POLL_MAX_DELAY_MS),
-        giveUp: false,
-    };
-}
-
-export function verificationBadge(profile) {
+export function verificationBadge(profile, { known = true } = {}) {
     // Q2-а: both statuses are shown honestly — vendor-verified is trusted,
     // local-store presence stays labeled "not verified live" in WORDS, but in
     // a NEUTRAL tone (owner finding #2): the engine has no vendor probe for
     // some harnesses (cursor), so a warning-toned "not verified" there is a
     // permanent alarm nothing can clear — noise, not honesty. "local session"
     // is the daemon's own name for the route (next_up.route).
+    //
+    // The instant moved OUT of this label (owner finding: a row must not lead
+    // with a raw ISO timestamp) — `accountMetaLine` humanizes it below.
     const status = profile?.status || profile || {};
     const source = String(status.verification_source || '');
     const verification = String(status.verification || '');
-    const at = String(status.last_verified_at || '');
-    if (source === 'vendor' && verification === 'passed') {
-        return { tone: 'ok', label: `verified live${at ? ` ${at}` : ''}` };
-    }
-    if (verification === 'passed') {
-        return { tone: 'muted', label: 'local session — not verified live' };
-    }
-    if (verification) {
-        return { tone: 'error', label: `verification ${verification}` };
-    }
-    return { tone: 'muted', label: 'not logged in' };
+    const badge = () => {
+        if (source === 'vendor' && verification === 'passed') {
+            return { tone: 'ok', label: 'Verified live' };
+        }
+        if (verification === 'passed') {
+            // The claim is NARROWER than "signed in" and must stay narrower in
+            // WORDS: local-store material has read `passed` a minute before a 401.
+            return { tone: 'muted', label: 'Signed in — not verified live' };
+        }
+        if (verification) {
+            return { tone: 'error', label: `Verification ${verification}` };
+        }
+        return { tone: 'muted', label: 'Not signed in' };
+    };
+    const value = badge();
+    // `known` = the ACCOUNTS facet was really read. Otherwise this row is the
+    // retained snapshot's memory of an account, and painting a green "Verified
+    // live" over a read that never landed is the same lie as the banner's — the
+    // panel used to say nothing could be listed while a stale row sat below it
+    // dressed as verified. The row survives (it is the only Connect affordance
+    // some harnesses have); only its claim is dated, and the green goes with it.
+    if (known) return value;
+    return { tone: 'muted', label: `${value.label} — last known` };
 }
 
-export function quotaSummary(snapshots, harnessId, subjectId = '') {
+export function humanizeResetAt(resetsAt, nowMs = Date.now()) {
+    // "resets in 2h", not "resets 2026-08-09T21:04:00Z". Absence is absence.
+    const at = Date.parse(String(resetsAt || ''));
+    if (!Number.isFinite(at)) return '';
+    const minutes = Math.round((at - nowMs) / 60000);
+    if (minutes <= 1) return 'in a moment';
+    if (minutes < 60) return `in ${minutes}m`;
+    const hours = Math.round(minutes / 60);
+    if (hours < 48) return `in ${hours}h`;
+    return `in ${Math.round(hours / 24)}d`;
+}
+
+export function quotaSummary(snapshots, harnessId, subjectId = '',
+                             { quotaRead = READ_OK, nowMs = Date.now() } = {}) {
     // The exhausted window is SHOWN with its reset time, never hidden (Q2-б):
-    // hiding it would make the D28 fallback to API money unexplainable.
+    // hiding it would make the D28 fallback to API money unexplainable. What
+    // CHANGED is only the wording — the owner asked for the limit text to be
+    // compact and understandable, so "window exhausted — resets
+    // 2026-08-09T21:04:00Z" became "Limit reached · resets in 2h".
+    //
+    // `quotaRead` is the QUOTA facet's own provenance. A refused quota read is
+    // not a zero and not a full window: it licenses no usage claim at all,
+    // while the catalogue and account facets beside it stay authoritative.
+    if (quotaRead !== READ_OK) {
+        return { label: 'Limits not checked', exhausted: false, resetsAt: '', tone: 'muted' };
+    }
     const rows = (snapshots || []).filter((snap) => {
         const subject = snap?.subject || {};
         if (String(subject.harness || '') !== String(harnessId)) return false;
@@ -131,295 +176,22 @@ export function quotaSummary(snapshots, harnessId, subjectId = '') {
         }
     }
     const note = scopedSpent.length ? `${[...new Set(scopedSpent)].join(', ')} spent` : '';
-    if (!worst && !exhausted && !note) return { label: '', exhausted: false, resetsAt: '' };
     const resetsAt = exhausted ? (exhaustedResetsAt || worst?.resetsAt || '') : (worst?.resetsAt || '');
-    const base = exhausted
-        ? `window exhausted — resets ${resetsAt || 'soon'}`
-        : (worst ? `${Math.min(100, Math.round(worst.used * 100))}% of window used` : '');
+    const resets = humanizeResetAt(resetsAt, nowMs);
+    let base = '';
+    if (exhausted) base = `Limit reached${resets ? ` · resets ${resets}` : ''}`;
+    else if (worst) {
+        base = `${Math.min(100, Math.round(worst.used * 100))}% used${resets ? ` · resets ${resets}` : ''}`;
+    }
+    // Read, and nothing to report about THIS account: say the usage is
+    // unavailable rather than implying an empty window.
+    if (!base && !note) return { label: 'Usage unavailable', exhausted: false, resetsAt: '', tone: 'muted' };
     return {
         exhausted,
         resetsAt,
+        tone: exhausted ? 'warn' : 'muted',
         label: [base, note].filter(Boolean).join(' · '),
     };
-}
-
-export function deviceCodeDisclosure(job) {
-    // The transient read-time projection (never journaled by the daemon):
-    // {flow, verificationUrl, userCode} wherever the flow surfaces one.
-    //
-    // The FLOW is the discriminator, not field truthiness. Claudexor's
-    // SetupDeviceCodeDisclosure (packages/schema/src/setup.ts) says the code is
-    // EMPTY for the browser-callback (`chatgpt`) and `oauth_url` flows —
-    // `oauth_url` being the sign-in link a TERMINAL-mode claude/cursor login
-    // prints. Demanding a userCode meant those URL-only disclosures matched
-    // nothing, so the engine published a link the card never showed.
-    const seen = new Set();
-    const stack = [job];
-    while (stack.length) {
-        const node = stack.pop();
-        if (!node || typeof node !== 'object' || seen.has(node)) continue;
-        seen.add(node);
-        if (node.flow && node.verificationUrl) {
-            return {
-                url: String(node.verificationUrl),
-                code: String(node.userCode || ''),
-                flow: String(node.flow),
-            };
-        }
-        for (const value of Object.values(node)) {
-            if (value && typeof value === 'object') stack.push(value);
-        }
-    }
-    return null;
-}
-
-// Which face the login card shows, in priority order. STRUCTURED WINS: when
-// the engine surfaces an OAuth device/link disclosure on ANY job the card
-// renders it (link-first). There is deliberately NO attach face any more: the
-// copy-paste command is a demoted, collapsed Advanced affordance under the
-// waiting face (attachFallbackDue below), never a primary card body — the
-// owner rejected terminal-first login outright. Pure for node tests.
-export function loginCardFace(active) {
-    if (!active) return 'none';
-    if (active.error) return 'error';
-    if (deviceCodeDisclosure(active.job || {})) return 'device';
-    return 'progress';
-}
-
-// How long the card waits for the engine to disclose a sign-in link before
-// offering the collapsed Advanced attach fallback.
-export const ATTACH_FALLBACK_MS = 20000;
-
-export function attachFallbackDue(active, nowMs) {
-    // The demoted fallback: only for a job that HAS a copy-paste command (the
-    // create answer issues one exactly for client_pty jobs — the POLL route's
-    // per-job attach_command is deliberately never read), and only when the
-    // primary path has nothing better: the engine predates the disclosure
-    // modes (engineDegraded — the create answer said so, or the input route
-    // 404'd), or no disclosure arrived within the window. A rendered
-    // disclosure keeps the fallback hidden unless the engine is degraded:
-    // link-first, always.
-    if (!active || !active.attachCommand) return false;
-    if (active.engineDegraded) return true;
-    if (deviceCodeDisclosure(active.job || {})) return false;
-    const started = Number(active.startedAtMs) || 0;
-    return started > 0 && (Number(nowMs) - started) >= ATTACH_FALLBACK_MS;
-}
-
-export function loginInputSupport(job) {
-    // Card shape 2 discriminator: can the user paste the browser's code back
-    // into this job? The engine's typed disclosure FLOW is the structural
-    // marker (3.3.7 final contract): `oauth_url_input` = sign-in link plus an
-    // optional paste-code the daemon forwards (claude's manual-callback
-    // path); `oauth_url`/`chatgpt` stay link-only. No boolean sidecar and no
-    // harness-name fallback — the enum decides. The input is OPTIONAL by
-    // design: claude's localhost callback may complete the login with no code
-    // ever shown, so the field's presence never implies obligation.
-    return deviceCodeDisclosure(job)?.flow === 'oauth_url_input';
-}
-
-// Job-failure reasons a stale post-login verification read can fabricate:
-// codex clears its auth store when a login STARTS, so a probe in that window
-// reads "not logged in" while the vendor login is succeeding — the owner's
-// codex login SUCCEEDED while the card said "Login failed · completed". These
-// verdicts are re-checked against live account status before the card is
-// allowed to say "failed".
-export const VERIFY_RACE_REASONS = ['capability_verification_failed', 'auth_not_ready'];
-
-export function loginVerdict(job) {
-    // State and verdict must never contradict: a non-terminal job has NO
-    // verdict, a succeeded job is success, and a failed job is only a final
-    // failure when its typed outcome reason is one no verification race can
-    // fabricate. Everything else is 'recheck' — judged by live account
-    // status, not by one stale read.
-    const summary = jobStateSummary(job);
-    if (!summary.terminal) return { kind: 'pending', reason: '' };
-    if (summary.succeeded) return { kind: 'success', reason: '' };
-    const outcome = job?.outcome || job?.job?.outcome || {};
-    const reason = String(outcome.reason || '') || summary.state;
-    if (summary.state === 'failed'
-        && (!outcome.reason || VERIFY_RACE_REASONS.includes(String(outcome.reason)))) {
-        return { kind: 'recheck', reason };
-    }
-    return { kind: 'failure', reason };
-}
-
-export function failureText(reason) {
-    return `Sign-in failed — ${String(reason || 'unknown reason').replace(/_/g, ' ')}.`;
-}
-
-// A bounded re-check that RAN OUT is not a failure. The verdict it re-checks
-// was already judged unproven (a verification race), and the account row it
-// waits for routinely lands a tick after the window closes — so the honest
-// answer is "not confirmed yet", pointing at the two places the truth appears,
-// never a hard "Sign-in failed" for a login that may well have succeeded.
-export const UNCONFIRMED_TEXT =
-    'Could not confirm the sign-in yet — check the account row above, or press Refresh.';
-
-export function jobDetail(job) {
-    // The engine's own SENTENCE about a settled job, beside the typed reason:
-    // `message` on the job (dual-level, because the POLL route answers the
-    // envelope while CREATE answers the bare job — the same shape every other
-    // field here is read through). The card used to drop it entirely: a codex
-    // login that ended `auth_not_ready` rendered only the fixed
-    // UNCONFIRMED_TEXT, while the daemon had already said exactly what was
-    // wrong ("native Codex session is not logged in") and that text was
-    // sitting in the snapshot the card was holding. A typed reason names a
-    // CATEGORY; this names the thing that happened, so it is the half the
-    // owner needs and the half that reached no reader.
-    for (const value of [job?.message, job?.job?.message]) {
-        if (typeof value === 'string' && value.trim()) return value.trim();
-    }
-    return '';
-}
-
-export function loginStatusLine(job) {
-    // The live state line for a non-terminal job — plain words mapped from
-    // the typed state/phase, never raw enum spellings glued together (the old
-    // "Login failed · completed" contradiction is structurally impossible
-    // now: a terminal job renders a verdict, never this line).
-    const summary = jobStateSummary(job);
-    if (summary.terminal) return '';
-    if (summary.phase === 'verifying') return 'Checking the sign-in…';
-    if (deviceCodeDisclosure(job)) return 'Waiting for you to finish signing in in the browser…';
-    if (summary.phase === 'awaiting_user' || summary.state === 'waiting_for_input') {
-        return 'Waiting for the sign-in link…';
-    }
-    return 'Starting the sign-in…';
-}
-
-export function accountLoginConfirmed(payload, harness, profileId = '') {
-    // The account-status truth the verdict re-check reads: the row for THIS
-    // harness+profile shows a login — vendor-verified or the daemon's own
-    // local-store detection (accountRows already projects both as 'passed').
-    const row = accountRows(payload).find((r) =>
-        r.harness === String(harness || '')
-        && String(r.profile_id || '') === String(profileId || ''));
-    return String(row?.status?.verification || '') === 'passed';
-}
-
-export async function submitLoginInput(jobId, value, { fetchImpl = apiFetch } = {}) {
-    // ONE code line to the engine via the gateway proxy. Typed non-2xx
-    // answers keep their meaning: 404 is a capability gap (`degraded` — the
-    // engine predates the route, or reaped the job) and 409 is a typed input
-    // CONFLICT (`conflict` carries the engine's code:
-    // setup_input_not_applicable = the callback already completed and no code
-    // is needed; setup_input_already_submitted = a repeat the server, being
-    // authoritative over our double-submit guard, refused). Neither is a raw
-    // error — the card maps both to friendly copy.
-    try {
-        const resp = await fetchImpl(`/api/claudexor/login/${encodeURIComponent(jobId)}/input`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ value }),
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (resp.ok) return { ok: true, degraded: false, conflict: '', error: '' };
-        if (resp.status === 404) {
-            return { ok: false, degraded: true, conflict: '', error: String(data.error || 'input not supported') };
-        }
-        if (resp.status === 409) {
-            return { ok: false, degraded: false, conflict: String(data.code || 'conflict'), error: String(data.error || 'input conflict') };
-        }
-        return { ok: false, degraded: false, conflict: '', error: String(data.error || `HTTP ${resp.status}`) };
-    } catch (error) {
-        return { ok: false, degraded: false, conflict: '', error: String(error?.message || error) };
-    }
-}
-
-export const CONFIRM_POLL_MS = 2500;
-export const CONFIRM_ATTEMPTS = 4;
-
-export async function confirmLoginLive(harness, profileId, {
-    fetchImpl = apiFetch, attempts = CONFIRM_ATTEMPTS, delayMs = CONFIRM_POLL_MS,
-    sleepImpl = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-    isStale = () => false,
-} = {}) {
-    // The verify-race re-check: briefly re-poll live account status and let
-    // IT decide, instead of declaring failure off the job's one stale
-    // verification read. Bounded; answers with the last payload so the caller
-    // can refresh the rows from the same reads.
-    let payload = null;
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-        if (attempt > 0) await sleepImpl(delayMs);
-        if (isStale()) return { confirmed: false, stale: true, payload };
-        try {
-            const resp = await fetchImpl('/api/claudexor/status', { cache: 'no-store' });
-            const data = await resp.json().catch(() => ({}));
-            if (resp.ok) {
-                payload = data;
-                if (accountLoginConfirmed(data, harness, profileId)) {
-                    return { confirmed: true, stale: false, payload };
-                }
-            }
-        } catch (err) { /* transient; the next attempt retries */ }
-    }
-    return { confirmed: false, stale: false, payload };
-}
-
-export function pollResponseApplies(captured, current) {
-    // Whether a poll answer may still be written onto the card. It belongs to
-    // the job it was captured for (`captured === current`: the card may have
-    // been closed, or reopened for another account, while the request was in
-    // flight) and only while that job is UNSETTLED — a verdict, or the live
-    // re-check that decides one, has already taken the card, and a snapshot
-    // captured before the job settled would put a pending state back under it.
-    // Pure so the ordering rule is asserted without a DOM or a timer.
-    return Boolean(captured) && captured === current
-        && !captured.verdict && !captured.confirming;
-}
-
-export function jobStateSummary(job) {
-    // The POLL returns ControlSetupJobSnapshot — the ENVELOPE {job, cursor,
-    // sequence, deviceCode?} — while the CREATE returns a bare ControlSetupJob.
-    // Reading only the top level found the state on the create response and
-    // never on any poll, so `terminal` stayed false forever: no "Connected." /
-    // "Login failed." banner, and the 3-second poll never stopped. `status` is
-    // a field ControlSetupJob does not have and never had.
-    const state = String(job?.state || job?.job?.state || '');
-    const phase = String(job?.phase || job?.job?.phase || '');
-    const terminal = ['succeeded', 'failed', 'cancelled', 'timed_out',
-        'interrupted_unknown', 'not_supported'].includes(state);
-    return { state, phase, terminal, succeeded: state === 'succeeded' };
-}
-
-export function accountRows(payload) {
-    // Consume the REAL ControlCredentialProfilesResponse shape (Claudexor
-    // packages/schema/src/credential-profile.ts): `profiles` is an ARRAY of
-    // wrapper objects `{profile, status, identity}` with snake_case fields, and
-    // `harnessAccounts` is an ARRAY of per-harness authority rows — not the flat
-    // camelCase maps an earlier draft invented. Fields are read exactly as the
-    // Zod schema names them so the golden fixture and the wire agree.
-    const rows = [];
-    const profiles = payload?.profiles?.profiles || [];
-    const harnessAccounts = payload?.profiles?.harnessAccounts || [];
-    for (const native of Array.isArray(harnessAccounts) ? harnessAccounts : []) {
-        rows.push({
-            harness: String(native?.harness_id || ''),
-            profile_id: '',
-            kind: 'native',
-            identity: native?.identity || {},
-            // Both engine schema versions declare this row
-            // additionalProperties:false with NO status field, so presence
-            // projects as local-store evidence — detected, liveness unproven.
-            status: {
-                verification: native?.native_login_detected ? 'passed' : '',
-                verification_source: 'local_store',
-            },
-        });
-    }
-    for (const wrapper of Array.isArray(profiles) ? profiles : []) {
-        const profile = wrapper?.profile || {};
-        rows.push({
-            harness: String(profile.harness_id || ''),
-            profile_id: String(profile.profile_id || ''),
-            display_name: String(profile.display_name || ''),
-            kind: 'profile',
-            identity: wrapper?.identity || {},
-            status: wrapper?.status || {},
-        });
-    }
-    return rows.filter((row) => row.harness);
 }
 
 export function normalizeProfileName(raw) {
@@ -428,7 +200,7 @@ export function normalizeProfileName(raw) {
     return String(raw || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-');
 }
 
-export async function promptProfileName({ dialogImpl = openConfirmDialog } = {}) {
+export async function promptProfileName({ dialogImpl = openConfirmDialog, family = '' } = {}) {
     // pywebview's WKWebView implements no window.prompt — it answers null
     // silently, so the old prompt()-based Add-account flow was a dead button on
     // the desktop app. The in-house input dialog asks instead, and it loops
@@ -436,7 +208,7 @@ export async function promptProfileName({ dialogImpl = openConfirmDialog } = {})
     // normalization would change ("Работа" → "------", "Work" → "work") is
     // shown back, editable, BEFORE any login starts — never rewritten silently.
     let initialValue = '';
-    let body = 'Name for the additional account (e.g. work, backup).'
+    let body = `Name for the additional ${family || 'agent'} account (e.g. work, backup).`
         + ' Lowercase letters, digits, "-" and "_" — anything else becomes "-".';
     for (;;) {
         const answer = await dialogImpl({ title: 'Add account', body, input: true, initialValue });
@@ -450,139 +222,50 @@ export async function promptProfileName({ dialogImpl = openConfirmDialog } = {})
     }
 }
 
-// ---------------------------------------------------------------------------
-// DOM section.
-// ---------------------------------------------------------------------------
-
-const state = {
-    payload: null,
-    // A status read is in flight. Only reads BEFORE the first settle repaint on
-    // it (see refreshStatus): once anything has been said, a silent refresh
-    // beats churn — and beats flickering muted↔error against a failing endpoint.
-    statusChecking: false,
-    statusEverSettled: false,
-    // The live read, shared by every caller (single-flight; see refreshStatus).
-    statusInFlight: null,
-    // A request that did not complete (network death, non-OK). Kept OUT of the
-    // wire payload: staleness is a property of THIS view, not of the daemon's
-    // answer. While set, the panel renders its last-known reading as exactly
-    // that instead of presenting it as current truth.
-    statusTransportError: '',
-    // The owner asked to wake the daemon (see wakeDaemon). Single-flighted like
-    // the status read: a cold runtime install takes real time and a second
-    // click must not start a second provisioning.
-    wakeInFlight: null,
-    wakeError: '',
-    wakeBusy: false,
-    // Status reads and the wake share ONE generation counter: a GET issued
-    // before a wake must never commit its (older) payload afterwards, or the
-    // panel would flip back to "not running" right after starting the daemon.
-    readGeneration: 0,
-    // { harness, profile, jobId, job, attachCommand, error, startedAtMs,
-    //   engineDegraded, inputValue, inputBusy, inputSent, inputError,
-    //   verdict, confirming, advancedOpen }
-    activeJob: null,
-    pollTimer: 0,
-    jobTimer: 0,
-};
-
-export function renderHarnessAccountsSection() {
-    return `
-        <div class="form-section" id="harness-accounts-section">
-            <h3>Harness Accounts</h3>
-            <div class="settings-section-copy">
-                Coding-agent subscriptions (Codex CLI, Claude Code, Cursor) used by delegated
-                subagents and reviewer slots. Accounts live in Ouroboros's own agent home —
-                your personal logins are never read or imported. Claudexor is installed,
-                repaired, and updated automatically when you connect or start delegated work;
-                login and verification remain the agent daemon's own flows.
-            </div>
-            <div id="harness-daemon-status" class="settings-inline-status">Checking daemon…</div>
-            <div id="harness-accounts-rows" class="settings-secret-list"></div>
-            <div id="harness-login-card"></div>
-            <div class="settings-toolbar">
-                <button type="button" class="settings-ghost-btn" id="btn-harness-refresh">Refresh</button>
-            </div>
-        </div>
-    `;
+export function runtimeActionLabel(payload) {
+    const state = String(payload?.daemon?.runtime?.state || '');
+    if (state === 'error') return 'Fix & connect';
+    if (state === 'missing') return 'Install & connect';
+    if (state === 'update_available') return 'Update & connect';
+    return 'Connect';
 }
 
-// The ONE place that decides what an empty collection MEANS. Every ES-module
-// consumer of /api/claudexor/status imports this instead of re-deriving the
-// rule; the onboarding wizard is a plain IIFE and cannot import, so it mirrors
-// the rule under a structural pin (tests/test_web_utils_ssot.py) — the
-// wizard proved a payload field alone is not enough: it already read
-// daemon.state and still printed "No accounts connected yet" (owner report,
-// 2026-08-08, three harnesses declared empty while two claude profiles, a
-// cursor profile and two native sessions sat in the agent home).
-//
-// `facet` is 'catalog' | 'accounts' | 'quota' — they are INDEPENDENT: one
-// fanned-out read can fail while its siblings land, so reviewer slots (which
-// reads the CATALOG) must not be gated on the accounts facet.
-export function facetReadState(payload, facet, { transportError = '' } = {}) {
-    // A request that never arrived outranks whatever the last payload said.
-    if (transportError) return 'transport';
-    // PRESENT-but-unusable is not ABSENT. `reads: null`, a string, a number —
-    // anything a drifting backend might emit — used to fall through to the
-    // legacy branch and become `ok` on a running daemon: unknown, authoritative
-    // again. Only a payload with no `reads` property at all is legacy.
-    const hasBlock = payload !== null && typeof payload === 'object'
-        && Object.prototype.hasOwnProperty.call(payload, 'reads');
-    if (hasBlock) {
-        const reads = payload.reads;
-        if (!reads || typeof reads !== 'object') return 'failed';
-        const state = String(reads[facet] || '');
-        if (state === 'ok' || state === 'not_read' || state === 'failed') return state;
-        // The block EXISTS but this facet is missing or carries a value this
-        // build does not know (a newer backend). Falling back to the daemon
-        // state here would make an unknown authoritative again — the exact bug.
-        return 'failed';
-    }
-    // LEGACY payload — the block is entirely ABSENT (older backend, or a fixture
-    // predating it). There the daemon state was the only signal and it carried
-    // exactly this fact: running meant every facet was read, anything else none.
-    return String(payload?.daemon?.state || '') === 'running' ? 'ok' : 'not_read';
+// The facets the status contract declares, as the LITERAL the backend parity
+// test greps out of this source (tests/test_gateway_parity.py compares it with
+// `ClaudexorStatusReads`). The store's `STATUS_FACETS` is the one runtime
+// reader; a node pin asserts the two spellings can never drift.
+export const READ_FACETS = ['catalog', 'accounts', 'quota'];
+
+export function unreadFacets(payload) {
+    // Which facets did NOT answer, in contract order. Empty means everything
+    // this payload promises was actually read. Derived through the STORE's one
+    // reader — a second parse of the `reads` block here is exactly the
+    // two-readers-disagreeing bug the store was extracted to end.
+    return STATUS_FACETS.filter((facet) => facetReadState(payload, facet) !== READ_OK);
 }
 
-// Sugar for the common question. NOT the only reader — see facetReadState.
-export function accountsKnown(payload, options) {
-    return facetReadState(payload, 'accounts', options) === 'ok';
-}
-
-// Why the truth is unavailable, in the words the surfaces render. Distinguishes
-// "nobody asked" from "asked and refused": telling an owner the daemon is not
-// running when it IS running and one endpoint died would be a second lie.
-export function unknownAccountsNote(payload, { transportError = '', checking = false } = {}) {
-    const state = facetReadState(payload, 'accounts', { transportError });
-    if (state === 'ok') return '';
-    // Nothing has answered YET. The first read fans out to four daemon
-    // round-trips that probe real CLIs, so this window lasts tens of seconds —
-    // long enough for "the agent daemon is not running" to be read as a verdict
-    // about a daemon that is, in fact, running.
-    if (checking && payload === null) return 'accounts not checked yet — reading the daemon status';
-    if (state === 'transport') return 'accounts not checked — the last status request did not complete';
-    if (state === 'failed') return 'accounts not checked — the daemon did not answer this read';
-    // `not_read` normally means the daemon never ran — but a discovery/handshake
-    // failure BEFORE the fan-out also leaves the facets untouched while the
-    // daemon reports `unreachable`. Saying "not running" there would contradict
-    // the status line one row above it.
-    return String(payload?.daemon?.state || '') === 'unreachable'
-        ? 'accounts not checked — the daemon did not answer'
-        : 'accounts not checked — the agent daemon is not running';
+export function daemonAnswered(payload) {
+    // Did the daemon ANSWER? A disjunction whose halves prove different things.
+    // An authenticated `running` is positive evidence on its own — the
+    // handshake happened. Anything else is NOT evidence of silence: a PARTIAL
+    // refusal (quota times out while the catalog and the account store land) is
+    // reported as `daemon.state = 'unreachable'`, so a predicate written on the
+    // literal `running` called a daemon dead while its own accounts were on
+    // screen — it kept a failed wake's error standing over them and made
+    // Refresh offer to start something already answering. There a facet's own
+    // `ok` is the evidence. What the aggregate can never be is the NEGATIVE
+    // answer.
+    if (String(payload?.daemon?.state || '') === 'running') return true;
+    return STATUS_FACETS.some((facet) => facetReadState(payload, facet) === READ_OK);
 }
 
 // The Refresh button's honest label. It only ever RE-READS while the daemon is
 // alive, but with a sleeping daemon a plain re-read returns the same nothing
-// forever — so there it becomes an explicit owner action that STARTS the daemon,
-// and the label says so rather than hiding the side effect.
+// forever — so there it becomes an explicit owner action that STARTS the
+// daemon, and the label says so rather than hiding the side effect. ONE
+// predicate behind BOTH the label and the click, so they cannot drift apart
+// again (they were written separately once, and did).
 export function refreshActionKind(payload) {
-    // ONE predicate behind BOTH the label and the click. They were written
-    // separately and drifted: the label promised a plain re-read on an
-    // `unreachable` daemon while the handler called wake, so the button did
-    // more than it said — and a comment claimed it "does not resurrect
-    // anything" while the code resurrected. Live, the button re-reads. In every
-    // other state — asleep, never installed, or answering nothing — pressing it
-    // starts/repairs the daemon, which is what the owner is asking for.
     return daemonAnswered(payload) ? 'refresh' : 'wake';
 }
 
@@ -592,46 +275,32 @@ export function refreshActionLabel(payload) {
         : 'Check accounts (starts the agent daemon)';
 }
 
-export function runtimeActionLabel(payload) {
-    const state = String(payload?.daemon?.runtime?.state || '');
-    if (state === 'error') return 'Fix & connect';
-    if (state === 'missing') return 'Install & connect';
-    if (state === 'update_available') return 'Update & connect';
-    return 'Connect';
+const capitalize = (text) => (text ? `${text.charAt(0).toUpperCase()}${text.slice(1)}` : text);
+
+function facetGapNames(reads) {
+    // The unread facets a sentence may NAME, in the store's own subjects.
+    // `indeterminate` is excluded on the store's rule — it is not a verdict
+    // ABOUT a facet, so naming subjects under it would invent the per-facet
+    // accusation the coarse state exists to avoid — and `unread` is just this
+    // client's first read still in flight.
+    const named = STATUS_FACETS
+        .filter((facet) => reads[facet] !== READ_OK
+            && reads[facet] !== READ_INDETERMINATE && reads[facet] !== READ_UNREAD)
+        .map((facet) => FACET_SUBJECT[facet] || facet);
+    return joinSubjects(named);
 }
 
-export function daemonStatusLine(payload, { checking = false, transportError = '', wakeError = '' } = {}) {
+export function daemonStatusLine(payload, { checking = false, reads = null } = {}) {
     const daemon = payload?.daemon || {};
     const runtime = daemon.runtime || {};
     const runtimeState = String(runtime.state || '');
     const status = String(daemon.state || 'unknown');
-    // A request that did not complete: whatever is on screen is a LAST-KNOWN
-    // reading, and saying so is the whole point — a swallowed failure used to
-    // leave "Claudexor ready" and green badges standing indefinitely.
-    if (wakeError) {
-        // The owner PRESSED the button and it did not work — silence here is the
-        // same class of dishonesty this change exists to remove (a typed 503 from
-        // a missing binary or foreign home, a 404 from an older backend, a dead
-        // network). Say what failed; the rows and Connect stay put.
-        return { tone: 'error', text: `Could not start the agent daemon: ${wakeError}` };
-    }
-    if (transportError) {
-        // With a previous reading on screen, say it is the LAST one rather than
-        // the current one. With none — the very first request died, page load
-        // against a restarting backend — there is no reading to qualify, and
-        // the fallback at the bottom would announce a verdict about the daemon
-        // built from zero data ("Daemon unknown", error tone) while the row
-        // beside it correctly says nothing was checked.
-        return daemon.state
-            ? { tone: 'warn', text: `Showing the last reading — the status request did not complete (${transportError}). Retrying.` }
-            : { tone: 'warn', text: `The status request did not complete (${transportError}). Retrying — nothing has been read yet.` };
-    }
     // Nothing read yet and a read in flight: SAY so, and say what it costs. The
-    // daemon re-probes every coding-agent CLI on each read, so first paint is
-    // tens of seconds — and an unexplained silent panel reads as "broken", not
-    // as "loading" (owner report, 2026-08-08).
+    // daemon re-probes every agent CLI on each read, so first paint is tens of
+    // seconds — and an unexplained silent panel reads as "broken", not as
+    // "loading" (owner report, 2026-08-08).
     if (checking && !daemon.state) {
-        return { tone: 'muted', text: 'Checking Claudexor… the first read probes each coding-agent CLI and can take a minute or more.' };
+        return { tone: 'muted', text: 'Checking Claudexor… the first read probes each agent CLI and can take a minute or more.' };
     }
     if (daemon.ownership_problem) {
         return { tone: 'error', text: `This daemon home is not managed from here: ${daemon.ownership_problem}` };
@@ -639,18 +308,15 @@ export function daemonStatusLine(payload, { checking = false, transportError = '
     // A facet can fail WITHOUT the aggregate hearing about it: an envelope that
     // arrived in the wrong shape is a failed read, not an exception, so the
     // daemon still reports `running`. The panel then said "Claudexor ready" in
-    // green while the row underneath said "accounts not checked" — the two
-    // halves of one screen contradicting each other, with the reassuring half
-    // on top. The status line asks the facets, not the aggregate.
-    //
-    // Computed BEFORE the runtime branches, which used to return above it and
-    // hide the unread facets entirely — and `update_staged` did worse than hide
-    // them: it says the engine "keeps running", a positive claim about a daemon
-    // that in this window answered nothing, over a button offering to START it.
-    const unread = unreadFacets(payload);
-    const unreadTail = unread.length
-        ? ` ${unread.join(' and ')} ${unread.length > 1 ? 'were' : 'was'} not read.`
-        : '';
+    // green while the row underneath said the accounts were not checked — one
+    // screen, two contradictory claims, the reassuring one on top. The status
+    // line asks the FACETS, not the aggregate, and it does so BEFORE the
+    // runtime branches, which used to return above the facet logic and hide the
+    // gaps entirely.
+    const facetReads = reads || readsFor(payload);
+    const unread = STATUS_FACETS.filter((facet) => facetReads[facet] !== READ_OK);
+    const gapNames = facetGapNames(facetReads);
+    const unreadTail = gapNames ? ` ${capitalize(gapNames)} were not read.` : '';
     if (runtimeState === 'installing') {
         const version = runtime.target_version ? ` ${runtime.target_version}` : '';
         return { tone: 'muted', text: `Installing or checking Claudexor${version}…${unreadTail}` };
@@ -659,9 +325,11 @@ export function daemonStatusLine(payload, { checking = false, transportError = '
         const detail = runtime.last_error ? `: ${runtime.last_error}.` : '.';
         return { tone: 'error', text: `Claudexor needs repair${detail} Connect retries automatically.${unreadTail}` };
     }
-    // The staged-update line asserts the current engine is still serving. Only
-    // say that when this reading actually saw it serve; otherwise the facets own
-    // the line and the staged update is a footnote.
+    // The staged-update line asserts the current engine is still SERVING. Only
+    // say that when this reading actually saw it serve; otherwise the facets
+    // own the line and the staged update is a footnote — "Engine X keeps
+    // running" was a positive claim about a daemon that, in that window,
+    // answered nothing, printed over a button offering to START it.
     if (runtimeState === 'update_staged' && !unread.length) {
         const target = runtime.staged_version || runtime.target_version || '?';
         const current = daemon.engine_version || runtime.version || '?';
@@ -669,24 +337,29 @@ export function daemonStatusLine(payload, { checking = false, transportError = '
     }
     if (runtimeState === 'update_staged') {
         const target = runtime.staged_version || runtime.target_version || '?';
-        return { tone: 'warn', text: `${unread.join(' and ')} ${unread.length > 1 ? 'were' : 'was'} not read${daemon.last_error ? `: ${daemon.last_error}` : ''}. Claudexor ${target} is staged and activates after the daemon next restarts.` };
-    }
-    if (status === 'running' && !unread.length) {
-        return { tone: 'ok', text: `Claudexor ready (engine ${daemon.engine_version || '?'}) · home ${payload.config_dir || ''}` };
+        const gap = gapNames ? `${capitalize(gapNames)} were not read` : 'The status answer did not complete';
+        return { tone: 'warn', text: `${gap}${daemon.last_error ? `: ${daemon.last_error}` : ''}. Claudexor ${target} is staged and activates after the daemon next restarts.` };
     }
     if (status === 'running') {
-        return { tone: 'warn', text: `Claudexor is running, but ${unread.join(' and ')} ${unread.length > 1 ? 'were' : 'was'} not read${daemon.last_error ? `: ${daemon.last_error}` : ''}. What those cover is unknown.` };
+        // A REAL refusal (a read that was made and did not land) demotes the
+        // green line: "ready" would be an overclaim about the facets. A gap
+        // that is merely `not_read` keeps the ready line — the daemon itself
+        // is proven up, and the tab's banner note (the store's own sentence)
+        // explains a read nobody made.
+        const refused = unread.filter((facet) =>
+            facetReads[facet] === READ_FAILED || facetReads[facet] === READ_TRANSPORT);
+        if (refused.length) {
+            const names = joinSubjects(refused.map((facet) => FACET_SUBJECT[facet] || facet));
+            return { tone: 'warn', text: `Claudexor is running, but ${names} were not read${daemon.last_error ? `: ${daemon.last_error}` : ''}. What those cover is unknown.` };
+        }
+        return { tone: 'ok', text: `Claudexor ready (engine ${daemon.engine_version || '?'}) · home ${payload.config_dir || ''}` };
     }
     if (status === 'not_provisioned') {
-        // Neither branch may claim there are no accounts: with no daemon the
-        // account store was never read, so `not_provisioned + accounts ok` is
-        // unreachable by contract. Say what IS known — the runtime state — and
-        // what the next step is.
         if (runtimeState === 'ready') {
             const version = runtime.version ? ` ${runtime.version}` : '';
-            return { tone: 'muted', text: `Claudexor${version} is ready. Connect starts Ouroboros’s own agent daemon and reads your accounts.` };
+            return { tone: 'muted', explainsUnread: true, text: `Claudexor${version} is ready. Connect an account to start Ouroboros’s own agent daemon.` };
         }
-        return { tone: 'muted', text: 'Connect installs Claudexor and starts Ouroboros’s own agent daemon; your accounts are read once it runs.' };
+        return { tone: 'muted', explainsUnread: true, text: 'No accounts connected yet. Connect installs Claudexor and starts Ouroboros’s own agent daemon automatically.' };
     }
     if (status === 'stale') {
         // NOT a warning: the daemon is LAZY by design (the status read never
@@ -702,846 +375,676 @@ export function daemonStatusLine(payload, { checking = false, transportError = '
         // surfaces through that run's own typed failure, not this panel. Hence
         // no "yet" — that word would claim it had never started.
         const version = runtime.version ? ` ${runtime.version}` : '';
-        return { tone: 'muted', text: `Claudexor${version} is installed; the agent daemon is not running. It starts automatically on the next login or delegated run.` };
+        return { tone: 'muted', explainsUnread: true, text: `Claudexor${version} is installed; the agent daemon is not running. It starts automatically on the next login or delegated run.` };
     }
     if (status === 'foreign_daemon') {
         return { tone: 'warn', text: 'Another daemon answered on the stale port (not ours — left untouched). The next login restarts our own daemon on a fresh port.' };
     }
-    if (daemonAnswered(payload) && unread.length) {
+    if (daemonAnswered(payload) && gapNames) {
         // A PARTIAL refusal: the aggregate says `unreachable` because one read
         // died, but the others landed and their rows are on screen right now.
         // Announcing a dead daemon above accounts it just handed over is the
         // same false verdict as an unread store rendered empty. NAME the facets
         // that did not answer — "what is shown below was read" was itself an
         // overclaim when the accounts facet is the one that failed.
-        return { tone: 'warn', text: `${unread.join(' and ')} ${unread.length > 1 ? 'were' : 'was'} not read${daemon.last_error ? `: ${daemon.last_error}` : ''}. What those cover is unknown.` };
+        return { tone: 'warn', text: `${capitalize(gapNames)} were not read${daemon.last_error ? `: ${daemon.last_error}` : ''}. What those cover is unknown.` };
     }
     return { tone: 'error', text: `Daemon ${status}${daemon.last_error ? `: ${daemon.last_error}` : ''}` };
 }
 
-function rowHtml(row, payload) {
-    const badge = verificationBadge(row);
-    const quota = quotaSummary(payload?.quota || [], row.harness, row.profile_id);
-    const identity = [row.identity?.email, row.identity?.plan].filter(Boolean).join(' · ');
-    const name = row.kind === 'native'
-        ? `${row.harness} — default account`
-        : `${row.harness} — ${row.profile_id}`;
+// The agent families a fresh install can connect BEFORE the daemon exists.
+// Discovery needs a running daemon, and on first run there is none — so with
+// nothing discovered the UI still offers a Connect affordance, and the first
+// Connect is exactly what provisions the owned daemon (D30). Presentation
+// only; the login flow itself stays harness-agnostic.
+export const BOOTSTRAP_HARNESSES = ['codex', 'claude', 'cursor'];
+
+// The display name comes from the store, which owns the payload it reads and is
+// imported by BOTH this tab and the onboarding wizard. Re-exported so this
+// module keeps its established import path.
+export { familyLabel };
+
+// Re-exported so the accounts surface keeps ONE import path for the payload
+// projection it renders (the definition lives with the store that owns the
+// payload).
+export { accountRows };
+
+export function bareRowStatusText(accountsRead) {
+    // The verdict for a family with NO row. "no account connected" is a claim
+    // about the ACCOUNT STORE, and it may only be made once that store was
+    // actually read: an idle daemon is never asked, so the emptiness says
+    // nothing (BIBLE P1 — a gap is not a zero). The Connect button stays in
+    // every case; onboarding must remain reachable.
+    if (accountsRead === READ_OK) return 'No account connected';
+    if (accountsRead === READ_UNREAD) return 'Checking…';
+    if (accountsRead === READ_TRANSPORT) return 'Not checked — the status request did not complete';
+    if (accountsRead === READ_FAILED) return 'Not checked — the daemon did not answer this read';
+    // The coarse state: the answer did not complete, and it does not say which
+    // read was the one that failed — so the row claims nothing beyond that.
+    // Without this branch a legacy payload's global refusal fell through to
+    // "never asked", which is the opposite of what happened.
+    if (accountsRead === READ_INDETERMINATE) return 'Not checked — the status answer did not complete';
+    // NOT READ says nobody asked; it does NOT say why. "the agent daemon is not
+    // running" named a cause this row cannot see — a runtime awaiting repair, a
+    // foreign daemon on the stale port and an ownership problem all arrive here
+    // as the same unread facet, and the tab's ONE banner is the place that
+    // explains which of them it is.
+    return 'Not checked — the agent daemon was never asked';
+}
+
+export function familyStatus(rows, { accountsRead = READ_OK } = {}) {
+    // The aggregate lozenge in a card header. Every connected account of a
+    // family is equivalent, so the header counts them and says they rotate —
+    // it never singles one out as the real one.
+    if (!rows.length) return { tone: 'muted', label: bareRowStatusText(accountsRead) };
+    // …and the SAME provenance rule the rows obey. These rows are the retained
+    // snapshot's memory when the accounts facet did not land, so a green
+    // "Connected" over them is the row badge's lie one level up — and the two
+    // would contradict each other inside one card, the header claiming fresh
+    // while the badge under it says last known.
+    const known = accountsRead === READ_OK;
+    const verdict = (tone, label) => (known
+        ? { tone, label }
+        : { tone: tone === 'error' ? 'error' : 'muted', label: `${label} — last known` });
+    const bad = rows.filter((row) => verificationBadge(row).tone === 'error').length;
+    if (bad) {
+        return verdict('error', `${bad} of ${rows.length} need attention`);
+    }
+    const live = rows.filter((row) => String(row?.status?.verification || '') === 'passed').length;
+    if (!live) return verdict('muted', `${rows.length} account${rows.length === 1 ? '' : 's'} · not signed in`);
+    // "N accounts · rotating" is a claim about what ROTATION will use, so it may
+    // only count the accounts that are actually signed in. A family with one
+    // live account and one cold row says exactly that instead of promising two.
+    if (live < rows.length) return verdict('ok', `${live} of ${rows.length} connected`);
+    if (live === 1) return verdict('ok', 'Connected');
+    return verdict('ok', `${live} accounts · rotating`);
+}
+
+export function accountName(row) {
+    if (row.kind === 'native') return 'Default CLI login';
+    return String(row.display_name || '') || String(row.profile_id || '') || 'Account';
+}
+
+export function accountMetaLine(row, payload, { quotaRead = READ_OK, nowMs = Date.now() } = {}) {
+    // Line 2: everything that is NOT the account itself, in human words and at
+    // muted ink. Order is the owner's — how much of the window is left, which
+    // plan, who it is, when we last checked.
+    const parts = [];
+    if (row.kind === 'native') {
+        parts.push(`Managed by the ${familyLabel(row.harness, payload)} CLI`);
+    }
+    parts.push(quotaSummary(payload?.quota || [], row.harness, row.profile_id,
+        { quotaRead, nowMs }).label);
+    const identity = row.identity || {};
+    if (identity.plan) parts.push(String(identity.plan));
+    if (identity.email) parts.push(String(identity.email));
+    const at = Date.parse(String(row?.status?.last_verified_at || ''));
+    if (Number.isFinite(at)) {
+        const age = formatRelativeAge(at, 'just now');
+        if (age) parts.push(`checked ${age}`);
+    }
+    return parts.filter(Boolean).join(' · ');
+}
+
+export function accountGroups(payload, { accountsRead = READ_OK } = {}) {
+    // One group per family, in a stable order: discovered families first (the
+    // engine's own order), then any bootstrap family still missing, so a fresh
+    // install shows all three cards and every one of them can be connected.
+    const rows = accountRows(payload);
+    const order = [];
+    for (const harness of payload?.harnesses || []) {
+        const id = String(harness?.id || '');
+        if (id && !order.includes(id)) order.push(id);
+    }
+    for (const row of rows) if (!order.includes(row.harness)) order.push(row.harness);
+    for (const id of BOOTSTRAP_HARNESSES) if (!order.includes(id)) order.push(id);
+    return order.map((id) => {
+        const own = rows.filter((row) => row.harness === id);
+        return {
+            harness: id,
+            label: familyLabel(id, payload),
+            rows: own,
+            status: familyStatus(own, { accountsRead }),
+        };
+    });
+}
+
+export function familyActionLabel(group, payload) {
+    // The card's OWN button, and the fix for "позиции кнопок нелогичные": the
+    // add affordance lives in the family header instead of hanging off one
+    // privileged row. An empty family connects its default CLI login first
+    // (carrying the runtime's install/repair intent); once a family has any
+    // account, the button adds a NAMED one — which is what makes the accounts
+    // equivalent instead of one-default-plus-extras.
+    //
+    // DISCLOSED RESIDUAL (adversarial review, 2026-08-09): unlike `rowActionLabel`
+    // this deliberately does NOT hand the label to a runtime that needs
+    // installing or repairing. The button's own action is to ASK FOR A NAME and
+    // then start a login — a header reading "Fix & connect" that opens a
+    // name-the-account dialog would misdescribe what the click does, and
+    // dropping the name step would remove the add intent this card exists for.
+    // The repair is a PREREQUISITE, not the destination: the login card
+    // performs it in the foreground and reports it there, and the tab's service
+    // banner already names the fault above.
+    return group.rows.length ? 'Add account' : runtimeActionLabel(payload);
+}
+
+export function rowActionLabel(row, payload) {
+    // A runtime that needs installing, repairing or updating owns the label —
+    // that work happens first whatever the row wants. Otherwise the row says
+    // what it is really offering: an account that HAS a session signs in again,
+    // one that does not simply signs in. ("Connect" belongs to a family with no
+    // account yet, where it is the first step rather than a repeat.)
+    const runtime = runtimeActionLabel(payload);
+    if (runtime !== 'Connect') return runtime;
+    return String(row?.status?.verification || '') === 'passed' ? 'Sign in again' : 'Sign in';
+}
+
+// "agents", "agents and limits", "agents, accounts and limits".
+function joinSubjects(names) {
+    const list = names.filter(Boolean);
+    if (list.length <= 1) return list[0] || '';
+    return `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
+}
+
+const TONE_RANK = { ok: 0, muted: 0, warn: 1, error: 2 };
+
+// A note whose only content is "we did not check" yields to a service line that
+// EXPLAINS why nothing was read. A warn/error note reports a real read failure
+// and keeps its place, because the service line cannot know which read died.
+const GENERIC_FACET_NOTE_YIELDS = new Set(['muted']);
+
+function faultOutranksReassurance(service, note) {
+    // A MUTED note is a reassurance: "nothing below is missing or wrong". It
+    // may not be the last word while the service line has a FAULT to report.
+    // Every settled non-running state — runtime `error`, `foreign_daemon`, an
+    // ownership problem, a recorded daemon `last_error` — leaves all three
+    // facets unread, so the benign note used to be the ONLY sentence the owner
+    // saw while the row buttons beside it offered "Fix & connect". The whole
+    // error/warn vocabulary daemonStatusLine already speaks was unreachable
+    // there. A warn/error note (a refused read, a dead request) is itself a
+    // report and keeps its place.
+    // Precedence is by SPECIFICITY, not by tone. A muted service line can still
+    // be the more informative sentence: on a first run "No accounts connected
+    // yet. Connect installs Claudexor…" is exactly what the owner needs, and it
+    // was unreachable while only warn/error could win — every stopped state
+    // leaves all three facets unread, so the generic note always spoke instead.
+    // The generic note explains nothing the service line does not; it is the
+    // FALLBACK for when the service line has nothing concrete to say.
+    if (!note) return service;
+    const serviceSpeaksFirst = Boolean(service) && (
+        service.tone === 'error' || service.tone === 'warn' || service.explainsUnread === true
+    );
+    if (GENERIC_FACET_NOTE_YIELDS.has(note.tone) && serviceSpeaksFirst) {
+        return { tone: service.tone, text: service.text };
+    }
+    return { tone: note.tone, text: note.text };
+}
+
+export function serviceBannerLine(store, { wakeError = '' } = {}) {
+    // THE service banner: one place on the tab that explains a daemon/runtime
+    // problem, replacing the scattering of "(not in discovery)" the owner
+    // reported. Provenance is PER FACET, so this line never collapses three
+    // independent reads into one verdict where the wire tells it apart: a
+    // refused quota read leaves the catalogue and accounts authoritative and
+    // says exactly that. That branch is READY, not yet exercised — no producer
+    // stamps `reads` today (`claudexor_accounts.py` keeps the older semantics
+    // and turns any refusal into one global `unreachable`), so the shape this
+    // line actually renders now is all three facets indeterminate together.
+    //
+    // Deliberately NOT built on the store's `facetGapClause`, which exists for a
+    // surface that LEADS with one facet and must still name the others (the
+    // Delegation note does exactly that for its model select). This line leads
+    // with none: it enumerates every facet it lost, in that facet's own state,
+    // so the shared clause would add a second "could not be read" about facets
+    // the sentence above it has already named. Same authority, one phrasing.
+    //
+    // A WAKE ERROR leads outright: the owner PRESSED the button and it did not
+    // work — silence there is the same class of dishonesty this banner exists
+    // to remove (a typed 503 from a missing binary or foreign home, a 404 from
+    // an older backend, a dead network). The rows and Connect stay put; the
+    // error's LIFECYCLE is the panel's (it expires only when the daemon
+    // provably answers — `daemonAnswered`, deliberately not the literal
+    // `running`).
+    if (wakeError) {
+        return { tone: 'error', text: `Could not start the agent daemon: ${wakeError}` };
+    }
+    const reads = store.reads || {};
+    const facets = [FACET_CATALOG, FACET_ACCOUNTS, FACET_QUOTA];
+    const bad = facets.filter((facet) => reads[facet] !== READ_OK);
+    if (!bad.length) {
+        return daemonStatusLine(store.snapshot || {}, {
+            checking: store.loading && !store.everSettled,
+            reads,
+        });
+    }
+    // NOTHING READ YET is not a gap to report — it is the first read in flight,
+    // and what the owner needs then is its COST: the daemon re-probes every
+    // agent CLI, so first paint is tens of seconds and a silent panel reads as
+    // broken rather than as loading (owner report, 2026-08-08). A bare
+    // "Reading…" would have thrown that sentence away.
+    if (!store.everSettled) {
+        return daemonStatusLine(store.snapshot || {}, { checking: store.loading, reads });
+    }
+    // The service line asks the FACETS too (invariant: facets outrank both the
+    // aggregate and the runtime branches), so when it wins below it already
+    // names the unread facets and gates its own positive claims ("keeps
+    // running", "ready") on a reading that actually saw them.
+    const service = daemonStatusLine(store.snapshot || {}, { reads });
+    // All three unread in the same way: ONE sentence about the service, from
+    // the shared vocabulary, with the subject widened to the whole tab —
+    // naming just the accounts would under-report a gap that also swallowed
+    // the agent catalogue and the limits. A runtime fault outranks it.
+    //
+    // The sentence is asked of the STORE, never assembled here, because the
+    // detail beside it is the store's to resolve: a transport error when the
+    // request itself died, and otherwise — for a read that was made and did not
+    // land — the daemon's OWN `last_error`. That string is the only explanation
+    // an `unreachable` answer carries, and a banner that called the copy factory
+    // directly printed "could not be read" and dropped it.
+    const states = new Set(bad.map((facet) => reads[facet]));
+    if (bad.length === 3 && states.size === 1) {
+        return faultOutranksReassurance(service,
+            store.unavailableNote(bad[0], { subject: 'agents, accounts and limits' }));
+    }
+    // A PARTIAL gap: name EVERY facet that could not be read — one sentence per
+    // distinct way they failed — and let the closing reassurance cover only the
+    // facets that genuinely read. Reporting `bad[0]` alone and appending
+    // "everything else was read normally" told the owner two of three failures
+    // had landed fine; it is unreachable only until the backend stamps `reads`
+    // per facet, which is exactly what makes a mixed verdict possible.
+    const sentences = [];
+    let tone = 'muted';
+    for (const readState of states) {
+        const group = bad.filter((facet) => reads[facet] === readState);
+        const subjects = group.map((facet) => FACET_SUBJECT[facet] || facet);
+        // Any facet of the group answers for it — they share the read state,
+        // and asking the store keeps the daemon's own reason attached.
+        const note = store.unavailableNote(group[0], { subject: joinSubjects(subjects) });
+        if (!note) continue;
+        sentences.push(note.text);
+        if (TONE_RANK[note.tone] > TONE_RANK[tone]) tone = note.tone;
+    }
+    if (!sentences.length) return service;
+    const readOk = facets
+        .filter((facet) => reads[facet] === READ_OK)
+        .map((facet) => FACET_SUBJECT[facet] || facet);
+    const tail = readOk.length ? ` Your ${joinSubjects(readOk)} were read normally.` : '';
+    // The SAME precedence as the full-gap branch above — the two are one
+    // decision, and fixing only one half of it is how this class survives. A
+    // mixed verdict is unreachable until the backend stamps `reads` per facet,
+    // and on that day a muted "some facets were never asked · the rest read
+    // normally" would swallow a runtime that needs repair.
+    return faultOutranksReassurance(service, { tone, text: `${sentences.join(' ')}${tail}` });
+}
+
+export async function removeAccount(harness, profileId, { fetchImpl = apiFetch } = {}) {
+    // The engine owns the account record, so removal is ITS contract. A failure
+    // is reported as a failure — nothing here pretends an account is gone.
+    const url = `/api/claudexor/credential-profiles/${encodeURIComponent(harness)}`
+        + `/${encodeURIComponent(profileId)}`;
+    const resp = await fetchImpl(url, { method: 'DELETE' });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(String(data?.error || `HTTP ${resp.status}`));
+    return data;
+}
+
+export function removeAccountConfirmBody(name, family) {
+    return `${family} will forget the account "${name}". Ouroboros deletes nothing on `
+        + `the ${family} side — sign in again any time to bring it back. Reviewer rows `
+        + 'pinned to this account stay visible and are shown as unavailable until you '
+        + 'repoint them.';
+}
+
+// ---------------------------------------------------------------------------
+// DOM section.
+// ---------------------------------------------------------------------------
+
+const state = {
+    store: claudexorStatus,
+    loginCard: null,
+    disposers: [],
+    removeError: '',
+    initialized: false,
+    // The owner asked to start the daemon and the wake refused. Rendered by the
+    // service banner and expired ONLY when the daemon provably answers
+    // (`daemonAnswered` over a fresh reading) — a 200 that reports the daemon
+    // still down must NOT wipe the reason before the owner can read it, and a
+    // daemon that came up on its own must not leave the error standing over
+    // its accounts. The wake POST itself is the STORE's (single writer).
+    wakeError: '',
+    wakeBusy: false,
+    // Mount and unmount are SERIALIZED through one chain. Releasing login
+    // custody is asynchronous (a DELETE the daemon has to confirm), so a
+    // fire-and-forget teardown followed by a remount is how one controller
+    // instance came to hold a live job while a second one started another
+    // beside it — the "one live login" invariant held only inside a single
+    // controller.
+    lifecycle: Promise.resolve(true),
+};
+
+/** The tab's ONE service banner; rendered above every section. */
+export function renderAgentsServiceBanner() {
+    return `<div id="agents-service-banner" class="agents-service-banner settings-inline-status" data-tone="muted">Checking the agent service…</div>`;
+}
+
+export function renderAgentAccountsSection() {
     return `
-        <div class="harness-account-row${quota.exhausted ? ' harness-exhausted' : ''}" data-harness="${escapeHtml(row.harness)}" data-profile="${escapeHtml(row.profile_id)}">
-            <div class="harness-account-main">
-                <span class="harness-chip" data-harness-chip="${escapeHtml(row.harness)}">${escapeHtml(row.harness)}</span>
-                <strong>${escapeHtml(name)}</strong>
-                ${identity ? `<span class="muted">${escapeHtml(identity)}</span>` : ''}
-                <span class="settings-inline-status" data-tone="${badge.tone}">${escapeHtml(badge.label)}</span>
-                ${quota.label ? `<span class="settings-inline-status" data-tone="${quota.exhausted ? 'warn' : 'muted'}" ${quota.exhausted && quota.resetsAt ? `data-resets-at="${escapeHtml(quota.resetsAt)}"` : ''}>${escapeHtml(quota.label)}</span>` : ''}
+        <div class="form-section" id="harness-accounts-section">
+            <h3>Accounts</h3>
+            <div class="settings-section-copy">
+                Agent subscriptions (Claude Code, Codex, Cursor) used by delegated subagents and
+                review lanes. Every account of a family is equivalent — work rotates across all of
+                them. Accounts live in Ouroboros's own agent home; your personal logins are never
+                read or imported.
             </div>
-            <div class="harness-account-actions">
-                <button type="button" class="settings-ghost-btn" data-harness-login>${runtimeActionLabel(payload)}</button>
-                ${row.kind === 'native' ? '<button type="button" class="settings-ghost-btn" data-harness-add-profile title="Register one more account for this agent (rotation uses every enabled account)">Add account…</button>' : ''}
+            <div id="harness-accounts-error" class="settings-inline-status" data-tone="error" hidden></div>
+            <div id="harness-accounts-groups" class="agent-family-list"></div>
+            <div id="harness-login-card"></div>
+            <div class="settings-toolbar">
+                <button type="button" class="settings-ghost-btn" id="btn-harness-refresh">Refresh</button>
             </div>
         </div>
     `;
 }
 
-// The coding-agent families a fresh install can connect BEFORE the daemon
-// exists. Discovery needs a running daemon, and on first run there is none —
-// so with nothing discovered the UI still offers a Connect affordance, and the
-// first Connect is exactly what provisions the owned daemon (D30). Presentation
-// only; the login flow itself stays harness-agnostic (asks device_auth, falls
-// back to the terminal command).
-export const BOOTSTRAP_HARNESSES = ['codex', 'claude', 'cursor'];
+export function accountRowFacts(row, payload,
+                                { accountsRead = READ_OK, quotaRead = READ_OK, nowMs = Date.now() } = {}) {
+    // Each projection is gated by ITS OWN facet: the identity claim is the
+    // ACCOUNTS read, the window is the QUOTA read, and one lands while the
+    // other refuses. The panel used to render both off the retained snapshot
+    // regardless, so after a refused read the banner said nothing could be
+    // listed while a stale row sat underneath it showing "Verified live" and a
+    // red exhausted window. Pure, because that rule is the thing worth pinning.
+    //
+    // The two-line anatomy is the owner's (D-10): line 1 is the account and its
+    // status, line 2 is muted metadata in human words. `quotaSummary` carries
+    // the quota gap itself — an unread window says "Limits not checked" rather
+    // than dressing a remembered percentage as current, and it never paints the
+    // row red, because the exhausted styling is a claim about RIGHT NOW and the
+    // reset it promises may already have happened.
+    return {
+        badge: verificationBadge(row, { known: accountsRead === READ_OK }),
+        quota: quotaSummary(payload?.quota || [], row.harness, row.profile_id, { quotaRead, nowMs }),
+        name: accountName(row),
+        meta: accountMetaLine(row, payload, { quotaRead, nowMs }),
+    };
+}
 
-function harnessesWithoutRows(payload, rows) {
-    const covered = new Set(rows.map((row) => row.harness));
-    const discovered = (payload?.harnesses || [])
-        .map((h) => String(h.id || ''))
-        .filter(Boolean);
-    // When the daemon has discovered nothing yet (fresh install / not
-    // provisioned), fall back to the bootstrap families so the first login is
-    // reachable — otherwise the whole onboarding path is a dead end.
-    const source = discovered.length ? discovered : BOOTSTRAP_HARNESSES;
-    return source.filter((id) => !covered.has(id));
+function rowHtml(row, payload, facets = {}) {
+    const { badge, quota, name, meta } = accountRowFacts(row, payload, facets);
+    return `
+        <div class="harness-account-row${quota.exhausted ? ' harness-exhausted' : ''}" data-harness="${escapeHtml(row.harness)}" data-profile="${escapeHtml(row.profile_id)}" data-kind="${escapeHtml(row.kind)}">
+            <div class="harness-account-main">
+                <strong>${escapeHtml(name)}</strong>
+                <span class="ui-status" data-tone="${badge.tone}">${escapeHtml(badge.label)}</span>
+            </div>
+            <div class="harness-account-meta muted">${escapeHtml(meta)}</div>
+            <div class="harness-account-actions">
+                <button type="button" class="settings-ghost-btn" data-harness-login>${escapeHtml(rowActionLabel(row, payload))}</button>
+                ${row.kind === 'native' ? '' : '<button type="button" class="settings-ghost-btn" data-harness-remove title="Ask the agent service to forget this account">Remove</button>'}
+            </div>
+        </div>
+    `;
+}
+
+function groupHtml(group, payload, facets) {
+    // An empty family is a ONE-LINE card: the header already carries the verdict
+    // (familyStatus falls through to it), and printing the same sentence again
+    // in the body just made the card twice as tall to say nothing new.
+    const body = group.rows.map((row) => rowHtml(row, payload, facets)).join('');
+    return `
+        <section class="agent-family-card" data-family="${escapeHtml(group.harness)}">
+            <div class="agent-family-head">
+                <div class="agent-family-id">
+                    <h4>${escapeHtml(group.label)}</h4>
+                    <span class="ui-status" data-tone="${group.status.tone}">${escapeHtml(group.status.label)}</span>
+                </div>
+                <button type="button" class="settings-ghost-btn" data-family-add>${escapeHtml(familyActionLabel(group, payload))}</button>
+            </div>
+            <div class="agent-family-rows">${body}</div>
+        </section>
+    `;
 }
 
 function renderRows() {
-    const host = document.getElementById('harness-accounts-rows');
-    const statusEl = document.getElementById('harness-daemon-status');
-    if (!host || !statusEl) return;
-    const payload = state.payload || {};
-    const line = daemonStatusLine(payload, {
-        checking: state.statusChecking && !state.statusEverSettled,
-        transportError: state.statusTransportError,
-        wakeError: state.wakeError,
-    });
-    statusEl.textContent = line.text;
-    statusEl.dataset.tone = line.tone;
-    const rows = accountRows(payload);
-    const bare = harnessesWithoutRows(payload, rows);
-    // The bootstrap rows and their Connect buttons STAY whatever we know —
-    // onboarding must stay reachable — but the verdict beside them may only
-    // assert absence when the account store was actually read.
-    // RAW state, not the `{}` normalized above: "nothing has answered yet" is
-    // exactly the absence of a payload, and handing the placeholder over made
-    // the branch that says so unreachable — so the bootstrap rows spent the
-    // whole first read printing "the agent daemon is not running" about a
-    // daemon that was answering, which is the verdict this file exists to stop.
-    const unknownNote = unknownAccountsNote(state.payload, {
-        transportError: state.statusTransportError, checking: state.statusChecking });
-    const bareStatus = unknownNote || 'no account connected';
-    const parts = rows.map((row) => rowHtml(row, payload));
-    for (const harness of bare) {
-        parts.push(`
-            <div class="harness-account-row" data-harness="${escapeHtml(harness)}" data-profile="">
-                <div class="harness-account-main">
-                    <span class="harness-chip" data-harness-chip="${escapeHtml(harness)}">${escapeHtml(harness)}</span>
-                    <strong>${escapeHtml(harness)}</strong>
-                    <span class="settings-inline-status" data-tone="muted">${escapeHtml(bareStatus)}</span>
-                </div>
-                <div class="harness-account-actions">
-                    <button type="button" class="settings-ghost-btn" data-harness-login>${runtimeActionLabel(payload)}</button>
-                </div>
-            </div>
-        `);
+    // The wake error expires HERE, on the one condition that makes it moot: a
+    // FRESH reading (store error retired) in which the daemon provably
+    // answered. A refusal was only ever news while nothing answered; keeping
+    // it over accounts the daemon just handed over would be the stale-error
+    // twin of the stale-absence lie.
+    if (state.wakeError && !state.store.error && daemonAnswered(state.store.snapshot)) {
+        state.wakeError = '';
     }
-    host.innerHTML = parts.join('')
-        || '<div class="muted">Connect a coding-agent account to run delegated work on subscriptions.</div>';
+    const host = document.getElementById('harness-accounts-groups');
+    const banner = document.getElementById('agents-service-banner');
+    if (banner) {
+        const line = serviceBannerLine(state.store, { wakeError: state.wakeError });
+        banner.textContent = line.text;
+        banner.dataset.tone = line.tone;
+    }
+    // The Refresh button says what pressing it does (one predicate feeds the
+    // label AND the click — see initHarnessAccounts), and while a wake is in
+    // flight it says that instead of inviting a second one.
     const refreshEl = document.getElementById('btn-harness-refresh');
     if (refreshEl) {
-        refreshEl.textContent = state.wakeBusy ? 'Starting the agent daemon…' : refreshActionLabel(payload);
+        refreshEl.textContent = state.wakeBusy
+            ? 'Starting the agent daemon…'
+            : refreshActionLabel(state.store.snapshot);
         refreshEl.disabled = Boolean(state.wakeBusy);
     }
+    if (!host) return;
+    const errorBox = document.getElementById('harness-accounts-error');
+    if (errorBox) {
+        errorBox.hidden = !state.removeError;
+        errorBox.textContent = state.removeError;
+    }
+    const payload = state.store.snapshot || {};
+    const accountsRead = state.store.facet(FACET_ACCOUNTS);
+    const quotaRead = state.store.facet(FACET_QUOTA);
+    host.innerHTML = accountGroups(payload, { accountsRead })
+        .map((group) => groupHtml(group, payload, { accountsRead, quotaRead })).join('');
     host.querySelectorAll('[data-harness-login]').forEach((button) => {
         button.addEventListener('click', () => {
             const row = button.closest('[data-harness]');
             startLogin(row?.dataset.harness, row?.dataset.profile);
         });
     });
-    host.querySelectorAll('[data-harness-add-profile]').forEach((button) => {
+    host.querySelectorAll('[data-harness-remove]').forEach((button) => {
+        button.addEventListener('click', () => {
+            const row = button.closest('[data-harness]');
+            confirmRemoveAccount(row?.dataset.harness, row?.dataset.profile);
+        });
+    });
+    host.querySelectorAll('[data-family-add]').forEach((button) => {
         button.addEventListener('click', async () => {
-            // Captured before the await: the 5-second status poll replaces the
-            // rows while the dialog is open, detaching this button's row.
-            const harness = button.closest('[data-harness]')?.dataset.harness;
-            const profile = await promptProfileName();
+            // Captured before the await: the status poll replaces the cards
+            // while the dialog is open, detaching this button's section.
+            const card = button.closest('[data-family]');
+            const harness = card?.dataset.family;
+            const hasRows = Boolean(card?.querySelector('[data-harness]'));
+            if (!hasRows) { startLogin(harness, ''); return; }
+            const profile = await promptProfileName({ family: familyLabel(harness, state.store.snapshot || {}) });
             if (profile) startLogin(harness, profile);
         });
     });
-    renderLoginCard();
+    state.loginCard?.render();
 }
 
-export function loginCardHtml(active, nowMs = Date.now()) {
-    // The card's whole body as a STRING — pure, so every face is asserted in
-    // node without a DOM: the unsafe-URL refusal, the unconfirmed re-check,
-    // and the rule that a verdict silences the live status line.
-    if (!active) return '';
-    const summary = jobStateSummary(active.job || {});
-    const disclosure = deviceCodeDisclosure(active.job || {});
-    const face = loginCardFace(active);
-    // NOT .panel-card: that class lives in onboarding.css, which the settings
-    // pages never load — the card rendered with no frame at all (finding #4).
-    const bits = [`<div class="harness-login-card" data-login-card>`,
-        `<h4>Connect ${escapeHtml(active.harness)}${active.profile ? ` (${escapeHtml(active.profile)})` : ''}</h4>`];
-    if (face === 'error') {
-        bits.push(`<div class="settings-inline-note" data-tone="error">${escapeHtml(active.error)}</div>`);
-        bits.push('<button type="button" class="btn btn-primary" data-login-retry>Try again</button>');
-    } else if (face === 'device') {
-        // LINK-FIRST: the prominent action is opening the disclosed sign-in
-        // URL, with an explicit copy affordance (the macOS-app card pattern).
-        // That link is now a PRIMARY click target built from engine-supplied
-        // text, so it goes through the house helper: http/https only, escaped
-        // by the helper itself. Anything else — javascript:, data:, a
-        // malformed string — yields '' and renders NO clickable link at all.
-        const href = safeExternalHrefAttr(disclosure.url);
-        bits.push(href ? `
-            <div class="harness-signin-actions">
-                <a class="btn btn-primary" data-open-signin href="${href}" target="_blank" rel="noopener">Open sign-in link</a>
-                <button type="button" class="settings-ghost-btn" data-copy-signin-link>Copy link</button>
-            </div>
-        ` : `
-            <div class="settings-inline-note" data-tone="error" data-unsafe-signin-link>
-                The engine disclosed a sign-in link this app will not open (only http and https links are opened).
-            </div>
-        `);
-        if (disclosure.code) {
-            // The codex device flow: big selectable one-time code, explicit
-            // Copy (never auto-copied).
-            bits.push(`
-                <div class="harness-device-code">
-                    <p>Enter this one-time code on that page:</p>
-                    <div class="harness-code" data-device-code>${escapeHtml(disclosure.code)}</div>
-                    <button type="button" class="settings-ghost-btn" data-copy-device-code>Copy code</button>
-                </div>
-            `);
-        }
-    }
-    // The live state line and the verdict are mutually exclusive by
-    // construction (loginStatusLine answers '' on a terminal job), so the
-    // card can never say two contradicting things at once. The verdict slot
-    // ALSO silences it explicitly: once a verdict (or its re-check) owns the
-    // card, a snapshot that still reads pending — a poll response captured
-    // before the job settled — must not print "Waiting for the sign-in link…"
-    // underneath "Connected.".
-    if (face !== 'error' && !active.verdict && !active.confirming) {
-        const line = active.preparingRuntime
-            ? 'Installing or checking Claudexor…'
-            : loginStatusLine(active.job || {});
-        if (line) bits.push(`<div class="settings-inline-status" data-tone="muted" data-login-state>${escapeHtml(line)}</div>`);
-    }
-    // Shape 2: the ALWAYS-VISIBLE paste-code entry for a job whose disclosure
-    // flow is `oauth_url_input`. Claude's CLI prompts for the code only when
-    // the browser cannot reach its localhost callback (e.g. the browser is on
-    // another device), and this UI cannot observe that prompt — so the field
-    // is unconditional while the job awaits the user, with the hint carrying
-    // both the "if" and the optionality (no code is needed when the callback
-    // completes on its own).
-    if (face === 'device' && loginInputSupport(active.job || {}) && !summary.terminal) {
-        const busy = active.inputBusy || active.inputSent;
-        bits.push(`
-            <div class="harness-code-entry" data-code-entry>
-                <label for="harness-code-input">If the browser shows a code instead of finishing, paste it here (otherwise the sign-in completes on its own):</label>
-                <div class="harness-code-entry-row">
-                    <input type="text" id="harness-code-input" data-login-code-input autocomplete="off" spellcheck="false"
-                        placeholder="sign-in code" value="${escapeHtml(active.inputValue || '')}"${active.inputSent ? ' disabled' : ''}>
-                    <button type="button" class="settings-ghost-btn" data-login-code-submit${busy ? ' disabled' : ''}>${active.inputBusy ? 'Sending…' : (active.inputSent ? 'Code sent' : 'Submit code')}</button>
-                </div>
-                ${active.inputError ? `<div class="settings-inline-note" data-tone="error">${escapeHtml(active.inputError)}</div>` : ''}
-                ${active.inputSent ? `<div class="settings-inline-status" data-tone="muted">${escapeHtml(active.inputNote || 'Code sent — finishing the sign-in…')}</div>` : ''}
-            </div>
-        `);
-    }
-    // The verdict: success, a REAL failure with its typed reason, or the
-    // in-between "confirming" state while live account status is re-checked.
-    if (active.confirming) {
-        bits.push('<div class="settings-inline-status" data-tone="muted" data-login-verdict>Confirming the sign-in…</div>');
-    } else if (active.verdict?.kind === 'success') {
-        bits.push('<div class="settings-inline-status" data-tone="ok" data-login-verdict>Connected.</div>');
-    } else if (active.verdict?.kind === 'failure') {
-        bits.push(`<div class="settings-inline-status" data-tone="error" data-login-verdict>${escapeHtml(failureText(active.verdict.reason))}</div>`);
-    } else if (active.verdict?.kind === 'unconfirmed') {
-        // The re-check window closed without the row appearing. Unknown, not
-        // failed — worded so the owner looks where the answer actually lands.
-        bits.push(`<div class="settings-inline-status" data-tone="warn" data-login-verdict>${escapeHtml(UNCONFIRMED_TEXT)}</div>`);
-    }
-    // …and beside that verdict, the engine's own explanation. The two verdict
-    // texts above are FIXED constants (deliberately: one is a category, the
-    // other an honest "unknown"), so without this line a settled login says
-    // nothing about WHY — the daemon's sentence lived in the snapshot and was
-    // rendered nowhere. Only for a settled non-success verdict: beside
-    // "Connected." a stale message would contradict the outcome, and while the
-    // job is pending the live status line already owns the card.
-    if (active.verdict?.kind === 'failure' || active.verdict?.kind === 'unconfirmed') {
-        // #125: a verdict minted client-side (the poll give-up) carries its own
-        // sentence; a daemon-settled verdict keeps the engine's own message.
-        const detail = String(active.verdict?.detail || '').trim() || jobDetail(active.job || {});
-        if (detail) {
-            bits.push(`<div class="settings-inline-note" data-login-detail>${escapeHtml(detail)}</div>`);
-        }
-    }
-    // The demoted attach fallback: a collapsed Advanced affordance, only when
-    // due (engine predates the disclosure modes, or no link within the
-    // window) and only while the job can still be attached.
-    if (!summary.terminal && attachFallbackDue(active, nowMs)) {
-        bits.push(`
-            <details class="harness-advanced" data-login-advanced${active.advancedOpen ? ' open' : ''}>
-                <summary>Advanced: sign in from your own terminal</summary>
-                <p>${active.engineDegraded
-        ? 'This engine cannot host the sign-in in the app yet. Run this in your own terminal (outside Ouroboros); the card follows the progress automatically:'
-        : 'No sign-in link arrived yet. You can run this in your own terminal (outside Ouroboros) instead; the card follows the progress automatically:'}</p>
-                <pre class="harness-attach-command" data-attach-command>${escapeHtml(active.attachCommand)}</pre>
-                <button type="button" class="settings-ghost-btn" data-copy-attach>Copy command</button>
-            </details>
-        `);
-    }
-    bits.push('<button type="button" class="settings-ghost-btn" data-login-dismiss>Close</button>', '</div>');
-    return bits.join('');
-}
-
-export function preserveCardFocus(host, swap, doc = typeof document === 'undefined' ? null : document) {
-    // The card re-renders on EVERY 3-second poll tick by replacing its whole
-    // DOM, and the replacement dropped the caret out of the paste-code field
-    // mid-typing — a sign-in code cannot be typed into a field that dies every
-    // three seconds. The focused entry and its selection are captured across
-    // the swap and restored onto the element that replaced it.
-    const prior = doc ? doc.activeElement : null;
-    const keep = Boolean(prior && host.contains?.(prior)
-        && prior.hasAttribute?.('data-login-code-input'));
-    const start = keep ? prior.selectionStart : null;
-    const end = keep ? prior.selectionEnd : null;
-    swap();
-    if (!keep) return;
-    const next = host.querySelector?.('[data-login-code-input]');
-    if (!next || next.disabled) return;
-    next.focus?.();
-    if (typeof next.setSelectionRange === 'function' && start !== null) {
-        next.setSelectionRange(start, end === null ? start : end);
-    }
-}
-
-function renderLoginCard() {
-    const host = document.getElementById('harness-login-card');
-    if (!host) return;
-    const active = state.activeJob;
-    if (!active) { host.innerHTML = ''; return; }
-    preserveCardFocus(host, () => { host.innerHTML = loginCardHtml(active, Date.now()); });
-    wireLoginCard(host, active, jobStateSummary(active.job || {}));
-}
-
-function wireLoginCard(host, active, summary) {
-    host.querySelector('[data-login-retry]')?.addEventListener('click', () => {
-        // NO preemptive stopJobPolling() here: if the C7 guard inside
-        // startLogin refuses (cancel unproven, job still live), the old poll
-        // must stay armed — it is the recovery path that clears the transient
-        // note and settles the real verdict. _startLoginLocked stops polling
-        // itself once the previous job is terminal or provably cancelled.
-        startLogin(active.harness, active.profile);
+async function confirmRemoveAccount(harness, profileId) {
+    if (!harness || !profileId) return;
+    const family = familyLabel(harness, state.store.snapshot || {});
+    const answer = await openConfirmDialog({
+        title: 'Remove account',
+        body: removeAccountConfirmBody(profileId, family),
+        confirmLabel: 'Remove',
+        danger: true,
     });
-    host.querySelector('[data-copy-signin-link]')?.addEventListener('click', () => {
-        const disclosure = deviceCodeDisclosure(active.job || {});
-        if (disclosure?.url) navigator.clipboard?.writeText(disclosure.url);
-    });
-    host.querySelector('[data-copy-device-code]')?.addEventListener('click', () => {
-        const disclosure = deviceCodeDisclosure(active.job || {});
-        if (disclosure?.code) navigator.clipboard?.writeText(disclosure.code);
-    });
-    host.querySelector('[data-copy-attach]')?.addEventListener('click', () => {
-        navigator.clipboard?.writeText(active.attachCommand || '');
-    });
-    const advanced = host.querySelector('[data-login-advanced]');
-    // Re-renders (every poll tick) must not slam the user's Advanced section
-    // shut: the open state is carried on the job and re-applied.
-    advanced?.addEventListener('toggle', () => { active.advancedOpen = advanced.open; });
-    const codeInput = host.querySelector('[data-login-code-input]');
-    codeInput?.addEventListener('input', () => { active.inputValue = codeInput.value; });
-    codeInput?.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter') { event.preventDefault(); submitCodeFromCard(active); }
-    });
-    host.querySelector('[data-login-code-submit]')?.addEventListener('click', () => submitCodeFromCard(active));
-    host.querySelector('[data-login-dismiss]')?.addEventListener('click', () => {
-        withLoginTransition(async () => {
-            // Stale wiring: a rebuilt card (or a completed transition) may
-            // have replaced the job this handler captured.
-            if (state.activeJob !== active) return;
-            if (active.jobId && !jobStateSummary(active.job || {}).terminal) {
-                // C7: the job id of a possibly-live login is never dropped on
-                // an UNPROVEN cancel — clearing it would let the next start
-                // bypass the serialization guard. The card stays with an
-                // honest error until the daemon confirms the job is gone.
-                const gone = await cancelLoginJob(active.jobId);
-                // Belt: the lock already excludes concurrent transitions, but
-                // an identity drift across the await must never clear a job
-                // this handler does not own.
-                if (state.activeJob !== active) return;
-                // A poll tick may have settled the job while the DELETE was in
-                // flight: a terminal job needs no cancel, the user asked the
-                // card to close — fall through to the clear instead of
-                // freezing a settled card on a stale cancel error.
-                const settledMeanwhile = loginSettleProven(active);
-                if (!gone && !settledMeanwhile) {
-                    active.error = 'Could not cancel this sign-in — it may still be running. '
-                        + 'Try dismissing again once the daemon is reachable.';
-                    renderLoginCard();
-                    return;
-                }
-            }
-            stopJobPolling();
-            state.activeJob = null;
-            renderLoginCard();
-            refreshStatus();
-        });
-    });
-}
-
-async function submitCodeFromCard(active) {
-    // Double-submit guard: one POST in flight at a time, and an accepted code
-    // is final — the button stays disabled after success.
-    if (!active || active.inputBusy || active.inputSent) return;
-    const value = String(active.inputValue || '').trim();
-    if (!value) return;
-    // The job may have finished while the user typed: render the verdict
-    // instead of posting into a dead job.
-    if (jobStateSummary(active.job || {}).terminal) { renderLoginCard(); return; }
-    active.inputBusy = true;
-    active.inputError = '';
-    renderLoginCard();
-    const result = await submitLoginInput(active.jobId, value);
-    if (state.activeJob !== active) return;   // card closed while in flight
-    active.inputBusy = false;
-    if (result.ok) {
-        active.inputSent = true;
-    } else if (result.conflict === 'setup_input_not_applicable') {
-        // Typed 409: the callback already completed (or the flow moved past
-        // the code step) — no code is needed. An answer, not an error: quiet
-        // note, and the job poll lands the verdict.
-        active.inputSent = true;
-        active.inputNote = 'No code needed — the sign-in is already completing.';
-    } else if (result.conflict === 'setup_input_already_submitted') {
-        // Typed 409: the server already has a code (it is authoritative over
-        // our double-submit guard, e.g. a second browser tab).
-        active.inputSent = true;
-        active.inputNote = 'Code already received — finishing the sign-in.';
-    } else if (result.degraded) {
-        // The engine predates the input route, or reaped the job. Degrade to
-        // the Advanced fallback when one exists; otherwise say what is known.
-        if (!jobStateSummary(active.job || {}).terminal && active.attachCommand) {
-            active.engineDegraded = true;
-            active.inputError = 'This engine cannot accept the code here — see Advanced below.';
-        } else {
-            active.inputError = 'The engine did not accept the code (the sign-in may have already finished).';
-        }
-    } else {
-        active.inputError = result.error || 'Code submission failed; try again.';
+    if (!answer?.confirmed) return;
+    state.removeError = '';
+    try {
+        await removeAccount(harness, profileId);
+    } catch (error) {
+        state.removeError = `Could not remove "${profileId}": ${error.message || error}. `
+            + 'The account is unchanged.';
     }
-    renderLoginCard();
+    await state.store.refresh();
+    renderRows();
 }
 
 /**
- * Cancel a login job and REPORT whether the daemon no longer runs it (C7):
- * ok/404/410 mean the job is gone; anything else (5xx, network death) means
- * it may still be live — the caller must not start a second job beside it.
+ * OWNER action behind the Refresh button when the daemon is asleep: start it,
+ * then take the fresh reading. The POST and the commit belong to the STORE
+ * (single writer — `store.wake()` serializes against the poll in both orders);
+ * what lives here is the error's LIFECYCLE: shown only while it still matters
+ * (a refusal is not news once the daemon answers — an ordinary poll can commit
+ * a live reading while the wake is in flight), and expired only by a daemon
+ * that provably answered (see renderRows).
  */
-export async function cancelLoginJob(jobId, fetchImpl = apiFetch) {
-    if (!jobId) return true;
+export async function wakeDaemon() {
+    if (state.wakeBusy) return;
+    state.wakeBusy = true;
+    state.wakeError = '';
+    renderRows();
+    let result;
     try {
-        const resp = await fetchImpl(`/api/claudexor/login/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
-        return !!resp && (resp.ok || resp.status === 404 || resp.status === 410);
-    } catch (err) {
-        return false;
-    }
-}
-
-/**
- * Whether the login job PROVABLY settled: only a TERMINAL job snapshot counts.
- * A verdict alone is NOT proof — the give-up path issues {kind:'unconfirmed'}
- * on LOST CONTACT, where the job may still be live server-side; the
- * terminal-derived kinds (success/failure/recheck) always ride a terminal
- * snapshot anyway, so the snapshot is the one honest witness.
- */
-export function loginSettleProven(active) {
-    return jobStateSummary(active?.job || {}).terminal;
-}
-
-// ONE lock for EVERY login lifecycle transition (C7): start AND dismiss.
-// Each transition is an async section that reads and replaces
-// state.activeJob across awaits (create POST while jobId is still '';
-// cancel DELETE while a start could run) — serializing only the starts
-// left the dismiss-vs-start overlap able to drop custody of a live job.
-let loginTransitionBusy = false;
-
-async function withLoginTransition(fn) {
-    if (loginTransitionBusy) return false;
-    loginTransitionBusy = true;
-    try {
-        await fn();
-        return true;
+        result = await state.store.wake();
     } finally {
-        loginTransitionBusy = false;
+        state.wakeBusy = false;
     }
+    if (!result?.ok) {
+        state.wakeError = daemonAnswered(state.store.snapshot)
+            ? ''
+            : String(result?.error || 'request failed');
+    }
+    renderRows();
 }
 
+function ensureLoginCard() {
+    if (state.loginCard) return state.loginCard;
+    state.loginCard = createLoginCardController({
+        host: () => document.getElementById('harness-login-card'),
+        store: state.store,
+        // The Settings face is the FULL card: paste-code entry, engine detail,
+        // the collapsed Advanced terminal fallback, Close.
+        mode: 'full',
+        onSettled: () => renderRows(),
+    });
+    return state.loginCard;
+}
+
+/**
+ * Start (or restart) a login for one account row. Exported because the account
+ * rows, the Add-account dialog and the browser smoke tests all drive it.
+ */
 export async function startLogin(harness, profile) {
     if (!harness) return;
-    await withLoginTransition(() => _startLoginLocked(harness, profile));
+    await ensureLoginCard().start(harness, profile);
 }
 
-async function _startLoginLocked(harness, profile) {
-    // C7 (plan roast, accepted): a NEW login may start only once the previous
-    // job is terminal or PROVABLY cancelled — a second job beside a live one
-    // races the daemon and orphans the old job server-side. Centralized HERE
-    // so every entry point (Connect, Add account, Retry) inherits the guard.
-    const prev = state.activeJob;
-    if (prev && prev.jobId && !jobStateSummary(prev.job || {}).terminal) {
-        const cancelled = await cancelLoginJob(prev.jobId);
-        // Re-read the world after the await: a poll tick may have settled the
-        // job (succeeded/failed) while the DELETE was in flight — a terminal
-        // job needs no cancellation, and writing a cancel error AFTER the
-        // settle would freeze the card on a stale face (the terminal tick
-        // schedules no further poll to clear it).
-        const settledMeanwhile = state.activeJob !== prev || loginSettleProven(prev);
-        if (!cancelled && !settledMeanwhile) {
-            prev.error = 'Could not cancel the active sign-in — it may still be running. '
-                + 'Retry from its card, or dismiss it first.';
-            renderLoginCard();
-            return;
+/** Read the shared status once (the Refresh button, and the first paint). */
+export function refreshHarnessStatus() {
+    return state.store.refresh();
+}
+
+/**
+ * Mount the section. SERIALIZED with the teardown, and refused while the
+ * previous mount still holds login custody.
+ *
+ * @returns {Promise<boolean>} whether the section is mounted. `false` = a
+ *          previous login could not be proven cancelled, so a second one must
+ *          not be started beside it; the panel says so and the next mount
+ *          retries the cancel.
+ */
+export function initHarnessAccounts({ store = claudexorStatus } = {}) {
+    state.lifecycle = state.lifecycle.then(() => _init(store), () => _init(store));
+    return state.lifecycle;
+}
+
+async function _init(store) {
+    const released = await _destroy();
+    if (!released) {
+        // The old controller is still holding a job id it could not prove
+        // gone. Mounting now would give the owner a Connect button that starts
+        // a SECOND live login — exactly what the custody verdict exists to
+        // prevent. Say it where the panel's own status line lives; the next
+        // mount re-attempts the cancel (dispose is retryable).
+        //
+        // That line is the tab's ONE service banner. It used to be
+        // `harness-daemon-status`, a node the Agents tab no longer renders, so
+        // this refusal reached the owner as an empty panel that simply never
+        // mounted. Nothing repaints the banner from under this message: the
+        // store subscription is bound below, after the early return.
+        const statusEl = document.getElementById('agents-service-banner');
+        if (statusEl) {
+            statusEl.textContent = 'A previous sign-in could not be cancelled and may still be '
+                + 'running, so this panel is holding off. Reopen this page to retry it.';
+            statusEl.dataset.tone = 'warn';
         }
+        return false;
     }
-    stopJobPolling();
-    // One start shape for every harness: the in-app flow is asked for and the
-    // server/engine decide the hosting (loginFlow rides only for codex).
-    const body = { harness, login_flow: 'device_auth' };
-    if (profile) body.profile_id = profile;
-    state.activeJob = {
-        harness, profile, jobId: '', job: null, attachCommand: '', error: '',
-        startedAtMs: Date.now(), engineDegraded: false,
-        inputValue: '', inputBusy: false, inputSent: false, inputError: '', inputNote: '',
-        verdict: null, confirming: false, advancedOpen: false, preparingRuntime: true,
-    };
-    const active = state.activeJob;
-    renderLoginCard();
-    try {
-        const resp = await apiFetch('/api/claudexor/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (state.activeJob !== active) return;
-        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-        active.preparingRuntime = false;
-        active.jobId = String(data.job_id || '');
-        active.job = data.job || {};
-        active.attachCommand = String(data.attach_command || '');
-        // An engine that predates the disclosure modes never sends a link;
-        // the demoted Advanced fallback may show right away (still collapsed).
-        active.engineDegraded = data.disclosure_native === false
-            && !!active.attachCommand;
-        startJobPolling();
-    } catch (error) {
-        if (state.activeJob !== active) return;
-        active.preparingRuntime = false;
-        active.error = String(error.message || error);
-    }
-    renderLoginCard();
-}
-
-function startJobPolling() {
-    stopJobPolling();
-    // #125: a setTimeout CHAIN, not an interval — the next tick is armed only
-    // after the previous round-trip settled, so overlapping polls (and the
-    // out-of-order snapshot that overwrote a terminal one) are structurally
-    // impossible; the pollResponseApplies ordering guard still stands for a
-    // card closed/reopened mid-flight. Failures back off exponentially and
-    // after 10 CONSECUTIVE failures the chain stops with an honest
-    // "unconfirmed" verdict instead of hammering a dead daemon forever.
-    let consecutiveFailures = 0;
-    const schedule = (delayMs) => { state.jobTimer = setTimeout(tick, delayMs); };
-    const tick = async () => {
-        state.jobTimer = 0;
-        const active = state.activeJob;
-        if (!active?.jobId) return;
-        let snapshot = null;
-        let readOk = false;
-        try {
-            const resp = await apiFetch(`/api/claudexor/login/${encodeURIComponent(active.jobId)}`, { cache: 'no-store' });
-            const data = await resp.json().catch(() => ({}));
-            // The CREATE answer is the only authority on whether this job has a
-            // copy-paste command: it issues one exactly for a client_pty job,
-            // while the poll route hands one back for every job including the
-            // daemon-transport codex device flow, which must never show it.
-            if (resp.ok) {
-                snapshot = data.job || null;
-                readOk = true;
-            }
-        } catch (err) { /* transient poll failure; the chain retries with backoff */ }
-        if (!pollResponseApplies(active, state.activeJob)) return;
-        // ANY parsed answer (a pending snapshot included) resets the failure
-        // streak — a legitimate multi-minute sign-in must never trip give-up.
-        consecutiveFailures = readOk ? 0 : consecutiveFailures + 1;
-        if (snapshot) active.job = snapshot;
-        if (readOk && active.error) {
-            // A successful job read re-establishes the true state: the
-            // cancel-failure note (a Dismiss whose DELETE the daemon never
-            // confirmed) is TRANSIENT and must not mask a live/terminal face
-            // forever — a recovered daemon + succeeded login used to leave the
-            // card stuck on the cancel-error face while the account row said
-            // connected. Fatal START errors never reach this line: a job that
-            // failed to create has no jobId and is never polled.
-            active.error = '';
-        }
-        const verdict = loginVerdict(active.job || {});
-        if (verdict.kind !== 'pending') {
-            settleVerdict(active, verdict);
-            return;
-        }
-        const next = nextJobPollDelay(consecutiveFailures);
-        if (next.giveUp) {
-            // Contact with the job is lost, NOT the login: the sign-in may
-            // well have completed. The EXISTING typed unconfirmed verdict path
-            // owns this face. Deliberately NOT active.error — its Try-again
-            // would start a SECOND login while the old jobId may still be
-            // live; a fresh attempt goes through Close (which DELETEs a
-            // non-terminal job) or the account row once the daemon answers.
-            active.verdict = {
-                kind: 'unconfirmed',
-                reason: 'job_poll_lost_contact',
-                detail: 'Lost contact with the sign-in job — the sign-in may '
-                    + 'still have completed. Press Refresh to re-check the account.',
-            };
-            renderLoginCard();
-            refreshStatus({ force: true });
-            return;
-        }
-        renderLoginCard();
-        schedule(next.delayMs);
-    };
-    schedule(nextJobPollDelay(0).delayMs);
-}
-
-async function settleVerdict(active, verdict) {
-    if (!active) return;
-    if (verdict.kind !== 'recheck') {
-        active.verdict = verdict;
-        renderLoginCard();
-        refreshStatus();
-        return;
-    }
-    // The verify-race: never declare failure off one stale verification read
-    // (the owner's codex login SUCCEEDED while the card said "Login failed ·
-    // completed"). Live account status — the truth the rows themselves render
-    // — briefly re-polled, is the judge.
-    active.confirming = true;
-    renderLoginCard();
-    // The same join the poll takes: the confirmation reads the status endpoint
-    // directly, and running it beside an in-flight wake would make it the
-    // THIRD writer in the race the wake exists to settle. Wait the wake out,
-    // then confirm against the reading it produced.
-    if (state.wakeInFlight) await state.wakeInFlight;
-    const generation = state.readGeneration;
-    const check = await confirmLoginLive(active.harness, active.profile || '', {
-        isStale: () => state.activeJob !== active,
-    });
-    if (state.activeJob !== active) return;
-    active.confirming = false;
-    // GENERATION, not just job identity. This read goes to the status endpoint
-    // directly, outside `refreshStatus`, so any commit that landed while it was
-    // in flight has already published a newer payload — and `readGeneration`
-    // promises that a read issued before a commit never lands on top of it.
-    const superseded = generation !== state.readGeneration;
-    if (check.payload && !superseded) commitStatusPayload(check.payload);
-    // A positive confirmation does not expire. The generation is captured once
-    // for a SERIES of attempts, so a commit landing between attempt 1 and
-    // attempt 2 marked the whole series stale — including the later attempt
-    // that watched the account come online. Seeing the login is monotone
-    // evidence: believe it whenever it happened, and otherwise judge the newest
-    // reading with the same predicate rather than the one this series began on.
-    const confirmed = check.confirmed
-        || accountLoginConfirmed(state.payload, active.harness, active.profile || '');
-    // An exhausted window is not a failure verdict: the job's own read was
-    // already judged unproven, and the account row often appears a tick after
-    // the bounded re-poll gives up. Say that, and say where to look.
-    active.verdict = confirmed
-        ? { kind: 'success', reason: '' }
-        : { kind: 'unconfirmed', reason: verdict.reason };
-    renderRows();
-}
-
-function stopJobPolling() {
-    if (state.jobTimer) clearTimeout(state.jobTimer);
-    state.jobTimer = 0;
-}
-
-// The ONE place a fresh status payload is committed. Three paths produce one
-// (the poll, the wake, and the login confirmation), and they disagreed: a
-// transport error was retired by two of them and a wake error by one, so a
-// daemon that came up still rendered "Could not start the agent daemon" until
-// the next tick — and a wake error was ALSO cleared by a 200 that reported the
-// daemon still down, wiping the reason before the owner could read it. A fresh
-// answer always retires staleness, because the answer IS current. It retires
-// the wake error only on proven recovery: its basis is a daemon that would not
-// answer, so only a daemon that ANSWERED expires it — `daemonAnswered`, which
-// is deliberately not the literal `running`.
-// The facets the status contract declares. `daemonAnswered` iterates this list,
-// so a facet added to the contract and not here would be invisible to it —
-// tests/test_gateway_parity.py reads this literal out of the source and
-// compares it with `ClaudexorStatusReads`.
-export const READ_FACETS = ['catalog', 'accounts', 'quota'];
-
-export function unreadFacets(payload) {
-    // Which facets did NOT answer, in contract order. Empty means everything
-    // this payload promises was actually read.
-    return READ_FACETS.filter((facet) => facetReadState(payload, facet) !== 'ok');
-}
-
-export function daemonAnswered(payload) {
-    // Did the daemon ANSWER? A disjunction whose halves prove different things.
-    // An authenticated `running` is positive evidence on its own — the
-    // handshake happened. Anything else is NOT evidence of silence: a PARTIAL
-    // refusal (quota times out while the catalog and the account store land) is
-    // reported as `daemon.state = 'unreachable'`, so a predicate written on the
-    // literal `running` called a daemon dead while its own accounts were on
-    // screen — it kept a failed wake's error standing over them and made
-    // Refresh offer to start something already answering. There a facet's own
-    // `ok` is the evidence. What the aggregate can never be is the NEGATIVE
-    // answer.
-    //
-    // The facet states come from `facetReadState`, never from the raw block:
-    // reading `Object.values(reads)` here was a SECOND reader of the same
-    // field, and the two disagreed — an ARRAY is `typeof 'object'`, so
-    // `reads: ['ok']` counted as an answered facet here while `facetReadState`
-    // correctly called every facet `failed`.
-    if (String(payload?.daemon?.state || '') === 'running') return true;
-    return READ_FACETS.some((facet) => facetReadState(payload, facet) === 'ok');
-}
-
-export function commitStatusPayload(data) {
-    state.payload = data;
-    state.statusTransportError = '';
-    if (daemonAnswered(data)) state.wakeError = '';
-    // The ONE owner of the read version. It used to be bumped only by the wake,
-    // so two readers of the same generation could still land out of order: a
-    // login confirmation that began before an ordinary poll committed AFTER it
-    // and put the older snapshot back. Every accepted payload retires every
-    // read that began before it, whichever path produced it.
-    state.readGeneration += 1;
-}
-
-// OWNER action behind the Refresh button when the daemon is asleep: start it,
-// then take the fresh reading. Never called by the poll — the status GET stays
-// side-effect-free, which is what makes an automatic 5s wake impossible.
-function wakeErrorIfStillNeeded(message) {
-    // A start that failed is only news while the daemon is still not answering.
-    // An ordinary poll can commit a live reading WHILE the wake is in flight —
-    // and then a refusal that arrived afterwards would plant "Could not start
-    // the agent daemon" on top of a panel already listing that daemon's
-    // accounts. The failure is real; it just stopped mattering.
-    return daemonAnswered(state.payload) ? '' : message;
-}
-
-export async function wakeDaemon({ fetchImpl = apiFetch } = {}) {
-    if (state.wakeInFlight) return state.wakeInFlight;
-    // CAUSAL ordering with a GET already in flight: its read may land daemon-side
-    // before or after ours — the client cannot know — but if we START after its
-    // COMMIT, our reading is later than its by construction, and the
-    // unconditional commit below is correct. So wait it out before posting.
-    // (A GET started after us joins us instead — the check at the top of
-    // refreshStatus — so the two writers never overlap in either order.)
-    const pendingRead = state.statusInFlight;
-    // NOTE: no generation bump here. An opening bump used to guard "a read
-    // started before the press must not undo it", but the bump taken at COMMIT
-    // time already stales every read that started before the commit — which
-    // includes those. On the failing path there is no commit to protect, and
-    // the refusal survives on its own (commitStatusPayload retires a wake error
-    // only on proven recovery). Two interleavings DO tell the two apart, and
-    // both are benign: a read released while the wake is still pending repaints
-    // from its own answer instead of being discarded, and a read that answers
-    // for a daemon that came up anyway retires the error — which is exactly the
-    // recovery rule this module declares. So the bump is not here claiming an
-    // invariant it does not hold alone.
+    state.store = store;
+    state.removeError = '';
     state.wakeError = '';
-    state.wakeBusy = true;
+    state.wakeBusy = false;
+    ensureLoginCard();
+    document.getElementById('btn-harness-refresh')
+        ?.addEventListener('click', () => {
+            // A sleeping daemon cannot be re-read into existence: there the
+            // button is the owner's explicit start. Live, it stays a plain
+            // re-read. SAME predicate the LABEL uses (renderRows), so the two
+            // cannot disagree again.
+            return refreshActionKind(state.store.snapshot) === 'refresh'
+                ? state.store.refresh()
+                : wakeDaemon();
+        });
+    // The SHARED surface binding: the visibility predicate that lets this
+    // section keep the poll armed, and the catch-up read when the panel becomes
+    // reachable — one implementation, released by one disposer. It carries no
+    // tab NAME on purpose, and this section is the proof: it moved from
+    // Providers to Agents in this very sprint, so a hardcoded tab name would
+    // have gone quietly dead on arrival while its comment still promised that
+    // a daemon coming up is picked up without a reload.
+    state.disposers.push(bindStatusSurface(state.store, {
+        listener: () => renderRows(),
+        elementId: 'harness-accounts-groups',
+    }));
+    state.initialized = true;
+    // The first read must not wait for the poll interval: init runs while the
+    // page may not be visible yet, and the panel would sit on "Checking
+    // daemon…" until the first tick (#125).
+    state.store.refresh();
     renderRows();
-    state.wakeInFlight = (async () => {
-        try {
-            if (pendingRead) await pendingRead.catch(() => {});
-            const resp = await fetchImpl('/api/claudexor/wake', { method: 'POST' });
-            const data = await resp.json().catch(() => ({}));
-            if (resp.ok) {
-                // The bump lives in commitStatusPayload now — one owner for the
-                // read version, so this path does not need its own.
-                commitStatusPayload(data);
-                state.statusEverSettled = true;
-            } else {
-                state.wakeError = wakeErrorIfStillNeeded(String(data?.error || `HTTP ${resp.status}`));
-            }
-        } catch (err) {
-            state.wakeError = wakeErrorIfStillNeeded(String(err?.message || err || 'request failed'));
-        } finally {
-            state.wakeBusy = false;
-            state.wakeInFlight = null;
-        }
-        renderRows();
-    })();
-    return state.wakeInFlight;
+    return true;
 }
 
-export async function refreshStatus({ force = false, fetchImpl = apiFetch } = {}) {
-    // Poll only while the section is actually on screen. Each tick fans out to four
-    // daemon round-trips, and the interval started at app load and never stopped —
-    // so every page in the app paid for them (`.page` is display:none when inactive,
-    // which is exactly what offsetParent reports). #125: the SAME gate used to
-    // suppress the very first fetch too (init runs before the page is shown), so
-    // the section sat on "Checking daemon…" until the 5s interval; a FORCED
-    // refresh (first load, the Refresh button, the poll give-up) skips the gate.
-    const host = document.getElementById('harness-accounts-rows');
-    if (!host) return;
-    if (shouldSkipStatusRefresh({
-        hostVisible: host.offsetParent !== null,
-        hidden: document.hidden,
-        force,
-    })) return;
-    // A wake OWNS the reading while it runs. It ensures the daemon and then
-    // reads, so its answer is the one worth having — and a poll running beside
-    // it is a second writer whose order against it cannot be established from
-    // the client at all: neither request knows when the other's read actually
-    // happened daemon-side. Comparing generations does not settle it either
-    // (either direction discards a genuinely newer reading). Removing the
-    // other writers does: the poll joins here, and the login confirmation
-    // waits the wake out in settleVerdict the same way.
-    if (state.wakeInFlight) return state.wakeInFlight;
-    // SINGLE-FLIGHT. The 5s interval outlives a read that takes tens of seconds,
-    // and each read fans out to four CLI-probing daemon GETs — unguarded, a
-    // visible panel stacks ~6 reads (~24 concurrent probes) against the very
-    // daemon whose slowness this is meant to relieve, and the first response to
-    // land clears the flag while later ones are still running. Callers share the
-    // live read; the interval's next tick starts the next one.
-    if (state.statusInFlight) return state.statusInFlight;
-    const generation = state.readGeneration;
-    state.statusChecking = true;
-    // Repaint BEFORE the request only until the first read SETTLES (success or
-    // failure) — with anything already said, a per-poll repaint is churn, and
-    // against a persistently failing endpoint it flickers muted↔error every tick.
-    if (!state.statusEverSettled) renderRows();
-    state.statusInFlight = (async () => {
-        try {
-            const resp = await fetchImpl('/api/claudexor/status', { cache: 'no-store' });
-            const data = await resp.json().catch(() => ({}));
-            if (generation !== state.readGeneration) return;  // a newer read won
-            if (resp.ok) {
-                commitStatusPayload(data);
-            } else {
-                // The MIRROR of the false absence: a swallowed failure used to
-                // leave the last good payload rendering "Claudexor ready" with
-                // green badges forever. Keep the snapshot — it is the best we
-                // have — but stop presenting it as current.
-                state.statusTransportError = String(data?.error || `HTTP ${resp.status}`);
-            }
-        } catch (err) {
-            if (generation !== state.readGeneration) return;  // a newer read won
-            state.statusTransportError = String(err?.message || err || 'request failed');
-        } finally {
-            state.statusChecking = false;
-            state.statusEverSettled = true;
-            state.statusInFlight = null;
-        }
-        renderRows();
-    })();
-    return state.statusInFlight;
+/**
+ * Tear the section down and REPORT whether login custody was released.
+ *
+ * @returns {Promise<boolean>} `false` = the controller could not prove its job
+ *          cancelled, so it is KEPT (job id and all) and this teardown is
+ *          retryable — call again, or mount again, and the same proven-cancel
+ *          path runs once more. The onboarding wizard consumes the identical
+ *          contract straight off the controller's own `dispose()`.
+ */
+export function destroyHarnessAccounts() {
+    state.lifecycle = state.lifecycle.then(() => _destroy(), () => _destroy());
+    return state.lifecycle;
 }
 
-// #125: wake the visibility-gated refresh the moment the section can actually
-// be seen again — browser tab restored, Settings page shown, Providers subtab
-// activated. Registered once per app lifetime (module flag); each handler
-// calls the UNFORCED refresh, so the gate still filters invisible states.
-let activationHandlersRegistered = false;
-
-function registerActivationHandlers() {
-    if (activationHandlersRegistered) return;
-    activationHandlersRegistered = true;
-    document.addEventListener('visibilitychange', () => {
-        if (!document.hidden) refreshStatus();
-    });
-    window.addEventListener('ouro:page-shown', (event) => {
-        // The boot default subtab does not dispatch a subtab event; page-shown
-        // covers reaching Settings with Providers already active.
-        if (event?.detail?.page === 'settings') refreshStatus();
-    });
-    window.addEventListener('ouro:settings-subtab-shown', (event) => {
-        if (event?.detail?.tab === 'providers') refreshStatus();
-    });
-}
-
-export function initHarnessAccounts() {
-    const refreshBtn = document.getElementById('btn-harness-refresh');
-    refreshBtn?.addEventListener('click', () => {
-        // A sleeping daemon cannot be re-read into existence: there the button
-        // is the owner's explicit start. Live, it stays a plain re-read. Same
-        // predicate the LABEL uses, so the two cannot disagree again.
-        return refreshActionKind(state.payload) === 'refresh'
-            ? refreshStatus({ force: true })
-            : wakeDaemon();
-    });
-    registerActivationHandlers();
-    // Forced: init runs while the page may not be visible yet, and the first
-    // daemon read must not wait 5 seconds for the interval (#125).
-    refreshStatus({ force: true });
-    if (state.pollTimer) clearInterval(state.pollTimer);
-    state.pollTimer = setInterval(refreshStatus, POLL_MS);
+async function _destroy() {
+    for (const dispose of state.disposers.splice(0)) {
+        try { dispose(); } catch (err) { /* a broken disposer must not block the rest */ }
+    }
+    state.initialized = false;
+    const card = state.loginCard;
+    if (!card) return true;
+    // The verdict is the POINT of the async disposer, and dropping it is how a
+    // remount could start a second live login: the probe had the first cancel
+    // answer 503, the controller keep its job id — and the next mount create
+    // another job beside it. A retained controller is kept on purpose so the
+    // cancel can be retried against the same job.
+    const released = await card.dispose();
+    if (released) state.loginCard = null;
+    return released;
 }

@@ -28,6 +28,19 @@ from ouroboros.tools.review_helpers import (
 )
 from ouroboros.tools.review_synthesis import build_scope_review_prompt
 
+# What the coverage manifest calls this delivery (D-12). The value names the
+# DELIVERY — the reviewer retrieved the surface itself — rather than the wire it
+# arrived on; `agent_session` is the transport's own name in `ReviewRouteKind`,
+# and reusing it made the manifest describe the route twice and the delivery not
+# at all.
+#
+# D-12 also asked that readers stay compatible with the old spelling. Measured,
+# there are NO readers: nothing in `ouroboros/` or `web/` reads this key. The
+# manifest is a durable forensic row whose consumer is a person reading it, so
+# the rename cannot break a caller, and a compatibility helper here would be
+# machinery guarding nothing. Stated rather than built.
+AGENTIC_RETRIEVAL_DELIVERY = "agentic_retrieval"
+
 
 def governance_nav_maps(repo_dir: pathlib.Path, doc_paths: Tuple[str, ...]) -> str:
     """The canonical governance docs as navigation maps (5.7).
@@ -82,8 +95,11 @@ def build_scope_session_task(
     SAME builder the api pack uses, so the two deliveries cannot drift apart.
 
     The returned manifest is FORENSICS, not a gate (5.6/D16): it records that
-    coverage is the session's own retrieval — declaredly not host-attested — as
-    the non-blocking ``coverage_incomplete`` fact. The atlas's
+    coverage is the session's own retrieval, and that the host did not observe
+    which files it opened, as the non-blocking
+    ``host_file_read_attestation`` fact. That is a provenance limit on what may
+    be CLAIMED about coverage, not a finding that the review was incomplete
+    (BIBLE P3, retrieving scope reviewers). The atlas's
     ``excluded_sensitive`` class is preserved on the host side (nothing
     sensitive is assembled at all here); what the harness reads with its own
     tools is not host-filtered, and the manifest says so instead of implying an
@@ -140,14 +156,20 @@ def build_scope_session_task(
         critical_calibration=CRITICAL_FINDING_CALIBRATION,
     )
     manifest: Dict[str, Any] = {
-        "delivery": "agent_session",
+        # D-12's ratified spelling. It is deliberately NOT `agent_session`: that
+        # is the TRANSPORT's name (`ReviewRouteKind`), and reusing it here made
+        # the manifest answer "how was this delivered" with the name of the wire
+        # rather than of the delivery. What this field states is that the
+        # reviewer RETRIEVED the surface itself. Nothing reads this key, so the
+        # rename breaks no caller — see the constant's own note.
+        "delivery": AGENTIC_RETRIEVAL_DELIVERY,
         "coverage": "agent_retrieval",
         # Non-blocking by construction (D16): forensics, never a gate, and the
         # fixed_overflow ladder does not apply to sessions (5.7).
-        "coverage_incomplete": True,
+        "host_file_read_attestation": "unobserved",
         "coverage_note": (
             "the reviewer session retrieves context with its own tools; the host "
-            "assembled no pack, so coverage is DECLAREDLY not host-attested"
+            "assembled no pack and does not observe which files the session opened"
         ),
         "excluded_sensitive": {"policy": "preserved", "host_enforced": False},
         "nav_mapped_docs": list(_CANONICAL_CONTEXT_DOCS),
@@ -185,9 +207,10 @@ def _unproven_window_sentence(scope_model: str, phrase: str) -> str:
     disclosure the owner reads and the reason the commit stopped cannot drift."""
     return (
         f"retrieving scope reviewer {scope_model} has a {phrase}, which does not meet "
-        f"the >={SESSION_WINDOW_FLOOR} SOURCED-evidence floor this lower-assurance "
-        "delivery needs to carry a blocking verdict (BIBLE P3: a window that cannot be "
-        "established by evidence is treated as too small, never assumed adequate)."
+        f"the >={SESSION_WINDOW_FLOOR} SOURCED-evidence floor this owner-declared "
+        "agentic delivery needs to carry a blocking verdict (BIBLE P3: a window that "
+        "cannot be established by evidence is treated as too small, never assumed "
+        "adequate)."
     )
 
 

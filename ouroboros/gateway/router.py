@@ -62,11 +62,13 @@ def collect_routes(
         api_ouroboroshub_update,
     )
     from ouroboros.gateway.claudexor_accounts import (
+        api_claudexor_credential_profile,
         api_claudexor_login,
         api_claudexor_login_job,
         api_claudexor_status,
         api_claudexor_wake,
     )
+    from ouroboros.gateway.onboarding import api_onboarding_complete
     from ouroboros.gateway.settings import api_reviewer_slots
     from ouroboros.gateway.mcp import api_mcp_refresh, api_mcp_status, api_mcp_test
     from ouroboros.gateway.models import (
@@ -117,6 +119,7 @@ def collect_routes(
         api_ui_preferences_get,
         api_ui_preferences_post,
     )
+    from ouroboros.gateway.onboarding_host import onboarding_page
     from ouroboros.gateway.settings import (
         api_claude_code_install,
         api_claude_code_status,
@@ -185,7 +188,17 @@ def collect_routes(
             methods=["POST"],
         ),
         *file_browser_routes(),
+        # The onboarding wizard PAGE (one host for desktop/browser/overlay); the
+        # /api/onboarding sibling below stays the readiness probe + legacy body.
+        Route("/onboarding", endpoint=onboarding_page, methods=["GET"]),
         Route("/api/onboarding", endpoint=onboarding),
+        # ONE atomic owner-scoped completion (D-8): replaces the wizard's old
+        # POST /api/settings + POST /api/owner/runtime-mode pair.
+        Route(
+            "/api/onboarding/complete",
+            endpoint=api_onboarding_complete,
+            methods=["POST"],
+        ),
         Route("/api/claude-code/status", endpoint=claude_status),
         Route(
             "/api/claude-code/install",
@@ -247,8 +260,8 @@ def collect_routes(
         Route("/api/mcp/status", endpoint=api_mcp_status, methods=["GET"]),
         Route("/api/mcp/refresh", endpoint=api_mcp_refresh, methods=["POST"]),
         Route("/api/mcp/test", endpoint=api_mcp_test, methods=["POST"]),
-        # Harness Accounts (D30): four thin proxies of the owned Claudexor
-        # daemon's own account surface; zero auth logic on this side.
+        # Agent accounts (D30): thin proxies of the owned Claudexor daemon's
+        # own account surface; zero auth logic on this side.
         Route("/api/reviewer-slots", endpoint=api_reviewer_slots, methods=["GET"]),
         Route("/api/claudexor/status", endpoint=api_claudexor_status, methods=["GET"]),
         Route("/api/claudexor/wake", endpoint=api_claudexor_wake, methods=["POST"]),
@@ -262,6 +275,11 @@ def collect_routes(
             "/api/claudexor/login/{job_id}/input",
             endpoint=api_claudexor_login_job,
             methods=["POST"],
+        ),
+        Route(
+            "/api/claudexor/credential-profiles/{harness}/{profile_id}",
+            endpoint=api_claudexor_credential_profile,
+            methods=["DELETE"],
         ),
         WebSocketRoute("/ws", endpoint=ws_endpoint),
     ]

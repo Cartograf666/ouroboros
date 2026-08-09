@@ -902,7 +902,10 @@ def test_malformed_reviewer_slots_block_plan_review_before_any_dispatch(tmp_path
 
     assert "Invalid reviewer-slot configuration blocks plan review" in result
     assert "not valid JSON" in result
-    assert "Fix Reviewer Slots in Settings" in result
+    # The pointer names a place that EXISTS: D-10 moved these rows out of the
+    # Models tab and renamed the section, so the old wording sent the owner
+    # looking for a heading no tab carries any more.
+    assert "Fix Review lanes on the Agents tab in Settings" in result
 
 
 def _contract_review_text(signal: str) -> str:
