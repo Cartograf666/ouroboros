@@ -43,6 +43,7 @@ from ouroboros.server_runtime import (
 )
 from ouroboros.settings_setup_contract import (
     BUDGET_SETTING_KEYS,
+    SECRET_SETTING_KEYS,
     build_setup_contract,
     parse_budget_setting,
 )
@@ -51,18 +52,6 @@ from ouroboros.utils import append_jsonl, utc_now_iso
 log = logging.getLogger(__name__)
 DEFAULT_PORT = int(os.environ.get("OUROBOROS_SERVER_PORT", "8765"))
 
-_SECRET_SETTING_KEYS = {
-    "OPENROUTER_API_KEY",
-    "OPENAI_API_KEY",
-    "OPENAI_COMPATIBLE_API_KEY",
-    "CLOUDRU_FOUNDATION_MODELS_API_KEY",
-    "GIGACHAT_CREDENTIALS",
-    "GIGACHAT_PASSWORD",
-    "ANTHROPIC_API_KEY",
-    "MINIMAX_API_KEY",
-    "GITHUB_TOKEN",
-    "OUROBOROS_NETWORK_PASSWORD",
-}
 _CUSTOM_SECRET_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
 
 def _get_lan_ip() -> str:
@@ -306,7 +295,10 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
             continue
         if key not in body:
             continue
-        if key in _SECRET_SETTING_KEYS and _looks_masked_secret(body[key]) and merged.get(key):
+        # A mask means "keep the stored secret", so with nothing stored it is
+        # DROPPED: a client echoing back what it was served (the wizard does
+        # exactly that) must not be able to write the marker in as a credential.
+        if key in SECRET_SETTING_KEYS and _looks_masked_secret(body[key]):
             continue
         merged[key] = body[key]
     for key, value in body.items():
@@ -317,7 +309,8 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
             continue
         if text_key.startswith("OUROBOROS_"):
             continue
-        if _looks_masked_secret(value) and merged.get(text_key):
+        # Same rule for owner-defined custom secret keys.
+        if _looks_masked_secret(value):
             continue
         merged[text_key] = value
     return merged
@@ -1113,7 +1106,7 @@ async def api_reviewer_slots(request: Request) -> JSONResponse:
 async def api_settings_get(request: Request) -> JSONResponse:
     settings, _, _ = apply_runtime_provider_defaults(load_settings())
     safe = {k: v for k, v in settings.items()}
-    for key in _SECRET_SETTING_KEYS:
+    for key in SECRET_SETTING_KEYS:
         if safe.get(key):
             safe[key] = (
                 _mask_password_class(safe[key])
@@ -1122,7 +1115,7 @@ async def api_settings_get(request: Request) -> JSONResponse:
             )
     safe["MCP_SERVERS"] = _mask_mcp_servers_payload(safe.get("MCP_SERVERS") or [])
     for key, value in list(safe.items()):
-        if key in _SECRET_SETTING_KEYS or key in _SETTINGS_DEFAULTS:
+        if key in SECRET_SETTING_KEYS or key in _SETTINGS_DEFAULTS:
             continue
         if _CUSTOM_SECRET_KEY_RE.match(str(key)) and value:
             safe[key] = _mask_secret_value(value)
@@ -1133,7 +1126,7 @@ async def api_settings_get(request: Request) -> JSONResponse:
     meta = _build_network_meta(_current_bind_host(request), port)
     meta["custom_secret_keys"] = sorted(
         key for key in settings
-        if key not in _SECRET_SETTING_KEYS
+        if key not in SECRET_SETTING_KEYS
         and key not in _SETTINGS_DEFAULTS
         and _CUSTOM_SECRET_KEY_RE.match(str(key))
         and settings.get(key)

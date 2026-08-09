@@ -287,28 +287,60 @@ def test_onboarding_frontend_uses_base_url_first_compatible_validation():
     assert "const hasRemote = keyValues.some(([, value]) => value);" not in source
 
 
-def test_build_onboarding_html_contains_multistep_markers():
+def test_build_onboarding_html_serves_a_real_page_with_linked_modules():
+    """ONE onboarding host: the page LINKS its stylesheet and its ES module from
+    /static instead of inlining them, so the wizard's steps can import ordinary
+    web/modules/* code. The bootstrap stays inline (it is per-install state)."""
     html = build_onboarding_html({})
 
+    assert '<script type="module" src="/static/modules/onboarding_wizard.js"></script>' in html
+    assert '<link rel="stylesheet" href="/static/onboarding.css">' in html
     assert '"contract": {' in html
     assert '"providerFields": [' in html
-    assert 'const STEP_ORDER = bootstrap.stepOrder || (SETUP_CONTRACT.steps || []).map' in html
-    assert "Add your access" in html
-    assert "Keys + local" in html
-    assert "Choose models" in html
-    assert "model slots" in html
-    assert "Choose review mode" in html
-    assert "Set your budget" in html
-    assert "Local model settings" in html
     assert "openai::gpt-5.6-terra" in html
     assert "openai::gpt-5.6-luna" in html
     assert "anthropic::claude-sonnet-5" in html
     assert "minimax::MiniMax-M3" in html
     assert "minimax::MiniMax-M2.7" in html
-    assert "OPENAI_BASE_URL: ''" not in html
-    assert "OPENAI_COMPATIBLE_API_KEY: ''" not in html
-    assert "OPENAI_COMPATIBLE_BASE_URL: ''" not in html
-    assert "CLOUDRU_FOUNDATION_MODELS_BASE_URL: ''" not in html
+    # The wizard's own source is no longer copied into the page body.
+    assert "const STEP_ORDER = bootstrap.stepOrder" not in html
+
+
+def test_onboarding_bootstrap_cannot_break_out_of_its_inline_script():
+    """A stored provider value containing ``</script>`` must not close the
+    element. ensure_ascii does not escape ``<``; the renderer does."""
+    html = build_onboarding_html({"OPENAI_COMPATIBLE_BASE_URL": "https://x/</script><b>"})
+
+    assert "</script><b>" not in html
+    assert "\\u003c/script>\\u003cb>" in html
+
+
+def test_onboarding_wizard_module_keeps_its_multistep_contract():
+    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
+
+    assert "const STEP_ORDER = bootstrap.stepOrder || (SETUP_CONTRACT.steps || []).map" in source
+    assert "Add your access" in source or "Local model settings" in source
+    assert "function detectProviderProfile()" in source
+    assert "function activeProviderProfile()" in source
+    assert "function profileLabel(profile)" in source
+    assert "function nextButtonShouldBeDisabled()" in source
+    assert "function syncCurrentStepActionState()" in source
+    assert "return 'direct-multi';" in source
+    assert "PROVIDER_FIELDS.map((field) => [field.settingKey, trim(state[field.stateKey])])" in source
+    assert "MODEL_SLOTS.map((slot) => [slot.settingKey, trim(state[slot.stateKey])])" in source
+    assert "LOCAL_ROUTING_MODE: trim(state.localSource) ? (trim(state.localRoutingMode) || 'cloud') : 'cloud'" in source
+
+
+def test_onboarding_steps_and_stylesheet_keep_their_owner_facing_shape():
+    contract = build_setup_contract("web")
+    titles = {step["title"] for step in contract["steps"]}
+    rails = {step["railCopy"] for step in contract["steps"]}
+    css = (REPO / "web" / "onboarding.css").read_text(encoding="utf-8")
+
+    assert {"Add your access", "Choose models", "Choose review mode", "Set your budget"} <= titles
+    assert {"Keys + local", "model slots"} <= rails
+    assert "@media (max-width: 720px)" in css
+    assert "scroll-snap-type: x proximity;" in css
 
 
 def test_build_onboarding_html_accepts_web_host_mode():
@@ -316,22 +348,6 @@ def test_build_onboarding_html_accepts_web_host_mode():
 
     assert '"hostMode": "web"' in html
     assert '"supportsLocalRuntimeControls": true' in html
-    assert "@media (max-width: 720px)" in html
-    assert "scroll-snap-type: x proximity;" in html
-
-
-def test_build_onboarding_html_adapts_to_multi_provider_access():
-    html = build_onboarding_html({})
-
-    assert "function detectProviderProfile()" in html
-    assert "function activeProviderProfile()" in html
-    assert "function profileLabel(profile)" in html
-    assert "function nextButtonShouldBeDisabled()" in html
-    assert "function syncCurrentStepActionState()" in html
-    assert "return 'direct-multi';" in html
-    assert "PROVIDER_FIELDS.map((field) => [field.settingKey, trim(state[field.stateKey])])" in html
-    assert "MODEL_SLOTS.map((slot) => [slot.settingKey, trim(state[slot.stateKey])])" in html
-    assert "LOCAL_ROUTING_MODE: trim(state.localSource) ? (trim(state.localRoutingMode) || 'cloud') : 'cloud'" in html
 
 
 def test_setup_contract_groups_rarely_used_providers():
@@ -354,18 +370,18 @@ def test_setup_contract_groups_rarely_used_providers():
     }
 
 
-def test_build_onboarding_html_collapses_rarely_used_providers():
-    html = build_onboarding_html({})
+def test_onboarding_wizard_collapses_rarely_used_providers():
+    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
 
     # Second access-step collapse hosting the "more" provider group.
-    assert 'data-collapse="more-providers"' in html
-    assert 'data-collapse="local-model"' in html
-    assert "More options" in html
-    assert "hasMoreProviderValue()" in html
+    assert 'data-collapse="more-providers"' in source
+    assert 'data-collapse="local-model"' in source
+    assert "More options" in source
+    assert "hasMoreProviderValue()" in source
     # Both collapses bind through scoped data-collapse selectors; the old
     # singular selector only ever reached the FIRST details element.
-    assert "root.querySelector('.wizard-collapse')" not in html
-    assert "moreProvidersOpen" in html
+    assert "root.querySelector('.wizard-collapse')" not in source
+    assert "moreProvidersOpen" in source
 
 
 def test_setup_contract_has_no_secret_values():
@@ -395,6 +411,142 @@ def test_setup_contract_has_no_secret_values():
     assert initial["providerProfile"] == "minimax"
     assert initial["mainModel"] == "minimax::MiniMax-M3"
     assert initial["lightModel"] == "minimax::MiniMax-M2.7"
+
+
+# --- The served page must not hand back a stored credential -----------------
+# The onboarding page is an unauthenticated GET on every host, and a non-loopback
+# bind without OUROBOROS_NETWORK_PASSWORD is a supported configuration — so any
+# client on the LAN could read whatever the bootstrap carries.
+
+_SECRET_CANARIES = {
+    "OPENROUTER_API_KEY": "sk-or-SECRETCANARY123",
+    "OPENAI_API_KEY": "sk-openai-SECRETCANARY124",
+    "OPENAI_COMPATIBLE_API_KEY": "compat-SECRETCANARY125",
+    "CLOUDRU_FOUNDATION_MODELS_API_KEY": "cloudru-SECRETCANARY126",
+    "MINIMAX_API_KEY": "minimax-SECRETCANARY127",
+    "ANTHROPIC_API_KEY": "sk-ant-SECRETCANARY128",
+    "GIGACHAT_CREDENTIALS": "giga-SECRETCANARY129",
+    "GIGACHAT_PASSWORD": "gigapw-SECRETCANARY130",
+    "GITHUB_TOKEN": "ghp-SECRETCANARY131",
+    "OUROBOROS_NETWORK_PASSWORD": "netpw-SECRETCANARY132",
+}
+
+
+def test_every_secret_class_field_is_covered_by_the_canary_sweep():
+    """The sweep below is only a class proof while it actually covers the class.
+
+    Both authorities: the canonical credential keys, and every password-typed
+    provider field (a new provider is usually added as the latter first).
+    """
+    from ouroboros.settings_setup_contract import (
+        SECRET_SETTING_KEYS,
+        secret_provider_setting_keys,
+    )
+
+    assert SECRET_SETTING_KEYS <= set(_SECRET_CANARIES)
+    assert secret_provider_setting_keys() <= set(_SECRET_CANARIES)
+
+
+def test_the_served_wizard_never_carries_a_stored_credential():
+    """Not one masked field — every secret-class field, on the renderer both
+    page routes share."""
+    html = build_onboarding_html(dict(_SECRET_CANARIES), host_mode="web")
+
+    leaked = sorted(key for key, value in _SECRET_CANARIES.items() if value in html)
+    assert leaked == [], f"credential served verbatim in the onboarding page: {leaked}"
+
+
+def test_a_configured_credential_is_reported_as_a_marker_not_a_prefix():
+    """The wizard still learns WHICH providers are configured — that is the only
+    fact it needs — and the marker leaks nothing about the value: no prefix, no
+    length, nothing that narrows a guess."""
+    from ouroboros.settings_setup_contract import (
+        CONFIGURED_SECRET_PLACEHOLDER,
+        secret_provider_setting_keys,
+    )
+
+    bootstrap = build_setup_bootstrap(dict(_SECRET_CANARIES), "web")
+    state = bootstrap["initialState"]
+    by_key = {field["settingKey"]: field for field in bootstrap["contract"]["providerFields"]}
+
+    assert bootstrap["secretPlaceholder"] == CONFIGURED_SECRET_PLACEHOLDER
+    for setting_key in secret_provider_setting_keys():
+        value = state[by_key[setting_key]["stateKey"]]
+        assert value == CONFIGURED_SECRET_PLACEHOLDER, setting_key
+        # Not a redaction of the secret: no leading characters of it survive.
+        assert not _SECRET_CANARIES[setting_key].startswith(value[:4])
+
+    # An UNCONFIGURED provider still reads as unconfigured, or the wizard would
+    # claim every key is set.
+    empty = build_setup_bootstrap({}, "web")["initialState"]
+    assert empty[by_key["OPENROUTER_API_KEY"]["stateKey"]] == ""
+
+
+def test_a_wizard_save_that_touches_no_credential_leaves_the_stored_one_intact():
+    """The untouched field posts the MARKER back. It must resolve to the stored
+    secret — byte for byte — and the marker must never reach settings.json."""
+    from ouroboros.settings_setup_contract import (
+        CONFIGURED_SECRET_PLACEHOLDER,
+        secret_provider_setting_keys,
+    )
+
+    stored = dict(_SECRET_CANARIES)
+    payload = _base_payload()
+    for setting_key in secret_provider_setting_keys():
+        payload[setting_key] = CONFIGURED_SECRET_PLACEHOLDER
+
+    prepared, error = prepare_onboarding_settings(payload, stored)
+
+    assert error is None
+    for setting_key in secret_provider_setting_keys():
+        assert prepared[setting_key] == stored[setting_key], setting_key
+    assert CONFIGURED_SECRET_PLACEHOLDER not in prepared.values()
+
+
+def test_the_marker_can_never_become_a_credential():
+    """With nothing stored, the marker resolves to EMPTY rather than being
+    written as if the owner had typed it — otherwise a client echoing back what
+    it was served could author a fake key, and the install would look configured
+    while every provider call failed."""
+    from ouroboros.settings_setup_contract import CONFIGURED_SECRET_PLACEHOLDER
+
+    payload = _base_payload()
+    payload["OPENROUTER_API_KEY"] = CONFIGURED_SECRET_PLACEHOLDER
+    payload["OPENAI_API_KEY"] = "sk-openai-1234567890"
+
+    prepared, error = prepare_onboarding_settings(payload, {})
+
+    assert error is None
+    assert prepared["OPENROUTER_API_KEY"] == ""
+    assert prepared["OPENAI_API_KEY"] == "sk-openai-1234567890"
+
+
+def test_the_generic_settings_merge_also_refuses_to_store_a_mask():
+    """The other save path the wizard can take. Same rule, so the class is closed
+    wherever a masked value is echoed back, not just in the setup validator."""
+    from ouroboros.gateway.settings import _merge_settings_payload
+
+    merged = _merge_settings_payload(
+        {"OPENROUTER_API_KEY": "sk-or-v1-stored"},
+        {"OPENROUTER_API_KEY": "***set***", "ANTHROPIC_API_KEY": "***set***"},
+    )
+
+    assert merged["OPENROUTER_API_KEY"] == "sk-or-v1-stored"
+    assert merged.get("ANTHROPIC_API_KEY", "") == ""
+
+
+def test_clearing_a_credential_field_still_clears_the_stored_secret():
+    """The marker means "untouched", never "locked": an emptied field is an
+    explicit owner decision and must still delete the stored key."""
+    stored = {"OPENROUTER_API_KEY": "sk-or-v1-stored", "OPENAI_API_KEY": "sk-openai-1234567890"}
+    payload = _base_payload()
+    payload["OPENROUTER_API_KEY"] = ""
+    payload["OPENAI_API_KEY"] = "sk-openai-1234567890"
+
+    prepared, error = prepare_onboarding_settings(payload, stored)
+
+    assert error is None
+    assert prepared["OPENROUTER_API_KEY"] == ""
 
 
 def test_api_settings_exposes_setup_contract_without_secrets(tmp_path):
@@ -428,45 +580,48 @@ def test_api_settings_exposes_setup_contract_without_secrets(tmp_path):
             item.stop()
 
 
-def test_build_onboarding_html_includes_claude_runtime_cta_and_host_transports():
-    desktop_html = build_onboarding_html({}, host_mode="desktop")
-    web_html = build_onboarding_html({}, host_mode="web")
+def test_onboarding_wizard_keeps_the_claude_runtime_cta_on_http_transports():
+    """The Claude-runtime card stays, but its status/repair calls are ordinary
+    endpoints on every host now — there is no parallel desktop bridge for them."""
+    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
 
-    assert "Claude Runtime" in desktop_html or "Claude runtime" in desktop_html
-    assert "Skip for now" in desktop_html
-    assert "window.pywebview.api.claude_code_status" in desktop_html
-    assert "window.pywebview.api.install_claude_code" in desktop_html
-    assert "/api/claude-code/status" in web_html
-    assert "/api/claude-code/install" in web_html
+    assert "Claude Runtime" in source or "Claude runtime" in source
+    assert "Skip for now" in source
+    assert "/api/claude-code/status" in source
+    assert "/api/claude-code/install" in source
 
 
-def _launcher_has_onboarding_bridge() -> bool:
-    launcher = REPO / "launcher.py"
-    if not launcher.exists():
+def _launcher_hosts_onboarding_on_the_live_server() -> bool:
+    host = REPO / "ouroboros" / "launcher_onboarding.py"
+    if not host.exists() or not (REPO / "launcher.py").exists():
         return False
-    source = launcher.read_text(encoding="utf-8")
+    source = host.read_text(encoding="utf-8")
     return all(marker in source for marker in (
         "has_startup_ready_provider(settings)",
         "prepare_onboarding_settings(data, settings)",
-        'build_onboarding_html(settings, host_mode="desktop")',
-        "def claude_code_status(self) -> dict:",
-        "def install_claude_code(self) -> dict:",
+        "def present_first_run_onboarding(",
     ))
 
-_LAUNCHER_HAS_ONBOARDING_BRIDGE = _launcher_has_onboarding_bridge()
+_LAUNCHER_HOSTS_ONBOARDING = _launcher_hosts_onboarding_on_the_live_server()
 
 @pytest.mark.skipif(
-    not _LAUNCHER_HAS_ONBOARDING_BRIDGE,
-    reason="launcher.py does not contain onboarding bridge (may be an older bundle or post-refactor version)",
+    not _LAUNCHER_HOSTS_ONBOARDING,
+    reason="launcher.py does not host onboarding (may be an older bundle or post-refactor version)",
 )
-def test_launcher_uses_shared_onboarding_and_claude_cli_bridge():
-    source = (REPO / "launcher.py").read_text(encoding="utf-8")
+def test_launcher_points_first_run_onboarding_at_the_live_server():
+    """The desktop setup window loads the SAME served page a browser owner sees,
+    at the authoritative loopback port — not a detached pre-server document."""
+    source = (REPO / "ouroboros" / "launcher_onboarding.py").read_text(encoding="utf-8")
+    launcher_source = (REPO / "launcher.py").read_text(encoding="utf-8")
 
+    assert "_present_first_run_onboarding(" in launcher_source
+    assert 'url=f"http://127.0.0.1:{port}/onboarding"' in source
     assert "has_startup_ready_provider(settings)" in source
     assert "prepare_onboarding_settings(data, settings)" in source
-    assert 'build_onboarding_html(settings, host_mode="desktop")' in source
-    assert "def claude_code_status(self) -> dict:" in source
-    assert "def install_claude_code(self) -> dict:" in source
+    # The desktop bridge is window lifecycle + the disclosed legacy save only.
+    assert "def claude_code_status(self) -> dict:" not in source
+    assert "def install_claude_code(self) -> dict:" not in source
+    assert "def fetch_compatible_models(self" not in source
 
 
 def test_web_style_contains_onboarding_overlay_shell():
@@ -484,6 +639,20 @@ def test_onboarding_overlay_surfaces_restart_required_message():
     assert "showRestartRequiredOverlay" in source
     assert "event.data.restart_required" in source
     assert "Continue in current mode" in source
+
+
+def test_onboarding_overlay_frames_the_served_page_not_an_inlined_document():
+    """The blocking overlay of an unconfigured running app still appears, but it
+    frames the one onboarding host so the wizard can import web/modules/*."""
+    source = (REPO / "web" / "modules" / "onboarding_overlay.js").read_text(encoding="utf-8")
+
+    assert "frame.src = '/onboarding'" in source
+    assert "frame.srcdoc" not in source
+    # 204 from the readiness probe still means "configured — no overlay", and it
+    # is the ONLY answer that takes the blocking shell down (see
+    # web/tests/onboarding_overlay.test.js for the behavioural pin).
+    assert "if (response.status === 204) {" in source
+    assert "removeOverlay();" in source
 
 
 # --- v6.82.0 rev.3-2: the wizard save authors safety "light" for NEW installs ---
@@ -614,10 +783,10 @@ def test_launcher_binds_the_settings_writer_the_wizard_callback_calls():
     """The desktop wizard save callback calls `save_settings(...)` directly; pin that
     the name is BOUND in launcher's namespace (a NameError there would break every
     fresh desktop onboarding, and launcher.py is outside most deterministic gates)."""
-    import launcher
+    from ouroboros import launcher_onboarding
 
-    assert callable(getattr(launcher, "save_settings", None))
-    source = pathlib.Path(launcher.__file__).read_text(encoding="utf-8")
+    assert callable(getattr(launcher_onboarding, "save_settings", None))
+    source = pathlib.Path(launcher_onboarding.__file__).read_text(encoding="utf-8")
     assert "onboarding_safety_default=wizard_authors_safety" in source
 
 
@@ -693,3 +862,11 @@ def test_onboarding_frontend_exempts_unchanged_prefilled_keys_from_length_check(
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
 
     assert "value.length < 10 && value !== trim(INITIAL_STATE[field.stateKey])" in source
+
+    # The exemption is now load-bearing for EVERY configured install, not just
+    # legacy short keys: a prefilled field holds the configured-marker, which is
+    # shorter than the minimum. Without the exemption the wizard would refuse to
+    # advance on any install that already has a provider key.
+    from ouroboros.settings_setup_contract import CONFIGURED_SECRET_PLACEHOLDER
+
+    assert len(CONFIGURED_SECRET_PLACEHOLDER) < 10

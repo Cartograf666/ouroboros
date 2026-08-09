@@ -118,6 +118,7 @@ def collect_routes(
         api_ui_preferences_get,
         api_ui_preferences_post,
     )
+    from ouroboros.gateway.onboarding_host import onboarding_page
     from ouroboros.gateway.settings import (
         api_claude_code_install,
         api_claude_code_status,
@@ -186,6 +187,9 @@ def collect_routes(
             methods=["POST"],
         ),
         *file_browser_routes(),
+        # The onboarding wizard PAGE (one host for desktop/browser/overlay); the
+        # /api/onboarding sibling below stays the readiness probe + legacy body.
+        Route("/onboarding", endpoint=onboarding_page, methods=["GET"]),
         Route("/api/onboarding", endpoint=onboarding),
         # ONE atomic owner-scoped completion (D-8): replaces the wizard's old
         # POST /api/settings + POST /api/owner/runtime-mode pair.

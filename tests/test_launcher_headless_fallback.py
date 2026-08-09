@@ -384,46 +384,39 @@ def test_headless_signal_handler_only_sets_event(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_headless_first_run_wizard_returns_false_without_touching_webview(
-    monkeypatch, capsys
-):
-    import launcher
+def test_headless_first_run_onboarding_opens_no_window(monkeypatch, capsys):
+    """Browser fallback is UNCHANGED by the server-first reordering: no setup
+    window is opened, the owner is told onboarding lives in the browser, and the
+    caller continues (the blocking /api/onboarding overlay is the surface)."""
+    from ouroboros import launcher_onboarding
 
     # None sentinel: any `import webview` after this raises ImportError, so a
-    # passing test proves the headless wizard path never touches webview.
+    # passing test proves the headless path never touches webview.
     monkeypatch.setitem(sys.modules, "webview", None)
-    monkeypatch.setattr(launcher, "_headless", True)
-    monkeypatch.setattr(
-        launcher,
-        "apply_runtime_provider_defaults",
-        lambda settings: (dict(settings), False, []),
-    )
-    monkeypatch.setattr(launcher, "has_startup_ready_provider", lambda settings: False)
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {})
-    monkeypatch.setattr(launcher, "_apply_settings_to_env", lambda settings: None)
 
-    # False → the existing caller logs "Launching anyway" and continues to
-    # server start, where browser onboarding (/api/onboarding overlay) serves
-    # the fresh install. Never sys.exit here.
-    assert launcher._run_first_run_wizard() is False
+    outcome = launcher_onboarding.present_first_run_onboarding({}, 8765, headless=True)
+
+    assert outcome == {"saved": False, "restart_required": False}
     assert "browser" in capsys.readouterr().out
 
 
-def test_first_run_wizard_skips_wizard_when_provider_ready_even_headless(monkeypatch):
-    import launcher
+def test_first_run_preparation_reports_whether_onboarding_is_due(monkeypatch):
+    from ouroboros import launcher_onboarding
 
     monkeypatch.setitem(sys.modules, "webview", None)
-    monkeypatch.setattr(launcher, "_headless", True)
     monkeypatch.setattr(
-        launcher,
+        launcher_onboarding,
         "apply_runtime_provider_defaults",
         lambda settings: (dict(settings), False, []),
     )
-    monkeypatch.setattr(launcher, "has_startup_ready_provider", lambda settings: True)
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {})
-    monkeypatch.setattr(launcher, "_apply_settings_to_env", lambda settings: None)
+    monkeypatch.setattr(launcher_onboarding, "load_settings", lambda: {})
+    monkeypatch.setattr(launcher_onboarding, "_apply_settings_to_env", lambda settings: None)
 
-    assert launcher._run_first_run_wizard() is True
+    monkeypatch.setattr(launcher_onboarding, "has_startup_ready_provider", lambda settings: True)
+    assert launcher_onboarding.prepare_first_run_settings()[1] is False
+
+    monkeypatch.setattr(launcher_onboarding, "has_startup_ready_provider", lambda settings: False)
+    assert launcher_onboarding.prepare_first_run_settings()[1] is True
 
 
 # ---------------------------------------------------------------------------

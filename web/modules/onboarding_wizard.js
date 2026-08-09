@@ -1,15 +1,11 @@
-(() => {
-    // Self-contained IIFE mirror of utils.escapeHtmlAttr; SSOT drift is tested.
-    function escapeHtml(value) {
-        return String(value ?? '')
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;')
-            .replace(/`/g, '&#96;');
-    }
+// The wizard is served as a real ES module now, so it uses the SPA's shared
+// helpers directly instead of carrying private copies that could drift from
+// them (the escaping is a security contract, and the request wrapper is the
+// gateway boundary).
+import { fetchJson } from './api_client.js';
+import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
+(() => {
         const bootstrap = window.__OURO_ONBOARDING_BOOTSTRAP__ || {};
         const SETUP_CONTRACT = bootstrap.contract || {};
         const HOST_MODE = bootstrap.hostMode || 'desktop';
@@ -34,6 +30,10 @@
         const LOCAL_PRESETS = bootstrap.localPresets || {};
         const MODEL_SUGGESTIONS = bootstrap.modelSuggestions || [];
         const INITIAL_STATE = bootstrap.initialState || {};
+        // What a stored credential looks like in INITIAL_STATE: a marker saying
+        // "configured", not the secret. Posting it back means "leave it alone";
+        // the shared server-side validator resolves it to the stored value.
+        const SECRET_PLACEHOLDER = bootstrap.secretPlaceholder || '';
         const root = document.getElementById('root');
 
     const state = Object.assign({
@@ -90,8 +90,18 @@
         return moreProviderFields().some((field) => trim(state[field.stateKey]).length > 0);
     }
 
+    // A credential prefilled from disk arrives as SECRET_PLACEHOLDER, never as
+    // the value, so "is this configured?" can no longer be answered by length.
+    // The length rule stays for what the owner types here: it is the client
+    // mirror of the server's too-short check.
+    function isConfiguredCredential(value) {
+        const text = trim(value);
+        if (!text) return false;
+        return text === SECRET_PLACEHOLDER || text.length >= 10;
+    }
+
     function hasAnthropicKeyConfigured() {
-        return trim(state.anthropicKey).length >= 10;
+        return isConfiguredCredential(state.anthropicKey);
     }
 
     function shouldShowClaudeCliCta() {
@@ -110,7 +120,7 @@
         function detectProviderProfile() {
             const configured = Object.fromEntries(PROVIDER_FIELDS.map((field) => [
                 field.settingKey,
-                trim(state[field.stateKey]).length >= 10,
+                isConfiguredCredential(state[field.stateKey]),
             ]));
             const hasOpenrouter = configured.OPENROUTER_API_KEY;
             const hasCompatible = trim(state.compatibleBaseUrl).length > 0;
@@ -312,14 +322,7 @@
         render();
     }
 
-    async function apiRequest(url, init = {}) {
-        const response = await fetch(url, init);
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok) {
-            throw new Error(data.error || `HTTP ${response.status}`);
-        }
-        return data;
-    }
+    const apiRequest = fetchJson;
 
     function applyClaudeCliStatus(payload = {}) {
         const ready = Boolean(payload.ready);
@@ -1234,40 +1237,102 @@
             syncCurrentStepActionState();
         }
 
-    async function saveWizardPayload(payload) {
-        if (HOST_MODE === 'web') {
-            const runtimeMode = trim(state.runtimeMode) || 'advanced';
-            await apiRequest('/api/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-            });
-            const runtimeResult = await apiRequest('/api/owner/runtime-mode', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ mode: runtimeMode }),
-            });
+    // --- Completion ---------------------------------------------------------
+    // The wizard runs against a live gateway on every host, so completion has one
+    // shape: persist, then tell whichever shell embeds this page that setup is
+    // done. Only the announcement differs (embedded frame / desktop setup window
+    // / plain browser tab).
+
+    const ONBOARDING_COMPLETE_ENDPOINT = '/api/onboarding/complete';
+
+    function announceCompletion(result) {
+        const restartRequired = Boolean(result?.restart_required);
+        const runtimeMode = trim(result?.runtime_mode) || trim(state.runtimeMode) || 'advanced';
+        if (window.parent && window.parent !== window) {
             // Target our own origin explicitly (paired with the receiver's
             // origin check) instead of broadcasting to any embedding page.
-            const _targetOrigin = window.location.origin === 'null'
+            const targetOrigin = window.location.origin === 'null'
                 ? (window.parent?.location?.origin ?? '*')
                 : window.location.origin;
-            window.parent?.postMessage({
+            window.parent.postMessage({
                 type: 'ouroboros:onboarding-complete',
-                restart_required: Boolean(runtimeResult?.restart_required),
-                runtime_mode: runtimeResult?.runtime_mode || runtimeMode,
-            }, _targetOrigin);
-            if (!window.parent || window.parent === window) {
-                window.location.replace('/');
-            }
-            return 'ok';
+                restart_required: restartRequired,
+                runtime_mode: runtimeMode,
+            }, targetOrigin);
+            return;
         }
-        if (!window.pywebview?.api?.save_wizard) {
-            throw new Error('Desktop onboarding bridge is unavailable.');
+        if (window.pywebview?.api?.onboarding_finished) {
+            // Desktop setup window: the launcher owns both this window and the
+            // managed server process, so it closes the window and recycles the
+            // server itself instead of asking the owner to restart the app.
+            window.pywebview.api.onboarding_finished({
+                ok: true,
+                restart_required: restartRequired,
+                runtime_mode: runtimeMode,
+            });
+            return;
         }
+        window.location.replace('/');
+    }
+
+    async function completeOnboardingAtomically(payload) {
+        // SEAM (D-8): one atomic completion — server-side fresh-install proof,
+        // structural provider gate, optional agent-preset compilation, a single
+        // persist, then supervisor start. Until that endpoint ships, an absent
+        // route answers 404/405 here and the caller keeps today's behaviour
+        // rather than breaking first-run.
+        const response = await fetch(ONBOARDING_COMPLETE_ENDPOINT, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        if (response.status === 404 || response.status === 405) return null;
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        return data && typeof data === 'object' ? data : {};
+    }
+
+    async function saveWizardThroughDesktopBridge(payload) {
+        // LEGACY FALLBACK, retained only until the atomic endpoint above ships:
+        // it is the one path that may author the fresh-install `light` safety
+        // coverage, which the generic settings endpoint must never be able to do.
         const result = await window.pywebview.api.save_wizard(payload);
         if (result !== 'ok') throw new Error(result || 'Failed to save onboarding settings.');
-        return result;
+        // The launcher wrote settings.json behind the running server's back, so
+        // the managed process has to be recycled before it can adopt them.
+        return { ok: true, restart_required: true };
+    }
+
+    async function saveWizardThroughSettingsPair(payload) {
+        // LEGACY FALLBACK: today's two-write web path (generic settings save,
+        // then the dedicated owner runtime-mode write).
+        const runtimeMode = trim(state.runtimeMode) || 'advanced';
+        await apiRequest('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const runtimeResult = await apiRequest('/api/owner/runtime-mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: runtimeMode }),
+        });
+        return {
+            ok: true,
+            restart_required: Boolean(runtimeResult?.restart_required),
+            runtime_mode: runtimeResult?.runtime_mode || runtimeMode,
+        };
+    }
+
+    async function saveWizardPayload(payload) {
+        let result = await completeOnboardingAtomically(payload);
+        if (!result) {
+            result = window.pywebview?.api?.save_wizard
+                ? await saveWizardThroughDesktopBridge(payload)
+                : await saveWizardThroughSettingsPair(payload);
+        }
+        announceCompletion(result);
+        return 'ok';
     }
 
     async function saveWizard() {
