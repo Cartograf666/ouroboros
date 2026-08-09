@@ -1292,12 +1292,21 @@ def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any) ->
     overwritten — how a folder came to be is a historical fact, and this branch
     only runs when the project had no usable folder at all.
 
-    Provisioning is slow (a real ``git init`` + seed commit), so the bind at the end
-    is ATOMIC (``set_working_dir_if_absent``, T2-7) rather than a second unlocked
+    Provisioning is slow (a real ``git init`` + seed commit), so a FIRST bind is
+    ATOMIC (``set_working_dir_if_absent``, T2-7) rather than a second unlocked
     write: if another writer bound a place while this one was digging, the winner's
     folder is returned untouched and the abandoned genesis tree is LOGGED — it lives
     under the durable projects root, which is never GC-pruned, so an unreported loss
     would be an orphan forever.
+
+    A REPLACEMENT is a different write and must stay one. This function also runs
+    when the row already names a folder that has since VANISHED, and there the
+    "only if absent" rule is exactly wrong: it declines, the caller reports a
+    concurrent bind that never happened, and the path handed back is the
+    non-existent one — while the tree just provisioned is orphaned under a root
+    nothing ever prunes. So the empty case claims atomically and the stale case
+    overwrites, deliberately, with ``update_project``. Provenance still follows the
+    historical-fact rule: it is stamped only when the row carries nothing.
     """
     entry = get_project(drive_root, project_id)
     if entry is None:
@@ -1316,6 +1325,19 @@ def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any) ->
             # recognizable shared root (binding identity stays the task_id). (I, v6.39)
             dir_name=str(entry.get("name") or ""),
         )
+        if existing:
+            # The row names a folder; it is simply GONE. Replacing it is the whole
+            # point of this call, so the write is unconditional.
+            fields: Dict[str, Any] = {"working_dir": str(handle.path)}
+            if str(entry.get("provenance") or "").strip() in ("", "none"):
+                fields["provenance"] = "genesis"
+            if update_project(drive_root, entry["id"], **fields) is not None:
+                return str(handle.path)
+            log.warning(
+                "Project %s is no longer active; genesis tree %s was not bound",
+                entry["id"], handle.path,
+            )
+            return ""
         bound, claimed = set_working_dir_if_absent(
             drive_root, entry["id"], str(handle.path), provenance="genesis"
         )
