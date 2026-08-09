@@ -22,7 +22,7 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
-from ouroboros.contracts.chat_id_policy import project_chat_id
+from ouroboros.contracts.chat_id_policy import MAIN_THREAD_ID, project_chat_id, thread_chat_id
 from ouroboros.contracts.schema_versions import with_schema_version
 from ouroboros.project_facts import sanitize_project_id
 from ouroboros.utils import atomic_write_json, iter_jsonl_objects, read_json_dict, utc_now_iso
@@ -46,6 +46,20 @@ PROJECT_DELETING = "deleting"
 PROJECT_TOMBSTONED = "tombstoned"
 PROJECT_LIFECYCLES = frozenset({PROJECT_ACTIVE, PROJECT_DELETING, PROJECT_TOMBSTONED})
 _DEPRECATED_CHAT_IDS_EVENTS: set[str] = set()
+
+# Threads (project-threads T0). A project row carries an ADDITIVE ``threads: []``
+# list of EXTRA threads; thread #0 is never stored — it is projected at read time
+# from the project's own chat_id/name/timestamps/revision, and the top-level
+# ``chat_id`` stays its compatibility alias. Nothing is rewritten on disk, so a
+# legacy row (and any row minted by reconcile) reads as a one-thread project.
+THREAD_NAME_MAX = PROJECT_NAME_MAX
+# Bound the retry walk when a minted thread chat id is already reserved. Each
+# step is a fresh deterministic pre-image, so exhausting this many is a
+# registry-wide alarm, not a routine outcome.
+_THREAD_ID_MINT_ATTEMPTS = 64
+# Drive roots whose duplicate-chat-id load scan already reported (once per
+# process per root — the scan is an alarm, not a per-read log flood).
+_DUPLICATE_CHAT_ID_REPORTED: set = set()
 
 
 @contextmanager
@@ -92,6 +106,7 @@ def _load(drive_root: Any) -> Dict[str, Any]:
         for p in data["projects"]
         if isinstance(p, dict) and p.get("id")
     ]
+    _report_duplicate_chat_ids(drive_root, data["projects"])
     return data
 
 
@@ -106,7 +121,149 @@ def _normalize_project_row(value: Dict[str, Any]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             row[field] = 0
     row["delete_error"] = str(row.get("delete_error") or "")
+    row["threads"] = _normalize_thread_rows(row.get("threads"))
     return row
+
+
+def _normalize_thread_rows(value: Any) -> List[Dict[str, Any]]:
+    """Normalize the ADDITIVE extra-thread list of a project row (read-only).
+
+    A legacy row has no ``threads`` key at all and normalizes to ``[]`` — i.e.
+    exactly one (projected) thread. Rows are dropped rather than repaired when
+    they carry no usable id/chat_id, and thread id ``0`` is never accepted from
+    storage: thread #0 is synthesized from the project itself, so a stored
+    duplicate would be a second, silently disagreeing truth.
+    """
+    out: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+    if not isinstance(value, list):
+        return out
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            thread_id = int(raw.get("id"))
+            chat_id = int(raw.get("chat_id"))
+        except (TypeError, ValueError):
+            continue
+        if thread_id <= MAIN_THREAD_ID or not chat_id or thread_id in seen_ids:
+            continue
+        seen_ids.add(thread_id)
+        row: Dict[str, Any] = {
+            "id": thread_id,
+            "chat_id": chat_id,
+            "name": str(raw.get("name") or "").strip() or f"Thread {thread_id}",
+            "created_at": str(raw.get("created_at") or ""),
+        }
+        try:
+            row["visible_revision"] = max(0, int(raw.get("visible_revision") or 0))
+        except (TypeError, ValueError):
+            row["visible_revision"] = 0
+        # Fork cursor (A3): a pointer into the PARENT's rows, never a copy.
+        try:
+            fork_of = int(raw.get("fork_of_chat_id") or 0)
+        except (TypeError, ValueError):
+            fork_of = 0
+        fork_before = str(raw.get("fork_before_ts") or "")
+        if fork_of and fork_before:
+            row["fork_of_chat_id"] = fork_of
+            row["fork_before_ts"] = fork_before
+        out.append(row)
+    return sorted(out, key=lambda r: int(r["id"]))
+
+
+def project_threads(project: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """CANONICAL thread projection of a project row — thread #0 first.
+
+    Thread #0 is SYNTHESIZED from the project's own ``chat_id``/``name``/
+    ``created_at``/``visible_revision`` (X7): nothing on disk is rewritten, and
+    the top-level ``chat_id`` remains its compatibility alias. Every consumer
+    that wants "the threads of this project" must read THIS, never the raw
+    ``threads`` list, or it will silently lose the project's main thread.
+    """
+    if not isinstance(project, dict):
+        return []
+    pid = str(project.get("id") or "")
+    try:
+        chat_id = int(project.get("chat_id") or 0)
+    except (TypeError, ValueError):
+        chat_id = 0
+    zero = {
+        "id": MAIN_THREAD_ID,
+        "chat_id": chat_id or project_chat_id(pid),
+        "name": str(project.get("name") or pid),
+        "created_at": str(project.get("created_at") or ""),
+        "visible_revision": max(0, int(project.get("visible_revision") or 0)),
+    }
+    return [zero, *_normalize_thread_rows(project.get("threads"))]
+
+
+def _row_chat_ids(project: Dict[str, Any]) -> List[int]:
+    """Every chat id a single project row reserves (thread #0 included)."""
+    return [int(thread["chat_id"]) for thread in project_threads(project)]
+
+
+def _chat_id_owners(projects: List[Dict[str, Any]]) -> Dict[int, List[tuple]]:
+    """chat_id -> [(project_id, thread_id), ...] across EVERY lifecycle state.
+
+    Tombstoned rows keep reserving their ids on purpose: a reused chat id would
+    silently merge a dead project's history into a live one.
+    """
+    owners: Dict[int, List[tuple]] = {}
+    for project in projects:
+        pid = str(project.get("id") or "")
+        for thread in project_threads(project):
+            owners.setdefault(int(thread["chat_id"]), []).append((pid, int(thread["id"])))
+    return owners
+
+
+def duplicate_chat_ids(drive_root: Any) -> Dict[int, List[tuple]]:
+    """Pre-existing chat-id collisions in the registry (X1 load-time detection).
+
+    Returns only ids claimed by more than one (project, thread) pair. A healthy
+    registry returns ``{}``; anything else means two conversations would share
+    one history stream and must be surfaced, never silently tolerated.
+    """
+    with _LOCK:
+        projects = _load(drive_root)["projects"]
+    return {cid: owners for cid, owners in _chat_id_owners(projects).items() if len(owners) > 1}
+
+
+def _report_duplicate_chat_ids(drive_root: Any, projects: List[Dict[str, Any]]) -> None:
+    """Loudly report pre-existing duplicates ONCE per process per drive root.
+
+    Called from ``_load`` so a corrupt registry cannot stay quiet; deliberately
+    non-raising, because refusing to load the registry would take the whole
+    server down over data that is still individually readable.
+    """
+    try:
+        key = str(pathlib.Path(drive_root).resolve(strict=False))
+    except Exception:
+        key = str(drive_root)
+    if key in _DUPLICATE_CHAT_ID_REPORTED:
+        return
+    clashes = {cid: owners for cid, owners in _chat_id_owners(projects).items() if len(owners) > 1}
+    _DUPLICATE_CHAT_ID_REPORTED.add(key)
+    if not clashes:
+        return
+    log.error(
+        "Project registry chat-id COLLISION: %s — these conversations share one "
+        "history stream; rename/recreate one of them",
+        {cid: owners for cid, owners in sorted(clashes.items())},
+    )
+    try:
+        from ouroboros.utils import append_jsonl
+
+        append_jsonl(
+            pathlib.Path(drive_root) / "logs" / "events.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "project_chat_id_collision_detected",
+                "collisions": {str(cid): owners for cid, owners in sorted(clashes.items())},
+            },
+        )
+    except Exception:
+        log.debug("Failed to record chat-id collision event", exc_info=True)
 
 
 def _validated_name(value: Any, fallback: str = "") -> str:
@@ -409,12 +566,16 @@ def reserved_project_chat_ids(drive_root: Any) -> set:
     history/fan-out partition that organizes threads into panels, (b) message
     routing, and (c) the project TASK's FOCUSED passive context (build_recent_
     sections shows the task its own thread).
+
+    Covers EVERY thread of every project (thread #0 included, via the canonical
+    projection) — one widening makes threads visible to history, ``/api/state``
+    and the agent's context at once.
     """
     out = set()
     try:
         for project in list_reserved_projects(drive_root):
             try:
-                out.add(int(project.get("chat_id") or 0))
+                out.update(_row_chat_ids(project))
             except (TypeError, ValueError):
                 continue
     except Exception:
@@ -466,6 +627,206 @@ def get_reserved_project(drive_root: Any, project_id: str) -> Optional[Dict[str,
     return None
 
 
+# chat_id -> binding index, memoized on the registry file's (mtime_ns, size).
+# atomic_write_json renames into place, so any mutation changes at least one of
+# those; a stale entry is therefore not reachable. C4: "which project/thread owns
+# this chat" is asked once per inbound message and per history request, and with
+# threads the naive scan is projects x threads.
+_CHAT_BINDING_INDEX: Dict[str, tuple] = {}
+
+
+def _chat_binding_index(drive_root: Any) -> Dict[int, Dict[str, Any]]:
+    path = _registry_path(drive_root)
+    try:
+        stat = path.stat()
+        stamp: tuple = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        stamp = (0, 0)
+    key = str(path)
+    cached = _CHAT_BINDING_INDEX.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    index: Dict[int, Dict[str, Any]] = {}
+    for project in list_reserved_projects(drive_root):
+        pid = str(project.get("id") or "")
+        for thread in project_threads(project):
+            index.setdefault(int(thread["chat_id"]), {
+                "project_id": pid,
+                "thread_id": int(thread["id"]),
+                "chat_id": int(thread["chat_id"]),
+                "lifecycle": str(project.get("lifecycle") or PROJECT_ACTIVE),
+                "name": str(thread.get("name") or ""),
+                "project": dict(project),
+            })
+    _CHAT_BINDING_INDEX[key] = (stamp, index)
+    return index
+
+
+def resolve_chat_binding(drive_root: Any, chat_id: Any) -> Dict[str, Any]:
+    """THE canonical "who owns this chat id" lookup (R3).
+
+    Returns ``{project_id, thread_id, chat_id, lifecycle, name, project}`` for
+    ANY thread of ANY project in ANY lifecycle state, or ``{}`` for the main
+    chat / an external transport id. Callers that must not resurrect a fenced
+    room filter on ``lifecycle``; they must NOT compare a chat id against
+    ``project["chat_id"]`` themselves — that comparison sees thread #0 only and
+    misroutes every other thread to Main.
+    """
+    try:
+        cid = int(chat_id or 0)
+    except (TypeError, ValueError):
+        return {}
+    if not cid:
+        return {}
+    try:
+        row = _chat_binding_index(drive_root).get(cid)
+    except Exception:
+        log.debug("resolve_chat_binding failed", exc_info=True)
+        return {}
+    return dict(row) if row else {}
+
+
+def get_thread(drive_root: Any, project_id: str, thread_id: Any) -> Optional[Dict[str, Any]]:
+    """One thread of a project by id (thread #0 included), else ``None``."""
+    project = get_reserved_project(drive_root, project_id)
+    if project is None:
+        return None
+    try:
+        want = int(thread_id)
+    except (TypeError, ValueError):
+        return None
+    for thread in project_threads(project):
+        if int(thread["id"]) == want:
+            return dict(thread)
+    return None
+
+
+def _mint_thread(data: Dict[str, Any], pid: str, existing: List[Dict[str, Any]]) -> tuple:
+    """Pick the next free ``(thread_id, chat_id)`` pair for project ``pid``.
+
+    Thread ids are opaque integers, so a chat-id collision is resolved by simply
+    walking to the next id (X1's "retry thread ids on collision") — no allocator
+    state, no widened hash. Raises when the walk is exhausted, which is a
+    registry-wide alarm rather than a routine outcome.
+    """
+    reserved = _chat_id_owners(data["projects"])
+    next_id = max((int(row["id"]) for row in existing), default=MAIN_THREAD_ID) + 1
+    for candidate in range(next_id, next_id + _THREAD_ID_MINT_ATTEMPTS):
+        chat_id = thread_chat_id(pid, candidate)
+        if chat_id not in reserved:
+            return candidate, chat_id
+    raise ValueError(
+        f"could not mint a free thread chat id for project {pid!r} after "
+        f"{_THREAD_ID_MINT_ATTEMPTS} attempts — the registry has a chat-id collision storm"
+    )
+
+
+def _active_project_row(data: Dict[str, Any], pid: str) -> Dict[str, Any]:
+    for entry in data["projects"]:
+        if entry.get("id") == pid:
+            if entry.get("lifecycle") != PROJECT_ACTIVE:
+                raise ValueError(
+                    f"project {pid!r} is {entry.get('lifecycle')}; it cannot accept thread changes"
+                )
+            return entry
+    raise ValueError(f"unknown project: {pid!r}")
+
+
+def create_thread(
+    drive_root: Any,
+    project_id: str,
+    *,
+    name: str = "",
+    fork_of_chat_id: int = 0,
+    fork_before_ts: str = "",
+) -> Dict[str, Any]:
+    """Append a NEW thread to a project and return its canonical row.
+
+    A thread is an empty chat sharing the project's working folder (A2). The
+    fork variant stores only a CURSOR ``{fork_of_chat_id, fork_before_ts}``
+    (A3) — no history row is copied, so the parent keeps one row identity, one
+    consolidation and one rotation cost. Prefer :func:`fork_thread` for forks;
+    this is the primitive both paths share.
+    """
+    pid = sanitize_project_id(project_id)
+    if not pid:
+        raise ValueError(f"unusable project id: {project_id!r}")
+    title = _validated_name(name, "New thread")
+    with _file_write_lock(_registry_path(drive_root)):
+        data = _load(drive_root)
+        entry = _active_project_row(data, pid)
+        threads = _normalize_thread_rows(entry.get("threads"))
+        thread_id, chat_id = _mint_thread(data, pid, threads)
+        row: Dict[str, Any] = {
+            "id": thread_id,
+            "chat_id": chat_id,
+            "name": title,
+            "created_at": utc_now_iso(),
+            "visible_revision": 0,
+        }
+        if fork_of_chat_id and fork_before_ts:
+            row["fork_of_chat_id"] = int(fork_of_chat_id)
+            row["fork_before_ts"] = str(fork_before_ts)
+        entry["threads"] = [*threads, row]
+        _save(drive_root, data)
+        log.info("Project thread created: %s#%s (chat_id=%s)", pid, thread_id, chat_id)
+        return dict(row)
+
+
+def rename_thread(drive_root: Any, project_id: str, thread_id: Any, name: str) -> Optional[Dict[str, Any]]:
+    """Rename a thread. Thread #0 IS the project, so renaming it renames the
+    project row itself — the projection would otherwise show a name the sidebar
+    never persists."""
+    pid = sanitize_project_id(project_id)
+    if not pid:
+        return None
+    try:
+        want = int(thread_id)
+    except (TypeError, ValueError):
+        return None
+    title = _validated_name(name)
+    if not title:
+        raise ValueError("thread name is required")
+    if want == MAIN_THREAD_ID:
+        updated = update_project(drive_root, pid, name=title)
+        return project_threads(updated)[0] if updated else None
+    with _file_write_lock(_registry_path(drive_root)):
+        data = _load(drive_root)
+        entry = _active_project_row(data, pid)
+        threads = _normalize_thread_rows(entry.get("threads"))
+        for row in threads:
+            if int(row["id"]) == want:
+                row["name"] = title
+                entry["threads"] = threads
+                _save(drive_root, data)
+                return dict(row)
+    return None
+
+
+def fork_thread(drive_root: Any, project_id: str, thread_id: Any) -> Dict[str, Any]:
+    """Fork a thread: a new thread carrying a CURSOR into the source's rows.
+
+    The source is untouched and keeps every row (A3). The cursor reads the
+    parent's rows REGARDLESS of the parent later being archived or deleted
+    (A3a), so a fork can never be orphaned. Auto-name is the plain English
+    ``Copy of …`` with NO model call (D2).
+    """
+    source = get_thread(drive_root, project_id, thread_id)
+    if source is None:
+        raise ValueError(f"unknown thread {thread_id!r} in project {project_id!r}")
+    label = str(source.get("name") or "").strip()
+    auto = f"Copy of {label}" if label else "Copy of thread"
+    return create_thread(
+        drive_root,
+        project_id,
+        name=auto[:THREAD_NAME_MAX],
+        fork_of_chat_id=int(source["chat_id"]),
+        # The fork moment. History treats it INCLUSIVELY (``ts <= cutoff``):
+        # a parent row stamped at exactly this instant existed before the fork.
+        fork_before_ts=utc_now_iso(),
+    )
+
+
 def create_project(
     drive_root: Any,
     project_id: str,
@@ -493,10 +854,21 @@ def create_project(
                         f"{existing.get('lifecycle')} project"
                     )
                 return dict(existing)
+        # Registry-WIDE chat-id reservation (X1). A project's chat id is
+        # deterministic from its id, so a collision cannot be retried away —
+        # refuse loudly instead of silently merging two histories. Every
+        # creation path funnels through here under the same file lock.
+        chat_id = project_chat_id(pid)
+        clash = _chat_id_owners(data["projects"]).get(chat_id)
+        if clash:
+            raise ValueError(
+                f"chat id {chat_id} for project {pid!r} is already reserved by "
+                f"{clash} — pick a different project id"
+            )
         entry = {
             "id": pid,
             "name": _validated_name(name, pid),
-            "chat_id": project_chat_id(pid),
+            "chat_id": chat_id,
             "working_dir": str(working_dir or "").strip(),
             "origin": str(origin or "owner"),
             "created_at": utc_now_iso(),
@@ -627,7 +999,14 @@ def increment_project_visible_revision(
     project_id: str = "",
     chat_id: Any = 0,
 ) -> Optional[Dict[str, Any]]:
-    """Advance unread state for one newly-appended owner-visible canonical row."""
+    """Advance unread state for one newly-appended owner-visible canonical row.
+
+    A row appended to a NON-primary thread advances that thread's own counter
+    AND the project's aggregate: the project counter is what today's flat
+    ``project_seen_revision`` cursor compares against, so leaving it untouched
+    would make every non-primary thread's activity silently unread-invisible.
+    (The per-thread counter is the number T1's nested cursor will read.)
+    """
     pid = sanitize_project_id(project_id)
     try:
         cid = int(chat_id or 0)
@@ -640,14 +1019,22 @@ def increment_project_visible_revision(
         for entry in data["projects"]:
             if entry.get("lifecycle") != PROJECT_ACTIVE:
                 continue
-            try:
-                matches_chat = cid and int(entry.get("chat_id") or 0) == cid
-            except (TypeError, ValueError):
-                matches_chat = False
-            if (pid and entry.get("id") == pid) or matches_chat:
-                entry["visible_revision"] = int(entry.get("visible_revision") or 0) + 1
-                _save(drive_root, data)
-                return dict(entry)
+            thread_hit = None
+            if cid:
+                thread_hit = next(
+                    (t for t in project_threads(entry) if int(t["chat_id"]) == cid), None
+                )
+            if not ((pid and entry.get("id") == pid) or thread_hit is not None):
+                continue
+            entry["visible_revision"] = int(entry.get("visible_revision") or 0) + 1
+            if thread_hit is not None and int(thread_hit["id"]) != MAIN_THREAD_ID:
+                threads = _normalize_thread_rows(entry.get("threads"))
+                for row in threads:
+                    if int(row["id"]) == int(thread_hit["id"]):
+                        row["visible_revision"] = int(row.get("visible_revision") or 0) + 1
+                entry["threads"] = threads
+            _save(drive_root, data)
+            return dict(entry)
     return None
 
 
@@ -672,16 +1059,30 @@ def reconcile_projects(drive_root: Any) -> int:
             with _file_write_lock(_registry_path(drive_root)):
                 data = _load(drive_root)
                 known = {p.get("id") for p in data["projects"]}
+                reserved = _chat_id_owners(data["projects"])
                 for entry in sorted(projects_root.iterdir()):
                     if not entry.is_dir() or entry.name.startswith("."):
                         continue
                     pid = sanitize_project_id(entry.name)
                     if not pid or pid in known:
                         continue
+                    # Same registry-wide reservation invariant as create_project
+                    # (X1): reconcile mints hashed ids too, so an unchecked
+                    # append here could collide with an existing project OR
+                    # thread. Skip loudly — a reconcile must never merge two
+                    # histories, and the store stays on disk for the owner.
+                    chat_id = project_chat_id(pid)
+                    if chat_id in reserved:
+                        log.error(
+                            "Project reconcile SKIPPED %s: chat id %s already reserved by %s",
+                            pid, chat_id, reserved[chat_id],
+                        )
+                        continue
+                    reserved[chat_id] = [(pid, MAIN_THREAD_ID)]
                     data["projects"].append({
                         "id": pid,
                         "name": pid,
-                        "chat_id": project_chat_id(pid),
+                        "chat_id": chat_id,
                         "working_dir": "",
                         "origin": "reconcile",
                         "created_at": utc_now_iso(),
@@ -869,6 +1270,10 @@ def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]
             "visible_revision": int(project.get("visible_revision") or 0),
             "delete_error": project.get("delete_error") or "",
             "has_thread_activity": _has_thread_activity(project),
+            # Canonical projection, thread #0 first (X7). ``chat_id`` above stays
+            # its compatibility alias, so a client that never learns about
+            # threads keeps working unchanged.
+            "threads": project_threads(project),
         })
     return out
 
@@ -878,16 +1283,24 @@ __all__ = [
     "PROJECT_DELETING",
     "PROJECT_NAME_MAX",
     "PROJECT_TOMBSTONED",
+    "THREAD_NAME_MAX",
     "all_task_bindings",
     "begin_project_deletion",
     "bind_task_to_project",
     "complete_project_deletion",
     "create_project",
+    "create_thread",
     "delete_project",
+    "duplicate_chat_ids",
     "ensure_project_workspace",
     "fail_project_deletion",
+    "fork_thread",
     "get_project",
     "get_reserved_project",
+    "get_thread",
+    "project_threads",
+    "rename_thread",
+    "resolve_chat_binding",
     "increment_project_visible_revision",
     "list_projects",
     "list_reserved_projects",
