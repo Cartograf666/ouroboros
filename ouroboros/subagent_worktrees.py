@@ -39,8 +39,11 @@ _LOCK_STALE_SEC = 600.0
 _BRANCH_PREFIX = "subagent/"
 
 # Serializes worktree mutations within this process; the on-disk lock serializes
-# across processes (parent worker, supervisor startup prune, etc.).
-_inproc_lock = threading.Lock()
+# across processes (parent worker, supervisor startup prune, etc.). REENTRANT:
+# the startup prune holds the registry-root lock while taking each affected
+# REPO's lock in turn. The nesting order is always root -> repo and nothing ever
+# takes them the other way round, so no deadlock cycle exists.
+_inproc_lock = threading.RLock()
 
 
 # --------------------------------------------------------------------------- #
@@ -115,12 +118,60 @@ def _save_registry(entries: List[Dict[str, Any]], data_dir: Optional[Any] = None
 # --------------------------------------------------------------------------- #
 # Locking
 # --------------------------------------------------------------------------- #
+def _ops_lock_path(target: Any) -> Path:
+    """Where the cross-process worktree-ops lockfile for ``target`` lives.
+
+    A git REPO locks on its own git common directory
+    (``<repo>/.git/.worktree_ops.lock``), because that is what the mutations
+    actually contend for: ``git worktree add|remove|prune`` all rewrite the
+    SAME ``.git/worktrees`` metadata, no matter which registry owns the
+    checkout. Keying the lockfile on the worktree ROOT instead gave the
+    subagent registry and the durable thread registry two DIFFERENT lockfiles
+    over one ``.git`` — the "every worktree owner serializes on the same lock"
+    promise below was not actually kept, and two owners could rewrite that
+    metadata concurrently.
+
+    A non-repo directory (the worktree root itself, the genesis projects root)
+    keeps a lockfile of its own: those operations contend for a NAME under that
+    root, not for git metadata.
+    """
+    path = Path(target)
+    git_path = path / ".git"
+    if git_path.is_dir():
+        return git_path / _LOCK_NAME
+    if git_path.is_file():
+        # A linked worktree: ``.git`` is a file pointing at
+        # ``<main>/.git/worktrees/<name>``. Lock the COMMON dir so a caller that
+        # handed us a checkout still meets the main repo's owners.
+        try:
+            text = git_path.read_text(encoding="utf-8").strip()
+            if text.startswith("gitdir:"):
+                linked = Path(text.split(":", 1)[1].strip())
+                if not linked.is_absolute():
+                    linked = (path / linked).resolve()
+                for parent in linked.parents:
+                    if parent.name == ".git":
+                        return parent / _LOCK_NAME
+        except OSError:
+            pass
+    return path / _LOCK_NAME
+
+
 @contextlib.contextmanager
-def _ops_lock(root: Path):
-    """Serialize worktree mutations in-process (threading.Lock) and across
-    processes via the shared portable file-lock SSOT (platform_layer)."""
-    root.mkdir(parents=True, exist_ok=True)
-    lock_path = root / _LOCK_NAME
+def _ops_lock(target: Any, mkdir_root: Optional[Any] = None):
+    """Serialize worktree mutations in-process (an RLock) and across processes
+    via the shared portable file-lock SSOT (platform_layer).
+
+    ``target`` is the REPO whose ``.git/worktrees`` metadata the operation
+    mutates (see :func:`_ops_lock_path`); pass a plain directory only when the
+    operation contends for a name under it rather than for git metadata.
+    ``mkdir_root`` is created if given — the worktree root must exist before a
+    checkout is placed in it.
+    """
+    if mkdir_root is not None:
+        Path(mkdir_root).mkdir(parents=True, exist_ok=True)
+    lock_path = _ops_lock_path(target)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     with _inproc_lock:
         fd = acquire_exclusive_file_lock(
             lock_path,
@@ -129,7 +180,7 @@ def _ops_lock(root: Path):
             metadata=str(os.getpid()),
         )
         if fd is None:
-            raise TimeoutError(f"subagent worktree ops lock timeout: {lock_path}")
+            raise TimeoutError(f"worktree ops lock timeout: {lock_path}")
         try:
             yield
         finally:
@@ -231,7 +282,9 @@ def provision_worktree(
     root = _resolve_root(worktree_root)
     _assert_root_isolated(root, repo_dir, _data_dir(data_dir))
     safe_task = _safe_name(task_id)
-    with _ops_lock(root):
+    # Lock the REPO: this rewrites <repo>/.git/worktrees, which the durable
+    # thread-worktree registry mutates too.
+    with _ops_lock(repo_dir, mkdir_root=root):
         if base_sha:
             _git(repo_dir, "rev-parse", "--verify", f"{base_sha}^{{commit}}")
             base_sha = _git(repo_dir, "rev-parse", base_sha).stdout.strip()
@@ -284,6 +337,9 @@ def provision_genesis_project(
     root = root.expanduser().resolve()
     _assert_root_isolated(root, repo_dir, _data_dir(data_dir))
     safe_task = _safe_name(dir_name or task_id)
+    # A genesis project is a STANDALONE repo created under `root`; it touches no
+    # existing .git/worktrees. What it contends for is a free NAME under the
+    # projects root, so that directory is the right lock.
     with _ops_lock(root):
         proj = (root / safe_task).resolve()
         # Genesis projects are durable: never clobber an existing one -> unique name. Since
@@ -359,7 +415,10 @@ def remove_worktree(
             match = entry
             break
     root = _resolve_root(worktree_root)
-    with _ops_lock(root):
+    # Lock the matched entry's REPO (its .git/worktrees is what shrinks here);
+    # an unregistered path has no repo, so the root lock guards that fallback.
+    lock_target = str(match.get("repo_dir") or "") if match is not None else ""
+    with _ops_lock(lock_target or root, mkdir_root=root):
         if match is not None:
             _remove_paths(Path(match.get("repo_dir") or "."), Path(match.get("path") or ""), match.get("branch") or "", allowed_root=root)
             survivors = [e for e in _load_registry(data_dir) if e.get("path") != match.get("path")]
@@ -389,26 +448,38 @@ def prune_orphans(
     removed: List[Dict[str, Any]] = []
     kept: List[Dict[str, Any]] = []
     repos: set[str] = set()
+    # Outer ROOT lock: registry consistency across the whole sweep. Each repo's
+    # git metadata is then mutated under that REPO's own lock, so a thread
+    # worktree owner working on the same .git is never racing this sweep.
+    # Order is always root -> repo (see _inproc_lock); nothing takes them the
+    # other way round.
     with _ops_lock(root):
+        by_repo: Dict[str, List[Dict[str, Any]]] = {}
         for entry in _load_registry(data_dir):
-            repo_dir = str(entry.get("repo_dir") or "")
-            wt_path = str(entry.get("path") or "")
-            created = float(entry.get("created_at") or 0)
+            by_repo.setdefault(str(entry.get("repo_dir") or ""), []).append(entry)
+        for repo_dir, group in by_repo.items():
             if repo_dir:
                 repos.add(repo_dir)
-            path_exists = Path(wt_path).exists() if wt_path else False
-            if created < cutoff or not path_exists:
-                if repo_dir or wt_path:
-                    _remove_paths(Path(repo_dir or "."), Path(wt_path), entry.get("branch") or "", allowed_root=root)
-                removed.append(entry)
-            else:
-                kept.append(entry)
+            with _ops_lock(repo_dir or root):
+                for entry in group:
+                    wt_path = str(entry.get("path") or "")
+                    created = float(entry.get("created_at") or 0)
+                    path_exists = Path(wt_path).exists() if wt_path else False
+                    if created < cutoff or not path_exists:
+                        if repo_dir or wt_path:
+                            _remove_paths(
+                                Path(repo_dir or "."), Path(wt_path),
+                                entry.get("branch") or "", allowed_root=root,
+                            )
+                        removed.append(entry)
+                    else:
+                        kept.append(entry)
+                if repo_dir:
+                    try:
+                        _git(Path(repo_dir), "worktree", "prune", check=False)
+                    except Exception:
+                        pass
         _save_registry(kept, data_dir)
-        for repo in repos:
-            try:
-                _git(Path(repo), "worktree", "prune", check=False)
-            except Exception:
-                pass
     return {"removed": len(removed), "kept": len(kept)}
 
 
@@ -421,9 +492,11 @@ def list_worktrees(data_dir: Optional[Any] = None) -> List[Dict[str, Any]]:
 # Shared primitives (durable thread worktrees reuse ONLY these)
 # --------------------------------------------------------------------------- #
 # `git worktree add/remove/prune` mutate shared `.git/worktrees` metadata, so
-# every worktree owner in the process must serialize on the SAME lock and use
-# the SAME containment guards. Exported as public names so the durable
-# thread-worktree registry can reuse them WITHOUT reaching into privates —
+# every worktree owner must serialize on the SAME lock — which is why the
+# lockfile is keyed on the REPO (`<repo>/.git/.worktree_ops.lock`), not on each
+# registry's own worktree root — and use the SAME containment guards. Exported
+# as public names so the durable thread-worktree registry can reuse them
+# WITHOUT reaching into privates —
 # and without inheriting this module's force-reset provisioning, force removal
 # or age-based orphan sweep, none of which may ever touch a thread's worktree.
 worktree_ops_lock = _ops_lock

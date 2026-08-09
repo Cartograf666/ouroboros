@@ -11,7 +11,11 @@ checkout                                             is never clobbered)
 removal              ``--force``, unconditional      requires INSPECTION; a
                                                      dirty tree or unmerged
                                                      commits must be
-                                                     acknowledged explicitly
+                                                     acknowledged explicitly.
+                                                     A permitted removal also
+                                                     deletes the thread branch,
+                                                     which would otherwise block
+                                                     re-provisioning forever
 startup GC           age sweep past the retention    NONE. A thread's worktree
                      window deletes the checkout     is durable and is only
                                                      removed by an explicit act
@@ -153,7 +157,10 @@ def provision_thread_worktree(
     name = safe_path_component(f"{key[0]}__{key[1]}")
     wt_path = (root / name).resolve()
     branch = f"{_BRANCH_PREFIX}{name}"
-    with _LOCK, worktree_ops_lock(root):
+    # The ops lock is keyed on the REPO, not on this registry's worktree root:
+    # `git worktree add` rewrites <repo>/.git/worktrees, which the SUBAGENT
+    # registry mutates too. Two roots meant two lockfiles over one .git.
+    with _LOCK, worktree_ops_lock(repo, mkdir_root=root):
         rows = _load(data_dir)
         if any(_matches(row, key) for row in rows):
             raise ValueError(
@@ -237,34 +244,76 @@ def remove_thread_worktree(
 ) -> Dict[str, Any]:
     """Remove a thread worktree AFTER inspecting what that would destroy.
 
-    Returns ``{removed, reason, inspection}``. A dirty tree or commits the base
-    never received refuse the removal unless ``acknowledge_unmerged`` is passed
-    — the caller must have SHOWN the owner the inspection first. There is no
-    silent path and no timer that reaches this function.
+    Returns ``{removed, reason, inspection, branch_deleted}``. A dirty tree or
+    commits the base never received refuse the removal unless
+    ``acknowledge_unmerged`` is passed — the caller must have SHOWN the owner
+    the inspection first. There is no silent path and no timer that reaches
+    this function.
+
+    A permitted removal ALSO deletes the thread's ``thread/<name>`` branch.
+    Provisioning deliberately refuses to reuse an existing branch (an owner's
+    work is never clobbered), so leaving the branch behind turned every removal
+    into a permanent block on re-provisioning the same thread — the owner would
+    have to delete a git branch by hand to branch off again. The destructive
+    decision has already been made and shown at this point: the worktree is
+    gone, and its branch is what pointed at it.
     """
     key = _key(project_id, thread_id)
     root = Path(worktree_root).expanduser().resolve() if worktree_root else thread_worktree_root()
-    with _LOCK, worktree_ops_lock(root):
-        rows = _load(data_dir)
-        match = next((row for row in rows if _matches(row, key)), None)
-        if match is None:
-            return {"removed": False, "reason": "unknown", "inspection": {}}
-        inspection = inspect_thread_worktree(match)
-        unsafe = bool(inspection["dirty"]) or int(inspection["unmerged_commits"]) > 0
-        if unsafe and not acknowledge_unmerged:
-            return {"removed": False, "reason": "unmerged_work", "inspection": inspection}
-        wt_path = Path(str(match.get("path") or ""))
-        if not str(wt_path).strip() or not path_is_within(wt_path, root):
-            # A malformed registry row must never delete an arbitrary path.
-            return {"removed": False, "reason": "path_outside_root", "inspection": inspection}
-        repo = Path(str(match.get("repo_dir") or "."))
-        run_git(repo, "worktree", "remove", "--force", str(wt_path), check=False)
-        if wt_path.exists():
-            force_rmtree(wt_path)
-        run_git(repo, "worktree", "prune", check=False)
-        _save(data_dir, [row for row in rows if not _matches(row, key)])
-        log.info("Thread worktree removed: %s#%s (%s)", key[0], key[1], wt_path)
-        return {"removed": True, "reason": "", "inspection": inspection}
+    with _LOCK:
+        seen = next((row for row in _load(data_dir) if _matches(row, key)), None)
+        if seen is None:
+            return {"removed": False, "reason": "unknown", "inspection": {}, "branch_deleted": False}
+        # Keyed on the REPO (see provisioning): `git worktree remove/prune`
+        # rewrites the same .git/worktrees the subagent registry mutates.
+        with worktree_ops_lock(str(seen.get("repo_dir") or root), mkdir_root=root):
+            rows = _load(data_dir)
+            match = next((row for row in rows if _matches(row, key)), None)
+            if match is None:
+                return {"removed": False, "reason": "unknown", "inspection": {}, "branch_deleted": False}
+            inspection = inspect_thread_worktree(match)
+            unsafe = bool(inspection["dirty"]) or int(inspection["unmerged_commits"]) > 0
+            if unsafe and not acknowledge_unmerged:
+                return {
+                    "removed": False, "reason": "unmerged_work",
+                    "inspection": inspection, "branch_deleted": False,
+                }
+            wt_path = Path(str(match.get("path") or ""))
+            if not str(wt_path).strip() or not path_is_within(wt_path, root):
+                # A malformed registry row must never delete an arbitrary path.
+                return {
+                    "removed": False, "reason": "path_outside_root",
+                    "inspection": inspection, "branch_deleted": False,
+                }
+            repo = Path(str(match.get("repo_dir") or "."))
+            run_git(repo, "worktree", "remove", "--force", str(wt_path), check=False)
+            if wt_path.exists():
+                force_rmtree(wt_path)
+            run_git(repo, "worktree", "prune", check=False)
+            branch = str(match.get("branch") or "")
+            branch_deleted = False
+            if branch.startswith(_BRANCH_PREFIX):
+                # -D, not -d: the acknowledged case is exactly the unmerged one,
+                # and git's merge check would refuse there. The prefix guard
+                # keeps this from ever reaching a branch we did not create.
+                deleted = run_git(repo, "branch", "-D", branch, check=False)
+                branch_deleted = deleted.returncode == 0
+                if not branch_deleted:
+                    log.warning(
+                        "Thread worktree %s#%s removed but branch %s could not be "
+                        "deleted (%s) — re-provisioning will refuse until it is gone",
+                        key[0], key[1], branch,
+                        (deleted.stderr or "").strip()[:200],
+                    )
+            _save(data_dir, [row for row in rows if not _matches(row, key)])
+            log.info(
+                "Thread worktree removed: %s#%s (%s, branch_deleted=%s)",
+                key[0], key[1], wt_path, branch_deleted,
+            )
+            return {
+                "removed": True, "reason": "",
+                "inspection": inspection, "branch_deleted": branch_deleted,
+            }
 
 
 __all__ = [

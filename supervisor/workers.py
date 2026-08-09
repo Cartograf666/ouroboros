@@ -934,6 +934,18 @@ def ensure_project_scope(evt: dict, ctx: Any) -> None:
                 get_bridge().broadcast({"type": "projects_changed", "project_id": pid, "chat_id": proj_chat})
             except Exception:
                 log.debug("ensure_project_scope: projects_changed broadcast failed for %s", pid, exc_info=True)
+    except ValueError as exc:
+        # The registry-wide chat-id reservation (X1) and the tombstone reservation
+        # both refuse a project creation by raising ValueError. That refusal is the
+        # LOUD half of "a project collision is refused loudly" — swallowing it into
+        # the generic log.debug below turned an unresolvable identity clash into a
+        # task that silently keeps running unscoped, which is the exact silent
+        # merge the reservation exists to prevent.
+        log.error(
+            "ensure_project_scope REFUSED for %s: %s — the task stays unscoped; "
+            "pick a different project id",
+            pid, exc,
+        )
     except Exception:
         log.debug("ensure_project_scope: project registration failed for %s", pid, exc_info=True)
 
@@ -2289,6 +2301,22 @@ def assign_tasks() -> None:
         from ouroboros.project_lease import candidate_is_leasable, running_project_lanes
         from ouroboros.config import get_max_active_subagents_per_root
 
+        # project_id -> registered working_dir, read ONCE per assignment pass.
+        # A task scoped POST-HOC (mark_task_project) carries no workspace_root of
+        # its own; without this map its lane would not match the room task
+        # already writing the SAME project folder, and both would be admitted as
+        # top-level writers. The lease itself stays filesystem-free under the
+        # queue lock, so the registry read lives here. Fail-open to {} — the
+        # lease then treats an unknown folder as a wildcard conflicting with
+        # every lane of its project (queue, never parallel-by-accident).
+        try:
+            from ouroboros.projects_registry import project_working_dirs
+
+            _project_workspaces = project_working_dirs(DRIVE_ROOT)
+        except Exception:
+            log.debug("assign_tasks: project working_dir map unavailable", exc_info=True)
+            _project_workspaces = {}
+
         def _running_subagent_count(root_task_id: str) -> int:
             if not root_task_id:
                 return 0
@@ -2333,8 +2361,9 @@ def assign_tasks() -> None:
                 # occupies its lane. The lane key is (project_id,
                 # workspace_root), so two threads of one project in the SAME
                 # folder still serialize while a worktree-branched thread runs
-                # concurrently.
-                leased = running_project_lanes(RUNNING.values())
+                # concurrently. A task with no workspace_root of its own
+                # resolves through _project_workspaces to its project's folder.
+                leased = running_project_lanes(RUNNING.values(), _project_workspaces)
                 # Find first suitable task (skip over-budget evolution tasks
                 # and project-leased candidates)
                 chosen_idx = None
@@ -2348,7 +2377,7 @@ def assign_tasks() -> None:
                         continue
                     if str(candidate.get("type") or "") == "evolution" and remaining < EVOLUTION_BUDGET_RESERVE:
                         continue
-                    if not candidate_is_leasable(candidate, leased):
+                    if not candidate_is_leasable(candidate, leased, _project_workspaces):
                         continue
                     if str(candidate.get("delegation_role") or "") == "subagent":
                         root_task_id = str(candidate.get("root_task_id") or "")

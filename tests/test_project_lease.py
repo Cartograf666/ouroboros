@@ -12,7 +12,9 @@ from ouroboros.contracts.chat_id_policy import (
     project_chat_id,
 )
 from ouroboros.project_lease import (
+    WILDCARD_WORKSPACE,
     candidate_is_leasable,
+    mark_task_project,
     running_project_ids,
     running_project_lanes,
 )
@@ -45,7 +47,11 @@ def test_running_project_lanes_counts_top_level_scoped_tasks_only():
         "garbage",
         None,
     ]
-    assert running_project_lanes(running) == {("alpha", ""), ("beta", "")}
+    # No task carries a workspace_root and no project folder map was supplied,
+    # so each lane's folder is UNKNOWN -> the wildcard, never a lane of its own.
+    assert running_project_lanes(running) == {
+        ("alpha", WILDCARD_WORKSPACE), ("beta", WILDCARD_WORKSPACE)
+    }
     # The project-WIDE activity query (merge/remove preconditions) is a
     # SEPARATE answer and is deliberately not the lease key.
     assert running_project_ids(running) == {"alpha", "beta"}
@@ -55,12 +61,12 @@ def test_running_project_lanes_unwraps_production_meta_shape():
     """Regression for the inert-lease bug: RUNNING.values() are meta dicts."""
     running = {"t1": _meta(_task("racer"))}.values()
     lanes = running_project_lanes(running)
-    assert lanes == {("racer", "")}
+    assert lanes == {("racer", WILDCARD_WORKSPACE)}
     assert candidate_is_leasable(_task("racer", tid="t2"), lanes) is False
 
 
 def test_candidate_is_leasable_matrix():
-    leased = {("alpha", "")}
+    leased = {("alpha", WILDCARD_WORKSPACE)}
     # Unscoped tasks never serialize.
     assert candidate_is_leasable(_task(""), leased) is True
     # A second writer for a leased project's own folder waits.
@@ -105,6 +111,131 @@ def test_lane_reads_the_metadata_mirror_and_normalizes_the_path():
     lanes = running_project_lanes([_meta(mirrored)])
     assert lanes == {("alpha", os.path.normcase("/w/alpha"))}
     assert candidate_is_leasable(noisy, lanes) is False
+
+
+def test_a_post_hoc_scoped_task_shares_the_project_folder_lane():
+    """The regression this decision closes: only the promote/room path stamps
+    workspace_root. A task scoped POST-HOC through mark_task_project carries the
+    project id alone, so comparing the raw field split ONE folder into two lanes
+    — ("alpha", "/w/alpha") and ("alpha", "") — and let TWO top-level writers
+    into it, which is strictly worse than the project-wide lease this key
+    replaced."""
+    room_task = _task("alpha", tid="t1", workspace_root="/w/alpha")
+    converted = {"id": "t2", "type": "task"}
+    assert mark_task_project({}, [converted], "t2", "alpha") is True
+    assert "workspace_root" not in converted        # the SSOT stamps only the id
+
+    folders = {"alpha": "/w/alpha"}
+    lanes = running_project_lanes([_meta(room_task)], folders)
+    assert lanes == {("alpha", os.path.normcase("/w/alpha"))}
+    # The empty workspace resolves to the project's registered working_dir.
+    assert candidate_is_leasable(converted, lanes, folders) is False
+    # A thread branched into its OWN worktree still runs concurrently.
+    branched = _task("alpha", tid="t3", workspace_root="/w/alpha-thread-2")
+    assert candidate_is_leasable(branched, lanes, folders) is True
+
+
+def test_an_unknown_project_folder_is_a_wildcard_lane():
+    """Fail-safe: when neither the task record nor the registry can name the
+    folder, the lane conflicts with EVERY lane of its project. Never
+    parallel-by-accident."""
+    room_task = _task("alpha", tid="t1", workspace_root="/w/alpha")
+    unknown = {"id": "t2", "type": "task", "project_id": "alpha"}
+
+    # No folder map at all (unreadable registry / file-less project).
+    lanes = running_project_lanes([_meta(room_task)], {})
+    assert candidate_is_leasable(unknown, lanes, {}) is False
+    # ...and symmetrically: a wildcard HOLDER blocks a folder-bearing candidate.
+    held_wild = running_project_lanes([_meta(unknown)], {})
+    assert held_wild == {("alpha", WILDCARD_WORKSPACE)}
+    assert candidate_is_leasable(room_task, held_wild, {}) is False
+    # A different project is untouched by either.
+    assert candidate_is_leasable(_task("beta", tid="t9"), held_wild, {}) is True
+
+
+def test_workspace_none_task_still_serializes_against_its_project_folder():
+    """`workspace="none"` is an explicit opt-out that yields NO workspace_root
+    (workspace_admission.resolve_room_workspace). "I write nowhere" is not a
+    claim the lease can verify, so it queues behind the folder's writer."""
+    room_task = _task("alpha", tid="t1", workspace_root="/w/alpha")
+    opted_out = {"id": "t2", "type": "task", "project_id": "alpha", "workspace": "none"}
+    folders = {"alpha": "/w/alpha"}
+
+    lanes = running_project_lanes([_meta(room_task)], folders)
+    assert candidate_is_leasable(opted_out, lanes, folders) is False
+
+
+def test_case_and_symlink_normalization_boundaries():
+    """`normcase` is a NO-OP on POSIX (it matters for case-insensitive Windows/
+    macOS spellings) and this module never touches the filesystem, so SYMLINK
+    resolution is a RECORD-WRITE-time job: workspace_admission resolves a task's
+    workspace_root and projects_registry resolves a project's working_dir before
+    either is stored. Both therefore arrive here already realpath'd."""
+    room = _task("alpha", tid="t1", workspace_root="/w/Alpha")
+    lanes = running_project_lanes([_meta(room)])
+    # Spelling equality is whatever normcase says on THIS platform — identity on
+    # POSIX, case-folded on a case-insensitive one.
+    same_case = _task("alpha", tid="t2", workspace_root="/w/Alpha/")
+    assert candidate_is_leasable(same_case, lanes) is False
+    other_case = _task("alpha", tid="t3", workspace_root="/w/alpha")
+    expected = os.path.normcase("/w/Alpha") == os.path.normcase("/w/alpha")
+    assert candidate_is_leasable(other_case, lanes) is not expected
+    # An UNRESOLVED symlink spelling is a different string: the lease cannot
+    # resolve it (no FS access under the queue lock), which is exactly why the
+    # writers canonicalize before storing.
+    via_link = _task("alpha", tid="t4", workspace_root="/link/to/alpha")
+    assert candidate_is_leasable(via_link, lanes) is True
+
+
+def test_lane_key_shape_is_validated_before_the_unscoped_short_circuit():
+    """A caller passing bare project ids must be told IMMEDIATELY. Checking the
+    shape after the unscoped short-circuit meant the misuse stayed silent for
+    every unscoped candidate and surfaced only once a project task happened to
+    be considered — by which time two writers could already be running."""
+    import pytest
+
+    with pytest.raises(TypeError, match="running_project_lanes"):
+        candidate_is_leasable(_task(""), {"alpha"})
+    with pytest.raises(TypeError):
+        candidate_is_leasable(_task("alpha"), {("alpha", "", "extra")})
+
+
+def test_project_working_dirs_feeds_the_lane_resolver(tmp_path):
+    """The map the supervisor hands the lease comes from the registry, and the
+    registry canonicalizes working_dir at WRITE time so the lease's pure
+    comparison meets an already-resolved path."""
+    from ouroboros.projects_registry import create_project, project_working_dirs
+
+    folder = tmp_path / "alpha"
+    folder.mkdir()
+    create_project(tmp_path, "alpha", working_dir=str(folder))
+    fileless = create_project(tmp_path, "notes")
+
+    folders = project_working_dirs(tmp_path)
+    assert folders["alpha"] == str(folder.resolve())
+    assert "notes" not in folders            # file-less -> wildcard, not a lane
+    assert fileless["working_dir"] == ""
+
+    # A LEGACY row stored an unresolved spelling. Against a task's already
+    # realpath'd workspace_root that is a different string — a second concrete
+    # lane, exactly the split this map exists to close — so the read
+    # canonicalizes too, not only the write.
+    from ouroboros.projects_registry import _registry_path
+    from ouroboros.utils import atomic_write_json, read_json_dict
+
+    link = tmp_path / "alpha-link"
+    link.symlink_to(folder, target_is_directory=True)
+    data = read_json_dict(_registry_path(tmp_path))
+    for entry in data["projects"]:
+        if entry.get("id") == "alpha":
+            entry["working_dir"] = str(link)
+    atomic_write_json(_registry_path(tmp_path), data)
+    assert project_working_dirs(tmp_path)["alpha"] == str(folder.resolve())
+
+    room = _task("alpha", tid="t1", workspace_root=str(folder))
+    converted = {"id": "t2", "type": "task", "project_id": "alpha"}
+    lanes = running_project_lanes([_meta(room)], folders)
+    assert candidate_is_leasable(converted, lanes, folders) is False
 
 
 def test_project_chat_id_policy():

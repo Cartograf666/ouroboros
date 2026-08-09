@@ -273,12 +273,69 @@ def test_visible_revision_advances_thread_and_project_aggregate(tmp_path):
     assert row["visible_revision"] == 1
     by_id = {t["id"]: t for t in row["threads"]}
     assert by_id[thread["id"]]["visible_revision"] == 1
-    assert by_id[MAIN_THREAD_ID]["visible_revision"] == 1
+    # ...but thread #0 has its OWN counter, and a SIBLING's activity is not its
+    # activity. Projecting the aggregate here marked the project's main thread
+    # unread every time any other thread received a message.
+    assert by_id[MAIN_THREAD_ID]["visible_revision"] == 0
 
     increment_project_visible_revision(tmp_path, chat_id=project_chat_id("racer"))
     row = projects_summary(tmp_path)[0]
     assert row["visible_revision"] == 2
-    assert {t["id"]: t["visible_revision"] for t in row["threads"]}[thread["id"]] == 1
+    by_id = {t["id"]: t for t in row["threads"]}
+    assert by_id[thread["id"]]["visible_revision"] == 1
+    assert by_id[MAIN_THREAD_ID]["visible_revision"] == 1
+
+
+def test_thread0_revision_seeds_from_a_legacy_aggregate(tmp_path):
+    """A registry written before thread #0 got its own counter carries only the
+    aggregate. While a project had ONE thread the two were the SAME fact, so the
+    projection seeds from it — a legacy project must not read as freshly-unread
+    (revision 0) after the upgrade."""
+    from ouroboros.utils import atomic_write_json, read_json_dict
+
+    create_project(tmp_path, "legacy")
+    for _ in range(3):
+        increment_project_visible_revision(tmp_path, project_id="legacy")
+    data = read_json_dict(_registry_path(tmp_path))
+    for entry in data["projects"]:
+        entry.pop("thread0_visible_revision", None)   # pre-split on-disk shape
+    atomic_write_json(_registry_path(tmp_path), data)
+
+    row = projects_summary(tmp_path)[0]
+    assert row["visible_revision"] == 3
+    assert project_threads(row)[0]["visible_revision"] == 3
+
+
+def test_normalization_preserves_unknown_thread_keys(tmp_path):
+    """T3 stores a ``worktree`` binding on a branched-off thread. Normalization
+    runs on EVERY read, so rebuilding a fresh dict of known keys would delete
+    such a field from an untouched registry — a loss indistinguishable from
+    never having written it."""
+    from ouroboros.utils import atomic_write_json, read_json_dict
+
+    create_project(tmp_path, "racer")
+    thread = create_thread(tmp_path, "racer", name="Branched")
+    data = read_json_dict(_registry_path(tmp_path))
+    for entry in data["projects"]:
+        for row in entry.get("threads") or []:
+            if int(row["id"]) == int(thread["id"]):
+                row["worktree"] = {"path": "/w/racer-2", "branch": "thread/racer__2"}
+                row["future_field"] = "kept"
+    atomic_write_json(_registry_path(tmp_path), data)
+
+    stored = get_thread(tmp_path, "racer", thread["id"])
+    assert stored["worktree"] == {"path": "/w/racer-2", "branch": "thread/racer__2"}
+    assert stored["future_field"] == "kept"
+
+    # A HALF-written fork cursor is still dropped whole: an ancestry walk must
+    # never inherit a bound without a parent (or the reverse).
+    data = read_json_dict(_registry_path(tmp_path))
+    for entry in data["projects"]:
+        for row in entry.get("threads") or []:
+            row["fork_of_chat_id"] = 12345      # no fork_before_ts
+    atomic_write_json(_registry_path(tmp_path), data)
+    reread = get_thread(tmp_path, "racer", thread["id"])
+    assert "fork_of_chat_id" not in reread and "fork_before_ts" not in reread
 
 
 def test_threads_cannot_be_added_to_a_fenced_project(tmp_path):

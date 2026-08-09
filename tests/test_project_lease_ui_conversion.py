@@ -41,6 +41,7 @@ def _request(tmp_path, body):
 
 def test_mark_task_project_running_and_pending():
     from ouroboros.project_lease import (
+        WILDCARD_WORKSPACE,
         candidate_is_leasable,
         mark_task_project,
         running_project_ids,
@@ -56,9 +57,14 @@ def test_mark_task_project_running_and_pending():
     # the project's own-folder lane.
     assert mark_task_project(running, pending, "t1", "proj-x") is True
     assert running["t1"]["task"]["project_id"] == "proj-x"
-    assert running_project_lanes(running.values()) == {("proj-x", "")}
+    # It stamps the project id ONLY, so the folder is unknown here; the lane is
+    # the fail-safe wildcard that conflicts with every lane of proj-x rather
+    # than a second lane the project's own folder task could run beside.
+    assert running_project_lanes(running.values()) == {("proj-x", WILDCARD_WORKSPACE)}
     assert running_project_ids(running.values()) == {"proj-x"}
-    assert candidate_is_leasable({"id": "z", "project_id": "proj-x"}, {("proj-x", "")}) is False
+    assert candidate_is_leasable(
+        {"id": "z", "project_id": "proj-x"}, {("proj-x", "/w/proj-x")}
+    ) is False
     # Bare project ids are a MISUSE, not a quietly permissive lease: every
     # candidate would read as leasable and two writers could enter one folder.
     with pytest.raises(TypeError):
@@ -103,6 +109,33 @@ def test_ui_conversion_marks_running_task_as_lease_holder(tmp_path, monkeypatch)
     assert candidate_is_leasable(
         {"id": "other", "project_id": pid}, running_project_lanes(workers.RUNNING.values()),
     ) is False
+
+
+def test_ensure_project_scope_logs_a_registry_refusal_loudly(tmp_path, monkeypatch, caplog):
+    """The registry-wide chat-id reservation refuses an unresolvable project
+    collision by RAISING. That refusal used to land in the generic
+    ``except Exception: log.debug(...)`` at the bottom of the handler, so the
+    loud half of "a project collision is refused loudly" was swallowed and the
+    task simply kept running unscoped with nothing above DEBUG to show for it."""
+    import supervisor.workers as workers
+    from ouroboros.projects_registry import create_project
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    create_project(tmp_path, "taken")
+
+    def _refuse(*args, **kwargs):
+        raise ValueError("chat id 123 for project 'clash' is already reserved by taken")
+
+    monkeypatch.setattr("ouroboros.projects_registry.create_project", _refuse)
+
+    with caplog.at_level("ERROR"):
+        workers.ensure_project_scope(
+            {"task_id": "t-clash", "project_id": "clash", "project_name": "Clash"},
+            SimpleNamespace(RUNNING={}),
+        )
+
+    assert "ensure_project_scope REFUSED" in caplog.text
+    assert "already reserved" in caplog.text
 
 
 def test_ui_conversion_scopes_a_pending_task(tmp_path, monkeypatch):

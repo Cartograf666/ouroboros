@@ -124,6 +124,21 @@ def _normalize_project_row(value: Dict[str, Any]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             row[field] = 0
     row["delete_error"] = str(row.get("delete_error") or "")
+    # Thread #0 owns its OWN revision counter; `visible_revision` stays the
+    # project-wide AGGREGATE the flat `project_seen_revision` cursor compares
+    # against. Sharing one number made every extra thread's activity mark thread
+    # #0 unread as well. A legacy row seeds thread #0 from the aggregate: while a
+    # project had exactly one thread the two numbers WERE the same fact, so the
+    # seed is exact and no unread state is invented or lost.
+    if "thread0_visible_revision" not in row:
+        row["thread0_visible_revision"] = row["visible_revision"]
+    else:
+        try:
+            row["thread0_visible_revision"] = max(
+                0, int(row.get("thread0_visible_revision") or 0)
+            )
+        except (TypeError, ValueError):
+            row["thread0_visible_revision"] = 0
     row["threads"] = _normalize_thread_rows(row.get("threads"))
     return row
 
@@ -136,6 +151,13 @@ def _normalize_thread_rows(value: Any) -> List[Dict[str, Any]]:
     they carry no usable id/chat_id, and thread id ``0`` is never accepted from
     storage: thread #0 is synthesized from the project itself, so a stored
     duplicate would be a second, silently disagreeing truth.
+
+    Like :func:`_normalize_project_row`, each row is built from ``dict(raw)``
+    and only the normalized keys are OVERWRITTEN. Rebuilding a fresh dict of
+    known keys silently DELETED every additive field a later phase adds — the
+    ``worktree`` binding T3 stores on a branched-off thread would have been
+    dropped on the next read of an untouched registry, and normalization runs on
+    every ``_load``, so the loss would look like data that was never written.
     """
     out: List[Dict[str, Any]] = []
     seen_ids: set = set()
@@ -152,17 +174,18 @@ def _normalize_thread_rows(value: Any) -> List[Dict[str, Any]]:
         if thread_id <= MAIN_THREAD_ID or not chat_id or thread_id in seen_ids:
             continue
         seen_ids.add(thread_id)
-        row: Dict[str, Any] = {
-            "id": thread_id,
-            "chat_id": chat_id,
-            "name": str(raw.get("name") or "").strip() or f"Thread {thread_id}",
-            "created_at": str(raw.get("created_at") or ""),
-        }
+        row: Dict[str, Any] = dict(raw)
+        row["id"] = thread_id
+        row["chat_id"] = chat_id
+        row["name"] = str(raw.get("name") or "").strip() or f"Thread {thread_id}"
+        row["created_at"] = str(raw.get("created_at") or "")
         try:
             row["visible_revision"] = max(0, int(raw.get("visible_revision") or 0))
         except (TypeError, ValueError):
             row["visible_revision"] = 0
-        # Fork cursor (A3): a pointer into the PARENT's rows, never a copy.
+        # Fork cursor (A3): a pointer into the PARENT's rows, never a copy. A
+        # HALF-written cursor is not a cursor — drop both keys so an ancestry
+        # walk can never inherit a bound without a parent (or the reverse).
         try:
             fork_of = int(raw.get("fork_of_chat_id") or 0)
         except (TypeError, ValueError):
@@ -171,6 +194,9 @@ def _normalize_thread_rows(value: Any) -> List[Dict[str, Any]]:
         if fork_of and fork_before:
             row["fork_of_chat_id"] = fork_of
             row["fork_before_ts"] = fork_before
+        else:
+            row.pop("fork_of_chat_id", None)
+            row.pop("fork_before_ts", None)
         out.append(row)
     return sorted(out, key=lambda r: int(r["id"]))
 
@@ -179,10 +205,16 @@ def project_threads(project: Dict[str, Any]) -> List[Dict[str, Any]]:
     """CANONICAL thread projection of a project row — thread #0 first.
 
     Thread #0 is SYNTHESIZED from the project's own ``chat_id``/``name``/
-    ``created_at``/``visible_revision`` (X7): nothing on disk is rewritten, and
-    the top-level ``chat_id`` remains its compatibility alias. Every consumer
-    that wants "the threads of this project" must read THIS, never the raw
-    ``threads`` list, or it will silently lose the project's main thread.
+    ``created_at`` (X7): nothing on disk is rewritten, and the top-level
+    ``chat_id`` remains its compatibility alias. Every consumer that wants "the
+    threads of this project" must read THIS, never the raw ``threads`` list, or
+    it will silently lose the project's main thread.
+
+    Its revision comes from the project's OWN ``thread0_visible_revision``, not
+    from ``visible_revision`` — that one is the project-wide AGGREGATE, so
+    projecting it here made activity in ANY thread read as unread activity in
+    thread #0. A row that predates the split falls back to the aggregate, which
+    is the same number while a project has one thread.
     """
     if not isinstance(project, dict):
         return []
@@ -191,12 +223,20 @@ def project_threads(project: Dict[str, Any]) -> List[Dict[str, Any]]:
         chat_id = int(project.get("chat_id") or 0)
     except (TypeError, ValueError):
         chat_id = 0
+    try:
+        own_revision = max(0, int(
+            project.get(
+                "thread0_visible_revision", project.get("visible_revision")
+            ) or 0
+        ))
+    except (TypeError, ValueError):
+        own_revision = 0
     zero = {
         "id": MAIN_THREAD_ID,
         "chat_id": chat_id or project_chat_id(pid),
         "name": str(project.get("name") or pid),
         "created_at": str(project.get("created_at") or ""),
-        "visible_revision": max(0, int(project.get("visible_revision") or 0)),
+        "visible_revision": own_revision,
     }
     return [zero, *_normalize_thread_rows(project.get("threads"))]
 
@@ -289,6 +329,11 @@ def _save(drive_root: Any, data: Dict[str, Any]) -> None:
     # Stamp the current schema version on every write (idempotent; old files that
     # never had it are treated as version 0 by read_schema_version).
     atomic_write_json(path, with_schema_version(dict(data), _REGISTRY_SCHEMA_VERSION))
+    # Monotonic in-process write counter feeding the chat-binding index memo:
+    # a same-size rewrite inside one mtime tick is otherwise indistinguishable
+    # from no write at all (see _CHAT_BINDING_INDEX).
+    key = str(path)
+    _REGISTRY_WRITE_SEQ[key] = _REGISTRY_WRITE_SEQ.get(key, 0) + 1
 
 
 def _load_bindings(drive_root: Any) -> Dict[str, Any]:
@@ -564,6 +609,57 @@ def list_sidebar_projects(drive_root: Any) -> List[Dict[str, Any]]:
     ]
 
 
+# project_id -> canonical working_dir, memoized on the same registry version
+# stamp as _CHAT_BINDING_INDEX (see that comment for what the stamp can and
+# cannot prove).
+_WORKING_DIR_INDEX: Dict[str, tuple] = {}
+
+
+def project_working_dirs(drive_root: Any) -> Dict[str, str]:
+    """``project_id -> registered working_dir`` for every RESERVED project.
+
+    The writer-lease lane resolver (``ouroboros.project_lease``) needs this and
+    must stay filesystem-free under the supervisor queue lock, so the map is
+    built HERE and handed in. A task scoped post-hoc through
+    ``mark_task_project`` carries no ``workspace_root`` of its own; without this
+    map its lane would not match the room task already writing the SAME folder
+    and two top-level writers would enter it. File-less projects are omitted —
+    the lease treats an unresolvable folder as a wildcard that conflicts with
+    every lane of its project, never as a lane of its own. Fail-open: an
+    unreadable registry yields ``{}``, which is exactly that conservative case.
+
+    Values are canonicalized here as well as at write time. New rows are stored
+    resolved, but a registry written BEFORE that could hold an unresolved
+    spelling — and against a task's already-realpath'd ``workspace_root`` that
+    is a DIFFERENT string, i.e. a second concrete lane and the very split this
+    map exists to close. The resolve is memoized on the registry file's version
+    stamp, so the filesystem is touched once per registry write rather than once
+    per assignment pass.
+    """
+    path = _registry_path(drive_root)
+    key = str(path)
+    try:
+        stat = path.stat()
+        stamp: tuple = (stat.st_mtime_ns, stat.st_size, _REGISTRY_WRITE_SEQ.get(key, 0))
+    except OSError:
+        stamp = (0, 0, _REGISTRY_WRITE_SEQ.get(key, 0))
+    cached = _WORKING_DIR_INDEX.get(key)
+    if cached is not None and cached[0] == stamp:
+        return dict(cached[1])
+    out: Dict[str, str] = {}
+    try:
+        for project in list_reserved_projects(drive_root):
+            pid = str(project.get("id") or "")
+            folder = _canonical_working_dir(project.get("working_dir"))
+            if pid and folder:
+                out[pid] = folder
+    except Exception:
+        log.debug("project_working_dirs failed", exc_info=True)
+        return {}
+    _WORKING_DIR_INDEX[key] = (stamp, dict(out))
+    return out
+
+
 def reserved_project_chat_ids(drive_root: Any) -> set:
     """The set of chat_ids reserved by every Project lifecycle state.
 
@@ -637,22 +733,32 @@ def get_reserved_project(drive_root: Any, project_id: str) -> Optional[Dict[str,
     return None
 
 
-# chat_id -> binding index, memoized on the registry file's (mtime_ns, size).
-# atomic_write_json renames into place, so any mutation changes at least one of
-# those; a stale entry is therefore not reachable. C4: "which project/thread owns
-# this chat" is asked once per inbound message and per history request, and with
+# chat_id -> binding index, memoized on the registry file's
+# (mtime_ns, size, in-process write counter). C4: "which project/thread owns this
+# chat" is asked once per inbound message and per history request, and with
 # threads the naive scan is projects x threads.
+#
+# Invalidation is a HEURISTIC, not a proof. atomic_write_json renames into place,
+# so a write normally changes the mtime; but a same-size rewrite landing inside
+# one filesystem timestamp tick (coarse mtime granularity on some filesystems)
+# can produce an identical (mtime_ns, size) pair. The monotonic counter closes
+# that window for writes made by THIS process — the case a request-path read is
+# actually racing. A concurrent write by ANOTHER process within the same tick can
+# still be missed for the remainder of it; the index is a routing cache, and the
+# next differing stamp repairs it.
 _CHAT_BINDING_INDEX: Dict[str, tuple] = {}
+# Bumped by _save on every registry write; part of the memo stamp above.
+_REGISTRY_WRITE_SEQ: Dict[str, int] = {}
 
 
 def _chat_binding_index(drive_root: Any) -> Dict[int, Dict[str, Any]]:
     path = _registry_path(drive_root)
+    key = str(path)
     try:
         stat = path.stat()
-        stamp: tuple = (stat.st_mtime_ns, stat.st_size)
+        stamp: tuple = (stat.st_mtime_ns, stat.st_size, _REGISTRY_WRITE_SEQ.get(key, 0))
     except OSError:
-        stamp = (0, 0)
-    key = str(path)
+        stamp = (0, 0, _REGISTRY_WRITE_SEQ.get(key, 0))
     cached = _CHAT_BINDING_INDEX.get(key)
     if cached is not None and cached[0] == stamp:
         return cached[1]
@@ -853,6 +959,29 @@ def fork_thread(drive_root: Any, project_id: str, thread_id: Any) -> Dict[str, A
     )
 
 
+def _canonical_working_dir(raw: Any) -> str:
+    """Symlink-resolved spelling of a project's folder, stored at WRITE time.
+
+    The writer-lease lane compares a task's ``workspace_root`` against this
+    value and must stay filesystem-free under the queue lock (see
+    ``ouroboros.project_lease``), so the one place allowed to touch the disk is
+    here — the record write. ``workspace_admission.validate_workspace_root``
+    already resolves the task-side carrier the same way, so both spellings meet
+    as realpaths and the pure ``normpath``/``normcase`` comparison is enough.
+    CASE is preserved: this value is also shown to the owner, and
+    ``normcase`` would lowercase it on a case-insensitive filesystem.
+    Fail-open — an unresolvable path is stored as given rather than dropped.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(pathlib.Path(text).expanduser().resolve(strict=False))
+    except (OSError, RuntimeError, ValueError):
+        log.debug("working_dir canonicalization failed for %r", text, exc_info=True)
+        return text
+
+
 def create_project(
     drive_root: Any,
     project_id: str,
@@ -895,13 +1024,16 @@ def create_project(
             "id": pid,
             "name": _validated_name(name, pid),
             "chat_id": chat_id,
-            "working_dir": str(working_dir or "").strip(),
+            "working_dir": _canonical_working_dir(working_dir),
             "origin": str(origin or "owner"),
             "created_at": utc_now_iso(),
             "last_active_at": utc_now_iso(),
             "lifecycle": PROJECT_ACTIVE,
             "routing_generation": 0,
+            # Project-wide AGGREGATE (the flat project_seen_revision cursor)…
             "visible_revision": 0,
+            # …and thread #0's OWN counter, which siblings must not advance.
+            "thread0_visible_revision": 0,
             "delete_error": "",
         }
         data["projects"].append(entry)
@@ -935,6 +1067,10 @@ def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional
                     continue
                 if key == "name":
                     value = _validated_name(value, str(entry.get("id") or ""))
+                elif key == "working_dir":
+                    # Record-write-time canonicalization (see the helper): the
+                    # lease compares this path purely, so symlinks resolve here.
+                    value = _canonical_working_dir(value)
                 entry[key] = value
             _save(drive_root, data)
             return dict(entry)
@@ -1027,11 +1163,14 @@ def increment_project_visible_revision(
 ) -> Optional[Dict[str, Any]]:
     """Advance unread state for one newly-appended owner-visible canonical row.
 
-    A row appended to a NON-primary thread advances that thread's own counter
-    AND the project's aggregate: the project counter is what today's flat
+    EVERY thread — thread #0 included — advances its OWN counter AND the
+    project's aggregate. The aggregate is what today's flat
     ``project_seen_revision`` cursor compares against, so leaving it untouched
-    would make every non-primary thread's activity silently unread-invisible.
-    (The per-thread counter is the number T1's nested cursor will read.)
+    would make a non-primary thread's activity silently unread-invisible; the
+    per-thread counters are the numbers T1's nested cursor will read. Thread #0
+    keeps its own number in ``thread0_visible_revision`` rather than borrowing
+    the aggregate — otherwise a message in ANY sibling thread would also mark
+    thread #0 unread.
     """
     pid = sanitize_project_id(project_id)
     try:
@@ -1053,10 +1192,18 @@ def increment_project_visible_revision(
             if not ((pid and entry.get("id") == pid) or thread_hit is not None):
                 continue
             entry["visible_revision"] = int(entry.get("visible_revision") or 0) + 1
-            if thread_hit is not None and int(thread_hit["id"]) != MAIN_THREAD_ID:
+            hit_id = int(thread_hit["id"]) if thread_hit is not None else MAIN_THREAD_ID
+            if hit_id == MAIN_THREAD_ID:
+                # Thread #0's own counter. `entry` came through
+                # _normalize_project_row, which seeds a legacy row's value from
+                # the aggregate, so this never silently restarts at 0.
+                entry["thread0_visible_revision"] = int(
+                    entry.get("thread0_visible_revision") or 0
+                ) + 1
+            else:
                 threads = _normalize_thread_rows(entry.get("threads"))
                 for row in threads:
-                    if int(row["id"]) == int(thread_hit["id"]):
+                    if int(row["id"]) == hit_id:
                         row["visible_revision"] = int(row.get("visible_revision") or 0) + 1
                 entry["threads"] = threads
             _save(drive_root, data)
@@ -1336,6 +1483,7 @@ __all__ = [
     "project_thread_note_for_task",
     "project_chat_for_task_tree",
     "project_task_bindings",
+    "project_working_dirs",
     "registered_project_chat_ids",
     "reserved_project_chat_ids",
     "projects_summary",

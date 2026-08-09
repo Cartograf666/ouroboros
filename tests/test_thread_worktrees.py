@@ -153,7 +153,9 @@ def test_removal_of_an_unknown_thread_is_a_typed_no_op(tmp_path):
         data_dir=tmp_path / "data", project_id="racer", thread_id=9,
         worktree_root=tmp_path / "thread_worktrees",
     )
-    assert result == {"removed": False, "reason": "unknown", "inspection": {}}
+    assert result == {
+        "removed": False, "reason": "unknown", "inspection": {}, "branch_deleted": False,
+    }
 
 
 def test_a_malformed_row_can_never_delete_an_outside_path(repo, tmp_path, wt_root):
@@ -188,6 +190,71 @@ def test_inspection_treats_unreadable_as_unsafe(tmp_path):
     assert report["exists"] is True
     assert report["dirty"] is True
     assert report["error"]
+
+
+def test_removal_deletes_the_thread_branch_so_reprovisioning_works(repo, tmp_path, wt_root):
+    """Provisioning refuses to reuse an existing branch (an owner's work is
+    never clobbered), so a removal that left ``thread/<name>`` behind turned
+    every removal into a PERMANENT block on branching that thread off again —
+    the owner would have had to delete a git branch by hand."""
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    (Path(handle.path) / "draft.txt").write_text("unsaved\n", encoding="utf-8")
+    _git(Path(handle.path), "config", "user.email", "t@example.com")
+    _git(Path(handle.path), "config", "user.name", "T")
+    _git(Path(handle.path), "add", "draft.txt")
+    _git(Path(handle.path), "commit", "-m", "work")
+
+    done = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True, worktree_root=wt_root,
+    )
+    assert done["removed"] is True
+    assert done["branch_deleted"] is True
+    listed = subprocess.run(
+        ["git", "branch", "--list", handle.branch],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+    )
+    assert listed.stdout.strip() == ""
+
+    # ...and the same thread can be branched off again.
+    again = _provision(repo, tmp_path, wt_root)
+    assert Path(again.path).is_dir()
+    assert again.branch == handle.branch
+
+
+def test_a_clean_removal_also_frees_the_branch(repo, tmp_path, wt_root):
+    handle = _provision(repo, tmp_path, wt_root)
+    result = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        worktree_root=wt_root,
+    )
+    assert result["removed"] is True and result["branch_deleted"] is True
+    assert _provision(repo, tmp_path, wt_root).branch == handle.branch
+
+
+def test_worktree_ops_lock_is_keyed_on_the_repo(repo, tmp_path, wt_root):
+    """T0-8: `git worktree add|remove|prune` all rewrite the SAME
+    <repo>/.git/worktrees metadata. Keying the cross-process lockfile on each
+    registry's own worktree ROOT gave the subagent owner and the thread owner
+    two different lockfiles over one .git — they never actually serialized."""
+    from pathlib import Path
+
+    from ouroboros.subagent_worktrees import _ops_lock_path
+
+    expected = repo / ".git" / ".worktree_ops.lock"
+    assert _ops_lock_path(repo) == expected
+    # Both registries resolve to that ONE file...
+    assert _ops_lock_path(str(repo)) == expected
+    # ...while a plain (non-repo) directory keeps a lock of its own: those ops
+    # contend for a NAME under the root, not for git metadata.
+    assert _ops_lock_path(wt_root) == wt_root / ".worktree_ops.lock"
+
+    # A linked worktree hands us a .git FILE; it must still meet the main repo.
+    handle = _provision(repo, tmp_path, wt_root)
+    assert (Path(handle.path) / ".git").is_file()
+    assert _ops_lock_path(handle.path) == expected
 
 
 def test_subagent_age_sweep_cannot_see_a_thread_worktree(repo, tmp_path, wt_root):
