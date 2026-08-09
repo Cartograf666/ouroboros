@@ -48,6 +48,12 @@ for _profile_defaults in _MODEL_DEFAULTS.values():
 
 _STEPS = _rows(("id", "title", "railCopy", "copy", "footer"), (
     ("providers", "Add your access", "Keys + local", "Fill at least one remote key or a local model source. The next step adapts to what you configured here.", "Paste only what you already have. OpenRouter, direct provider keys, and an optional local model can coexist."),
+    # SKIPPABLE by design and placed right after access, because it is the step
+    # that explains what the access already bought and what an agent plan adds
+    # on top of it. It never blocks completion (D-1). Named "agents", never
+    # "coding agents" (D-10): these agents build presentations and run ordinary
+    # tasks too.
+    ("agents", "Connect your agents", "Optional", "Optional. Ouroboros already runs on the access you just added. Signing in to an agent plan moves delegated subagents and commit review onto that plan instead of per-call API spend.", "Skippable. Connect, add, or change agent accounts any time in Settings → Agents."),
     ("models", "Choose models", "model slots", "Review the visible model defaults derived from your current setup, then edit anything you want before launch.", "Plain openai/... or anthropic/... remains router-style. Direct values use openai::... and anthropic::...."),
     ("review_mode", "Choose review mode", "Advisory vs blocking", "Decide how strict pre-commit review should be before Ouroboros starts modifying itself.", "Pick both review enforcement and the initial runtime mode before Ouroboros starts."),
     ("budget", "Set your budget", "Session limits", "Budget is its own step because it directly shapes how far Ouroboros can go in one session and in a single task.", "Total budget is global. Per-task cost cap is a hard cap over one task's whole tree, subagents included: the task wraps up gracefully just before the ledger fence force-stops it."),

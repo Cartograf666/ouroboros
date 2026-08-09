@@ -6,7 +6,18 @@ export const OVERLAY_ID = 'onboarding-overlay';
 // The framed wizard's sandbox policy, in one place: it is a security boundary
 // AND the thing that has to change when a wizard step needs a new capability,
 // so it should be one edit rather than a token buried in markup.
-export const FRAME_SANDBOX = 'allow-same-origin allow-scripts allow-forms';
+//
+// `allow-popups` + `allow-popups-to-escape-sandbox` are LOAD-BEARING, not
+// hygiene: the Agents step's primary action is the agent's own sign-in link,
+// opened with target="_blank". Without them the browser blocks that click
+// SILENTLY — the owner presses "Open sign-in link" and nothing happens, and
+// copying the URL by hand is the only way through. The escape variant is
+// required too: a popup that inherits this sandbox lands on the vendor's OAuth
+// page without same-origin or scripts, which no sign-in survives. Both apply
+// only to windows the framed page opens, never to the frame's own authority
+// over this document.
+export const FRAME_SANDBOX = 'allow-same-origin allow-scripts allow-forms '
+    + 'allow-popups allow-popups-to-escape-sandbox';
 
 function removeOverlay() {
     document.getElementById(OVERLAY_ID)?.remove();

@@ -14,7 +14,6 @@ from ouroboros.config import (
     load_settings,
     save_settings,
 )
-from ouroboros.onboarding_wizard import prepare_onboarding_settings
 from ouroboros.server_runtime import apply_runtime_provider_defaults, has_startup_ready_provider
 
 # The launcher's own logger: these lines belong in launcher.log next to the
@@ -57,9 +56,15 @@ def present_first_run_onboarding(settings: dict, port: int, *, headless: bool = 
     supervisor is a supported runtime state (ARCHITECTURE §2), so nothing new
     is started to make this work.
 
-    Returns ``{"saved": bool, "restart_required": bool}``. Closing the window
-    without saving stays non-fatal: startup continues and the main window's
-    blocking overlay still offers the same wizard.
+    Returns ``{"saved": bool, "restart_required": bool}`` — reported BY the page
+    through the lifecycle bridge, not written here: this module persists
+    nothing. Closing the window without saving stays non-fatal: startup
+    continues and the main window's blocking overlay still offers the same
+    wizard.
+
+    ``settings`` is the launcher's already-normalized snapshot. It is no longer
+    read (the completion endpoint reloads and validates for itself) and is kept
+    only so the launcher's call site stays untouched.
     """
     outcome = {"saved": False, "restart_required": False}
 
@@ -84,44 +89,14 @@ def present_first_run_onboarding(settings: dict, port: int, *, headless: bool = 
     class OnboardingHostApi:
         """Window-lifecycle bridge for the desktop setup window.
 
-        Deliberately NOT a settings authority: the gateway persists completion,
-        exactly as for a browser owner. ``save_wizard`` is the one disclosed
-        exception and exists only while the atomic completion endpoint is not
-        deployed (see the seam in ``web/modules/onboarding_wizard.js``).
+        NOT a settings authority, and no longer even capable of being one. The
+        page completes through ``POST /api/onboarding/complete`` exactly as a
+        browser owner does, and that endpoint authors the fresh-install
+        ``light`` safety coverage on its OWN server-side freshness proof — the
+        one reason a desktop-only save path ever existed. A bridge method that
+        can write ``settings.json`` while nothing calls it is not dead code but
+        a live authority nobody audits, so it is gone: window lifecycle only.
         """
-
-        def save_wizard(self, data: dict) -> str:
-            prepared_settings, error = prepare_onboarding_settings(data, settings)
-            if error:
-                return error
-            # Rev.3-2 (v6.82.0): a FRESH wizard save explicitly authors the
-            # new-install "light" safety coverage (prepare_onboarding_settings only
-            # adds it when the settings file carries no explicit choice). Name the
-            # key as authored and allow this owner-driven onboarding write past the
-            # full->light ratchet; every other save path keeps the ratchet intact.
-            # The DESKTOP host authors it — the shared validator must not, because
-            # web/Docker onboarding posts the same payload through the non-owner
-            # generic /api/settings path. Eligibility is a fresh install (no
-            # settings file); the persist seam re-proves it under the lock.
-            from ouroboros.settings_setup_contract import wizard_authors_safety_light
-
-            wizard_authors_safety = wizard_authors_safety_light()
-            if wizard_authors_safety:
-                prepared_settings["OUROBOROS_SAFETY_MODE"] = "light"
-            settings.update(prepared_settings)
-            settings.update(apply_runtime_provider_defaults(settings)[0])
-            try:
-                save_settings(
-                    settings,
-                    allow_elevation=True,
-                    onboarding_safety_default=wizard_authors_safety,
-                )
-                _apply_settings_to_env(settings)
-                # Window teardown belongs to onboarding_finished, which the page
-                # calls next: this method only persists.
-                return "ok"
-            except Exception as exc:
-                return f"Failed to save: {exc}"
 
         def onboarding_finished(self, result: dict | None = None) -> str:
             payload = result if isinstance(result, dict) else {}

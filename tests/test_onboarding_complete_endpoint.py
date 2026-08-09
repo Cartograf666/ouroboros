@@ -505,6 +505,37 @@ def test_the_preset_save_does_not_stall_on_its_own_lock(onboarding):
     assert elapsed < 1.0, f"the preset save waited {elapsed:.2f}s on a lock it held"
 
 
+def test_a_desktop_shaped_completion_still_authors_light_on_a_fresh_install(onboarding):
+    """D-8 closure proof. The desktop `save_wizard` bridge existed for exactly
+    ONE reason: a genuinely fresh install had to author the new-install `light`
+    safety coverage, and neither the shared validator nor the generic settings
+    endpoint may lower safety. Removing that bridge is only honest if the same
+    completion the desktop window now posts still lands `light`."""
+    assert not onboarding.settings_path.exists()   # genuinely fresh
+
+    response = onboarding.client.post("/api/onboarding/complete", json=dict(WIZARD_PAYLOAD))
+
+    assert response.status_code == 200, response.text
+    assert onboarding.saved()["OUROBOROS_SAFETY_MODE"] == "light"
+
+
+def test_a_completion_over_an_existing_install_can_never_lower_safety(onboarding):
+    """The other half: the ratchet. With a settings file already on disk the
+    install is not fresh, so completion authors nothing — and a payload that
+    tries to carry the lowering itself gets no further, because
+    OUROBOROS_SAFETY_MODE is not a wizard field at all."""
+    onboarding.settings_path.write_text(
+        json.dumps({"OUROBOROS_SAFETY_MODE": "full", "OPENROUTER_API_KEY": "sk-or-v1-existing"}),
+        encoding="utf-8")
+
+    response = onboarding.client.post(
+        "/api/onboarding/complete",
+        json={**WIZARD_PAYLOAD, "OUROBOROS_SAFETY_MODE": "light"})
+
+    assert response.status_code == 200, response.text
+    assert onboarding.saved()["OUROBOROS_SAFETY_MODE"] == "full"
+
+
 def test_old_install_is_not_retro_presetted(onboarding):
     """An install that already has a provider is past install time — the missing
     marker is NOT permission to preset it (every pre-preset install lacks one)."""

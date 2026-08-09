@@ -1038,7 +1038,20 @@ Before every commit, verify the following:
   mode, the fresh-install safety default and the agent-subscription preset in a
   single write; `GET /api/onboarding` normalizes for display but must never
   persist, because a read that authors `settings.json` destroys the
-  fresh-install latch both install-time behaviours depend on. Install-time
+  fresh-install latch both install-time behaviours depend on. There is no second
+  completion path on any host — no generic-settings pair, no desktop save bridge
+  — and the client treats only the exact success envelope as a completion: a 2xx
+  whose body will not parse, or lacks `ok`/`runtime_mode`/`restart_required`, is
+  a failure the wizard shows, never a silent success that discards the restart
+  receipt. A failure after the bytes reach disk says so rather than claiming
+  nothing was saved.
+- The onboarding frame is sandboxed WITH popup permission
+  (`allow-popups allow-popups-to-escape-sandbox`). The Agents step's primary
+  action is the agent's own sign-in link in a new tab; a sandbox without those
+  tokens blocks that click silently, and a popup that inherits the sandbox
+  reaches the vendor's OAuth page with neither same-origin nor scripts. Assert
+  this behaviourally, from the login card's own markup — an attribute-string
+  test passes while the click stays broken. Install-time
   defaults are compiled from LIVE discovery and refuse typed when a model
   cannot be resolved — never guessed, never half-applied, and never
   re-derived after onboarding (that would be a second, continuous authority

@@ -1,8 +1,16 @@
-// The wizard is served as a real ES module now, so it uses the SPA's shared
-// helpers directly instead of carrying private copies that could drift from
-// them (the escaping is a security contract, and the request wrapper is the
-// gateway boundary).
+// The wizard is served as a real ES module (`GET /onboarding`), so it uses the
+// SPA's shared helpers directly instead of carrying private copies that could
+// drift from them (the escaping is a security contract, and the request wrapper
+// is the gateway boundary) — and the Agents step imports the SAME login
+// machinery and the SAME status store the rest of the app uses.
 import { fetchJson } from './api_client.js';
+import {
+    agentsStepHtml,
+    completionFailureNotice,
+    createAgentsStep,
+    familyLabels,
+    readCompletionAnswer,
+} from './onboarding_agents_step.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
 (() => {
@@ -57,10 +65,20 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
         claudeCliTone: 'muted',
         claudeCliError: '',
         claudeCliDismissed: false,
+        // Agents step: what the step OBSERVED (never a guess), the owner's
+        // explicit "finish without agent defaults" choice, and the typed reason
+        // a completion attempt refused to write the preset.
+        agentsConnected: [],
+        skipSubscriptionPresets: false,
+        presetFailure: null,
+        // Set once completion SUCCEEDED but the receipt says the saved runtime
+        // mode needs a restart, in the one shell that cannot restart anything.
+        completedRestartMode: '',
     }, INITIAL_STATE);
 
     let localStatusPollStarted = false;
     let claudeCliPollStarted = false;
+    let agentsStep = null;
 
     function trim(value) {
         return String(value || '').trim();
@@ -292,6 +310,10 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
     }
 
     function validateCurrentStep() {
+        // 'agents' is deliberately absent from this list: the step is SKIPPABLE
+        // and can never block completion. A subscription is an amplifier, never
+        // an admission gate (D-1) — the launch requirement was already met on
+        // the access step.
         if (state.currentStep === 'providers') return validateProvidersStep();
         if (state.currentStep === 'models') return validateModelsStep();
         if (state.currentStep === 'review_mode') return validateReviewStep();
@@ -491,46 +513,6 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
         `;
     }
 
-    function renderHarnessAccountsCard() {
-        // D30: skippable coding-agent-accounts card. On the desktop first-run
-        // the wizard runs BEFORE the server exists, so the card degrades to a
-        // Settings pointer; on web it shows the live account count. The full
-        // login flows (device-code card, terminal-command fallback) live in
-        // Settings → Providers → Harness Accounts — never a terminal in-app.
-        if (state.harnessCardSkipped) return '';
-        const liveLine = HOST_MODE === 'desktop'
-            ? 'Available after launch: open Settings → Providers → Harness Accounts.'
-            : escapeHtml(state.harnessAccountsLine || 'Checking connected accounts…');
-        return `
-            <div class="panel-card" id="wizard-harness-card">
-                <h3>Coding-agent subscriptions (optional)</h3>
-                <p>Run delegated subagents and reviewers on your Codex CLI / Claude Code / Cursor
-                subscriptions instead of API tokens. Accounts are connected to Ouroboros's own
-                agent home — your personal logins are never imported.</p>
-                <div class="wizard-runtime-strip">
-                    <span class="wizard-runtime-status">${liveLine}</span>
-                    <button type="button" class="btn btn-secondary" id="wizard-harness-skip">Skip for now</button>
-                </div>
-            </div>
-        `;
-    }
-
-    async function refreshHarnessAccountsLine() {
-        if (HOST_MODE === 'desktop' || state.harnessCardSkipped) return;
-        try {
-            const data = await apiRequest('/api/claudexor/status', { cache: 'no-store' });
-            const daemonState = String(data?.daemon?.state || '');
-            const profiles = Array.isArray(data?.profiles?.profiles) ? data.profiles.profiles.length : 0;
-            state.harnessAccountsLine = daemonState === 'running'
-                ? `${profiles} account${profiles === 1 ? '' : 's'} connected. Manage them in Settings → Providers → Harness Accounts.`
-                : 'No accounts connected yet. Connect them any time in Settings → Providers → Harness Accounts.';
-        } catch (error) {
-            state.harnessAccountsLine = 'Connect accounts any time in Settings → Providers → Harness Accounts.';
-        }
-        const card = document.querySelector('#wizard-harness-card .wizard-runtime-status');
-        if (card) card.textContent = state.harnessAccountsLine;
-    }
-
     function renderClaudeCliControls() {
         return `
             <div class="panel-card" id="wizard-claude-card"${shouldShowClaudeCliCta() ? '' : ' hidden'}>
@@ -572,10 +554,25 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
                 ['Local routing', localRoutingLabel(state.localRoutingMode)],
             );
         }
+        rows.push(['Agents', agentsSummaryValue()]);
         if (trim(state.skillsRepoPath)) {
             rows.push(['Skills repo', trim(state.skillsRepoPath)]);
         }
         return rows;
+    }
+
+    function agentsSummaryValue() {
+        const labels = familyLabels(state.agentsConnected);
+        if (!labels.length) return 'none connected (API access only)';
+        if (state.skipSubscriptionPresets) return `${labels.join(', ')} (finishing without agent defaults)`;
+        return `${labels.join(', ')} — will run commit review and delegated subagents`;
+    }
+
+    function shouldOfferPresetSkip() {
+        // The endpoint's own escape hatch, surfaced exactly when it can change
+        // the outcome: something is connected to move onto, or a completion
+        // attempt already refused the preset and said the skip is available.
+        return state.agentsConnected.length > 0 || Boolean(state.presetFailure);
     }
 
         function providerKeyField({ id, label, placeholder, value, note, inputType }) {
@@ -642,7 +639,6 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
                 </div>
             </details>
             ${renderClaudeCliControls()}
-            ${renderHarnessAccountsCard()}
             <details class="wizard-collapse" data-collapse="local-model" ${localSourceOpen ? 'open' : ''}>
                 <summary>
                     <span>Local model settings</span>
@@ -675,6 +671,33 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
                 </div>
             </details>
         `;
+    }
+
+    function renderAgentsStep() {
+        // SKIPPABLE by construction: `validateCurrentStep` returns '' for this
+        // step, so Continue is never disabled and no field here can block
+        // finishing. An agent plan is an amplifier, never an admission gate.
+        return `
+            <div class="step-header">
+                <div>
+                    <h2 class="step-title">${escapeHtml(STEP_META.agents.title)}</h2>
+                    <p class="step-copy">${escapeHtml(STEP_META.agents.copy)}</p>
+                </div>
+            </div>
+            ${agentsStepHtml()}
+        `;
+    }
+
+    function bindAgentsStep() {
+        if (!agentsStep) {
+            agentsStep = createAgentsStep({
+                isVisible: () => state.currentStep === 'agents',
+                onChange: (connected) => { state.agentsConnected = connected; },
+            });
+        }
+        agentsStep.setSkipPresets(state.skipSubscriptionPresets);
+        agentsStep.mount();
+        syncCurrentStepActionState();
     }
 
     function modelSuggestionField({ id, label, value, note }) {
@@ -814,8 +837,30 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
         `;
     }
 
+    function renderRestartRequiredScreen() {
+        return `
+            <div class="step-header">
+                <div>
+                    <h2 class="step-title">Setup saved — restart to apply it</h2>
+                    <p class="step-copy">Everything you entered is on disk. One choice needs a fresh start before it is live.</p>
+                </div>
+            </div>
+            <div class="panel-card">
+                <h3>Runtime mode takes effect at the next boot</h3>
+                <p>Ouroboros saved <code>${escapeHtml(state.completedRestartMode)}</code> as the runtime mode for the next boot, but this
+                process is still running the mode it started with. Restart Ouroboros to run in the mode you chose.
+                Opening the app now works — it simply runs in the previous mode until you do.</p>
+                <div class="wizard-runtime-strip">
+                    <button type="button" class="btn btn-primary" id="open-app-btn">Open Ouroboros in the current mode</button>
+                </div>
+            </div>
+        `;
+    }
+
     function renderStepContent() {
+        if (state.completedRestartMode) return renderRestartRequiredScreen();
         if (state.currentStep === 'providers') return renderProvidersStep();
+        if (state.currentStep === 'agents') return renderAgentsStep();
         if (state.currentStep === 'models') return renderModelsStep();
         if (state.currentStep === 'review_mode') return renderReviewModeStep();
         if (state.currentStep === 'budget') return renderBudgetStep();
@@ -855,14 +900,19 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
                 <div class="wizard-steps">${stepCards()}</div>
                 <div class="wizard-content">
                     ${renderStepContent()}
+                    ${state.completedRestartMode ? '' : `
                     <div class="wizard-footer">
                         <div class="footer-copy">${escapeHtml(meta.footer)}</div>
                         <div class="footer-actions">
                             <button class="btn btn-secondary" id="back-btn" type="button" ${index === 0 || state.saving ? 'disabled' : ''}>Back</button>
+                            ${state.currentStep === 'summary' && shouldOfferPresetSkip() ? `
+                                <button class="btn btn-secondary" id="skip-presets-btn" type="button" ${state.saving ? 'disabled' : ''}>Finish without agent defaults</button>
+                            ` : ''}
                             <button class="btn btn-primary" id="next-btn" type="button" ${nextButtonShouldBeDisabled() ? 'disabled' : ''}>${escapeHtml(nextLabel)}</button>
                         </div>
                     </div>
                     <div class="wizard-error">${escapeHtml(state.error)}</div>
+                    `}
                 </div>
             </div>
         `;
@@ -1056,12 +1106,6 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
             state.claudeCliDismissed = true;
             syncClaudeCliVisibility();
         });
-        document.getElementById('wizard-harness-skip')?.addEventListener('click', () => {
-            state.harnessCardSkipped = true;
-            const card = document.getElementById('wizard-harness-card');
-            if (card) card.hidden = true;
-        });
-        refreshHarnessAccountsLine();
         if (shouldShowClaudeCliCta()) {
             startClaudeCliStatusPolling();
             updateClaudeCliStatus();
@@ -1238,10 +1282,18 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
         }
 
     // --- Completion ---------------------------------------------------------
-    // The wizard runs against a live gateway on every host, so completion has one
-    // shape: persist, then tell whichever shell embeds this page that setup is
-    // done. Only the announcement differs (embedded frame / desktop setup window
-    // / plain browser tab).
+    // ONE completion path on every host (D-8). The wizard runs against a live
+    // gateway everywhere, so it posts the single atomic transaction and then
+    // tells whichever shell embeds this page that setup is done; only the
+    // announcement differs (embedded frame / desktop setup window / browser tab).
+    //
+    // The two legacy fallbacks are GONE. `POST /api/settings` + `POST
+    // /api/owner/runtime-mode` was the pair whose failure between the two writes
+    // left providers saved and runtime mode not, and the desktop `save_wizard`
+    // bridge existed only to author the fresh-install `light` safety coverage
+    // that the endpoint now authors itself, on its own server-side freshness
+    // proof. Keeping either as a "not deployed yet" hedge meant a first run
+    // could still silently take a non-atomic path.
 
     const ONBOARDING_COMPLETE_ENDPOINT = '/api/onboarding/complete';
 
@@ -1272,70 +1324,71 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
             });
             return;
         }
+        // PLAIN BROWSER TAB. Nothing here owns the server process, so a receipt
+        // that says a restart is required cannot be discharged by navigating —
+        // and redirecting anyway drops the owner into an app running a runtime
+        // mode DIFFERENT from the one they just chose, with nothing on screen
+        // saying so. The other two shells each show this (the overlay's restart
+        // card, the launcher's own recycle); this one used to be the only place
+        // the flag was silently thrown away.
+        if (restartRequired) {
+            showBrowserRestartRequired(runtimeMode);
+            return;
+        }
         window.location.replace('/');
     }
 
+    function showBrowserRestartRequired(runtimeMode) {
+        state.saving = false;
+        state.completedRestartMode = trim(runtimeMode) || 'advanced';
+        render();
+    }
+
     async function completeOnboardingAtomically(payload) {
-        // SEAM (D-8): one atomic completion — server-side fresh-install proof,
+        // The atomic completion (D-8): server-side fresh-install proof, the
         // structural provider gate, optional agent-preset compilation, a single
-        // persist, then supervisor start. Until that endpoint ships, an absent
-        // route answers 404/405 here and the caller keeps today's behaviour
-        // rather than breaking first-run.
+        // persist, then supervisor start.
         const response = await fetch(ONBOARDING_COMPLETE_ENDPOINT, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
         });
-        if (response.status === 404 || response.status === 405) return null;
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-        return data && typeof data === 'object' ? data : {};
-    }
-
-    async function saveWizardThroughDesktopBridge(payload) {
-        // LEGACY FALLBACK, retained only until the atomic endpoint above ships:
-        // it is the one path that may author the fresh-install `light` safety
-        // coverage, which the generic settings endpoint must never be able to do.
-        const result = await window.pywebview.api.save_wizard(payload);
-        if (result !== 'ok') throw new Error(result || 'Failed to save onboarding settings.');
-        // The launcher wrote settings.json behind the running server's back, so
-        // the managed process has to be recycled before it can adopt them.
-        return { ok: true, restart_required: true };
-    }
-
-    async function saveWizardThroughSettingsPair(payload) {
-        // LEGACY FALLBACK: today's two-write web path (generic settings save,
-        // then the dedicated owner runtime-mode write).
-        const runtimeMode = trim(state.runtimeMode) || 'advanced';
-        await apiRequest('/api/settings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+        // A body that will not parse is UNKNOWN, not empty. Substituting `{}`
+        // made a 200 carrying HTML (a proxy error page, a login redirect) look
+        // like a completion, and `{}` being truthy meant the caller announced
+        // success with `restart_required` silently gone.
+        let data = null;
+        let parsed = true;
+        try {
+            data = await response.json();
+        } catch (err) {
+            parsed = false;
+        }
+        if (!data || typeof data !== 'object') { data = {}; parsed = false; }
+        // ONE reader for both answers (typed refusal and success envelope); the
+        // branches live in onboarding_agents_step.js so every one is node-tested.
+        const answer = readCompletionAnswer({
+            status: response.status, ok: response.ok, parsed, data,
         });
-        const runtimeResult = await apiRequest('/api/owner/runtime-mode', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ mode: runtimeMode }),
-        });
-        return {
-            ok: true,
-            restart_required: Boolean(runtimeResult?.restart_required),
-            runtime_mode: runtimeResult?.runtime_mode || runtimeMode,
-        };
+        if (answer.failure) {
+            const error = new Error(answer.failure.message);
+            Object.assign(error, answer.failure);
+            throw error;
+        }
+        return answer.receipt;
     }
 
     async function saveWizardPayload(payload) {
-        let result = await completeOnboardingAtomically(payload);
-        if (!result) {
-            result = window.pywebview?.api?.save_wizard
-                ? await saveWizardThroughDesktopBridge(payload)
-                : await saveWizardThroughSettingsPair(payload);
-        }
+        const result = await completeOnboardingAtomically(payload);
+        // Setup is over: release the Agents step's status subscription and its
+        // login-job timer before the shell takes the page away.
+        agentsStep?.dispose();
+        agentsStep = null;
         announceCompletion(result);
         return 'ok';
     }
 
-    async function saveWizard() {
+    async function saveWizard({ skipPresets = false } = {}) {
         const providersError = validateProvidersStep();
         const modelsError = validateModelsStep();
         const reviewError = validateReviewStep();
@@ -1345,10 +1398,16 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
             render();
             return;
         }
+            if (skipPresets) state.skipSubscriptionPresets = true;
             state.saving = true;
             state.error = '';
             render();
             const payload = {
+                // What this step OBSERVED, plus the owner's explicit escape
+                // hatch. Neither is authority: the endpoint re-reads live
+                // account state and re-proves install-time eligibility.
+                subscriptionsConnected: state.agentsConnected.length > 0,
+                skipSubscriptionPresets: state.skipSubscriptionPresets,
                 ...Object.fromEntries(PROVIDER_FIELDS.map((field) => [field.settingKey, trim(state[field.stateKey])])),
                 ...Object.fromEntries(BUDGET_FIELDS.map((field) => [field.settingKey, Number(state[field.stateKey] || 0)])),
                 OUROBOROS_REVIEW_ENFORCEMENT: trim(state.reviewEnforcement) || 'advisory',
@@ -1365,20 +1424,35 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
         try {
             await saveWizardPayload(payload);
         } catch (error) {
+            // The wizard STAYS OPEN with the real reason. A typed preset refusal
+            // wrote nothing, so the offered escape is honest: finish without the
+            // agent defaults and keep everything editable in Settings.
+            const notice = completionFailureNotice(error);
             state.saving = false;
-            state.error = String(error?.message || error || 'Failed to save onboarding settings.');
+            state.presetFailure = notice.canSkip ? { code: notice.code } : null;
+            state.error = notice.text;
             render();
         }
     }
 
     function bindEvents() {
+        if (state.completedRestartMode) {
+            document.getElementById('open-app-btn')?.addEventListener('click', () => {
+                window.location.replace('/');
+            });
+            return;
+        }
         bindClearButtons();
         document.getElementById('back-btn')?.addEventListener('click', previousStep);
         document.getElementById('next-btn')?.addEventListener('click', () => {
             if (state.currentStep === 'summary') saveWizard();
             else nextStep();
         });
+        document.getElementById('skip-presets-btn')?.addEventListener('click', () => {
+            saveWizard({ skipPresets: true });
+        });
         if (state.currentStep === 'providers') bindProvidersStep();
+        if (state.currentStep === 'agents') bindAgentsStep();
         if (state.currentStep === 'models') bindModelsStep();
         if (state.currentStep === 'review_mode') bindReviewModeStep();
         if (state.currentStep === 'budget') bindBudgetStep();
