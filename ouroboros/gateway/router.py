@@ -66,6 +66,7 @@ def collect_routes(
         api_claudexor_login_job,
         api_claudexor_status,
     )
+    from ouroboros.gateway.onboarding import api_onboarding_complete
     from ouroboros.gateway.settings import api_reviewer_slots
     from ouroboros.gateway.mcp import api_mcp_refresh, api_mcp_status, api_mcp_test
     from ouroboros.gateway.models import (
@@ -189,6 +190,13 @@ def collect_routes(
         # /api/onboarding sibling below stays the readiness probe + legacy body.
         Route("/onboarding", endpoint=onboarding_page, methods=["GET"]),
         Route("/api/onboarding", endpoint=onboarding),
+        # ONE atomic owner-scoped completion (D-8): replaces the wizard's old
+        # POST /api/settings + POST /api/owner/runtime-mode pair.
+        Route(
+            "/api/onboarding/complete",
+            endpoint=api_onboarding_complete,
+            methods=["POST"],
+        ),
         Route("/api/claude-code/status", endpoint=claude_status),
         Route(
             "/api/claude-code/install",

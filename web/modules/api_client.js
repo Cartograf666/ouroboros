@@ -90,6 +90,14 @@ export const apiClient = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
     }),
+    /**
+     * Finish first-run onboarding in ONE atomic owner-scoped save (D-8):
+     * settings + runtime mode + safety default + the install-time agent
+     * preset land together, or nothing does.
+     * @param {import('./api_types.js').OnboardingCompleteRequest} payload
+     * @returns {Promise<import('./api_types.js').OnboardingCompleteResponse>}
+     */
+    completeOnboarding: (payload) => jsonPost('/api/onboarding/complete', payload),
     ownerRuntimeMode: (mode) => jsonPost('/api/owner/runtime-mode', { mode }),
     ownerAutoGrant: (enabled) => jsonPost('/api/owner/auto-grant', { enabled: Boolean(enabled) }),
     ownerContextMode: (mode) => jsonPost('/api/owner/context-mode', { mode }),

@@ -9,6 +9,10 @@ from ouroboros.gateway.contracts import (
     WS_MESSAGE_TYPES,
     ChatInbound,
     ChatOutbound,
+    OnboardingCompleteRequest,
+    OnboardingCompleteResponse,
+    OnboardingPresetFailureResponse,
+    OnboardingPresetProjection,
     OwnerScopeReviewFloorResponse,
     PhotoOutbound,
     SkillDeleteResponse,
@@ -107,12 +111,19 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "UpdateApplySuccessResponse",
         "UpdateApplyErrorResponse",
         "UpdateStatusReadyOutbound",
+        "OnboardingCompleteRequest",
+        "OnboardingPresetProjection",
+        "OnboardingCompleteResponse",
+        "OnboardingPresetFailureResponse",
     ):
         assert re.search(rf"@typedef \{{Object\}} {name}\b", text), f"api_types.js missing {name}"
     api_client = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_client.js").read_text(
         encoding="utf-8"
     )
     assert "openAICompatibleModels" in api_client
+    # D-8: the wizard's ONE atomic completion call must exist on the browser client.
+    assert "completeOnboarding" in api_client
+    assert "'/api/onboarding/complete'" in api_client
     # v6.80.0: the two contracts extended this release join the FIELD-level parity list. The name-level
     # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
     # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
@@ -120,7 +131,9 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 StateResponse, OwnerScopeReviewFloorResponse, UpdateMergePlan,
                 UpdatePreflightRequest, UpdatePreflightResponse, UpdateApplyRequest,
                 UpdateApplySuccessResponse, UpdateApplyErrorResponse,
-                UpdateStatusReadyOutbound, TaskCostBreakdown, TaskDetailResponse):
+                UpdateStatusReadyOutbound, TaskCostBreakdown, TaskDetailResponse,
+                OnboardingCompleteRequest, OnboardingPresetProjection,
+                OnboardingCompleteResponse, OnboardingPresetFailureResponse):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"

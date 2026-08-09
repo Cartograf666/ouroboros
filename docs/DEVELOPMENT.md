@@ -1023,6 +1023,16 @@ Before every commit, verify the following:
   tail of the same key from engine discovery ("Engine default model" = empty
   tail); reasoning effort stays derived per call, and a hand-written `:effort`
   remainder rides through verbatim with no control over it.
+- Onboarding completes in ONE transaction, and install-time defaults belong in
+  it. `POST /api/onboarding/complete` persists settings, the next-boot runtime
+  mode, the fresh-install safety default and the agent-subscription preset in a
+  single write; `GET /api/onboarding` normalizes for display but must never
+  persist, because a read that authors `settings.json` destroys the
+  fresh-install latch both install-time behaviours depend on. Install-time
+  defaults are compiled from LIVE discovery and refuse typed when a model
+  cannot be resolved — never guessed, never half-applied, and never
+  re-derived after onboarding (that would be a second, continuous authority
+  over settings the owner has since edited).
 - A control the owner cannot use is worse than none. With no coding-agent
   subscription connected the Subagents section says so and points at Providers →
   Harness Accounts instead of rendering a delegation toggle whose every dispatch
