@@ -703,4 +703,4 @@
  * @property {?boolean} check_ok
  */
 
-export const GATEWAY_CONTRACT_VERSION = '6.93.0';
+export const GATEWAY_CONTRACT_VERSION = '6.93.1';
