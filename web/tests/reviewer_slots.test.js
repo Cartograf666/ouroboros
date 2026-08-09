@@ -14,7 +14,9 @@ import {
     decodeRouteChoice,
     describeLastExecution,
     encodeRouteChoice,
+    harnessModelsKnown,
     mintSlotId,
+    modelsGapNote,
     profileOptionsFor,
     routeChoiceGroups,
     reviewerServiceNote,
@@ -196,6 +198,37 @@ test('the session model-options fragment guards a saved model discovery no longe
     assert.deepEqual(sessionModelOptions(null, '').map((o) => o.value), ['']);
 });
 
+test('a per-harness model-read failure is not a discovery: the not-in-discovery claim is withdrawn', () => {
+    // Discovery is TWO reads. The endpoint answers `models: []` with a typed
+    // `models_error` for one harness while the daemon stays globally running
+    // — so `catalogKnown` is true and the empty list is NOT authoritative for
+    // this harness. Reading it as one labelled the saved model
+    // "gpt-saved (not in discovery)": a successful discovery cited as proof of
+    // absence, for a discovery that never happened.
+    const refused = { id: 'codex', models: [], models_error: 'models_probe_failed' };
+    assert.equal(harnessModelsKnown(refused, true), false, 'the catalog read says nothing about this list');
+    assert.equal(harnessModelsKnown({ id: 'codex', models: [{ id: 'x' }] }, true), true);
+    assert.equal(harnessModelsKnown({ id: 'codex', models: [{ id: 'x' }] }, false), false,
+        'an unread catalog still withdraws the claim');
+
+    const options = sessionModelOptions(refused, 'gpt-saved', { catalogKnown: true });
+    assert.deepEqual(options.map((o) => o.value), ['', 'gpt-saved'], 'the saved pin keeps its option');
+    assert.equal(options[1].label, 'gpt-saved', 'and loses the absence label');
+    assert.doesNotMatch(JSON.stringify(options), /not in discovery/);
+
+    // …and the gap is SAID, not left as a silently short list.
+    assert.match(modelsGapNote(refused, true), /model list could not be read/);
+    assert.equal(modelsGapNote({ id: 'codex', models: [{ id: 'x' }] }, true), '');
+    // With the catalog itself unread the section note already explains it; a
+    // second sentence for the same silence would be noise.
+    assert.equal(modelsGapNote(refused, false), '');
+
+    // A harness whose list really WAS read keeps the honest accusation.
+    const read = { id: 'codex', models: [{ id: 'gpt-5.6-sol' }] };
+    assert.match(sessionModelOptions(read, 'gpt-saved', { catalogKnown: true })[2].label,
+        /not in discovery/);
+});
+
 test('an advisory session model composes into the target and survives save-load', () => {
     // Compose exactly as the data-advisory-model handler does…
     const target = composeSessionTarget('codex', 'gpt-5.6-luna');
@@ -336,7 +369,7 @@ test('the ONE service note explains the catalog gap AND names the account gap', 
     const accountsDied = store({ catalog: 'ok', accounts: 'failed', quota: 'ok' });
     await accountsDied.refresh();
     const onlyAccounts = reviewerServiceNote(accountsDied);
-    assert.match(onlyAccounts.text, /Agent accounts could not be read/);
+    assert.match(onlyAccounts.text, /Agent accounts were not read/);
     assert.match(onlyAccounts.text, /last known/);
     accountsDied.dispose();
 
@@ -344,16 +377,20 @@ test('the ONE service note explains the catalog gap AND names the account gap', 
     await catalogDied.refresh();
     const onlyCatalog = reviewerServiceNote(catalogDied);
     assert.match(onlyCatalog.text, /Your agents could not be read/);
-    assert.doesNotMatch(onlyCatalog.text, /Agent accounts could not be read/, 'a healthy facet is not accused');
+    assert.doesNotMatch(onlyCatalog.text, /Agent accounts were not read/, 'a healthy facet is not accused');
     // …and a read that merely did not land never claims a stopped daemon.
     assert.doesNotMatch(onlyCatalog.text, /not running/);
     catalogDied.dispose();
 
+    // Both facets in the SAME state: the account pins are STILL named. They
+    // used to be dropped for matching the catalog's enum, so the note spoke
+    // only of agents while the pins sat on screen unexplained — equal state is
+    // not equal subject.
     const both = store({ catalog: 'not_read', accounts: 'not_read', quota: 'not_read' });
     await both.refresh();
     const bothNote = reviewerServiceNote(both);
     assert.match(bothNote.text, /daemon is not running/);
-    assert.equal(bothNote.text.match(/could not be read/g), null, 'one sentence covers both');
+    assert.match(bothNote.text, /Agent accounts were not read/);
     both.dispose();
 
     const healthy = store({ catalog: 'ok', accounts: 'ok', quota: 'ok' });

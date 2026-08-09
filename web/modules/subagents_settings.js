@@ -34,7 +34,7 @@ import {
     statusUnavailableNote,
 } from './claudexor_status_store.js';
 import { renderSegmentedField } from './page_header.js';
-import { sessionModelOptions } from './reviewer_slots.js';
+import { modelsGapNote, sessionModelOptions } from './reviewer_slots.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -106,13 +106,14 @@ export function lastDelegationLine(entry) {
     return `Last delegated run: ${parts.join(' · ')}`;
 }
 
-function harnessModels(payload, harnessId) {
+function harnessRow(payload, harnessId) {
+    // The discovery ROW, not just its models: the row also carries the typed
+    // `models_error` that says the model list itself could not be read, and a
+    // synthetic `{models}` object dropped that fact on the floor.
     for (const harness of payload?.harnesses || []) {
-        if (String(harness?.id || '') === String(harnessId || '')) {
-            return harness?.models || [];
-        }
+        if (String(harness?.id || '') === String(harnessId || '')) return harness;
     }
-    return [];
+    return null;
 }
 
 export function connectedHarnesses(payload) {
@@ -149,11 +150,13 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
     // and the model select rides the CATALOG. Explaining only the accounts left
     // a catalog gap silently on screen — the model options would quietly narrow
     // to whatever the last read happened to hold, with nothing saying so. A
-    // catalog in the same state as the accounts facet is already covered by the
-    // sentence that state produces and is not repeated.
+    // catalog is coalesced by SUBJECT, never by enum: dropping it because its
+    // STATE equalled the accounts facet's left the model select unexplained
+    // whenever both reads were in the same trouble — the accounts sentence
+    // says nothing about agent discovery. (The coarse `indeterminate` yields
+    // no clause by construction; its own global sentence covers everything.)
     const accountsState = statusError ? READ_TRANSPORT : String(accountsRead || '');
-    const catalogClause = facetGapClause({ [FACET_CATALOG]: catalogRead },
-        catalogRead === accountsState ? [] : [FACET_CATALOG]);
+    const catalogClause = facetGapClause({ [FACET_CATALOG]: catalogRead }, [FACET_CATALOG]);
     const view = (value) => (catalogClause
         ? { ...value, note: `${value.note} ${catalogClause}`.trim() }
         : value);
@@ -213,13 +216,16 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
     // The SAME options fragment the reviewer rows use, "(not in discovery)"
     // guard included: a Save while the daemon is down must not silently erase
     // the saved model pin.
+    const row = harness ? harnessRow(payload, harness) : null;
     const modelOptions = enabled && harness
         // The MODEL list rides the CATALOG facet, which is independent of the
         // accounts facet that got us here: with the catalog unread the saved
         // pin keeps its option and loses only the "(not in discovery)" claim.
-        ? sessionModelOptions({ models: harnessModels(payload, harness) }, model,
-            { catalogKnown: catalogRead === READ_OK })
+        // The ROW is passed whole so the per-harness model-read gap is seen.
+        ? sessionModelOptions(row, model, { catalogKnown: catalogRead === READ_OK })
         : [];
+    const modelsGap = enabled && harness
+        ? modelsGapNote(row, catalogRead === READ_OK) : '';
 
     const options = [...connected];
     if (savedHarness && !options.some((item) => item.id === savedHarness)) {
@@ -245,6 +251,11 @@ export function delegationView({ saved = '', payload = null, statusError = '', a
         // stored yet would misreport where subagents actually run today.
         state = 'default_on';
         note = 'On by default now that a subscription is connected. Save Settings to apply it — until then subagents still run on the API.';
+    }
+    if (modelsGap) {
+        // The catalog listed this agent but its MODEL list refused, so the
+        // select below is short for a reason nothing else on the page states.
+        note = `${note} The model list for ${harness} could not be read, so the choices below may be incomplete; your saved model is kept.`;
     }
     return view({ state, enabled, harness, model, modelOptions, suffix, options, note });
 }
@@ -413,6 +424,10 @@ export function renderSignature(store) {
         (snapshot.harnesses || []).map((harness) => [
             String(harness?.id || ''),
             (harness?.models || []).map((model) => String(model?.id || model?.value || model || '')),
+            // The typed model-read gap is RENDERED (it adds a sentence to the
+            // note and withdraws the not-in-discovery label), so a later probe
+            // that succeeds must repaint even when the list stays the same.
+            String(harness?.models_error || ''),
         ]),
         snapshot.subagent_last_delegation || null,
     ];

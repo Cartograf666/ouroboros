@@ -10,12 +10,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { readFileSync } from 'node:fs';
+
 import {
     DAEMON_STATES_STOPPED,
     FACET_ACCOUNTS,
     FACET_CATALOG,
     FACET_QUOTA,
     READ_FAILED,
+    READ_INDETERMINATE,
     READ_NOT_READ,
     READ_OK,
     READ_TRANSPORT,
@@ -28,11 +31,20 @@ import {
     facetKnown,
     facetReadState,
     readsFor,
+    statusPayloadValid,
     statusUnavailableNote,
 } from '../modules/claudexor_status_store.js';
 
-const RUNNING = { daemon: { state: 'running', engine_version: '3.3.13', runtime: {} }, harnesses: [{ id: 'codex' }] };
-const STOPPED = { daemon: { state: 'stale', runtime: { state: 'ready', version: '3.3.13' } }, harnesses: [] };
+// A payload shaped like the producer's own: `_status_payload` sets
+// daemon/harnesses/profiles/quota unconditionally, before it reaches the
+// daemon at all, and the store now requires exactly those four.
+const payloadOf = (daemon, extra = {}) => ({
+    daemon, config_dir: '/home/agent', harnesses: [], profiles: {}, quota: [], ...extra,
+});
+
+const RUNNING = payloadOf({ state: 'running', engine_version: '3.3.13', runtime: {} },
+    { harnesses: [{ id: 'codex' }] });
+const STOPPED = payloadOf({ state: 'stale', runtime: { state: 'ready', version: '3.3.13' } });
 
 function fakeDoc({ hidden = false } = {}) {
     const listeners = {};
@@ -63,9 +75,10 @@ test('a stopped daemon, an unreachable endpoint and a real answer are three DIFF
     // never tell a consumer which world it is in. The derivation must.
     assert.equal(facetReadState(RUNNING, FACET_CATALOG), READ_OK);
     assert.equal(facetReadState(STOPPED, FACET_CATALOG), READ_NOT_READ);
-    // Nothing at all to derive from is NOT "the daemon is stopped": with no
-    // payload the honest answer is that the read did not land.
-    assert.equal(facetReadState(null, FACET_CATALOG), READ_FAILED);
+    // Nothing at all to derive from is NOT "the daemon is stopped", and it is
+    // not a verdict on this facet either: the honest answer is that the answer
+    // did not complete and it does not say which read landed.
+    assert.equal(facetReadState(null, FACET_CATALOG), READ_INDETERMINATE);
     assert.equal(facetReadState(RUNNING, FACET_CATALOG, { transportError: 'HTTP 503' }), READ_TRANSPORT);
     // A transport failure over a STALE snapshot is still "we could not ask":
     // the payload in hand describes a past read, never the current one.
@@ -78,12 +91,15 @@ test('a stopped daemon, an unreachable endpoint and a real answer are three DIFF
     assert.equal(facetKnown(READ_FAILED), false);
     assert.equal(facetKnown(READ_TRANSPORT), false);
     assert.equal(facetKnown(READ_UNREAD), false);
+    assert.equal(facetKnown(READ_INDETERMINATE), false);
 });
 
 test('facets are INDEPENDENT: one refused read never downgrades its siblings', () => {
-    // The backend stamps provenance per fanned-out read, because one can fail
-    // while the others land. A consumer that collapses them into one global
-    // verdict mislabels every row the surviving facets could have described.
+    // FUTURE-COMPATIBILITY, not today's wire: the per-facet `reads` stamp is
+    // landing from its own branch, and the live producer does NOT emit it yet
+    // (see the golden test below). This pins that the store already prefers a
+    // stamp when it arrives — one read can fail while the others land, and a
+    // consumer that collapses them mislabels every row the survivors describe.
     const partial = {
         daemon: { state: 'unreachable', last_error: 'quota read died' },
         harnesses: [{ id: 'codex' }], profiles: {}, quota: [],
@@ -109,11 +125,12 @@ test('a payload WITHOUT the reads block is read legacy-style, per facet', () => 
 });
 
 test('a PRESENT but invalid reads stamp fails closed — it never falls back to the global verdict', () => {
-    // A 2xx is a transport fact, not a semantic one. The stamp existed and was
-    // junk, and the store answered with the daemon's global "running" — so an
-    // unparseable provenance block silently became three authoritative facets,
-    // the exact collapse this seam exists to end, in the other direction.
-    const running = { daemon: { state: 'running' } };
+    // (Future wire again — the stamp is not emitted yet.) A 2xx is a transport
+    // fact, not a semantic one. The stamp existed and was junk, and the store
+    // answered with the daemon's global "running" — so an unparseable
+    // provenance block silently became three authoritative facets, the exact
+    // collapse this seam exists to end, in the other direction.
+    const running = payloadOf({ state: 'running' });
     assert.equal(facetReadState({ ...running, reads: { catalog: 'weird' } }, FACET_CATALOG), READ_FAILED);
     // A PARTIAL stamp answers only for what it stamps; the unstamped siblings
     // are gaps, not inherited successes.
@@ -129,30 +146,91 @@ test('a PRESENT but invalid reads stamp fails closed — it never falls back to 
 });
 
 test('unreachable is NOT stopped: only a genuinely stopped daemon gets the stopped sentence', () => {
-    // The live endpoint turns a refusal in ANY of its fanned-out reads into one
-    // global daemon.state = "unreachable" — the reviewer probed it with catalog
-    // and accounts SUCCEEDING and only quota failing, and every facet still read
-    // "never asked" while the copy announced a daemon that was in fact running.
     for (const state of DAEMON_STATES_STOPPED) {
-        assert.deepEqual(readsFor({ daemon: { state } }),
+        assert.deepEqual(readsFor(payloadOf({ state })),
             { catalog: READ_NOT_READ, accounts: READ_NOT_READ, quota: READ_NOT_READ },
             `${state} genuinely means not running`);
         assert.match(statusUnavailableNote(READ_NOT_READ).text, /daemon is not running/);
     }
-    for (const state of ['unreachable', 'error', 'unknown', '']) {
-        assert.deepEqual(readsFor({ daemon: { state } }),
-            { catalog: READ_FAILED, accounts: READ_FAILED, quota: READ_FAILED },
-            `${state || '(no state)'} means the status could not be read`);
-    }
     // …and the WORDING per state, which is what the owner actually reads.
     const wording = (state) => statusUnavailableNote(
-        facetReadState({ daemon: { state } }, FACET_ACCOUNTS), { facet: FACET_ACCOUNTS }).text;
+        facetReadState(payloadOf({ state }), FACET_ACCOUNTS), { facet: FACET_ACCOUNTS }).text;
     assert.match(wording('stale'), /daemon is not running/);
-    assert.match(wording('unreachable'), /could not be read/);
     assert.doesNotMatch(wording('unreachable'), /not running/);
     assert.doesNotMatch(wording('error'), /not running/);
     assert.doesNotMatch(wording(''), /not running/);
-    assert.equal(statusUnavailableNote(facetReadState({ daemon: { state: 'running' } }, FACET_ACCOUNTS)), null);
+    assert.equal(statusUnavailableNote(facetReadState(payloadOf({ state: 'running' }), FACET_ACCOUNTS)), null);
+});
+
+test('a GLOBAL refusal is one coarse indeterminate — never three per-facet verdicts', () => {
+    // The round-one fix traded one lie for another. It stopped calling a
+    // running daemon "stopped", but it turned the endpoint's ONE global
+    // `unreachable` into three `failed` facets carrying the same error — so
+    // the accounts panel accused the ACCOUNT read using the QUOTA probe's
+    // message, over accounts that were sitting right there in the payload
+    // (reviewer probe against the live producer, reproduced in the golden
+    // test below). A verdict about a facet may only come from a stamp that
+    // names that facet.
+    for (const state of ['unreachable', 'error', 'unknown', '']) {
+        assert.deepEqual(readsFor(payloadOf({ state })),
+            { catalog: READ_INDETERMINATE, accounts: READ_INDETERMINATE, quota: READ_INDETERMINATE },
+            `${state || '(no state)'} says only that the answer did not complete`);
+    }
+    // ONE neutral global sentence: no facet subject, and the SAME text for
+    // every facet a surface might ask about — three surfaces, one truth.
+    const notes = [FACET_CATALOG, FACET_ACCOUNTS, FACET_QUOTA]
+        .map((facet) => statusUnavailableNote(READ_INDETERMINATE, { facet, error: 'quota_probe_failed' }));
+    assert.equal(new Set(notes.map((n) => n.text)).size, 1, 'the sentence is not per facet');
+    for (const note of notes) {
+        assert.match(note.text, /did not finish answering/);
+        assert.match(note.text, /which parts is not known/);
+        assert.doesNotMatch(note.text, /agent accounts|subscription limits|your agents/i,
+            'no facet may be named in a verdict the payload does not carry');
+        assert.doesNotMatch(note.text, /not running/);
+        assert.equal(note.tone, 'warn');
+    }
+    // The daemon's own global error is still the only explanation there is, so
+    // it rides the GLOBAL sentence.
+    assert.match(notes[0].text, /quota_probe_failed/);
+    // …and no facet is named as a gap either — there is nothing to attribute.
+    assert.equal(facetGapClause(
+        { catalog: READ_INDETERMINATE, accounts: READ_INDETERMINATE, quota: READ_INDETERMINATE },
+        [FACET_CATALOG, FACET_ACCOUNTS, FACET_QUOTA]), '');
+    // Nothing is claimed as discovered, either — the whole point of the state.
+    assert.equal(facetKnown(READ_INDETERMINATE), false);
+});
+
+test("GOLDEN: today's producer payload, with two reads that SUCCEEDED and one that refused", () => {
+    // Captured from the REAL producer (`gateway/claudexor_accounts.py::
+    // _status_payload`) with the catalog and credential-profile reads landing
+    // and only the quota probe raising ClaudexorUnavailable. Regenerate with
+    // the same stub if the producer's shape moves; the point of a golden is
+    // that this file, not a hand-written double, is what the client is judged
+    // against.
+    const golden = JSON.parse(readFileSync(
+        new URL('./fixtures/status_quota_refused.json', import.meta.url), 'utf8'));
+
+    // What today's wire actually is: NO per-facet stamp, one global state, and
+    // the successful reads' data present beside it.
+    assert.equal('reads' in golden, false, 'the producer does not stamp per-facet reads yet');
+    assert.equal(golden.daemon.state, 'unreachable');
+    assert.match(golden.daemon.last_error, /quota_probe_failed/);
+    assert.equal(golden.harnesses.length, 1, 'the CATALOG read succeeded and is in the payload');
+    assert.equal(golden.profiles.profiles.length, 1, 'the ACCOUNTS read succeeded too');
+    assert.deepEqual(golden.quota, [], 'only the quota read refused');
+    assert.equal(statusPayloadValid(golden), true, 'and it is a valid status answer');
+
+    // So the client says one coarse thing about the whole answer…
+    assert.deepEqual(readsFor(golden), {
+        catalog: READ_INDETERMINATE, accounts: READ_INDETERMINATE, quota: READ_INDETERMINATE,
+    });
+    // …and never accuses the two reads that worked, nor hangs the quota
+    // probe's error off the account subject.
+    const note = statusUnavailableNote(READ_INDETERMINATE,
+        { facet: FACET_ACCOUNTS, error: golden.daemon.last_error });
+    assert.doesNotMatch(note.text, /Your agent accounts could not be read/);
+    assert.doesNotMatch(note.text, /not running/);
+    assert.match(note.text, /did not finish answering/);
 });
 
 test('a surface renders more than one facet, and the note names the second gap too', () => {
@@ -161,15 +239,21 @@ test('a surface renders more than one facet, and the note names the second gap t
     // other's stale value on screen dressed as fresh.
     const reads = { catalog: READ_OK, accounts: READ_OK, quota: READ_FAILED };
     assert.equal(facetGapClause(reads, [FACET_CATALOG]), '');
-    assert.match(facetGapClause(reads, [FACET_QUOTA]), /^Subscription limits could not be read/);
+    assert.match(facetGapClause(reads, [FACET_QUOTA]), /^Subscription limits were not read/);
     assert.match(facetGapClause(reads, [FACET_QUOTA]), /is last known\.$/);
     // Two gaps read as one sentence, and an unread-yet facet is not a gap.
     const both = facetGapClause({ catalog: READ_NOT_READ, accounts: READ_UNREAD, quota: READ_TRANSPORT },
         [FACET_CATALOG, FACET_ACCOUNTS, FACET_QUOTA]);
-    assert.match(both, /Agents and subscription limits could not be read/);
+    assert.match(both, /Agents and subscription limits were not read/);
     assert.match(both, /shown for them is last known/);
     assert.equal(facetGapClause({ catalog: READ_OK }, [FACET_CATALOG]), '');
     assert.equal(facetGapClause({}, [FACET_CATALOG]), '');
+    // Coalescing is by SUBJECT, not by enum: facets in the SAME state are
+    // still each named, because one sentence about accounts says nothing about
+    // agent discovery or the windows.
+    const allFailed = { catalog: READ_FAILED, accounts: READ_FAILED, quota: READ_FAILED };
+    const secondary = facetGapClause(allFailed, [FACET_CATALOG, FACET_QUOTA]);
+    assert.match(secondary, /Agents and subscription limits were not read/);
 });
 
 test('each unavailable read state has ONE shared sentence, and an ok read has none', () => {
@@ -188,14 +272,18 @@ test('each unavailable read state has ONE shared sentence, and an ok read has no
     // reached by a running daemon refusing one read and by an `unreachable`
     // answer, and both would be mislabeled by the stopped sentence.
     assert.doesNotMatch(refused.text, /not running/);
-    // All three are distinct: "nobody asked", "the request died", "it refused".
-    assert.equal(new Set([down.text, dead.text, refused.text]).size, 3);
+    const coarse = statusUnavailableNote(READ_INDETERMINATE);
+    assert.match(coarse.text, /did not finish answering/);
+    assert.doesNotMatch(coarse.text, /not running/);
+    // All four are distinct: "nobody asked", "the request died", "this read
+    // refused", "the answer did not complete and we cannot say which read".
+    assert.equal(new Set([down.text, dead.text, refused.text, coarse.text]).size, 4);
 
     // D-10: the owner retired "coding agents" for new copy — these agents are
     // used for far more than code.
     assert.match(statusUnavailableNote(READ_UNREAD).text, /Reading your agent accounts/);
     assert.equal(statusUnavailableNote(READ_OK), null);
-    for (const state of [READ_NOT_READ, READ_FAILED, READ_TRANSPORT, READ_UNREAD]) {
+    for (const state of [READ_NOT_READ, READ_FAILED, READ_TRANSPORT, READ_UNREAD, READ_INDETERMINATE]) {
         for (const facet of [FACET_CATALOG, FACET_ACCOUNTS, FACET_QUOTA]) {
             assert.doesNotMatch(statusUnavailableNote(state, { facet }).text, /coding[ -]agent/i);
         }
@@ -235,13 +323,13 @@ test('the store says the right sentence for EVERY daemon state it can be served'
         ['stale', READ_NOT_READ, /daemon is not running/],
         ['not_provisioned', READ_NOT_READ, /daemon is not running/],
         ['foreign_daemon', READ_NOT_READ, /daemon is not running/],
-        ['unreachable', READ_FAILED, /could not be read/],
-        ['error', READ_FAILED, /could not be read/],
-        ['', READ_FAILED, /could not be read/],
+        ['unreachable', READ_INDETERMINATE, /did not finish answering/],
+        ['error', READ_INDETERMINATE, /did not finish answering/],
+        ['', READ_INDETERMINATE, /did not finish answering/],
     ];
     for (const [daemonState, expected, wording] of cases) {
         const store = createClaudexorStatusStore({
-            fetchImpl: async () => okResponse({ daemon: { state: daemonState }, harnesses: [] }),
+            fetchImpl: async () => okResponse(payloadOf({ state: daemonState })),
             doc: fakeDoc(),
         });
         await store.refresh();
@@ -265,23 +353,24 @@ test("a read that did not land carries the daemon's own explanation", async () =
     // The exact payload the reviewer probed: the daemon IS running, one fanned
     // -out read refused, and the endpoint collapsed that into `unreachable`
     // plus a last_error. Routing the state to the shared sentence must not lose
-    // the only detail the owner has.
+    // the only detail the owner has — while still not attributing that error to
+    // any one facet's subject.
     const store = createClaudexorStatusStore({
-        fetchImpl: async () => okResponse({
-            daemon: { state: 'unreachable', last_error: 'quota_read_failed: window read died' },
-            harnesses: [{ id: 'codex' }], profiles: {}, quota: [],
-        }),
+        fetchImpl: async () => okResponse(payloadOf(
+            { state: 'unreachable', last_error: 'quota_read_failed: window read died' },
+            { harnesses: [{ id: 'codex' }] })),
         doc: fakeDoc(),
     });
     await store.refresh();
     const note = store.unavailableNote(FACET_ACCOUNTS);
-    assert.match(note.text, /could not be read/);
+    assert.match(note.text, /did not finish answering/);
     assert.match(note.text, /window read died/, "the daemon's own reason survives");
     assert.doesNotMatch(note.text, /not running/);
+    assert.doesNotMatch(note.text, /Your agent accounts could not be read/);
     // A stopped daemon keeps its calm line — a crashed daemon also lands in
     // `stale`, and that decision is deliberate.
     const stopped = createClaudexorStatusStore({
-        fetchImpl: async () => okResponse({ daemon: { state: 'stale', last_error: 'boom' } }),
+        fetchImpl: async () => okResponse(payloadOf({ state: 'stale', last_error: 'boom' })),
         doc: fakeDoc(),
     });
     await stopped.refresh();
@@ -293,8 +382,15 @@ test("a read that did not land carries the daemon's own explanation", async () =
 test('a 200 that is not a status answer is a protocol failure, not an empty world', async () => {
     // A 200 carrying non-JSON parsed to {} and sailed through every facet
     // derivation, so the app confidently rendered "nothing is connected" off a
-    // body it never understood.
-    for (const body of [null, {}, [], 'ok', { daemon: 'running' }]) {
+    // body it never understood. The bar is the producer's UNCONDITIONAL fields
+    // with their types — checking `daemon` alone was not depth: a bare
+    // {daemon:{state:'running'}} passed and yielded three authoritative facets
+    // over collections the body did not contain.
+    for (const body of [null, {}, [], 'ok', { daemon: 'running' },
+        { daemon: { state: 'running' } },
+        { daemon: { state: 'running' }, harnesses: [], profiles: {} },
+        { daemon: { state: 'running' }, harnesses: {}, profiles: {}, quota: [] },
+        { daemon: { state: 'running' }, harnesses: [], profiles: [], quota: [] }]) {
         const store = createClaudexorStatusStore({
             fetchImpl: async () => ({ ok: true, status: 200, json: async () => body }),
             doc: fakeDoc(),
@@ -524,7 +620,7 @@ test('a hidden page pauses polling, and a login hold keeps it awake off-surface'
     store2.dispose();
 });
 
-test('dispose releases the timer, the listeners and the visibilitychange handler', async () => {
+test('dispose releases the timer, the listeners and the visibilitychange handler, and refuses a LATER refresh', async () => {
     const doc = fakeDoc();
     let reads = 0;
     const store = createClaudexorStatusStore({
@@ -550,6 +646,32 @@ test('dispose releases the timer, the listeners and the visibilitychange handler
     assert.deepEqual(seen, []);
     // …and it is idempotent (a double destroy must not throw).
     store.dispose();
+});
+
+test('an IN-FLIGHT model upgrade queued before dispose never reads afterwards', async () => {
+    // The disposer test above only proves that an EXPLICIT later refresh is
+    // refused — its old name overstated what it covered. The queued upgrade
+    // reaches the read path directly, bypassing refresh()'s guard: a section
+    // that asked for model discovery while a plain poll was in flight left a
+    // continuation that fired AFTER dispose, spending four CLI-probing daemon
+    // round-trips for a surface with zero subscribers and polling off.
+    const urls = [];
+    let release = null;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const store = createClaudexorStatusStore({
+        fetchImpl: async (url) => { urls.push(url); await gate; return okResponse(RUNNING); },
+        doc: fakeDoc(),
+    });
+    const plain = store.refresh();
+    const upgrade = store.refresh({ includeModels: true });   // queued behind it
+    assert.deepEqual(urls, ['/api/claudexor/status']);
+
+    store.dispose();
+    release();
+    await Promise.all([plain, upgrade]);
+    await flush();
+    assert.deepEqual(urls, ['/api/claudexor/status'],
+        'the queued upgrade must not read for a disposed store');
 });
 
 test('subscribers are notified with the settled view, and one broken listener cannot silence the rest', async () => {

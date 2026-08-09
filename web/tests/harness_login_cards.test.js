@@ -28,13 +28,17 @@ function fakeHost() {
 }
 
 function statusPayload(loggedIn) {
+    // The producer's unconditional shape (daemon/harnesses/profiles/quota) —
+    // the store refuses to derive facets from anything less.
     return {
         daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
+        config_dir: '/home/agent',
         harnesses: [{ id: 'codex' }],
         profiles: {
             harnessAccounts: [{ harness_id: 'codex', native_login_detected: loggedIn }],
             profiles: [],
         },
+        quota: [],
     };
 }
 
@@ -384,6 +388,141 @@ test('malformed 2xx polls count toward the SAME bounded give-up', async (t) => {
         `an honest unconfirmed verdict, not a forever-pending card: ${host.innerHTML}`);
     assert.equal(store.polling, false, 'the give-up released the status hold');
     await ctl.dispose();
+    store.dispose();
+    t.mock.timers.reset();
+});
+
+test('a 2xx poll carrying an EMPTY job object is a failure, not a healthy pending read', async (t) => {
+    // Reachable on the real wire, not hypothetical: the gateway normalizes a
+    // non-object engine reply to `{}` (gateways/claudexor.py::setup_job_call),
+    // so the proxy answers {job:{}} — an object, so the old guard called it a
+    // success, reset the failure streak and armed another timer. Twelve of
+    // them left the verdict null and the card pending for good.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    store.subscribe(() => {}, { visible: () => false });
+    const host = fakeHost();
+    let polls = 0;
+    const ctl = createLoginCardController({
+        host,
+        store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(200, { job_id: 'job-7', job: { state: 'running' } });
+            }
+            if (init.method === 'DELETE') return json(200, {});
+            polls += 1;
+            return json(200, { job: {} });          // present, and says nothing
+        },
+    });
+    await ctl.start('codex', '');
+    for (let i = 0; i < 12; i += 1) { t.mock.timers.tick(30000); await flush(); }
+
+    assert.equal(polls, JOB_POLL_GIVE_UP_FAILURES,
+        `an empty job must count toward the bounded give-up: ${polls} polls`);
+    assert.ok(host.innerHTML.includes('Could not confirm the sign-in yet'),
+        `and the card settles honestly instead of polling forever: ${host.innerHTML}`);
+    await ctl.dispose();
+    store.dispose();
+    t.mock.timers.reset();
+});
+
+test('duplicate starts are COALESCED, so a double-click cannot create-cancel-create', async (t) => {
+    // Serializing was not enough: the queue ran the second start AFTER the
+    // first, whose C7 guard then cancelled the job the first had installed and
+    // created another — so the device link the owner was reading was
+    // invalidated as it appeared, and the daemon saw two creates.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const calls = [];
+    let releaseCreate = null;
+    const gate = new Promise((resolve) => { releaseCreate = resolve; });
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    const host = fakeHost();
+    let created = 0;
+    const ctl = createLoginCardController({
+        host,
+        store,
+        fetchImpl: async (url, init = {}) => {
+            calls.push(`${init.method || 'GET'} ${url}`);
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                created += 1;
+                await gate;
+                return json(200, { job_id: `job-${created}`, job: { state: 'running' } });
+            }
+            if (init.method === 'DELETE') return json(200, {});
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+    const first = ctl.start('codex', '');
+    const second = ctl.start('codex', '');           // the second click
+    assert.equal(first, second, 'the same pending start is shared, not queued behind itself');
+    releaseCreate();
+    await Promise.all([first, second]);
+
+    assert.equal(created, 1, `exactly one job was created: ${calls.join(' | ')}`);
+    assert.equal(calls.filter((c) => c.startsWith('DELETE')).length, 0,
+        'and nothing was cancelled to make room for a duplicate');
+    assert.equal(ctl.active.jobId, 'job-1');
+
+    // A DIFFERENT account is not the same start, and once a start has settled
+    // the next one is a real (guarded) restart — coalescing is not caching.
+    await ctl.start('codex', 'work');
+    assert.equal(created, 2);
+    assert.ok(calls.includes('DELETE /api/claudexor/login/job-1'), 'the C7 guard still runs');
+    await ctl.dispose();
+    store.dispose();
+    t.mock.timers.reset();
+});
+
+test('a dispose that RETAINED custody can be retried against the same job', async (t) => {
+    // The verdict is only useful if the caller can act on it. A retained job
+    // must stay cancellable — otherwise a host that refuses to remount while
+    // custody is held is stuck forever.
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    let deleteStatus = 503;
+    const deletes = [];
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, statusPayload(false)),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    const host = fakeHost();
+    const ctl = createLoginCardController({
+        host,
+        store,
+        fetchImpl: async (url, init = {}) => {
+            if (url === '/api/claudexor/login' && init.method === 'POST') {
+                return json(200, { job_id: 'job-8', job: { state: 'running' } });
+            }
+            if (init.method === 'DELETE') { deletes.push(url); return json(deleteStatus, {}); }
+            return json(200, { job: { state: 'running' } });
+        },
+    });
+    await ctl.start('codex', '');
+
+    assert.equal(await ctl.dispose(), false, 'the daemon refused, so custody is retained');
+    assert.equal(ctl.active?.jobId, 'job-8');
+    assert.equal(deletes.length, 1);
+
+    // The retry re-runs the SAME proven-cancel path — it used to answer a
+    // permanent `false` off the idempotence branch and never try again.
+    assert.equal(await ctl.dispose(), false, 'still refused, still honest');
+    assert.equal(deletes.length, 2, 'and it really re-attempted the cancel');
+    deleteStatus = 200;
+    assert.equal(await ctl.dispose(), true, 'the daemon answers, custody is released');
+    assert.equal(ctl.active, null);
+    assert.equal(deletes.length, 3);
+    // …and now it is idempotent again: nothing left to cancel.
+    assert.equal(await ctl.dispose(), true);
+    assert.equal(deletes.length, 3);
     store.dispose();
     t.mock.timers.reset();
 });

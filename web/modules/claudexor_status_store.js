@@ -26,20 +26,34 @@
 //                   payload; it outranks whatever the last payload said.
 //   * `unread`    — this client has not read yet (store-side only; the pure
 //                   `facetReadState` never answers it).
+//   * `indeterminate` — the answer as a WHOLE did not complete, and which
+//                   facets landed is unknowable from it. The coarse verdict of
+//                   the legacy wire; never a per-facet claim (see below).
 // Only `ok` licenses a row-level "(not in discovery)" claim.
 //
 // Wire contract: the backend stamps `payload.reads = {catalog, accounts,
 // quota}`. A payload WITHOUT that block is read legacy-style from the daemon
 // state, so this store works unchanged on both wires and gains precision the
-// day the field lands. Two rules keep the legacy path honest:
+// day the field lands. Three rules keep the legacy path honest:
 //   * A `reads` block that is PRESENT but not a valid stamp is a protocol
 //     failure, never an excuse to fall back to the global verdict — a partial
 //     `{catalog: ok}` used to make all three facets `ok`, which is the same
 //     collapse in the other direction.
 //   * `unreachable` is NOT `stopped`. The endpoint turns a refusal in ANY of
 //     its fanned-out reads into one global `daemon.state = unreachable`, so
-//     that state means «the status could not be read», and only the states
-//     that genuinely mean a stopped daemon may print the stopped sentence.
+//     that state means «the status could not be read», never «the daemon is
+//     not running».
+//   * …and it is NOT a per-facet verdict either. Probed against the live
+//     producer (`gateway/claudexor_accounts.py::_status_payload`): the catalog
+//     and the accounts landed, only the quota probe refused, and the payload
+//     carried BOTH successes beside `daemon.state = unreachable` and the
+//     quota's error. Turning that one global refusal into three `failed`
+//     facets made the accounts panel announce a failed ACCOUNT read WITH THE
+//     QUOTA ERROR, and the reviewer rows a failed AGENT read — two reads that
+//     had in fact succeeded. So a legacy global refusal answers ONE coarse
+//     `indeterminate` for every facet, and its sentence names no facet and no
+//     facet-specific error. PER-FACET verdicts are legitimate only when a
+//     valid `reads` stamp actually says which read failed.
 //
 // Polling is a held resource, not a background fact: the store ticks only
 // while it has subscribers, the page is visible, and either some subscriber
@@ -59,6 +73,7 @@ export const READ_NOT_READ = 'not_read';
 export const READ_FAILED = 'failed';
 export const READ_TRANSPORT = 'transport';
 export const READ_UNREAD = 'unread';
+export const READ_INDETERMINATE = 'indeterminate';
 
 // The independent facets of one status payload. The login-capability manifest
 // read is deliberately NOT one: its failure is absorbed (fail-open) rather
@@ -77,10 +92,12 @@ export const STATUS_FACETS = [FACET_CATALOG, FACET_ACCOUNTS, FACET_QUOTA];
 const WIRE_READ_STATES = new Set([READ_OK, READ_NOT_READ, READ_FAILED]);
 
 // The daemon states that GENUINELY mean the daemon is not running — the only
-// ones the «not running» sentence may be printed for. Everything else that is
-// not `running` (notably `unreachable`, which the endpoint also emits when a
-// RUNNING daemon refused one of the fanned-out reads, plus any state spelling
-// this client does not know) means the status could not be read.
+// ones the «not running» sentence may be printed for, and the only non-running
+// states that say anything per facet (nothing was asked, so no facet was read).
+// Everything else that is not `running` (notably `unreachable`, which the
+// endpoint also emits when a RUNNING daemon refused ONE of several fanned-out
+// reads, plus any state spelling this client does not know) is the coarse
+// «this answer did not complete» — see the header.
 export const DAEMON_STATES_STOPPED = ['stale', 'not_provisioned', 'foreign_daemon'];
 const STOPPED = new Set(DAEMON_STATES_STOPPED);
 
@@ -102,10 +119,14 @@ export function facetReadState(payload, facet, { transportError = '' } = {}) {
     }
     // LEGACY payload (a backend without the `reads` block, or a fixture that
     // predates it): the daemon state carries the same fact at coarser
-    // resolution — but only the genuinely-stopped states mean «never asked».
+    // resolution — and COARSE is the whole point. A stopped daemon was asked
+    // nothing, so every facet is honestly `not_read`; a global refusal says
+    // only that the answer did not complete, so every facet is `indeterminate`
+    // and NO facet may be accused of failing (the producer probe: two of the
+    // three reads had actually succeeded and their data was in the payload).
     const state = String(body?.daemon?.state || '');
     if (state === 'running') return READ_OK;
-    return STOPPED.has(state) ? READ_NOT_READ : READ_FAILED;
+    return STOPPED.has(state) ? READ_NOT_READ : READ_INDETERMINATE;
 }
 
 export function readsFor(payload, { transportError = '' } = {}) {
@@ -149,17 +170,34 @@ export function facetGapClause(reads, facets = []) {
     // panel renders rows AND quota, the reviewer rows render the catalog AND
     // account pins — and a banner that consults a single facet leaves a stale
     // value on screen dressed as a fresh one. '' when they were all read.
+    //
+    // Coalescing is by SUBJECT, never by enum. The callers used to drop a
+    // secondary facet whose state merely EQUALLED the primary's, so with all
+    // three facets failed the accounts panel said «your agent accounts could
+    // not be read» and silently omitted agent discovery and subscription
+    // limits, whose values stayed on screen looking fresh. Equal state is not
+    // equal subject: one sentence may cover several subjects, but every
+    // rendered facet that is not ok has to be named in it.
+    //
+    // `indeterminate` is the exception, and for the same reason: it is not a
+    // verdict ABOUT a facet, so naming subjects under it would invent the
+    // per-facet accusation the coarse state exists to avoid. Its own global
+    // sentence covers the whole answer.
     const gaps = (facets || []).filter((name) => {
         const state = reads ? reads[name] : '';
-        return Boolean(state) && state !== READ_OK && state !== READ_UNREAD;
+        return Boolean(state) && state !== READ_OK && state !== READ_UNREAD
+            && state !== READ_INDETERMINATE;
     });
     if (!gaps.length) return '';
-    const subjects = gaps.map((name) => FACET_SUBJECT[name] || name);
+    const subjects = [...new Set(gaps.map((name) => FACET_SUBJECT[name] || name))];
     const list = subjects.length > 1
         ? `${subjects.slice(0, -1).join(', ')} and ${subjects[subjects.length - 1]}`
         : subjects[0];
-    return `${list.charAt(0).toUpperCase()}${list.slice(1)} could not be read, so anything `
-        + `shown for ${gaps.length > 1 ? 'them' : 'it'} is last known.`;
+    // Every subject is a plural noun, and «were not read» is true of all three
+    // gap states (never asked, asked and refused, request died) — «could not be
+    // read» would overclaim an attempt for a daemon nobody asked.
+    return `${list.charAt(0).toUpperCase()}${list.slice(1)} were not read, so anything `
+        + 'shown for them is last known.';
 }
 
 export function statusUnavailableNote(readState, { error = '', facet = FACET_ACCOUNTS } = {}) {
@@ -204,22 +242,49 @@ export function statusUnavailableNote(readState, { error = '', facet = FACET_ACC
                 + 'Nothing below is missing or wrong — your saved choices are unchanged.',
         };
     }
+    if (readState === READ_INDETERMINATE) {
+        // ONE global sentence, deliberately subject-free: the answer did not
+        // complete AS A WHOLE, and it does not say which of its reads landed.
+        // Naming `subject` here (or hanging the daemon's global error off it)
+        // is exactly the misattribution the coarse state prevents — the probe
+        // that found it had the accounts panel blaming a failed ACCOUNT read
+        // for the QUOTA probe's error while the accounts were right there in
+        // the payload. `error` is the daemon's own global last_error, which is
+        // the only explanation a legacy payload carries at all.
+        return {
+            tone: 'warn', action: null,
+            text: `The agent service did not finish answering${error ? ` (${error})` : ''}, `
+                + 'so some of what is shown may be out of date — which parts is not known. '
+                + 'Your saved choices are unchanged.',
+        };
+    }
     if (readState === READ_UNREAD) {
         return { tone: 'muted', action: null, text: `Reading your ${subject}…` };
     }
     return null;
 }
 
+const isObject = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+
 export function statusPayloadValid(payload) {
     // The MINIMUM schema a status answer must satisfy before any facet is
     // derived from it. A 2xx is a transport fact, not a semantic one: a 200
     // carrying non-JSON (or an unrelated body) parsed to `{}` and then sailed
-    // through every facet derivation as if the daemon had answered. `daemon`
-    // is unconditional in the endpoint's own payload, so its absence means the
-    // body is not a status answer at all.
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
-    const daemon = payload.daemon;
-    return Boolean(daemon) && typeof daemon === 'object' && !Array.isArray(daemon);
+    // through every facet derivation as if the daemon had answered.
+    //
+    // The bar is the producer's UNCONDITIONAL fields, with their types —
+    // `_status_payload` sets daemon/harnesses/profiles/quota before it reaches
+    // the daemon at all, and these four are precisely what this store projects
+    // (rows, windows, routes). Checking `daemon` alone was not depth: a bare
+    // `{daemon:{state:"running"}}` passed and yielded three authoritative
+    // facets over collections the body never contained. `config_dir` and
+    // `subagent_last_delegation` are unconditional too but carry no projection
+    // here, so requiring them would add brittleness, not truth.
+    if (!isObject(payload)) return false;
+    return isObject(payload.daemon)
+        && Array.isArray(payload.harnesses)
+        && isObject(payload.profiles)
+        && Array.isArray(payload.quota);
 }
 
 export function accountRows(payload) {
@@ -398,6 +463,12 @@ export function createClaudexorStatusStore({
     }
 
     function startRead(withModels) {
+        // The READ PATH's own disposal guard, not just `refresh()`'s: the
+        // model-upgrade continuation below reaches this function directly, so a
+        // controller disposed while an upgrade was queued used to fan out two
+        // more status reads — each of them four CLI-probing daemon round-trips
+        // — for a surface with zero subscribers and polling off.
+        if (inner.disposed) return Promise.resolve(inner.snapshot);
         inner.loading = true;
         inner.inFlightModels = withModels;
         // A pre-request repaint only until the first read SETTLES: with
@@ -460,10 +531,13 @@ export function createClaudexorStatusStore({
         if (inner.inFlight) {
             if (!wantModels || inner.inFlightModels) return inner.inFlight;
             if (!inner.queued) {
-                inner.queued = inner.inFlight.then(
-                    () => { inner.queued = null; return startRead(true); },
-                    () => { inner.queued = null; return startRead(true); },
-                );
+                // BOTH arms re-check disposal: they run after an await, and the
+                // world they were queued in may no longer exist.
+                const follow = () => {
+                    inner.queued = null;
+                    return inner.disposed ? inner.snapshot : startRead(true);
+                };
+                inner.queued = inner.inFlight.then(follow, follow);
             }
             return inner.queued;
         }
@@ -544,15 +618,20 @@ export function createClaudexorStatusStore({
         facet,
         unavailableNote(name = FACET_ACCOUNTS) {
             // The detail beside the sentence: a transport error when the request
-            // itself died, otherwise — for a read that did not land — the
+            // itself died, otherwise — for an answer that did not land — the
             // daemon's OWN last_error. On a legacy payload that string is the
             // only explanation of an `unreachable` answer there is, and routing
             // that state to the shared sentence would otherwise have dropped it.
+            // It is a GLOBAL error and rides only the global sentence; the
+            // per-facet sentences never carry it, because attributing one
+            // read's failure to another read's subject is the misattribution
+            // this whole derivation exists to prevent.
             // Deliberately NOT attached to `not_read`: the stopped-daemon line
             // stays calm on purpose (a crashed daemon also lands in `stale`).
             const state = facet(name);
+            const daemonError = String(inner.snapshot?.daemon?.last_error || '');
             const detail = inner.error
-                || (state === READ_FAILED ? String(inner.snapshot?.daemon?.last_error || '') : '');
+                || (state === READ_FAILED || state === READ_INDETERMINATE ? daemonError : '');
             return statusUnavailableNote(state, { error: detail, facet: name });
         },
         refresh,

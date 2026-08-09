@@ -221,6 +221,26 @@ function lastRunMetaTitle(entry) {
     return `UI projection of capability_delta (D22) — ran as ${route}${ts ? ` at ${ts}` : ''}`;
 }
 
+export function harnessModelsKnown(harness, catalogKnown = true) {
+    // Discovery is TWO reads, not one. The catalog read can land — daemon
+    // globally `running`, `catalogKnown` true — while THIS harness's model
+    // list refuses: the endpoint answers `models: []` with a typed
+    // `models_error` for exactly that harness (claudexor_accounts.py, the
+    // per-harness `harness_models` probe). Reading the empty list as discovery
+    // then labelled a saved model "(not in discovery)", which claims a
+    // successful discovery proved its absence — while no discovery happened.
+    return Boolean(catalogKnown) && !String(harness?.models_error || '');
+}
+
+export function modelsGapNote(harness, catalogKnown = true) {
+    // The typed gap, SAID rather than left as a silently short list. Only when
+    // the catalog itself was read: with the catalog unread the section note
+    // above already explains everything, and this would be a second sentence
+    // for the same silence.
+    return catalogKnown && String(harness?.models_error || '')
+        ? 'model list could not be read' : '';
+}
+
 export function sessionModelOptions(harness, currentModel, { catalogKnown = true } = {}) {
     // The ONE model-options fragment for a session row's model select (triad,
     // scope, advisory, and the Subagents section import it too). "Engine
@@ -232,7 +252,12 @@ export function sessionModelOptions(harness, currentModel, { catalogKnown = true
     const options = [{ value: '', label: 'Engine default model' },
         ...models.map((m) => ({ value: String(m.id || m.value || m), label: String(m.id || m.label || m) }))];
     if (currentModel && !options.some((o) => o.value === currentModel)) {
-        options.push({ value: currentModel, label: undiscoveredLabel(currentModel, catalogKnown) });
+        // Gated on the MODEL read, not on the catalog read (see above): the
+        // option survives either way, only its accusation is withdrawn.
+        options.push({
+            value: currentModel,
+            label: undiscoveredLabel(currentModel, harnessModelsKnown(harness, catalogKnown)),
+        });
     }
     return options;
 }
@@ -421,6 +446,8 @@ function rowHtml(row, group) {
     // last-run projection share it; nothing is dropped — the raw route + ISO
     // timestamp live in the tooltip.
     const metaParts = [capabilityBadge(row, harnessesById(), { catalogKnown })];
+    const modelsGap = session ? modelsGapNote(harness, catalogKnown) : '';
+    if (modelsGap) metaParts.push(modelsGap);
     if (lastText) metaParts.push(`Last run: ${lastText}`);
     const surfaceDefault = group === 'scope' ? 'scope review effort' : 'review effort';
     return `
@@ -468,6 +495,8 @@ function advisoryHtml() {
     const last = state.lastExecutions.advisory_slot_1;
     const lastText = last ? describeLastExecution(last) : '';
     const metaParts = [capabilityBadge({ route: advisory.route || {} }, harnessesById(), { catalogKnown })];
+    const modelsGap = session ? modelsGapNote(harnessesById()[split.harness], catalogKnown) : '';
+    if (modelsGap) metaParts.push(modelsGap);
     if (lastText) metaParts.push(`Last run: ${lastText}`);
     return `
         <div class="reviewer-slot-row" data-advisory-row>
@@ -682,12 +711,14 @@ export function reviewerServiceNote(store) {
     // subject: which routes and models exist) and then NAMES the account gap
     // too, because the rows also render account pins — a silently dropped
     // second gap left pins on screen with no explanation of why they could not
-    // be checked. A facet in the same state as the catalog is already covered
-    // by the leading sentence and is not repeated.
+    // be checked. Coalescing is by SUBJECT, never by enum: the accounts gap
+    // used to be dropped whenever its STATE matched the catalog's, so with
+    // both failed the note spoke only of agents and the pins went unexplained.
+    // (Under the coarse `indeterminate` the clause is empty by construction —
+    // there is no per-facet verdict to name.)
     const note = store.unavailableNote(FACET_CATALOG);
     const reads = store.reads || {};
-    const clause = facetGapClause(reads,
-        reads[FACET_ACCOUNTS] === reads[FACET_CATALOG] ? [] : [FACET_ACCOUNTS]);
+    const clause = facetGapClause(reads, [FACET_ACCOUNTS]);
     if (!clause) return note;
     if (!note) return { tone: 'warn', action: null, text: clause };
     return { ...note, text: `${note.text} ${clause}` };

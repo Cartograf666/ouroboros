@@ -15,6 +15,7 @@ import {
     FACET_CATALOG,
     FACET_QUOTA,
     READ_FAILED,
+    READ_INDETERMINATE,
     READ_OK,
     READ_TRANSPORT,
     READ_UNREAD,
@@ -249,6 +250,13 @@ const state = {
     loginCard: null,
     disposers: [],
     initialized: false,
+    // Mount and unmount are SERIALIZED through one chain. Releasing login
+    // custody is asynchronous (a DELETE the daemon has to confirm), so a
+    // fire-and-forget teardown followed by a remount is how one controller
+    // instance came to hold a live job while a second one started another
+    // beside it — the "one live login" invariant held only inside a single
+    // controller.
+    lifecycle: Promise.resolve(true),
 };
 
 export function renderHarnessAccountsSection() {
@@ -337,7 +345,9 @@ export function sectionStatusLine(store) {
     // that was never delivered. Every other state is the existing lifecycle
     // line, which already names each not-running daemon state precisely.
     const accounts = store.facet(FACET_ACCOUNTS);
-    const base = (accounts === READ_TRANSPORT || accounts === READ_FAILED)
+    const accountsSpoken = accounts === READ_TRANSPORT || accounts === READ_FAILED
+        || accounts === READ_INDETERMINATE;
+    const base = accountsSpoken
         ? store.unavailableNote(FACET_ACCOUNTS)
         : daemonStatusLine(store.snapshot || {}, {
             checking: store.loading && !store.everSettled,
@@ -346,11 +356,19 @@ export function sectionStatusLine(store) {
     // to consult the accounts facet alone while the rows came from the catalog
     // and the windows from the quota read, so a refused quota read left an
     // exhausted-window claim on screen under a line that said everything was
-    // fine. A gap in the SAME state as the accounts facet is already covered by
-    // the sentence above and is not repeated.
+    // fine. Coalescing is by SUBJECT: dropping a facet because its STATE
+    // matched the accounts facet's is how «your agent accounts could not be
+    // read» came to stand alone with agent discovery and the subscription
+    // limits silently omitted — the leading sentence says nothing about them.
+    // (Under the coarse `indeterminate` the clause is empty by construction:
+    // there is no per-facet verdict to name.) The ACCOUNTS facet joins the
+    // clause whenever the leading sentence is the LIFECYCLE line, which
+    // describes the daemon and not this read — otherwise an accounts gap under
+    // a "Claudexor ready" header would be the same silent drop one level up.
     const reads = store.reads || {};
-    const clause = facetGapClause(reads, [FACET_CATALOG, FACET_QUOTA]
-        .filter((facet) => reads[facet] !== accounts));
+    const clause = facetGapClause(reads, accountsSpoken
+        ? [FACET_CATALOG, FACET_QUOTA]
+        : [FACET_ACCOUNTS, FACET_CATALOG, FACET_QUOTA]);
     if (!clause) return base;
     return { ...base, tone: base.tone === 'error' ? 'error' : 'warn', text: `${base.text} ${clause}` };
 }
@@ -365,6 +383,9 @@ export function bareRowStatusText(accountsRead) {
     if (accountsRead === READ_UNREAD) return 'checking…';
     if (accountsRead === READ_TRANSPORT) return 'not checked — the status request did not complete';
     if (accountsRead === READ_FAILED) return 'not checked — the daemon did not answer this read';
+    // The coarse state: the answer did not complete, and it does not say which
+    // read was the one that failed — so the row claims nothing beyond that.
+    if (accountsRead === READ_INDETERMINATE) return 'not checked — the status answer did not complete';
     return 'not checked — the agent daemon is not running';
 }
 
@@ -443,8 +464,36 @@ export function refreshHarnessStatus() {
     return state.store.refresh();
 }
 
+/**
+ * Mount the section. SERIALIZED with the teardown, and refused while the
+ * previous mount still holds login custody.
+ *
+ * @returns {Promise<boolean>} whether the section is mounted. `false` = a
+ *          previous login could not be proven cancelled, so a second one must
+ *          not be started beside it; the panel says so and the next mount
+ *          retries the cancel.
+ */
 export function initHarnessAccounts({ store = claudexorStatus } = {}) {
-    destroyHarnessAccounts();
+    state.lifecycle = state.lifecycle.then(() => _init(store), () => _init(store));
+    return state.lifecycle;
+}
+
+async function _init(store) {
+    const released = await _destroy();
+    if (!released) {
+        // The old controller is still holding a job id it could not prove
+        // gone. Mounting now would give the owner a Connect button that starts
+        // a SECOND live login — exactly what the custody verdict exists to
+        // prevent. Say it where the panel's own status line lives; the next
+        // mount re-attempts the cancel (dispose is retryable).
+        const statusEl = document.getElementById('harness-daemon-status');
+        if (statusEl) {
+            statusEl.textContent = 'A previous sign-in could not be cancelled and may still be '
+                + 'running, so this panel is holding off. Reopen this page to retry it.';
+            statusEl.dataset.tone = 'warn';
+        }
+        return false;
+    }
     state.store = store;
     ensureLoginCard();
     document.getElementById('btn-harness-refresh')
@@ -464,13 +513,36 @@ export function initHarnessAccounts({ store = claudexorStatus } = {}) {
     // daemon…" until the first tick (#125).
     state.store.refresh();
     renderRows();
+    return true;
 }
 
+/**
+ * Tear the section down and REPORT whether login custody was released.
+ *
+ * @returns {Promise<boolean>} `false` = the controller could not prove its job
+ *          cancelled, so it is KEPT (job id and all) and this teardown is
+ *          retryable — call again, or mount again, and the same proven-cancel
+ *          path runs once more. The onboarding wizard consumes the identical
+ *          contract straight off the controller's own `dispose()`.
+ */
 export function destroyHarnessAccounts() {
+    state.lifecycle = state.lifecycle.then(() => _destroy(), () => _destroy());
+    return state.lifecycle;
+}
+
+async function _destroy() {
     for (const dispose of state.disposers.splice(0)) {
         try { dispose(); } catch (err) { /* a broken disposer must not block the rest */ }
     }
-    state.loginCard?.dispose();
-    state.loginCard = null;
     state.initialized = false;
+    const card = state.loginCard;
+    if (!card) return true;
+    // The verdict is the POINT of the async disposer, and dropping it is how a
+    // remount could start a second live login: the probe had the first cancel
+    // answer 503, the controller keep its job id — and the next mount create
+    // another job beside it. A retained controller is kept on purpose so the
+    // cancel can be retried against the same job.
+    const released = await card.dispose();
+    if (released) state.loginCard = null;
+    return released;
 }

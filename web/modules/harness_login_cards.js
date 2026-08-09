@@ -510,6 +510,13 @@ export function preserveCardFocus(host, swap, doc = typeof document === 'undefin
  *     that arrives during the create POST is applied to the job that POST
  *     installs — it used to be answered `false` and forgotten, leaving a live
  *     server-side job nobody ever cancelled.
+ *   * `dispose()` is RETRYABLE after a `false`: the job id is retained and a
+ *     later call re-runs the same proven-cancel path. A host must therefore
+ *     await the verdict and refuse to remount while it is `false` — the "one
+ *     live login" invariant spans controller INSTANCES only if the host
+ *     enforces it (a dropped verdict + a remount = two live logins).
+ *   * `start()` COALESCES duplicate starts for the same harness/profile onto
+ *     one promise, so a double-click cannot create-then-cancel-then-create.
  */
 export function createLoginCardController({
     host,
@@ -526,6 +533,7 @@ export function createLoginCardController({
         active: null,
         jobTimer: 0,
         transitionChain: Promise.resolve(),
+        pendingStart: null,
         releaseHold: null,
         disposed: false,
     };
@@ -727,9 +735,26 @@ export function createLoginCardController({
         render();
     }
 
-    async function start(harness, profile) {
-        if (!harness || ctl.disposed) return;
-        await withLoginTransition(() => _startLocked(harness, profile));
+    function start(harness, profile) {
+        if (!harness || ctl.disposed) return Promise.resolve();
+        // Duplicate starts are COALESCED, not merely serialized. The queue
+        // guaranteed order, and order made an ordinary double-click into
+        // create → cancel → create: the second start ran the C7 guard against
+        // the job the first one had just installed, DELETEd it, and created
+        // another — so the device link the owner was reading was invalidated
+        // the moment it appeared. While a start for the same account is still
+        // settling, every caller shares its promise.
+        const key = `${harness} ${profile || ''}`;
+        if (ctl.pendingStart && ctl.pendingStart.key === key) return ctl.pendingStart.promise;
+        const promise = withLoginTransition(() => _startLocked(harness, profile));
+        const clear = () => {
+            if (ctl.pendingStart && ctl.pendingStart.promise === promise) ctl.pendingStart = null;
+        };
+        // Both arms, and on the ORIGINAL promise: a derived one would be an
+        // unhandled rejection for callers that fire and forget.
+        promise.then(clear, clear);
+        ctl.pendingStart = { key, promise };
+        return promise;
     }
 
     async function _startLocked(harness, profile) {
@@ -838,7 +863,14 @@ export function createLoginCardController({
                 // give-up was unreachable, and the card stayed pending for good.
                 const job = data && typeof data.job === 'object' && data.job !== null
                     && !Array.isArray(data.job) ? data.job : null;
-                if (resp.ok && job) {
+                // …and an EMPTY job object is no more an answer than a missing
+                // one. The gateway normalizes a non-object engine reply to `{}`
+                // (`gateways/claudexor.py::setup_job_call`), so `{job:{}}` is
+                // reachable on the real wire, not hypothetical: twelve such
+                // polls left the verdict null and armed another timer, because
+                // each one reset the failure streak. A snapshot with no state
+                // says nothing about this login, so it counts as a failure.
+                if (resp.ok && job && jobStateSummary(job).state) {
                     snapshot = job;
                     readOk = true;
                 }
@@ -935,19 +967,22 @@ export function createLoginCardController({
      *
      * @returns {Promise<boolean>} whether custody was released. `false` = the
      *        cancel could not be proven, so the job id is deliberately retained
-     *        (readable through `active`) rather than forgotten.
+     *        (readable through `active`) rather than forgotten — and this
+     *        disposer stays RETRYABLE: call it again and the same proven-cancel
+     *        path runs against the same job. That is the whole recovery path
+     *        for a host that must not remount while a login may still be live.
      */
     function dispose() {
-        if (ctl.disposed) {
-            // Idempotent: a second disposer call must neither re-DELETE nor
-            // wait on anything, and must not answer "released" over a retained
-            // job it never proved gone.
+        if (ctl.disposed && !ctl.active) {
+            // Idempotent once custody is genuinely gone: no second DELETE, and
+            // nothing to wait on.
             stopJobPolling();
             releaseStatusPolling();
-            return Promise.resolve(!ctl.active);
+            return Promise.resolve(true);
         }
         // Set FIRST: no new start may be queued behind the shutdown.
         ctl.disposed = true;
+        ctl.pendingStart = null;
         return withLoginTransition(() => _closeLocked(undefined, { shuttingDown: true }));
     }
 

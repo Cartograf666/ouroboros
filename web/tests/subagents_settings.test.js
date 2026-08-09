@@ -22,11 +22,16 @@ import {
 // The wire body the Harness Accounts panel really consumes: `profiles` is an
 // array of {profile, status, identity} wrappers and `harnessAccounts` an array
 // of per-harness authority rows (Claudexor credential-profile.ts).
-function statusPayload({ native = [], profiles = [], harnesses = [] } = {}) {
+function statusPayload({ native = [], profiles = [], harnesses = [], quota = [] } = {}) {
+    // Shaped like the producer's own answer — daemon/harnesses/profiles/quota
+    // are unconditional there, and the store now requires all four before it
+    // will derive a facet from a 2xx body.
     return {
         daemon: { state: 'running' },
+        config_dir: '/home/agent',
         harnesses,
         profiles: { harnessAccounts: native, profiles },
+        quota,
     };
 }
 
@@ -384,19 +389,20 @@ test('a CATALOG gap is named too, instead of being dropped behind the accounts s
     });
     const gap = delegationView({ saved: 'codex', payload, accountsRead: 'ok', catalogRead: 'failed' });
     assert.equal(gap.state, 'on', 'the accounts facet still decides the view');
-    assert.match(gap.note, /Agents could not be read/);
+    assert.match(gap.note, /Agents were not read/);
     assert.match(gap.note, /last known/);
     // The saved model pin keeps its option and loses only the earned claim.
     assert.doesNotMatch(JSON.stringify(gap.modelOptions), /not in discovery/);
 
     // A healthy catalog adds nothing…
     const clean = delegationView({ saved: 'codex', payload, accountsRead: 'ok', catalogRead: 'ok' });
-    assert.doesNotMatch(clean.note, /could not be read/);
-    // …and a catalog in the SAME state as the accounts facet is already covered
-    // by that sentence — it is not repeated.
+    assert.doesNotMatch(clean.note, /were not read/);
+    // …and a catalog in the SAME state as the accounts facet is STILL named:
+    // equal state is not equal subject, and the accounts sentence says nothing
+    // about agent discovery. Dropping it left the model select unexplained.
     const both = delegationView({ saved: 'codex', payload: null, accountsRead: 'not_read', catalogRead: 'not_read' });
     assert.match(both.note, /daemon is not running/);
-    assert.equal(both.note.match(/could not be read/g), null);
+    assert.match(both.note, /Agents were not read/);
 });
 
 // ---------------------------------------------------------------------------
@@ -445,14 +451,17 @@ test('a model swapped at EQUAL count really reaches the pixels', async () => {
     globalThis.document = doc;
     globalThis.window = win;
     let models = [{ id: 'old-model' }];
+    let modelsError = '';
     const store = createClaudexorStatusStore({
         fetchImpl: async () => ({
             ok: true,
             status: 200,
-            json: async () => ({
-                daemon: { state: 'running' },
-                harnesses: [{ id: 'codex', display_name: 'Codex CLI', models }],
-                profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }], profiles: [] },
+            json: async () => statusPayload({
+                harnesses: [{
+                    id: 'codex', display_name: 'Codex CLI', models,
+                    ...(modelsError ? { models_error: modelsError } : {}),
+                }],
+                native: [{ harness_id: 'codex', native_login_detected: true }],
             }),
         }),
         doc,
@@ -476,6 +485,18 @@ test('a model swapped at EQUAL count really reaches the pixels', async () => {
         host.innerHTML = 'SENTINEL';
         await store.refresh();
         assert.equal(host.innerHTML, 'SENTINEL', 'no repaint when nothing this section renders changed');
+
+        // The typed model-read gap is rendered too, so its ARRIVAL and its
+        // clearing must both repaint — the list itself can stay identical
+        // across a refused probe, and the signature saw only the list.
+        modelsError = 'models_probe_failed';
+        await store.refresh();
+        assert.ok(host.innerHTML.includes('could not be read'),
+            `the model-read gap must reach the DOM: ${host.innerHTML}`);
+        modelsError = '';
+        await store.refresh();
+        assert.ok(!host.innerHTML.includes('could not be read'),
+            `and a later successful probe must clear it: ${host.innerHTML}`);
     } finally {
         destroySubagentsSection();
         store.dispose();

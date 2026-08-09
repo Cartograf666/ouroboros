@@ -12,11 +12,14 @@ import {
     accountRowFacts,
     bareRowStatusText,
     daemonStatusLine,
+    destroyHarnessAccounts,
+    initHarnessAccounts,
     normalizeProfileName,
     promptProfileName,
     quotaSummary,
     runtimeActionLabel,
     sectionStatusLine,
+    startLogin,
     verificationBadge,
 } from '../modules/harness_accounts.js';
 // The login machinery moved to the shared controller module (phase 2) so the
@@ -1061,9 +1064,13 @@ test('a harness with no row only says "no account connected" once the store was 
     assert.match(bareRowStatusText('failed'), /did not answer/);
     assert.match(bareRowStatusText('transport'), /request did not complete/);
     assert.equal(bareRowStatusText('unread'), 'checking…');
+    // The coarse state claims nothing beyond "the answer did not complete" —
+    // it does not know which read failed, so it may not blame this one.
+    assert.match(bareRowStatusText('indeterminate'), /answer did not complete/);
+    assert.doesNotMatch(bareRowStatusText('indeterminate'), /not running/);
     // Each gap is its OWN sentence — collapsing them would re-create the lie.
-    const gaps = ['not_read', 'failed', 'transport'].map(bareRowStatusText);
-    assert.equal(new Set(gaps).size, 3);
+    const gaps = ['not_read', 'failed', 'transport', 'indeterminate'].map(bareRowStatusText);
+    assert.equal(new Set(gaps).size, 4);
 });
 
 test('the section line reports a REFUSED account read instead of "Claudexor ready"', () => {
@@ -1079,6 +1086,9 @@ test('the section line reports a REFUSED account read instead of "Claudexor read
     });
     assert.match(sectionStatusLine(fakeStore('failed')).text, /did not answer/);
     assert.match(sectionStatusLine(fakeStore('transport', 'net')).text, /did not answer/);
+    // …and so does the coarse state, which is what a legacy `unreachable`
+    // answer becomes: the green line over an undelivered list is the lie.
+    assert.match(sectionStatusLine(fakeStore('indeterminate')).text, /did not answer/);
     // A healthy read keeps the existing lifecycle sentence, unchanged.
     assert.match(sectionStatusLine(fakeStore('ok')).text, /Claudexor ready/);
 });
@@ -1093,9 +1103,12 @@ test('the section line reports a REFUSED account read instead of "Claudexor read
 // ---------------------------------------------------------------------------
 
 function storeWithReads(reads, extra = {}) {
-    // A REAL store over a payload that carries the backend's per-facet stamps,
-    // so the whole chain (wire → facets → copy) is exercised, not a hand-built
-    // double of it.
+    // A REAL store over a payload that carries per-facet stamps, so the whole
+    // chain (wire → facets → copy) is exercised, not a hand-built double of it.
+    // FUTURE-COMPATIBILITY: the live producer does not emit `reads` yet (see
+    // the golden test in claudexor_status_store.test.js) — these cases pin what
+    // the store does the day the stamp lands, and the coarse legacy behaviour
+    // is pinned separately below.
     return createClaudexorStatusStore({
         fetchImpl: async () => ({
             ok: true,
@@ -1119,13 +1132,13 @@ test('the ONE section line names the SECOND gap, instead of dropping it silently
     await quotaDied.refresh();
     const line = sectionStatusLine(quotaDied);
     assert.match(line.text, /Claudexor ready/, 'the accounts facet is healthy, so its own line stands');
-    assert.match(line.text, /Subscription limits could not be read/, 'and the refused read is NAMED');
+    assert.match(line.text, /Subscription limits were not read/, 'and the refused read is NAMED');
     assert.match(line.text, /last known/);
     quotaDied.dispose();
 
     const catalogDied = storeWithReads({ catalog: 'failed', accounts: 'ok', quota: 'ok' });
     await catalogDied.refresh();
-    assert.match(sectionStatusLine(catalogDied).text, /Agents could not be read/);
+    assert.match(sectionStatusLine(catalogDied).text, /Agents were not read/);
     catalogDied.dispose();
 
     const accountsDied = storeWithReads({ catalog: 'ok', accounts: 'failed', quota: 'ok' });
@@ -1142,14 +1155,65 @@ test('the ONE section line names the SECOND gap, instead of dropping it silently
     // All three read: one sentence, nothing appended.
     const healthy = storeWithReads({ catalog: 'ok', accounts: 'ok', quota: 'ok' });
     await healthy.refresh();
-    assert.doesNotMatch(sectionStatusLine(healthy).text, /could not be read/);
+    assert.doesNotMatch(sectionStatusLine(healthy).text, /were not read/);
     healthy.dispose();
 
-    // All three in the SAME gap: the leading sentence already covers them.
+    // All three in the SAME state: the secondary subjects are STILL named.
+    // Coalescing by enum dropped them, so the panel said only "your agent
+    // accounts …" while agent discovery and the windows sat unexplained — the
+    // leading sentence is about ONE subject, whatever its state.
+    // (Here the stamp says "never asked" while the daemon reports running, so
+    // the leading line is the LIFECYCLE sentence — which describes the daemon,
+    // not this panel's reads. The accounts gap therefore joins the clause
+    // rather than vanishing under a green header.)
     const allDown = storeWithReads({ catalog: 'not_read', accounts: 'not_read', quota: 'not_read' });
     await allDown.refresh();
-    assert.equal(sectionStatusLine(allDown).text.match(/could not be read/g), null);
+    const downLine = sectionStatusLine(allDown).text;
+    assert.match(downLine, /Agent accounts, agents and subscription limits were not read/);
     allDown.dispose();
+
+    const allFailed = storeWithReads({ catalog: 'failed', accounts: 'failed', quota: 'failed' });
+    await allFailed.refresh();
+    const failedLine = sectionStatusLine(allFailed).text;
+    assert.match(failedLine, /Your agent accounts could not be read/);
+    assert.match(failedLine, /Agents and subscription limits were not read/);
+    allFailed.dispose();
+});
+
+test("the LEGACY wire's global refusal blames no facet and quotes no facet's error", async () => {
+    // Today's producer: no `reads` stamp, one global `unreachable`, and the
+    // successful catalog + account data sitting in the very same payload. The
+    // round-one fix turned that into three per-facet failures and hung the
+    // QUOTA probe's error off the ACCOUNTS sentence — an accusation aimed at a
+    // read that had succeeded. (Golden payload: fixtures/status_quota_refused.)
+    const legacy = createClaudexorStatusStore({
+        fetchImpl: async () => ({
+            ok: true,
+            status: 200,
+            json: async () => ({
+                daemon: {
+                    state: 'unreachable', engine_version: '3.3.11', runtime: {},
+                    last_error: 'quota_probe_failed: quota read refused by the daemon',
+                },
+                config_dir: '/home/agent',
+                harnesses: [{ id: 'claude' }],
+                profiles: { harnessAccounts: [{ harness_id: 'claude', native_login_detected: true }], profiles: [] },
+                quota: [],
+            }),
+        }),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await legacy.refresh();
+    const text = sectionStatusLine(legacy).text;
+    assert.doesNotMatch(text, /Your agent accounts could not be read/,
+        'the ACCOUNTS read succeeded — its data is in this very payload');
+    assert.doesNotMatch(text, /Agents .*were not read/,
+        'and so did the CATALOG read: no per-facet verdict may be minted here');
+    assert.doesNotMatch(text, /not running/);
+    assert.match(text, /did not finish answering/, 'one coarse, global sentence');
+    assert.match(text, /quota_probe_failed/, "with the daemon's own global reason");
+    assert.equal(legacy.accountsKnown, false, 'and nothing is claimed as discovered');
+    legacy.dispose();
 });
 
 test('each row projection is gated by ITS OWN facet, and a stale value says it is last known', () => {
@@ -1188,4 +1252,114 @@ test('each row projection is gated by ITS OWN facet, and a stale value says it i
     // The default is the fresh reading, so nothing else changes shape.
     assert.deepEqual(accountRowFacts(row, payload), fresh);
     assert.deepEqual(verificationBadge(row), fresh.badge);
+});
+
+// ---------------------------------------------------------------------------
+// The custody verdict has a CONSUMER. `dispose()` answers asynchronously
+// whether the daemon still runs the login, and the section used to drop that
+// answer and rebuild immediately — so the advertised "one live login" held only
+// inside one controller instance, and a remount created a second one.
+// ---------------------------------------------------------------------------
+
+function fakeElement(id) {
+    const el = {
+        id,
+        innerHTML: '',
+        textContent: '',
+        dataset: {},
+        offsetParent: {},
+        listeners: [],
+        addEventListener(type, fn) { el.listeners.push([type, fn]); },
+        removeEventListener() {},
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        contains: () => false,
+        closest: () => null,
+    };
+    return el;
+}
+
+function mountSection() {
+    const elements = {};
+    for (const id of ['harness-accounts-rows', 'harness-daemon-status',
+        'harness-login-card', 'btn-harness-refresh']) elements[id] = fakeElement(id);
+    const doc = {
+        hidden: false,
+        activeElement: null,
+        getElementById: (id) => elements[id] || null,
+        addEventListener() {}, removeEventListener() {},
+    };
+    const win = { addEventListener() {}, removeEventListener() {} };
+    return { elements, doc, win };
+}
+
+test('the custody verdict is CONSUMED: a remount is refused while a login may still be live', async () => {
+    // The reviewer's probe: the first cancel answered 503, `first_cancel_proven
+    // : false`, the controller kept its job id — and a remount immediately
+    // created a SECOND live login, because the teardown neither awaited nor
+    // read the verdict.
+    const { elements, doc, win } = mountSection();
+    const priorDoc = globalThis.document;
+    const priorWin = globalThis.window;
+    const priorFetch = globalThis.fetch;
+    globalThis.document = doc;
+    globalThis.window = win;
+
+    const calls = [];
+    let deleteStatus = 503;
+    // The login controller talks through the app's own apiFetch (global fetch);
+    // the status store is injected below, so only login traffic lands here.
+    globalThis.fetch = async (url, init = {}) => {
+        calls.push(`${init.method || 'GET'} ${url}`);
+        if (url === '/api/claudexor/login' && init.method === 'POST') {
+            return fakeResponse(200, { job_id: `job-${calls.length}`, job: { state: 'running' } });
+        }
+        if (init.method === 'DELETE') return fakeResponse(deleteStatus, { error: 'daemon unreachable' });
+        return fakeResponse(200, { job: { state: 'running' } });
+    };
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => fakeResponse(200, {
+            daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
+            config_dir: '/home/agent',
+            harnesses: [{ id: 'codex' }],
+            profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: false }], profiles: [] },
+            quota: [],
+        }),
+        doc,
+    });
+
+    try {
+        assert.equal(await initHarnessAccounts({ store }), true, 'a clean mount succeeds');
+        await startLogin('codex', '');
+        const creates = () => calls.filter((c) => c === 'POST /api/claudexor/login').length;
+        assert.equal(creates(), 1);
+
+        // The daemon refuses the cancel: custody is retained and REPORTED.
+        assert.equal(await destroyHarnessAccounts(), false,
+            'an unproven cancel must not be answered "released"');
+        assert.ok(calls.some((c) => c.startsWith('DELETE /api/claudexor/login/')),
+            `the teardown really tried: ${calls.join(' | ')}`);
+
+        // …so the remount is refused, and NO second login can be created.
+        assert.equal(await initHarnessAccounts({ store }), false, 'the remount is blocked');
+        assert.equal(creates(), 1, 'no second live login was started beside the first');
+        await startLogin('codex', '');
+        assert.equal(creates(), 1, 'and a disposed controller still starts nothing');
+        assert.match(elements['harness-daemon-status'].textContent, /could not be cancelled/,
+            'the owner is told why the panel is holding off');
+
+        // The daemon comes back: the retained job is cancelled and the section
+        // mounts again — a failed disposer is retryable, not a dead end.
+        deleteStatus = 200;
+        assert.equal(await destroyHarnessAccounts(), true, 'the retry proves the cancel');
+        assert.equal(await initHarnessAccounts({ store }), true);
+        await startLogin('codex', '');
+        assert.equal(creates(), 2, 'and only now may a new login be created');
+    } finally {
+        await destroyHarnessAccounts();
+        store.dispose();
+        globalThis.document = priorDoc;
+        globalThis.window = priorWin;
+        globalThis.fetch = priorFetch;
+    }
 });
