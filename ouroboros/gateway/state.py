@@ -66,8 +66,12 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
     try:
         ensure_legacy_imported(drive_root)
         breakdown = usage_breakdown(drive_root)
+        # include_roots=False: /api/state serializes named scalars only, so the
+        # per-root map would be built per poll and thrown away (O(N×roots) work
+        # with zero readers on this path). The slim projection still carries
+        # limit_usd/remaining_known_usd for the evolution budget snapshot below.
         accounting = (
-            usage_projection(drive_root, global_limit_usd=limit)
+            usage_projection(drive_root, global_limit_usd=limit, include_roots=False)
             if limit > 0
             else dict(breakdown)
         )
