@@ -653,7 +653,10 @@ pack cannot fit. Freely degradable touched snapshots move to diff-only first,
 largest-first within that tier; an artifact owed in full is reached only after
 the `-U0` rung and cannot buy fit by degrading into an invalid review.
 Owner-selected Low records the distinct BIBLE P3 scope skip; other route or
-assembly failure is not a clean verdict.
+assembly failure is not a clean verdict. An agent-session scope slot delivers by
+retrieval: its verdict is authoritative once its window is sourced at ≥200K, and
+"the host did not observe which files it read" is a provenance disclosure, never
+a missing-authority finding.
 
 The gate is one logical reviewer interaction per API slot. A same-route
 transport or empty-response rail may make one bounded second physical send. A

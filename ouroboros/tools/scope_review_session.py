@@ -82,8 +82,11 @@ def build_scope_session_task(
     SAME builder the api pack uses, so the two deliveries cannot drift apart.
 
     The returned manifest is FORENSICS, not a gate (5.6/D16): it records that
-    coverage is the session's own retrieval — declaredly not host-attested — as
-    the non-blocking ``coverage_incomplete`` fact. The atlas's
+    coverage is the session's own retrieval, and that the host did not observe
+    which files it opened, as the non-blocking
+    ``host_file_read_attestation`` fact. That is a provenance limit on what may
+    be CLAIMED about coverage, not a finding that the review was incomplete
+    (BIBLE P3, retrieving scope reviewers). The atlas's
     ``excluded_sensitive`` class is preserved on the host side (nothing
     sensitive is assembled at all here); what the harness reads with its own
     tools is not host-filtered, and the manifest says so instead of implying an
@@ -144,10 +147,10 @@ def build_scope_session_task(
         "coverage": "agent_retrieval",
         # Non-blocking by construction (D16): forensics, never a gate, and the
         # fixed_overflow ladder does not apply to sessions (5.7).
-        "coverage_incomplete": True,
+        "host_file_read_attestation": "unobserved",
         "coverage_note": (
             "the reviewer session retrieves context with its own tools; the host "
-            "assembled no pack, so coverage is DECLAREDLY not host-attested"
+            "assembled no pack and does not observe which files the session opened"
         ),
         "excluded_sensitive": {"policy": "preserved", "host_enforced": False},
         "nav_mapped_docs": list(_CANONICAL_CONTEXT_DOCS),

@@ -278,15 +278,14 @@ following bounds are constitutional:
   reviewer whose window cannot be established by sourced Capability
   Evidence is treated as too small rather than assumed adequate.
 
-  **Retrieving scope reviewers (owner-declared, lower assurance).** A scope
+  **Retrieving scope reviewers (owner-declared agentic delivery).** A scope
   reviewer may instead RETRIEVE the surface itself through read-only tools
-  rather than receive it assembled. Ouroboros does not claim this is
-  equivalent to the pushed floor and does not claim the surface was
-  covered: a retrieving reviewer reads what it chooses, and the host
-  cannot establish from outside what a vendor session actually held in
-  context. This mode is therefore admitted on the same honest footing as
-  the `low` coupling below — as a DECLARED reduction in assurance, never
-  as a substitute claim. It is bounded by four conditions:
+  rather than receive it assembled — an ALTERNATE AUTHORITATIVE delivery
+  mode, not a degraded fallback, whenever the four conditions below hold.
+  What differs is PROVENANCE: the host cannot observe which files a vendor
+  session opened, which bounds what Ouroboros may CLAIM about coverage but
+  is not evidence the review was incomplete. It is bounded by four
+  conditions:
 
   - the owner selects it explicitly per scope slot. This is an OWNER
     INTENT, not an enforced control: the reviewer-slot setting travels the
@@ -308,16 +307,10 @@ following bounds are constitutional:
     see what a vendor session read; recording it awaits an upstream
     Claudexor capability to report a session's read events. Until that
     exists, the coverage manifest states plainly that coverage is the
-    session's own retrieval and is not host-attested — which is the honest
-    form of the same disclosure, and is what the condition above already
-    makes non-certifying.
+    session's own retrieval and is not host-attested.
 
-  The cost is stated as plainly as the `low` cost: a retrieving reviewer
-  may reach a verdict having consulted less of the repository than a
-  pushed reviewer received, and Ouroboros accepts that trade knowingly
-  rather than disguising it. This bound applies ONLY where scope review
-  applies; the diff-reviewer triad has no context floor of its own and
-  gains none here.
+  This bound applies ONLY where scope review applies; the diff-reviewer
+  triad has no context floor of its own and gains none here.
 
   Whether scope review applies is decided by ONE owner-selected control,
   the context-size mode of P1 — not by a separate reviewer-strength dial:
@@ -338,7 +331,7 @@ following bounds are constitutional:
   single-small-provider setup) `low` remains a legitimate owner choice —
   and, since the retrieving mode above, no longer the only one admitted:
   the owner may instead declare a retrieving scope slot under its four
-  bounds, whose assurance is DECLARED lower rather than claimed equal.
+  bounds, which keeps whole-repository review rather than dropping it.
   Both are selectable today. What stays forbidden either way is an
   undeclared partial-coverage reviewer that
   looks like the pushed gate. In EVERY mode the staged diff is still
