@@ -55,12 +55,12 @@ MOVED_CONTROLS = {
 STAYED_IN_ADVANCED = ("s-workers", "s-gc-retention-days")
 
 
-# The ONE file exempt from the sweeps below, and only while its own phase is in
-# flight: `onboarding_wizard.js` belongs to the onboarding worktree, whose agent
-# is repointing exactly these strings there. The exemption is asserted to still
-# be NEEDED (see the test at the bottom), so it cannot outlive the debt it
-# covers — the day that work merges, this file must drop the entry.
-CROSS_PHASE_PENDING = "onboarding_wizard.js"
+# The sweeps below once exempted ONE file — `onboarding_wizard.js`, which
+# belonged to the onboarding worktree while that phase was in flight and still
+# carried the dead addresses its own agent was repointing. The exemption was
+# asserted to still be NEEDED, so it could not outlive its debt: at synthesis
+# the onboarding phase landed its repointing, the assertion fired, and the
+# entry was deleted. Nothing is exempt now.
 
 
 def _read(name: str) -> str:
@@ -93,7 +93,7 @@ def _swept_sources(*, with_tests: bool) -> list[tuple[str, str, str]]:
         groups.append((sorted((REPO_ROOT / "tests").glob("*.py")), "#"))
     for paths, comment in groups:
         for path in paths:
-            if path.name == CROSS_PHASE_PENDING or path.resolve() == pathlib.Path(__file__).resolve():
+            if path.resolve() == pathlib.Path(__file__).resolve():
                 continue
             out.append((str(path.relative_to(REPO_ROOT)),
                         path.read_text(encoding="utf-8"), comment or "\0"))
@@ -308,21 +308,6 @@ def test_no_source_still_sends_anyone_to_a_section_this_phase_removed() -> None:
             offenders.append(f"{label}:{lineno}: {line}\n    → {correction}")
     assert not offenders, (
         "a stale section address survived the move:\n" + "\n".join(offenders))
-
-
-def test_the_cross_phase_exemption_cannot_outlive_its_debt() -> None:
-    """The one exempt file is exempt because a SIBLING branch is fixing it, not
-    because the rule does not apply there. So the exemption is asserted to still
-    be needed: once the onboarding phase lands its repointing, this test fails
-    and `CROSS_PHASE_PENDING` must be deleted rather than quietly kept forever.
-    """
-    text = _read(CROSS_PHASE_PENDING)
-    pending = _stale_address_hits(text)
-    assert pending, (
-        f"web/modules/{CROSS_PHASE_PENDING} no longer carries a stale address — "
-        "the onboarding phase landed its fix. Delete CROSS_PHASE_PENDING and its "
-        "skip in _swept_sources() so the file is swept like every other."
-    )
 
 
 def test_a_spent_window_is_emphasised_rather_than_dimmed() -> None:

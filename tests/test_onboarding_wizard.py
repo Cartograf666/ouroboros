@@ -490,7 +490,14 @@ def test_the_overlay_frame_can_open_the_agent_sign_in_link():
     card = (REPO / "web/modules/harness_login_cards.js").read_text(encoding="utf-8")
 
     assert 'target="_blank"' in card          # the card opens a new context...
-    sandbox = source.split('sandbox="', 1)[1].split('"', 1)[0].split()
+    # The policy is a NAMED constant the overlay applies to the frame, so read
+    # the constant rather than a sandbox= attribute in markup: the markup moved
+    # into DOM construction, and a scrape that follows it would keep passing
+    # over a constant the module forgot to apply.
+    declaration = source.split("export const FRAME_SANDBOX = ", 1)[1].split(";", 1)[0]
+    sandbox = "".join(
+        part.split("'")[1] for part in declaration.split("+") if "'" in part
+    ).split()
     assert "allow-popups" in sandbox          # ...so the frame must permit one
     # ...and the vendor page must not inherit the wizard's sandbox: an OAuth
     # page with neither same-origin nor scripts cannot complete a sign-in.

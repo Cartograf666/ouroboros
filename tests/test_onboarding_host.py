@@ -26,6 +26,8 @@ import sys
 import types
 
 import pytest
+from starlette.applications import Starlette
+from starlette.testclient import TestClient
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
