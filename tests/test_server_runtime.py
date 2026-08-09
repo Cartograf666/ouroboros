@@ -762,7 +762,7 @@ def test_a_fresh_local_first_install_still_authors_safety_light(tmp_path, monkey
     # onboarding, so its own boot normalization could create the file just as
     # easily (behavioural coverage: tests/test_onboarding_host.py).
     repo = cfg.pathlib.Path(__file__).parent.parent
-    launcher_host = (repo / "ouroboros" / "launcher_onboarding.py").read_text()
-    server_src = (repo / "server.py").read_text()
+    launcher_host = (repo / "ouroboros" / "launcher_onboarding.py").read_text(encoding="utf-8")
+    server_src = (repo / "server.py").read_text(encoding="utf-8")
     assert "if provider_defaults_changed and _settings_path.exists():" in launcher_host
     assert "if provider_defaults_changed and _settings_path.exists():" in server_src

@@ -3361,11 +3361,14 @@ def test_ui_smoke_login_start_serialized_and_dismiss_keeps_unproven_job(direct_s
 
 @pytest.mark.ui_browser
 def test_ui_smoke_dismiss_overlapping_start_cannot_drop_a_live_job(direct_server_with_data):
-    """C7 (round b4): dismiss and start share ONE lifecycle lock. A start
-    attempted while Dismiss awaits its (slow) cancel DELETE is refused — it can
-    neither create a job the dismiss continuation would then drop, nor cancel a
-    job it does not own. After the dismissal settles, a fresh start works and
-    stays tracked."""
+    """C7, semantics updated by the PR-175 merge: dismiss and start share ONE
+    transition QUEUE (it used to be a try-lock that DROPPED the overlapped
+    start — and a dropped Close left the daemon running a sign-in for a card
+    the owner had dismissed). A start attempted while Dismiss awaits its slow
+    cancel DELETE is not lost and not interleaved: it runs AFTER the dismissal
+    settles, so it can neither create a job the dismiss continuation would
+    drop, nor cancel a job it does not own. A further start beside the live
+    job first cancels it (the centralized C7 guard), then creates its own."""
     import time as _time
 
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
@@ -3378,21 +3381,21 @@ def test_ui_smoke_dismiss_overlapping_start_cannot_drop_a_live_job(direct_server
             browser = pw.chromium.launch()
             try:
                 page = browser.new_page()
-                posts: list = []
-                deletes: list = []
+                events: list = []
 
                 def handle_create(route):
-                    posts.append(1)
+                    events.append("post")
                     route.fulfill(
                         status=200,
                         content_type="application/json",
                         body='{"job_id": "job-ov-%d", "job": {"state": "running"},'
-                             ' "attach_command": ""}' % len(posts),
+                             ' "attach_command": ""}' % len(events),
                     )
 
                 def handle_cancel(route):
-                    deletes.append(1)
+                    events.append("delete-open")
                     _time.sleep(0.35)  # hold the DELETE open: the overlap window
+                    events.append("delete-done")
                     route.fulfill(status=200, content_type="application/json", body="{}")
 
                 page.route("**/api/claudexor/login", handle_create)
@@ -3407,31 +3410,43 @@ def test_ui_smoke_dismiss_overlapping_start_cannot_drop_a_live_job(direct_server
                         const m = await import('/static/modules/harness_accounts.js');
                         await m.startLogin('codex', 'ov-a');          // create #1
                         host.querySelector('[data-login-dismiss]')?.click();
-                        // While the dismiss awaits its slow DELETE, a start
-                        // must be refused by the shared lifecycle lock.
+                        // Queued behind the dismiss: this start lands AFTER the
+                        // slow DELETE settles, and its card renders — the press
+                        // is not lost the way the old try-lock lost it.
                         await m.startLogin('codex', 'ov-b');
                         await new Promise((r) => setTimeout(r, 600));
-                        const clearedAfterDismiss = host.innerHTML === '';
-                        await m.startLogin('codex', 'ov-c');          // create #2
+                        const cardAfterQueuedStart = host.innerHTML.length > 0;
+                        // A start beside the live ov-b job first cancels it
+                        // (the centralized guard), then creates its own.
+                        await m.startLogin('codex', 'ov-c');
                         return {
-                            clearedAfterDismiss,
+                            cardAfterQueuedStart,
                             finalHasCard: host.innerHTML.length > 0,
                         };
                     }
                     """
                 )
                 assert result.get("error") is None
-                assert result["clearedAfterDismiss"] is True, (
-                    "a PROVEN cancel must clear the card"
+                assert result["cardAfterQueuedStart"] is True, (
+                    "the start queued behind the dismiss must land, not vanish"
                 )
                 assert result["finalHasCard"] is True, (
-                    "the post-dismiss start must stay tracked (its card renders)"
+                    "the final start must stay tracked (its card renders)"
                 )
-                assert len(posts) == 2, (
-                    f"exactly two create POSTs (the overlapped start is refused), got {len(posts)}"
+                posts = events.count("post")
+                deletes = events.count("delete-open")
+                assert posts == 3, f"three create POSTs (none dropped), got {posts}"
+                assert deletes == 2, (
+                    f"two cancel DELETEs (the dismissed ov-a, then ov-b under the "
+                    f"start guard), got {deletes}"
                 )
-                assert len(deletes) == 1, (
-                    f"exactly one cancel DELETE (nobody cancels a job they don't own), got {len(deletes)}"
+                # The preserved C7 invariant, now as ORDER: the queued start's
+                # POST happens only after the dismissal's DELETE fully settled —
+                # no job is created for a dismiss continuation to drop.
+                first_delete_done = events.index("delete-done")
+                second_post = [i for i, e in enumerate(events) if e == "post"][1]
+                assert first_delete_done < second_post, (
+                    f"the queued start POSTed before the dismiss DELETE settled: {events}"
                 )
             finally:
                 browser.close()
