@@ -1517,9 +1517,13 @@ rail): each destination is a `.nav-row` (16px icon + 13px label, 34px tall) and
 the Projects group is a `.nav-section-toggle` that expands a data-driven list of
 project rows (`renderProjectsNav` in `web/app.js`, fed by `/api/state`).
 `syncNavigationState` keeps the active row, the Projects expand/collapse, and the
-open right panel in sync. A project opens as a right split panel on desktop and a
-full-width overlay with backdrop on mobile, hosting a full chat instance over the
-ONE shared WebSocket (client-side fan-out by `chat_id`). On mobile the sidebar
+open right panel in sync. A project THREAD opens in the CENTRE area — the same
+place Main Chat lives — hosting a full chat instance over the ONE shared
+WebSocket (client-side fan-out by `chat_id`). It used to open as a right split
+panel that became a full-width overlay with a backdrop on mobile; that was two
+competing full-screen surfaces on a phone, and project threads (T1) retired it.
+Do not reintroduce a right-panel project view: the right slot is the task
+inspector's, and a thread and an inspected task are meant to coexist. On mobile the sidebar
 collapses behind an "Open navigation" toggle (drawer), NOT a horizontal bottom
 bar. Spacing/typography come from the shared design tokens in `web/style.css`
 (no per-screen hardcoding); global agent controls (Evolve/Review/Restart ghost
@@ -1553,19 +1557,26 @@ timer (~3s while Chat is visible, ~20s elsewhere, paused while
 `document.hidden`), forced on WS `open`, `projects_changed`, and owner-control
 writes. Do not add a module-local `/api/state` poll or a second timer.
 
-The right panel is ONE slot with mutually exclusive kinds (`project` today, plus
-whatever registers via `registerRightPanel(kind, {mount, unmount})`). Opening one
-kind closes the other, and navigating away closes the panel. The project kind
-keeps its persisted drag width; the task inspector is fixed at
-`--inspector-width`.
+The right panel is ONE slot for kinds registered via
+`registerRightPanel(kind, {mount, unmount})` — the task inspector today. Opening
+one kind closes the other, and navigating away closes the panel. The task
+inspector is fixed at `--inspector-width`. `project` is NOT a panel kind (a
+thread owns the centre) but the name stays reserved so a module cannot
+re-register the retired behaviour.
 
 The compact Projects header keeps the shared layers icon, label, unread pill,
-chevron, and an always-visible `+`. Project rows expose one sibling Rename/Delete
-menu, reachable by pointer and keyboard; Enter/Space open, Escape closes, focus
-order stays logical, click-outside closes, and placement is viewport-safe. Name
-validation uses the backend `PROJECT_NAME_MAX` SSOT (80), never a divergent UI
-constant. Unread is `visible_revision > project_seen_revision`; acknowledge only
-after the room has painted, and make cursor writes monotonic/server-clamped.
+chevron, and an always-visible `+` (new project). Project rows expose ONE sibling
+action slot holding a per-project `+` (new thread) and the Rename/Fork/Delete
+menu; a project's threads are listed in a SIBLING container after the row, never
+nested inside the row button. Both menus mount through
+`project_create.js::openRowMenu`, the one accessible row-menu shell: reachable by
+pointer and keyboard, Enter/Space open, Escape closes, focus order stays logical,
+click-outside closes, placement is viewport-safe. Do not hand-roll a second menu.
+Name validation uses the backend `PROJECT_NAME_MAX` / `THREAD_NAME_MAX` SSOT
+(80), never a divergent UI constant. Unread is per THREAD —
+`thread.visible_revision > project_seen_revision[project][thread]` — and a
+project row shows the aggregate of its threads; acknowledge only after that
+thread has painted, and make cursor writes monotonic/server-clamped.
 Routine task heartbeat telemetry must never create a bubble or unread revision.
 Only typed real incidents may enter the live card/Activity plus one deduplicated
 toast.

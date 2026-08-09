@@ -192,10 +192,17 @@ def test_project_sidebar_and_menu_static_contracts():
     assert "acknowledgeProjectAfterPaint" in app
     assert "inst.refreshHistory?.({ revision })" in app
     assert "paint?.painted" in app
-    assert "await markProjectViewed(project.id, revision)" in app
-    assert "async function markProjectViewed" in app
+    # Project threads (T1): the paint ACK names the exact THREAD it painted, and
+    # writes into that thread's lane of the nested cursor.
+    assert "await markProjectViewed(project.id, thread.id, revision)" in app
+    assert "async function markProjectViewed(projectId, threadId, revision)" in app
+    assert "project_seen_revision: { [projectId]: { [tid]: seen } }" in app
     assert "await fetchJson('/api/ui/preferences'" in app
+    # The project row keeps its pinned two-child markup: ONE row button plus ONE
+    # trailing action slot. The thread list is a SIBLING of the row, never nested
+    # inside the button (which would be interactive content inside a button).
     assert "item.append(btn, trailing)" in app
+    assert "if (threads) navProjectsList.appendChild(threads);" in app
     assert "hideProjectFromSidebar" not in app
     assert "project_last_viewed" not in app
     assert "project_hidden" not in app
@@ -213,6 +220,14 @@ def test_project_sidebar_and_menu_static_contracts():
     assert 'role="menuitem" data-prm="rename"' in menu
     assert 'role="menuitem" class="danger" data-prm="delete"' in menu
     assert 'data-prm="hide"' not in menu
+    # The thread row menu reuses THIS shell rather than growing a second one.
+    threads = (root / "web" / "modules" / "project_threads.js").read_text(encoding="utf-8")
+    assert "export function openRowMenu({" in menu
+    assert "import { openRowMenu } from './project_create.js';" in threads
+    assert 'role="menuitem" data-prm="rename"' in threads
+    assert 'role="menuitem" data-prm="fork"' in threads
+    assert "const THREAD_NAME_MAX = 80" in threads
+    assert "newName.length > THREAD_NAME_MAX" in threads
     for key in ("Escape", "ArrowDown", "ArrowUp", "Home", "End"):
         assert key in menu
     assert "window.innerWidth" in menu and "window.innerHeight" in menu

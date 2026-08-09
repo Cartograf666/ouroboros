@@ -647,7 +647,9 @@
  * @property {boolean} nested_subagents_expanded
  * @property {number} sidebar_width  // px; 0 = CSS default (v6.33.0)
  * @property {number} project_panel_width  // px; 0 = CSS default
- * @property {Object.<string,number>} project_seen_revision  // monotonic paint ACK
+ * @property {Object.<string,Object.<string,number>>} project_seen_revision  // monotonic paint ACK, NESTED per thread since T1: {project_id: {thread_id: revision}}. A flat {project_id: revision} is accepted for one minor and reads back as {project_id: {"0": revision}}.
+ * @property {string[]} project_order  // owner drag-and-drop order; unlisted projects keep the default order
+ * @property {Object.<string,string[]>} project_thread_order  // owner drag-and-drop thread order per project
  * @property {Object.<string,string>} project_last_viewed  // deprecated accepted no-op
  * @property {Object.<string,boolean>} project_hidden  // deprecated accepted no-op
  * @property {boolean=} ok

@@ -129,13 +129,15 @@ def test_ui_projects_sidebar_unread_and_keyboard_menu(direct_server_with_data):
                 assert row.locator(".nav-unread-dot").count() == 1
 
                 # A real room paint advances the monotonic cursor and clears unread.
+                # The thread opens in the CENTRE now (project threads, T1), not in
+                # a right split panel.
                 row.click()
-                page.wait_for_selector('#project-panel:not([hidden])', timeout=30_000)
+                page.wait_for_selector('#page-thread.active', timeout=30_000)
                 page.wait_for_function(
                     "() => document.querySelector('#nav-projects-count')?.textContent === ''",
                     timeout=30_000,
                 )
-                page.click("#project-panel-close")
+                page.click("#thread-stage-close")
 
                 kebab = page.locator('.nav-project-kebab[aria-label="Actions for Alpha project"]')
                 kebab.focus()
@@ -159,6 +161,143 @@ def test_ui_projects_sidebar_unread_and_keyboard_menu(direct_server_with_data):
                 assert toggle.get_attribute("aria-expanded") == "false"
                 assert page.locator("#nav-projects-list").is_hidden()
                 assert add.is_visible()
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+
+
+@pytest.mark.ui_browser
+def test_ui_project_threads_create_rename_fork_open_in_centre(direct_server_with_data):
+    """The T1 thread journey end to end, at desktop AND at phone width.
+
+    create -> rename -> fork -> open in the CENTRE -> per-thread unread dot.
+    The mobile leg is the reason this phase exists: a thread used to open as a
+    right panel that became a second full-screen overlay on a phone. Here it must
+    be the centre PAGE, with the sidebar drawer closed and no panel over it.
+    """
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    from ouroboros.projects_registry import create_project
+
+    url = direct_server_with_data["url"]
+    data_dir = direct_server_with_data["data_dir"]
+    create_project(data_dir, "threaded", name="Threaded project")
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                row = page.locator('.nav-project-row[data-project-id="threaded"]')
+                row.wait_for(state="visible", timeout=30_000)
+                # A project with no extra threads renders NO thread list at all —
+                # the sidebar of someone who never uses threads is unchanged.
+                assert page.locator('[data-threads-for="threaded"]').count() == 0
+
+                # "+" creates a thread (A5) and opens it in the centre.
+                page.click('.nav-thread-add[aria-label="New thread in Threaded project"]')
+                page.wait_for_selector("#page-thread.active", timeout=30_000)
+                thread_list = page.locator('[data-threads-for="threaded"]')
+                thread_list.wait_for(state="visible", timeout=30_000)
+                assert thread_list.locator(".nav-thread-item").count() == 1
+                thread_row = thread_list.locator(".nav-thread-row").first
+                created_id = thread_row.get_attribute("data-thread-id")
+                assert created_id and created_id != "0"
+
+                # The chat instance lives in the CENTRE stage, not in a right panel.
+                assert page.locator("#thread-stage-body .chat-instance-panel").count() == 1
+                assert page.locator("#thread-stage-body .chat-instance-centre").count() == 1
+                assert page.locator("#project-panel").count() == 0
+                # A thread carries NO global agent controls (they belong to the one
+                # agent, not to one room) — that is the chrome half of the X8 split.
+                assert page.locator("#page-thread [data-chat-command='panic']").count() == 0
+                assert page.locator("#page-thread .chat-panel-statusbar").count() == 1
+                # The stage names the project above the thread's own name.
+                assert page.locator("#thread-stage-project").inner_text() == "Threaded project"
+
+                # Rename through the per-thread menu (A4) — Codex still cannot.
+                kebab = thread_list.locator(".nav-thread-kebab").first
+                kebab.click()
+                menu = page.locator('.project-row-menu[role="menu"]')
+                menu.wait_for(state="visible", timeout=5_000)
+                assert page.locator(":focus").get_attribute("data-prm") == "rename"
+                menu.locator('[data-prm="rename"]').click()
+                dialog_input = page.locator("[data-confirm-input]")
+                dialog_input.wait_for(state="visible", timeout=5_000)
+                dialog_input.fill("Renamed thread")
+                page.click(".confirm-dialog [data-confirm-ok]")
+                page.wait_for_function(
+                    "() => [...document.querySelectorAll('.nav-thread-label')]"
+                    ".some(el => el.textContent === 'Renamed thread')",
+                    timeout=30_000,
+                )
+
+                # Fork (D2): a NEW thread named "Copy of …"; the source is untouched.
+                thread_list.locator(".nav-thread-kebab").first.click()
+                page.locator('.project-row-menu [data-prm="fork"]').click()
+                page.wait_for_function(
+                    "() => [...document.querySelectorAll('.nav-thread-label')]"
+                    ".some(el => el.textContent === 'Copy of Renamed thread')",
+                    timeout=30_000,
+                )
+                labels = page.locator('[data-threads-for="threaded"] .nav-thread-label')
+                assert labels.count() == 2
+                # D3: the newest thread sits on TOP within its project.
+                assert labels.first.inner_text() == "Copy of Renamed thread"
+
+                # Per-thread unread: activity in ONE thread dots only that thread,
+                # and the project row aggregates it.
+                from ouroboros.projects_registry import (
+                    get_project,
+                    increment_project_visible_revision,
+                    project_threads,
+                )
+
+                threads = project_threads(get_project(data_dir, "threaded"))
+                other = next(t for t in threads if str(t["id"]) not in {"0", created_id})
+                increment_project_visible_revision(data_dir, chat_id=int(other["chat_id"]))
+                page.wait_for_function(
+                    "id => {"
+                    "  const row = document.querySelector("
+                    "    `.nav-thread-row[data-thread-id='${id}']`);"
+                    "  return row && row.querySelector('.nav-unread-dot');"
+                    "}",
+                    arg=str(other["id"]),
+                    timeout=30_000,
+                )
+                assert page.locator("#nav-projects-count").inner_text() == "1"
+
+                # Opening THAT thread clears its dot and leaves the sibling alone.
+                page.click(f'.nav-thread-row[data-thread-id="{other["id"]}"]')
+                page.wait_for_function(
+                    "() => document.querySelector('#nav-projects-count')?.textContent === ''",
+                    timeout=30_000,
+                )
+                assert page.locator("#thread-stage-title").inner_text() \
+                    == "Copy of Renamed thread"
+                browser.close()
+
+                # --- the mobile fix -------------------------------------------
+                browser = pw.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"width": 375, "height": 812})
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                page.click("[data-mobile-nav-toggle]")
+                page.wait_for_selector(".primary-sidebar.open", timeout=15_000)
+                page.click('.nav-thread-row[data-thread-id="%s"]' % other["id"])
+                page.wait_for_selector("#page-thread.active", timeout=30_000)
+                # The drawer closed, the thread is the PAGE (not an overlay over it),
+                # and it fills the viewport without a second close affordance.
+                assert not page.locator(".primary-sidebar.open").count()
+                box = page.locator("#page-thread").bounding_box()
+                assert box is not None and box["width"] <= 375 + 1, box
+                assert box["x"] >= -1, box
+                assert page.locator("#page-thread .chat-input-area").is_visible()
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -213,16 +352,16 @@ def test_ui_smoke_project_panel_lifecycle_does_not_leak(direct_server_with_data)
 
                 def open_project(project_id):
                     page.click(f'.nav-project-row[data-project-id="{project_id}"]')
-                    page.wait_for_selector("#project-panel:not([hidden])", timeout=30_000)
+                    page.wait_for_selector("#page-thread.active", timeout=30_000)
                     page.wait_for_selector(
                         f'[id="panel-pchat-{project_id}"]:not([hidden])', timeout=30_000
                     )
 
                 def close_project():
-                    page.click("#project-panel-close")
+                    page.click("#thread-stage-close")
                     page.wait_for_function(
-                        "() => !document.getElementById('project-panel')"
-                        ".classList.contains('open')",
+                        "() => !document.getElementById('page-thread')"
+                        ".classList.contains('active')",
                         timeout=30_000,
                     )
 
@@ -2896,10 +3035,10 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
 
                 with (logs_dir / "progress.jsonl").open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(panel_row) + "\n")
-                wide.evaluate(
-                    "() => document.documentElement.style.setProperty('--project-panel-width', '440px')"
-                )
-                project_row = wide.locator('[data-project-id="layout-project"]')
+                # The project thread mounts in the CENTRE now, so its width is the
+                # shell's centre column (viewport minus the sidebar), not a
+                # separately-sized right panel.
+                project_row = wide.locator('.nav-project-row[data-project-id="layout-project"]')
                 project_row.wait_for(state="visible", timeout=30_000)
                 project_row.click()
                 panel_card = wide.locator(
@@ -2924,7 +3063,9 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                         };
                     }"""
                 )
-                assert panel_facts["panelWidth"] <= 560, panel_facts
+                # Still narrower than the viewport: the card must respond to its
+                # actual consumer width (the centre column) rather than the window.
+                assert panel_facts["panelWidth"] <= 1100 - 180, panel_facts
                 assert panel_facts["cardWidth"] >= panel_facts["panelWidth"] * 0.9, panel_facts
                 assert panel_facts["cardScroll"] <= panel_facts["cardClient"] + 1, panel_facts
                 assert panel_facts["titleWidth"] >= 180, panel_facts
@@ -4105,9 +4246,8 @@ def test_ui_smoke_changes_screen_and_task_inspector(direct_server_with_data):
                 assert "LLM rounds" in cost_text and "1200 / 300" in cost_text
                 page.screenshot(path=str(data_dir.parent / "inspector-cost.png"), full_page=True)
 
-                # Mutual exclusion: opening the inspector while a project panel is
-                # open closes that panel, and leaving Chat/Changes closes the
-                # inspector (it belongs to the chat surface).
+                # Leaving Chat/Changes closes the inspector (it belongs to the chat
+                # surface).
                 page.click('[data-nav-page="chat"]')
                 page.evaluate(
                     "() => window.dispatchEvent(new CustomEvent('ouro:inspect-task',"
@@ -4115,22 +4255,24 @@ def test_ui_smoke_changes_screen_and_task_inspector(direct_server_with_data):
                 )
                 panel.wait_for(state="visible", timeout=15_000)
 
-                # The right side is ONE slot: a project panel opened while the
-                # inspector is up evicts it, and the inspector opened over a project
-                # panel evicts that. Asserting only the second direction would leave
-                # the shared slot half-tested.
-                project_panel = page.locator('#project-panel')
+                # Project threads (T1): a thread is no longer a right-panel kind —
+                # it takes the CENTRE — so a thread and the inspector are NOT
+                # mutually exclusive any more. Inspecting the task a thread is
+                # talking about while that thread stays open is the whole point of
+                # splitting the two surfaces, so pin that they coexist rather than
+                # re-pinning an eviction that would now be a regression.
+                thread_stage = page.locator('#page-thread')
                 project_row = page.locator('.nav-project-row[data-project-id="alpha"]')
                 project_row.wait_for(state="visible", timeout=15_000)
                 project_row.click()
-                project_panel.wait_for(state="visible", timeout=15_000)
-                panel.wait_for(state="hidden", timeout=15_000)
+                thread_stage.wait_for(state="visible", timeout=15_000)
+                panel.wait_for(state="visible", timeout=15_000)
                 page.evaluate(
                     "() => window.dispatchEvent(new CustomEvent('ouro:inspect-task',"
                     " { detail: { taskId: 'diff-smoke' } }))"
                 )
                 panel.wait_for(state="visible", timeout=15_000)
-                project_panel.wait_for(state="hidden", timeout=15_000)
+                assert thread_stage.is_visible()
 
                 page.click('[data-nav-page="settings"]')
                 panel.wait_for(state="hidden", timeout=15_000)

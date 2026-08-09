@@ -651,7 +651,13 @@ class UiPreferencesResponse(TypedDict):
     nested_subagents_expanded: bool
     sidebar_width: int  # px; 0 = CSS default (resizable side sections, v6.33.0)
     project_panel_width: int  # px; 0 = CSS default
-    project_seen_revision: dict[str, int]  # monotonic paint ACK per active Project
+    # BREAKING since project threads (T1): the monotonic paint ACK is NESTED per
+    # thread — {project_id: {thread_id: revision}}. A stored or posted FLAT
+    # {project_id: revision} is accepted for one minor and normalized to
+    # {project_id: {"0": revision}} (thread #0 IS the project's original chat).
+    project_seen_revision: dict[str, dict[str, int]]
+    project_order: list[str]  # owner drag-and-drop order; unlisted projects keep the default order
+    project_thread_order: dict[str, list[str]]  # owner drag-and-drop thread order per project
     project_last_viewed: dict[str, str]  # deprecated one-minor accepted no-op
     project_hidden: dict[str, bool]  # deprecated one-minor accepted no-op
 

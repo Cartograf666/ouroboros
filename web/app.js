@@ -7,6 +7,20 @@ import { initChat, createChatInstance, headerBudgetPresentation } from './module
 import { initFiles } from './modules/files.js';
 import { apiClient } from './modules/api_client.js';
 import { openNewProjectDialog, openProjectRowMenu } from './modules/project_create.js';
+import {
+    MAIN_THREAD_ID,
+    attachProjectReorder,
+    createThreadStage,
+    isThreadUnread,
+    normalizeSeenRevision,
+    openThreadRowMenu,
+    orderProjectRows,
+    projectThreadRows,
+    rememberSeenRevision,
+    renderThreadList,
+    threadKey,
+    unreadThreadCount,
+} from './modules/project_threads.js';
 
 import { initLogs } from './modules/logs.js';
 import { initEvolution } from './modules/evolution.js';
@@ -20,6 +34,7 @@ import { initUpdateStatus } from './modules/update_status.js';
 import { initDashboard } from './modules/dashboard.js';
 import { hydrateNavIcons } from './modules/page_icons.js';
 import { createStatePoll } from './modules/state_poll.js';
+import { showToast } from './modules/toast.js';
 
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
 
@@ -37,6 +52,10 @@ const state = {
     // empty Set (never undefined) so chat.js::isMyThread is deterministic before
     // the first /api/state response; populated by renderProjectsNav.
     projectChatIds: new Set(),
+    // Nested per-thread read cursor {project: {thread: revision}}. Initialized to
+    // an empty object (never undefined) so the unread arithmetic is deterministic
+    // before /api/ui/preferences resolves; replaced by the normalized response.
+    projectSeenRevision: {},
 };
 
 // Connect only after modules register listeners.
@@ -48,22 +67,27 @@ const beforePageLeaveHandlers = [];
 let settingsControls = null;
 let dashboardControls = null;
 const navState = {
+    // The open thread, as (project, thread). A project row IS its thread #0, so
+    // `activeThreadId === 0` means "the project's own chat is open".
     activeProjectId: null,
+    activeThreadId: null,
     projectsExpanded: true,
     mobileDrawerOpen: false,
-    // Right panel = ONE slot with mutually exclusive kinds. 'project' is the
-    // existing project thread; other kinds (e.g. 'inspector') register their
-    // mount/unmount against the state machine below.
+    // Right panel = ONE slot with mutually exclusive kinds. Since T1 a project
+    // thread takes over the CENTRE instead, so the panel serves registered kinds
+    // (the task inspector today) only.
     panelKind: null,
 };
+/** The instance/stash/cursor key of the open thread, or '' when none is open. */
+const activeThreadKey = () => (
+    navState.activeProjectId === null
+        ? ''
+        : threadKey(navState.activeProjectId, navState.activeThreadId ?? MAIN_THREAD_ID)
+);
 // kind -> { mount(opts) => boolean|Promise<boolean>, unmount() }
 const rightPanelRegistry = {};
 const primarySidebar = document.getElementById('primary-sidebar');
 const navDrawerBackdrop = document.getElementById('nav-drawer-backdrop');
-const projectPanelBackdrop = document.getElementById('project-panel-backdrop');
-const projectPanel = document.getElementById('project-panel');
-const projectPanelBody = document.getElementById('project-panel-body');
-const projectPanelTitle = document.getElementById('project-panel-title');
 const navProjects = document.getElementById('nav-projects');
 const navProjectsToggle = document.getElementById('nav-projects-toggle');
 const navProjectsCount = document.getElementById('nav-projects-count');
@@ -73,11 +97,16 @@ const navBrandStatus = document.getElementById('nav-brand-status');
 const navBudget = document.getElementById('nav-budget');
 const navBudgetAmount = document.getElementById('nav-budget-amount');
 const navBudgetBar = document.getElementById('nav-budget-bar');
+// Keyed by threadKey(projectId, threadId) — one project can hold many threads,
+// and keying any of these by project id alone would make two threads of the same
+// project share an instance, a scroll stash and a paint receipt.
 const projectInstances = new Map();
 const projectPaintRequests = new Map();
 let knownProjectsJson = '';
 let lastProjectRows = [];
-let projectPanelHideTimer = null;
+// Owner drag-and-drop order (D3), persisted through /api/ui/preferences.
+let projectOrder = [];
+let threadOrder = {};
 let releaseMobileKeyboardForDrawer = () => {};
 
 function setMobileDrawerOpen(open, { sync = true } = {}) {
@@ -105,7 +134,15 @@ async function showPage(name, options = {}) {
             updateUnreadBadge();
         }
     }
-    if (options.closeProject !== false) closeProjectPanel({ sync: false });
+    // Navigating anywhere else tears the open thread down (single live instance)
+    // AND vacates the right panel. `openThread` passes closeProject:false because
+    // it IS the navigation — and because a thread and the task inspector are no
+    // longer mutually exclusive: the thread owns the centre, the inspector owns
+    // the right slot, so inspecting the task a thread is discussing keeps both.
+    if (options.closeProject !== false) {
+        closeProjectPanel({ sync: false });
+        closeRightPanel({ sync: false });
+    }
     if (options.closeDrawer !== false) navState.mobileDrawerOpen = false;
     syncNavigationState();
     return true;
@@ -142,6 +179,10 @@ function updateUnreadBadge() {
 
 function syncNavigationState() {
     const activeProjectId = navState.activeProjectId;
+    const openThreadKey = activeThreadKey();
+    // A project ROW is "active" only when the project's OWN thread (#0) is the
+    // open one; an open sibling thread highlights its own row instead.
+    const activeRowProjectId = navState.activeThreadId === MAIN_THREAD_ID ? activeProjectId : null;
     const drawerOpen = Boolean(navState.mobileDrawerOpen);
     document.body.classList.toggle('nav-drawer-open', drawerOpen);
     primarySidebar?.classList.toggle('open', drawerOpen);
@@ -159,35 +200,18 @@ function syncNavigationState() {
     navProjectsToggle?.classList.toggle('active', Boolean(activeProjectId));
     navProjectsToggle?.setAttribute('aria-expanded', navState.projectsExpanded ? 'true' : 'false');
     navProjectsList.hidden = !navState.projectsExpanded;
-    document.querySelectorAll('[data-project-id]').forEach((button) => {
-        const isActive = button.dataset.projectId === activeProjectId;
+    document.querySelectorAll('.nav-project-row[data-project-id]').forEach((button) => {
+        const isActive = button.dataset.projectId === activeRowProjectId;
         button.classList.toggle('active', isActive);
         if (isActive) button.setAttribute('aria-current', 'page');
         else button.removeAttribute('aria-current');
     });
-    if (projectPanel) {
-        if (projectPanelHideTimer) {
-            clearTimeout(projectPanelHideTimer);
-            projectPanelHideTimer = null;
-        }
-        if (activeProjectId) {
-            projectPanel.hidden = false;
-            if (projectPanelBackdrop) projectPanelBackdrop.hidden = false;
-            requestAnimationFrame(() => {
-                projectPanel.classList.add('open');
-                projectPanelBackdrop?.classList.add('open');
-            });
-        } else {
-            projectPanel.classList.remove('open');
-            projectPanelBackdrop?.classList.remove('open');
-            projectPanelHideTimer = setTimeout(() => {
-                projectPanel.hidden = true;
-                if (projectPanelBackdrop) projectPanelBackdrop.hidden = true;
-                projectPanelHideTimer = null;
-            }, 220);
-        }
-        document.body.classList.toggle('project-panel-open', Boolean(activeProjectId));
-    }
+    document.querySelectorAll('.nav-thread-row[data-thread-key]').forEach((button) => {
+        const isActive = button.dataset.threadKey === openThreadKey;
+        button.classList.toggle('active', isActive);
+        if (isActive) button.setAttribute('aria-current', 'page');
+        else button.removeAttribute('aria-current');
+    });
 }
 
 document.querySelectorAll('[data-nav-page]').forEach(btn => {
@@ -247,7 +271,9 @@ async function readStateSnapshot() {
 
 const statePoll = createStatePoll({
     read: readStateSnapshot,
-    activePage: () => state.activePage,
+    // An open project THREAD is a chat surface, so it takes the chat cadence:
+    // its unread ACK and live header state need the same ~3s freshness Main does.
+    activePage: () => (state.activePage === 'thread' ? 'chat' : state.activePage),
     hidden: () => document.hidden,
     setTimer: (fn, ms) => setTimeout(fn, ms),
     clearTimer: (handle) => clearTimeout(handle),
@@ -432,22 +458,30 @@ document.addEventListener('keydown', (event) => {
 });
 
 // ---------------------------------------------------------------------------
-// Multi-project navigation + right thread panel (v6.32.0). Projects come from
-// /api/state; each opens as a chat instance bound to its project chat_id.
-// Navigation is one state machine now: page, project, and mobile drawer are
-// synchronized together so Utilities and Projects can't remain active at once.
+// Multi-project navigation + the CENTRE thread stage (project threads, T1).
+// Projects come from /api/state; each carries its canonical thread projection,
+// and opening a thread mounts a chat instance bound to that thread's chat_id in
+// the CENTRE area — the same place Main Chat lives. It used to open as a right
+// split panel, which on a phone became a second full-screen overlay stacked on
+// the content area; the centre is where a conversation belongs. The right panel
+// is now the task inspector's alone.
+// Navigation is one state machine: page, thread, and mobile drawer are
+// synchronized together so Utilities and a thread can't remain active at once.
 // ---------------------------------------------------------------------------
-// Single-live-panel policy (P3, owner 7A): at most ONE project chat instance is
-// alive; closing or switching destroys the previous one. The exception is an
-// instance holding unsendable client state (staged File attachments / an
-// in-flight upload): it is hidden and marked instead, so switching to Settings
-// mid-upload never drops attachments. Scroll intent survives destruction in a
-// small stash keyed by project id and is re-applied after the recreated
+// Single-live-instance policy (P3, owner 7A): at most ONE project thread chat
+// instance is alive; closing or switching destroys the previous one. The
+// exception is an instance holding unsendable client state (staged File
+// attachments / an in-flight upload): it is hidden and marked instead, so
+// switching to Settings mid-upload never drops attachments. That survivor rule
+// is keyed by THREAD now — two threads of one project are two rooms, and keying
+// it by project would have let opening a sibling thread silently discard the
+// other thread's staged attachments. Scroll intent survives destruction in a
+// small stash keyed the same way and is re-applied after the recreated
 // instance's first paint.
 const projectScrollStash = new Map();
 
-function destroyProjectInstance(pid) {
-    const inst = projectInstances.get(pid);
+function destroyProjectInstance(key) {
+    const inst = projectInstances.get(key);
     if (!inst) return;
     if (inst.hasPendingWork?.()) {
         inst.page.hidden = true;
@@ -456,16 +490,15 @@ function destroyProjectInstance(pid) {
         return;
     }
     const scroll = inst.getScrollState?.();
-    if (scroll) projectScrollStash.set(pid, scroll);
+    if (scroll) projectScrollStash.set(key, scroll);
     inst.destroy?.();
-    projectInstances.delete(pid);
-    projectPaintRequests.delete(pid);
+    projectInstances.delete(key);
+    projectPaintRequests.delete(key);
 }
 
-// The right panel is ONE slot. `openRightPanel`/`closeRightPanel` are the state
-// machine; a later module registers its own kind (e.g. the task inspector) via
-// `registerRightPanel` and gets mutual exclusion for free. The project kind
-// keeps its exact previous behaviour, including its persisted drag width.
+// The right panel is ONE slot for registered kinds (the task inspector today).
+// `project` is no longer one of them — a thread opens in the centre — and the
+// name stays reserved so a module cannot re-register the retired behaviour.
 function registerRightPanel(kind, handlers) {
     const name = String(kind || '').trim();
     if (!name || name === 'project') return () => {};
@@ -477,7 +510,6 @@ function registerRightPanel(kind, handlers) {
 }
 
 async function openRightPanel(kind, opts = {}) {
-    if (kind === 'project') return openProjectPanel(opts.project, opts);
     const entry = rightPanelRegistry[kind];
     if (!entry || typeof entry.mount !== 'function') return false;
     if (navState.panelKind && navState.panelKind !== kind) closeRightPanel({ sync: false });
@@ -493,19 +525,42 @@ async function openRightPanel(kind, opts = {}) {
     return mounted;
 }
 
-// Closing the slot runs the registered kind's unmount AND the project teardown:
-// the project kind's single-live-panel policy (destroy the active instance,
-// stash its scroll intent, keep pending-work survivors hidden) is unchanged —
-// it just lives behind the generalized close now.
 function closeRightPanel({ sync = true } = {}) {
     const kind = navState.panelKind;
-    if (kind && kind !== 'project') {
+    if (kind) {
         try { rightPanelRegistry[kind]?.unmount?.(); } catch {}
     }
     navState.panelKind = null;
-    const activeId = navState.activeProjectId;
+    if (sync) syncNavigationState();
+}
+
+// The centre stage every thread mounts into. Built once; the header carries the
+// title, the per-thread menu and the close affordance so the chat instance
+// itself never has to render project chrome.
+const threadStage = createThreadStage({
+    content: document.getElementById('content'),
+    onClose: () => showPage('chat'),
+    onMenu: (anchorEl) => {
+        const project = lastProjectRows.find((row) => row.id === navState.activeProjectId);
+        if (!project) return;
+        const thread = projectThreadRows(project)
+            .find((row) => row.id === (navState.activeThreadId ?? MAIN_THREAD_ID));
+        if (!thread) return;
+        if (thread.id === MAIN_THREAD_ID) {
+            openProjectRowMenu(project, { apiClient, anchorEl, onChanged: onProjectsMutated });
+        } else {
+            openThreadRowMenu(project, thread, { apiClient, anchorEl, onChanged: onProjectsMutated });
+        }
+    },
+});
+
+// Historical name kept: it is what every close call site says. Tearing the open
+// thread down IS the close, because the stage hosts exactly one.
+function closeProjectPanel({ sync = true } = {}) {
+    const openKey = activeThreadKey();
     navState.activeProjectId = null;
-    if (activeId) destroyProjectInstance(activeId);
+    navState.activeThreadId = null;
+    if (openKey) destroyProjectInstance(openKey);
     // Anything left is a hidden pending-work survivor; keep it hidden.
     for (const inst of projectInstances.values()) {
         inst.page.hidden = true;
@@ -514,80 +569,88 @@ function closeRightPanel({ sync = true } = {}) {
     if (sync) syncNavigationState();
 }
 
-// Historical name kept: it is what every project-close call site says.
-function closeProjectPanel(options = {}) {
-    closeRightPanel(options);
+/** Open a project's own chat (thread #0) — what clicking a project row does. */
+function openProjectPanel(project, options = {}) {
+    const thread = project ? projectThreadRows(project)[0] : null;
+    return openThread(project, thread, options);
 }
 
-async function openProjectPanel(project, { closeDrawer = true } = {}) {
+async function openThread(project, thread, { closeDrawer = true } = {}) {
     if (!project?.id || String(project.lifecycle || 'active') !== 'active') return;
-    if (navState.activeProjectId === project.id) {
+    if (!thread) return;
+    const key = threadKey(project.id, thread.id);
+    if (activeThreadKey() === key) {
         closeProjectPanel();
+        showPage('chat');
         return;
     }
-    // Mutual exclusion: any other right-panel kind vacates the ONE slot first.
-    if (navState.panelKind && navState.panelKind !== 'project') closeRightPanel({ sync: false });
-    // perf2 P4.2: signal chat.js that a panel open is in flight so Main's
+    // perf2 P4.2: signal chat.js that a thread open is in flight so Main's
     // deferred first hydration yields the CPU to this build/paint.
     projectPanelOpeningSince = Date.now();
     try {
-        const movedToChat = await showPage('chat', { closeProject: false, closeDrawer: false });
-        if (movedToChat === false) return;
+        const moved = await showPage('thread', { closeProject: false, closeDrawer: false });
+        if (moved === false) return;
         navState.activeProjectId = project.id;
-        navState.panelKind = 'project';
-        projectPanelTitle.textContent = project.name || project.id;
-        // One live panel: every OTHER project instance is destroyed (or hidden and
-        // marked when it holds pending work) before the target is created/shown.
-        for (const pid of [...projectInstances.keys()]) {
-            if (pid !== project.id) destroyProjectInstance(pid);
+        navState.activeThreadId = Number(thread.id) || MAIN_THREAD_ID;
+        threadStage.setTitle(project, thread);
+        // One live instance: every OTHER thread instance is destroyed (or hidden
+        // and marked when it holds pending work) before the target is shown.
+        for (const other of [...projectInstances.keys()]) {
+            if (other !== key) destroyProjectInstance(other);
         }
-        let inst = projectInstances.get(project.id);
+        let inst = projectInstances.get(key);
         if (!inst) {
             inst = createChatInstance({
                 ...ctx,
-                chatId: Number(project.chat_id) || 1,
+                chatId: Number(thread.chat_id) || Number(project.chat_id) || 1,
                 projectId: project.id,
                 idPrefix: `pchat-${project.id}`,
-                mountEl: projectPanelBody,
-                asPanel: true,
-                title: project.name || project.id,
-                initialScrollState: projectScrollStash.get(project.id) || null,
+                mountEl: threadStage.body,
+                // Thread chrome (no global agent controls) in the CENTRE layout —
+                // the two used to be one `asPanel` flag (X8).
+                layout: 'centre',
+                chrome: 'thread',
+                title: thread.name || project.name || project.id,
+                initialScrollState: projectScrollStash.get(key) || null,
             });
-            projectScrollStash.delete(project.id);
-            projectInstances.set(project.id, inst);
+            projectScrollStash.delete(key);
+            projectInstances.set(key, inst);
         }
         // A reopened pending-work survivor is live again.
         delete inst.page.dataset.pendingWork;
-        for (const [pid, other] of projectInstances) {
-            other.page.hidden = pid !== project.id;
-            if (pid !== project.id) other.cancelHistoryPaint?.();
+        for (const [other, instance] of projectInstances) {
+            instance.page.hidden = other !== key;
+            if (other !== key) instance.cancelHistoryPaint?.();
         }
         if (closeDrawer) navState.mobileDrawerOpen = false;
         syncNavigationState();
         // Restore this thread's scroll instead of leaving it at the top (P7). Runs
-        // after the panel is shown so the column has real geometry to scroll.
+        // after the stage is shown so the column has real geometry to scroll.
         inst.restoreScrollPosition?.();
         // ACK only the exact revision whose history was fetched and painted. chat.js
         // owns the paint receipt; an already-painted instance skips the forced
         // refetch — the server clamps the ACK, so no repaint is needed.
-        await acknowledgeProjectAfterPaint(project, inst, { forcePaint: !inst.hasPaintedHistory?.() });
+        await acknowledgeProjectAfterPaint(project, thread, inst, {
+            forcePaint: !inst.hasPaintedHistory?.(),
+        });
     } finally {
         projectPanelOpeningSince = 0;
     }
 }
 
-// A Project can receive a new visible revision while its panel remains open.
-// Coalesce polling updates per Project, but never acknowledge a newer revision
-// until that exact history snapshot has completed a real browser paint.
-async function acknowledgeProjectAfterPaint(project, instance = null, { forcePaint = false } = {}) {
-    if (!project?.id || navState.activeProjectId !== project.id) return;
-    const inst = instance || projectInstances.get(project.id);
+// A thread can receive a new visible revision while it stays open. Coalesce
+// polling updates per thread, but never acknowledge a newer revision until that
+// exact history snapshot has completed a real browser paint.
+async function acknowledgeProjectAfterPaint(project, thread, instance = null, { forcePaint = false } = {}) {
+    if (!project?.id || !thread) return;
+    const key = threadKey(project.id, thread.id);
+    if (activeThreadKey() !== key) return;
+    const inst = instance || projectInstances.get(key);
     if (!inst || inst.page.hidden) return;
-    const revision = Math.max(0, Number(project.visible_revision) || 0);
-    const alreadySeen = Math.max(0, Number(state.projectSeenRevision?.[project.id]) || 0);
-    if (!forcePaint && revision <= alreadySeen) return;
+    const revision = Math.max(0, Number(thread.visible_revision) || 0);
+    if (!forcePaint && !isThreadUnread(thread, state.projectSeenRevision, project.id)) return;
 
-    const current = projectPaintRequests.get(project.id);
+    const current = projectPaintRequests.get(key);
     if (current && current.revision >= revision) return current.promise;
     inst.cancelHistoryPaint?.();
     const promise = (async () => {
@@ -596,25 +659,23 @@ async function acknowledgeProjectAfterPaint(project, instance = null, { forcePai
         if (
             paint?.painted
             && Number(paint.revision) === revision
-            && navState.activeProjectId === project.id
+            && activeThreadKey() === key
             && !inst.page.hidden
             // A destroyed instance's page reports hidden===false but is detached;
             // a late paint must never ACK a revision nobody saw (GPT#15).
             && inst.page.isConnected
         ) {
-            await markProjectViewed(project.id, revision);
+            await markProjectViewed(project.id, thread.id, revision);
         }
     })().finally(() => {
-        if (projectPaintRequests.get(project.id)?.promise === promise) {
-            projectPaintRequests.delete(project.id);
+        if (projectPaintRequests.get(key)?.promise === promise) {
+            projectPaintRequests.delete(key);
         }
     });
-    projectPaintRequests.set(project.id, { revision, promise });
+    projectPaintRequests.set(key, { revision, promise });
     return promise;
 }
 
-document.getElementById('project-panel-close')?.addEventListener('click', () => closeProjectPanel());
-projectPanelBackdrop?.addEventListener('click', () => closeProjectPanel());
 navProjectsToggle?.addEventListener('click', () => {
     navState.projectsExpanded = !navState.projectsExpanded;
     syncNavigationState();
@@ -633,27 +694,21 @@ function renderProjectsNav(projects, projectChatIds) {
         ? projectChatIds
         : all.map(p => Number(p && p.chat_id) || 0);
     state.projectChatIds = new Set(completeChatIds.map(Number).filter(Boolean));
-    // Every active Project is visible, including a newly-created empty room. Unread
-    // is a monotonic revision comparison, never a timestamp race.
-    const seenRevision = state.projectSeenRevision || {};
-    const recency = (p) => String(p.last_active_at || p.updated_at || p.created_at || '');
-    const isUnread = (p) => Math.max(0, Number(p.visible_revision) || 0)
-        > Math.max(0, Number(seenRevision[p.id]) || 0);
-    const rows = all
-        .filter(p => p && p.id && ['active', 'deleting'].includes(String(p.lifecycle || 'active')))
-        .map(p => ({
-            ...p,
-            _unread: String(p.lifecycle || 'active') === 'active' && isUnread(p),
-        }))
-        .sort((a, b) => {
-            if (a._unread !== b._unread) return a._unread ? -1 : 1;  // unread to the top
-            return recency(b).localeCompare(recency(a));
-        });
+    // Every active Project is visible, including a newly-created empty room.
+    // Unread is a monotonic per-THREAD revision comparison, never a timestamp
+    // race; a project row shows the count of its unread threads (aggregate).
+    const rows = orderProjectRows(
+        all.filter(p => p && p.id && ['active', 'deleting'].includes(String(p.lifecycle || 'active')))
+            .map(p => ({ ...p, _unread: unreadThreadCount(p, state.projectSeenRevision) })),
+        projectOrder,
+    );
     if (rows.some(p => p.id === navState.activeProjectId && p.lifecycle === 'deleting')) {
         closeProjectPanel();
+        showPage('chat');
     }
     const json = JSON.stringify(rows.map(p => [
         p.id, p.name, p.chat_id, p.lifecycle, p.visible_revision, p._unread, p.delete_error,
+        projectThreadRows(p).map(t => [t.id, t.name, t.visible_revision]),
     ]));
     if (json === knownProjectsJson) return;
     knownProjectsJson = json;
@@ -661,36 +716,43 @@ function renderProjectsNav(projects, projectChatIds) {
     paintProjectsNav();
     syncNavigationState();
     const active = rows.find((project) => project.id === navState.activeProjectId);
-    if (active?._unread && active.lifecycle === 'active') {
-        acknowledgeProjectAfterPaint(active);
+    const openThreadRow = active && projectThreadRows(active)
+        .find((thread) => thread.id === (navState.activeThreadId ?? MAIN_THREAD_ID));
+    // A rename reaches the sidebar through `projects_changed` -> /api/state, so
+    // the open stage's title has to follow it too; otherwise the header keeps
+    // showing the old name until the thread is closed and reopened.
+    if (openThreadRow) threadStage.setTitle(active, openThreadRow);
+    if (openThreadRow && active.lifecycle === 'active'
+        && isThreadUnread(openThreadRow, state.projectSeenRevision, active.id)) {
+        acknowledgeProjectAfterPaint(active, openThreadRow);
     }
 }
 
-// ACK exactly the revision painted. The server max-merges and clamps the cursor,
-// so stale tabs cannot move it backwards or acknowledge unseen future output.
-async function markProjectViewed(projectId, revision) {
+// ACK exactly the revision painted, into that THREAD's lane of the nested cursor.
+// The server max-merges and clamps against the thread's own visible_revision, so
+// stale tabs cannot move it backwards or acknowledge unseen future output.
+async function markProjectViewed(projectId, threadId, revision) {
     if (!projectId) return false;
     const seen = Math.max(0, Number(revision) || 0);
+    const tid = String(Number(threadId) || MAIN_THREAD_ID);
     try {
         await fetchJson('/api/ui/preferences', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ project_seen_revision: { [projectId]: seen } }),
+            body: JSON.stringify({ project_seen_revision: { [projectId]: { [tid]: seen } } }),
         });
     } catch {
         // The room was painted, but the durable monotonic ACK failed. Keep it
         // unread locally so polling or the next open retries the same revision.
         return false;
     }
-    state.projectSeenRevision = state.projectSeenRevision || {};
-    state.projectSeenRevision[projectId] = Math.max(
-        Number(state.projectSeenRevision[projectId]) || 0,
-        seen,
+    state.projectSeenRevision = rememberSeenRevision(
+        state.projectSeenRevision || {}, projectId, threadId, seen,
     );
     if (Array.isArray(lastProjectRows)) {
         let changed = false;
         for (const row of lastProjectRows) {
             if (row.id !== projectId) continue;
-            const unread = (Number(row.visible_revision) || 0) > state.projectSeenRevision[projectId];
+            const unread = unreadThreadCount(row, state.projectSeenRevision);
             if (row._unread !== unread) { row._unread = unread; changed = true; }
         }
         if (changed) paintProjectsNav();
@@ -698,15 +760,50 @@ async function markProjectViewed(projectId, revision) {
     return true;
 }
 
+// One writer for the owner's manual sidebar order (D3). It rides the SAME
+// /api/ui/preferences surface as widget_order — no second ordering mechanism.
+async function persistSidebarOrder(patch) {
+    try {
+        await fetchJson('/api/ui/preferences', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(patch),
+        });
+    } catch {
+        // A failed order write leaves the local order in place for this session;
+        // the next reload falls back to the default order rather than a lie.
+    }
+}
+
+// Every registry mutation from a row/thread menu funnels here: an optimistic
+// delete paints immediately, everything else re-reads authoritative truth.
+function onProjectsMutated(change = {}) {
+    if (change.optimistic && change.projectId) {
+        const row = lastProjectRows.find(p => p.id === change.projectId);
+        if (row) { row.lifecycle = 'deleting'; row._unread = 0; }
+        if (navState.activeProjectId === change.projectId) {
+            closeProjectPanel();
+            showPage('chat');
+        }
+        knownProjectsJson = '';
+        paintProjectsNav();
+        return;
+    }
+    knownProjectsJson = '';
+    refreshProjectsNav();
+}
+
 // Paint the collapsible, scrollable projects list from the cached rows.
 function paintProjectsNav() {
     const rows = lastProjectRows;
     navProjectsList.textContent = '';
     navProjects.hidden = false;
-    const unreadCount = rows.filter((project) => project._unread).length;
+    // The header pill counts unread THREADS across every project — the number the
+    // sidebar's dots actually add up to. Counting projects would have hidden a
+    // project with three unread threads behind a "1".
+    const unreadCount = rows.reduce((total, project) => total + project._unread, 0);
     if (navProjectsCount) {
         navProjectsCount.textContent = unreadCount ? (unreadCount > 99 ? '99+' : String(unreadCount)) : '';
-        navProjectsCount.title = unreadCount ? `${unreadCount} unread project${unreadCount === 1 ? '' : 's'}` : '';
+        navProjectsCount.title = unreadCount ? `${unreadCount} unread thread${unreadCount === 1 ? '' : 's'}` : '';
         if (unreadCount) navProjectsCount.setAttribute('aria-label', navProjectsCount.title);
         else navProjectsCount.removeAttribute('aria-label');
     }
@@ -714,6 +811,8 @@ function paintProjectsNav() {
         const deleting = String(project.lifecycle || 'active') === 'deleting';
         const item = document.createElement('div');
         item.className = `nav-project-item${deleting ? ' is-deleting' : ''}`;
+        item.dataset.projectId = project.id;
+        item.draggable = !deleting;
         const btn = document.createElement('button');
         btn.className = 'nav-row nav-project-row';
         btn.type = 'button';
@@ -733,7 +832,10 @@ function paintProjectsNav() {
             btn.appendChild(dot);
             btn.classList.add('has-unread');
         }
-        // The action control is a sibling button, never nested interactive UI.
+        // The action controls are SIBLING buttons, never nested interactive UI
+        // inside the row button. `trailing` stays ONE slot node — it now holds
+        // the thread "+" and the kebab — so the pinned two-child row markup
+        // contract is unchanged.
         let trailing;
         if (deleting) {
             trailing = document.createElement('span');
@@ -741,6 +843,31 @@ function paintProjectsNav() {
             trailing.textContent = 'Deleting…';
             trailing.title = project.delete_error || 'Cancellation and cleanup are in progress';
         } else {
+            trailing = document.createElement('span');
+            trailing.className = 'nav-project-actions';
+            const add = document.createElement('button');
+            add.type = 'button';
+            add.className = 'nav-project-kebab nav-thread-add';
+            add.textContent = '+';
+            add.title = 'New thread in this project';
+            add.setAttribute('aria-label', `New thread in ${project.name || project.id}`);
+            add.addEventListener('click', async (event) => {
+                event.stopPropagation();
+                // A5: "+" creates a thread — an EMPTY chat sharing this project's
+                // folder (A2). Its chat_id is learned synchronously so the live
+                // fan-out never misroutes the new thread's first frame to Main.
+                try {
+                    const payload = await apiClient.projectThreadCreate(project.id);
+                    const thread = payload?.thread;
+                    if (Number(thread?.chat_id)) state.projectChatIds.add(Number(thread.chat_id));
+                    knownProjectsJson = '';
+                    await refreshProjectsNav();
+                    const fresh = lastProjectRows.find((row) => row.id === project.id) || project;
+                    if (thread) openThread(fresh, thread);
+                } catch (e) {
+                    showToast(`Could not create a thread: ${e?.body?.error || e?.message || e}`, 'error');
+                }
+            });
             const kebab = document.createElement('button');
             kebab.type = 'button';
             kebab.className = 'nav-project-kebab';
@@ -752,28 +879,45 @@ function paintProjectsNav() {
                 openProjectRowMenu(project, {
                     apiClient,
                     anchorEl: kebab,
-                    onChanged: (change = {}) => {
-                        if (change.optimistic && change.projectId) {
-                            const row = lastProjectRows.find(p => p.id === change.projectId);
-                            if (row) { row.lifecycle = 'deleting'; row._unread = false; }
-                            if (navState.activeProjectId === change.projectId) closeProjectPanel();
-                            knownProjectsJson = '';
-                            paintProjectsNav();
-                            return;
-                        }
-                        knownProjectsJson = '';
-                        refreshProjectsNav();
-                    },
+                    onChanged: onProjectsMutated,
                 });
             });
-            trailing = kebab;
+            trailing.append(add, kebab);
         }
-        if (project.id === navState.activeProjectId) btn.classList.add('active');
+        if (project.id === navState.activeProjectId && navState.activeThreadId === MAIN_THREAD_ID) {
+            btn.classList.add('active');
+        }
         if (!deleting) btn.addEventListener('click', () => openProjectPanel(project));
         item.append(btn, trailing);
         navProjectsList.appendChild(item);
+        // The thread list is a SIBLING container after the project row, never a
+        // child of it: the row is one button, and interactive thread rows cannot
+        // live inside a button.
+        const threads = deleting ? null : renderThreadList(project, {
+            cursor: state.projectSeenRevision,
+            manualOrder: threadOrder[project.id] || [],
+            activeThreadKey: activeThreadKey(),
+            onOpen: (proj, thread) => openThread(proj, thread),
+            onMenu: (proj, thread, anchorEl) => openThreadRowMenu(proj, thread, {
+                apiClient, anchorEl, onChanged: onProjectsMutated,
+            }),
+            onReorder: (pid, ids) => {
+                threadOrder = { ...threadOrder, [pid]: ids };
+                knownProjectsJson = '';
+                paintProjectsNav();
+                persistSidebarOrder({ project_thread_order: threadOrder });
+            },
+        });
+        if (threads) navProjectsList.appendChild(threads);
     }
+    attachProjectReorder(navProjectsList, (ids) => {
+        projectOrder = ids;
+        knownProjectsJson = '';
+        paintProjectsNav();
+        persistSidebarOrder({ project_order: projectOrder });
+    });
 }
+
 
 document.getElementById('nav-projects-add')?.addEventListener('click', async (event) => {
     event.stopPropagation();
@@ -859,8 +1003,11 @@ window.addEventListener('ouro:open-project', (event) => {
     openProjectPanel(resolved);
 });
 
-// Resizable side sections: edge drag-handles write --sidebar-width /
-// --project-panel-width on :root and persist (debounced) to /api/ui/preferences.
+// Resizable side sections: the edge drag-handle writes --sidebar-width on :root
+// and persists (debounced) to /api/ui/preferences. The project thread lost its
+// resizable column when it moved to the CENTRE (the centre is sized by the shell
+// grid), so `project_panel_width` is no longer read; the key stays accepted by
+// the preferences contract so an older stored value is not an error.
 // Disabled under the mobile drawer breakpoint. Width 0 = keep the CSS default.
 // CW10 note: the DEVELOPMENT.md "no inline styles in JS" rule targets static styling
 // that belongs in a stylesheet — the drag's transient `userSelect:none` was that, and
@@ -880,7 +1027,6 @@ function setupResizablePanels(prefs) {
         }, 400);
     };
     if (Number(prefs?.sidebar_width) > 0) root.style.setProperty('--sidebar-width', `${prefs.sidebar_width}px`);
-    if (Number(prefs?.project_panel_width) > 0) root.style.setProperty('--project-panel-width', `${prefs.project_panel_width}px`);
     const isMobile = () => window.matchMedia('(max-width: 980px)').matches;
     const makeHandle = (target, cssVar, dir, prefKey, min, max) => {
         if (!target) return;
@@ -913,13 +1059,18 @@ function setupResizablePanels(prefs) {
         handle.addEventListener('pointercancel', end);
     };
     makeHandle(document.getElementById('primary-sidebar'), '--sidebar-width', 'right', 'sidebar_width', 180, 560);
-    makeHandle(document.getElementById('project-panel'), '--project-panel-width', 'left', 'project_panel_width', 320, 1100);
 }
 
 apiFetch('/api/ui/preferences', { cache: 'no-store' })
     .then((r) => (r.ok ? r.json() : null))
     .then((prefs) => {
-        state.projectSeenRevision = (prefs && prefs.project_seen_revision) || {};
+        // The cursor is nested per thread (T1). Normalizing HERE too — not only on
+        // the server — is what lets a browser that reads a flat value written by an
+        // older runtime agree with it instead of showing every project as unread.
+        state.projectSeenRevision = normalizeSeenRevision(prefs && prefs.project_seen_revision);
+        projectOrder = Array.isArray(prefs?.project_order) ? prefs.project_order.map(String) : [];
+        threadOrder = (prefs && typeof prefs.project_thread_order === 'object' && prefs.project_thread_order)
+            ? prefs.project_thread_order : {};
         setupResizablePanels(prefs || {});
         // Re-evaluate unread now that revision cursors are known.
         if (Array.isArray(lastProjectRows)) { knownProjectsJson = null; renderProjectsNav(lastProjectRows, Array.from(state.projectChatIds || [])); }

@@ -199,19 +199,24 @@ export function openNewProjectDialog({ apiClient, onCreated }) {
 
 let closeOpenProjectRowMenu = null;
 
-// Accessible row menu: Rename/Delete only. `project` is a sidebar read model;
-// callbacks refresh the authoritative registry projection.
-export async function openProjectRowMenu(project, { apiClient, anchorEl, onChanged }) {
-    const maxNameLength = PROJECT_NAME_MAX;
+/**
+ * The ONE row-menu shell: markup contract (`role=menu` + `[role=menuitem]`),
+ * keyboard model (Escape / ArrowUp / ArrowDown / Home / End), click-outside
+ * dismissal, focus restoration and viewport-safe placement. Project rows and
+ * project THREAD rows (`modules/project_threads.js`) both mount through it, so
+ * there is one accessible menu behaviour to keep correct rather than two that
+ * drift. `itemsHtml` supplies the `[data-prm]` items; `onSelect(action)` runs
+ * after the menu has closed.
+ *
+ * @returns {{ close: (opts?: {restoreFocus?: boolean}) => void }}
+ */
+export function openRowMenu({ anchorEl, ariaLabel, itemsHtml, onSelect }) {
     closeOpenProjectRowMenu?.();
     const menu = document.createElement('div');
     menu.className = 'project-row-menu';
     menu.setAttribute('role', 'menu');
-    menu.setAttribute('aria-label', `Actions for ${project.name || project.id}`);
-    menu.innerHTML = `
-        <button type="button" role="menuitem" data-prm="rename">Rename…</button>
-        <button type="button" role="menuitem" class="danger" data-prm="delete">Delete project…</button>
-    `;
+    menu.setAttribute('aria-label', ariaLabel);
+    menu.innerHTML = itemsHtml;
     const rect = anchorEl.getBoundingClientRect();
     const close = ({ restoreFocus = false } = {}) => {
         menu.remove();
@@ -243,6 +248,47 @@ export async function openProjectRowMenu(project, { apiClient, anchorEl, onChang
         const action = event.target.closest('[data-prm]')?.dataset?.prm;
         if (!action) return;
         close();
+        await onSelect?.(action);
+    });
+    document.body.appendChild(menu);
+    const menuRect = menu.getBoundingClientRect();
+    const margin = 8;
+    const top = Math.min(
+        Math.max(margin, rect.bottom + 4),
+        Math.max(margin, window.innerHeight - menuRect.height - margin),
+    );
+    const left = Math.min(
+        Math.max(margin, rect.right - menuRect.width),
+        Math.max(margin, window.innerWidth - menuRect.width - margin),
+    );
+    menu.style.setProperty('--prm-top', `${Math.round(top)}px`);
+    menu.style.setProperty('--prm-left', `${Math.round(left)}px`);
+    menu.querySelector('[role="menuitem"]')?.focus();
+    return { close };
+}
+
+// Accessible row menu: Rename/Fork/Delete. `project` is a sidebar read model;
+// callbacks refresh the authoritative registry projection. The project row IS
+// thread #0's row (T1), so Fork here forks the project's main thread — the one
+// thing the global Main chat cannot do (A3).
+export async function openProjectRowMenu(project, { apiClient, anchorEl, onChanged }) {
+    const maxNameLength = PROJECT_NAME_MAX;
+    openRowMenu({
+        anchorEl,
+        ariaLabel: `Actions for ${project.name || project.id}`,
+        itemsHtml: `
+        <button type="button" role="menuitem" data-prm="rename">Rename…</button>
+        <button type="button" role="menuitem" data-prm="fork">Fork thread</button>
+        <button type="button" role="menuitem" class="danger" data-prm="delete">Delete project…</button>
+    `,
+        onSelect: (action) => runProjectRowAction(action, project, {
+            apiClient, anchorEl, onChanged, maxNameLength,
+        }),
+    });
+}
+
+async function runProjectRowAction(action, project, { apiClient, anchorEl, onChanged, maxNameLength }) {
+    {
         if (action === 'rename') {
             const res = await openConfirmDialog({
                 title: 'Rename project',
@@ -289,20 +335,21 @@ export async function openProjectRowMenu(project, { apiClient, anchorEl, onChang
                 finally { onChanged?.({ authoritative: true }); }
             }
             if (anchorEl.isConnected) anchorEl.focus();
+        } else if (action === 'fork') {
+            // Thread #0 of a project — NOT the global Main chat, which has no
+            // forkable spelling. The fork stores a cursor into this thread's
+            // rows; nothing is copied and the source is untouched (A3).
+            try {
+                const payload = await apiClient.projectThreadFork(project.id, 0);
+                onChanged?.({ authoritative: true, thread: payload?.thread || null });
+            } catch (e) {
+                await openConfirmDialog({
+                    title: 'Fork failed',
+                    body: `Fork failed: ${e?.body?.error || e?.message || e}`,
+                    alert: true,
+                });
+            }
+            if (anchorEl.isConnected) anchorEl.focus();
         }
-    });
-    document.body.appendChild(menu);
-    const menuRect = menu.getBoundingClientRect();
-    const margin = 8;
-    const top = Math.min(
-        Math.max(margin, rect.bottom + 4),
-        Math.max(margin, window.innerHeight - menuRect.height - margin),
-    );
-    const left = Math.min(
-        Math.max(margin, rect.right - menuRect.width),
-        Math.max(margin, window.innerWidth - menuRect.width - margin),
-    );
-    menu.style.setProperty('--prm-top', `${Math.round(top)}px`);
-    menu.style.setProperty('--prm-left', `${Math.round(left)}px`);
-    menu.querySelector('[role="menuitem"]')?.focus();
+    }
 }

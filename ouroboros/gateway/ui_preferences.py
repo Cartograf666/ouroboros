@@ -8,6 +8,7 @@ from typing import Any
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ouroboros.contracts.chat_id_policy import MAIN_THREAD_ID
 from ouroboros.gateway._helpers import json_error, request_drive_root, request_json_or
 from ouroboros.utils import append_jsonl, atomic_write_json, read_json_dict, utc_now_iso
 
@@ -18,9 +19,15 @@ DEFAULT_UI_PREFERENCES: dict[str, Any] = {
     # a stored value can never collapse or run away with the layout.
     "sidebar_width": 0,
     "project_panel_width": 0,
-    # Monotonic, server-clamped read cursors. A Project is unread exactly when its
-    # durable visible_revision is greater than this value.
+    # Monotonic, server-clamped read cursors, NESTED per thread since project
+    # threads (T1): ``{project_id: {thread_id: revision}}``. A thread is unread
+    # exactly when its durable visible_revision is greater than its own value.
     "project_seen_revision": {},
+    # Owner drag-and-drop ordering (D3), same shape family as ``widget_order``:
+    # an explicit prefix of ids; anything not listed keeps the default order
+    # behind it (new project on top, new thread on top within its project).
+    "project_order": [],
+    "project_thread_order": {},
     # One-minor compatibility inputs: accepted as loud no-ops.
     "project_last_viewed": {},
     "project_hidden": {},
@@ -31,7 +38,19 @@ _MAX_WIDGET_KEY_LENGTH = 200
 _SIDEBAR_WIDTH_MIN, _SIDEBAR_WIDTH_MAX = 180, 560
 _PROJECT_PANEL_WIDTH_MIN, _PROJECT_PANEL_WIDTH_MAX = 320, 1100
 _MAX_PROJECT_CURSORS = 1000
+# The 64-char key budget was sized for the FLAT cursor, where "thread" could only
+# ever have been encoded by suffixing the project id (`pid:12`) — that packing is
+# exactly what the nested shape (D1) exists to avoid. Nesting therefore does NOT
+# spend the project-id budget: 64 still bounds a project id alone, and thread ids
+# are small integers bounded separately by _MAX_THREAD_CURSORS. Revisited and
+# deliberately left at 64 (X6).
 _MAX_PROJECT_ID_LENGTH = 64
+# Per project. A project's thread count is owner-driven; this only bounds what a
+# malicious or buggy client can persist, and drops the oldest entries first.
+_MAX_THREAD_CURSORS = 200
+_MAX_THREAD_ID_LENGTH = 12
+_MAX_ORDERED_PROJECTS = 1000
+_MAX_ORDERED_THREADS = 200
 _DEPRECATED_UI_PREFERENCE_EVENTS: set[str] = set()
 
 
@@ -59,6 +78,92 @@ def _normalize_width(value: Any, lo: int, hi: int) -> int:
     if n <= 0:
         return 0
     return max(lo, min(hi, n))
+
+
+def _normalize_seen_revision(value: Any) -> dict[str, dict[str, int]]:
+    """Normalize the read cursor to its NESTED ``{project: {thread: rev}}`` shape.
+
+    BREAKING ABI migration (X6), shipped atomically with the thread UI. The
+    compatibility window is the per-entry branch below: a FLAT ``{pid: int}``
+    entry — every value stored before this release, and any request from a
+    client that predates it — maps to ``{pid: {"0": int}}``. Thread #0 IS the
+    project's original chat (``thread_chat_id(pid, 0) == project_chat_id(pid)``),
+    so the old number describes exactly that thread and no unread state is
+    invented or lost. Mixed input (some projects flat, some nested) is normal
+    during the window and is accepted per entry, not per document.
+
+    Rejection stays LOUD (``ValueError`` -> HTTP 400) for anything that is
+    neither an int nor an object of ints: a silently-dropped cursor would look
+    like a room that refuses to go read.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(
+            "project_seen_revision must be an object of {project_id: {thread_id: revision}}"
+        )
+    cleaned: dict[str, dict[str, int]] = {}
+    for pid, per_thread in list(value.items())[:_MAX_PROJECT_CURSORS]:
+        key = str(pid or "").strip()[:_MAX_PROJECT_ID_LENGTH]
+        if not key:
+            continue
+        if isinstance(per_thread, bool):
+            # bool is an int subclass; a boolean cursor is a client bug, not a 0/1 revision.
+            raise ValueError("project_seen_revision values must be integers")
+        if isinstance(per_thread, dict):
+            threads: dict[str, int] = {}
+            for tid, revision in list(per_thread.items())[:_MAX_THREAD_CURSORS]:
+                thread_key = str(tid if tid is not None else "").strip()[:_MAX_THREAD_ID_LENGTH]
+                if not thread_key or isinstance(revision, bool):
+                    if isinstance(revision, bool):
+                        raise ValueError("project_seen_revision values must be integers")
+                    continue
+                try:
+                    thread_key = str(int(thread_key))
+                except (TypeError, ValueError):
+                    raise ValueError("project_seen_revision thread ids must be integers")
+                try:
+                    threads[thread_key] = max(0, int(revision or 0))
+                except (TypeError, ValueError):
+                    raise ValueError("project_seen_revision values must be integers")
+            cleaned[key] = threads
+            continue
+        # Compatibility window: a flat per-project number IS thread #0's cursor.
+        try:
+            cleaned[key] = {str(MAIN_THREAD_ID): max(0, int(per_thread or 0))}
+        except (TypeError, ValueError):
+            raise ValueError("project_seen_revision values must be integers")
+    return cleaned
+
+
+def _normalize_thread_order(value: Any) -> dict[str, list[str]]:
+    """``{project_id: [thread_id, ...]}`` — the owner's manual thread order (D3)."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("project_thread_order must be an object of {project_id: [thread_id]}")
+    cleaned: dict[str, list[str]] = {}
+    for pid, order in list(value.items())[:_MAX_PROJECT_CURSORS]:
+        key = str(pid or "").strip()[:_MAX_PROJECT_ID_LENGTH]
+        if not key:
+            continue
+        if not isinstance(order, list):
+            raise ValueError("project_thread_order values must be lists of thread ids")
+        ids: list[str] = []
+        seen: set[str] = set()
+        for item in order[:_MAX_ORDERED_THREADS]:
+            if isinstance(item, bool):
+                raise ValueError("project_thread_order values must be lists of thread ids")
+            try:
+                thread_key = str(int(item))
+            except (TypeError, ValueError):
+                raise ValueError("project_thread_order values must be lists of thread ids")
+            if thread_key in seen:
+                continue
+            seen.add(thread_key)
+            ids.append(thread_key)
+        cleaned[key] = ids
+    return cleaned
 
 
 def _normalize_preferences(
@@ -97,22 +202,27 @@ def _normalize_preferences(
     if "project_panel_width" in raw:
         prefs["project_panel_width"] = _normalize_width(raw.get("project_panel_width"), _PROJECT_PANEL_WIDTH_MIN, _PROJECT_PANEL_WIDTH_MAX)
     if "project_seen_revision" in raw:
-        value = raw.get("project_seen_revision")
+        prefs["project_seen_revision"] = _normalize_seen_revision(raw.get("project_seen_revision"))
+    if "project_order" in raw:
+        value = raw.get("project_order")
         if value is None:
-            prefs["project_seen_revision"] = {}
-        elif not isinstance(value, dict):
-            raise ValueError("project_seen_revision must be an object of {project_id: revision}")
+            prefs["project_order"] = []
+        elif not isinstance(value, list):
+            raise ValueError("project_order must be a list of project ids")
         else:
-            cleaned: dict[str, int] = {}
-            for pid, revision in list(value.items())[:_MAX_PROJECT_CURSORS]:
-                key = str(pid or "").strip()[:_MAX_PROJECT_ID_LENGTH]
-                if not key:
+            ordered: list[str] = []
+            seen_pids: set[str] = set()
+            for item in value[:_MAX_ORDERED_PROJECTS]:
+                if not isinstance(item, str):
+                    raise ValueError("project_order must be a list of project ids")
+                key = item.strip()[:_MAX_PROJECT_ID_LENGTH]
+                if not key or key in seen_pids:
                     continue
-                try:
-                    cleaned[key] = max(0, int(revision or 0))
-                except (TypeError, ValueError):
-                    raise ValueError("project_seen_revision values must be integers")
-            prefs["project_seen_revision"] = cleaned
+                seen_pids.add(key)
+                ordered.append(key)
+            prefs["project_order"] = ordered
+    if "project_thread_order" in raw:
+        prefs["project_thread_order"] = _normalize_thread_order(raw.get("project_thread_order"))
     for deprecated in ("project_last_viewed", "project_hidden"):
         if deprecated in raw and raw.get(deprecated) is not None and not isinstance(raw.get(deprecated), dict):
             raise ValueError(f"{deprecated} must be an object")
@@ -182,16 +292,35 @@ async def api_ui_preferences_post(request: Request) -> JSONResponse:
             prefs = _normalize_preferences(read_json_dict(path))
             incoming = _normalize_preferences(body, fill_defaults=False)
             if "project_seen_revision" in incoming:
-                from ouroboros.projects_registry import get_project
+                from ouroboros.projects_registry import get_project, project_threads
 
-                merged = dict(prefs.get("project_seen_revision") or {})
+                merged = {
+                    pid: dict(threads)
+                    for pid, threads in (prefs.get("project_seen_revision") or {}).items()
+                }
                 for project_id, requested in incoming.pop("project_seen_revision").items():
                     project = get_project(drive_root, project_id)
                     if project is None:
                         continue
-                    current = max(0, int(project.get("visible_revision") or 0))
-                    acknowledged = min(max(0, int(requested or 0)), current)
-                    merged[project_id] = max(int(merged.get(project_id) or 0), acknowledged)
+                    # Clamp EACH thread against its OWN durable revision, read
+                    # through the canonical projection so thread #0 is clamped by
+                    # `thread0_visible_revision` and not by the project-wide
+                    # aggregate (which any sibling thread can advance). Clamping
+                    # thread #0 against the aggregate would let a sibling's
+                    # message silently mark thread #0 read.
+                    ceilings = {
+                        str(thread["id"]): max(0, int(thread.get("visible_revision") or 0))
+                        for thread in project_threads(project)
+                    }
+                    lane = dict(merged.get(project_id) or {})
+                    for thread_id, revision in requested.items():
+                        if thread_id not in ceilings:
+                            continue  # unknown/removed thread: never newly admitted
+                        acknowledged = min(max(0, int(revision or 0)), ceilings[thread_id])
+                        lane[thread_id] = max(int(lane.get(thread_id) or 0), acknowledged)
+                    if len(lane) > _MAX_THREAD_CURSORS:
+                        lane = dict(list(lane.items())[-_MAX_THREAD_CURSORS:])
+                    merged[project_id] = lane
                 if len(merged) > _MAX_PROJECT_CURSORS:
                     # Bound retained cursors by insertion order; active-only writes
                     # ensure tombstones/unknown ids are not newly admitted here.
