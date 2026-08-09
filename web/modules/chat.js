@@ -4935,6 +4935,10 @@ export function createChatInstance({
         composerParts.setParts([...kept, ...normalizeParts(parts)]);
         resizeChatInput({ preserveStickiness: false });
         composerParts.focus();
+        // `setParts` repaints without emitting, so persist explicitly: a handed-over
+        // chip must survive a close exactly like one captured in this composer,
+        // and the persisted value is always the SERIALIZED field.
+        saveInputDraft();
         return composerParts.serialize();
     }
 
