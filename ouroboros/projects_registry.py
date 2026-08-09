@@ -230,16 +230,21 @@ def duplicate_chat_ids(drive_root: Any) -> Dict[int, List[tuple]]:
 
 
 def _report_duplicate_chat_ids(drive_root: Any, projects: List[Dict[str, Any]]) -> None:
-    """Loudly report pre-existing duplicates ONCE per process per drive root.
+    """Loudly report duplicates once per registry VERSION per drive root.
 
     Called from ``_load`` so a corrupt registry cannot stay quiet; deliberately
     non-raising, because refusing to load the registry would take the whole
-    server down over data that is still individually readable.
+    server down over data that is still individually readable. The memo is
+    keyed on the file's (mtime, size) rather than the root alone, so a
+    hand-edited collision introduced AFTER the first load is still reported
+    instead of hiding behind a once-per-process flag.
     """
+    path = _registry_path(drive_root)
     try:
-        key = str(pathlib.Path(drive_root).resolve(strict=False))
-    except Exception:
-        key = str(drive_root)
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = (str(path), 0, 0)
     if key in _DUPLICATE_CHAT_ID_REPORTED:
         return
     clashes = {cid: owners for cid, owners in _chat_id_owners(projects).items() if len(owners) > 1}

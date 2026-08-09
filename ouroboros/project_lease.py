@@ -113,12 +113,19 @@ def running_project_ids(running: Iterable[Any]) -> Set[str]:
 def candidate_is_leasable(candidate: Dict[str, Any], running_lanes: Set[LaneKey]) -> bool:
     """True when ``candidate`` may be assigned now under the one-writer rule.
 
-    ``running_lanes`` MUST come from :func:`running_project_lanes` — a set of
-    bare project ids would silently never match a lane tuple, disabling the
-    lease entirely.
+    ``running_lanes`` MUST come from :func:`running_project_lanes`. A set of
+    bare project ids would never match a lane tuple, so every candidate would
+    read as leasable and TWO writers could enter one folder — a silent
+    data-corruption path. Misuse raises instead.
     """
     if not _is_lane_occupant(candidate):
         return True
+    for lane in running_lanes or ():
+        if not (isinstance(lane, tuple) and len(lane) == 2):
+            raise TypeError(
+                "candidate_is_leasable expects lane keys from running_project_lanes "
+                f"((project_id, workspace_root) tuples), got {lane!r}"
+            )
     return _task_lane(candidate) not in running_lanes
 
 

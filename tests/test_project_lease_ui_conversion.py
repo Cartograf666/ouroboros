@@ -44,17 +44,25 @@ def test_mark_task_project_running_and_pending():
         candidate_is_leasable,
         mark_task_project,
         running_project_ids,
+        running_project_lanes,
     )
 
     running = {"t1": {"task": {"id": "t1", "project_id": ""}}}
     pending = [{"id": "t2", "project_id": ""}]  # PENDING holds bare task dicts
-    assert running_project_ids(running.values()) == set()           # no lane yet
+    assert running_project_lanes(running.values()) == set()          # no lane yet
 
-    # RUNNING task -> occupies the lane immediately
+    # RUNNING task -> occupies the lane immediately. The lane key is
+    # (project_id, workspace_root): this task names no workspace, so it holds
+    # the project's own-folder lane.
     assert mark_task_project(running, pending, "t1", "proj-x") is True
     assert running["t1"]["task"]["project_id"] == "proj-x"
+    assert running_project_lanes(running.values()) == {("proj-x", "")}
     assert running_project_ids(running.values()) == {"proj-x"}
-    assert candidate_is_leasable({"id": "z", "project_id": "proj-x"}, {"proj-x"}) is False
+    assert candidate_is_leasable({"id": "z", "project_id": "proj-x"}, {("proj-x", "")}) is False
+    # Bare project ids are a MISUSE, not a quietly permissive lease: every
+    # candidate would read as leasable and two writers could enter one folder.
+    with pytest.raises(TypeError):
+        candidate_is_leasable({"id": "z", "project_id": "proj-x"}, {"proj-x"})
 
     # PENDING task -> its own dict is scoped, so when assigned it will carry the lane
     # (assign_tasks reads the candidate's project_id and copies it into RUNNING)
@@ -69,7 +77,11 @@ def test_mark_task_project_running_and_pending():
 
 def test_ui_conversion_marks_running_task_as_lease_holder(tmp_path, monkeypatch):
     from ouroboros.gateway.projects import api_project_from_task
-    from ouroboros.project_lease import candidate_is_leasable, running_project_ids
+    from ouroboros.project_lease import (
+        candidate_is_leasable,
+        running_project_ids,
+        running_project_lanes,
+    )
     import supervisor.workers as workers
 
     (tmp_path / "logs").mkdir()
@@ -88,7 +100,9 @@ def test_ui_conversion_marks_running_task_as_lease_holder(tmp_path, monkeypatch)
     assert workers.RUNNING["tlive"]["task"]["project_id"] == pid
     assert pid in running_project_ids(workers.RUNNING.values())
     # so a concurrent same-project task is held out of assignment (one writer)
-    assert candidate_is_leasable({"id": "other", "project_id": pid}, running_project_ids(workers.RUNNING.values())) is False
+    assert candidate_is_leasable(
+        {"id": "other", "project_id": pid}, running_project_lanes(workers.RUNNING.values()),
+    ) is False
 
 
 def test_ui_conversion_scopes_a_pending_task(tmp_path, monkeypatch):
