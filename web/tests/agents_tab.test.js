@@ -230,6 +230,21 @@ test('the banner is the only place a service problem is explained', () => {
     assert.match(serviceBannerLine(fakeStore(ALL('ok'))).text, /Claudexor ready/);
 });
 
+test('the first read in flight states its COST, not a bare "reading…"', () => {
+    // The daemon re-probes every agent CLI on each read, so first paint is tens
+    // of seconds. An unexplained silent panel reads as broken, not as loading
+    // (owner report, 2026-08-08) — a per-facet "Reading your agents…" would
+    // have thrown that sentence away.
+    const store = {
+        reads: ALL('unread'), facet: (n) => ALL('unread')[n], error: '',
+        snapshot: null, loading: true, everSettled: false,
+        unavailableNote: () => ({ tone: 'muted', text: 'Reading…', action: null }),
+    };
+    const line = serviceBannerLine(store);
+    assert.match(line.text, /Checking Claudexor/);
+    assert.match(line.text, /minute/);
+});
+
 test('one refused facet never withdraws the authority of the other two', () => {
     // PER FACET, never a global verdict: with the catalogue and accounts read,
     // a quota refusal must not read as "the service is down".

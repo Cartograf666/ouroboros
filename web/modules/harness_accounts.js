@@ -410,6 +410,14 @@ export function serviceBannerLine(store) {
             checking: store.loading && !store.everSettled,
         });
     }
+    // NOTHING READ YET is not a gap to report — it is the first read in flight,
+    // and what the owner needs then is its COST: the daemon re-probes every
+    // agent CLI, so first paint is tens of seconds and a silent panel reads as
+    // broken rather than as loading (owner report, 2026-08-08). A bare
+    // "Reading…" would have thrown that sentence away.
+    if (!store.everSettled) {
+        return daemonStatusLine(store.snapshot || {}, { checking: store.loading });
+    }
     // All three unread in the same way: ONE sentence about the service, from
     // the shared vocabulary, with the subject widened to the whole tab —
     // naming just the accounts would under-report a gap that also swallowed
