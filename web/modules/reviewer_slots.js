@@ -18,6 +18,13 @@
 // Pure helpers live at the top and are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
+import {
+    FACET_ACCOUNTS,
+    FACET_CATALOG,
+    bindStatusSurface,
+    claudexorStatus,
+    facetGapClause,
+} from './claudexor_status_store.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -76,7 +83,21 @@ export function splitSessionTarget(target) {
     return { harness: raw.slice(0, eq), model: raw.slice(eq + 1) };
 }
 
-export function routeChoiceGroups({ harnesses = [], currentChoice = '' } = {}) {
+// `catalogKnown` / `accountsKnown` = the matching facet of the status payload
+// was actually READ (claudexor_status_store.facetReadState). Only then does the
+// absence of a harness/model/account mean anything about that harness/model/
+// account. With the daemon stopped, unreachable, or that one read refused, the
+// backend answers `harnesses: []` by construction, and this UI used to decorate
+// EVERY saved row with "(not in discovery)" — an accusation nobody had earned,
+// and the exact screen the owner reported (2026-08-08). The saved value keeps
+// its option either way (that guard is what stops a Save from erasing a pin);
+// only the LABEL's claim is withdrawn. The two facets are INDEPENDENT: a failed
+// account read must not silence the catalog's own honest verdict.
+function undiscoveredLabel(value, known, suffix = '(not in discovery)') {
+    return known ? `${value} ${suffix}` : String(value);
+}
+
+export function routeChoiceGroups({ harnesses = [], currentChoice = '', catalogKnown = true } = {}) {
     const sessionValues = (harnesses || [])
         .filter((h) => h && h.id)
         .map((h) => ({
@@ -93,7 +114,7 @@ export function routeChoiceGroups({ harnesses = [], currentChoice = '' } = {}) {
     if (savedChoice.startsWith('session:') && !sessionValues.some((o) => o.value === savedChoice)) {
         sessionValues.push({
             value: savedChoice,
-            label: `${savedChoice.slice('session:'.length)} (not in discovery)`,
+            label: undiscoveredLabel(savedChoice.slice('session:'.length), catalogKnown),
         });
     }
     const groups = [{ label: 'API', options: [{ value: API_ROUTE_CHOICE, label: 'API model' }] }];
@@ -106,7 +127,9 @@ export function routeChoiceGroups({ harnesses = [], currentChoice = '' } = {}) {
         ? { label: 'Coding agents — subscriptions', options: sessionValues }
         : { label: 'Coding agents — subscriptions', options: [{
             value: '', disabled: true,
-            label: 'None available — sign in under Providers → Harness Accounts',
+            label: catalogKnown
+                ? 'None available — sign in under Providers → Harness Accounts'
+                : 'Could not be listed — see the note above',
         }] });
     return groups;
 }
@@ -198,7 +221,27 @@ function lastRunMetaTitle(entry) {
     return `UI projection of capability_delta (D22) — ran as ${route}${ts ? ` at ${ts}` : ''}`;
 }
 
-export function sessionModelOptions(harness, currentModel) {
+export function harnessModelsKnown(harness, catalogKnown = true) {
+    // Discovery is TWO reads, not one. The catalog read can land — daemon
+    // globally `running`, `catalogKnown` true — while THIS harness's model
+    // list refuses: the endpoint answers `models: []` with a typed
+    // `models_error` for exactly that harness (claudexor_accounts.py, the
+    // per-harness `harness_models` probe). Reading the empty list as discovery
+    // then labelled a saved model "(not in discovery)", which claims a
+    // successful discovery proved its absence — while no discovery happened.
+    return Boolean(catalogKnown) && !String(harness?.models_error || '');
+}
+
+export function modelsGapNote(harness, catalogKnown = true) {
+    // The typed gap, SAID rather than left as a silently short list. Only when
+    // the catalog itself was read: with the catalog unread the section note
+    // above already explains everything, and this would be a second sentence
+    // for the same silence.
+    return catalogKnown && String(harness?.models_error || '')
+        ? 'model list could not be read' : '';
+}
+
+export function sessionModelOptions(harness, currentModel, { catalogKnown = true } = {}) {
     // The ONE model-options fragment for a session row's model select (triad,
     // scope, advisory, and the Subagents section import it too). "Engine
     // default model" is the empty tail; a SAVED model discovery no longer
@@ -209,12 +252,17 @@ export function sessionModelOptions(harness, currentModel) {
     const options = [{ value: '', label: 'Engine default model' },
         ...models.map((m) => ({ value: String(m.id || m.value || m), label: String(m.id || m.label || m) }))];
     if (currentModel && !options.some((o) => o.value === currentModel)) {
-        options.push({ value: currentModel, label: `${currentModel} (not in discovery)` });
+        // Gated on the MODEL read, not on the catalog read (see above): the
+        // option survives either way, only its accusation is withdrawn.
+        options.push({
+            value: currentModel,
+            label: undiscoveredLabel(currentModel, harnessModelsKnown(harness, catalogKnown)),
+        });
     }
     return options;
 }
 
-export function profileOptionsFor(profiles, savedPin) {
+export function profileOptionsFor(profiles, savedPin, { accountsKnown = true } = {}) {
     // Mirrors the model list's own rule: a SAVED pin the daemon no longer discovers
     // (account signed out, daemon down, profile renamed) matched no option, so the
     // select fell back to its first entry and redrew the row as "automatic rotation".
@@ -223,14 +271,25 @@ export function profileOptionsFor(profiles, savedPin) {
     const options = [{ value: '', label: 'Account: automatic rotation' },
         ...(profiles || []).map((p) => ({ value: p, label: `Account: ${p} (pinned)` }))];
     if (savedPin && !options.some((o) => o.value === savedPin)) {
-        options.push({ value: savedPin, label: `Account: ${savedPin} (not in discovery)` });
+        options.push({
+            value: savedPin,
+            // A pin nobody could check is still a pin: without a successful
+            // discovery the honest label is the one a discovered pin gets.
+            label: accountsKnown
+                ? `Account: ${savedPin} (not in discovery)`
+                : `Account: ${savedPin} (pinned)`,
+        });
     }
     return options;
 }
 
-export function capabilityBadge(row, harnessesById) {
+export function capabilityBadge(row, harnessesById, { catalogKnown = true } = {}) {
     // DISPLAY-only facts: never a control (6.2).
     if (row.route.kind === ROUTE_KIND_SESSION) {
+        // "route not discovered" is a claim about the ROUTE; with no successful
+        // discovery it is a claim about the read. Say nothing rather than
+        // something false — the one section note above already says why.
+        if (!catalogKnown) return 'agent session — retrieves context with its own tools';
         const harness = harnessesById?.[splitSessionTarget(row.route.target_id).harness];
         const status = harness ? (harness.status || 'unknown') : 'not discovered';
         return `agent session — retrieves context with its own tools · route ${status}`;
@@ -285,6 +344,15 @@ const state = {
     catalogModels: [],
     harnesses: [],
     profilesByHarness: {},
+    // PER-FACET provenance: the route/model lists come from the CATALOG facet,
+    // the account pins from the ACCOUNTS facet, and one can be authoritative
+    // while the other was never read. Only an `ok` facet may license a row-level
+    // "(not in discovery)" label.
+    catalogKnown: false,
+    accountsKnown: false,
+    serviceNote: null,
+    store: claudexorStatus,
+    disposers: [],
     onChange: () => {},
 };
 
@@ -307,6 +375,9 @@ export function renderReviewerSlotsSection() {
                 the shipped default models and spend API budget — keep at least one API row.
             </div>
             <div id="reviewer-slots-error" class="ui-status" data-tone="error" hidden></div>
+            <!-- ONE explanation when the coding-agent list could not be read,
+                 instead of decorating every row with "(not in discovery)". -->
+            <div id="reviewer-slots-service" class="settings-inline-status" hidden></div>
             <datalist id="reviewer-api-model-catalog"></datalist>
             <h4 class="reviewer-slots-heading">Triad slots <span class="muted" id="reviewer-triad-limit" title="The commit gate's real ceiling"></span></h4>
             <div id="reviewer-triad-rows" class="reviewer-slot-rows"></div>
@@ -360,20 +431,23 @@ function effortSelectHtml(attrs, selected, surfaceDefault) {
 }
 
 function rowHtml(row, group) {
+    const { catalogKnown, accountsKnown } = state;
     const choice = encodeRouteChoice(row);
-    const groups = routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice });
+    const groups = routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice, catalogKnown });
     const session = row.route.kind === ROUTE_KIND_SESSION;
     const split = session ? splitSessionTarget(row.route.target_id) : { harness: '', model: '' };
     const harness = session ? harnessesById()[split.harness] : null;
-    const modelOptions = sessionModelOptions(harness, split.model);
+    const modelOptions = sessionModelOptions(harness, split.model, { catalogKnown });
     const profiles = session ? (state.profilesByHarness[split.harness] || []) : [];
-    const profileOptions = profileOptionsFor(profiles, row.route.profile_id);
+    const profileOptions = profileOptionsFor(profiles, row.route.profile_id, { accountsKnown });
     const last = state.lastExecutions[row.slot_id];
     const lastText = last ? describeLastExecution(last) : '';
     // ONE quiet meta line per row (owner feedback): the delivery badge and the
     // last-run projection share it; nothing is dropped — the raw route + ISO
     // timestamp live in the tooltip.
-    const metaParts = [capabilityBadge(row, harnessesById())];
+    const metaParts = [capabilityBadge(row, harnessesById(), { catalogKnown })];
+    const modelsGap = session ? modelsGapNote(harness, catalogKnown) : '';
+    if (modelsGap) metaParts.push(modelsGap);
     if (lastText) metaParts.push(`Last run: ${lastText}`);
     const surfaceDefault = group === 'scope' ? 'scope review effort' : 'review effort';
     return `
@@ -393,6 +467,7 @@ function rowHtml(row, group) {
 
 function advisoryHtml() {
     const advisory = state.advisory;
+    const { catalogKnown, accountsKnown } = state;
     // TRAP: the advisory state carries kind='api' while ROUTE_KIND_API is
     // 'api_chat', so every branch here tests `!== ROUTE_KIND_SESSION` — a
     // naive `=== ROUTE_KIND_API` silently never matches.
@@ -404,7 +479,7 @@ function advisoryHtml() {
     // the API entry read as stray next to the labeled subscriptions group.
     const groups = [
         { label: 'API', options: [{ value: API_ROUTE_CHOICE, label: 'Claude (Anthropic API key)' }] },
-        ...routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice }).slice(1),
+        ...routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice, catalogKnown }).slice(1),
     ];
     // Session branch: the SAME model-options fragment the triad rows use —
     // rewriting it here would lose the "(not in discovery)" guard and let a
@@ -412,12 +487,16 @@ function advisoryHtml() {
     // WITHOUT the catalog datalist — the advisory api route is the Claude
     // Agent SDK, whose model spellings (sonnet, opus[1m], claude-…) are not
     // the OpenRouter catalog ids the datalist suggests.
-    const modelOptions = session ? sessionModelOptions(harnessesById()[split.harness], split.model) : [];
+    const modelOptions = session
+        ? sessionModelOptions(harnessesById()[split.harness], split.model, { catalogKnown }) : [];
     const profiles = session ? (state.profilesByHarness[split.harness] || []) : [];
-    const profileOptions = session ? profileOptionsFor(profiles, advisory.route?.profile_id) : [];
+    const profileOptions = session
+        ? profileOptionsFor(profiles, advisory.route?.profile_id, { accountsKnown }) : [];
     const last = state.lastExecutions.advisory_slot_1;
     const lastText = last ? describeLastExecution(last) : '';
-    const metaParts = [capabilityBadge({ route: advisory.route || {} }, harnessesById())];
+    const metaParts = [capabilityBadge({ route: advisory.route || {} }, harnessesById(), { catalogKnown })];
+    const modelsGap = session ? modelsGapNote(harnessesById()[split.harness], catalogKnown) : '';
+    if (modelsGap) metaParts.push(modelsGap);
     if (lastText) metaParts.push(`Last run: ${lastText}`);
     return `
         <div class="reviewer-slot-row" data-advisory-row>
@@ -446,6 +525,17 @@ function renderRows() {
             : (state.loadError
                 ? `Could not reach the reviewer-slot settings — ${state.loadError}. Your saved configuration is unchanged; retry when the connection is back.`
                 : '');
+    }
+    // The ONE coding-agent-service explanation. It answers a question the
+    // config-error banner above never could: that banner accuses the SAVED
+    // reviewer configuration, while this one says nobody could be asked what
+    // is discoverable — so no row below may be read as missing.
+    const serviceBox = document.getElementById('reviewer-slots-service');
+    if (serviceBox) {
+        const note = state.serviceNote;
+        serviceBox.hidden = !note;
+        serviceBox.textContent = note ? note.text : '';
+        serviceBox.dataset.tone = note ? note.tone : 'muted';
     }
     const triadBox = document.getElementById('reviewer-triad-rows');
     const scopeBox = document.getElementById('reviewer-scope-rows');
@@ -608,30 +698,91 @@ export async function reloadReviewerSlots() {
         state.loaded = false;
         state.loadError = `could not load reviewer slots: ${error.message || error}`;
     }
-    try {
-        const resp = await apiFetch('/api/claudexor/status?include=models', { cache: 'no-store' });
-        const data = await resp.json().catch(() => ({}));
-        state.harnesses = Array.isArray(data.harnesses) ? data.harnesses : [];
-        state.profilesByHarness = indexProfilesByHarness(data);
-    } catch (error) {
-        state.harnesses = [];
-        state.profilesByHarness = {};
-    }
+    // ONE status read for the whole app (the accounts panel and the Subagents
+    // section share this request; `includeModels` is sticky, so no later read
+    // downgrades the snapshot these selects depend on).
+    await state.store.refresh({ includeModels: true });
+    adoptStatusSnapshot();
     renderRows();
 }
 
-export function initReviewerSlots({ onChange } = {}) {
+export function reviewerServiceNote(store) {
+    // The section's ONE note. It LEADS with the catalog (this page's primary
+    // subject: which routes and models exist) and then NAMES the account gap
+    // too, because the rows also render account pins — a silently dropped
+    // second gap left pins on screen with no explanation of why they could not
+    // be checked. Coalescing is by SUBJECT, never by enum: the accounts gap
+    // used to be dropped whenever its STATE matched the catalog's, so with
+    // both failed the note spoke only of agents and the pins went unexplained.
+    // (Under the coarse `indeterminate` the clause is empty by construction —
+    // there is no per-facet verdict to name.)
+    const note = store.unavailableNote(FACET_CATALOG);
+    const reads = store.reads || {};
+    const clause = facetGapClause(reads, [FACET_ACCOUNTS]);
+    if (!clause) return note;
+    if (!note) return { tone: 'warn', action: null, text: clause };
+    return { ...note, text: `${note.text} ${clause}` };
+}
+
+function adoptStatusSnapshot() {
+    // Each facet answers for itself. A never-read catalog and a never-read
+    // account store are separate gaps, and neither is evidence that a saved
+    // route or pin no longer exists. A facet that was read keeps its
+    // authoritative list either way.
+    state.catalogKnown = state.store.catalogKnown;
+    state.accountsKnown = state.store.accountsKnown;
+    state.serviceNote = reviewerServiceNote(state.store);
+    const snapshot = state.store.snapshot || {};
+    state.harnesses = state.catalogKnown && Array.isArray(snapshot.harnesses) ? snapshot.harnesses : [];
+    state.profilesByHarness = state.accountsKnown ? indexProfilesByHarness(snapshot) : {};
+}
+
+export function initReviewerSlots({ onChange, store = claudexorStatus } = {}) {
+    destroyReviewerSlots();
     state.onChange = typeof onChange === 'function' ? onChange : () => {};
+    state.store = store;
+    // Seed from whatever the shared store already holds, so a render triggered
+    // before the first notify (the model-catalog event) is not rendered from a
+    // blank derived state.
+    adoptStatusSnapshot();
+    // Follow the shared read: when the daemon comes up while Settings is open
+    // the rows stop claiming "(not in discovery)" without a page reload. That
+    // promise needs the SHARED surface binding — a bare subscribe() carries no
+    // visibility predicate, and the store never polls for a subscriber that
+    // cannot say it is on screen, so nothing ever arrived to react to. Only a
+    // change this section RENDERS repaints: a repaint on every poll tick would
+    // drop the caret out of the API-model field mid-typing.
+    let signature = '';
+    state.disposers.push(bindStatusSurface(state.store, {
+        elementId: 'reviewer-triad-rows',
+        includeModels: true,
+        listener: () => {
+            adoptStatusSnapshot();
+            const next = JSON.stringify([state.catalogKnown, state.accountsKnown,
+                state.serviceNote?.text || '', state.harnesses, state.profilesByHarness]);
+            if (next === signature) return;
+            signature = next;
+            renderRows();
+        },
+    }));
     document.getElementById('btn-add-triad-slot')?.addEventListener('click', () => addRow('triad'));
     document.getElementById('btn-add-scope-slot')?.addEventListener('click', () => addRow('scope'));
-    document.addEventListener('settings-model-catalog:updated', (event) => {
+    const onCatalog = (event) => {
         const items = event?.detail?.items || [];
         state.catalogModels = items.map((item) => String(item.value || item.id || '')).filter(Boolean);
         renderRows();
-    });
+    };
+    document.addEventListener('settings-model-catalog:updated', onCatalog);
+    state.disposers.push(() => document.removeEventListener('settings-model-catalog:updated', onCatalog));
     // The initial load is driven by settings.js loadSettings(), which awaits
     // reloadReviewerSlots() BEFORE taking the clean-draft baseline — otherwise
     // the async arrival of the rows would read as an unsaved edit.
+}
+
+export function destroyReviewerSlots() {
+    for (const dispose of state.disposers.splice(0)) {
+        try { dispose(); } catch (err) { /* a broken disposer must not block the rest */ }
+    }
 }
 
 // #126, pure and node-tested: what the settings save sends for reviewer slots.

@@ -1,26 +1,37 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { createClaudexorStatusStore } from '../modules/claudexor_status_store.js';
 import { accountRows } from '../modules/harness_accounts.js';
 import {
     DELEGATION_OFF,
+    applySubagentsSettings,
     composeSubagentRoute,
     composeSubagentTail,
     connectedHarnesses,
     delegationView,
+    destroySubagentsSection,
+    initSubagentsSection,
     lastDelegationLine,
     parseSubagentRoute,
+    reloadSubagentsSection,
+    renderSignature,
     splitSubagentTail,
 } from '../modules/subagents_settings.js';
 
 // The wire body the Harness Accounts panel really consumes: `profiles` is an
 // array of {profile, status, identity} wrappers and `harnessAccounts` an array
 // of per-harness authority rows (Claudexor credential-profile.ts).
-function statusPayload({ native = [], profiles = [], harnesses = [] } = {}) {
+function statusPayload({ native = [], profiles = [], harnesses = [], quota = [] } = {}) {
+    // Shaped like the producer's own answer — daemon/harnesses/profiles/quota
+    // are unconditional there, and the store now requires all four before it
+    // will derive a facet from a 2xx body.
     return {
         daemon: { state: 'running' },
+        config_dir: '/home/agent',
         harnesses,
         profiles: { harnessAccounts: native, profiles },
+        quota,
     };
 }
 
@@ -124,7 +135,7 @@ test('before the accounts have been read the section says it is reading, not "no
     const view = delegationView({ saved: '', payload: null, loaded: false });
     assert.equal(view.state, 'loading');
     assert.equal(view.enabled, false);
-    assert.match(view.note, /Reading your coding-agent accounts/);
+    assert.match(view.note, /Reading your agent accounts/);
     assert.doesNotMatch(view.note, /No coding-agent subscription/);
 });
 
@@ -325,4 +336,171 @@ test('the last-delegated-run line discloses mismatch and shows absence as absenc
         requested_model: 'sonnet', applied_model: '', run_id: 'r3' });
     assert.ok(bare.includes('model not disclosed'));
     assert.ok(!bare.includes('sonnet'));
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2: "we could not ask" and "we asked and the daemon is down" are two
+// different sentences, and NEITHER earns a row-level claim about the owner's
+// saved harness. Before the shared store, a stopped daemon reached this
+// section as a successful read with no harnesses — so a saved route was
+// labeled "(no account connected)" and the note announced an API fallback
+// nobody had established.
+// ---------------------------------------------------------------------------
+
+test('a stopped daemon explains itself instead of accusing the saved harness', () => {
+    const view = delegationView({ saved: 'codex', payload: { daemon: { state: 'stale' }, harnesses: [] },
+        accountsRead: 'not_read' });
+    assert.equal(view.state, 'unknown');
+    assert.equal(view.enabled, false);
+    assert.deepEqual(view.options, []);
+    assert.match(view.note, /daemon is not running/);
+    assert.match(view.note, /saved choices are unchanged/);
+    assert.doesNotMatch(view.note, /no account connected/);
+    assert.doesNotMatch(view.note, /ordinary subagent on the API/);
+});
+
+test('a fresh read with a genuinely absent harness still says so', () => {
+    // The row-level claim is not deleted — it is now EARNED. A daemon that
+    // answered and simply does not have this account keeps the honest label.
+    const view = delegationView({ saved: 'codex', payload: statusPayload(), accountsRead: 'ok' });
+    assert.match(view.note, /No connected account for codex/);
+    assert.ok(view.options.some((o) => /no account connected/.test(o.label)),
+        'the saved harness keeps its option so a Save cannot re-point delegation');
+});
+
+test('a transport failure and a stopped daemon are not the same sentence', () => {
+    const dead = delegationView({ saved: '', payload: null, statusError: 'HTTP 503' });
+    const down = delegationView({ saved: '', payload: null, accountsRead: 'not_read' });
+    assert.equal(dead.state, 'unknown');
+    assert.equal(down.state, 'unknown');
+    assert.match(dead.note, /HTTP 503/);
+    assert.doesNotMatch(down.note, /HTTP 503/);
+    assert.notEqual(dead.note, down.note);
+});
+
+test('a CATALOG gap is named too, instead of being dropped behind the accounts sentence', () => {
+    // This section renders two facets: the accounts decide the view, the model
+    // select rides the catalog. With the accounts read fine and the catalog
+    // refused, the model list quietly narrowed to whatever the last read held
+    // and the note said nothing at all about it.
+    const payload = statusPayload({
+        harnesses: [{ id: 'codex', display_name: 'Codex CLI', models: [{ id: 'gpt-5.6' }] }],
+        native: [{ harness_id: 'codex', native_login_detected: true }],
+    });
+    const gap = delegationView({ saved: 'codex', payload, accountsRead: 'ok', catalogRead: 'failed' });
+    assert.equal(gap.state, 'on', 'the accounts facet still decides the view');
+    assert.match(gap.note, /Agents were not read/);
+    assert.match(gap.note, /last known/);
+    // The saved model pin keeps its option and loses only the earned claim.
+    assert.doesNotMatch(JSON.stringify(gap.modelOptions), /not in discovery/);
+
+    // A healthy catalog adds nothing…
+    const clean = delegationView({ saved: 'codex', payload, accountsRead: 'ok', catalogRead: 'ok' });
+    assert.doesNotMatch(clean.note, /were not read/);
+    // …and a catalog in the SAME state as the accounts facet is STILL named:
+    // equal state is not equal subject, and the accounts sentence says nothing
+    // about agent discovery. Dropping it left the model select unexplained.
+    const both = delegationView({ saved: 'codex', payload: null, accountsRead: 'not_read', catalogRead: 'not_read' });
+    assert.match(both.note, /daemon is not running/);
+    assert.match(both.note, /Agents were not read/);
+});
+
+// ---------------------------------------------------------------------------
+// The live subscription: what makes the section repaint, and whether it can
+// keep the shared poll armed at all.
+// ---------------------------------------------------------------------------
+
+function fakeSurface() {
+    // The minimum this section's renderRows() touches, plus the offsetParent
+    // that answers "is this surface on screen".
+    const host = { innerHTML: '', offsetParent: {}, querySelector: () => null };
+    const doc = {
+        hidden: false,
+        getElementById: (id) => (id === 'subagents-rows' ? host : null),
+        addEventListener() {}, removeEventListener() {},
+    };
+    const win = { addEventListener() {}, removeEventListener() {} };
+    return { host, doc, win };
+}
+
+test('the repaint signature is keyed on model IDENTITY, not on how many there are', () => {
+    // Pure form of the defect: same count, different model.
+    const store = (models) => ({
+        reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+        error: '',
+        snapshot: {
+            daemon: { state: 'running' },
+            harnesses: [{ id: 'codex', display_name: 'Codex CLI', models }],
+            profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }], profiles: [] },
+        },
+    });
+    const before = JSON.stringify(renderSignature(store([{ id: 'old-model' }])));
+    const after = JSON.stringify(renderSignature(store([{ id: 'new-model' }])));
+    assert.notEqual(before, after, 'a model swapped at equal count must change the signature');
+    assert.equal(before, JSON.stringify(renderSignature(store([{ id: 'old-model' }]))), 'and be stable otherwise');
+});
+
+test('a model swapped at EQUAL count really reaches the pixels', async () => {
+    // The subscriber skipped the repaint because the signature counted models
+    // instead of naming them: the section kept offering the model that no
+    // longer exists and never exposed the one that does — and the select is
+    // built from exactly these ids.
+    const { host, doc, win } = fakeSurface();
+    const priorDoc = globalThis.document;
+    const priorWin = globalThis.window;
+    globalThis.document = doc;
+    globalThis.window = win;
+    let models = [{ id: 'old-model' }];
+    let modelsError = '';
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => ({
+            ok: true,
+            status: 200,
+            json: async () => statusPayload({
+                harnesses: [{
+                    id: 'codex', display_name: 'Codex CLI', models,
+                    ...(modelsError ? { models_error: modelsError } : {}),
+                }],
+                native: [{ harness_id: 'codex', native_login_detected: true }],
+            }),
+        }),
+        doc,
+        pollMs: 5000,
+    });
+    try {
+        initSubagentsSection({ store });
+        applySubagentsSettings({ OUROBOROS_SUBAGENT_HARNESS: '' });
+        await reloadSubagentsSection();
+        assert.ok(host.innerHTML.includes('old-model'), host.innerHTML);
+        // The section's own binding is what keeps the shared read alive: a
+        // subscriber with no visibility predicate could never arm the poll.
+        assert.equal(store.polling, true, 'a visible section keeps the shared poll armed');
+
+        models = [{ id: 'new-model' }];
+        await store.refresh();
+        assert.ok(host.innerHTML.includes('new-model'), `the swap must reach the DOM: ${host.innerHTML}`);
+        assert.ok(!host.innerHTML.includes('old-model'), `and the dead model must go: ${host.innerHTML}`);
+
+        // An unchanged payload still does not repaint (the caret guard).
+        host.innerHTML = 'SENTINEL';
+        await store.refresh();
+        assert.equal(host.innerHTML, 'SENTINEL', 'no repaint when nothing this section renders changed');
+
+        // The typed model-read gap is rendered too, so its ARRIVAL and its
+        // clearing must both repaint — the list itself can stay identical
+        // across a refused probe, and the signature saw only the list.
+        modelsError = 'models_probe_failed';
+        await store.refresh();
+        assert.ok(host.innerHTML.includes('could not be read'),
+            `the model-read gap must reach the DOM: ${host.innerHTML}`);
+        modelsError = '';
+        await store.refresh();
+        assert.ok(!host.innerHTML.includes('could not be read'),
+            `and a later successful probe must clear it: ${host.innerHTML}`);
+    } finally {
+        destroySubagentsSection();
+        store.dispose();
+        globalThis.document = priorDoc;
+        globalThis.window = priorWin;
+    }
 });

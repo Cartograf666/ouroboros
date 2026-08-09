@@ -21,10 +21,20 @@
 //
 // Pure helpers live at the top and are node-tested without a DOM.
 
-import { apiFetch } from './api_client.js';
-import { accountRows } from './harness_accounts.js';
+import {
+    FACET_ACCOUNTS,
+    FACET_CATALOG,
+    READ_OK,
+    READ_TRANSPORT,
+    READ_UNREAD,
+    accountRows,
+    bindStatusSurface,
+    claudexorStatus,
+    facetGapClause,
+    statusUnavailableNote,
+} from './claudexor_status_store.js';
 import { renderSegmentedField } from './page_header.js';
-import { sessionModelOptions } from './reviewer_slots.js';
+import { modelsGapNote, sessionModelOptions } from './reviewer_slots.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -96,13 +106,14 @@ export function lastDelegationLine(entry) {
     return `Last delegated run: ${parts.join(' · ')}`;
 }
 
-function harnessModels(payload, harnessId) {
+function harnessRow(payload, harnessId) {
+    // The discovery ROW, not just its models: the row also carries the typed
+    // `models_error` that says the model list itself could not be read, and a
+    // synthetic `{models}` object dropped that fact on the floor.
     for (const harness of payload?.harnesses || []) {
-        if (String(harness?.id || '') === String(harnessId || '')) {
-            return harness?.models || [];
-        }
+        if (String(harness?.id || '') === String(harnessId || '')) return harness;
     }
-    return [];
+    return null;
 }
 
 export function connectedHarnesses(payload) {
@@ -126,7 +137,8 @@ export function connectedHarnesses(payload) {
     return out;
 }
 
-export function delegationView({ saved = '', payload = null, statusError = '', edit = null, loaded = true } = {}) {
+export function delegationView({ saved = '', payload = null, statusError = '', accountsRead = '',
+    catalogRead = READ_OK, edit = null, loaded = true } = {}) {
     // The whole section as ONE value: which state to render, what the harness
     // select offers, and the muted sentence under it. `edit` is the owner's
     // unsaved choice laid over the saved value — it goes through the same
@@ -134,21 +146,41 @@ export function delegationView({ saved = '', payload = null, statusError = '', e
     // controls above it (it did: turning delegation off still read "on by
     // default", because the note was computed from the saved value alone).
     const route = parseSubagentRoute(saved);
+    // This section renders TWO facets: the account list decides the whole view,
+    // and the model select rides the CATALOG. Explaining only the accounts left
+    // a catalog gap silently on screen — the model options would quietly narrow
+    // to whatever the last read happened to hold, with nothing saying so. A
+    // catalog is coalesced by SUBJECT, never by enum: dropping it because its
+    // STATE equalled the accounts facet's left the model select unexplained
+    // whenever both reads were in the same trouble — the accounts sentence
+    // says nothing about agent discovery. (The coarse `indeterminate` yields
+    // no clause by construction; its own global sentence covers everything.)
+    const accountsState = statusError ? READ_TRANSPORT : String(accountsRead || '');
+    const catalogClause = facetGapClause({ [FACET_CATALOG]: catalogRead }, [FACET_CATALOG]);
+    const view = (value) => (catalogClause
+        ? { ...value, note: `${value.note} ${catalogClause}`.trim() }
+        : value);
     if (!loaded) {
         // Not read YET is not "nothing connected": until the accounts arrive the
         // section states only that it is reading (collect() already guards on the
         // same fact, so this renders nothing it would then author).
-        return { state: 'loading', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
-            note: 'Reading your coding-agent accounts…' };
+        return view({ state: 'loading', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
+            note: statusUnavailableNote(READ_UNREAD, { facet: FACET_ACCOUNTS }).text });
     }
-    if (statusError) {
-        // A failed accounts read decides the WHOLE view, saved harness or not.
-        // Offering the live control here let Save answer "saved" while collect()
-        // returned {} — and any sentence about where delegated work runs would be
-        // a guess: this page failing to read the accounts says nothing about the
-        // daemon-side account, so the note stops at the error.
-        return { state: 'unknown', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
-            note: `Could not read the coding-agent accounts (${statusError}). Delegation is unchanged; reopen Settings when the connection is back.` };
+    // This section renders the ACCOUNTS facet, so that facet alone decides the
+    // whole view. "Nobody could be asked", "never asked" and "asked and
+    // refused" are three different sentences and none of them says anything
+    // about the daemon-side account — so the note stops at what is actually
+    // known. Offering the live control here let Save answer "saved" while
+    // collect() returned {}; and the never-asked case used to fall through to
+    // "no account connected for codex right now", a row-level accusation
+    // earned only by a read that actually happened.
+    const unavailable = (accountsState && accountsState !== READ_OK && accountsState !== READ_UNREAD)
+        ? statusUnavailableNote(accountsState, { error: statusError, facet: FACET_ACCOUNTS })
+        : null;
+    if (unavailable) {
+        return view({ state: 'unknown', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
+            note: unavailable.text });
     }
     const connected = connectedHarnesses(payload);
     const savedHarness = route.harness;
@@ -158,11 +190,11 @@ export function delegationView({ saved = '', payload = null, statusError = '', e
         // `off` is the owner's own answer and never re-defaults, so promising
         // "turns on by itself" over it would announce an override that will not
         // happen.
-        return route.decided
+        return view(route.decided
             ? { state: 'no_subscription', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
                 note: 'Delegation is off because you turned it off, and it stays off until you turn it back on. No coding-agent subscription is connected right now; sign one in under Providers → Harness Accounts to make delegation available again.' }
             : { state: 'no_subscription', enabled: false, harness: '', model: '', modelOptions: [], suffix: '', options: [],
-                note: 'No coding-agent subscription is connected, so there is nothing to delegate to. Sign one in under Providers → Harness Accounts and delegation turns on by itself.' };
+                note: 'No coding-agent subscription is connected, so there is nothing to delegate to. Sign one in under Providers → Harness Accounts and delegation turns on by itself.' });
     }
 
     const defaultOn = !route.decided && connected.length > 0;
@@ -184,9 +216,16 @@ export function delegationView({ saved = '', payload = null, statusError = '', e
     // The SAME options fragment the reviewer rows use, "(not in discovery)"
     // guard included: a Save while the daemon is down must not silently erase
     // the saved model pin.
+    const row = harness ? harnessRow(payload, harness) : null;
     const modelOptions = enabled && harness
-        ? sessionModelOptions({ models: harnessModels(payload, harness) }, model)
+        // The MODEL list rides the CATALOG facet, which is independent of the
+        // accounts facet that got us here: with the catalog unread the saved
+        // pin keeps its option and loses only the "(not in discovery)" claim.
+        // The ROW is passed whole so the per-harness model-read gap is seen.
+        ? sessionModelOptions(row, model, { catalogKnown: catalogRead === READ_OK })
         : [];
+    const modelsGap = enabled && harness
+        ? modelsGapNote(row, catalogRead === READ_OK) : '';
 
     const options = [...connected];
     if (savedHarness && !options.some((item) => item.id === savedHarness)) {
@@ -213,7 +252,12 @@ export function delegationView({ saved = '', payload = null, statusError = '', e
         state = 'default_on';
         note = 'On by default now that a subscription is connected. Save Settings to apply it — until then subagents still run on the API.';
     }
-    return { state, enabled, harness, model, modelOptions, suffix, options, note };
+    if (modelsGap) {
+        // The catalog listed this agent but its MODEL list refused, so the
+        // select below is short for a reason nothing else on the page states.
+        note = `${note} The model list for ${harness} could not be read, so the choices below may be incomplete; your saved model is kept.`;
+    }
+    return view({ state, enabled, harness, model, modelOptions, suffix, options, note });
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +269,14 @@ const state = {
     saved: '',
     payload: null,
     statusError: '',
+    // The ACCOUNTS facet's own read state, so this section can tell "we could
+    // not ask" from "never asked" from "asked and refused" from a real, empty
+    // account list. Independent of the catalog facet, which the model select
+    // rides — one can be authoritative while the other was never read.
+    accountsRead: '',
+    catalogRead: READ_OK,
+    store: claudexorStatus,
+    disposers: [],
     // The owner's unsaved answer only; everything derived from it (which route,
     // which options, which sentence) stays in delegationView. `model: null`
     // means "no unsaved model edit" — '' is a real answer (Engine default).
@@ -280,6 +332,8 @@ function currentView() {
         saved: state.saved,
         payload: state.payload,
         statusError: state.statusError,
+        accountsRead: state.accountsRead,
+        catalogRead: state.catalogRead,
         edit: state.enabled === null
             ? null
             : { enabled: state.enabled, harness: state.harness, model: state.model },
@@ -355,36 +409,93 @@ export function applySubagentsSettings(settings) {
     renderRows();
 }
 
+export function renderSignature(store) {
+    // Everything this section RENDERS, so a repaint is skipped only when the
+    // pixels would really be identical. The model list was keyed on its LENGTH,
+    // and a swap at equal count (a harness renaming or replacing a model)
+    // therefore left the section showing the model that no longer exists and
+    // never offering the one that does — the select is built from these very
+    // ids. Compare the ids, not how many of them there are.
+    const snapshot = store.snapshot || {};
+    return [
+        store.reads,
+        store.error,
+        connectedHarnesses(snapshot),
+        (snapshot.harnesses || []).map((harness) => [
+            String(harness?.id || ''),
+            (harness?.models || []).map((model) => String(model?.id || model?.value || model || '')),
+            // The typed model-read gap is RENDERED (it adds a sentence to the
+            // note and withdraws the not-in-discovery label), so a later probe
+            // that succeeds must repaint even when the list stays the same.
+            String(harness?.models_error || ''),
+        ]),
+        snapshot.subagent_last_delegation || null,
+    ];
+}
+
+function adoptStoreSnapshot() {
+    // includeModels: the same status payload, plus per-harness model discovery
+    // for the default-model select. The flag is STICKY on the store, so the
+    // accounts panel's own polls keep carrying models once this section has
+    // asked once — no surface can silently downgrade another's snapshot.
+    state.accountsRead = state.store.facet(FACET_ACCOUNTS);
+    state.catalogRead = state.store.facet(FACET_CATALOG);
+    state.statusError = state.store.error || '';
+    state.payload = state.statusError ? null : state.store.snapshot;
+    // "Not read YET" is not "read and found nothing": the pre-request paint
+    // must keep saying it is reading, or a connected owner briefly sees
+    // "No coding-agent subscription is connected".
+    state.loaded = state.store.everSettled;
+}
+
 export async function reloadSubagentsSection() {
-    try {
-        // ?include=models: the same status payload, plus per-harness model
-        // discovery for the default-model select (claudexor_accounts).
-        const resp = await apiFetch('/api/claudexor/status?include=models', { cache: 'no-store' });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-        state.payload = data;
-        state.statusError = '';
-    } catch (error) {
-        state.payload = null;
-        state.statusError = String(error.message || error);
-    }
-    state.loaded = true;
+    await state.store.refresh({ includeModels: true });
+    adoptStoreSnapshot();
     renderRows();
 }
 
-export function initSubagentsSection({ onChange } = {}) {
+export function initSubagentsSection({ onChange, store = claudexorStatus } = {}) {
+    destroySubagentsSection();
     state.onChange = typeof onChange === 'function' ? onChange : () => {};
+    state.store = store;
+    // Stay in sync with the ONE status read: when the daemon comes up while
+    // Settings is open, this section stops saying "could not be listed" without
+    // the owner reloading the page. That needs the SHARED surface binding — a
+    // bare subscribe() carries no visibility predicate, and the store never
+    // polls for a subscriber that cannot say it is on screen, so nothing ever
+    // arrived to react to. Re-render only on a state change that this section
+    // actually renders: a repaint on every poll tick would drop the caret out
+    // of a control the owner is using.
+    let signature = '';
+    state.disposers.push(bindStatusSurface(state.store, {
+        elementId: 'subagents-rows',
+        includeModels: true,
+        listener: () => {
+            const next = JSON.stringify(renderSignature(state.store));
+            adoptStoreSnapshot();
+            if (next === signature) return;
+            signature = next;
+            renderRows();
+        },
+    }));
     // The initial load is driven by settings.js loadSettings(), which awaits
     // reloadSubagentsSection() BEFORE taking the clean-draft baseline — otherwise
     // the async arrival of the accounts would read as an unsaved edit.
 }
 
+export function destroySubagentsSection() {
+    for (const dispose of state.disposers.splice(0)) {
+        try { dispose(); } catch (err) { /* a broken disposer must not block the rest */ }
+    }
+}
+
 export function collectSubagentsSettings() {
     // Never author the route from an UNLOADED or unreadable view: an unrelated
     // save must not turn delegation off because this page could not reach the
-    // daemon (same rule as collectReviewerSlots).
+    // daemon (same rule as collectReviewerSlots). A STOPPED daemon is the same
+    // class — the section rendered no control, so it has no answer to save.
     if (!state.loaded || state.statusError) return {};
     const view = currentView();
-    if (view.state === 'no_subscription') return {};
+    if (view.state === 'no_subscription' || view.state === 'unknown' || view.state === 'loading') return {};
     return { OUROBOROS_SUBAGENT_HARNESS: composeSubagentRoute(view.harness, view.suffix) };
 }

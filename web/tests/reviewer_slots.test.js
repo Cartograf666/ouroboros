@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { createClaudexorStatusStore } from '../modules/claudexor_status_store.js';
+
 import {
     API_ROUTE_CHOICE,
     ROUTE_KIND_API,
@@ -12,12 +14,16 @@ import {
     decodeRouteChoice,
     describeLastExecution,
     encodeRouteChoice,
+    harnessModelsKnown,
     mintSlotId,
+    modelsGapNote,
     profileOptionsFor,
     routeChoiceGroups,
+    reviewerServiceNote,
     sessionModelOptions,
     splitSessionTarget,
 } from '../modules/reviewer_slots.js';
+
 
 test('a saved account pin survives a discovery list that no longer contains it', () => {
     // The select's value must EXIST as an option or the browser silently selects the
@@ -192,6 +198,37 @@ test('the session model-options fragment guards a saved model discovery no longe
     assert.deepEqual(sessionModelOptions(null, '').map((o) => o.value), ['']);
 });
 
+test('a per-harness model-read failure is not a discovery: the not-in-discovery claim is withdrawn', () => {
+    // Discovery is TWO reads. The endpoint answers `models: []` with a typed
+    // `models_error` for one harness while the daemon stays globally running
+    // — so `catalogKnown` is true and the empty list is NOT authoritative for
+    // this harness. Reading it as one labelled the saved model
+    // "gpt-saved (not in discovery)": a successful discovery cited as proof of
+    // absence, for a discovery that never happened.
+    const refused = { id: 'codex', models: [], models_error: 'models_probe_failed' };
+    assert.equal(harnessModelsKnown(refused, true), false, 'the catalog read says nothing about this list');
+    assert.equal(harnessModelsKnown({ id: 'codex', models: [{ id: 'x' }] }, true), true);
+    assert.equal(harnessModelsKnown({ id: 'codex', models: [{ id: 'x' }] }, false), false,
+        'an unread catalog still withdraws the claim');
+
+    const options = sessionModelOptions(refused, 'gpt-saved', { catalogKnown: true });
+    assert.deepEqual(options.map((o) => o.value), ['', 'gpt-saved'], 'the saved pin keeps its option');
+    assert.equal(options[1].label, 'gpt-saved', 'and loses the absence label');
+    assert.doesNotMatch(JSON.stringify(options), /not in discovery/);
+
+    // …and the gap is SAID, not left as a silently short list.
+    assert.match(modelsGapNote(refused, true), /model list could not be read/);
+    assert.equal(modelsGapNote({ id: 'codex', models: [{ id: 'x' }] }, true), '');
+    // With the catalog itself unread the section note already explains it; a
+    // second sentence for the same silence would be noise.
+    assert.equal(modelsGapNote(refused, false), '');
+
+    // A harness whose list really WAS read keeps the honest accusation.
+    const read = { id: 'codex', models: [{ id: 'gpt-5.6-sol' }] };
+    assert.match(sessionModelOptions(read, 'gpt-saved', { catalogKnown: true })[2].label,
+        /not in discovery/);
+});
+
 test('an advisory session model composes into the target and survives save-load', () => {
     // Compose exactly as the data-advisory-model handler does…
     const target = composeSessionTarget('codex', 'gpt-5.6-luna');
@@ -248,4 +285,116 @@ test('the runs-as line shows APPLIED account/access and honest absence for an un
     // An api row keeps its sent-model-is-applied-model reading with no noise.
     const api = describeLastExecution({ effective: { route: 'api_chat', model: 'openai/x' } });
     assert.ok(api.includes('openai/x') && !api.includes('not disclosed'));
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2: a row may only be labeled "(not in discovery)" after a SUCCESSFUL
+// discovery. With the daemon stopped (or the endpoint unreachable) the backend
+// answers `harnesses: []` by construction, and this page used to stamp that
+// label onto every saved row while explaining nothing — the exact screen the
+// owner reported (2026-08-08). The saved option itself must survive either
+// way: that guard is what stops the next Save from erasing the pin.
+// ---------------------------------------------------------------------------
+
+test('an unread facet never accuses a saved row of being undiscovered', () => {
+    // Same empty discovery, two different worlds.
+    const discoveredMiss = routeChoiceGroups({ harnesses: [], currentChoice: 'session:codex' });
+    assert.match(discoveredMiss[1].options[0].label, /not in discovery/);
+
+    const cannotAsk = routeChoiceGroups({ harnesses: [], currentChoice: 'session:codex', catalogKnown: false });
+    assert.equal(cannotAsk[1].options[0].value, 'session:codex', 'the saved option SURVIVES');
+    assert.equal(cannotAsk[1].options[0].label, 'codex', 'but nothing is claimed about it');
+    assert.doesNotMatch(JSON.stringify(cannotAsk), /not in discovery/);
+    // The empty-group placeholder stops promising a sign-in that would not help.
+    const emptyGroup = routeChoiceGroups({ harnesses: [], catalogKnown: false })[1].options[0];
+    assert.doesNotMatch(emptyGroup.label, /sign in under Providers/);
+});
+
+test('the model and account pins survive a daemon-down save without the undiscovered label', () => {
+    const models = sessionModelOptions({ models: [] }, 'gpt-5.6-sol', { catalogKnown: false });
+    assert.deepEqual(models.map((o) => o.value), ['', 'gpt-5.6-sol'], 'the pin keeps its option');
+    assert.equal(models[1].label, 'gpt-5.6-sol');
+    assert.match(sessionModelOptions({ models: [] }, 'gpt-5.6-sol')[1].label, /not in discovery/);
+
+    const pins = profileOptionsFor([], 'koshak', { accountsKnown: false });
+    assert.deepEqual(pins.map((o) => o.value), ['', 'koshak']);
+    assert.match(pins[1].label, /pinned/);
+    assert.doesNotMatch(pins[1].label, /not in discovery/);
+    assert.match(profileOptionsFor([], 'koshak')[1].label, /not in discovery/);
+
+    // …and the pin still reaches the save payload unchanged, which is the
+    // whole point of keeping the option (a Save with the daemon down must not
+    // silently widen which account a reviewer may spend).
+    const row = { slot_id: 'triad_a', route: { kind: ROUTE_KIND_SESSION, target_id: 'codex=gpt-5.6-sol', profile_id: 'koshak' } };
+    const saved = JSON.parse(buildReviewerSlotsSetting({ triad: [row], scope: [], advisory: {} }));
+    assert.deepEqual(saved.triad[0].route, { kind: ROUTE_KIND_SESSION, target_id: 'codex=gpt-5.6-sol', profile_id: 'koshak' });
+});
+
+test('the delivery badge does not claim "route not discovered" when nobody could be asked', () => {
+    const row = { route: { kind: ROUTE_KIND_SESSION, target_id: 'codex' } };
+    assert.match(capabilityBadge(row, {}), /route not discovered/);
+    assert.doesNotMatch(capabilityBadge(row, {}, { catalogKnown: false }), /not discovered/);
+    assert.match(capabilityBadge(row, {}, { catalogKnown: false }), /agent session/);
+});
+
+test('facets are independent: an unread ACCOUNT store does not silence the CATALOG verdict', () => {
+    // The concrete mislabel a single global verdict produces: the harness
+    // catalog was read fine and genuinely no longer lists `claude`, while the
+    // credential-profile read never happened. The route option must keep its
+    // earned "(not in discovery)" and the account pin must NOT be given one.
+    const groups = routeChoiceGroups({
+        harnesses: [{ id: 'codex' }], currentChoice: 'session:claude', catalogKnown: true,
+    });
+    assert.match(groups[1].options.at(-1).label, /not in discovery/);
+
+    const pins = profileOptionsFor([], 'koshak', { accountsKnown: false });
+    assert.doesNotMatch(pins[1].label, /not in discovery/);
+    assert.deepEqual(pins.map((o) => o.value), ['', 'koshak']);
+});
+
+test('the ONE service note explains the catalog gap AND names the account gap', async () => {
+    // This section renders two facets — the route/model lists from the catalog,
+    // the account pins from the credential profiles — but the note consulted the
+    // catalog alone. A refused ACCOUNT read left pins on screen with nothing on
+    // the page saying they could not be checked.
+    const store = (reads) => createClaudexorStatusStore({
+        fetchImpl: async () => ({
+            ok: true,
+            status: 200,
+            json: async () => ({ daemon: { state: 'running' }, harnesses: [], profiles: {}, quota: [], reads }),
+        }),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+
+    const accountsDied = store({ catalog: 'ok', accounts: 'failed', quota: 'ok' });
+    await accountsDied.refresh();
+    const onlyAccounts = reviewerServiceNote(accountsDied);
+    assert.match(onlyAccounts.text, /Agent accounts were not read/);
+    assert.match(onlyAccounts.text, /last known/);
+    accountsDied.dispose();
+
+    const catalogDied = store({ catalog: 'failed', accounts: 'ok', quota: 'ok' });
+    await catalogDied.refresh();
+    const onlyCatalog = reviewerServiceNote(catalogDied);
+    assert.match(onlyCatalog.text, /Your agents could not be read/);
+    assert.doesNotMatch(onlyCatalog.text, /Agent accounts were not read/, 'a healthy facet is not accused');
+    // …and a read that merely did not land never claims a stopped daemon.
+    assert.doesNotMatch(onlyCatalog.text, /not running/);
+    catalogDied.dispose();
+
+    // Both facets in the SAME state: the account pins are STILL named. They
+    // used to be dropped for matching the catalog's enum, so the note spoke
+    // only of agents while the pins sat on screen unexplained — equal state is
+    // not equal subject.
+    const both = store({ catalog: 'not_read', accounts: 'not_read', quota: 'not_read' });
+    await both.refresh();
+    const bothNote = reviewerServiceNote(both);
+    assert.match(bothNote.text, /daemon is not running/);
+    assert.match(bothNote.text, /Agent accounts were not read/);
+    both.dispose();
+
+    const healthy = store({ catalog: 'ok', accounts: 'ok', quota: 'ok' });
+    await healthy.refresh();
+    assert.equal(reviewerServiceNote(healthy), null, 'nothing to say when everything was read');
+    healthy.dispose();
 });

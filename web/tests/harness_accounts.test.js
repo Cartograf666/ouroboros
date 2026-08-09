@@ -4,14 +4,33 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
-    ATTACH_FALLBACK_MS,
-    UNCONFIRMED_TEXT,
     accountLoginConfirmed,
     accountRows,
-    attachFallbackDue,
-    confirmLoginLive,
+    createClaudexorStatusStore,
+} from '../modules/claudexor_status_store.js';
+import {
+    accountRowFacts,
+    bareRowStatusText,
     daemonStatusLine,
-    refreshStatus,
+    destroyHarnessAccounts,
+    initHarnessAccounts,
+    normalizeProfileName,
+    promptProfileName,
+    quotaSummary,
+    runtimeActionLabel,
+    sectionStatusLine,
+    startLogin,
+    verificationBadge,
+} from '../modules/harness_accounts.js';
+// The login machinery moved to the shared controller module (phase 2) so the
+// onboarding wizard can mount the same flow; the assertions below are
+// unchanged, which is what makes the extraction behavior-preserving.
+import {
+    ATTACH_FALLBACK_MS,
+    UNCONFIRMED_TEXT,
+    attachFallbackDue,
+    cancelLoginJob,
+    confirmLoginLive,
     deviceCodeDisclosure,
     failureText,
     jobDetail,
@@ -19,19 +38,13 @@ import {
     loginCardFace,
     loginCardHtml,
     loginInputSupport,
+    loginSettleProven,
     loginStatusLine,
     loginVerdict,
-    normalizeProfileName,
     pollResponseApplies,
     preserveCardFocus,
-    promptProfileName,
-    quotaSummary,
-    runtimeActionLabel,
     submitLoginInput,
-    verificationBadge,
-    cancelLoginJob,
-    loginSettleProven,
-} from '../modules/harness_accounts.js';
+} from '../modules/harness_login_cards.js';
 
 test('managed runtime keeps one contextual Connect intent across install, repair, and update', () => {
     const payload = (runtime, daemon = {}) => ({ daemon: { state: 'not_provisioned', runtime, ...daemon } });
@@ -618,7 +631,7 @@ test('confirmLoginLive re-polls live account status briefly instead of trusting 
     let polls = 0;
     const slept = [];
     const confirmed = await confirmLoginLive('codex', '', {
-        fetchImpl: async () => fakeResponse(200, ++polls >= 2 ? warm : cold),
+        readStatus: async () => (++polls >= 2 ? warm : cold),
         attempts: 4, delayMs: 7, sleepImpl: async (ms) => { slept.push(ms); },
     });
     assert.equal(confirmed.confirmed, true);
@@ -630,7 +643,7 @@ test('confirmLoginLive re-polls live account status briefly instead of trusting 
     // the caller can render the rows it actually saw.
     let coldPolls = 0;
     const unconfirmed = await confirmLoginLive('codex', '', {
-        fetchImpl: async () => { coldPolls += 1; return fakeResponse(200, cold); },
+        readStatus: async () => { coldPolls += 1; return cold; },
         attempts: 3, delayMs: 1, sleepImpl: async () => {},
     });
     assert.equal(unconfirmed.confirmed, false);
@@ -639,7 +652,7 @@ test('confirmLoginLive re-polls live account status briefly instead of trusting 
 
     // A card closed mid-check aborts without a verdict.
     const stale = await confirmLoginLive('codex', '', {
-        fetchImpl: async () => fakeResponse(200, cold),
+        readStatus: async () => cold,
         attempts: 3, delayMs: 1, sleepImpl: async () => {}, isStale: () => true,
     });
     assert.equal(stale.stale, true);
@@ -1009,14 +1022,15 @@ test('cancelLoginJob reports gone only on ok/404/410; failures and network death
 });
 
 test('startLogin centralizes the C7 guard: cancel-or-refuse BEFORE the new login POST', () => {
-    // ESM keeps startLogin internal state untestable directly; pin the control
-    // flow at the source level (same source-based technique as the HTML pins
-    // in this file): the guard must sit inside startLogin ahead of the POST,
-    // and a failed cancellation must return without starting a second job.
-    const src = readFileSync(fileURLToPath(new URL('../modules/harness_accounts.js', import.meta.url)), 'utf8');
-    const fn = src.slice(src.indexOf('async function startLogin'));
-    const guardAt = fn.indexOf('cancelLoginJob(prev.jobId)');
-    const postAt = fn.indexOf("apiFetch('/api/claudexor/login'");
+    // ESM keeps the controller's internal state untestable directly; pin the
+    // control flow at the source level (same source-based technique as the HTML
+    // pins in this file): the guard must sit inside the locked start ahead of
+    // the POST, and a failed cancellation must return without starting a second
+    // job. The flow moved to harness_login_cards.js in phase 2; the RULE did not.
+    const src = readFileSync(fileURLToPath(new URL('../modules/harness_login_cards.js', import.meta.url)), 'utf8');
+    const fn = src.slice(src.indexOf('async function _startLocked'));
+    const guardAt = fn.indexOf('cancelLoginJob(prev.jobId');
+    const postAt = fn.indexOf("fetchImpl('/api/claudexor/login'");
     assert.ok(guardAt > -1, 'startLogin must call cancelLoginJob for a live previous job');
     assert.ok(postAt > -1);
     assert.ok(guardAt < postAt, 'the C7 guard must run before the new login POST');
@@ -1040,67 +1054,312 @@ test('loginSettleProven: only a TERMINAL job snapshot proves the settle — an u
     assert.equal(loginSettleProven({ job: { state: 'cancelled' } }), true);
 });
 
+test('a harness with no row only says "no account connected" once the store was READ', () => {
+    // BIBLE P1 at the pixel: the owner's panel declared three harnesses empty
+    // while two claude profiles, a cursor profile and two native sessions sat
+    // in the agent home — a lazy daemon had simply never been asked.
+    assert.equal(bareRowStatusText('ok'), 'no account connected');
+    assert.match(bareRowStatusText('not_read'), /not checked/);
+    assert.match(bareRowStatusText('not_read'), /daemon is not running/);
+    assert.match(bareRowStatusText('failed'), /did not answer/);
+    assert.match(bareRowStatusText('transport'), /request did not complete/);
+    assert.equal(bareRowStatusText('unread'), 'checking…');
+    // The coarse state claims nothing beyond "the answer did not complete" —
+    // it does not know which read failed, so it may not blame this one.
+    assert.match(bareRowStatusText('indeterminate'), /answer did not complete/);
+    assert.doesNotMatch(bareRowStatusText('indeterminate'), /not running/);
+    // Each gap is its OWN sentence — collapsing them would re-create the lie.
+    const gaps = ['not_read', 'failed', 'transport', 'indeterminate'].map(bareRowStatusText);
+    assert.equal(new Set(gaps).size, 4);
+});
 
-// The wiring of the loading state, not just its wording: a revert that deletes
-// the flag plumbing (keeping daemonStatusLine intact) must go RED here.
-function stubStatusDom() {
-    const host = { offsetParent: {}, innerHTML: '', querySelectorAll: () => [] };
-    const statusEl = { textContent: '', dataset: {} };
-    const lines = [];
-    const el = {
-        'harness-accounts-rows': host,
-        'harness-daemon-status': new Proxy(statusEl, {
-            set(target, key, value) {
-                if (key === 'textContent') lines.push(value);
-                target[key] = value;
-                return true;
-            },
+test('the section line reports a REFUSED account read instead of "Claudexor ready"', () => {
+    // A running daemon whose account read died would otherwise print the green
+    // lifecycle line over a list that was never delivered.
+    const fakeStore = (facetState, error = '') => ({
+        facet: () => facetState,
+        error,
+        snapshot: { daemon: { state: 'running', engine_version: '3.3.13', runtime: {} } },
+        loading: false,
+        everSettled: true,
+        unavailableNote: () => ({ tone: 'warn', text: 'the daemon did not answer this read', action: null }),
+    });
+    assert.match(sectionStatusLine(fakeStore('failed')).text, /did not answer/);
+    assert.match(sectionStatusLine(fakeStore('transport', 'net')).text, /did not answer/);
+    // …and so does the coarse state, which is what a legacy `unreachable`
+    // answer becomes: the green line over an undelivered list is the lie.
+    assert.match(sectionStatusLine(fakeStore('indeterminate')).text, /did not answer/);
+    // A healthy read keeps the existing lifecycle sentence, unchanged.
+    assert.match(sectionStatusLine(fakeStore('ok')).text, /Claudexor ready/);
+});
+
+// ---------------------------------------------------------------------------
+// Per-facet provenance has to reach the PIXELS, not just the banner. This panel
+// renders three reads at once — the rows come from the accounts read, the
+// windows from the quota read, the bare Connect rows from the catalog — and it
+// used to render all three off the retained snapshot while consulting one facet
+// for the sentence above them. After a refused read it said nothing could be
+// listed while a stale row sat below it, still labeled "verified live".
+// ---------------------------------------------------------------------------
+
+function storeWithReads(reads, extra = {}) {
+    // A REAL store over a payload that carries per-facet stamps, so the whole
+    // chain (wire → facets → copy) is exercised, not a hand-built double of it.
+    // FUTURE-COMPATIBILITY: the live producer does not emit `reads` yet (see
+    // the golden test in claudexor_status_store.test.js) — these cases pin what
+    // the store does the day the stamp lands, and the coarse legacy behaviour
+    // is pinned separately below.
+    return createClaudexorStatusStore({
+        fetchImpl: async () => ({
+            ok: true,
+            status: 200,
+            json: async () => ({
+                daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
+                config_dir: '/home/agent',
+                harnesses: [{ id: 'codex' }],
+                profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }], profiles: [] },
+                quota: [],
+                reads,
+                ...extra,
+            }),
         }),
-        'harness-login-card': null,
-    };
-    globalThis.document = { getElementById: (id) => el[id] ?? null, hidden: false };
-    return { lines };
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
 }
 
-test('the status poll is single-flight and announces the first read before it lands', async () => {
-    const previousDocument = globalThis.document;
-    const { lines } = stubStatusDom();
+test('the ONE section line names the SECOND gap, instead of dropping it silently', async () => {
+    const quotaDied = storeWithReads({ catalog: 'ok', accounts: 'ok', quota: 'failed' });
+    await quotaDied.refresh();
+    const line = sectionStatusLine(quotaDied);
+    assert.match(line.text, /Claudexor ready/, 'the accounts facet is healthy, so its own line stands');
+    assert.match(line.text, /Subscription limits were not read/, 'and the refused read is NAMED');
+    assert.match(line.text, /last known/);
+    quotaDied.dispose();
+
+    const catalogDied = storeWithReads({ catalog: 'failed', accounts: 'ok', quota: 'ok' });
+    await catalogDied.refresh();
+    assert.match(sectionStatusLine(catalogDied).text, /Agents were not read/);
+    catalogDied.dispose();
+
+    const accountsDied = storeWithReads({ catalog: 'ok', accounts: 'failed', quota: 'ok' });
+    await accountsDied.refresh();
+    const accountsLine = sectionStatusLine(accountsDied);
+    assert.match(accountsLine.text, /Your agent accounts could not be read/);
+    assert.doesNotMatch(accountsLine.text, /Claudexor ready/, 'never the green line over an undelivered list');
+    // A daemon that could not be read is NEVER reported as a daemon that is not
+    // running — the live endpoint answers `unreachable` for a single refused
+    // read, and the panel used to print "the agent daemon is not running".
+    assert.doesNotMatch(accountsLine.text, /not running/);
+    accountsDied.dispose();
+
+    // All three read: one sentence, nothing appended.
+    const healthy = storeWithReads({ catalog: 'ok', accounts: 'ok', quota: 'ok' });
+    await healthy.refresh();
+    assert.doesNotMatch(sectionStatusLine(healthy).text, /were not read/);
+    healthy.dispose();
+
+    // All three in the SAME state: the secondary subjects are STILL named.
+    // Coalescing by enum dropped them, so the panel said only "your agent
+    // accounts …" while agent discovery and the windows sat unexplained — the
+    // leading sentence is about ONE subject, whatever its state.
+    // (Here the stamp says "never asked" while the daemon reports running, so
+    // the leading line is the LIFECYCLE sentence — which describes the daemon,
+    // not this panel's reads. The accounts gap therefore joins the clause
+    // rather than vanishing under a green header.)
+    const allDown = storeWithReads({ catalog: 'not_read', accounts: 'not_read', quota: 'not_read' });
+    await allDown.refresh();
+    const downLine = sectionStatusLine(allDown).text;
+    assert.match(downLine, /Agent accounts, agents and subscription limits were not read/);
+    allDown.dispose();
+
+    const allFailed = storeWithReads({ catalog: 'failed', accounts: 'failed', quota: 'failed' });
+    await allFailed.refresh();
+    const failedLine = sectionStatusLine(allFailed).text;
+    assert.match(failedLine, /Your agent accounts could not be read/);
+    assert.match(failedLine, /Agents and subscription limits were not read/);
+    allFailed.dispose();
+});
+
+test("the LEGACY wire's global refusal blames no facet and quotes no facet's error", async () => {
+    // Today's producer: no `reads` stamp, one global `unreachable`, and the
+    // successful catalog + account data sitting in the very same payload. The
+    // round-one fix turned that into three per-facet failures and hung the
+    // QUOTA probe's error off the ACCOUNTS sentence — an accusation aimed at a
+    // read that had succeeded. (Golden payload: fixtures/status_quota_refused.)
+    const legacy = createClaudexorStatusStore({
+        fetchImpl: async () => ({
+            ok: true,
+            status: 200,
+            json: async () => ({
+                daemon: {
+                    state: 'unreachable', engine_version: '3.3.11', runtime: {},
+                    last_error: 'quota_probe_failed: quota read refused by the daemon',
+                },
+                config_dir: '/home/agent',
+                harnesses: [{ id: 'claude' }],
+                profiles: { harnessAccounts: [{ harness_id: 'claude', native_login_detected: true }], profiles: [] },
+                quota: [],
+            }),
+        }),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await legacy.refresh();
+    const text = sectionStatusLine(legacy).text;
+    assert.doesNotMatch(text, /Your agent accounts could not be read/,
+        'the ACCOUNTS read succeeded — its data is in this very payload');
+    assert.doesNotMatch(text, /Agents .*were not read/,
+        'and so did the CATALOG read: no per-facet verdict may be minted here');
+    assert.doesNotMatch(text, /not running/);
+    assert.match(text, /did not finish answering/, 'one coarse, global sentence');
+    assert.match(text, /quota_probe_failed/, "with the daemon's own global reason");
+    assert.equal(legacy.accountsKnown, false, 'and nothing is claimed as discovered');
+    legacy.dispose();
+});
+
+test('each row projection is gated by ITS OWN facet, and a stale value says it is last known', () => {
+    const row = {
+        harness: 'codex', profile_id: '', kind: 'native', identity: {},
+        status: { verification: 'passed', verification_source: 'vendor', last_verified_at: '2026-08-09' },
+    };
+    const payload = { quota: [{
+        subject: { harness: 'codex', subject_id: '' },
+        freshness: 'fresh',
+        constraints: [{ used_ratio: 1.0, resets_at: '2026-08-09T12:00:00Z' }],
+    }] };
+
+    // Both facets read: exactly today's row.
+    const fresh = accountRowFacts(row, payload, { accountsKnown: true, quotaKnown: true });
+    assert.equal(fresh.badge.tone, 'ok');
+    assert.match(fresh.badge.label, /^verified live/);
+    assert.equal(fresh.quota.exhausted, true);
+    assert.match(fresh.quota.label, /window exhausted/);
+
+    // The QUOTA read refused: the window is memory, so it is labeled and it
+    // stops painting the row red — the reset it promises may already have come.
+    const staleQuota = accountRowFacts(row, payload, { accountsKnown: true, quotaKnown: false });
+    assert.equal(staleQuota.badge.tone, 'ok', 'the accounts facet is untouched by the quota gap');
+    assert.equal(staleQuota.quota.exhausted, false);
+    assert.match(staleQuota.quota.label, /last known/);
+
+    // The ACCOUNTS read refused: the row is memory of an account, so its
+    // verification claim is dated — and the window, read fine, is not.
+    const staleAccount = accountRowFacts(row, payload, { accountsKnown: false, quotaKnown: true });
+    assert.match(staleAccount.badge.label, /last known/);
+    assert.equal(staleAccount.badge.tone, 'muted', 'no green "verified live" over a read that never landed');
+    assert.equal(staleAccount.quota.exhausted, true);
+    assert.doesNotMatch(staleAccount.quota.label, /last known/);
+
+    // The default is the fresh reading, so nothing else changes shape.
+    assert.deepEqual(accountRowFacts(row, payload), fresh);
+    assert.deepEqual(verificationBadge(row), fresh.badge);
+});
+
+// ---------------------------------------------------------------------------
+// The custody verdict has a CONSUMER. `dispose()` answers asynchronously
+// whether the daemon still runs the login, and the section used to drop that
+// answer and rebuild immediately — so the advertised "one live login" held only
+// inside one controller instance, and a remount created a second one.
+// ---------------------------------------------------------------------------
+
+function fakeElement(id) {
+    const el = {
+        id,
+        innerHTML: '',
+        textContent: '',
+        dataset: {},
+        offsetParent: {},
+        listeners: [],
+        addEventListener(type, fn) { el.listeners.push([type, fn]); },
+        removeEventListener() {},
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        contains: () => false,
+        closest: () => null,
+    };
+    return el;
+}
+
+function mountSection() {
+    const elements = {};
+    for (const id of ['harness-accounts-rows', 'harness-daemon-status',
+        'harness-login-card', 'btn-harness-refresh']) elements[id] = fakeElement(id);
+    const doc = {
+        hidden: false,
+        activeElement: null,
+        getElementById: (id) => elements[id] || null,
+        addEventListener() {}, removeEventListener() {},
+    };
+    const win = { addEventListener() {}, removeEventListener() {} };
+    return { elements, doc, win };
+}
+
+test('the custody verdict is CONSUMED: a remount is refused while a login may still be live', async () => {
+    // The reviewer's probe: the first cancel answered 503, `first_cancel_proven
+    // : false`, the controller kept its job id — and a remount immediately
+    // created a SECOND live login, because the teardown neither awaited nor
+    // read the verdict.
+    const { elements, doc, win } = mountSection();
+    const priorDoc = globalThis.document;
+    const priorWin = globalThis.window;
+    const priorFetch = globalThis.fetch;
+    globalThis.document = doc;
+    globalThis.window = win;
+
+    const calls = [];
+    let deleteStatus = 503;
+    // The login controller talks through the app's own apiFetch (global fetch);
+    // the status store is injected below, so only login traffic lands here.
+    globalThis.fetch = async (url, init = {}) => {
+        calls.push(`${init.method || 'GET'} ${url}`);
+        if (url === '/api/claudexor/login' && init.method === 'POST') {
+            return fakeResponse(200, { job_id: `job-${calls.length}`, job: { state: 'running' } });
+        }
+        if (init.method === 'DELETE') return fakeResponse(deleteStatus, { error: 'daemon unreachable' });
+        return fakeResponse(200, { job: { state: 'running' } });
+    };
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => fakeResponse(200, {
+            daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
+            config_dir: '/home/agent',
+            harnesses: [{ id: 'codex' }],
+            profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: false }], profiles: [] },
+            quota: [],
+        }),
+        doc,
+    });
+
     try {
-        let started = 0;
-        let release = null;
-        const gate = new Promise((resolve) => { release = resolve; });
-        const fetchImpl = async () => {
-            started += 1;
-            await gate;
-            return { ok: true, json: async () => ({ daemon: { state: 'running', engine_version: '3.3.13', runtime: {} } }) };
-        };
+        assert.equal(await initHarnessAccounts({ store }), true, 'a clean mount succeeds');
+        await startLogin('codex', '');
+        const creates = () => calls.filter((c) => c === 'POST /api/claudexor/login').length;
+        assert.equal(creates(), 1);
 
-        const first = refreshStatus({ force: true, fetchImpl });
-        // Painted BEFORE the response: the panel says it is checking, muted.
-        assert.ok(lines.some((line) => line.includes('Checking Claudexor')),
-            'the first read announces itself before it lands');
+        // The daemon refuses the cancel: custody is retained and REPORTED.
+        assert.equal(await destroyHarnessAccounts(), false,
+            'an unproven cancel must not be answered "released"');
+        assert.ok(calls.some((c) => c.startsWith('DELETE /api/claudexor/login/')),
+            `the teardown really tried: ${calls.join(' | ')}`);
 
-        // Every caller while one read is live SHARES it — the 5s interval must not
-        // stack reads over a request that takes tens of seconds (each fans out to
-        // four CLI-probing daemon GETs).
-        const joined = [refreshStatus({ force: true, fetchImpl }), refreshStatus({ fetchImpl })];
-        assert.equal(started, 1, 'overlapping polls did not start a second read');
+        // …so the remount is refused, and NO second login can be created.
+        assert.equal(await initHarnessAccounts({ store }), false, 'the remount is blocked');
+        assert.equal(creates(), 1, 'no second live login was started beside the first');
+        await startLogin('codex', '');
+        assert.equal(creates(), 1, 'and a disposed controller still starts nothing');
+        assert.match(elements['harness-daemon-status'].textContent, /could not be cancelled/,
+            'the owner is told why the panel is holding off');
 
-        release();
-        await Promise.all([first, ...joined]);
-        assert.equal(started, 1, 'the shared read served every caller');
-        assert.ok(lines.at(-1).includes('3.3.13'), 'the settled read replaces the checking line');
-
-        // After the first settle the checking line never returns: a stable line
-        // beats flickering muted<->error on every tick.
-        lines.length = 0;
-        const fourth = refreshStatus({ force: true, fetchImpl });
-        assert.equal(started, 2, 'a settled read releases the single-flight slot');
-        assert.ok(!lines.some((line) => line.includes('Checking Claudexor')),
-            'no pre-request repaint once anything has been said');
-        release();
-        await fourth;
+        // The daemon comes back: the retained job is cancelled and the section
+        // mounts again — a failed disposer is retryable, not a dead end.
+        deleteStatus = 200;
+        assert.equal(await destroyHarnessAccounts(), true, 'the retry proves the cancel');
+        assert.equal(await initHarnessAccounts({ store }), true);
+        await startLogin('codex', '');
+        assert.equal(creates(), 2, 'and only now may a new login be created');
     } finally {
-        globalThis.document = previousDocument;
+        await destroyHarnessAccounts();
+        store.dispose();
+        globalThis.document = priorDoc;
+        globalThis.window = priorWin;
+        globalThis.fetch = priorFetch;
     }
 });

@@ -1,0 +1,54 @@
+{
+  "daemon": {
+    "state": "unreachable",
+    "runtime": {
+      "state": "ready",
+      "version": "3.3.11"
+    },
+    "engine_version": "3.3.11",
+    "last_error": "quota_probe_failed: quota read refused by the daemon"
+  },
+  "config_dir": "/tmp/fake-claudexor-home",
+  "harnesses": [
+    {
+      "id": "claude",
+      "display_name": "Claude Code",
+      "status": "ok",
+      "enabled": true,
+      "provider_family": "anthropic",
+      "access_profiles_supported": [
+        "readonly",
+        "workspace_write"
+      ]
+    }
+  ],
+  "profiles": {
+    "profiles": [
+      {
+        "profile": {
+          "harness_id": "claude",
+          "profile_id": "koshak",
+          "display_name": "koshak"
+        },
+        "status": {
+          "verification": "passed",
+          "verification_source": "vendor",
+          "last_verified_at": "2026-08-09T09:00:00Z"
+        },
+        "identity": {
+          "email": "owner@example.com",
+          "plan": "Max"
+        }
+      }
+    ],
+    "harnessAccounts": [
+      {
+        "harness_id": "claude",
+        "native_login_detected": true,
+        "identity": {}
+      }
+    ]
+  },
+  "quota": [],
+  "subagent_last_delegation": {}
+}
