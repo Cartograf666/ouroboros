@@ -15,6 +15,17 @@ Ouroboros is an open-source, general-purpose AI agent whose identity, durable me
 
 It runs as a native desktop app or through a headless CLI. The runtime keeps its repository, durable memory, history, and interface on your machine, while model inference can use remote APIs you configure or a local GGUF model.
 
+The charts below are model-matched, self-reported results against Codex, Claude Code, Cursor, and Hermes on Terminal-Bench 2.1, OSWorld-Verified, and CL-Bench.
+
+<p align="center">
+  <a href="https://ouroboros-agent.ai/benchmarks/"><img src="assets/bench-terminal-bench.svg" width="760" alt="Terminal-Bench 2.1: Ouroboros against Claude Code, Codex CLI, Cursor CLI, and Hermes on matched models, with a same-harness portability row"></a>
+</p>
+
+<p align="center">
+  <a href="https://ouroboros-agent.ai/benchmarks/"><img src="assets/bench-osworld.svg" width="375" alt="OSWorld-Verified: Ouroboros against the public leaderboard, including the matched Claude Sonnet-4.6 pair"></a>
+  <a href="https://ouroboros-agent.ai/benchmarks/"><img src="assets/bench-cl-bench.svg" width="375" alt="CL-Bench: Ouroboros against in-context learning baselines, Claude Code, and Codex on matched models"></a>
+</p>
+
 ## Install
 
 ### macOS (Apple silicon)
@@ -41,7 +52,7 @@ Prerelease artifacts stay on their tag pages; `/releases/latest` points to the l
 Use your existing **Codex, Claude Code, or Cursor subscriptions** for
 delegated coding and review — Ouroboros drives them through
 [Claudexor](https://github.com/razzant/claudexor), its bundled multi-harness
-engine. Connect accounts in **Providers → Harness Accounts**; no separate
+engine. Connect accounts in **Settings → Agents**; no separate
 install is needed. Works on macOS and Linux. Release artifacts carry the exact
 reviewed engine archive; source checkouts fetch that same pinned archive on
 first use. Connecting an account installs or repairs the engine in the
