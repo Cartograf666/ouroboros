@@ -106,7 +106,7 @@ This list is an orientation, not a second specification. [BIBLE.md](BIBLE.md) de
 
 ## Benchmarks
 
-Ouroboros has reproducible self-reported state-of-the-art results on Terminal-Bench 2.1, OSWorld-Verified, and CL-Bench. The Terminal-Bench 2.1 rows are matched pairs that lead Codex, Claude Code, Cursor, and Hermes; the OSWorld-Verified and CL-Bench rows lead a matched Pointer run and the previous public-leaderboard top respectively. The public SWE-bench Pro matched pair is a statistical tie with Codex CLI. A separate GAIA campaign reports 129/165 for Ouroboros and 131/165 for Claude Code, with strict pass@1 at 128/165 for both; its scrubbed trace capsule is still pending. Upstream review can take time, so open submissions are marked without delaying publication. Read every row as model plus harness because the same model can score differently inside a different harness.
+Ouroboros has reproducible self-reported state-of-the-art results on Terminal-Bench 2.1, OSWorld-Verified, and CL-Bench. In those model-matched results, it leads Codex, Claude Code, Cursor, and Hermes. The public SWE-bench Pro matched pair is a statistical tie with Codex CLI. A separate GAIA campaign reports 129/165 for Ouroboros and 131/165 for Claude Code, with strict pass@1 at 128/165 for both; its scrubbed trace capsule is still pending. Upstream review can take time, so open submissions are marked without delaying publication. Read every row as model plus harness because the same model can score differently inside a different harness.
 
 | Benchmark | Model | Ouroboros | Comparison | Status | Evidence |
 |-----------|-------|----------:|------------|--------|----------|
