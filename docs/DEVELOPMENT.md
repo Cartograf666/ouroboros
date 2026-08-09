@@ -1281,9 +1281,27 @@ settings state.
 
 ## Design System
 
+> **Authority split — read this first.** `docs/DESIGN.md` defines the **visual
+> and interaction semantics**: the type scale and hierarchy rule, foreground and
+> state colour meaning, status/chip conventions, card and row anatomy, onboarding
+> density, dark-theme contrast. **This section defines the engineering rules that
+> preserve them**: where values may live, which component is the SSOT, what
+> counts as review debt, how a visual change is verified. Changing what a size or
+> colour *means* is a `DESIGN.md` edit; changing how the code is allowed to
+> *express* it is an edit here. Neither file restates the other.
+
 `web/style.css` custom properties and shared component classes are the value
 SSOT. Documentation keeps semantic roles and failure-prevention rules, not a
 copied color/radius/dimension inventory.
+
+Typography and hierarchy are `docs/DESIGN.md`'s call, and the engineering
+consequence is narrow: a text declaration on a migrated surface names a
+`--type-*` size token and a named foreground token. A rule that declares a size
+and no colour is the specific defect that made secondary text inherit
+near-white primary ink across the settings panels;
+`tests/test_web_typography_static.py` keeps that class closed on the migrated
+files. Migrating a new surface and extending that guard to it are the same
+commit.
 
 ### Layout and controls
 
