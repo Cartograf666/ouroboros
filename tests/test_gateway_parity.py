@@ -11,12 +11,18 @@ from ouroboros.gateway.contracts import (
     ChatOutbound,
     OwnerScopeReviewFloorResponse,
     PhotoOutbound,
+    ProjectEntry,
     SkillDeleteResponse,
     SkillLifecycleQueueResponse,
     StateResponse,
     TaskCostBreakdown,
     TaskDetailResponse,
     TaskDiffResponse,
+    ThreadCreateRequest,
+    ThreadEntry,
+    ThreadResponse,
+    ThreadUpdateRequest,
+    UiPreferencesResponse,
     UpdateApplyErrorResponse,
     UpdateApplyRequest,
     UpdateApplySuccessResponse,
@@ -111,6 +117,10 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "UpdateApplySuccessResponse",
         "UpdateApplyErrorResponse",
         "UpdateStatusReadyOutbound",
+        "ThreadEntry",
+        "ThreadCreateRequest",
+        "ThreadUpdateRequest",
+        "ThreadResponse",
     ):
         assert re.search(rf"@typedef \{{Object\}} {name}\b", text), f"api_types.js missing {name}"
     api_client = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_client.js").read_text(
@@ -118,15 +128,24 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     )
     assert "openAICompatibleModels" in api_client
     assert "taskDiff" in api_client
+    # Thread lifecycle: the browser must reach every route the gateway mounts,
+    # or the UI phase would hand-roll fetches outside the api_client seam.
+    for call in ("projectThreadCreate", "projectThreadUpdate", "projectThreadFork"):
+        assert call in api_client, f"api_client.js missing {call}"
     # v6.80.0: the two contracts extended this release join the FIELD-level parity list. The name-level
     # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
     # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
+    # Project threads (T0): UiPreferencesResponse and ProjectEntry were BOTH missing from this loop —
+    # ProjectEntry's JSDoc had already drifted (no `origin`, no `created_at`) with nothing to catch it,
+    # and UiPreferencesResponse is the surface the nested per-thread read cursor will migrate.
     for cls in (ChatInbound, ChatOutbound, PhotoOutbound, VideoOutbound,
                 StateResponse, OwnerScopeReviewFloorResponse, UpdateMergePlan,
                 UpdatePreflightRequest, UpdatePreflightResponse, UpdateApplyRequest,
                 UpdateApplySuccessResponse, UpdateApplyErrorResponse,
                 UpdateStatusReadyOutbound, TaskCostBreakdown, TaskDetailResponse,
-                ClaudexorStatusReads, ClaudexorStatusResponse, TaskDiffResponse):
+                ClaudexorStatusReads, ClaudexorStatusResponse, TaskDiffResponse,
+                UiPreferencesResponse, ProjectEntry,
+                ThreadEntry, ThreadCreateRequest, ThreadUpdateRequest, ThreadResponse):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"

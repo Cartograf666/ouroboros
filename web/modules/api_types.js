@@ -274,6 +274,23 @@
  */
 
 /**
+ * One THREAD of a project — an empty chat sharing the project's working folder.
+ * Thread 0 is the project's OWN chat (its chat_id equals the project's) and is
+ * synthesized from the project row rather than stored; the project's top-level
+ * chat_id stays its compatibility alias. fork_of_chat_id + fork_before_ts are a
+ * CURSOR into the source thread's rows (rows are never copied) and appear
+ * together or not at all.
+ * @typedef {Object} ThreadEntry
+ * @property {number=} id
+ * @property {number=} chat_id
+ * @property {string=} name
+ * @property {string=} created_at
+ * @property {number=} visible_revision
+ * @property {number=} fork_of_chat_id
+ * @property {string=} fork_before_ts
+ */
+
+/**
  * @typedef {Object} ProjectEntry
  * @property {string} id
  * @property {string=} name
@@ -282,11 +299,36 @@
  * @property {string=} provenance   // attached | cloned | genesis | none (historical fact)
  * @property {string=} clone_url
  * @property {string=} trusted_at
+ * @property {string=} origin
+ * @property {string=} created_at
  * @property {string=} last_active_at
  * @property {"active"|"deleting"|"tombstoned"=} lifecycle
  * @property {number=} routing_generation
  * @property {number=} visible_revision
  * @property {string=} delete_error
+ * @property {ThreadEntry[]=} threads  // canonical projection, thread 0 first
+ */
+
+/**
+ * POST /api/projects/{project_id}/threads body. name is optional — an unnamed
+ * thread gets a neutral default (no model call).
+ * @typedef {Object} ThreadCreateRequest
+ * @property {string=} name
+ */
+
+/**
+ * POST /api/projects/{project_id}/threads/{thread_id}/update body.
+ * @typedef {Object} ThreadUpdateRequest
+ * @property {string} name
+ */
+
+/**
+ * Envelope of every thread lifecycle route (create / update / fork). The
+ * affected thread's chat_id also rides the projects_changed broadcast, so the
+ * client adds it to its known-chat set before any live frame for it arrives.
+ * @typedef {Object} ThreadResponse
+ * @property {string} project_id
+ * @property {ThreadEntry} thread
  */
 
 /**

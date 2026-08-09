@@ -118,6 +118,26 @@ export const apiClient = {
     projectUpdate: (projectId, name) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/update`, { name }),
     /** @returns {Promise<import('./api_types.js').ProjectDeleteResponse>} */
     projectDelete: (projectId) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/delete`, {}),
+    /**
+     * Create a new empty thread in a project (a chat sharing its folder).
+     * @returns {Promise<import('./api_types.js').ThreadResponse>}
+     */
+    projectThreadCreate: (projectId, name = '') => jsonPost(
+        `/api/projects/${encodeURIComponent(projectId)}/threads`, name ? { name } : {},
+    ),
+    /** @returns {Promise<import('./api_types.js').ThreadResponse>} */
+    projectThreadUpdate: (projectId, threadId, name) => jsonPost(
+        `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/update`,
+        { name },
+    ),
+    /**
+     * Fork a thread. The source is untouched: the new thread stores a cursor
+     * into its rows, never a copy.
+     * @returns {Promise<import('./api_types.js').ThreadResponse>}
+     */
+    projectThreadFork: (projectId, threadId) => jsonPost(
+        `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/fork`, {},
+    ),
     /** @returns {Promise<import('./api_types.js').FsDirsResponse>} */
     fsDirs: (path = '') => fetchJson(`/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`, { cache: 'no-store' }),
     /**

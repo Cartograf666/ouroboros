@@ -372,10 +372,31 @@ class ProjectCreateRequest(TypedDict, total=False):
     with_workspace: bool
 
 
+class ThreadEntry(TypedDict, total=False):
+    """One THREAD of a project — an empty chat sharing the project's folder.
+
+    Thread ``0`` is the project's own chat (its ``chat_id`` equals the
+    project's) and is SYNTHESIZED at read time from the project row, never
+    stored; the project's top-level ``chat_id`` stays its compatibility alias.
+    ``fork_of_chat_id`` + ``fork_before_ts`` are a CURSOR into the source
+    thread's rows (rows are never copied) and appear together or not at all.
+    """
+
+    id: int
+    chat_id: int
+    name: str
+    created_at: str
+    visible_revision: int
+    fork_of_chat_id: int
+    fork_before_ts: str
+
+
 class ProjectEntry(TypedDict, total=False):
     """A registry project row as returned by the projects endpoints. ``provenance``
     (attached|cloned|genesis|none) and ``clone_url`` are historical facts;
-    operational git data is always read live from ``.git``."""
+    operational git data is always read live from ``.git``. ``threads`` is the
+    canonical projection (thread #0 first); a client that ignores it keeps
+    working off ``chat_id`` exactly as before."""
 
     id: str
     name: str
@@ -391,6 +412,33 @@ class ProjectEntry(TypedDict, total=False):
     routing_generation: int
     visible_revision: int
     delete_error: str
+    threads: List[ThreadEntry]
+
+
+class ThreadCreateRequest(TypedDict, total=False):
+    """POST /api/projects/{project_id}/threads body. ``name`` is optional — an
+    unnamed thread gets a neutral default, with no model call."""
+
+    name: str
+
+
+class ThreadUpdateRequest(TypedDict):
+    """POST /api/projects/{project_id}/threads/{thread_id}/update body."""
+
+    name: str
+
+
+class ThreadResponse(TypedDict):
+    """Envelope of every thread lifecycle route (create / update / fork).
+
+    These are OWNER surfaces reached through the gateway, deliberately not
+    LLM-callable tools. The affected thread's ``chat_id`` also rides the
+    `projects_changed` broadcast, so an open client adds it to its known-chat
+    set before any live frame for it can arrive.
+    """
+
+    project_id: str
+    thread: ThreadEntry
 
 
 class ProjectDeleteResponse(TypedDict):
@@ -935,6 +983,9 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/projects/from-task",
     "POST /api/projects/{project_id}/update",
     "POST /api/projects/{project_id}/delete",
+    "POST /api/projects/{project_id}/threads",
+    "POST /api/projects/{project_id}/threads/{thread_id}/update",
+    "POST /api/projects/{project_id}/threads/{thread_id}/fork",
     "GET /api/fs/dirs",
     "GET /api/chat/history",
     "GET /api/logs/{name}",
@@ -1038,6 +1089,10 @@ __all__ = [
     "UpdateStatusReadyOutbound",
     "ProjectCreateRequest",
     "ProjectEntry",
+    "ThreadCreateRequest",
+    "ThreadEntry",
+    "ThreadResponse",
+    "ThreadUpdateRequest",
     "ProjectDeleteResponse",
     "FsDirsEntry",
     "FsDirsResponse",

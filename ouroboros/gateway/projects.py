@@ -507,6 +507,119 @@ async def api_project_delete(request: Request) -> JSONResponse:
         return json_exception(exc)
 
 
+async def _thread_body(request: Request) -> Any:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return body if isinstance(body, dict) else None
+
+
+def _thread_name_error(name: str, *, required: bool) -> Any:
+    from ouroboros.projects_registry import THREAD_NAME_MAX
+
+    if required and not name:
+        return JSONResponse({"error": "name is required"}, status_code=400)
+    if len(name) > THREAD_NAME_MAX:
+        return JSONResponse(
+            {"error": f"name must be <= {THREAD_NAME_MAX} characters"}, status_code=400
+        )
+    return None
+
+
+async def api_project_thread_create(request: Request) -> JSONResponse:
+    """POST /api/projects/{project_id}/threads — a new empty thread.
+
+    Owner surface only (gateway route, not an LLM-callable tool). The new
+    thread's chat id rides the `projects_changed` broadcast so every open client
+    adds it to its known-chat set BEFORE a live frame for it can arrive.
+    """
+    try:
+        from ouroboros.projects_registry import create_thread, get_project, touch_project
+
+        project_id = str(request.path_params.get("project_id") or "").strip()
+        body = await _thread_body(request)
+        if body is None:
+            return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+        drive_root = request_drive_root(request)
+        project = get_project(drive_root, project_id)
+        if project is None:
+            return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
+        name = str(body.get("name") or "").strip()
+        invalid = _thread_name_error(name, required=False)
+        if invalid is not None:
+            return invalid
+        thread = create_thread(drive_root, str(project["id"]), name=name)
+        touch_project(drive_root, str(project["id"]))
+        _broadcast_projects_changed(str(project["id"]), thread.get("chat_id"))
+        return JSONResponse({"project_id": str(project["id"]), "thread": thread})
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return json_exception(exc)
+
+
+async def api_project_thread_update(request: Request) -> JSONResponse:
+    """POST /api/projects/{project_id}/threads/{thread_id}/update — rename."""
+    try:
+        from ouroboros.projects_registry import get_project, get_thread, rename_thread
+
+        project_id = str(request.path_params.get("project_id") or "").strip()
+        thread_id = str(request.path_params.get("thread_id") or "").strip()
+        body = await _thread_body(request)
+        if body is None:
+            return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+        drive_root = request_drive_root(request)
+        project = get_project(drive_root, project_id)
+        if project is None:
+            return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
+        if get_thread(drive_root, str(project["id"]), thread_id) is None:
+            return JSONResponse({"error": f"unknown thread: {thread_id}"}, status_code=404)
+        name = str(body.get("name") or "").strip()
+        invalid = _thread_name_error(name, required=True)
+        if invalid is not None:
+            return invalid
+        thread = rename_thread(drive_root, str(project["id"]), thread_id, name)
+        if thread is None:
+            return JSONResponse({"error": f"unknown thread: {thread_id}"}, status_code=404)
+        _broadcast_projects_changed(str(project["id"]), thread.get("chat_id"))
+        return JSONResponse({"project_id": str(project["id"]), "thread": thread})
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return json_exception(exc)
+
+
+async def api_project_thread_fork(request: Request) -> JSONResponse:
+    """POST /api/projects/{project_id}/threads/{thread_id}/fork.
+
+    The source thread is UNTOUCHED: the new thread stores a cursor into the
+    source's rows, so no history is copied and no row identity is minted twice.
+    """
+    try:
+        from ouroboros.projects_registry import fork_thread, get_project, touch_project
+
+        project_id = str(request.path_params.get("project_id") or "").strip()
+        thread_id = str(request.path_params.get("thread_id") or "").strip()
+        drive_root = request_drive_root(request)
+        project = get_project(drive_root, project_id)
+        if project is None:
+            return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
+        try:
+            thread = fork_thread(drive_root, str(project["id"]), thread_id)
+        except ValueError as exc:
+            if "unknown thread" in str(exc):
+                return JSONResponse({"error": str(exc)}, status_code=404)
+            raise
+        touch_project(drive_root, str(project["id"]))
+        _broadcast_projects_changed(str(project["id"]), thread.get("chat_id"))
+        return JSONResponse({"project_id": str(project["id"]), "thread": thread})
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return json_exception(exc)
+
+
 def _broadcast_projects_changed(project_id: str, chat_id: Any) -> None:
     try:
         from supervisor.message_bus import get_bridge
@@ -722,6 +835,9 @@ __all__ = [
     "api_fs_dirs",
     "api_project_delete",
     "api_project_from_task",
+    "api_project_thread_create",
+    "api_project_thread_fork",
+    "api_project_thread_update",
     "api_project_update",
     "api_projects_create",
     "api_projects_list",
