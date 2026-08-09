@@ -69,6 +69,31 @@ _PROVIDER_FIELDS = _rows(("id", "stateKey", "settingKey", "settingsInputId", "la
     ("openai-compatible-key", "compatibleApiKey", "OPENAI_COMPATIBLE_API_KEY", "s-compatible-key", "OpenAI-compatible API Key", "Leave empty for no auth", "API key for the endpoint. Leave empty if your server does not require authentication.", "password", "more"),
 ))
 
+# Every settings key whose VALUE is a credential. ONE authority: /api/settings
+# masking, the generic settings merge, and the onboarding bootstrap all read it
+# from here, so a new provider cannot be secret on one surface and plaintext on
+# another. It lives in the setup contract because that is the lowest layer all
+# three already depend on.
+SECRET_SETTING_KEYS = frozenset({
+    "OPENROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_COMPATIBLE_API_KEY",
+    "CLOUDRU_FOUNDATION_MODELS_API_KEY",
+    "GIGACHAT_CREDENTIALS",
+    "GIGACHAT_PASSWORD",
+    "ANTHROPIC_API_KEY",
+    "MINIMAX_API_KEY",
+    "GITHUB_TOKEN",
+    "OUROBOROS_NETWORK_PASSWORD",
+})
+
+# What a configured credential looks like once it leaves the server. It is a
+# MARKER, not a redaction of the value: no prefix, no length, nothing that
+# narrows a guess. Deliberately the same token /api/settings already round-trips
+# for password-class secrets (``looks_masked_secret``), so every save path
+# rehydrates it through the rule it already has instead of a second one.
+CONFIGURED_SECRET_PLACEHOLDER = "***set***"
+
 _PROFILE_SPECS = {
     "openrouter": ("OpenRouter", "OpenRouter is present, so the next step keeps router-style defaults while still saving any extra direct keys you paste here.", "OpenRouter-style routing remains active. Unprefixed provider IDs like openai/gpt-5.6-terra or anthropic/claude-sonnet-5 continue to route through OpenRouter."),
     "openai": ("OpenAI", "OpenAI is present, so the next step prefills direct openai:: model values.", "OpenAI-only setup detected. These defaults are explicit and official."),
@@ -192,6 +217,31 @@ def parse_budget_setting(
     return value, None
 
 
+def secret_provider_setting_keys() -> frozenset:
+    """Provider fields whose stored value must never leave the server verbatim.
+
+    The union of the canonical secret keys and every password-typed provider
+    field, so the rule holds for a field added on either side: a new credential
+    listed in ``SECRET_SETTING_KEYS`` is covered even if someone renders it as a
+    text input, and a new password input is covered before anyone remembers to
+    add its key to the canonical set.
+    """
+    return frozenset(
+        field["settingKey"]
+        for field in _PROVIDER_FIELDS
+        if field["settingKey"] in SECRET_SETTING_KEYS
+        or (field.get("inputType") or "password") == "password"
+    )
+
+
+def _is_secret_placeholder(value: str) -> bool:
+    # Imported lazily: the predicate's home is the MCP client, and the launcher
+    # imports this contract long before any MCP machinery is wanted.
+    from ouroboros.mcp_client import looks_masked_secret
+
+    return looks_masked_secret(value)
+
+
 def derive_provider_profile(settings: dict) -> str:
     flags = {field["settingKey"]: bool(_string(settings.get(field["settingKey"]))) for field in _PROVIDER_FIELDS}
     if flags["OPENROUTER_API_KEY"]:
@@ -281,7 +331,21 @@ def build_initial_setup_state(settings: dict, host_mode: str = "desktop") -> dic
         "localChatFormat": _string(settings.get("LOCAL_MODEL_CHAT_FORMAT")),
         "localRoutingMode": derive_local_routing_mode(settings),
     }
-    state.update({field["stateKey"]: _string(settings.get(field["settingKey"])) for field in _PROVIDER_FIELDS})
+    # A credential is reported as CONFIGURED, never handed back. The onboarding
+    # page is served by an unauthenticated GET on every host, and on a supported
+    # non-loopback bind without a network password that page is retrievable by
+    # anyone on the LAN — so the bootstrap must carry the same "configured or
+    # not" fact /api/settings carries, and nothing more. The wizard needs only
+    # that fact: which providers are already set up.
+    secret_keys = secret_provider_setting_keys()
+    state.update({
+        field["stateKey"]: (
+            CONFIGURED_SECRET_PLACEHOLDER
+            if field["settingKey"] in secret_keys and _string(settings.get(field["settingKey"]))
+            else _string(settings.get(field["settingKey"]))
+        )
+        for field in _PROVIDER_FIELDS
+    })
     state.update(budget_state)
     state.update({slot["stateKey"]: _string(settings.get(slot["settingKey"])) or defaults[slot["slot"]] for slot in _MODEL_SLOTS})
     return state
@@ -296,6 +360,9 @@ def build_setup_bootstrap(settings: dict, host_mode: str = "desktop") -> dict:
         "modelDefaults": {key: dict(value) for key, value in _MODEL_DEFAULTS.items()},
         "localPresets": {key: dict(value) for key, value in _LOCAL_PRESETS.items()},
         "modelSuggestions": list(_MODEL_SUGGESTIONS),
+        # The wizard must recognize its own "already configured" marker without
+        # hardcoding it: a prefilled credential field holds this string, not a key.
+        "secretPlaceholder": CONFIGURED_SECRET_PLACEHOLDER,
         "contract": build_setup_contract(normalized_host),
         "initialState": build_initial_setup_state(settings, normalized_host),
     }
@@ -319,7 +386,21 @@ def wizard_authors_safety_light() -> bool:
 
 
 def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, str | None]:
-    keys = {field["settingKey"]: _string(data.get(field["settingKey"])) for field in _PROVIDER_FIELDS}
+    secret_keys = secret_provider_setting_keys()
+    keys: Dict[str, str] = {}
+    for field in _PROVIDER_FIELDS:
+        setting_key = field["settingKey"]
+        value = _string(data.get(setting_key))
+        # An untouched credential field posts back the marker it was prefilled
+        # with. It means "keep the stored secret" and NEVER "store this string":
+        # resolving it to the stored value here — before the length check, the
+        # has-remote gate and the prepared merge — is what keeps the marker out
+        # of settings.json on every host, since every save path (the atomic
+        # completion endpoint, the desktop bridge) shares this validator. With
+        # nothing stored the marker resolves to empty, so it cannot become a key.
+        if setting_key in secret_keys and _is_secret_placeholder(value):
+            value = _string(current_settings.get(setting_key))
+        keys[setting_key] = value
     local_source = _string(data.get("LOCAL_MODEL_SOURCE"))
     local_filename = _string(data.get("LOCAL_MODEL_FILENAME"))
     local_chat_format = _string(data.get("LOCAL_MODEL_CHAT_FORMAT"))

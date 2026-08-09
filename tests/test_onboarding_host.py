@@ -7,7 +7,9 @@ These tests pin the startup REORDERING and the single wizard host:
 * the wizard is a real page (`GET /onboarding`) reachable with no provider
   configured and no supervisor running;
 * neither the launcher's nor the server's boot normalization may CREATE
-  settings.json, because the fresh-install proofs are gated on its absence;
+  settings.json, and neither may the readiness probe, because the fresh-install
+  proofs are gated on its absence;
+* neither onboarding surface hands a stored credential back out;
 * a genuinely fresh desktop completion still authors `OUROBOROS_SAFETY_MODE=light`
   while the generic save path still cannot lower safety;
 * closing the setup window without saving stays non-fatal.
@@ -389,12 +391,120 @@ def test_onboarding_readiness_probe_still_gates_the_blocking_overlay(monkeypatch
     assert configured.status_code == 204
 
 
+# --------------------------------------------------------------------------
+# 4b. Neither onboarding surface may write, and neither may serve a credential.
+#
+# Self-contained on purpose (own app builder, own imports): these guard a
+# defect that was live on this branch, and the completion branch is rewriting
+# the section above them. A merge that drops their helper must fail loudly
+# instead of quietly deleting the proof.
+# --------------------------------------------------------------------------
+
+
+def _onboarding_client(tmp_path):
+    from starlette.applications import Starlette as _Starlette
+    from starlette.testclient import TestClient as _TestClient
+
+    from ouroboros.gateway.router import collect_routes
+
+    app = _Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    return _TestClient(app)
+
+
+def test_the_readiness_probe_never_authors_settings_json(monkeypatch, tmp_path):
+    """A GET must never be the first author of settings.json (D-8).
+
+    The fixture is the case that actually persisted: a fresh install whose
+    shipped remote defaults normalization CLEARS because LOCAL_MODEL_SOURCE is
+    present. That write created the file before the owner had answered
+    anything, destroying the fresh-install proof the install presets and the
+    `light` safety default are both gated on.
+    """
+    from ouroboros.config import SETTINGS_DEFAULTS
+    from ouroboros.gateway import settings as gw_settings
+    from ouroboros.server_runtime import apply_runtime_provider_defaults
+
+    settings_path = tmp_path / "settings.json"
+    saves: list = []
+    fresh_local_first = dict(SETTINGS_DEFAULTS)
+    fresh_local_first["LOCAL_MODEL_SOURCE"] = "Qwen/Qwen2.5-7B-Instruct-GGUF"
+
+    # Normalization must still have something to change, or the fixture would
+    # prove nothing about persistence.
+    _normalized, changed, _keys = apply_runtime_provider_defaults(dict(fresh_local_first))
+    assert changed is True
+
+    monkeypatch.setattr(gw_settings, "load_settings", lambda: dict(fresh_local_first))
+    monkeypatch.setattr(
+        gw_settings, "save_settings",
+        lambda *a, **k: (saves.append(a), settings_path.write_text("{}", encoding="utf-8")),
+        raising=False,
+    )
+    with _onboarding_client(tmp_path) as client:
+        assert client.get("/api/onboarding").status_code == 200
+
+    assert saves == []
+    assert not settings_path.exists()
+
+
 def test_onboarding_page_route_is_declared_on_the_gateway_boundary():
     from ouroboros.gateway.contracts import HTTP_ENDPOINTS
 
     assert "GET /onboarding" in HTTP_ENDPOINTS
-    # Phase 3A hosts the wizard; it does NOT implement the atomic completion.
-    assert "POST /api/onboarding/complete" not in HTTP_ENDPOINTS
+    assert "GET /api/onboarding" in HTTP_ENDPOINTS
+
+
+_SECRET_CANARIES = {
+    "OPENROUTER_API_KEY": "sk-or-SECRETCANARY123",
+    "OPENAI_API_KEY": "sk-openai-SECRETCANARY124",
+    "OPENAI_COMPATIBLE_API_KEY": "compat-SECRETCANARY125",
+    "CLOUDRU_FOUNDATION_MODELS_API_KEY": "cloudru-SECRETCANARY126",
+    "MINIMAX_API_KEY": "minimax-SECRETCANARY127",
+    "ANTHROPIC_API_KEY": "sk-ant-SECRETCANARY128",
+    "GIGACHAT_CREDENTIALS": "giga-SECRETCANARY129",
+    "GIGACHAT_PASSWORD": "gigapw-SECRETCANARY130",
+    "GITHUB_TOKEN": "ghp-SECRETCANARY131",
+    "OUROBOROS_NETWORK_PASSWORD": "netpw-SECRETCANARY132",
+}
+
+
+def _leaked(text: str) -> list:
+    return sorted(key for key, value in _SECRET_CANARIES.items() if value in text)
+
+
+def test_the_onboarding_page_route_serves_no_stored_credential(monkeypatch, tmp_path):
+    """`GET /onboarding` is unauthenticated on every host and has no startup
+    gate at all — it always serves. On a supported non-loopback bind with no
+    OUROBOROS_NETWORK_PASSWORD, anything in that page is readable by anyone on
+    the LAN, so a stored credential must not be in it."""
+    from ouroboros.gateway import onboarding_host
+
+    monkeypatch.setattr(onboarding_host, "load_settings", lambda: dict(_SECRET_CANARIES))
+    with _onboarding_client(tmp_path) as client:
+        response = client.get("/onboarding")
+
+    assert response.status_code == 200
+    assert _leaked(response.text) == []
+    # …and the page still tells the wizard the providers ARE configured.
+    assert "***set***" in response.text
+
+
+def test_the_readiness_probe_body_serves_no_stored_credential(monkeypatch, tmp_path):
+    """`GET /api/onboarding` answers 204 once the startup gate passes, so the
+    stored credential reachable through its wizard body is one that does not
+    satisfy that gate — an OpenAI-compatible KEY with no base URL. Same class,
+    second route."""
+    from ouroboros.gateway import settings as gw_settings
+
+    stored = {"OPENAI_COMPATIBLE_API_KEY": _SECRET_CANARIES["OPENAI_COMPATIBLE_API_KEY"]}
+    monkeypatch.setattr(gw_settings, "load_settings", lambda: dict(stored))
+    with _onboarding_client(tmp_path) as client:
+        response = client.get("/api/onboarding")
+
+    assert response.status_code == 200
+    assert _leaked(response.text) == []
+    assert "***set***" in response.text
 
 
 # --------------------------------------------------------------------------
@@ -402,23 +512,41 @@ def test_onboarding_page_route_is_declared_on_the_gateway_boundary():
 # --------------------------------------------------------------------------
 
 
-def test_completion_prefers_the_atomic_endpoint_and_falls_back_when_absent():
-    """SEAM for the atomic `POST /api/onboarding/complete`: the page tries it
-    first on every host; an absent route (404/405) falls back to today's
-    behaviour instead of breaking first-run."""
+def test_completion_targets_the_atomic_endpoint_on_every_host():
+    """SEAM for the atomic `POST /api/onboarding/complete`: the page asks for it
+    FIRST on every host, and announces completion the same way for all shells.
+
+    Deliberately not pinned here: whether the legacy fallbacks still exist, and
+    whether the endpoint is mounted in this tree. Both are transitional — the
+    completion branch is removing the fallbacks and the presets branch mounts
+    the route — so asserting either way makes this test fail on a merge that
+    changes nothing about the behaviour it is guarding.
+    """
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
 
     assert "const ONBOARDING_COMPLETE_ENDPOINT = '/api/onboarding/complete';" in source
-    assert "if (response.status === 404 || response.status === 405) return null;" in source
     assert "let result = await completeOnboardingAtomically(payload);" in source
-    assert "saveWizardThroughDesktopBridge(payload)" in source
-    assert "saveWizardThroughSettingsPair(payload)" in source
-    # The desktop fallback is chosen by CAPABILITY, not by a host-mode flag.
-    assert "window.pywebview?.api?.save_wizard" in source
     # One completion announcer for all three shells.
     assert "function announceCompletion(result)" in source
     assert "ouroboros:onboarding-complete" in source
     assert "window.pywebview.api.onboarding_finished" in source
+
+
+def test_the_atomic_completion_route_is_declared_wherever_it_is_implemented(tmp_path):
+    """Gateway-boundary invariant that survives the merge either way: the
+    contract and the router agree about the atomic endpoint. Phase 3A hosts the
+    wizard and does not implement it; the presets branch does. Both states are
+    valid — a contract that disagrees with the router never is."""
+    from ouroboros.gateway import router
+    from ouroboros.gateway.contracts import HTTP_ENDPOINTS
+
+    declared = "POST /api/onboarding/complete" in HTTP_ENDPOINTS
+    mounted = any(
+        getattr(route, "path", "") == "/api/onboarding/complete"
+        for route in router.collect_routes(data_dir=tmp_path)
+    )
+
+    assert declared == mounted
 
 
 # --------------------------------------------------------------------------

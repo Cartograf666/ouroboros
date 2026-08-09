@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_MODULES = REPO_ROOT / "web" / "modules"
 
@@ -207,30 +209,34 @@ def test_accent_tokens_have_concrete_rgba_values():
         )
 
 
-def test_onboarding_escape_mirrors_utils():
-    """``onboarding_wizard.js`` is an IIFE bundle and cannot ``import`` from
-    ``utils.js`` without a bootstrap rewrite. Its local ``escapeHtml`` MUST
-    therefore mirror the same chain of HTML-escape ``replace`` calls
-    ``escapeHtmlAttr`` performs so the security contract (replace ``&``
-    first, then the five HTML metas, then backtick) cannot drift between
-    the wizard and the SPA. We compare on the normalized list of
-    ``.replace(<from>, <to>)`` calls — indentation differs (IIFE has one
-    extra wrap level) but the actual escape sequence must be identical.
+@pytest.mark.parametrize("module_name", ["onboarding_wizard.js", "onboarding_overlay.js"])
+def test_onboarding_uses_the_shared_escape_helper(module_name):
+    """Both onboarding modules are real ES modules now, so escaping has ONE
+    authority instead of a copy per module.
+
+    The predecessor of this test compared the two ``replace`` chains character
+    for character and explained the copy by saying the wizard "is an IIFE bundle
+    and cannot import from utils.js". That stopped being true when the wizard
+    became a linked ES module: the comparison then froze a duplicate the code
+    was free to delete. Behaviour of the shared helper itself is pinned by
+    web/tests/onboarding_overlay.test.js.
     """
-    import re
-    onboarding = _read("onboarding_wizard.js")
-    utils = _read("utils.js")
-    wizard_body = onboarding.split("function escapeHtml(value) {", 1)[1].split("}", 1)[0]
-    utils_body = utils.split("export function escapeHtmlAttr(value) {", 1)[1].split("}", 1)[0]
-    pattern = re.compile(r"\.replace\(([^)]+)\)")
-    wizard_replaces = pattern.findall(wizard_body)
-    utils_replaces = pattern.findall(utils_body)
-    assert wizard_replaces == utils_replaces, (
-        "onboarding_wizard.escapeHtml drifted from utils.escapeHtmlAttr "
-        f"— wizard chain: {wizard_replaces}, utils chain: {utils_replaces}"
+    source = _read(module_name)
+
+    assert "escapeHtmlAttr as escapeHtml" in source, (
+        f"{module_name} must import the shared escape helper from utils.js"
     )
-    # Smoke-check that the chain still escapes ampersand FIRST (any other
-    # order would double-encode the entity numbers later in the chain).
-    assert wizard_replaces[0].startswith("/&/g"), (
-        "ampersand replacement must be first in the chain"
+    assert "function escapeHtml(" not in source, (
+        f"{module_name} redefines escapeHtml instead of using the shared helper"
     )
+
+
+def test_onboarding_wizard_uses_the_shared_gateway_fetch_helper():
+    """Same dedup, same reason: the wizard's private ``apiRequest`` was a second
+    copy of ``api_client.fetchJson`` (identical throw-on-!ok, identical error
+    message), and a second copy is a second place for the gateway error contract
+    to drift."""
+    source = _read("onboarding_wizard.js")
+
+    assert "import { fetchJson } from './api_client.js';" in source
+    assert "async function apiRequest(" not in source

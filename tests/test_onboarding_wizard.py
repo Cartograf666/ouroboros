@@ -413,6 +413,142 @@ def test_setup_contract_has_no_secret_values():
     assert initial["lightModel"] == "minimax::MiniMax-M2.7"
 
 
+# --- The served page must not hand back a stored credential -----------------
+# The onboarding page is an unauthenticated GET on every host, and a non-loopback
+# bind without OUROBOROS_NETWORK_PASSWORD is a supported configuration — so any
+# client on the LAN could read whatever the bootstrap carries.
+
+_SECRET_CANARIES = {
+    "OPENROUTER_API_KEY": "sk-or-SECRETCANARY123",
+    "OPENAI_API_KEY": "sk-openai-SECRETCANARY124",
+    "OPENAI_COMPATIBLE_API_KEY": "compat-SECRETCANARY125",
+    "CLOUDRU_FOUNDATION_MODELS_API_KEY": "cloudru-SECRETCANARY126",
+    "MINIMAX_API_KEY": "minimax-SECRETCANARY127",
+    "ANTHROPIC_API_KEY": "sk-ant-SECRETCANARY128",
+    "GIGACHAT_CREDENTIALS": "giga-SECRETCANARY129",
+    "GIGACHAT_PASSWORD": "gigapw-SECRETCANARY130",
+    "GITHUB_TOKEN": "ghp-SECRETCANARY131",
+    "OUROBOROS_NETWORK_PASSWORD": "netpw-SECRETCANARY132",
+}
+
+
+def test_every_secret_class_field_is_covered_by_the_canary_sweep():
+    """The sweep below is only a class proof while it actually covers the class.
+
+    Both authorities: the canonical credential keys, and every password-typed
+    provider field (a new provider is usually added as the latter first).
+    """
+    from ouroboros.settings_setup_contract import (
+        SECRET_SETTING_KEYS,
+        secret_provider_setting_keys,
+    )
+
+    assert SECRET_SETTING_KEYS <= set(_SECRET_CANARIES)
+    assert secret_provider_setting_keys() <= set(_SECRET_CANARIES)
+
+
+def test_the_served_wizard_never_carries_a_stored_credential():
+    """Not one masked field — every secret-class field, on the renderer both
+    page routes share."""
+    html = build_onboarding_html(dict(_SECRET_CANARIES), host_mode="web")
+
+    leaked = sorted(key for key, value in _SECRET_CANARIES.items() if value in html)
+    assert leaked == [], f"credential served verbatim in the onboarding page: {leaked}"
+
+
+def test_a_configured_credential_is_reported_as_a_marker_not_a_prefix():
+    """The wizard still learns WHICH providers are configured — that is the only
+    fact it needs — and the marker leaks nothing about the value: no prefix, no
+    length, nothing that narrows a guess."""
+    from ouroboros.settings_setup_contract import (
+        CONFIGURED_SECRET_PLACEHOLDER,
+        secret_provider_setting_keys,
+    )
+
+    bootstrap = build_setup_bootstrap(dict(_SECRET_CANARIES), "web")
+    state = bootstrap["initialState"]
+    by_key = {field["settingKey"]: field for field in bootstrap["contract"]["providerFields"]}
+
+    assert bootstrap["secretPlaceholder"] == CONFIGURED_SECRET_PLACEHOLDER
+    for setting_key in secret_provider_setting_keys():
+        value = state[by_key[setting_key]["stateKey"]]
+        assert value == CONFIGURED_SECRET_PLACEHOLDER, setting_key
+        # Not a redaction of the secret: no leading characters of it survive.
+        assert not _SECRET_CANARIES[setting_key].startswith(value[:4])
+
+    # An UNCONFIGURED provider still reads as unconfigured, or the wizard would
+    # claim every key is set.
+    empty = build_setup_bootstrap({}, "web")["initialState"]
+    assert empty[by_key["OPENROUTER_API_KEY"]["stateKey"]] == ""
+
+
+def test_a_wizard_save_that_touches_no_credential_leaves_the_stored_one_intact():
+    """The untouched field posts the MARKER back. It must resolve to the stored
+    secret — byte for byte — and the marker must never reach settings.json."""
+    from ouroboros.settings_setup_contract import (
+        CONFIGURED_SECRET_PLACEHOLDER,
+        secret_provider_setting_keys,
+    )
+
+    stored = dict(_SECRET_CANARIES)
+    payload = _base_payload()
+    for setting_key in secret_provider_setting_keys():
+        payload[setting_key] = CONFIGURED_SECRET_PLACEHOLDER
+
+    prepared, error = prepare_onboarding_settings(payload, stored)
+
+    assert error is None
+    for setting_key in secret_provider_setting_keys():
+        assert prepared[setting_key] == stored[setting_key], setting_key
+    assert CONFIGURED_SECRET_PLACEHOLDER not in prepared.values()
+
+
+def test_the_marker_can_never_become_a_credential():
+    """With nothing stored, the marker resolves to EMPTY rather than being
+    written as if the owner had typed it — otherwise a client echoing back what
+    it was served could author a fake key, and the install would look configured
+    while every provider call failed."""
+    from ouroboros.settings_setup_contract import CONFIGURED_SECRET_PLACEHOLDER
+
+    payload = _base_payload()
+    payload["OPENROUTER_API_KEY"] = CONFIGURED_SECRET_PLACEHOLDER
+    payload["OPENAI_API_KEY"] = "sk-openai-1234567890"
+
+    prepared, error = prepare_onboarding_settings(payload, {})
+
+    assert error is None
+    assert prepared["OPENROUTER_API_KEY"] == ""
+    assert prepared["OPENAI_API_KEY"] == "sk-openai-1234567890"
+
+
+def test_the_generic_settings_merge_also_refuses_to_store_a_mask():
+    """The other save path the wizard can take. Same rule, so the class is closed
+    wherever a masked value is echoed back, not just in the setup validator."""
+    from ouroboros.gateway.settings import _merge_settings_payload
+
+    merged = _merge_settings_payload(
+        {"OPENROUTER_API_KEY": "sk-or-v1-stored"},
+        {"OPENROUTER_API_KEY": "***set***", "ANTHROPIC_API_KEY": "***set***"},
+    )
+
+    assert merged["OPENROUTER_API_KEY"] == "sk-or-v1-stored"
+    assert merged.get("ANTHROPIC_API_KEY", "") == ""
+
+
+def test_clearing_a_credential_field_still_clears_the_stored_secret():
+    """The marker means "untouched", never "locked": an emptied field is an
+    explicit owner decision and must still delete the stored key."""
+    stored = {"OPENROUTER_API_KEY": "sk-or-v1-stored", "OPENAI_API_KEY": "sk-openai-1234567890"}
+    payload = _base_payload()
+    payload["OPENROUTER_API_KEY"] = ""
+    payload["OPENAI_API_KEY"] = "sk-openai-1234567890"
+
+    prepared, error = prepare_onboarding_settings(payload, stored)
+
+    assert error is None
+    assert prepared["OPENROUTER_API_KEY"] == ""
+
+
 def test_api_settings_exposes_setup_contract_without_secrets(tmp_path):
     from unittest.mock import patch
 
@@ -512,8 +648,11 @@ def test_onboarding_overlay_frames_the_served_page_not_an_inlined_document():
 
     assert "frame.src = '/onboarding'" in source
     assert "frame.srcdoc" not in source
-    # 204 from the readiness probe still means "configured — no overlay".
-    assert "if (response.status === 204) return;" in source
+    # 204 from the readiness probe still means "configured — no overlay", and it
+    # is the ONLY answer that takes the blocking shell down (see
+    # web/tests/onboarding_overlay.test.js for the behavioural pin).
+    assert "if (response.status === 204) {" in source
+    assert "removeOverlay();" in source
 
 
 # --- v6.82.0 rev.3-2: the wizard save authors safety "light" for NEW installs ---
@@ -723,3 +862,11 @@ def test_onboarding_frontend_exempts_unchanged_prefilled_keys_from_length_check(
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
 
     assert "value.length < 10 && value !== trim(INITIAL_STATE[field.stateKey])" in source
+
+    # The exemption is now load-bearing for EVERY configured install, not just
+    # legacy short keys: a prefilled field holds the configured-marker, which is
+    # shorter than the minimum. Without the exemption the wizard would refuse to
+    # advance on any install that already has a provider key.
+    from ouroboros.settings_setup_contract import CONFIGURED_SECRET_PLACEHOLDER
+
+    assert len(CONFIGURED_SECRET_PLACEHOLDER) < 10

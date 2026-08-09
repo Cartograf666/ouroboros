@@ -1,15 +1,11 @@
-(() => {
-    // Self-contained IIFE mirror of utils.escapeHtmlAttr; SSOT drift is tested.
-    function escapeHtml(value) {
-        return String(value ?? '')
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;')
-            .replace(/`/g, '&#96;');
-    }
+// The wizard is served as a real ES module now, so it uses the SPA's shared
+// helpers directly instead of carrying private copies that could drift from
+// them (the escaping is a security contract, and the request wrapper is the
+// gateway boundary).
+import { fetchJson } from './api_client.js';
+import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
+(() => {
         const bootstrap = window.__OURO_ONBOARDING_BOOTSTRAP__ || {};
         const SETUP_CONTRACT = bootstrap.contract || {};
         const HOST_MODE = bootstrap.hostMode || 'desktop';
@@ -34,6 +30,10 @@
         const LOCAL_PRESETS = bootstrap.localPresets || {};
         const MODEL_SUGGESTIONS = bootstrap.modelSuggestions || [];
         const INITIAL_STATE = bootstrap.initialState || {};
+        // What a stored credential looks like in INITIAL_STATE: a marker saying
+        // "configured", not the secret. Posting it back means "leave it alone";
+        // the shared server-side validator resolves it to the stored value.
+        const SECRET_PLACEHOLDER = bootstrap.secretPlaceholder || '';
         const root = document.getElementById('root');
 
     const state = Object.assign({
@@ -90,8 +90,18 @@
         return moreProviderFields().some((field) => trim(state[field.stateKey]).length > 0);
     }
 
+    // A credential prefilled from disk arrives as SECRET_PLACEHOLDER, never as
+    // the value, so "is this configured?" can no longer be answered by length.
+    // The length rule stays for what the owner types here: it is the client
+    // mirror of the server's too-short check.
+    function isConfiguredCredential(value) {
+        const text = trim(value);
+        if (!text) return false;
+        return text === SECRET_PLACEHOLDER || text.length >= 10;
+    }
+
     function hasAnthropicKeyConfigured() {
-        return trim(state.anthropicKey).length >= 10;
+        return isConfiguredCredential(state.anthropicKey);
     }
 
     function shouldShowClaudeCliCta() {
@@ -110,7 +120,7 @@
         function detectProviderProfile() {
             const configured = Object.fromEntries(PROVIDER_FIELDS.map((field) => [
                 field.settingKey,
-                trim(state[field.stateKey]).length >= 10,
+                isConfiguredCredential(state[field.stateKey]),
             ]));
             const hasOpenrouter = configured.OPENROUTER_API_KEY;
             const hasCompatible = trim(state.compatibleBaseUrl).length > 0;
@@ -312,14 +322,7 @@
         render();
     }
 
-    async function apiRequest(url, init = {}) {
-        const response = await fetch(url, init);
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok) {
-            throw new Error(data.error || `HTTP ${response.status}`);
-        }
-        return data;
-    }
+    const apiRequest = fetchJson;
 
     function applyClaudeCliStatus(payload = {}) {
         const ready = Boolean(payload.ready);
