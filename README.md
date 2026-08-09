@@ -52,7 +52,7 @@ Prerelease artifacts stay on their tag pages; `/releases/latest` points to the l
 Use your existing **Codex, Claude Code, or Cursor subscriptions** for
 delegated coding and review — Ouroboros drives them through
 [Claudexor](https://github.com/razzant/claudexor), its bundled multi-harness
-engine. Connect accounts in **Providers → Harness Accounts**; no separate
+engine. Connect accounts in **Settings → Agents**; no separate
 install is needed. Works on macOS and Linux. Release artifacts carry the exact
 reviewed engine archive; source checkouts fetch that same pinned archive on
 first use. Connecting an account installs or repairs the engine in the
