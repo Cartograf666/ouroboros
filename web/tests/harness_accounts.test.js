@@ -7,6 +7,7 @@ import {
     accountLoginConfirmed,
     accountRows,
     createClaudexorStatusStore,
+    statusUnavailableNote,
 } from '../modules/claudexor_status_store.js';
 import {
     accountRowFacts,
@@ -18,7 +19,7 @@ import {
     promptProfileName,
     quotaSummary,
     runtimeActionLabel,
-    sectionStatusLine,
+    serviceBannerLine,
     startLogin,
     verificationBadge,
 } from '../modules/harness_accounts.js';
@@ -134,13 +135,17 @@ test('both verification statuses are honest: vendor is trusted, local is neutral
         verification: 'passed', verification_source: 'vendor', last_verified_at: '2026-08-03T10:00:00Z',
     } });
     assert.equal(vendor.tone, 'ok');
-    assert.ok(vendor.label.startsWith('verified live'));
+    assert.equal(vendor.label, 'Verified live');
+    // The raw ISO instant left the badge entirely (owner: a row must never lead
+    // with a timestamp); accountMetaLine humanizes it on line 2 instead.
+    assert.doesNotMatch(vendor.label, /2026-/);
 
     const local = verificationBadge({ status: { verification: 'passed', verification_source: 'local_store' } });
     assert.equal(local.tone, 'muted');
-    assert.equal(local.label, 'local session — not verified live');
+    // Narrower claim, narrower words — shorter, but "not verified live" stays.
+    assert.equal(local.label, 'Signed in — not verified live');
 
-    assert.equal(verificationBadge({ status: {} }).label, 'not logged in');
+    assert.equal(verificationBadge({ status: {} }).label, 'Not signed in');
     assert.equal(verificationBadge({ status: { verification: 'failed', verification_source: 'vendor' } }).tone, 'error');
 });
 
@@ -152,17 +157,28 @@ test('an exhausted window is shown with its reset time, never hidden', () => {
         subject: { harness: 'codex', subject_id: 'koshak' }, freshness: 'fresh',
         constraints: [{ used_ratio: 1.0, resets_at: '2026-08-04T00:00:00Z' }],
     }];
-    const summary = quotaSummary(snapshots, 'codex', 'koshak');
+    // Owner ask: the limit text compact and understandable. The RESET is
+    // humanized against a fixed now, and the raw instant stays on `resetsAt`.
+    const now = Date.parse('2026-08-03T22:00:00Z');
+    const summary = quotaSummary(snapshots, 'codex', 'koshak', { nowMs: now });
     assert.equal(summary.exhausted, true);
     assert.equal(summary.resetsAt, '2026-08-04T00:00:00Z');
-    assert.ok(summary.label.includes('resets 2026-08-04T00:00:00Z'));
+    assert.equal(summary.label, 'Limit reached · resets in 2h');
+    assert.doesNotMatch(summary.label, /2026-/);
 
     const healthy = quotaSummary([{
         subject: { harness: 'codex' }, freshness: 'fresh', constraints: [{ used_ratio: 0.42 }],
     }], 'codex');
     assert.equal(healthy.exhausted, false);
-    assert.equal(healthy.label, '42% of window used');
-    assert.deepEqual(quotaSummary([], 'codex'), { label: '', exhausted: false, resetsAt: '' });
+    assert.equal(healthy.label, '42% used');
+    // Read, and nothing to say about THIS account: absence stated as absence.
+    assert.deepEqual(quotaSummary([], 'codex'),
+        { label: 'Usage unavailable', exhausted: false, resetsAt: '', tone: 'muted' });
+    // A REFUSED quota read licenses no usage claim at all, while the catalogue
+    // and account facets beside it stay authoritative.
+    assert.equal(quotaSummary([{
+        subject: { harness: 'codex' }, freshness: 'fresh', constraints: [{ used_ratio: 0.42 }],
+    }], 'codex', '', { quotaRead: 'failed' }).label, 'Limits not checked');
 });
 
 test('the card reads a window on the same bar the runtime dispatches on', () => {
@@ -177,7 +193,7 @@ test('the card reads a window on the same bar the runtime dispatches on', () => 
         constraints: [{ used_ratio: 1.0, resets_at: '2026-08-04T00:00:00Z' }],
     }];
     assert.deepEqual(quotaSummary(stale, 'codex', 'koshak'),
-        { label: '', exhausted: false, resetsAt: '' });
+        { label: 'Usage unavailable', exhausted: false, resetsAt: '', tone: 'muted' });
     assert.equal(quotaSummary([{ ...stale[0], freshness: 'unknown' }], 'codex', 'koshak').exhausted, false);
     assert.equal(quotaSummary([{ ...stale[0], freshness: 'fresh' }], 'codex', 'koshak').exhausted, true);
 
@@ -218,7 +234,7 @@ test('a named profile\'s exhausted window is never reported as the default accou
     ];
     const defaultRow = quotaSummary(snapshots, 'codex', '');
     assert.equal(defaultRow.exhausted, false);
-    assert.equal(defaultRow.label, '5% of window used');
+    assert.equal(defaultRow.label, '5% used');
     const namedRow = quotaSummary(snapshots, 'codex', 'koshak');
     assert.equal(namedRow.exhausted, true);
     assert.equal(namedRow.resetsAt, '2026-08-04T00:00:00Z');
@@ -241,7 +257,7 @@ test('a model-scoped window never paints the whole account exhausted — it is a
     }], 'claude', 'abstractdl');
     assert.equal(mixed.exhausted, false);
     // The account bar stays the GLOBAL window's; the spent scope is still said.
-    assert.equal(mixed.label, '40% of window used · Fable window spent');
+    assert.equal(mixed.label, '40% used · Fable window spent');
 
     // Scoped-only spent (cooldown, no ratio): the note IS the label, no red.
     const scopedOnly = quotaSummary([{
@@ -256,7 +272,8 @@ test('a model-scoped window never paints the whole account exhausted — it is a
     assert.deepEqual(quotaSummary([{
         subject, freshness: 'fresh',
         constraints: [{ label: 'Fable window', applies_to_models: ['claude-fable-5'], used_ratio: 0.8 }],
-    }], 'claude', 'abstractdl'), { label: '', exhausted: false, resetsAt: '' });
+    }], 'claude', 'abstractdl'),
+    { label: 'Usage unavailable', exhausted: false, resetsAt: '', tone: 'muted' });
 
     // A GLOBAL window (applies_to_models null/omitted = every model) keeps the
     // account-level exhausted behavior exactly as before.
@@ -265,7 +282,7 @@ test('a model-scoped window never paints the whole account exhausted — it is a
         constraints: [{ applies_to_models: null, used_ratio: 1.0, resets_at: '2026-08-08T00:00:00Z' }],
     }], 'claude', 'abstractdl');
     assert.equal(global.exhausted, true);
-    assert.ok(global.label.startsWith('window exhausted'));
+    assert.ok(global.label.startsWith('Limit reached'));
 
     // Without a label, the note falls back to the constraint id, then models.
     assert.equal(quotaSummary([{
@@ -407,7 +424,7 @@ test('account rows consume the REAL schema shape: array of {profile,status,ident
     const native = rows.find((row) => row.kind === 'native');
     assert.equal(native.harness, 'codex');  // read from harness_id (snake_case), not harnessId
     // A native login detected locally is still only local_store evidence.
-    assert.equal(verificationBadge(native).label, 'local session — not verified live');
+    assert.equal(verificationBadge(native).label, 'Signed in — not verified live');
 
     const profile = rows.find((row) => row.kind === 'profile');
     // Read from the NESTED wrapper.profile.* snake_case fields, not a flat map.
@@ -417,7 +434,7 @@ test('account rows consume the REAL schema shape: array of {profile,status,ident
     assert.equal(profile.identity.email, 'koshak@example.com');
     // The vendor-verified status flows straight through from wrapper.status.
     assert.equal(verificationBadge(profile).tone, 'ok');
-    assert.ok(verificationBadge(profile).label.startsWith('verified live'));
+    assert.equal(verificationBadge(profile).label, 'Verified live');
 });
 
 test('the invented flat camelCase shape yields NOTHING (guards against the regression)', () => {
@@ -451,11 +468,11 @@ test('DTO end-to-end: EMPTY and MULTI-ACCOUNT schema-parsed bodies', () => {
     const byId = Object.fromEntries(rows.filter((r) => r.kind === 'profile')
         .map((r) => [r.profile_id, verificationBadge(r)]));
     assert.equal(byId.koshak.tone, 'ok');                       // vendor-verified
-    assert.equal(byId.backup.label, 'local session — not verified live');
+    assert.equal(byId.backup.label, 'Signed in — not verified live');
     assert.equal(byId.main.tone, 'error');                      // vendor said failed
     // A claude native row with no login shows "not logged in", not a lie.
     const claudeNative = rows.find((r) => r.kind === 'native' && r.harness === 'claude');
-    assert.equal(verificationBadge(claudeNative).label, 'not logged in');
+    assert.equal(verificationBadge(claudeNative).label, 'Not signed in');
 });
 
 test('the attach command is DEMOTED: never a card face, only a due fallback', () => {
@@ -1058,39 +1075,69 @@ test('a harness with no row only says "no account connected" once the store was 
     // BIBLE P1 at the pixel: the owner's panel declared three harnesses empty
     // while two claude profiles, a cursor profile and two native sessions sat
     // in the agent home — a lazy daemon had simply never been asked.
-    assert.equal(bareRowStatusText('ok'), 'no account connected');
-    assert.match(bareRowStatusText('not_read'), /not checked/);
-    assert.match(bareRowStatusText('not_read'), /daemon is not running/);
+    assert.equal(bareRowStatusText('ok'), 'No account connected');
+    assert.match(bareRowStatusText('not_read'), /Not checked/);
+    // NOT READ says nobody asked. It may not name a CAUSE the row cannot
+    // see: a runtime awaiting repair and a foreign daemon on the stale port
+    // arrive here as the same unread facet, and the tab's banner owns the why.
+    assert.match(bareRowStatusText('not_read'), /daemon was never asked/);
+    assert.doesNotMatch(bareRowStatusText('not_read'), /is not running/);
     assert.match(bareRowStatusText('failed'), /did not answer/);
     assert.match(bareRowStatusText('transport'), /request did not complete/);
-    assert.equal(bareRowStatusText('unread'), 'checking…');
+    assert.equal(bareRowStatusText('unread'), 'Checking…');
     // The coarse state claims nothing beyond "the answer did not complete" —
     // it does not know which read failed, so it may not blame this one.
     assert.match(bareRowStatusText('indeterminate'), /answer did not complete/);
     assert.doesNotMatch(bareRowStatusText('indeterminate'), /not running/);
+    assert.doesNotMatch(bareRowStatusText('indeterminate'), /never asked/);
     // Each gap is its OWN sentence — collapsing them would re-create the lie.
     const gaps = ['not_read', 'failed', 'transport', 'indeterminate'].map(bareRowStatusText);
     assert.equal(new Set(gaps).size, 4);
 });
 
-test('the section line reports a REFUSED account read instead of "Claudexor ready"', () => {
+test('the ONE service banner reports a REFUSED read instead of "Claudexor ready"', () => {
     // A running daemon whose account read died would otherwise print the green
     // lifecycle line over a list that was never delivered.
-    const fakeStore = (facetState, error = '') => ({
-        facet: () => facetState,
+    // The fake wraps the REAL sentence factory: a fake that invents its own
+    // wording pins the fake, so a copy regression in the product passes green.
+    const fakeStore = (reads, error = '') => ({
+        reads,
+        facet: (name) => reads[name],
         error,
         snapshot: { daemon: { state: 'running', engine_version: '3.3.13', runtime: {} } },
         loading: false,
         everSettled: true,
-        unavailableNote: () => ({ tone: 'warn', text: 'the daemon did not answer this read', action: null }),
+        unavailableNote: (facet, { subject = '' } = {}) =>
+            statusUnavailableNote(reads[facet], { error, facet, subject }),
     });
-    assert.match(sectionStatusLine(fakeStore('failed')).text, /did not answer/);
-    assert.match(sectionStatusLine(fakeStore('transport', 'net')).text, /did not answer/);
-    // …and so does the coarse state, which is what a legacy `unreachable`
-    // answer becomes: the green line over an undelivered list is the lie.
-    assert.match(sectionStatusLine(fakeStore('indeterminate')).text, /did not answer/);
+    const all = (v) => ({ catalog: v, accounts: v, quota: v });
+    // Every facet gone the same way: ONE sentence, with the subject widened to
+    // the whole tab — naming only the accounts would under-report the gap.
+    assert.match(serviceBannerLine(fakeStore(all('failed'))).text, /could not be read/);
+    assert.match(serviceBannerLine(fakeStore(all('failed'))).text, /agents, accounts and limits/);
+    // A read that was ATTEMPTED and did not land is never dressed as a read
+    // nobody made: the calm never-asked sentence belongs to the stopped states.
+    assert.doesNotMatch(serviceBannerLine(fakeStore(all('failed'))).text, /was not asked/);
+    assert.match(serviceBannerLine(fakeStore(all('transport'), 'net')).text, /Could not read/);
+    // …and so does the COARSE state, which is what a legacy `unreachable`
+    // answer becomes: the green lifecycle line over an undelivered list is the
+    // lie, and the coarse sentence may name no facet as the culprit.
+    const coarse = serviceBannerLine(fakeStore(all('indeterminate')));
+    assert.match(coarse.text, /did not finish answering/);
+    assert.doesNotMatch(coarse.text, /Claudexor ready/);
+    assert.doesNotMatch(coarse.text, /was not asked/);
+    assert.doesNotMatch(coarse.text, /agent accounts could not be read/);
     // A healthy read keeps the existing lifecycle sentence, unchanged.
-    assert.match(sectionStatusLine(fakeStore('ok')).text, /Claudexor ready/);
+    assert.match(serviceBannerLine(fakeStore(all('ok'))).text, /Claudexor ready/);
+
+    // PER FACET, never one global verdict: a refused QUOTA read must not
+    // withdraw the catalogue's and the accounts' authority.
+    const partial = serviceBannerLine(fakeStore({ catalog: 'ok', accounts: 'ok', quota: 'failed' }));
+    assert.match(partial.text, /Your subscription limits could not be read/);
+    // The reassurance covers the facets that GENUINELY read, named one by one —
+    // "everything else" was written for a single failure and stayed true only
+    // by accident.
+    assert.match(partial.text, /Your agents and agent accounts were read normally/);
 });
 
 // ---------------------------------------------------------------------------
@@ -1127,56 +1174,66 @@ function storeWithReads(reads, extra = {}) {
     });
 }
 
-test('the ONE section line names the SECOND gap, instead of dropping it silently', async () => {
+test('the ONE banner names the SECOND gap, instead of dropping it silently', async () => {
+    // Written against the per-section status line, and kept against the tab's
+    // ONE banner that replaced it: the sections moved onto the Agents tab and
+    // the three scattered service sentences became one. The guarantee is the
+    // same and is what this pins — a surface renders several facets, and none
+    // of them may fail unmentioned. Driven through a REAL store over a stamped
+    // payload, so the whole chain (wire → facets → copy) runs.
     const quotaDied = storeWithReads({ catalog: 'ok', accounts: 'ok', quota: 'failed' });
     await quotaDied.refresh();
-    const line = sectionStatusLine(quotaDied);
-    assert.match(line.text, /Claudexor ready/, 'the accounts facet is healthy, so its own line stands');
-    assert.match(line.text, /Subscription limits were not read/, 'and the refused read is NAMED');
-    assert.match(line.text, /last known/);
+    const line = serviceBannerLine(quotaDied);
+    assert.match(line.text, /Your subscription limits could not be read/, 'the refused read is NAMED');
+    assert.match(line.text, /Your agents and agent accounts were read normally/,
+        'and the two facets that landed keep their authority, one by one');
+    assert.equal(line.tone, 'warn');
     quotaDied.dispose();
 
     const catalogDied = storeWithReads({ catalog: 'failed', accounts: 'ok', quota: 'ok' });
     await catalogDied.refresh();
-    assert.match(sectionStatusLine(catalogDied).text, /Agents were not read/);
+    assert.match(serviceBannerLine(catalogDied).text, /Your agents could not be read/);
     catalogDied.dispose();
 
     const accountsDied = storeWithReads({ catalog: 'ok', accounts: 'failed', quota: 'ok' });
     await accountsDied.refresh();
-    const accountsLine = sectionStatusLine(accountsDied);
+    const accountsLine = serviceBannerLine(accountsDied);
     assert.match(accountsLine.text, /Your agent accounts could not be read/);
     assert.doesNotMatch(accountsLine.text, /Claudexor ready/, 'never the green line over an undelivered list');
-    // A daemon that could not be read is NEVER reported as a daemon that is not
-    // running — the live endpoint answers `unreachable` for a single refused
+    // A daemon that could not be read is NEVER reported as a daemon nobody
+    // asked — the live endpoint answers `unreachable` for a single refused
     // read, and the panel used to print "the agent daemon is not running".
+    assert.doesNotMatch(accountsLine.text, /was not asked/);
     assert.doesNotMatch(accountsLine.text, /not running/);
     accountsDied.dispose();
 
-    // All three read: one sentence, nothing appended.
+    // All three read: the ordinary lifecycle sentence, nothing appended.
     const healthy = storeWithReads({ catalog: 'ok', accounts: 'ok', quota: 'ok' });
     await healthy.refresh();
-    assert.doesNotMatch(sectionStatusLine(healthy).text, /were not read/);
+    assert.match(serviceBannerLine(healthy).text, /Claudexor ready/);
+    assert.doesNotMatch(serviceBannerLine(healthy).text, /could not be read/);
     healthy.dispose();
 
-    // All three in the SAME state: the secondary subjects are STILL named.
-    // Coalescing by enum dropped them, so the panel said only "your agent
-    // accounts …" while agent discovery and the windows sat unexplained — the
-    // leading sentence is about ONE subject, whatever its state.
-    // (Here the stamp says "never asked" while the daemon reports running, so
-    // the leading line is the LIFECYCLE sentence — which describes the daemon,
-    // not this panel's reads. The accounts gap therefore joins the clause
-    // rather than vanishing under a green header.)
+    // All three in the SAME gap: ONE sentence covering all of them, never one
+    // per facet — and never the refused-read wording over a read nobody made.
     const allDown = storeWithReads({ catalog: 'not_read', accounts: 'not_read', quota: 'not_read' });
     await allDown.refresh();
-    const downLine = sectionStatusLine(allDown).text;
-    assert.match(downLine, /Agent accounts, agents and subscription limits were not read/);
+    const down = serviceBannerLine(allDown);
+    assert.match(down.text, /agents, accounts and limits/);
+    assert.equal(down.text.match(/could not be read/g), null, 'one sentence covers all three');
+    assert.doesNotMatch(down.text, /were read normally/, 'nothing left to reassure about');
     allDown.dispose();
 
     const allFailed = storeWithReads({ catalog: 'failed', accounts: 'failed', quota: 'failed' });
     await allFailed.refresh();
-    const failedLine = sectionStatusLine(allFailed).text;
-    assert.match(failedLine, /Your agent accounts could not be read/);
-    assert.match(failedLine, /Agents and subscription limits were not read/);
+    // The banner leads with no facet, so every failed subject rides ONE
+    // sentence. The rule the section line encoded — a secondary subject is
+    // never dropped because its STATE matched the primary's — survives as
+    // "all three subjects are named, once".
+    const failedLine = serviceBannerLine(allFailed).text;
+    assert.match(failedLine, /could not be read/);
+    assert.match(failedLine, /agents, accounts and limits/);
+    assert.doesNotMatch(failedLine, /were read normally/, 'nothing landed to reassure about');
     allFailed.dispose();
 });
 
@@ -1204,7 +1261,7 @@ test("the LEGACY wire's global refusal blames no facet and quotes no facet's err
         doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
     });
     await legacy.refresh();
-    const text = sectionStatusLine(legacy).text;
+    const text = serviceBannerLine(legacy).text;
     assert.doesNotMatch(text, /Your agent accounts could not be read/,
         'the ACCOUNTS read succeeded — its data is in this very payload');
     assert.doesNotMatch(text, /Agents .*were not read/,
@@ -1227,25 +1284,31 @@ test('each row projection is gated by ITS OWN facet, and a stale value says it i
         constraints: [{ used_ratio: 1.0, resets_at: '2026-08-09T12:00:00Z' }],
     }] };
 
-    // Both facets read: exactly today's row.
-    const fresh = accountRowFacts(row, payload, { accountsKnown: true, quotaKnown: true });
+    // Both facets read: exactly today's row, in the two-line anatomy — line 1
+    // the account and its status, line 2 the humanized metadata (D-10).
+    const fresh = accountRowFacts(row, payload, { accountsRead: 'ok', quotaRead: 'ok' });
     assert.equal(fresh.badge.tone, 'ok');
-    assert.match(fresh.badge.label, /^verified live/);
+    assert.equal(fresh.badge.label, 'Verified live');
+    assert.equal(fresh.name, 'Default CLI login');
     assert.equal(fresh.quota.exhausted, true);
-    assert.match(fresh.quota.label, /window exhausted/);
+    assert.match(fresh.quota.label, /^Limit reached/);
+    assert.match(fresh.meta, /Limit reached/);
 
-    // The QUOTA read refused: the window is memory, so it is labeled and it
-    // stops painting the row red — the reset it promises may already have come.
-    const staleQuota = accountRowFacts(row, payload, { accountsKnown: true, quotaKnown: false });
+    // The QUOTA read refused: nothing may be claimed about the window, so the
+    // remembered percentage is not re-shown as current — and the row stops
+    // being painted red, because the exhausted styling is a claim about RIGHT
+    // NOW and the reset it promises may already have come.
+    const staleQuota = accountRowFacts(row, payload, { accountsRead: 'ok', quotaRead: 'failed' });
     assert.equal(staleQuota.badge.tone, 'ok', 'the accounts facet is untouched by the quota gap');
     assert.equal(staleQuota.quota.exhausted, false);
-    assert.match(staleQuota.quota.label, /last known/);
+    assert.equal(staleQuota.quota.label, 'Limits not checked');
+    assert.match(staleQuota.meta, /Limits not checked/);
 
     // The ACCOUNTS read refused: the row is memory of an account, so its
     // verification claim is dated — and the window, read fine, is not.
-    const staleAccount = accountRowFacts(row, payload, { accountsKnown: false, quotaKnown: true });
+    const staleAccount = accountRowFacts(row, payload, { accountsRead: 'failed', quotaRead: 'ok' });
     assert.match(staleAccount.badge.label, /last known/);
-    assert.equal(staleAccount.badge.tone, 'muted', 'no green "verified live" over a read that never landed');
+    assert.equal(staleAccount.badge.tone, 'muted', 'no green "Verified live" over a read that never landed');
     assert.equal(staleAccount.quota.exhausted, true);
     assert.doesNotMatch(staleAccount.quota.label, /last known/);
 

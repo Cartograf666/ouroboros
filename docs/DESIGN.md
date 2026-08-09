@@ -154,17 +154,28 @@ derived from whatever generic opacity happens to sit on the element.
 For a repeated identity row (a connected agent account, a reviewer slot,
 a server entry):
 
-1. **Classification chip** — neutral pair, `--type-meta`.
+1. **Classification chip** — neutral pair, `--type-meta`. Only where the row's
+   family is not already expressed by the group it sits in; inside a per-family
+   card the chip repeats the header and is dropped.
 2. **Name** — `--type-body` semibold, `--text-primary`. The one primary thing.
 3. **Identity detail** (email, plan) — `--type-meta`, `--text-meta`.
 4. **Status** — dot + text from the status pairs.
-5. **Actions** — docked right, legible at rest. A control rendered at
+5. **Meta line** — `--type-meta`, `--text-meta`, on its own line under the
+   name. Quantities are stated in human words ("38% used · resets in 2h"), and
+   an instant is humanized. A row never leads with a raw ISO timestamp.
+6. **Actions** — docked right, legible at rest. A control rendered at
    secondary ink reads as disabled; if the owner can click it, it is
    `--text-primary`.
 
 Rows of the same kind are equivalent: no row gets extra visual weight for
 being first, default, or native. Grouping and section-level actions express
-which family a row belongs to.
+which family a row belongs to, and a section-level action (add, connect)
+belongs in its group's header rather than attached to one privileged row.
+
+**A degraded row is emphasised, not dimmed.** Lowering a whole row's opacity
+greys out the sentence that reports the problem and makes its still-clickable
+controls read as disabled. Tint the row with the matching `--status-*-bg`
+instead, and let the status text carry the claim.
 
 ## 7. Onboarding density
 

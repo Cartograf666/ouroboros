@@ -553,7 +553,11 @@ def test_legacy_session_row_with_no_shared_route_is_empty_not_a_model(monkeypatc
 def test_all_delegated_commit_surface_discloses_the_api_fallback(monkeypatch):
     """Claim 1: when every commit/scope row is delegated the API-pinned surfaces
     fall back to default models and spend budget — disclosed, never silent, and
-    the save is NOT blocked (recommendation A, reversible default)."""
+    the save is NOT blocked (recommendation A, reversible default).
+
+    The disclosure is NEUTRAL routing information, not advice: an
+    all-subscription triad IS the ratified default (D-3), so the sentence must
+    not tell the owner to keep an API row and undo it."""
     from ouroboros.config import SETTINGS_DEFAULTS
     from ouroboros.reviewer_slot_config import (
         api_fallback_disclosure,
@@ -573,7 +577,16 @@ def test_all_delegated_commit_surface_discloses_the_api_fallback(monkeypatch):
 
     _set_structured(monkeypatch, payload)
     warning = reviewer_slot_api_fallback_warning()
-    assert warning and "fall back" in warning and "commit review" in warning
+    assert warning and "commit review" in warning and "scope review" in warning
+    # It names both halves of the routing fact: what moved to subscriptions,
+    # and which surfaces the API still serves with which models.
+    assert "agent subscription" in warning
+    assert "Plan review, task acceptance and skill review" in warning
+    assert str(SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"]).split(",")[0] in warning
+    # The retired advice: telling the owner to keep an API reviewer row
+    # contradicts the ratified all-subscription default.
+    assert "Keep at least one API" not in warning
+    assert "coding agent" not in warning
     # The projection still keeps the reviewers WORKING (defaults present), and
     # writes the durable record — disclose-and-continue, never a block.
     import os as _os

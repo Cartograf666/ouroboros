@@ -510,6 +510,25 @@ class ClaudexorGateway:
         )
         return body if isinstance(body, dict) else {}
 
+    def delete_credential_profile(self, harness_id: str, profile_id: str) -> Dict[str, Any]:
+        """DELETE /v2/credential-profiles/:harness/:profileId — the engine's own
+        removal contract for a NAMED account.
+
+        Ouroboros never deletes vendor credential material itself: the daemon
+        owns the profile record and whatever it stored for it, so removal is a
+        request to that owner and its refusal is the answer. There is no
+        counterpart for a native CLI login — that account belongs to the
+        vendor's own CLI, and simulating a sign-out here would claim an effect
+        this process cannot have."""
+        from urllib.parse import quote
+
+        body = self._request(
+            "DELETE",
+            f"/v2/credential-profiles/{quote(str(harness_id), safe='')}"
+            f"/{quote(str(profile_id), safe='')}",
+        )
+        return body if isinstance(body, dict) else {}
+
     def harness_models(self, harness_id: str) -> List[Dict[str, Any]]:
         """GET /v2/harnesses/:id/models — the discovered model list (owner
         directive: models are a dropdown fed by discovery, never free input)."""

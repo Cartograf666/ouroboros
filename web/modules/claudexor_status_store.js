@@ -1,7 +1,7 @@
 // ONE client-side store over `GET /api/claudexor/status` (phase 2 seam).
 //
 // Three surfaces used to read this endpoint independently — the Harness
-// Accounts panel polled it every 5s, Reviewer Slots fetched it once per
+// Accounts panel polled it every 5s, the review-lanes panel fetched it once per
 // settings load, Subagents fetched it once more — so the app held three
 // copies of the same truth, three failure handlings, and three staleness
 // clocks. Worse, each of them mapped "we could not ask" onto the SAME empty
@@ -154,10 +154,12 @@ export function shouldPollStatus({
     return Boolean(held || surfaceVisible);
 }
 
-// What each facet is CALLED in a sentence to the owner. NOT "coding agents":
-// the owner retired that word for new copy because these agents are used for
-// far more than code (D-10).
-const FACET_SUBJECT = {
+// What each facet is CALLED in a sentence to the owner. "agent", never "coding
+// agent" (D-10): the same subscriptions run presentations, research and any
+// other task, so the narrower word describes only one of their uses. Exported
+// because the Agents tab's single banner speaks for SEVERAL facets at once and
+// has to name them in the store's own words rather than invent a second set.
+export const FACET_SUBJECT = {
     [FACET_CATALOG]: 'agents',
     [FACET_ACCOUNTS]: 'agent accounts',
     [FACET_QUOTA]: 'subscription limits',
@@ -200,7 +202,9 @@ export function facetGapClause(reads, facets = []) {
         + 'shown for them is last known.';
 }
 
-export function statusUnavailableNote(readState, { error = '', facet = FACET_ACCOUNTS } = {}) {
+export function statusUnavailableNote(readState, {
+    error = '', facet = FACET_ACCOUNTS, subject = '',
+} = {}) {
     // ONE sentence per read state, shared by every consumer, so the app cannot
     // explain the same gap three different ways. `null` = nothing to say.
     //
@@ -211,7 +215,10 @@ export function statusUnavailableNote(readState, { error = '', facet = FACET_ACC
     // a surface that already renders `note.action` needs no rewrite. Shape:
     // `{ kind, label, run }` — `kind` names the action, `label` is the button
     // text, `run()` performs it and resolves once the store has re-read.
-    const subject = FACET_SUBJECT[facet] || FACET_SUBJECT[FACET_ACCOUNTS];
+    // `subject` overrides the per-facet noun for a caller that speaks for MORE
+    // than one facet — the Agents tab's single banner, when every facet failed
+    // the same way and naming just one of them would under-report the gap.
+    subject = subject || FACET_SUBJECT[facet] || FACET_SUBJECT[FACET_ACCOUNTS];
     if (readState === READ_TRANSPORT) {
         return {
             tone: 'error', action: null,
@@ -221,11 +228,18 @@ export function statusUnavailableNote(readState, { error = '', facet = FACET_ACC
         };
     }
     if (readState === READ_NOT_READ) {
+        // "NOT ASKED" is what this state actually establishes, and it is the
+        // only cause this sentence may name. Saying "the daemon is not running"
+        // asserted a diagnosis the read state does not carry: a runtime that
+        // needs repair, a foreign daemon on the stale port and an ownership
+        // problem all land here too, and once the backend stamps `reads`
+        // per facet a RUNNING daemon can leave one facet unasked. The banner
+        // above (and only it) explains WHY nobody asked.
         return {
             tone: 'muted', action: null,
-            text: `Ouroboros’s agent daemon is not running, so your ${subject} were never `
+            text: `Ouroboros’s agent daemon was not asked, so your ${subject} were never `
                 + 'checked. Nothing below is missing or wrong — your saved choices are '
-                + 'unchanged, and the daemon starts automatically on the next login or '
+                + 'unchanged, and the daemon is asked again on the next login or '
                 + 'delegated run.',
         };
     }
@@ -421,7 +435,7 @@ export function createClaudexorStatusStore({
         }
         // A hidden page pauses EVERY reason to poll, a held login included:
         // nothing is on screen to update, and the daemon read is expensive
-        // (it re-probes each coding-agent CLI).
+        // (it re-probes each agent CLI).
         return shouldPollStatus({
             hasSubscribers: inner.listeners.size > 0,
             hidden: Boolean(document_ && document_.hidden),
@@ -616,7 +630,7 @@ export function createClaudexorStatusStore({
         get polling() { return Boolean(inner.timer); },
         get subscriberCount() { return inner.listeners.size; },
         facet,
-        unavailableNote(name = FACET_ACCOUNTS) {
+        unavailableNote(name = FACET_ACCOUNTS, { subject = '' } = {}) {
             // The detail beside the sentence: a transport error when the request
             // itself died, otherwise — for an answer that did not land — the
             // daemon's OWN last_error. On a legacy payload that string is the
@@ -628,11 +642,18 @@ export function createClaudexorStatusStore({
             // this whole derivation exists to prevent.
             // Deliberately NOT attached to `not_read`: the stopped-daemon line
             // stays calm on purpose (a crashed daemon also lands in `stale`).
+            //
+            // `subject` widens the noun for a caller that speaks for SEVERAL
+            // facets at once (the Agents tab's single banner). It rides through
+            // this method rather than around it precisely so that caller keeps
+            // the detail resolution above — a banner that assembled the sentence
+            // itself printed "could not be read" over an `unreachable` daemon
+            // and silently dropped the one explanation the owner had.
             const state = facet(name);
             const daemonError = String(inner.snapshot?.daemon?.last_error || '');
             const detail = inner.error
                 || (state === READ_FAILED || state === READ_INDETERMINATE ? daemonError : '');
-            return statusUnavailableNote(state, { error: detail, facet: name });
+            return statusUnavailableNote(state, { error: detail, facet: name, subject });
         },
         refresh,
         subscribe,

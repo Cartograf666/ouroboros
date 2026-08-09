@@ -1,12 +1,12 @@
-"""Harness Accounts HTTP surface (D30): three THIN proxies, zero auth logic.
+"""Agent accounts HTTP surface (D30): four THIN proxies, zero auth logic.
 
 Ouroboros's own Claudexor daemon (``claudexor_daemon.py``) owns every account
 fact — profiles, login jobs, device-code custody, the two honest verification
 statuses, quota windows. The browser cannot talk to the daemon directly (its
 control plane is loopback-Origin-guarded and bearer-token'd; the token must
 never reach a page), so these handlers translate: status aggregation, login
-job create, login job read/cancel. Nothing here interprets a credential and
-nothing here stores one.
+job create, login job read/cancel, and credential-profile removal. Nothing
+here interprets a credential and nothing here stores one.
 
 Login shapes ("красота-сначала", D30): a structural link/device-code card
 wherever the engine can host the flow itself — codex device-code today, and
@@ -145,7 +145,7 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
             payload["daemon"]["engine_version"] = gateway.engine_version
             # The catalog, manifest, profile and quota reads are INDEPENDENT GETs
             # over one thread-safe httpx client, and each costs SECONDS daemon-side
-            # (it probes the real coding-agent CLIs on every read: binary, version,
+            # (it probes the real agent CLIs on every read: binary, version,
             # login state). Serialized, the panel waited for their SUM — ~23s on a
             # warm daemon with nothing on screen; fanned out it waits for the
             # slowest. Failure semantics are deliberately unchanged: the results are
@@ -411,7 +411,44 @@ async def api_claudexor_login_job(request: Request) -> JSONResponse:
         return json_error(f"{type(exc).__name__}: Claudexor login job {op} failed")
 
 
+def _remove_credential_profile(harness: str, profile_id: str) -> Dict[str, Any]:
+    from ouroboros.claudexor_daemon import owned_config_dir
+    from ouroboros.gateways.claudexor import ClaudexorGateway, discover_daemon_at
+
+    endpoint = discover_daemon_at(owned_config_dir())
+    with ClaudexorGateway(endpoint) as gateway:
+        gateway.handshake()
+        gateway.delete_credential_profile(harness, profile_id)
+    return {"ok": True, "harness": harness, "profile_id": profile_id}
+
+
+async def api_claudexor_credential_profile(request: Request) -> JSONResponse:
+    """DELETE /api/claudexor/credential-profiles/{harness}/{profile_id}.
+
+    A FOURTH thin proxy, same rule as the other three: the daemon owns the
+    account record, so removing one is its own contract
+    (``DELETE /v2/credential-profiles/:harness/:profileId``) and its refusal is
+    the answer. Nothing here touches a vendor credential file — a native CLI
+    login has no route because this process cannot honestly sign it out.
+    """
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    harness = str(request.path_params.get("harness") or "").strip()
+    profile_id = str(request.path_params.get("profile_id") or "").strip()
+    if not harness or not profile_id:
+        return json_error("harness and profile_id are required", 400)
+    try:
+        return JSONResponse(
+            await asyncio.to_thread(_remove_credential_profile, harness, profile_id))
+    except ClaudexorUnavailable as exc:
+        return json_error(f"{exc.code}: {exc}", 503)
+    except Exception as exc:
+        log.exception("api_claudexor_credential_profile failed")
+        return json_error(f"{type(exc).__name__}: Claudexor account removal failed")
+
+
 __all__ = [
+    "api_claudexor_credential_profile",
     "api_claudexor_login",
     "api_claudexor_login_job",
     "api_claudexor_status",

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createClaudexorStatusStore } from '../modules/claudexor_status_store.js';
+import { serviceBannerLine } from '../modules/harness_accounts.js';
 
 import {
     API_ROUTE_CHOICE,
@@ -17,12 +18,42 @@ import {
     harnessModelsKnown,
     mintSlotId,
     modelsGapNote,
+    pinnedAccountWarning,
     profileOptionsFor,
+    renderReviewerSlotsSection,
     routeChoiceGroups,
-    reviewerServiceNote,
     sessionModelOptions,
     splitSessionTarget,
 } from '../modules/reviewer_slots.js';
+
+
+test('the standing note states the POLICY, never the current routing', () => {
+    // The section's inline note is STATIC markup: it renders identically for an
+    // owner with three subscriptions and for one with none, whose every row is
+    // an API model. It used to open "Commit and scope review run on
+    // subscriptions and never fall back to API spend", so the second owner read
+    // Settings and believed their commit reviews were spending subscription
+    // windows and would wait for capacity — while in fact they were spending
+    // API budget on the next commit (BIBLE P1). The conditional version of that
+    // claim already exists server-side, emitted only when the configuration
+    // really is all-delegated (`reviewer_slot_config._fallback_warning_text`);
+    // a static copy of it cannot carry the condition, so it must state the rule
+    // instead of the situation.
+    const markup = renderReviewerSlotsSection();
+
+    // The section ships with NO rows — they are painted from the saved setting
+    // at runtime — so this is exactly the markup an all-API owner sees.
+    assert.doesNotMatch(markup, /data-route-kind|session:/,
+        'the static section must not ship a pre-rendered row');
+
+    assert.match(markup, /Rows routed to a subscription never fall back to API spend/);
+    assert.match(markup, /waits for capacity/);
+    // The unconditional claim, in the shapes it could come back as.
+    assert.doesNotMatch(markup, /review runs? on subscriptions/i);
+    assert.doesNotMatch(markup, /reviews? run on your subscription/i);
+    // The API-only surfaces sentence is unconditional AND true, so it stays.
+    assert.match(markup, /API-only surfaces today/);
+});
 
 
 test('a saved account pin survives a discovery list that no longer contains it', () => {
@@ -352,11 +383,13 @@ test('facets are independent: an unread ACCOUNT store does not silence the CATAL
     assert.deepEqual(pins.map((o) => o.value), ['', 'koshak']);
 });
 
-test('the ONE service note explains the catalog gap AND names the account gap', async () => {
+test('neither facet gap is dropped: the tab banner names it and the section claims nothing', async () => {
     // This section renders two facets — the route/model lists from the catalog,
-    // the account pins from the credential profiles — but the note consulted the
-    // catalog alone. A refused ACCOUNT read left pins on screen with nothing on
-    // the page saying they could not be checked.
+    // the account pins from the credential profiles — and a gap in EITHER used
+    // to vanish. The sentence now belongs to the tab's ONE service banner (the
+    // sections moved onto the Agents tab, and three scattered service notes
+    // became one); what this section owes is the other half of the same rule —
+    // making no claim the unread facet never licensed.
     const store = (reads) => createClaudexorStatusStore({
         fetchImpl: async () => ({
             ok: true,
@@ -365,21 +398,35 @@ test('the ONE service note explains the catalog gap AND names the account gap', 
         }),
         doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
     });
+    const pins = (accountsKnown) => profileOptionsFor(['koshak'], 'gone', { accountsKnown });
+    const pinnedRows = {
+        triad: [{ slot_id: 't1', route: { kind: ROUTE_KIND_SESSION, target_id: 'cursor:x', profile_id: 'gone' } }],
+        profilesByHarness: { cursor: ['koshak'] },
+    };
 
     const accountsDied = store({ catalog: 'ok', accounts: 'failed', quota: 'ok' });
     await accountsDied.refresh();
-    const onlyAccounts = reviewerServiceNote(accountsDied);
-    assert.match(onlyAccounts.text, /Agent accounts were not read/);
-    assert.match(onlyAccounts.text, /last known/);
+    assert.match(serviceBannerLine(accountsDied).text, /Your agent accounts could not be read/,
+        'the banner NAMES the gap this section would otherwise have dropped');
+    // …and the rows say nothing they did not earn: a pin is not "gone" because
+    // nobody could ask, and the missing-account warning stays silent.
+    assert.doesNotMatch(pins(accountsDied.accountsKnown)[1].label, /not in discovery/);
+    assert.equal(pinnedAccountWarning({ ...pinnedRows, accountsKnown: accountsDied.accountsKnown }), '');
     accountsDied.dispose();
 
     const catalogDied = store({ catalog: 'failed', accounts: 'ok', quota: 'ok' });
     await catalogDied.refresh();
-    const onlyCatalog = reviewerServiceNote(catalogDied);
-    assert.match(onlyCatalog.text, /Your agents could not be read/);
-    assert.doesNotMatch(onlyCatalog.text, /Agent accounts were not read/, 'a healthy facet is not accused');
-    // …and a read that merely did not land never claims a stopped daemon.
-    assert.doesNotMatch(onlyCatalog.text, /not running/);
+    const catalogLine = serviceBannerLine(catalogDied);
+    assert.match(catalogLine.text, /Your agents could not be read/);
+    assert.doesNotMatch(catalogLine.text, /agent accounts could not be read/, 'a healthy facet is not accused');
+    // …and a read that merely did not land never claims nobody asked.
+    assert.doesNotMatch(catalogLine.text, /was not asked/);
+    // The route select points at that one sentence instead of writing a second.
+    const empty = routeChoiceGroups({ harnesses: [], catalogKnown: catalogDied.catalogKnown })[1].options[0];
+    assert.match(empty.label, /see the service banner above/);
+    // With the accounts read, the SAME pin is now genuinely missing and says so.
+    assert.match(pinnedAccountWarning({ ...pinnedRows, accountsKnown: catalogDied.accountsKnown }),
+        /pinned to an account the agent service no longer lists/);
     catalogDied.dispose();
 
     // Both facets in the SAME state: the account pins are STILL named. They
@@ -388,13 +435,14 @@ test('the ONE service note explains the catalog gap AND names the account gap', 
     // not equal subject.
     const both = store({ catalog: 'not_read', accounts: 'not_read', quota: 'not_read' });
     await both.refresh();
-    const bothNote = reviewerServiceNote(both);
-    assert.match(bothNote.text, /daemon is not running/);
-    assert.match(bothNote.text, /Agent accounts were not read/);
+    const bothLine = serviceBannerLine(both);
+    assert.match(bothLine.text, /daemon was not asked/);
+    assert.equal(bothLine.text.match(/could not be read/g), null, 'one sentence covers both');
     both.dispose();
 
     const healthy = store({ catalog: 'ok', accounts: 'ok', quota: 'ok' });
     await healthy.refresh();
-    assert.equal(reviewerServiceNote(healthy), null, 'nothing to say when everything was read');
+    assert.doesNotMatch(serviceBannerLine(healthy).text, /could not be read/,
+        'nothing to say when everything was read');
     healthy.dispose();
 });

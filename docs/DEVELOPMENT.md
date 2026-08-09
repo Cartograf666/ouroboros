@@ -1012,11 +1012,18 @@ Before every commit, verify the following:
   "Off" false claims. The v6.22.1-era rule that the empty runtime-default must
   not become a third owner-facing button was valid only while the unset default
   was binary per mode; the v6.91 surface-aware light default obsoleted it.
-- One capability, one section. Delegation (`OUROBOROS_SUBAGENT_HARNESS`) and the
-  write permission (`OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`) share Models → Subagents
-  (`web/modules/subagents_settings.js`), beside Reviewer Slots: both answer "where
-  and how far do subagents run". Never render a second control over the same
-  settings key — two controls carry two drafts, and the last one collected wins.
+- One capability, one section. The whole subagent story lives in Agents →
+  Delegation (`web/modules/subagents_settings.js`), beside Review lanes: the
+  route (`OUROBOROS_SUBAGENT_HARNESS`), the write permission
+  (`OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS`), and the two counts that bound it
+  (`OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT`, `OUROBOROS_MAX_SUBAGENT_DEPTH`),
+  with the two path roots behind a collapsed Advanced disclosure. They all answer
+  "where and how far do subagents run"; `OUROBOROS_MAX_WORKERS` stays in Advanced
+  because it sizes the process pool, not the agents. Never render a second control
+  over the same settings key — two controls carry two drafts, and the last one
+  collected wins, and a MOVE that leaves the old markup behind is exactly how a
+  duplicate appears (`tests/test_agents_tab_static.py` pins each moved id to one
+  occurrence).
   The delegated-run MODEL is the owner's default, authored here as the `=model`
   tail of the same key from engine discovery ("Engine default model" = empty
   tail); reasoning effort stays derived per call, and a hand-written `:effort`
@@ -1055,12 +1062,15 @@ Before every commit, verify the following:
   exported back to it; the generic save's merge skip-list reads the same set.
   Blocking only the request body is not enough — an install-time fact that the
   environment can supply closes its own window before the endpoint runs.
-- A control the owner cannot use is worse than none. With no coding-agent
-  subscription connected the Subagents section says so and points at Providers →
-  Harness Accounts instead of rendering a delegation toggle whose every dispatch
-  would silently fall back to an API child. Harness lists come from the accounts
-  panel's own source (`accountRows` over `/api/claudexor/status`) — one catalog
-  path, one login-capable discriminator.
+- A control the owner cannot use is worse than none. With no agent subscription
+  connected the Delegation section says so and points at Accounts in the same tab
+  instead of rendering a delegation toggle whose every dispatch would silently
+  fall back to an API child. Harness lists come from the accounts panel's own
+  source (`accountRows` over `/api/claudexor/status`) — one catalog path, one
+  login-capable discriminator.
+- Owner-facing copy says "agent", never "coding agent" (D-10, owner verbatim:
+  the same subscriptions build presentations and run arbitrary tasks). Product
+  names — Claude Code, Codex, Cursor — are trademarks and stay as they are.
 
 #### LLM Call Rules
 - [ ] New LLM calls go through the shared `LLMClient` / `llm.py` layer — no ad-hoc HTTP clients or direct provider SDKs outside that layer. **Exception (v5.7.0+):** skill / extension `plugin.py` modules may call providers directly because they have not yet been migrated to a host-mediated `api.invoke_llm(...)` bridge. When that bridge lands, the exception goes away. Runtime callers (anything inside `ouroboros/`) must still use `LLMClient`.

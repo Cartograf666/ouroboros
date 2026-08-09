@@ -156,6 +156,39 @@
     padding-top: 18px;
 }
 
+/* Collapsed subsection INSIDE a form section (Agents → Delegation → Advanced):
+   the same "More options" grammar as the provider wrapper above, one step
+   quieter because it sits within a section rather than beside cards. Two path
+   roots nobody edits in a normal week must not cost the tab its scannability. */
+.settings-subsection > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 8px 0;
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    color: var(--text-meta);
+    border-top: 1px solid var(--divider);
+}
+
+.settings-subsection > summary::-webkit-details-marker {
+    display: none;
+}
+
+.settings-subsection > summary::before {
+    content: "▸ ";
+}
+
+.settings-subsection[open] > summary::before {
+    content: "▾ ";
+}
+
+.settings-subsection-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 4px 0 8px;
+}
+
 .settings-extension-sections {
     display: flex;
     flex-direction: column;

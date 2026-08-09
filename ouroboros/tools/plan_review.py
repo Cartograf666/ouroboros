@@ -1400,7 +1400,7 @@ async def _run_plan_review_async(
         return _plan_unavailable(
             ctx,
             f"ERROR: Invalid reviewer-slot configuration blocks plan review — {err}. "
-            "Fix Reviewer Slots in Settings.",
+            "Fix Review lanes on the Agents tab in Settings.",
             "reviewer_slot_config_invalid")
     if not list(_cfg.get_review_models() or []):
         return _plan_unavailable(

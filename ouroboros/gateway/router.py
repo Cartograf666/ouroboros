@@ -62,6 +62,7 @@ def collect_routes(
         api_ouroboroshub_update,
     )
     from ouroboros.gateway.claudexor_accounts import (
+        api_claudexor_credential_profile,
         api_claudexor_login,
         api_claudexor_login_job,
         api_claudexor_status,
@@ -254,8 +255,8 @@ def collect_routes(
         Route("/api/mcp/status", endpoint=api_mcp_status, methods=["GET"]),
         Route("/api/mcp/refresh", endpoint=api_mcp_refresh, methods=["POST"]),
         Route("/api/mcp/test", endpoint=api_mcp_test, methods=["POST"]),
-        # Harness Accounts (D30): three thin proxies of the owned Claudexor
-        # daemon's own account surface; zero auth logic on this side.
+        # Agent accounts (D30): thin proxies of the owned Claudexor daemon's
+        # own account surface; zero auth logic on this side.
         Route("/api/reviewer-slots", endpoint=api_reviewer_slots, methods=["GET"]),
         Route("/api/claudexor/status", endpoint=api_claudexor_status, methods=["GET"]),
         Route("/api/claudexor/login", endpoint=api_claudexor_login, methods=["POST"]),
@@ -268,6 +269,11 @@ def collect_routes(
             "/api/claudexor/login/{job_id}/input",
             endpoint=api_claudexor_login_job,
             methods=["POST"],
+        ),
+        Route(
+            "/api/claudexor/credential-profiles/{harness}/{profile_id}",
+            endpoint=api_claudexor_credential_profile,
+            methods=["DELETE"],
         ),
         WebSocketRoute("/ws", endpoint=ws_endpoint),
     ]

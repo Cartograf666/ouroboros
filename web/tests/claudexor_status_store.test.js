@@ -149,15 +149,31 @@ test('unreachable is NOT stopped: only a genuinely stopped daemon gets the stopp
     for (const state of DAEMON_STATES_STOPPED) {
         assert.deepEqual(readsFor(payloadOf({ state })),
             { catalog: READ_NOT_READ, accounts: READ_NOT_READ, quota: READ_NOT_READ },
-            `${state} genuinely means not running`);
-        assert.match(statusUnavailableNote(READ_NOT_READ).text, /daemon is not running/);
+            `${state} genuinely means nobody was asked`);
+        // The CALM sentence, and it stops at what this state establishes:
+        // nobody asked. WHY nobody asked — a stopped daemon, a runtime awaiting
+        // repair, a foreign daemon on the stale port, an ownership problem — is
+        // the tab banner's job, because only the daemon state can tell those
+        // apart and `foreign_daemon` lands here with a daemon that IS running.
+        assert.match(statusUnavailableNote(READ_NOT_READ).text, /daemon was not asked/);
+        assert.doesNotMatch(statusUnavailableNote(READ_NOT_READ).text, /could not be read/);
     }
     // …and the WORDING per state, which is what the owner actually reads.
     const wording = (state) => statusUnavailableNote(
         facetReadState(payloadOf({ state }), FACET_ACCOUNTS), { facet: FACET_ACCOUNTS }).text;
-    assert.match(wording('stale'), /daemon is not running/);
+    // A stopped daemon is the calm branch — and it still names no diagnosis:
+    // "was not asked" is all this read state establishes.
+    assert.match(wording('stale'), /daemon was not asked/);
+    assert.doesNotMatch(wording('stale'), /not running/);
+    // A global refusal is the coarse state, not the calm one: a read that DID
+    // happen and did not land must never be dressed as a read nobody
+    // attempted, and it may not claim the daemon is down either.
+    assert.match(wording('unreachable'), /did not finish answering/);
+    assert.doesNotMatch(wording('unreachable'), /was not asked/);
     assert.doesNotMatch(wording('unreachable'), /not running/);
+    assert.doesNotMatch(wording('error'), /was not asked/);
     assert.doesNotMatch(wording('error'), /not running/);
+    assert.doesNotMatch(wording(''), /was not asked/);
     assert.doesNotMatch(wording(''), /not running/);
     assert.equal(statusUnavailableNote(facetReadState(payloadOf({ state: 'running' }), FACET_ACCOUNTS)), null);
 });
@@ -258,7 +274,12 @@ test('a surface renders more than one facet, and the note names the second gap t
 
 test('each unavailable read state has ONE shared sentence, and an ok read has none', () => {
     const down = statusUnavailableNote(READ_NOT_READ);
-    assert.match(down.text, /daemon is not running/);
+    // NOT READ = never asked. It is NOT a diagnosis: a runtime that needs
+    // repair, a foreign daemon and an ownership problem all land here, and
+    // once the backend stamps `reads` per facet a RUNNING daemon can leave
+    // one facet unasked. Naming a cause here would be a lie in all four cases.
+    assert.match(down.text, /daemon was not asked/);
+    assert.doesNotMatch(down.text, /is not running/);
     assert.match(down.text, /saved choices are unchanged/);
     assert.doesNotMatch(down.text, /not in discovery/);
 
@@ -279,8 +300,6 @@ test('each unavailable read state has ONE shared sentence, and an ok read has no
     // refused", "the answer did not complete and we cannot say which read".
     assert.equal(new Set([down.text, dead.text, refused.text, coarse.text]).size, 4);
 
-    // D-10: the owner retired "coding agents" for new copy — these agents are
-    // used for far more than code.
     assert.match(statusUnavailableNote(READ_UNREAD).text, /Reading your agent accounts/);
     assert.equal(statusUnavailableNote(READ_OK), null);
     for (const state of [READ_NOT_READ, READ_FAILED, READ_TRANSPORT, READ_UNREAD, READ_INDETERMINATE]) {
@@ -290,7 +309,10 @@ test('each unavailable read state has ONE shared sentence, and an ok read has no
     }
 
     // The note names the facet it is about, so three surfaces can share it.
-    assert.match(statusUnavailableNote(READ_NOT_READ, { facet: FACET_CATALOG }).text, /your agents/);
+    // D-10: the subject is "agents", not "coding agents" — the same
+    // subscriptions build presentations and run arbitrary tasks.
+    assert.match(statusUnavailableNote(READ_NOT_READ, { facet: FACET_CATALOG }).text, /your agents were never checked/);
+    assert.doesNotMatch(statusUnavailableNote(READ_NOT_READ, { facet: FACET_CATALOG }).text, /coding/);
     assert.match(statusUnavailableNote(READ_NOT_READ, { facet: FACET_QUOTA }).text, /subscription limits/);
 
     // The ACTION slot exists and is empty on this branch — an owner action that
@@ -320,9 +342,9 @@ test('the store says the right sentence for EVERY daemon state it can be served'
     // and the panel announced a daemon that was not running.
     const cases = [
         ['running', READ_OK, null],
-        ['stale', READ_NOT_READ, /daemon is not running/],
-        ['not_provisioned', READ_NOT_READ, /daemon is not running/],
-        ['foreign_daemon', READ_NOT_READ, /daemon is not running/],
+        ['stale', READ_NOT_READ, /daemon was not asked/],
+        ['not_provisioned', READ_NOT_READ, /daemon was not asked/],
+        ['foreign_daemon', READ_NOT_READ, /daemon was not asked/],
         ['unreachable', READ_INDETERMINATE, /did not finish answering/],
         ['error', READ_INDETERMINATE, /did not finish answering/],
         ['', READ_INDETERMINATE, /did not finish answering/],
@@ -341,8 +363,8 @@ test('the store says the right sentence for EVERY daemon state it can be served'
         } else {
             assert.match(note.text, wording, `daemon.state=${daemonState}`);
             if (expected !== READ_NOT_READ) {
-                assert.doesNotMatch(note.text, /not running/,
-                    `daemon.state=${daemonState} must not claim a stopped daemon`);
+                assert.doesNotMatch(note.text, /was not asked/,
+                    `daemon.state=${daemonState} was asked — it just did not answer`);
             }
         }
         store.dispose();
@@ -470,8 +492,8 @@ test('includeModels is sticky-upgrading: no later read downgrades the shared sna
         fetchImpl: async (url) => { urls.push(url); await gate; return okResponse(RUNNING); },
         doc: fakeDoc(),
     });
-    // The accounts panel's model-less poll is in flight when the Models tab
-    // asks for discovery: the upgrade cannot be served by that request, so ONE
+    // The accounts panel's model-less poll is in flight when the review-lane
+    // rows ask for discovery: the upgrade cannot be served by that request, so ONE
     // follow-up is queued — and every upgrading caller shares it.
     const plain = store.refresh();
     const upgrade = [store.refresh({ includeModels: true }), store.refresh({ includeModels: true })];
@@ -482,7 +504,7 @@ test('includeModels is sticky-upgrading: no later read downgrades the shared sna
     assert.equal(store.includesModels, true);
 
     // Sticky: a later plain refresh KEEPS models rather than downgrading the
-    // snapshot the Models tab depends on.
+    // snapshot the review-lane and delegation selects depend on.
     await store.refresh();
     assert.equal(urls.at(-1), '/api/claudexor/status?include=models');
     assert.equal(store.includesModels, true);
