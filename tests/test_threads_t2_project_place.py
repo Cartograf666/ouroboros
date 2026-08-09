@@ -14,6 +14,7 @@ Sibling coverage: the entry-point admissions live in
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import types
@@ -87,6 +88,173 @@ def test_attach_refuses_a_folder_nested_in_another_repository(tmp_path):
     )
     assert enclosing_git_worktree(owner_repo) == ""
     assert enclosing_git_worktree(plain) == ""
+
+
+def test_containment_survives_a_git_that_refuses_to_answer(tmp_path, monkeypatch):
+    """The guard must not FAIL OPEN. It used to read `git rev-parse` and treat every
+    non-zero exit as "nothing encloses this" — but git exits non-zero for reasons
+    that have nothing to do with containment: `safe.directory` refusing a
+    foreign-owned repo, an older git refusing unknown `extensions.*` (a sha256 or
+    reftable repo), a hostile `[include]` stalling past the timeout. Each one turned
+    UNKNOWN into ADMIT and let through exactly the nested shape the guard exists to
+    refuse. The answer now comes off the filesystem, which always has one."""
+    from ouroboros.project_sources import enclosing_git_worktree, validate_attach_path
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    owner_repo, subdir = _repo_with_subdir(tmp_path)
+
+    # A `git` that answers rc=128 the way the dubious-ownership refusal does, and
+    # one that never answers at all.
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    for name, body in (
+        ("git", "#!/bin/sh\necho 'fatal: detected dubious ownership' >&2\nexit 128\n"),
+    ):
+        (shim / name).write_text(body, encoding="utf-8")
+        (shim / name).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    assert enclosing_git_worktree(subdir) == str(owner_repo.resolve())
+    _, error = validate_attach_path(str(subdir), system_repo_dir=repo, drive_root=data)
+    assert str(owner_repo.resolve()) in error
+    # A11/A12 still hold with the same broken git: a plain folder encloses nothing.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert validate_attach_path(str(plain), system_repo_dir=repo, drive_root=data) == (
+        plain.resolve(), "",
+    )
+
+
+def test_containment_ignores_inherited_git_location_env(tmp_path, monkeypatch):
+    """The probes ran with the ambient environment, so whatever launched Ouroboros
+    decided which repository git thought it was standing in. `GIT_DIR`/`GIT_WORK_TREE`
+    made a PLAIN folder report someone else's toplevel and get REFUSED — an A11/A12
+    violation — and `GIT_CEILING_DIRECTORIES` stopped the upward search so a real
+    repo subdirectory reported nothing and was ADMITTED. Both directions are wrong,
+    and neither is a fact about the folder."""
+    from ouroboros.project_sources import validate_attach_path
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    owner_repo, subdir = _repo_with_subdir(tmp_path)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+
+    monkeypatch.setenv("GIT_DIR", str(owner_repo / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(owner_repo))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(owner_repo))
+
+    assert validate_attach_path(str(plain), system_repo_dir=repo, drive_root=data) == (
+        plain.resolve(), "",
+    )
+    _, error = validate_attach_path(str(subdir), system_repo_dir=repo, drive_root=data)
+    assert str(owner_repo.resolve()) in error
+
+
+def test_git_storage_and_submodules_are_not_project_folders(tmp_path):
+    """Two shapes that slipped the guard. A bare repository (and any interior of
+    one) is git's STORAGE, not a folder to work in, and `.git` has no toplevel of
+    its own to report. A submodule working directory is a repository by git's
+    reckoning — `--show-toplevel` returns the submodule itself — so it answered
+    "nothing encloses me" while sitting squarely inside the superproject's tree."""
+    from ouroboros.project_sources import validate_attach_path
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    _, err_bare = validate_attach_path(str(bare), system_repo_dir=repo, drive_root=data)
+    assert "internal storage" in err_bare
+    _, err_interior = validate_attach_path(
+        str(bare / "refs" / "heads"), system_repo_dir=repo, drive_root=data
+    )
+    assert str(bare.resolve()) in err_interior
+
+    superproject = tmp_path / "superproject"
+    _init_git_repo(superproject)
+    donor = tmp_path / "donor"
+    _init_git_repo(donor)
+    added = subprocess.run(
+        ["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+         str(donor), "vendor/lib"],
+        cwd=str(superproject), capture_output=True, text=True,
+    )
+    if added.returncode == 0:
+        _, err_sub = validate_attach_path(
+            str(superproject / "vendor" / "lib"), system_repo_dir=repo, drive_root=data
+        )
+        assert str(superproject.resolve()) in err_sub
+
+
+def test_containment_refusal_does_not_recommend_an_ephemeral_root(tmp_path):
+    """"Attach that root instead" is advice, and advice can be wrong. When the
+    repository enclosing the folder is itself one of Ouroboros's removable
+    checkouts, pointing the owner at it recommends a home that a `git worktree
+    remove` or the retention sweep deletes. The refusal still names what it found;
+    it just stops calling it a destination."""
+    from ouroboros.project_sources import validate_attach_path
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    host = tmp_path / "host_repo"
+    _init_git_repo(host)
+    linked = tmp_path / "linked_wt"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "wt", str(linked)],
+        cwd=str(host), check=True,
+    )
+    inner = linked / "pkg"
+    inner.mkdir()
+
+    _, error = validate_attach_path(str(inner), system_repo_dir=repo, drive_root=data)
+    assert str(linked.resolve()) in error
+    assert "attach that root instead" not in error
+    assert "temporary checkout" in error
+
+
+def test_promote_source_refuses_an_agent_supplied_ephemeral_checkout(tmp_path):
+    """`resolve_promote_source` runs an AGENT-typed path through the attach guards
+    only, and the paths an agent has in hand are exactly the checkouts Ouroboros
+    makes for itself. A linked worktree passed every attach guard, so a project's
+    PERMANENT home became a view that one `git worktree remove` deletes.
+    `adopt_task_workspace` already applied the durable-place rule; this surface
+    needs it more, because no owner ever looked at the path."""
+    from ouroboros.projects_registry import get_project
+    from ouroboros.promotion_source import resolve_promote_source
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    host = tmp_path / "host_repo"
+    _init_git_repo(host)
+    linked = tmp_path / "linked_wt"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "wt", str(linked)],
+        cwd=str(host), check=True,
+    )
+
+    ctx = types.SimpleNamespace(DRIVE_ROOT=data, REPO_DIR=repo)
+    folder, note, error, pid = resolve_promote_source(ctx, str(linked), "linkedproj")
+    assert folder == "" and not note
+    assert "linked git worktree" in error and str(host.resolve()) in error
+    # Refused BEFORE any registry mutation — a placeless row is better than one
+    # pointing at a folder that vanishes.
+    assert get_project(data, pid) is None
+
+    # The host repository itself is a perfectly good place and still passes.
+    folder, _, error, _ = resolve_promote_source(ctx, str(host), "hostproj")
+    assert error == "" and folder == str(host.resolve())
 
 
 def test_create_never_git_inits_inside_someone_elses_repository(tmp_path):
@@ -531,7 +699,13 @@ def test_autoprovisioned_folder_is_surfaced_as_genesis_not_silently(tmp_path, mo
 def test_autoprovisioning_never_relabels_an_existing_provenance(tmp_path, monkeypatch):
     """How a folder came to be is a historical fact. If a project's attached folder
     has gone missing, provisioning a replacement must not rewrite its history into
-    "Ouroboros made this" — the owner attached something, and that is what happened."""
+    "Ouroboros made this" — the owner attached something, and that is what happened.
+
+    And the replacement has to actually LAND. Asserting the truthiness of the return
+    was too weak to notice that the stale path was being handed back unchanged: a
+    non-empty string is exactly what a REFUSED replacement returns too. The folder is
+    the point, so the assertion is that a folder EXISTS there and that the row now
+    names it."""
     from ouroboros.projects_registry import (
         create_project,
         ensure_project_workspace,
@@ -545,10 +719,18 @@ def test_autoprovisioning_never_relabels_an_existing_provenance(tmp_path, monkey
     repo.mkdir()
     monkeypatch.setenv("OUROBOROS_SUBAGENT_PROJECTS_ROOT", str(tmp_path / "projects"))
 
+    vanished = tmp_path / "vanished"
     create_project(data, "moved", name="Moved", origin="owner_ui")
-    update_project(data, "moved", working_dir=str(tmp_path / "vanished"), provenance="attached")
-    assert ensure_project_workspace(data, "moved", repo)
-    assert get_project(data, "moved")["provenance"] == "attached"
+    update_project(data, "moved", working_dir=str(vanished), provenance="attached")
+    result = ensure_project_workspace(data, "moved", repo)
+    assert os.path.isdir(result)
+    assert result != str(vanished)
+    row = get_project(data, "moved")
+    assert row["provenance"] == "attached"
+    # The row must point at the tree that was just dug, or the genesis folder is an
+    # orphan under a root the GC deliberately never prunes and the caller is holding
+    # a path that does not exist.
+    assert row["working_dir"] == result
 
 
 # --- a project born from a task inherits that task's folder ------------------------

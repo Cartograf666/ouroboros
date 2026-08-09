@@ -326,6 +326,7 @@ async def api_projects_create(request: Request) -> JSONResponse:
             PROJECT_NAME_MAX,
             create_project,
             ensure_project_workspace,
+            set_working_dir_if_absent,
             update_project,
         )
         from ouroboros.utils import utc_now_iso
@@ -386,8 +387,11 @@ async def api_projects_create(request: Request) -> JSONResponse:
         if attach_path:
             from ouroboros.project_sources import attach_snapshot_init, validate_attach_path
 
-            resolved, error = validate_attach_path(
-                attach_path, system_repo_dir=repo_dir, drive_root=drive_root
+            # Off the event loop: the guard forks `git` with a 5 s timeout, and a
+            # repository that stalls it would otherwise freeze every other request
+            # for those 5 seconds. The init-git route already runs it this way.
+            resolved, error = await asyncio.to_thread(
+                validate_attach_path, attach_path, system_repo_dir=repo_dir, drive_root=drive_root
             )
             if error:
                 return JSONResponse({"error": error}, status_code=400)
@@ -425,7 +429,12 @@ async def api_projects_create(request: Request) -> JSONResponse:
                 working_dir, provenance = workspace, "genesis"
         if working_dir and not str(entry.get("working_dir") or "").strip():
             # create_project was idempotent for an existing row — bind the folder now.
-            update_project(drive_root, entry["id"], working_dir=working_dir)
+            # ATOMICALLY: the read above and this write are two separately-locked
+            # operations, so testing `entry` and then overwriting is precisely the
+            # read-then-write race DEVELOPMENT.md forbids. `set_working_dir_if_absent`
+            # re-tests under the same lock that writes, and a concurrent binder keeps
+            # its folder instead of losing it here.
+            set_working_dir_if_absent(drive_root, entry["id"], working_dir)
         if _existing and provenance == "none":
             # Source-less repeat create of an EXISTING project is a pure idempotent
             # lookup: provenance/clone_url/trusted_at are ADDITIVE HISTORICAL FACTS
