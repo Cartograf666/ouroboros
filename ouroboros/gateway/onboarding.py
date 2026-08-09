@@ -505,8 +505,6 @@ def _settings_fingerprint() -> str:
         return "absent"
     except OSError as exc:
         return f"unreadable:{type(exc).__name__}:{uuid4()}"
-    except OSError as exc:
-        return f"unreadable:{type(exc).__name__}"
 
 
 def _prepared_settings(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
