@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import pathlib
 import re
 import socket
 import sys
-from typing import Any, Callable, Dict, Optional, Sequence
+from typing import Any, Dict, Optional
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
@@ -22,6 +21,16 @@ from ouroboros.config import (
     load_settings,
 )
 from ouroboros.gateway._helpers import json_error, json_exception, request_drive_root
+from ouroboros.gateway.owner_settings import (
+    CommitBoundary,
+    SettingsLockUnavailable,
+    _CONTEXT_MODE_KEYS,
+    _owner_audit,
+    _owner_read_settings_raw,
+    _owner_write_settings,
+    owner_write_guard,
+    post_commit_failure_response,
+)
 from ouroboros.onboarding_wizard import build_onboarding_html
 from ouroboros.platform_layer import is_container_env
 from ouroboros.provider_models import MINIMAX_REGION_ENDPOINTS, resolve_minimax_base_url
@@ -35,7 +44,7 @@ from ouroboros.settings_setup_contract import (
     build_setup_contract,
     parse_budget_setting,
 )
-from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso
+from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
 DEFAULT_PORT = int(os.environ.get("OUROBOROS_SERVER_PORT", "8765"))
@@ -287,12 +296,13 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
             # flows ONLY through the dedicated audited owner endpoint
             # (api_owner_safety_mode); save_settings additionally ratchets lowering.
             "OUROBOROS_SAFETY_MODE",
-            # The install-time subscription-preset marker is written ONCE, by
-            # POST /api/onboarding/complete, beside the preset it records. A
-            # generic save must neither author it (that would fake an applied
-            # preset) nor clear it (that would re-arm install-time behaviour on
-            # an install that already completed onboarding).
+            # The install-time facts are written by POST /api/onboarding/complete
+            # alone, beside what they record. A generic save must neither author
+            # them (faking an applied preset, or a completion that never
+            # happened) nor clear them, which would re-arm install-time
+            # behaviour on an install that already completed onboarding.
             "OUROBOROS_SUBSCRIPTION_PRESET_VERSION",
+            "OUROBOROS_ONBOARDING_COMPLETED_AT",
         }:
             continue
         if key not in body:
@@ -339,93 +349,6 @@ async def _json_body_or_empty(request: Request) -> Any:
         return {}
 
 
-def _owner_audit(request: Request, action: str, payload: Dict[str, Any]) -> None:
-    try:
-        drive_root = request_drive_root(request)
-    except Exception:
-        drive_root = pathlib.Path(DATA_DIR)
-    try:
-        client = getattr(request, "client", None)
-        append_jsonl(
-            drive_root / "logs" / "events.jsonl",
-            {
-                "ts": utc_now_iso(),
-                "type": "owner_api_action",
-                "action": str(action or ""),
-                "client_host": str(getattr(client, "host", "") or ""),
-                **{
-                    key: value
-                    for key, value in dict(payload or {}).items()
-                    if "key" not in str(key).lower() and "secret" not in str(key).lower()
-                },
-            },
-        )
-    except Exception:
-        log.debug("Failed to write owner API audit event", exc_info=True)
-
-
-# The context mode and its derived authority bit are authored together, by the owner endpoint
-# or by the system auto-downgrade — never by a generic save (see prepare_settings_for_persist).
-_CONTEXT_MODE_KEYS = ("OUROBOROS_CONTEXT_MODE", "OUROBOROS_CONTEXT_MODE_AUTO_LOW")
-
-
-class SettingsPreconditionFailed(RuntimeError):
-    """A locked-in precondition refused the write; nothing was persisted."""
-
-
-def _owner_write_settings(
-    settings: Dict[str, Any],
-    *,
-    authored_keys: Sequence[str] = (),
-    allow_context_lowering: bool = False,
-    allow_safety_lowering: bool = False,
-    precondition: Optional[Callable[[], str]] = None,
-) -> None:
-    """Write owner-controlled settings without applying the runtime-mode ratchet.
-
-    Skipping that ONE ratchet is the whole reason this writer exists; everything else comes from
-    ``config.prepare_settings_for_persist``, the single point both persisting writers pass through.
-    An endpoint that genuinely authors a disk-authored key (context mode, safety mode, the derived
-    auto-low flag) must name it in ``authored_keys`` — otherwise a POST about an unrelated key would
-    author a mode decision out of the defaults merge that ``_owner_read_settings_raw`` performs.
-
-    ``precondition`` (optional) is re-evaluated INSIDE the settings lock, after it is held and
-    immediately before the write. An install-time transaction must prove its eligibility against
-    the state it is about to overwrite, not against a read taken before a multi-second daemon call;
-    a non-empty return value aborts with ``SettingsPreconditionFailed`` and writes nothing."""
-    from ouroboros import config as _config
-
-    _config._guard_live_settings_write()
-    to_write = _config.prepare_settings_for_persist(
-        dict(settings), authored_keys=authored_keys,
-        allow_context_lowering=allow_context_lowering, allow_safety_lowering=allow_safety_lowering)
-    _config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    fd = _config._acquire_settings_lock()
-    try:
-        if precondition is not None:
-            refusal = str(precondition() or "")
-            if refusal:
-                raise SettingsPreconditionFailed(refusal)
-        atomic_write_json(_config.SETTINGS_PATH, to_write, trailing_newline=False)
-    finally:
-        _config._release_settings_lock(fd)
-
-
-def _owner_read_settings_raw() -> Dict[str, Any]:
-    """Read settings for owner endpoints without applying runtime-mode ratchets."""
-    from ouroboros import config as _config
-
-    merged = dict(_SETTINGS_DEFAULTS)
-    try:
-        if _config.SETTINGS_PATH.exists():
-            raw = json.loads(_config.SETTINGS_PATH.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                merged.update(raw)
-    except Exception:
-        log.debug("Failed to read raw owner settings; using defaults", exc_info=True)
-    return merged
-
-
 def _has_running_agent_tasks() -> bool:
     try:
         from supervisor.workers import PENDING, RUNNING, _get_chat_agent
@@ -459,6 +382,7 @@ def _has_started_agent_tasks() -> bool:
         return False
 
 
+@owner_write_guard
 async def api_owner_runtime_mode(request: Request) -> JSONResponse:
     """Persist the owner-selected runtime mode for the next boot."""
     body = await _json_body_or_empty(request)
@@ -496,6 +420,7 @@ async def api_owner_runtime_mode(request: Request) -> JSONResponse:
     })
 
 
+@owner_write_guard
 async def api_owner_auto_grant(request: Request) -> JSONResponse:
     """Persist the owner auto-grant toggle outside generic settings writes."""
     body = await _json_body_or_empty(request)
@@ -931,6 +856,7 @@ def _apply_max_context_auto_downgrade(
     ), None
 
 
+@owner_write_guard
 async def api_owner_context_mode(request: Request) -> JSONResponse:
     """Persist the owner-selected context mode (low/max).
 
@@ -982,6 +908,7 @@ _SCOPE_REVIEW_FLOOR_DEPRECATION_NOTICE = (
 )
 
 
+@owner_write_guard
 async def api_owner_scope_review_floor(request: Request) -> JSONResponse:
     """Persist the owner-selected P3 scope-review floor (blocking_1m | advisory).
 
@@ -1019,6 +946,7 @@ async def api_owner_scope_review_floor(request: Request) -> JSONResponse:
     })
 
 
+@owner_write_guard
 async def api_owner_safety_mode(request: Request) -> JSONResponse:
     """Persist the owner-selected LLM-safety-supervisor coverage (full | light | off).
 
@@ -1047,6 +975,7 @@ async def api_owner_safety_mode(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "safety_mode": raw_mode})
 
 
+@owner_write_guard
 async def api_acknowledge_capability(request: Request) -> JSONResponse:
     """Record a route-fingerprinted owner acknowledgement of a model's context
     window (Capability Evidence: ASSERTED). Auditable and NON-generic — it covers
@@ -1351,6 +1280,10 @@ def _apply_settings_save_side_effects(
 
 
 async def api_settings_post(request: Request) -> JSONResponse:
+    # Everything below the write is a POST-commit step. The broad handler at the
+    # bottom used to answer a failure there with "400, nothing saved" while the
+    # bytes were already on disk; `boundary` is what lets it tell the two apart.
+    boundary = CommitBoundary()
     try:
         body = await request.json()
         if not isinstance(body, dict):
@@ -1506,11 +1439,16 @@ async def api_settings_post(request: Request) -> JSONResponse:
         _owner_write_settings(
             settings_to_save,
             authored_keys=_CONTEXT_MODE_KEYS if _max_downgrade_notice else (),
-            allow_context_lowering=bool(_max_downgrade_notice))
+            allow_context_lowering=bool(_max_downgrade_notice),
+            boundary=boundary)
+        boundary.at("environment projection")
         _apply_settings_to_env(current)
+        boundary.at("supervisor start")
         _start_supervisor_if_needed_for_request(request, current)
 
+        boundary.at("hot-reload")
         _apply_settings_save_side_effects(request, current, old_effective_settings, all_changed)
+        boundary.at("post-save notices")
 
         warnings = []
         if _reviewer_fallback_warning:
@@ -1547,6 +1485,7 @@ async def api_settings_post(request: Request) -> JSONResponse:
         _repo_slug = current.get("GITHUB_REPO", "")
         _gh_token = current.get("GITHUB_TOKEN", "")
         if _gh_token and any(k in all_changed for k in ("GITHUB_REPO", "GITHUB_TOKEN")):
+            boundary.at("GitHub remote configuration")
             from supervisor.git_ops import configure_personal_remote
             remote_ok, remote_msg, resolved_slug = configure_personal_remote(
                 _repo_slug,
@@ -1624,4 +1563,11 @@ async def api_settings_post(request: Request) -> JSONResponse:
                 resp["review_capability_notices"] = _capability_notices
         return JSONResponse(resp)
     except Exception as e:
+        if boundary.committed:
+            # The bytes ARE on disk. Reporting this as a failed save would send
+            # the owner looking for changes that landed (BIBLE P1). This branch
+            # comes FIRST so a post-commit lock refusal is not misread as one.
+            return post_commit_failure_response(e, boundary)
+        if isinstance(e, SettingsLockUnavailable):
+            return json_error(str(e), 503, code="settings_locked", saved=False)
         return json_exception(e, 400)

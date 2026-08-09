@@ -41,11 +41,22 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ouroboros.gateway._helpers import json_error
+from ouroboros.gateway.owner_settings import (
+    CommitBoundary,
+    SettingsLockUnavailable,
+    SettingsPreconditionFailed,
+    _owner_audit,
+    _owner_write_settings,
+    post_commit_failure_response,
+)
 from ouroboros.server_runtime import (
     apply_runtime_provider_defaults,
     has_startup_ready_provider,
 )
-from ouroboros.settings_setup_contract import parse_subscription_intent
+from ouroboros.settings_setup_contract import (
+    ONBOARDING_COMPLETED_KEY,
+    parse_subscription_intent,
+)
 from ouroboros.subscription_install_presets import (
     PRESET_HARNESSES,
     PRESET_MARKER_KEY,
@@ -85,33 +96,21 @@ class PresetFailure:
 # ---------------------------------------------------------------------------
 
 
-def _vouched_harness_ids(profiles: Any) -> set:
-    """Harnesses the DAEMON vouches an account for.
-
-    Two independent proofs, both the daemon's own: a native pseudo-row with
-    ``native_login_detected`` (the local CLI session), or a registered
-    credential profile whose verification PASSED. Ouroboros interprets no
-    credential of its own here — it only reads which lanes the engine says it
-    can actually run."""
-    vouched: set = set()
-    if not isinstance(profiles, dict):
-        return vouched
-    for row in profiles.get("harnessAccounts") or []:
-        if isinstance(row, dict) and row.get("native_login_detected"):
-            vouched.add(str(row.get("harness_id") or ""))
-    for wrapper in profiles.get("profiles") or []:
-        if not isinstance(wrapper, dict):
-            continue
-        profile = wrapper.get("profile")
-        status = wrapper.get("status")
-        if not isinstance(profile, dict) or not isinstance(status, dict):
-            continue
-        if not profile.get("enabled"):
-            continue
-        if str(status.get("verification") or "") == "passed":
-            vouched.add(str(profile.get("harness_id") or ""))
-    vouched.discard("")
-    return vouched
+# The daemon's credential-kind enum is {config_dir_login, oauth_token, api_key}.
+# The first two ARE a signed-in vendor session — what a subscription is. The
+# third is metered API spend, which is precisely what a preset row must never
+# become (D-3): such a row would either refuse at review time or quietly bill
+# the owner's API key for work they connected a subscription to cover.
+_SUBSCRIPTION_CREDENTIAL_KINDS = frozenset({"config_dir_login", "oauth_token"})
+# ``next_up.route`` for the native/default subject. The daemon names it
+# ``local_session`` for a CLI login and ``api_key`` for a configured key; older
+# daemons omit the field, in which case ``native_login_detected`` (the engine's
+# own "a vendor login is detected") carries the claim on its own.
+_API_KEY_NATIVE_ROUTE = "api_key"
+# Harness rows the engine will not run at all. Anything else it publishes
+# (``ok``, ``degraded``) stays admissible: degradation is the engine's business,
+# and a preset seat still resolves against the models it discovered.
+_UNRUNNABLE_HARNESS_STATUS = frozenset({"unavailable"})
 
 
 def _discovery_rows(harnesses: Any) -> Dict[str, Dict[str, Any]]:
@@ -120,6 +119,106 @@ def _discovery_rows(harnesses: Any) -> Dict[str, Dict[str, Any]]:
         for row in (harnesses or [])
         if isinstance(row, dict) and str(row.get("id") or "")
     }
+
+
+def _profile_index(profiles: Any) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    index: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for wrapper in (profiles or []):
+        if not isinstance(wrapper, dict):
+            continue
+        profile = wrapper.get("profile")
+        if not isinstance(profile, dict):
+            continue
+        key = (str(profile.get("harness_id") or ""), str(profile.get("profile_id") or ""))
+        index[key] = wrapper
+    return index
+
+
+def _next_up_verdict(
+    harness: str, account: Dict[str, Any], profiles: Dict[Tuple[str, str], Dict[str, Any]],
+) -> Tuple[bool, str]:
+    """Would an UNPINNED run of this harness route through a subscription seat?
+
+    ``next_up`` is the daemon's own server-computed answer to "who would an
+    unpinned run use next", derived from enabled profiles + native readiness +
+    quota. Ouroboros reads that answer instead of re-deriving one: the rotation
+    is the engine's (D28), and a second policy here would disagree with it the
+    first time an account changed. The only judgement left is whether the seat
+    the engine names is a SUBSCRIPTION or an API key."""
+    next_up = account.get("next_up") if isinstance(account.get("next_up"), dict) else {}
+    kind = str(next_up.get("kind") or "")
+    if kind == "none":
+        return False, str(next_up.get("reason") or "the engine has nothing routable for it")
+    if kind == "native":
+        if not account.get("native_login_detected"):
+            return False, "no signed-in session is detected for the default account"
+        if not account.get("native_credentials_enabled"):
+            return False, "its default login is disabled in the engine's credential ladder"
+        route = str(next_up.get("route") or "")
+        if route == _API_KEY_NATIVE_ROUTE:
+            return False, "an unpinned run would route through an API key, not a subscription"
+        return True, f"default session ({route or 'route not reported'})"
+    if kind == "profile":
+        profile_id = str(next_up.get("profileId") or "")
+        wrapper = profiles.get((harness, profile_id))
+        if wrapper is None:
+            return False, f"the engine names account {profile_id!r}, which it does not list"
+        profile = wrapper.get("profile") if isinstance(wrapper.get("profile"), dict) else {}
+        status = wrapper.get("status") if isinstance(wrapper.get("status"), dict) else {}
+        credential_kind = str(profile.get("credential_kind") or "")
+        if credential_kind not in _SUBSCRIPTION_CREDENTIAL_KINDS:
+            return False, (f"account {profile_id!r} is an API credential "
+                           f"({credential_kind or 'kind not reported'}), not a subscription")
+        if not profile.get("enabled"):
+            return False, f"account {profile_id!r} is disabled"
+        availability = str(status.get("availability") or "")
+        if availability and availability != "available":
+            return False, f"account {profile_id!r} is {availability}"
+        if str(status.get("verification") or "") != "passed":
+            return False, f"account {profile_id!r} has not verified"
+        return True, f"account {profile_id!r} ({credential_kind})"
+    return False, f"the engine reports an unknown routing state {kind or 'none given'!r}"
+
+
+def subscription_routable_harnesses(
+    snapshot: Dict[str, Any],
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """``(routable, refused)`` — which preset harnesses can actually run a
+    subscription session right now, and why the others cannot.
+
+    An account being SIGNED IN is not the question the preset needs answered.
+    The question is whether a subscription session would actually start, and the
+    daemon already answers it: the harness row says whether the harness itself
+    is enabled and runnable, and the per-harness accounts row says which
+    credential an unpinned run would take next. Both come from the engine."""
+    routable: Dict[str, str] = {}
+    refused: Dict[str, str] = {}
+    rows = _discovery_rows(snapshot.get("harnesses"))
+    payload = snapshot.get("profiles") if isinstance(snapshot.get("profiles"), dict) else {}
+    profiles = _profile_index(payload.get("profiles"))
+    accounts = {
+        str(row.get("harness_id") or ""): row
+        for row in (payload.get("harnessAccounts") or [])
+        if isinstance(row, dict)
+    }
+    for harness in PRESET_HARNESSES:
+        account = accounts.get(harness)
+        if account is None:
+            continue  # the engine publishes no accounts authority for it: silent absence
+        row = rows.get(harness)
+        if row is None:
+            refused[harness] = "the engine does not list this harness"
+            continue
+        if not row.get("enabled"):
+            refused[harness] = "the engine has this harness disabled"
+            continue
+        status = str(row.get("status") or "")
+        if status in _UNRUNNABLE_HARNESS_STATUS:
+            refused[harness] = f"the engine reports it {status}"
+            continue
+        ok, evidence = _next_up_verdict(harness, account, profiles)
+        (routable if ok else refused)[harness] = evidence
+    return routable, refused
 
 
 def verified_harness_discoveries(
@@ -135,14 +234,15 @@ def verified_harness_discoveries(
             f"The agent engine is {state or 'not running'}"
             + (f" ({(daemon or {}).get('last_error')})" if (daemon or {}).get("last_error") else ""),
         )
-    vouched = _vouched_harness_ids(snapshot.get("profiles"))
+    routable, refused = subscription_routable_harnesses(snapshot)
     rows = _discovery_rows(snapshot.get("harnesses"))
-    wanted = [h for h in PRESET_HARNESSES if h in vouched]
+    wanted = [h for h in PRESET_HARNESSES if h in routable]
     if not wanted:
+        detail = "; ".join(f"{harness}: {reason}" for harness, reason in sorted(refused.items()))
         return (), PresetFailure(
             "no_verified_account",
-            "The engine vouches no signed-in account for "
-            f"{', '.join(PRESET_HARNESSES)}.",
+            "The engine can run no subscription session for "
+            f"{', '.join(PRESET_HARNESSES)}." + (f" {detail}" if detail else ""),
         )
     discoveries: List[HarnessDiscovery] = []
     for harness in wanted:
@@ -169,11 +269,15 @@ def verified_harness_discoveries(
 def _harness_capability(snapshot: Dict[str, Any], connected: Sequence[str]) -> Dict[str, Any]:
     """Disclosure-only evidence recorded in the receipt (never a gate)."""
     rows = _discovery_rows(snapshot.get("harnesses"))
+    routable, _refused = subscription_routable_harnesses(snapshot)
     return {
         harness: {
             "status": str((rows.get(harness) or {}).get("status") or ""),
             "access_profiles_supported": list(
                 (rows.get(harness) or {}).get("access_profiles_supported") or []),
+            # WHICH seat the engine said an unpinned run would take. The rows are
+            # unpinned by design (D28), so this records the evidence, not a pin.
+            "subscription_route": routable.get(harness, ""),
         }
         for harness in connected
     }
@@ -220,18 +324,34 @@ def install_is_unconfigured(settings: Dict[str, Any]) -> bool:
     """Is this install still IN onboarding, as the server itself sees it?
 
     The same predicate that decides whether ``GET /api/onboarding`` mounts the
-    blocking overlay. It is the authority for install-time behaviour precisely
-    because it cannot be forged from a payload — and because the preset marker's
-    ABSENCE proves nothing (every install that predates presets lacks it too).
-    """
+    blocking overlay. It is NOT install-time on its own: an install that has run
+    for a year and whose one provider key stopped working answers True here too,
+    which is why ``preset_eligible`` requires two further proofs."""
     return not has_startup_ready_provider(settings)
 
 
 def preset_eligible(settings: Dict[str, Any]) -> bool:
-    """Install-time AND not already presetted (D-4: install only, no re-write)."""
+    """May this save apply the install-time agent preset (D-4)?
+
+    Three independent proofs, because "no working provider" alone is a state an
+    OLD install reaches whenever its key stops working — and presetting there
+    would overwrite reviewer/subagent choices the owner made themselves:
+
+    * onboarding has never completed here (the durable ``…COMPLETED_AT`` fact,
+      written on EVERY completion — skipped and subscription-less included);
+    * no preset generation has been applied;
+    * the install still has no settings file at all, the same "genuinely fresh
+      install" rule the wizard already uses for the ``light`` safety default.
+
+    Marker ABSENCE alone would prove nothing (every install that predates this
+    release lacks both), which is what the file-existence proof answers."""
+    if str(settings.get(ONBOARDING_COMPLETED_KEY) or "").strip():
+        return False
     if str(settings.get(PRESET_MARKER_KEY) or "").strip():
         return False
-    return install_is_unconfigured(settings)
+    if not install_is_unconfigured(settings):
+        return False
+    return _fresh_settings_file()
 
 
 def _fresh_settings_file() -> bool:
@@ -244,14 +364,19 @@ def _fresh_settings_file() -> bool:
 
 def _write_precondition(expect_preset: bool, expect_safety_light: bool):
     """Re-prove eligibility INSIDE the settings lock, against the state this
-    write is about to overwrite."""
+    write is about to overwrite.
+
+    The re-read is ``load_settings_lock_held``: the settings lock is not
+    re-entrant, so the ordinary ``load_settings()`` would wait out its full 2s
+    timeout and then read anyway — two seconds added to every onboarding save
+    for a lock it already holds."""
     def _check() -> str:
-        from ouroboros.config import SETTINGS_PATH, load_settings
+        from ouroboros.config import SETTINGS_PATH, load_settings_lock_held
 
         if expect_safety_light and SETTINGS_PATH.exists():
             return ("A settings file appeared while onboarding was being saved; "
                     "refusing to author the first-install safety default over it.")
-        if expect_preset and not preset_eligible(load_settings()):
+        if expect_preset and not preset_eligible(load_settings_lock_held()):
             return ("This install is no longer in first-run onboarding; refusing "
                     "to apply install-time agent defaults over it.")
         return ""
@@ -286,12 +411,17 @@ def _prepared_settings(body: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, 
 
 
 def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, Any],
-             pending_mode: str, safety_light: bool, preset_applied: bool) -> None:
-    """The ONE write, plus the established post-save seams."""
+             pending_mode: str, safety_light: bool, preset_applied: bool,
+             boundary: CommitBoundary) -> None:
+    """The ONE write, plus the established post-save seams.
+
+    ``boundary`` is committed the instant the bytes land, so the endpoint can
+    distinguish "the transaction was refused" from "the transaction landed and
+    a later step failed" — two facts that were previously both reported as
+    ``saved=False``."""
     from ouroboros.config import apply_settings_to_env, get_runtime_mode
     from ouroboros.gateway.settings import (
         _apply_settings_save_side_effects,
-        _owner_write_settings,
         _start_supervisor_if_needed_for_request,
     )
 
@@ -303,13 +433,17 @@ def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, 
         authored_keys=authored,
         allow_safety_lowering=safety_light,
         precondition=_write_precondition(preset_applied, safety_light),
+        boundary=boundary,
     )
     # The RUNNING process keeps its boot runtime mode; the owner's next-boot
     # choice lives on disk only (identical to the endpoint this replaces).
+    boundary.at("environment projection")
     env_view = dict(current)
     env_view["OUROBOROS_RUNTIME_MODE"] = get_runtime_mode()
     apply_settings_to_env(env_view)
+    boundary.at("supervisor start")
     _start_supervisor_if_needed_for_request(request, current)
+    boundary.at("hot-reload")
     changed = [
         key for key in current
         if str(current.get(key, "") or "") != str(old_settings.get(key, "") or "")
@@ -320,7 +454,7 @@ def _persist(request: Request, old_settings: Dict[str, Any], current: Dict[str, 
 async def api_onboarding_complete(request: Request) -> JSONResponse:
     """POST /api/onboarding/complete — finish onboarding in ONE transaction."""
     from ouroboros.config import get_runtime_mode, normalize_runtime_mode
-    from ouroboros.gateway.settings import SettingsPreconditionFailed, _owner_audit
+    from ouroboros.utils import utc_now_iso
 
     try:
         body = await request.json()
@@ -358,18 +492,29 @@ async def api_onboarding_complete(request: Request) -> JSONResponse:
         # the structured preset keys land on top of it, never through it.
         current.update(preset.settings_keys())
 
+    # The durable completion fact rides in the SAME write, whatever the preset
+    # did: a completion that connected nothing must still close the window.
+    current[ONBOARDING_COMPLETED_KEY] = utc_now_iso()
     pending_mode = normalize_runtime_mode(current.get("OUROBOROS_RUNTIME_MODE"))
     active_mode = get_runtime_mode()
+    boundary = CommitBoundary()
     try:
         await asyncio.to_thread(
             _persist, request, old_settings, current, pending_mode, safety_light,
-            preset is not None,
+            preset is not None, boundary,
         )
-    except SettingsPreconditionFailed as exc:
-        return json_error(str(exc), 409, code="onboarding_state_changed", saved=False)
-    except PermissionError as exc:
-        return json_error(str(exc), 403, saved=False)
     except Exception as exc:
+        if boundary.committed:
+            # The transaction LANDED; a post-save step did not. Saying
+            # "nothing was saved" here would send the owner back through an
+            # onboarding that is already complete (BIBLE P1).
+            return post_commit_failure_response(exc, boundary)
+        if isinstance(exc, SettingsPreconditionFailed):
+            return json_error(str(exc), 409, code="onboarding_state_changed", saved=False)
+        if isinstance(exc, SettingsLockUnavailable):
+            return json_error(str(exc), 503, code="settings_locked", saved=False, can_skip=True)
+        if isinstance(exc, PermissionError):
+            return json_error(str(exc), 403, saved=False)
         log.exception("onboarding completion failed")
         return json_error(f"{type(exc).__name__}: {exc}", 500, saved=False)
 
@@ -401,5 +546,6 @@ __all__ = [
     "install_is_unconfigured",
     "preset_eligible",
     "resolve_install_preset",
+    "subscription_routable_harnesses",
     "verified_harness_discoveries",
 ]

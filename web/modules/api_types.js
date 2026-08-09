@@ -87,6 +87,18 @@
  */
 
 /**
+ * 500 from an owner settings write whose BYTES ALREADY LANDED: `saved` is true
+ * and `post_commit_failed` names the step that failed afterwards (environment
+ * projection, supervisor start, hot-reload…). Never re-save on this — the
+ * settings are on disk. Shared by POST /api/settings and the onboarding finish.
+ * @typedef {Object} SettingsPostCommitFailureResponse
+ * @property {string} error
+ * @property {string} status  // saved_with_post_commit_error
+ * @property {boolean} saved  // always true
+ * @property {string} post_commit_failed
+ */
+
+/**
  * 503 from POST /api/onboarding/complete: NOTHING was persisted, the wizard
  * stays open, and `can_skip` means "finish without agent defaults" will work.
  * @typedef {Object} OnboardingPresetFailureResponse

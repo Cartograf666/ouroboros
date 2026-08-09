@@ -1027,7 +1027,16 @@ Before every commit, verify the following:
   defaults are compiled from LIVE discovery and refuse typed when a model
   cannot be resolved — never guessed, never half-applied, and never
   re-derived after onboarding (that would be a second, continuous authority
-  over settings the owner has since edited).
+  over settings the owner has since edited). Install time is a conjunction of
+  three proofs — no recorded completion (`OUROBOROS_ONBOARDING_COMPLETED_AT`,
+  written by every completion), no preset generation, no `settings.json` yet —
+  because "no working provider" is a state an old install reaches too.
+- Owner settings writes go through `gateway/owner_settings.py`. The settings
+  lock is a PRECONDITION of the write, not a hint: `_acquire_settings_lock`
+  answers `None` on timeout and a writer that proceeds anyway is unlocked while
+  claiming to be atomic. Once the bytes land, the response must say so — carry a
+  `CommitBoundary` through the write and report a later failure as that step
+  failing, never as a failed save (BIBLE P1).
 - A control the owner cannot use is worse than none. With no coding-agent
   subscription connected the Subagents section says so and points at Providers →
   Harness Accounts instead of rendering a delegation toggle whose every dispatch

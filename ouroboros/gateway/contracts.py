@@ -859,6 +859,22 @@ class OnboardingCompleteResponse(TypedDict):
     preset: OnboardingPresetProjection
 
 
+class SettingsPostCommitFailureResponse(TypedDict):
+    """500 from an owner settings write whose BYTES ALREADY LANDED.
+
+    The distinction the broad handlers used to erase: a failure BEFORE the write
+    is "nothing was saved", a failure AFTER it is "saved, and then this step
+    failed". ``post_commit_failed`` names the step (environment projection,
+    supervisor start, hot-reload…) so the owner knows what to retry — never that
+    the settings themselves need saving again. Shared by ``POST /api/settings``
+    and ``POST /api/onboarding/complete``."""
+
+    error: str
+    status: str
+    saved: bool
+    post_commit_failed: str
+
+
 class OnboardingPresetFailureResponse(TypedDict):
     """503: the connected agent accounts could not be verified, so
     NOTHING was persisted. ``can_skip`` tells the wizard the secondary
@@ -1037,6 +1053,7 @@ __all__ = [
     "OnboardingCompleteResponse",
     "OnboardingPresetFailureResponse",
     "OnboardingPresetProjection",
+    "SettingsPostCommitFailureResponse",
     "SkillGrantResponse",
     "SkillDeleteResponse",
     "UiPreferencesResponse",

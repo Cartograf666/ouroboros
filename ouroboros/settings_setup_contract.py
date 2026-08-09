@@ -161,6 +161,12 @@ _LOCAL_PRESETS: Dict[str, Dict[str, Any]] = {
 SUBSCRIPTIONS_CONNECTED_FIELD = "subscriptionsConnected"
 SKIP_SUBSCRIPTION_PRESETS_FIELD = "skipSubscriptionPresets"
 
+# The durable "onboarding finished here" fact, written by every completion —
+# including one that connected no subscription and one that skipped the preset.
+# Absence of a working provider is a state an OLD install reaches too, so it
+# cannot be the latch on its own; this key is what closes the window for good.
+ONBOARDING_COMPLETED_KEY = "OUROBOROS_ONBOARDING_COMPLETED_AT"
+
 _SUBSCRIPTION_FIELDS = _rows(("id", "payloadKey", "label", "note"), (
     ("subscriptions-connected", SUBSCRIPTIONS_CONNECTED_FIELD, "Agent subscription connected", "Set by the wizard when at least one agent account was signed in during onboarding. The server re-reads the live account state before applying anything."),
     ("skip-subscription-presets", SKIP_SUBSCRIPTION_PRESETS_FIELD, "Finish without agent defaults", "Completes onboarding without moving reviewers and subagents onto the connected subscriptions. Everything stays editable in Settings afterwards."),

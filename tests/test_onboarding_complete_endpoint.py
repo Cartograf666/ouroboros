@@ -14,6 +14,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from ouroboros.settings_setup_contract import ONBOARDING_COMPLETED_KEY
 from ouroboros.subscription_install_presets import PRESET_MARKER_KEY
 
 _PROVIDER_ENV = (
@@ -23,7 +24,47 @@ _PROVIDER_ENV = (
     "USE_LOCAL_MAIN", "USE_LOCAL_HEAVY", "USE_LOCAL_LIGHT", "USE_LOCAL_FALLBACK",
     "USE_LOCAL_CONSCIOUSNESS", "LOCAL_MODEL_SOURCE", PRESET_MARKER_KEY,
     "OUROBOROS_REVIEWER_SLOTS", "OUROBOROS_SUBAGENT_HARNESS", "OUROBOROS_SAFETY_MODE",
+    ONBOARDING_COMPLETED_KEY,
 )
+
+# Shapes copied from the LIVE daemon (GET /v2/credential-profiles, GET
+# /v2/agent-capabilities, 2026-08-09) through the same projection the accounts
+# panel uses: a per-harness accounts row carrying the engine's own `next_up`
+# routing pointer, and credential profiles carrying `credential_kind` +
+# availability. A fake without `next_up` is a fake of an engine that does not
+# exist.
+def _native_account(harness, *, route="local_session", detected=True, enabled=True):
+    return {
+        "harness_id": harness,
+        "native_credentials_enabled": enabled,
+        "native_login_detected": detected,
+        "identity": {"email": "owner@example.com", "plan": "claude_max"},
+        "next_up": {"kind": "native", "route": route},
+    }
+
+
+def _profile_account(harness, profile_id):
+    return {
+        "harness_id": harness,
+        "native_credentials_enabled": True,
+        "native_login_detected": False,
+        "identity": None,
+        "next_up": {"kind": "profile", "profileId": profile_id},
+    }
+
+
+def _profile(harness, profile_id, *, kind="config_dir_login", enabled=True,
+             availability="available", verification="passed"):
+    return {
+        "profile": {"profile_id": profile_id, "harness_id": harness,
+                    "display_name": profile_id, "credential_kind": kind,
+                    "enabled": enabled},
+        "status": {"profile_id": profile_id, "harness_id": harness,
+                   "availability": availability, "verification": verification,
+                   "verification_source": "vendor"},
+        "identity": {"email": "owner@example.com", "plan": "pro"},
+    }
+
 
 LIVE_SNAPSHOT = {
     "daemon": {"state": "running"},
@@ -40,10 +81,7 @@ LIVE_SNAPSHOT = {
         },
     ],
     "profiles": {
-        "harnessAccounts": [
-            {"harness_id": "claude", "native_login_detected": True},
-            {"harness_id": "codex", "native_login_detected": True},
-        ],
+        "harnessAccounts": [_native_account("claude"), _native_account("codex")],
         "profiles": [],
     },
 }
@@ -175,11 +213,10 @@ def test_daemon_unavailable_persists_nothing_and_keeps_the_wizard_open(onboardin
 def test_unresolvable_model_refuses_before_any_write(onboarding):
     onboarding.calls["snapshot_payload"] = {
         "daemon": {"state": "running"},
-        "harnesses": [{"id": "claude", "status": "ok",
+        "harnesses": [{"id": "claude", "status": "ok", "enabled": True,
                        "models": [{"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
                                   {"id": "claude-fable-5"}]}],
-        "profiles": {"harnessAccounts": [
-            {"harness_id": "claude", "native_login_detected": True}]},
+        "profiles": {"harnessAccounts": [_native_account("claude")]},
     }
 
     response = onboarding.client.post(
@@ -195,9 +232,9 @@ def test_unresolvable_model_refuses_before_any_write(onboarding):
 def test_a_signed_in_account_without_discovery_is_a_typed_failure(onboarding):
     onboarding.calls["snapshot_payload"] = {
         "daemon": {"state": "running"},
-        "harnesses": [{"id": "claude", "models": [], "models_error": "harness_unavailable"}],
-        "profiles": {"harnessAccounts": [
-            {"harness_id": "claude", "native_login_detected": True}]},
+        "harnesses": [{"id": "claude", "status": "ok", "enabled": True,
+                       "models": [], "models_error": "harness_unavailable"}],
+        "profiles": {"harnessAccounts": [_native_account("claude")]},
     }
 
     response = onboarding.client.post(
@@ -236,6 +273,163 @@ def test_no_subscription_declared_never_reads_the_daemon(onboarding):
     assert response.status_code == 200, response.text
     assert response.json()["preset"]["reason"] == "not_requested"
     assert onboarding.calls["snapshot"] == 0
+
+
+def test_an_old_unconfigured_install_is_not_retro_presetted(onboarding):
+    """The reviewer's probe: a long-lived install whose provider stopped working.
+
+    "No startup-ready provider" is true for it too, so that predicate alone made
+    the install-time window RE-OPEN and wrote the preset over reviewer/subagent
+    choices the owner made themselves (D-4). A settings file that already exists
+    is proof this is not a first run."""
+    onboarding.settings_path.write_text(json.dumps({
+        "OUROBOROS_MODEL": "openai/gpt-5.6-luna",
+        "OUROBOROS_REVIEWER_SLOTS": '{"triad": [{"route": {"target_id": "mine"}}]}',
+        "OUROBOROS_SUBAGENT_HARNESS": "claude=claude-sonnet-5",
+        "OUROBOROS_SAFETY_MODE": "full",
+    }), encoding="utf-8")
+
+    response = onboarding.client.post(
+        "/api/onboarding/complete",
+        json={**WIZARD_PAYLOAD, "subscriptionsConnected": True},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["preset"] == {
+        "applied": False, "reason": "not_install_time", "harnesses": [], "receipt": {}}
+    assert onboarding.calls["snapshot"] == 0  # the daemon is not even asked
+    saved = onboarding.saved()
+    assert not saved.get(PRESET_MARKER_KEY)
+    # The owner's OWN reviewer/subagent configuration survived untouched.
+    assert saved["OUROBOROS_REVIEWER_SLOTS"] == '{"triad": [{"route": {"target_id": "mine"}}]}'
+    assert saved["OUROBOROS_SUBAGENT_HARNESS"] == "claude=claude-sonnet-5"
+    assert saved["OUROBOROS_SAFETY_MODE"] == "full"
+
+
+def test_every_completion_records_the_durable_onboarding_fact(onboarding):
+    """Including one that connected nothing: absence of a provider must never be
+    able to re-open the install-time window later."""
+    response = onboarding.client.post("/api/onboarding/complete", json=dict(WIZARD_PAYLOAD))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["preset"]["reason"] == "not_requested"
+    assert onboarding.saved()[ONBOARDING_COMPLETED_KEY]
+
+
+def test_a_recorded_completion_closes_the_window_even_without_a_settings_file(onboarding):
+    """The marker is the durable fact, checked before anything else: an install
+    that once completed onboarding is not install-time again."""
+    from ouroboros.gateway.onboarding import preset_eligible
+
+    assert preset_eligible({}) is True
+    assert preset_eligible({ONBOARDING_COMPLETED_KEY: "2026-08-09T00:00:00Z"}) is False
+    assert preset_eligible({PRESET_MARKER_KEY: "1"}) is False
+
+
+def test_generic_settings_save_cannot_author_or_clear_the_completion_fact():
+    from ouroboros.gateway.settings import _merge_settings_payload
+
+    merged = _merge_settings_payload({ONBOARDING_COMPLETED_KEY: "2026-08-09T00:00:00Z"},
+                                     {ONBOARDING_COMPLETED_KEY: ""})
+    assert merged[ONBOARDING_COMPLETED_KEY] == "2026-08-09T00:00:00Z"
+    fresh = _merge_settings_payload({}, {ONBOARDING_COMPLETED_KEY: "2026-08-09T00:00:00Z"})
+    assert not fresh.get(ONBOARDING_COMPLETED_KEY)
+
+
+def test_a_contended_lock_writes_nothing_and_starts_nothing(onboarding):
+    """FINDING 1 (the class): `_acquire_settings_lock` answers None on timeout.
+
+    The write used to run the precondition and `atomic_write_json` ANYWAY, so a
+    contended save was the one save that skipped the check it advertises. The
+    lock is now a precondition of the write itself."""
+    import os
+
+    lock_path = onboarding.settings_path.with_name(onboarding.settings_path.name + ".lock")
+    foreign_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    try:
+        response = onboarding.client.post(
+            "/api/onboarding/complete",
+            json={**WIZARD_PAYLOAD, "subscriptionsConnected": True})
+    finally:
+        os.close(foreign_fd)
+
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["code"] == "settings_locked"
+    assert body["saved"] is False
+    assert not onboarding.settings_path.exists()
+    assert onboarding.calls["env"] == []
+    assert onboarding.calls["supervisor"] == 0
+    assert lock_path.exists()  # the other holder's lock was neither taken nor removed
+
+
+def test_the_precondition_never_runs_without_the_lock(monkeypatch, tmp_path):
+    """The same class, at the seam every owner endpoint shares."""
+    import os
+
+    import ouroboros.config as config
+    from ouroboros.gateway.owner_settings import SettingsLockUnavailable, _owner_write_settings
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "SETTINGS_PATH", settings_path)
+    checked: list = []
+    foreign_fd = os.open(str(tmp_path / "settings.json.lock"),
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    try:
+        with pytest.raises(SettingsLockUnavailable):
+            _owner_write_settings({"TOTAL_BUDGET": 10.0},
+                                  precondition=lambda: checked.append(1) or "")
+    finally:
+        os.close(foreign_fd)
+
+    assert checked == []
+    assert not settings_path.exists()
+
+
+def test_a_post_commit_failure_reports_the_save_that_landed(monkeypatch, onboarding):
+    """FINDING 4: the commit boundary. The bytes are on disk before the
+    supervisor starts, so a supervisor failure is its own fact — reporting
+    `saved=False` sent the owner back through a completed onboarding."""
+    import ouroboros.gateway.settings as gw_settings
+
+    def _boom(_request, _settings):
+        raise RuntimeError("supervisor refused to start")
+
+    monkeypatch.setattr(gw_settings, "_start_supervisor_if_needed_for_request", _boom)
+
+    response = onboarding.client.post(
+        "/api/onboarding/complete",
+        json={**WIZARD_PAYLOAD, "subscriptionsConnected": True})
+
+    assert response.status_code == 500, response.text
+    body = response.json()
+    assert body["saved"] is True
+    assert body["status"] == "saved_with_post_commit_error"
+    assert body["post_commit_failed"] == "supervisor start"
+    assert "supervisor refused to start" in body["error"]
+    # And the transaction really IS on disk, preset marker included.
+    saved = onboarding.saved()
+    assert saved[PRESET_MARKER_KEY] == "1"
+    assert saved[ONBOARDING_COMPLETED_KEY]
+    assert saved["OPENROUTER_API_KEY"] == WIZARD_PAYLOAD["OPENROUTER_API_KEY"]
+
+
+def test_the_preset_save_does_not_stall_on_its_own_lock(onboarding):
+    """FINDING 5: the precondition re-read used to take the settings lock a
+    second time. It is not re-entrant, so every successful preset save burned
+    the full 2s timeout before reading the file it was already holding."""
+    import time
+
+    started = time.monotonic()
+    response = onboarding.client.post(
+        "/api/onboarding/complete",
+        json={**WIZARD_PAYLOAD, "subscriptionsConnected": True})
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 200, response.text
+    assert response.json()["preset"]["applied"] is True
+    assert elapsed < 1.0, f"the preset save waited {elapsed:.2f}s on a lock it held"
 
 
 def test_old_install_is_not_retro_presetted(onboarding):
@@ -367,29 +561,34 @@ def test_running_process_keeps_its_boot_runtime_mode(onboarding):
 # ---------------------------------------------------------------------------
 
 
-def test_only_daemon_vouched_accounts_become_discoveries():
+def _routable_snapshot(accounts, profiles=(), harnesses=None):
+    return {
+        "daemon": {"state": "running"},
+        "harnesses": harnesses if harnesses is not None else [
+            {"id": "claude", "status": "ok", "enabled": True, "models": [{"id": "claude-opus-5"}]},
+            {"id": "codex", "status": "ok", "enabled": True, "models": [{"id": "gpt-5.6-sol"}]},
+            {"id": "cursor", "status": "ok", "enabled": True,
+             "models": [{"id": "cursor-grok-4.5-high"}]},
+        ],
+        "profiles": {"harnessAccounts": list(accounts), "profiles": list(profiles)},
+    }
+
+
+def test_only_daemon_routable_accounts_become_discoveries():
+    """The engine's OWN answer decides: `next_up` says which credential an
+    unpinned run would take, and only a subscription seat counts."""
     from ouroboros.gateway.onboarding import verified_harness_discoveries
 
-    snapshot = {
-        "daemon": {"state": "running"},
-        "harnesses": [
-            {"id": "claude", "models": [{"id": "claude-opus-5"}]},
-            {"id": "codex", "models": [{"id": "gpt-5.6-sol"}]},
-            {"id": "cursor", "models": [{"id": "cursor-grok-4.5-high"}]},
-        ],
-        "profiles": {
-            # claude: a live local session. codex: a verified named profile.
-            # cursor: a profile that exists but never verified -> NOT connected.
-            "harnessAccounts": [{"harness_id": "claude", "native_login_detected": True},
-                                {"harness_id": "cursor", "native_login_detected": False}],
-            "profiles": [
-                {"profile": {"harness_id": "codex", "enabled": True},
-                 "status": {"verification": "passed"}},
-                {"profile": {"harness_id": "cursor", "enabled": True},
-                 "status": {"verification": "failed"}},
-            ],
-        },
-    }
+    snapshot = _routable_snapshot(
+        # claude: the live CLI session. codex: the engine would rotate onto a
+        # verified subscription profile. cursor: signed in nowhere.
+        [_native_account("claude"),
+         _profile_account("codex", "koshak"),
+         {"harness_id": "cursor", "native_credentials_enabled": True,
+          "native_login_detected": False, "identity": None,
+          "next_up": {"kind": "none", "reason": "the default credential is not ready"}}],
+        [_profile("codex", "koshak")],
+    )
 
     discoveries, failure = verified_harness_discoveries(snapshot)
 
@@ -397,7 +596,99 @@ def test_only_daemon_vouched_accounts_become_discoveries():
     assert [d.harness_id for d in discoveries] == ["claude", "codex"]
 
 
-def test_no_vouched_account_is_a_typed_failure():
+def test_an_api_key_profile_is_never_counted_as_a_subscription():
+    """The reviewer's probe: `credential_kind=api_key` with a PASSED
+    verification. Presetting it would put agent_session reviewer rows on a lane
+    that bills the owner's API key — exactly what D-3 forbids."""
+    from ouroboros.gateway.onboarding import subscription_routable_harnesses
+
+    routable, refused = subscription_routable_harnesses(_routable_snapshot(
+        [_profile_account("claude", "byok")],
+        [_profile("claude", "byok", kind="api_key", availability="unavailable")],
+    ))
+
+    assert routable == {}
+    assert "API credential" in refused["claude"]
+
+
+def test_a_native_api_key_route_is_never_counted_as_a_subscription():
+    """Same class on the OTHER seat: the default account of an API-key-only
+    harness is a detected login too — the engine names its route `api_key`."""
+    from ouroboros.gateway.onboarding import subscription_routable_harnesses
+
+    routable, refused = subscription_routable_harnesses(
+        _routable_snapshot([_native_account("codex", route="api_key")]))
+
+    assert routable == {}
+    assert "API key" in refused["codex"]
+
+
+def test_a_disabled_or_unavailable_harness_is_refused_even_when_signed_in():
+    """The other half of the reviewer's probe: the harness row itself. An
+    engine that cannot run the harness cannot run a subscription session on it,
+    however healthy the account looks."""
+    from ouroboros.gateway.onboarding import subscription_routable_harnesses
+
+    routable, refused = subscription_routable_harnesses(_routable_snapshot(
+        [_native_account("claude"), _native_account("codex")],
+        harnesses=[
+            {"id": "claude", "status": "ok", "enabled": False, "models": [{"id": "claude-opus-5"}]},
+            {"id": "codex", "status": "unavailable", "enabled": True,
+             "models": [{"id": "gpt-5.6-sol"}]},
+        ],
+    ))
+
+    assert routable == {}
+    assert refused == {"claude": "the engine has this harness disabled",
+                       "codex": "the engine reports it unavailable"}
+
+
+def test_an_unverified_or_disabled_profile_seat_is_refused():
+    from ouroboros.gateway.onboarding import subscription_routable_harnesses
+
+    unverified = subscription_routable_harnesses(_routable_snapshot(
+        [_profile_account("cursor", "koshakcot-ultra")],
+        [_profile("cursor", "koshakcot-ultra", availability="unavailable",
+                  verification="not_run")]))
+    disabled = subscription_routable_harnesses(_routable_snapshot(
+        [_profile_account("cursor", "sol-validator")],
+        [_profile("cursor", "sol-validator", enabled=False)]))
+    missing = subscription_routable_harnesses(
+        _routable_snapshot([_profile_account("cursor", "ghost")]))
+
+    assert unverified[0] == {} and "unavailable" in unverified[1]["cursor"]
+    assert disabled[0] == {} and "disabled" in disabled[1]["cursor"]
+    assert missing[0] == {} and "does not list" in missing[1]["cursor"]
+
+
+def test_a_signed_in_session_the_engine_will_not_route_is_refused():
+    """`next_up.kind == "none"` is the daemon saying an unpinned run has nothing
+    to route to. Ouroboros does not second-guess it with its own derivation."""
+    from ouroboros.gateway.onboarding import subscription_routable_harnesses
+
+    routable, refused = subscription_routable_harnesses(_routable_snapshot(
+        [{"harness_id": "claude", "native_credentials_enabled": True,
+          "native_login_detected": True, "identity": None,
+          "next_up": {"kind": "none", "reason": "the default credential is disabled"}}],
+        [_profile("claude", "koshak")],  # a healthy profile the engine did NOT pick
+    ))
+
+    assert routable == {}
+    assert refused == {"claude": "the default credential is disabled"}
+
+
+def test_no_routable_account_is_a_typed_failure_that_names_the_reason():
+    from ouroboros.gateway.onboarding import verified_harness_discoveries
+
+    discoveries, failure = verified_harness_discoveries(_routable_snapshot(
+        [_native_account("claude", detected=False)]))
+
+    assert discoveries == ()
+    assert failure is not None and failure.code == "no_verified_account"
+    assert "no signed-in session" in failure.detail
+
+
+def test_an_engine_with_no_accounts_authority_vouches_nothing():
     from ouroboros.gateway.onboarding import verified_harness_discoveries
 
     discoveries, failure = verified_harness_discoveries({
