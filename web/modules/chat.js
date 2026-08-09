@@ -539,18 +539,24 @@ function projectIdFromTask(taskId = '') {
     return (seed ? `task-${seed}` : `task-${Date.now().toString(36)}`).slice(0, 64);
 }
 
-function loadInputHistory() {
+// Composer recall (↑/↓ through what you last sent) is PER THREAD, so the key is
+// supplied by the instance's `storeKey` — the same scoping the transcript cache
+// and the draft already used. It was the one composer store still reading the
+// bare global key, which meant every project thread recalled (and appended to)
+// the main chat's sent messages, and vice versa: a leak across rooms that only
+// grew more visible once one project could hold many threads.
+function loadInputHistory(key) {
     try {
-        const raw = JSON.parse(sessionStorage.getItem(CHAT_INPUT_HISTORY_KEY) || '[]');
+        const raw = JSON.parse(sessionStorage.getItem(key) || '[]');
         return Array.isArray(raw) ? raw.filter(Boolean).slice(-50) : [];
     } catch {
         return [];
     }
 }
 
-function saveInputHistory(entries) {
+function saveInputHistory(key, entries) {
     try {
-        sessionStorage.setItem(CHAT_INPUT_HISTORY_KEY, JSON.stringify(entries.slice(-50)));
+        sessionStorage.setItem(key, JSON.stringify(entries.slice(-50)));
     } catch {}
 }
 
@@ -563,7 +569,7 @@ export function createChatInstance({
     ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab,
     subscribeState = null, refreshState = null,
     chatId = 1, projectId = '', idPrefix = 'chat', mountEl = null,
-    asPanel = false, title = 'Chat', initialScrollState = null,
+    asPanel = false, layout = '', chrome = '', title = 'Chat', initialScrollState = null,
     // perf2 P4.2: app.js signal "a project panel is opening right now" — Main
     // defers its first hydration to it (bounded by an unconditional deadline).
     isProjectOpening = null,
@@ -577,16 +583,35 @@ export function createChatInstance({
     // Per-thread storage so a project thread never bleeds into the main chat.
     const storeKey = (base) => (isMain ? base : `${base}:${chatId}`);
 
+    // TWO independent questions, decoupled (X8). `asPanel` used to answer both,
+    // which made "no global agent controls" inseparable from "live in the right
+    // panel" — so a project thread could not be mounted in the CENTRE without
+    // either duplicating the global Evolve/Review/Restart/Panic chrome or
+    // pretending to be a right panel.
+    //   layout: 'page'   -> the app's own full page (`#page-chat`, Main only)
+    //           'panel'  -> a hosted, fill-its-container instance
+    //           'centre' -> the same hosted shape, mounted in the centre stage
+    //   chrome: 'global' -> the overlay page header with the ONE agent's controls
+    //           'thread' -> a status-only bar; the host supplies title + actions
+    // `asPanel` stays the back-compat shorthand for ('panel','thread').
+    const layoutMode = String(layout || (asPanel ? 'panel' : 'page'));
+    const chromeMode = String(chrome || (asPanel ? 'thread' : 'global'));
+    const hostedLayout = layoutMode !== 'page';
+
     const page = document.createElement('div');
-    page.id = asPanel ? `panel-${idPrefix}` : 'page-chat';
-    page.className = asPanel ? 'chat-instance-panel' : 'page active';
-    // A project panel reuses the lean `.project-panel-bar` (title + close) from
-    // index.html, so it renders a minimal status-only header — NOT the overlay
-    // page header (that would duplicate the title and drag in the GLOBAL
-    // Evolve/Review/Restart/Panic chrome, which belongs to the one agent, not a
+    page.id = hostedLayout ? `panel-${idPrefix}` : 'page-chat';
+    // `.chat-instance-panel` is the hosted FILL shape (flex:1, min-height:0,
+    // position:relative) — correct in the right panel and in the centre alike;
+    // `.chat-instance-centre` is the modifier the centre stage styles through.
+    page.className = hostedLayout
+        ? `chat-instance-panel${layoutMode === 'centre' ? ' chat-instance-centre' : ''}`
+        : 'page active';
+    // Thread chrome renders a minimal status-only header — NOT the overlay page
+    // header (that would duplicate the host's title and drag in the GLOBAL
+    // Evolve/Review/Restart/Panic controls, which belong to the one agent, not a
     // single project thread). The main chat keeps the full overlay header; the
     // budget meter is not here at all — it lives once in the sidebar.
-    const headerHtml = asPanel
+    const headerHtml = chromeMode === 'thread'
         ? `<div class="chat-panel-statusbar"><span id="chat-status" class="status-badge offline">Connecting...</span></div>`
         : renderPageHeader({
             title: title,
@@ -907,7 +932,7 @@ export function createChatInstance({
     const seenMessageKeys = new Set();
     const messageKeyOrder = [];
     const pendingUserBubbles = new Map();
-    const inputHistory = loadInputHistory();
+    const inputHistory = loadInputHistory(storeKey(CHAT_INPUT_HISTORY_KEY));
     let inputHistoryIndex = inputHistory.length;
     let inputDraft = '';
     let historyLoaded = false;
@@ -3776,7 +3801,7 @@ export function createChatInstance({
                     }
                     inputHistory.length = 0;
                     inputHistory.push(...deduped.slice(-50));
-                    saveInputHistory(inputHistory);
+                    saveInputHistory(storeKey(CHAT_INPUT_HISTORY_KEY), inputHistory);
                     inputHistoryIndex = inputHistory.length;
                     inputHistorySeededFromServer = true;
                 }
@@ -3911,7 +3936,7 @@ export function createChatInstance({
     function rememberInput(text) {
         if (!text) return;
         if (inputHistory[inputHistory.length - 1] !== text) inputHistory.push(text);
-        saveInputHistory(inputHistory);
+        saveInputHistory(storeKey(CHAT_INPUT_HISTORY_KEY), inputHistory);
         inputHistoryIndex = inputHistory.length;
         inputDraft = '';
     }
@@ -4404,7 +4429,7 @@ export function createChatInstance({
     // Handler refs are kept so destroy() can remove them (P3 lifecycle).
     let documentClickHandler = null;
     let documentKeydownHandler = null;
-    if (!asPanel) {
+    if (chromeMode !== 'thread') {
         const collapseHeaderMenus = (predicate) => {
             page.querySelectorAll('details.chat-header-more[open]').forEach((details) => {
                 if (predicate(details)) details.removeAttribute('open');
@@ -4423,8 +4448,8 @@ export function createChatInstance({
     // The budget affordance itself lives in the SIDEBAR now (`#nav-budget` in
     // app.js), which owns the same `openDashboardTab('costs')` click. The chat
     // header no longer renders a budget pill, so there is nothing to bind here.
-    if (asPanel) {
-        // The panel has no global controls/budget to poll; seed the status from
+    if (chromeMode === 'thread') {
+        // Thread chrome has no global controls/budget to poll; seed the status from
         // the live socket so a late-created panel never gets stuck on
         // "Connecting…" (the one-shot WS `open` already fired before it existed;
         // future reconnects still update it via the shared `open` handler).
