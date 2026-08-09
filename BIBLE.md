@@ -331,7 +331,7 @@ following bounds are constitutional:
   single-small-provider setup) `low` remains a legitimate owner choice —
   and, since the retrieving mode above, no longer the only one admitted:
   the owner may instead declare a retrieving scope slot under its four
-  bounds, whose assurance is DECLARED lower rather than claimed equal.
+  bounds, which keeps whole-repository review rather than dropping it.
   Both are selectable today. What stays forbidden either way is an
   undeclared partial-coverage reviewer that
   looks like the pushed gate. In EVERY mode the staged diff is still

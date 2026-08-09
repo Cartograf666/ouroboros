@@ -140,7 +140,7 @@ def run_parallel_review(ctx, commit_message, *, goal="", scope="", review_rebutt
             _scope_statuses = [str(getattr(r, "status", "") or "") for r in results]
             # `responded` is the ONLY authoritative status. A retrieving (session) row
             # whose window is not sourced-proven arrives as `session_advisory`: its
-            # coverage is declaredly not host-attested, so it must never be counted as
+            # window evidence — not its retrieval — is what is missing, so it must not be counted as
             # the authoritative verdict that satisfies the blocking scope quorum — it is
             # advisory evidence, and the shortfall it leaves is disclosed below. Such a
             # row also arrives BLOCKED (its own authority function decides that, exactly
