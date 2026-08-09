@@ -15,22 +15,24 @@ import copy
 import json
 import os
 from typing import Any, Dict
-from unittest.mock import patch
 
 import pytest
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from ouroboros.secret_masking import looks_masked_secret
+from ouroboros.secret_masking import (
+    looks_masked_mcp_secret,
+    looks_masked_secret,
+    looks_masked_settings_secret,
+)
 
 REAL_KEY = "sk-original-secret"
-# Every placeholder shape this codebase emits.
-MASKS = ("***", "***set***", "sk-origi...")
+TOKEN_MASKS = ("***", "***set***", "sk-origi...")
 
 
 @pytest.fixture()
-def settings_client(tmp_path):
+def settings_client(tmp_path, monkeypatch):
     """TestClient over the real GET/POST settings endpoints with an in-memory disk."""
     import server as srv
 
@@ -52,32 +54,39 @@ def settings_client(tmp_path):
         saved.update(settings)
         on_disk.update(settings)
 
-    patches = [
-        patch.object(srv, "_start_supervisor_if_needed", lambda *a, **k: None),
-        patch.object(srv, "_apply_settings_to_env", lambda *a, **k: None),
-        patch.object(srv, "apply_runtime_provider_defaults", lambda s: (dict(s), False, [])),
-        patch.object(srv, "load_settings", side_effect=fake_load_settings),
-        patch.object(srv, "save_settings", side_effect=fake_save_settings),
-        patch.object(srv._gateway_settings, "apply_runtime_provider_defaults", lambda s: (dict(s), False, [])),
-        patch.object(srv._gateway_settings, "_apply_max_context_auto_downgrade", lambda *a, **k: ("", "")),
-        patch.object(srv._gateway_settings, "_owner_read_settings_raw", side_effect=fake_load_settings),
-        patch.object(srv._gateway_settings, "_owner_write_settings", side_effect=fake_save_settings),
-        patch("ouroboros.server_auth.get_configured_network_password", return_value=""),
-    ]
-    for p in patches:
-        p.start()
-    try:
-        app = Starlette(routes=[
+    gateway = srv._gateway_settings
+
+    def provider_defaults(settings):
+        return dict(settings), False, []
+
+    monkeypatch.setattr(gateway, "load_settings", fake_load_settings)
+    # server's compatibility shim still assigns this retired module attribute.
+    # Record its absence so monkeypatch removes the temporary assignment again.
+    monkeypatch.setattr(gateway, "save_settings", fake_save_settings, raising=False)
+    monkeypatch.setattr(gateway, "_apply_settings_to_env", lambda *a, **k: None)
+    monkeypatch.setattr(gateway, "apply_runtime_provider_defaults", provider_defaults)
+    monkeypatch.setattr(gateway, "_apply_max_context_auto_downgrade", lambda *a, **k: ("", ""))
+    monkeypatch.setattr(gateway, "_owner_read_settings_raw", fake_load_settings)
+    monkeypatch.setattr(gateway, "_owner_write_settings", fake_save_settings)
+
+    # server's compatibility wrapper copies these four globals into the gateway
+    # on every request. Patch the gateway first so monkeypatch restores both
+    # modules to their real functions after the fixture.
+    monkeypatch.setattr(srv, "load_settings", fake_load_settings)
+    monkeypatch.setattr(srv, "save_settings", fake_save_settings)
+    monkeypatch.setattr(srv, "_apply_settings_to_env", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "apply_runtime_provider_defaults", provider_defaults)
+
+    app = Starlette(
+        routes=[
             Route("/api/settings", endpoint=srv.api_settings_get, methods=["GET"]),
             Route("/api/settings", endpoint=srv.api_settings_post, methods=["POST"]),
-        ])
-        app.state.drive_root = tmp_path
-        app.state.repo_dir = tmp_path
-        with TestClient(app) as client:
-            yield client, on_disk, saved
-    finally:
-        for p in patches:
-            p.stop()
+        ]
+    )
+    app.state.drive_root = tmp_path
+    app.state.repo_dir = tmp_path
+    with TestClient(app) as client:
+        yield client, on_disk, saved
 
 
 def test_get_masks_the_stored_key(settings_client):
@@ -85,7 +94,7 @@ def test_get_masks_the_stored_key(settings_client):
     resp = client.get("/api/settings")
     assert resp.status_code == 200
     assert REAL_KEY not in resp.text
-    assert looks_masked_secret(resp.json()["OPENAI_COMPATIBLE_API_KEY"])
+    assert looks_masked_settings_secret("OPENAI_COMPATIBLE_API_KEY", resp.json()["OPENAI_COMPATIBLE_API_KEY"])
 
 
 def test_reposting_the_served_mask_keeps_the_real_key(settings_client):
@@ -100,7 +109,7 @@ def test_reposting_the_served_mask_keeps_the_real_key(settings_client):
     assert on_disk["OPENAI_COMPATIBLE_API_KEY"] == REAL_KEY
 
 
-@pytest.mark.parametrize("mask", MASKS)
+@pytest.mark.parametrize("mask", TOKEN_MASKS)
 def test_a_mask_is_never_persisted_even_with_nothing_stored(settings_client, mask):
     """Without this, an empty field turns the placeholder into the credential."""
     client, on_disk, saved = settings_client
@@ -112,7 +121,7 @@ def test_a_mask_is_never_persisted_even_with_nothing_stored(settings_client, mas
     assert saved["OPENAI_COMPATIBLE_API_KEY"] == ""
 
 
-@pytest.mark.parametrize("mask", MASKS)
+@pytest.mark.parametrize("mask", TOKEN_MASKS)
 def test_a_mask_is_never_persisted_as_a_custom_secret(settings_client, mask):
     """Custom secret keys share the contract; they are masked by the same GET."""
     client, _on_disk, saved = settings_client
@@ -121,6 +130,33 @@ def test_a_mask_is_never_persisted_as_a_custom_secret(settings_client, mask):
 
     assert resp.status_code == 200, resp.text
     assert not saved.get("MY_CUSTOM_TOKEN")
+
+
+def test_password_mask_is_never_persisted_with_nothing_stored(settings_client):
+    client, on_disk, saved = settings_client
+    on_disk["OUROBOROS_NETWORK_PASSWORD"] = ""
+
+    resp = client.post("/api/settings", json={"OUROBOROS_NETWORK_PASSWORD": "***set***"})
+
+    assert resp.status_code == 200, resp.text
+    assert saved["OUROBOROS_NETWORK_PASSWORD"] == ""
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("OUROBOROS_NETWORK_PASSWORD", "correct-horse..."),
+        ("MY_CUSTOM_TOKEN", "owner-chosen..."),
+    ],
+)
+def test_a_real_secret_ending_in_ellipsis_is_persisted(settings_client, key, value):
+    client, on_disk, saved = settings_client
+    on_disk[key] = ""
+
+    resp = client.post("/api/settings", json={key: value})
+
+    assert resp.status_code == 200, resp.text
+    assert saved[key] == value
 
 
 def test_a_new_key_replaces_the_old_one(settings_client):
@@ -153,19 +189,22 @@ def test_absent_key_keeps_the_stored_secret(settings_client):
     assert saved["OPENAI_COMPATIBLE_API_KEY"] == REAL_KEY
 
 
-@pytest.mark.parametrize("key", [
-    "OPENROUTER_API_KEY",
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "GITHUB_TOKEN",
-    "OPENAI_COMPATIBLE_API_KEY",
-])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GITHUB_TOKEN",
+        "OPENAI_COMPATIBLE_API_KEY",
+    ],
+)
 def test_every_provider_secret_round_trips(settings_client, key):
     """One contract for all masked secrets, not a per-provider patch."""
     client, on_disk, saved = settings_client
     original = on_disk[key]
     mask = client.get("/api/settings").json()[key]
-    assert looks_masked_secret(mask)
+    assert looks_masked_settings_secret(key, mask)
 
     assert client.post("/api/settings", json={key: mask}).status_code == 200
     assert saved[key] == original
@@ -174,16 +213,21 @@ def test_every_provider_secret_round_trips(settings_client, key):
     assert saved[key] == "brand-new-value-123"
 
 
-@pytest.mark.parametrize("mask", MASKS)
+@pytest.mark.parametrize("mask", TOKEN_MASKS)
 def test_a_stored_mask_reads_back_as_unset(tmp_path, monkeypatch, mask):
     """Repair for an install an older round-trip already poisoned."""
     from ouroboros import config as cfg
 
     settings_path = tmp_path / "settings.json"
-    settings_path.write_text(json.dumps({
-        "OPENAI_COMPATIBLE_API_KEY": mask,
-        "OPENAI_COMPATIBLE_BASE_URL": "http://127.0.0.1:4000/v1",
-    }), encoding="utf-8")
+    settings_path.write_text(
+        json.dumps(
+            {
+                "OPENAI_COMPATIBLE_API_KEY": mask,
+                "OPENAI_COMPATIBLE_BASE_URL": "http://127.0.0.1:4000/v1",
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
     monkeypatch.delenv("OPENAI_COMPATIBLE_API_KEY", raising=False)
 
@@ -193,16 +237,106 @@ def test_a_stored_mask_reads_back_as_unset(tmp_path, monkeypatch, mask):
     assert loaded["OPENAI_COMPATIBLE_BASE_URL"] == "http://127.0.0.1:4000/v1"
 
 
+def test_a_stored_password_mask_reads_back_as_unset(tmp_path, monkeypatch):
+    from ouroboros import config as cfg
+
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps({"OUROBOROS_NETWORK_PASSWORD": "***set***"}), encoding="utf-8")
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
+
+    assert cfg.load_settings()["OUROBOROS_NETWORK_PASSWORD"] == ""
+
+
+def test_disk_mask_does_not_block_a_real_environment_secret(tmp_path, monkeypatch):
+    from ouroboros import config as cfg
+
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps({"OPENAI_COMPATIBLE_API_KEY": "***"}), encoding="utf-8")
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
+    monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "sk-real-from-env")
+
+    assert cfg.load_settings()["OPENAI_COMPATIBLE_API_KEY"] == "sk-real-from-env"
+
+
+def test_environment_secret_ending_in_ellipsis_is_not_repaired(tmp_path, monkeypatch):
+    from ouroboros import config as cfg
+
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
+    monkeypatch.setenv("OPENAI_COMPATIBLE_API_KEY", "sk-real-ending...")
+
+    assert cfg.load_settings()["OPENAI_COMPATIBLE_API_KEY"] == "sk-real-ending..."
+
+
+def test_real_stored_password_ending_in_ellipsis_is_not_repaired(tmp_path, monkeypatch):
+    from ouroboros import config as cfg
+
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps({"OUROBOROS_NETWORK_PASSWORD": "correct-horse..."}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
+
+    assert cfg.load_settings()["OUROBOROS_NETWORK_PASSWORD"] == "correct-horse..."
+
+
+def test_custom_stored_masks_read_back_as_unset(tmp_path, monkeypatch):
+    from ouroboros import config as cfg
+
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "MY_CUSTOM_TOKEN": "***",
+                "TELEGRAM_BOT_TOKEN": "telegram...",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
+
+    loaded = cfg.load_settings()
+
+    assert loaded["MY_CUSTOM_TOKEN"] == ""
+    assert loaded["TELEGRAM_BOT_TOKEN"] == ""
+
+
+def test_common_writer_blanks_top_level_masks(tmp_path, monkeypatch):
+    from ouroboros import config as cfg
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
+
+    cfg.save_settings(
+        {
+            "OPENAI_COMPATIBLE_API_KEY": "sk-origi...",
+            "MY_CUSTOM_TOKEN": "my-token...",
+        }
+    )
+
+    raw = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert raw["OPENAI_COMPATIBLE_API_KEY"] == ""
+    assert raw["MY_CUSTOM_TOKEN"] == ""
+
+
 @pytest.mark.serial
 def test_a_stored_mask_never_reaches_the_environment(tmp_path, monkeypatch):
     """apply_settings_to_env writes the real process env, so restore it after."""
     from ouroboros import config as cfg
 
     settings_path = tmp_path / "settings.json"
-    settings_path.write_text(json.dumps({
-        "OPENAI_COMPATIBLE_API_KEY": "***",
-        "OPENAI_COMPATIBLE_BASE_URL": "http://127.0.0.1:4000/v1",
-    }), encoding="utf-8")
+    settings_path.write_text(
+        json.dumps(
+            {
+                "OPENAI_COMPATIBLE_API_KEY": "***",
+                "OPENAI_COMPATIBLE_BASE_URL": "http://127.0.0.1:4000/v1",
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
     monkeypatch.delenv("OPENAI_COMPATIBLE_API_KEY", raising=False)
 
@@ -220,6 +354,34 @@ def test_looks_masked_secret_accepts_every_placeholder(value):
     assert looks_masked_secret(value) is True
 
 
-@pytest.mark.parametrize("value", ["", "sk-a", "*", "**", "sk-original-secret", "p@ssw0rd"])
+@pytest.mark.parametrize(
+    "value",
+    ["", "sk-a", "*", "**", "sk-original-secret", "p@ssw0rd", "correct-horse..."],
+)
 def test_looks_masked_secret_rejects_real_values(value):
     assert looks_masked_secret(value) is False
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        ("OPENAI_API_KEY", "***", True),
+        ("OPENAI_API_KEY", "sk-origi...", True),
+        ("OPENAI_API_KEY", "***set***", True),
+        ("OUROBOROS_NETWORK_PASSWORD", "***set***", True),
+        ("OUROBOROS_NETWORK_PASSWORD", "***", False),
+        ("OUROBOROS_NETWORK_PASSWORD", "sk-origi...", False),
+    ],
+)
+def test_settings_masks_are_key_class_specific(key, value, expected):
+    assert looks_masked_settings_secret(key, value) is expected
+
+
+@pytest.mark.parametrize("value", ["***", "abcd...", "sk-origi..."])
+def test_mcp_recognizer_accepts_both_emitted_prefix_lengths(value):
+    assert looks_masked_mcp_secret(value) is True
+
+
+@pytest.mark.parametrize("value", ["***set***", "abcde...", "correct-horse..."])
+def test_mcp_recognizer_rejects_other_shapes(value):
+    assert looks_masked_mcp_secret(value) is False

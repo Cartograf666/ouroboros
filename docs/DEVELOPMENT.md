@@ -1421,10 +1421,11 @@ host state, never in extension manifests.
 
 The base runtime is an optional client for trusted HTTP/SSE and local stdio MCP
 servers; it is not an MCP server. `ouroboros/mcp_client.py` owns server parsing,
-transport-specific validation, auth masking, provider-safe tool names,
-discovery, timeout, and result normalization. Settings carry only `MCP_ENABLED`,
-`MCP_TOOL_TIMEOUT_SEC`, and structured `MCP_SERVERS`; tokens never appear in
-status responses.
+transport-specific validation, provider-safe tool names, discovery, timeout,
+and result normalization. `ouroboros/secret_masking.py` owns the exact shared
+Settings/MCP auth-placeholder emitters and recognizers. Settings carry only
+`MCP_ENABLED`, `MCP_TOOL_TIMEOUT_SEC`, and structured `MCP_SERVERS`; tokens never
+appear in status responses.
 
 MCP descriptions/results are untrusted data, not policy. Enabled tools join the
 initial capability envelope, still pass runtime safety, and remain unavailable

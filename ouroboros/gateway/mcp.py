@@ -14,10 +14,9 @@ from ouroboros.gateway._helpers import json_error, request_json_or
 from ouroboros.mcp_client import (
     canonical_server_id,
     get_manager,
-    looks_masked_secret,
     reconfigure_from_settings,
 )
-
+from ouroboros.secret_masking import looks_masked_mcp_secret
 
 log = logging.getLogger(__name__)
 
@@ -84,7 +83,7 @@ async def api_mcp_test(request: Request) -> JSONResponse:
                 # values from the saved config. The caller can also omit
                 # auth_token entirely to intentionally test without auth.
                 probe = dict(candidate)
-                if looks_masked_secret(probe.get("auth_token")):
+                if looks_masked_mcp_secret(probe.get("auth_token")):
                     probe["auth_token"] = str(target.get("auth_token") or "")
                 target = probe
             outcome = await asyncio.to_thread(manager.test_server, target)

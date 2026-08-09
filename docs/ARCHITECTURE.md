@@ -39,6 +39,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   │
   └── ouroboros/               ← Agent core (runs inside worker processes)
       ├── config.py            ← SSOT: paths, settings defaults, load/save, PID lock
+      ├── secret_masking.py    ← Exact Settings/MCP wire-placeholder emitters and recognizers, plus top-level known/custom secret repair before env overlay and persistence
       ├── update_channels.py   ← Closed Stable/QA/Development mapping and update-network defaults
       ├── colab_bootstrap.py   ← Google Colab source-mode bootstrap helpers: selected official update source, stable local `ouroboros` branch, Drive-backed settings/data, personal origin, no-UI server command, and native Telegram setup
       ├── cli.py               ← Source/headless CLI over gateway tasks, logs, settings, skills, marketplace, local-model, and MCP wrappers
@@ -1662,7 +1663,7 @@ Bundled native skills and editable marketplace/user payloads occupy separate pay
 
 ### MCP and browser-facing external tools
 
-`mcp_client.py` owns configured HTTP/SSE and local stdio MCP discovery and invocation. HTTP/SSE entries validate URLs and auth headers. Stdio entries pass one executable `command` and an exact string `args` list directly to the MCP SDK, without a shell, custom environment, or custom working directory; the SDK context owns process shutdown. Settings shows URL/auth fields for HTTP/SSE and command plus one-argument-per-line args for stdio. When MCP is enabled, successfully discovered tools join the selected initial capability envelope. Discovery failure produces an explicit capability omission through `list_available_tools`; it never silently removes an expected surface. Descriptions and results remain untrusted data, and every call still crosses registry, resource, safety, timeout, and result-handling policy.
+`mcp_client.py` owns configured HTTP/SSE and local stdio MCP discovery and invocation. HTTP/SSE entries validate URLs and auth headers. `secret_masking.py` owns the shared exact MCP token placeholder shapes used by status and Settings; load-time legacy repair remains intentionally limited to top-level Settings secrets and does not migrate pre-existing nested MCP values. Stdio entries pass one executable `command` and an exact string `args` list directly to the MCP SDK, without a shell, custom environment, or custom working directory; the SDK context owns process shutdown. Settings shows URL/auth fields for HTTP/SSE and command plus one-argument-per-line args for stdio. When MCP is enabled, successfully discovered tools join the selected initial capability envelope. Discovery failure produces an explicit capability omission through `list_available_tools`; it never silently removes an expected surface. Descriptions and results remain untrusted data, and every call still crosses registry, resource, safety, timeout, and result-handling policy.
 
 Browser tools are stateful and thread-sticky because Playwright sessions and greenlets have affinity; they cannot be scheduled as ordinary parallel stateless calls. Chromium is the default. WebKit and device descriptors are targeted tools for a real Safari/iOS risk, not a universal acceptance matrix and not a claim that a narrow Chromium viewport is Safari-equivalent. First-party PR helpers are normal built-ins, but their mutating operations remain subject to workspace, runtime-mode, local-readonly, heal-mode, credential, and reviewed-publication authority.
 
@@ -1707,6 +1708,12 @@ Single source of truth for:
   `acquire_pid_lock()`, `release_pid_lock()`
 
 Settings file: `~/Ouroboros/data/settings.json`. File-locked for concurrent access.
+`secret_masking.py` is the wire-placeholder authority for known and owner-defined
+top-level secrets. `load_settings()` repairs only recognized disk placeholders
+before environment precedence is resolved, so a real environment credential is
+never classified as a mask; `prepare_settings_for_persist()` applies the same
+top-level repair at the common writer boundary. Password, token, and MCP masks
+remain context-specific rather than sharing a suffix heuristic.
 
 ### LLM output token budgets
 

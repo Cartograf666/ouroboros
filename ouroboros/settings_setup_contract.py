@@ -13,6 +13,10 @@ from ouroboros.provider_models import (
     MINIMAX_REGION_ENDPOINTS,
     OPENAI_DIRECT_DEFAULTS,
 )
+from ouroboros.secret_masking import (
+    CONFIGURED_SECRET_PLACEHOLDER,
+    MASKED_SECRET_SETTING_KEYS as SECRET_SETTING_KEYS,
+)
 from ouroboros.task_pacing import COST_PLANNING_MARGIN_USD
 
 
@@ -75,30 +79,8 @@ _PROVIDER_FIELDS = _rows(("id", "stateKey", "settingKey", "settingsInputId", "la
     ("openai-compatible-key", "compatibleApiKey", "OPENAI_COMPATIBLE_API_KEY", "s-compatible-key", "OpenAI-compatible API Key", "Leave empty for no auth", "API key for the endpoint. Leave empty if your server does not require authentication.", "password", "more"),
 ))
 
-# Every settings key whose VALUE is a credential. ONE authority: /api/settings
-# masking, the generic settings merge, and the onboarding bootstrap all read it
-# from here, so a new provider cannot be secret on one surface and plaintext on
-# another. It lives in the setup contract because that is the lowest layer all
-# three already depend on.
-SECRET_SETTING_KEYS = frozenset({
-    "OPENROUTER_API_KEY",
-    "OPENAI_API_KEY",
-    "OPENAI_COMPATIBLE_API_KEY",
-    "CLOUDRU_FOUNDATION_MODELS_API_KEY",
-    "GIGACHAT_CREDENTIALS",
-    "GIGACHAT_PASSWORD",
-    "ANTHROPIC_API_KEY",
-    "MINIMAX_API_KEY",
-    "GITHUB_TOKEN",
-    "OUROBOROS_NETWORK_PASSWORD",
-})
-
-# What a configured credential looks like once it leaves the server. It is a
-# MARKER, not a redaction of the value: no prefix, no length, nothing that
-# narrows a guess. Deliberately the same token /api/settings already round-trips
-# for password-class secrets (``looks_masked_secret``), so every save path
-# rehydrates it through the rule it already has instead of a second one.
-CONFIGURED_SECRET_PLACEHOLDER = "***set***"
+# Secret-key membership and its configured marker are re-exported from the
+# leaf wire contract so onboarding, Settings, repair, and persistence cannot drift.
 
 _PROFILE_SPECS = {
     "openrouter": ("OpenRouter", "OpenRouter is present, so the next step keeps router-style defaults while still saving any extra direct keys you paste here.", "OpenRouter-style routing remains active. Unprefixed provider IDs like openai/gpt-5.6-terra or anthropic/claude-sonnet-5 continue to route through OpenRouter."),
