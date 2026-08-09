@@ -9,12 +9,12 @@ import test from 'node:test';
 import { promptUpdateVersion } from '../modules/marketplace.js';
 import { promptCampaignObjective } from '../modules/evolution.js';
 import { confirmAndSendPanic, shouldFirePanic } from '../modules/chat.js';
+import { shouldPollStatus } from '../modules/claudexor_status_store.js';
 import {
     JOB_POLL_GIVE_UP_FAILURES,
     JOB_POLL_MAX_DELAY_MS,
     nextJobPollDelay,
-    shouldSkipStatusRefresh,
-} from '../modules/harness_accounts.js';
+} from '../modules/harness_login_cards.js';
 import { reviewerSlotsSavePayload } from '../modules/reviewer_slots.js';
 
 // ---------------------------------------------------------------------------
@@ -137,19 +137,22 @@ test('/panic cancel/backdrop/Escape resolutions send NOTHING', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// harness_accounts (#125): status-refresh gate + job-poll pacing.
+// claudexor status store (#125, phase 2): polling gate + job-poll pacing.
 // ---------------------------------------------------------------------------
 
-test('the status-refresh gate skips invisible states unless forced', () => {
-    // Visible, tab shown: runs.
-    assert.equal(shouldSkipStatusRefresh({ hostVisible: true, hidden: false, force: false }), false);
-    // Hidden host (another page/subtab) or hidden browser tab: skipped.
-    assert.equal(shouldSkipStatusRefresh({ hostVisible: false, hidden: false, force: false }), true);
-    assert.equal(shouldSkipStatusRefresh({ hostVisible: true, hidden: true, force: false }), true);
-    // FORCE always runs — first load (init runs before the page is shown, the
-    // bug that left "Checking daemon…" for 5s), the Refresh button, give-up.
-    assert.equal(shouldSkipStatusRefresh({ hostVisible: false, hidden: true, force: true }), false);
-    assert.equal(shouldSkipStatusRefresh({}), true);
+test('the status POLL gate needs a subscriber, a visible page, and a reason', () => {
+    // Visible surface, tab shown, someone listening: polls.
+    assert.equal(shouldPollStatus({ hasSubscribers: true, surfaceVisible: true }), true);
+    // Nobody listening: never — the old app-lifetime interval ran on every page.
+    assert.equal(shouldPollStatus({ hasSubscribers: false, surfaceVisible: true }), false);
+    // Listening but the surface is on another page/subtab: no reason to poll.
+    assert.equal(shouldPollStatus({ hasSubscribers: true, surfaceVisible: false }), false);
+    // A live login job HOLDS the poll open even off-surface…
+    assert.equal(shouldPollStatus({ hasSubscribers: true, held: true }), true);
+    // …but a hidden browser tab pauses every reason, the hold included.
+    assert.equal(shouldPollStatus({ hasSubscribers: true, surfaceVisible: true, hidden: true }), false);
+    assert.equal(shouldPollStatus({ hasSubscribers: true, held: true, hidden: true }), false);
+    assert.equal(shouldPollStatus({}), false);
 });
 
 test('job polling backs off on consecutive failures and gives up at the bound', () => {

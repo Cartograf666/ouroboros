@@ -326,3 +326,43 @@ test('the last-delegated-run line discloses mismatch and shows absence as absenc
     assert.ok(bare.includes('model not disclosed'));
     assert.ok(!bare.includes('sonnet'));
 });
+
+// ---------------------------------------------------------------------------
+// Phase 2: "we could not ask" and "we asked and the daemon is down" are two
+// different sentences, and NEITHER earns a row-level claim about the owner's
+// saved harness. Before the shared store, a stopped daemon reached this
+// section as a successful read with no harnesses — so a saved route was
+// labeled "(no account connected)" and the note announced an API fallback
+// nobody had established.
+// ---------------------------------------------------------------------------
+
+test('a stopped daemon explains itself instead of accusing the saved harness', () => {
+    const view = delegationView({ saved: 'codex', payload: { daemon: { state: 'stale' }, harnesses: [] },
+        accountsRead: 'not_read' });
+    assert.equal(view.state, 'unknown');
+    assert.equal(view.enabled, false);
+    assert.deepEqual(view.options, []);
+    assert.match(view.note, /daemon is not running/);
+    assert.match(view.note, /saved choices are unchanged/);
+    assert.doesNotMatch(view.note, /no account connected/);
+    assert.doesNotMatch(view.note, /ordinary subagent on the API/);
+});
+
+test('a fresh read with a genuinely absent harness still says so', () => {
+    // The row-level claim is not deleted — it is now EARNED. A daemon that
+    // answered and simply does not have this account keeps the honest label.
+    const view = delegationView({ saved: 'codex', payload: statusPayload(), accountsRead: 'ok' });
+    assert.match(view.note, /No connected account for codex/);
+    assert.ok(view.options.some((o) => /no account connected/.test(o.label)),
+        'the saved harness keeps its option so a Save cannot re-point delegation');
+});
+
+test('a transport failure and a stopped daemon are not the same sentence', () => {
+    const dead = delegationView({ saved: '', payload: null, statusError: 'HTTP 503' });
+    const down = delegationView({ saved: '', payload: null, accountsRead: 'not_read' });
+    assert.equal(dead.state, 'unknown');
+    assert.equal(down.state, 'unknown');
+    assert.match(dead.note, /HTTP 503/);
+    assert.doesNotMatch(down.note, /HTTP 503/);
+    assert.notEqual(dead.note, down.note);
+});
