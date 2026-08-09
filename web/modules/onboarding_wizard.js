@@ -22,6 +22,11 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
         const STEP_META = Object.fromEntries((SETUP_CONTRACT.steps || []).map((step) => [step.id, step]));
         const PROVIDER_FIELDS = SETUP_CONTRACT.providerFields || [];
         const PROVIDER_PROFILES = SETUP_CONTRACT.providerProfiles || {};
+        // Bounded, because completion must not hang on an engine that is down:
+        // three tries over ~1.2s converts a blip into a proven cancel, and
+        // anything longer stops being a blip.
+        const LOGIN_RELEASE_RETRIES = 2;
+        const LOGIN_RELEASE_RETRY_MS = 600;
         const MODEL_SLOTS = SETUP_CONTRACT.modelSlots || [];
         const REVIEW_MODES = SETUP_CONTRACT.reviewModes || [];
         const RUNTIME_MODES = SETUP_CONTRACT.runtimeModes || [];
@@ -562,7 +567,10 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
     }
 
     function agentsSummaryValue() {
-        const labels = familyLabels(state.agentsConnected);
+        // Through the step's own snapshot, so this line and the Agents step one
+        // screen earlier spell a family the same way. Without it the summary
+        // fell back to the bootstrap names and quietly undid an engine rename.
+        const labels = familyLabels(state.agentsConnected, agentsStep?.snapshot);
         if (!labels.length) return 'none connected (API access only)';
         if (state.skipSubscriptionPresets) return `${labels.join(', ')} (finishing without agent defaults)`;
         return `${labels.join(', ')} — will run commit review and delegated subagents`;
@@ -1385,16 +1393,27 @@ import { escapeHtmlAttr as escapeHtml } from './utils.js';
         // step answers whether the login was genuinely let go, and announcing
         // completion first would navigate away while a create POST was still in
         // flight, stranding a live login job with nobody left to cancel it.
-        const released = await agentsStep?.dispose();
+        // The disposer is retryable by contract, and this is the LAST moment it
+        // can run: announceCompletion takes the page away, and with the page
+        // goes the only client that knows the job id. So a refused release is
+        // retried a bounded number of times before giving up — which is what
+        // turns the realistic cause (a daemon blip during the DELETE) into a
+        // proven cancel instead of an orphan.
+        let released = await agentsStep?.dispose();
+        for (let attempt = 0; released === false && attempt < LOGIN_RELEASE_RETRIES; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, LOGIN_RELEASE_RETRY_MS));
+            released = await agentsStep?.dispose();
+        }
         if (released === false) {
-            // The cancel could not be proven, so the controller kept the job id
-            // and stays retryable. Keep the step rather than dropping the only
-            // handle to that retry, and say so instead of reporting a clean
-            // teardown that did not happen (BIBLE P1). The save itself LANDED,
-            // so completion is still announced: withholding it would be the
-            // larger lie and would send the owner back through onboarding.
-            console.warn('onboarding: a login job could not be confirmed cancelled; '
-                + 'it is retained and the agent engine still owns it.');
+            // Still unproven. The controller kept the job id, but nothing here
+            // can act on it once the page is gone, so this is a DISCLOSED
+            // residual rather than a handled one: the engine owns that job and
+            // settles it on its own. Completion is still announced, because the
+            // save LANDED — withholding it would be the larger lie and would
+            // send the owner back through an onboarding that is already done.
+            console.warn('onboarding: a sign-in could not be confirmed cancelled after '
+                + `${LOGIN_RELEASE_RETRIES + 1} attempts; the agent engine still owns that job `
+                + 'and will settle it.');
         } else {
             agentsStep = null;
         }

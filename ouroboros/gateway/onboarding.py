@@ -447,6 +447,13 @@ def _write_precondition(expect_preset: bool, expect_safety_light: bool, read_fin
         # this one is told, in the seam that already exists for exactly this,
         # that nothing was written.
         if _settings_fingerprint() != read_fingerprint:
+            # Deliberately OVER-refuses in two narrow cases rather than risk
+            # under-refusing in any: a write that lands in the microseconds
+            # between the digest and the read is rejected even though this
+            # request went on to derive from the newer document, and a
+            # formatting-only rewrite of identical content is rejected because
+            # the comparison is over bytes. Both cost the owner one retry, which
+            # then succeeds; the opposite error costs them a change they made.
             return ("The settings file changed while onboarding was being saved, "
                     "so this save would have overwritten it; nothing was written. "
                     "Try finishing again.")
@@ -476,10 +483,19 @@ def _settings_fingerprint() -> str:
     turns that into something the locked precondition can notice.
 
     A digest of the raw bytes, not of a parsed dict: it is the file this write
-    replaces. Absent file and unreadable file are distinct answers, so neither
-    is mistaken for the other.
+    replaces.
+
+    Exactly two answers can ever COMPARE EQUAL: a digest, and the absent
+    sentinel. An unreadable file is neither — it is returned as a value that
+    never equals anything, itself included, because a stable
+    ``unreadable:PermissionError`` token on both sides would let a swap between
+    two different unreadable files satisfy the check. That is fail-OPEN, and it
+    is reachable: the loader silently falls back to defaults when it cannot
+    read, while the atomic rename still lands because the parent directory is
+    writable. So an unreadable settings file refuses the write.
     """
     from hashlib import sha256
+    from uuid import uuid4
 
     from ouroboros.config import SETTINGS_PATH
 
@@ -487,6 +503,8 @@ def _settings_fingerprint() -> str:
         return sha256(SETTINGS_PATH.read_bytes()).hexdigest()
     except FileNotFoundError:
         return "absent"
+    except OSError as exc:
+        return f"unreadable:{type(exc).__name__}:{uuid4()}"
     except OSError as exc:
         return f"unreadable:{type(exc).__name__}"
 

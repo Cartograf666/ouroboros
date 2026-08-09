@@ -1091,13 +1091,45 @@ def test_completion_awaits_login_custody_and_keeps_the_retry_handle():
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
 
     body = source.split("async function saveWizardPayload", 1)[1].split("\n    }", 1)[0]
+    # Ordering is judged on CODE only: both names also appear in the comments
+    # that explain the ordering, and matching those would pass on prose alone.
+    code = "\n".join(line for line in body.splitlines()
+                     if not line.strip().startswith("//"))
 
     # Awaited, and its answer kept.
-    assert "await agentsStep?.dispose()" in body
+    assert "await agentsStep?.dispose()" in code
     # The announcement comes AFTER the disposal, not before it.
-    assert body.index("dispose()") < body.index("announceCompletion")
+    assert code.index("dispose()") < code.index("announceCompletion")
     # A refused release keeps the handle; only a proven one drops it.
-    assert "released === false" in body
-    drop = body.index("agentsStep = null")
-    assert body.index("released === false") < drop, (
+    assert "released === false" in code
+    drop = code.index("agentsStep = null")
+    assert code.index("released === false") < drop, (
         "the handle must only be dropped on the proven-release branch")
+
+    # And the refusal is RETRIED before the page goes away, because this is the
+    # last moment anything client-side knows the job id. Bounded, so completion
+    # cannot hang on an engine that is simply down.
+    assert "LOGIN_RELEASE_RETRIES" in code and "LOGIN_RELEASE_RETRY_MS" in code
+    assert source.count("const LOGIN_RELEASE_RETRIES = ") == 1
+    retries = int(source.split("const LOGIN_RELEASE_RETRIES = ", 1)[1].split(";", 1)[0])
+    delay = int(source.split("const LOGIN_RELEASE_RETRY_MS = ", 1)[1].split(";", 1)[0])
+    assert 1 <= retries <= 5 and 100 <= delay <= 2000, (
+        "the retry must stay a blip-sized bound, not a stall")
+
+
+def test_the_review_step_spells_a_family_the_way_the_agents_step_did():
+    """Both screens name the SAME families, so they must read the same payload.
+
+    The summary used to call the shared `familyLabels` with no snapshot, which
+    falls back to the bootstrap product names — so an engine rename appeared on
+    the Agents step and then silently un-renamed itself one screen later.
+    """
+    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
+    summary = source.split("function agentsSummaryValue", 1)[1].split("\n    }", 1)[0]
+
+    assert "familyLabels(state.agentsConnected, agentsStep?.snapshot)" in summary
+
+    # ...and the step really exposes that payload, rather than the wizard
+    # reading a name the step never published.
+    step = (REPO / "web/modules/onboarding_agents_step.js").read_text(encoding="utf-8")
+    assert "get snapshot()" in step

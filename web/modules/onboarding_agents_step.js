@@ -570,6 +570,12 @@ export function createAgentsStep({
         paint,
         dispose,
         get connected() { return [...state.connected]; },
+        // The payload the family names are spoken from. The wizard's review
+        // step renders the SAME families one screen later, and without this it
+        // fell back to the bootstrap product names — so an engine rename showed
+        // up on the Agents step and then silently un-renamed itself in the
+        // summary. Same store, same snapshot, one spelling.
+        get snapshot() { return store?.snapshot || null; },
         get accountsKnown() { return accountsKnown(); },
         setSkipPresets(value) { state.skipPresets = Boolean(value); paint(); },
         declaration({ skipPresets = state.skipPresets } = {}) {
