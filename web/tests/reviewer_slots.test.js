@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { createClaudexorStatusStore } from '../modules/claudexor_status_store.js';
+import { serviceBannerLine } from '../modules/harness_accounts.js';
+
 import {
     API_ROUTE_CHOICE,
     ROUTE_KIND_API,
@@ -13,6 +16,7 @@ import {
     describeLastExecution,
     encodeRouteChoice,
     mintSlotId,
+    pinnedAccountWarning,
     profileOptionsFor,
     renderReviewerSlotsSection,
     routeChoiceGroups,
@@ -344,4 +348,64 @@ test('facets are independent: an unread ACCOUNT store does not silence the CATAL
     const pins = profileOptionsFor([], 'koshak', { accountsKnown: false });
     assert.doesNotMatch(pins[1].label, /not in discovery/);
     assert.deepEqual(pins.map((o) => o.value), ['', 'koshak']);
+});
+
+test('neither facet gap is dropped: the tab banner names it and the section claims nothing', async () => {
+    // This section renders two facets — the route/model lists from the catalog,
+    // the account pins from the credential profiles — and a gap in EITHER used
+    // to vanish. The sentence now belongs to the tab's ONE service banner (the
+    // sections moved onto the Agents tab, and three scattered service notes
+    // became one); what this section owes is the other half of the same rule —
+    // making no claim the unread facet never licensed.
+    const store = (reads) => createClaudexorStatusStore({
+        fetchImpl: async () => ({
+            ok: true,
+            status: 200,
+            json: async () => ({ daemon: { state: 'running' }, harnesses: [], profiles: {}, quota: [], reads }),
+        }),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    const pins = (accountsKnown) => profileOptionsFor(['koshak'], 'gone', { accountsKnown });
+    const pinnedRows = {
+        triad: [{ slot_id: 't1', route: { kind: ROUTE_KIND_SESSION, target_id: 'cursor:x', profile_id: 'gone' } }],
+        profilesByHarness: { cursor: ['koshak'] },
+    };
+
+    const accountsDied = store({ catalog: 'ok', accounts: 'failed', quota: 'ok' });
+    await accountsDied.refresh();
+    assert.match(serviceBannerLine(accountsDied).text, /Your agent accounts could not be read/,
+        'the banner NAMES the gap this section would otherwise have dropped');
+    // …and the rows say nothing they did not earn: a pin is not "gone" because
+    // nobody could ask, and the missing-account warning stays silent.
+    assert.doesNotMatch(pins(accountsDied.accountsKnown)[1].label, /not in discovery/);
+    assert.equal(pinnedAccountWarning({ ...pinnedRows, accountsKnown: accountsDied.accountsKnown }), '');
+    accountsDied.dispose();
+
+    const catalogDied = store({ catalog: 'failed', accounts: 'ok', quota: 'ok' });
+    await catalogDied.refresh();
+    const catalogLine = serviceBannerLine(catalogDied);
+    assert.match(catalogLine.text, /Your agents could not be read/);
+    assert.doesNotMatch(catalogLine.text, /agent accounts could not be read/, 'a healthy facet is not accused');
+    // …and a read that merely did not land never claims nobody asked.
+    assert.doesNotMatch(catalogLine.text, /was not asked/);
+    // The route select points at that one sentence instead of writing a second.
+    const empty = routeChoiceGroups({ harnesses: [], catalogKnown: catalogDied.catalogKnown })[1].options[0];
+    assert.match(empty.label, /see the service banner above/);
+    // With the accounts read, the SAME pin is now genuinely missing and says so.
+    assert.match(pinnedAccountWarning({ ...pinnedRows, accountsKnown: catalogDied.accountsKnown }),
+        /pinned to an account the agent service no longer lists/);
+    catalogDied.dispose();
+
+    const both = store({ catalog: 'not_read', accounts: 'not_read', quota: 'not_read' });
+    await both.refresh();
+    const bothLine = serviceBannerLine(both);
+    assert.match(bothLine.text, /daemon was not asked/);
+    assert.equal(bothLine.text.match(/could not be read/g), null, 'one sentence covers both');
+    both.dispose();
+
+    const healthy = store({ catalog: 'ok', accounts: 'ok', quota: 'ok' });
+    await healthy.refresh();
+    assert.doesNotMatch(serviceBannerLine(healthy).text, /could not be read/,
+        'nothing to say when everything was read');
+    healthy.dispose();
 });

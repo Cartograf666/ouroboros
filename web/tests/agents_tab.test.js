@@ -47,15 +47,23 @@ function fakeStore(reads, { error = '', snapshot = null } = {}) {
     // The fake wraps the REAL sentence factory. An invented note ("…for your
     // quota") let a copy regression pass green: the banner assertions pinned
     // the fake's words instead of the product's ("…for your subscription
-    // limits"), which is exactly the wording nothing else pins either.
+    // limits"), which is exactly the wording nothing else pins either. Same
+    // reason for the DETAIL rule below: it mirrors the store's own, so a banner
+    // that stopped carrying the daemon's `last_error` fails here too.
+    const held = snapshot || { daemon: RUNNING };
     return {
         reads,
         facet: (name) => reads[name],
         error,
-        snapshot: snapshot || { daemon: RUNNING },
+        snapshot: held,
         loading: false,
         everSettled: true,
-        unavailableNote: (facet) => statusUnavailableNote(reads[facet], { error, facet }),
+        unavailableNote: (facet, { subject = '' } = {}) => {
+            const state = reads[facet];
+            const detail = error
+                || (state === 'failed' ? String(held?.daemon?.last_error || '') : '');
+            return statusUnavailableNote(state, { error: detail, facet, subject });
+        },
     };
 }
 
@@ -293,7 +301,7 @@ test('a BROKEN service is never reported as "nothing below is missing or wrong"'
         snapshot: { daemon: { state: 'stale', runtime: { state: 'error' } } },
     }));
     assert.equal(refused.tone, 'warn');
-    assert.match(refused.text, /did not answer/);
+    assert.match(refused.text, /could not be read/);
 });
 
 test('the REAL store, fed a corrupted runtime, reaches the repair sentence', async () => {
@@ -325,6 +333,63 @@ test('the REAL store, fed a corrupted runtime, reaches the repair sentence', asy
     store.dispose();
 });
 
+test('a card does not contradict itself: the header is dated by the same read as its rows', () => {
+    // The row badge stops claiming "Verified live" when the ACCOUNTS read never
+    // landed. The header lozenge counts the very same rows, so it obeys the very
+    // same provenance — otherwise one card says "Connected" in green over rows
+    // that each say "last known", and the owner has to decide which half to
+    // believe. An account that needs ATTENTION keeps its tone: a dated warning
+    // is still a warning, and muting it would hide the one row worth acting on.
+    const live = [{ harness: 'codex', profile_id: 'work', kind: 'profile',
+        status: { verification: 'passed', verification_source: 'vendor' } }];
+    const broken = [{ harness: 'codex', profile_id: 'work', kind: 'profile',
+        status: { verification: 'failed' } }];
+
+    assert.deepEqual(familyStatus(live, { accountsRead: 'ok' }), { tone: 'ok', label: 'Connected' });
+    for (const gap of ['not_read', 'failed', 'transport']) {
+        const dated = familyStatus(live, { accountsRead: gap });
+        assert.equal(dated.tone, 'muted', `${gap} must not paint a green aggregate`);
+        assert.match(dated.label, /Connected — last known/);
+        assert.equal(familyStatus(broken, { accountsRead: gap }).tone, 'error',
+            `${gap} must not mute an account that needs attention`);
+    }
+    // Two rows, one signed in: the count is still honest, just dated.
+    assert.match(familyStatus([...live, { harness: 'codex', profile_id: 'cold', kind: 'profile', status: {} }],
+        { accountsRead: 'failed' }).label, /1 of 2 connected — last known/);
+});
+
+test('an UNREACHABLE daemon reaches the banner as a refused read, carrying its own reason', async () => {
+    // Where the two fixes meet. The store stopped reading `unreachable` as a
+    // stopped daemon (it is what the endpoint answers when a RUNNING daemon
+    // refused ONE of its fanned-out reads), and the tab's banner must carry
+    // that through: the honest sentence, the error-toned service line it
+    // outranks, and the daemon's OWN last_error — which on this payload is the
+    // only explanation of the refusal there is. A banner that assembled the
+    // sentence from the copy factory itself would drop it silently.
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => ({
+            ok: true,
+            json: async () => ({
+                daemon: { state: 'unreachable', last_error: 'quota_read_failed: window read died' },
+                harnesses: [{ id: 'codex' }], profiles: {}, quota: [],
+            }),
+        }),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+    await store.refresh();
+    assert.deepEqual(store.reads, { catalog: 'failed', accounts: 'failed', quota: 'failed' });
+
+    const line = serviceBannerLine(store);
+    assert.match(line.text, /agents, accounts and limits could not be read/);
+    assert.match(line.text, /window read died/, "the daemon's own reason survives to the pixels");
+    // Neither of the two lies: not "nobody asked" (the reads were made), and
+    // not the green lifecycle line over lists that never arrived.
+    assert.doesNotMatch(line.text, /was not asked/);
+    assert.doesNotMatch(line.text, /Claudexor ready/);
+    assert.equal(line.tone, 'warn');
+    store.dispose();
+});
+
 test('the first read in flight states its COST, not a bare "reading…"', () => {
     // The daemon re-probes every agent CLI on each read, so first paint is tens
     // of seconds. An unexplained silent panel reads as broken, not as loading
@@ -333,7 +398,7 @@ test('the first read in flight states its COST, not a bare "reading…"', () => 
     const store = {
         reads: ALL('unread'), facet: (n) => ALL('unread')[n], error: '',
         snapshot: null, loading: true, everSettled: false,
-        unavailableNote: (facet) => statusUnavailableNote('unread', { facet }),
+        unavailableNote: (facet, { subject = '' } = {}) => statusUnavailableNote('unread', { facet, subject }),
     };
     const line = serviceBannerLine(store);
     assert.match(line.text, /Checking Claudexor/);
@@ -352,7 +417,7 @@ test('one refused facet never withdraws the authority of the other two', () => {
     // owns — not in a word this test invented for it.
     const line = serviceBannerLine(fakeStore({ catalog: 'ok', accounts: 'ok', quota: 'failed' }));
     assert.equal(line.tone, 'warn');
-    assert.match(line.text, /did not answer for your subscription limits/);
+    assert.match(line.text, /Your subscription limits could not be read/);
     assert.match(line.text, /Your agents and agent accounts were read normally/);
 });
 
@@ -404,7 +469,7 @@ test('a partial gap obeys the SAME fault precedence as a total one', () => {
     const refused = serviceBannerLine(fakeStore(
         { catalog: 'ok', accounts: 'failed', quota: 'not_read' }, { snapshot: broken }));
     assert.equal(refused.tone, 'warn');
-    assert.match(refused.text, /did not answer for your agent accounts/);
+    assert.match(refused.text, /Your agent accounts could not be read/);
     assert.match(refused.text, /Your agents were read normally/);
 
     // A healthy daemon leaves the partial sentence exactly as it was.

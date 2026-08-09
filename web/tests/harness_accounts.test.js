@@ -6,9 +6,11 @@ import test from 'node:test';
 import {
     accountLoginConfirmed,
     accountRows,
+    createClaudexorStatusStore,
     statusUnavailableNote,
 } from '../modules/claudexor_status_store.js';
 import {
+    accountRowFacts,
     bareRowStatusText,
     daemonStatusLine,
     normalizeProfileName,
@@ -1097,13 +1099,17 @@ test('the ONE service banner reports a REFUSED read instead of "Claudexor ready"
         snapshot: { daemon: { state: 'running', engine_version: '3.3.13', runtime: {} } },
         loading: false,
         everSettled: true,
-        unavailableNote: (facet) => statusUnavailableNote(reads[facet], { error, facet }),
+        unavailableNote: (facet, { subject = '' } = {}) =>
+            statusUnavailableNote(reads[facet], { error, facet, subject }),
     });
     const all = (v) => ({ catalog: v, accounts: v, quota: v });
     // Every facet gone the same way: ONE sentence, with the subject widened to
     // the whole tab — naming only the accounts would under-report the gap.
-    assert.match(serviceBannerLine(fakeStore(all('failed'))).text, /did not answer/);
+    assert.match(serviceBannerLine(fakeStore(all('failed'))).text, /could not be read/);
     assert.match(serviceBannerLine(fakeStore(all('failed'))).text, /agents, accounts and limits/);
+    // A read that was ATTEMPTED and did not land is never dressed as a read
+    // nobody made: the calm never-asked sentence belongs to the stopped states.
+    assert.doesNotMatch(serviceBannerLine(fakeStore(all('failed'))).text, /was not asked/);
     assert.match(serviceBannerLine(fakeStore(all('transport'), 'net')).text, /Could not read/);
     // A healthy read keeps the existing lifecycle sentence, unchanged.
     assert.match(serviceBannerLine(fakeStore(all('ok'))).text, /Claudexor ready/);
@@ -1111,9 +1117,135 @@ test('the ONE service banner reports a REFUSED read instead of "Claudexor ready"
     // PER FACET, never one global verdict: a refused QUOTA read must not
     // withdraw the catalogue's and the accounts' authority.
     const partial = serviceBannerLine(fakeStore({ catalog: 'ok', accounts: 'ok', quota: 'failed' }));
-    assert.match(partial.text, /did not answer for your subscription limits/);
+    assert.match(partial.text, /Your subscription limits could not be read/);
     // The reassurance covers the facets that GENUINELY read, named one by one —
     // "everything else" was written for a single failure and stayed true only
     // by accident.
     assert.match(partial.text, /Your agents and agent accounts were read normally/);
+});
+
+// ---------------------------------------------------------------------------
+// Per-facet provenance has to reach the PIXELS, not just the banner. This panel
+// renders three reads at once — the rows come from the accounts read, the
+// windows from the quota read, the bare Connect rows from the catalog — and it
+// used to render all three off the retained snapshot while consulting one facet
+// for the sentence above them. After a refused read it said nothing could be
+// listed while a stale row sat below it, still labeled "verified live".
+// ---------------------------------------------------------------------------
+
+function storeWithReads(reads, extra = {}) {
+    // A REAL store over a payload that carries the backend's per-facet stamps,
+    // so the whole chain (wire → facets → copy) is exercised, not a hand-built
+    // double of it.
+    return createClaudexorStatusStore({
+        fetchImpl: async () => ({
+            ok: true,
+            status: 200,
+            json: async () => ({
+                daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
+                config_dir: '/home/agent',
+                harnesses: [{ id: 'codex' }],
+                profiles: { harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }], profiles: [] },
+                quota: [],
+                reads,
+                ...extra,
+            }),
+        }),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+    });
+}
+
+test('the ONE banner names the SECOND gap, instead of dropping it silently', async () => {
+    // Written against the per-section status line, and kept against the tab's
+    // ONE banner that replaced it: the sections moved onto the Agents tab and
+    // the three scattered service sentences became one. The guarantee is the
+    // same and is what this pins — a surface renders several facets, and none
+    // of them may fail unmentioned. Driven through a REAL store over a stamped
+    // payload, so the whole chain (wire → facets → copy) runs.
+    const quotaDied = storeWithReads({ catalog: 'ok', accounts: 'ok', quota: 'failed' });
+    await quotaDied.refresh();
+    const line = serviceBannerLine(quotaDied);
+    assert.match(line.text, /Your subscription limits could not be read/, 'the refused read is NAMED');
+    assert.match(line.text, /Your agents and agent accounts were read normally/,
+        'and the two facets that landed keep their authority, one by one');
+    assert.equal(line.tone, 'warn');
+    quotaDied.dispose();
+
+    const catalogDied = storeWithReads({ catalog: 'failed', accounts: 'ok', quota: 'ok' });
+    await catalogDied.refresh();
+    assert.match(serviceBannerLine(catalogDied).text, /Your agents could not be read/);
+    catalogDied.dispose();
+
+    const accountsDied = storeWithReads({ catalog: 'ok', accounts: 'failed', quota: 'ok' });
+    await accountsDied.refresh();
+    const accountsLine = serviceBannerLine(accountsDied);
+    assert.match(accountsLine.text, /Your agent accounts could not be read/);
+    assert.doesNotMatch(accountsLine.text, /Claudexor ready/, 'never the green line over an undelivered list');
+    // A daemon that could not be read is NEVER reported as a daemon nobody
+    // asked — the live endpoint answers `unreachable` for a single refused
+    // read, and the panel used to print "the agent daemon is not running".
+    assert.doesNotMatch(accountsLine.text, /was not asked/);
+    assert.doesNotMatch(accountsLine.text, /not running/);
+    accountsDied.dispose();
+
+    // All three read: the ordinary lifecycle sentence, nothing appended.
+    const healthy = storeWithReads({ catalog: 'ok', accounts: 'ok', quota: 'ok' });
+    await healthy.refresh();
+    assert.match(serviceBannerLine(healthy).text, /Claudexor ready/);
+    assert.doesNotMatch(serviceBannerLine(healthy).text, /could not be read/);
+    healthy.dispose();
+
+    // All three in the SAME gap: ONE sentence covering all of them, never one
+    // per facet — and never the refused-read wording over a read nobody made.
+    const allDown = storeWithReads({ catalog: 'not_read', accounts: 'not_read', quota: 'not_read' });
+    await allDown.refresh();
+    const down = serviceBannerLine(allDown);
+    assert.match(down.text, /agents, accounts and limits/);
+    assert.equal(down.text.match(/could not be read/g), null, 'one sentence covers all three');
+    assert.doesNotMatch(down.text, /were read normally/, 'nothing left to reassure about');
+    allDown.dispose();
+});
+
+test('each row projection is gated by ITS OWN facet, and a stale value says it is last known', () => {
+    const row = {
+        harness: 'codex', profile_id: '', kind: 'native', identity: {},
+        status: { verification: 'passed', verification_source: 'vendor', last_verified_at: '2026-08-09' },
+    };
+    const payload = { quota: [{
+        subject: { harness: 'codex', subject_id: '' },
+        freshness: 'fresh',
+        constraints: [{ used_ratio: 1.0, resets_at: '2026-08-09T12:00:00Z' }],
+    }] };
+
+    // Both facets read: exactly today's row, in the two-line anatomy — line 1
+    // the account and its status, line 2 the humanized metadata (D-10).
+    const fresh = accountRowFacts(row, payload, { accountsRead: 'ok', quotaRead: 'ok' });
+    assert.equal(fresh.badge.tone, 'ok');
+    assert.equal(fresh.badge.label, 'Verified live');
+    assert.equal(fresh.name, 'Default CLI login');
+    assert.equal(fresh.quota.exhausted, true);
+    assert.match(fresh.quota.label, /^Limit reached/);
+    assert.match(fresh.meta, /Limit reached/);
+
+    // The QUOTA read refused: nothing may be claimed about the window, so the
+    // remembered percentage is not re-shown as current — and the row stops
+    // being painted red, because the exhausted styling is a claim about RIGHT
+    // NOW and the reset it promises may already have come.
+    const staleQuota = accountRowFacts(row, payload, { accountsRead: 'ok', quotaRead: 'failed' });
+    assert.equal(staleQuota.badge.tone, 'ok', 'the accounts facet is untouched by the quota gap');
+    assert.equal(staleQuota.quota.exhausted, false);
+    assert.equal(staleQuota.quota.label, 'Limits not checked');
+    assert.match(staleQuota.meta, /Limits not checked/);
+
+    // The ACCOUNTS read refused: the row is memory of an account, so its
+    // verification claim is dated — and the window, read fine, is not.
+    const staleAccount = accountRowFacts(row, payload, { accountsRead: 'failed', quotaRead: 'ok' });
+    assert.match(staleAccount.badge.label, /last known/);
+    assert.equal(staleAccount.badge.tone, 'muted', 'no green "Verified live" over a read that never landed');
+    assert.equal(staleAccount.quota.exhausted, true);
+    assert.doesNotMatch(staleAccount.quota.label, /last known/);
+
+    // The default is the fresh reading, so nothing else changes shape.
+    assert.deepEqual(accountRowFacts(row, payload), fresh);
+    assert.deepEqual(verificationBadge(row), fresh.badge);
 });

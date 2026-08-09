@@ -20,7 +20,7 @@
 // Pure helpers live at the top and are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
-import { claudexorStatus } from './claudexor_status_store.js';
+import { bindStatusSurface, claudexorStatus } from './claudexor_status_store.js';
 import { formatRelativeAge } from './ui_helpers.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -701,8 +701,9 @@ export async function reloadReviewerSlots() {
 function adoptStatusSnapshot() {
     // Each facet answers for itself. A never-read catalog and a never-read
     // account store are separate gaps, and neither is evidence that a saved
-    // route or pin no longer exists. The tab's service banner explains the gap
-    // once; a facet that WAS read keeps its authoritative list either way.
+    // route or pin no longer exists. The tab's ONE service banner explains the
+    // gap — every facet it lost, named — so this section adds no second
+    // sentence about it; a facet that WAS read keeps its authoritative list.
     state.catalogKnown = state.store.catalogKnown;
     state.accountsKnown = state.store.accountsKnown;
     const snapshot = state.store.snapshot || {};
@@ -719,17 +720,24 @@ export function initReviewerSlots({ onChange, store = claudexorStatus } = {}) {
     // blank derived state.
     adoptStatusSnapshot();
     // Follow the shared read: when the daemon comes up while Settings is open
-    // the rows stop claiming "(not in discovery)" without a page reload. Only
-    // a change this section RENDERS repaints — a repaint on every poll tick
-    // would drop the caret out of the API-model field mid-typing.
+    // the rows stop claiming "(not in discovery)" without a page reload. That
+    // promise needs the SHARED surface binding — a bare subscribe() carries no
+    // visibility predicate, and the store never polls for a subscriber that
+    // cannot say it is on screen, so nothing ever arrived to react to. Only a
+    // change this section RENDERS repaints: a repaint on every poll tick would
+    // drop the caret out of the API-model field mid-typing.
     let signature = '';
-    state.disposers.push(state.store.subscribe(() => {
-        adoptStatusSnapshot();
-        const next = JSON.stringify([state.catalogKnown, state.accountsKnown,
-            state.harnesses, state.profilesByHarness]);
-        if (next === signature) return;
-        signature = next;
-        renderRows();
+    state.disposers.push(bindStatusSurface(state.store, {
+        elementId: 'reviewer-triad-rows',
+        includeModels: true,
+        listener: () => {
+            adoptStatusSnapshot();
+            const next = JSON.stringify([state.catalogKnown, state.accountsKnown,
+                state.harnesses, state.profilesByHarness]);
+            if (next === signature) return;
+            signature = next;
+            renderRows();
+        },
     }));
     document.getElementById('btn-add-triad-slot')?.addEventListener('click', () => addRow('triad'));
     document.getElementById('btn-add-scope-slot')?.addEventListener('click', () => addRow('scope'));
