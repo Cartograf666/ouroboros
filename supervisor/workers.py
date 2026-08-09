@@ -2286,7 +2286,7 @@ def assign_tasks() -> None:
                 send_with_budget(int(st["owner_chat_id"]), evo_block)
             queue.persist_queue_snapshot(reason="evolution_blocked_light")
 
-        from ouroboros.project_lease import candidate_is_leasable, running_project_ids
+        from ouroboros.project_lease import candidate_is_leasable, running_project_lanes
         from ouroboros.config import get_max_active_subagents_per_root
 
         def _running_subagent_count(root_task_id: str) -> int:
@@ -2328,9 +2328,13 @@ def assign_tasks() -> None:
 
         for w in WORKERS.values():
             if w.busy_task_id is None and not getattr(w, "reaping", False) and PENDING:
-                # One-writer-per-project lease: recompute per assignment so a
-                # task assigned in THIS loop pass immediately occupies its lane.
-                leased = running_project_ids(RUNNING.values())
+                # One-writer-per-WORKING-FOLDER lease: recompute per
+                # assignment so a task assigned in THIS loop pass immediately
+                # occupies its lane. The lane key is (project_id,
+                # workspace_root), so two threads of one project in the SAME
+                # folder still serialize while a worktree-branched thread runs
+                # concurrently.
+                leased = running_project_lanes(RUNNING.values())
                 # Find first suitable task (skip over-budget evolution tasks
                 # and project-leased candidates)
                 chosen_idx = None

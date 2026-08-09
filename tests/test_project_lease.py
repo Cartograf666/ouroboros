@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from ouroboros.contracts.chat_id_policy import (
     PROJECT_CHAT_ID_MIN,
     WEB_UI_CHAT_ID,
@@ -9,15 +11,21 @@ from ouroboros.contracts.chat_id_policy import (
     is_project_chat_id,
     project_chat_id,
 )
-from ouroboros.project_lease import candidate_is_leasable, running_project_ids
+from ouroboros.project_lease import (
+    candidate_is_leasable,
+    running_project_ids,
+    running_project_lanes,
+)
 
 
-def _task(project_id="", role="", tid="t1"):
+def _task(project_id="", role="", tid="t1", workspace_root=""):
     task = {"id": tid, "type": "task"}
     if project_id:
         task["project_id"] = project_id
     if role:
         task["delegation_role"] = role
+    if workspace_root:
+        task["workspace_root"] = workspace_root
     return task
 
 
@@ -26,9 +34,9 @@ def _meta(task):
     return {"task": task, "worker_id": 0, "last_heartbeat_at": 1.0}
 
 
-def test_running_project_ids_counts_top_level_scoped_tasks_only():
+def test_running_project_lanes_counts_top_level_scoped_tasks_only():
     # Mix the PRODUCTION meta shape (workers.py RUNNING values) with bare task
-    # dicts — running_project_ids must unwrap meta and still count both.
+    # dicts — the lane query must unwrap meta and still count both.
     running = [
         _meta(_task("alpha")),               # production shape
         _task("beta"),                       # bare task dict
@@ -37,27 +45,66 @@ def test_running_project_ids_counts_top_level_scoped_tasks_only():
         "garbage",
         None,
     ]
+    assert running_project_lanes(running) == {("alpha", ""), ("beta", "")}
+    # The project-WIDE activity query (merge/remove preconditions) is a
+    # SEPARATE answer and is deliberately not the lease key.
     assert running_project_ids(running) == {"alpha", "beta"}
 
 
-def test_running_project_ids_unwraps_production_meta_shape():
+def test_running_project_lanes_unwraps_production_meta_shape():
     """Regression for the inert-lease bug: RUNNING.values() are meta dicts."""
     running = {"t1": _meta(_task("racer"))}.values()
-    ids = running_project_ids(running)
-    assert ids == {"racer"}
-    assert candidate_is_leasable(_task("racer", tid="t2"), ids) is False
+    lanes = running_project_lanes(running)
+    assert lanes == {("racer", "")}
+    assert candidate_is_leasable(_task("racer", tid="t2"), lanes) is False
 
 
 def test_candidate_is_leasable_matrix():
-    leased = {"alpha"}
+    leased = {("alpha", "")}
     # Unscoped tasks never serialize.
     assert candidate_is_leasable(_task(""), leased) is True
-    # A second writer for a leased project waits.
+    # A second writer for a leased project's own folder waits.
     assert candidate_is_leasable(_task("alpha"), leased) is False
     # A different project proceeds in parallel.
     assert candidate_is_leasable(_task("beta"), leased) is True
     # The leased project's OWN subagents must not deadlock the swarm.
     assert candidate_is_leasable(_task("alpha", role="subagent"), leased) is True
+
+
+def test_lane_is_keyed_on_project_AND_workspace_root():
+    """The precondition that makes "branch off for parallel work" real.
+
+    Two threads of ONE project in the SAME folder must still serialize; a
+    thread branched off into its own git worktree gets its own lane and runs
+    concurrently. Keying the lane on project_id alone made branching a promise
+    the queue could not keep.
+    """
+    main_folder = _task("alpha", tid="t1", workspace_root="/w/alpha")
+    same_folder = _task("alpha", tid="t2", workspace_root="/w/alpha")
+    branched = _task("alpha", tid="t3", workspace_root="/w/alpha-thread-2")
+
+    lanes = running_project_lanes([_meta(main_folder)])
+
+    assert candidate_is_leasable(same_folder, lanes) is False
+    assert candidate_is_leasable(branched, lanes) is True
+    # ...and the branched worktree then holds a lane of its own.
+    both = running_project_lanes([_meta(main_folder), _meta(branched)])
+    assert len(both) == 2
+    assert candidate_is_leasable(_task("alpha", tid="t4", workspace_root="/w/alpha-thread-2"), both) is False
+    # The project-wide activity query still sees ONE busy project.
+    assert running_project_ids([_meta(main_folder), _meta(branched)]) == {"alpha"}
+
+
+def test_lane_reads_the_metadata_mirror_and_normalizes_the_path():
+    """workspace_root rides both the task record and its metadata mirror; the
+    comparison is pure normpath/normcase (no filesystem access under the queue
+    lock), so a trailing slash or a redundant segment is the SAME lane."""
+    mirrored = {"id": "t1", "project_id": "alpha", "metadata": {"workspace_root": "/w/alpha"}}
+    noisy = _task("alpha", tid="t2", workspace_root="/w/alpha/./")
+
+    lanes = running_project_lanes([_meta(mirrored)])
+    assert lanes == {("alpha", os.path.normcase("/w/alpha"))}
+    assert candidate_is_leasable(noisy, lanes) is False
 
 
 def test_project_chat_id_policy():
