@@ -32,6 +32,10 @@ export const THREAD_NAME_MAX = 80;
 // Pure helpers
 // ---------------------------------------------------------------------------
 
+// Drag rows are the ITEM wrappers, never their inner row buttons.
+const THREAD_ITEM_SELECTOR = '.nav-thread-item[data-thread-id]';
+const PROJECT_ITEM_SELECTOR = '.nav-project-item[data-project-id]';
+
 /** The instance/stash/cursor key for one thread. Project ids never contain '#'. */
 export function threadKey(projectId, threadId) {
     return `${String(projectId || '')}#${Number(threadId) || 0}`;
@@ -239,7 +243,12 @@ export function renderThreadList(project, {
     list.setAttribute('role', 'group');
     list.setAttribute('aria-label', `Threads in ${project.name || pid}`);
 
-    const displayedIds = () => Array.from(list.querySelectorAll('[data-thread-id]'))
+    // The ITEM wrapper only. Both the wrapper and its inner row button carry
+    // `data-thread-id` (the button's is what the active-state sync and tests
+    // select on), so a bare `[data-thread-id]` would report every id twice —
+    // committing a duplicated order — and would attach the drag feedback classes
+    // to the button, which the `.nav-thread-item.*` rules do not style.
+    const displayedIds = () => Array.from(list.querySelectorAll(THREAD_ITEM_SELECTOR))
         .map((el) => el.dataset.threadId);
 
     for (const thread of threads) {
@@ -292,7 +301,7 @@ export function renderThreadList(project, {
         list.appendChild(item);
     }
 
-    attachReorder(list, '[data-thread-id]', (ids) => onReorder?.(pid, ids), displayedIds);
+    attachReorder(list, THREAD_ITEM_SELECTOR, (ids) => onReorder?.(pid, ids), displayedIds);
     return list;
 }
 
@@ -345,9 +354,9 @@ function attachReorder(container, rowSelector, onCommit, displayedIds) {
 export function attachProjectReorder(listEl, onCommit) {
     attachReorder(
         listEl,
-        '.nav-project-item[data-project-id]',
+        PROJECT_ITEM_SELECTOR,
         onCommit,
-        () => Array.from(listEl.querySelectorAll('.nav-project-item[data-project-id]'))
+        () => Array.from(listEl.querySelectorAll(PROJECT_ITEM_SELECTOR))
             .map((el) => el.dataset.projectId),
     );
 }

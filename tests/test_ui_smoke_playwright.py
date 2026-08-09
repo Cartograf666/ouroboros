@@ -281,6 +281,37 @@ def test_ui_project_threads_create_rename_fork_open_in_centre(direct_server_with
                 )
                 assert page.locator("#thread-stage-title").inner_text() \
                     == "Copy of Renamed thread"
+
+                # D3: drag the BOTTOM thread onto the top. The committed order is
+                # the full displayed list (no duplicates — the drag rows are the
+                # item wrappers, not their inner row buttons) and it persists
+                # through the same UI-preferences surface widget_order uses.
+                items = page.locator('[data-threads-for="threaded"] .nav-thread-item')
+                before = page.locator(
+                    '[data-threads-for="threaded"] .nav-thread-label'
+                ).all_inner_texts()
+                src = items.last.bounding_box()
+                dst = items.first.bounding_box()
+                page.mouse.move(src["x"] + 40, src["y"] + src["height"] / 2)
+                page.mouse.down()
+                page.mouse.move(dst["x"] + 40, dst["y"] + 2, steps=12)
+                page.mouse.up()
+                page.wait_for_function(
+                    "first => document.querySelector("
+                    "  '[data-threads-for=\"threaded\"] .nav-thread-label'"
+                    ").textContent !== first",
+                    arg=before[0],
+                    timeout=15_000,
+                )
+                after = page.locator(
+                    '[data-threads-for="threaded"] .nav-thread-label'
+                ).all_inner_texts()
+                assert after[0] == before[-1], (before, after)
+                assert sorted(after) == sorted(before), (before, after)
+                stored = json.loads(
+                    (data_dir / "state" / "ui_preferences.json").read_text(encoding="utf-8")
+                )["project_thread_order"]["threaded"]
+                assert len(stored) == len(set(stored)) == len(after), stored
                 browser.close()
 
                 # --- the mobile fix -------------------------------------------
