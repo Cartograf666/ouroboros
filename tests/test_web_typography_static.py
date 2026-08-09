@@ -220,12 +220,6 @@ def test_migrated_region_markers_do_not_swallow_unmigrated_surfaces() -> None:
         "the end marker must appear exactly once — a second mention (even "
         "inside a comment) silently truncates the guarded region"
     )
-    # And the guard is genuinely scoped: the unmigrated remainder still holds
-    # literals it is not this test's job to fail on. (_decommented is
-    # length-preserving, so raw offsets index it unchanged.)
-    start, end = css.index(BEGIN_MARKER), css.index(END_MARKER, css.index(BEGIN_MARKER))
-    blanked = _decommented(css)
-    remainder = blanked[:start] + blanked[end:]
     # NOTE: deliberately NOT asserting that debt still exists out there. A guard
     # that fails when someone independently improves an unmigrated surface would
     # punish exactly the work it wants. The markers' own uniqueness (above) is

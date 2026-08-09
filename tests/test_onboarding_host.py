@@ -8,8 +8,10 @@ These tests pin the startup REORDERING and the single wizard host:
   configured and no supervisor running;
 * neither the launcher's nor the server's boot normalization may CREATE
   settings.json, because the fresh-install proofs are gated on its absence;
-* a genuinely fresh desktop completion still authors `OUROBOROS_SAFETY_MODE=light`
-  while the generic save path still cannot lower safety;
+* the desktop host has NO save path of its own: completion is the single atomic
+  `POST /api/onboarding/complete` on every host, and that endpoint authors the
+  fresh-install `OUROBOROS_SAFETY_MODE=light` while the generic save path still
+  cannot lower safety;
 * closing the setup window without saving stays non-fatal.
 """
 
@@ -22,8 +24,6 @@ import sys
 import types
 
 import pytest
-from starlette.applications import Starlette
-from starlette.testclient import TestClient
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -182,10 +182,13 @@ def test_setup_window_loads_the_live_onboarding_page(monkeypatch):
     assert created["url"] == "http://127.0.0.1:8899/onboarding"
     assert created.get("html") is None
     assert created["started"] is True
-    # Window lifecycle + the disclosed legacy save; nothing else.
+    # Window LIFECYCLE ONLY. The bridge is not a settings authority any more:
+    # completion is the same atomic endpoint a browser owner posts to, so a
+    # bridge method able to write settings.json would be a live authority with
+    # no caller and no audit.
     api = created["js_api"]
     assert callable(getattr(api, "onboarding_finished", None))
-    assert callable(getattr(api, "save_wizard", None))
+    assert not hasattr(api, "save_wizard")
     assert not hasattr(api, "claude_code_status")
     assert not hasattr(api, "install_claude_code")
     assert not hasattr(api, "fetch_compatible_models")
@@ -237,164 +240,82 @@ def test_completion_reporting_restart_required_recycles_the_managed_server(monke
 # --------------------------------------------------------------------------
 
 
-def test_fresh_desktop_completion_authors_light_while_generic_saves_cannot(
-    monkeypatch, tmp_path,
-):
-    """The ONE deliberately preserved desktop exception. A genuinely fresh
-    desktop completion authors the new-install `light` safety coverage through
-    the owner save path; the same lowering through an ordinary save is refused,
-    with or without a settings file."""
+def test_the_desktop_setup_window_cannot_write_settings_at_all(monkeypatch, tmp_path):
+    """D-8 closed: the desktop host has NO save path of its own.
+
+    The one deliberately preserved exception was authoring the fresh-install
+    `light` safety coverage. `POST /api/onboarding/complete` now authors it on
+    its own server-side freshness proof (see
+    `test_a_desktop_shaped_completion_still_authors_light_on_a_fresh_install`
+    in tests/test_onboarding_complete_endpoint.py), so the exception is gone and
+    the full->light ratchet is the ONLY rule an ordinary save sees — before and
+    after a settings file exists."""
     from ouroboros import config as cfg
     from ouroboros import launcher_onboarding
 
     monkeypatch.setattr(cfg, "SETTINGS_PATH", tmp_path / "settings.json")
     monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
     monkeypatch.delenv("OUROBOROS_SAFETY_MODE", raising=False)
-    monkeypatch.setattr(launcher_onboarding, "_apply_settings_to_env", lambda settings: None)
 
-    # Generic (non-owner) save of the same lowering: refused on a fresh install.
+    # Generic (non-owner) save of that lowering: refused on a fresh install.
     with pytest.raises(PermissionError, match="OUROBOROS_SAFETY_MODE lowering refused"):
         cfg.save_settings({"OUROBOROS_SAFETY_MODE": "light", "TOTAL_BUDGET": 10})
     assert not (tmp_path / "settings.json").exists()
 
+    seen = {}
+
     def drive(created):
         api = created["js_api"]
-        assert api.save_wizard(_valid_onboarding_payload()) == "ok"
+        seen["methods"] = [n for n in dir(api) if not n.startswith("_")]
         api.onboarding_finished({"ok": True, "restart_required": True})
 
     _created, _fake = _install_fake_webview(monkeypatch, on_start=drive)
     outcome = launcher_onboarding.present_first_run_onboarding({}, 8765)
 
-    assert outcome["saved"] is True
-    stored = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
-    assert stored["OUROBOROS_SAFETY_MODE"] == "light"
-    assert stored["OPENAI_API_KEY"] == "sk-openai-1234567890"
+    assert seen["methods"] == ["onboarding_finished"]
+    assert outcome == {"saved": True, "restart_required": True}
+    # The window reported completion, and the LAUNCHER still wrote nothing: the
+    # bytes on disk (if any) came from the endpoint the page posted to.
+    assert not (tmp_path / "settings.json").exists()
 
-    # And with a settings file now on disk, the generic path still refuses.
+    # With a settings file present, the ratchet still refuses the same lowering.
+    (tmp_path / "settings.json").write_text(json.dumps({"TOTAL_BUDGET": 10}), encoding="utf-8")
     with pytest.raises(PermissionError, match="OUROBOROS_SAFETY_MODE lowering refused"):
         cfg.save_settings({"OUROBOROS_SAFETY_MODE": "off", "TOTAL_BUDGET": 10})
 
 
-def test_a_rejected_payload_never_reaches_the_settings_file(monkeypatch, tmp_path):
+def test_the_launcher_never_authors_settings_during_first_run(monkeypatch, tmp_path):
+    """The invariant the old bridge-validation test guarded, at its new home.
+
+    Payload validation and the refusal-writes-nothing rule now belong to the
+    completion endpoint (tests/test_onboarding_complete_endpoint.py:
+    `test_subscription_alone_does_not_satisfy_the_launch_gate`). What remains
+    true HERE is stronger and simpler: presenting first-run onboarding writes
+    nothing, whatever the page does."""
     from ouroboros import config as cfg
     from ouroboros import launcher_onboarding
 
     monkeypatch.setattr(cfg, "SETTINGS_PATH", tmp_path / "settings.json")
     monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(launcher_onboarding, "_apply_settings_to_env", lambda settings: None)
-
-    errors = []
 
     def drive(created):
-        payload = _valid_onboarding_payload()
-        payload["OPENAI_API_KEY"] = ""
-        errors.append(created["js_api"].save_wizard(payload))
+        # Nothing on the bridge can persist, so a page that tries finds no door.
+        assert not hasattr(created["js_api"], "save_wizard")
 
     _install_fake_webview(monkeypatch, on_start=drive)
     outcome = launcher_onboarding.present_first_run_onboarding({}, 8765)
 
-    assert errors and "Configure OpenRouter" in errors[0]
     assert outcome["saved"] is False
     assert not (tmp_path / "settings.json").exists()
-
-
-def test_pre_server_normalization_never_creates_the_settings_file(monkeypatch, tmp_path):
-    """The launcher normalizes provider defaults before starting the server, but
-    on a FRESH install it must not persist them: creating settings.json here
-    would destroy the freshness every install-time proof is gated on."""
-    from ouroboros import config as cfg
-    from ouroboros import launcher_onboarding
-
-    monkeypatch.setattr(cfg, "SETTINGS_PATH", tmp_path / "settings.json")
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(launcher_onboarding, "load_settings", lambda: {})
-    monkeypatch.setattr(launcher_onboarding, "_apply_settings_to_env", lambda settings: None)
-    monkeypatch.setattr(
-        launcher_onboarding,
-        "apply_runtime_provider_defaults",
-        lambda settings: (dict(settings), True, ["OUROBOROS_MODEL_LIGHT"]),
-    )
-    saved: list = []
-    monkeypatch.setattr(
-        launcher_onboarding, "save_settings", lambda settings, **kwargs: saved.append(settings)
-    )
-
-    _settings, onboarding_required = launcher_onboarding.prepare_first_run_settings()
-
-    assert onboarding_required is True
-    assert saved == []
-    assert not (tmp_path / "settings.json").exists()
-
-    # An install that ALREADY has a settings file still persists normalization.
-    (tmp_path / "settings.json").write_text("{}", encoding="utf-8")
-    launcher_onboarding.prepare_first_run_settings()
-    assert len(saved) == 1
-
-
-def test_server_boot_normalization_carries_the_same_guard():
-    """Mirror of the launcher guard: with the server now starting BEFORE
-    onboarding, its own boot normalization must not author the file either."""
-    source = (REPO / "server.py").read_text(encoding="utf-8")
-
-    assert "if provider_defaults_changed and _settings_path.exists():" in source
-
-
-# --------------------------------------------------------------------------
-# 4. The served wizard host
-# --------------------------------------------------------------------------
-
-
-def _routes_app(tmp_path):
-    from ouroboros.gateway.router import collect_routes
-
-    app = Starlette(routes=collect_routes(data_dir=tmp_path))
-    app.state.drive_root = tmp_path
-    return app
-
-
-def test_onboarding_page_is_served_without_a_provider_or_a_supervisor(monkeypatch, tmp_path):
-    """No provider configured, no supervisor in this process at all: the wizard
-    host is still reachable, because a gateway without a supervisor is a normal
-    runtime state (ARCHITECTURE §2)."""
-    from ouroboros.gateway import onboarding_host
-
-    settings_path = tmp_path / "settings.json"
-    monkeypatch.setattr(onboarding_host, "load_settings", lambda: {})
-
-    with TestClient(_routes_app(tmp_path)) as client:
-        response = client.get("/onboarding")
-
-    assert response.status_code == 200
-    assert 'src="/static/modules/onboarding_wizard.js"' in response.text
-    assert 'href="/static/onboarding.css"' in response.text
-    assert "__OURO_ONBOARDING_BOOTSTRAP__" in response.text
-    assert response.headers["cache-control"] == "no-store"
-    # Side-effect-free: serving the page authors nothing.
-    assert not settings_path.exists()
-
-
-def test_onboarding_readiness_probe_still_gates_the_blocking_overlay(monkeypatch, tmp_path):
-    from ouroboros.gateway import settings as gw_settings
-
-    monkeypatch.setattr(gw_settings, "load_settings", lambda: {})
-    with TestClient(_routes_app(tmp_path)) as client:
-        unconfigured = client.get("/api/onboarding")
-    assert unconfigured.status_code == 200
-
-    monkeypatch.setattr(
-        gw_settings, "load_settings", lambda: {"OPENROUTER_API_KEY": "sk-or-v1-configured"}
-    )
-    with TestClient(_routes_app(tmp_path)) as client:
-        configured = client.get("/api/onboarding")
-    assert configured.status_code == 204
 
 
 def test_onboarding_page_route_is_declared_on_the_gateway_boundary():
     from ouroboros.gateway.contracts import HTTP_ENDPOINTS
 
     assert "GET /onboarding" in HTTP_ENDPOINTS
-    # Phase 3A hosts the wizard; it does NOT implement the atomic completion.
-    assert "POST /api/onboarding/complete" not in HTTP_ENDPOINTS
+    # The page and the atomic completion it posts to are both on the boundary:
+    # every host now finishes through the same one transaction.
+    assert "POST /api/onboarding/complete" in HTTP_ENDPOINTS
 
 
 # --------------------------------------------------------------------------
@@ -402,20 +323,35 @@ def test_onboarding_page_route_is_declared_on_the_gateway_boundary():
 # --------------------------------------------------------------------------
 
 
-def test_completion_prefers_the_atomic_endpoint_and_falls_back_when_absent():
-    """SEAM for the atomic `POST /api/onboarding/complete`: the page tries it
-    first on every host; an absent route (404/405) falls back to today's
-    behaviour instead of breaking first-run."""
-    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
+def test_completion_is_the_single_atomic_endpoint_on_every_host():
+    """D-8 closed. The page posts ONE transaction and has no second way to
+    finish: not the `POST /api/settings` + `POST /api/owner/runtime-mode` pair
+    whose failure between the two writes left providers saved and runtime mode
+    not, and not the desktop `save_wizard` bridge, whose only reason to exist
+    (authoring the fresh-install `light` safety default) the endpoint now
+    discharges itself.
 
-    assert "const ONBOARDING_COMPLETE_ENDPOINT = '/api/onboarding/complete';" in source
-    assert "if (response.status === 404 || response.status === 405) return null;" in source
-    assert "let result = await completeOnboardingAtomically(payload);" in source
-    assert "saveWizardThroughDesktopBridge(payload)" in source
-    assert "saveWizardThroughSettingsPair(payload)" in source
-    # The desktop fallback is chosen by CAPABILITY, not by a host-mode flag.
-    assert "window.pywebview?.api?.save_wizard" in source
-    # One completion announcer for all three shells.
+    CHANGED EXPECTATION: this test previously REQUIRED both fallbacks, because
+    the endpoint did not exist in the branch that wrote it. It does now, so the
+    fallbacks were the last thing keeping a first run able to take a
+    non-atomic path."""
+    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
+    # The absence assertions read CODE, not prose: the module documents the two
+    # removed paths by name, and a comment must not be able to fail the gate
+    # (nor to satisfy it).
+    code = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("//"))
+
+    assert "const ONBOARDING_COMPLETE_ENDPOINT = '/api/onboarding/complete';" in code
+    assert "const result = await completeOnboardingAtomically(payload);" in code
+    assert "saveWizardThroughDesktopBridge" not in code
+    assert "saveWizardThroughSettingsPair" not in code
+    assert "save_wizard" not in code
+    assert "/api/owner/runtime-mode" not in code
+    assert "'/api/settings'" not in code
+    # A missing route is now a real error, not a signal to take another path.
+    assert "response.status === 404" not in code
+    # One completion announcer for all three shells (that part is unchanged).
     assert "function announceCompletion(result)" in source
     assert "ouroboros:onboarding-complete" in source
     assert "window.pywebview.api.onboarding_finished" in source

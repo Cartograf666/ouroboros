@@ -124,7 +124,7 @@ test('before the accounts have been read the section says it is reading, not "no
     const view = delegationView({ saved: '', payload: null, loaded: false });
     assert.equal(view.state, 'loading');
     assert.equal(view.enabled, false);
-    assert.match(view.note, /Reading your coding-agent accounts/);
+    assert.match(view.note, /Reading your agent accounts/);
     assert.doesNotMatch(view.note, /No coding-agent subscription/);
 });
 

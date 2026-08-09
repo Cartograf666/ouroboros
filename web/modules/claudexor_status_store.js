@@ -104,9 +104,12 @@ export function shouldPollStatus({
 }
 
 // What each facet is CALLED in a sentence to the owner.
+// D-10: "agent", never "coding agent" — these agents also build presentations
+// and run ordinary tasks, and this sentence is now rendered by the first-run
+// wizard as well as Settings.
 const FACET_SUBJECT = {
-    [FACET_CATALOG]: 'coding agents',
-    [FACET_ACCOUNTS]: 'coding-agent accounts',
+    [FACET_CATALOG]: 'agents',
+    [FACET_ACCOUNTS]: 'agent accounts',
     [FACET_QUOTA]: 'subscription limits',
 };
 

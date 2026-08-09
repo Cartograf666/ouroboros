@@ -11,9 +11,18 @@ function mountOverlay() {
     overlay.setAttribute('role', 'dialog');
     overlay.setAttribute('aria-modal', 'true');
     overlay.setAttribute('aria-label', 'Ouroboros setup');
+    // `allow-popups` + `allow-popups-to-escape-sandbox` are LOAD-BEARING, not
+    // hygiene: the Agents step's primary action is the agent's own sign-in link,
+    // opened with target="_blank". Without them the browser blocks that click
+    // SILENTLY — the owner presses "Open sign-in link" and nothing happens, and
+    // copying the URL by hand is the only way through. The escape variant is
+    // required too: a popup that inherits this sandbox lands on the vendor's
+    // OAuth page without same-origin or scripts, which no sign-in survives.
+    // Both apply only to windows the framed page opens, never to the frame's own
+    // authority over this document.
     overlay.innerHTML = `
         <div class="onboarding-overlay-backdrop"></div>
-        <iframe class="onboarding-frame" title="Ouroboros Setup" sandbox="allow-same-origin allow-scripts allow-forms"></iframe>
+        <iframe class="onboarding-frame" title="Ouroboros Setup" sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"></iframe>
     `;
     const frame = overlay.querySelector('.onboarding-frame');
     // ONE onboarding host: frame the real /onboarding page rather than an
