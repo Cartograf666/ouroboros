@@ -48,6 +48,149 @@ class _ProjectsReq:
         return self._body
 
 
+# --- containment: a place is never carved out of somebody else's repository --------
+
+def _repo_with_subdir(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    owner_repo = tmp_path / "owner_repo"
+    _init_git_repo(owner_repo)
+    subdir = owner_repo / "packages" / "web"
+    subdir.mkdir(parents=True)
+    (subdir / "app.js").write_text("console.log(1)\n", encoding="utf-8")
+    return owner_repo, subdir
+
+
+def test_attach_refuses_a_folder_nested_in_another_repository(tmp_path):
+    """Dropping the git REQUIREMENT must not drop CONTAINMENT with it: they are
+    different rules. "Not a git repo" is fine; "a subdirectory of somebody's git
+    repo" is not, because the only way to track a place there is to nest a second
+    repository inside theirs. The refusal names the enclosing root, so the owner is
+    told what to attach rather than that their folder is bad."""
+    from ouroboros.project_sources import enclosing_git_worktree, validate_attach_path
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    owner_repo, subdir = _repo_with_subdir(tmp_path)
+
+    resolved, error = validate_attach_path(str(subdir), system_repo_dir=repo, drive_root=data)
+    assert resolved is None
+    assert str(owner_repo.resolve()) in error and "attach that root instead" in error
+
+    # The two shapes A11/A12 exist to admit still pass: a plain folder (nothing
+    # encloses it) and a worktree ROOT (git's toplevel IS the folder).
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert validate_attach_path(str(plain), system_repo_dir=repo, drive_root=data) == (plain.resolve(), "")
+    assert validate_attach_path(str(owner_repo), system_repo_dir=repo, drive_root=data) == (
+        owner_repo.resolve(), "",
+    )
+    assert enclosing_git_worktree(owner_repo) == ""
+    assert enclosing_git_worktree(plain) == ""
+
+
+def test_create_never_git_inits_inside_someone_elses_repository(tmp_path):
+    """The create dialog's `init_git` is a `git init` in whatever folder it was
+    handed. Pointed at a repo subdirectory it produced a SHADOW repository nested in
+    the owner's — after which the folder passed admission as a worktree root and
+    every later diff, rollback and commit happened where the owner's real VCS shows
+    only an untracked directory. The refusal comes BEFORE any registry mutation."""
+    import asyncio
+
+    from ouroboros.gateway.projects import api_projects_create
+    from ouroboros.projects_registry import get_project
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    owner_repo, subdir = _repo_with_subdir(tmp_path)
+
+    resp = asyncio.run(api_projects_create(
+        _ProjectsReq({"name": "Nested", "path": str(subdir), "init_git": True},
+                     drive_root=data, repo_dir=repo)
+    ))
+    assert resp.status_code == 400
+    assert "inside the git repository at" in json.loads(resp.body)["error"]
+    assert not (subdir / ".git").exists(), "no shadow repository inside the owner's repo"
+    assert get_project(data, "nested") is None
+    # The owner's own repository is untouched — no stray commit, no new tracked file.
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=str(owner_repo),
+        capture_output=True, text=True, check=True,
+    ).stdout.strip() == "?? packages/"
+
+
+def test_init_git_route_refuses_a_working_dir_inside_another_repository(tmp_path):
+    """The route whose ENTIRE job is to run `git init` in the folder. It re-runs the
+    attach guards against the current working_dir, so a project whose row points
+    inside a repository (registered before this guard, or hand-edited) still cannot
+    have a shadow repo initialised in it."""
+    import asyncio
+
+    from ouroboros.gateway.projects import api_project_init_git
+    from ouroboros.projects_registry import create_project, update_project
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _owner_repo, subdir = _repo_with_subdir(tmp_path)
+
+    create_project(data, "legacy", name="Legacy")
+    update_project(data, "legacy", working_dir=str(subdir), provenance="attached")
+    resp = asyncio.run(api_project_init_git(
+        _ProjectsReq({}, drive_root=data, repo_dir=repo, path_params={"project_id": "legacy"})
+    ))
+    assert resp.status_code == 400
+    assert "inside the git repository at" in json.loads(resp.body)["error"]
+    assert not (subdir / ".git").exists()
+
+
+def test_promote_attach_refuses_a_folder_nested_in_another_repository(tmp_path):
+    """The agent-side attach inherits the guard from the same validator, so the
+    subdirectory is never PERSISTED as the project's place. That matters on its own:
+    a persisted repo subdir is a place task admission then refuses forever ("must be
+    the git worktree root") with no offer attached and no route back."""
+    from ouroboros.promotion_source import resolve_promote_source
+    from ouroboros.projects_registry import get_project
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    owner_repo, subdir = _repo_with_subdir(tmp_path)
+
+    ctx = types.SimpleNamespace(DRIVE_ROOT=data, REPO_DIR=repo)
+    workspace, note, error, pid = resolve_promote_source(ctx, str(subdir), "nestedroom")
+    assert workspace == "" and note == ""
+    assert "inside the git repository at" in error
+    assert get_project(data, pid) is None
+
+    # The enclosing ROOT is exactly what the error tells them to use, and it works.
+    workspace_ok, _note_ok, error_ok, pid_ok = resolve_promote_source(ctx, str(owner_repo), "rootroom")
+    assert error_ok == "" and workspace_ok == str(owner_repo.resolve())
+    assert get_project(data, pid_ok)["working_dir"] == str(owner_repo.resolve())
+
+
+def test_adopt_refuses_a_task_folder_nested_in_another_repository(tmp_path):
+    """The fourth surface: a converted task whose workspace was a repo subdirectory.
+    The conversion still succeeds — that is its job — and the reason is disclosed."""
+    from ouroboros.projects_registry import adopt_task_workspace, create_project, get_project
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _owner_repo, subdir = _repo_with_subdir(tmp_path)
+
+    create_project(data, "sub", name="Sub")
+    adopted, error = adopt_task_workspace(data, "sub", str(subdir), system_repo_dir=repo)
+    assert adopted == ""
+    assert "inside the git repository at" in error
+    assert str(get_project(data, "sub").get("working_dir") or "") == ""
+
+
 # --- the direct task API returns the decision instead of queueing ------------------
 
 def test_api_tasks_create_returns_the_typed_git_offer_and_queues_nothing(tmp_path, monkeypatch):
@@ -504,6 +647,154 @@ def test_turn_into_project_never_replaces_an_existing_project_folder(tmp_path):
     ))
     assert resp.status_code == 200
     assert get_project(data, "keeper")["working_dir"] == str(home_folder)
+
+
+def test_turn_into_project_refuses_an_ephemeral_checkout_as_a_durable_place(tmp_path):
+    """A task's workspace_root is exactly where Ouroboros's OWN checkouts live. A
+    linked worktree is removable with one command and a subagent checkout is swept
+    by age, so adopting either would give the project a place that vanishes under
+    it — and it would be a checkout of the system body, not the owner's work."""
+    import asyncio
+
+    from ouroboros.gateway.projects import api_project_from_task
+    from ouroboros.projects_registry import get_project
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    origin = tmp_path / "origin"
+    _init_git_repo(origin)
+    linked = tmp_path / "linked_checkout"
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "wt-adopt", str(linked)],
+        cwd=str(origin), check=True, capture_output=True,
+    )
+    _persist_task_result(data, "t6", description="branch work", workspace_root=str(linked))
+
+    resp = asyncio.run(api_project_from_task(
+        _ProjectsReq({"task_id": "t6", "id": "linkedp", "name": "Linked"}, drive_root=data, repo_dir=repo)
+    ))
+    payload = json.loads(resp.body)
+    assert resp.status_code == 200, payload
+    assert "linked git worktree" in payload["working_dir_error"]
+    assert str(get_project(data, "linkedp").get("working_dir") or "") == ""
+
+
+def test_adopt_refuses_the_subagent_and_thread_worktree_roots(tmp_path, monkeypatch):
+    """The other half of the same rule, at the registry seam both conversion paths
+    share: an acting subagent's self_worktree and a thread's branch-off checkout are
+    Ouroboros's own trees, and the subagent root is age-GC'd."""
+    from ouroboros.projects_registry import adopt_task_workspace, create_project, get_project
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sub_root = tmp_path / "subagent_worktrees"
+    thread_root = tmp_path / "thread_worktrees"
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_WORKTREE_ROOT", str(sub_root))
+    monkeypatch.setenv("OUROBOROS_THREAD_WORKTREE_ROOT", str(thread_root))
+
+    for pid, root, marker in (
+        ("selfwt", sub_root / "task_abc", "acting-subagent worktree root"),
+        ("threadwt", thread_root / "proj__1", "thread worktree root"),
+    ):
+        root.mkdir(parents=True)
+        create_project(data, pid, name=pid)
+        adopted, error = adopt_task_workspace(data, pid, str(root), system_repo_dir=repo)
+        assert adopted == "", f"{pid} must not adopt {root}"
+        assert marker in error, error
+        assert str(get_project(data, pid).get("working_dir") or "") == ""
+
+
+# --- a project's place is bound atomically -----------------------------------------
+
+def test_set_working_dir_if_absent_binds_once_under_concurrency(tmp_path):
+    """"Never overwrites an existing working_dir" was true of the code and false of
+    the timeline: the check and the write were separate locked operations with a
+    whole folder validation (or a whole genesis provisioning) between them. Exactly
+    one of N concurrent writers may win, and every loser must learn the winner's
+    folder rather than assume its own landed."""
+    import threading
+
+    from ouroboros.projects_registry import create_project, get_project, set_working_dir_if_absent
+
+    data = tmp_path / "data"
+    data.mkdir()
+    create_project(data, "raced", name="Raced")
+    folders = [tmp_path / f"candidate_{n}" for n in range(6)]
+    for folder in folders:
+        folder.mkdir()
+
+    results: list = []
+    start = threading.Barrier(len(folders))
+
+    def _claim(folder):
+        start.wait()
+        results.append(set_working_dir_if_absent(
+            data, "raced", str(folder), provenance="attached", trusted_at="2026-08-10T00:00:00Z"
+        ))
+
+    threads = [threading.Thread(target=_claim, args=(f,)) for f in folders]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    winners = [bound for bound, claimed in results if claimed]
+    assert len(winners) == 1, f"exactly one writer may bind the place, got {winners}"
+    bound_dir = get_project(data, "raced")["working_dir"]
+    assert bound_dir == winners[0]
+    # Every loser is TOLD the winner's folder — the whole point of the second value.
+    assert {bound for bound, claimed in results if not claimed} in (set(), {bound_dir})
+    assert get_project(data, "raced")["provenance"] == "attached"
+
+
+def test_ensure_project_workspace_does_not_clobber_a_place_bound_mid_provision(tmp_path, monkeypatch):
+    """The race that motivates the atomic setter, played out on the slow side: a
+    conversion binds the project's folder while provisioning is still digging. The
+    genesis tree must NOT replace it (the owner's real folder would be silently
+    swapped), and the abandoned tree must be logged — it sits under the durable
+    projects root, which is never GC-pruned."""
+    from ouroboros import projects_registry
+    from ouroboros.projects_registry import (
+        create_project,
+        ensure_project_workspace,
+        get_project,
+        set_working_dir_if_absent,
+    )
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROJECTS_ROOT", str(tmp_path / "projects"))
+    owner_folder = tmp_path / "owner_folder"
+    owner_folder.mkdir()
+
+    create_project(data, "slow", name="Slow", origin="owner_ui")
+    real_provision = None
+
+    def _slow_provision(**kwargs):
+        # The competing writer lands DURING provisioning — the window the old
+        # get_project → update_project pair left wide open.
+        set_working_dir_if_absent(data, "slow", str(owner_folder), provenance="attached")
+        return real_provision(**kwargs)
+
+    import ouroboros.subagent_worktrees as sw
+
+    real_provision = sw.provision_genesis_project
+    monkeypatch.setattr(sw, "provision_genesis_project", _slow_provision)
+
+    warnings: list = []
+    monkeypatch.setattr(projects_registry.log, "warning", lambda msg, *a, **k: warnings.append(msg % a if a else msg))
+
+    result = ensure_project_workspace(data, "slow", repo)
+    assert result == str(owner_folder), "the folder bound first must win"
+    assert get_project(data, "slow")["working_dir"] == str(owner_folder)
+    assert get_project(data, "slow")["provenance"] == "attached"
+    assert any("abandoned" in str(text) for text in warnings), warnings
 
 
 def test_ensure_project_scope_adopts_the_running_tasks_folder(tmp_path, monkeypatch):

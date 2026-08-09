@@ -941,6 +941,57 @@ def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional
     return None
 
 
+def set_working_dir_if_absent(
+    drive_root: Any,
+    project_id: str,
+    working_dir: str,
+    *,
+    provenance: str = "",
+    trusted_at: str = "",
+) -> tuple[str, bool]:
+    """Bind a project's working_dir ONLY if it has none — check and write under ONE lock.
+
+    "Never overwrites an existing working_dir/provenance" was true of the code but
+    not of the timeline: both places that promised it (``adopt_task_workspace``,
+    ``ensure_project_workspace``) read the entry with ``get_project`` and wrote it
+    back with ``update_project``, two separately-locked operations with an unbounded
+    gap between them — a folder validation in one, a whole genesis provisioning in
+    the other. Two writers interleaving there both saw "no working_dir" and both
+    wrote, so the loser's folder was silently replaced; when the loser was
+    ``ensure_project_workspace`` the abandoned genesis tree sits under the durable
+    projects root, which is deliberately never GC-pruned, i.e. it is orphaned for
+    good. Doing the test and the write inside the same ``_file_write_lock`` makes
+    the promise atomic across threads AND processes.
+
+    ``provenance``/``trusted_at`` follow the same historical-fact rule as elsewhere:
+    written only when the row carries nothing (or ``"none"``) yet.
+
+    Returns ``(effective_working_dir, claimed)`` — ``claimed`` is True only for the
+    writer that actually bound the folder, so the loser can report the truth instead
+    of assuming its own value landed. An unknown/inactive project answers ``("", False)``.
+    """
+    pid = sanitize_project_id(project_id)
+    folder = str(working_dir or "").strip()
+    if not pid or not folder:
+        return "", False
+    with _file_write_lock(_registry_path(drive_root)):
+        data = _load(drive_root)
+        for entry in data["projects"]:
+            if entry.get("id") != pid or entry.get("lifecycle") != PROJECT_ACTIVE:
+                continue
+            existing = str(entry.get("working_dir") or "").strip()
+            if existing:
+                return existing, False
+            entry["working_dir"] = folder
+            if provenance and str(entry.get("provenance") or "").strip() in ("", "none"):
+                entry["provenance"] = provenance
+                if trusted_at and not str(entry.get("trusted_at") or "").strip():
+                    entry["trusted_at"] = trusted_at
+            _save(drive_root, data)
+            return folder, True
+    return "", False
+
+
 def begin_project_deletion(drive_root: Any, project_id: str) -> Optional[Dict[str, Any]]:
     """Close admission/routing before the supervisor cancels the live subtree."""
     pid = sanitize_project_id(project_id)
@@ -1240,6 +1291,13 @@ def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any) ->
     than that they had pointed at it themselves. An existing provenance is never
     overwritten — how a folder came to be is a historical fact, and this branch
     only runs when the project had no usable folder at all.
+
+    Provisioning is slow (a real ``git init`` + seed commit), so the bind at the end
+    is ATOMIC (``set_working_dir_if_absent``, T2-7) rather than a second unlocked
+    write: if another writer bound a place while this one was digging, the winner's
+    folder is returned untouched and the abandoned genesis tree is LOGGED — it lives
+    under the durable projects root, which is never GC-pruned, so an unreported loss
+    would be an orphan forever.
     """
     entry = get_project(drive_root, project_id)
     if entry is None:
@@ -1258,11 +1316,25 @@ def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any) ->
             # recognizable shared root (binding identity stays the task_id). (I, v6.39)
             dir_name=str(entry.get("name") or ""),
         )
-        stamp: Dict[str, Any] = {"working_dir": str(handle.path)}
-        if str(entry.get("provenance") or "").strip() in ("", "none"):
-            stamp["provenance"] = "genesis"
-        update_project(drive_root, entry["id"], **stamp)
-        return str(handle.path)
+        bound, claimed = set_working_dir_if_absent(
+            drive_root, entry["id"], str(handle.path), provenance="genesis"
+        )
+        if claimed:
+            return str(handle.path)
+        if bound:
+            log.warning(
+                "Project %s was given a folder concurrently (%s); the genesis tree "
+                "provisioned here is abandoned and NOT auto-removed: %s",
+                entry["id"], bound, handle.path,
+            )
+            return bound
+        # A project that stopped being active mid-provision: the entry that asked
+        # for the folder is gone, so there is nothing to bind it to.
+        log.warning(
+            "Project %s is no longer active; genesis tree %s was not bound",
+            entry["id"], handle.path,
+        )
+        return ""
     except Exception:
         log.warning("Project workspace provisioning failed for %s", project_id, exc_info=True)
         return ""
@@ -1282,9 +1354,18 @@ def adopt_task_workspace(
 
     Adopting is an ATTACH, so it re-runs the attach guards rather than trusting the
     task record: the same resolved-realpath checks (exists, real dir, not the home
-    root, disjoint from the Ouroboros repo/data roots), and deliberately NO git
-    requirement (A12 — a plain folder is a legitimate place). An EXISTING
-    working_dir is never overwritten; a project that already has a place keeps it.
+    root, disjoint from the Ouroboros repo/data roots, not nested inside another
+    repository), and deliberately NO git requirement (A12 — a plain folder is a
+    legitimate place). An EXISTING working_dir is never overwritten; a project that
+    already has a place keeps it.
+
+    It also applies a rule the attach surfaces do not need. An attach path is typed
+    by the owner; an ADOPTED path arrives from a task record, and a task's workspace
+    is precisely where Ouroboros's own EPHEMERAL checkouts live — an acting
+    subagent's ``self_worktree``, a thread's branch-off worktree. Those are linked
+    worktrees and age-swept roots: adopting one would give the project a place that
+    a ``git worktree remove`` or a retention sweep can delete underneath it. So
+    ``ephemeral_checkout_reason`` refuses them through the same disclosure channel.
 
     Returns ``(working_dir, error)``. ``error`` is a disclosure, not a failure the
     caller must abort on: conversion's job is to create the project, and a folder
@@ -1299,21 +1380,34 @@ def adopt_task_workspace(
         return "", ""
     if str(entry.get("working_dir") or "").strip():
         return str(entry["working_dir"]), ""
-    from ouroboros.project_sources import validate_attach_path
+    from ouroboros.project_sources import ephemeral_checkout_reason, validate_attach_path
 
     resolved, error = validate_attach_path(
         raw, system_repo_dir=system_repo_dir, drive_root=drive_root
     )
     if error or resolved is None:
         return "", f"the task's workspace {raw} was not adopted as the project folder: {error}"
-    updates: Dict[str, Any] = {"working_dir": str(resolved)}
-    if str(entry.get("provenance") or "").strip() in ("", "none"):
-        # The owner chose this folder when they started the work there; the
-        # conversion inherits that grant rather than asking for it a second time.
-        updates["provenance"] = "attached"
-        updates["trusted_at"] = str(entry.get("trusted_at") or "") or utc_now_iso()
-    update_project(drive_root, pid, **updates)
-    return str(resolved), ""
+    ephemeral = ephemeral_checkout_reason(resolved)
+    if ephemeral:
+        return "", f"the task's workspace {raw} was not adopted as the project folder: {ephemeral}"
+    # The owner chose this folder when they started the work there; the conversion
+    # inherits that grant rather than asking for it a second time. The claim is
+    # ATOMIC (T2-7): the "does it already have a place" check and the write happen
+    # inside ONE registry lock, so a conversion racing an auto-provision cannot
+    # overwrite the winner's folder and orphan a genesis tree nothing ever GCs.
+    bound, claimed = set_working_dir_if_absent(
+        drive_root, pid, str(resolved), provenance="attached", trusted_at=utc_now_iso()
+    )
+    if claimed:
+        return str(resolved), ""
+    if bound:
+        # Another writer bound a place first. That project HAS its place; saying so
+        # is the truth, and overwriting it would be the very race this closes.
+        return bound, ""
+    return "", (
+        f"the task's workspace {raw} was not adopted as the project folder: "
+        f"project {pid!r} is no longer registered as active"
+    )
 
 
 def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]]:
@@ -1401,6 +1495,7 @@ __all__ = [
     "reserved_project_chat_ids",
     "projects_summary",
     "reconcile_projects",
+    "set_working_dir_if_absent",
     "touch_project",
     "update_project",
 ]

@@ -281,10 +281,18 @@ def test_api_projects_create_attaches_a_plain_folder_and_never_auto_inits(tmp_pa
 def test_api_projects_create_keeps_every_non_git_attach_guard(tmp_path):
     """Dropping the git REQUIREMENT drops nothing else: the resolved-realpath
     guards (exists / is a directory / not the home root / no overlap with the
-    Ouroboros repo or data drive) still refuse before any registry mutation."""
+    Ouroboros repo or data drive) still refuse before any registry mutation.
+
+    The last case is the CONTAINMENT guard, which REPLACED the git requirement
+    rather than being replaced by it. A subdirectory of somebody's repository is
+    not a place: persisting it registers a working_dir that task admission then
+    refuses forever ("must be the git worktree root") with no offer attached and no
+    repair route, and the only thing that could make it admissible is a shadow repo
+    nested inside the owner's."""
     import asyncio
     import json
     import pathlib as _pathlib
+    import subprocess
     from types import SimpleNamespace
 
     from ouroboros.gateway.projects import api_projects_create
@@ -294,6 +302,11 @@ def test_api_projects_create_keeps_every_non_git_attach_guard(tmp_path):
     data.mkdir()
     repo = tmp_path / "repo"
     repo.mkdir()
+    owner_repo = tmp_path / "owner_repo"
+    owner_repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(owner_repo), check=True)
+    nested = owner_repo / "packages" / "web"
+    nested.mkdir(parents=True)
 
     class _Req:
         def __init__(self, body):
@@ -308,6 +321,7 @@ def test_api_projects_create_keeps_every_non_git_attach_guard(tmp_path):
         ("Home", str(_pathlib.Path.home()), "home directory"),
         ("InRepo", str(repo), "Ouroboros system repo"),
         ("InData", str(data), "Ouroboros data drive"),
+        ("Nested", str(nested), "inside the git repository at"),
     ):
         resp = asyncio.run(api_projects_create(_Req({"name": name, "path": path})))
         payload = json.loads(resp.body)

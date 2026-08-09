@@ -19,6 +19,13 @@ the git question is asked separately — as the typed `git_init_required` offer
 as the one thing the owner's "yes" runs, whether it comes from the create dialog's
 `init_git` or from `POST /api/projects/{id}/init-git` afterwards.
 
+What replaced the git REQUIREMENT is a CONTAINMENT guard, and the two are not the
+same rule. "Not a git repo" is fine; "a subdirectory of somebody else's git repo"
+is not, because saying yes there would `git init` a second repository nested inside
+the owner's, after which every diff, rollback and commit Ouroboros makes happens in
+a shadow repo the owner's VCS cannot see. `enclosing_git_worktree` answers that one
+question, so plain folders and worktree ROOTS both still attach.
+
 Clone doctrine: server-side, atomic (clone into a ``.tmp.<pid>`` sibling, rename
 into place on success), never interactive (``GIT_TERMINAL_PROMPT=0`` + null
 askpass), with a TYPED ``auth_required`` classification so the UI can say
@@ -79,7 +86,13 @@ def validate_attach_path(
     Ouroboros system repo or data drive. Being a git repo is NOT required — not at
     attach time and not for the project to keep the folder; ``init_git`` is the
     opt-in, and task admission raises the typed ``git_init_required`` offer for an
-    untracked folder rather than refusing it. Returns (resolved, error)."""
+    untracked folder rather than refusing it.
+
+    What IS required is that the folder not sit INSIDE another git repository
+    (``enclosing_git_worktree``). That is containment, not a git requirement: a
+    plain folder and a worktree root both pass, and only a subdirectory of
+    somebody's repo is refused — by name, so the owner can attach the root the
+    error points at. Returns (resolved, error)."""
     text = str(raw_path or "").strip()
     if not text:
         return None, "path is required"
@@ -102,7 +115,135 @@ def validate_attach_path(
     ):
         if resolved == protected or path_is_relative_to(resolved, protected) or path_is_relative_to(protected, resolved):
             return None, f"path must not overlap the {label}"
+    enclosing = enclosing_git_worktree(resolved)
+    if enclosing:
+        return None, (
+            f"this folder is inside the git repository at {enclosing} — attach that root "
+            "instead. A project folder nested in someone else's repository cannot be put "
+            "under git of its own without hiding a second repository inside theirs"
+        )
     return resolved, ""
+
+
+def enclosing_git_worktree(path: pathlib.Path) -> str:
+    """The git worktree root that CONTAINS ``path`` without BEING it, or "".
+
+    Deliberately a CONTAINMENT question, not a git one. A plain folder answers ""
+    (nothing encloses it) and so does a worktree ROOT (git's toplevel is the folder
+    itself), so both remain attachable under A11/A12. Only a SUBDIRECTORY of a
+    repository answers with that repository's root — the one shape where making
+    the folder a project's place is wrong in a way the owner cannot see later:
+    ``git init`` there nests a second repository inside theirs, the nested folder
+    then passes task admission as a worktree root, and every diff, rollback and
+    commit afterwards lands in the shadow repo while the owner's real VCS reports
+    only an untracked directory.
+
+    Never raises: git missing, unreadable or slow answers "" and the remaining
+    attach guards still apply — this widens what is refused, and a probe failure
+    must not turn into a refusal of a folder that is probably fine."""
+    bootstrap_process_path()
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(path), capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return ""
+    top = (res.stdout or "").strip() if res.returncode == 0 else ""
+    if not top:
+        return ""
+    try:
+        toplevel = pathlib.Path(top).resolve(strict=False)
+        if toplevel == pathlib.Path(path).resolve(strict=False):
+            return ""
+    except OSError:
+        return ""
+    return str(toplevel)
+
+
+def ephemeral_checkout_reason(path: pathlib.Path) -> str:
+    """Why ``path`` must not become a project's DURABLE place, or "".
+
+    A project's folder outlives every task that ever runs in it, so the checkouts
+    Ouroboros makes FOR ITSELF are disqualified even though each is a perfectly
+    good workspace for the task holding it:
+
+    - a LINKED git worktree — ``--git-common-dir`` differs from its own
+      ``--git-dir`` — is a temporary view of another repository's history that one
+      ``git worktree remove`` deletes, taking the project's place with it;
+    - anything under the acting-subagent worktree root is a checkout of the
+      Ouroboros body itself AND is age-swept by the orphan GC, so a project
+      pointed at one would lose its folder on a retention pass;
+    - anything under the thread worktree root is a branch-off checkout owned by a
+      thread's lifecycle, not by a project.
+
+    This is the DURABLE-place rule, which is why it lives beside the attach guards
+    rather than inside them: attach paths are typed by the owner, but an adopted
+    folder arrives from a task record, and a task's workspace is exactly where
+    these checkouts show up. Never raises."""
+    try:
+        resolved = pathlib.Path(path).resolve(strict=False)
+    except OSError:
+        return ""
+    from ouroboros.tool_access import path_is_relative_to
+
+    roots: list[tuple[str, pathlib.Path, str]] = []
+    try:
+        from ouroboros.config import get_subagent_worktree_root
+
+        roots.append((
+            "acting-subagent worktree root",
+            pathlib.Path(get_subagent_worktree_root()).expanduser().resolve(strict=False),
+            "those checkouts are copies of Ouroboros itself and the orphan sweep deletes them by age",
+        ))
+    except Exception:
+        pass
+    try:
+        from ouroboros.thread_worktrees import thread_worktree_root
+
+        roots.append((
+            "thread worktree root",
+            thread_worktree_root(),
+            "a thread's branch-off checkout belongs to that thread's lifecycle, not to a project",
+        ))
+    except Exception:
+        pass
+    for label, root, why in roots:
+        if resolved == root or path_is_relative_to(resolved, root):
+            return (
+                f"{resolved} sits under the Ouroboros {label} ({root}) — {why}, so it cannot "
+                "be a project's permanent folder"
+            )
+
+    bootstrap_process_path()
+
+    def _rev_parse(flag: str) -> str:
+        try:
+            res = subprocess.run(
+                ["git", "rev-parse", flag],
+                cwd=str(resolved), capture_output=True, text=True, timeout=5,
+            )
+        except Exception:
+            return ""
+        return (res.stdout or "").strip() if res.returncode == 0 else ""
+
+    own_dir, common_dir = _rev_parse("--git-dir"), _rev_parse("--git-common-dir")
+    if not own_dir or not common_dir:
+        return ""
+    try:
+        own = pathlib.Path(own_dir)
+        shared = pathlib.Path(common_dir)
+        own = (own if own.is_absolute() else resolved / own).resolve(strict=False)
+        shared = (shared if shared.is_absolute() else resolved / shared).resolve(strict=False)
+    except OSError:
+        return ""
+    if own == shared:
+        return ""
+    return (
+        f"{resolved} is a linked git worktree of the repository at {shared.parent} — a "
+        "worktree is a temporary checkout that can be removed at any time, so it cannot be "
+        "a project's permanent folder; use the repository itself"
+    )
 
 
 def _unstage_sensitive_paths(path: pathlib.Path) -> list[str]:
