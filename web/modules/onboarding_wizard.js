@@ -1,15 +1,27 @@
 (() => {
-    // Self-contained IIFE mirrors of harness_accounts.js; SSOT drift is tested.
-    // The wizard cannot import (it is a plain IIFE), so the two rules it needs
-    // are restated here and pinned against the real exports in the web tests.
+    // Self-contained IIFE mirrors of harness_accounts.js. The pin in
+    // tests/test_web_utils_ssot.py compares these against the real exports
+    // rule by rule; it is a structural pin, not a behavioural one, so a
+    // rewrite that keeps the shape can still drift. (The wizard is a plain
+    // IIFE inside a page module and cannot import, which is why the two rules
+    // it needs are restated at all.)
     //
     // 1. Was the account store actually READ? An empty list under a lazily
     //    started daemon means "never asked", not "no accounts" — the wizard
     //    used to announce "No accounts connected yet" on an idle machine.
     function claudexorAccountsRead(payload) {
-        const state = String(payload?.reads?.accounts || '');
-        if (state === 'ok' || state === 'not_read' || state === 'failed') return state;
-        return String(payload?.daemon?.state || '') === 'running' ? 'ok' : 'not_read';  // legacy
+        const hasBlock = payload !== null && typeof payload === 'object'
+            && Object.prototype.hasOwnProperty.call(payload, 'reads');
+        if (hasBlock) {
+            const reads = payload.reads;
+            if (!reads || typeof reads !== 'object') return 'failed';
+            const state = String(reads.accounts || '');
+            if (state === 'ok' || state === 'not_read' || state === 'failed') return state;
+            return 'failed';   // block present, facet unknown => never authoritative
+        }
+        // Legacy payload with no read block AT ALL: the daemon state is the
+        // only signal there is.
+        return String(payload?.daemon?.state || '') === 'running' ? 'ok' : 'not_read';
     }
 
     // 2. What counts as CONNECTED — the same predicate the accounts panel and
@@ -552,7 +564,12 @@
             // predicates the accounts panel and delegation use.
             const read = claudexorAccountsRead(data);
             const n = countConnectedAccounts(data);
-            const unknownWhy = read === 'not_read'
+            // `not_read` normally means the daemon never ran — but a discovery
+            // or handshake failure BEFORE the fan-out leaves every facet
+            // untouched while the daemon reports `unreachable`. Blaming a
+            // daemon that is running would be a second false statement.
+            const asleep = String(data?.daemon?.state || '') !== 'unreachable';
+            const unknownWhy = read === 'not_read' && asleep
                 ? 'Accounts not checked yet — the agent daemon is not running.'
                 : 'Accounts not checked — the daemon did not answer.';
             state.harnessAccountsLine = read === 'ok'

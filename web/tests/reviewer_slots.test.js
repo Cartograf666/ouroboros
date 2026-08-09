@@ -19,6 +19,57 @@ import {
     splitSessionTarget,
 } from '../modules/reviewer_slots.js';
 
+test('a saved pin is only accused of being undiscovered by a facet that was read', () => {
+    // The suffix helpers took the read state as a parameter and every
+    // behavioural test passed the authoritative default, so hardcoding
+    // "not in discovery" in either of them stayed green — restoring the
+    // owner-visible accusation in miniature, one field at a time.
+    for (const unread of ['not_read', 'failed', 'transport']) {
+        const opts = profileOptionsFor(['valentine'], 'koshak', { accountsRead: unread });
+        const pin = opts.find((o) => o.value === 'koshak');
+        assert.ok(pin, `accountsRead=${unread} dropped the saved pin`);
+        assert.match(pin.label, /not checked/, `accountsRead=${unread}`);
+        assert.ok(!/not in discovery/.test(pin.label), `accountsRead=${unread} accused an unread store`);
+
+        const models = sessionModelOptions({ models: [{ id: 'other' }] }, 'gpt-5.6-sol', { modelsRead: unread });
+        const saved = models.find((o) => o.value === 'gpt-5.6-sol');
+        assert.ok(saved && /not checked/.test(saved.label), `modelsRead=${unread}`);
+        assert.ok(!/not in discovery/.test(saved.label), `modelsRead=${unread}`);
+    }
+    // A facet that WAS read keeps the honest accusation.
+    const read = profileOptionsFor(['valentine'], 'koshak', { accountsRead: 'ok' });
+    assert.match(read.find((o) => o.value === 'koshak').label, /not in discovery/);
+});
+
+test('a per-harness model read that refused is not reported as a discovery result', () => {
+    // The catalog can land while ONE harness refuses its model read — the
+    // daemon probes each CLI separately and a timeout there is ordinary. The
+    // row carries `models_error` for exactly this, and dropping it (or building
+    // a synthetic harness object without it) relabels a saved model as a search
+    // result nobody obtained.
+    const refused = sessionModelOptions({ models: [], models_error: 'daemon_unreachable' }, 'gpt-5.6-sol');
+    const saved = refused.find((o) => o.value === 'gpt-5.6-sol');
+    assert.ok(saved, 'the saved model lost its option when the model read refused');
+    assert.match(saved.label, /not checked/);
+    assert.ok(!/not in discovery/.test(saved.label));
+});
+
+test('the route badge does not call a route undiscovered before anyone looked', () => {
+    // "not discovered" is a claim about the CATALOG. With the daemon idle the
+    // catalog is simply unknown, and the badge was accusing a route that is
+    // very likely fine — the same empty-as-denial reading, one surface over.
+    const sessionRow = { route: { kind: ROUTE_KIND_SESSION, target_id: 'codex=gpt-5.6-sol' } };
+    assert.match(capabilityBadge(sessionRow, {}, { catalogRead: 'ok' }), /not discovered/);
+    for (const read of ['not_read', 'failed', 'transport']) {
+        const badge = capabilityBadge(sessionRow, {}, { catalogRead: read });
+        assert.match(badge, /not checked/, `catalogRead=${read}`);
+        assert.ok(!/not discovered/.test(badge), `catalogRead=${read} still accused the route`);
+    }
+    // A route the catalog DID return keeps its real status either way.
+    assert.match(capabilityBadge(sessionRow, { codex: { status: 'ok' } }, { catalogRead: 'not_read' }),
+        /route ok/);
+});
+
 test('a saved account pin survives a discovery list that no longer contains it', () => {
     // The select's value must EXIST as an option or the browser silently selects the
     // first one — "automatic rotation" — so a row pinned to one account redrew as
@@ -31,7 +82,10 @@ test('a saved account pin survives a discovery list that no longer contains it',
     assert.deepEqual(undiscovered.map((o) => o.value), ['', 'valentine', 'koshak']);
     assert.match(undiscovered[2].label, /not in discovery/);
 
-    // Discovery empty entirely (daemon down) is the SAME case, not a special one.
+    // An empty discovery list is the same SURVIVAL case whatever emptied it —
+    // the saved pin is kept either way. What it MEANS is not the same, and the
+    // read state decides that: this call is the authoritative one (the store was
+    // read and is empty), the unread ones are pinned separately below.
     assert.deepEqual(profileOptionsFor([], 'koshak').map((o) => o.value), ['', 'koshak']);
     // No pin: nothing invented, and the rotation entry stays the only default.
     assert.deepEqual(profileOptionsFor([], '').map((o) => o.value), ['']);

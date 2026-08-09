@@ -806,8 +806,11 @@ class ClaudexorStatusReads(TypedDict):
     one fanned-out read can fail while its siblings land:
 
     - ``ok`` — read; the matching collection is AUTHORITATIVE (empty means empty)
-    - ``not_read`` — never asked (no live daemon)
-    - ``failed`` — asked, and the answer did not arrive
+    - ``not_read`` — this facet was never asked: the daemon was not running, or
+      discovery/handshake died BEFORE the fan-out (which leaves every facet
+      untouched while the aggregate state reports ``unreachable``)
+    - ``failed`` — asked, and no usable answer came back: the read refused, or
+      the body arrived in a shape the facet does not promise
 
     Facets map to ``harnesses`` (catalog), ``profiles`` (accounts) and ``quota``.
     The manifest read behind the login-capability filter is deliberately NOT a

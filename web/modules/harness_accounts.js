@@ -507,8 +507,10 @@ export function renderHarnessAccountsSection() {
     `;
 }
 
-// The ONE place that decides what an empty collection MEANS. Every consumer of
-// /api/claudexor/status imports this instead of re-deriving the rule — the
+// The ONE place that decides what an empty collection MEANS. Every ES-module
+// consumer of /api/claudexor/status imports this instead of re-deriving the
+// rule; the onboarding wizard is a plain IIFE and cannot import, so it mirrors
+// the rule under a structural pin (tests/test_web_utils_ssot.py) — the
 // wizard proved a payload field alone is not enough: it already read
 // daemon.state and still printed "No accounts connected yet" (owner report,
 // 2026-08-08, three harnesses declared empty while two claude profiles, a
@@ -520,8 +522,15 @@ export function renderHarnessAccountsSection() {
 export function facetReadState(payload, facet, { transportError = '' } = {}) {
     // A request that never arrived outranks whatever the last payload said.
     if (transportError) return 'transport';
-    const reads = payload?.reads;
-    if (reads && typeof reads === 'object') {
+    // PRESENT-but-unusable is not ABSENT. `reads: null`, a string, a number —
+    // anything a drifting backend might emit — used to fall through to the
+    // legacy branch and become `ok` on a running daemon: unknown, authoritative
+    // again. Only a payload with no `reads` property at all is legacy.
+    const hasBlock = payload !== null && typeof payload === 'object'
+        && Object.prototype.hasOwnProperty.call(payload, 'reads');
+    if (hasBlock) {
+        const reads = payload.reads;
+        if (!reads || typeof reads !== 'object') return 'failed';
         const state = String(reads[facet] || '');
         if (state === 'ok' || state === 'not_read' || state === 'failed') return state;
         // The block EXISTS but this facet is missing or carries a value this
@@ -543,9 +552,14 @@ export function accountsKnown(payload, options) {
 // Why the truth is unavailable, in the words the surfaces render. Distinguishes
 // "nobody asked" from "asked and refused": telling an owner the daemon is not
 // running when it IS running and one endpoint died would be a second lie.
-export function unknownAccountsNote(payload, { transportError = '' } = {}) {
+export function unknownAccountsNote(payload, { transportError = '', checking = false } = {}) {
     const state = facetReadState(payload, 'accounts', { transportError });
     if (state === 'ok') return '';
+    // Nothing has answered YET. The first read fans out to four daemon
+    // round-trips that probe real CLIs, so this window lasts tens of seconds —
+    // long enough for "the agent daemon is not running" to be read as a verdict
+    // about a daemon that is, in fact, running.
+    if (checking && payload === null) return 'accounts not checked yet — reading the daemon status';
     if (state === 'transport') return 'accounts not checked — the last status request did not complete';
     if (state === 'failed') return 'accounts not checked — the daemon did not answer this read';
     // `not_read` normally means the daemon never ran — but a discovery/handshake
@@ -561,13 +575,21 @@ export function unknownAccountsNote(payload, { transportError = '' } = {}) {
 // alive, but with a sleeping daemon a plain re-read returns the same nothing
 // forever — so there it becomes an explicit owner action that STARTS the daemon,
 // and the label says so rather than hiding the side effect.
+export function refreshActionKind(payload) {
+    // ONE predicate behind BOTH the label and the click. They were written
+    // separately and drifted: the label promised a plain re-read on an
+    // `unreachable` daemon while the handler called wake, so the button did
+    // more than it said — and a comment claimed it "does not resurrect
+    // anything" while the code resurrected. Live, the button re-reads. In every
+    // other state — asleep, never installed, or answering nothing — pressing it
+    // starts/repairs the daemon, which is what the owner is asking for.
+    return daemonAnswered(payload) ? 'refresh' : 'wake';
+}
+
 export function refreshActionLabel(payload) {
-    // Only promise a START where a start is what is missing. With the daemon
-    // `unreachable` it ANSWERED some facets and died on others — pressing this
-    // re-reads, it does not resurrect anything.
-    const state = String(payload?.daemon?.state || '');
-    if (state === 'running' || state === 'unreachable') return 'Refresh';
-    return 'Check accounts (starts the agent daemon)';
+    return refreshActionKind(payload) === 'refresh'
+        ? 'Refresh'
+        : 'Check accounts (starts the agent daemon)';
 }
 
 export function runtimeActionLabel(payload) {
@@ -593,8 +615,16 @@ export function daemonStatusLine(payload, { checking = false, transportError = '
         // network). Say what failed; the rows and Connect stay put.
         return { tone: 'error', text: `Could not start the agent daemon: ${wakeError}` };
     }
-    if (transportError && daemon.state) {
-        return { tone: 'warn', text: `Showing the last reading — the status request did not complete (${transportError}). Retrying.` };
+    if (transportError) {
+        // With a previous reading on screen, say it is the LAST one rather than
+        // the current one. With none — the very first request died, page load
+        // against a restarting backend — there is no reading to qualify, and
+        // the fallback at the bottom would announce a verdict about the daemon
+        // built from zero data ("Daemon unknown", error tone) while the row
+        // beside it correctly says nothing was checked.
+        return daemon.state
+            ? { tone: 'warn', text: `Showing the last reading — the status request did not complete (${transportError}). Retrying.` }
+            : { tone: 'warn', text: `The status request did not complete (${transportError}). Retrying — nothing has been read yet.` };
     }
     // Nothing read yet and a read in flight: SAY so, and say what it costs. The
     // daemon re-probes every coding-agent CLI on each read, so first paint is
@@ -606,21 +636,46 @@ export function daemonStatusLine(payload, { checking = false, transportError = '
     if (daemon.ownership_problem) {
         return { tone: 'error', text: `This daemon home is not managed from here: ${daemon.ownership_problem}` };
     }
+    // A facet can fail WITHOUT the aggregate hearing about it: an envelope that
+    // arrived in the wrong shape is a failed read, not an exception, so the
+    // daemon still reports `running`. The panel then said "Claudexor ready" in
+    // green while the row underneath said "accounts not checked" — the two
+    // halves of one screen contradicting each other, with the reassuring half
+    // on top. The status line asks the facets, not the aggregate.
+    //
+    // Computed BEFORE the runtime branches, which used to return above it and
+    // hide the unread facets entirely — and `update_staged` did worse than hide
+    // them: it says the engine "keeps running", a positive claim about a daemon
+    // that in this window answered nothing, over a button offering to START it.
+    const unread = unreadFacets(payload);
+    const unreadTail = unread.length
+        ? ` ${unread.join(' and ')} ${unread.length > 1 ? 'were' : 'was'} not read.`
+        : '';
     if (runtimeState === 'installing') {
         const version = runtime.target_version ? ` ${runtime.target_version}` : '';
-        return { tone: 'muted', text: `Installing or checking Claudexor${version}…` };
+        return { tone: 'muted', text: `Installing or checking Claudexor${version}…${unreadTail}` };
     }
     if (runtimeState === 'error') {
         const detail = runtime.last_error ? `: ${runtime.last_error}.` : '.';
-        return { tone: 'error', text: `Claudexor needs repair${detail} Connect retries automatically.` };
+        return { tone: 'error', text: `Claudexor needs repair${detail} Connect retries automatically.${unreadTail}` };
     }
-    if (runtimeState === 'update_staged') {
+    // The staged-update line asserts the current engine is still serving. Only
+    // say that when this reading actually saw it serve; otherwise the facets own
+    // the line and the staged update is a footnote.
+    if (runtimeState === 'update_staged' && !unread.length) {
         const target = runtime.staged_version || runtime.target_version || '?';
         const current = daemon.engine_version || runtime.version || '?';
         return { tone: 'warn', text: `Claudexor ${target} is ready and will activate after the daemon next restarts. Engine ${current} keeps running until then.` };
     }
-    if (status === 'running') {
+    if (runtimeState === 'update_staged') {
+        const target = runtime.staged_version || runtime.target_version || '?';
+        return { tone: 'warn', text: `${unread.join(' and ')} ${unread.length > 1 ? 'were' : 'was'} not read${daemon.last_error ? `: ${daemon.last_error}` : ''}. Claudexor ${target} is staged and activates after the daemon next restarts.` };
+    }
+    if (status === 'running' && !unread.length) {
         return { tone: 'ok', text: `Claudexor ready (engine ${daemon.engine_version || '?'}) · home ${payload.config_dir || ''}` };
+    }
+    if (status === 'running') {
+        return { tone: 'warn', text: `Claudexor is running, but ${unread.join(' and ')} ${unread.length > 1 ? 'were' : 'was'} not read${daemon.last_error ? `: ${daemon.last_error}` : ''}. What those cover is unknown.` };
     }
     if (status === 'not_provisioned') {
         // Neither branch may claim there are no accounts: with no daemon the
@@ -651,6 +706,15 @@ export function daemonStatusLine(payload, { checking = false, transportError = '
     }
     if (status === 'foreign_daemon') {
         return { tone: 'warn', text: 'Another daemon answered on the stale port (not ours — left untouched). The next login restarts our own daemon on a fresh port.' };
+    }
+    if (daemonAnswered(payload) && unread.length) {
+        // A PARTIAL refusal: the aggregate says `unreachable` because one read
+        // died, but the others landed and their rows are on screen right now.
+        // Announcing a dead daemon above accounts it just handed over is the
+        // same false verdict as an unread store rendered empty. NAME the facets
+        // that did not answer — "what is shown below was read" was itself an
+        // overclaim when the accounts facet is the one that failed.
+        return { tone: 'warn', text: `${unread.join(' and ')} ${unread.length > 1 ? 'were' : 'was'} not read${daemon.last_error ? `: ${daemon.last_error}` : ''}. What those cover is unknown.` };
     }
     return { tone: 'error', text: `Daemon ${status}${daemon.last_error ? `: ${daemon.last_error}` : ''}` };
 }
@@ -716,7 +780,13 @@ function renderRows() {
     // The bootstrap rows and their Connect buttons STAY whatever we know —
     // onboarding must stay reachable — but the verdict beside them may only
     // assert absence when the account store was actually read.
-    const unknownNote = unknownAccountsNote(payload, { transportError: state.statusTransportError });
+    // RAW state, not the `{}` normalized above: "nothing has answered yet" is
+    // exactly the absence of a payload, and handing the placeholder over made
+    // the branch that says so unreachable — so the bootstrap rows spent the
+    // whole first read printing "the agent daemon is not running" about a
+    // daemon that was answering, which is the verdict this file exists to stop.
+    const unknownNote = unknownAccountsNote(state.payload, {
+        transportError: state.statusTransportError, checking: state.statusChecking });
     const bareStatus = unknownNote || 'no account connected';
     const parts = rows.map((row) => rowHtml(row, payload));
     for (const harness of bare) {
@@ -1219,16 +1289,35 @@ async function settleVerdict(active, verdict) {
     // — briefly re-polled, is the judge.
     active.confirming = true;
     renderLoginCard();
+    // The same join the poll takes: the confirmation reads the status endpoint
+    // directly, and running it beside an in-flight wake would make it the
+    // THIRD writer in the race the wake exists to settle. Wait the wake out,
+    // then confirm against the reading it produced.
+    if (state.wakeInFlight) await state.wakeInFlight;
+    const generation = state.readGeneration;
     const check = await confirmLoginLive(active.harness, active.profile || '', {
         isStale: () => state.activeJob !== active,
     });
     if (state.activeJob !== active) return;
     active.confirming = false;
-    if (check.payload) state.payload = check.payload;
+    // GENERATION, not just job identity. This read goes to the status endpoint
+    // directly, outside `refreshStatus`, so any commit that landed while it was
+    // in flight has already published a newer payload — and `readGeneration`
+    // promises that a read issued before a commit never lands on top of it.
+    const superseded = generation !== state.readGeneration;
+    if (check.payload && !superseded) commitStatusPayload(check.payload);
+    // A positive confirmation does not expire. The generation is captured once
+    // for a SERIES of attempts, so a commit landing between attempt 1 and
+    // attempt 2 marked the whole series stale — including the later attempt
+    // that watched the account come online. Seeing the login is monotone
+    // evidence: believe it whenever it happened, and otherwise judge the newest
+    // reading with the same predicate rather than the one this series began on.
+    const confirmed = check.confirmed
+        || accountLoginConfirmed(state.payload, active.harness, active.profile || '');
     // An exhausted window is not a failure verdict: the job's own read was
     // already judged unproven, and the account row often appears a tick after
     // the bounded re-poll gives up. Say that, and say where to look.
-    active.verdict = check.confirmed
+    active.verdict = confirmed
         ? { kind: 'success', reason: '' }
         : { kind: 'unconfirmed', reason: verdict.reason };
     renderRows();
@@ -1239,28 +1328,111 @@ function stopJobPolling() {
     state.jobTimer = 0;
 }
 
+// The ONE place a fresh status payload is committed. Three paths produce one
+// (the poll, the wake, and the login confirmation), and they disagreed: a
+// transport error was retired by two of them and a wake error by one, so a
+// daemon that came up still rendered "Could not start the agent daemon" until
+// the next tick — and a wake error was ALSO cleared by a 200 that reported the
+// daemon still down, wiping the reason before the owner could read it. A fresh
+// answer always retires staleness, because the answer IS current. It retires
+// the wake error only on proven recovery: its basis is a daemon that would not
+// answer, so only a daemon that ANSWERED expires it — `daemonAnswered`, which
+// is deliberately not the literal `running`.
+// The facets the status contract declares. `daemonAnswered` iterates this list,
+// so a facet added to the contract and not here would be invisible to it —
+// tests/test_gateway_parity.py reads this literal out of the source and
+// compares it with `ClaudexorStatusReads`.
+export const READ_FACETS = ['catalog', 'accounts', 'quota'];
+
+export function unreadFacets(payload) {
+    // Which facets did NOT answer, in contract order. Empty means everything
+    // this payload promises was actually read.
+    return READ_FACETS.filter((facet) => facetReadState(payload, facet) !== 'ok');
+}
+
+export function daemonAnswered(payload) {
+    // Did the daemon ANSWER? A disjunction whose halves prove different things.
+    // An authenticated `running` is positive evidence on its own — the
+    // handshake happened. Anything else is NOT evidence of silence: a PARTIAL
+    // refusal (quota times out while the catalog and the account store land) is
+    // reported as `daemon.state = 'unreachable'`, so a predicate written on the
+    // literal `running` called a daemon dead while its own accounts were on
+    // screen — it kept a failed wake's error standing over them and made
+    // Refresh offer to start something already answering. There a facet's own
+    // `ok` is the evidence. What the aggregate can never be is the NEGATIVE
+    // answer.
+    //
+    // The facet states come from `facetReadState`, never from the raw block:
+    // reading `Object.values(reads)` here was a SECOND reader of the same
+    // field, and the two disagreed — an ARRAY is `typeof 'object'`, so
+    // `reads: ['ok']` counted as an answered facet here while `facetReadState`
+    // correctly called every facet `failed`.
+    if (String(payload?.daemon?.state || '') === 'running') return true;
+    return READ_FACETS.some((facet) => facetReadState(payload, facet) === 'ok');
+}
+
+export function commitStatusPayload(data) {
+    state.payload = data;
+    state.statusTransportError = '';
+    if (daemonAnswered(data)) state.wakeError = '';
+    // The ONE owner of the read version. It used to be bumped only by the wake,
+    // so two readers of the same generation could still land out of order: a
+    // login confirmation that began before an ordinary poll committed AFTER it
+    // and put the older snapshot back. Every accepted payload retires every
+    // read that began before it, whichever path produced it.
+    state.readGeneration += 1;
+}
+
 // OWNER action behind the Refresh button when the daemon is asleep: start it,
 // then take the fresh reading. Never called by the poll — the status GET stays
 // side-effect-free, which is what makes an automatic 5s wake impossible.
+function wakeErrorIfStillNeeded(message) {
+    // A start that failed is only news while the daemon is still not answering.
+    // An ordinary poll can commit a live reading WHILE the wake is in flight —
+    // and then a refusal that arrived afterwards would plant "Could not start
+    // the agent daemon" on top of a panel already listing that daemon's
+    // accounts. The failure is real; it just stopped mattering.
+    return daemonAnswered(state.payload) ? '' : message;
+}
+
 export async function wakeDaemon({ fetchImpl = apiFetch } = {}) {
     if (state.wakeInFlight) return state.wakeInFlight;
-    state.readGeneration += 1;   // anything already in flight is now stale
+    // CAUSAL ordering with a GET already in flight: its read may land daemon-side
+    // before or after ours — the client cannot know — but if we START after its
+    // COMMIT, our reading is later than its by construction, and the
+    // unconditional commit below is correct. So wait it out before posting.
+    // (A GET started after us joins us instead — the check at the top of
+    // refreshStatus — so the two writers never overlap in either order.)
+    const pendingRead = state.statusInFlight;
+    // NOTE: no generation bump here. An opening bump used to guard "a read
+    // started before the press must not undo it", but the bump taken at COMMIT
+    // time already stales every read that started before the commit — which
+    // includes those. On the failing path there is no commit to protect, and
+    // the refusal survives on its own (commitStatusPayload retires a wake error
+    // only on proven recovery). Two interleavings DO tell the two apart, and
+    // both are benign: a read released while the wake is still pending repaints
+    // from its own answer instead of being discarded, and a read that answers
+    // for a daemon that came up anyway retires the error — which is exactly the
+    // recovery rule this module declares. So the bump is not here claiming an
+    // invariant it does not hold alone.
     state.wakeError = '';
     state.wakeBusy = true;
     renderRows();
     state.wakeInFlight = (async () => {
         try {
+            if (pendingRead) await pendingRead.catch(() => {});
             const resp = await fetchImpl('/api/claudexor/wake', { method: 'POST' });
             const data = await resp.json().catch(() => ({}));
             if (resp.ok) {
-                state.payload = data;
-                state.statusTransportError = '';
+                // The bump lives in commitStatusPayload now — one owner for the
+                // read version, so this path does not need its own.
+                commitStatusPayload(data);
                 state.statusEverSettled = true;
             } else {
-                state.wakeError = String(data?.error || `HTTP ${resp.status}`);
+                state.wakeError = wakeErrorIfStillNeeded(String(data?.error || `HTTP ${resp.status}`));
             }
         } catch (err) {
-            state.wakeError = String(err?.message || err || 'request failed');
+            state.wakeError = wakeErrorIfStillNeeded(String(err?.message || err || 'request failed'));
         } finally {
             state.wakeBusy = false;
             state.wakeInFlight = null;
@@ -1285,6 +1457,15 @@ export async function refreshStatus({ force = false, fetchImpl = apiFetch } = {}
         hidden: document.hidden,
         force,
     })) return;
+    // A wake OWNS the reading while it runs. It ensures the daemon and then
+    // reads, so its answer is the one worth having — and a poll running beside
+    // it is a second writer whose order against it cannot be established from
+    // the client at all: neither request knows when the other's read actually
+    // happened daemon-side. Comparing generations does not settle it either
+    // (either direction discards a genuinely newer reading). Removing the
+    // other writers does: the poll joins here, and the login confirmation
+    // waits the wake out in settleVerdict the same way.
+    if (state.wakeInFlight) return state.wakeInFlight;
     // SINGLE-FLIGHT. The 5s interval outlives a read that takes tens of seconds,
     // and each read fans out to four CLI-probing daemon GETs — unguarded, a
     // visible panel stacks ~6 reads (~24 concurrent probes) against the very
@@ -1304,8 +1485,7 @@ export async function refreshStatus({ force = false, fetchImpl = apiFetch } = {}
             const data = await resp.json().catch(() => ({}));
             if (generation !== state.readGeneration) return;  // a newer read won
             if (resp.ok) {
-                state.payload = data;
-                state.statusTransportError = '';
+                commitStatusPayload(data);
             } else {
                 // The MIRROR of the false absence: a swallowed failure used to
                 // leave the last good payload rendering "Claudexor ready" with
@@ -1314,6 +1494,7 @@ export async function refreshStatus({ force = false, fetchImpl = apiFetch } = {}
                 state.statusTransportError = String(data?.error || `HTTP ${resp.status}`);
             }
         } catch (err) {
+            if (generation !== state.readGeneration) return;  // a newer read won
             state.statusTransportError = String(err?.message || err || 'request failed');
         } finally {
             state.statusChecking = false;
@@ -1351,9 +1532,11 @@ export function initHarnessAccounts() {
     const refreshBtn = document.getElementById('btn-harness-refresh');
     refreshBtn?.addEventListener('click', () => {
         // A sleeping daemon cannot be re-read into existence: there the button
-        // is the owner's explicit start. Live, it stays a plain re-read.
-        const running = String(state.payload?.daemon?.state || '') === 'running';
-        return running ? refreshStatus({ force: true }) : wakeDaemon();
+        // is the owner's explicit start. Live, it stays a plain re-read. Same
+        // predicate the LABEL uses, so the two cannot disagree again.
+        return refreshActionKind(state.payload) === 'refresh'
+            ? refreshStatus({ force: true })
+            : wakeDaemon();
     });
     registerActivationHandlers();
     // Forced: init runs while the page may not be visible yet, and the first

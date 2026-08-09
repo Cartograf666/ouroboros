@@ -247,7 +247,7 @@ def collect_routes(
         Route("/api/mcp/status", endpoint=api_mcp_status, methods=["GET"]),
         Route("/api/mcp/refresh", endpoint=api_mcp_refresh, methods=["POST"]),
         Route("/api/mcp/test", endpoint=api_mcp_test, methods=["POST"]),
-        # Harness Accounts (D30): three thin proxies of the owned Claudexor
+        # Harness Accounts (D30): four thin proxies of the owned Claudexor
         # daemon's own account surface; zero auth logic on this side.
         Route("/api/reviewer-slots", endpoint=api_reviewer_slots, methods=["GET"]),
         Route("/api/claudexor/status", endpoint=api_claudexor_status, methods=["GET"]),

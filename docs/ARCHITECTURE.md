@@ -196,7 +196,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── extensions.py    ← extensions/skills HTTP surface (GET /api/extensions, GET /api/extensions/<skill>/manifest, ALL /api/extensions/<skill>/<rest:path>, POST /api/skills/<skill>/toggle, POST /api/skills/<skill>/delete, POST /api/skills/<skill>/review, POST /api/skills/<skill>/grants)
       │   ├── marketplace.py   ← ClawHub + OuroborosHub HTTP surface
       │   ├── mcp.py           ← MCP Settings API surface backed by the shared MCPManager
-      │   ├── claudexor_accounts.py ← (D30) Harness Accounts HTTP surface: FOUR thin proxies of the owned daemon's account truth (GET /api/claudexor/status[?include=models] — side-effect-free daemon/runtime state, each facet stamped with its read state so an unread store is never rendered as an empty one; POST /api/claudexor/wake — the OWNER-initiated daemon start behind the panel's Refresh button, the only path that may spawn from this surface (no poll ever does) + harness catalog + credential profiles with both honest verification statuses + quota windows; POST /api/claudexor/login — one Connect intent that foreground-installs/repairs/updates the exact managed runtime, starts or attaches the owned daemon, then continues its setup job; GET/DELETE /api/claudexor/login/{job_id} — snapshot with the transient device-code disclosure / cancel). Zero auth logic on this side; the browser never sees the daemon token. The fallback login card is a copy-paste `claudexor setup attach …` command for the user's own terminal — no in-app terminal exists. The snapshot proxy is a VERBATIM pass-through, and that is load-bearing for the card: a `failed` job whose reason is a verification race is judged `recheck` (codex clears its auth store when a login STARTS, so a probe in that window lies), but when the bounded re-check runs out the card's verdict text is a fixed CONSTANT, so the engine's own `message` is the only thing that can say WHY. `harness_accounts.jobDetail()` reads it at both envelope levels and renders it beside a settled non-success verdict only — escaped, never beside "Connected." where a stale message would contradict the outcome, never while the job is pending (the live status line owns the card then), and never truncated (BIBLE P1: this is an owner-facing surface)
+      │   ├── claudexor_accounts.py ← (D30) Harness Accounts HTTP surface: FOUR thin proxies of the owned daemon's account truth (GET /api/claudexor/status[?include=models] — side-effect-free daemon/runtime state + harness catalog + credential profiles with both honest verification statuses + quota windows, each facet stamped with its read state so an unread store is never rendered as an empty one; POST /api/claudexor/wake — the OWNER-initiated daemon start behind the panel's Refresh button; no GET and no poll on this surface ever spawns, and Connect (POST /api/claudexor/login) is the other owner-initiated start; POST /api/claudexor/login — one Connect intent that foreground-installs/repairs/updates the exact managed runtime, starts or attaches the owned daemon, then continues its setup job; GET/DELETE /api/claudexor/login/{job_id} — snapshot with the transient device-code disclosure / cancel; POST /api/claudexor/login/{job_id}/input — the owner's answer to a prompt the engine is waiting on). Zero auth logic on this side; the browser never sees the daemon token. The fallback login card is a copy-paste `claudexor setup attach …` command for the user's own terminal — no in-app terminal exists. The snapshot proxy is a VERBATIM pass-through, and that is load-bearing for the card: a `failed` job whose reason is a verification race is judged `recheck` (codex clears its auth store when a login STARTS, so a probe in that window lies), but when the bounded re-check runs out the card's verdict text is a fixed CONSTANT, so the engine's own `message` is the only thing that can say WHY. `harness_accounts.jobDetail()` reads it at both envelope levels and renders it beside a settled non-success verdict only — escaped, never beside "Connected." where a stale message would contradict the outcome, never while the job is pending (the live status line owns the card then), and never truncated (BIBLE P1: this is an owner-facing surface)
       │   ├── host_service.py  ← Loopback-only Host Service API for reviewed skill callbacks
       │   ├── history.py       ← Chat history + cost breakdown endpoint factories
       │   ├── projects.py      ← Multi-project CRUD surface (v6.32.0): GET /api/projects, POST /api/projects, POST /api/projects/from-task (bind an existing task to a new project). (v6.33.0 removed the /sleep + /wake status endpoints.)
@@ -1283,14 +1283,30 @@ later change narrows the rule.
 `not_read` | `failed`) because the owned daemon starts LAZILY: an idle machine used to
 serve empty collections under a 200, and every consumer read that as "no account
 connected" while real accounts sat in the agent home. `ok` makes the matching collection
-authoritative (empty means empty); `not_read` means nothing was asked; `failed` means the
-answer did not arrive. Facets are independent — one fanned-out read can fail while its
-siblings land — and the rule lives in ONE reader
-(`harness_accounts.facetReadState`) that every importing consumer uses. Two
-surfaces cannot import it and restate it instead: the onboarding wizard is a
-plain IIFE (its mirror is drift-tested in `tests/test_web_utils_ssot.py`), and
-the reviewer-slot row builders take the state as a parameter rather than reading
-the payload themselves. Those are the only restatements, and both are pinned.
+authoritative (empty means empty); `not_read` means nothing was asked; `failed` means it
+was asked and no usable answer came back — the read refused, or the body arrived in a
+shape the facet does not promise. Facets are independent — one fanned-out read can fail while its
+siblings land, so each is classified on its own — and the rule lives in ONE
+reader (`harness_accounts.facetReadState`) that every importing consumer uses,
+including the delegation section. ONE surface cannot import it and restates it:
+the onboarding wizard is a plain IIFE, and its mirror is drift-tested in
+`tests/test_web_utils_ssot.py` — a STRUCTURAL pin (the rules are compared clause
+by clause against the real exports, including the order of the failed-closed
+check), not a behavioural one. The reviewer-slot row builders take the state as a
+parameter instead of reading the payload, and each pin is labelled from ITS OWN
+facet: an account pin from `accounts`, a model from `catalog`. A read block that
+is present but unusable, or a facet value this build does not know, is `failed` —
+never authoritative — and neither is the aggregate `daemon.state`, in either
+direction: it reports `unreachable` for a PARTIAL refusal, and it goes on
+reporting `running` when a facet failed on SHAPE rather than by raising. So the
+panel and the Refresh button ask the facets. The question is a disjunction: an
+authenticated `running` handshake is positive evidence on its own, a facet's own
+`ok` is the evidence when it is not, and the aggregate is never the negative
+answer. The status line names the facets that did not answer rather than
+claiming what is on screen was read. On the daemon side a facet is `ok` only
+when EVERY key its envelope promised arrived: a non-object body is collapsed by
+the transport into an empty `{}`, an object whose keys have drifted arrives
+intact, and either would otherwise be published as an authoritative nothing.
 
 ### Git and commit review
 

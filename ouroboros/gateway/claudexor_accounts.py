@@ -4,9 +4,10 @@ Ouroboros's own Claudexor daemon (``claudexor_daemon.py``) owns every account
 fact — profiles, login jobs, device-code custody, the two honest verification
 statuses, quota windows. The browser cannot talk to the daemon directly (its
 control plane is loopback-Origin-guarded and bearer-token'd; the token must
-never reach a page), so these handlers translate: status aggregation, login
-job create, login job read/cancel. Nothing here interprets a credential and
-nothing here stores one.
+never reach a page), so these handlers translate: status aggregation, the
+owner-initiated daemon wake behind the panel's Refresh button, login job
+create, and login job read/cancel/input. Nothing here interprets a credential
+and nothing here stores one.
 
 Login shapes ("красота-сначала", D30): a structural link/device-code card
 wherever the engine can host the flow itself — codex device-code today, and
@@ -142,8 +143,11 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
         # harnesses while two claude profiles, a cursor profile and two native
         # sessions sat on disk, simply because a lazily-started daemon had not
         # been asked. `ok` — this facet was read and its collection is
-        # AUTHORITATIVE (empty means empty); `not_read` — never asked (no live
-        # daemon); `failed` — asked, and the answer did not arrive. Facets are
+        # AUTHORITATIVE (empty means empty); `not_read` — never asked, either
+        # because no daemon was running or because discovery/handshake died
+        # BEFORE the fan-out and left every facet untouched; `failed` — asked, and
+        # no usable answer came back: the read refused, or the body arrived in a
+        # shape the facet does not promise. Facets are
         # independent because one fan-out read can fail while its siblings land.
         "reads": {
             "catalog": READ_NOT_READ,
@@ -167,10 +171,10 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
             # (it probes the real coding-agent CLIs on every read: binary, version,
             # login state). Serialized, the panel waited for their SUM — ~23s on a
             # warm daemon with nothing on screen; fanned out it waits for the
-            # slowest. Failure semantics are deliberately unchanged: the results are
-            # read back in the ORIGINAL order, so a catalog/profile/quota refusal
-            # still surfaces as the typed unreachable state below, and a manifest
-            # refusal still fails OPEN.
+            # slowest. Failure semantics are per-facet: each result is classified
+            # on its own (see `_facet_outcome`), a refusal surfaces as the typed
+            # unreachable state below WITHOUT downgrading the siblings that
+            # landed, and a manifest refusal still fails OPEN.
             with ThreadPoolExecutor(max_workers=4) as pool:
                 catalog_call = pool.submit(gateway.agent_capabilities)
                 manifests_call = pool.submit(gateway.harnesses)
@@ -181,8 +185,9 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
             # verdict depend on which sibling raised first — a catalog failure
             # would leave `accounts` reported as unread even though its own read
             # succeeded. Each facet answers only for itself.
-            catalog_outcome = _facet_outcome(catalog_call)
-            profiles_outcome = _facet_outcome(profiles_call)
+            catalog_outcome = _facet_outcome(catalog_call, envelope=("harnesses",))
+            profiles_outcome = _facet_outcome(
+                profiles_call, envelope=("profiles", "harnessAccounts"))
             quota_outcome = _facet_outcome(quota_call)
             payload["reads"] = {
                 "catalog": catalog_outcome[0],
@@ -276,12 +281,30 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
     return payload
 
 
-def _facet_outcome(call: "Future") -> tuple:
+def _facet_outcome(call: "Future", *, envelope: tuple = ()) -> tuple:
     """Classify ONE fanned-out read: (state, value, error).
 
     Independent by construction — a sibling's exception can never downgrade a
     facet whose own read landed, and the verdict does not depend on completion
     or consumption order (the pool has already joined when this runs).
+
+    ``envelope`` names EVERY key the facet's own reader promises to deliver;
+    all of them must be present for the body to count as the shape we asked
+    for. Requiring only one was its own version of the bug: the accounts
+    envelope carries named profiles AND native rows, and half an envelope made
+    the missing half an authoritative empty. This is not schema validation; it
+    closes ONE reachable case, and TWO different bodies reach it. A NON-OBJECT
+    body — null, a list, a string — is collapsed by the transport into an empty
+    ``{}`` (both ``ClaudexorGateway.agent_capabilities`` and
+    ``credential_profiles`` end in ``return body if isinstance(body, dict) else
+    {}``), so it arrives here already looking like a legitimate empty answer. A
+    body that IS an object but has drifted its keys is NOT touched by the
+    transport and arrives intact. Either would otherwise be published as an
+    AUTHORITATIVE empty — exactly the lie the read block exists to stop — and
+    both land on the same verdict here. An envelope carrying none of its keys is
+    a read that did not answer, not an account store that is empty. Quota passes
+    ``()``: its reader already filters to a list of rows, and an empty quota
+    renders as a neutral absence rather than a verdict.
     """
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
@@ -289,11 +312,9 @@ def _facet_outcome(call: "Future") -> tuple:
         value = call.result()
     except ClaudexorUnavailable as exc:
         return (READ_FAILED, None, exc)
-    # The transport normalizes a schema-invalid 2xx (null body, wrong envelope,
-    # a missing array) into an empty {} / [] — which would then be published as
-    # an AUTHORITATIVE empty and reproduce the very lie this block exists to
-    # stop. A read whose shape is not what the facet promises is a failed read.
     if not isinstance(value, (dict, list)):
+        return (READ_FAILED, None, None)
+    if envelope and not (isinstance(value, dict) and all(key in value for key in envelope)):
         return (READ_FAILED, None, None)
     return (READ_OK, value, None)
 

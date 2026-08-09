@@ -1456,8 +1456,11 @@ def test_status_payload_keeps_typed_unreachable_when_a_fanned_out_read_refuses(m
     assert payload["harnesses"] == []
 
 
-def _reads_probe(monkeypatch, tmp_path, daemon_state, failing_facet=""):
-    """Drive _status_payload with one facet optionally refusing."""
+def _reads_probe(monkeypatch, tmp_path, daemon_state, failing_facet="", malformed=None):
+    """Drive _status_payload with one facet optionally refusing, or answering
+    with a body that does not carry the envelope it promised — either one the
+    transport already collapsed to ``{}``, or an object that kept only half of
+    the keys it owes."""
     from ouroboros.gateway.claudexor_accounts import _status_payload
     from ouroboros.gateways import claudexor as gw
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
@@ -1487,6 +1490,8 @@ def _reads_probe(monkeypatch, tmp_path, daemon_state, failing_facet=""):
 
         def agent_capabilities(self):
             refuse_if("catalog")
+            if malformed == "catalog":
+                return {}
             return {"harnesses": [{"id": "codex", "displayName": "Codex CLI",
                                    "status": "ok", "enabled": True}]}
 
@@ -1496,6 +1501,12 @@ def _reads_probe(monkeypatch, tmp_path, daemon_state, failing_facet=""):
 
         def credential_profiles(self):
             refuse_if("accounts")
+            if malformed == "accounts":
+                return {}
+            if malformed == "accounts_half_named":
+                return {"profiles": []}          # native rows key missing
+            if malformed == "accounts_half_native":
+                return {"harnessAccounts": []}   # named profiles key missing
             return {"profiles": [], "harnessAccounts": []}
 
         def quota_snapshots(self):
@@ -1507,6 +1518,29 @@ def _reads_probe(monkeypatch, tmp_path, daemon_state, failing_facet=""):
     monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
     monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
     return _status_payload(include_models=False)
+
+
+@pytest.mark.parametrize("facet", ["catalog", "accounts"])
+def test_status_payload_calls_a_normalized_empty_envelope_a_failed_read(
+    monkeypatch, tmp_path, facet
+):
+    """A NON-OBJECT 2xx body — null, a list, a string — is collapsed by the
+    transport into an empty ``{}`` (``ClaudexorGateway.agent_capabilities`` /
+    ``credential_profiles`` both end in
+    ``return body if isinstance(body, dict) else {}``), so it arrives looking
+    like a legitimate empty answer. Without the envelope check it is published
+    as `ok` — an AUTHORITATIVE nothing — and one daemon-side schema drift
+    silently restores the owner-visible lie. The type check alone cannot see
+    this: `{}` IS a dict. (A drifted OBJECT is not normalized at all; it reaches
+    the same verdict through the same check — see the half-envelope test.)"""
+    payload = _reads_probe(monkeypatch, tmp_path, "running", malformed=facet)
+
+    assert payload["reads"][facet] == "failed", "a body that answered nothing read as ok"
+    # The SIBLING facets are untouched — the envelope check must not become a
+    # second way for one read to speak for another.
+    for other in ("catalog", "accounts", "quota"):
+        if other != facet:
+            assert payload["reads"][other] == "ok"
 
 
 @pytest.mark.parametrize("daemon_state", ["not_provisioned", "stale", "foreign_daemon"])
@@ -1534,6 +1568,88 @@ def test_status_payload_marks_facets_ok_when_the_daemon_answered(monkeypatch, tm
 
     assert payload["reads"] == {"catalog": "ok", "accounts": "ok", "quota": "ok"}
     assert [h["id"] for h in payload["harnesses"]] == ["codex"]
+
+
+def test_status_payload_discloses_a_refused_per_harness_model_read(monkeypatch, tmp_path):
+    """`include=models` asks the daemon for each harness's model list separately,
+    and one of those reads can refuse while the catalog itself landed. The row
+    carries `models_error` so the UI can say "not checked" instead of calling a
+    saved model undiscovered — a verdict about a search nobody ran. Nothing
+    pinned the field's emission, so dropping it left every suite green."""
+    from ouroboros.gateway.claudexor_accounts import _status_payload
+    from ouroboros.gateways import claudexor as gw
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+
+    class FakeDaemon:
+        def status_dict(self):
+            return {"state": "running"}
+
+    class FakeGateway:
+        engine_version = "3.3.13"
+
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self, **_kw):
+            return {}
+
+        def agent_capabilities(self):
+            return {"harnesses": [{"id": "codex", "displayName": "Codex CLI",
+                                   "status": "ok", "enabled": True}]}
+
+        def harnesses(self):
+            return [{"id": "codex", "manifest": {"capability_profile": {"auth": {
+                "supported_sources": ["native_session"]}}}}]
+
+        def harness_models(self, harness_id):
+            raise ClaudexorUnavailable("daemon_unreachable", "model read refused")
+
+        def credential_profiles(self):
+            return {"profiles": [], "harnessAccounts": []}
+
+        def quota_snapshots(self):
+            return []
+
+    monkeypatch.setattr(owned, "get_owned_daemon", lambda: FakeDaemon())
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _path: object())
+    monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
+
+    payload = _status_payload(include_models=True)
+
+    row = payload["harnesses"][0]
+    assert row["models"] == []
+    assert row["models_error"] == "daemon_unreachable", (
+        "a refused model read is indistinguishable from a harness with no models"
+    )
+    # The CATALOG itself answered, so its facet stays authoritative.
+    assert payload["reads"]["catalog"] == "ok"
+
+
+@pytest.mark.parametrize("half", ["accounts_half_named", "accounts_half_native"])
+def test_status_payload_calls_half_an_account_envelope_a_failed_read(monkeypatch, tmp_path, half):
+    """The accounts envelope carries TWO collections — named credential profiles
+    and the daemon's native per-harness rows — and the owner's machine has both
+    kinds. Accepting an envelope that brought only one made the missing half an
+    authoritative empty: exactly the reported bug ("no account connected" beside
+    accounts that exist), reached through a half-answer instead of a lazy daemon.
+    The engine schema declares both inside a strict object
+    (`ControlCredentialProfilesResponse`): `profiles` is REQUIRED outright and
+    `harnessAccounts` carries `.default([])`, so a validating daemon always
+    materializes the pair and a body missing either one is a read that did not
+    answer."""
+    payload = _reads_probe(monkeypatch, tmp_path, "running", malformed=half)
+
+    assert payload["reads"]["accounts"] == "failed", (
+        "half an account envelope was published as an authoritative empty"
+    )
+    assert payload["reads"]["catalog"] == "ok" and payload["reads"]["quota"] == "ok"
 
 
 @pytest.mark.parametrize("failing", ["catalog", "accounts", "quota"])
@@ -1594,12 +1710,29 @@ def test_wake_endpoint_starts_the_daemon_and_returns_the_fresh_reading(monkeypat
         started["n"] += 1
         return FakeGateway()
 
-    monkeypatch.setattr("ouroboros.claudexor_daemon.ensure_owned_gateway", fake_ensure)
-    monkeypatch.setattr(accounts, "_status_payload",
-                        lambda include_models: {"daemon": {"state": "running"},
-                                                "reads": {"catalog": "ok", "accounts": "ok", "quota": "ok"}})
+    order = []
+
+    def fake_ensure_ordered():
+        order.append("ensure")
+        return fake_ensure()
+
+    def fake_status(include_models):
+        order.append("read")
+        return {"daemon": {"state": "running"},
+                "reads": {"catalog": "ok", "accounts": "ok", "quota": "ok"}}
+
+    monkeypatch.setattr("ouroboros.claudexor_daemon.ensure_owned_gateway", fake_ensure_ordered)
+    monkeypatch.setattr(accounts, "_status_payload", fake_status)
 
     response = asyncio.run(accounts.api_claudexor_wake(object()))
+
+    # ORDER is the whole promise of this endpoint: a read taken BEFORE the
+    # daemon exists answers with the same nothing Refresh already had, which is
+    # the state the owner pressed the button to leave. The docstring said
+    # "ensures the daemon, then answers with the reading it just made possible"
+    # while a mocked constant payload made the sequence unobservable.
+    assert order == ["ensure", "read"], f"the wake read the status before starting anything: {order}"
+
 
     assert started["n"] == 1, "the wake must actually ensure the daemon"
     assert response.status_code == 200

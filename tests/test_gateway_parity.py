@@ -127,6 +127,26 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+    # The panel's own list of facets. `daemonAnswered` iterates it to decide
+    # whether the daemon answered anything at all, so a facet added to the
+    # contract but not here would be INVISIBLE to that predicate: a payload in
+    # which only the new facet landed would read as total silence, and the panel
+    # would print a dead-daemon verdict over data the daemon had just handed
+    # over. The name-level and field-level loops above cannot see this — they
+    # compare Python against the browser's typedef, never against the module
+    # that consumes it.
+    accounts_js = (pathlib.Path(__file__).resolve().parent.parent
+                   / "web" / "modules" / "harness_accounts.js").read_text(encoding="utf-8")
+    facets = re.search(r"export const READ_FACETS = \[([^\]]*)\]", accounts_js)
+    assert facets, "harness_accounts.js no longer declares READ_FACETS"
+    # Strip comments inside the literal first: a facet name mentioned in a
+    # comment there would otherwise satisfy this check while the exported array
+    # — the thing `daemonAnswered` iterates — never grew.
+    literal = re.sub(r"/\*.*?\*/", "", re.sub(r"//[^\n]*", "", facets.group(1)), flags=re.S)
+    assert set(re.findall(r"'([^']+)'", literal)) == set(
+        get_type_hints(ClaudexorStatusReads, include_extras=True)
+    ), "READ_FACETS drifted from ClaudexorStatusReads; daemonAnswered would go blind to a facet"
+
     assert UpdatePreflightResponse.__required_keys__ == frozenset({"merge_plan"})
     assert re.search(r"@property \{'auto_merge'\|'assisted'\|'manual'\|'replace'\} strategy\b", text)
     assert re.search(r"@property \{string=\} expected_base_sha\b", text)

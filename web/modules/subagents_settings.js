@@ -22,7 +22,7 @@
 // Pure helpers live at the top and are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
-import { accountRows, accountsKnown, unknownAccountsNote } from './harness_accounts.js';
+import { accountRows, accountsKnown, facetReadState, unknownAccountsNote } from './harness_accounts.js';
 import { renderSegmentedField } from './page_header.js';
 import { sessionModelOptions } from './reviewer_slots.js';
 import { formatRelativeAge } from './ui_helpers.js';
@@ -96,13 +96,14 @@ export function lastDelegationLine(entry) {
     return `Last delegated run: ${parts.join(' · ')}`;
 }
 
-function harnessModels(payload, harnessId) {
+function harnessRow(payload, harnessId) {
+    // The WHOLE row, not just its models: `models_error` is how a per-harness
+    // model read reports that it refused, and dropping it here relabelled a
+    // saved model as "not in discovery" when nobody had looked.
     for (const harness of payload?.harnesses || []) {
-        if (String(harness?.id || '') === String(harnessId || '')) {
-            return harness?.models || [];
-        }
+        if (String(harness?.id || '') === String(harnessId || '')) return harness;
     }
-    return [];
+    return null;
 }
 
 export function connectedHarnesses(payload) {
@@ -122,7 +123,9 @@ export function connectedHarnesses(payload) {
     // Ouroboros should PREFER subscriptions over the API budget, and demanding
     // a live vendor probe would leave delegation off on exactly the machines
     // that have subscriptions sitting right there. Strengthen this bias, never
-    // trade it for caution. `test_subscription_first_default_on_*` guards it.
+    // trade it for caution. The pin is the node test
+    // 'subscription-first: a local session is enough to turn delegation on by
+    // default' in web/tests/subagents_settings.test.js.
     const names = {};
     for (const harness of payload?.harnesses || []) {
         const id = String(harness?.id || '');
@@ -208,8 +211,10 @@ export function delegationView({ saved = '', payload = null, statusError = '', e
     // The SAME options fragment the reviewer rows use, "(not in discovery)"
     // guard included: a Save while the daemon is down must not silently erase
     // the saved model pin.
+    const catalogRead = facetReadState(payload, 'catalog');
     const modelOptions = enabled && harness
-        ? sessionModelOptions({ models: harnessModels(payload, harness) }, model)
+        ? sessionModelOptions(harnessRow(payload, harness) || { models: [] }, model,
+            { modelsRead: catalogRead !== 'ok' ? catalogRead : '' })
         : [];
 
     const options = [...connected];

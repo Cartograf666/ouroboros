@@ -77,7 +77,8 @@ export function splitSessionTarget(target) {
     return { harness: raw.slice(0, eq), model: raw.slice(eq + 1) };
 }
 
-export function routeChoiceGroups({ harnesses = [], currentChoice = '', catalogRead = 'ok' } = {}) {
+export function routeChoiceGroups({ harnesses = [], currentChoice = '', catalogRead = 'ok',
+                                    daemonState = '' } = {}) {
     const sessionValues = (harnesses || [])
         .filter((h) => h && h.id)
         .map((h) => ({
@@ -118,9 +119,14 @@ export function routeChoiceGroups({ harnesses = [], currentChoice = '', catalogR
             // for accounts that were already there. The REASON matters too:
             // "the daemon is not running" is a second lie when it IS running
             // and this one read failed.
+            // `not_read` normally means the daemon never ran, but a discovery or
+            // handshake failure BEFORE the fan-out leaves every facet untouched
+            // while the daemon reports `unreachable` — blaming a running daemon
+            // there is a second false statement, the one the panel's own note
+            // already avoids.
             label: catalogRead === 'ok'
                 ? 'None available — sign in under Providers → Harness Accounts'
-                : (catalogRead === 'not_read'
+                : (catalogRead === 'not_read' && daemonState !== 'unreachable'
                     ? 'Not checked yet — the agent daemon is not running'
                     : 'Not checked — the last read did not complete'),
         }] });
@@ -250,11 +256,16 @@ export function profileOptionsFor(profiles, savedPin, { accountsRead = 'ok' } = 
     return options;
 }
 
-export function capabilityBadge(row, harnessesById) {
+export function capabilityBadge(row, harnessesById, { catalogRead = 'ok' } = {}) {
     // DISPLAY-only facts: never a control (6.2).
     if (row.route.kind === ROUTE_KIND_SESSION) {
         const harness = harnessesById?.[splitSessionTarget(row.route.target_id).harness];
-        const status = harness ? (harness.status || 'unknown') : 'not discovered';
+        // "not discovered" is a claim about the CATALOG, and it is only true
+        // when the catalog was read. Idle daemon, failed read — the route is
+        // unknown, and saying it was not discovered accuses a route that may be
+        // perfectly fine.
+        const missing = catalogRead === 'ok' ? 'not discovered' : 'not checked';
+        const status = harness ? (harness.status || 'unknown') : missing;
         return `agent session — retrieves context with its own tools · route ${status}`;
     }
     return 'API delivery';
@@ -383,20 +394,23 @@ function effortSelectHtml(attrs, selected, surfaceDefault) {
 
 function rowHtml(row, group) {
     const choice = encodeRouteChoice(row);
-    const groups = routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice, catalogRead: state.catalogRead || 'ok' });
+    const groups = routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice,
+        catalogRead: state.catalogRead || 'not_read', daemonState: state.daemonState || '' });
     const session = row.route.kind === ROUTE_KIND_SESSION;
     const split = session ? splitSessionTarget(row.route.target_id) : { harness: '', model: '' };
     const harness = session ? harnessesById()[split.harness] : null;
-    const modelOptions = sessionModelOptions(harness, split.model);
+    const modelOptions = sessionModelOptions(harness, split.model,
+        { modelsRead: state.catalogRead !== 'ok' ? (state.catalogRead || 'not_read') : '' });
     const profiles = session ? (state.profilesByHarness[split.harness] || []) : [];
     const profileOptions = profileOptionsFor(profiles, row.route.profile_id,
-        { accountsRead: state.catalogRead || 'ok' });
+        { accountsRead: state.accountsRead || 'not_read' });
     const last = state.lastExecutions[row.slot_id];
     const lastText = last ? describeLastExecution(last) : '';
     // ONE quiet meta line per row (owner feedback): the delivery badge and the
     // last-run projection share it; nothing is dropped — the raw route + ISO
     // timestamp live in the tooltip.
-    const metaParts = [capabilityBadge(row, harnessesById())];
+    const metaParts = [capabilityBadge(row, harnessesById(),
+        { catalogRead: state.catalogRead || 'not_read' })];
     if (lastText) metaParts.push(`Last run: ${lastText}`);
     const surfaceDefault = group === 'scope' ? 'scope review effort' : 'review effort';
     return `
@@ -427,7 +441,8 @@ function advisoryHtml() {
     // the API entry read as stray next to the labeled subscriptions group.
     const groups = [
         { label: 'API', options: [{ value: API_ROUTE_CHOICE, label: 'Claude (Anthropic API key)' }] },
-        ...routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice, catalogRead: state.catalogRead || 'ok' }).slice(1),
+        ...routeChoiceGroups({ harnesses: state.harnesses, currentChoice: choice,
+        catalogRead: state.catalogRead || 'not_read', daemonState: state.daemonState || '' }).slice(1),
     ];
     // Session branch: the SAME model-options fragment the triad rows use —
     // rewriting it here would lose the "(not in discovery)" guard and let a
@@ -435,14 +450,18 @@ function advisoryHtml() {
     // WITHOUT the catalog datalist — the advisory api route is the Claude
     // Agent SDK, whose model spellings (sonnet, opus[1m], claude-…) are not
     // the OpenRouter catalog ids the datalist suggests.
-    const modelOptions = session ? sessionModelOptions(harnessesById()[split.harness], split.model) : [];
+    const modelOptions = session
+        ? sessionModelOptions(harnessesById()[split.harness], split.model,
+            { modelsRead: state.catalogRead !== 'ok' ? (state.catalogRead || 'not_read') : '' })
+        : [];
     const profiles = session ? (state.profilesByHarness[split.harness] || []) : [];
     const profileOptions = session
-        ? profileOptionsFor(profiles, advisory.route?.profile_id, { accountsRead: state.catalogRead || 'ok' })
+        ? profileOptionsFor(profiles, advisory.route?.profile_id, { accountsRead: state.accountsRead || 'not_read' })
         : [];
     const last = state.lastExecutions.advisory_slot_1;
     const lastText = last ? describeLastExecution(last) : '';
-    const metaParts = [capabilityBadge({ route: advisory.route || {} }, harnessesById())];
+    const metaParts = [capabilityBadge({ route: advisory.route || {} }, harnessesById(),
+        { catalogRead: state.catalogRead || 'not_read' })];
     if (lastText) metaParts.push(`Last run: ${lastText}`);
     return `
         <div class="reviewer-slot-row" data-advisory-row>
@@ -644,10 +663,16 @@ export async function reloadReviewerSlots() {
         state.harnesses = Array.isArray(data.harnesses) ? data.harnesses : [];
         state.profilesByHarness = indexProfilesByHarness(data);
         state.catalogRead = facetReadState(data, 'catalog');
+        // `profiles` is stamped by the ACCOUNTS facet — the facets are independent
+        // by design, so a catalog that landed says nothing about the profiles.
+        state.accountsRead = facetReadState(data, 'accounts');
+        state.daemonState = String(data?.daemon?.state || '');
     } catch (error) {
         state.harnesses = [];
         state.profilesByHarness = {};
         state.catalogRead = 'transport';
+        state.accountsRead = 'transport';
+        state.daemonState = '';
     }
     renderRows();
 }

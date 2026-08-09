@@ -15,6 +15,11 @@ import {
     accountsKnown,
     unknownAccountsNote,
     refreshActionLabel,
+    refreshActionKind,
+    commitStatusPayload,
+    daemonAnswered,
+    READ_FACETS,
+    initHarnessAccounts,
     wakeDaemon,
     refreshStatus,
     deviceCodeDisclosure,
@@ -1182,6 +1187,26 @@ test('the Refresh button tells the truth about what it does, and wakes the daemo
     }
 });
 
+test('a first request that never lands says so instead of judging the daemon', () => {
+    // Page load against a restarting backend: the very FIRST status GET dies,
+    // so there is no reading to qualify. The transport branch required a prior
+    // daemon state, so this fell through to the aggregate fallback and printed
+    // "Daemon unknown" in error tone — a verdict about the daemon assembled
+    // from zero data, next to a row that correctly said nothing was checked.
+    const line = daemonStatusLine(null, { transportError: 'Failed to fetch' });
+    assert.equal(line.tone, 'warn');
+    assert.match(line.text, /nothing has been read yet/i);
+    assert.ok(!/Daemon unknown/i.test(line.text));
+    assert.match(line.text, /Failed to fetch/);
+
+    // With a reading already on screen the wording still qualifies THAT reading.
+    const withReading = daemonStatusLine(
+        { daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
+          reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } },
+        { transportError: 'HTTP 502' });
+    assert.match(withReading.text, /last reading/i);
+});
+
 test('a failed refresh keeps the last reading but stops calling it current', () => {
     // The MIRROR of the false absence, and the owner has not seen it yet: a
     // swallowed failure used to leave "Claudexor ready" and green badges
@@ -1196,6 +1221,525 @@ test('a failed refresh keeps the last reading but stops calling it current', () 
     assert.match(stale.text, /last reading/i);
     assert.match(stale.text, /502/);
     assert.ok(!/Claudexor ready/.test(stale.text), 'no health claim from a failed read');
+});
+
+test('a read block that is present but unusable is never authoritative', () => {
+    // The block itself can arrive broken — `reads: null` from a drifting
+    // backend, a string, a number. Treating those as "no block at all" sent
+    // them down the legacy branch, where a running daemon turns unknown into
+    // `ok`: the original false absence, restored through the very field added
+    // to prevent it. Only a payload with NO `reads` property is legacy.
+    const running = { daemon: { state: 'running' } };
+    for (const broken of [null, 'ok', 7, []]) {
+        assert.equal(facetReadState({ ...running, reads: broken }, 'accounts'), 'failed',
+            `reads:${JSON.stringify(broken)} was treated as a legacy payload`);
+    }
+    assert.equal(facetReadState(running, 'accounts'), 'ok', 'a real legacy payload still works');
+    assert.equal(facetReadState({ daemon: { state: 'stale' } }, 'accounts'), 'not_read');
+});
+
+test('the refresh button says exactly what pressing it does', () => {
+    // Label and handler were written apart and drifted: on an `unreachable`
+    // daemon the label promised a plain re-read (and a comment claimed it
+    // "does not resurrect anything") while the click called wake. One
+    // predicate now feeds both, so the button cannot promise less than it does.
+    assert.equal(refreshActionKind({ daemon: { state: 'running' } }), 'refresh');
+    assert.equal(refreshActionLabel({ daemon: { state: 'running' } }), 'Refresh');
+    for (const state of ['unreachable', 'stale', 'not_provisioned', 'foreign_daemon', '']) {
+        assert.equal(refreshActionKind({ daemon: { state } }), 'wake', `state ${state}`);
+        assert.match(refreshActionLabel({ daemon: { state } }), /starts the agent daemon/i,
+            `the label hides the start on state ${state}`);
+    }
+});
+
+test('a recovered daemon clears the error from an earlier failed wake', async () => {
+    // The daemon comes up on its own at the next login or delegated run. The
+    // failed-wake message had no way to expire, so the panel went on insisting
+    // the daemon could not be started while it was answering reads — a stale
+    // error is the same class of lie as a stale absence.
+    const previousDocument = globalThis.document;
+    const { lines } = stubStatusDom();
+    try {
+        // The state a wake actually happens in: the button only routes to wake
+        // when nothing has answered. Establish it instead of inheriting whatever
+        // payload an earlier test left in module state.
+        commitStatusPayload({ daemon: { state: 'stale', engine_version: '3.3.13', runtime: {} },
+                              reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } });
+        await wakeDaemon({ fetchImpl: async () => ({
+            ok: false, status: 503, json: async () => ({ error: 'claudexord_not_installed: no binary' }),
+        }) });
+        assert.match(lines.at(-1), /Could not start the agent daemon/i);
+
+        await refreshStatus({ force: true, fetchImpl: async () => ({ ok: true, json: async () => ({
+            daemon: { state: 'running', engine_version: '3.3.14', runtime: {} },
+            reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+        }) }) });
+        assert.ok(!/Could not start the agent daemon/i.test(lines.at(-1)),
+            'the stale wake error outlived the daemon that came up anyway');
+        assert.ok(lines.at(-1).includes('3.3.14'));
+    } finally {
+        globalThis.document = previousDocument;
+    }
+});
+
+test('the refresh button routes the click through the same predicate as its label', async () => {
+    // The label and the handler were written apart and disagreed once already.
+    // Pinning the predicate alone does not stop the handler from ignoring it —
+    // replacing its body with an unconditional wake left every test green.
+    const previousDocument = globalThis.document;
+    const { lines } = stubStatusDom();
+    const clicks = [];
+    const base = globalThis.document.getElementById;
+    globalThis.document.getElementById = (id) => (id === 'btn-harness-refresh'
+        ? { addEventListener: (_ev, fn) => clicks.push(fn) }
+        : base(id));
+    globalThis.document.addEventListener = () => {};
+    globalThis.document.querySelector = () => null;
+    const previousWindow = globalThis.window;
+    globalThis.window = { addEventListener: () => {} };
+    // The module owns its poll timer privately; neutralise it here so the test
+    // process can exit instead of ticking against a stubbed document forever.
+    const previousSetInterval = globalThis.setInterval;
+    globalThis.setInterval = () => 0;
+    const previousFetch = globalThis.fetch;
+    const urls = [];
+    globalThis.fetch = async (url) => {
+        urls.push(String(url));
+        return { ok: true, json: async () => ({ daemon: { state: 'running', engine_version: '3.3.14', runtime: {} },
+                                                reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } }) };
+    };
+    try {
+        initHarnessAccounts();
+        assert.equal(clicks.length, 1, 'the refresh button lost its listener');
+
+        // Daemon asleep -> the press must START it.
+        commitStatusPayload({ daemon: { state: 'stale' }, reads: {} });
+        urls.length = 0;
+        await clicks[0]();
+        assert.ok(urls.some((u) => u.includes('/api/claudexor/wake')),
+            'a sleeping daemon was only re-read, so the button could not help');
+
+        // Daemon live -> the press must stay a plain re-read.
+        commitStatusPayload({ daemon: { state: 'running' }, reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } });
+        urls.length = 0;
+        await clicks[0]();
+        assert.ok(urls.every((u) => !u.includes('/api/claudexor/wake')),
+            'a live daemon was provisioned by a button that says Refresh');
+    } finally {
+        globalThis.setInterval = previousSetInterval;
+        globalThis.window = previousWindow;
+        globalThis.fetch = previousFetch;
+        globalThis.document = previousDocument;
+    }
+});
+
+test('the first read says it is reading, not that the daemon is down', async () => {
+    // The first paint happens BEFORE any answer — the fan-out probes each
+    // coding-agent CLI and takes tens of seconds. The branch that says so was
+    // keyed on a null payload while the renderer handed it a normalized `{}`,
+    // so it never ran: every bootstrap row spent that window announcing "the
+    // agent daemon is not running" about a daemon that was answering, next to a
+    // status line that said "Checking Claudexor…".
+    //
+    // A FRESH module instance (the query string defeats the ESM cache) is the
+    // only way to see the true first paint: module state is shared, and by the
+    // time the other tests have run a payload is already committed.
+    const previousDocument = globalThis.document;
+    const { lines } = stubStatusDom();
+    const host = globalThis.document.getElementById('harness-accounts-rows');
+    try {
+        const fresh = await import('../modules/harness_accounts.js?first-paint');
+        let release = null;
+        const gate = new Promise((resolve) => { release = resolve; });
+        const pending = fresh.refreshStatus({ force: true, fetchImpl: async () => {
+            await gate;
+            return { ok: true, json: async () => ({ daemon: { state: 'stale', engine_version: '3.3.13', runtime: {} },
+                                                    reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } }) };
+        } });
+        assert.match(host.innerHTML, /reading the daemon status/,
+            'the first paint announced a verdict about a daemon nobody had asked');
+        assert.ok(!/the agent daemon is not running/.test(host.innerHTML));
+        release();
+        await pending;
+        // Once a read SETTLES on a genuinely sleeping daemon, the verdict is
+        // earned and must appear.
+        assert.match(host.innerHTML, /the agent daemon is not running/);
+        assert.ok(lines.length > 0);
+    } finally {
+        globalThis.document = previousDocument;
+    }
+});
+
+test('the wake and the poll never overlap, whichever starts first', async () => {
+    // Two writers, two orders. A poll STARTED DURING a wake joins it (no second
+    // GET runs). A wake pressed DURING a poll waits that poll out before
+    // POSTing, so the wake's daemon-side read causally follows the poll's
+    // commit and the unconditional wake commit can never resurrect an older
+    // snapshot — the reviewer's probe showed exactly that rollback when the
+    // wake fired mid-poll without waiting.
+    const previousDocument = globalThis.document;
+    const { lines } = stubStatusDom();
+    try {
+        // Order 1: wake first, poll joins.
+        commitStatusPayload({ daemon: { state: 'stale', engine_version: '3.3.13', runtime: {} },
+                              reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } });
+        let releaseWake = null;
+        const wakeGate = new Promise((resolve) => { releaseWake = resolve; });
+        let polls = 0;
+        const wake = wakeDaemon({ fetchImpl: async () => {
+            await wakeGate;
+            return { ok: true, json: async () => ({
+                daemon: { state: 'running', engine_version: '3.3.14', runtime: {} },
+                reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } }) };
+        } });
+        const joined = refreshStatus({ force: true, fetchImpl: async () => {
+            polls += 1;
+            return { ok: true, json: async () => ({ daemon: { state: 'stale', runtime: {} }, reads: {} }) };
+        } });
+        assert.equal(polls, 0, 'a second reader was started while the wake was in flight');
+        releaseWake();
+        await Promise.all([wake, joined]);
+        assert.ok(lines.at(-1).includes('3.3.14'), 'the wake reading did not survive');
+
+        // Order 2: poll first, wake waits it out before POSTing.
+        commitStatusPayload({ daemon: { state: 'stale', engine_version: '3.3.14', runtime: {} },
+                              reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } });
+        let releasePoll = null;
+        const pollGate = new Promise((resolve) => { releasePoll = resolve; });
+        const events = [];
+        const slowPoll = refreshStatus({ force: true, fetchImpl: async () => {
+            await pollGate;
+            events.push('poll-answered');
+            return { ok: true, json: async () => ({
+                daemon: { state: 'running', engine_version: '3.3.99', runtime: {} },
+                reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } }) };
+        } });
+        const lateWake = wakeDaemon({ fetchImpl: async () => {
+            events.push('wake-posted');
+            return { ok: true, json: async () => ({
+                daemon: { state: 'running', engine_version: '3.4.00', runtime: {} },
+                reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } }) };
+        } });
+        releasePoll();
+        await Promise.all([slowPoll, lateWake]);
+        assert.deepEqual(events, ['poll-answered', 'wake-posted'],
+            'the wake POSTed before the in-flight poll finished');
+        assert.ok(lines.at(-1).includes('3.4.00'),
+            'the wake reading (causally later) did not win');
+    } finally {
+        globalThis.document = previousDocument;
+    }
+});
+
+test('a refusal that arrives after the daemon started answering is not shown', async () => {
+    // The wake is pressed only when nothing answers — but an ordinary poll can
+    // commit a LIVE reading while the wake is still in flight. A refusal landing
+    // afterwards then planted "Could not start the agent daemon" on top of a
+    // panel already listing that daemon's accounts. The failure was real; it had
+    // stopped mattering.
+    const previousDocument = globalThis.document;
+    const { lines } = stubStatusDom();
+    try {
+        commitStatusPayload({ daemon: { state: 'stale', engine_version: '3.3.13', runtime: {} },
+                              reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } });
+        let releaseWake = null;
+        const gate = new Promise((resolve) => { releaseWake = resolve; });
+        const wake = wakeDaemon({ fetchImpl: async () => {
+            await gate;
+            return { ok: false, status: 503, json: async () => ({ error: 'claudexord_not_installed: no binary' }) };
+        } });
+        // ...the daemon comes up on its own and a poll commits that reading.
+        commitStatusPayload({ daemon: { state: 'running', engine_version: '3.3.14', runtime: {} },
+                              reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } });
+        releaseWake();
+        await wake;
+        assert.ok(!/Could not start the agent daemon/i.test(lines.at(-1)),
+            'a moot refusal was printed over a daemon that is answering');
+        assert.ok(lines.at(-1).includes('3.3.14'));
+    } finally {
+        globalThis.document = previousDocument;
+    }
+});
+
+test('a payload with no unread facets never renders an empty list', () => {
+    // The contract declares `daemon` optional, and a payload carrying only a
+    // reads block took the partial-refusal branch with an EMPTY complement —
+    // rendering the sentence " was not read. What those cover is unknown.",
+    // which starts with a space and names nothing.
+    const noDaemon = { reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } };
+    const line = daemonStatusLine(noDaemon, {});
+    assert.ok(!/^\s/.test(line.text), 'the line begins with an empty facet list');
+    assert.ok(!/was not read/.test(line.text));
+});
+
+test('a staged update does not claim the engine is serving when nothing answered', () => {
+    // The runtime branches used to return ABOVE the facet logic, so 26 of the 27
+    // facet vectors went unnamed — and update_staged did worse than hide them:
+    // "Engine X keeps running until then" is a positive claim about a daemon
+    // that, in this window, answered nothing, printed over a button offering to
+    // START it. One screen saying both "running" and "needs starting".
+    const silentStaged = { daemon: { state: 'unreachable', engine_version: '3.3.13',
+                                     runtime: { state: 'update_staged', staged_version: '3.3.14' } },
+                           reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } };
+    const line = daemonStatusLine(silentStaged, {});
+    assert.ok(!/keeps running/.test(line.text), 'claimed the engine is serving on a reading that saw nothing');
+    assert.match(line.text, /were not read/);
+    assert.match(line.text, /staged/, 'the staged update is still disclosed');
+
+    // Everything read: the staged-update line is earned and keeps its wording.
+    const servingStaged = { daemon: { state: 'running', engine_version: '3.3.13',
+                                      runtime: { state: 'update_staged', staged_version: '3.3.14' } },
+                            reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } };
+    assert.match(daemonStatusLine(servingStaged, {}).text, /keeps running/);
+
+    // installing / error keep their own wording but stop hiding the facets.
+    const installing = { daemon: { state: 'unreachable', runtime: { state: 'installing', target_version: '3.3.14' } },
+                         reads: { catalog: 'ok', accounts: 'failed', quota: 'failed' } };
+    assert.match(daemonStatusLine(installing, {}).text, /accounts and quota were not read/);
+    const broken = { daemon: { state: 'unreachable', runtime: { state: 'error', last_error: 'exit 1' } },
+                     reads: { catalog: 'ok', accounts: 'failed', quota: 'ok' } };
+    assert.match(daemonStatusLine(broken, {}).text, /accounts was not read/);
+});
+
+test('a login seen online is not un-seen by a reading that landed meanwhile', () => {
+    // The generation is captured once for a SERIES of confirmation attempts. A
+    // commit landing between attempt 1 and attempt 2 marked the whole series
+    // stale — including the attempt that watched the account come online — and
+    // the card announced "not confirmed" about an account that had just
+    // connected. Seeing the login is monotone evidence.
+    const src = readFileSync(new URL('../modules/harness_accounts.js', import.meta.url), 'utf8');
+    const body = src.split('async function settleVerdict(')[1].split('\n}\n')[0];
+    assert.ok(!/superseded\s*\?\s*accountLoginConfirmed/.test(body),
+        'the verdict is still gated on the series-wide generation');
+    assert.match(body, /check\.confirmed\s*\n?\s*\|\|/,
+        'a positive confirmation no longer wins on its own');
+});
+
+test('a facet that failed without the aggregate hearing it is still reported', () => {
+    // An envelope in the wrong shape is a FAILED read, not an exception, so the
+    // daemon goes on reporting `running`. The status line trusted that literal
+    // and printed green "Claudexor ready" directly above a row saying "accounts
+    // not checked — the daemon did not answer this read": one screen, two
+    // contradictory claims, the reassuring one on top.
+    const drifted = { daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
+                      config_dir: '/x', reads: { catalog: 'failed', accounts: 'failed', quota: 'ok' } };
+    const line = daemonStatusLine(drifted, {});
+    assert.equal(line.tone, 'warn', 'a running daemon with two dead reads was called ready');
+    assert.ok(!/Claudexor ready/.test(line.text));
+    assert.match(line.text, /catalog and accounts were not read/);
+
+    // Everything read: the green claim is earned and must still be made.
+    const whole = { daemon: { state: 'running', engine_version: '3.3.13', runtime: {} },
+                    config_dir: '/x', reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } };
+    assert.equal(daemonStatusLine(whole, {}).tone, 'ok');
+    assert.match(daemonStatusLine(whole, {}).text, /Claudexor ready/);
+
+    // A legacy payload with no read block at all keeps the old meaning.
+    const legacy = { daemon: { state: 'running', engine_version: '3.3.13', runtime: {} }, config_dir: '/x' };
+    assert.equal(daemonStatusLine(legacy, {}).tone, 'ok');
+});
+
+test('a partial refusal is not announced as a dead daemon', () => {
+    // The aggregate reports `unreachable` whenever ANY read refused, so the
+    // status line printed red "Daemon unreachable" directly above the account
+    // rows the same poll had just delivered — the panel contradicting itself,
+    // with the false half on top.
+    const partial = { daemon: { state: 'unreachable', last_error: 'daemon_unreachable: quota refused', runtime: {} },
+                      reads: { catalog: 'ok', accounts: 'ok', quota: 'failed' } };
+    const line = daemonStatusLine(partial, {});
+    assert.equal(line.tone, 'warn', 'a daemon that answered two reads was called dead');
+    assert.ok(!/unreachable$/.test(line.text));
+    assert.match(line.text, /quota was not read/,
+        'the line must name WHICH facet is missing, not claim everything visible was read');
+    assert.ok(!/shown below was read/.test(line.text));
+    assert.match(line.text, /quota refused/, 'the reason the owner needs was dropped');
+
+    // Total silence keeps the hard verdict.
+    const silent = { daemon: { state: 'unreachable', last_error: 'handshake failed', runtime: {} },
+                     reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } };
+    assert.equal(daemonStatusLine(silent, {}).tone, 'error');
+    assert.match(daemonStatusLine(silent, {}).text, /Daemon unreachable/);
+});
+
+test('a daemon that answered some reads is not called dead by the aggregate', async () => {
+    // The partial refusal this whole surface exists for: quota times out while
+    // the catalog and the account store both land, and the backend still
+    // reports the aggregate as `unreachable`. A predicate written on that
+    // aggregate kept a failed wake's error standing above accounts that were
+    // genuinely read, and made Refresh promise to start a daemon already
+    // answering — the coarse-signal mistake, committed inside the fix for it.
+    const partial = { daemon: { state: 'unreachable', engine_version: '3.3.13', runtime: {} },
+                      reads: { catalog: 'ok', accounts: 'ok', quota: 'failed' } };
+    assert.equal(daemonAnswered(partial), true, 'two landed reads read as no answer at all');
+    // The ACCOUNTS facet is not privileged: a catalog that landed alone still
+    // proves the daemon answered. Without this, keying the predicate on
+    // `reads.accounts` alone passes every other fixture.
+    assert.equal(daemonAnswered({ daemon: { state: 'unreachable' },
+        reads: { catalog: 'ok', accounts: 'failed', quota: 'failed' } }), true);
+    assert.equal(daemonAnswered({ daemon: { state: 'unreachable' },
+        reads: { catalog: 'failed', accounts: 'failed', quota: 'ok' } }), true);
+    // A read block that is not a facet MAP answers for nothing — an array is
+    // `typeof 'object'`, and asking it directly (instead of through the shared
+    // reader) made `['ok']` look like an answered facet while the reader called
+    // every facet failed. Two readers of one field, disagreeing.
+    assert.equal(daemonAnswered({ daemon: { state: 'unreachable' }, reads: ['ok'] }), false);
+    assert.equal(refreshActionKind({ daemon: { state: 'unreachable' }, reads: ['ok'] }), 'wake');
+    assert.deepEqual(READ_FACETS, ['catalog', 'accounts', 'quota']);
+    assert.equal(refreshActionKind(partial), 'refresh',
+        'the button offered to start a daemon that is answering');
+
+    // Nothing read at all — a pre-fan-out discovery/handshake failure — still
+    // means the daemon never spoke, and there the button must start it.
+    const silent = { daemon: { state: 'unreachable' },
+                     reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } };
+    assert.equal(daemonAnswered(silent), false);
+    assert.equal(refreshActionKind(silent), 'wake');
+
+    const previousDocument = globalThis.document;
+    const { lines } = stubStatusDom();
+    try {
+        // The state a wake actually happens in: the button only routes to wake
+        // when nothing has answered. Establish it instead of inheriting whatever
+        // payload an earlier test left in module state.
+        commitStatusPayload({ daemon: { state: 'stale', engine_version: '3.3.13', runtime: {} },
+                              reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } });
+        await wakeDaemon({ fetchImpl: async () => ({
+            ok: false, status: 503, json: async () => ({ error: 'claudexord_not_installed: no binary' }) }) });
+        assert.match(lines.at(-1), /claudexord_not_installed/);
+        await refreshStatus({ force: true, fetchImpl: async () => ({ ok: true, json: async () => partial }) });
+        assert.ok(!/Could not start the agent daemon/i.test(lines.at(-1)),
+            'a stale wake error stood over accounts the daemon had just handed over');
+    } finally {
+        globalThis.document = previousDocument;
+    }
+});
+
+test('a wake error expires only when the daemon is proven up', async () => {
+    // Both edges of the same lie. The error must not outlive the daemon coming
+    // up on its own (login, delegated run) — but it must also not be wiped by a
+    // 200 that REPORTS the daemon still down: the reason the owner asked for
+    // then vanishes within one 5s tick, before it can be read.
+    const previousDocument = globalThis.document;
+    const { lines } = stubStatusDom();
+    try {
+        const stillDown = { daemon: { state: 'stale', engine_version: '3.3.13', runtime: {} },
+                            reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } };
+        const up = { daemon: { state: 'running', engine_version: '3.3.14', runtime: {} },
+                     reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } };
+
+        // The state a wake actually happens in: the button only routes to wake
+        // when nothing has answered. Establish it instead of inheriting whatever
+        // payload an earlier test left in module state.
+        commitStatusPayload({ daemon: { state: 'stale', engine_version: '3.3.13', runtime: {} },
+                              reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } });
+        await wakeDaemon({ fetchImpl: async () => ({
+            ok: false, status: 503, json: async () => ({ error: 'claudexord_not_installed: no binary' }) }) });
+        assert.match(lines.at(-1), /claudexord_not_installed/, 'the refusal reached the owner');
+
+        await refreshStatus({ force: true, fetchImpl: async () => ({ ok: true, json: async () => stillDown }) });
+        assert.match(lines.at(-1), /Could not start the agent daemon/i,
+            'a 200 that says the daemon is STILL down erased the reason it failed');
+
+        await refreshStatus({ force: true, fetchImpl: async () => ({ ok: true, json: async () => up }) });
+        assert.ok(!/Could not start the agent daemon/i.test(lines.at(-1)),
+            'the error outlived the daemon that came up');
+        assert.ok(lines.at(-1).includes('3.3.14'));
+    } finally {
+        globalThis.document = previousDocument;
+    }
+});
+
+test('the login confirmation commits under the same generation rule as the poll', () => {
+    // STRUCTURAL pin: settleVerdict is module-private, so the guard is read out
+    // of the source rather than exercised. It matters because that path fetches
+    // the status endpoint DIRECTLY, outside refreshStatus — a wake that landed
+    // while the confirmation was in flight has already committed a newer
+    // payload, and the comment on readGeneration promises a read issued before
+    // a wake never commits after it.
+    const src = readFileSync(new URL('../modules/harness_accounts.js', import.meta.url), 'utf8');
+    const body = src.split('async function settleVerdict(')[1].split('\n}\n')[0];
+    assert.match(body, /const generation = state\.readGeneration/,
+        'the confirmation does not capture a generation before awaiting');
+    // The comparison must GATE the commit, not merely appear near it: a dead
+    // `const ok = generation === state.readGeneration;` beside an unconditional
+    // commit would satisfy a looser pin while the invariant is broken.
+        const named = body.match(/const (\w+) = generation !== state\.readGeneration/);
+    const guard = named
+        ? new RegExp(`if \\([^)]*!${named[1]}[^)]*\\)\\s*commitStatusPayload\\(`)
+        : /if \([^)]*generation === state\.readGeneration[^)]*\)\s*commitStatusPayload\(/;
+    assert.match(body, guard, 'the generation check does not gate the commit');
+    // ...and the VERDICT must not be gated by it. A confirmation that SAW the
+    // login is monotone evidence — the generation is captured once for a series
+    // of attempts, so gating the verdict on it threw away a later attempt that
+    // watched the account come online.
+    assert.match(body, /const confirmed = check\.confirmed\s*\n?\s*\|\|\s*accountLoginConfirmed\(state\.payload/,
+        'a positive confirmation is discarded when its series was superseded');
+    // ...and the confirmation must JOIN an in-flight wake, not read beside it:
+    // it hits the status endpoint directly, so without the join it is the
+    // third writer in the exact race the wake serialization exists to settle.
+    assert.match(body, /if \(state\.wakeInFlight\) await state\.wakeInFlight/,
+        'the login confirmation races an in-flight wake as a third writer');
+    // ...and the capture must happen BEFORE the await it is protecting.
+    assert.ok(body.indexOf('const generation = state.readGeneration')
+        < body.indexOf('await confirmLoginLive'),
+        'the generation is captured after the await, which measures nothing');
+});
+
+test('every path that commits a fresh reading retires staleness the same way', () => {
+    // Three producers of a fresh payload (poll, wake, login confirmation) went
+    // through three different commits, so which errors got retired depended on
+    // which one answered. One function owns it now.
+    const src = readFileSync(new URL('../modules/harness_accounts.js', import.meta.url), 'utf8');
+    const assignments = src.match(/state\.payload = /g) || [];
+    assert.equal(assignments.length, 1,
+        'a payload is committed outside commitStatusPayload; the retire rules will drift again');
+    assert.ok(/export function commitStatusPayload/.test(src));
+});
+
+test('a status read that started before the fresh one never commits over it', async () => {
+    // The generation guard's remaining job. The wake no longer overlaps the
+    // poll (causal serialization), but the login CONFIRMATION reads the status
+    // endpoint outside refreshStatus and commits through commitStatusPayload —
+    // so a poll that started before that commit still carries an older reading
+    // and must not land on top of it.
+    const previousDocument = globalThis.document;
+    const { lines } = stubStatusDom();
+    try {
+        const fresh = { daemon: { state: 'running', engine_version: '3.3.14', runtime: {} },
+                        reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' } };
+        const stale = { daemon: { state: 'stale', engine_version: '3.3.13', runtime: {} },
+                        reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } };
+        // (a) The older read RESOLVES after the fresh commit: it must be dropped.
+        let releasePoll = null;
+        const gate = new Promise((resolve) => { releasePoll = resolve; });
+        const slowPoll = refreshStatus({ force: true, fetchImpl: async () => {
+            await gate;
+            return { ok: true, json: async () => stale };
+        } });
+        commitStatusPayload(fresh);   // the confirmation's commit path
+        releasePoll();
+        await slowPoll;
+        // A dropped read does not render at all (the early return skips the
+        // post-commit paint — the winning reader owns the screen). What the
+        // owner must never see is the ROLLBACK: no line from the stale body.
+        assert.ok(!lines.some((l) => l.includes('3.3.13') || /not running/i.test(l)),
+            'the stale poll reached the screen after losing the generation race');
+
+        // (b) The older read FAILS instead: it must not brand the fresh reading stale.
+        let failPoll = null;
+        const failGate = new Promise((resolve) => { failPoll = resolve; });
+        const failingPoll = refreshStatus({ force: true, fetchImpl: async () => {
+            await failGate;
+            throw new Error('socket hang up');
+        } });
+        commitStatusPayload(fresh);
+        failPoll();
+        await failingPoll;
+        assert.ok(!lines.some((l) => /last reading/i.test(l)),
+            'a stale failure marked a fresh reading stale');
+    } finally {
+        globalThis.document = previousDocument;
+    }
 });
 
 test('a failed status request marks the view stale, and a failed wake is never silent', async () => {
@@ -1218,6 +1762,11 @@ test('a failed status request marks the view stale, and a failed wake is never s
 
         // A wake the owner pressed that refuses (typed 503, or a 404 from an
         // older backend) must SAY so instead of silently returning to idle.
+        // The state a wake actually happens in: the button only routes to wake
+        // when nothing has answered. Establish it instead of inheriting whatever
+        // payload an earlier test left in module state.
+        commitStatusPayload({ daemon: { state: 'stale', engine_version: '3.3.13', runtime: {} },
+                              reads: { catalog: 'not_read', accounts: 'not_read', quota: 'not_read' } });
         await wakeDaemon({ fetchImpl: async () => ({ ok: false, status: 503, json: async () => ({ error: 'claudexord_not_installed: no binary' }) }) });
         assert.match(lines.at(-1), /Could not start the agent daemon/i);
         assert.match(lines.at(-1), /claudexord_not_installed/);

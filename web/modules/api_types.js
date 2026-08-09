@@ -500,7 +500,9 @@
  * starts lazily, so an idle machine served empty lists that every consumer read
  * as "no account connected" while real accounts sat in the agent home.
  * "ok" — read, the matching collection is AUTHORITATIVE (empty means empty);
- * "not_read" — never asked (no live daemon); "failed" — asked, no answer.
+ * "not_read" — never asked: no daemon, or discovery/handshake died before the
+ * fan-out (which leaves every facet untouched); "failed" — asked, and no
+ * usable answer came back (refused, or a body in the wrong shape).
  * Facets are independent: one fanned-out read can fail while its siblings land.
  * @typedef {"ok"|"not_read"|"failed"} ClaudexorReadState
  */

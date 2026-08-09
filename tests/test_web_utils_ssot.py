@@ -229,9 +229,11 @@ def test_onboarding_account_truth_mirrors_the_panel_rules():
     "No accounts connected yet" on an idle machine, and a native codex login
     counted as zero — so a silent revert of either mirror must go RED here.
 
-    We pin BEHAVIOUR, not text: the wizard's own source is extracted and the
-    two rules are compared against `harness_accounts.js` on the payload shapes
-    that distinguish them.
+    This is a STRUCTURAL pin, not a behavioural one: the wizard is an IIFE
+    inside a page module, so it cannot be imported and executed here. Each rule
+    is extracted from both sources and compared clause by clause, including the
+    ORDER of the failed-closed check against the legacy fallback — a rewrite
+    that keeps every clause but changes the meaning can still slip through.
     """
     import re
 
@@ -242,7 +244,9 @@ def test_onboarding_account_truth_mirrors_the_panel_rules():
     #    must key on `reads.accounts`, must NOT collapse it to a boolean, and
     #    must fall back to daemon.state for a payload that predates the block.
     body = wizard.split("function claudexorAccountsRead(payload) {", 1)[1].split("\n    }", 1)[0]
-    assert "reads?.accounts" in body, "the wizard must read the per-facet read state"
+    assert re.search(r"reads\??\.accounts", body), (
+        "the wizard must read the per-facet read state"
+    )
     assert "'not_read'" in body and "'failed'" in body, (
         "the wizard collapsed the three read states into a boolean; a refused read "
         "would then be announced as 'the daemon is not running'"
@@ -253,6 +257,45 @@ def test_onboarding_account_truth_mirrors_the_panel_rules():
     panel_reader = panel.split("export function facetReadState(", 1)[1].split("\n}", 1)[0]
     for state in ("'ok'", "'not_read'", "'failed'"):
         assert state in panel_reader and state in body, f"read state {state} drifted"
+    # A read block that IS present but carries a value neither side knows must
+    # fail closed, and it must do so BEFORE the legacy daemon-state fallback —
+    # otherwise an unknown value falls through to "running => ok" and the false
+    # absence is back on the surface where the owner first saw it.
+    for where, src in (("wizard", body), ("panel", panel_reader)):
+        assert "return 'failed'" in src, (
+            f"{where}: an unknown facet value is not failed closed"
+        )
+        assert src.index("return 'failed'") < src.index("=== 'running'"), (
+            f"{where}: the legacy fallback is reached before the unknown-value "
+            "check, so an unknown read state becomes authoritative again"
+        )
+
+    # The REASON the wizard gives for an unread facet must not contradict the
+    # daemon it just read. `not_read` normally means the daemon never ran, but a
+    # discovery/handshake failure before the fan-out leaves every facet untouched
+    # while the daemon reports `unreachable` — blaming a running daemon there is
+    # a second false statement, which is what the panel's own note already
+    # avoids (`unknownAccountsNote`).
+    def code_only(src: str) -> str:
+        """Drop // comments — a rule that lives only in prose is not a rule, and
+        a pin that reads prose passes on a revert that kept the comment."""
+        return "\n".join(
+            line for line in src.splitlines() if not line.strip().startswith("//")
+        )
+
+    line_body = code_only(
+        wizard.split("async function refreshHarnessAccountsLine", 1)[1].split("\n    }", 1)[0]
+    )
+    assert "unreachable" in line_body, (
+        "the wizard blames a non-running daemon even when the payload says the "
+        "daemon answered nothing because it was unreachable"
+    )
+    panel_note = code_only(
+        panel.split("export function unknownAccountsNote", 1)[1].split("\n}", 1)[0]
+    )
+    assert "unreachable" in panel_note, (
+        "the panel's own note lost the distinction the wizard mirrors"
+    )
 
     # 2. The connected-row rule: a NATIVE login counts (the wizard used to count
     #    only named profiles, so a native codex session read as "0 connected"),
@@ -267,3 +310,72 @@ def test_onboarding_account_truth_mirrors_the_panel_rules():
     )
     # The panel derives native rows from the same field, with the same meaning.
     assert "native_login_detected" in panel
+
+
+def test_reviewer_rows_label_each_pin_from_its_own_facet():
+    """The read states are per-facet and INDEPENDENT — the backend pins that
+    explicitly (`test_status_payload_classifies_each_fanned_out_facet_independently`).
+    The row builders therefore have to label a saved ACCOUNT pin from the
+    accounts read and a saved MODEL from the catalog read. Threading the wrong
+    facet is invisible in the helper tests (they take the state as a parameter),
+    and it re-creates the owner-visible lie in miniature: a profile nobody read
+    gets told it is "not in discovery".
+
+    Structural pin: each call site in the module source is inspected.
+    """
+    import re
+
+    src = _read("reviewer_slots.js")
+    def call_sites(name):
+        """Every call of `name` with its full argument list, definitions aside."""
+        found = []
+        for match in re.finditer(re.escape(name) + r"\(", src):
+            if src[:match.start()].rstrip().endswith("function"):
+                continue
+            depth, i = 0, match.end() - 1
+            while i < len(src):
+                if src[i] == "(":
+                    depth += 1
+                elif src[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            found.append(src[match.start():i + 1])
+        return found
+
+    profile_calls = call_sites("profileOptionsFor")
+    # Two builders (the triad/scope row and the advisory row) plus nothing else.
+    assert len(profile_calls) >= 2, "the profile-option call sites moved"
+    for call in profile_calls:
+        assert "accountsRead: state.accountsRead" in call, (
+            f"a saved account pin is labelled from the wrong read facet: {call!r}"
+        )
+        assert "state.catalogRead" not in call, (
+            "the catalog read is standing in for the accounts read; a failed "
+            f"accounts read would then be announced as discovery truth: {call!r}"
+        )
+    model_calls = call_sites("sessionModelOptions")
+    assert len(model_calls) >= 2, "the model-option call sites moved"
+    for call in model_calls:
+        assert "modelsRead" in call, (
+            "a saved model is labelled without the catalog read state, so an "
+            f"unread catalog says 'not in discovery' about it: {call!r}"
+        )
+        # ...and from the CATALOG read specifically. Asserting only that the
+        # option exists lets the facets be swapped — the very defect this test
+        # was written for, one field over.
+        assert "catalogRead" in call, (
+            "a saved model is labelled from a facet that does not stamp the "
+            f"model list; models come from the catalog: {call!r}"
+        )
+        assert "accountsRead" not in call, (
+            f"the accounts read is standing in for the catalog read: {call!r}"
+        )
+    # An unread facet must never default to the authoritative state on the way
+    # in. (The helpers keep `'ok'` as their own parameter default, which is the
+    # discovery-truth case they were written for and is pinned separately.)
+    assert not re.search(r"state\.\w*Read \|\| 'ok'", src), (
+        "a missing read state falls back to 'ok'; unknown must never be "
+        "authoritative — that is the original bug's shape"
+    )

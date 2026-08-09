@@ -429,3 +429,41 @@ test('the settings collector itself refuses to author from an unknown read', asy
         globalThis.document = previousDocument;
     }
 });
+
+test('a saved delegation model is not called undiscovered before the catalog was read', () => {
+    // Third restatement of the same rule (the panel and the reviewer rows were
+    // the first two). This one built a synthetic harness object and threw away
+    // both `models_error` and the catalog read state, so a saved model was
+    // labelled "(not in discovery)" on an idle daemon — an accusation about a
+    // catalog nobody had opened.
+    const saved = 'codex=gpt-5.6-sol';
+    const unread = delegationView({
+        saved,
+        // The INDEPENDENT-facet window: the accounts landed (so the section is
+        // live and shows its controls), the catalog did not.
+        payload: {
+            daemon: { state: 'running' },
+            reads: { catalog: 'not_read', accounts: 'ok', quota: 'ok' },
+            harnesses: [],
+            profiles: { profiles: [], harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }] },
+        },
+    });
+    const unreadPin = (unread.modelOptions || []).find((o) => o.value === 'gpt-5.6-sol');
+    assert.ok(unreadPin, 'the saved model lost its option');
+    assert.match(unreadPin.label, /not checked/);
+    assert.ok(!/not in discovery/.test(unreadPin.label));
+
+    // Read catalog, model genuinely absent -> the honest accusation is allowed.
+    const read = delegationView({
+        saved,
+        payload: {
+            daemon: { state: 'running' },
+            reads: { catalog: 'ok', accounts: 'ok', quota: 'ok' },
+            harnesses: [{ id: 'codex', models: [{ id: 'other-model' }] }],
+            profiles: { profiles: [], harnessAccounts: [{ harness_id: 'codex', native_login_detected: true }] },
+        },
+    });
+    const readPin = (read.modelOptions || []).find((o) => o.value === 'gpt-5.6-sol');
+    assert.ok(readPin && /not in discovery/.test(readPin.label),
+        'a read catalog must still be able to say a model is missing');
+});
