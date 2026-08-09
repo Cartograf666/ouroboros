@@ -318,6 +318,80 @@ def test_a_vouched_login_survives_an_unreadable_manifest(monkeypatch, tmp_path):
     assert [w["profile"]["profile_id"] for w in payload["profiles"]["profiles"]] == ["backup"]
 
 
+def test_account_removal_is_the_engine_contract_and_refuses_out_loud(monkeypatch, tmp_path):
+    """The FOURTH thin proxy: removing a named account is the daemon's own
+    ``DELETE /v2/credential-profiles/:harness/:profileId``.
+
+    Two invariants, one test. Ouroboros deletes NO vendor credential material
+    itself — the whole handler is one forwarded call — and an engine refusal
+    comes back AS a refusal (503), never as a cheerful ok that would leave the
+    owner believing an account is gone while it still rotates."""
+    import asyncio
+
+    from starlette.requests import Request
+
+    from ouroboros.claudexor_daemon import owned_config_dir  # noqa: F401  (patched below)
+    from ouroboros.gateway import claudexor_accounts as accounts
+    from ouroboros.gateways import claudexor as gw
+    import ouroboros.claudexor_daemon as owned
+
+    deleted: list = []
+
+    class FakeGateway:
+        def __init__(self, endpoint):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def handshake(self, **_kw):
+            return {}
+
+        def delete_credential_profile(self, harness_id, profile_id):
+            if refuse:
+                raise gw.ClaudexorUnavailable("profile_in_use", "still running work")
+            deleted.append((harness_id, profile_id))
+            return {"ok": True}
+
+    monkeypatch.setattr(owned, "owned_config_dir", lambda: tmp_path / "cfg")
+    monkeypatch.setattr(gw, "ClaudexorGateway", FakeGateway)
+    monkeypatch.setattr(gw, "discover_daemon_at", lambda _cfg: object())
+
+    def _call(harness, profile_id):
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        request = Request({
+            "type": "http", "method": "DELETE",
+            "path": f"/api/claudexor/credential-profiles/{harness}/{profile_id}",
+            "headers": [], "query_string": b"",
+            "path_params": {"harness": harness, "profile_id": profile_id},
+        }, receive)
+        return asyncio.run(accounts.api_claudexor_credential_profile(request))
+
+    refuse = False
+    ok = _call("codex", "work")
+    assert ok.status_code == 200
+    assert deleted == [("codex", "work")], "the handler forwards and does nothing else"
+
+    refuse = True
+    denied = _call("codex", "work")
+    assert denied.status_code == 503
+    assert b"profile_in_use" in denied.body
+    assert deleted == [("codex", "work")], "a refusal removed nothing"
+
+    # A native CLI login has no profile id, and no route: this process cannot
+    # honestly sign a vendor CLI out, so it refuses at the edge instead of
+    # inventing a deletion.
+    refuse = False
+    bare = _call("codex", "")
+    assert bare.status_code == 400
+    assert b"profile_id" in bare.body
+
+
 def test_login_endpoint_validates_before_any_daemon_work():
     import asyncio
 
