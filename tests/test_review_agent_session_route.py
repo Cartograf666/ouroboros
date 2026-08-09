@@ -1195,15 +1195,27 @@ def test_scope_session_delivery_never_builds_the_pack(tmp_path, fake_route, monk
     assert manifest["host_file_read_attestation"] == "unobserved"  # forensic, non-blocking
     assert "coverage_incomplete" not in manifest  # retired framing (BIBLE P3 amendment)
 
-    # ...and D-12 also required readers to keep accepting what is already
-    # written in durable rows, so the shared reader answers for both spellings
-    # and for neither-of-them.
-    from ouroboros.tools.scope_review_session import manifest_delivery_is_agentic_retrieval
+    # D-12 also asked that readers stay compatible with the old spelling. This
+    # pins the measured reason no compatibility layer was built: the key has NO
+    # reader — the manifest is a durable forensic row a person reads. If code
+    # ever starts consuming it, this fails and the compatibility becomes real
+    # work rather than machinery guarding nothing.
+    import pathlib as _pathlib
 
-    assert manifest_delivery_is_agentic_retrieval(manifest) is True
-    assert manifest_delivery_is_agentic_retrieval({"delivery": "agent_session"}) is True
-    assert manifest_delivery_is_agentic_retrieval({"delivery": "api_chat"}) is False
-    assert manifest_delivery_is_agentic_retrieval(None) is False
+    src_roots = [_pathlib.Path(__file__).resolve().parents[1] / "ouroboros",
+                 _pathlib.Path(__file__).resolve().parents[1] / "web" / "modules"]
+    readers = [
+        f"{path}:{n}"
+        for root in src_roots
+        for path in root.rglob("*")
+        if path.suffix in (".py", ".js") and path.is_file()
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if ('["delivery"]' in line or "'delivery']" in line
+            or '.get("delivery"' in line or ".get('delivery'" in line)
+    ]
+    assert readers == [], (
+        "something now reads the coverage manifest's `delivery` key, so D-12's "
+        "backward compatibility stops being hypothetical:\n" + "\n".join(readers))
     assert manifest["excluded_sensitive"] == {"policy": "preserved", "host_enforced": False}
 
     start = fake_route.instances[0].start_requests[0]
