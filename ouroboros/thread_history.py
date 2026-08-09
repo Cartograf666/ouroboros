@@ -22,12 +22,14 @@ Semantics pinned by this module:
 * **Lifecycle-blind ancestry.** Ancestors resolve whether they are active,
   archived, deleting or tombstoned. Filtering the chain by liveness would
   silently orphan every fork of a deleted thread.
-* **Project-bound ancestors only.** A cursor is followed ONLY to a chat that
-  ``resolve_chat_binding`` recognises as a project thread. A hand-written
-  ``fork_of_chat_id: 1`` (or any unbound chat) would otherwise pour the WHOLE
-  Main conversation into a project thread's history and into the agent's
-  focused context — silently, on both surfaces. The unreadable ancestor is
-  refused BEFORE it enters the cutoffs, and the refusal is disclosed.
+* **Same-project ancestors only.** A cursor is followed ONLY to a chat that
+  ``resolve_chat_binding`` recognises as a thread of the SAME project as the
+  chat being read. A hand-written ``fork_of_chat_id: 1`` (or any unbound chat)
+  would otherwise pour the WHOLE Main conversation into a project thread's
+  history and into the agent's focused context; a cursor naming another
+  project's thread would pour THAT project's conversation across the boundary
+  just as silently, on both surfaces. The foreign ancestor is refused BEFORE it
+  enters the cutoffs, and the refusal is disclosed.
 * **The requesting chat's own present is never bounded.** A cycle that closes
   back on the chat being read (a self-parent, or A→B→A) must not tighten that
   chat's own cutoff: a thread would start rejecting the messages it just sent.
@@ -233,6 +235,7 @@ def thread_ancestry_lens(
 
     cutoffs: Dict[int, str] = {cid: ""}
     order: List[int] = [cid]
+    own_project = str(binding.get("project_id") or "")
     truncated = False
     current: Optional[Dict[str, Any]] = binding
     effective = ""
@@ -275,7 +278,8 @@ def thread_ancestry_lens(
         # Lifecycle-blind by construction: _chat_binding answers for
         # deleting/tombstoned rows too, so a fork of a deleted thread keeps
         # reading its shared past (A3a). But an ancestor with NO binding at all
-        # is the Main chat or an external transport — admitting it would pour a
+        # is the Main chat or an external transport, and an ancestor bound to
+        # ANOTHER project is just as foreign — admitting either would pour a
         # whole foreign conversation into this thread. Refuse BEFORE it enters
         # the cutoffs, and disclose the refusal.
         parent_binding = _chat_binding(drive_root, parent_chat)
@@ -285,6 +289,15 @@ def thread_ancestry_lens(
                 "Thread ancestry of chat %s names chat %s as a parent, but that "
                 "chat has no project binding — ancestor refused",
                 cid, parent_chat,
+            )
+            break
+        if str(parent_binding.get("project_id") or "") != own_project:
+            truncated = True
+            log.warning(
+                "Thread ancestry of chat %s (project %s) names chat %s as a "
+                "parent, but that chat belongs to project %s — ancestor refused",
+                cid, own_project, parent_chat,
+                str(parent_binding.get("project_id") or ""),
             )
             break
         cutoffs[parent_chat] = effective

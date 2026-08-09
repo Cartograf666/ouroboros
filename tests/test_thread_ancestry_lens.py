@@ -384,6 +384,43 @@ def test_an_unbound_ancestor_never_enters_the_lens(tmp_path):
     assert "own" in agent and "private-main-chat" not in agent
 
 
+def test_an_ancestor_in_another_project_never_enters_the_lens(tmp_path):
+    """An ancestor bound to a DIFFERENT project is just as foreign as an unbound
+    one: a hand-written ``fork_of_chat_id`` pointing at project beta would pour
+    beta's whole conversation into an alpha thread — on the owner's history AND
+    in the agent's focused context — with ``truncated`` left False, so nothing
+    even disclosed the crossing."""
+    from ouroboros.gateway.history import _assemble_history_response
+
+    create_project(tmp_path, "alpha")
+    create_project(tmp_path, "beta")
+    mine = create_thread(tmp_path, "alpha", name="Mine")
+    theirs = create_thread(tmp_path, "beta", name="Theirs")
+    _rewrite_thread(
+        tmp_path, "alpha", mine["id"],
+        fork_of_chat_id=theirs["chat_id"], fork_before_ts="2030-01-01T00:00:00+00:00",
+    )
+    _rows(tmp_path, [
+        _chat_row(theirs["chat_id"], "2026-01-01T00:00:00+00:00", "beta-private"),
+        _chat_row(mine["chat_id"], "2026-01-02T00:00:00+00:00", "alpha-own"),
+    ])
+
+    lens = thread_ancestry_lens(tmp_path, mine["chat_id"])
+    assert lens.cutoffs == {mine["chat_id"]: ""}
+    assert lens.admits(theirs["chat_id"], "2026-01-01T00:00:00+00:00") is False
+    assert lens.truncated is True          # refused, not silently crossed
+
+    payload = json.loads(
+        _assemble_history_response(tmp_path, mine["chat_id"], 50, 10)
+    )
+    texts = [m["text"] for m in payload["messages"]]
+    assert "alpha-own" in texts and "beta-private" not in texts
+    assert "ancestry_depth" in payload["window"]["truncated_by"]
+
+    agent = _agent_chat_section(tmp_path, mine["chat_id"])
+    assert "alpha-own" in agent and "beta-private" not in agent
+
+
 def test_a_cycle_never_narrows_the_requesting_threads_own_present(tmp_path):
     """A self-parent (or A->B->A) used to tighten the REQUESTING chat's cutoff,
     so a thread started rejecting the messages it had just sent."""

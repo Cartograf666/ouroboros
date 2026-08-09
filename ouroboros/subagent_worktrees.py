@@ -460,7 +460,14 @@ def prune_orphans(
         for repo_dir, group in by_repo.items():
             if repo_dir:
                 repos.add(repo_dir)
-            with _ops_lock(repo_dir or root):
+            # A row with NO repo_dir touches no git metadata, so it needs no
+            # repo lock — and falling back to the root here would re-acquire the
+            # lockfile this sweep already holds. The in-process RLock is
+            # re-entrant and hides that; the cross-process O_EXCL file lock is
+            # not, so the sweep would block for the whole timeout and then throw
+            # its work away.
+            ctx = _ops_lock(repo_dir) if repo_dir else contextlib.nullcontext()
+            with ctx:
                 for entry in group:
                     wt_path = str(entry.get("path") or "")
                     created = float(entry.get("created_at") or 0)

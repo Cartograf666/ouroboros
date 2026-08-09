@@ -151,6 +151,31 @@ test('load-older control follows the SERVER window verdict', () => {
         ).mode,
         'button',
     );
+    // TWO unescalatable causes at once: both boundaries get named. Stopping at
+    // the first match told a forked thread about its fork chain while silently
+    // dropping the on-disk archive floor that was ALSO cutting its window.
+    const both = loadOlderControlState(
+        { complete: false, truncated_by: ['archive_floor', 'ancestry_depth'] }, null,
+    );
+    assert.equal(both.mode, 'notice');
+    assert.match(both.label, /shared past/i);
+    assert.match(both.label, /archive/i);
+    assert.match(both.label, /lineage/i);
+    // ...and order of the causes cannot change what is disclosed.
+    assert.equal(
+        loadOlderControlState(
+            { complete: false, truncated_by: ['ancestry_depth', 'archive_floor'] }, null,
+        ).label,
+        both.label,
+    );
+    // A capped quota alongside a fork gap names both too.
+    const cappedFork = loadOlderControlState(
+        { complete: false, truncated_by: ['quota', 'ancestry_depth'] },
+        { n_human: 1500, n_progress: 600 },
+    );
+    assert.equal(cappedFork.mode, 'notice');
+    assert.match(cappedFork.label, /shared past/i);
+    assert.match(cappedFork.label, /archive/i);
 });
 
 // ─────────────── source pins: routine path & sticky boundary ───────────────

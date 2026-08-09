@@ -136,6 +136,8 @@ export function nextQuotaEscalation(current = null) {
  * A larger quota cannot recover it, and the archive/lineage wording would
  * misname where the missing conversation is, so it gets its own sentence
  * (plan A3b: a shared past out of reach is disclosed, never a silent gap).
+ * Causes accumulate: a notice carries ONE sentence per present cause, because
+ * a window can be cut by the fork chain and the archive floor at once.
  */
 export function loadOlderControlState(windowInfo = null, quota = null) {
     if (!windowInfo || typeof windowInfo !== 'object' || windowInfo.complete === true) {
@@ -147,16 +149,24 @@ export function loadOlderControlState(windowInfo = null, quota = null) {
     if (causes.includes('quota') && nextQuotaEscalation(quota)) {
         return { mode: 'button', label: 'Load older messages' };
     }
+    // Causes ACCUMULATE: a forked thread can hit its ancestry cap AND the
+    // on-disk archive floor in the same window. Stopping at the first match
+    // named one boundary and silently swallowed the other, which is the same
+    // silent gap the disclosure exists to prevent — so every present cause
+    // contributes its own sentence.
+    const sentences = [];
     if (causes.includes('ancestry_depth')) {
-        return {
-            mode: 'notice',
-            label: 'Part of this thread’s shared past could not be read: the fork '
-                + 'chain is too deep, or one of its parent threads is unavailable.',
-        };
+        sentences.push(
+            'Part of this thread’s shared past could not be read: the fork '
+            + 'chain is too deep, or one of its parent threads is unavailable.',
+        );
     }
-    return {
-        mode: 'notice',
-        label: 'Older messages stay in on-disk archives, and deep subagent lineage '
+    const others = causes.filter((cause) => cause !== 'ancestry_depth');
+    if (others.length || !sentences.length) {
+        sentences.push(
+            'Older messages stay in on-disk archives, and deep subagent lineage '
             + 'is capped per window — this view is at its maximum depth.',
-    };
+        );
+    }
+    return { mode: 'notice', label: sentences.join(' ') };
 }

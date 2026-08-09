@@ -248,7 +248,9 @@ def remove_thread_worktree(
     commits the base never received refuse the removal unless
     ``acknowledge_unmerged`` is passed — the caller must have SHOWN the owner
     the inspection first. There is no silent path and no timer that reaches
-    this function.
+    this function. A checkout that survives the removal attempt reports
+    ``reason="removal_failed"`` and KEEPS its registry row: an orphaned checkout
+    the registry has forgotten can never be re-provisioned or removed again.
 
     A permitted removal ALSO deletes the thread's ``thread/<name>`` branch.
     Provisioning deliberately refuses to reuse an existing branch (an owner's
@@ -290,6 +292,23 @@ def remove_thread_worktree(
             if wt_path.exists():
                 force_rmtree(wt_path)
             run_git(repo, "worktree", "prune", check=False)
+            if wt_path.exists():
+                # Both removals run best-effort (``check=False`` / a swallowing
+                # rmtree), so a checkout held by a git lock, a read-only parent
+                # or a busy file SURVIVES them. Reporting that as removed and
+                # dropping the row would leave an orphan holding the branch that
+                # the registry can no longer see, re-provision or remove. Say so
+                # and KEEP the row — and leave the branch alone, the surviving
+                # checkout is still on it.
+                log.warning(
+                    "Thread worktree %s#%s could not be removed — %s still "
+                    "exists; registry row retained",
+                    key[0], key[1], wt_path,
+                )
+                return {
+                    "removed": False, "reason": "removal_failed",
+                    "inspection": inspection, "branch_deleted": False,
+                }
             branch = str(match.get("branch") or "")
             branch_deleted = False
             if branch.startswith(_BRANCH_PREFIX):

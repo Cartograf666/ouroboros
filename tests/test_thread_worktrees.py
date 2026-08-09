@@ -158,6 +158,52 @@ def test_removal_of_an_unknown_thread_is_a_typed_no_op(tmp_path):
     }
 
 
+def test_a_survived_checkout_is_reported_as_not_removed_and_keeps_its_row(
+    repo, tmp_path, wt_root,
+):
+    """``git worktree remove`` runs with ``check=False`` and ``force_rmtree``
+    swallows its errors, so a checkout that CANNOT be deleted (git lock,
+    read-only parent, busy file) used to be reported ``removed: True`` while its
+    registry row was dropped — an orphaned checkout holding the branch, invisible
+    to the registry, and impossible to re-provision or remove again."""
+    import os
+    import stat
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    # A read-only parent: entries inside it cannot be unlinked, so both git's
+    # removal and the rmtree fallback fail while the checkout stays readable.
+    original = stat.S_IMODE(os.stat(wt_root).st_mode)
+    os.chmod(wt_root, 0o555)
+    try:
+        result = remove_thread_worktree(
+            data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+            acknowledge_unmerged=True, worktree_root=wt_root,
+        )
+    finally:
+        os.chmod(wt_root, original)
+        # The failed rmtree left the surviving directory write-only; restoring
+        # it is part of clearing the obstruction, not part of the guarantee.
+        if Path(handle.path).exists():
+            os.chmod(Path(handle.path), 0o755)
+
+    assert Path(handle.path).exists(), "precondition: the checkout survived"
+    assert result["removed"] is False
+    assert result["reason"] == "removal_failed"
+    assert result["inspection"]["exists"] is True
+    # The row is RETAINED: the orphan stays visible and re-removable.
+    assert get_thread_worktree(tmp_path / "data", "racer", 1) is not None
+
+    # ...and once the obstruction is gone the same call actually removes it.
+    done = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True, worktree_root=wt_root,
+    )
+    assert done["removed"] is True
+    assert not Path(handle.path).exists()
+    assert list_thread_worktrees(tmp_path / "data") == []
+
+
 def test_a_malformed_row_can_never_delete_an_outside_path(repo, tmp_path, wt_root):
     import json
 
