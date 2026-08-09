@@ -1075,3 +1075,29 @@ def test_onboarding_frontend_exempts_unchanged_prefilled_keys_from_length_check(
     from ouroboros.settings_setup_contract import CONFIGURED_SECRET_PLACEHOLDER
 
     assert len(CONFIGURED_SECRET_PLACEHOLDER) < 10
+
+
+def test_completion_awaits_login_custody_and_keeps_the_retry_handle():
+    """The wizard is the CONSUMER of the step's custody verdict, and the step's
+    own node tests cannot reach it: the wizard body is an IIFE with no exports.
+
+    So the contract is pinned against the source. Two things must hold, and both
+    were broken before the gate found them: completion must not be announced
+    while the disposer is still running (a deferred create POST was answered
+    AFTER the page had already navigated), and the step handle must not be
+    dropped when the verdict is false, because that handle is the only thing
+    that can retry the cancel against the retained job.
+    """
+    source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
+
+    body = source.split("async function saveWizardPayload", 1)[1].split("\n    }", 1)[0]
+
+    # Awaited, and its answer kept.
+    assert "await agentsStep?.dispose()" in body
+    # The announcement comes AFTER the disposal, not before it.
+    assert body.index("dispose()") < body.index("announceCompletion")
+    # A refused release keeps the handle; only a proven one drops it.
+    assert "released === false" in body
+    drop = body.index("agentsStep = null")
+    assert body.index("released === false") < drop, (
+        "the handle must only be dropped on the proven-release branch")
