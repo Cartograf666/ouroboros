@@ -415,3 +415,20 @@ def prune_orphans(
 def list_worktrees(data_dir: Optional[Any] = None) -> List[Dict[str, Any]]:
     """Return registered worktree records (for UI / inspection)."""
     return _load_registry(data_dir)
+
+
+# --------------------------------------------------------------------------- #
+# Shared primitives (durable thread worktrees reuse ONLY these)
+# --------------------------------------------------------------------------- #
+# `git worktree add/remove/prune` mutate shared `.git/worktrees` metadata, so
+# every worktree owner in the process must serialize on the SAME lock and use
+# the SAME containment guards. Exported as public names so the durable
+# thread-worktree registry can reuse them WITHOUT reaching into privates —
+# and without inheriting this module's force-reset provisioning, force removal
+# or age-based orphan sweep, none of which may ever touch a thread's worktree.
+worktree_ops_lock = _ops_lock
+assert_worktree_root_isolated = _assert_root_isolated
+path_is_within = _is_within
+run_git = _git
+safe_path_component = _safe_name
+force_rmtree = _force_rmtree
