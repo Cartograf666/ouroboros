@@ -100,7 +100,12 @@ def present_first_run_onboarding(settings: dict, port: int, *, headless: bool = 
 
         def onboarding_finished(self, result: dict | None = None) -> str:
             payload = result if isinstance(result, dict) else {}
-            if payload.get("ok", True):
+            # Absent/malformed payload means the wizard told us NOTHING, and on
+            # the flag that says "the owner's settings were saved" the honest
+            # default is no (BIBLE P1). Unreachable today — the wizard only
+            # calls this with the completion envelope — but the default must
+            # not be the one that invents a save.
+            if payload.get("ok", False):
                 outcome["saved"] = True
             if payload.get("restart_required"):
                 outcome["restart_required"] = True

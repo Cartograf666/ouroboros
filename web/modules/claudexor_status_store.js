@@ -165,6 +165,27 @@ export const FACET_SUBJECT = {
     [FACET_QUOTA]: 'subscription limits',
 };
 
+// Product names for the families a first run can bootstrap. They are used ONLY
+// until discovery answers with the engine's own `display_name`, and they are
+// trademarks rather than the generic label the Agents tab renamed away from.
+export const BOOTSTRAP_LABELS = { codex: 'Codex', claude: 'Claude Code', cursor: 'Cursor' };
+
+// THE family display name, for every surface that shows one. It lives with the
+// store because the store owns the payload this reads, and because two
+// authorities is how a surface ends up printing a raw harness id: the settings
+// tab preferred the engine's `display_name` while the onboarding wizard kept a
+// private map of three and fell through to the id, so a renamed or fourth
+// family would have reached the owner spelled `claude`.
+export function familyLabel(harnessId, payload) {
+    const id = String(harnessId || '');
+    for (const harness of payload?.harnesses || []) {
+        if (String(harness?.id || '') === id) {
+            return String(harness.display_name || '') || BOOTSTRAP_LABELS[id] || id;
+        }
+    }
+    return BOOTSTRAP_LABELS[id] || id;
+}
+
 export function facetGapClause(reads, facets = []) {
     // ONE clause naming the OTHER facets a surface renders that were not read,
     // so a surface can explain its primary gap without silently dropping the

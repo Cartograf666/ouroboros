@@ -187,6 +187,30 @@ test('several accounts are named in family order and the rows say they rotate', 
     assert.deepEqual(familyStatusText(twoInOne, 'claude'), { tone: 'muted', text: 'Not connected' });
 });
 
+test('a family the engine renames is spoken in the engine words, never as a raw id', () => {
+    // The step used to keep its OWN map of three families and fall through to
+    // the harness id, while the Agents tab preferred the engine's display_name.
+    // Two authorities is how an owner ends up reading "claude" in a sentence.
+    // Both now go through the store's `familyLabel`, so a renamed family — or a
+    // fourth one the engine adds — reaches this text spelled properly.
+    const renamed = snapshotWith(['claude']);
+    renamed.harnesses = [{ id: 'claude', display_name: 'Claude Code Max' },
+                         { id: 'codex' }, { id: 'cursor' }];
+    const text = agentsOutcomeText(['claude'], { snapshot: renamed });
+    assert.match(text, /Claude Code Max is connected/);
+    assert.doesNotMatch(text, /\bclaude\b/);
+
+    // A family with no product name of its own is still never printed raw...
+    const fourth = snapshotWith([]);
+    fourth.harnesses = [{ id: 'gemini_cli', display_name: 'Gemini CLI' }];
+    assert.match(agentsOutcomeText(['gemini_cli'], { snapshot: fourth }),
+                 /Gemini CLI is connected/);
+
+    // ...and with no payload at all the bootstrap product names still apply,
+    // which is exactly what every surface printed before the two merged.
+    assert.match(agentsOutcomeText(['claude', 'cursor']), /Claude Code and Cursor are connected/);
+});
+
 test('an unread account facet claims nothing — a gap is not a zero', () => {
     const rows = familyListHtml(snapshotWith(['claude']), { accountsKnown: false });
     assert.ok(rows.includes('Not checked'));

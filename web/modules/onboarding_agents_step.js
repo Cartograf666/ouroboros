@@ -34,7 +34,7 @@
 //
 // Pure helpers up top are node-tested without a DOM.
 
-import { claudexorStatus, accountRows } from './claudexor_status_store.js';
+import { claudexorStatus, accountRows, familyLabel } from './claudexor_status_store.js';
 import { LOGIN_CARD_FULL, createLoginCardController } from './harness_login_cards.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
 
@@ -48,7 +48,9 @@ export const AGENT_FAMILIES = [
     { harness: 'cursor', label: 'Cursor' },
 ];
 
-const FAMILY_LABEL = Object.fromEntries(AGENT_FAMILIES.map((f) => [f.harness, f.label]));
+// AGENT_FAMILIES still carries the label the STEP renders for a family it lists
+// before any discovery has answered; the shared `familyLabel` owns every name
+// shown once a payload exists.
 
 // The three rungs, in the owner's own logic. `tone` is the one-word verdict the
 // eye lands on first; `title` is the action; `body` is the honest consequence.
@@ -105,8 +107,13 @@ export function harnessAccountCount(snapshot, harness) {
     ).length;
 }
 
-export function familyLabels(harnesses) {
-    return (harnesses || []).map((harness) => FAMILY_LABEL[harness] || harness);
+export function familyLabels(harnesses, snapshot) {
+    // ONE authority, shared with the Agents tab: prefer the engine's own
+    // display_name, fall back to the bootstrap product names. Passing the
+    // snapshot keeps this pure and node-testable like the helpers around it;
+    // without it the wizard would print a raw `claude` the day the engine
+    // renames a family or adds a fourth.
+    return (harnesses || []).map((harness) => familyLabel(harness, snapshot));
 }
 
 function joinLabels(labels) {
@@ -221,7 +228,8 @@ export function completionFailureNotice(error) {
     };
 }
 
-export function agentsOutcomeText(connected = [], { accountsKnown = true, skipPresets = false } = {}) {
+export function agentsOutcomeText(connected = [],
+                                  { accountsKnown = true, skipPresets = false, snapshot } = {}) {
     // What the owner is told BEFORE finishing. Every verb is conditional,
     // because the compiler can still refuse a seat no live model id satisfies.
     if (!accountsKnown) {
@@ -233,7 +241,7 @@ export function agentsOutcomeText(connected = [], { accountsKnown = true, skipPr
             + 'access you configured — you can connect an account any time in '
             + 'Settings → Agents.';
     }
-    const labels = joinLabels(familyLabels(connected));
+    const labels = joinLabels(familyLabels(connected, snapshot));
     if (skipPresets) {
         return `${labels} ${connected.length === 1 ? 'is' : 'are'} connected, but you chose to `
             + 'finish without agent defaults: reviewers and subagents stay on your API '
@@ -466,6 +474,7 @@ export function createAgentsStep({
             outcome.textContent = agentsOutcomeText(state.connected, {
                 accountsKnown: known,
                 skipPresets: state.skipPresets,
+                snapshot,
             });
         }
         login.render();

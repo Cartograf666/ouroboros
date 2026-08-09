@@ -1275,9 +1275,8 @@ def main():
             )
         if onboarding["restart_required"] and not _shutdown_event.is_set():
             # The completion changed something this process pinned at boot (its
-            # runtime-mode baseline), or the legacy bridge wrote settings.json
-            # behind its back. The launcher owns the process, so it recycles it
-            # instead of leaving the owner with a restart nag.
+            # runtime-mode baseline). The launcher owns the process, so it
+            # recycles it instead of leaving the owner with a restart nag.
             _request_agent_restart()
             server_ready, actual_port = _await_server_ready(port, _abort)
 

@@ -42,6 +42,7 @@ import {
     accountRows,
     bindStatusSurface,
     claudexorStatus,
+    familyLabel,
 } from './claudexor_status_store.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { createLoginCardController } from './harness_login_cards.js';
@@ -287,20 +288,10 @@ export function daemonStatusLine(payload, { checking = false } = {}) {
 // only; the login flow itself stays harness-agnostic.
 export const BOOTSTRAP_HARNESSES = ['codex', 'claude', 'cursor'];
 
-// Product names, used only until discovery answers with the engine's own
-// display_name. These three are the families a first run can bootstrap, and
-// they are trademarks, not the generic label the tab renamed away from.
-const BOOTSTRAP_LABELS = { codex: 'Codex', claude: 'Claude Code', cursor: 'Cursor' };
-
-export function familyLabel(harnessId, payload) {
-    const id = String(harnessId || '');
-    for (const harness of payload?.harnesses || []) {
-        if (String(harness?.id || '') === id) {
-            return String(harness.display_name || '') || BOOTSTRAP_LABELS[id] || id;
-        }
-    }
-    return BOOTSTRAP_LABELS[id] || id;
-}
+// The display name comes from the store, which owns the payload it reads and is
+// imported by BOTH this tab and the onboarding wizard. Re-exported so this
+// module keeps its established import path.
+export { familyLabel };
 
 // Re-exported so the accounts surface keeps ONE import path for the payload
 // projection it renders (the definition lives with the store that owns the
@@ -483,8 +474,12 @@ export function serviceBannerLine(store) {
     // THE service banner: one place on the tab that explains a daemon/runtime
     // problem, replacing the scattering of "(not in discovery)" the owner
     // reported. Provenance is PER FACET, so this line never collapses three
-    // independent reads into one verdict: a refused quota read leaves the
-    // catalogue and accounts authoritative and says exactly that.
+    // independent reads into one verdict where the wire tells it apart: a
+    // refused quota read leaves the catalogue and accounts authoritative and
+    // says exactly that. That branch is READY, not yet exercised — no producer
+    // stamps `reads` today (`claudexor_accounts.py` keeps the older semantics
+    // and turns any refusal into one global `unreachable`), so the shape this
+    // line actually renders now is all three facets indeterminate together.
     //
     // Deliberately NOT built on the store's `facetGapClause`, which exists for a
     // surface that LEADS with one facet and must still name the others (the
