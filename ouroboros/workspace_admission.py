@@ -83,11 +83,13 @@ class GitInitRequiredError(WorkspaceRootError):
     Kept a subclass of ``WorkspaceRootError`` on purpose: a caller that knows
     nothing about the offer still refuses admission exactly as it did before, so
     removing the git requirement can never quietly admit a file task. A caller that
-    CAN ask the owner catches this first and renders ``decision``.
+    CAN ask the owner catches this first and renders ``decision``. The validator
+    knows only the path, so ``decision`` carries no ``project_id``; the room-level
+    caller re-stamps it with ``git_init_decision`` once it knows whose folder it is.
     """
 
-    def __init__(self, root: Any, *, project_id: str = "") -> None:
-        self.decision = git_init_decision(root, project_id=project_id)
+    def __init__(self, root: Any) -> None:
+        self.decision = git_init_decision(root)
         super().__init__(str(self.decision["message"]))
 
 
