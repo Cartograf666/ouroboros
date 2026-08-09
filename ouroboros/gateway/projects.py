@@ -365,11 +365,7 @@ async def api_projects_create(request: Request) -> JSONResponse:
         working_dir, provenance, clone_url = "", "none", ""
         init_git_skipped: list = []
         if attach_path:
-            from ouroboros.project_sources import (
-                attach_snapshot_init,
-                is_git_worktree_root,
-                validate_attach_path,
-            )
+            from ouroboros.project_sources import attach_snapshot_init, validate_attach_path
 
             resolved, error = validate_attach_path(
                 attach_path, system_repo_dir=repo_dir, drive_root=drive_root
@@ -380,20 +376,13 @@ async def api_projects_create(request: Request) -> JSONResponse:
                 init_error, init_git_skipped = await asyncio.to_thread(attach_snapshot_init, resolved)
                 if init_error:
                     return JSONResponse({"error": f"init_git failed: {init_error}"}, status_code=400)
-            elif not await asyncio.to_thread(is_git_worktree_root, resolved):
-                # Task admission requires a git worktree root — registering a non-git
-                # folder would create a project whose room tasks are born dead
-                # (triad r5). Actionable refusal BEFORE any registry mutation.
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"{resolved} is not a git repository — enable init_git "
-                            "(makes an attach-snapshot commit) or pick a git worktree root"
-                        ),
-                        "error_code": "attach_requires_git",
-                    },
-                    status_code=400,
-                )
+            # A11/A12: an UNTRACKED folder is admitted and stays untracked. Attach used
+            # to refuse it outright because task admission demanded a git worktree root,
+            # which made "designate a place" and "put that place under git" one
+            # inseparable decision taken on the owner's behalf. They are now two: the
+            # project keeps the folder, and admission raises the typed
+            # `git_init_required` offer before the FIRST file task instead. The
+            # remaining validate_attach_path guards are untouched.
             working_dir, provenance = str(resolved), "attached"
         elif git_url:
             from ouroboros.project_sources import clone_project_repo

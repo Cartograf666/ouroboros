@@ -372,6 +372,27 @@ class ProjectCreateRequest(TypedDict, total=False):
     with_workspace: bool
 
 
+class WorkspaceGitInitDecision(TypedDict, total=False):
+    """The typed ``git_init_required`` OFFER (A12), not an error report.
+
+    Raised by ``workspace_admission`` BEFORE a file task is queued in a folder that
+    is safe and valid but not tracked by git, and carried unchanged by every
+    surface: the ``POST /api/tasks`` 400 body (``error_code`` +  ``decision``), the
+    project-room promote outcome, and the chat message that discloses the halted
+    task. ``enables`` is the plain-language answer to "what does saying yes buy me"
+    — diff, rollback, branching — and ``offer`` names the operation the owner's yes
+    calls (``POST /api/projects/{project_id}/init-git``). Nothing is ever
+    initialised without that answer.
+    """
+
+    decision: Literal["git_init_required"]
+    workspace_root: str
+    project_id: str
+    offer: Literal["init_git"]
+    enables: List[str]
+    message: str
+
+
 class ThreadEntry(TypedDict, total=False):
     """One THREAD of a project — an empty chat sharing the project's folder.
 
@@ -1089,6 +1110,7 @@ __all__ = [
     "UpdateStatusReadyOutbound",
     "ProjectCreateRequest",
     "ProjectEntry",
+    "WorkspaceGitInitDecision",
     "ThreadCreateRequest",
     "ThreadEntry",
     "ThreadResponse",

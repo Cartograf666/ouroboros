@@ -411,12 +411,20 @@ async def api_tasks_create(request: Request) -> JSONResponse:
         return json_error(f"task_id already exists: {task_id}", 409)
     if (drive_root / HEADLESS_TASKS_DIR / task_id).exists() or (drive_root / ARTIFACTS_DIR / task_id).exists():
         return json_error(f"task_id already has headless state: {task_id}", 409)
+    from ouroboros.workspace_admission import GIT_INIT_REQUIRED, GitInitRequiredError
+
     try:
         workspace_root = _resolve_workspace_root(
             body.get("workspace_root"),
             system_repo_dir=repo_dir,
             drive_root=drive_root,
         )
+    except GitInitRequiredError as exc:
+        # A12: the folder is fine — it is simply untracked. The task is NOT queued
+        # (file work with no diff/rollback is not what the caller asked for) and the
+        # browser gets the typed OFFER to render, not a refusal to decode. Ordered
+        # before the ValueError arm because it IS a ValueError subclass.
+        return json_error(str(exc), 400, error_code=GIT_INIT_REQUIRED, decision=exc.decision)
     except ValueError as exc:
         return json_error(str(exc), 400)
     workspace_mode = str(body.get("workspace_mode") or ("external" if workspace_root else "")).strip()

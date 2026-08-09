@@ -8,7 +8,7 @@ folder into a task's active workspace:
   path — previously a DEGRADED twin that set ``workspace_root`` as a raw string
   with no validation).
 
-Two invariants this module enforces (BIBLE P3/P5):
+Three invariants this module enforces (BIBLE P3/P5):
 
 1. **One admission path.** Both surfaces call ``validate_workspace_root`` — the
    SAME git-worktree-root + repo/data-overlap check — so they cannot drift.
@@ -18,6 +18,13 @@ Two invariants this module enforces (BIBLE P3/P5):
    workspace-less task resolves to the ``self_modification`` tool profile over the
    system repo (``tool_access.active_tool_profile``), which is exactly the danger
    the projects feature exists to steer work AWAY from.
+3. **Git is OFFERED, never forced (A12).** A plain, safe folder that is simply not
+   tracked by git is no longer one more unusable path: admission still stops before
+   the task is queued — auto-``git init`` in someone else's folder stays forbidden —
+   but it stops with the TYPED ``git_init_required`` decision
+   (``GitInitRequiredError.decision``) that the owner answers, instead of an error
+   they have to decode. The project itself keeps the folder either way; the folder
+   is the project's PLACE (A11), and only FILE WORK waits on the answer.
 
 The heavy per-task preflight (git snapshot + toolchain probes) stays on the
 creation surface that can afford it: the async gateway handler runs it inline;
@@ -41,6 +48,49 @@ class WorkspaceRootError(ValueError):
     """A workspace_root that is missing, overlapping, or not a git worktree root."""
 
 
+# The one spelling of the decision, shared by the exception, the gateway error
+# envelope and the promote outcome so the three cannot drift apart.
+GIT_INIT_REQUIRED = "git_init_required"
+
+
+def git_init_decision(workspace_root: Any, *, project_id: str = "") -> dict:
+    """The typed ``git_init_required`` decision (A12) — an OFFER, not a refusal.
+
+    Returned INSTEAD of queueing a file task in a folder that is safe and valid but
+    not tracked by git. It carries its own plain-language reason so every surface
+    (gateway 400 body, promote outcome, chat message) says the same honest thing
+    about what git buys, and no surface has to invent copy of its own.
+    """
+    return {
+        "decision": GIT_INIT_REQUIRED,
+        "workspace_root": str(workspace_root),
+        "project_id": str(project_id or ""),
+        "offer": "init_git",
+        "enables": ["diff", "rollback", "branching"],
+        "message": (
+            f"{workspace_root} is not tracked by git, so file work there cannot be "
+            "diffed, rolled back, or branched. Ouroboros can start tracking it — one "
+            "snapshot commit of what is already in the folder, with credential-shaped "
+            "files deliberately left untracked. Nothing is initialised until you say "
+            "yes: the folder is yours."
+        ),
+    }
+
+
+class GitInitRequiredError(WorkspaceRootError):
+    """The folder is a SAFE, valid workspace that is simply not git-backed (A12).
+
+    Kept a subclass of ``WorkspaceRootError`` on purpose: a caller that knows
+    nothing about the offer still refuses admission exactly as it did before, so
+    removing the git requirement can never quietly admit a file task. A caller that
+    CAN ask the owner catches this first and renders ``decision``.
+    """
+
+    def __init__(self, root: Any, *, project_id: str = "") -> None:
+        self.decision = git_init_decision(root, project_id=project_id)
+        super().__init__(str(self.decision["message"]))
+
+
 def validate_workspace_root(
     value: Any,
     *,
@@ -51,7 +101,12 @@ def validate_workspace_root(
     admission surfaces share it). Returns the resolved root, ``None`` for empty
     input, or raises ``WorkspaceRootError``: the path must exist, be a directory,
     NOT overlap the Ouroboros system repo or data drive, and BE the git worktree
-    root (not a subdir of one)."""
+    root (not a subdir of one).
+
+    A folder that passes every safety guard and is merely UNTRACKED raises the
+    ``GitInitRequiredError`` subclass instead, carrying the owner's offer (A12).
+    A folder INSIDE someone else's worktree stays a plain refusal — initialising
+    git there would nest a second repository, which is not an offer worth making."""
     from ouroboros.tool_access import paths_overlap_casefold
 
     text = str(value or "").strip()
@@ -91,7 +146,7 @@ def validate_workspace_root(
     git_root_text = (res.stdout or "").strip() if res is not None and res.returncode == 0 else ""
     git_root = pathlib.Path(git_root_text).resolve(strict=False) if git_root_text else None
     if git_root is None:
-        raise WorkspaceRootError("workspace_root must be a git worktree root")
+        raise GitInitRequiredError(root)
     if git_root != root:
         raise WorkspaceRootError(f"workspace_root must be the git worktree root: {git_root}")
     return root
@@ -109,7 +164,7 @@ def resolve_room_workspace(
     project_id: str,
     explicit_workspace: str = "",
     workspace_sentinel: str = "",
-) -> tuple[str, str]:
+) -> tuple[str, str, dict]:
     """Resolve the workspace_root for a task born in a project room (promote/route).
 
     Precedence (P5 — the semantic "this work belongs to project X" is already the
@@ -120,13 +175,18 @@ def resolve_room_workspace(
     - else the project's registered ``working_dir`` (if any) → validated and used.
     - else no workspace (a file-less project), returns ("","").
 
-    Returns ``(workspace_root, error)``. ``error`` is non-empty when a workspace was
-    REQUESTED (explicit path or a set project working_dir) but is unusable, AND when
-    the project's registry entry cannot be READ at all — the caller MUST fail the task
-    loudly rather than fall back to a workspace-less self_modification profile (the
-    loud-fail invariant)."""
+    Returns ``(workspace_root, error, decision)``. ``error`` is non-empty when a
+    workspace was REQUESTED (explicit path or a set project working_dir) but is
+    unusable, AND when the project's registry entry cannot be READ at all — the
+    caller MUST fail the task loudly rather than fall back to a workspace-less
+    self_modification profile (the loud-fail invariant). ``decision`` is the typed
+    ``git_init_required`` OFFER (A12) for the one case that is not a breakage: a
+    perfectly good folder nobody has put under git yet. It is a THIRD outcome on
+    purpose — collapsing it into ``error`` would present the owner's open choice as
+    someone's mistake, and collapsing it into a resolved root would queue file work
+    with no diff, no rollback and no way back."""
     if str(workspace_sentinel or "").strip().lower() == WORKSPACE_NONE:
-        return "", ""
+        return "", "", {}
 
     requested = str(explicit_workspace or "").strip()
     source = "explicit workspace_root"
@@ -149,21 +209,25 @@ def resolve_room_workspace(
             return "", (
                 f"project {project_id!r} registry entry is unreadable "
                 f"({type(exc).__name__}: {exc}) — cannot determine the task's workspace"
-            )
+            ), {}
         requested = str(project.get("working_dir") or "").strip()
         source = f"project {project_id!r} working_dir"
     if not requested:
-        return "", ""  # file-less project (or no working_dir): a non-workspace task
+        return "", "", {}  # file-less project (or no working_dir): a non-workspace task
 
     try:
         resolved = validate_workspace_root(
             requested, system_repo_dir=system_repo_dir, drive_root=drive_root
         )
+    except GitInitRequiredError as exc:
+        # NOT a failure: the folder is fine, it is simply untracked. Hand the owner
+        # the offer and let admission stop here (A12 — never auto-init).
+        return "", "", git_init_decision(exc.decision["workspace_root"], project_id=str(project_id or ""))
     except WorkspaceRootError as exc:
         # LOUD FAIL: a set-but-broken working_dir must never silently degrade to a
         # workspace-less (self_modification-profile) task over the system repo.
-        return "", f"{source} is unusable: {exc}"
-    return (str(resolved) if resolved else ""), ""
+        return "", f"{source} is unusable: {exc}", {}
+    return (str(resolved) if resolved else ""), "", {}
 
 
 def room_chat_lens_dir(drive_root: Any, project_id: str) -> tuple[str, str]:

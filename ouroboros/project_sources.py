@@ -12,7 +12,12 @@ act in the UI/tool, so `trusted_at` is stamped automatically and the dialog carr
 the honest "the agent gets write+shell in this folder" text — no second
 confirmation gate. `init_git` is OPT-IN ONLY: an attach NEVER auto-runs `git init`
 on the owner's folder without the flag (the folder belongs to the owner; mutating
-it is a decision, not a default).
+it is a decision, not a default). Attach does NOT require the folder to be a git
+worktree either (A11/A12): a plain folder is a legitimate PLACE for a project, and
+the git question is asked separately — as the typed `git_init_required` offer
+`workspace_admission` raises before the first FILE task — with `attach_snapshot_init`
+as the one thing the owner's "yes" runs, whether it comes from the create dialog's
+`init_git` or from `POST /api/projects/{id}/init-git` afterwards.
 
 Clone doctrine: server-side, atomic (clone into a ``.tmp.<pid>`` sibling, rename
 into place on success), never interactive (``GIT_TERMINAL_PROMPT=0`` + null
@@ -71,9 +76,10 @@ def validate_attach_path(
     """Validate an owner folder for attach. Checks run on the RESOLVED realpath
     (symlinks followed) so a symlink cannot smuggle the home root or repo/data in:
     must exist, be a directory, not be the home root itself, and not overlap the
-    Ouroboros system repo or data drive. Being a git repo is NOT required at attach
-    time (``init_git`` is the opt-in; task admission separately requires a git
-    worktree root and loud-fails otherwise). Returns (resolved, error)."""
+    Ouroboros system repo or data drive. Being a git repo is NOT required — not at
+    attach time and not for the project to keep the folder; ``init_git`` is the
+    opt-in, and task admission raises the typed ``git_init_required`` offer for an
+    untracked folder rather than refusing it. Returns (resolved, error)."""
     text = str(raw_path or "").strip()
     if not text:
         return None, "path is required"
@@ -97,27 +103,6 @@ def validate_attach_path(
         if resolved == protected or path_is_relative_to(resolved, protected) or path_is_relative_to(protected, resolved):
             return None, f"path must not overlap the {label}"
     return resolved, ""
-
-
-def is_git_worktree_root(path: pathlib.Path) -> bool:
-    """True when ``path`` IS a git worktree root (the same fact task admission's
-    validate_workspace_root later requires — checked at attach time so a non-git
-    attach cannot register a project whose room tasks are born dead, triad r5)."""
-    bootstrap_process_path()
-    try:
-        res = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=str(path), capture_output=True, text=True, timeout=5,
-        )
-    except Exception:
-        return False
-    top = (res.stdout or "").strip() if res.returncode == 0 else ""
-    if not top:
-        return False
-    try:
-        return pathlib.Path(top).resolve(strict=False) == pathlib.Path(path).resolve(strict=False)
-    except OSError:
-        return False
 
 
 def _unstage_sensitive_paths(path: pathlib.Path) -> list[str]:

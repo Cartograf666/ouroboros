@@ -55,8 +55,12 @@ def resolve_promote_source(
         folder, provenance, clone_url = cloned, "cloned", src
         note = f"cloned {src} -> {cloned}"
     else:
-        from ouroboros.project_sources import is_git_worktree_root
-
+        # A11/A12: the folder becomes the project's PLACE on the strength of the
+        # safety guards alone (exists, real dir, not the home root, disjoint from
+        # the Ouroboros repo/data roots). Being a git worktree is NOT one of them
+        # any more — an untracked folder is admitted and STAYS untracked until the
+        # owner answers the typed `git_init_required` offer that task admission
+        # raises before any file work is queued (workspace_admission).
         resolved, err = validate_attach_path(
             src,
             system_repo_dir=getattr(ctx, "REPO_DIR", getattr(ctx, "repo_dir", "")),
@@ -64,8 +68,6 @@ def resolve_promote_source(
         )
         if err:
             return "", "", f"attach: {err}", pid
-        if not is_git_worktree_root(resolved):
-            return "", "", f"attach: {resolved} is not a git repository", pid
         folder, provenance, clone_url = str(resolved), "attached", ""
         note = f"attached {resolved}"
     prior_wd = str((existing or {}).get("working_dir") or "").strip()

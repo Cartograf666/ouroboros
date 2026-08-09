@@ -716,6 +716,7 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
     # working_dir fails LOUDLY here — never a silent workspace-less task that would
     # resolve to the self_modification profile over the system repo.
     from ouroboros.workspace_admission import (
+        GIT_INIT_REQUIRED,
         WORKSPACE_NONE,
         bounded_workspace_preflight,
         compose_workspace_block,
@@ -763,7 +764,7 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
                 # Bind-or-fail (v6.58.0): falling through to a workspace-less
                 # self_modification-profile task over the system repo is exactly
                 # the silent degradation the admission SSOT exists to kill.
-                _fail_promoted_task_loudly(
+                _halt_promoted_task_loudly(
                     ctx, task,
                     f"project {pid!r} has no working folder and auto-provisioning one failed; "
                     "see the supervisor log (ensure_project_workspace)",
@@ -775,15 +776,34 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
                 }
             task.setdefault("metadata", {})["workspace_autoprovisioned"] = True
 
-    resolved_ws, ws_error = resolve_room_workspace(
+    resolved_ws, ws_error, ws_decision = resolve_room_workspace(
         drive_root=DRIVE_ROOT,
         system_repo_dir=REPO_DIR,
         project_id=pid,
         explicit_workspace=str(evt.get("workspace_root") or "").strip(),
         workspace_sentinel=str(evt.get("workspace") or ""),
     )
+    if ws_decision:
+        # A12: the owner's folder is untracked. STOP before queueing (never auto-init
+        # in someone else's folder) and hand the decision up typed, with the same
+        # plain-language offer the gateway surface serves.
+        _halt_promoted_task_loudly(
+            ctx, task, str(ws_decision.get("message") or ""),
+            reason_code=GIT_INIT_REQUIRED,
+            banner="GIT_INIT_REQUIRED",
+            advice=(
+                "Say yes in Projects → this project to start tracking the folder, or "
+                "re-promote with workspace='none' for a folder-less task."
+            ),
+        )
+        return {
+            "status": "needs_manual_target",
+            "reason": GIT_INIT_REQUIRED,
+            "decision": ws_decision,
+            "task_id": tid,
+        }
     if ws_error:
-        _fail_promoted_task_loudly(ctx, task, ws_error)
+        _halt_promoted_task_loudly(ctx, task, ws_error)
         return {"status": "needs_manual_target", "reason": "workspace_unusable", "task_id": tid}
     if resolved_ws:
         task["workspace_root"] = resolved_ws
@@ -834,28 +854,41 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
     return None
 
 
-def _fail_promoted_task_loudly(ctx: Any, task: dict, ws_error: str) -> None:
+def _halt_promoted_task_loudly(
+    ctx: Any,
+    task: dict,
+    ws_error: str,
+    *,
+    reason_code: str = "workspace_unusable",
+    banner: str = "WORKSPACE_UNUSABLE",
+    advice: str = (
+        "Fix the project's working folder (Projects → this project) or re-promote with "
+        "workspace='none' for a folder-less task."
+    ),
+) -> None:
     """v6.58.0 loud-fail invariant: a room task whose workspace is SET-but-unusable
     is terminally FAILED at admission with a visible card + chat message — never
     silently admitted workspace-less (which would run the self_modification profile
-    over the system repo). Never raises."""
+    over the system repo). Never raises.
+
+    The banner/reason are parameters because A12 added a SECOND reason a promoted
+    task legitimately does not start: the folder is untracked and the owner has not
+    answered the git offer yet. That is not a breakage, and labelling it
+    `workspace_unusable` would tell the owner their folder is broken when the only
+    thing missing is their answer."""
     tid = str(task.get("id") or "")
     chat_id = 0
     try:
         chat_id = int(task.get("chat_id") or 0)
     except (TypeError, ValueError):
         chat_id = 0
-    message = (
-        f"⚠️ WORKSPACE_UNUSABLE: task {tid} was NOT started — {ws_error} "
-        "Fix the project's working folder (Projects → this project) or re-promote with "
-        "workspace='none' for a folder-less task."
-    )
+    message = f"⚠️ {banner}: task {tid} was NOT started — {ws_error} {advice}"
     try:
         from ouroboros.task_results import STATUS_FAILED, write_task_result
 
         write_task_result(
             DRIVE_ROOT, tid, STATUS_FAILED,
-            reason_code="workspace_unusable",
+            reason_code=reason_code,
             result=message,
             description=str(task.get("description") or ""),
             chat_id=chat_id,

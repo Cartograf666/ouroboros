@@ -31,6 +31,7 @@ from ouroboros.gateway.contracts import (
     UpdatePreflightResponse,
     UpdateStatusReadyOutbound,
     VideoOutbound,
+    WorkspaceGitInitDecision,
     ClaudexorStatusReads,
     ClaudexorStatusResponse,
 )
@@ -121,6 +122,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "ThreadCreateRequest",
         "ThreadUpdateRequest",
         "ThreadResponse",
+        "WorkspaceGitInitDecision",
     ):
         assert re.search(rf"@typedef \{{Object\}} {name}\b", text), f"api_types.js missing {name}"
     api_client = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_client.js").read_text(
@@ -145,7 +147,8 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 UpdateStatusReadyOutbound, TaskCostBreakdown, TaskDetailResponse,
                 ClaudexorStatusReads, ClaudexorStatusResponse, TaskDiffResponse,
                 UiPreferencesResponse, ProjectEntry,
-                ThreadEntry, ThreadCreateRequest, ThreadUpdateRequest, ThreadResponse):
+                ThreadEntry, ThreadCreateRequest, ThreadUpdateRequest, ThreadResponse,
+                WorkspaceGitInitDecision):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"

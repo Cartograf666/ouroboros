@@ -274,6 +274,23 @@
  */
 
 /**
+ * The typed git_init_required OFFER (A12) — not an error report. Admission raises
+ * it BEFORE queueing a file task in a folder that is safe and valid but not tracked
+ * by git, and the same object rides the POST /api/tasks 400 body (alongside
+ * error_code: 'git_init_required') and the project-room promote outcome. `enables`
+ * is the plain-language answer to "what does saying yes buy me" and `offer` names
+ * the operation the yes calls (POST /api/projects/{project_id}/init-git). Nothing
+ * is initialised in the owner's folder without that answer.
+ * @typedef {Object} WorkspaceGitInitDecision
+ * @property {'git_init_required'=} decision
+ * @property {string=} workspace_root
+ * @property {string=} project_id
+ * @property {'init_git'=} offer
+ * @property {string[]=} enables
+ * @property {string=} message
+ */
+
+/**
  * One THREAD of a project — an empty chat sharing the project's working folder.
  * Thread 0 is the project's OWN chat (its chat_id equals the project's) and is
  * synthesized from the project row rather than stored; the project's top-level
