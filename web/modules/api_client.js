@@ -119,6 +119,13 @@ export const apiClient = {
     /** @returns {Promise<import('./api_types.js').ProjectDeleteResponse>} */
     projectDelete: (projectId) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/delete`, {}),
     /**
+     * The owner's YES to a git_init_required offer: start tracking the project's
+     * working folder with one attach-snapshot commit. Never called automatically —
+     * admission raises the offer and stops; only the owner answers it.
+     * @returns {Promise<import('./api_types.js').ProjectInitGitResponse>}
+     */
+    projectInitGit: (projectId) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/init-git`, {}),
+    /**
      * Create a new empty thread in a project (a chat sharing its folder).
      * @returns {Promise<import('./api_types.js').ThreadResponse>}
      */

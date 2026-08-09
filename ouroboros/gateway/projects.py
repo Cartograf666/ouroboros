@@ -460,6 +460,64 @@ async def api_project_update(request: Request) -> JSONResponse:
         return json_exception(exc)
 
 
+async def api_project_init_git(request: Request) -> JSONResponse:
+    """POST /api/projects/{project_id}/init-git — the owner's YES to the typed
+    ``git_init_required`` offer (A12).
+
+    This is the ONLY thing that answer calls, and it runs the SAME
+    ``attach_snapshot_init`` the create dialog's ``init_git`` runs — one snapshot
+    commit of what is already in the folder, credential-shaped files deliberately
+    left untracked and disclosed. Admission never reaches this route by itself:
+    it raises the offer and stops, and the owner decides.
+
+    The attach guards are re-run against the CURRENT working_dir rather than
+    trusted from registration time — the registry is a file on disk, and the one
+    thing this route does is write into a folder, so it re-establishes that the
+    folder is still a real directory outside the Ouroboros repo/data roots first.
+    """
+    try:
+        import asyncio
+
+        from ouroboros.project_sources import attach_snapshot_init, validate_attach_path
+        from ouroboros.projects_registry import get_project
+
+        project_id = str(request.path_params.get("project_id") or "").strip()
+        drive_root = request_drive_root(request)
+        repo_dir = request_repo_dir(request)
+        project = get_project(drive_root, project_id)
+        if project is None:
+            return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
+        working_dir = str(project.get("working_dir") or "").strip()
+        if not working_dir:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"project {project['id']!r} has no working folder to initialise — "
+                        "attach or create one first"
+                    ),
+                    "error_code": "no_working_dir",
+                },
+                status_code=400,
+            )
+        resolved, error = await asyncio.to_thread(
+            validate_attach_path, working_dir, system_repo_dir=repo_dir, drive_root=drive_root
+        )
+        if error:
+            return JSONResponse({"error": f"working folder is unusable: {error}"}, status_code=400)
+        init_error, skipped = await asyncio.to_thread(attach_snapshot_init, resolved)
+        if init_error:
+            return JSONResponse({"error": f"init_git failed: {init_error}"}, status_code=400)
+        payload: dict = {"project": project, "working_dir": str(resolved)}
+        if skipped:
+            # Disclosed omission (P1): credential-shaped files stayed out of the
+            # snapshot and remain untracked via .git/info/exclude.
+            payload["init_git_skipped"] = skipped[:50]
+        _broadcast_projects_changed(str(project["id"]), project.get("chat_id"))
+        return JSONResponse(payload)
+    except Exception as exc:
+        return json_exception(exc)
+
+
 async def api_project_delete(request: Request) -> JSONResponse:
     """Fence admission, cancel the live tree, then preserve a tombstone.
 
@@ -824,6 +882,7 @@ __all__ = [
     "api_fs_dirs",
     "api_project_delete",
     "api_project_from_task",
+    "api_project_init_git",
     "api_project_thread_create",
     "api_project_thread_fork",
     "api_project_thread_update",

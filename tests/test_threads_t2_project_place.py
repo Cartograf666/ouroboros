@@ -196,3 +196,129 @@ def test_promote_workspace_none_opts_out_of_the_git_offer_too(tmp_path, monkeypa
 
     assert outcome["status"] == "scheduled"
     assert enqueued and not enqueued[0].get("workspace_root")
+
+
+# --- the owner's YES ---------------------------------------------------------------
+
+def test_init_git_route_answers_the_offer_and_then_the_task_admits(tmp_path):
+    """The whole loop: attach a plain folder, get the offer instead of a queued
+    task, say yes through the route, and the same folder now admits file work."""
+    import asyncio
+
+    from ouroboros.gateway.projects import api_project_init_git, api_projects_create
+    from ouroboros.projects_registry import get_project
+    from ouroboros.workspace_admission import GitInitRequiredError, validate_workspace_root
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plain = tmp_path / "owner_site"
+    plain.mkdir()
+    (plain / "index.html") .write_text("<h1>hi</h1>\n", encoding="utf-8")
+
+    created = asyncio.run(api_projects_create(
+        _ProjectsReq({"name": "Site", "path": str(plain)}, drive_root=data, repo_dir=repo)
+    ))
+    assert created.status_code == 200
+    pid = json.loads(created.body)["project"]["id"]
+
+    # Before the answer: admission refuses with the offer, folder untouched.
+    try:
+        validate_workspace_root(str(plain), system_repo_dir=repo, drive_root=data)
+        raise AssertionError("an untracked folder must not admit a file task")
+    except GitInitRequiredError:
+        pass
+    assert not (plain / ".git").exists()
+
+    resp = asyncio.run(api_project_init_git(
+        _ProjectsReq({}, drive_root=data, repo_dir=repo, path_params={"project_id": pid})
+    ))
+    payload = json.loads(resp.body)
+    assert resp.status_code == 200, payload
+    assert payload["working_dir"] == str(plain.resolve())
+    assert (plain / ".git").exists()
+    # The owner's existing files are in the snapshot, not silently ignored.
+    tracked = subprocess.run(
+        ["git", "ls-files"], cwd=str(plain), capture_output=True, text=True, check=True
+    ).stdout.split()
+    assert "index.html" in tracked
+    # The folder binding is unchanged — saying yes tracks the place, it never moves it.
+    assert get_project(data, pid)["working_dir"] == str(plain.resolve())
+    # And the same folder now admits a file task.
+    assert validate_workspace_root(
+        str(plain), system_repo_dir=repo, drive_root=data
+    ) == plain.resolve()
+
+
+def test_init_git_route_refuses_what_it_cannot_safely_touch(tmp_path):
+    """This route's whole job is to write into a folder, so it re-establishes the
+    attach guards against the CURRENT working_dir instead of trusting a registry
+    value that could have been edited or gone stale."""
+    import asyncio
+
+    from ouroboros.gateway.projects import api_project_init_git
+    from ouroboros.projects_registry import create_project, update_project
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def _call(pid):
+        return asyncio.run(api_project_init_git(
+            _ProjectsReq({}, drive_root=data, repo_dir=repo, path_params={"project_id": pid})
+        ))
+
+    assert _call("ghost").status_code == 404
+
+    create_project(data, "fileless", name="Fileless")
+    resp = _call("fileless")
+    assert resp.status_code == 400
+    assert json.loads(resp.body)["error_code"] == "no_working_dir"
+
+    create_project(data, "gone", name="Gone")
+    update_project(data, "gone", working_dir=str(tmp_path / "no-such-folder"))
+    resp_gone = _call("gone")
+    assert resp_gone.status_code == 400
+    assert "does not exist" in json.loads(resp_gone.body)["error"]
+
+    # A working_dir that overlaps the Ouroboros system repo is refused even though
+    # the registry claims it: the guard is re-run, not remembered.
+    create_project(data, "inrepo", name="InRepo")
+    update_project(data, "inrepo", working_dir=str(repo))
+    resp_repo = _call("inrepo")
+    assert resp_repo.status_code == 400
+    assert "Ouroboros system repo" in json.loads(resp_repo.body)["error"]
+    assert not (repo / ".git").exists()
+
+
+def test_init_git_route_keeps_credential_shaped_files_out_of_the_snapshot(tmp_path):
+    """Same disclosed omission the create-dialog init_git makes: secrets are never
+    baked into git history, and the owner is TOLD which files were left out."""
+    import asyncio
+
+    from ouroboros.gateway.projects import api_project_init_git
+    from ouroboros.projects_registry import create_project, update_project
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plain = tmp_path / "with_secrets"
+    plain.mkdir()
+    (plain / "app.py").write_text("print('x')\n", encoding="utf-8")
+    (plain / ".env").write_text("API_KEY=supersecret\n", encoding="utf-8")
+
+    create_project(data, "secrets", name="Secrets")
+    update_project(data, "secrets", working_dir=str(plain), provenance="attached")
+    resp = asyncio.run(api_project_init_git(
+        _ProjectsReq({}, drive_root=data, repo_dir=repo, path_params={"project_id": "secrets"})
+    ))
+    payload = json.loads(resp.body)
+    assert resp.status_code == 200, payload
+    assert ".env" in payload["init_git_skipped"]
+    tracked = subprocess.run(
+        ["git", "ls-files"], cwd=str(plain), capture_output=True, text=True, check=True
+    ).stdout.split()
+    assert "app.py" in tracked and ".env" not in tracked

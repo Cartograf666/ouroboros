@@ -436,6 +436,19 @@ class ProjectEntry(TypedDict, total=False):
     threads: List[ThreadEntry]
 
 
+class ProjectInitGitResponse(TypedDict, total=False):
+    """``POST /api/projects/{project_id}/init-git`` — the owner's YES to the typed
+    ``git_init_required`` offer, and the ONLY caller of the attach snapshot besides
+    the create dialog's ``init_git``. ``init_git_skipped`` names credential-shaped
+    files deliberately left OUT of the snapshot and still untracked (disclosed
+    omission, P1); it is absent when nothing was skipped.
+    """
+
+    project: ProjectEntry
+    working_dir: str
+    init_git_skipped: List[str]
+
+
 class ThreadCreateRequest(TypedDict, total=False):
     """POST /api/projects/{project_id}/threads body. ``name`` is optional — an
     unnamed thread gets a neutral default, with no model call."""
@@ -1004,6 +1017,7 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/projects/from-task",
     "POST /api/projects/{project_id}/update",
     "POST /api/projects/{project_id}/delete",
+    "POST /api/projects/{project_id}/init-git",
     "POST /api/projects/{project_id}/threads",
     "POST /api/projects/{project_id}/threads/{thread_id}/update",
     "POST /api/projects/{project_id}/threads/{thread_id}/fork",
@@ -1110,6 +1124,7 @@ __all__ = [
     "UpdateStatusReadyOutbound",
     "ProjectCreateRequest",
     "ProjectEntry",
+    "ProjectInitGitResponse",
     "WorkspaceGitInitDecision",
     "ThreadCreateRequest",
     "ThreadEntry",

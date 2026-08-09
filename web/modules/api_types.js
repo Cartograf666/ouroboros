@@ -327,6 +327,18 @@
  */
 
 /**
+ * POST /api/projects/{project_id}/init-git response — the owner's YES to the
+ * git_init_required offer, and the only caller of the attach snapshot besides the
+ * create dialog's init_git. init_git_skipped names credential-shaped files
+ * deliberately left OUT of the snapshot and still untracked; it is absent when
+ * nothing was skipped.
+ * @typedef {Object} ProjectInitGitResponse
+ * @property {ProjectEntry=} project
+ * @property {string=} working_dir
+ * @property {string[]=} init_git_skipped
+ */
+
+/**
  * POST /api/projects/{project_id}/threads body. name is optional — an unnamed
  * thread gets a neutral default (no model call).
  * @typedef {Object} ThreadCreateRequest

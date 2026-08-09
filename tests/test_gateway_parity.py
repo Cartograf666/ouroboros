@@ -12,6 +12,7 @@ from ouroboros.gateway.contracts import (
     OwnerScopeReviewFloorResponse,
     PhotoOutbound,
     ProjectEntry,
+    ProjectInitGitResponse,
     SkillDeleteResponse,
     SkillLifecycleQueueResponse,
     StateResponse,
@@ -123,6 +124,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "ThreadUpdateRequest",
         "ThreadResponse",
         "WorkspaceGitInitDecision",
+        "ProjectInitGitResponse",
     ):
         assert re.search(rf"@typedef \{{Object\}} {name}\b", text), f"api_types.js missing {name}"
     api_client = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_client.js").read_text(
@@ -134,6 +136,10 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     # or the UI phase would hand-roll fetches outside the api_client seam.
     for call in ("projectThreadCreate", "projectThreadUpdate", "projectThreadFork"):
         assert call in api_client, f"api_client.js missing {call}"
+    # T2: the owner's YES to the git_init_required offer must be reachable through
+    # the one client seam, or the UI phase hand-rolls a fetch for the single route
+    # that writes into the owner's own folder.
+    assert "projectInitGit" in api_client, "api_client.js missing projectInitGit"
     # v6.80.0: the two contracts extended this release join the FIELD-level parity list. The name-level
     # loop above cannot see a new @property, so an ABI field added on the Python side would otherwise
     # never have to appear in the browser's typedef (ARCHITECTURE.md §11.3).
@@ -148,7 +154,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
                 ClaudexorStatusReads, ClaudexorStatusResponse, TaskDiffResponse,
                 UiPreferencesResponse, ProjectEntry,
                 ThreadEntry, ThreadCreateRequest, ThreadUpdateRequest, ThreadResponse,
-                WorkspaceGitInitDecision):
+                WorkspaceGitInitDecision, ProjectInitGitResponse):
         expected = set(get_type_hints(cls, include_extras=True))
         actual = _js_typedef_fields(text, cls.__name__)
         assert actual == expected, f"{cls.__name__} JSDoc fields drifted: missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
