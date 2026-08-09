@@ -253,9 +253,9 @@ export function daemonStatusLine(payload, { checking = false } = {}) {
     if (status === 'not_provisioned') {
         if (runtimeState === 'ready') {
             const version = runtime.version ? ` ${runtime.version}` : '';
-            return { tone: 'muted', text: `Claudexor${version} is ready. Connect an account to start Ouroboros’s own agent daemon.` };
+            return { tone: 'muted', explainsUnread: true, text: `Claudexor${version} is ready. Connect an account to start Ouroboros’s own agent daemon.` };
         }
-        return { tone: 'muted', text: 'No accounts connected yet. Connect installs Claudexor and starts Ouroboros’s own agent daemon automatically.' };
+        return { tone: 'muted', explainsUnread: true, text: 'No accounts connected yet. Connect installs Claudexor and starts Ouroboros’s own agent daemon automatically.' };
     }
     if (status === 'stale') {
         // NOT a warning: the daemon is LAZY by design (the status read never
@@ -271,7 +271,7 @@ export function daemonStatusLine(payload, { checking = false } = {}) {
         // surfaces through that run's own typed failure, not this panel. Hence
         // no "yet" — that word would claim it had never started.
         const version = runtime.version ? ` ${runtime.version}` : '';
-        return { tone: 'muted', text: `Claudexor${version} is installed; the agent daemon is not running. It starts automatically on the next login or delegated run.` };
+        return { tone: 'muted', explainsUnread: true, text: `Claudexor${version} is installed; the agent daemon is not running. It starts automatically on the next login or delegated run.` };
     }
     if (status === 'foreign_daemon') {
         return { tone: 'warn', text: 'Another daemon answered on the stale port (not ours — left untouched). The next login restarts our own daemon on a fresh port.' };
@@ -441,6 +441,11 @@ function joinSubjects(names) {
 
 const TONE_RANK = { ok: 0, muted: 0, warn: 1, error: 2 };
 
+// A note whose only content is "we did not check" yields to a service line that
+// EXPLAINS why nothing was read. A warn/error note reports a real read failure
+// and keeps its place, because the service line cannot know which read died.
+const GENERIC_FACET_NOTE_YIELDS = new Set(['muted']);
+
 function faultOutranksReassurance(service, note) {
     // A MUTED note is a reassurance: "nothing below is missing or wrong". It
     // may not be the last word while the service line has a FAULT to report.
@@ -451,9 +456,19 @@ function faultOutranksReassurance(service, note) {
     // error/warn vocabulary daemonStatusLine already speaks was unreachable
     // there. A warn/error note (a refused read, a dead request) is itself a
     // report and keeps its place.
+    // Precedence is by SPECIFICITY, not by tone. A muted service line can still
+    // be the more informative sentence: on a first run "No accounts connected
+    // yet. Connect installs Claudexor…" is exactly what the owner needs, and it
+    // was unreachable while only warn/error could win — every stopped state
+    // leaves all three facets unread, so the generic note always spoke instead.
+    // The generic note explains nothing the service line does not; it is the
+    // FALLBACK for when the service line has nothing concrete to say.
     if (!note) return service;
-    if (note.tone === 'muted' && (service.tone === 'error' || service.tone === 'warn')) {
-        return service;
+    const serviceSpeaksFirst = Boolean(service) && (
+        service.tone === 'error' || service.tone === 'warn' || service.explainsUnread === true
+    );
+    if (GENERIC_FACET_NOTE_YIELDS.has(note.tone) && serviceSpeaksFirst) {
+        return { tone: service.tone, text: service.text };
     }
     return { tone: note.tone, text: note.text };
 }

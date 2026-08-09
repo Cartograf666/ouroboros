@@ -253,12 +253,25 @@ test('the banner is the only place a service problem is explained', () => {
     // Owner report (2026-08-08): a stopped daemon decorated every saved row
     // with "(not in discovery)" and explained nothing. One sentence, at the
     // top, that names the whole tab.
+    // A service line that EXPLAINS why nothing was read speaks first: the idle
+    // daemon's own sentence carries what happens next ("starts automatically on
+    // the next login"), which the generic note does not. The generic note is the
+    // fallback for when the service line has nothing concrete to say.
     const line = serviceBannerLine(fakeStore(ALL('not_read'), {
         snapshot: { daemon: { state: 'stale', runtime: { state: 'ready' } } },
     }));
-    assert.match(line.text, /agents, accounts and limits/);
-    assert.match(line.text, /agent daemon was not asked/);
+    assert.match(line.text, /agent daemon is not running/);
+    assert.match(line.text, /starts automatically/);
     assert.equal(line.tone, 'muted');
+    // And when the service line explains NOTHING about the gap — a daemon that
+    // is up and healthy while the reads are unstamped — the generic note is what
+    // shows, because "Claudexor ready" printed over unread facts is the
+    // reassuring lie this whole precedence rule exists to prevent.
+    const healthy = serviceBannerLine(fakeStore(ALL('not_read'), {
+        snapshot: { daemon: { state: 'running', engine_version: '3.3.13' } },
+    }));
+    assert.match(healthy.text, /agents, accounts and limits/);
+    assert.doesNotMatch(healthy.text, /Claudexor ready/);
     // Healthy: the ordinary lifecycle sentence, unchanged.
     assert.match(serviceBannerLine(fakeStore(ALL('ok'))).text, /Claudexor ready/);
 });
@@ -289,11 +302,18 @@ test('a BROKEN service is never reported as "nothing below is missing or wrong"'
     assert.equal(unknown.tone, 'error');
     assert.match(unknown.text, /connection refused/);
 
-    // The IDLE daemon is not a fault: its own muted line has nothing to add
-    // over the reassurance, so the not-read note keeps its place.
+    // The IDLE daemon is not a fault — it keeps the calm muted tone — but its
+    // own line is the MORE informative one, so it speaks instead of the generic
+    // note. This is what makes the first-run sentence ("No accounts connected
+    // yet. Connect installs Claudexor…") reachable at all: every stopped state
+    // leaves all three facets unread, so while only warn/error could win, the
+    // sentence written for a fresh install could never be printed.
     const idle = broken({ state: 'stale', runtime: { state: 'ready', version: '3.3.13' } });
     assert.equal(idle.tone, 'muted');
-    assert.match(idle.text, /Nothing below is missing or wrong/);
+    assert.match(idle.text, /agent daemon is not running/);
+    const firstRun = broken({ state: 'not_provisioned', runtime: {} });
+    assert.equal(firstRun.tone, 'muted');
+    assert.match(firstRun.text, /No accounts connected yet/);
 
     // A read that FAILED is itself a report, not a reassurance: it survives a
     // broken runtime rather than being replaced by it.
