@@ -1201,18 +1201,46 @@ def test_scope_session_delivery_never_builds_the_pack(tmp_path, fake_route, monk
     # ever starts consuming it, this fails and the compatibility becomes real
     # work rather than machinery guarding nothing.
     import pathlib as _pathlib
+    import re as _re
 
-    src_roots = [_pathlib.Path(__file__).resolve().parents[1] / "ouroboros",
-                 _pathlib.Path(__file__).resolve().parents[1] / "web" / "modules"]
-    readers = [
-        f"{path}:{n}"
-        for root in src_roots
-        for path in root.rglob("*")
-        if path.suffix in (".py", ".js") and path.is_file()
-        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
-        if ('["delivery"]' in line or "'delivery']" in line
-            or '.get("delivery"' in line or ".get('delivery'" in line)
-    ]
+    repo = _pathlib.Path(__file__).resolve().parents[1]
+    # The WHOLE web source tree, not just `web/modules` — `web/app.js` alone is
+    # ~870 lines of real source and sat outside the first version of this sweep,
+    # which both gate reviewers caught by injecting a reader there.
+    src_roots = [repo / "ouroboros", repo / "web"]
+    skip_dirs = {"tests", "node_modules", "vendor", "dist"}
+
+    # Bracket and `.get` for both languages, plus the two idiomatic JS forms the
+    # first version missed: dot access and destructuring. `\b` after `delivery`
+    # is what keeps `ctx.delivery_candidate` and `payload["output_delivery"]`
+    # from registering as reads of THIS key.
+    reader_re = _re.compile(
+        r"""\[\s*["']delivery["']\s*\]"""
+        r"""|\.get\(\s*["']delivery["']"""
+        r"""|\.delivery\b"""
+        r"""|\{\s*delivery\s*[,}]"""
+    )
+
+    swept: list = []
+    readers: list = []
+    for root in src_roots:
+        assert root.is_dir(), f"the sweep is rooted at a path that does not exist: {root}"
+        contributed = 0
+        for path in root.rglob("*"):
+            if path.suffix not in (".py", ".js") or not path.is_file():
+                continue
+            if skip_dirs & set(path.relative_to(root).parts):
+                continue
+            contributed += 1
+            swept.append(path)
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if reader_re.search(line):
+                    readers.append(f"{path.relative_to(repo)}:{n}: {line.strip()[:90]}")
+        # Without this a renamed or moved root makes the whole guard pass
+        # vacuously — the exact way the first version could have gone quiet.
+        assert contributed > 0, f"the sweep matched no source files under {root}"
+
+    assert len(swept) > 200, f"the sweep is suspiciously small: {len(swept)} files"
     assert readers == [], (
         "something now reads the coverage manifest's `delivery` key, so D-12's "
         "backward compatibility stops being hypothetical:\n" + "\n".join(readers))
