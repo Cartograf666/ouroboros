@@ -228,6 +228,14 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
     The base is the FALLBACK, and deliberately the conservative direction: when
     the project's HEAD cannot be read, counting from the branch point can only
     over-report, which refuses a removal rather than permitting one.
+
+    Counted from BOTH tips — the checkout's HEAD and the thread's own branch —
+    because those come apart. A checkout standing on a detached HEAD, or moved
+    onto some other branch, has a ``thread/<name>`` branch that still holds every
+    commit made in it; asking only where HEAD points reported ZERO and the owner
+    was told the removal "deletes only the folder". Nothing was actually lost —
+    ``git branch -d`` refuses an unmerged branch, so the commits survived — but
+    A10's evidence has to be true when it is READ, not merely harmless.
     """
     out: Dict[str, Any] = {
         "exists": False, "dirty": False, "dirty_files": [], "unmerged_commits": 0,
@@ -250,7 +258,15 @@ def inspect_thread_worktree(row: Dict[str, Any]) -> Dict[str, Any]:
         reference = _project_head(row) or str(row.get("base_sha") or "")
         if reference:
             out["unmerged_against"] = reference
-            ahead = run_git(wt_path, "rev-list", "--count", f"{reference}..HEAD", check=False)
+            tips = ["HEAD"]
+            branch = str(row.get("branch") or "").strip()
+            if branch and run_git(
+                wt_path, "rev-parse", "--verify", "-q", branch, check=False,
+            ).returncode == 0:
+                tips.append(branch)
+            ahead = run_git(
+                wt_path, "rev-list", "--count", *tips, "--not", reference, check=False,
+            )
             if ahead.returncode != 0:
                 out["error"] = (ahead.stderr or "git rev-list failed").strip()[:500]
                 out["dirty"] = True

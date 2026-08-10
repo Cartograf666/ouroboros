@@ -399,3 +399,49 @@ def test_a_row_pointing_outside_its_provisioning_root_is_still_refused(repo, tmp
     assert outcome["removed"] is False
     assert outcome["reason"] == "path_outside_root"
     assert Path(outsider / "precious.txt").exists()
+
+
+def test_a_DETACHED_checkout_does_not_hide_its_branchs_commits(repo, tmp_path, wt_root):
+    """A10's evidence is counted from BOTH tips, because they come apart.
+
+    A checkout standing on a detached HEAD — or moved onto another branch — still
+    has a `thread/<name>` branch holding every commit made in it. Asking only
+    where HEAD points reported ZERO, and the owner was told the removal "deletes
+    only the folder". Nothing was actually lost, because `git branch -d` refuses
+    an unmerged branch, but evidence has to be true when it is READ, not merely
+    harmless.
+    """
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    checkout = Path(handle.path)
+    _git(checkout, "config", "user.email", "t@example.com")
+    _git(checkout, "config", "user.name", "T")
+    (checkout / "the_only_copy.txt").write_text("thread work\n", encoding="utf-8")
+    _git(checkout, "add", "-A")
+    _git(checkout, "commit", "-m", "the only copy")
+    branch_tip = _git(checkout, "rev-parse", "HEAD").stdout.strip()
+    # Detach onto the project's HEAD: the tree is clean and HEAD is level with
+    # the project, while the branch is one commit ahead of it.
+    _git(checkout, "checkout", "-q", "--detach", _git(repo, "rev-parse", "HEAD").stdout.strip())
+
+    inspection = inspect_thread_worktree(get_thread_worktree(tmp_path / "data", "racer", 1))
+
+    assert inspection["dirty"] is False
+    assert inspection["unmerged_commits"] == 1, "the branch still holds that commit"
+
+    refused = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+
+    assert refused["removed"] is False
+    assert refused["reason"] == "unmerged_work"
+    assert Path(handle.path).is_dir()
+    # And an acknowledged removal keeps the branch, so the commit survives.
+    done = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True, worktree_root=wt_root,
+    )
+    assert done["removed"] is True
+    assert done["branch_removed"] is False
+    assert _git(repo, "cat-file", "-e", branch_tip).returncode == 0
