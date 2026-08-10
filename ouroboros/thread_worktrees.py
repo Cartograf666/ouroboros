@@ -682,6 +682,15 @@ def remove_project_thread_worktrees(data_dir: Any, project_id: Any) -> Dict[str,
     ``unmerged_work`` and lands in ``kept``. The consequence is disclosed rather
     than hidden — see the caller, which records the survivors on the tombstoned row
     and tells the owner where they are.
+
+    DISCLOSED residual, not a silent one: the judge still runs OUTSIDE
+    :func:`remove_thread_worktree`'s git-op lock, so work appearing between this
+    inspection and the one taken inside it would still ride the acknowledgement.
+    That window is now the same one ``api_thread_delete`` and ``api_project_delete``
+    already have — an ops-lock acquisition and one ``git status`` — instead of the
+    entire fence-and-quiesce span this used to reason across, and closing it
+    completely means moving the risk judge inside the lock, which changes the
+    removal's own signature and is deliberately not done here.
     """
     removed: List[int] = []
     kept: List[Dict[str, Any]] = []
