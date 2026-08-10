@@ -457,6 +457,14 @@ def remove_thread_worktree(
     while deleting the folder under the live worker. ``busy`` overrides the live
     query for tests and for callers that already hold the answer.
 
+    That query is a bare READ, so the inspection and both deletions run inside
+    ``project_lease.reserved_folder_lane`` on the CHECKOUT — the same reservation
+    merge-back holds over the project folder. Without it the scheduler could admit
+    a task into the checkout in the gap between "nothing is running here" and the
+    ``rmtree``, which is exactly the two-writer state the lane exists to prevent.
+    The reservation reorders NOTHING: every refusal still happens before anything
+    is destroyed, so a refused removal leaves the checkout exactly as it was.
+
     Containment is checked against the root the row was PROVISIONED under
     (T0R2-9), not against whatever this process resolves today. Resolving it at
     removal time meant relocating ``OUROBOROS_THREAD_WORKTREE_ROOT`` — or simply
@@ -515,78 +523,96 @@ def remove_thread_worktree(
             match = next((row for row in _load(data_dir) if _matches(row, key)), None)
         if match is None:
             return {"removed": False, "reason": "unknown", "inspection": {}}
-        # Removal deletes a folder a task may be WRITING in. `project_is_busy`,
-        # `running_project_ids` and ARCHITECTURE all said this was guarded; only
-        # merge-back actually asked. Reproduced: a running task in the checkout,
-        # merge-back correctly refuses `project_busy`, and removal answered
-        # `removed: True` and deleted the folder under the live worker.
-        if _project_is_busy(project_id, match) if busy is None else bool(busy):
-            return {"removed": False, "reason": "project_busy", "inspection": {}}
-        inspection = inspect_thread_worktree(match)
-        unsafe = bool(inspection["dirty"]) or int(inspection["unmerged_commits"]) > 0
-        if unsafe and not acknowledge_unmerged:
-            return {"removed": False, "reason": "unmerged_work", "inspection": inspection}
-        wt_path = Path(str(match.get("path") or ""))
-        guard_root = _trusted_guard_root(match, root, data_dir)
-        if (
-            not str(wt_path).strip()
-            or not path_is_within(wt_path, guard_root)
-            or wt_path.name != safe_path_component(f"{key[0]}__{key[1]}")
-        ):
-            # A malformed registry row must never delete an arbitrary path — and
-            # that was exactly what it could do, because the boundary it was
-            # checked against came from the SAME untrusted row (T0R2-9 moved the
-            # root onto the row and the guard moved with it). Two independent
-            # facts are required now: a root this process would itself accept, and
-            # the path this thread's checkout is DERIVED to have.
-            return {"removed": False, "reason": "path_outside_root", "inspection": inspection}
-        repo = Path(str(match.get("repo_dir") or "."))
-        branch = str(match.get("branch") or "").strip()
-        _git(repo, "worktree", "remove", "--force", str(wt_path), check=False)
-        if wt_path.exists():
-            force_rmtree(wt_path)
-        _git(repo, "worktree", "prune", check=False)
-        if wt_path.exists():
-            # Both deletions above run best-effort (`check=False` / a swallowing
-            # rmtree), so a checkout held by a git lock, a read-only parent or a
-            # busy file SURVIVES them. Reporting that as removed and dropping the
-            # row would leave an orphan holding the branch that the registry can no
-            # longer see, re-provision or remove. Say so and KEEP the row — and
-            # leave the branch alone, the surviving checkout is still on it.
-            log.warning(
-                "Thread worktree %s#%s could not be removed — %s still exists; "
-                "registry row retained",
-                key[0], key[1], wt_path,
+        # M5's reservation, applied to the OTHER destructive gesture. Merge-back
+        # HOLDS the folder it rewrites for the duration; this DELETES one and held
+        # nothing at all — `_project_is_busy` is a bare READ, so a task the
+        # scheduler was already considering could be admitted into the checkout in
+        # the gap between the check and the `rmtree`, and a message arriving after
+        # the check could queue work into the folder being deleted. Reserving the
+        # CHECKOUT's lane makes the scheduler refuse admission for the WHOLE
+        # window, exactly as merge-back does for the project folder, and
+        # `reserved_folder_lanes(include_own=False)` is why this holder is never
+        # refused by its own claim.
+        #
+        # Deliberately NOT a routing fence, and deliberately not reordered: the
+        # inspection and every refusal stay BEFORE anything is fenced or removed
+        # (86aaf2b1), so a REFUSED delete never destroys the checkout first. A
+        # reservation closes the check-then-act gap without touching that order.
+        from ouroboros.project_lease import reserved_folder_lane
+
+        with reserved_folder_lane(str(match.get("path") or "")):
+            # Removal deletes a folder a task may be WRITING in. `project_is_busy`,
+            # `running_project_ids` and ARCHITECTURE all said this was guarded; only
+            # merge-back actually asked. Reproduced: a running task in the checkout,
+            # merge-back correctly refuses `project_busy`, and removal answered
+            # `removed: True` and deleted the folder under the live worker.
+            if _project_is_busy(project_id, match) if busy is None else bool(busy):
+                return {"removed": False, "reason": "project_busy", "inspection": {}}
+            inspection = inspect_thread_worktree(match)
+            unsafe = bool(inspection["dirty"]) or int(inspection["unmerged_commits"]) > 0
+            if unsafe and not acknowledge_unmerged:
+                return {"removed": False, "reason": "unmerged_work", "inspection": inspection}
+            wt_path = Path(str(match.get("path") or ""))
+            guard_root = _trusted_guard_root(match, root, data_dir)
+            if (
+                not str(wt_path).strip()
+                or not path_is_within(wt_path, guard_root)
+                or wt_path.name != safe_path_component(f"{key[0]}__{key[1]}")
+            ):
+                # A malformed registry row must never delete an arbitrary path — and
+                # that was exactly what it could do, because the boundary it was
+                # checked against came from the SAME untrusted row (T0R2-9 moved the
+                # root onto the row and the guard moved with it). Two independent
+                # facts are required now: a root this process would itself accept, and
+                # the path this thread's checkout is DERIVED to have.
+                return {"removed": False, "reason": "path_outside_root", "inspection": inspection}
+            repo = Path(str(match.get("repo_dir") or "."))
+            branch = str(match.get("branch") or "").strip()
+            _git(repo, "worktree", "remove", "--force", str(wt_path), check=False)
+            if wt_path.exists():
+                force_rmtree(wt_path)
+            _git(repo, "worktree", "prune", check=False)
+            if wt_path.exists():
+                # Both deletions above run best-effort (`check=False` / a swallowing
+                # rmtree), so a checkout held by a git lock, a read-only parent or a
+                # busy file SURVIVES them. Reporting that as removed and dropping the
+                # row would leave an orphan holding the branch that the registry can no
+                # longer see, re-provision or remove. Say so and KEEP the row — and
+                # leave the branch alone, the surviving checkout is still on it.
+                log.warning(
+                    "Thread worktree %s#%s could not be removed — %s still exists; "
+                    "registry row retained",
+                    key[0], key[1], wt_path,
+                )
+                return {
+                    "removed": False,
+                    "reason": "removal_failed",
+                    "inspection": inspection,
+                    "branch": branch,
+                    "branch_removed": False,
+                    "branch_kept_reason": "the checkout survived removal, so its branch still points at it",
+                }
+            # The branch is kept for COMMITS, never merely for dirt. An acknowledged
+            # removal whose only dirt was an ignored `node_modules/` has nothing on
+            # that branch the repository would not still have, and keeping it left a
+            # `thread/<name>` behind that the next branch-off refuses on — and that
+            # nothing can reach at all once the thread it belonged to is tombstoned.
+            # `git branch -d` is still the second judge and still refuses on its own
+            # account, so this only ever ASKS; it never forces.
+            branch_removed, branch_kept_reason = _drop_clean_branch(
+                repo, branch, bool(inspection["error"]) or int(inspection["unmerged_commits"]) > 0,
             )
+            with _LOCK:
+                _save(data_dir, [row for row in _load(data_dir) if not _matches(row, key)])
+            log.info("Thread worktree removed: %s#%s (%s)", key[0], key[1], wt_path)
             return {
-                "removed": False,
-                "reason": "removal_failed",
+                "removed": True,
+                "reason": "",
                 "inspection": inspection,
                 "branch": branch,
-                "branch_removed": False,
-                "branch_kept_reason": "the checkout survived removal, so its branch still points at it",
+                "branch_removed": branch_removed,
+                "branch_kept_reason": branch_kept_reason,
             }
-        # The branch is kept for COMMITS, never merely for dirt. An acknowledged
-        # removal whose only dirt was an ignored `node_modules/` has nothing on
-        # that branch the repository would not still have, and keeping it left a
-        # `thread/<name>` behind that the next branch-off refuses on — and that
-        # nothing can reach at all once the thread it belonged to is tombstoned.
-        # `git branch -d` is still the second judge and still refuses on its own
-        # account, so this only ever ASKS; it never forces.
-        branch_removed, branch_kept_reason = _drop_clean_branch(
-            repo, branch, bool(inspection["error"]) or int(inspection["unmerged_commits"]) > 0,
-        )
-        with _LOCK:
-            _save(data_dir, [row for row in _load(data_dir) if not _matches(row, key)])
-        log.info("Thread worktree removed: %s#%s (%s)", key[0], key[1], wt_path)
-        return {
-            "removed": True,
-            "reason": "",
-            "inspection": inspection,
-            "branch": branch,
-            "branch_removed": branch_removed,
-            "branch_kept_reason": branch_kept_reason,
-        }
 
 
 def project_thread_worktrees(data_dir: Any, project_id: Any) -> List[Dict[str, Any]]:

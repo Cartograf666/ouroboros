@@ -64,11 +64,16 @@ stored on a task record, and ``projects_registry.create_project``/
 therefore arrive here already realpath'd, and the caller's project->folder map
 needs no FS access to build.
 
-``project_id == ""`` means "no lane": ordinary unscoped tasks never serialize
-against each other. Subagents carry their parent's stored ``project_id`` but
-hold no lease of their own — the parent task IS the folder's writer and its
-swarm must not deadlock against itself, so only top-level (non-subagent)
-tasks count as lane occupants.
+A task that names NEITHER a project NOR a folder has no lane: ordinary unscoped
+tasks never serialize against each other. But naming a FOLDER is enough on its
+own — a projectless task carrying a ``workspace_root`` writes in that folder, so
+it occupies that folder's lane (:func:`_is_lane_occupant`). Requiring a
+``project_id`` made ``reserved_folder_lane`` half a reservation: with the folder
+held by a merge-back or a removal, a project-scoped candidate was refused and a
+PROJECTLESS candidate naming the SAME folder was admitted into it. Subagents carry
+their parent's stored ``project_id`` and workspace root but hold no lease of their
+own — the parent task IS the folder's writer and its swarm must not deadlock
+against itself, so only top-level (non-subagent) tasks count as lane occupants.
 
 A task's lane is PINNED onto its record when it enters RUNNING
 (:func:`pin_task_lane`) and read back from there afterwards. Deriving it on
@@ -289,13 +294,33 @@ def _held_lane(
 
 
 def _is_lane_occupant(task: Any) -> bool:
-    """Top-level project-scoped tasks occupy the lane; subagents do not."""
+    """Top-level tasks that NAME A FOLDER or a project occupy a lane; subagents do not.
+
+    Occupancy used to require a ``project_id``, which contradicted the folder-keyed
+    lane this module now describes: a task carrying a ``workspace_root`` and NO
+    project id held no lane at all, so with ``reserved_folder_lane`` HELD over a
+    folder — a merge-back rewriting it, a removal deleting it — a project-scoped
+    candidate for that folder was correctly refused while a PROJECTLESS candidate
+    naming the same folder was admitted straight into it. The reservation was
+    therefore only half a reservation, and the hole was in the one place a
+    reservation exists to cover.
+
+    ``running_workspace_roots``' own docstring already named this ("a task carrying
+    a ``workspace_root`` with NO ``project_id`` holds no lane at all yet still
+    writes there"), and the promote path derives a project id specifically so the
+    folder lane would bind — belt-and-braces now rather than the only defence. The
+    DIRECT task API needs no such derivation to be safe.
+
+    Subagents stay exempt, and that check stays FIRST: a swarm carries its parent's
+    workspace root, and the parent task IS the folder's writer, so counting a
+    subagent would deadlock a task against its own children.
+    """
     task = _as_task(task)
     if not isinstance(task, dict):
         return False
     if str(task.get("delegation_role") or "") == "subagent":
         return False
-    return bool(_task_project_id(task))
+    return bool(_task_project_id(task) or _task_workspace_root(task))
 
 
 #: Folder lanes held by something that is NOT a task — today, a merge-back

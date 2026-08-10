@@ -987,3 +987,88 @@ def test_a_wedged_git_lets_the_inspection_return(tmp_path, monkeypatch):
     assert not worker.is_alive(), "inspect_thread_worktree never returned — unbounded"
     assert result["out"]["dirty"] is True
     assert "did not finish within" in result["out"]["error"]
+
+
+# --------------------------------------------------------------------------- #
+# P5(i) — the removal HOLDS the folder it is deleting
+# --------------------------------------------------------------------------- #
+
+def test_removal_reserves_the_checkout_lane_for_its_whole_window(repo, tmp_path, wt_root, monkeypatch):
+    """P5(i): `_project_is_busy` is a bare READ.
+
+    Merge-back HOLDS the folder it rewrites (`reserved_folder_lane`); removal held
+    nothing, so between "nothing is running in this checkout" and the `rmtree` the
+    scheduler could admit a task straight into the folder being deleted. The
+    reservation is observed from INSIDE the operation — at the busy check, at the
+    inspection and at the deletion — because a claim taken and dropped before the
+    destructive part would prove nothing.
+
+    Ordering is deliberately NOT changed: this is a reservation, not a routing
+    fence, so a REFUSED removal still touches nothing (86aaf2b1).
+    """
+    from ouroboros.project_lease import (
+        candidate_is_leasable,
+        normalize_workspace_root,
+        reserved_folder_lanes,
+        running_project_lanes,
+    )
+    import ouroboros.thread_worktrees as twt
+
+    handle = _provision(repo, tmp_path, wt_root)
+    lane = ("", normalize_workspace_root(handle.path))
+    seen: list[tuple[str, bool]] = []
+
+    real_inspect = twt.inspect_thread_worktree
+    real_rmtree = twt.force_rmtree
+
+    def _inspect(row):
+        seen.append(("inspect", lane in reserved_folder_lanes()))
+        return real_inspect(row)
+
+    def _rmtree(path):
+        seen.append(("rmtree", lane in reserved_folder_lanes()))
+        return real_rmtree(path)
+
+    monkeypatch.setattr(twt, "inspect_thread_worktree", _inspect)
+    monkeypatch.setattr(twt, "force_rmtree", _rmtree)
+    # `busy` is answered by the module's own judge so the reservation is exercised
+    # exactly where the check-then-act gap used to be.
+    monkeypatch.setattr(
+        twt, "_project_is_busy",
+        lambda pid, row: seen.append(("busy", lane in reserved_folder_lanes())) or False,
+    )
+
+    outcome = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1,
+        acknowledge_unmerged=True, worktree_root=wt_root,
+    )
+    assert outcome["removed"] is True, outcome
+
+    stages = dict(seen)
+    assert "busy" in stages and "inspect" in stages, seen
+    assert all(held for _stage, held in seen), seen
+    # A task naming that checkout could not have been admitted during the window.
+    with_lane = running_project_lanes([], {}) | {lane}
+    assert candidate_is_leasable(
+        {"id": "t9", "workspace_root": handle.path}, with_lane, {},
+    ) is False
+    # And the folder is free again the moment the removal returns.
+    assert lane not in reserved_folder_lanes()
+
+
+def test_a_refused_removal_still_destroys_nothing(repo, tmp_path, wt_root):
+    """The reservation must not have reordered anything: 86aaf2b1 put the
+    inspection and every refusal BEFORE any destruction on purpose."""
+    from pathlib import Path
+
+    handle = _provision(repo, tmp_path, wt_root)
+    checkout = Path(handle.path)
+    (checkout / "unsaved.txt").write_text("only copy\n", encoding="utf-8")
+
+    refused = remove_thread_worktree(
+        data_dir=tmp_path / "data", project_id="racer", thread_id=1, worktree_root=wt_root,
+    )
+    assert refused["removed"] is False
+    assert refused["reason"] == "unmerged_work"
+    assert (checkout / "unsaved.txt").read_text(encoding="utf-8") == "only copy\n"
+    assert get_thread_worktree(tmp_path / "data", "racer", 1) is not None

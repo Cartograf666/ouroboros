@@ -422,17 +422,30 @@ def test_a_running_lane_is_pinned_and_cannot_drift():
 def test_post_hoc_conversion_pins_the_lane_it_acquires():
     """A RUNNING task that was never a lane occupant ACQUIRES one when the owner
     converts it into a project. That is a deliberate take, not drift, so it pins
-    on the spot — otherwise a later registry edit could move a live writer."""
+    on the spot — otherwise a later registry edit could move a live writer.
+
+    Since P5(ii) the task that acquires a lane here is the PLACELESS one. A task
+    that already NAMES a folder is a lane occupant before any conversion, because
+    naming a folder is what writing in it means.
+    """
     from ouroboros.project_lease import LANE_PIN_FIELD, mark_task_project
 
-    unscoped = {"id": "t1", "workspace_root": "/w/alpha"}
-    running = {"t1": {"task": unscoped}}
-    assert running_project_lanes(running.values()) == set()
+    placeless = {"id": "t1"}
+    running = {"t1": {"task": placeless}}
+    folders = {"alpha": "/w/alpha"}
+    assert running_project_lanes(running.values(), folders) == set()
 
-    assert mark_task_project(running, [], "t1", "alpha") is True
+    assert mark_task_project(running, [], "t1", "alpha", folders) is True
 
-    assert unscoped[LANE_PIN_FIELD] == ["", os.path.normcase("/w/alpha")]
-    assert running_project_lanes(running.values()) == {("", os.path.normcase("/w/alpha"))}
+    assert placeless[LANE_PIN_FIELD] == ["", os.path.normcase("/w/alpha")]
+    assert running_project_lanes(running.values(), folders) == {
+        ("", os.path.normcase("/w/alpha"))
+    }
+
+    # The folder-naming task holds that folder's lane with no project at all, so
+    # the conversion widens what serializes WITH it rather than granting the lane.
+    named = {"id": "t2", "workspace_root": "/w/beta"}
+    assert running_project_lanes([{"task": named}]) == {("", os.path.normcase("/w/beta"))}
 
 
 def test_project_chat_id_policy():
@@ -540,3 +553,55 @@ def test_a_candidate_is_compared_by_what_it_DESCRIBES_never_by_a_stale_pin():
     assert candidate_is_leasable(retried, busy_beta) is False
     stale_alpha = running_project_lanes([_meta(_task("alpha", tid="t9", workspace_root="/w/alpha"))])
     assert candidate_is_leasable(retried, stale_alpha) is True
+
+
+def test_a_projectless_task_naming_a_reserved_folder_is_not_leasable():
+    """P5(ii): the reservation was only half a reservation.
+
+    With `reserved_folder_lane(folder)` HELD — a merge-back rewriting it, a
+    checkout removal deleting it — a project-scoped candidate for that folder was
+    correctly refused while a PROJECTLESS candidate naming the SAME folder was
+    admitted straight into it, because `_is_lane_occupant` short-circuited on
+    `bool(project_id)`. Reproduced 3/3 against the merged tree.
+    """
+    from ouroboros.project_lease import normalize_workspace_root, reserved_folder_lane
+
+    folder = "/tmp/owner_folder"
+    with reserved_folder_lane(folder) as key:
+        lanes = running_project_lanes([], {})
+        assert key == ("", normalize_workspace_root(folder))
+        assert key in lanes
+
+        scoped = {"id": "t1", "project_id": "alpha", "workspace_root": folder}
+        projectless = {"id": "t2", "workspace_root": folder}
+        subagent = {
+            "id": "t3", "project_id": "alpha", "workspace_root": folder,
+            "delegation_role": "subagent",
+        }
+        elsewhere = {"id": "t4", "workspace_root": "/tmp/other_folder"}
+        placeless = {"id": "t5"}
+
+        assert candidate_is_leasable(scoped, lanes, {}) is False
+        assert candidate_is_leasable(projectless, lanes, {}) is False
+        # A swarm member must still be admitted: the parent task IS the writer and
+        # a task cannot be made to wait for its own children.
+        assert candidate_is_leasable(subagent, lanes, {}) is True
+        # Nothing that is not in THAT folder becomes slower.
+        assert candidate_is_leasable(elsewhere, lanes, {}) is True
+        assert candidate_is_leasable(placeless, lanes, {}) is True
+    # The reservation is released, so nothing is refused for good.
+    assert running_project_lanes([], {}) == set()
+    assert candidate_is_leasable({"id": "t2", "workspace_root": "/tmp/owner_folder"}, set(), {}) is True
+
+
+def test_two_projectless_writers_in_one_folder_serialize():
+    """The same fact from the RUNNING side: a projectless task carrying a
+    workspace_root holds that folder's lane, so a second writer for the folder
+    queues instead of entering it. Two folders stay parallel."""
+    first = {"id": "t1", "workspace_root": "/w/shared"}
+    lanes = running_project_lanes([{"task": first}], {})
+    assert lanes == {("", os.path.normcase("/w/shared"))}
+    assert candidate_is_leasable({"id": "t2", "workspace_root": "/w/shared"}, lanes, {}) is False
+    assert candidate_is_leasable({"id": "t3", "workspace_root": "/w/other"}, lanes, {}) is True
+    # An unscoped, placeless task is untouched: it names nothing, so it has no lane.
+    assert candidate_is_leasable({"id": "t4"}, lanes, {}) is True
