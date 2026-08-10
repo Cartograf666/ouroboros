@@ -1247,3 +1247,172 @@ def test_the_direct_task_api_offers_git_for_an_untracked_project_folder(
     assert resp.json()["error_code"] == "git_init_required"
     assert enqueued == []
     assert not (plain / ".git").exists()
+
+
+# --------------------------------------------------------------------------- #
+# P7 — the vanished-folder REPLACEMENT is a compare-and-swap
+# --------------------------------------------------------------------------- #
+
+def test_two_concurrent_replacements_leave_no_orphan_and_no_lie(tmp_path, monkeypatch):
+    """P7: `ensure_project_workspace`'s replacement branch was an unconditional
+    `update_project` — no `_file_write_lock`, no comparison against the observed
+    stale value.
+
+    Reproduced: two callers both observe the same vanished `working_dir`, both
+    provision (`genesis_1`, `genesis_2`), both write. The registry ends on one and
+    the OTHER is orphaned under the never-pruned durable projects root, while BOTH
+    callers are handed their own path back — so one reports a binding that does not
+    exist. Exactly the race `set_working_dir_if_absent` was written to close, on the
+    one branch that opted out of it.
+    """
+    import threading
+
+    from ouroboros import projects_registry
+    from ouroboros.projects_registry import (
+        create_project,
+        ensure_project_workspace,
+        get_project,
+        update_project,
+    )
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    vanished = tmp_path / "gone"
+    create_project(data, "alpha", name="Alpha", origin="owner_ui")
+    update_project(data, "alpha", working_dir=str(vanished), provenance="attached")
+    assert not vanished.exists()
+
+    made: list = []
+    gate = threading.Barrier(2)
+    counter = {"n": 0}
+    lock = threading.Lock()
+
+    class Handle:
+        def __init__(self, path):
+            self.path = path
+
+    def fake_provision(*, repo_dir, task_id, data_dir, dir_name=""):
+        with lock:
+            counter["n"] += 1
+            path = tmp_path / f"genesis_{counter['n']}"
+        path.mkdir()
+        made.append(str(path))
+        gate.wait(timeout=10)  # force the interleave
+        return Handle(path)
+
+    import ouroboros.subagent_worktrees as sw
+
+    monkeypatch.setattr(sw, "provision_genesis_project", fake_provision)
+    warnings: list = []
+    monkeypatch.setattr(
+        projects_registry.log, "warning",
+        lambda msg, *a, **k: warnings.append(msg % a if a else msg),
+    )
+
+    results: list = []
+
+    def call():
+        results.append(ensure_project_workspace(data, "alpha", repo))
+
+    first = threading.Thread(target=call)
+    second = threading.Thread(target=call)
+    first.start(); second.start(); first.join(); second.join()
+
+    final = str(get_project(data, "alpha")["working_dir"])
+    assert len(made) == 2, "both callers really did provision their own tree"
+    assert final in made
+    # NOBODY is told a path that is not the binding: the loser reports the winner's.
+    assert results == [final, final], (results, final)
+    # ...and the abandoned tree is named rather than silently orphaned.
+    assert any("abandoned" in str(text) for text in warnings), warnings
+    # Provenance is a historical fact and survives the swap.
+    assert get_project(data, "alpha")["provenance"] == "attached"
+
+
+def test_a_newer_binding_is_never_overwritten_by_a_stale_replacement(tmp_path, monkeypatch):
+    """The deterministic half: a binding written between the READ and the WRITE was
+    silently overwritten, because the write compared against nothing."""
+    from ouroboros.projects_registry import (
+        create_project,
+        ensure_project_workspace,
+        get_project,
+        update_project,
+    )
+
+    data = tmp_path / "data"
+    data.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    vanished = tmp_path / "gone"
+    create_project(data, "beta", name="Beta", origin="owner_ui")
+    update_project(data, "beta", working_dir=str(vanished), provenance="attached")
+
+    owner_folder = tmp_path / "the_owner_attached_this"
+    owner_folder.mkdir()
+
+    class Handle:
+        def __init__(self, path):
+            self.path = path
+
+    def fake_provision(*, repo_dir, task_id, data_dir, dir_name=""):
+        # While THIS caller digs, the owner attaches a real folder.
+        update_project(data, "beta", working_dir=str(owner_folder))
+        path = tmp_path / "genesis_beta"
+        path.mkdir()
+        return Handle(path)
+
+    import ouroboros.subagent_worktrees as sw
+
+    monkeypatch.setattr(sw, "provision_genesis_project", fake_provision)
+
+    returned = ensure_project_workspace(data, "beta", repo)
+
+    assert str(get_project(data, "beta")["working_dir"]) == str(owner_folder)
+    assert returned == str(owner_folder), "the caller must be told the winner's path"
+
+
+def test_replace_working_dir_if_unchanged_is_a_real_compare_and_swap(tmp_path):
+    """The primitive on its own, beside `set_working_dir_if_absent`."""
+    from ouroboros.projects_registry import (
+        begin_project_deletion,
+        create_project,
+        get_project,
+        replace_working_dir_if_unchanged,
+        update_project,
+    )
+
+    data = tmp_path / "data"
+    data.mkdir()
+    create_project(data, "gamma", name="Gamma", origin="owner_ui")
+    update_project(data, "gamma", working_dir="/w/old")
+
+    # A stale expectation changes nothing and reports the truth.
+    assert replace_working_dir_if_unchanged(data, "gamma", "/w/never", "/w/new") == (
+        "/w/old", False,
+    )
+    assert get_project(data, "gamma")["working_dir"] == "/w/old"
+
+    # The matching expectation swaps, once.
+    assert replace_working_dir_if_unchanged(
+        data, "gamma", "/w/old", "/w/new", provenance="genesis",
+    ) == ("/w/new", True)
+    assert get_project(data, "gamma")["working_dir"] == "/w/new"
+    assert get_project(data, "gamma")["provenance"] == "genesis"
+    # ...and a second attempt with the same now-stale expectation does not.
+    assert replace_working_dir_if_unchanged(data, "gamma", "/w/old", "/w/other") == (
+        "/w/new", False,
+    )
+
+    # Provenance is a historical fact: an existing one is never rewritten.
+    assert replace_working_dir_if_unchanged(
+        data, "gamma", "/w/new", "/w/third", provenance="attached",
+    ) == ("/w/third", True)
+    assert get_project(data, "gamma")["provenance"] == "genesis"
+
+    # An inactive project answers ("", False), exactly as the sibling does.
+    begin_project_deletion(data, "gamma")
+    assert replace_working_dir_if_unchanged(data, "gamma", "/w/third", "/w/fourth") == (
+        "", False,
+    )

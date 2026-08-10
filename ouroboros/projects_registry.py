@@ -860,6 +860,65 @@ def set_working_dir_if_absent(
     return "", False
 
 
+def replace_working_dir_if_unchanged(
+    drive_root: Any,
+    project_id: str,
+    expected: str,
+    working_dir: str,
+    *,
+    provenance: str = "",
+) -> tuple[str, bool]:
+    """Compare-and-swap a project's working_dir — compare and write under ONE lock.
+
+    The sibling of :func:`set_working_dir_if_absent` for the case that function
+    deliberately declines: the row NAMES a folder which has since vanished, and
+    replacing it is the whole point of the call. "Only if absent" is wrong there,
+    but so was the unconditional ``update_project`` that replaced it, for the same
+    reason ``set_working_dir_if_absent`` exists at all — the read and the write were
+    separately locked with an entire genesis provisioning between them.
+
+    Reproduced: two callers both observe the same vanished ``working_dir``, both
+    provision (``genesis_1``, ``genesis_2``), both write, so the registry ends on
+    one and the OTHER is orphaned under the never-pruned durable projects root —
+    while BOTH callers are handed their own path back, so one of them reports a
+    binding that does not exist. Second reproduction: an owner attach landing
+    between the read and the write is silently overwritten.
+
+    ``expected`` is the value the caller OBSERVED. The write happens only while the
+    row still holds it; otherwise the row is left alone and the current value is
+    returned. ``(effective_working_dir, claimed)`` — ``claimed`` is True only for
+    the writer that actually swapped, so a loser reports the winner's path and logs
+    its orphan instead of assuming its own value landed. An unknown or inactive
+    project answers ``("", False)``, exactly as the sibling does.
+
+    ``provenance`` follows the same historical-fact rule, and is judged from the row
+    UNDER THE LOCK rather than from the caller's stale read: how a folder came to be
+    is only written when the row carries nothing.
+    """
+    pid = sanitize_project_id(project_id)
+    folder = str(working_dir or "").strip()
+    want = str(expected or "").strip()
+    if not pid or not folder:
+        return "", False
+    with _file_write_lock(_registry_path(drive_root)):
+        data = _load(drive_root)
+        for entry in data["projects"]:
+            if entry.get("id") != pid or entry.get("lifecycle") != PROJECT_ACTIVE:
+                continue
+            existing = str(entry.get("working_dir") or "").strip()
+            if existing != want:
+                # Somebody else moved it: an owner attach, or another provisioner
+                # that won. Either way this caller's observation is stale and its
+                # write would destroy a NEWER binding.
+                return existing, False
+            entry["working_dir"] = folder
+            if provenance and str(entry.get("provenance") or "").strip() in ("", "none"):
+                entry["provenance"] = provenance
+            _save(drive_root, data)
+            return folder, True
+    return "", False
+
+
 def begin_project_deletion(drive_root: Any, project_id: str) -> Optional[Dict[str, Any]]:
     """Close admission/routing before the supervisor cancels the live subtree."""
     pid = sanitize_project_id(project_id)
@@ -1195,14 +1254,21 @@ def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any) ->
     under the durable projects root, which is never GC-pruned, so an unreported loss
     would be an orphan forever.
 
-    A REPLACEMENT is a different write and must stay one. This function also runs
-    when the row already names a folder that has since VANISHED, and there the
-    "only if absent" rule is exactly wrong: it declines, the caller reports a
-    concurrent bind that never happened, and the path handed back is the
+    A REPLACEMENT is a different write, but it is not an UNCONDITIONAL one. This
+    function also runs when the row already names a folder that has since VANISHED,
+    and there the "only if absent" rule is exactly wrong: it declines, the caller
+    reports a concurrent bind that never happened, and the path handed back is the
     non-existent one — while the tree just provisioned is orphaned under a root
-    nothing ever prunes. So the empty case claims atomically and the stale case
-    overwrites, deliberately, with ``update_project``. Provenance still follows the
-    historical-fact rule: it is stamped only when the row carries nothing.
+    nothing ever prunes. So the empty case claims atomically through
+    ``set_working_dir_if_absent`` and the stale case COMPARE-AND-SWAPS through
+    ``replace_working_dir_if_unchanged``, writing only while the row still holds the
+    path that was observed vanished. A plain ``update_project`` there had the same
+    read-then-write gap the atomic bind exists to close: two callers both observed
+    the same stale path, both provisioned, both wrote, one durable tree was orphaned
+    for good and both callers were told their own path had been bound — and an owner
+    attach landing in that window was silently overwritten. Provenance still follows
+    the historical-fact rule and is now judged under the lock: it is stamped only
+    when the row carries nothing.
     """
     entry = get_project(drive_root, project_id)
     if entry is None:
@@ -1223,12 +1289,25 @@ def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any) ->
         )
         if existing:
             # The row names a folder; it is simply GONE. Replacing it is the whole
-            # point of this call, so the write is unconditional.
-            fields: Dict[str, Any] = {"working_dir": str(handle.path)}
-            if str(entry.get("provenance") or "").strip() in ("", "none"):
-                fields["provenance"] = "genesis"
-            if update_project(drive_root, entry["id"], **fields) is not None:
+            # point of this call — but as a COMPARE-AND-SWAP against the value that
+            # was observed vanished, not as an unconditional write. Two callers both
+            # observing the same stale path both provisioned and both wrote, so one
+            # durable tree was orphaned under the never-pruned projects root while
+            # BOTH were told their own path had been bound; and an owner attach
+            # landing in that window was silently overwritten.
+            bound, claimed = replace_working_dir_if_unchanged(
+                drive_root, entry["id"], existing, str(handle.path),
+                provenance="genesis",
+            )
+            if claimed:
                 return str(handle.path)
+            if bound:
+                log.warning(
+                    "Project %s was re-bound concurrently (%s); the genesis tree "
+                    "provisioned here is abandoned and NOT auto-removed: %s",
+                    entry["id"], bound, handle.path,
+                )
+                return bound
             log.warning(
                 "Project %s is no longer active; genesis tree %s was not bound",
                 entry["id"], handle.path,
@@ -1447,6 +1526,7 @@ __all__ = [
     "project_task_bindings",
     "project_working_dirs",
     "registered_project_chat_ids",
+    "replace_working_dir_if_unchanged",
     "reserved_project_chat_ids",
     "projects_summary",
     "reconcile_projects",
