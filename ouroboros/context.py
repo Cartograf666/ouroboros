@@ -846,6 +846,80 @@ def _entry_chat_id(entry: Any) -> int:
 _PROJECT_THREAD_SCAN = 4000
 
 
+def _shared_past_beyond_scan(lens: Any, scanned: List[Dict[str, Any]]) -> str:
+    """Did a FORK's shared past fall out of the scanned tail entirely? (A3b, P8)
+
+    The focused thread view reads one bounded tail of the shared live
+    ``chat.jsonl`` (``_PROJECT_THREAD_SCAN``) and then filters it through the
+    lens, while ``gateway/history.py`` reads per-thread with archive backfill. So
+    a busy install pushes an ancestor's rows out of the tail before the lens ever
+    sees them: reproduced with a fork whose ancestor row sits at position 0 behind
+    4050 unrelated Main rows — the agent gets ONLY its own message while
+    ``lens.admits(ancestor_row)`` is ``True``.
+
+    This is the DISCLOSURE half only, by owner decision. Building per-ancestor
+    bounded reads across archives would overlap §C+'s deliberately deferred
+    archive-cap work, so the fix here is to say what is missing rather than to go
+    and get it.
+
+    TWO conditions, either of which proves the scan could not have covered an
+    ancestor's admitted window. Both are one-directional: they establish that rows
+    were not READ, never that rows existed, so the wording says the shared past is
+    not in this view rather than asserting a loss.
+
+    * The scan hit its CAP, so rows older than its oldest exist and were not looked
+      at. Every ancestor's window extends below that edge by construction, which is
+      why the tail size alone is enough. This is the case a real install reaches:
+      the fork happens, then 4000 rows accumulate after it.
+    * The oldest scanned row is NEWER than an ancestor's cutoff. Rows are appended
+      in timestamp order, so nothing of that ancestor's window is in the scan at
+      all — and if the live file was not even capped, those rows are in the rotated
+      archive this reader does not open.
+    """
+    if not bool(getattr(lens, "has_ancestors", False)) or not scanned:
+        return ""
+    own = 0
+    try:
+        own = int(getattr(lens, "chat_id", 0) or 0)
+    except (TypeError, ValueError):
+        own = 0
+    ancestors = []
+    cutoffs = getattr(lens, "cutoffs", None) or {}
+    for chat in cutoffs:
+        try:
+            other = int(chat)
+        except (TypeError, ValueError):
+            continue
+        if other != own:
+            ancestors.append(other)
+    if not ancestors:
+        return ""
+    oldest = str((scanned[0] or {}).get("ts") or "")
+    capped = len(scanned) >= _PROJECT_THREAD_SCAN
+    wholly_out = bool(oldest) and any(
+        oldest > str(cutoffs.get(chat) or "") for chat in ancestors
+        if str(cutoffs.get(chat) or "")
+    )
+    if not capped and not wholly_out:
+        return ""
+    named = ", ".join(str(chat) for chat in sorted(ancestors))
+    why = (
+        f"the {len(scanned)}-row window scanned here is full, so older rows exist "
+        "that it never looked at"
+        if capped else
+        f"this window begins at {oldest}, after the point the fork was taken"
+    )
+    return (
+        f"This thread is a FORK of chat {named}, and the shared past it inherits may "
+        f"not be complete below: {why}. This view filters ONE bounded tail of the "
+        "live journal, which is shared by every chat and rotates into on-disk "
+        "archives it does not read, so the owner's own history view can reach "
+        "further back than this one. Treat the conversation here as possibly "
+        "incomplete, do not reconstruct the missing part by guessing, and ask the "
+        "owner if the task depends on it."
+    )
+
+
 def build_recent_sections(
     memory: Memory, env: Any, task_id: str = "", thread_chat_id: int = 0
 ) -> List[str]:
@@ -924,6 +998,9 @@ def build_recent_sections(
                 e for e in recent
                 if admits_row(_lens, e, bound_chat_for_row(e, _bound))
             ][-_chat_tail:]
+            _shared_past_note = _shared_past_beyond_scan(_lens, recent)
+            if _shared_past_note:
+                _thread_omissions.append(_shared_past_note)
         else:
             # Lens unavailable (unreadable registry): degrade to this thread's
             # OWN rows plus its own directly-bound tasks — narrower, never wider.

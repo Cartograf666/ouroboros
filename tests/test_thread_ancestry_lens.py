@@ -640,7 +640,7 @@ def test_the_agent_context_discloses_an_unavailable_lens(tmp_path, monkeypatch):
     logs.mkdir(parents=True, exist_ok=True)
     (logs / "chat.jsonl").write_text(
         json.dumps({"chat_id": fork_chat, "ts": "2026-01-02T00:00:00Z",
-                    "role": "user", "content": "own turn"}) + "\n",
+                    "direction": "in", "text": "own turn"}) + "\n",
         encoding="utf-8",
     )
 
@@ -660,3 +660,165 @@ def test_the_agent_context_discloses_an_unavailable_lens(tmp_path, monkeypatch):
         (i for i, s in enumerate(sections) if s.startswith("## Recent chat")), len(sections)
     )
     assert sections.index(gaps[0]) < chat_index
+
+
+# --------------------------------------------------------------------------- #
+# P8 — the agent's scan horizon is DISCLOSED (the fetch half is out of scope)
+# --------------------------------------------------------------------------- #
+
+def test_a_forks_shared_past_beyond_the_scan_is_disclosed_to_the_agent(tmp_path):
+    """P8: the agent and the owner see different fork histories.
+
+    `context.py` filters ONE bounded tail of the shared live `chat.jsonl`
+    (`_PROJECT_THREAD_SCAN`) and `Memory._read_jsonl_entries` opens only the live
+    file, while `gateway/history.py` reads per-thread WITH archive backfill.
+    Reproduced: fork + parent, the ancestor row at position 0, then 4050 unrelated
+    Main rows, then the fork's own turn — the agent gets only its own message while
+    `lens.admits(ancestor_row)` is True. ARCHITECTURE claimed the two surfaces can
+    never differ and named exactly one exception.
+
+    Owner scope decision: do the DISCLOSURE half only. Per-ancestor bounded reads
+    across archives overlap §C+'s deferred archive-cap work.
+    """
+    from ouroboros import context as ctx
+    from ouroboros.memory import Memory
+    from ouroboros.thread_history import admits_row, bound_chat_for_row
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    create_project(tmp_path, "alpha", name="Alpha", working_dir=str(folder))
+    parent = create_thread(tmp_path, "alpha", name="Parent")
+    forked = fork_thread(tmp_path, "alpha", parent["id"])
+    parent_chat = int(parent["chat_id"])
+    fork_chat = int(forked["chat_id"])
+
+    lens = thread_ancestry_lens(tmp_path, fork_chat, with_source_refs=True)
+    assert parent_chat in lens.chat_ids
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"chat_id": parent_chat, "ts": "2026-01-01T00:00:00Z",
+         "direction": "in", "text": "THE ANCESTOR ROW"},
+    ]
+    rows += [
+        {"chat_id": 1, "ts": f"2026-02-01T00:00:{i:02d}Z", "direction": "in",
+         "text": f"unrelated {i}"}
+        for i in range(ctx._PROJECT_THREAD_SCAN + 50)
+    ]
+    rows.append({"chat_id": fork_chat, "ts": "2026-03-01T00:00:00Z",
+                 "direction": "in", "text": "the fork's own message"})
+    (logs / "chat.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8",
+    )
+
+    memory = Memory(tmp_path)
+    tail = memory.read_jsonl_tail("chat.jsonl", ctx._PROJECT_THREAD_SCAN)
+    admitted = [e for e in tail if admits_row(lens, e, bound_chat_for_row(e, {}))]
+    # The loss itself is UNCHANGED and deliberately so — only the silence is fixed.
+    assert not any(e["text"] == "THE ANCESTOR ROW" for e in admitted)
+    assert lens.admits(parent_chat, "2026-01-01T00:00:00Z") is True
+
+    sections = ctx.build_recent_sections(memory, env=None, thread_chat_id=fork_chat)
+    gaps = [s for s in sections if s.startswith("## Conversation gaps in this view")]
+    assert gaps, sections
+    assert str(parent_chat) in gaps[0]
+    assert "FORK" in gaps[0]
+    assert "may not be complete below" in gaps[0]
+    assert "never looked at" in gaps[0]
+
+
+def test_a_fork_whose_shared_past_IS_in_the_scan_says_nothing(tmp_path):
+    """The disclosure must not become noise on every fork. When the scan reaches
+    back past the fork point there is nothing omitted, so nothing is claimed."""
+    from ouroboros import context as ctx
+    from ouroboros.memory import Memory
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    create_project(tmp_path, "alpha", name="Alpha", working_dir=str(folder))
+    parent = create_thread(tmp_path, "alpha", name="Parent")
+    forked = fork_thread(tmp_path, "alpha", parent["id"])
+    parent_chat = int(parent["chat_id"])
+    fork_chat = int(forked["chat_id"])
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "chat.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in [
+            {"chat_id": parent_chat, "ts": "2020-01-01T00:00:00Z",
+             "direction": "in", "text": "shared past, in view"},
+            {"chat_id": fork_chat, "ts": "2026-03-01T00:00:00Z",
+             "direction": "in", "text": "own turn"},
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    sections = ctx.build_recent_sections(
+        Memory(tmp_path), env=None, thread_chat_id=fork_chat,
+    )
+    assert not [s for s in sections if s.startswith("## Conversation gaps in this view")]
+    assert any("shared past, in view" in s for s in sections)
+
+
+def test_a_non_fork_thread_never_gets_the_notice(tmp_path):
+    """An ancestor-less thread has no shared past to be missing."""
+    from ouroboros import context as ctx
+    from ouroboros.memory import Memory
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    project = create_project(tmp_path, "alpha", name="Alpha", working_dir=str(folder))
+    plain = create_thread(tmp_path, "alpha", name="Plain")
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "chat.jsonl").write_text(
+        json.dumps({"chat_id": int(plain["chat_id"]), "ts": "2026-03-01T00:00:00Z",
+                    "direction": "in", "text": "hello"}) + "\n",
+        encoding="utf-8",
+    )
+    assert project["id"] == "alpha"
+
+    sections = ctx.build_recent_sections(
+        Memory(tmp_path), env=None, thread_chat_id=int(plain["chat_id"]),
+    )
+    assert not [s for s in sections if s.startswith("## Conversation gaps in this view")]
+
+
+def test_the_notice_also_fires_when_the_window_starts_after_the_fork(tmp_path):
+    """The second, narrower condition, and the one the finding named: rows are
+    appended in timestamp order, so a window that BEGINS after an ancestor's cutoff
+    contains none of that ancestor's admitted rows — and with the live file not even
+    capped, they are in the rotated archive this reader does not open."""
+    from ouroboros import context as ctx
+    from ouroboros.memory import Memory
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    create_project(tmp_path, "alpha", name="Alpha", working_dir=str(folder))
+    parent = create_thread(tmp_path, "alpha", name="Parent")
+    forked = fork_thread(tmp_path, "alpha", parent["id"])
+    fork_chat = int(forked["chat_id"])
+    parent_chat = int(parent["chat_id"])
+
+    lens = thread_ancestry_lens(tmp_path, fork_chat)
+    cutoff = lens.cutoffs[parent_chat]
+    assert cutoff, "a fork's ancestor always carries a cutoff"
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    # ONE row, so the scan is nowhere near its cap — and it is stamped after the
+    # fork instant, so nothing of the parent's window could be in view.
+    (logs / "chat.jsonl").write_text(
+        json.dumps({"chat_id": fork_chat, "ts": "2999-01-01T00:00:00Z",
+                    "direction": "in", "text": "own turn"}) + "\n",
+        encoding="utf-8",
+    )
+
+    sections = ctx.build_recent_sections(
+        Memory(tmp_path), env=None, thread_chat_id=fork_chat,
+    )
+    gaps = [s for s in sections if s.startswith("## Conversation gaps in this view")]
+    assert gaps, sections
+    assert "after the point the fork was taken" in gaps[0]
+    assert str(parent_chat) in gaps[0]
