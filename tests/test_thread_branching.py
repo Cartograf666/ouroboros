@@ -375,3 +375,38 @@ def test_project_is_busy_fails_closed(monkeypatch):
     monkeypatch.setattr(lease, "running_project_ids", _explode)
 
     assert branching.project_is_busy("racer") is True
+
+
+def test_a_thread_being_deleted_cannot_branch_off_or_merge_back(drive, folder, wt_root):
+    """A fenced thread is closed to routing and having its tasks cancelled.
+    Provisioning a checkout for it — or merging its branch — would be work on a
+    room the owner has already written off."""
+    from ouroboros.projects_registry import begin_thread_deletion
+    from ouroboros.thread_branching import REASON_THREAD_NOT_LIVE
+
+    thread = _project(drive, folder)
+    branched = _branch(drive, "racer", thread["id"], wt_root)
+    assert branched["ok"] is True
+    begin_thread_deletion(drive, "racer", thread["id"])
+
+    merged = merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+    assert merged["ok"] is False
+    assert merged["reason"] == REASON_THREAD_NOT_LIVE
+
+    other = create_thread(drive, "racer", name="Also doomed")
+    begin_thread_deletion(drive, "racer", other["id"])
+    refused = _branch(drive, "racer", other["id"], wt_root)
+    assert refused["ok"] is False
+    assert refused["reason"] == REASON_THREAD_NOT_LIVE
+
+
+def test_an_ARCHIVED_thread_can_still_branch_off(drive, folder, wt_root):
+    """Archiving hides a thread; it does not close it."""
+    from ouroboros.projects_registry import archive_thread
+
+    thread = _project(drive, folder)
+    archive_thread(drive, "racer", thread["id"])
+
+    out = _branch(drive, "racer", thread["id"], wt_root)
+
+    assert out["ok"] is True, out

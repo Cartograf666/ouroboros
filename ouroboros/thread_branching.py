@@ -61,6 +61,7 @@ REASON_LOCAL_TREE_DIRTY = "local_tree_dirty"
 REASON_MERGE_CONFLICT = "merge_conflict"
 REASON_MERGE_FAILED = "merge_failed"
 REASON_CHECKOUT_MISSING = "checkout_missing"
+REASON_THREAD_NOT_LIVE = "thread_not_live"
 
 #: Bounded like every other owner-facing git call on a request path.
 _GIT_TIMEOUT_SEC = 120
@@ -93,6 +94,26 @@ def _detail(proc: subprocess.CompletedProcess) -> str:
 
 def _refused(reason: str, message: str, **extra: Any) -> Dict[str, Any]:
     return {"ok": False, "reason": reason, "message": message, **extra}
+
+
+def _live_thread_refusal(thread: Dict[str, Any], project_id: str) -> Optional[Dict[str, Any]]:
+    """Refuse a git operation on a thread that is fenced or already gone.
+
+    A thread being deleted is closed to routing and having its tasks cancelled;
+    provisioning a checkout for it, or merging its branch, would be work on a
+    room the owner has written off. An ARCHIVED thread is fine — archiving hides
+    a thread, it does not close it.
+    """
+    from ouroboros.project_threads_registry import THREAD_ACTIVE, THREAD_ARCHIVED
+
+    lifecycle = str(thread.get("lifecycle") or THREAD_ACTIVE)
+    if lifecycle in {THREAD_ACTIVE, THREAD_ARCHIVED}:
+        return None
+    return _refused(
+        REASON_THREAD_NOT_LIVE,
+        f"This thread is {lifecycle}; it cannot branch off or merge back.",
+        project_id=str(project_id), thread_id=int(thread.get("id") or 0),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -307,6 +328,9 @@ def branch_off_thread(
             REASON_UNKNOWN_THREAD, f"unknown thread {thread_id!r} in project {pid!r}",
             project_id=pid,
         )
+    not_live = _live_thread_refusal(thread, pid)
+    if not_live is not None:
+        return not_live
     tid = int(thread["id"])
     location = thread_location(data_root, pid, tid)
     if location["where"] == "worktree":
@@ -518,6 +542,9 @@ def merge_back_thread(
             REASON_UNKNOWN_THREAD, f"unknown thread {thread_id!r} in project {pid!r}",
             project_id=pid,
         )
+    not_live = _live_thread_refusal(thread, pid)
+    if not_live is not None:
+        return not_live
     tid = int(thread["id"])
     row = get_thread_worktree(data_root, pid, tid)
     if not row:
@@ -616,6 +643,7 @@ __all__ = [
     "REASON_NO_FOLDER",
     "REASON_PROJECT_BUSY",
     "REASON_SNAPSHOT_FAILED",
+    "REASON_THREAD_NOT_LIVE",
     "REASON_UNKNOWN_BASE",
     "REASON_UNKNOWN_PROJECT",
     "REASON_UNKNOWN_THREAD",
