@@ -209,3 +209,34 @@ def test_subagent_age_sweep_cannot_see_a_thread_worktree(repo, tmp_path, wt_root
     assert Path(handle.path).is_dir()
     assert _registry_path(tmp_path / "data").name == "thread_worktrees.json"
     assert list_thread_worktrees(tmp_path / "data")
+
+
+def test_force_rmtree_repairs_a_directory_instead_of_bricking_it(tmp_path):
+    """The shared teardown hook must not turn a recoverable failure permanent.
+
+    ``os.chmod(p, stat.S_IWRITE)`` REPLACED a directory's mode with ``0o200`` —
+    write-only, no execute — so nothing inside it could be listed or unlinked
+    afterwards. The tree survived the "force" removal AND could no longer be
+    removed by anything, including the owner. The repair must be additive and
+    give a directory its ``+x`` back.
+    """
+    import os
+    import stat as stat_mod
+
+    from ouroboros.subagent_worktrees import force_rmtree
+
+    tree = tmp_path / "brick"
+    (tree / "inner").mkdir(parents=True)
+    (tree / "inner" / "file.txt").write_text("x", encoding="utf-8")
+    # The exact shape the hook exists for: a locked-down directory whose
+    # contents cannot be reached until permission is restored.
+    os.chmod(tree / "inner", 0o500)
+    os.chmod(tree, 0o500)
+    try:
+        force_rmtree(tree)
+        assert not tree.exists(), "force_rmtree left the tree behind"
+    finally:
+        if tree.exists():  # keep tmp_path teardown from failing on our own bricking
+            for path in sorted(tree.rglob("*"), reverse=True):
+                os.chmod(path, stat_mod.S_IRWXU)
+            os.chmod(tree, stat_mod.S_IRWXU)
