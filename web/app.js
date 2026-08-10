@@ -9,8 +9,10 @@ import { apiClient } from './modules/api_client.js';
 import { openNewProjectDialog, openProjectRowMenu } from './modules/project_create.js';
 import {
     MAIN_THREAD_ID,
+    applyManualOrder,
     attachProjectReorder,
     createThreadStage,
+    isMainThreadUnread,
     isThreadUnread,
     normalizeSeenRevision,
     openThreadRowMenu,
@@ -405,8 +407,10 @@ function isKeyboardEditable(node) {
 
 /* [anchor:phase-B] right-panel registrations */
 // The Changes screen fills the `page-changes` container created above; the task
-// inspector registers itself as the `inspector` right-panel kind (mutually
-// exclusive with the project panel) and opens on `ouro:inspect-task`.
+// inspector registers itself as the `inspector` right-panel kind and opens on
+// `ouro:inspect-task`. Since a thread moved to the CENTRE the panel no longer
+// competes with it, so keeping the action to main chat is a scoping decision
+// rather than a layout constraint.
 // The imports live in this region deliberately: ES module imports are hoisted, so
 // keeping them here makes the whole phase-B wiring one append-only block instead
 // of a second edit in the shared import header.
@@ -701,10 +705,16 @@ function renderProjectsNav(projects, projectChatIds) {
     state.projectChatIds = new Set(completeChatIds.map(Number).filter(Boolean));
     // Every active Project is visible, including a newly-created empty room.
     // Unread is a monotonic per-THREAD revision comparison, never a timestamp
-    // race; a project row shows the count of its unread threads (aggregate).
+    // race. TWO numbers, because the project row is two things at once: `_unread`
+    // is the GROUP aggregate that feeds the `#nav-projects-count` pill, and
+    // `_mainUnread` is thread #0's own state, which is what the row's dot shows.
     const rows = orderProjectRows(
         all.filter(p => p && p.id && ['active', 'deleting'].includes(String(p.lifecycle || 'active')))
-            .map(p => ({ ...p, _unread: unreadThreadCount(p, state.projectSeenRevision) })),
+            .map(p => ({
+                ...p,
+                _unread: unreadThreadCount(p, state.projectSeenRevision),
+                _mainUnread: isMainThreadUnread(p, state.projectSeenRevision),
+            })),
         projectOrder,
     );
     if (rows.some(p => p.id === navState.activeProjectId && p.lifecycle === 'deleting')) {
@@ -712,7 +722,7 @@ function renderProjectsNav(projects, projectChatIds) {
         showPage('chat');
     }
     const json = JSON.stringify(rows.map(p => [
-        p.id, p.name, p.chat_id, p.lifecycle, p.visible_revision, p._unread, p.delete_error,
+        p.id, p.name, p.chat_id, p.lifecycle, p.visible_revision, p._unread, p._mainUnread, p.delete_error,
         projectThreadRows(p).map(t => [t.id, t.name, t.visible_revision]),
     ]));
     if (json === knownProjectsJson) return;
@@ -757,8 +767,12 @@ async function markProjectViewed(projectId, threadId, revision) {
         let changed = false;
         for (const row of lastProjectRows) {
             if (row.id !== projectId) continue;
+            // Both derived numbers, because an ACK into ANY lane can change the
+            // pill total while an ACK into lane 0 also clears the row's dot.
             const unread = unreadThreadCount(row, state.projectSeenRevision);
+            const mainUnread = isMainThreadUnread(row, state.projectSeenRevision);
             if (row._unread !== unread) { row._unread = unread; changed = true; }
+            if (row._mainUnread !== mainUnread) { row._mainUnread = mainUnread; changed = true; }
         }
         if (changed) paintProjectsNav();
     }
@@ -767,6 +781,13 @@ async function markProjectViewed(projectId, threadId, revision) {
 
 // One writer for the owner's manual sidebar order (D3). It rides the SAME
 // /api/ui/preferences surface as widget_order — no second ordering mechanism.
+//
+// LAST WRITE WINS, deliberately: the patch replaces the WHOLE `project_order` /
+// `project_thread_order` key rather than merging per row, so two tabs dragging
+// at once leave the loser's arrangement overwritten by the winner's, and the
+// loser's sidebar catches up on its next poll. Merging would be worse, not
+// better — an order is one list, and interleaving two of them produces an
+// arrangement neither owner asked for.
 async function persistSidebarOrder(patch) {
     try {
         await fetchJson('/api/ui/preferences', {
@@ -774,8 +795,9 @@ async function persistSidebarOrder(patch) {
             body: JSON.stringify(patch),
         });
     } catch {
-        // A failed order write leaves the local order in place for this session;
-        // the next reload falls back to the default order rather than a lie.
+        // A failed write leaves the dragged order painted for THIS session only;
+        // nothing durable changed, so the next reload shows whatever order was
+        // last persisted (the default order if none ever was).
     }
 }
 
@@ -784,7 +806,7 @@ async function persistSidebarOrder(patch) {
 function onProjectsMutated(change = {}) {
     if (change.optimistic && change.projectId) {
         const row = lastProjectRows.find(p => p.id === change.projectId);
-        if (row) { row.lifecycle = 'deleting'; row._unread = 0; }
+        if (row) { row.lifecycle = 'deleting'; row._unread = 0; row._mainUnread = false; }
         if (navState.activeProjectId === change.projectId) {
             closeProjectPanel();
             showPage('chat');
@@ -830,7 +852,11 @@ function paintProjectsNav() {
         label.className = 'nav-row-label';
         label.textContent = project.name || project.id;
         btn.appendChild(label);
-        if (project._unread && !deleting) {
+        // Thread #0's dot, NOT the group's: this row opens thread #0, so an
+        // aggregate dot here would double-count a sibling (whose own row is lit
+        // one line below) and could never be cleared by clicking it. The group
+        // total is the `#nav-projects-count` pill above.
+        if (project._mainUnread && !deleting) {
             const dot = document.createElement('span');
             dot.className = 'nav-unread-dot';
             dot.title = 'New activity';
@@ -925,6 +951,13 @@ function paintProjectsNav() {
 attachProjectReorder(navProjectsList, (ids) => {
     projectOrder = ids;
     knownProjectsJson = '';
+    // The manual order is applied where the rows are BUILT (`renderProjectsNav`
+    // -> `orderProjectRows`); `paintProjectsNav` paints `lastProjectRows`
+    // verbatim. So the drop has to reorder the cache itself, or the row snaps
+    // back to where it was until the next /api/state poll repaints it (3s on a
+    // chat/thread page, 20s elsewhere). Threads need no equivalent because
+    // `renderThreadList` applies `manualOrder` at paint time.
+    lastProjectRows = applyManualOrder(lastProjectRows, projectOrder, (row) => String(row.id));
     paintProjectsNav();
     persistSidebarOrder({ project_order: projectOrder });
 });

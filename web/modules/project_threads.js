@@ -134,14 +134,36 @@ export function isThreadUnread(thread, cursor, projectId) {
 }
 
 /**
- * How many of a project's threads are unread — the project ROW's aggregate.
- * The row owns no unread number of its own; it is a grouping over its threads,
- * so a sibling thread's message can never mark the project's main thread read.
+ * How many of a project's threads are unread — the GROUP total behind the
+ * `#nav-projects-count` pill. The project row owns no unread number of its own;
+ * it is a grouping over its threads, so a sibling thread's message can never
+ * mark the project's main thread read.
+ *
+ * This is deliberately NOT what the project row's dot reads — see
+ * `isMainThreadUnread`.
  */
 export function unreadThreadCount(project, cursor) {
     if (String(project?.lifecycle || 'active') !== 'active') return 0;
     const pid = String(project?.id || '');
     return projectThreadRows(project).filter((thread) => isThreadUnread(thread, cursor, pid)).length;
+}
+
+/**
+ * Is the project's OWN chat (thread #0) unread? THIS is the project row's dot.
+ *
+ * The project row is simultaneously thread #0's row and the group's header, and
+ * a dot can only mean one of those. It means thread #0: clicking the row opens
+ * thread #0, so a dot the click cannot clear would be an indicator with no way
+ * out, and an aggregate dot would light a SECOND dot for a message whose own
+ * thread row is already lit right below it. The group's unread is not lost —
+ * it is the `#nav-projects-count` pill, which counts unread THREADS and stays
+ * visible while the list is collapsed.
+ */
+export function isMainThreadUnread(project, cursor) {
+    if (String(project?.lifecycle || 'active') !== 'active') return false;
+    const rows = projectThreadRows(project);
+    const main = rows.find((thread) => Number(thread.id) === MAIN_THREAD_ID);
+    return Boolean(main) && isThreadUnread(main, cursor, String(project?.id || ''));
 }
 
 /**

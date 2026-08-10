@@ -187,6 +187,9 @@ def test_ui_project_threads_create_rename_fork_open_in_centre(direct_server_with
     url = direct_server_with_data["url"]
     data_dir = direct_server_with_data["data_dir"]
     create_project(data_dir, "threaded", name="Threaded project")
+    # A second project exists only so the PROJECT-row drag leg below has
+    # something to drag past; nothing before that leg looks at it.
+    create_project(data_dir, "second", name="Second project")
 
     try:
         with sync_playwright() as pw:
@@ -319,6 +322,45 @@ def test_ui_project_threads_create_rename_fork_open_in_centre(direct_server_with
                     (data_dir / "state" / "ui_preferences.json").read_text(encoding="utf-8")
                 )["project_thread_order"]["threaded"]
                 assert len(stored) == len(set(stored)) == len(after), stored
+
+                # D3, PROJECT rows: the same drag one level up. Asserted
+                # IMMEDIATELY after the drop, because the bug this leg exists for
+                # was invisible to a poll-tolerant assertion: the order persisted
+                # but the sidebar kept painting the pre-drop cache, so the row
+                # snapped back and only the next /api/state repaint (up to 3s)
+                # made it look right. The thread leg above cannot catch it —
+                # `renderThreadList` applies the manual order at paint time.
+                project_order = """() =>
+                    [...document.querySelectorAll('#nav-projects-list .nav-project-item')]
+                        .map(el => el.dataset.projectId)"""
+                page.wait_for_function(
+                    f"() => ({project_order})().length === 2", timeout=30_000
+                )
+                projects_before = page.evaluate(project_order)
+                p_items = page.locator("#nav-projects-list .nav-project-item")
+                p_src = p_items.last.bounding_box()
+                p_dst = p_items.first.bounding_box()
+                page.mouse.move(p_src["x"] + 40, p_src["y"] + p_src["height"] / 2)
+                page.mouse.down()
+                page.mouse.move(p_dst["x"] + 40, p_dst["y"] + 2, steps=12)
+                page.mouse.up()
+                # No wait_for_function: the drop handler repaints synchronously,
+                # so the very next read must already show the new order.
+                projects_after = page.evaluate(project_order)
+                assert projects_after[0] == projects_before[-1], (
+                    projects_before, projects_after
+                )
+                assert sorted(projects_after) == sorted(projects_before), (
+                    projects_before, projects_after
+                )
+                # ...and a full poll cycle later (3s on a chat/thread page) the
+                # authoritative repaint AGREES rather than reshuffling.
+                page.wait_for_timeout(4_000)
+                assert page.evaluate(project_order) == projects_after
+                stored_projects = json.loads(
+                    (data_dir / "state" / "ui_preferences.json").read_text(encoding="utf-8")
+                )["project_order"]
+                assert stored_projects == projects_after, stored_projects
                 browser.close()
 
                 # --- the mobile fix -------------------------------------------
@@ -437,6 +479,13 @@ def test_ui_smoke_project_panel_lifecycle_does_not_leak(direct_server_with_data)
                     cycle_dom = page.evaluate(dom_count)
                     assert cycle_dom <= dom_baseline + dom_slack, (dom_baseline, cycle_dom)
                     assert page.evaluate(count_listeners) == listeners_baseline
+                    # The row menus this phase adds (project kebab, thread kebab)
+                    # mount on document.body, OUTSIDE every root `dom_count`
+                    # measures, so an unclosed one would be invisible to the
+                    # count above. Assert their absence directly.
+                    assert page.evaluate(
+                        "() => document.querySelectorAll('.project-row-menu').length"
+                    ) == 0
 
                 # Direct project-to-project switch (no explicit close) also
                 # destroys the previous instance: one live panel, ever.

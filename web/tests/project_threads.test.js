@@ -5,6 +5,7 @@ import {
     MAIN_THREAD_ID,
     applyManualOrder,
     extraThreadRows,
+    isMainThreadUnread,
     isThreadUnread,
     normalizeSeenRevision,
     orderProjectRows,
@@ -92,6 +93,31 @@ test('a sibling thread never marks the project main thread read', () => {
 
 test('a deleting project reports no unread threads', () => {
     assert.equal(unreadThreadCount(project({ lifecycle: 'deleting' }), {}), 0);
+    assert.equal(isMainThreadUnread(project({ lifecycle: 'deleting' }), {}), false);
+});
+
+test('the project ROW dot is thread #0 only — the aggregate is the pill', () => {
+    // One unread SIBLING. The sibling's own row is already lit, and clicking the
+    // project row opens thread #0, so an aggregate dot on the row would be a
+    // second dot for the same message that the click could never clear.
+    const siblingOnly = normalizeSeenRevision({ alpha: { 0: 3, 1: 0 } });
+    assert.equal(isMainThreadUnread(project(), siblingOnly), false);
+    assert.equal(unreadThreadCount(project(), siblingOnly), 1);   // still the pill's 1
+
+    // Thread #0 itself unread: the row lights, and clicking it clears it.
+    const mainOnly = normalizeSeenRevision({ alpha: { 0: 0, 1: 2 } });
+    assert.equal(isMainThreadUnread(project(), mainOnly), true);
+    assert.equal(unreadThreadCount(project(), mainOnly), 1);
+
+    // The project-wide aggregate `visible_revision` (9) is never the row's dot:
+    // with thread #0 acknowledged, a project whose aggregate has run far ahead
+    // because of sibling traffic still shows no dot on its own row.
+    assert.equal(isMainThreadUnread(project({ visible_revision: 99 }), siblingOnly), false);
+
+    // Without a threads projection the row IS thread #0, so it answers for it.
+    const legacy = { id: 'a', name: 'A', chat_id: 5, visible_revision: 4 };
+    assert.equal(isMainThreadUnread(legacy, {}), true);
+    assert.equal(isMainThreadUnread(legacy, normalizeSeenRevision({ a: 4 })), false);
 });
 
 test('an empty cursor means every thread with activity is unread', () => {
