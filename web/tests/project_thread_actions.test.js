@@ -395,3 +395,71 @@ test('the two delete refusals read differently: one is a question, one is a wall
     assert.match(atRisk.text, /exist nowhere else/);
     assert.match(atRisk.text, /Remove checkout/);
 });
+
+// ---------------------------------------------------------------------------
+// T4: a typed refusal has to arrive as a VALUE, or none of the above runs
+// ---------------------------------------------------------------------------
+
+test('threadOps unwraps the typed refusal `fetchJson` throws on a 409', async () => {
+    // The seam this file describes assumed the refusal envelope arrives as a
+    // return value. It does not: every thread route answers a refusal with a
+    // 400/404/409, and `api_client.fetchJson` turns EVERY non-2xx into a throw
+    // carrying the envelope on `error.body`. Unwrapped, `describeOutcome` never
+    // sees the refusal, `acknowledgeable` never renders its second call, T2's
+    // `decision` never renders its offer, and a menu can only say "something went
+    // wrong". Neither stream could see it — T3 wrote the envelopes with no menu
+    // calling them, T1's menu only called routes that answer 200.
+    const { apiClient } = await import('../modules/api_client.js');
+    const { threadOps, describeOutcome } = await import('../modules/project_thread_actions.js');
+
+    const original = apiClient.threadMergeBack;
+    apiClient.threadMergeBack = async () => {
+        const error = new Error('the checkout still holds uncommitted changes');
+        error.status = 409;
+        error.body = {
+            ok: false,
+            reason: 'checkout_dirty',
+            message: 'The checkout still holds uncommitted changes.',
+            acknowledgeable: true,
+            dirty_files: [' M build.log'],
+        };
+        throw error;
+    };
+    try {
+        const outcome = await threadOps.mergeBack('alpha', 3);
+        const described = describeOutcome(outcome);
+        assert.equal(described.reason, 'checkout_dirty');
+        assert.equal(described.acknowledgeable, true);
+        assert.deepEqual(described.evidence, [' M build.log']);
+    } finally {
+        apiClient.threadMergeBack = original;
+    }
+});
+
+test('threadOps still THROWS what is not an answer the owner can act on', async () => {
+    // A 500, an HTML error page or a dropped connection is not a refusal, and
+    // dressing one up as `{ok:false}` would tell the owner their work was
+    // declined when nothing decided anything.
+    const { apiClient } = await import('../modules/api_client.js');
+    const { threadOps } = await import('../modules/project_thread_actions.js');
+
+    const original = apiClient.threadDelete;
+    apiClient.threadDelete = async () => {
+        const error = new Error('HTTP 500');
+        error.status = 500;
+        error.body = { error: 'internal server error' };
+        throw error;
+    };
+    try {
+        await assert.rejects(() => threadOps.delete('alpha', 3), /HTTP 500/);
+    } finally {
+        apiClient.threadDelete = original;
+    }
+    const dropped = apiClient.threadArchive;
+    apiClient.threadArchive = async () => { throw new TypeError('Failed to fetch'); };
+    try {
+        await assert.rejects(() => threadOps.archive('alpha', 3), /Failed to fetch/);
+    } finally {
+        apiClient.threadArchive = dropped;
+    }
+});

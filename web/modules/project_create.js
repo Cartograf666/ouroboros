@@ -271,19 +271,31 @@ export function openRowMenu({ anchorEl, ariaLabel, itemsHtml, onSelect }) {
 // callbacks refresh the authoritative registry projection. The project row IS
 // thread #0's row (T1), so Fork here forks the project's main thread — the one
 // thing the global Main chat cannot do (A3).
-export async function openProjectRowMenu(project, { apiClient, anchorEl, onChanged }) {
+export async function openProjectRowMenu(project, {
+    apiClient, anchorEl, onChanged, extraItemsHtml = '', onExtraSelect = null,
+} = {}) {
     const maxNameLength = PROJECT_NAME_MAX;
+    // `extraItemsHtml`/`onExtraSelect` let a caller append project-level rows this
+    // module does not own — today the archived-thread list (T4), which belongs to
+    // the thread vocabulary in `project_threads.js`. Passed IN rather than
+    // imported, because that module already imports `openRowMenu` from here and an
+    // import back would close a cycle. `onExtraSelect` returning true means "this
+    // was mine"; anything else falls through to the rows below.
     openRowMenu({
         anchorEl,
         ariaLabel: `Actions for ${project.name || project.id}`,
         itemsHtml: `
         <button type="button" role="menuitem" data-prm="rename">Rename…</button>
         <button type="button" role="menuitem" data-prm="fork">Fork thread</button>
+        ${extraItemsHtml}
         <button type="button" role="menuitem" class="danger" data-prm="delete">Delete project…</button>
     `,
-        onSelect: (action) => runProjectRowAction(action, project, {
-            apiClient, anchorEl, onChanged, maxNameLength,
-        }),
+        onSelect: async (action) => {
+            if (onExtraSelect && (await onExtraSelect(action)) === true) return;
+            await runProjectRowAction(action, project, {
+                apiClient, anchorEl, onChanged, maxNameLength,
+            });
+        },
     });
 }
 

@@ -20,11 +20,15 @@ import {
     isMainThreadUnread,
     isThreadUnread,
     normalizeSeenRevision,
+    openArchivedThreadsMenu,
     openThreadRowMenu,
     orderProjectRows,
     projectThreadRows,
+    readThreadCheckout,
     rememberSeenRevision,
     renderThreadList,
+    runThreadAction,
+    threadActionItemsHtml,
     threadKey,
     unreadThreadCount,
 } from './modules/project_threads.js';
@@ -556,14 +560,14 @@ function closeRightPanel({ sync = true } = {}) {
 const threadStage = createThreadStage({
     content: document.getElementById('content'),
     onClose: () => showPage('chat'),
-    onMenu: (anchorEl) => {
+    onMenu: async (anchorEl) => {
         const project = lastProjectRows.find((row) => row.id === navState.activeProjectId);
         if (!project) return;
         const thread = projectThreadRows(project)
             .find((row) => row.id === (navState.activeThreadId ?? MAIN_THREAD_ID));
         if (!thread) return;
         if (thread.id === MAIN_THREAD_ID) {
-            openProjectRowMenu(project, { apiClient, anchorEl, onChanged: onProjectsMutated });
+            openProjectRowMenu(project, await projectRowMenuOptions(project, anchorEl));
         } else {
             openThreadRowMenu(project, thread, { apiClient, anchorEl, onChanged: onProjectsMutated });
         }
@@ -839,6 +843,49 @@ function onProjectsMutated(change = {}) {
     refreshProjectsNav();
 }
 
+// The project row IS thread #0's row, so its menu carries thread #0's own
+// branch/merge/checkout rows as well as the project-level ones. Without them A7
+// ("each thread can work in the project folder OR in its own checkout") held for
+// every thread EXCEPT the one the project opens by default — a hole no refusal
+// would ever mention, because the routes accept thread #0 perfectly well and
+// nothing was asking them. Archive/delete are NOT among them: thread #0 has no
+// lifecycle of its own and the server refuses it by name, which `threadActions`
+// already renders as a disabled row with that reason.
+//
+// Plus ONE project-level row this module does not own: archived threads. The
+// sidebar paints `/api/state`, whose projection hides them, so without a surface
+// that can ask for them `restore` was unreachable and archiving a thread was a
+// one-way trip (T3R-8/D4). Kept to a disclosure plus a list, in the existing
+// row-menu vocabulary — no new screen (P7).
+const THREAD_ZERO_MENU_ROWS = ['branch_off', 'merge_back', 'show_changes', 'remove_worktree'];
+
+async function projectRowMenuOptions(project, anchorEl) {
+    const zero = projectThreadRows(project)[0] || { id: MAIN_THREAD_ID, name: project.name };
+    const { location, inspection, locationError } = await readThreadCheckout(project.id, zero.id);
+    return {
+        apiClient,
+        anchorEl,
+        onChanged: onProjectsMutated,
+        extraItemsHtml: `${threadActionItemsHtml(zero, location, locationError, THREAD_ZERO_MENU_ROWS)}
+        <button type="button" role="menuitem" data-prm="archived_threads">Archived threads…</button>`,
+        onExtraSelect: async (action) => {
+            if (action === 'archived_threads') {
+                await openArchivedThreadsMenu(project, {
+                    apiClient, anchorEl, onChanged: onProjectsMutated,
+                });
+                return true;
+            }
+            if (!THREAD_ZERO_MENU_ROWS.includes(action)) {
+                return false;
+            }
+            await runThreadAction(action, project, zero, {
+                apiClient, onChanged: onProjectsMutated, location, inspection,
+            });
+            return true;
+        },
+    };
+}
+
 // Paint the collapsible, scrollable projects list from the cached rows.
 function paintProjectsNav() {
     const rows = lastProjectRows;
@@ -925,13 +972,9 @@ function paintProjectsNav() {
             kebab.textContent = '⋯';
             kebab.title = 'Project actions';
             kebab.setAttribute('aria-label', `Actions for ${project.name || project.id}`);
-            kebab.addEventListener('click', (event) => {
+            kebab.addEventListener('click', async (event) => {
                 event.stopPropagation();
-                openProjectRowMenu(project, {
-                    apiClient,
-                    anchorEl: kebab,
-                    onChanged: onProjectsMutated,
-                });
+                openProjectRowMenu(project, await projectRowMenuOptions(project, kebab));
             });
             trailing.append(add, kebab);
         }

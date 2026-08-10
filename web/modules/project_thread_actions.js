@@ -288,9 +288,40 @@ export function openThreadChanges({ projectId, threadId, label = '', branch = ''
     return true;
 }
 
+/**
+ * A typed refusal is DATA, not an exception.
+ *
+ * Every thread route answers a refusal with the shared envelope
+ * `{ok:false, reason, message, acknowledgeable?, decision?, inspection?}` under a
+ * 400/404/409 — and `api_client.fetchJson` turns EVERY non-2xx into a throw
+ * carrying that envelope on `error.body`. Unwrapped, the whole design above is
+ * unreachable in a browser: `describeOutcome` never sees the refusal,
+ * `acknowledgeable` never renders its second call, T2's `decision` never renders
+ * its offer, and a menu can only report that "something went wrong". Neither
+ * stream could see this — T3 wrote the envelopes with no menu calling them, and
+ * T1's menu only ever called routes that answer 200 or genuinely fail.
+ *
+ * A body that is NOT one of these envelopes (a transport failure, a 500, an HTML
+ * error page) still throws: those are not answers the owner can act on, and
+ * swallowing them into `{ok:false}` would dress an outage up as a refusal.
+ */
+async function typedAnswer(call) {
+    try {
+        return await call();
+    } catch (error) {
+        const body = error?.body;
+        const refusal = body && typeof body === 'object'
+            && (typeof body.reason === 'string' || body.ok === false);
+        if (refusal) return body;
+        throw error;
+    }
+}
+
 export const threadOps = {
-    bases: (projectId, threadId) => apiClient.threadBranchBases(projectId, threadId),
-    branchOff: (projectId, threadId, baseRef) => apiClient.threadBranchOff(projectId, threadId, baseRef),
+    bases: (projectId, threadId) => typedAnswer(() => apiClient.threadBranchBases(projectId, threadId)),
+    branchOff: (projectId, threadId, baseRef) => typedAnswer(
+        () => apiClient.threadBranchOff(projectId, threadId, baseRef),
+    ),
     /**
      * Merge a thread's branch home. `acknowledged` is the owner's answer to the
      * `checkout_dirty` refusal — the SAME shape `removeWorktree` already has, and
@@ -298,20 +329,22 @@ export const threadOps = {
      * no producer at all, which made the server's only escape from that refusal
      * unreachable: one stray `build.log` in a checkout and merge-back was over.
      */
-    mergeBack: (projectId, threadId, acknowledged = false) => (
-        apiClient.threadMergeBack(projectId, threadId, acknowledged)
+    mergeBack: (projectId, threadId, acknowledged = false) => typedAnswer(
+        () => apiClient.threadMergeBack(projectId, threadId, acknowledged),
     ),
-    inspectWorktree: (projectId, threadId) => apiClient.threadWorktree(projectId, threadId),
+    inspectWorktree: (projectId, threadId) => typedAnswer(
+        () => apiClient.threadWorktree(projectId, threadId),
+    ),
     /**
      * Remove a checkout. `acknowledged` is the owner's answer to `removalPrompt`
      * and is the ONLY way past unmerged work — deliberately a separate argument
      * so no caller can pass it by accident.
      */
-    removeWorktree: (projectId, threadId, acknowledged = false) => (
-        apiClient.threadWorktreeRemove(projectId, threadId, acknowledged)
+    removeWorktree: (projectId, threadId, acknowledged = false) => typedAnswer(
+        () => apiClient.threadWorktreeRemove(projectId, threadId, acknowledged),
     ),
-    archive: (projectId, threadId) => apiClient.threadArchive(projectId, threadId),
-    restore: (projectId, threadId) => apiClient.threadRestore(projectId, threadId),
+    archive: (projectId, threadId) => typedAnswer(() => apiClient.threadArchive(projectId, threadId)),
+    restore: (projectId, threadId) => typedAnswer(() => apiClient.threadRestore(projectId, threadId)),
     /**
      * Delete a thread, checkout and all. `acknowledged` is the owner's answer to
      * `checkout_holds_rebuildable_files` — a checkout whose only contents are
@@ -322,7 +355,7 @@ export const threadOps = {
      * tracked files, an unreadable checkout) refuses whatever this says, and the
      * route out of that one is `removeWorktree` or a merge back.
      */
-    delete: (projectId, threadId, acknowledged = false) => (
-        apiClient.threadDelete(projectId, threadId, acknowledged)
+    delete: (projectId, threadId, acknowledged = false) => typedAnswer(
+        () => apiClient.threadDelete(projectId, threadId, acknowledged),
     ),
 };

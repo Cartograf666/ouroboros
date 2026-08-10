@@ -4529,3 +4529,98 @@ def test_ui_smoke_composer_parts_chip_dom_behaviours(direct_server):
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             pytest.skip(str(exc))
         raise
+
+
+@pytest.mark.ui_browser
+def test_ui_thread_menu_offers_the_branch_rows_and_archive_round_trips(direct_server_with_data):
+    """T4: the seams T1 could not consume and T3 could not reach.
+
+    Two things this proves that no unit test can. First, the thread menu now
+    RENDERS the branch/merge/checkout rows — availability from
+    `threadActions`, an unavailable one greyed WITH its reason rather than
+    omitted. Second, and the reason it exists at all: archive → restore is a
+    ROUND TRIP. The sidebar paints `/api/state`, whose projection filters
+    archived threads, so an archived thread was on no surface the owner could
+    reach and `POST …/restore` — routed, contracted and tested on the server —
+    could not be invoked by anything. Archive was a one-way trip with a
+    documented inverse nobody could press.
+    """
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    from ouroboros.projects_registry import create_project, create_thread
+
+    url = direct_server_with_data["url"]
+    data_dir = direct_server_with_data["data_dir"]
+    create_project(data_dir, "wired", name="Wired project")
+    thread = create_thread(data_dir, "wired", name="Spike")
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                thread_row = f'.nav-thread-row[data-thread-id="{thread["id"]}"]'
+                page.wait_for_selector(thread_row, timeout=30_000)
+
+                # --- the menu rows -------------------------------------------
+                page.locator('[data-threads-for="wired"] .nav-thread-kebab').first.click()
+                menu = page.locator('.project-row-menu[role="menu"]')
+                menu.wait_for(state="visible", timeout=15_000)
+                # A thread working in the project folder CAN branch off...
+                assert menu.locator('[data-prm="branch_off"]:not([disabled])').count() == 1
+                # ...and the rows that need a checkout are greyed WITH the reason,
+                # never silently missing: a missing item teaches nothing.
+                assert menu.locator('[data-prm="merge_back"][disabled]').count() == 1
+                assert menu.locator('[data-prm="remove_worktree"][disabled]').count() == 1
+                assert "no checkout" in (
+                    menu.locator('[data-prm="remove_worktree"]').get_attribute("title") or ""
+                )
+                assert menu.locator('[data-prm="archive"]:not([disabled])').count() == 1
+                page.keyboard.press("Escape")
+
+                # --- archive hides it ----------------------------------------
+                page.locator('[data-threads-for="wired"] .nav-thread-kebab').first.click()
+                page.locator('.project-row-menu [data-prm="archive"]').click()
+                page.wait_for_function(
+                    "sel => !document.querySelector(sel)", arg=thread_row, timeout=30_000,
+                )
+
+                # --- ...and the project menu is the way back ------------------
+                page.locator(
+                    '.nav-project-item[data-project-id="wired"] .nav-project-kebab:not(.nav-thread-add)'
+                ).last.click()
+                project_menu = page.locator('.project-row-menu[role="menu"]')
+                project_menu.wait_for(state="visible", timeout=15_000)
+                # The project row IS thread #0's row, so its menu carries thread
+                # #0's own checkout rows too. Without them A7 held for every
+                # thread EXCEPT the one the project opens by default, and no
+                # refusal would ever have said so — the routes accept thread #0
+                # perfectly well; nothing was asking them.
+                assert project_menu.locator('[data-prm="branch_off"]:not([disabled])').count() == 1
+                assert project_menu.locator('[data-prm="merge_back"][disabled]').count() == 1
+                # ...but NOT a lifecycle of its own: thread #0 IS the project and
+                # the server refuses archiving or deleting it by name, so those
+                # rows are left out of THIS menu entirely — it already carries
+                # `Delete project…`, and two delete-shaped rows meaning different
+                # things is worse than one row missing an operation nobody can run.
+                assert project_menu.locator('[data-prm="archive"]').count() == 0
+                assert project_menu.locator('[data-prm="delete"]').count() == 1
+                assert "Delete project" in project_menu.locator('[data-prm="delete"]').inner_text()
+                project_menu.locator('[data-prm="archived_threads"]').click()
+                archived = page.locator('.project-row-menu[role="menu"]')
+                archived.wait_for(state="visible", timeout=15_000)
+                assert archived.locator(f'[data-prm="restore:{thread["id"]}"]').count() == 1
+                archived.locator(f'[data-prm="restore:{thread["id"]}"]').click()
+
+                # Back on the surface it was archived from, under its own name.
+                page.wait_for_selector(thread_row, timeout=30_000)
+                assert page.locator(thread_row).inner_text().startswith("Spike")
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise

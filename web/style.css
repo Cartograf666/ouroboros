@@ -7006,6 +7006,29 @@ textarea.chat-input {
     color: var(--project);
 }
 
+/* THREE thread lifecycles, painted apart (D4/X10). `deleting` is the deliberate
+   end of a deletion that would not quiesce and stays on screen so the owner can
+   retry it; `archived` reaches the sidebar only while a task is still live in it.
+   Sharing one greyed-out look told the owner the wrong thing about which of the
+   two their instruction had produced, so the state is also spelled in words. */
+.nav-thread-item.is-deleting .nav-thread-row {
+    color: var(--text-muted);
+    opacity: 0.62;
+}
+
+.nav-thread-item.is-archived .nav-thread-row {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.nav-thread-state {
+    margin-left: auto;
+    padding-left: var(--space-2);
+    color: var(--text-muted);
+    font-size: 10px;
+    white-space: nowrap;
+}
+
 /* Drag-and-drop reordering feedback (D3). The insertion point is an edge, not a
    moved element: nothing is reordered until the drop actually commits. */
 .nav-project-item.is-dragging,

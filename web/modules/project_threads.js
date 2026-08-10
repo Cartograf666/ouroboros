@@ -22,6 +22,14 @@
 import { openConfirmDialog } from './confirm_dialog.js';
 import { openRowMenu } from './project_create.js';
 import { renderMobileNavToggle } from './page_header.js';
+import {
+    describeOutcome,
+    openThreadChanges,
+    removalPrompt,
+    snapshotReceipt,
+    threadActions,
+    threadOps,
+} from './project_thread_actions.js';
 
 /** Thread #0 IS the project's original chat — mirrors `contracts/chat_id_policy.py`. */
 export const MAIN_THREAD_ID = 0;
@@ -238,6 +246,45 @@ export function reorderIds(ids, draggedId, targetId, placeAfter = false) {
 // ---------------------------------------------------------------------------
 
 /**
+ * How one thread row PAINTS, by lifecycle. Pure, so the rule is testable.
+ *
+ * THREE states reach the sidebar, not two, and they mean different things:
+ *
+ *   - `active` — an ordinary thread.
+ *   - `deleting` — the deliberate end state of a deletion that would not quiesce
+ *     (`fail_thread_deletion`). The projection keeps it on screen precisely so the
+ *     owner can retry it, and the menu offers exactly that one action. An unread
+ *     dot here would invite a click into a room that is being torn down.
+ *   - `archived` — hidden everywhere EXCEPT while a task is still live in it
+ *     (X10: hiding a room that is still emitting output leaves the owner watching
+ *     nothing while work continues).
+ *
+ * Painting all three alike told the owner nothing about which of their
+ * instructions had landed; painting `deleting` and `archived` the SAME told them
+ * the wrong one.
+ */
+export function threadRowPresentation(thread) {
+    const lifecycle = String(thread?.lifecycle || 'active');
+    const deleting = lifecycle === 'deleting';
+    const archived = lifecycle === 'archived';
+    const name = String(thread?.name || '');
+    const error = String(thread?.delete_error || '').trim();
+    let title = name;
+    if (deleting) title = `${name} — Deleting…${error ? ` ${error}` : ''}`;
+    else if (archived) title = `${name} — Archived; still shown because a task is running in it`;
+    return {
+        lifecycle,
+        modifier: `${deleting ? ' is-deleting' : ''}${archived ? ' is-archived' : ''}`,
+        state: deleting ? 'Deleting…' : (archived ? 'Archived' : ''),
+        title,
+        // A thread on its way out is not a thread to open, and the drag order of a
+        // row that is about to disappear is not an order worth persisting.
+        draggable: !deleting,
+        showsUnread: !deleting,
+    };
+}
+
+/**
  * Build the sibling container listing a project's extra threads.
  *
  * SIBLING, not a child of the project row: the pinned markup contract keeps the
@@ -275,11 +322,13 @@ export function renderThreadList(project, {
 
     for (const thread of threads) {
         const key = threadKey(pid, thread.id);
+        const paint = threadRowPresentation(thread);
         const item = document.createElement('div');
-        item.className = 'nav-thread-item';
+        item.className = `nav-thread-item${paint.modifier}`;
         item.dataset.threadKey = key;
         item.dataset.threadId = String(thread.id);
-        item.draggable = true;
+        item.dataset.threadLifecycle = paint.lifecycle;
+        item.draggable = paint.draggable;
 
         const row = document.createElement('button');
         row.type = 'button';
@@ -290,12 +339,21 @@ export function renderThreadList(project, {
         row.dataset.threadProjectId = pid;
         row.dataset.threadId = String(thread.id);
         row.dataset.threadKey = key;
-        row.title = thread.name;
+        row.title = paint.title;
         const label = document.createElement('span');
         label.className = 'nav-row-label nav-thread-label';
         label.textContent = thread.name;
         row.appendChild(label);
-        if (isThreadUnread(thread, cursor, pid)) {
+        if (paint.state) {
+            // The state, in words, on the row itself: a greyed row with no reason
+            // teaches nothing, and this one is the reason the menu offers what it
+            // offers.
+            const state = document.createElement('span');
+            state.className = 'nav-thread-state';
+            state.textContent = paint.state;
+            row.appendChild(state);
+        }
+        if (paint.showsUnread && isThreadUnread(thread, cursor, pid)) {
             const dot = document.createElement('span');
             dot.className = 'nav-unread-dot';
             dot.title = 'New activity';
@@ -395,15 +453,58 @@ export function attachProjectReorder(listEl, onCommit) {
  * Rename validates against the mirrored 80-char backend contract before the
  * request, so the owner gets the limit explained rather than a 400.
  */
-export function openThreadRowMenu(project, thread, { apiClient, anchorEl, onChanged }) {
+/**
+ * Where a thread WORKS, and what removing its checkout would destroy — one read.
+ *
+ * A thread's location is derived, never stored (A7), so a menu has to ASK before
+ * it can know whether there is a checkout to merge, show or remove. The same
+ * answer carries the inspection the removal prompt needs, so this is one request,
+ * not two. A failed read is DISCLOSED rather than guessed: reporting "works in
+ * the project folder" for a registry we could not read would offer Branch off…
+ * for a thread that already has a checkout, and provisioning refuses that by name
+ * a second later.
+ */
+export async function readThreadCheckout(projectId, threadId, { ops = threadOps } = {}) {
+    const unknown = (why) => ({
+        location: { where: 'project_folder' },
+        inspection: {},
+        locationError: String(why),
+    });
+    try {
+        const seen = await ops.inspectWorktree(projectId, threadId);
+        // A typed refusal now arrives as a VALUE (`threadOps` unwraps it), so
+        // `ok === false` has to be read here or an unknown thread would report
+        // "works in the project folder" — a location we did not learn, rendered
+        // as one we did.
+        if (seen && seen.ok === false) return unknown(seen.message || seen.reason || 'unknown');
+        return {
+            location: seen?.location || { where: 'project_folder' },
+            inspection: seen?.inspection || {},
+            locationError: '',
+        };
+    } catch (e) {
+        return unknown(e?.body?.error || e?.message || e);
+    }
+}
+
+export async function openThreadRowMenu(project, thread, { apiClient, anchorEl, onChanged }) {
+    const { location, inspection, locationError } = await readThreadCheckout(project.id, thread.id);
     openRowMenu({
         anchorEl,
         ariaLabel: `Actions for thread ${thread.name}`,
         itemsHtml: `
             <button type="button" role="menuitem" data-prm="rename">Rename…</button>
             <button type="button" role="menuitem" data-prm="fork">Fork</button>
+            ${threadActionItemsHtml(thread, location, locationError)}
         `,
         onSelect: async (action) => {
+            if (action && action !== 'rename' && action !== 'fork') {
+                await runThreadAction(action, project, thread, {
+                    apiClient, onChanged, location, inspection,
+                });
+                if (anchorEl.isConnected) anchorEl.focus();
+                return;
+            }
             if (action === 'rename') {
                 const res = await openConfirmDialog({
                     title: 'Rename thread',
@@ -456,6 +557,411 @@ export function openThreadRowMenu(project, thread, { apiClient, anchorEl, onChan
             if (anchorEl.isConnected) anchorEl.focus();
         },
     });
+}
+
+// ---------------------------------------------------------------------------
+// Branch / merge / checkout / lifecycle: the menu half of the T3 seam
+// ---------------------------------------------------------------------------
+
+/** Menu-safe text. The row-menu shell takes an HTML string, so this is required. */
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/** How many evidence lines a one-paragraph dialog shows before it says "and N more". */
+const EVIDENCE_CAP = 8;
+
+/**
+ * A sentence with its evidence attached, never flattened away.
+ *
+ * `openConfirmDialog` renders ONE escaped paragraph, so the paths ride inline.
+ * They are capped and the omission is COUNTED rather than silently dropped —
+ * "and 30 more" is information; a truncated list that looks complete is not.
+ */
+export function withEvidence(text, evidence) {
+    const list = (evidence || []).filter(Boolean).map(String);
+    if (!list.length) return String(text || '');
+    const shown = list.slice(0, EVIDENCE_CAP);
+    const more = list.length - shown.length;
+    return `${text} — ${shown.join('; ')}${more ? ` (and ${more} more)` : ''}`;
+}
+
+/**
+ * The action rows for one thread, as menu HTML.
+ *
+ * Order and availability come from `threadActions` (the T3 seam) so the rule
+ * "what may this thread do right now" has ONE definition. An unavailable row is
+ * rendered DISABLED with its reason as the tooltip rather than omitted: a missing
+ * item teaches nothing, a greyed one teaches what to do first. The `Retry delete`
+ * row is the exception that carries a `reason` while being AVAILABLE — that is
+ * `thread.delete_error`, i.e. why the row is on offer at all.
+ */
+export function threadActionItemsHtml(thread, location, locationError = '', only = null) {
+    const wanted = Array.isArray(only) ? new Set(only) : null;
+    // `only` exists for ONE caller: the project row menu, which is thread #0's row
+    // and already carries the project's own Rename…/Delete project…. Showing
+    // thread #0's disabled Archive/Delete… beside them would put two delete-shaped
+    // rows in one menu, one of which means something entirely different.
+    const rows = threadActions(thread, location).filter((row) => !wanted || wanted.has(row.id));
+    const items = rows.map((row) => {
+        // A checkout read that FAILED is not "no checkout": disable the rows that
+        // depend on the answer and say why, instead of offering an action that
+        // will refuse a second later for a reason the owner cannot connect to it.
+        const dependsOnCheckout = ['branch_off', 'merge_back', 'show_changes', 'remove_worktree']
+            .includes(row.id);
+        const blocked = Boolean(locationError) && dependsOnCheckout;
+        const available = row.available && !blocked;
+        const title = blocked
+            ? `This thread's checkout could not be read: ${locationError}`
+            : (row.disabledReason || row.reason || '');
+        return `<button type="button" role="menuitem" data-prm="${escapeHtml(row.id)}"${
+            available ? '' : ' disabled'
+        }${row.id === 'delete' ? ' class="danger"' : ''}${
+            title ? ` title="${escapeHtml(title)}"` : ''
+        }>${escapeHtml(row.label)}</button>`;
+    });
+    return items.join('\n');
+}
+
+/**
+ * Show one owner-facing outcome, with its evidence.
+ *
+ * `ask` is injected all the way down this file rather than imported at each call
+ * site. It defaults to `openConfirmDialog`, and it is what makes these decisions
+ * testable at all: the DOM dialog cannot run under `node --test`, so without the
+ * seam the only covered part of a branch/merge/delete gesture would be the part
+ * that decides nothing. It is NOT called `confirm`: that is the banned native
+ * dialog's name, and the deterministic gate over `web/modules` cannot tell a
+ * parameter from the global — nor should a reader have to.
+ */
+async function announce(ask, title, described) {
+    await ask({
+        title,
+        body: withEvidence(described.text, described.evidence),
+        alert: true,
+    });
+}
+
+/**
+ * A refusal the owner can ANSWER, answered — or `false` when they declined.
+ *
+ * Two typed follow-ups, and both were unreachable before this existed:
+ *
+ *   - `acknowledgeable` — the server saying this refusal has a second call. The
+ *     owner is shown what stays behind, by name, and the retry passes the flag.
+ *   - `decision` (`git_init_required`) — T2's OFFER. `apiClient.projectInitGit`
+ *     is the yes; a menu that never renders it leaves a folder the owner is
+ *     perfectly happy to track blocking every file operation in the project.
+ */
+async function answerRefusal(described, { title, confirmLabel, project, apiClient, ask }) {
+    const decision = described.decision;
+    if (decision && String(decision.offer || '') === 'init_git') {
+        const ok = await ask({
+            title: 'Start tracking this folder?',
+            body: `${described.text} Starting git here enables ${
+                (decision.enables || ['diff', 'rollback', 'branching']).join(', ')
+            }. Nothing is committed by Ouroboros without you.`,
+            confirmLabel: 'Start tracking',
+        });
+        if (ok !== true) return false;
+        try {
+            await apiClient.projectInitGit(project.id);
+            return true;
+        } catch (e) {
+            await ask({
+                title: 'Could not start tracking',
+                body: `Could not start tracking that folder: ${e?.body?.error || e?.message || e}`,
+                alert: true,
+            });
+            return false;
+        }
+    }
+    if (!described.acknowledgeable) return false;
+    const ok = await ask({
+        title,
+        body: withEvidence(described.text, described.evidence),
+        confirmLabel,
+        danger: true,
+    });
+    return ok === true;
+}
+
+/** One call plus its owner-answerable retry. `run(acknowledged)` does the work. */
+async function withAcknowledgement(run, { title, confirmLabel, project, apiClient, ask }) {
+    let outcome = await run(false);
+    let described = describeOutcome(outcome);
+    if (!outcome?.ok) {
+        const answered = await answerRefusal(described, {
+            title, confirmLabel, project, apiClient, ask,
+        });
+        if (!answered) return { outcome, described, retried: false };
+        outcome = await run(true);
+        described = describeOutcome(outcome);
+        return { outcome, described, retried: true };
+    }
+    return { outcome, described, retried: false };
+}
+
+/**
+ * Perform one thread action. The menu decides WHAT may be offered
+ * (`threadActions`); this decides what each answer means.
+ *
+ * Every refusal is shown with its evidence; every refusal that carries an
+ * owner-answerable flag is offered its second call in the same gesture, because a
+ * refusal a menu cannot answer is a dead end wearing a sentence.
+ */
+export async function runThreadAction(action, project, thread, {
+    apiClient, onChanged, location = null, inspection = null, ask = openConfirmDialog,
+    ops = threadOps,
+} = {}) {
+    const pid = project.id;
+    const tid = thread.id;
+    const refresh = () => onChanged?.({ authoritative: true });
+    try {
+        if (action === 'branch_off') return await branchOff(project, thread, { apiClient, refresh, ask, ops });
+        if (action === 'merge_back') return await mergeBack(project, thread, { apiClient, refresh, ask, ops });
+        if (action === 'show_changes') {
+            const shown = openThreadChanges({
+                projectId: pid, threadId: tid, label: thread.name,
+                branch: String(location?.branch || ''),
+            });
+            if (!shown) {
+                await ask({
+                    title: 'Show changes',
+                    body: 'This thread works in the project folder, so it has no checkout of its own to diff.',
+                    alert: true,
+                });
+            }
+            return shown;
+        }
+        if (action === 'remove_worktree') {
+            return await removeCheckout(project, thread, { apiClient, refresh, inspection, ask, ops });
+        }
+        if (action === 'archive' || action === 'restore') {
+            const outcome = action === 'archive' ? await ops.archive(pid, tid) : await ops.restore(pid, tid);
+            const described = describeOutcome(outcome);
+            refresh();
+            if (described.tone !== 'ok') {
+                await announce(ask, action === 'archive' ? 'Archive' : 'Restore', described);
+            } else if (outcome?.visible_until_terminal) {
+                // X10's decision, said out loud. The server answers this flag "so
+                // the surface can say which of the two just happened" and nothing
+                // said it: the owner archived a thread, watched it stay exactly
+                // where it was, and had no way to tell a deliberate rule from an
+                // instruction that did not land.
+                await ask({
+                    title: 'Archived',
+                    body: `“${thread.name}” is archived, and stays on screen until the task running in it finishes — hiding a room that is still producing output would leave you watching nothing while the work continues.`,
+                    alert: true,
+                });
+            }
+            return described;
+        }
+        if (action === 'delete') return await deleteThread(project, thread, { apiClient, refresh, ask, ops });
+    } catch (e) {
+        await ask({
+            title: 'That did not finish',
+            body: `${action.replace(/_/g, ' ')} did not finish: ${e?.body?.error || e?.message || e}`,
+            alert: true,
+        });
+        refresh();
+    }
+    return null;
+}
+
+/** BRANCH OFF (A7/A8): choose a base, then disclose exactly what the snapshot did. */
+async function branchOff(project, thread, { apiClient, refresh, ask, ops }) {
+    const listed = await ops.bases(project.id, thread.id);
+    if (listed && listed.ok === false) {
+        const described = describeOutcome(listed);
+        // A folder-less or untracked project answers HERE, before any base list
+        // exists, and `git_init_required` is answerable — so the offer is made at
+        // the moment the owner asked to branch, not two refusals later.
+        if (await answerRefusal(described, {
+            title: 'Branch off', confirmLabel: 'Continue', project, apiClient, ask,
+        })) return branchOff(project, thread, { apiClient, refresh, ask, ops });
+        await announce(ask, 'Branch off', described);
+        return described;
+    }
+    // A14, at the one moment it is both true and actionable.
+    const notice = listed?.queue_notice;
+    const bases = Array.isArray(listed?.bases) ? listed.bases : [];
+    const snapshot = listed?.snapshot;
+    const offer = [...bases, ...(snapshot ? [snapshot] : [])];
+    const labels = offer.map((base, index) => `${index + 1}. ${base.label || base.ref}`).join('  ');
+    const res = await ask({
+        title: 'Branch off',
+        body: `${notice?.queued ? `${notice.message} ` : ''}Base for ${thread.name}'s own checkout — type a number, a branch, a tag or a commit. ${labels}`,
+        input: true,
+        initialValue: String(listed?.current_branch || ''),
+        confirmLabel: 'Branch off',
+    });
+    if (!res?.confirmed) return null;
+    const typed = String(res.value || '').trim();
+    if (!typed) return null;
+    // The numbered list is an OFFER, not a restriction (A8): anything else the
+    // owner types goes to the server as a commit-ish and is resolved there.
+    const picked = /^\d+$/.test(typed) ? offer[Number(typed) - 1] : null;
+    const baseRef = picked ? String(picked.ref || '') : typed;
+    const { outcome, described } = await withAcknowledgement(
+        () => ops.branchOff(project.id, thread.id, baseRef),
+        { title: 'Branch off', confirmLabel: 'Continue', project, apiClient, ask },
+    );
+    refresh();
+    // The snapshot receipt is the only surface `tracked_sensitive` has: which
+    // credential-shaped files were LEFT OUT of the commit (still untracked, still
+    // in the folder) and which were already tracked and therefore committed with
+    // everything else. Two opposite facts, and the owner needs both.
+    const receipt = snapshotReceipt(outcome);
+    await announce(ask, 'Branch off', {
+        ...described,
+        text: [described.text, receipt].filter(Boolean).join(' '),
+    });
+    return described;
+}
+
+/** MERGE BACK (A9), including the `checkout_dirty` retry the server offers. */
+async function mergeBack(project, thread, { apiClient, refresh, ask, ops }) {
+    const { outcome, described } = await withAcknowledgement(
+        (acknowledged) => ops.mergeBack(project.id, thread.id, acknowledged),
+        {
+            title: 'Merge back',
+            confirmLabel: 'Merge anyway',
+            project,
+            apiClient,
+            ask,
+        },
+    );
+    refresh();
+    if (!outcome?.ok && String(outcome?.reason || '') === 'merge_abort_failed') {
+        // The one state that blocks everything else in that folder: the merge
+        // could neither finish NOR be undone, so the project folder is stopped
+        // part-way through it. Rendering that as one more red sentence next to
+        // "conflicts" would hide the difference that matters — a conflict left the
+        // folder byte-for-byte as it was, and this did not.
+        await ask({
+            title: 'The project folder is mid-merge',
+            body: withEvidence(
+                `${described.text} The folder ${outcome.working_dir || ''} is stopped part-way through a merge, so nothing else can run in it until you finish or abort it there yourself (git merge --abort).`.replace(/\s{2,}/g, ' '),
+                [outcome.abort_detail, ...(described.evidence || [])],
+            ),
+            alert: true,
+        });
+        return described;
+    }
+    await announce(ask, 'Merge back', described);
+    return described;
+}
+
+/** Remove a checkout (A10): the inspection is SHOWN before anything is removed. */
+async function removeCheckout(project, thread, { apiClient, refresh, inspection, ask, ops }) {
+    const prompt = removalPrompt(inspection);
+    const ok = await ask({
+        title: 'Remove checkout',
+        body: withEvidence(prompt.text, prompt.evidence),
+        confirmLabel: 'Remove checkout',
+        danger: prompt.needsAcknowledgement,
+    });
+    if (ok !== true) return null;
+    const described = describeOutcome(
+        await ops.removeWorktree(project.id, thread.id, prompt.needsAcknowledgement),
+    );
+    refresh();
+    await announce(ask, 'Remove checkout', described);
+    return described;
+}
+
+/**
+ * Delete a thread, checkout and all (D4) — two steps for rebuildable dirt, a wall
+ * for work.
+ *
+ * `checkout_holds_rebuildable_files` is a QUESTION: the checkout's only contents
+ * are files git was told to ignore or was never told about, so nothing the
+ * repository would not still have is at stake. `checkout_holds_work` is a WALL:
+ * commits that exist nowhere else, edits to tracked files, or an inspection that
+ * could not be taken — and the way past it is a merge back or an acknowledged
+ * removal, not a louder yes here. The server names which one it is; this only has
+ * to stop conflating them.
+ */
+async function deleteThread(project, thread, { apiClient, refresh, ask, ops }) {
+    const retrying = String(thread.lifecycle || 'active') === 'deleting';
+    const ok = await ask({
+        title: retrying ? 'Retry delete' : 'Delete thread',
+        body: retrying
+            ? `Deleting “${thread.name}” did not finish${thread.delete_error ? `: ${thread.delete_error}` : ''}. Ask again?`
+            : `Delete “${thread.name}”? Its id and chat id are reserved forever and its journal rows physically remain — they are not erased. A checkout it owns is removed with it.`,
+        confirmLabel: retrying ? 'Retry delete' : 'Delete',
+        danger: true,
+    });
+    if (ok !== true) return null;
+    const { described } = await withAcknowledgement(
+        (acknowledged) => ops.delete(project.id, thread.id, acknowledged),
+        {
+            title: 'Delete thread',
+            confirmLabel: 'Delete anyway',
+            project,
+            apiClient,
+            ask,
+        },
+    );
+    refresh();
+    if (described.tone !== 'ok') await announce(ask, 'Delete thread', described);
+    return described;
+}
+
+/**
+ * ARCHIVED threads, and the way back (D4).
+ *
+ * The sidebar paints `/api/state`, whose projection FILTERS archived threads, so
+ * without this affordance an archived thread was on no surface the owner could
+ * reach and `restore` could not be invoked at all — archive was a one-way trip
+ * with a documented inverse nobody could press. `include_archived` exists on
+ * `/api/projects` precisely for a surface that can show them; this is that
+ * surface, deliberately built out of the SAME row-menu vocabulary rather than a
+ * new screen (P7).
+ */
+export async function openArchivedThreadsMenu(project, {
+    apiClient, anchorEl, onChanged, ask = openConfirmDialog, openMenu = openRowMenu,
+    ops = threadOps,
+} = {}) {
+    let rows = [];
+    let error = '';
+    try {
+        const listed = await apiClient.projectsList(true);
+        const entry = (listed?.projects || []).find((row) => String(row.id) === String(project.id));
+        rows = (entry?.threads || []).filter((t) => String(t.lifecycle || '') === 'archived');
+    } catch (e) {
+        error = String(e?.body?.error || e?.message || e);
+    }
+    if (error || !rows.length) {
+        await ask({
+            title: 'Archived threads',
+            body: error
+                ? `The archived threads could not be read: ${error}`
+                : `No archived threads in “${project.name || project.id}”.`,
+            alert: true,
+        });
+        if (anchorEl?.isConnected) anchorEl.focus();
+        return rows;
+    }
+    openMenu({
+        anchorEl,
+        ariaLabel: `Archived threads in ${project.name || project.id}`,
+        itemsHtml: rows.map((row) => (
+            `<button type="button" role="menuitem" data-prm="restore:${escapeHtml(row.id)}" title="Restore this thread">${escapeHtml(row.name)}</button>`
+        )).join('\n'),
+        onSelect: async (action) => {
+            const id = String(action || '').startsWith('restore:') ? action.slice(8) : '';
+            if (!id) return;
+            const described = describeOutcome(await ops.restore(project.id, id));
+            onChanged?.({ authoritative: true });
+            if (described.tone !== 'ok') await announce(ask, 'Restore', described);
+            if (anchorEl?.isConnected) anchorEl.focus();
+        },
+    });
+    return rows;
 }
 
 // ---------------------------------------------------------------------------

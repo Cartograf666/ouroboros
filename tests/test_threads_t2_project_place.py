@@ -1060,3 +1060,190 @@ def test_ensure_project_scope_adopts_the_running_tasks_folder(tmp_path, monkeypa
         {"task_id": "live1", "project_id": "livesite", "project_name": "Live Site"}, ctx
     )
     assert get_project(drive, "livesite")["working_dir"] == str(ws.resolve())
+
+
+# --- T4: the direct task API is an ADMISSION path too -----------------------------
+
+def test_every_resolve_room_workspace_call_site_names_the_room(tmp_path):
+    """A guard against the NEXT admission path forgetting `room_chat_id`.
+
+    `resolve_room_workspace` grew that argument so it can tell WHICH thread is
+    asking: a thread that branched off works in its own checkout, and a task
+    admitted without the room's chat id is handed the PROJECT's folder instead —
+    it then takes the project folder's writer lane and queues behind it. Branching
+    bought the owner a second copy of their files and no concurrency, and nothing
+    on any surface says so; the loss is visible only through the lane.
+
+    The argument has a default, deliberately (the resolver is also asked
+    project-wide questions), so a new caller that omits it compiles, passes every
+    behavioural test it writes, and silently reintroduces the defect. This reads
+    the SOURCE instead, because the fact under test is "no call site forgets",
+    which no single behavioural test can express.
+    """
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    call = re.compile(r"resolve_room_workspace\s*\(", re.MULTILINE)
+    offenders = []
+    inspected = 0
+    for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(root)
+        if rel.parts[0] in {"tests", ".git", "build", "dist"}:
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for match in call.finditer(text):
+            # The call spans several lines; take the balanced argument list.
+            depth, index = 0, match.end() - 1
+            while index < len(text):
+                if text[index] == "(":
+                    depth += 1
+                elif text[index] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                index += 1
+            args = text[match.end():index]
+            if "def resolve_room_workspace" in text[max(0, match.start() - 40):match.start()]:
+                continue
+            inspected += 1
+            if "room_chat_id" not in args:
+                offenders.append(f"{rel}:{text[:match.start()].count(chr(10)) + 1}")
+    assert inspected >= 2, (
+        "the scan found no admission call sites at all — the pattern went stale and "
+        "this guard is now vacuous"
+    )
+    assert offenders == [], (
+        "these admission paths call resolve_room_workspace without room_chat_id, so "
+        f"every thread of a project resolves to the project's folder: {offenders}"
+    )
+
+
+def test_the_direct_task_api_admits_a_branched_thread_into_its_own_checkout(
+    tmp_path, monkeypatch,
+):
+    """The direct task API resolved NO room workspace at all (T4).
+
+    `POST /api/tasks` with a `project_id` and no `workspace_root` queued a
+    folder-less task, so a task born in a branched thread's room never reached that
+    thread's checkout. Same admission question, same answer, whichever door the
+    caller came through.
+    """
+    from ouroboros.gateway.tasks import api_tasks_create
+    from ouroboros.projects_registry import create_project, create_thread
+    from ouroboros.thread_worktrees import provision_thread_worktree
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = tmp_path / "data"
+    (data / "memory").mkdir(parents=True)
+    folder = tmp_path / "alpha"
+    _init_git_repo(folder)
+    create_project(data, "alpha", working_dir=str(folder))
+    thread = create_thread(data, "alpha", name="Branched")
+    handle = provision_thread_worktree(
+        repo_dir=folder, project_id="alpha", thread_id=thread["id"],
+        data_dir=data, worktree_root=tmp_path / "checkouts",
+    )
+
+    enqueued: list = []
+    monkeypatch.setattr("supervisor.workers.WORKERS", {0: object()})
+    monkeypatch.setattr("supervisor.workers._WORKER_POOL_DISABLED_REASON", "")
+    monkeypatch.setattr("supervisor.queue.enqueue_task", lambda task: enqueued.append(dict(task)) or task)
+    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": True)
+
+    app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
+    app.state.drive_root = data
+    app.state.repo_dir = repo
+    client = TestClient(app)
+
+    resp = client.post("/api/tasks", json={
+        "description": "work in my branch",
+        "project_id": "alpha",
+        "chat_id": int(thread["chat_id"]),
+    })
+    assert resp.status_code == 200, resp.text
+    assert enqueued[-1]["workspace_root"] == str(pathlib.Path(handle.path).resolve())
+
+    # ...and thread #0 of the same project still gets the project folder, so the
+    # two are different LANES and can run at the same time (A7/A14).
+    resp = client.post("/api/tasks", json={
+        "description": "work in the folder",
+        "project_id": "alpha",
+        "chat_id": 0,
+    })
+    assert resp.status_code == 200, resp.text
+    assert enqueued[-1]["workspace_root"] == str(folder.resolve())
+
+    from ouroboros.project_lease import candidate_is_leasable, running_project_lanes
+
+    held = running_project_lanes([{"task": enqueued[0]}])
+    assert candidate_is_leasable(enqueued[1], held) is True
+    assert candidate_is_leasable(dict(enqueued[0]), held) is False
+
+
+def test_a_workspace_none_task_is_still_folder_less_through_the_direct_api(
+    tmp_path, monkeypatch,
+):
+    """The opt-out survives the new resolution: `workspace="none"` is an explicit
+    "I write nowhere", and resolving a folder for it would hand file access to a
+    caller that asked not to have any."""
+    from ouroboros.gateway.tasks import api_tasks_create
+    from ouroboros.projects_registry import create_project
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = tmp_path / "data"
+    (data / "memory").mkdir(parents=True)
+    folder = tmp_path / "alpha"
+    _init_git_repo(folder)
+    create_project(data, "alpha", working_dir=str(folder))
+
+    enqueued: list = []
+    monkeypatch.setattr("supervisor.workers.WORKERS", {0: object()})
+    monkeypatch.setattr("supervisor.workers._WORKER_POOL_DISABLED_REASON", "")
+    monkeypatch.setattr("supervisor.queue.enqueue_task", lambda task: enqueued.append(dict(task)) or task)
+    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": True)
+
+    app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
+    app.state.drive_root = data
+    app.state.repo_dir = repo
+    resp = TestClient(app).post("/api/tasks", json={
+        "description": "think about it", "project_id": "alpha", "workspace": "none",
+    })
+    assert resp.status_code == 200, resp.text
+    assert not enqueued[-1].get("workspace_root")
+
+
+def test_the_direct_task_api_offers_git_for_an_untracked_project_folder(
+    tmp_path, monkeypatch,
+):
+    """A12 through the second door: the project's own folder is untracked, so the
+    task is not queued and the caller gets the same typed offer the explicit
+    `workspace_root` path already returned."""
+    from ouroboros.gateway.tasks import api_tasks_create
+    from ouroboros.projects_registry import create_project
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    data = tmp_path / "data"
+    (data / "memory").mkdir(parents=True)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    create_project(data, "alpha", working_dir=str(plain))
+
+    enqueued: list = []
+    monkeypatch.setattr("supervisor.workers.WORKERS", {0: object()})
+    monkeypatch.setattr("supervisor.workers._WORKER_POOL_DISABLED_REASON", "")
+    monkeypatch.setattr("supervisor.queue.enqueue_task", lambda task: enqueued.append(dict(task)) or task)
+    monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": True)
+
+    app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
+    app.state.drive_root = data
+    app.state.repo_dir = repo
+    resp = TestClient(app).post("/api/tasks", json={
+        "description": "edit the files", "project_id": "alpha",
+    })
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error_code"] == "git_init_required"
+    assert enqueued == []
+    assert not (plain / ".git").exists()

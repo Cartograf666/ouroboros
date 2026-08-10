@@ -1537,7 +1537,16 @@ WebSocket (client-side fan-out by `chat_id`). It used to open as a right split
 panel that became a full-width overlay with a backdrop on mobile; that was two
 competing full-screen surfaces on a phone, and project threads (T1) retired it.
 Do not reintroduce a right-panel project view: the right slot is the task
-inspector's, and a thread and an inspected task are meant to coexist. On mobile the sidebar
+inspector's, and a thread and an inspected task are meant to coexist. Every
+owner gesture on a thread — rename, fork, branch off, merge back, show changes,
+remove the checkout, archive, restore, delete — belongs to the ONE thread row
+menu in `web/modules/project_threads.js`, built from `project_thread_actions.js`
+and mounted through the shared row-menu shell. Do not add a second surface for
+any of them, and do not re-author a refusal's copy on the client: the sentence
+belongs beside the rule that produced it, and a second copy drifts the moment
+either is edited. A refusal that carries `acknowledgeable` or a typed `decision`
+MUST be rendered with its answer in the same gesture — an escape with no
+producer is an escape that does not exist. On mobile the sidebar
 collapses behind an "Open navigation" toggle (drawer), NOT a horizontal bottom
 bar. Spacing/typography come from the shared design tokens in `web/style.css`
 (no per-screen hardcoding); global agent controls (Evolve/Review/Restart ghost
