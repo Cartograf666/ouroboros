@@ -115,20 +115,36 @@ export function successText(outcome) {
 /**
  * What a snapshot base actually did, for the receipt after a branch-off.
  *
- * Returns '' when no snapshot was involved. A snapshot that EXCLUDED
- * credential-shaped files says so by name: those files are still in the folder
- * and still untracked, and an owner who is not told will believe their `.env`
- * came along.
+ * Returns '' when no snapshot was involved. TWO disclosures, and they are
+ * opposite facts that used to be told as one sentence:
+ *
+ *   - `skipped_sensitive` — credential-shaped files git did NOT already track.
+ *     They were kept out of the commit and are still in the folder, still
+ *     untracked. An owner who is not told will believe their `.env` came along.
+ *   - `tracked_sensitive` — credential-shaped files git ALREADY tracks. They were
+ *     snapshotted like every other tracked file, because unstaging a tracked path
+ *     stages a DELETION on the owner's branch and protects nothing: its contents
+ *     are in history already. "Still untracked" was only ever true of these
+ *     because the snapshot had just untracked them, which is the bug it described.
  */
 export function snapshotReceipt(outcome) {
     const snapshot = outcome?.snapshot_commit;
     if (!snapshot) return '';
-    const skipped = Array.isArray(snapshot.skipped_sensitive) ? snapshot.skipped_sensitive.filter(Boolean) : [];
-    if (!snapshot.created) return 'The folder had no uncommitted changes, so nothing new was committed.';
-    const base = 'Your uncommitted changes were committed first, so the branch starts from exactly what was there.';
-    return skipped.length
-        ? `${base} Left out of that commit (still in your folder, still untracked): ${skipped.join(', ')}.`
-        : base;
+    const list = (key) => (Array.isArray(snapshot[key]) ? snapshot[key].filter(Boolean) : []);
+    const skipped = list('skipped_sensitive');
+    const tracked = list('tracked_sensitive');
+    const parts = [
+        snapshot.created
+            ? 'Your uncommitted changes were committed first, so the branch starts from exactly what was there.'
+            : 'The folder had no uncommitted changes, so nothing new was committed.',
+    ];
+    if (skipped.length) {
+        parts.push(`Left out of that commit (still in your folder, still untracked): ${skipped.join(', ')}.`);
+    }
+    if (tracked.length) {
+        parts.push(`Already tracked by git, so committed with everything else: ${tracked.join(', ')}.`);
+    }
+    return parts.join(' ');
 }
 
 /**

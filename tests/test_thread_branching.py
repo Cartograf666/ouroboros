@@ -29,12 +29,16 @@ from ouroboros.projects_registry import create_project
 from ouroboros.thread_branching import (
     BASE_SNAPSHOT,
     REASON_ALREADY_BRANCHED,
+    REASON_CHECKOUT_DIRTY,
+    REASON_CHECKOUT_HEAD_OFF_BRANCH,
     REASON_GIT_INIT_REQUIRED,
     REASON_LOCAL_TREE_DIRTY,
+    REASON_MERGE_ABORT_FAILED,
     REASON_MERGE_CONFLICT,
     REASON_NOT_BRANCHED,
     REASON_NO_FOLDER,
     REASON_PROJECT_BUSY,
+    REASON_SNAPSHOT_FAILED,
     REASON_UNKNOWN_BASE,
     branch_off_bases,
     branch_off_thread,
@@ -214,6 +218,102 @@ def test_as_it_is_now_snapshots_uncommitted_work_and_leaves_secrets_out(drive, f
     assert ".env" not in tracked
 
 
+def test_a_snapshot_never_deletes_a_TRACKED_credential_shaped_file(drive, folder, wt_root):
+    """T3R-1, the regression that matters most in this module.
+
+    ``_unstage_sensitive_paths`` was written for ``attach_snapshot_init``, where
+    the repository was created one line earlier and EVERY staged path is untracked
+    by construction. On the owner's own pre-existing repository the same call is a
+    different operation: ``git diff --cached --name-only`` lists TRACKED
+    modifications too, and ``git rm --cached`` on one of those stages a DELETION.
+    A fixture the project had tracked for months was committed away on the owner's
+    branch, vanished from ``git ls-files``, and the receipt told them it was
+    "still in your folder, still untracked" — true only because the snapshot had
+    just untracked it.
+
+    Both shapes in one repository, because telling them apart is the fix:
+    (a) a TRACKED credential-shaped file the owner modified — snapshotted like any
+        other tracked file and DISCLOSED, never deleted;
+    (b) an UNTRACKED one — still kept out of history, as it always was.
+    """
+    fixtures = folder / "tests" / "fixtures"
+    fixtures.mkdir(parents=True)
+    (fixtures / "token.json").write_text('{"token": "fixture"}\n', encoding="utf-8")
+    _git(folder, "add", "-A")
+    _git(folder, "commit", "-qm", "the fixture has been tracked for months")
+    exclude = folder / ".git" / "info" / "exclude"
+    exclude_before = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+
+    # (a) tracked and modified, (b) untracked and new.
+    (fixtures / "token.json").write_text('{"token": "fixture-v2"}\n', encoding="utf-8")
+    (folder / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
+    thread = _project(drive, folder)
+
+    out = _branch(drive, "racer", thread["id"], wt_root, base_ref=BASE_SNAPSHOT)
+
+    assert out["ok"] is True, out
+    snapshot = out["snapshot_commit"]
+    # (b) the untracked secret stays out of history, exactly as before.
+    assert snapshot["skipped_sensitive"] == [".env"]
+    # (a) the tracked one is disclosed rather than deleted.
+    assert snapshot["tracked_sensitive"] == ["tests/fixtures/token.json"]
+    tracked = _git(folder, "ls-files").stdout.split()
+    assert "tests/fixtures/token.json" in tracked, "a tracked file must survive a snapshot"
+    assert ".env" not in tracked
+    assert (fixtures / "token.json").is_file()
+    # The snapshot commit MODIFIES it; it must never delete it.
+    changed = _git(folder, "show", "--name-status", "--format=", "HEAD").stdout
+    assert "M\ttests/fixtures/token.json" in changed
+    assert "D\t" not in changed
+    # The owner's own exclude file is theirs; a pre-existing repo is not rewritten.
+    assert (exclude.read_text(encoding="utf-8") if exclude.exists() else "") == exclude_before
+
+
+def test_a_snapshot_that_cannot_tell_tracked_from_untracked_refuses(drive, folder, wt_root, monkeypatch):
+    """"Which of these does HEAD already have" has no safe default: guessing ABSENT
+    deletes the owner's tracked file, guessing PRESENT commits a new secret. So the
+    snapshot refuses — and hands the INDEX back, because `git add -A` has already
+    staged the whole folder by then (T3R-10)."""
+    import ouroboros.project_sources as sources
+
+    (folder / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
+    (folder / "app.txt").write_text("unsaved\n", encoding="utf-8")
+    thread = _project(drive, folder)
+    head_before = _git(folder, "rev-parse", "HEAD").stdout.strip()
+    monkeypatch.setattr(
+        sources, "_staged_sensitive_partition", lambda _p: ([], [], "git ls-tree exploded"),
+    )
+
+    out = _branch(drive, "racer", thread["id"], wt_root, base_ref=BASE_SNAPSHOT)
+
+    assert out["ok"] is False
+    assert out["reason"] == REASON_SNAPSHOT_FAILED
+    assert "already tracked" in out["message"]
+    assert _git(folder, "rev-parse", "HEAD").stdout.strip() == head_before
+    # T3R-10: the folder is handed back as it was — nothing staged, nothing lost.
+    staged = _git(folder, "diff", "--cached", "--name-only").stdout.strip()
+    assert staged == "", f"the owner's index was left staged: {staged!r}"
+    assert (folder / "app.txt").read_text(encoding="utf-8") == "unsaved\n"
+    assert (folder / ".env").read_text(encoding="utf-8") == "API_KEY=secret\n"
+
+
+def test_a_folder_whose_only_change_is_an_untracked_secret_makes_no_commit(drive, folder, wt_root):
+    """With the secret left out there is nothing left to commit, and that is read
+    from the INDEX rather than from git's English "nothing to commit" (T3R-11)."""
+    (folder / ".env").write_text("API_KEY=secret\n", encoding="utf-8")
+    thread = _project(drive, folder)
+    before = _git(folder, "rev-parse", "HEAD").stdout.strip()
+
+    out = _branch(drive, "racer", thread["id"], wt_root, base_ref=BASE_SNAPSHOT)
+
+    assert out["ok"] is True, out
+    assert out["snapshot_commit"]["created"] is False
+    assert out["snapshot_commit"]["sha"] == before
+    assert out["snapshot_commit"]["skipped_sensitive"] == [".env"]
+    assert _git(folder, "rev-parse", "HEAD").stdout.strip() == before
+    assert _git(folder, "diff", "--cached", "--name-only").stdout.strip() == ""
+
+
 def test_as_it_is_now_on_a_clean_tree_makes_no_commit(drive, folder, wt_root):
     """"Exactly as it is now" of a clean folder is already a commit — HEAD."""
     before = _git(folder, "rev-parse", "HEAD").stdout.strip()
@@ -330,6 +430,115 @@ def test_a_real_conflict_is_shown_stops_the_merge_and_leaves_both_sides_intact(d
     # The thread stays in its branch with its work intact.
     assert _git(out["path"], "rev-parse", "HEAD").stdout.strip() == thread_head
     assert thread_location(drive, "racer", thread["id"])["where"] == "worktree"
+
+
+def test_a_failed_abort_is_reported_as_a_mid_merge_folder_not_as_success(drive, folder, wt_root, monkeypatch):
+    """T3R-2. "The merge was stopped and the folder left as it was" is a CLAIM
+    about a git command, and that command can fail.
+
+    The abort's result was never read, so the sentence was asserted rather than
+    verified: with a failing abort the owner's folder sat with MERGE_HEAD, `UU`
+    entries and conflict markers in the file while the answer said it was
+    untouched. The mid-merge state must be NAMED, with what the owner has to do.
+    """
+    import ouroboros.thread_branching as branching
+
+    thread = _project(drive, folder)
+    out = _branch(drive, "racer", thread["id"], wt_root)
+    _commit_in(out["path"], "app.txt", "the thread's version\n")
+    (folder / "app.txt").write_text("the owner's version\n", encoding="utf-8")
+    _git(folder, "commit", "-qam", "owner edit")
+
+    real_git = branching._git
+
+    def _abort_fails(root, *args):
+        if args[:2] == ("merge", "--abort"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 128, "", "fatal: could not abort",
+            )
+        return real_git(root, *args)
+
+    monkeypatch.setattr(branching, "_git", _abort_fails)
+    refused = merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+    monkeypatch.undo()
+
+    assert refused["ok"] is False
+    assert refused["reason"] == REASON_MERGE_ABORT_FAILED
+    assert refused["folder_left_mid_merge"] is True
+    assert "stopped part-way" in refused["message"]
+    assert "git merge --abort" in refused["message"]
+    assert refused["conflicts"] == ["app.txt"]
+    assert refused["working_dir"] == str(folder)
+    # The answer is true: the folder really IS mid-merge, and now says so.
+    assert (folder / ".git" / "MERGE_HEAD").exists()
+    assert _git(folder, "status", "--porcelain").stdout.strip().startswith("UU")
+    assert "<<<<<<<" in (folder / "app.txt").read_text(encoding="utf-8")
+    _git(folder, "merge", "--abort")
+
+
+def test_a_merge_git_refused_outright_is_not_reported_as_a_stuck_folder(drive, folder, wt_root):
+    """The abort is only checked when a merge actually STARTED. A merge git
+    refused before beginning leaves nothing in progress, so `merge --abort`
+    failing there means the folder is FINE — reporting it as stopped part-way
+    would send the owner to fix a folder that needs nothing."""
+    thread = _project(drive, folder)
+    out = _branch(drive, "racer", thread["id"], wt_root)
+    _commit_in(out["path"], "feature.txt", "from the thread\n")
+    # An unrelated history: git refuses the merge outright, without starting one.
+    _git(folder, "checkout", "-q", "--orphan", "unrelated")
+    _git(folder, "commit", "-qm", "a history with no common ancestor")
+
+    refused = merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+
+    assert refused["ok"] is False
+    assert refused["reason"] != REASON_MERGE_ABORT_FAILED
+    assert not (folder / ".git" / "MERGE_HEAD").exists()
+
+
+def test_merge_back_refuses_while_the_checkout_still_holds_uncommitted_work(drive, folder, wt_root):
+    """T3R-3(a). A merge moves COMMITS. Edits that were never committed in the
+    checkout do not travel with it, and answering `ok: true, merged: true` tells
+    the owner everything came home while that work sits in a folder they have
+    stopped looking at."""
+    thread = _project(drive, folder)
+    out = _branch(drive, "racer", thread["id"], wt_root)
+    _commit_in(out["path"], "feature.txt", "committed\n")
+    from pathlib import Path
+
+    Path(out["path"], "feature.txt").write_text("committed + more\n", encoding="utf-8")
+    Path(out["path"], "brand_new.txt").write_text("never committed\n", encoding="utf-8")
+
+    refused = merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+
+    assert refused["ok"] is False
+    assert refused["reason"] == REASON_CHECKOUT_DIRTY
+    assert "never committed" in refused["message"]
+    assert any("brand_new.txt" in row for row in refused["dirty_files"])
+    # Nothing was merged: a refusal must not half-do the operation it refused.
+    assert not (folder / "feature.txt").exists()
+    assert refused["inspection"]["dirty"] is True
+
+
+def test_merge_back_refuses_when_the_checkouts_HEAD_is_off_the_threads_branch(drive, folder, wt_root):
+    """T3R-3(b), the quieter of the two and the worse one.
+
+    Every commit went to a branch the thread is not bound to, so the bound branch
+    never moved, the merge was a no-op, and `ok: true, merged: false` renders as
+    "nothing new to merge — the folder already has this work". The folder has none
+    of it."""
+    thread = _project(drive, folder)
+    out = _branch(drive, "racer", thread["id"], wt_root)
+    _git(out["path"], "checkout", "-q", "-b", "my-side-work")
+    _commit_in(out["path"], "feature.txt", "all of the thread's real work\n")
+
+    refused = merge_back_thread(drive, "racer", thread["id"], data_dir=drive, busy=False)
+
+    assert refused["ok"] is False
+    assert refused["reason"] == REASON_CHECKOUT_HEAD_OFF_BRANCH
+    assert refused["checkout_branch"] == "my-side-work"
+    assert refused["branch"] in refused["message"]
+    assert "my-side-work" in refused["message"]
+    assert not (folder / "feature.txt").exists()
 
 
 def test_an_unbranched_thread_has_nothing_to_merge(drive, folder, wt_root):

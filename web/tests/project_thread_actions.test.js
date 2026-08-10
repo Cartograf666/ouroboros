@@ -112,6 +112,32 @@ test('a snapshot receipt names the credential files it left out', () => {
     assert.equal(snapshotReceipt({}), '');
 });
 
+test('a snapshot receipt does not call an ALREADY TRACKED file untracked (T3R-1)', () => {
+    // The old wording said every credential-shaped file was "still untracked".
+    // For a file git already tracked that was true only because the snapshot had
+    // just untracked it — by committing a DELETION on the owner's branch. Now the
+    // file is snapshotted like any other tracked file, so the receipt says so.
+    const text = snapshotReceipt({
+        snapshot_commit: {
+            created: true,
+            sha: 'abc',
+            skipped_sensitive: ['.env'],
+            tracked_sensitive: ['tests/fixtures/token.json'],
+        },
+    });
+    assert.match(text, /still in your folder, still untracked\): \.env/);
+    assert.match(text, /Already tracked by git, so committed with everything else: tests\/fixtures\/token\.json/);
+    // The two facts are never merged into one claim about all of them.
+    assert.ok(!/still untracked\): [^.]*token\.json/.test(text));
+
+    // A snapshot with only tracked ones says nothing about untracked files.
+    const trackedOnly = snapshotReceipt({
+        snapshot_commit: { created: true, sha: 'abc', tracked_sensitive: ['secrets.yml'] },
+    });
+    assert.ok(!/still untracked/.test(trackedOnly));
+    assert.match(trackedOnly, /secrets\.yml/);
+});
+
 test('a clean checkout removes without an acknowledgement; unmerged work does not', () => {
     const clean = removalPrompt({ dirty_files: [], unmerged_commits: 0 });
     assert.equal(clean.needsAcknowledgement, false);

@@ -384,35 +384,104 @@ def ephemeral_checkout_reason(path: pathlib.Path) -> str:
     return _linked(str(shared.parent))
 
 
+def _staged_sensitive_partition(path: pathlib.Path) -> tuple[list[str], list[str], str]:
+    """Split the STAGED credential-shaped paths by whether HEAD already has them.
+
+    Returns ``(absent_from_head, present_in_head, error)``. Only the first list may
+    ever be unstaged, and that distinction is the whole point of this function.
+
+    ``attach_snapshot_init`` runs on a repository it just created, where every
+    staged path is untracked BY CONSTRUCTION, so "unstage everything that looks
+    like a credential" was correct there and only there. On an EXISTING repository
+    — which is what branching off snapshots — ``git diff --cached --name-only``
+    also lists TRACKED modifications, and ``git rm --cached`` on one of those does
+    not "leave it out of the commit": it stages a DELETION. The file leaves
+    ``git ls-files``, the owner's branch gets a commit removing it, and nothing in
+    history is protected by the removal, because a tracked file's contents are
+    already in history. Keeping a secret OUT of history and TAKING a tracked file
+    out of the owner's branch are opposite acts that share one git command, so the
+    two cases must be told apart before it runs.
+
+    ``error`` is non-empty when membership in HEAD could not be determined. That is
+    never treated as "absent": failing that direction is exactly the data loss this
+    function exists to prevent, so the caller refuses the whole snapshot instead.
+    An UNBORN HEAD is not an error — it is the definitive answer "nothing is
+    tracked yet", which is the attach case.
+    """
+    from ouroboros.headless import _sensitive_untracked_reason
+
+    def _run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-c", "core.quotepath=off", *args],
+            cwd=str(path), capture_output=True, text=True, timeout=60,
+            env={**os.environ, "LC_ALL": "C", "GIT_LITERAL_PATHSPECS": "1"},
+        )
+
+    staged = _run("diff", "--cached", "--name-only", "-z")
+    if staged.returncode != 0:
+        return [], [], (staged.stderr or "git diff --cached failed").strip()[:300]
+    flagged = [
+        rel for rel in (staged.stdout or "").split("\0")
+        if rel and _sensitive_untracked_reason(rel)
+    ]
+    if not flagged:
+        return [], [], ""
+    if _run("rev-parse", "--verify", "-q", "HEAD").returncode != 0:
+        # No commit yet: nothing can be tracked, so every flagged path is new.
+        return flagged, [], ""
+    listed = _run("ls-tree", "-r", "-z", "--name-only", "--full-tree", "HEAD")
+    if listed.returncode != 0:
+        return [], [], (listed.stderr or "git ls-tree HEAD failed").strip()[:300]
+    in_head = {rel for rel in (listed.stdout or "").split("\0") if rel}
+    return (
+        [rel for rel in flagged if rel not in in_head],
+        [rel for rel in flagged if rel in in_head],
+        "",
+    )
+
+
+def _unstage_staged_paths(path: pathlib.Path, rels: list[str]) -> str:
+    """``git rm --cached`` the given paths. Returns "" or the failure detail.
+
+    ``GIT_LITERAL_PATHSPECS`` because these are FILENAMES, not patterns: a file
+    literally named ``*.env`` or ``:(glob)token.json`` would otherwise be handed to
+    git as pathspec magic and unstage something nobody named."""
+    if not rels:
+        return ""
+    proc = subprocess.run(
+        ["git", "-c", "core.quotepath=off", "rm", "-q", "--cached", "--", *rels],
+        cwd=str(path), capture_output=True, text=True, timeout=60,
+        env={**os.environ, "LC_ALL": "C", "GIT_LITERAL_PATHSPECS": "1"},
+    )
+    if proc.returncode != 0:
+        return (proc.stderr or proc.stdout or "git rm --cached failed").strip()[:300]
+    return ""
+
+
 def _unstage_sensitive_paths(path: pathlib.Path) -> list[str]:
     """Unstage credential-shaped files after ``git add -A`` and keep them untracked
     via `.git/info/exclude` (local-only — the owner's folder files are never edited).
     Same `_sensitive_untracked_reason` SSOT the workspace patch and coop checkpoint
     use (triad r4: an attach snapshot must not bake `.env`/keys into history).
-    Returns the skipped relative paths for disclosure."""
-    from ouroboros.headless import _sensitive_untracked_reason
+    Returns the skipped relative paths for disclosure.
 
-    staged = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "-z"],
-        cwd=str(path), capture_output=True, text=True, timeout=60,
-    )
-    skipped = [
-        rel for rel in (staged.stdout or "").split("\0")
-        if rel and _sensitive_untracked_reason(rel)
-    ]
-    if not skipped:
+    Only for a repository this process just created (``attach_snapshot_init``),
+    which is why writing ``.git/info/exclude`` is unconditional here: the file is
+    this function's own, one line old. A snapshot of a PRE-EXISTING repository must
+    use :func:`_staged_sensitive_partition` directly and leave the owner's exclude
+    file alone."""
+    absent, _present, error = _staged_sensitive_partition(path)
+    if error or not absent:
         return []
-    subprocess.run(
-        ["git", "rm", "-q", "--cached", "--"] + skipped,
-        cwd=str(path), capture_output=True, text=True, timeout=60,
-    )
+    if _unstage_staged_paths(path, absent):
+        return []
     exclude = path / ".git" / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
     with exclude.open("a", encoding="utf-8") as fh:
         fh.write("\n# ouroboros attach-snapshot: credential-shaped files stay untracked\n")
-        for rel in skipped:
+        for rel in absent:
             fh.write(f"/{rel}\n")
-    return skipped
+    return absent
 
 
 def attach_snapshot_init(path: pathlib.Path) -> tuple[str, list[str]]:
