@@ -156,6 +156,9 @@ def test_triad_prompt_keeps_distinct_goal_and_scope_in_production_wiring(
         return json.dumps({"results": []})
 
     monkeypatch.setattr(review, "run_cmd", fake_run_cmd)
+    import ouroboros.tools.review_binary_context as _rbc
+    monkeypatch.setattr(_rbc, "capture_staged_diff",
+                        lambda _repo, *, unified=3: "diff --git a/x.py b/x.py\n+x = 1")
     monkeypatch.setattr(review, "_preflight_check", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(review, "_load_checklist_section", lambda: "checklist")
     monkeypatch.setattr(review, "load_governance_doc", lambda *_args, **_kwargs: "governance")

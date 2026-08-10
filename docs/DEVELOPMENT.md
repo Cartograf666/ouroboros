@@ -1217,6 +1217,14 @@ Before every commit, verify the following:
   same update lock and honors this admission owner; it must not stash/reset
   behind the fence. Managed merge tests pass before restart; the ordinary
   self-modification commit/tag/test/push ordering remains unchanged.
+- Take a fresh rescue before every destructive rollback and before boot-resume
+  re-materialization: the pre-update snapshot predates the merge and holds none
+  of the resolution. The hook is fail-open — never block a rollback on it — but
+  its outcome, captured or failed, is disclosed durably at capture time, before
+  the destruction. Record the pointer in the update transaction so a replayed
+  rollback does not re-snapshot and a retry rescues what appeared since; keep
+  that pointer until the transaction ends, because a re-materialized merge looks
+  identical to restored work and is not evidence the rescue was applied.
 - Manual Restore reuses the same writer fence and pins the previous HEAD on a
   local recovery branch before reset. Promotion resolves the development SHA
   once and uses that exact SHA for both the local QA ref and any remote push.
@@ -1520,7 +1528,12 @@ that:
 ### The commit gate mirrors the CI split
 
 `ouroboros/preflight_runner.py::run_hermetic_pytest` runs the same two logical
-passes as CI in one disposable checkout and scrubbed temporary data root:
+passes as CI in one disposable checkout and scrubbed temporary data root. The
+candidate is captured universally — one hardened worktree-vs-`HEAD` binary diff
+applied as raw bytes, assembled identically whether the source index is clean,
+dirty, or mid-merge — and a capture or apply failure is the typed
+`PREFLIGHT_CANDIDATE_ASSEMBLY` hard block with its own remediation, never a
+test failure:
 
 1. parallel `not serial` with xdist, loadscope distribution, no worker restart,
    and the configured per-test timeout;

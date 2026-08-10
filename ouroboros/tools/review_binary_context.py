@@ -7,6 +7,53 @@ import pathlib
 import subprocess
 
 
+class StagedDiffUnavailable(RuntimeError):
+    """The canonical staged diff could not be captured.
+
+    A RuntimeError so it lands in the prompt-assembly fail-closed path: a review
+    whose only evidence of a degraded file is the staged diff must not run
+    authoritatively on a placeholder string that says the capture failed.
+    """
+
+
+def capture_staged_diff(repo_dir: pathlib.Path, *, unified: int = 3) -> str:
+    """The staged diff exactly as the reviewer must see it.
+
+    ONE capture for both ladder rungs (full context and ``-U0``). The flag tail
+    pins away operator config that rewrites diff output into something that no
+    longer describes the staged bytes: external diff drivers, textconv filters,
+    colour escapes and prefix rewrites; GIT_DIFF_OPTS leaves the environment
+    because it overrides the context width from outside the argv. Output is
+    taken as BYTES and decoded strictly; non-UTF-8 staged text is rendered with
+    ``backslashreplace`` plus an explicit note, so it reaches the reviewer in a
+    readable form instead of raising or being flattened into U+FFFD.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "GIT_DIFF_OPTS"}
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color",
+             "--src-prefix=a/", "--dst-prefix=b/", f"--unified={int(unified)}"],
+            cwd=repo_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=300, env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise StagedDiffUnavailable(f"staged diff capture failed: {exc!r}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or b"").decode("utf-8", "replace").strip()
+        raise StagedDiffUnavailable(
+            f"staged diff capture failed (rc {result.returncode}): {detail or 'no detail'}"
+        )
+    raw = result.stdout or b""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        rendered = raw.decode("utf-8", "backslashreplace")
+        return (
+            f"{rendered}\n\n*(staged diff contained non-UTF-8 bytes; they are "
+            "rendered above as backslash escapes)*\n"
+        )
+
+
 def _git_bytes(repo_dir: pathlib.Path, args: list[str]) -> bytes:
     try:
         result = subprocess.run(

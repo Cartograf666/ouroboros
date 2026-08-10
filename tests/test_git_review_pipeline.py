@@ -432,6 +432,11 @@ class TestReviewEnforcementModes:
                 return diff_text
             return ""
         monkeypatch.setattr(review_mod, "run_cmd", _fake_run_cmd)
+        # The triad now reads its change evidence through the hardened
+        # capture_staged_diff seam (imported function-locally), not run_cmd.
+        import ouroboros.tools.review_binary_context as _rbc
+        monkeypatch.setattr(_rbc, "capture_staged_diff",
+                            lambda _repo, *, unified=3: diff_text)
 
     def test_blocking_mode_blocks_critical_findings(self, review_ctx, monkeypatch):
         review, ctx = review_ctx
@@ -476,6 +481,73 @@ class TestReviewEnforcementModes:
         # findings: repeats on the next attempt must still be recognized.
         assert ctx._review_iteration_count == 1
 
+    @pytest.mark.parametrize("failure", ["nonzero_rc", "non_utf8_rc"])
+    def test_uncapturable_staged_diff_blocks_instead_of_reviewing_a_placeholder(
+        self, review_ctx, monkeypatch, failure
+    ):
+        """The triad's change evidence is the staged diff, and the old ``run_cmd``
+        capture fell back to a ``(failed to get staged diff)`` STRING that a full,
+        authoritative review then ran against — findings about a diff nobody has.
+        It now goes through the hardened ``capture_staged_diff``; when git cannot
+        produce the diff the review fails closed in blocking mode (no reviewer is
+        dispatched), exactly like a checklist-load or reviewer-config infra
+        failure."""
+        review, ctx = review_ctx
+        # name-status / name-only still answer so we reach the diff capture, but
+        # the content capture is what fails.
+        self._mock_staged(monkeypatch, review, changed_files="x.py")
+        import ouroboros.tools.review_binary_context as rbc
+
+        def broken(_repo, *, unified=3):
+            detail = "fatal: bad object" if failure == "nonzero_rc" else "fatal: \udcffbad"
+            raise rbc.StagedDiffUnavailable(f"staged diff capture failed (rc 128): {detail}")
+
+        monkeypatch.setattr(rbc, "capture_staged_diff", broken)
+        monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
+        dispatched = []
+        monkeypatch.setattr(
+            review, "_handle_multi_model_review",
+            lambda *a, **k: dispatched.append(True) or self._fake_result("[]", "[]"),
+        )
+
+        result = review._run_unified_review(ctx, "test commit", repo_dir=ctx.repo_dir)
+
+        assert result is not None and "REVIEW_BLOCKED" in result
+        assert "staged diff" in result.lower()
+        assert "failed to get staged diff" not in result  # no placeholder anywhere
+        assert ctx._last_review_block_reason == "infra_failure"
+        assert dispatched == [], "no reviewer may run without the staged diff"
+
+    def test_uncapturable_staged_diff_is_advisory_skip_not_placeholder_review(
+        self, review_ctx, monkeypatch
+    ):
+        """Advisory counterpart: review is non-blocking, so an infra failure to
+        capture the diff skips the triad with a durable warning instead of feeding
+        a placeholder into it. The commit proceeds (``None``) and the skip is
+        recorded, never a review of ``(failed to get staged diff)``."""
+        review, ctx = review_ctx
+        self._mock_staged(monkeypatch, review, changed_files="x.py")
+        import ouroboros.tools.review_binary_context as rbc
+        monkeypatch.setattr(
+            review, "_handle_multi_model_review",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("triad must not run")),
+        )
+
+        def broken(_repo, *, unified=3):
+            raise rbc.StagedDiffUnavailable("staged diff capture failed: boom")
+
+        monkeypatch.setattr(rbc, "capture_staged_diff", broken)
+        monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+
+        result = review._run_unified_review(ctx, "test commit", repo_dir=ctx.repo_dir)
+
+        assert result is None
+        assert ctx._last_review_block_reason == "infra_failure"
+        assert any(
+            isinstance(w, str) and "staged diff capture failed" in w.lower()
+            for w in ctx._review_advisory
+        )
+
     def test_triad_one_pass_fit_removes_only_duplicated_context(self, review_ctx, monkeypatch):
         """Oversized triad evidence is compacted before its single dispatch."""
         review, ctx = review_ctx
@@ -496,6 +568,11 @@ class TestReviewEnforcementModes:
 
         captured = {}
         monkeypatch.setattr(review, "run_cmd", fake_run_cmd)
+        import ouroboros.tools.review_binary_context as _rbc
+        monkeypatch.setattr(
+            _rbc, "capture_staged_diff",
+            lambda _repo, *, unified=3: compact_diff if unified == 0 else huge_diff,
+        )
         monkeypatch.setattr(
             review, "build_touched_file_pack",
             lambda *_a, **_k: ("FULL SNAPSHOT\n" + ("x = 1\n" * 400_000), []),
@@ -526,6 +603,58 @@ class TestReviewEnforcementModes:
             tokenizer_margin=50_000,
             budget_cap=review.REVIEW_PROMPT_TOKEN_BUDGET,
         )
+
+    def test_triad_compact_rung_uses_hardened_capture_not_raw_run_cmd(self, review_ctx, monkeypatch):
+        """The oversized ladder's compact rung called a RAW ``run_cmd(git diff
+        --cached -U0)`` that inherits diff config/env and text decode, while only
+        the primary diff used the hardened capture. The compact rung must use
+        ``capture_staged_diff(unified=0)`` and never issue the raw ``-U0``
+        command."""
+        review, ctx = review_ctx
+        huge_diff = "diff --git a/x.py b/x.py\n" + ("+changed line\n" * 190_000)
+        compact_diff = "diff --git a/x.py b/x.py\n@@ -1 +1 @@\n-old\n+new\n"
+
+        run_cmd_calls = []
+
+        def fake_run_cmd(cmd, cwd=None):
+            run_cmd_calls.append(list(cmd))
+            cmd = list(cmd)
+            if cmd == ["git", "diff", "--cached", "--name-status"]:
+                return "M\tx.py"
+            if cmd == ["git", "diff", "--cached", "--name-only"]:
+                return "x.py"
+            return ""
+
+        monkeypatch.setattr(review, "run_cmd", fake_run_cmd)
+
+        capture_calls = []
+        import ouroboros.tools.review_binary_context as _rbc
+
+        def fake_capture(_repo, *, unified=3):
+            capture_calls.append(unified)
+            return compact_diff if unified == 0 else huge_diff
+
+        monkeypatch.setattr(_rbc, "capture_staged_diff", fake_capture)
+        monkeypatch.setattr(
+            review, "build_touched_file_pack",
+            lambda *_a, **_k: ("FULL SNAPSHOT\n" + ("x = 1\n" * 400_000), []))
+        monkeypatch.setattr(review._cfg, "get_review_models", lambda: [
+            "openai/gpt-5.5", "google/gemini-3.5-flash", "anthropic/claude-fable-5"])
+
+        captured = {}
+
+        def fake_review(*_args, **kwargs):
+            captured["prompt"] = kwargs["prompt"]
+            return self._fake_result(
+                '[{"item":"code_quality","verdict":"PASS","severity":"advisory","reason":"ok"}]',
+                '[{"item":"code_quality","verdict":"PASS","severity":"advisory","reason":"ok"}]')
+
+        monkeypatch.setattr(review, "_handle_multi_model_review", fake_review)
+
+        assert review._run_unified_review(ctx, "test commit", repo_dir=ctx.repo_dir) is None
+        assert 0 in capture_calls, "compact rung must call capture_staged_diff(unified=0)"
+        assert ["git", "diff", "--cached", "-U0"] not in run_cmd_calls, run_cmd_calls
+        assert compact_diff in captured["prompt"]
 
     def test_advisory_mode_downgrades_quorum_failure(self, review_ctx, monkeypatch):
         review, ctx = review_ctx
